@@ -76,8 +76,14 @@ export async function buildTestActors(): Promise<TestActors> {
           auth: authFor(tenant.user_id, 'tenant', tenant.tenant_id, null),
         }
       case 'landlord':
+        // S650: shaped like routes/agent.ts builds it since S634 — profileId
+        // EMPTY and the account's companies in landlordIds. Without landlordIds
+        // every landlord tool scoped to nothing, so the harness's landlord cases
+        // had been failing on "I don't see a tenant named Chen" whatever the
+        // agent did.
         return {
-          userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id,
+          userId: lord.user_id, role: 'landlord', profileId: '',
+          landlordIds: [lord.landlord_id],
           auth: authFor(lord.user_id, 'landlord', lord.landlord_id, lord.landlord_id),
         }
       case 'prospect': {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { allocateOldestFirst } from './paymentAllocation'
+import { allocateOldestFirst, compareForAllocation, sortForAllocation } from './paymentAllocation'
 
 
 /**
@@ -117,5 +117,89 @@ describe('carried-forward balance is paid last', () => {
     const aug  = { id: 'aug',  amount: 800, due_date: '2026-08-01', type: 'rent' }
     const r = allocateOldestFirst([arrears, sept, aug], 1600)
     expect(r.lines.map(l => l.payment_id)).toEqual(['aug', 'sept'])
+  })
+})
+
+// ── S655 (money plan §1.4): the ONE allocation order ─────────────────
+//
+// Kim Harland's rent, water and trash were due the same day and created in the
+// same second. Her $450 move-in special belongs on the rent; before the type
+// tie-break, which line took the money depended on the order a query happened
+// to return them in.
+describe('S655 the one allocation order', () => {
+  const at = '2026-09-01T07:00:00.000Z'
+  const row = (id: string, type: string, extra: Record<string, unknown> = {}) =>
+    ({ id, amount: 100, due_date: '2026-09-01', type, created_at: at, ...extra })
+
+  it('same-day rows sort rent, utility, late fee, fee, home payment, then creation time', () => {
+    const shuffled = [
+      row('home', 'home_payment'),
+      row('fee', 'fee'),
+      row('late', 'late_fee'),
+      row('deposit', 'deposit'),
+      row('water-later', 'utility', { created_at: '2026-09-01T07:00:05.000Z' }),
+      row('water', 'utility'),
+      row('rent', 'rent'),
+    ]
+    expect(sortForAllocation(shuffled).map(r => r.id)).toEqual(
+      ['rent', 'water', 'water-later', 'late', 'fee', 'home', 'deposit'])
+  })
+
+  it('same day, same type and same second: the id decides, so every path agrees', () => {
+    const a = row('aaaa', 'utility'), b = row('bbbb', 'utility')
+    expect(sortForAllocation([b, a]).map(r => r.id)).toEqual(['aaaa', 'bbbb'])
+    expect(compareForAllocation(a, b)).toBeLessThan(0)
+  })
+
+  it('an older due date still beats the type order', () => {
+    const oldFee = { ...row('old-fee', 'fee'), due_date: '2026-08-01' }
+    expect(sortForAllocation([row('rent', 'rent'), oldFee]).map(r => r.id)).toEqual(['old-fee', 'rent'])
+  })
+
+  it('propane and carried balance still sink below everything', () => {
+    const propane = row('propane', 'utility', { entry_description: 'PROPANE', due_date: '2026-07-01' })
+    const carried = row('carried', 'carried_balance', { due_date: '2026-01-01' })
+    const sorted = sortForAllocation([carried, propane, row('home', 'home_payment'), row('rent', 'rent')])
+    expect(sorted.map(r => r.id)).toEqual(['rent', 'home', 'propane', 'carried'])
+  })
+
+  it('a row with no creation time sorts after the rows that have one, then by id (the SQL twin\'s NULLS LAST)', () => {
+    const x = { id: 'zzz', amount: 10, due_date: '2026-09-01', type: 'utility' }
+    const y = { id: 'aaa', amount: 10, due_date: '2026-09-01', type: 'utility' }
+    const dated = row('mmm', 'utility')
+    expect(sortForAllocation([x, y]).map(r => r.id)).toEqual(['aaa', 'zzz'])
+    expect(sortForAllocation([x, dated, y]).map(r => r.id)).toEqual(['mmm', 'aaa', 'zzz'])
+    // A missing creation time never jumps the type order or the due date.
+    const rent = { id: 'zzz-rent', amount: 10, due_date: '2026-09-01', type: 'rent' }
+    expect(sortForAllocation([dated, rent]).map(r => r.id)).toEqual(['zzz-rent', 'mmm'])
+  })
+
+  it('the order is total: rows with and without a creation time sort the same in every arrival order', () => {
+    const rows = [
+      row('b-dated', 'utility', { created_at: '2026-09-01T07:00:02.000Z' }),
+      { id: 'c-undated', amount: 10, due_date: '2026-09-01', type: 'utility' },
+      row('d-dated', 'utility'),
+      { id: 'a-undated', amount: 10, due_date: '2026-09-01', type: 'utility', created_at: null },
+      row('e-dated', 'utility'),
+    ]
+    const expected = ['d-dated', 'e-dated', 'b-dated', 'a-undated', 'c-undated']
+    const permutations = <T,>(xs: T[]): T[][] =>
+      xs.length <= 1 ? [xs] : xs.flatMap((x, i) => permutations([...xs.slice(0, i), ...xs.slice(i + 1)]).map(p => [x, ...p]))
+    for (const p of permutations(rows)) expect(sortForAllocation(p).map(r => r.id)).toEqual(expected)
+    // Antisymmetric and transitive over every pair and triple.
+    const sign = (n: number) => Math.sign(n)
+    for (const a of rows) for (const b of rows) {
+      expect(sign(compareForAllocation(a, b)) + sign(compareForAllocation(b, a))).toBe(0)
+      if (a !== b) expect(compareForAllocation(a, b)).not.toBe(0)
+      for (const c of rows) {
+        if (compareForAllocation(a, b) < 0 && compareForAllocation(b, c) < 0) expect(compareForAllocation(a, c)).toBeLessThan(0)
+      }
+    }
+  })
+
+  it('a credit the size of the rent lands on the rent (Kim Harland)', () => {
+    const res = allocateOldestFirst(
+      [row('trash', 'utility'), row('water', 'utility'), { ...row('rent', 'rent'), amount: 450 }], 450)
+    expect(res.lines).toEqual([{ payment_id: 'rent', amount_applied: 450 }])
   })
 })

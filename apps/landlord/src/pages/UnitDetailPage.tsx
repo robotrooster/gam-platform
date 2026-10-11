@@ -50,7 +50,14 @@ export function UnitDetailPage() {
   const [schedLocal, setSchedLocal] = useState('')  // yyyy-MM-ddTHH:mm local to unit's state tz
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const { data: unit, isLoading } = useQuery(['unit', id], () => apiGet<any>('/units/' + id))
+  const { data: unit, isLoading, error: unitError, refetch: refetchUnit, isFetching: unitFetching } = useQuery(
+    ['unit', id], () => apiGet<any>('/units/' + id), {
+      // A refusal or a missing unit will not change on a retry: say it once.
+      retry: (count: number, e: any) => {
+        const status = e?.response?.status
+        return !(status >= 400 && status < 500) && count < 2
+      },
+    })
   // S630: which physical facts this unit's TAGS decide. Same query key the
   // subtype row uses, so react-query serves one request. A fact the tags own is
   // shown here rather than offered as an editable field — two places to set one
@@ -113,6 +120,9 @@ export function UnitDetailPage() {
       securityDeposit: unit.securityDeposit != null ? String(unit.securityDeposit) : '',
       dwellingOwnership: unit.dwellingOwnership || 'tenant',
       ownerHouseholdSize: String(unit.ownerHouseholdSize ?? 1),
+      ownerOccupantName: unit.ownerOccupantName || '',
+      ownerOccupantPhone: unit.ownerOccupantPhone || '',
+      ownerOccupantEmail: unit.ownerOccupantEmail || '',
       isMultiLevel: !!unit.isMultiLevel,
       isAdaAccessible: !!unit.isAdaAccessible,
       floorLevel: unit.floorLevel || '',
@@ -141,6 +151,9 @@ export function UnitDetailPage() {
       securityDeposit: num(f.securityDeposit),
       dwellingOwnership: f.dwellingOwnership,
       ownerHouseholdSize: Math.max(1, Number(f.ownerHouseholdSize) || 1),
+      ownerOccupantName: f.ownerOccupantName?.trim() || null,
+      ownerOccupantPhone: f.ownerOccupantPhone?.trim() || null,
+      ownerOccupantEmail: f.ownerOccupantEmail?.trim() || null,
       isMultiLevel: f.isMultiLevel,
       isAdaAccessible: f.isAdaAccessible,
       floorLevel: f.floorLevel || null,
@@ -219,7 +232,29 @@ export function UnitDetailPage() {
   )
 
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
-  if (!unit) return <div className="empty-state"><h3>Unit not found</h3></div>
+  if (!unit) {
+    // S655: say why in plain words, with the way out — a staff member assigned
+    // to particular properties cannot open a unit at another property.
+    const status = (unitError as any)?.response?.status
+    const reason: string | undefined = (unitError as any)?.response?.data?.error
+    const title = status === 403 ? "You can't open this unit"
+      : status === 404 || !unitError ? 'Unit not found'
+      : "This unit's page didn't load"
+    return (
+      <div className="empty-state">
+        <h3>{title}</h3>
+        {status === 403 && reason && <p>{reason}</p>}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 12 }}>
+          {unitError && status !== 403 && status !== 404 && (
+            <button className="btn btn-primary btn-sm" disabled={unitFetching} onClick={() => refetchUnit()}>
+              {unitFetching ? 'Trying again…' : 'Try again'}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units')}>Back to units</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div>
@@ -343,14 +378,28 @@ export function UnitDetailPage() {
                       so a headcount utility split has nobody to count — this is
                       what it weighs the unit by, and weighing it is what keeps the
                       owner's own usage off the tenants' bills. */}
-                  {unit.status === 'owner_use' && (
+                  {unit.status === 'owner_use' && (<>
                     <div className="data-row"><span className="data-key">People living here</span>
                       <input {...inpS} type="number" min={1} max={30}
                         style={{ ...inpS.style, maxWidth: 90 }}
                         value={editForm.ownerHouseholdSize}
                         onChange={e => set('ownerHouseholdSize', e.target.value)} />
                     </div>
-                  )}
+                    {/* S653 (Nic): who is actually in an owner-use space, for
+                        contact. No lease, no portal, nothing billed to them. */}
+                    <div className="data-row"><span className="data-key">Occupant</span>
+                      <input {...inpS} placeholder="Name" value={editForm.ownerOccupantName}
+                        onChange={e => set('ownerOccupantName', e.target.value)} />
+                    </div>
+                    <div className="data-row"><span className="data-key">Occupant phone</span>
+                      <input {...inpS} placeholder="Phone" value={editForm.ownerOccupantPhone}
+                        onChange={e => set('ownerOccupantPhone', e.target.value)} />
+                    </div>
+                    <div className="data-row"><span className="data-key">Occupant email</span>
+                      <input {...inpS} type="email" placeholder="Email" value={editForm.ownerOccupantEmail}
+                        onChange={e => set('ownerOccupantEmail', e.target.value)} />
+                    </div>
+                  </>)}
                   {isInterior && <>
                     <div className="data-row"><span className="data-key">Multi-level</span>
                       <select {...selS} value={editForm.isMultiLevel ? 'yes' : 'no'} onChange={e => set('isMultiLevel', e.target.value === 'yes')}>
@@ -455,7 +504,7 @@ export function UnitDetailPage() {
                       Still shown for every other unit type, where the list is about
                       what is actually inside a home. An RV spot with no ticks falls
                       back to the preset list for its type, which was always the
-                      behaviour for an unconfigured unit — and any ticks already saved
+                      behavior for an unconfigured unit — and any ticks already saved
                       are preserved, since the form still round-trips `features`. */}
                   {!isRv && featuresForType(editForm.unitType).length > 0 && (() => {
                     const offered = featuresForType(editForm.unitType)
@@ -501,6 +550,13 @@ export function UnitDetailPage() {
                 {/* S629: no "set by <subtype>" — the unit owns this number. */}
                 <span className="data-val mono">{fmt(unit.rentAmount)}/mo</span>
               </div>
+              {unit.status === 'owner_use' && (
+                <div className="data-row"><span className="data-key">Occupant</span><span className="data-val">
+                  {unit.ownerOccupantName || <span style={{ color: 'var(--text-3)' }}>— (edit to add who lives here)</span>}
+                  {unit.ownerOccupantPhone && <> · <a href={`tel:${unit.ownerOccupantPhone}`}>{unit.ownerOccupantPhone}</a></>}
+                  {unit.ownerOccupantEmail && <> · <a href={`mailto:${unit.ownerOccupantEmail}`}>{unit.ownerOccupantEmail}</a></>}
+                </span></div>
+              )}
               <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
               {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
                 <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
@@ -540,7 +596,8 @@ export function UnitDetailPage() {
               <div className="data-row"><span className="data-key">Name</span><span className="data-val">{unit.tenantFirst} {unit.tenantLast}</span></div>
               <div className="data-row"><span className="data-key">Email</span><span className="data-val">{unit.tenantEmail}</span></div>
               <div className="data-row"><span className="data-key">ACH</span><span className={'badge ' + (unit.achVerified ? 'badge-green' : 'badge-amber')}>{unit.achVerified ? 'Verified' : 'Pending'}</span></div>
-              <div className="data-row"><span className="data-key">SSI/SSDI</span><span className="data-val">{unit.ssiSsdi ? 'Yes' : 'No'}</span></div>
+              {/* S655 (Nic, 10/2): no SSI/SSDI row. "That's our check for the
+                  flex products" — GAM-side only; the server no longer sends it. */}
             </>
           ) : (
             <div style={{ color: 'var(--text-3)', fontSize: '.875rem', padding: '16px 0' }}>No tenant assigned.</div>
@@ -1206,7 +1263,27 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
   // else — deliberately, because a tenant pays what they signed — so this warns
   // rather than offering a switch that would override the lease.
   const notBilled = (t: string) => hasLease && !tenantBilled.includes(t)
-  const LeaseGateWarning = ({ t }: { t: string }) => notBilled(t) ? (
+  // S652 (Nic, Billy Miranda): "take it off just one unit during the duration
+  // of his lease" — one household, two spaces, one trash can. The switch is
+  // per LEASE, recorded as an addendum: when somebody else takes the space,
+  // their own lease decides again.
+  const LeaseOffSwitch = ({ t }: { t: string }) => hasLease && tenantBilled.includes(t) && can('schedule.configure_unit') ? (
+    <div style={{ fontSize: '.66rem', color: 'var(--text-3)', margin: '2px 0 6px 10px', display: 'flex', alignItems: 'center', gap: 8 }}>
+      <span>Billed to this tenant.</span>
+      <button className="btn btn-ghost btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }}
+        disabled={respMut.isLoading}
+        onClick={() => appConfirm(
+          `Stop billing ${t} to this tenant?\n\n` +
+          `This is for their current lease only — GAM records that you turned it off and when. ` +
+          `Whoever takes this space next is billed by their own lease.\n\n` +
+          `It stops on the next invoice. Nothing already sent changes.`,
+          { confirmLabel: `Turn ${t} off for this lease` },
+        ).then(ok => { if (ok) respMut.mutate({ utilityType: t, tenantResponsible: false }) })}>
+        Turn off for this lease
+      </button>
+    </div>
+  ) : null
+  const LeaseGateWarning = ({ t }: { t: string }) => !notBilled(t) ? <LeaseOffSwitch t={t} /> : (
     <div style={{ fontSize: '.66rem', color: 'var(--amber)', margin: '2px 0 6px 10px', lineHeight: 1.6,
                   display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <span>⚠ This tenant&apos;s signed lease doesn&apos;t mention {t}, so nothing bills for it.</span>
@@ -1225,7 +1302,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
         </button>
       )}
     </div>
-  ) : null
+  )
   const HOW_LABEL: Record<string, string> = {
     submeter:  'Its own sub-meter (read monthly)',
     flat_rate: 'Flat monthly charge',
@@ -1242,7 +1319,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
           One section, one question per utility: what does this space have? The
           answer happens to be a submeter for electric, a flat charge for trash
           and a tank for propane, but that is the mechanism, not the question. It
-          used to be three separate blocks organised by mechanism, so "does this
+          used to be three separate blocks organized by mechanism, so "does this
           unit have propane" had no home at all. */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         {embedded
@@ -1583,7 +1660,7 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
             onClick={() => appConfirm(
               owed > 0
                 ? `This space still owes ${money(owed)} on propane already delivered. Taking the tank off ` +
-                  `does not cancel that — the scheduled instalments keep billing. It only stops this space ` +
+                  `does not cancel that — the scheduled installments keep billing. It only stops this space ` +
                   `being offered on Record Delivery. Remove it?`
                 : `Take the propane tank off this space? It stops appearing on Record Delivery, so a ` +
                   `future delivery here couldn't be recorded until it's added back. Fills already ` +

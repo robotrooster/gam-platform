@@ -44,8 +44,24 @@ export async function cleanupAllSchema(): Promise<void> {
       `Tests must run with DB_NAME=gam_test (use \`npm test\` from apps/api). ` +
       `This guard exists because a stray run once wiped the dev DB.`)
   }
+  // S655 (money plan): the credit ledger FKs both credit tables, payments,
+  // deposit returns, reversals, remittances and leases, so it clears FIRST.
+  // TRUNCATE, not DELETE: a credit use refuses deletion ("kept forever") and
+  // TRUNCATE does not fire row triggers. Nothing references credit_uses.
+  // The deposit-slip tables FK remittances, register sales and bank rows; the
+  // items reference the slips, so both go in one TRUNCATE.
+  await db.query(`TRUNCATE credit_uses`)
+  // 10/4 (decisions #38): an early check-out's refund parts point at the
+  // payments they went back to (RESTRICT — never erased from under them), so
+  // they clear before those payments, with their decisions and the stay ledger.
+  await db.query(`DELETE FROM stay_refund_parts`)
+  await db.query(`DELETE FROM stay_checkout_decisions`)
+  await db.query(`DELETE FROM stay_payments`)
+  await db.query(`TRUNCATE bank_deposit_slip_items, bank_deposit_slips`)
   // S553: call slots FK sales_leads — clear child first. Availability has
   // no FKs but tests seed their own windows.
+  // S652: card-reader orders FK to properties/landlords; clear first.
+  await db.query(`DELETE FROM pos_reader_orders`)
   await db.query(`DELETE FROM sales_call_slots`)
   await db.query(`DELETE FROM sales_leads`)
   await db.query(`DELETE FROM sales_call_availability`)
@@ -124,6 +140,10 @@ export async function cleanupAllSchema(): Promise<void> {
   // (same NO ACTION posture as otp_advances above). Without this clear,
   // any test that creates a FlexPay advance traps the next file's
   // cleanupAllSchema on leases/users delete.
+  // S655 (money plan M2): a covered bill line and the FLEXPAY pull row point
+  // back at their advance (payments.flexpay_advance_id), so that link is cut
+  // before the advances go; payments themselves are cleared further down.
+  await db.query(`UPDATE payments SET flexpay_advance_id = NULL WHERE flexpay_advance_id IS NOT NULL`)
   await db.query(`DELETE FROM flexpay_advances`)
   // S629: suspended_utility_charges.released_bill_id FKs utility_bills — the
   // bill a held share became when the tenant signed. Held rows go first or the
@@ -160,6 +180,10 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flexsuite_enrollment_acceptances`)
   await db.query(`DELETE FROM flex_deposit_installments`)
   await db.query(`DELETE FROM screening_fee_accruals`)
+  // S640: the archive can now hold a webhook we could not attribute to a check
+  // (background_check_id NULL), so nothing cascades it away — it keeps a
+  // landlord_id, which keeps a user alive, which blocks the user delete below.
+  await db.query(`DELETE FROM background_check_reports`)
   await db.query(`DELETE FROM background_checks`)
   // S579: pending_tenant_intents FKs properties + units (property_id +
   // screening_waived_unit_id) with NO ACTION. Property-level intents have a
@@ -167,6 +191,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // intents explicitly before properties/units are wiped below.
   await db.query(`DELETE FROM pending_tenant_intents`)
   // S580: platform_transfer_intents FKs landlords + users — clear before them.
+  // S648: held items point at payees and the batch that carried them.
+  await db.query(`DELETE FROM held_payout_items`)
   await db.query(`DELETE FROM platform_transfer_intents`)
   // S580: instant-withdrawal margin FKs landlords + disbursements; circuit is standalone.
   await db.query(`DELETE FROM landlord_instant_margins`)
@@ -195,10 +221,25 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_charge_statements`)
   await db.query(`DELETE FROM flex_charge_accounts`)
   await db.query(`DELETE FROM remittance_applications`)
+  // lease_prepaid_credit_draws stays until contract step C3 drops the table.
+  await db.query(`DELETE FROM lease_prepaid_credit_draws`)
   await db.query(`DELETE FROM lease_prepaid_credits`)
+  // S655: tenant_credits now carries an audit trigger, so it is cleared here,
+  // before audit_row_changes below, instead of by the landlord cascade at the
+  // end (whose audit rows would pile up across files). Interest accruals point
+  // at a credit ON DELETE SET NULL, so nothing blocks this.
+  await db.query(`DELETE FROM tenant_credits`)
   // S609: tenant autopay schedules (one per lease, cascades from leases anyway,
   // but leases are deleted later in this chain).
   await db.query(`DELETE FROM tenant_autopay`)
+  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
+  // allocation RESTRICTs both the transaction and the payment — the proof of a
+  // settled rent payment is not throwaway. Both clear before either parent.
+  // S655: a RECORDED declaration also RESTRICTs the receipt it became
+  // (tenant_declared_deposits.recorded_remittance_id), so both clear before
+  // tenant_remittances too.
+  await db.query(`DELETE FROM bank_deposit_allocations`)
+  await db.query(`DELETE FROM tenant_declared_deposits`)
   await db.query(`DELETE FROM tenant_remittances`)
   // S616: a one-off charge FKs a payments row, plus the lease, unit and tenant
   // — all NO ACTION, so it clears before the earliest of them.
@@ -211,12 +252,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // FIRST. This was latent until the deposit-match path became the first thing
   // to ever populate that column — the constraint has always been there, nothing
   // had exercised it. (bank_transactions is deleted again further down with its
-  // connection; a second DELETE on an empty table is free.)
-  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
-  // allocation RESTRICTs both the transaction and the payment — the proof of a
-  // settled rent payment is not throwaway. Both clear before either parent.
-  await db.query(`DELETE FROM bank_deposit_allocations`)
-  await db.query(`DELETE FROM tenant_declared_deposits`)
+  // connection; a second DELETE on an empty table is free.) Allocations and
+  // declarations, which RESTRICT it, were cleared above with tenant_remittances.
   await db.query(`DELETE FROM bank_transactions`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —
@@ -291,6 +328,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // property_duplicate_flags all CASCADE via units / properties.
   await db.query(`DELETE FROM unit_applications`)
   // S350: unit_bookings FK units RESTRICT; clear before units.
+  // S652: a ticket may name the booking it is payment for. Nulling that column
+  // is not an option — a ticket has to say who it is for, and for a walk-in the
+  // booking IS the answer — so the tickets go first, after releasing the sale
+  // rows that point at them.
+  await db.query(`UPDATE pos_transactions SET open_ticket_id = NULL`)
+  await db.query(`DELETE FROM pos_open_tickets`)
   await db.query(`DELETE FROM unit_bookings`)
   // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
   // for work_trade_logs (CASCADE on agreement delete). Clear before units.
@@ -310,6 +353,7 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM lot_rent_charges`)
   // S568: landlord_expenses FK units/properties/landlords/users. Clear before units.
   await db.query(`DELETE FROM landlord_expenses`)
+  await db.query(`DELETE FROM unit_out_of_order`)
   await db.query(`DELETE FROM units`)
   await db.query(`DELETE FROM property_allocation_rules`)
   // S338: POS chain. All landlord-FK'd with ON DELETE RESTRICT;
@@ -328,7 +372,14 @@ export async function cleanupAllSchema(): Promise<void> {
   // S343: pos_sessions FKs pos_transactions via completed_transaction_id;
   // session_items cascade on parent session delete.
   await db.query(`DELETE FROM pos_sessions`)
+  // S652: open tickets and transactions point AT EACH OTHER — a ticket names
+  // the sale that settled it, and that sale names the ticket. Neither can be
+  // deleted first, so the link is broken before either goes.
+  await db.query(`UPDATE pos_open_tickets SET settled_transaction_id = NULL`)
   await db.query(`DELETE FROM pos_transactions`)
+  await db.query(`DELETE FROM pos_open_tickets`)
+  // S648: register pay links FK properties, landlords, bookings and the sale.
+  await db.query(`DELETE FROM pos_pay_links`)
   await db.query(`DELETE FROM pos_purchase_orders`)
   await db.query(`DELETE FROM pos_items`)
   await db.query(`DELETE FROM pos_categories`)
@@ -343,6 +394,7 @@ export async function cleanupAllSchema(): Promise<void> {
   // landlords; no children to cascade.
   await db.query(`DELETE FROM pos_terminal_readers`)
   await db.query(`DELETE FROM pos_customer_invitations`)
+  await db.query(`DELETE FROM pos_customer_cards`)   // S654: cards → customers
   await db.query(`DELETE FROM pos_customers`)
   // S348: maintenance-portal tables — all FK landlords with RESTRICT.
   // purchase_requests FKs maintenance_requests via work_order_id (already
@@ -426,6 +478,7 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM vehicles`)
   await db.query(`DELETE FROM depots`)
   await db.query(`DELETE FROM dump_locations`)
+  await db.query(`DELETE FROM business_platform_fee_accruals`)
   await db.query(`DELETE FROM businesses`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
@@ -469,7 +522,7 @@ export async function seedLandlord(
     // S600: default test landlords to "live since the epoch" so the platform-fee
     // accrual gate lets them bill for ANY accrual month — including the fixed past
     // months (e.g. 2026-05) the platformFeeAccrual tests pass. Matches pre-grace
-    // behaviour. Grace-specific tests override billing_starts_at / billing_grace_until.
+    // behavior. Grace-specific tests override billing_starts_at / billing_grace_until.
     `INSERT INTO landlords (user_id, billing_starts_at)
      VALUES ($1, DATE '2000-01-01') RETURNING id`,
     [userId]
@@ -514,16 +567,24 @@ export async function seedProperty(
     ownerUserId: string
     managedByUserId: string
     state?: string
+    /**
+     * 10/6 (Nic): properties.tenants_deposit_at_bank. Production starts every
+     * property OFF; test properties start ON so the bank-deposit suites (the
+     * tenant's report, the "Bank deposit" method, bank-feed matching) run the
+     * paths they were written for. Pass false to test a property that does
+     * not take bank deposits from tenants.
+     */
+    tenantsDepositAtBank?: boolean
   }
 ): Promise<string> {
   const res = await client.query<{ id: string }>(
     `INSERT INTO properties
        (landlord_id, name, street1, city, state, zip,
-        owner_user_id, managed_by_user_id)
-     VALUES ($1, 'Test Property', '1 Test St', 'Phoenix', $2, '85001', $3, $4)
+        owner_user_id, managed_by_user_id, tenants_deposit_at_bank)
+     VALUES ($1, 'Test Property', '1 Test St', 'Phoenix', $2, '85001', $3, $4, $5)
      RETURNING id`,
     [params.landlordId, params.state || 'AZ',
-     params.ownerUserId, params.managedByUserId]
+     params.ownerUserId, params.managedByUserId, params.tenantsDepositAtBank !== false]
   )
   return res.rows[0].id
 }

@@ -1,3 +1,4 @@
+import { MAINTENANCE_CATEGORIES, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { api, apiGet, apiPatch } from '../lib/api'
@@ -192,6 +193,8 @@ export function SettingsPage() {
 
   const [threshold, setThreshold] = useState<string>('')
   const [depThreshold, setDepThreshold] = useState<string>('')
+  // S652 (Nic): whether this company looks at utility bills before they go out.
+  const [reviewBills, setReviewBills] = useState<boolean>(false)
   const [saved, setSaved] = useState(false)
 
   // S620: editing the entity's business name + EIN. The PATCH already accepted
@@ -218,6 +221,7 @@ export function SettingsPage() {
     if (me) {
       setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
       setDepThreshold(me.depositReturnApprovalThreshold != null ? String(me.depositReturnApprovalThreshold) : '500')
+      setReviewBills(me.reviewUtilityBills === true)
     }
   }, [me])
 
@@ -225,6 +229,7 @@ export function SettingsPage() {
     () => apiPatch('/landlords/me', {
       maintApprovalThreshold: Number(threshold),
       depositReturnApprovalThreshold: Number(depThreshold),
+      reviewUtilityBills: reviewBills,
       landlordId: companyId || undefined,
     }),
     {
@@ -243,6 +248,7 @@ export function SettingsPage() {
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
     && !isNaN(depThresholdNum) && depThresholdNum >= 0
   const thresholdChanged = me && (
+    (me.reviewUtilityBills === true) !== reviewBills ||
     Number(me.maintApprovalThreshold || 500) !== thresholdNum
     || Number(me.depositReturnApprovalThreshold ?? 500) !== depThresholdNum
   )
@@ -354,7 +360,8 @@ export function SettingsPage() {
           <SecurityCard />
 
           {/* S631: first billing cycle */}
-          {can('settings.billing_view') && <FirstBillingCycleCard />}
+          {can('settings.billing_view') && <><FirstBillingCycleCard />
+          <MeterPhotosCard /><MaintenanceRequestsCard /></>}
 
           {/* Billing */}
           {can('settings.billing_view') && (
@@ -460,6 +467,21 @@ export function SettingsPage() {
                 </div>
               </div>
 
+              {/* S652 (Nic): "The landlord toggles whether or not they want to be
+                  part of the review process or just trust them to go through."
+                  Separate from WHO may enter readings — that is a permission. */}
+              <div style={{ marginTop: 18, maxWidth: 480 }}>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={reviewBills} onChange={e => setReviewBills(e.target.checked)} style={{ marginTop: 3 }} />
+                  <span>
+                    <span style={{ fontSize: '.86rem', fontWeight: 600, color: 'var(--text-0)' }}>Review utility bills before they go out</span>
+                    <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.45 }}>
+                      On: each month's meter readings are priced and shown to you first; nothing reaches a tenant until you approve, and a mistyped read can be fixed in place. Off: bills go out on each tenant's next invoice as soon as their meters are read. Either way you can look over any month on the Utilities page.
+                    </div>
+                  </span>
+                </label>
+              </div>
+
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 14 }}>
                 <button
                   className="btn btn-primary"
@@ -487,6 +509,7 @@ export function SettingsPage() {
               PM-company surface (PM Invitations not in the launch trio). */}
           {can('settings.default_pm_company') && !LAUNCH_HIDDEN.has('/pm-invitations') && (
             <DefaultPmCompanyCard
+              landlordId={companyId}
               currentDefaultId={me?.defaultPmCompanyId ?? null}
               onChange={() => qc.invalidateQueries('landlord-me')}
             />
@@ -545,10 +568,11 @@ function SecurityCard() {
 }
 
 function DefaultPmCompanyCard({
-  currentDefaultId, onChange,
+  landlordId, currentDefaultId, onChange,
 }: {
   currentDefaultId: string | null
   onChange: () => void
+  landlordId: string
 }) {
   const linkedQ = useQuery<LinkedPmCompany[]>(
     'linked-pm-companies',
@@ -557,7 +581,7 @@ function DefaultPmCompanyCard({
   const [pendingId, setPendingId] = useState<string>('')
 
   const setMut = useMutation(
-    (pmCompanyId: string | null) => apiPatch('/landlords/me/default-pm-company', { pmCompanyId }),
+    (pmCompanyId: string | null) => apiPatch('/landlords/me/default-pm-company', { pmCompanyId, landlordId }),
     { onSuccess: () => { setPendingId(''); onChange() } },
   )
 
@@ -725,6 +749,87 @@ function FeatureRequestCard() {
 // GET /properties already spans every entity the account owns, so this list
 // needs no entity picker and no switcher: a property is named, and its company
 // is printed beside it.
+// ── S652 (Nic): maintenance requests per property ─────────────────────────────
+// "We need to have a good system for limiting maintenance requests to common
+// areas." A park of tenant-owned homes repairs the park, not the stove.
+function MaintenanceRequestsCard() {
+  const qc = useQueryClient()
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card-header"><span className="card-title">Maintenance requests</span></div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        Which kinds of request tenants at each property may file. Leave every box checked to take
+        everything. At a park of tenant-owned homes, untick the kinds that are the tenant&apos;s own
+        repair and say so in the note — the form shows it, and those requests cannot be filed.
+      </div>
+      {(properties as any[]).map(p => <PropertyMaintenanceRow key={p.id} property={p} qc={qc} />)}
+    </div>
+  )
+}
+
+function PropertyMaintenanceRow({ property, qc }: { property: any; qc: any }) {
+  const all = [...MAINTENANCE_CATEGORIES] as string[]
+  const current: string[] = property.maintenanceCategories?.length ? property.maintenanceCategories : all
+  const [picked, setPicked] = useState<string[]>(current)
+  const [note, setNote] = useState<string>(property.maintenanceNote || '')
+  const [saved, setSaved] = useState(false)
+  const saveMut = useMutation(
+    () => apiPatch(`/properties/${property.id}/maintenance-config`,
+      { categories: picked.length === all.length ? null : picked, note: note.trim() || null }),
+    { onSuccess: () => { qc.invalidateQueries('properties'); setSaved(true); setTimeout(() => setSaved(false), 2500) } })
+  const changed = picked.slice().sort().join() !== current.slice().sort().join() || (note.trim() || '') !== (property.maintenanceNote || '')
+  return (
+    <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12, marginTop: 12 }}>
+      <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{property.name || 'Unnamed property'}</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 8 }}>
+        {all.map(c => (
+          <label key={c} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.78rem', cursor: 'pointer' }}>
+            <input type="checkbox" checked={picked.includes(c)}
+              onChange={e => setPicked(p => e.target.checked ? [...p, c] : p.filter(x => x !== c))} />
+            {(MAINTENANCE_CATEGORY_LABEL as any)[c] || c}
+          </label>
+        ))}
+      </div>
+      <input className="form-input" value={note} onChange={e => setNote(e.target.value)} maxLength={400}
+        placeholder="Shown on the tenant's form, e.g. Repairs inside your home are yours; this form is for the park."
+        style={{ width: '100%', marginTop: 8 }} />
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+        <button className="btn btn-primary btn-sm" disabled={!changed || saveMut.isLoading || picked.length === 0} onClick={() => saveMut.mutate()}>Save</button>
+        {saved && <span style={{ fontSize: '.74rem', color: 'var(--green)' }}>Saved</span>}
+        {picked.length === 0 && <span style={{ fontSize: '.74rem', color: 'var(--red)' }}>Pick at least one kind.</span>}
+      </div>
+    </div>
+  )
+}
+
+// S652 (Nic): "take a picture of each meter for historical accuracy… make the
+// photo step optional… set it at the property level, prevents discrimination."
+function MeterPhotosCard() {
+  const qc = useQueryClient()
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  const toggle = useMutation(
+    (args: { id: string; required: boolean }) => apiPatch(`/properties/${args.id}/meter-photo-config`, { required: args.required }),
+    { onSuccess: () => qc.invalidateQueries('properties') })
+  return (
+    <div className="card">
+      <div className="card-header"><span className="card-title">Meter photos</span></div>
+      <p style={{ fontSize: '.8rem', color: 'var(--text-2)', margin: '0 0 6px' }}>
+        The reading walk always offers a photo of the meter face. Turn this on and the walk will not take a
+        number without one — for every meter at that property, every month.
+      </p>
+      {(properties as any[]).map(p => (
+        <label key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', fontSize: '.82rem', cursor: 'pointer' }}>
+          <input type="checkbox" checked={!!p.meterPhotoRequired} disabled={toggle.isLoading}
+            onChange={e => toggle.mutate({ id: p.id, required: e.target.checked })} />
+          <span style={{ fontWeight: 600 }}>{p.name || 'Unnamed property'}</span>
+          <span style={{ color: 'var(--text-3)' }}>{p.meterPhotoRequired ? 'photo required with every reading' : 'photo optional'}</span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
 function FirstBillingCycleCard() {
   const qc = useQueryClient()
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
@@ -766,6 +871,18 @@ function PropertyBillingCycleRow({ property, qc }: { property: any; qc: any }) {
     },
   )
   const changed = month !== current
+  // S652 (Nic): set when the property was added, locked once anyone is billed.
+  if (property.firstBillingCycleLocked) {
+    return (
+      <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12 }}>
+        <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{property.name || 'Unnamed property'}</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 6 }}>
+          First bill from GAM: <b>{current ? new Date(current + '-01T12:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'not set'}</b>
+          <span style={{ fontSize: '.7rem', color: 'var(--text-3)', marginLeft: 8 }}>set when the property was added · locked now that tenants are on it</span>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12 }}>

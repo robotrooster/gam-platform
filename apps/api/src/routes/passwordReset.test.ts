@@ -145,7 +145,7 @@ describe('POST /api/auth/forgot-password', () => {
       expect(String(sendResetMock.mock.calls[0][2])).toContain(`${TENANT}/reset-password?token=`)
     })
 
-    it('IGNORES an unrecognised Origin — a spoofed host must never receive a token', async () => {
+    it('IGNORES an unrecognized Origin — a spoofed host must never receive a token', async () => {
       await seedUserWithPassword('victim@test.dev', 'oldpass1234')
       await request(buildApp())
         .post('/api/auth/forgot-password')

@@ -793,16 +793,29 @@ describe('PATCH /api/units/:id/number', () => {
     expect(res.status).toBe(403)
   })
 
-  // S604 (Nic): "I wouldn't allow a rename of a unit after data is on something."
-  // Nothing snapshots unit_number, so a rename rewrites how years of invoices
-  // display. Retire + replace is the intended path instead.
-  it('LOCKS the number once the unit has history (seed puts a booking on A)', async () => {
+  // S604 locked the number once a unit carried data, because nothing
+  // snapshotted unit_number and a rename rewrote years of invoices.
+  //
+  // S641 (Nic) fixed the cause instead: "would we just say that we're changing
+  // the unit number in the system — show a timeline of: this was classified as
+  // unit one up until this date." unit_number_history records each period,
+  // maintained by a database trigger, so the rename is now safe and allowed.
+  it('RENAMES a unit that has history, and records the old number', async () => {
     const f = await seed()
     const res = await request(buildApp()).patch(`/api/units/${f.aUnitId}/number`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 99' })
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/number is locked/i)
-    expect(res.body.error).toMatch(/retire/i)
+    expect(res.status).toBe(200)
+
+    const { rows } = await db.query(
+      `SELECT unit_number, effective_to FROM unit_number_history
+        WHERE unit_id=$1 ORDER BY effective_from`, [f.aUnitId])
+    // the old name is preserved with a closed period, the new one is live
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    expect(rows.at(-1)!.effective_to).toBeNull()
+    // canonicalised against the unit's TYPE — the fixture unit is an apartment,
+    // so 'RV 99' is stored as 'APT 99'. Long-standing behavior, not new here.
+    expect(rows.at(-1)!.unit_number).toBe('APT 99')
+    expect(rows.at(-2)!.effective_to).not.toBeNull()
   })
 
   it('still allows renaming a freshly-created unit with no history', async () => {
@@ -855,10 +868,10 @@ describe('DELETE /api/units/:id', () => {
 
   // S630 (Nic): a space with no history of its own must stay deletable even when
   // it shares a RUBS master that HAS been read. The guard asked whether the METER
-  // had readings, so one master reading taken for a neighbour walled off every
+  // had readings, so one master reading taken for a neighbor walled off every
   // unit on the meter. Nic hit this retiring RV 21; it slipped through only
   // because Oak Park's water masters were still unread.
-  it('deletes a unit on a SHARED read meter — the readings are its neighbours\' history', async () => {
+  it('deletes a unit on a SHARED read meter — the readings are its neighbors\' history', async () => {
     const f = await seed()
     const app = buildApp()
     const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
@@ -871,7 +884,7 @@ describe('DELETE /api/units/:id', () => {
         `INSERT INTO utility_meters (property_id, utility_type, billing_method, rubs_allocation_method, label)
          VALUES ($1,'water','rubs','occupant_count','master') RETURNING id`, [f.aPropId])
       const meterId = m.rows[0].id
-      // The master serves the new unit AND an existing neighbour.
+      // The master serves the new unit AND an existing neighbor.
       await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2),($1,$3)`,
         [meterId, id, f.aUnitId])
       await c.query(
@@ -980,5 +993,37 @@ describe('GET /api/units — pending invite count (S613)', () => {
     const res = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
     const row = res.body.data.find((u: any) => u.id === f.aUnitId)
     expect(Number(row.pending_invite_count ?? row.pendingInviteCount)).toBe(1)
+  })
+
+  // S655: since S647 the lease drafts at invite and waits for the landlord's
+  // signature. A lease that waited more than seven days (for him, or for the
+  // resident after he signed) let the invite's clock run out and the unit was
+  // offered to a second household while that lease was still live.
+  it('a DRAFTED lease holds the unit even after the invite\'s clock has run out', async () => {
+    const f = await seed()
+    const app = buildApp()
+    // The invite's seven days ran out two days ago.
+    const t = (await db.query<{ id: string }>(
+      `WITH u AS (
+         INSERT INTO users (email, password_hash, role, first_name, last_name, tenant_invite_token, tenant_invite_expires_at)
+         VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Held', 'Unit', 'old', NOW() - INTERVAL '2 days')
+         RETURNING id)
+       INSERT INTO tenants (user_id) SELECT id FROM u RETURNING id`,
+      [`held-${f.aLid.slice(0, 6)}@test.dev`])).rows[0]
+    const d = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1, $2, 'Lease', 'original_lease', 'pending') RETURNING id`, [f.aLid, f.aUnitId])).rows[0]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, draft_document_id)
+       VALUES ($1, $2, 'not_uploaded', $3, $4)`, [f.aLid, t.id, f.aUnitId, d.id])
+    const held = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowHeld = held.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowHeld.pending_invite_count ?? rowHeld.pendingInviteCount)).toBe(1)
+
+    // Voiding the lease lets the lapsed invite release the unit, as before.
+    await db.query(`UPDATE lease_documents SET status = 'voided' WHERE id = $1`, [d.id])
+    const freed = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowFreed = freed.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowFreed.pending_invite_count ?? rowFreed.pendingInviteCount)).toBe(0)
   })
 })

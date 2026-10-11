@@ -7,6 +7,8 @@ import { landlordScopeIds, landlordIdForUnit, ownsLandlord } from '../lib/landlo
 import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
+import { DateTime } from 'luxon'
+import { lastBusinessDay, WORK_TRADE_SKILLS, WORK_TRADE_FIELD_PERMISSIONS } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough Landlord #29 — work-trade routes, percent model.
@@ -118,6 +120,10 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       renewalTerms: z.string().optional(),
       // W-56: per-person target; the property value is only the default.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      // S637 (Nic): the parent switch. False = a trusted trade — covered charges
+      // clear every month and nobody logs or approves hours. The target above is
+      // still stored so switching tracking back on restores it.
+      tracksHours: z.boolean().optional(),
       // S613 (Nic): what this agreement trades for. Omitted = everything, which
       // is what every agreement written before this did.
       coveredCharges: z.array(z.enum(
@@ -125,7 +131,7 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     }).parse(req.body)
 
     // S633: the agreement belongs to the company that owns the unit it is
-    // written against — derived and authorised in one step, rather than assumed
+    // written against — derived and authorized in one step, rather than assumed
     // from whichever company the session sat on.
     const landlordId = await landlordIdForUnit(req.user!, body.unitId, query)
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [body.unitId])
@@ -145,21 +151,17 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       [body.tenantId, landlordId, body.unitId])
     if (!tenantLease) throw new AppError(400, 'This tenant has no active lease on this unit. Work trade requires an active tenancy — add or renew the lease first.')
 
-    const propDefault = await queryOne<{ work_trade_hours_target: number }>(
-      `SELECT p.work_trade_hours_target FROM properties p
-        JOIN units u ON u.property_id = p.id WHERE u.id = $1`, [body.unitId])
-    const agreement = await queryOne<any>(`
-      INSERT INTO work_trade_agreements
-        (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms,
-         monthly_hours_target, covered_charges)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
-              COALESCE($9::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))
-      RETURNING *`,
-      [body.unitId, body.tenantId, landlordId, body.duties || null,
-       body.startDate, body.endDate || null, body.renewalTerms || null,
-       body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80,
-       body.coveredCharges ?? null]
-    )
+    // 10/6: the ONE insert of an agreement's terms (services/stayWorkTrade) —
+    // the hours default to the property's work-trade setting, the covered
+    // charges to everything — shared with a work trade made on a stay.
+    const { insertWorkTradeAgreement } = await import('../services/stayWorkTrade')
+    const agreement = await insertWorkTradeAgreement({ query: (sql: string, p?: any[]) => query(sql, p ?? []).then(rows => ({ rows })) } as any, {
+      unitId: body.unitId, tenantId: body.tenantId, landlordId,
+      duties: body.duties || null, startDate: body.startDate, endDate: body.endDate || null,
+      renewalTerms: body.renewalTerms || null,
+      hoursTarget: body.monthlyHoursTarget ?? null, tracksHours: body.tracksHours ?? true,
+      coveredCharges: body.coveredCharges ?? null,
+    })
 
     // S631 (Nic): "I have no way to mark that person as a work trade person
     // until they accept the invite and sign the lease. If they sign the lease
@@ -203,6 +205,59 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
 })
 
 // ── GET AGREEMENT BY UNIT ─────────────────────────────────────
+
+// ── S652: MAINTENANCE JOBS FOR WORK TRADERS ─────────────────────
+// Declared before '/:id' so "jobs" is never read as an agreement id.
+
+/** The caller's jobs: open ones they may take, theirs, and (trusted) ones to check. */
+workTradeRouter.get('/jobs', async (req, res, next) => {
+  try {
+    const { jobsForTrader } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await jobsForTrader(req.user!.userId) })
+  } catch (e) { next(e) }
+})
+
+workTradeRouter.post('/jobs/:jobId/take', async (req, res, next) => {
+  try {
+    const { takeJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await takeJob(req.user!.userId, req.params.jobId) })
+  } catch (e) { next(e) }
+})
+
+workTradeRouter.post('/jobs/:jobId/done', async (req, res, next) => {
+  try {
+    const body = z.object({
+      hours: z.number().positive().max(24).optional(),
+      note: z.string().max(2000).optional(),
+    }).parse(req.body ?? {})
+    const { finishJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await finishJob(req.user!.userId, req.params.jobId, body) })
+  } catch (e) { next(e) }
+})
+
+/** Confirm finished skilled work: the landlord's side, or a trusted work trader. */
+workTradeRouter.post('/jobs/:jobId/check', async (req, res, next) => {
+  try {
+    const job = await queryOne<{ landlord_id: string }>(
+      `SELECT landlord_id FROM maintenance_requests WHERE id=$1`, [req.params.jobId])
+    if (!job) throw new AppError(404, 'Job not found')
+    const asLandlord = canManageLandlordResource(req.user, job.landlord_id, ['property_manager', 'onsite_manager', 'maintenance'])
+    const { checkJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await checkJob(req.user!, req.params.jobId, asLandlord) })
+  } catch (e) { next(e) }
+})
+
+/** Work traders a landlord may assign a job at this property to. */
+workTradeRouter.get('/assignable/:propertyId', requirePerm('maintenance.assign'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.propertyId])
+    if (!prop || !canManageLandlordResource(req.user, prop.landlord_id, ['property_manager', 'onsite_manager', 'maintenance'])) {
+      throw new AppError(404, 'Property not found')
+    }
+    const { assignableForProperty } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await assignableForProperty(req.params.propertyId) })
+  } catch (e) { next(e) }
+})
 
 workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
   try {
@@ -249,10 +304,13 @@ workTradeRouter.get('/:id', async (req, res, next) => {
   try {
     const agreement = await queryOne<any>(`
       SELECT wta.*, wta.monthly_hours_target AS target,
-        un.unit_number, p.name as property_name
+        un.unit_number, p.name as property_name, p.id AS property_id,
+        tu.first_name AS tenant_first, tu.last_name AS tenant_last, tu.id AS tenant_user_id
       FROM work_trade_agreements wta
       JOIN units un ON un.id = wta.unit_id
       JOIN properties p ON p.id = un.property_id
+      LEFT JOIN tenants tt ON tt.id = wta.tenant_id
+      LEFT JOIN users tu ON tu.id = tt.user_id
       WHERE wta.id=$1`, [req.params.id])
     if (!agreement) throw new AppError(404, 'Not found')
     // S397: validate caller scope (owner landlord / team / own tenant / admin).
@@ -282,11 +340,42 @@ workTradeRouter.get('/:id', async (req, res, next) => {
       const wd = new Date(d)
       return wd.getMonth() === now.getMonth() && wd.getFullYear() === now.getFullYear()
     }
-    const target = Number(agreement.target)
+    // S637: tracks_hours is the parent switch — a trusted agreement asks for no
+    // hours, so its effective target is 0 and workTradeFraction reads that as
+    // fully covered.
+    const target = agreement.tracks_hours === false ? 0 : Number(agreement.target)
     const approvedThisMonth = logs.filter(l => l.status === 'approved' && inThisMonth(l.work_date))
     const hoursApprovedThisMonth = approvedThisMonth.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
     const pendingLogs = logs.filter(l => l.status === 'pending')
     const fraction = workTradeFraction(hoursApprovedThisMonth, target)
+
+    // S652 (Nic): "keep track of how many total sets of hours they turn in and
+    // percentage of denied versus approved... hey, you don't do the right thing
+    // half the time." Counted by submissions AND by hours — a denied 10-hour
+    // day and a denied half hour are not the same thing.
+    const decided = logs.filter((l: any) => l.status === 'approved' || l.status === 'rejected')
+    const sumH = (xs: any[]) => xs.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
+    const approvedAll = logs.filter((l: any) => l.status === 'approved')
+    const deniedAll = logs.filter((l: any) => l.status === 'rejected')
+    const pct = (n: number, d: number) => d > 0 ? Math.round((n / d) * 1000) / 10 : null
+    const record = {
+      submitted: logs.length,
+      approved: approvedAll.length,
+      denied: deniedAll.length,
+      logged: pendingLogs.length,
+      approvedPct: pct(approvedAll.length, decided.length),
+      deniedPct: pct(deniedAll.length, decided.length),
+      hoursApproved: sumH(approvedAll),
+      hoursDenied: sumH(deniedAll),
+      hoursDeniedPct: pct(sumH(deniedAll), sumH(decided)),
+    }
+    // Hours are reviewed by the last business day of the month — the same day
+    // meters are read. Anything still logged then counts as not worked.
+    const tz = (await queryOne<{ timezone: string | null }>(
+      `SELECT p.timezone FROM units un JOIN properties p ON p.id=un.property_id WHERE un.id=$1`,
+      [agreement.unit_id]))?.timezone || 'America/Phoenix'
+    const nowTz = DateTime.now().setZone(tz)
+    const reviewBy = lastBusinessDay(nowTz.year, nowTz.month, tz).toISODate()
 
     res.json({
       success: true,
@@ -299,7 +388,19 @@ workTradeRouter.get('/:id', async (req, res, next) => {
           pendingCount: pendingLogs.length,
           creditFraction: fraction,
           creditPct: Math.round(fraction * 1000) / 10,   // e.g. 62.5
-        }
+          reviewBy,
+        },
+        record,
+        // S652: this person's jobs, for the landlord's copy of the window —
+        // what they have on the go and what they finished lately.
+        jobs: await query<any>(`
+          SELECT mr.id, mr.title, mr.category, mr.status, mr.needs_check, mr.completed_at,
+                 un.unit_number
+            FROM maintenance_requests mr JOIN units un ON un.id = mr.unit_id
+           WHERE (mr.assigned_to = $1 OR mr.done_by_user_id = $1)
+             AND (mr.status IN ('assigned','in_progress') OR mr.completed_at > NOW() - interval '60 days')
+           ORDER BY mr.status = 'completed', mr.completed_at DESC NULLS FIRST
+           LIMIT 40`, [agreement.tenant_user_id ?? null]),
       }
     })
   } catch (e) { next(e) }
@@ -331,10 +432,17 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
       throw new AppError(403, 'Forbidden')
     }
 
+    // S652: a TRUSTED person's hours count the moment they log them (Nic:
+    // "some people can be trusted to do their own hours"); hours the landlord's
+    // side logs are the reviewer's own word. Everyone else's stay "logged"
+    // until approved or denied.
+    const approvedNow = (isOwnTenant && agreement.trusted === true) || isOwnerLandlord || isTeam || isAdmin
     const log = await queryOne<any>(`
-      INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description)
-      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [agreement.id, agreement.tenant_id, req.user!.userId, body.workDate, body.hours, body.description]
+      INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description,
+                                   status, reviewed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [agreement.id, agreement.tenant_id, req.user!.userId, body.workDate, body.hours, body.description,
+       approvedNow ? 'approved' : 'pending', approvedNow ? new Date() : null]
     )
 
     res.json({ success: true, data: log })
@@ -423,11 +531,21 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
 // seeing another is how a work-trade argument starts.
 workTradeRouter.get('/:id/standing', async (req, res, next) => {
   try {
-    await getAgreementForEitherParty(req.params.id, req.user!)
+    const agreement = await getAgreementForEitherParty(req.params.id, req.user!)
+    // S643 (Nic, DIRECTIVE): the tenant's copy of this never carries a dollar
+    // figure next to an hour count — "don't show the tenant any sort of hourly
+    // rate... that's when they decide it's not worth it." The two audiences
+    // still read the SAME HOURS from the same place, which is the point of one
+    // endpoint; what differs is only whether the shortfall is priced. Decided
+    // here rather than on the screen so the tenant portal cannot render it by
+    // accident (see the audience-isolation rule).
+    const audience = canManageLandlordResource(
+      req.user, agreement.landlord_id, ['property_manager']) ? 'landlord' : 'tenant'
     const { loadWorkTradeStanding } = await import('../services/workTradeStanding')
     const standing = await loadWorkTradeStanding(
       req.params.id,
-      typeof req.query.month === 'string' ? req.query.month : undefined)
+      typeof req.query.month === 'string' ? req.query.month : undefined,
+      audience)
     if (!standing) throw new AppError(404, 'Work-trade agreement not found')
     res.json({ success: true, data: standing })
   } catch (e) { next(e) }
@@ -437,19 +555,29 @@ workTradeRouter.get('/:id/standing', async (req, res, next) => {
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate, monthlyHoursTarget, coveredCharges, carryForwardMonths } = z.object({
+    const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths,
+            trusted, skills, duties, carryForwardIndefinite, fieldPermissions } = z.object({
+      // S652: trusted or monitored, what they can fix, and the duties in words.
+      trusted: z.boolean().optional(),
+      skills: z.array(z.enum(WORK_TRADE_SKILLS as unknown as [string, ...string[]])).optional(),
+      // S652: field work the landlord lets this person do from their tenant portal.
+      fieldPermissions: z.array(z.enum(WORK_TRADE_FIELD_PERMISSIONS as unknown as [string, ...string[]])).optional(),
+      duties: z.string().max(5000).nullable().optional(),
       coveredCharges: z.array(z.enum(
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
       // W-56: per-person target is editable on the agreement.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      tracksHours: z.boolean().optional(),   // S637: parent switch
       // S624 (Nic): how long a shortfall may carry before it is billed in cash
       // and the agreement ends. "My two month rule was just an example. If a
       // landlord wants to give leniency for six months, they may choose to do
       // so... but at some point, a landlord's gonna know that somebody's never
       // gonna be able to physically catch up." 0 = bill at the first close.
       carryForwardMonths: z.number().int().min(0).max(24).optional(),
+      // S652: float a shortfall with no deadline while the agreement runs.
+      carryForwardIndefinite: z.boolean().optional(),
     }).parse(req.body)
 
     const before = await getAgreementForUser(req.params.id, req.user!)
@@ -464,10 +592,22 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         monthly_hours_target=COALESCE($4,monthly_hours_target),
         covered_charges=COALESCE($5::text[], covered_charges),
         carry_forward_months=COALESCE($6,carry_forward_months),
+        tracks_hours=COALESCE($7,tracks_hours),
+        trusted=COALESCE($8,trusted),
+        skills=COALESCE($9::text[],skills),
+        duties=CASE WHEN $10::boolean THEN $11 ELSE duties END,
+        carry_forward_indefinite=COALESCE($12,carry_forward_indefinite),
+        field_permissions=COALESCE($13::text[],field_permissions),
+        -- 10/6 (review): a work trade made on a reservation that the landlord
+        -- ENDS here no longer follows the stay — a later change to the stay
+        -- (a drag, an edit, Add a month) must not bring it back.
+        booking_id=CASE WHEN $1::text = 'ended' THEN NULL ELSE booking_id END,
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
-       coveredCharges ?? null, carryForwardMonths ?? null]
+       coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null,
+       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null, carryForwardIndefinite ?? null,
+       fieldPermissions ?? null]
     )
 
     // S624 (Nic): "when the landlord marks the work trade agreement as over, any
@@ -481,6 +621,11 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
     // Deliberately not fatal: the status change is the landlord's decision and
     // must stand even if billing the remainder fails. A failure here leaves open
     // periods that the month-close run will still find.
+    // S652: an agreement that stops hands back the jobs its person had taken.
+    if ((status === 'ended' || status === 'paused') && wasActive) {
+      const { releaseJobsFor } = await import('../services/workTradeJobs')
+      await releaseJobsFor({ query: (sql: string, p: any[]) => query(sql, p) }, [req.params.id])
+    }
     let settlement = null
     if (status === 'ended' && wasActive) {
       try {

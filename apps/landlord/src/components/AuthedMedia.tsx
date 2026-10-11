@@ -8,7 +8,7 @@ import { useState, useEffect } from 'react'
 // 401s. These helpers fetch the file as a blob with the bearer
 // token and render it through an object URL, revoking on unmount.
 //
-// Mirrors the S512 AuthedImg pattern in LeaseFormModal
+// Mirrors the S512 AuthedImg pattern (formerly in the lease edit form, removed S653)
 // (MoveInPhotosSection) and openLandlordAddendumPdf.
 //
 // Blob trade-off (video): a blob fetch pulls the whole file before

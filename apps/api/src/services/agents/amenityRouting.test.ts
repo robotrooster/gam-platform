@@ -32,7 +32,7 @@ describe('a complaint about an amenity is still a complaint', () => {
   // NOUN must not steal a turn where somebody is reporting a problem.
   it.each([
     'someone is smoking by the pool',
-    'my neighbour is blasting music by the pool at 2am',
+    'my neighbor is blasting music by the pool at 2am',
   ])('%j stays a complaint', (m) => {
     expect(t(m)).toContain('log_complaint')
     expect(t(m)).not.toContain('get_my_amenities')

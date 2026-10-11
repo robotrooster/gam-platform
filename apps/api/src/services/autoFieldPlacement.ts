@@ -102,7 +102,7 @@ export interface LateFeeTerms {
 
 export interface DetectionReport {
   /** Conventions this document actually matched. */
-  recognised: string[]
+  recognized: string[]
   /** Elections laid out, with how many options each. */
   elections: Array<{ label: string; options: number; page: number }>
   /** Reads like a choice, could not be structured. Needs a human. */
@@ -151,7 +151,7 @@ export interface AutoPlaceResult {
    */
   lateFeeTerms: LateFeeTerms | null
   /**
-   * S622: what the placer RECOGNISED, and what looked like a choice it could
+   * S622: what the placer RECOGNIZED, and what looked like a choice it could
    * not lay out. Without this an unfamiliar lease fails silently — boxes appear
    * on the blanks it understood and nothing says a whole election was missed.
    * Same principle as naming the screening fees we exclude on purpose: a gap
@@ -214,10 +214,32 @@ function columnFor(ctx: string): string | null {
   // due_timing='move_in', and the move-in invoice even books it as RENT). It
   // must be tested BEFORE rent_amount, since "rent pre-payment" contains "rent".
   if (/pre-?pay|prepaid rent|last month.?s? rent|advance rent/.test(c)) return 'last_month_rent'
-  if (/installments of|monthly installments|rental rate|monthly rent|first month.?s rent/.test(c)) return 'rent_amount'
+  // S648 (Nic): the move-in cost table is the move-in invoice. Its lines are
+  // their own tags now, checked BEFORE rent_amount ("first month's rent"
+  // contains "rent") so a new landlord's upload links them the way Nic's
+  // templates are linked. The landlord can still re-tag any box in the editor.
+  if (/first month.?s rent|first month rent/.test(c)) return 'move_in_first_month_rent'
+  if (/pro-?rat/.test(c)) return 'move_in_proration'
+  if (/total (amount )?due|total move.?in|amount due (at|upon|before) move|due at (move.?in|signing)/.test(c)) return 'move_in_total_due'
+  if (/installments of|monthly installments|rental rate|monthly rent/.test(c)) return 'rent_amount'
   if (/security deposit/.test(c)) return 'security_deposit'
+  // S648: every fee type a property can list, so the boxes link to them.
   if (/pet deposit/.test(c)) return 'pet_deposit'
+  if (/pet rent/.test(c)) return 'pet_rent'
   if (/pet fee/.test(c)) return 'pet_fee'
+  if (/utility deposit/.test(c)) return 'utility_deposit'
+  if (/key (deposit|fob deposit)/.test(c)) return 'key_deposit'
+  if (/cleaning deposit/.test(c)) return 'cleaning_deposit'
+  if (/cleaning fee/.test(c)) return 'cleaning_fee'
+  if (/move.?in fee/.test(c)) return 'move_in_fee'
+  if (/lease (prep|preparation|processing) fee|admin(istrative)? fee/.test(c)) return 'lease_prep_fee'
+  if (/hoa transfer/.test(c)) return 'hoa_transfer_fee'
+  if (/parking (rent|fee)/.test(c)) return 'parking_rent'
+  if (/storage (rent|fee)/.test(c)) return 'storage_rent'
+  if (/trash (fee|service)/.test(c)) return 'trash_fee'
+  if (/pest control/.test(c)) return 'pest_control_fee'
+  if (/technology fee|tech fee/.test(c)) return 'technology_fee'
+  if (/early termination|lease break fee/.test(c)) return 'early_termination_fee'
   if (/guest fee/.test(c)) return 'other_fee'
   if (/e-?mail|email/.test(c)) return 'tenant_email'
   if (/property address|premises.*address|address of (the )?premises/.test(c)) return 'property_address'
@@ -349,7 +371,7 @@ function detectTargets(pages: ReturnType<() => any>): { targets: RawTarget[]; pa
     // Signature labels mark the LEFT EDGE of their column ("TENANT(S)
     // SIGNATURE:" at x=43, "LANDLORD SIGNATURE:" at x=295, each block ~182
     // wide). So the question is containment — the last label at or left of the
-    // box — not which label centre happens to be nearest. Nearest-by-distance
+    // box — not which label center happens to be nearest. Nearest-by-distance
     // put a date at x=132, plainly inside the tenant column, on the landlord:
     // 132 is 89 from the tenant label but the lookup ran at the SLASH GLYPH's x
     // (192, since a "/ /" box is drawn 60pt to the left of the slashes), and
@@ -538,7 +560,7 @@ function nonSigRole(col: string | null, label: string | null, ctx: string, split
   // they are the landlord's to state correctly.
   //
   // Genuinely tenant-supplied facts — date of birth, emergency contact, driver's
-  // licence, phone — carry NO lease column (the landlord does not hold them), so
+  // license, phone — carry NO lease column (the landlord does not hold them), so
   // they fall through to the personal-info path below and stay with the tenant.
   // S635 (Nic, DIRECTIVE) EXTENDS THE RULE ABOVE ONE STEP. S622's reasoning was
   // that a value GAM already holds is "wrong by construction" as a tenant-entry
@@ -816,7 +838,9 @@ function sanitize(r: any, t: RawTarget): Classification {
   const hCol = h.leaseColumn
   if (hCol && hCol !== col) {
     const hCat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[hCol]
-    if (hCat === 'writable' || hCat === 'fee_row') col = hCol
+    // S648: the computed page 8 lines too — a model that calls "Total due"
+    // the rent would make it the monthly rent.
+    if (hCat === 'writable' || hCat === 'fee_row' || String(hCol).startsWith('move_in_')) col = hCol
   }
   let split: 'per_tenant' | 'none' = r.split === 'per_tenant' ? 'per_tenant' : 'none'
   const label = typeof r.label === 'string' && r.label ? r.label.slice(0, 60) : h.label
@@ -1296,7 +1320,7 @@ export function detectLateFeeTerms(pages: any[]): LateFeeTerms | null {
  *
  * Nic: "somebody could literally just have a word document drafted up with no
  * numbers, no indentations... every landlord's gonna have different lease
- * types." The recognisers here cover the conventions this engine understands.
+ * types." The recognizers here cover the conventions this engine understands.
  * Anything that reads like an either/or and did not become an election is
  * reported rather than dropped, so an unfamiliar format is a flagged gap
  * instead of a silent one.
@@ -1316,7 +1340,7 @@ const CHOICE_LANGUAGE = [
 function buildDetectionReport(
   pages: any[], radios: ProposedField[], consumed: Array<{ page: number; x: number; y: number }>,
 ): DetectionReport {
-  const recognised: string[] = []
+  const recognized: string[] = []
   const elections = radios
     .filter((r) => r.fieldType === 'radio_group' && r.leaseColumn)
     .map((r) => ({
@@ -1324,9 +1348,9 @@ function buildDetectionReport(
       options: String(r.options ?? '').split(',').filter(Boolean).length,
       page: r.page,
     }))
-  if (elections.length > 0) recognised.push('"(check one)" elections with underscore blanks')
-  if (radios.some((r) => r.parentKey)) recognised.push('nesting by indentation')
-  if (consumed.length > 0) recognised.push('option blanks')
+  if (elections.length > 0) recognized.push('"(check one)" elections with underscore blanks')
+  if (radios.some((r) => r.parentKey)) recognized.push('nesting by indentation')
+  if (consumed.length > 0) recognized.push('option blanks')
 
   // Lines already consumed as options are structured; everything else is fair
   // game for the sweep.
@@ -1357,7 +1381,7 @@ function buildDetectionReport(
       }
     }
   }
-  return { recognised, elections, unstructured }
+  return { recognized, elections, unstructured }
 }
 
 function detectCheckOneRadios(pages: any[]): {
@@ -1686,7 +1710,12 @@ export async function autoPlaceFields(
     const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
     if (cat !== 'writable' && cat !== 'fee_row') continue
     if (claimed.has(col)) {
-      f.leaseColumn = null   // display-only from here on
+      // S648: a second security-deposit box sitting in the move-in table is
+      // that table's deposit line — the system copies page 2 into it.
+      const inMoveInTable = col === 'security_deposit' && ordered.some(o => o.page === f.page
+        && ['move_in_first_month_rent', 'move_in_proration', 'move_in_total_due', 'last_month_rent']
+          .includes(String(o.leaseColumn)))
+      f.leaseColumn = inMoveInTable ? 'move_in_security_deposit' : null   // else display-only
       continue
     }
     claimed.add(col)

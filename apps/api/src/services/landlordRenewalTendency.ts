@@ -35,16 +35,28 @@ export async function getLandlordRenewalTendency(landlordId: string): Promise<La
     ended_count: string
     not_renewed_count: string
   }>(
-    `WITH renewals AS (
+    // A renewal that was cancelled before the tenant signed (its document
+    // voided — the lease is kept, terminated, as the record that it was
+    // offered) is not a renewal, and its lease never "ended". E-signed
+    // renewals carry the link since the renewal billing rule; before that only
+    // PDF-import supersedes did.
+    `WITH voided AS (
+       SELECT d.lease_id AS id FROM lease_documents d
+        WHERE d.status = 'voided' AND d.lease_id IS NOT NULL AND d.document_type = 'original_lease'
+     ),
+     renewals AS (
        SELECT (b.rent_amount - a.rent_amount) / NULLIF(a.rent_amount, 0) * 100 AS pct
          FROM leases b
          JOIN leases a ON a.id = b.supersedes_lease_id
         WHERE b.landlord_id = $1 AND a.rent_amount > 0
+          AND b.id NOT IN (SELECT id FROM voided)
      ),
      ended AS (
-       SELECT l.id, EXISTS (SELECT 1 FROM leases s WHERE s.supersedes_lease_id = l.id) AS renewed
+       SELECT l.id, EXISTS (SELECT 1 FROM leases s WHERE s.supersedes_lease_id = l.id
+                              AND s.id NOT IN (SELECT id FROM voided)) AS renewed
          FROM leases l
         WHERE l.landlord_id = $1 AND l.status IN ('expired', 'terminated')
+          AND l.id NOT IN (SELECT id FROM voided)
      )
      SELECT (SELECT COUNT(*) FROM renewals)                                                          AS renewal_count,
             (SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY pct)::numeric, 1) FROM renewals) AS median_increase_pct,

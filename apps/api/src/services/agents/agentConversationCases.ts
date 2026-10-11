@@ -7,7 +7,7 @@
  * responses stay on topic for the most part. If there's a decent segue into a
  * different topic, test a few transitional flows."
  *
- * WHY TURN TWO IS ITS OWN SUITE. Several behaviours the agents were BUILT for
+ * WHY TURN TWO IS ITS OWN SUITE. Several behaviors the agents were BUILT for
  * do not exist on turn one and cannot be measured there:
  *
  *   - confirm-then-act. The guest profile says "confirm the specifics with the
@@ -40,7 +40,7 @@
  *   pushing on a hard stop (money) · and three deliberate SEGUES into an
  *   adjacent topic, which is how real conversations move.
  *
- * ASSERTIONS ARE DELIBERATELY LOOSE ON PROSE AND TIGHT ON BEHAVIOUR. Turn two
+ * ASSERTIONS ARE DELIBERATELY LOOSE ON PROSE AND TIGHT ON BEHAVIOR. Turn two
  * has more freedom in how it answers than turn one, and roughly a third of
  * everything this battery has ever flagged turned out to be my expectation
  * being wrong rather than the agent. So: assert the TOOL that must fire, and
@@ -55,8 +55,8 @@ export interface Conversation {
   opener: string
   /** what a REAL person says back, written to fit any reasonable first reply */
   followUp: string
-  /** plain-language note on the human behaviour being tested */
-  behaviour: string
+  /** plain-language note on the human behavior being tested */
+  behavior: string
   /** the tool that must run ON TURN TWO */
   expectTool?: string
   /** any one of these on turn two is acceptable */
@@ -82,7 +82,7 @@ export interface Conversation {
 export const TENANT_CONVERSATIONS: Conversation[] = [
   {
     audience: 'tenant', id: 'balance-then-pay-half',
-    behaviour: 'told what they owe, asks to split it — the single most natural reaction to a big number',
+    behavior: 'told what they owe, asks to split it — the single most natural reaction to a big number',
     opener: 'how much do I owe?',
     followUp: 'can I just pay half now and the rest next week?',
     // STANDING DIRECTIVE, platform-wide: rent is pay-in-full only. No
@@ -95,7 +95,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'late-fee-then-waive',
-    behaviour: 'hears the late fee, immediately asks for it to be waived — pushing on a money hard stop',
+    behavior: 'hears the late fee, immediately asks for it to be waived — pushing on a money hard stop',
     opener: 'what is my late fee?',
     followUp: 'any chance you can take that off? it was only two days late',
     // S626: THIS ASSERTION WAS WRONG, and it was wrong against Nic's own
@@ -106,7 +106,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
     // scoring a failure every time the agent obeyed the prompt.
     //
     // That is the fourth time an assertion in this file has punished correct
-    // behaviour, and S624 lost most of a day to the same shape.
+    // behavior, and S624 lost most of a day to the same shape.
     //
     // What Nic actually asked for is ARITHMETIC. His note on this exact
     // conversation: "do the math out loud — the grace period already gave them
@@ -125,7 +125,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'lease-end-then-renewal',
-    behaviour: 'SEGUE — gets the lease end date, naturally asks what happens next',
+    behavior: 'SEGUE — gets the lease end date, naturally asks what happens next',
     opener: 'when does my lease end?',
     followUp: 'and what happens if I want to stay on after that?',
     expectToolAny: ['get_my_lease', 'get_my_full_lease', 'get_my_landlord_renewal_tendency'],
@@ -133,7 +133,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'maintenance-then-accept',
-    behaviour: 'CONFIRMS something already done — the agent filed it on turn one, so turn two must not file it again',
+    behavior: 'CONFIRMS something already done — the agent filed it on turn one, so turn two must not file it again',
     opener: 'my kitchen sink has been leaking since yesterday',
     // S624 (Nic): the old follow-up was "yes please, go ahead and put that in
     // for me", written as though the agent had OFFERED. It had already FILED —
@@ -155,7 +155,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
     // It went unnoticed because turn one never filed at all — it said "I'll
     // file a maintenance request" and called nothing (see promisesAnAction in
     // agentRunner). One row per run, created on turn two, so the count looked
-    // right. Two bugs cancelling out.
+    // right. Two bugs canceling out.
     //
     // Now: turn one files, turn two must not file again. Checking the STATUS of
     // the existing request on turn two is fine and rather good, so this forbids
@@ -172,7 +172,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'deposit-then-correction',
-    behaviour: 'CORRECTS the agent — thinks the number is wrong and asks it to check the document',
+    behavior: 'CORRECTS the agent — thinks the number is wrong and asks it to check the document',
     opener: 'how much is my pet deposit?',
     followUp: "that doesn't sound right to me — can you check what my actual lease says?",
     // Appealing to the DOCUMENT should reach the full lease, not a re-read of
@@ -182,7 +182,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'balance-then-decline',
-    behaviour: 'DECLINES the offer — the agent must let it go, not keep selling',
+    behavior: 'DECLINES the offer — the agent must let it go, not keep selling',
     opener: 'what do I owe right now?',
     followUp: "no thanks, I'll sort it out myself later",
     expectNoTool: true,
@@ -193,7 +193,7 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
 export const LANDLORD_CONVERSATIONS: Conversation[] = [
   {
     audience: 'landlord', id: 'narrow-then-answer',
-    behaviour: "THE case for Nic's rule — agent asks which Chen, landlord says which, and must now ANSWER",
+    behavior: "THE case for Nic's rule — agent asks which Chen, landlord says which, and must now ANSWER",
     opener: "what's chen's balance?",
     followUp: 'the one in apt 101',
     // Nic: "The first clarifying question points you in the right direction.
@@ -204,7 +204,7 @@ export const LANDLORD_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 'vacancy-then-drill-down',
-    behaviour: 'gets the portfolio number, drills into one property — the normal way a landlord narrows',
+    behavior: 'gets the portfolio number, drills into one property — the normal way a landlord narrows',
     opener: 'how many units do I have vacant?',
     followUp: 'which of those are at sunset palms?',
     expectToolAny: ['get_vacant_units', 'get_property_rent_roll', 'query_portfolio', 'get_landlord_portfolio'],
@@ -212,7 +212,7 @@ export const LANDLORD_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 'delinquent-then-notice',
-    behaviour: 'sees who is behind and asks for the obvious action on one of them',
+    behavior: 'sees who is behind and asks for the obvious action on one of them',
     opener: 'who is behind on rent?',
     followUp: 'can you put together a notice for frank?',
     expectToolAny: ['draft_tenant_notice', 'escalate', 'escalate_to_human'],
@@ -222,7 +222,7 @@ export const LANDLORD_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 'pl-then-expenses',
-    behaviour: 'SEGUE — gets a P&L that says no expenses are recorded, asks how to fix that',
+    behavior: 'SEGUE — gets a P&L that says no expenses are recorded, asks how to fix that',
     opener: 'show me my profit and loss for this year',
     followUp: 'how do I get my expenses in there?',
     // The P&L refuses to call income "profit" with no expenses entered. The
@@ -232,7 +232,7 @@ export const LANDLORD_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 'expirations-then-one-unit',
-    behaviour: 'SEGUE — from what is expiring to the specifics of one of them',
+    behavior: 'SEGUE — from what is expiring to the specifics of one of them',
     opener: 'what leases are expiring soon?',
     followUp: 'tell me more about the apt 204 one',
     expectToolAny: ['get_unit_lease', 'get_lease_expirations', 'lookup_tenant_payment_status'],
@@ -243,7 +243,7 @@ export const LANDLORD_CONVERSATIONS: Conversation[] = [
 export const GUEST_CONVERSATIONS: Conversation[] = [
   {
     audience: 'guest', id: 'late-checkout-commit',
-    behaviour: 'THE confirm-then-act case — gives the specifics, so the request must actually be sent',
+    behavior: 'THE confirm-then-act case — gives the specifics, so the request must actually be sent',
     opener: 'can I get a late checkout?',
     // Answers day AND time at once, so it fits whichever the agent asked.
     followUp: 'on my checkout day, around 11 if that works',
@@ -254,7 +254,7 @@ export const GUEST_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'guest', id: 'amenity-then-book',
-    behaviour: 'hears an amenity exists and asks to reserve it — accepting with specifics',
+    behavior: 'hears an amenity exists and asks to reserve it — accepting with specifics',
     opener: 'is there a pool here?',
     followUp: 'can you book it for me tomorrow afternoon?',
     expectToolAny: ['request_guest_amenity_reservation', 'get_guest_amenities'],
@@ -262,7 +262,7 @@ export const GUEST_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'guest', id: 'stay-then-extend',
-    behaviour: 'SEGUE — checks their dates, then decides they want longer',
+    behavior: 'SEGUE — checks their dates, then decides they want longer',
     opener: 'when do I check out?',
     followUp: 'actually could I keep it one more night after that?',
     expectTool: 'request_booking_change',
@@ -273,7 +273,7 @@ export const GUEST_CONVERSATIONS: Conversation[] = [
 export const VISITOR_CONVERSATIONS: Conversation[] = [
   {
     audience: 'visitor', id: 'rates-then-dates',
-    behaviour: 'gets the rate card and supplies real dates — the quote must become a real total',
+    behavior: 'gets the rate card and supplies real dates — the quote must become a real total',
     opener: 'how much per night?',
     followUp: "we'd be coming in on the 15th and leaving the 20th",
     expectTool: 'check_availability',
@@ -281,7 +281,7 @@ export const VISITOR_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'visitor', id: 'quote-then-book',
-    behaviour: 'gives the month when asked, then says yes — the agent must not have told them their dates were in the past',
+    behavior: 'gives the month when asked, then says yes — the agent must not have told them their dates were in the past',
     opener: 'do you have a pull through site available the 15th to the 20th?',
     // S624 (Nic): the old follow-up was "yeah let's go ahead and book that",
     // said to an agent that had given them NO information — nobody does that,
@@ -301,7 +301,7 @@ export const VISITOR_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'visitor', id: 'rates-then-monthly',
-    behaviour: 'SEGUE — nightly rates prompt the longer-stay question',
+    behavior: 'SEGUE — nightly rates prompt the longer-stay question',
     opener: 'what are your nightly rates?',
     followUp: 'what would it be if we stayed a whole month?',
     expectToolAny: ['get_property_pricing', 'check_availability'],
@@ -312,16 +312,16 @@ export const VISITOR_CONVERSATIONS: Conversation[] = [
 export const PROSPECT_CONVERSATIONS: Conversation[] = [
   {
     audience: 'prospect', id: 'pricing-then-scale',
-    behaviour: 'hears the price and volunteers their portfolio — the qualifying moment',
+    behavior: 'hears the price and volunteers their portfolio — the qualifying moment',
     opener: 'how much does GAM cost?',
     followUp: "I've got about 40 RV sites in arizona",
     // MY EXPECTATION WAS WRONG. I asserted a tool and the agent was right not
     // to call one: Lucy's prompt says call capture_lead "once you've got
     // contact info and they're interested", and she has no name or email yet.
     // What she produced — "RV parks are right in our wheelhouse... want me to
-    // grab you a time?" — is near-verbatim her own example dialogue.
+    // grab you a time?" — is near-verbatim her own example dialog.
     //
-    // So what is asserted is the behaviour that actually matters here: she
+    // So what is asserted is the behavior that actually matters here: she
     // engages the scale she was told and steers to a call, without inventing
     // a quote for 40 sites or pretending to have booked anything.
     expectAny: ['call', 'strategist', 'time', 'RV'],
@@ -332,7 +332,7 @@ export const PROSPECT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'prospect', id: 'call-then-pick-time',
-    behaviour: 'THE booking case — asks for a call, then picks when',
+    behavior: 'THE booking case — asks for a call, then picks when',
     opener: 'can I talk to someone?',
     followUp: 'tuesday afternoon would work for me',
     // MY EXPECTATION CONTRADICTED MY OWN COMMENT. I wrote "asking for them is
@@ -358,12 +358,12 @@ export const PROSPECT_CONVERSATIONS: Conversation[] = [
  * where being wrong costs money or a home, chosen for that and not for
  * coverage.
  *
- * Four behaviours are being tested, and each is something I ASSERTED in a tool
+ * Four behaviors are being tested, and each is something I ASSERTED in a tool
  * description today without evidence:
  *
  *   1. IT ASKS WHICH, rather than picking. Three onboarding routes do three
  *      different things and the landlord says one sentence covering all three.
- *   2. IT SAYS WHAT A CHANGE DOES NOT DO. Cancelling FlexDeposit refunds
+ *   2. IT SAYS WHAT A CHANGE DOES NOT DO. Canceling FlexDeposit refunds
  *      nothing. Eviction mode stops the landlord being paid. A fee schedule
  *      does not bill anybody.
  *   3. IT DOES NOT GUESS AT MONEY. An unmatched deposit in a park where every
@@ -375,7 +375,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   // ── LANDLORD ────────────────────────────────────────────────────────
   {
     audience: 'landlord', id: 's628-waive-late-fee',
-    behaviour: 'the landlord means it — and money on a tenant account is HIS act, not the agent\'s',
+    behavior: 'the landlord means it — and money on a tenant account is HIS act, not the agent\'s',
     opener: 'can you waive the late fee on 204?',
     followUp: 'yes, waive it — they called me about it and I said I would',
     // S630 DIRECTIVE (Nic): "The assistant cannot waive the late fee. The
@@ -397,7 +397,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 's628-evicting-must-say-payments-stop',
-    behaviour: 'says they are evicting — the consequence has to be stated before the switch is thrown',
+    behavior: 'says they are evicting — the consequence has to be stated before the switch is thrown',
     opener: "I'm starting an eviction on spot 7",
     followUp: 'yes, turn it on',
     expectTool: 'set_eviction_mode',
@@ -411,7 +411,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 's628-onboard-which-of-three',
-    behaviour: 'one sentence that fits all three onboarding routes — migrate, invite-to-sign, or park',
+    behavior: 'one sentence that fits all three onboarding routes — migrate, invite-to-sign, or park',
     opener: 'I need to get the Alvarez family into the system, they live in 12',
     followUp: 'they have been there four years, I have their lease in a folder somewhere',
     // "Four years, lease in a folder" = a paper lease that exists but is not to
@@ -422,7 +422,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 's628-deposit-must-not-guess',
-    behaviour: 'an unmatched deposit and no idea whose it is — the money question where guessing is the harm',
+    behavior: 'an unmatched deposit and no idea whose it is — the money question where guessing is the harm',
     opener: 'there is a $1,300 deposit on the 4th I cannot place',
     followUp: 'I honestly do not know which of them it was',
     // It must NOT confirm a match. Every lot pays the same rent; an amount
@@ -432,7 +432,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 's628-rent-increase-needs-a-date',
-    behaviour: 'a rent change is an addendum with an effective date, not an edit',
+    behavior: 'a rent change is an addendum with an effective date, not an edit',
     opener: 'I want to put spot 12 up to $520',
     followUp: 'from the first of March',
     expectToolAny: ['draft_terms_addendum', 'update_lease'],
@@ -442,7 +442,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'landlord', id: 's628-fee-schedule-is-not-a-charge',
-    behaviour: 'the confusion worth heading off — a property price versus billing one person',
+    behavior: 'the confusion worth heading off — a property price versus billing one person',
     opener: 'pets are $300 at Sunset Palms',
     followUp: 'yes, set that up',
     expectToolAny: ['set_property_fee'],
@@ -454,7 +454,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   // ── TENANT ──────────────────────────────────────────────────────────
   {
     audience: 'tenant', id: 's628-pay-rent-quote-then-charge',
-    behaviour: 'THE case — pay my rent, with the total read back before anything is charged',
+    behavior: 'THE case — pay my rent, with the total read back before anything is charged',
     opener: 'I want to pay my rent',
     followUp: 'yes, go ahead with that',
     expectToolAny: ['pay_my_balance', 'get_payment_quote'],
@@ -464,11 +464,11 @@ export const S628_CONVERSATIONS: Conversation[] = [
     mustNotContain: ["I've already charged", 'the payment has cleared', 'your landlord has received'],
   },
   {
-    audience: 'tenant', id: 's628-flexpay-is-not-enrolment',
-    behaviour: 'asks to sign up for a product the agent must NOT enrol them in',
+    audience: 'tenant', id: 's628-flexpay-is-not-enrollment',
+    behavior: 'asks to sign up for a product the agent must NOT enroll them in',
     opener: 'can I move my rent due date to when my benefit comes in?',
     followUp: 'yes please, sign me up',
-    // register_flexpay_interest at most. Enrolment records an acceptance of
+    // register_flexpay_interest at most. Enrollment records an acceptance of
     // terms with their IP and is theirs to do.
     expectToolAny: ['register_flexpay_interest'],
     // And this month has not moved. Somebody who thinks it has will not pay.
@@ -476,11 +476,11 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 's628-cancel-flexdeposit-says-what-it-does-not-do',
-    behaviour: 'cancelling something has a half people always miss',
+    behavior: 'canceling something has a half people always miss',
     opener: 'I want to cancel my deposit payment plan',
     followUp: 'yes, cancel it',
     expectToolAny: ['cancel_flexdeposit'],
-    // Cancelling stops the instalments. It does NOT refund what has been paid
+    // Canceling stops the installments. It does NOT refund what has been paid
     // and does NOT reduce the deposit owed. Somebody expecting money back will
     // be angry later, and it will be the agent's fault.
     expectAny: ['still', 'owe', 'refund', 'balance', 'deposit'],
@@ -488,7 +488,7 @@ export const S628_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 's628-moving-out-is-binding-notice',
-    behaviour: 'says they are leaving — recording it is giving legal notice, and they must be told that',
+    behavior: 'says they are leaving — recording it is giving legal notice, and they must be told that',
     opener: 'my lease ends in March and I think I am moving out',
     followUp: 'yes, that is right, I am not renewing',
     expectTool: 'submit_renewal_intent',

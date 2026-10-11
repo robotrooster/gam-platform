@@ -773,7 +773,8 @@ businessQuotesRouter.post('/:id/send', requireAuth, async (req, res, next) => {
           totalAmount: Number(q.total_amount),
           expiresAt: new Date(expiresAtIso),
           notes: q.notes,
-          ctx: { businessId, quoteId: q.id },
+          // 10/5: replies reach the business, not GAM (services/replyRouting).
+          ctx: { businessId, quoteId: q.id, replyTo: { kind: 'business', businessId } },
         })
       } catch {/* logged at email-service layer */}
     }

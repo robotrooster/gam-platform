@@ -11,6 +11,7 @@ vi.mock('../../db', () => ({ query: vi.fn(), queryOne: vi.fn() }))
 
 import { query, queryOne } from '../../db'
 import { checkTurnBudget, isAssistantHidden, getBudgetConfig, unproductiveTurnSql } from './turnBudget'
+import { todayIn, addDaysTo } from '../../lib/timezone'
 
 const mockQuery = query as unknown as ReturnType<typeof vi.fn>
 const mockQueryOne = queryOne as unknown as ReturnType<typeof vi.fn>
@@ -78,8 +79,9 @@ describe('isAssistantHidden', () => {
   // S609: these were hardcoded to July 2026. The hide lasts a fixed number of
   // days AFTER the last offending day, so once the calendar moved past that
   // window the test failed on a date rather than on a change. Anchored to "now".
-  const dayStr = (n: number) =>
-    new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10)
+  // S654: the rows stand in for `created_at::date`, which Postgres buckets in
+  // Phoenix, so the days count back from the Phoenix today, not UTC's.
+  const dayStr = (n: number) => addDaysTo(todayIn(null), -n)
   const offendingWeek = [
     { day: dayStr(3), n: 5 },
     { day: dayStr(2), n: 6 },

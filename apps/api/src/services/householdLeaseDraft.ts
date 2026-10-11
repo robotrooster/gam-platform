@@ -27,9 +27,21 @@ import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { resolveLeaseSigner } from './leaseSigner'
 import { createDocumentRecord } from '../routes/esign'
 import { logger } from '../lib/logger'
+import { ROSTER_MAX_HOUSEHOLD } from '@gam/shared'
+import { tooManyForOneLease } from './leaseOnboarding'
+
+/**
+ * Final sweep (10/3): how to fix a household too big for one lease, in the
+ * same words autoDraftLeasesForUnit (leaseOnboarding) puts after
+ * tooManyForOneLease on the invite screen and in its notice. A test pins the
+ * two to the same text.
+ */
+const MOVE_AN_INVITED_PERSON =
+  'To move someone, cancel their invite in Tenant Onboarding (Pending Pool), then invite them to the other unit. '
+  + 'The lease for the rest then drafts on its own within the hour.'
 
 export type HouseholdDraftResult =
-  | { drafted: true; documentId: string; templateId: string }
+  | { drafted: true; documentId: string; templateId: string; packetSize?: number }
   | { drafted: false; reason: string }
 
 /**
@@ -45,6 +57,10 @@ export async function draftHouseholdLease(args: {
   unitId: string
   /** Every resident invited to this unit, in household order (primary first). */
   residents: Array<{ userId: string; name: string; email: string; phone?: string | null }>
+  /** S652: the household is buying the home on installments — terms from the invite. */
+  homeSale?: any | null
+  /** S652: what the landlord left ticked on the invite. */
+  packageTemplateIds?: string[] | null
 }): Promise<HouseholdDraftResult> {
   const { landlordId, unitId, residents } = args
   if (!residents.length) return { drafted: false, reason: 'No residents to draft for' }
@@ -60,6 +76,17 @@ export async function draftHouseholdLease(args: {
       reason: `No default lease template is set for ${u?.unit_type ? `"${u.unit_type}" units` : 'this unit type'}. ` +
         `Set one under Leases → Templates and the lease will draft automatically on the next invite.`,
     }
+  }
+  // Final sweep (10/3): no lease GAM can draft holds more than
+  // ROSTER_MAX_HOUSEHOLD people. Templates carry primary and co_tenant_1..3, and
+  // createDocumentRecord refuses any other seat, so a fifth resident was handed
+  // co_tenant_4, the draft failed inside its transaction, and the landlord was
+  // told to "send it manually", the same dead end. Said up front instead, in
+  // the words every other door uses (tooManyForOneLease), in the order
+  // autoDraftLeasesForUnit checks: the template first, then the household.
+  if (residents.length > ROSTER_MAX_HOUSEHOLD) {
+    const u = await queryOne<{ unit_number: string }>(`SELECT unit_number FROM units WHERE id = $1`, [unitId])
+    return { drafted: false, reason: tooManyForOneLease(u?.unit_number ?? '', residents.length) }
   }
   if (!template.base_pdf_url) {
     return { drafted: false, reason: 'That unit type’s default template has no uploaded document yet.' }
@@ -109,22 +136,56 @@ export async function draftHouseholdLease(args: {
         { userId: signer.userId, role: 'landlord', name: signer.name,
           email: signer.email, phone: signer.phone, orderIndex: 1 },
         // Residents sign after, in household order — primary first.
+        //
+        // S652 — THE ROLE IS THE BINDING, AND 'tenant' BINDS TO NOTHING.
+        //
+        // This said `role: 'tenant'` for every resident while the comment
+        // beside it said "primary first". Lease templates place their fields
+        // against 'primary' and 'co_tenant_1..3' — that vocabulary is what the
+        // roster fill, the initials and the signature dates all look up — so a
+        // signer called 'tenant' matched no field, and every tenant field was
+        // dropped from the document without a word.
+        //
+        // Blu read thirteen Country Acres leases and reported it from the other
+        // end: "Tenant name(s) on page 1 didn't auto populate... page 5 didn't
+        // auto populate... page 7 didn't auto populate... Area for a date on
+        // page 7 didn't auto-populate or give the option to manually enter
+        // anything." 70 of the template's 125 fields never reached the document.
+        // Nobody could have signed those leases correctly.
         ...residents.map((r, i) => ({
-          userId: r.userId, role: 'tenant', name: r.name, email: r.email,
+          userId: r.userId,
+          role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          name: r.name, email: r.email,
           phone: r.phone ?? null, orderIndex: i + 2,
         })),
       ],
     })
+    // S652 (Nic): "no selecting package/templates at invite." The unit's
+    // default PACKAGE decides what rides with the lease; a home sale comes in
+    // with the invite. One helper for every door — services/packetDraft.
+    const { draftPacketSiblings } = await import('./packetDraft')
+    const siblings = await draftPacketSiblings(client as any, {
+      landlordId, unitId, leaseDocId: doc.id, leaseTemplateId: template.id,
+      signers: [
+        { userId: signer.userId, role: 'landlord', name: signer.name, email: signer.email, phone: signer.phone, orderIndex: 1 },
+        ...residents.map((r, i) => ({ userId: r.userId, role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          name: r.name, email: r.email, phone: r.phone ?? null, orderIndex: i + 2 })),
+      ],
+      homeSale: args.homeSale ?? null,
+      templateIds: args.packageTemplateIds ?? null,
+    }, createDocumentRecord)
+    const packetSize = 1 + siblings.count
     // Waiting rows are closed out inside createDocumentRecord — every lease
     // document goes through it, so a hand-sent lease clears them too.
     await client.query('COMMIT')
-    logger.info({ unitId, documentId: doc.id, residents: residents.length },
-      '[household-draft] lease drafted, awaiting landlord signature')
-    return { drafted: true, documentId: doc.id, templateId: template.id }
+    logger.info({ unitId, documentId: doc.id, residents: residents.length, packetSize },
+      '[household-draft] packet drafted, awaiting landlord signature')
+    return { drafted: true, documentId: doc.id, templateId: template.id, packetSize }
   } catch (e: any) {
     await client.query('ROLLBACK')
     logger.error({ err: e, unitId }, '[household-draft] draft failed')
-    return { drafted: false, reason: 'Could not draft the lease automatically — you can send it manually from the unit.' }
+    return { drafted: false, reason: e?.statusCode === 400 && e?.message ? e.message
+      : 'Could not draft the lease automatically — you can send it manually from the unit.' }
   } finally {
     client.release()
   }
@@ -224,7 +285,7 @@ export async function draftPendingForUnitType(args: {
          FROM pending_tenant_intents pti
          JOIN units u2 ON u2.id = pti.unit_id
         WHERE pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
-          AND pti.accepted_at IS NOT NULL
+          -- S647: no longer waits for acceptance; see autoDraftLeasesForUnit.
           AND pti.draft_document_id IS NULL
      ) AS u
      WHERE u.landlord_id = $1
@@ -249,7 +310,7 @@ export async function draftPendingForUnitType(args: {
     const intentWaiting = await queryOne<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
         WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
-          AND accepted_at IS NOT NULL AND draft_document_id IS NULL`, [unit_id])
+          AND draft_document_id IS NULL`, [unit_id])
     if (Number(intentWaiting?.n || 0) > 0) {
       const client = await getClient()
       try {
@@ -276,18 +337,21 @@ export async function draftPendingForUnitType(args: {
           // unbuilt RV template, and a household genuinely waiting on a
           // co-tenant looks identical to one blocked on setup.
           const tmpl = await resolveDefaultTemplateForUnit(unit_id)
-          const waiting = await queryOne<{ n: string }>(
-            `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
-              WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
-                AND accepted_at IS NULL`, [unit_id])
-          const stillToAccept = Number(waiting?.n || 0)
           const tmplFields = tmpl ? await queryOne<{ n: string }>(
             `SELECT COUNT(*)::text AS n FROM lease_template_fields WHERE template_id = $1`,
             [tmpl.id]) : null
+          const tooBig = tmpl ? await householdTooBigForOneLease(unit_id) : null
           await noteSkip(unit_id,
             !tmpl
               ? 'No default lease template is set for this unit type. Set one under Leases → '
                 + 'Templates and this drafts automatically.'
+            // Final sweep (10/3): a whole-unit household over the cap. Same
+            // check, same order as the drafter, and the how-to is written out
+            // here (MOVE_AN_INVITED_PERSON): the drafter's "Too many people for
+            // one lease" notice goes to the property's signing contact, and the
+            // person who set the default template may not be that contact.
+            : tooBig
+              ? `${tooManyForOneLease(tooBig.unitNumber, tooBig.people)} ${MOVE_AN_INVITED_PERSON}`
             : !tmpl.base_pdf_url
               ? 'That unit type’s default template has no uploaded document yet.'
             : Number(tmplFields?.n || 0) === 0
@@ -297,13 +361,12 @@ export async function draftPendingForUnitType(args: {
               // on the household", which sent Nic looking at his residents.
               ? 'That unit type’s default template has no fields saved yet — open it in the '
                 + 'template editor and save the auto-placed fields.'
-            : stillToAccept > 0
-              ? `Waiting on ${stillToAccept} more of the household to accept`
-              // Everyone accepted, the template looks complete, and drafting
-              // still refused — the reason is specific (e.g. the late-fee policy
-              // must appear in the document) and was sent as its own
-              // notification. Never guess at it here.
-              : 'The draft was refused — see the "Lease could not be drafted automatically" '
+              // S647: "waiting on the household to accept" is gone as a reason —
+              // drafting no longer waits for acceptance at all. With the template
+              // complete and drafting still refused, the reason is specific (e.g.
+              // the late-fee policy must appear in the document) and was sent as
+              // its own notification. Never guess at it here.
+            : 'The draft was refused — see the "Lease could not be drafted automatically" '
                 + 'notification for the reason.')
         }
       } catch (e: any) {
@@ -338,6 +401,29 @@ export async function draftPendingForUnitType(args: {
       '[household-draft] template default set — retried pending')
   }
   return { drafted, skipped, skippedUnits }
+}
+
+/**
+ * Final sweep (10/3): the case autoDraftLeasesForUnit refuses with its "Too many
+ * people for one lease" notice, read the same way it reads it (loadRoster): a
+ * whole-unit household whose open invites outnumber what one lease holds, with
+ * none of them drafted yet. Null when that is not why the unit is waiting.
+ */
+export async function householdTooBigForOneLease(unitId: string): Promise<{ unitNumber: string; people: number } | null> {
+  const row = await queryOne<{ unit_number: string; occupancy_mode: string | null; people: string; drafted: string }>(
+    `SELECT u.unit_number, u.occupancy_mode,
+            COUNT(pti.id)::text AS people,
+            COUNT(pti.draft_document_id)::text AS drafted
+       FROM units u
+       LEFT JOIN pending_tenant_intents pti
+              ON pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+             AND EXISTS (SELECT 1 FROM tenants t JOIN users us ON us.id = t.user_id WHERE t.id = pti.tenant_id)
+      WHERE u.id = $1
+      GROUP BY u.id, u.unit_number, u.occupancy_mode`, [unitId])
+  if (!row || row.occupancy_mode === 'by_room') return null
+  const people = Number(row.people)
+  if (people <= ROSTER_MAX_HOUSEHOLD || Number(row.drafted) > 0) return null
+  return { unitNumber: row.unit_number, people }
 }
 
 /**
@@ -377,8 +463,7 @@ export async function draftAllPendingLeases(): Promise<{ drafted: number; skippe
      SELECT DISTINCT pti.landlord_id, u.unit_type
        FROM pending_tenant_intents pti
        JOIN units u ON u.id = pti.unit_id
-      WHERE pti.accepted_at IS NOT NULL
-        AND pti.draft_document_id IS NULL
+      WHERE pti.draft_document_id IS NULL
         AND pti.resolved_at IS NULL
         AND pti.cancelled_at IS NULL
         AND u.unit_type IS NOT NULL`)

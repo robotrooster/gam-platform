@@ -116,7 +116,7 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
       utilitiesBilled: z.boolean().optional(),
       // S547 contact page: office phone / email / free-form hours text.
       officePhone: z.string().max(40).nullable().optional(),
-      officeEmail: z.string().email().max(200).nullable().optional(),
+      officeEmail: z.string().trim().toLowerCase().email().max(200).nullable().optional(),  // 10/5: also the reply address (services/replyRouting)
       officeHours: z.string().max(2000).nullable().optional(),
       nightlyRate: z.number().min(0).nullable().optional(),
       weeklyRate:  z.number().min(0).nullable().optional(),

@@ -287,6 +287,49 @@ describe('FlexPay — GET + enroll + terms + DELETE', () => {
     })
   })
 
+  // S655 (Nic 10/2): no FlexPay pull on the 1st-5th. The routes pass the day
+  // through and the service refuses it in plain words, so the tenant reads the
+  // reason the server gives.
+  it('S655: enrolling with a pull day on the 1st-5th is refused in plain words', async () => {
+    const f = await seedTenantFixture()
+    // Launched, and the tenant's request approved: the day rule is what refuses.
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexpay_rollout_visible', TRUE, 'S655 test'), ('flexpay_enrollment_open', TRUE, 'S655 test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    await db.query(
+      `INSERT INTO flexpay_inquiries (tenant_id, status, claimed_income_source, reviewed_at)
+       VALUES ($1, 'approved', 'ssdi', now())`, [f.tenantId])
+    const actual = await vi.importActual<typeof import('../services/flexpay')>('../services/flexpay')
+    enrollFlexPayMock.mockImplementationOnce(actual.enrollFlexPay as any)
+    const res = await request(buildApp())
+      .post('/api/tenants/flexpay/enroll')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ pullDay: 3, acceptedTerms: true })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Pick a pull day from the 6th through the 28th. The 1st through the 5th are not offered.')
+    const { rows: [t] } = await db.query<any>(`SELECT flexpay_enrolled FROM tenants WHERE id = $1`, [f.tenantId])
+    expect(t.flexpay_enrolled).toBe(false)
+  })
+
+  it('S655: moving the pull day onto the 1st-5th is refused and the day is unchanged', async () => {
+    const f = await seedTenantFixture()
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description) VALUES ('flexpay_rollout_visible', TRUE, 'S655 test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    await db.query(
+      `UPDATE tenants SET flexpay_enrolled = TRUE, flexpay_pull_day = 15, flexpay_monthly_fee = 25 WHERE id = $1`,
+      [f.tenantId])
+    const res = await request(buildApp())
+      .patch('/api/tenants/flexpay/pull-day')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ pullDay: 2 })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/6th through the 28th/)
+    const { rows: [t] } = await db.query<any>(`SELECT flexpay_pull_day FROM tenants WHERE id = $1`, [f.tenantId])
+    expect(t.flexpay_pull_day).toBe(15)
+  })
+
   it('DELETE /flexpay calls cancelFlexPay with tenantId', async () => {
     const f = await seedTenantFixture()
     const res = await request(buildApp())

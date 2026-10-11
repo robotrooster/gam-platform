@@ -5,7 +5,8 @@
  * Covered routes (5):
  *   - GET /me — full tenant profile + active-lease + deposit summary
  *   - GET /me/deposit-interest — statutory rate + accruals
- *   - POST /verify-ach — mock ACH verification + OTP-qualified stamp
+ *   - POST /verify-ach — REMOVED in S655 (money plan Step 5): a typed-in mock
+ *     that marked a tenant bank-verified with no bank behind it. Pinned gone below.
  *
  * Out of slice (future sessions):
  *   - FlexCharge / FlexPay / FlexDeposit / FlexSuite re-acceptance
@@ -169,6 +170,64 @@ describe('GET /api/tenants/me', () => {
   })
 })
 
+// S655 (Nic, 10/2) + S648: the signing lock-in. A tenant with an unsigned
+// lease sees only the signing flow — unless they already rent or take
+// utilities from ANOTHER company on GAM, whose bills they must still be able
+// to pay. A unit of their own from THIS lease (the landlord's signature issued
+// it) is no reason to skip signing.
+describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', () => {
+  async function waitingOn(f: TFixture, landlordId: string, unitId: string, leaseId: string | null) {
+    const doc = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+       VALUES ($1,$2,$3,'Lease','original_lease','in_progress') RETURNING id`,
+      [landlordId, unitId, leaseId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'primary','T T','t@test.dev',2,$3,'sent')`,
+      [doc, f.tenantUserId, randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')])
+    return doc
+  }
+  const me = (f: TFixture) => request(buildApp()).get('/api/tenants/me').set('Authorization', `Bearer ${f.tenantToken}`)
+
+  it("a new tenant whose lease the landlord's signature already issued is still locked into signing", async () => {
+    const f = await seedTFixture()   // the issued lease: active, on this unit
+    const doc = await waitingOn(f, f.landlordId, f.unitId, f.leaseId!)
+    const res = await me(f)
+    expect(res.body.data.unit_id).toBe(f.unitId)
+    expect(res.body.data.pending_lease_document_id).toBe(doc)
+    expect(res.body.data.pending_lease_locks).toBe(true)
+  })
+
+  it("another company's resident is not locked in — they keep paying what they owe there", async () => {
+    const f = await seedTFixture()   // lives at company A
+    const c = await db.connect()
+    let b: { landlordId: string; unitId: string }
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c)
+      const pid = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      b = { landlordId: ll.landlordId, unitId: await seedUnit(c, { propertyId: pid, landlordId: ll.landlordId }) }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    await waitingOn(f, b!.landlordId, b!.unitId, null)
+    expect((await me(f)).body.data.pending_lease_locks).toBe(false)
+  })
+
+  it('a second lease with the same company keeps the lock-in', async () => {
+    const f = await seedTFixture()
+    const c = await db.connect()
+    let unit2: string
+    try { unit2 = await seedUnit(c, { propertyId: f.propertyId, landlordId: f.landlordId }) } finally { c.release() }
+    await waitingOn(f, f.landlordId, unit2!, null)
+    expect((await me(f)).body.data.pending_lease_locks).toBe(true)
+  })
+
+  it('nothing waiting: no lock-in flag at all', async () => {
+    const f = await seedTFixture()
+    expect((await me(f)).body.data.pending_lease_locks).toBeNull()
+  })
+})
+
 describe('GET /api/tenants/me/payment-health', () => {
   it('computes on-time rate from the tenant\'s own payments', async () => {
     const f = await seedTFixture()
@@ -323,64 +382,19 @@ describe('GET /api/tenants/me/deposit-interest', () => {
   })
 })
 
-describe('POST /api/tenants/verify-ach', () => {
-  it('invalid last4 (not 4 chars) → 400', async () => {
+describe('POST /api/tenants/verify-ach is gone (S655)', () => {
+  // It let any tenant type four digits and become "bank verified" — the gate
+  // for FlexPay and FlexDeposit — with no bank behind it. A bank is verified
+  // only by Stripe's microdeposits now (routes/stripe.ts).
+  it('the typed-in mock no longer marks anyone bank-verified', async () => {
     const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/tenants/verify-ach')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ bankName: 'Chase', last4: '123' })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Valid bank last 4/)
-  })
-
-  it('S374 F1 regression pin: deposit fully funded → ach_verified=true + qualified message', async () => {
-    // Pre-S374 this path 500\'d with "column otp_qualified_at does
-    // not exist." Post-fix: ach_verified flips, deposit_fully_funded
-    // reflects state, message reflects qualification. OTP qualification
-    // is now a dynamic check via services/otp.getQualificationStatus
-    // (per S365), not a persisted timestamp on tenants.
-    const f = await seedTFixture()
-    const client = await db.connect()
-    try {
-      await seedSecurityDeposit(client, {
-        unitId: f.unitId, leaseId: f.leaseId!, tenantId: f.tenantId,
-        totalAmount: 1500, collectedAmount: 1500,
-      })
-    } finally { client.release() }
-
     const res = await request(buildApp())
       .post('/api/tenants/verify-ach')
       .set('Authorization', `Bearer ${f.tenantToken}`)
       .send({ bankName: 'Chase', last4: '4321' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.ach_verified).toBe(true)
-    expect(res.body.data.deposit_fully_funded).toBe(true)
-    expect(res.body.data.message).toMatch(/Bank verified/)
-
-    const row = await db.query<{ ach_verified: boolean; bank_last4: string }>(
+    expect(res.status).toBe(404)
+    const row = await db.query<{ ach_verified: boolean; bank_last4: string | null }>(
       `SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [f.tenantId])
-    expect(row.rows[0].ach_verified).toBe(true)
-    expect(row.rows[0].bank_last4).toBe('4321')
-  })
-
-  it('deposit NOT fully funded → ach_verified=true + deposit-not-funded message', async () => {
-    const f = await seedTFixture()
-    const client = await db.connect()
-    try {
-      await seedSecurityDeposit(client, {
-        unitId: f.unitId, leaseId: f.leaseId!, tenantId: f.tenantId,
-        totalAmount: 1500, collectedAmount: 500,  // partial
-      })
-    } finally { client.release() }
-
-    const res = await request(buildApp())
-      .post('/api/tenants/verify-ach')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ bankName: 'Chase', last4: '4321' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.ach_verified).toBe(true)
-    expect(res.body.data.deposit_fully_funded).toBe(false)
-    expect(res.body.data.message).toMatch(/deposit is not yet fully funded/)
+    expect(row.rows[0]).toEqual({ ach_verified: false, bank_last4: null })
   })
 })

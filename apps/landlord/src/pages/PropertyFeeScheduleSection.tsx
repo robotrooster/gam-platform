@@ -1,11 +1,19 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Plus, Trash2 } from 'lucide-react'
+import { UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 import { apiGet, apiPost, apiDelete } from '../lib/api'
 import { appConfirm } from '../components/dialogs'
 
+// S648 (Nic): move-in fees are set per property AND per kind of unit — "a pet
+// deposit on an apartment is gonna only apply to apartments... not RVs because
+// the tenants own those." A new lease's fee boxes start from the list for its
+// unit's type and stay editable; the signed lease is what bills. Existing
+// residents being onboarded start at $0 whatever this list says.
+
 type FeeRow = {
   id: string
+  unitType: string
   feeType: string
   slotIndex: number
   description: string | null
@@ -22,12 +30,13 @@ const SINGLE_INSTANCE_FEE_TYPES = [
   { type: 'pet_deposit',           label: 'Pet deposit',           defaultRefundable: true,  defaultTiming: 'move_in'     },
   { type: 'key_deposit',           label: 'Key deposit',           defaultRefundable: true,  defaultTiming: 'move_in'     },
   { type: 'cleaning_deposit',      label: 'Cleaning deposit',      defaultRefundable: true,  defaultTiming: 'move_in'     },
+  { type: 'utility_deposit',       label: 'Utility deposit',       defaultRefundable: true,  defaultTiming: 'move_in'     },
   { type: 'move_in_fee',           label: 'Move-in fee',           defaultRefundable: false, defaultTiming: 'move_in'     },
   { type: 'application_fee',       label: 'Application fee',       defaultRefundable: false, defaultTiming: 'move_in'     },
   { type: 'amenity_fee',           label: 'Amenity fee (one-time)',defaultRefundable: false, defaultTiming: 'move_in'     },
   { type: 'hoa_transfer_fee',      label: 'HOA transfer fee',      defaultRefundable: false, defaultTiming: 'move_in'     },
   { type: 'lease_prep_fee',        label: 'Lease prep fee',        defaultRefundable: false, defaultTiming: 'move_in'     },
-  { type: 'last_month_rent',       label: "Last month's rent",     defaultRefundable: true,  defaultTiming: 'move_in'     },
+  { type: 'last_month_rent',       label: 'Rent pre-payment',      defaultRefundable: true,  defaultTiming: 'move_in'     },
   { type: 'pet_rent',              label: 'Pet rent (monthly)',    defaultRefundable: false, defaultTiming: 'monthly_ongoing' },
   { type: 'parking_rent',          label: 'Parking rent',          defaultRefundable: false, defaultTiming: 'monthly_ongoing' },
   { type: 'storage_rent',          label: 'Storage rent',          defaultRefundable: false, defaultTiming: 'monthly_ongoing' },
@@ -51,17 +60,22 @@ const fmt = (n: any) => {
   return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string }) {
+export function PropertyFeeScheduleSection({ propertyId, unitTypes }: { propertyId: string; unitTypes: string[] }) {
   const qc = useQueryClient()
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<string | null>(null) // fee_type:slot_index key
+  const [unitType, setUnitType] = useState<string>(unitTypes[0] ?? '')
+  useEffect(() => {
+    if (!unitTypes.includes(unitType)) setUnitType(unitTypes[0] ?? '')
+  }, [unitTypes.join(',')])
 
   const { data = [], isLoading } = useQuery<FeeRow[]>(
     ['property-fee-schedule', propertyId],
     () => apiGet<FeeRow[]>(`/properties/${propertyId}/fee-schedule`),
   )
 
-  const list = data as FeeRow[]
+  if (unitTypes.length === 0) return null
+  const list = (data as FeeRow[]).filter(r => r.unitType === unitType)
   const byKey = new Map<string, FeeRow>()
   for (const r of list) byKey.set(`${r.feeType}:${r.slotIndex}`, r)
 
@@ -72,12 +86,24 @@ export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string 
     <div className="card" style={{ padding: 0, marginTop: 24 }}>
       <div style={{ padding: 16, borderBottom: '1px solid var(--border-0)', display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
         <div>
-          <h2 style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: '1.05rem', color: 'var(--text-0)' }}>Standard Fee Schedule</h2>
+          <h2 style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: '1.05rem', color: 'var(--text-0)' }}>Move-in &amp; Standard Fees</h2>
           <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 4 }}>
-            New leases on this property pre-populate from these fees. Per-lease overrides are flagged for audit.
+            Set for each kind of unit. A new tenant&apos;s lease starts with these amounts and you can change them
+            before signing. Existing residents you onboard start at $0. The security deposit comes from the unit.
           </div>
         </div>
       </div>
+      {unitTypes.length > 1 && (
+        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border-0)', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {unitTypes.map(t => (
+            <button key={t}
+              className={`btn btn-sm ${t === unitType ? 'btn-primary' : 'btn-ghost'}`}
+              onClick={() => { setEditing(null); setUnitType(t) }}>
+              {(UNIT_TYPE_LABEL as Record<string, string>)[t] || humanize(t)}
+            </button>
+          ))}
+        </div>
+      )}
 
       {error && (
         <div style={{ padding: 12, background: 'rgba(239,68,68,.06)', borderBottom: '1px solid rgba(239,68,68,.2)', color: 'var(--red)', fontSize: '.85rem' }}>{error}</div>
@@ -93,7 +119,8 @@ export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string 
           </div>
           {SINGLE_INSTANCE_FEE_TYPES.map(f => (
             <FeeRowEditor
-              key={f.type}
+              key={`${unitType}:${f.type}`}
+              unitType={unitType}
               propertyId={propertyId}
               feeType={f.type}
               slotIndex={0}
@@ -128,7 +155,8 @@ export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string 
             <>
               {otherFees.map(f => (
                 <FeeRowEditor
-                  key={`${f.feeType}:${f.slotIndex}`}
+                  key={`${unitType}:${f.feeType}:${f.slotIndex}`}
+                  unitType={unitType}
                   propertyId={propertyId}
                   feeType="other_fee"
                   slotIndex={f.slotIndex}
@@ -146,6 +174,7 @@ export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string 
               ))}
               {editing === `other_fee:${nextOtherSlot}` && (
                 <FeeRowEditor
+                  unitType={unitType}
                   propertyId={propertyId}
                   feeType="other_fee"
                   slotIndex={nextOtherSlot}
@@ -170,6 +199,7 @@ export function PropertyFeeScheduleSection({ propertyId }: { propertyId: string 
 }
 
 function FeeRowEditor({
+  unitType,
   propertyId,
   feeType,
   slotIndex,
@@ -184,6 +214,7 @@ function FeeRowEditor({
   onError,
   showDescription,
 }: {
+  unitType: string
   propertyId: string
   feeType: string
   slotIndex: number
@@ -206,6 +237,7 @@ function FeeRowEditor({
 
   const saveMut = useMutation(
     () => apiPost(`/properties/${propertyId}/fee-schedule`, {
+      unitType,
       feeType,
       slotIndex,
       description: description || null,

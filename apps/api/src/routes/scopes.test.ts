@@ -66,6 +66,14 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_scopes'
 })
 
+/** S654: the token from the last invitation email's link — the only place it
+ *  ever goes. */
+function tokenFromEmail(): string {
+  const calls = emailInvitationMock.mock.calls
+  const url = String(calls[calls.length - 1]?.[3] ?? '')
+  return url.split('/').pop() ?? ''
+}
+
 interface ScopesFixture {
   landlordUserId: string
   landlordId:     string
@@ -218,7 +226,10 @@ describe('POST /:roleType/invite', () => {
     expect(res.status).toBe(201)
     expect(res.body.data.role).toBe('maintenance')
     expect(res.body.data.status).toBe('pending')
-    expect(res.body.data.token).toMatch(/^[0-9a-f]{64}$/)  // 32 bytes hex
+    // S654: the token goes only to the invitee's address, never back to the
+    // caller. The emailed link carries it (32 bytes hex).
+    expect(res.body.data).not.toHaveProperty('token')
+    expect(tokenFromEmail()).toMatch(/^[0-9a-f]{64}$/)
 
     const ev = await db.query<{ event_type: string }>(
       `SELECT event_type FROM platform_events WHERE subject_id=$1`, [res.body.data.id])
@@ -307,7 +318,8 @@ describe('POST /invitations/:token/accept', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ email, scope })
     if (res.status !== 201) throw new Error(`invite failed: ${JSON.stringify(res.body)}`)
-    return res.body.data.token
+    // S654: read from the email, the one place the token is sent.
+    return tokenFromEmail()
   }
 
   it('happy path: new account, creates user + scope row + flips invitation to accepted', async () => {
@@ -410,8 +422,14 @@ describe('POST /invitations/:token/accept', () => {
 
     // Step 3: accept b's invite → MUST 409 (post-fix); pre-fix this succeeded
     // and created a second onsite_manager_scopes row under b.
+    // S654: the account exists now, so accepting takes that person's own
+    // session.
+    const ownSession = jwt.sign(
+      { userId, role: 'onsite_manager', email, profileId: userId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
     const r2 = await request(buildApp())
       .post(`/api/invitations/${t2}/accept`)
+      .set('Authorization', `Bearer ${ownSession}`)
       .send({})
     expect(r2.status).toBe(409)
     expect(r2.body.error).toMatch(/already an on-site manager/)
@@ -428,20 +446,26 @@ describe('POST /invitations/:token/accept', () => {
     // Seed an existing landlord-role user with email X.
     const client = await db.connect()
     let existingEmail = `existing-${randomUUID()}@test.dev`
+    let existingId = ''
     try {
       await client.query('BEGIN')
-      await client.query(
+      existingId = (await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-         VALUES ($1, 'x', 'landlord', 'Already', 'Landlord', TRUE)`,
-        [existingEmail])
+         VALUES ($1, 'x', 'landlord', 'Already', 'Landlord', TRUE) RETURNING id`,
+        [existingEmail])).rows[0].id
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 
     const token = await createPendingInvite(f, 'maintenance', existingEmail, {
       propertyIds: [], unitIds: [], jobCategories: [], allProperties: true,
     })
+    // S654: from that person's own session (an existing account always needs it).
+    const ownSession = jwt.sign(
+      { userId: existingId, role: 'landlord', email: existingEmail, profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
     const res = await request(buildApp())
       .post(`/api/invitations/${token}/accept`)
+      .set('Authorization', `Bearer ${ownSession}`)
       .send({})
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/already registered as landlord/)
@@ -517,5 +541,131 @@ describe('POST /invitations/:id/revoke + /resend', () => {
     const row = await db.query<{ status: string }>(
       `SELECT status FROM invitations WHERE id = $1`, [bInvId])
     expect(row.rows[0].status).toBe('pending')
+  })
+})
+
+// ── S654: team invitations ──────────────────────────────────────────────────
+//
+// Round 8, reproduced. POST /:roleType/invite (RETURNING *), /resend, /revoke
+// and GET /:roleType (SELECT * FROM invitations) all handed the caller the
+// invitation's token. POST /invitations/:token/accept asked for no login when
+// an account already sat on the address. So landlord B invited landlord A's
+// property manager, read the token off the 201, accepted with an empty body,
+// and A's manager was on B's team without ever being asked. For a fresh
+// address B accepted with a password B chose, and a verified account sat at
+// someone else's address with B's password.
+//
+// THE RULE: an invitation secret goes only to the invitee's address and never
+// back in a response; nobody attaches another company's person without that
+// person's own consent from their own session.
+describe('S654: an invitation token never leaves by response; an existing account accepts only from its own session', () => {
+  const MW_SCOPE = { propertyIds: [], unitIds: [], jobCategories: [], allProperties: true }
+
+  it('no team route returns the token: invite, list, resend and revoke', async () => {
+    const f = await seedScopesFixture()
+    const app = buildApp()
+    const created = await request(app)
+      .post('/api/scopes/maintenance/invite')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ email: `tok-${randomUUID()}@test.dev`, scope: MW_SCOPE })
+    expect(created.status).toBe(201)
+    const first = tokenFromEmail()
+    expect(first).toMatch(/^[0-9a-f]{64}$/)
+    expect(created.body.data).not.toHaveProperty('token')
+    expect(JSON.stringify(created.body)).not.toContain(first)
+    const invId = created.body.data.id
+
+    const listed = await request(app)
+      .get('/api/scopes/maintenance')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(listed.status).toBe(200)
+    expect(listed.body.data.invitations).toHaveLength(1)
+    expect(listed.body.data.invitations[0]).not.toHaveProperty('token')
+    expect(listed.body.data.invitations[0].id).toBe(invId)
+    expect(JSON.stringify(listed.body)).not.toContain(first)
+
+    const resent = await request(app)
+      .post(`/api/scopes/invitations/${invId}/resend`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({})
+    expect(resent.status).toBe(200)
+    const second = tokenFromEmail()
+    expect(second).toMatch(/^[0-9a-f]{64}$/)
+    expect(second).not.toBe(first)
+    expect(resent.body.data).not.toHaveProperty('token')
+    expect(JSON.stringify(resent.body)).not.toContain(second)
+    // The resend went to the invitation's stored address only.
+    const lastCall = emailInvitationMock.mock.calls[emailInvitationMock.mock.calls.length - 1]!
+    expect(lastCall[0]).toBe(created.body.data.email)
+
+    const revoked = await request(app)
+      .post(`/api/scopes/invitations/${invId}/revoke`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({})
+    expect(revoked.status).toBe(200)
+    expect(revoked.body.data.status).toBe('revoked')
+    expect(revoked.body.data).not.toHaveProperty('token')
+    expect(JSON.stringify(revoked.body)).not.toContain(second)
+  })
+
+  it("B invites A's property manager: the link alone attaches nobody; B's session can't either; only the manager's own session can", async () => {
+    const a = await seedScopesFixture()
+    const b = await seedScopesFixture()
+    const aMgr = await seedManagerWithScope(a)
+    const aMgrEmail = (await db.query<{ email: string }>(
+      `SELECT email FROM users WHERE id=$1`, [aMgr.userId])).rows[0].email
+
+    const inv = await request(buildApp())
+      .post('/api/scopes/property_manager/invite')
+      .set('Authorization', `Bearer ${b.landlordToken}`)
+      .send({ email: aMgrEmail.toUpperCase(), scope: { propertyIds: [], unitIds: [], allProperties: true } })
+    expect(inv.status).toBe(201)
+    expect(inv.body.data).not.toHaveProperty('token')
+    // Whoever holds the link (here read from the email) still needs the session.
+    const token = tokenFromEmail()
+    const onB = async () => (await db.query(
+      `SELECT 1 FROM property_manager_scopes WHERE user_id=$1 AND landlord_id=$2`,
+      [aMgr.userId, b.landlordId])).rows.length
+
+    // 1. No login at all, empty body: the round-8 attack.
+    const bare = await request(buildApp()).post(`/api/invitations/${token}/accept`).send({})
+    expect(bare.status).toBe(403)
+    expect(bare.body.error).toMatch(/already has a GAM account/)
+    // 2. A password in the body changes nothing: the account is not re-keyed.
+    const before = (await db.query(`SELECT password_hash FROM users WHERE id=$1`, [aMgr.userId])).rows[0]
+    const withPw = await request(buildApp()).post(`/api/invitations/${token}/accept`)
+      .send({ password: 'b_chose_this_1', firstName: 'B', lastName: 'Chose' })
+    expect(withPw.status).toBe(403)
+    // 3. B's own session is not the manager's.
+    const asB = await request(buildApp()).post(`/api/invitations/${token}/accept`)
+      .set('Authorization', `Bearer ${b.landlordToken}`).send({})
+    expect(asB.status).toBe(403)
+    expect(await onB()).toBe(0)
+    expect((await db.query(`SELECT password_hash FROM users WHERE id=$1`, [aMgr.userId])).rows[0]).toEqual(before)
+    const pending = (await db.query<{ status: string }>(
+      `SELECT status FROM invitations WHERE id=$1`, [inv.body.data.id])).rows[0]
+    expect(pending.status).toBe('pending')
+
+    // 4. The manager, from their own session, says yes.
+    const own = await request(buildApp()).post(`/api/invitations/${token}/accept`)
+      .set('Authorization', `Bearer ${aMgr.token}`).send({})
+    expect(own.status).toBe(200)
+    expect(own.body.data.userId).toBe(aMgr.userId)
+    expect(await onB()).toBe(1)
+  })
+
+  it('a new address: the account is made only by whoever holds the emailed link', async () => {
+    const f = await seedScopesFixture()
+    const email = `fresh-${randomUUID()}@test.dev`
+    const inv = await request(buildApp())
+      .post('/api/scopes/bookkeeper/invite')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ email, scope: { accessLevel: 'read_only' } })
+    expect(inv.status).toBe(201)
+    expect(JSON.stringify(inv.body)).not.toContain(tokenFromEmail())
+    expect(emailInvitationMock.mock.calls[0]![0]).toBe(email)
+
+    const res = await request(buildApp()).post(`/api/invitations/${tokenFromEmail()}/accept`)
+      .send({ password: 'their_own_pw_1', firstName: 'Fresh', lastName: 'Keeper' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.role).toBe('bookkeeper')
   })
 })

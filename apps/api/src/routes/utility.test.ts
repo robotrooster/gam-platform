@@ -206,14 +206,16 @@ describe('GET /master-bills', () => {
 })
 
 describe('GET /bills', () => {
-  it('tenant: sees only own bills', async () => {
+  it('tenant: sees only own bills, and only once they are issued', async () => {
     const f = await seed()
     const meter = await seedMeter(f, f.propertyAId)
-    await seedBill(f, meter)
-    const res = await request(buildApp())
-      .get('/api/utility/bills')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
+    const id = await seedBill(f, meter)
+    // S652: computed for the landlord's review, not yet issued — not the tenant's to see.
+    let res = await request(buildApp()).get('/api/utility/bills').set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(0)
+    await db.query(`UPDATE utility_bills SET status = 'billed', billed_at = NOW() WHERE id = $1`, [id])
+    res = await request(buildApp()).get('/api/utility/bills').set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].tenant_id).toBe(f.tenantAId)
   })
@@ -678,7 +680,7 @@ describe('POST /bills/:id/pay (deprecated)', () => {
     expect(res.body.error).toMatch(/not been invoiced yet/i)
   })
 
-  it('tenant own bill with payment_id → 410 with redirect to /payments/:id/pay', async () => {
+  it('tenant own bill with payment_id → 410 pointing to pay-balance (the whole bill), never a one-row pay', async () => {
     const f = await seed()
     const m = await seedMeter(f, f.propertyAId)
     // Seed a payment first to link the bill to
@@ -701,7 +703,9 @@ describe('POST /bills/:id/pay (deprecated)', () => {
       .post(`/api/utility/bills/${bill}/pay`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(410)
-    expect(res.body.error).toContain(p.rows[0].id)
+    expect(res.body.error).toContain('/api/payments/pay-balance')
+    // S655: /payments/:id/pay is retired too — never point anyone at it.
+    expect(res.body.error).not.toMatch(/\/api\/payments\/[^ ]+\/pay\b/)
   })
 })
 
@@ -855,12 +859,15 @@ describe('S605 meter baselines', () => {
 // assignment was refused the meter had ALREADY been created and stayed behind —
 // three failed attempts left three orphaned meters with no unit.
 describe('S605 meter + unit assignment is atomic', () => {
+  // 10/3: unit A has a resident (an active lease), so a submeter for it is
+  // created with its opening read (see "an occupied unit's own meter").
+  const OPENING = { baselineReading: 1000, baselineDate: '2026-09-30' }
   it('creates and assigns in one call', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
-              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId, ...OPENING })
     expect(res.status).toBe(201)
     const { rows } = await db.query<any>(
       `SELECT unit_id FROM utility_meter_units WHERE meter_id = $1`, [res.body.data.id])
@@ -874,7 +881,7 @@ describe('S605 meter + unit assignment is atomic', () => {
     await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
 
     const { rows: before } = await db.query<any>(
       `SELECT id FROM utility_meters WHERE property_id = $1`, [f.propertyAId])
@@ -883,7 +890,7 @@ describe('S605 meter + unit assignment is atomic', () => {
     const dup = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
     expect(dup.status).toBe(400)
 
     // ...and must not have created anything. This is the orphan regression.
@@ -897,12 +904,12 @@ describe('S605 meter + unit assignment is atomic', () => {
     await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
-              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId, ...OPENING })
     // Exactly what Nic was trying to do: add water to a unit that has electric.
     const water = await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
-              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId, ...OPENING })
     expect(water.status).toBe(201)
   })
 
@@ -916,6 +923,84 @@ describe('S605 meter + unit assignment is atomic', () => {
     const { rows } = await db.query<any>(
       `SELECT id FROM utility_meters WHERE label = 'X'`)
     expect(rows).toHaveLength(0)   // and nothing created
+  })
+})
+
+// ── 10/3 (final sweep): an occupied unit's own meter needs its opening read ──
+// Oak Park RV 24 was moved onto a new water submeter on 9/30 with no starting
+// read: its first read would only have been a starting point, so the first
+// month on the new meter would have billed no water for a space somebody lives
+// in. Creating a unit's own meter on an occupied unit now asks for the read.
+describe("an occupied unit's own meter needs its opening read", () => {
+  const meterCount = async (propertyId: string) =>
+    Number((await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM utility_meters WHERE property_id = $1`, [propertyId])).rows[0].n)
+
+  it('refuses a submeter for a unit with a resident and no opening read, in plain words, creating nothing', async () => {
+    const f = await seed()
+    await db.query(`UPDATE units SET unit_number = 'RV 24' WHERE id = $1`, [f.unitAId])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 24 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Someone lives in RV 24, so its new water meter needs an opening read: the number on the '
+      + 'meter face today and the date you read it. Without it, their first month on this meter would not bill. '
+      + 'Nothing was added. To add it, open the Utilities page, choose "Add meter", fill in the opening read and the '
+      + 'date you read it, then assign the meter to RV 24.')
+    expect(await meterCount(f.propertyAId)).toBe(0)
+  })
+
+  it('creates it with the opening read, stamped as the starting point', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 24 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId,
+              baselineReading: 4200, baselineDate: '2026-09-30' })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(
+      `SELECT reading_value::float AS v, reason, to_char(billing_cycle_month, 'YYYY-MM-DD') AS cycle
+         FROM utility_meter_readings WHERE meter_id = $1`, [res.body.data.id])
+    expect(rows).toEqual([{ v: 4200, reason: 'baseline', cycle: '2026-09-01' }])
+  })
+
+  it('an empty unit needs none — its first read is the right starting point', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let empty = ''
+    try { empty = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId }) } finally { c.release() }
+    await db.query(`UPDATE units SET status = 'vacant' WHERE id = $1`, [empty])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 60 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.21, assignUnitId: empty })
+    expect(res.status).toBe(201)
+  })
+
+  it('a unit whose residents are invited (no lease yet) counts as lived in', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let invited = ''
+    try { invited = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId }) } finally { c.release() }
+    await db.query(`UPDATE units SET status = 'vacant' WHERE id = $1`, [invited])
+    const tenantId = (await db.query<{ id: string }>(`SELECT id FROM tenants LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id) VALUES ($1, $2, $3)`,
+      [f.landlordAId, tenantId, invited])
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 61 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.21, assignUnitId: invited })
+    expect(res.status).toBe(400)
+  })
+
+  it('a flat charge (trash) reads nothing, so it needs no opening read', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', assignUnitId: f.unitAId })
+    expect(res.status).toBe(201)
   })
 })
 
@@ -1394,5 +1479,44 @@ describe('S632 POST /utility/opening-reads — one date, many meters, one save',
     expect(res.status).toBeGreaterThanOrEqual(400)
     const rows = await db.query(`SELECT 1 FROM utility_meter_readings WHERE meter_id = $1`, [b.meterIds[0]])
     expect(rows.rows).toHaveLength(0)
+  })
+})
+
+// S648 (Nic): "For the meters marked broken and then marked as repaired, they
+// also need a new fresh meter read... we need to set that as the starting point
+// for the next billing cycle so that it reflects an accurate amount."
+describe('marking a broken meter repaired', () => {
+  const patch = (token: string, id: string, body: any) =>
+    request(buildApp()).patch(`/api/utility/meters/${id}`).set('Authorization', `Bearer ${token}`).send(body)
+
+  it('refuses without the new reading, and changes nothing', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    await db.query(`UPDATE utility_meters SET out_of_service=TRUE, out_of_service_since=CURRENT_DATE WHERE id=$1`, [m])
+    const res = await patch(f.tokenA, m, { outOfService: false })
+    expect(res.status).toBe(400)
+    const row = (await db.query(`SELECT out_of_service FROM utility_meters WHERE id=$1`, [m])).rows[0]
+    expect(row.out_of_service).toBe(true)
+  })
+
+  it('records the new reading as the starting point', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    await db.query(`UPDATE utility_meters SET out_of_service=TRUE, out_of_service_since=CURRENT_DATE WHERE id=$1`, [m])
+    const res = await patch(f.tokenA, m, { outOfService: false, repairedStartingReading: 1250 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.out_of_service ?? res.body.data.outOfService).toBe(false)
+    const reads = (await db.query(
+      `SELECT reading_value::float AS v, reason FROM utility_meter_readings WHERE meter_id=$1`, [m])).rows
+    expect(reads).toEqual([{ v: 1250, reason: 'meter_replaced' }])
+  })
+
+  it('a meter that was never broken needs no reading to stay working', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    const res = await patch(f.tokenA, m, { outOfService: false })
+    expect(res.status).toBe(200)
+    const reads = await db.query(`SELECT 1 FROM utility_meter_readings WHERE meter_id=$1`, [m])
+    expect(reads.rows).toHaveLength(0)
   })
 })

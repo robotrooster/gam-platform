@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
@@ -15,8 +16,17 @@ const STATUS_MAP: Record<string, string> = {
   processing: 'badge-blue', complete: 'badge-green',
   failed: 'badge-red', cancelled: 'badge-muted', expired: 'badge-muted',
 }
-// Statuses the API's /decision route will accept a decision for.
-const DECIDABLE = new Set(['complete', 'submitted', 'processing'])
+// Statuses the API's /decision route will accept a decision for. 10/5 (Nic,
+// A6): only once the results are back — a decision before then is refused.
+const DECIDABLE = new Set(['complete'])
+// Still on its way to a result: submitted to the screener, or being worked.
+const RESULTS_PENDING = new Set(['submitted', 'processing'])
+
+// 10/5 (Nic, R10/A8): a guest screened for a STAY. Their approval clears the
+// stay for check-in; it is never waiting on a space or a lease here — a stay
+// that chose a lease already has its own draft on the Leases page.
+const stayDay = (ymd: string | null | undefined) =>
+  ymd ? new Date(String(ymd).slice(0, 10) + 'T00:00:00').toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }) : null
 
 type Cra = { name: string; address: string; phone: string; website: string | null }
 
@@ -24,31 +34,78 @@ export function BackgroundChecksPage() {
   const { data: checks = [], isLoading, refetch } = useQuery<any[]>('background-checks', () => apiGet('/background'))
   const [selected, setSelected] = useState<any | null>(null)
   const [denyFlow, setDenyFlow] = useState<{ checkId: string; cra: Cra | null; savedTemplate: string | null } | null>(null)
+  // S653 (Nic): "the main background checks page is only showing people that
+  // need attention." The API says which list a row is on (bucket); denied,
+  // housed, expired and cancelled sit behind the Past tab, searchable.
+  const [tab, setTab] = useUrlTab('tab', 'attention', ['attention','past'] as const)
+  const [q, setQ] = useState('')
+  const term = q.trim().toLowerCase()
+  const attention = (checks as any[]).filter(c => c.bucket !== 'past')
+  const past = (checks as any[]).filter(c => c.bucket === 'past')
+  const shown = (tab === 'attention' ? attention : past).filter(c => !term ||
+    [c.firstName, c.lastName, c.email, c.unitNumber, c.propertyName].some(v => String(v ?? '').toLowerCase().includes(term)))
 
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Background Checks</h1><p className="page-subtitle">Applicant screening results</p></div>
+        <div><h1 className="page-title">Background Checks</h1><p className="page-subtitle">
+          {attention.length} need{attention.length === 1 ? 's' : ''} attention · {past.length} past
+        </p></div>
+      </div>
+      <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12}}>
+        <button type="button" className={`btn btn-sm ${tab === 'attention' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('attention')}>
+          Needs attention ({attention.length})
+        </button>
+        <button type="button" className={`btn btn-sm ${tab === 'past' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('past')}>
+          Past ({past.length})
+        </button>
+        <input className="input" style={{marginLeft:'auto',maxWidth:280}} placeholder="Name, email, space…" value={q} onChange={e => setQ(e.target.value)} />
       </div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
           <table className="data-table" style={{minWidth:780}}>
-            <thead><tr><th>Applicant</th><th>Started</th><th>Risk</th><th>Status</th><th></th></tr></thead>
+            {/* S639 (Nic): "is that low risk vetted by Checkr?" No — and the
+                column said "Risk" as though it were. riskLevel is GAM's own
+                INTAKE score, computed from what the applicant typed on the form
+                (stated income, employment, how fast they filled it in) before
+                Checkr is contacted at all. Anastacio read "low" here while
+                Checkr's verdict on him was CONSIDER. Two different questions,
+                and the screening answer is the one a tenancy turns on, so it
+                gets the column and the intake score is named for what it is. */}
+            <thead><tr><th>Applicant</th><th>Started</th><th>Screening</th><th>Intake score</th><th>Status</th><th></th></tr></thead>
             <tbody>
-              {checks.length ? checks.map((c: any) => (
-                <tr key={c.id} onClick={() => setSelected(c)} style={{cursor:'pointer'}}>
+              {shown.length ? shown.map((c: any) => (
+                <tr key={c.id} onClick={() => { setSelected(c); refetch() }} style={{cursor:'pointer'}}>
                   <td style={{fontWeight:500}}>{[c.firstName, c.lastName].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{c.createdAt ? new Date(c.createdAt).toLocaleDateString() : '—'}</td>
                   <td>
+                    {(() => {
+                      // Checkr's verdict — the one that matters for a tenancy decision.
+                      const v = (c.reportSummary && typeof c.reportSummary === 'object')
+                        ? (c.reportSummary as any).result : null
+                      return <span className={`badge ${v === 'clear' ? 'badge-green' : v === 'consider' ? 'badge-amber' : 'badge-muted'}`}>
+                        {v === 'clear' ? 'Clear' : v === 'consider' ? 'Consider' : 'Not back yet'}
+                      </span>
+                    })()}
+                  </td>
+                  <td>
                     {c.riskLevel
-                      ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`}>{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
+                      ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`} title="GAM's intake plausibility score from the application form — NOT the background check result">{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
                       : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
-                  <td><span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span></td>
+                  <td>
+                    <span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span>
+                    {c.status === 'approved' && c.clearedForStay && <span className="badge badge-muted" style={{marginLeft:4}} title="Screened for their stay — they can be checked in">Cleared for their stay</span>}
+                    {c.status === 'approved' && !c.clearedForStay && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
+                    {c.status === 'approved' && !c.clearedForStay && !c.housed && c.parkedAt && <span className="badge badge-muted" style={{marginLeft:4}} title={c.parkedNote || 'Set aside — not moving in for now'}>Not moving in for now</span>}
+                    {c.status === 'approved' && !c.clearedForStay && !c.housed && !c.parkedAt && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
+                  </td>
                   <td style={{textAlign:'right',color:'var(--text-3)',fontSize:'.8rem'}}>Review →</td>
                 </tr>
               )) : (
-                <tr><td colSpan={5} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No background checks yet.</td></tr>
+                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>
+                  {term ? 'Nobody matches that.' : tab === 'attention' ? 'Nobody needs anything from you right now.' : 'Nothing here yet.'}
+                </td></tr>
               )}
             </tbody>
           </table>
@@ -57,8 +114,11 @@ export function BackgroundChecksPage() {
 
       {selected && (
         <ReviewModal
-          check={selected}
-          onClose={() => setSelected(null)}
+          // 10/4: always the row as it is NOW — the list refetches when the
+          // window opens and closes, so an approval left at "Which space?"
+          // reopens on that step, never on Approve / Deny again.
+          check={(checks as any[]).find(c => c.id === selected.id) ?? selected}
+          onClose={() => { setSelected(null); refetch() }}
           onDecided={(denied) => {
             refetch()
             if (denied) {
@@ -91,12 +151,95 @@ function ReviewModal({ check, onClose, onDecided }: {
   const [busy, setBusy] = useState<'' | 'approved' | 'denied'>('')
   const decidable = DECIDABLE.has(check.status)
 
+  // S639: an approval used to end at "approved" with nothing to click. The
+  // application already carries the space, the move-in date and the term, so
+  // the next step is one button — it files the screening as an application and
+  // hands it to the same drafter the listings door uses.
+  const [drafting, setDrafting] = useState(false)
+  const [pickedUnit, setPickedUnit] = useState('')
+  // A walk-up who scanned the park's QR code named no space — that is the point
+  // of the code. The park IS known, so the choice is between ITS vacant units
+  // and nothing else: unit numbers repeat across parks, and a cross-property
+  // list here would let one wrong click file a lease at another property.
+  // S653: after an approval in THIS modal the prop is stale (the list has not
+  // refetched yet), so the approved state is tracked here too.
+  const [approvedNow, setApprovedNow] = useState(false)
+  const isApproved = check.status === 'approved' || approvedNow
+  // A guest screened for a stay: their check only clears check-in (R10/A8).
+  const forStay = !!check.stayBookingId
+  const needsUnit = isApproved && !check.unitId && !forStay
+  const { data: vacants = [] } = useQuery<any[]>(
+    ['vacant-units', check.propertyId],
+    () => apiGet(`/units?propertyId=${check.propertyId}`),
+    { enabled: !!(needsUnit && check.propertyId) },
+  )
+  const choosable = (vacants as any[]).filter(u => u.status === 'vacant')
+
+  // S653 (Nic): the draft IS the signing packet. Land on it to sign — never on
+  // an edit window. No default template for the unit type → GoldSign, where
+  // one is set, and the sweep drafts the moment it exists.
+  const landOnDraft = (d: any) => {
+    if (d?.documentId) {
+      toast(`Lease drafted for ${d.unitNumber || 'the space'} — sign it and it goes to them.`)
+      window.location.href = `/sign/${d.documentId}`
+    } else if (d?.needsTemplate) {
+      toast.error(`No default lease template for that unit type yet — set one in GoldSign and the lease drafts on its own.`)
+      window.location.href = '/esign'
+    } else {
+      toast('Lease drafted — it is waiting for your signature in GoldSign.')
+      window.location.href = '/esign'
+    }
+  }
+
+  const draftLease = async () => {
+    setDrafting(true)
+    try {
+      const res: any = await apiPost(`/background/${check.id}/draft-lease`,
+        pickedUnit ? { unitId: pickedUnit } : {})
+      const d = res?.data ?? res
+      onClose()
+      landOnDraft(d)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not draft a lease.')
+      setDrafting(false)
+    }
+  }
+
   const decide = async (decision: 'approved' | 'denied') => {
     setBusy(decision)
     try {
       const res: any = await apiPatch(`/background/${check.id}/decision`, { decision })
+      if (decision === 'approved' && res?.stay) {
+        // A stay guest: cleared for check-in, nothing to draft (R10/A8).
+        toast(res.stay.leaseId
+          ? 'Approved — cleared for their stay. Their lease is already drafted on the Leases page.'
+          : 'Approved — cleared for their stay. Check them in from the schedule.')
+        onDecided(null)
+        return
+      }
+      if (decision === 'approved' && res?.alreadyApproved) {
+        // An older screen: it was approved already — show the next step here.
+        toast(res.needsUnit ? 'Already approved. Which space are they taking?' : 'Already approved. Draft their lease, or mark them not moving in for now.')
+        setApprovedNow(true)
+        setBusy('')
+        return
+      }
       if (decision === 'approved') {
-        toast('Applicant approved.')
+        // S653 (Nic): "When we approve somebody... it doesn't automatically draft
+        // up a lease for me to sign." Now it does: the approval drafted it, so
+        // go straight to it. A walk-up with no space named stays here to pick one.
+        if (res?.lease) {
+          onDecided(null)
+          landOnDraft(res.lease)
+          return
+        }
+        if (res?.needsUnit) {
+          toast('Approved. Which space are they taking?')
+          setApprovedNow(true)
+          setBusy('')
+          return
+        }
+        toast.error(res?.draftError ? `Approved, but the lease could not be drafted: ${res.draftError}` : 'Approved.')
         onDecided(null)
       } else {
         toast('Applicant denied. Send them an adverse-action notice.')
@@ -109,6 +252,22 @@ function ReviewModal({ check, onClose, onDecided }: {
     } catch (e: any) {
       toast.error(e?.response?.data?.error || 'Could not record the decision.')
       setBusy('')
+    }
+  }
+
+  // S653 (Nic): "keep them approved but mark them as dormant for now." The
+  // approval stands; they leave the to-do list until they turn up again.
+  const [parkNote, setParkNote] = useState('')
+  const [parking, setParking] = useState(false)
+  const park = async (dir: 'park' | 'unpark') => {
+    setParking(true)
+    try {
+      await apiPost(`/background/${check.id}/${dir}`, dir === 'park' ? { note: parkNote.trim() || null } : {})
+      toast(dir === 'park' ? 'Set aside — still approved, off the to-do list.' : 'Back on the to-do list.')
+      onDecided(null)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not save that.')
+      setParking(false)
     }
   }
 
@@ -136,18 +295,128 @@ function ReviewModal({ check, onClose, onDecided }: {
             {field('Email', check.email)}
             {field('Phone', check.phone)}
             {field('Applied', check.createdAt ? new Date(check.createdAt).toLocaleDateString() : null)}
-            {field('Screening cost (billed to you)', check.landlordCharge ? `$${Number(check.landlordCharge).toFixed(2)}` : '—')}
+            {/* S639 (Nic): "I don't know how much he's wanting to have the spot
+                for... I don't wanna do back and forth with, hey, they told me
+                something, and then I forgot because I was busy." Asked on the
+                application now, so the answer is sitting here when he decides. */}
+            {field('Wants to move in', check.desiredMoveIn ? new Date(check.desiredMoveIn + 'T00:00:00').toLocaleDateString() : null)}
+            {field('Term wanted', check.desiredMonthToMonth ? 'Month to month'
+              : check.desiredTermMonths ? `${check.desiredTermMonths} months` : null)}
           </div>
 
+          {/* ── S639 (Nic): "how do I see the actual data in the report? Is the
+              landlord gonna have to go to the Checkr settings?" ─────────────
+
+              They could not see it. This block looped the summary's TOP level,
+              so it printed order_id, provider and report_id — identifiers of no
+              use to anybody — while the findings themselves sat one level down
+              inside `products` and rendered as nothing at all. Anastacio
+              Erreguin's report came back CONSIDER on the credit file and clear
+              on everything else, and none of that reached the screen.
+
+              Per-product, plainly, with the overall verdict first. */}
           {report && (
             <div style={{marginTop:8,padding:12,background:'var(--bg-3)',borderRadius:8}}>
-              <div style={{fontSize:'.72rem',textTransform:'uppercase',letterSpacing:'.05em',color:'var(--text-3)',marginBottom:8}}>Report</div>
-              {Object.entries(report).map(([k, v]) => v != null && (
-                <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.82rem',padding:'3px 0'}}>
-                  <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
-                  <span style={{color: String(v) === 'clear' ? 'var(--green,#22c55e)' : String(v) === 'consider' ? 'var(--amber,#f59e0b)' : 'var(--text-1)',fontWeight:600}}>{humanize(String(v))}</span>
-                </div>
-              ))}
+              <div style={{fontSize:'.72rem',textTransform:'uppercase',letterSpacing:'.05em',color:'var(--text-3)',marginBottom:8}}>
+                Background report · Checkr
+              </div>
+              {(() => {
+                // report_summary is on camelize's JSONB_PASSTHROUGH_KEYS list, so
+                // Checkr's own response shape survives verbatim — these inner keys
+                // are deliberately snake_case and camelCase reads return undefined.
+                // S639: the API camelizes with lib/caseConversion, which has NO
+                // passthrough list — it descends into jsonb, so Checkr's own
+                // snake_case keys arrive camelCased and are read that way.
+                // (packages/shared/camelize DOES have a passthrough list; it is a
+                // different, client-side camelizer. I read that one, marked the
+                // wire-contract guard a false positive, and shipped reads that
+                // returned undefined — the exact bug the guard exists to catch.)
+                const r: any = report
+                const verdict = typeof r.result === 'string' ? r.result : null
+                const products: Record<string, any> = (r.products && typeof r.products === 'object') ? r.products : {}
+                const details: Record<string, any> = (r.details && typeof r.details === 'object') ? r.details : {}
+                // S639: the figures that explain a status — a credit score of 720
+                // reading "consider" makes no sense until you can see the 720.
+                const detailFor = (k: string): string | null => {
+                  const d = details[k]
+                  if (!d || typeof d !== 'object') return null
+                  const bits: string[] = []
+                  if (d.creditScore != null) bits.push(`score ${d.creditScore}`)
+                  if (d.recordsCount != null) bits.push(`${d.recordsCount} record${Number(d.recordsCount) === 1 ? '' : 's'}`)
+                  const fileStatus = d.creditFileStatus
+                  if (typeof fileStatus === 'string' && fileStatus !== 'available') bits.push(humanize(fileStatus))
+                  return bits.length ? bits.join(' · ') : null
+                }
+                const reportId: string | null = r.reportId ? String(r.reportId) : null
+                const fetchedAt: string | null = r.fetchedAt ? String(r.fetchedAt) : null
+                const tone = (v: string) => v === 'clear' ? 'var(--green,#22c55e)'
+                  : v === 'consider' ? 'var(--amber,#f59e0b)' : 'var(--text-1)'
+                return (
+                  <>
+                    {verdict && (
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+                                   paddingBottom:8,marginBottom:8,borderBottom:'1px solid var(--border-0)'}}>
+                        <span style={{color:'var(--text-1)',fontWeight:700}}>Overall</span>
+                        <span style={{color:tone(verdict),fontWeight:800,fontSize:'.95rem'}}>
+                          {verdict === 'clear' ? 'Clear' : verdict === 'consider' ? 'Consider — review before deciding' : humanize(verdict)}
+                        </span>
+                      </div>
+                    )}
+                    {Object.keys(products).length === 0 ? (
+                      <div style={{fontSize:'.82rem',color:'var(--text-3)'}}>
+                        No per-check results returned yet.
+                      </div>
+                    ) : Object.entries(products).map(([k, v]) => {
+                      const extra = detailFor(k)
+                      return (
+                        <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0',gap:12}}>
+                          <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
+                          <span style={{textAlign:'right'}}>
+                            <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
+                            {extra && <span style={{color:'var(--text-3)',fontWeight:500}}> · {extra}</span>}
+                          </span>
+                        </div>
+                      )
+                    })}
+                    {verdict === 'consider' && (
+                      <div style={{marginTop:10,fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5}}>
+                        A “consider” is not a decline, and not a judgment that a number is
+                        bad — it means the result did not automatically clear the criteria set
+                        on the Checkr account, so Checkr is handing you the decision. Read the
+                        figures beside each line before deciding. If you do decline on one, the
+                        applicant is entitled to an adverse action notice naming the agency and
+                        their right to dispute; use the Adverse Action button rather than
+                        declining silently.
+                      </div>
+                    )}
+                    {reportId && (
+                      <div style={{marginTop:10,fontSize:'.72rem',color:'var(--text-3)'}}>
+                        Checkr report {reportId}
+                        {fetchedAt ? ` · pulled ${new Date(fetchedAt).toLocaleString()}` : ''}
+                      </div>
+                    )}
+                  </>
+                )
+              })()}
+            </div>
+          )}
+
+          {RESULTS_PENDING.has(check.status) && (
+            <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)'}}>The results aren't back yet. You can approve or deny once they are.</div>
+          )}
+
+          {forStay && (
+            <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.5}}>
+              {isApproved
+                ? 'Cleared for their stay'
+                : 'Screened for their stay'}
+              {check.stayCheckIn ? ` — check-in ${stayDay(check.stayCheckIn)}` : ''}
+              {check.stayCheckOut ? `, check-out ${stayDay(check.stayCheckOut)}` : ''}.
+              {isApproved ? ' They can be checked in from the schedule.'
+                : check.status === 'denied' ? ' You can still check them in from the schedule if you choose to.'
+                : check.status === 'complete' ? ' Check-in waits for your decision.'
+                : ' Check-in waits for the results and your decision.'}
+              {check.stayLeaseId ? ' They chose a lease — it is already drafted on the Leases page.' : ''}
             </div>
           )}
 
@@ -157,7 +426,45 @@ function ReviewModal({ check, onClose, onDecided }: {
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose} disabled={!!busy}>Close</button>
-          {decidable && (
+          {isApproved && forStay && check.stayLeaseId && (
+            <button className="btn btn-primary" onClick={() => { window.location.href = `/leases?open=${check.stayLeaseId}` }}>
+              Open their lease
+            </button>
+          )}
+          {isApproved && !forStay && !check.housed && (
+            check.parkedAt ? (
+              <button className="btn btn-ghost" onClick={() => park('unpark')} disabled={parking}
+                title={check.parkedNote ? `Set aside: ${check.parkedNote}` : 'Set aside — not moving in for now'}>
+                {parking ? '…' : 'They\'re back'}
+              </button>
+            ) : (
+              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                <input className="input" style={{maxWidth:200}} placeholder="Why? (optional)" value={parkNote} onChange={e => setParkNote(e.target.value)} />
+                <button className="btn btn-ghost" onClick={() => park('park')} disabled={parking}
+                  title="Keeps the approval; takes them off Needs attention until they turn up again">
+                  {parking ? '…' : 'Not moving in for now'}
+                </button>
+              </div>
+            )
+          )}
+          {isApproved && !forStay && (
+            <>
+              {needsUnit && (
+                <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>
+                  <option value="">Which space?</option>
+                  {choosable.map(u => (
+                    <option key={u.id} value={u.id}>
+                      {u.unitNumber}{u.rentAmount ? ` · $${Number(u.rentAmount).toLocaleString()}/mo` : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <button className="btn btn-primary" onClick={draftLease} disabled={drafting || (needsUnit && !pickedUnit)}>
+                {drafting ? 'Drafting…' : 'Draft lease'}
+              </button>
+            </>
+          )}
+          {decidable && !approvedNow && (
             <>
               <button className="btn" style={{background:'var(--danger,#dc2626)',color:'#fff',borderColor:'var(--danger,#dc2626)'}} onClick={() => decide('denied')} disabled={!!busy}>
                 {busy === 'denied' ? 'Denying…' : 'Deny'}

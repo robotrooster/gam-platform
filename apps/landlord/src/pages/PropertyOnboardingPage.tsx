@@ -1,7 +1,7 @@
-import { useState, useRef, useMemo } from 'react'
+import { useState, useRef, useMemo, useCallback } from 'react'
 import { useMutation } from 'react-query'
 // S633: an import lands in ONE company. The account names it.
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
 import { useNavigate } from 'react-router-dom'
 import { Upload, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { apiPost } from '../lib/api'
@@ -55,6 +55,13 @@ type CommitResponse = {
   mappingStatus?: 'unverified' | 'verified'
 }
 
+// S654: the API's reason lives in `error` (errorHandler). Reading only
+// `message` hid every 400 behind "check the CSV format".
+const serverReason = (e: any, fallback: string): string =>
+  e?.response?.data?.error || e?.response?.data?.message || fallback
+
+const CHOOSE_COMPANY_FIRST = 'Choose the company this file belongs to first.'
+
 const FIELD_TO_ISSUE_KEY: Record<string, string> = {
   propertyName:    'property_name',
   street1:         'street1',
@@ -105,6 +112,23 @@ export function PropertyOnboardingPage() {
   // S297: free-text claim required on generic uploads.
   const [claimedPlatformName, setClaimedPlatformName] = useState<string>('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // S654: NO DEFAULT COMPANY — a several-company account validates and commits
+  // nothing until it names one.
+  const companyMissing = useCompanyMissing(landlordId)
+  // S654: a review was matched against one company's properties; switching
+  // company makes it stale, so it goes. The first pick (from nothing) keeps it.
+  const chooseCompany = useCallback((id: string) => {
+    if (landlordId && id !== landlordId) {
+      setPunchListRows(null)
+      setSummary(null)
+      setDecidedPairs(new Set())
+      setFeeDecisions({})
+      setErrorMsg('')
+      setSuccessBanner('')
+      setReviewBanner(null)
+    }
+    setLandlordId(id)
+  }, [landlordId])
 
   // S297: lightweight client-side mirror of services/csvImportAttempts.ts
   // normalizeClaimName(). Used for the "we have a dedicated importer"
@@ -135,7 +159,7 @@ export function PropertyOnboardingPage() {
         setFeeDecisions({})
       },
       onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.message || 'Validation failed. Check the CSV format and try again.')
+        setErrorMsg(serverReason(err, 'Validation failed. Check the CSV format and try again.'))
         setPunchListRows(null)
         setSummary(null)
       },
@@ -168,7 +192,7 @@ export function PropertyOnboardingPage() {
         if (fileInputRef.current) fileInputRef.current.value = ''
       },
       onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.message || 'Commit failed. Review the issues below.')
+        setErrorMsg(serverReason(err, 'Commit failed. Review the issues below.'))
       },
     }
   )
@@ -189,6 +213,7 @@ export function PropertyOnboardingPage() {
       setErrorMsg('Pick a CSV file first.')
       return
     }
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     validateMut.mutate({
       csv: csvText, source,
       ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
@@ -242,6 +267,7 @@ export function PropertyOnboardingPage() {
 
   const handleCommit = () => {
     if (!punchListRows) return
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     if (source === 'generic' && !claimedPlatformName.trim()) {
       setErrorMsg('Enter the platform name your CSV came from before committing.')
       return
@@ -272,7 +298,8 @@ export function PropertyOnboardingPage() {
         <h1 style={{ fontSize: '1.6rem', fontWeight: 700, color: 'var(--text-0)', margin: 0 }}>
           Property &amp; Unit Onboarding
         </h1>
-        <EntityPicker value={landlordId} onChange={setLandlordId}
+        <EntityPicker value={landlordId} onChange={chooseCompany}
+          disabled={validateMut.isLoading || commitMut.isLoading}
           note="Imported properties and units are created under this company." />
         <p style={{ fontSize: '.88rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
           Bring your full portfolio onto GAM in one shot. One CSV row per unit;
@@ -401,9 +428,12 @@ export function PropertyOnboardingPage() {
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
             <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
-            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading || companyMissing} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
             </button>
+            {companyMissing && (
+              <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
+            )}
           </div>
         )}
       </div>
@@ -558,12 +588,15 @@ export function PropertyOnboardingPage() {
           <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button
               onClick={handleCommit}
-              disabled={commitMut.isLoading || !allDecided || punchListRows.some(r => r.issues.some(i => i.severity === 'block'))}
+              disabled={commitMut.isLoading || companyMissing || !allDecided || punchListRows.some(r => r.issues.some(i => i.severity === 'block'))}
               className="btn btn-primary"
               style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
             >
               {commitMut.isLoading ? 'Committing…' : `Commit ${summary.ready} ready row(s)`}
             </button>
+            {companyMissing && (
+              <span style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
+            )}
             {punchListRows.some(r => r.issues.some(i => i.severity === 'block')) && (
               <span style={{ fontSize: '.82rem', color: '#dc2626' }}>
                 Fix blockers above before committing.

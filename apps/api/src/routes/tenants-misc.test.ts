@@ -10,6 +10,8 @@
  *
  * Slice arc map (cumulative):
  *   S374 slice 1: /me + landlord-banking + verify-ach + deposit-interest (5)
+ *     (S655: the mock POST /verify-ach was removed; its pin lives in
+ *     tenants-profile-dashboard.test.ts)
  *   S375 slice 2: FlexCharge/Pay/Deposit/Suite + portability auth (13)
  *   S376 slice 3: OTP/credit/payments + portability decline + re-accept preview (5)
  *   S377 slice 4: invite + accept-invite + invite-info (3) [+ 2 bugs fixed]

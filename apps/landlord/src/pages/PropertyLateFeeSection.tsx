@@ -171,7 +171,7 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
   //
   // Calls the SAME shared helpers the billing job runs (nextAccrualDate /
   // computeLateFeeAmount / lateFeeStartDate) so the preview can never drift
-  // from what actually bills. Modelled on rent due the 1st of a 30-day month.
+  // from what actually bills. Modeled on rent due the 1st of a 30-day month.
   const previewRows = (() => {
     const g = Math.trunc(Number(grace) || 0)
     const hasAcc = accrualAmount !== '' && Number(accrualAmount) > 0

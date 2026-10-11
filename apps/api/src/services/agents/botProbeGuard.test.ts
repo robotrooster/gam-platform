@@ -50,6 +50,22 @@ describe('questions about the agent', () => {
     }
   })
 
+  // S650: Nic's "Are you there?" to David forced a lookup retry.
+  it('a presence check is not an account question', () => {
+    for (const m of ['Are you there?', 'you still there?', 'u there', 'hello??', 'are you around'])
+      expect(demandsAToolCall(m, 'landlord'), m).toBe(false)
+    // ...but a real question that happens to start that way still is.
+    expect(demandsAToolCall('are you there with my balance', 'tenant')).toBe(true)
+  })
+
+  // S650: turning down an offer is not asking for data.
+  it('a decline is not an account question', () => {
+    for (const m of ["no thanks, I'll sort it out myself later", 'no thank you', "nah I'm good", 'not now, thanks', "no, I'll handle it"])
+      expect(demandsAToolCall(m, 'tenant'), m).toBe(false)
+    // ...but "no" followed by a real question still is.
+    expect(demandsAToolCall('no, what do I owe?', 'tenant')).toBe(true)
+  })
+
   it('greetings are still exempt, as before', () => {
     expect(demandsAToolCall('hey', 'tenant')).toBe(false)
     expect(demandsAToolCall('thanks!', 'tenant')).toBe(false)

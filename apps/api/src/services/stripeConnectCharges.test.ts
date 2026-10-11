@@ -175,6 +175,31 @@ describe('createRentPlatformCharge', () => {
     expect(call.payment_method_options?.us_bank_account?.financial_connections)
       .toEqual({ permissions: ['payment_method'] })
   })
+
+  // decisions.md #48.4: autopay card pulls go off-session.
+  it('a card the payer is present for saves it for later and is not sent off-session', async () => {
+    await createRentPlatformCharge({ ...baseOpts, paymentMethodTypes: ['card'] })
+    const call = (paymentIntentsCreateMock.mock.calls[0] as any[])[0]
+    expect(call.setup_future_usage).toBe('off_session')
+    expect(call.off_session).toBeUndefined()
+    expect(call.confirm).toBe(true)
+  })
+
+  it('an off-session card pull (autopay) is sent off_session: true with no setup_future_usage', async () => {
+    await createRentPlatformCharge({ ...baseOpts, paymentMethodTypes: ['card'], offSession: true })
+    const call = (paymentIntentsCreateMock.mock.calls[0] as any[])[0]
+    expect(call.off_session).toBe(true)
+    expect('setup_future_usage' in call).toBe(false)
+    expect(call.confirm).toBe(true)
+  })
+
+  it('offSession is ignored for a bank debit (it runs on its mandate)', async () => {
+    await createRentPlatformCharge({ ...baseOpts, paymentMethodTypes: ['us_bank_account'], offSession: true })
+    const call = (paymentIntentsCreateMock.mock.calls[0] as any[])[0]
+    expect(call.off_session).toBeUndefined()
+    expect(call.setup_future_usage).toBeUndefined()
+    expect(call.mandate_data).toBeDefined()
+  })
 })
 
 // ─── createPmCompanyTransfer ─────────────────────────────────

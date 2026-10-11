@@ -17,6 +17,12 @@
  * number promised in advance is one the system cannot keep. They are told the
  * rule instead: it charges the full balance on the day you picked, and picking a
  * day after rent is due means late fees under your lease.
+ *
+ * S655 (Nic, 10/2): "use my account credit first" — the tenant's own setting,
+ * OFF by default. Off: autopay charges the whole bill and the credit waits for
+ * the tenant to use it. On: the credit pays its part and the rest is charged.
+ * A method pinned for autopay must be one that can be charged: a bank still
+ * waiting on its microdeposits cannot be chosen yet.
  */
 
 import { Router } from 'express'
@@ -26,6 +32,7 @@ import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { payDateForPullDay } from '../services/autopayProjection'
+import { readStripeMethodFacts } from '../services/tenantBankMethods'
 
 export const tenantAutopayRouter = Router()
 tenantAutopayRouter.use(requireAuth)
@@ -71,6 +78,7 @@ tenantAutopayRouter.get('/', async (req: any, res, next) => {
               a.enabled,
               a.pull_day,
               a.payment_method_id,
+              COALESCE(a.use_credit, FALSE) AS use_credit,
               a.last_run_cycle::text     AS last_run_cycle,
               a.last_success_cycle::text AS last_success_cycle,
               a.last_error,
@@ -100,6 +108,8 @@ const putSchema = z.object({
   // NULL = follow whatever the tenant's default method is at charge time, so
   // someone who later switches from card to bank does not have to re-arm.
   paymentMethodId: z.string().min(1).nullable().optional(),
+  // S655: "Use my account credit first". Omitted leaves the setting as it is.
+  useCredit: z.boolean().optional(),
 })
 
 // PUT /api/autopay — the tenant sets, changes, or switches off their schedule.
@@ -119,32 +129,49 @@ tenantAutopayRouter.put('/', async (req: any, res, next) => {
     // check is against Stripe — otherwise a guessed id would schedule monthly
     // charges against a stranger's bank account.
     if (body.paymentMethodId) {
-      const tenant = await queryOne<{ stripe_customer_id: string | null }>(
-        `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [tenantId])
+      const tenant = await queryOne<{ stripe_customer_id: string | null; ach_suspended: boolean }>(
+        `SELECT stripe_customer_id, (ach_suspended_at IS NOT NULL) AS ach_suspended FROM tenants WHERE id = $1`, [tenantId])
       if (!tenant?.stripe_customer_id) throw new AppError(409, 'Finish setting up a payment method first.')
-      const pm = await getStripe().paymentMethods.retrieve(body.paymentMethodId)
-      if (pm.customer !== tenant.stripe_customer_id) {
+      const pm = await getStripe().paymentMethods.retrieve(body.paymentMethodId).catch(() => null)
+      // A bank still waiting on its microdeposits is not attached to the
+      // customer yet (S637), so it reads as "not on your account" — say why.
+      if (!pm || pm.customer !== tenant.stripe_customer_id) {
+        const facts = await readStripeMethodFacts(tenant.stripe_customer_id).catch(() => null)
+        if (facts?.banks.some(b => b.id === body.paymentMethodId && b.verifying)) {
+          throw new AppError(409, 'That bank is still being verified. It can be chosen for autopay once its two small deposits are confirmed.')
+        }
         throw new AppError(403, 'That payment method is not on your account.')
+      }
+      if (pm.type === 'us_bank_account') {
+        if (tenant.ach_suspended) {
+          throw new AppError(409, 'Bank payments are paused on this account after a bank return. Choose a card, or contact your landlord.')
+        }
+        const facts = await readStripeMethodFacts(tenant.stripe_customer_id).catch(() => null)
+        if (facts?.banks.some(b => b.id === body.paymentMethodId && b.verifying)) {
+          throw new AppError(409, 'That bank is still being verified. It can be chosen for autopay once its two small deposits are confirmed.')
+        }
       }
     }
 
     // Turning it back on clears a system disarm — the tenant has seen why it
     // stopped and is choosing to restart it, so the failure count starts over.
     const row = await queryOne<any>(
-      `INSERT INTO tenant_autopay (tenant_id, lease_id, enabled, pull_day, payment_method_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO tenant_autopay (tenant_id, lease_id, enabled, pull_day, payment_method_id, use_credit)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6::boolean, FALSE))
        ON CONFLICT (lease_id) DO UPDATE
           SET enabled              = EXCLUDED.enabled,
               pull_day             = EXCLUDED.pull_day,
               payment_method_id    = EXCLUDED.payment_method_id,
+              use_credit           = COALESCE($6::boolean, tenant_autopay.use_credit),
               consecutive_failures = CASE WHEN EXCLUDED.enabled THEN 0 ELSE tenant_autopay.consecutive_failures END,
               disarmed_at          = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.disarmed_at END,
               disarmed_reason      = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.disarmed_reason END,
               last_error           = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.last_error END,
               updated_at           = NOW()
         WHERE tenant_autopay.tenant_id = $1
-       RETURNING id, enabled, pull_day, payment_method_id`,
-      [tenantId, body.leaseId, body.enabled, body.pullDay ?? null, body.paymentMethodId ?? null])
+       RETURNING id, enabled, pull_day, payment_method_id, use_credit`,
+      [tenantId, body.leaseId, body.enabled, body.pullDay ?? null, body.paymentMethodId ?? null,
+       body.useCredit ?? null])
     if (!row) throw new AppError(403, 'That autopay schedule belongs to another tenant.')
 
     res.json({ success: true, data: row })

@@ -34,10 +34,28 @@ describe('the allowlist is the boundary', () => {
     expect(seen).toHaveLength(0)   // nothing was sent
   })
 
+  // S640: `card` was matched as a bare substring, so it fired on the word
+  // DISCARD — /api/leases/:leaseId/discard, an action about unsigned paperwork
+  // with no card anywhere near it. A word-start boundary keeps everything the
+  // rule is actually for (card, cards, cardholder, card-update) and stops the
+  // guard from failing a deploy over English. The boundary is on the FRONT
+  // only, deliberately: a suffix must never be what lets a card route through.
   it('contains nothing from another portal, and nothing credential-shaped', () => {
-    const banned = /\/(admin|business|pos|platform|superadmin)\b|password|otp|totp|two-factor|\/stripe\/|card/i
+    const banned = /\/(admin|business|pos|platform|superadmin)\b|password|otp|totp|two-factor|\/stripe\/|\bcard/i
     for (const a of PORTAL_ACTIONS) {
       expect(banned.test(a.path), `${a.id} → ${a.path}`).toBe(false)
+    }
+  })
+
+  it('the credential guard still catches what it is for', () => {
+    const banned = /\/(admin|business|pos|platform|superadmin)\b|password|otp|totp|two-factor|\/stripe\/|\bcard/i
+    for (const bad of ['/api/tenants/card', '/api/cards/update', '/api/billing/card-update',
+                       '/api/cardholder/x', '/api/admin/users', '/api/auth/password',
+                       '/api/pos/sale', '/api/stripe/webhook']) {
+      expect(banned.test(bad), bad).toBe(true)
+    }
+    for (const ok of ['/api/leases/:leaseId/discard', '/api/background/:checkId/draft-lease']) {
+      expect(banned.test(ok), ok).toBe(false)
     }
   })
 

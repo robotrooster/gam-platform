@@ -12,6 +12,9 @@
 // remaining amount, then stops accruing (locked decision: cap-edge partial).
 // Idempotent via ux_payments_late_fee_idempotent partial unique index —
 // the 6 firings per timezone per night are safe; first writes, rest no-op.
+//
+// S655: each invoice is decided under the household lock, right after the
+// whole-bill credit rule, and re-read fresh before any fee (lateFeeForInvoice).
 
 import type { PoolClient } from 'pg'
 import { getClient } from '../db'
@@ -25,12 +28,15 @@ import {
   type LateFeeAccrualFrom,
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
+import { deletedLateFeeDates } from '../services/lateFeeDelete'
 import { logger } from '../lib/logger'
+import { lockHousehold } from '../services/moneyPredicates'
+import { settleWholeBillIfCovered, billHouseholdTenant, type WholeBillResult } from '../services/creditUse'
 
 interface QualifyingInvoice {
   invoice_id: number
   // S615: NULL on a utility-service invoice — it has an agreement, not a lease.
-  lease_id: number | null
+  lease_id: string | null
   landlord_id: string
   unit_id: string | null
   resolved_unit_id: string
@@ -123,6 +129,44 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         -- catch-up plan shouldn't be fined for arrears from the old system."
         -- Set per invoice, so a landlord CAN opt a specific debt back in.
         AND i.late_fee_exempt = false
+        -- ── S640 (Nic): THE ONBOARDING WAIVER CANNOT DEPEND ON A STAMP ───────
+        --
+        --   "That's a false flag on the tenants currently, because onboarding
+        --    tenants are exempt from late fees."
+        --
+        -- The S639 waiver — an existing resident's FIRST bill on the platform is
+        -- never late, because the delay was our onboarding and not theirs — is
+        -- stamped onto late_fee_exempt when the invoice is generated. That is
+        -- fine for invoices the generator makes, and useless for every other
+        -- way an invoice comes into being: two of the five delinquent leases
+        -- carry is_existing_tenancy with a first invoice and no stamp, because
+        -- their invoices were written before the rule existed or by another
+        -- path. Nothing would have re-checked before fining them.
+        --
+        -- So the condition is asserted here as well, against the facts rather
+        -- than against a flag. The stamp stays — it is the record, and a
+        -- landlord can still opt a specific debt back in by clearing it — but
+        -- it is no longer the only thing standing between an onboarding
+        -- resident and a fee they were promised they would not get.
+        --
+        -- COALESCE, not a bare comparison: a utility-service invoice has no
+        -- lease at all, so is_existing_tenancy is NULL there, and NULL inside a
+        -- NOT(...) filters the row out entirely — it would have silently
+        -- stopped late fees on every service agreement on the platform. Two
+        -- tests caught it; without them nobody would have noticed for months.
+        --
+        -- S648 (Nic): only where the landlord CHOSE the waiver for this
+        -- property ("the tenants need to be billed late fees if the landlord
+        -- doesn't agree to waive them"). Unanswered (NULL) = no waiver.
+        AND NOT (
+          COALESCE(l.is_existing_tenancy, FALSE)
+          AND COALESCE(p.onboarding_late_fee_waiver, FALSE)
+          -- S654: a VOIDED history invoice (Country Acres' "billed before GAM"
+          -- rows) is not a prior bill; counting it defeated the waiver for ten
+          -- of twelve residents.
+          AND NOT EXISTS (SELECT 1 FROM invoices ip
+                           WHERE ip.lease_id = l.id AND ip.due_date < i.due_date AND ip.status <> 'void')
+        )
         AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled) = true
         AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount) IS NOT NULL
         AND (NOW() AT TIME ZONE p.timezone)::date
@@ -180,22 +224,84 @@ export async function generateLateFeesForTimezone(
     result.invoicesScanned = invoices.length
 
     for (const inv of invoices) {
+      let receipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
-        await processInvoice(client, inv, result)
+        receipts = await lateFeeForInvoice(client, inv, result)
         await client.query('COMMIT')
       } catch (e: unknown) {
         await client.query('ROLLBACK').catch(() => {})
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push({ invoice_id: inv.invoice_id, error: msg })
         logger.error({ err: e, tz, invoice_id: inv.invoice_id }, '[LateFees] invoice error')
+        continue
       }
+      // A bill the credit paid gets its "paid with your account credit"
+      // receipt once the settle is committed. Never throws.
+      if (receipts) await receipts()
     }
   } finally {
     client.release()
   }
 
   return result
+}
+
+/**
+ * One invoice, inside the caller's transaction (S655 money plan §1.5 and the
+ * whole-bill rule, Nic 10/2):
+ *   1. The household lock, like every writer of the household's money. The
+ *      invoice was picked by a scan that ran before this transaction, so a
+ *      tenant may have paid, or a credit landed, in between.
+ *   2. The whole-bill rule, right before the fee: a credit that covers the
+ *      whole bill pays it now, and a bill paid in full is not late. 10/6
+ *      (Nic): money paid ahead also goes on the balance, part of a bill when
+ *      it cannot pay all of it (creditUse.drawPaidAheadOnBalance); other
+ *      saved credit that covers less settles nothing. Whatever is still owed
+ *      after that does NOT stop the fee (Nic: "saved credit doesn't stop a
+ *      late fee unless it covers the whole bill"). Savepoint-guarded: if the credit step fails, the bill stays
+ *      open and the fee is raised exactly as before.
+ *   3. The invoice is asked again, fresh, under the lock: the fee is raised
+ *      only if it still qualifies (anything paid since the scan — by credit
+ *      here, by the tenant, the desk or a bank deposit — means no fee).
+ * Returns the credit receipts to send after COMMIT, if the credit paid a bill.
+ */
+async function lateFeeForInvoice(
+  client: PoolClient,
+  scanned: QualifyingInvoice,
+  result: LateFeeResult,
+): Promise<WholeBillResult['afterCommit'] | null> {
+  let receipts: WholeBillResult['afterCommit'] | null = null
+  // The bill's household: the invoice's tenant, else (an invoice written
+  // without one) the lease's resident.
+  const hh = scanned.tenant_id
+    ? { tenantId: scanned.tenant_id, landlordId: scanned.landlord_id }
+    : scanned.lease_id ? await billHouseholdTenant(client, scanned.lease_id) : null
+  if (hh) {
+    await lockHousehold(client, hh.tenantId, hh.landlordId)
+    await client.query('SAVEPOINT late_fee_whole_bill')
+    try {
+      const wb = await settleWholeBillIfCovered(client, {
+        tenantId: hh.tenantId, landlordId: hh.landlordId, source: 'whole_bill',
+      })
+      await client.query('RELEASE SAVEPOINT late_fee_whole_bill')
+      if (wb.settledIds.length > 0) {
+        receipts = wb.afterCommit
+        logger.info({ invoice_id: scanned.invoice_id, settled: wb.settledIds.length },
+          '[LateFees] the account credit covered the whole bill — paid before any late fee')
+      }
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT late_fee_whole_bill')
+      logger.error({ err: e, invoice_id: scanned.invoice_id },
+        '[LateFees] the credit check before the fee failed — the bill is treated as unpaid')
+    }
+  }
+  const { rows } = await client.query<QualifyingInvoice>(
+    qualifyingInvoicesSql('i.id = $1'), [scanned.invoice_id])
+  const fresh = rows[0]
+  if (!fresh) return receipts
+  await processInvoice(client, fresh, result)
+  return receipts
 }
 
 /**
@@ -207,6 +313,14 @@ export async function generateLateFeesForTimezone(
  * if the payment never happened") instead of waiting for the next nightly run.
  * No-op if the invoice doesn't qualify (grace not crossed, no late-fee config,
  * nothing unpaid, an in-flight retry, etc.).
+ *
+ * S655: it runs on its OWN connection and takes the household lock
+ * (lateFeeForInvoice). Call it only AFTER the caller's transaction has
+ * committed — never from inside a transaction that holds that household's
+ * lock: it would wait on the caller, the caller on it, and Postgres cannot see
+ * that as a deadlock (the caller's connection is merely idle in its
+ * transaction), so both hang for good. paymentReversal calls it after its
+ * COMMIT. creditUse.runWholeBillCheckAfterCommit has the same rule.
  */
 export async function generateLateFeesForInvoice(invoiceId: string): Promise<LateFeeResult> {
   const result: LateFeeResult = { invoicesScanned: 0, rowsWritten: 0, capsHit: 0, errors: [] }
@@ -217,16 +331,19 @@ export async function generateLateFeesForInvoice(invoiceId: string): Promise<Lat
     )
     result.invoicesScanned = invoices.length
     for (const inv of invoices) {
+      let receipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
-        await processInvoice(client, inv, result)
+        receipts = await lateFeeForInvoice(client, inv, result)
         await client.query('COMMIT')
       } catch (e: unknown) {
         await client.query('ROLLBACK').catch(() => {})
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push({ invoice_id: inv.invoice_id, error: msg })
         logger.error({ err: e, invoice_id: inv.invoice_id }, '[LateFees] on-demand invoice error')
+        continue
       }
+      if (receipts) await receipts()
     }
   } finally {
     client.release()
@@ -295,6 +412,10 @@ async function processInvoice(
   `, [inv.invoice_id])
   let existingSum = existingFees.reduce((s, r) => s + Number(r.amount), 0)
   const existingDates = new Set(existingFees.map(r => r.due_date))
+  // 10/6 (Nic): a late fee the landlord deleted on the onboarding bill
+  // (services/lateFeeDelete) is never charged again — its day counts as
+  // charged, at $0, exactly as a zeroed fee's does.
+  for (const d of await deletedLateFeeDates(client, String(inv.invoice_id), inv.due_date)) existingDates.add(d)
 
   // Cap = the lease's OWN stamped cap (late_fee_cap_*), part of the signed doc.
   const capKind = inv.late_fee_cap_type

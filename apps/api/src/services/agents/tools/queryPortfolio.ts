@@ -25,25 +25,26 @@
  * toolRouting.ts).
  *
  * COMPLAINTS ARE NOW CAPTURED. When this was first written nothing on the
- * platform recorded a complaint, so "who complains about their neighbour most"
+ * platform recorded a complaint, so "who complains about their neighbor most"
  * had no answer. Nic: "the table is gonna be created in the agent chat — that's
  * the point of contact where tenants are gonna complain about the neighbor."
  * So tenant_complaints exists and log_complaint (tenant side) writes to it, and
  * the two rankings that matter are here:
  *
  *   tenants.complaints_filed  -> who is always unhappy
- *   units.complaints_about    -> the neighbour who is the actual problem
+ *   units.complaints_about    -> the neighbor who is the actual problem
  *
  * Counts start from the day that shipped; a quiet older tenancy means "not
  * recorded", not "never complained", and the result says so.
  *
- * Still NOT categorisable: lease_notices is free text with no type column, so
+ * Still NOT categorizable: lease_notices is free text with no type column, so
  * notices can be counted per tenant and not broken down by reason. Never infer
  * a complaint from a maintenance category — those are hvac/plumbing/electrical/
- * appliance and say nothing about neighbours.
+ * appliance and say nothing about neighbors.
  */
 
 import { query } from '../../../db'
+import { openBalanceSql, openAmountSql } from '../../openBalances'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Subject = 'tenants' | 'units' | 'properties'
@@ -117,16 +118,21 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
              GROUP BY t.id, u.first_name, u.last_name`,
     },
+    // S655 (money plan, Step 11): the Outstanding page's own rule
+    // (services/openBalances.openBalanceSql) — never a payment still clearing,
+    // a work-trade line or the FlexPay pull — so "who owes the most" ranks the
+    // same figures that page shows. The full balance: credit is not taken off.
     balance_owed: {
-      means: 'what they currently owe',
+      means: 'what they currently owe (the full balance; credit they have is not taken off)',
       unit: 'dollars',
       sql: `SELECT u.first_name || ' ' || u.last_name AS label,
-                   COALESCE(SUM(p.amount), 0)::numeric AS value,
+                   COALESCE(SUM(${openAmountSql('p')}), 0)::numeric AS value,
                    COUNT(*)::text || ' unpaid charges' AS detail
               FROM payments p
-              JOIN tenants t ON t.id = p.tenant_id
+              LEFT JOIN invoices inv ON inv.id = p.invoice_id
+              JOIN tenants t ON t.id = COALESCE(p.tenant_id, inv.tenant_id)
               JOIN users u   ON u.id = t.user_id
-             WHERE p.landlord_id = ANY($1::uuid[]) AND p.status IN ('pending','failed')
+             WHERE p.landlord_id = ANY($1::uuid[]) AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     complaints_filed: {
@@ -143,7 +149,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     notices_received: {
-      means: 'how many notices the landlord has served them (free text — not categorised)',
+      means: 'how many notices the landlord has served them (free text — not categorized)',
       unit: 'notices',
       sql: `SELECT u.first_name || ' ' || u.last_name AS label,
                    COUNT(n.id)::int AS value, NULL::text AS detail
@@ -179,7 +185,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              GROUP BY un.id, un.unit_number`,
     },
     complaints_about: {
-      means: 'how many complaints have been raised ABOUT this unit — the neighbour who is the actual problem',
+      means: 'how many complaints have been raised ABOUT this unit — the neighbor who is the actual problem',
       unit: 'complaints',
       sql: `SELECT un.unit_number AS label, COUNT(c.id)::int AS value,
                    MAX(p.name) AS detail
@@ -365,7 +371,7 @@ export const queryPortfolio: AgentTool = {
       })),
       whatThisDoesNotContain:
         'Only the rows above, in this order, for this one measure. No trend, no cause, no comparison ' +
-        'to other landlords, and no judgement about whether a tenant is reasonable — report the ' +
+        'to other landlords, and no judgment about whether a tenant is reasonable — report the ' +
         'numbers and let the landlord draw the conclusion.',
     }
   },

@@ -2,7 +2,7 @@
 scope: landlord
 title: Tenant payment fees and the pass-through toggle
 ---
-Every electronic rent payment carries a small processing fee. GAM never absorbs it, so one side or the other always pays — and the rules are simple: **card fees are always paid by the tenant** (added on top at checkout — landlords never cover card), and for **ACH you choose per property** whether your tenant or you cover it.
+Every card or bank payment carries a small processing fee. GAM never absorbs it, so one side or the other always pays. You make **one choice per property: pass the fees on, or cover them** — and it applies the same way to everyone who pays at that property: rent, the front counter, pay links and the booking site. Card and bank fees go together; you can't cover one and pass on the other, or cover them for some people and not others.
 
 Here are the standard processing rates:
 
@@ -10,15 +10,15 @@ Here are the standard processing rates:
 - Card: 3.5% plus $0.55 per transaction
 - Non-US-issued cards: an extra 1.5% on top
 
-The ACH pass-through choice works like this:
+How the choice works:
 
-- Tenant pays: the fee is added on top of the rent at checkout, so the tenant sees the rent plus the processing fee. You receive the full rent amount.
-- Landlord pays: the tenant pays exactly the rent, and the ACH fee is netted out of what you receive.
+- Pass them on: the fee is added on top at checkout, so the payer sees the amount plus the processing fee. You receive the full amount.
+- Cover them: the payer pays exactly the amount, and the fee is taken out of your payout.
 
-The choice lives at the property level, so you can run different properties differently. A good way to think about it: "tenant pays" keeps your payout clean and predictable, while "landlord pays" makes the tenant's total simpler at the cost of a deduction on your side. Your account-wide default is set at onboarding and new properties inherit it; you can override any property later.
+You answer it when you set up each property, and you can change it any time on the property's page; it affects payments from then on. Cash, check and money order have no fee at all.
 
-This processing fee is completely separate from the monthly platform fee ($2 per occupied unit, $10 minimum per payout account). One is per-payment, the other is monthly — and the platform fee has its own per-property payer setting (default: landlord).
+This processing fee is completely separate from the monthly platform fee ($2 per occupied unit, $10 minimum per payout account), which is always yours.
 
-How payouts work alongside this: tenant payments are collected electronically, and once the funds clear, GAM sends your money to your connected bank through Stripe Connect on your payout schedule. You'll need to finish Stripe Connect onboarding (a quick identity and bank-verification step) before payouts can be sent.
+How payouts work alongside this: tenant payments are collected electronically, and once the funds clear, GAM sends your money to your connected bank on your payout schedule. You'll need to finish the payout setup (a quick identity and bank-verification step) before payouts can be sent.
 
 Rent amount and due date are set on each lease; late-fee terms come from your per-property, per-unit-type policy. The processing fee only applies to the electronic payment itself, not to how you structure the rent.

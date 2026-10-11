@@ -36,13 +36,34 @@ api.interceptors.request.use((config) => {
 // register, forgot-password and reset-password all render the server's message
 // inline. Only a 401 on a NORMAL authed request means a dead session worth
 // bouncing. The tenant portal already had this carve-out (S537).
+//
+// S652: a 402 ACCOUNT_LOCKED is NOT a dead session and must never bounce anyone
+// to /login. The landlord is signed in perfectly well; GAM has suspended the
+// account because it cannot collect what it is owed. Throwing them at the login
+// page would leave them typing a correct password into a form that keeps
+// working, with no idea why nothing loads. The flag is broadcast instead, and
+// the app draws the lock screen over the top.
+export const ACCOUNT_LOCKED_EVENT = 'gam:account-locked'
+
 api.interceptors.response.use(
   (res) => res,
   (err) => {
+    // S652: say WHY. Axios' own message is "Request failed with status code
+    // 400", and 61 screens fall back to e.message — so Blu, saving a package,
+    // saw a status code instead of the server's plain sentence. Every caller
+    // that reads e.message now gets the reason; callers reading
+    // response.data.error are unchanged.
+    const serverSays = err.response?.data?.error ?? err.response?.data?.message
+    if (typeof serverSays === 'string' && serverSays.trim()) err.message = serverSays
     const url = String(err.config?.url || '')
     if (err.response?.status === 401 && !url.includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
+    }
+    if (err.response?.status === 402 && err.response?.data?.code === 'ACCOUNT_LOCKED') {
+      window.dispatchEvent(new CustomEvent(ACCOUNT_LOCKED_EVENT, {
+        detail: { reason: err.response?.data?.lockedReason ?? null },
+      }))
     }
     return Promise.reject(err)
   }
@@ -55,3 +76,12 @@ export const apiDel  = (url: string) => api.delete(url).then(r => r.data)
 
 export const apiPut = <T = any>(url: string, body?: any) => api.put<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
 export const apiDelete = <T = any>(url: string) => api.delete<{ success: boolean; data: T }>(url).then(r => r.data)
+
+// S536 (ported from apps/business/src/lib/api.ts): PDF endpoints return
+// binary; fetch with auth and open in a new tab via blob URL.
+export async function openPdfInNewTab(url: string): Promise<void> {
+  const r = await api.get(url, { responseType: 'blob' })
+  const blobUrl = URL.createObjectURL(r.data as Blob)
+  window.open(blobUrl, '_blank', 'noopener,noreferrer')
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000)
+}

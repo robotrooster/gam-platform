@@ -60,7 +60,7 @@ export type LinkResult = LinkRow
  * part rather than a preamble to a consent screen. It fires only when the two
  * addresses agree on town AND street AND street numbers close together. What
  * still protects people if it is ever wrong: the amounts do not change, the
- * tenant's line still itemises the meter reads behind the charge so something
+ * tenant's line still itemizes the meter reads behind the charge so something
  * that is not theirs is visible rather than buried, and unlinking separates the
  * billing again from the next cycle.
  *

@@ -10,7 +10,8 @@ import {
 } from 'lucide-react'
 import {
   ACCOUNT_TYPE_VALUES, ACCOUNT_HOLDER_TYPE_VALUES,
-  AccountType, AccountHolderType, cardFeeLabel,
+  AccountType, AccountHolderType,
+  PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT,
   UNIT_TYPES, UNIT_TYPE_LABEL,
 } from '@gam/shared'
 
@@ -61,19 +62,18 @@ export function OnboardingPage() {
   const [showAddBank, setShowAddBank] = useState(false)
   // S513 (#2): landlord's onboarding ACH fee election. Default false = tenant
   // pays ACH (the launch default). Card is always the tenant's — not a choice.
-  const [coverTenantAch, setCoverTenantAch] = useState(false)
+  const [coverFees, setCoverFees] = useState(false)
 
   // Profile form
   const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
   // Property form
-  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential' })
+  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential', firstBillingCycle: (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` })() })
   const [errors, setErrors] = useState<Record<string, string>>({})
 
-  // S67: Banking step now reads the user's bank account catalog directly.
-  // Step 2 is complete when at least one active account exists.
-  const { data: bankAccounts = [] } = useQuery<any[]>(
-    'bank-accounts', () => apiGet('/bank-accounts')
-  )
+  // S637: the bank-account CATALOG no longer gates onboarding. It stays
+  // available on the Banking page (PM-company payouts and owner distributions
+  // read it), but "Get Paid" is answered by the Stripe Connect account — see
+  // payoutsReady below.
   // S605: the operating-bank feed. Polls while the landlord is on that step so
   // the screen flips to "connected" the moment Stripe's window closes.
   const { data: feedConnections = [], refetch: refetchFeed } = useQuery<any[]>(
@@ -106,8 +106,28 @@ export function OnboardingPage() {
       setFeedErr(e?.response?.data?.error || e?.message || 'Could not link the bank.')
     } finally { setFeedBusy(false) }
   }
-  const activeBankAccounts = bankAccounts.filter((a: any) => a.status === 'active')
-  const bankReady = activeBankAccounts.length > 0
+
+  // S637 (Nic, DIRECTIVE): "Get Paid" means the STRIPE CONNECT ACCOUNT, and
+  // nothing else counts as done.
+  //
+  // This step used to be satisfied by adding a row to GAM's own bank catalog —
+  // type a routing and account number, see a green tick, move on. But rent pays
+  // out through Connect, and that catalog row reaches payouts for nobody: it
+  // serves PM-company payouts and owner distributions. So a landlord typed their
+  // bank details, was told they were set up to get paid, and wasn't. Dusty
+  // Rhoades did exactly that at 1:44pm, then hit the feed step, tried to link
+  // the same Wells Fargo account a second time, and locked himself out of his
+  // own bank — for a step that was never his payout account to begin with.
+  //
+  // Nic: "Both places where they connect an account... should just take them to
+  // the connect account. The feed can come after."
+  const connectStatusQ = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
+    'onboarding-connect-status',
+    () => apiGet('/stripe/connect/status?entity=user'),
+    { refetchInterval: 15000 },
+  )
+  const payoutsReady = !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+  const bankReady = payoutsReady
   useEffect(() => {
     if (bankReady) setCompleted(prev => new Set([...prev, 2]))
   }, [bankReady])
@@ -179,7 +199,7 @@ export function OnboardingPage() {
   )
 
   const completeMut = useMutation(
-    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverTenantAch }),
+    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverFees, propertyId: targetPropertyId }),
     { onSuccess: async () => {
       await refresh?.()
       // S604: same reason as addPropertyMut — everything downstream of the
@@ -203,6 +223,7 @@ export function OnboardingPage() {
     if (stepIdx === 1) {
       if (!property.name.trim()) errs.propName = 'Property name required'
       if (!property.street1.trim()) errs.street1 = 'Address required'
+      if (!/^\d{4}-\d{2}$/.test(property.firstBillingCycle || '')) errs.firstBillingCycle = 'Pick the month GAM sends the first bill'
       if (!property.city.trim()) errs.city = 'City required'
       if (!property.zip.trim()) errs.zip = 'ZIP required'
     }
@@ -400,6 +421,13 @@ export function OnboardingPage() {
                 </div>
 
                 <div style={{ marginBottom: 14 }}>
+                  <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>First bill from GAM *</label>
+                  <input type="month" className="input" value={property.firstBillingCycle} onChange={e => setProperty(p => ({ ...p, firstBillingCycle: e.target.value }))} style={{ width: 180 }} />
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>GAM sends the first bill for this month and nothing earlier. Existing residents you add mid-month get their first bill here; what happened before stays outside GAM.</div>
+                  {errors.firstBillingCycle && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstBillingCycle}</div>}
+                </div>
+
+                <div style={{ marginBottom: 14 }}>
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Suite / Unit / Lot <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional)</span></label>
                   <input className="input" placeholder="Suite 100" value={property.street2} onChange={e => setProperty(p => ({ ...p, street2: e.target.value }))} style={{ width: '100%' }} />
                 </div>
@@ -516,34 +544,26 @@ export function OnboardingPage() {
               </div>
             )}
 
-            {/* ── STEP 3: BANKING ── */}
-            {step === 4 && (
+            {/* ── STEP 3: GET PAID (Stripe Connect) ── */}
+            {/* S649: this was `step === 4` — the Bank Feed step's index — since
+                Add Your Units was inserted ahead of it, so Get Paid rendered an
+                empty screen with Next disabled (Nicholas Fausett, stuck). */}
+            {step === 3 && (
               <div>
-                {bankReady ? (
-                  <div>
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: 12 }}>
-                      <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <Check size={28} style={{ color: 'var(--green)' }} />
+                {payoutsReady ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: 12 }}>
+                    <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Check size={28} style={{ color: 'var(--green)' }} />
+                    </div>
+                    <div style={{ textAlign: 'center' }}>
+                      <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
+                        Payouts are live
                       </div>
-                      <div style={{ textAlign: 'center' }}>
-                        <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Bank Account Added</div>
-                        <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>You can route each property to one of your accounts from the Properties page.</div>
+                      <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
+                        Rent collected through GAM is deposited to your bank each week. You can route each
+                        property to a different account from the Properties page.
                       </div>
                     </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
-                      {activeBankAccounts.map((a: any) => (
-                        <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
-                          <div>
-                            <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>{a.nickname}</div>
-                            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{a.accountHolderName} · {a.accountType} •••• {a.accountNumberLast4}</div>
-                          </div>
-                          <Check size={16} style={{ color: 'var(--green)' }} />
-                        </div>
-                      ))}
-                    </div>
-                    <button className="btn btn-ghost btn-sm" onClick={() => setShowAddBank(true)}>
-                      <Plus size={12} /> Add another account
-                    </button>
                   </div>
                 ) : (
                   <div>
@@ -553,65 +573,69 @@ export function OnboardingPage() {
                           <Landmark size={20} style={{ color: 'var(--gold)' }} />
                         </div>
                         <div>
-                          <div style={{ fontSize: '.88rem', fontWeight: 700, color: 'var(--text-0)' }}>Add a payout bank account</div>
-                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Where rent disbursements land. Multiple LLCs? Add one per LLC.</div>
+                          <div style={{ fontSize: '.88rem', fontWeight: 700, color: 'var(--text-0)' }}>Set up your payout account</div>
+                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>The account your rent is deposited into.</div>
                         </div>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
                         {[
-                          'US checking or savings account',
-                          'Personal or business (LLC) accounts both supported',
-                          'Account number encrypted at rest, last 4 only ever shown',
-                          'Multiple properties can share one account — collapses to a single ACH',
+                          'Verifies your business so rent can legally be paid to you',
+                          'US checking or savings — personal or business (LLC)',
+                          'You can enter your routing and account number by hand; no bank login is required',
+                          'Handled by Stripe. GAM never sees your bank login',
                         ].map(item => (
                           <div key={item} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.78rem', color: 'var(--text-2)' }}>
                             <Check size={12} style={{ color: 'var(--green)', flexShrink: 0 }} /> {item}
                           </div>
                         ))}
                       </div>
-                      <div style={{ background: 'rgba(255,184,32,.06)', border: '1px solid rgba(255,184,32,.2)', borderRadius: 8, padding: '8px 12px', fontSize: '.72rem', color: 'var(--amber)', display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
-                        <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-                        Test mode. No real money will move until live payment processing is enabled.
-                      </div>
-                      <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }} onClick={() => setShowAddBank(true)}>
-                        <Plus size={14} /> Add Bank Account
+                      {connectStatusQ.data?.exists && !payoutsReady && (
+                        <div style={{ background: 'rgba(255,184,32,.06)', border: '1px solid rgba(255,184,32,.2)', borderRadius: 8, padding: '8px 12px', fontSize: '.72rem', color: 'var(--amber)', display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
+                          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                          Started but not finished — pick up where you left off.
+                        </div>
+                      )}
+                      <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }}
+                        onClick={() => navigate('/banking')}>
+                        {connectStatusQ.data?.exists ? 'Continue payout setup' : 'Set up payouts'}
                       </button>
                     </div>
                     <div style={{ textAlign: 'center' }}>
-                      <button className="btn btn-ghost btn-sm" onClick={() => { setCompleted(prev => new Set([...prev, 2])); setStep(3) }}>
+                      {/* Skipping payouts also skips the bank feed — the feed is
+                          only useful once money is actually moving, and offering
+                          it first is what let people link the read-only feed
+                          believing they had set up payouts. */}
+                      <button className="btn btn-ghost btn-sm"
+                        onClick={() => { setCompleted(prev => new Set([...prev, 3, 4])); setStep(5) }}>
                         Skip for now — finish payout setup later
                       </button>
                     </div>
                   </div>
                 )}
 
-                {/* S513 (#2): ACH fee election. Card is always the tenant's. */}
+                {/* 10/5 (Nic): ONE choice per property for card and bank fees,
+                    for everyone who pays there. Kept OUTSIDE the payouts-ready
+                    branch on purpose — it is a pricing decision, answerable
+                    whether or not payout setup is done. */}
                 <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 18, marginTop: 8 }}>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Who pays the ACH processing fee?</div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card and bank payment fees</div>
                   <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-                    ACH bank payments cost a flat $6.00. By default your tenants pay this fee. You can
-                    choose to cover it for them — applied across your properties (change per-property later in Settings).
+                    Do you want to pass them on, or cover them? It applies to everyone who pays at your property —
+                    rent, the front counter, pay links and the booking site. You can change it on the property's page any time.
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
-                    {[
-                      { v: false, title: 'Tenant pays ACH', sub: 'Standard — fee added on top of rent' },
-                      { v: true,  title: "I'll cover ACH",   sub: 'Deducted from your payouts' },
-                    ].map(opt => {
-                      const selected = coverTenantAch === opt.v
+                    {PROCESSING_FEE_CHOICES.map(v => {
+                      const selected = (coverFees ? 'cover' : 'pass_on') === v
                       return (
-                        <button key={String(opt.v)} type="button" onClick={() => setCoverTenantAch(opt.v)}
+                        <button key={v} type="button" onClick={() => setCoverFees(v === 'cover')}
                           style={{ flex: 1, textAlign: 'left', padding: '12px 14px', borderRadius: 10, cursor: 'pointer',
                             background: selected ? 'rgba(201,162,39,.1)' : 'var(--bg-1)',
                             border: selected ? '1.5px solid var(--gold)' : '1px solid var(--border-0)' }}>
-                          <div style={{ fontSize: '.82rem', fontWeight: 700, color: selected ? 'var(--gold)' : 'var(--text-0)' }}>{opt.title}</div>
-                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>{opt.sub}</div>
+                          <div style={{ fontSize: '.82rem', fontWeight: 700, color: selected ? 'var(--gold)' : 'var(--text-0)' }}>{PROCESSING_FEE_CHOICE_LABEL[v]}</div>
+                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>{PROCESSING_FEE_CHOICE_HINT[v]}</div>
                         </button>
                       )
                     })}
-                  </div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 12, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                    <CreditCard size={12} style={{ flexShrink: 0, marginTop: 2 }} />
-                    Card payments ({cardFeeLabel()}) are always paid by the tenant — landlords never cover card fees.
                   </div>
                 </div>
               </div>
@@ -808,7 +832,10 @@ function AddBankAccountInlineModal({ onClose, onAdded }: { onClose: () => void; 
 
   const submit = () => {
     const errs: Record<string, string> = {}
-    if (!form.nickname.trim()) errs.nickname = 'Required'
+    // S637: nickname is OPTIONAL here too — the server derives one from the
+    // account details. This is a SECOND copy of the add-account form (the other
+    // is BankingPage) and it kept the required check after that one dropped it,
+    // so the trap that stopped Dusty Rhoades was still live on this path.
     if (!form.accountHolderName.trim()) errs.accountHolderName = 'Required'
     if (!/^\d{9}$/.test(form.routingNumber.replace(/\D/g, ''))) errs.routingNumber = 'Must be 9 digits'
     const acct = form.accountNumber.replace(/\D/g, '')
@@ -835,7 +862,7 @@ function AddBankAccountInlineModal({ onClose, onAdded }: { onClose: () => void; 
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Nickname</label>
+          <label style={lbl}>Nickname <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--text-3)' }}>(optional)</span></label>
           <input className="input" style={{ width: '100%' }} value={form.nickname}
             placeholder='e.g. "Acme Holdings LLC"'
             onChange={e => setForm(f => ({ ...f, nickname: e.target.value }))} />

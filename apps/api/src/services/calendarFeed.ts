@@ -91,7 +91,7 @@ function locationLine(a: CalendarFeedAppointment): string {
 }
 
 // Map GAM appointment status → iCalendar VEVENT STATUS. Cancelled/no-show both
-// surface as CANCELLED so a subscriber's calendar greys/removes the event;
+// surface as CANCELLED so a subscriber's calendar grays/removes the event;
 // scheduled → CONFIRMED; completed → CONFIRMED (it still happened).
 function icalStatus(s: CalendarFeedAppointment['status']): 'CONFIRMED' | 'CANCELLED' {
   return s === 'cancelled' || s === 'no_show' ? 'CANCELLED' : 'CONFIRMED'

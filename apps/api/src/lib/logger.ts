@@ -14,9 +14,8 @@
  * Output format:
  *   - dev (`NODE_ENV !== 'production'`) → pino-pretty (colorized,
  *     human-readable single line per record).
- *   - prod → raw JSON. Each record is one line; pipe to a log
- *     aggregator (Datadog / Logtail / hosting platform's log
- *     viewer) for parsing.
+ *   - prod → daily JSON files under LOG_DIR (the Mac), or raw JSON on
+ *     stdout on Cloud Run / LOG_TO_STDOUT=1 (see below).
  *
  * Level via `LOG_LEVEL` env var; defaults to `info` (or `debug` in
  * test so test-time captures are visible).
@@ -36,6 +35,8 @@
 import pino, { type LoggerOptions } from 'pino'
 import pinoHttp, { type HttpLogger } from 'pino-http'
 import { randomUUID } from 'crypto'
+import os from 'os'
+import path from 'path'
 
 const isProd = process.env.NODE_ENV === 'production'
 const isTest = process.env.NODE_ENV === 'test' || !!process.env.VITEST_POOL_ID
@@ -54,7 +55,50 @@ const baseOptions: LoggerOptions = {
   timestamp: pino.stdTimeFunctions.isoTime,
 }
 
-const transport = !isProd && !isTest
+/**
+ * S652 (Nic): "it needs to have a full history of exactly what happened."
+ *
+ * Production used to log to stdout, which launchd appended to /tmp/gam-api.log:
+ * one file, never rotated, and /tmp is wiped by macOS on reboot and pruned by
+ * its periodic cleanup — the whole history could vanish with no one touching
+ * it. Production now writes its own file, one per day, under
+ * ~/Library/Logs/gam (LOG_DIR to override), named after APP_NAME so the demo
+ * API keeps a separate history. Nothing is ever deleted (no `limit`). launchd
+ * still captures stdout/stderr separately, for crash output only.
+ */
+export const LOG_DIR = process.env.LOG_DIR || path.join(os.homedir(), 'Library', 'Logs', 'gam')
+
+/**
+ * GCP migration: on Cloud Run a container's disk is ephemeral, so a log file
+ * there is history that vanishes on the next deploy. Cloud Run (K_SERVICE is
+ * set by the platform) or LOG_TO_STDOUT=1 logs raw JSON to stdout instead —
+ * Cloud Logging keeps it — with the `severity` field it reads levels from.
+ */
+const toStdout = !!process.env.K_SERVICE || process.env.LOG_TO_STDOUT === '1'
+const CLOUD_SEVERITY: Record<string, string> = {
+  trace: 'DEBUG', debug: 'DEBUG', info: 'INFO', warn: 'WARNING', error: 'ERROR', fatal: 'CRITICAL',
+}
+if (isProd && toStdout) {
+  baseOptions.messageKey = 'message'   // Cloud Logging's summary-line field
+  baseOptions.formatters = {
+    level: (label, number) => ({ severity: CLOUD_SEVERITY[label] ?? 'DEFAULT', level: number }),
+  }
+}
+
+const transport = isProd && toStdout
+  ? undefined
+  : isProd
+  ? {
+      target: 'pino-roll',
+      options: {
+        file: path.join(LOG_DIR, process.env.APP_NAME || 'gam-api'),
+        frequency: 'daily',
+        dateFormat: 'yyyy-MM-dd',
+        extension: '.log',
+        mkdir: true,
+      },
+    }
+  : !isTest
   ? {
       // pino-pretty for dev. Lazy-loaded by pino, only required when
       // it's actually needed. Disable in test to keep vitest output

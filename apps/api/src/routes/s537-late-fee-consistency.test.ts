@@ -17,8 +17,9 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease, seedLateFeeDecision,
+  seedLease, seedLateFeeDecision, seedLeaseTenant, seedAllocationRule,
 } from '../test/dbHelpers'
+import { coverFlexPayCycle } from '../services/flexpay'
 import { unitsRouter } from './units'
 import { landlordsRouter } from './landlords'
 import { errorHandler } from '../middleware/errorHandler'
@@ -470,5 +471,123 @@ describe('S537c late fees vs in-flight and settled payments', () => {
     expect(inv.rows[0].status).toBe('partial')
     await generateLateFeesForTimezone(TZ)
     expect(await lateFeeTotal(invoiceId)).toBe(afterFirstRun) // not a cent more
+  })
+})
+
+// S655 money plan Step 4 (Nic 10/2): FlexPay pays the whole monthly bill on the
+// last day of grace, before the late-fee engine's midnight run, so that bill
+// is never late. The twin bill beside it, whose tenant has no FlexPay, shows
+// the engine would otherwise have charged.
+describe('S655 FlexPay: a covered bill gets no late fee', () => {
+  // One instant for the whole test: the bill's due date and the cover's
+  // "today" are both read from it, so the test passes on any day and at any
+  // hour (Step 10: these read the clock twice and broke near midnight).
+  let NOW_AT = new Date()
+  beforeEach(() => { NOW_AT = new Date() })
+  async function billOnItsLastGraceDay(f: any, flexpay: boolean) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
+      const tenantId = await seedTenant(client)
+      if (flexpay) {
+        // A FlexPay tenant has a verified bank (enrollment requires it; with
+        // none, FlexPay ends instead of paying — FlexPay terms §4.3).
+        await client.query(
+          `UPDATE tenants SET flexpay_enrolled = TRUE, flexpay_pull_day = 20, flexpay_monthly_fee = 25, ach_verified = TRUE WHERE id = $1`,
+          [tenantId])
+      }
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId, rentAmount: 1000 })
+      await seedLeaseTenant(client, { leaseId, tenantId })
+      await client.query(
+        `UPDATE leases SET late_fee_enabled = TRUE, late_fee_initial_amount = 25,
+                late_fee_initial_type = 'flat', late_fee_grace_days = 5 WHERE id = $1`, [leaseId])
+      // Due four days ago: today is the last of five grace days (due + 5 − 1).
+      const inv = await client.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
+         VALUES ($1, $2, $3, $4, $5, ($7::timestamptz AT TIME ZONE $6)::date - 4, 1000, 1000, 'pending') RETURNING id`,
+        [f.landlordId, tenantId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, NOW_AT])
+      await client.query(
+        `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)
+         VALUES ($1, $2, $3, $4, 'rent', 1000, 'pending', 'RENT', ($7::timestamptz AT TIME ZONE $5)::date - 4, $6)`,
+        [f.landlordId, tenantId, unitId, leaseId, TZ, inv.rows[0].id, NOW_AT])
+      await client.query('COMMIT')
+      return { invoiceId: inv.rows[0].id }
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  it('a covered bill gets no late fee', async () => {
+    const f = await fixture()
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description) VALUES ('flexpay_rollout_visible', TRUE, 'S655 test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    await db.query(
+      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
+       SELECT 'ach', 0, 1.0, 0, 0.5
+        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+    const c = await db.connect()
+    try { await seedAllocationRule(c, { propertyId: f.propertyId }) } finally { c.release() }
+    const covered = await billOnItsLastGraceDay(f, true)
+    const uncovered = await billOnItsLastGraceDay(f, false)
+
+    const r = await coverFlexPayCycle(NOW_AT)
+    expect(r.bills_covered).toBe(1)
+    const rent = await db.query<{ status: string; platform_held: boolean }>(
+      `SELECT status, platform_held FROM payments WHERE invoice_id = $1 AND type = 'rent'`, [covered.invoiceId])
+    expect(rent.rows[0]).toEqual({ status: 'settled', platform_held: true })
+
+    // Midnight: grace has run out on both bills.
+    for (const { invoiceId } of [covered, uncovered]) {
+      await db.query(`UPDATE invoices SET due_date = due_date - 1 WHERE id = $1`, [invoiceId])
+      await db.query(`UPDATE payments SET due_date = due_date - 1 WHERE invoice_id = $1`, [invoiceId])
+    }
+    await generateLateFeesForTimezone(TZ)
+    expect(await lateFeeTotal(covered.invoiceId)).toBe(0)
+    expect(await lateFeeTotal(uncovered.invoiceId)).toBe(25)
+  })
+
+  it('a line waiting on its own retry is covered and its retry canceled; no late fee', async () => {
+    const f = await fixture()
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description) VALUES ('flexpay_rollout_visible', TRUE, 'S655 test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    await db.query(
+      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
+       SELECT 'ach', 0, 1.0, 0, 0.5
+        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+    const c = await db.connect()
+    try { await seedAllocationRule(c, { propertyId: f.propertyId }) } finally { c.release() }
+    const covered = await billOnItsLastGraceDay(f, true)
+    // The rent's own bank pull bounced; its retry is scheduled for after grace.
+    await db.query(
+      `UPDATE payments SET status = 'failed', stripe_payment_intent_id = 'pi_bounced_rent',
+              next_retry_at = NOW() + interval '2 days', retry_count = 0
+        WHERE invoice_id = $1 AND type = 'rent'`, [covered.invoiceId])
+
+    // No Stripe in this file: the after-commit cancel of the old intent fails
+    // and an admin is told, which is all it may do.
+    const key = process.env.STRIPE_SECRET_KEY
+    delete process.env.STRIPE_SECRET_KEY
+    try {
+      const r = await coverFlexPayCycle(NOW_AT)
+      expect(r.bills_covered).toBe(1)
+    } finally {
+      if (key !== undefined) process.env.STRIPE_SECRET_KEY = key
+    }
+    const rent = await db.query<any>(
+      `SELECT status, next_retry_at, flexpay_advance_id FROM payments WHERE invoice_id = $1 AND type = 'rent'`,
+      [covered.invoiceId])
+    expect(rent.rows[0].status).toBe('settled')
+    expect(rent.rows[0].next_retry_at).toBeNull()       // the retry will never pull the tenant
+    expect(rent.rows[0].flexpay_advance_id).not.toBeNull()
+    const cancelNotice = await db.query<any>(
+      `SELECT context FROM admin_notifications WHERE category = 'superseded_retry_cancel_failed'`)
+    expect(cancelNotice.rows.map((n: any) => n.context.stripe_payment_intent_id)).toEqual(['pi_bounced_rent'])
+
+    // Midnight: grace has run out — and the bill is paid.
+    await db.query(`UPDATE invoices SET due_date = due_date - 1 WHERE id = $1`, [covered.invoiceId])
+    await db.query(`UPDATE payments SET due_date = due_date - 1 WHERE invoice_id = $1`, [covered.invoiceId])
+    await generateLateFeesForTimezone(TZ)
+    expect(await lateFeeTotal(covered.invoiceId)).toBe(0)
   })
 })

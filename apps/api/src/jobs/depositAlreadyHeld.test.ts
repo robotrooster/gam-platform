@@ -6,7 +6,7 @@
  * the landlord has held for years.
  *
  * The fix marks the custody row 'carried_forward' BEFORE the invoice runs,
- * reusing the S516 double-charge guard. These lock in the money behaviour:
+ * reusing the S516 double-charge guard. These lock in the money behavior:
  * the lease still STATES the deposit (so the signed document and the move-out
  * sweep are correct) but no deposit payment row is ever created.
  */

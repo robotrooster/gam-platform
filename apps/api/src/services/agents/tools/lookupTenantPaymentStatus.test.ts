@@ -28,7 +28,7 @@ describe('cleaning a name out of a question', () => {
     }
   })
 
-  // The trim only removes recognised filler from the ends, so a real name
+  // The trim only removes recognized filler from the ends, so a real name
   // always survives — that is what makes it safe to apply to every lookup.
   it('never eats a real name', () => {
     for (const n of ['Chen', 'Bob Chen', "O'Neill", 'Grace Littlefeather',

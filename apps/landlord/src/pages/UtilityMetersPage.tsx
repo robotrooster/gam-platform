@@ -1,11 +1,13 @@
-import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
+import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useSearchParams } from 'react-router-dom'
-import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
-import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
-import { toast, appConfirm } from '../components/dialogs'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
+import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check } from 'lucide-react'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
+const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => api.post(url, form).then(r => r.data) }
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -87,7 +89,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
   const { data: masterBills = [] } = useQuery<any[]>(
     ['master-bills', propertyId],
     () => apiGet(`/utility/master-bills?propertyId=${propertyId}`),
-    { enabled: !!propertyId && canRead }
+    // 10/3: owners only — past master readings and dollars are not for a
+    // staffer who reads meters blind.
+    { enabled: !!propertyId && canReview }
   )
   const { data: runs = [] } = useQuery<any[]>(
     ['reading-runs', propertyId],
@@ -120,8 +124,27 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
   })()
 
   const [walkRun, setWalkRun] = useState<any | null>(null)
+  // S652: Blu reviews the bills before they go out.
+  const [reviewRunId, setReviewRunId] = useState<string | null>(null)
+  const thisProperty = (properties as any[]).find((p: any) => p.id === propertyId)
+  const downloadReads = async () => {
+    try {
+      const res = await fetch(`${(import.meta as any).env?.VITE_API_URL || ''}/api/utility/readings/export?propertyId=${propertyId}`,
+        { headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') } })
+      if (!res.ok) { toast.error('Could not download the readings'); return }
+      const blob = await res.blob()
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `${String(thisProperty?.name || 'property').replace(/[^A-Za-z0-9]+/g, '-')}-meter-readings.csv`
+      a.click()
+      URL.revokeObjectURL(a.href)
+    } catch { toast.error('Could not download the readings') }
+  }
+  // S652 (Nic): "I don't want to download readings… I want stuff to stay in the
+  // system, visible without downloading external reports."
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [reviewReading, setReviewReading] = useState<any | null>(null)
-  const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string } | null>(null)
+  const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string; leaseId?: string } | null>(null)
 
   const invalidate = () => {
     qc.invalidateQueries(['utility-meters', propertyId])
@@ -218,28 +241,45 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             </div>
           )}
 
+          {/* ── S652: the readings spreadsheet ── */}
+          {canReview && propertyId && (
+            <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
+              <button className="btn btn-primary btn-sm" onClick={() => setHistoryOpen(true)}><Gauge size={13}/> Reading history</button>
+            </div>
+          )}
+
           {/* ── READING RUN ────────────────────────────────── */}
           {openRun ? (
             <div className="card" style={{ marginBottom:24, display:'flex', alignItems:'center', gap:16, borderColor:'var(--gold)', flexWrap:'wrap' }}>
               <ClipboardList size={28} style={{ color:'var(--gold)', flexShrink:0 }}/>
               <div style={{ flex:1, minWidth:220 }}>
                 <div style={{ fontWeight:700 }}>
-                  {openRun.status === 'double_check' ? 'Verification walk' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
+                  {openRun.status === 'double_check' ? 'Readings waiting on your double-check' : 'Meter readings due'} — {monthLabel(openRun.billingCycleMonth)}
                 </div>
                 <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:2 }}>
+                  {/* S652 (Nic): one window. Every meter is read; what is left is the
+                      flagged reads in the card below, and the last one settled sends
+                      the month's bills. */}
                   {openRun.status === 'double_check'
-                    ? `${openRun.dcDone} of ${openRun.dcTotal} re-checks entered. Units with reads already bill on their invoice date — re-checks just verify them.`
+                    ? (canReview
+                        ? `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' looks' : 's look'} off — settle ${openRun.flaggedCount === 1 ? 'it' : 'them'} in "Readings to double-check" below and the month's bills go out.`
+                        : `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' is' : 's are'} with the landlord to double-check; the month's bills go out when ${openRun.flaggedCount === 1 ? "it's" : "they're"} settled.`)
                     : needsOpening.count > 0
                       ? `${openRun.metersRead} of ${openRun.metersTotal} meters read — but ${needsOpening.count} have no opening read yet, so those will record a number and bill nothing. Set those first.`
                       : `${openRun.metersRead} of ${openRun.metersTotal} meters read. Each unit bills on its tenant's next invoice as soon as its meters are read — an unread meter holds only that unit's invoice.`}
                 </div>
               </div>
-              <button className="btn btn-primary" onClick={()=>setWalkRun(openRun)}>
-                {openRun.status === 'double_check'
-                  ? (openRun.dcDone > 0 ? 'Continue verification' : 'Start verification')
-                  : (openRun.metersRead > 0 ? 'Continue reading' : 'Start reading')} <ChevronRight size={14}/>
-              </button>
-              {(openRun.status === 'double_check' || openRun.metersRead > 0) && (
+              {openRun.status !== 'double_check' && (
+                <button className="btn btn-primary" onClick={()=>setWalkRun(openRun)}>
+                  {openRun.metersRead > 0 ? 'Continue reading' : 'Start reading'} <ChevronRight size={14}/>
+                </button>
+              )}
+              {canReview && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
+                <button className="btn btn-primary btn-sm" onClick={() => setReviewRunId(openRun.id)}>
+                  {openRun.needsApproval ? 'Review bills & approve' : 'Review bills'}
+                </button>
+              )}
+              {!openRun.needsApproval && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" disabled={forceCompleteMut.isLoading}
                   onClick={()=>{ appConfirm('Complete this run now? Unread meters produce no bill this cycle and their held invoices release. Flagged reads still need your review before their unit\'s invoice goes out.', { confirmLabel: 'Complete run' }).then(ok => { if (ok) forceCompleteMut.mutate(openRun.id) }) }}>
                   Complete now
@@ -275,7 +315,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                       {r.who ? `${r.who} — ` : ''}left {String(r.departedOn).slice(0,10)}
                     </span>
                     <button className="btn btn-primary btn-sm" style={{ marginLeft:'auto' }}
-                      onClick={()=>setSpecialRead({ meterId: r.meterId, unitNumber: r.unitNumber, reason: r.reason, label: r.meterLabel })}>
+                      onClick={()=>setSpecialRead({ meterId: r.meterId, unitNumber: r.unitNumber, reason: r.reason, label: r.meterLabel, leaseId: r.reason === 'move_out_final' ? r.leaseId : undefined })}>
                       Read meter
                     </button>
                   </div>
@@ -310,7 +350,8 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 
           {/* S605: rates sit ABOVE meter setup — the price is the first thing
               you decide for a property, and every meter below bills at it. */}
-          <PropertyRatesCard propertyId={propertyId} />
+          {canReview && <PropertyRatesCard propertyId={propertyId} />}
+          {canReview && <BrokenMeterPolicyCard property={(properties as any[]).find((p: any) => p.id === propertyId)} />}
 
           {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
           {/* Meter setup is LANDLORD-only (broken toggle, rates, links). */}
@@ -339,6 +380,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               went back out to tenants. The per-tenant split lives on the
               tenant's own invoice and on the unit; restating it here was
               the same money listed twice in the landlord's setup screen. */}
+          {canReview && (<>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
             <div>
               <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Master bills</h2>
@@ -390,6 +432,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               </table>
             )}
           </div>
+          </>)}
           {/* ── PROPANE (tank fills — gas for RVs) ─────────── */}
           <PropaneSection propertyId={propertyId} property={(properties as any[]).find((p:any)=>p.id===propertyId)} units={units as any[]} onChanged={invalidate} />
 
@@ -403,8 +446,12 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           onClose={()=>setOpeningReads(false)} onSaved={invalidate} />
       )}
 
+      {reviewRunId && <ReviewBillsModal runId={reviewRunId} onClose={() => setReviewRunId(null)} onDone={invalidate} />}
       {walkRun && (
-        <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} onClose={()=>{ setWalkRun(null); invalidate() }} />
+        <ReadingWalkModal run={walkRun} api={walkApi} onClose={()=>{ setWalkRun(null); invalidate() }} />
+      )}
+      {historyOpen && propertyId && (
+        <ReadingHistoryModal propertyId={propertyId} propertyName={thisProperty?.name || ''} onDownload={downloadReads} onClose={() => setHistoryOpen(false)} />
       )}
       {specialRead && (
         <SpecialReadModal preset={specialRead} meters={(meters as any[]).filter(m=>m.billingMethod==='submeter')}
@@ -424,7 +471,36 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 // ((1,000,000 − previous) + current); a meter swap/reset bills nothing
 // that cycle. Resolving re-bills the cycle automatically if its run
 // already completed.
+// S648 (Nic): "If they're sub-metering an RV park and their meters are broken,
+// the landlord can set if they want to bill off of an average usage of other
+// residents... that's up to them whether their area law allows it."
+function BrokenMeterPolicyCard({ property }: { property: any }) {
+  const qc = useQueryClient()
+  const set = useMutation(
+    (estimate: boolean) => apiPatch(`/properties/${property.id}/broken-meter-estimate`, { estimate }),
+    { onSuccess: () => { qc.invalidateQueries('properties'); qc.invalidateQueries(['utility-meters', property.id]) },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save') })
+  if (!property) return null
+  const on = !!property.estimatesStuckMeters
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When a submeter stops reading</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        A meter that shows no change on an occupied space is marked broken. Choose what it bills until you mark it
+        repaired. Whether estimated billing is allowed where you are is your call — check your local laws.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => on && set.mutate(false)}>Bill nothing until repaired</button>
+        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => !on && set.mutate(true)}>Bill the low end of what neighbors used</button>
+      </div>
+    </div>
+  )
+}
+
 function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () => void }) {
+  const navigate = useNavigate()
   const [value, setValue] = useState('')
   const [reason, setReason] = useState<'rollover' | 'swap' | null>(null)
   const digits = Number(reading.digits) || METER_READING_DEFAULT_DIGITS
@@ -453,6 +529,13 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
           <div style={{ display:'flex', justifyContent:'space-between', marginTop:6 }}>
             <span style={{ color:'var(--text-3)' }}>Entered this cycle</span>
             <span className="mono" style={{ fontWeight:600, color:'var(--amber, #d97706)' }}>{fmtRead(reading.readingValue, digits)}</span>
+            {/* S652: the meter face the reader photographed, when there is one. */}
+            {reading.photoUrl && (
+              <button className="btn btn-ghost btn-sm" style={{ marginLeft:8 }}
+                onClick={() => navigate(`/view?src=${encodeURIComponent(`/utility/readings/${reading.id}/photo`)}&title=${encodeURIComponent('Meter photo')}`)}>
+                📷 View meter photo
+              </button>
+            )}
           </div>
           {reading.reviewNote && <div style={{ marginTop:8, fontSize:'.75rem', color:'var(--text-3)' }}>{reading.reviewNote}</div>}
         </div>
@@ -494,7 +577,7 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
 // reads-due to-do), punch the number. NO prior value is ever shown.
 // move_out_final bills the departing tenant; every other reason is a
 // reference/baseline read that resets the baseline for the next stay.
-function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: string; unitNumber?: string; reason?: string; label?: string }; meters: any[]; onClose: () => void }) {
+function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: string; unitNumber?: string; reason?: string; label?: string; leaseId?: string }; meters: any[]; onClose: () => void }) {
   const presetReason = !!preset.reason && preset.reason !== 'monthly_cycle'
   const [meterId, setMeterId] = useState(preset.meterId || (meters.length === 1 ? meters[0].id : ''))
   const [reason, setReason] = useState<string>(presetReason ? preset.reason! : (METER_READ_MANUAL_REASONS[0] as string))
@@ -504,7 +587,11 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
   const digits = Number(meter?.digits) || METER_READING_DEFAULT_DIGITS
   const valueOk = new RegExp(`^\\d{1,${digits}}$`).test(value)
   const save = useMutation(
-    () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined }),
+    // 10/3: a move-out read from the to-do names whose move-out it is, so the
+    // bill lands on that household — only while the meter is still the one the
+    // to-do picked.
+    () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined,
+      ...(reason === 'move_out_final' && preset.leaseId && meterId === preset.meterId ? { leaseId: preset.leaseId } : {}) }),
     { onSuccess: (r:any) => { toast(r?.data?.billed ? 'Read recorded — final bill created' : 'Reading recorded'); onClose() },
       onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not record the reading') }
   )
@@ -568,296 +655,6 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
 // reader. The only button is Next: it saves the step's readings and
 // advances. When the last meter is read the backend completes the run
 // and bills land on the tenants' next monthly invoices.
-function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 'verify'; onClose: () => void }) {
-  const qc = useQueryClient()
-  const { data: meters = [], isLoading } = useQuery<any[]>(
-    ['run-meters', run.id, mode],
-    () => apiGet(mode === 'verify'
-      ? `/utility/reading-runs/${run.id}/double-checks`
-      : `/utility/reading-runs/${run.id}/meters`))
-  const [stepIdx, setStepIdx] = useState(0)
-  const [values, setValues] = useState<Record<string, string>>({})
-  // S607: a bill_amount master needs a second number — the provider's dollar
-  // charge for the cycle — kept beside the usage entry, keyed the same way.
-  const [bills, setBills] = useState<Record<string, string>>({})
-  const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
-  const [summary, setSummary] = useState<any | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  // S631 (Nic, DIRECTIVE): "It's a shared workflow process... anybody that has
-  // access can jump on and complete some or all of it... they can be done really
-  // in any order. Nothing hinges on something else being done first... so
-  // anybody could do any portion of the flow, and there's no blocking order and
-  // no assigning. It's whoever jumps on and does what."
-  //
-  // Every meter is a step, DONE ONES INCLUDED. They used to be filtered out,
-  // which made this a one-person queue: it always resumed at the next unread
-  // meter and only moved forward, so somebody who came to enter the two water
-  // masters had to click past twenty-seven submeters to reach them, and could
-  // never see what a partner had already finished.
-  //
-  // Nothing here waits on anything else. That is not a new rule — S534 already
-  // bills each unit from its own reads (ensureBillsForUnit on the lease's due
-  // date), so a mobile home's water submeter bills that home whether or not the
-  // master bill has arrived. The run is a checklist for people, never a gate on
-  // money, and this list is what makes that visible.
-  const steps = useMemo(() => {
-    const byMeter = new Map<string, any>()
-    for (const m of meters as any[]) {
-      if (!byMeter.has(m.meterId)) byMeter.set(m.meterId, { ...m, unitNumbers: [] })
-      if (m.unitNumber) byMeter.get(m.meterId).unitNumbers.push(m.unitNumber)
-    }
-    const unitSteps = new Map<string, { title: string; meters: any[] }>()
-    const propertySteps: { title: string; meters: any[] }[] = []
-    for (const m of byMeter.values()) {
-      if (m.unitNumbers.length === 1) {
-        const key = m.unitNumbers[0]
-        if (!unitSteps.has(key)) unitSteps.set(key, { title: key, meters: [] })
-        unitSteps.get(key)!.meters.push(m)
-      } else {
-        propertySteps.push({ title: m.label, meters: [m] })
-      }
-    }
-    const sorted = [...unitSteps.values()]
-      .sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }))
-    return [...sorted, ...propertySteps]
-  }, [meters])
-
-  // Read on the server (by anyone, at any point) or saved in this sitting.
-  const isDone = (m: any) => m.isRead || savedIds.has(m.meterId)
-  const stepDone = (st: { meters: any[] }) => st.meters.every(isDone)
-  const totalMeters = steps.reduce((s, st) => s + st.meters.length, 0)
-  const doneMeters = steps.reduce((s, st) => s + st.meters.filter(isDone).length, 0)
-  const step = steps[stepIdx]
-
-  // Land on the first thing still outstanding rather than the top of the list —
-  // a partner opening this after someone else has done half should not have to
-  // scroll past their work.
-  const jumpedRef = useRef(false)
-  useEffect(() => {
-    if (jumpedRef.current || !steps.length) return
-    jumpedRef.current = true
-    const first = steps.findIndex(st => !stepDone(st))
-    if (first > 0) setStepIdx(first)
-  }, [steps])
-  // A submeter read is exactly the meter's digit width (odometer
-  // convention — cycled-over meters are entered with leading zeros,
-  // e.g. 000133). RUBS masters record a usage total: any length up to
-  // the width.
-  // S634: a master on the bill total NEVER needs a usage figure. It used to,
-  // when submetered units on its line were carved out of the pool and that
-  // carve-out was measured in usage. Nothing is carved out now, so the bill
-  // alone is always enough — which is what an electric bill with peak/off-peak
-  // tiers, demand charges and riders leaves you with anyway.
-  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount'
-  const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
-    ? new RegExp(`^\\d{${m.digits}}$`).test(v)
-    : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
-  const billOk = (m: any, v: string) => m.rubsBasis !== 'bill_amount' || /^\d+(\.\d{1,2})?$/.test(v)
-  // S631 fix: `isDone` here, not `savedIds`. Including already-recorded meters
-  // as steps (so the verification walk shows what a partner finished) left a
-  // done step with an EMPTY, enabled input and a disabled Next — you landed on
-  // somebody else's completed re-read and could not move past it without
-  // retyping it. That is the "entered one and it locked up" Nic's brother hit.
-  const stepComplete = !!step && step.meters.every(m =>
-    isDone(m) || (readOk(m, values[m.meterId] ?? '') && billOk(m, bills[m.meterId] ?? '')))
-
-  const [saving, setSaving] = useState(false)
-  const next = async () => {
-    if (!step || saving) return
-    setSaving(true)
-    setError(null)
-    try {
-      let last: any = null
-      const saved = new Set(savedIds)
-      for (const m of step.meters) {
-        if (saved.has(m.meterId)) continue
-        const r: any = await apiPost(mode === 'verify'
-          ? `/utility/reading-runs/${run.id}/double-checks/${m.meterId}`
-          : `/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
-          { readingValue: Number(values[m.meterId] || 0),
-            ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(bills[m.meterId]) } : {}) })
-        saved.add(m.meterId)
-        last = r?.data
-      }
-      setSavedIds(saved)
-      // S631: the count on the page behind is read from the reading-runs query.
-      // It was only refetched when this modal CLOSED, so after recording a
-      // re-check the banner still showed the pre-save number — Nic's brother
-      // entered one and was told "0 of 6 done", and reasonably concluded it had
-      // not saved. It had; the page was just showing a stale copy.
-      qc.invalidateQueries(['reading-runs'])
-      // Main walk done → the system generated the verification list.
-      if (last?.run?.status === 'double_check') { setSummary({ kind: 'verify_ready', dcTotal: last.dcTotal }); return }
-      // Verification done → bills ran; show the money summary.
-      if (last?.run?.status === 'completed') { setSummary({ kind: 'completed', ...last.run, escalated: last.escalated ?? 0 }); return }
-      if (stepIdx < steps.length - 1) setStepIdx(stepIdx + 1)
-      else onClose()
-    } catch (e: any) {
-      setError(e?.response?.data?.error || 'Could not record the reading')
-    } finally { setSaving(false) }
-  }
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth:440 }} onClick={e=>e.stopPropagation()}>
-        {summary ? (
-          summary.kind === 'verify_ready' ? (
-            <>
-              <div className="modal-title" style={{ display:'flex', alignItems:'center', gap:8 }}><CheckCircle2 size={18} style={{ color:'var(--green)' }}/> Readings recorded</div>
-              <div style={{ fontSize:'.85rem', color:'var(--text-2)', lineHeight:1.6 }}>
-                All meters are in. A verification list of <b>{summary.dcTotal}</b> meter{summary.dcTotal === 1 ? '' : 's'} is ready — re-read those when you're back out, then billing runs automatically.
-              </div>
-              <div className="modal-footer"><button className="btn btn-primary" onClick={onClose}>Done</button></div>
-            </>
-          ) : (
-            <>
-              <div className="modal-title" style={{ display:'flex', alignItems:'center', gap:8 }}><CheckCircle2 size={18} style={{ color:'var(--green)' }}/> Reading run complete</div>
-              <div style={{ fontSize:'.85rem', color:'var(--text-2)', lineHeight:1.6 }}>
-                {monthLabel(summary.billingCycleMonth)} — {summary.billsCreated ?? 0} bill{(summary.billsCreated ?? 0) === 1 ? '' : 's'} totaling <b>{fmt(summary.billedTotal)}</b> generated.
-                <div style={{ marginTop:8, fontSize:'.78rem', color:'var(--text-3)' }}>
-                  Each charge is added automatically to that tenant's next monthly invoice. Spots without a responsible lease recorded a reading only — no charge.
-                </div>
-                {summary.escalated > 0 && (
-                  <div style={{ marginTop:8, fontSize:'.78rem', color:'var(--amber, #d97706)' }}>
-                    {summary.escalated} reading{summary.escalated === 1 ? '' : 's'} still need{summary.escalated === 1 ? 's' : ''} your review (rollover vs meter swap) — see the double-check card.
-                  </div>
-                )}
-              </div>
-              <div className="modal-footer"><button className="btn btn-primary" onClick={onClose}>Done</button></div>
-            </>
-          )
-        ) : isLoading ? (
-          <div style={{ color:'var(--text-3)', padding:16 }}>Loading…</div>
-        ) : !step ? (
-          // S631: the list now includes read meters, so an empty list means this
-          // property has no readable meters at all — not that the work is done.
-          <div style={{ color:'var(--text-3)', padding:16, fontSize:'.85rem' }}>
-            No submeters or master meters are set up on this property yet.
-          </div>
-        ) : mode === 'read' ? (
-          // S631: the monthly read is a LIST, not a wizard. The verification
-          // re-read below stays one meter at a time on purpose — it is a blind
-          // second read, and showing the whole list at once is precisely what it
-          // must not do.
-          <ReadingListForm run={run} meters={meters as any[]}
-            onDone={setSummary} onClose={onClose} />
-        ) : (
-          <>
-            <div className="modal-title" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
-              <span>{mode === 'verify' ? 'Verification walk' : 'Meter reading'} — {monthLabel(run.billingCycleMonth)}</span>
-              <span className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{doneMeters}/{totalMeters}</span>
-            </div>
-
-            {/* S631: the whole list, any order. Tap what you're standing in
-                front of — or what arrived in your post — instead of walking the
-                queue to reach it. Done items stay visible so two people can see
-                each other's progress without asking. */}
-            <div style={{ display:'flex', flexWrap:'wrap', gap:5, marginBottom:12,
-              maxHeight:112, overflowY:'auto', padding:'2px 0' }}>
-              {steps.map((st, i) => {
-                const done = stepDone(st)
-                const here = i === stepIdx
-                return (
-                  <button key={st.title} type="button" onClick={() => setStepIdx(i)}
-                    title={done ? 'Already read' : 'Not read yet'}
-                    style={{ padding:'2px 8px', borderRadius:20, fontSize:'.68rem', fontWeight:700,
-                      cursor:'pointer', whiteSpace:'nowrap',
-                      border:`1px solid ${here ? 'var(--gold)' : done ? 'var(--border-0)' : 'rgba(201,162,39,.35)'}`,
-                      background: here ? 'rgba(201,162,39,.14)' : done ? 'var(--bg-2)' : 'transparent',
-                      color: done ? 'var(--text-3)' : here ? 'var(--gold)' : 'var(--text-1)' }}>
-                    {done ? '✓ ' : ''}{st.title}
-                  </button>
-                )
-              })}
-            </div>
-
-            <div style={{ fontWeight:700, fontSize:'1.15rem', marginBottom:2 }}>{step.title}</div>
-            <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginBottom:12 }}>
-              {stepDone(step)
-                ? 'Already read this cycle — entering again replaces it.'
-                : 'Nothing waits on this. Each unit bills from its own reads.'}
-            </div>
-
-            <div style={{ display:'grid', gap:12 }}>
-              {step.meters.map((m: any, i: number) => (
-                <div key={m.meterId}>
-                  <span style={lbl}>{UTILITY_ICONS[m.utilityType]} {m.utilityType[0].toUpperCase() + m.utilityType.slice(1)}{UTILITY_UNITS[m.utilityType] ? ` (${UTILITY_UNITS[m.utilityType]})` : ''}</span>
-                  <input
-                    className="form-input mono"
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={m.billingMethod === 'submeter' ? m.digits : 12}
-                    autoComplete="off"
-                    autoFocus={i === 0}
-                    placeholder={m.billingMethod === 'submeter' ? `${m.digits}-digit read, e.g. ${'0'.repeat(Math.max(0, m.digits - 3))}133` : `usage total (up to ${m.digits} digits)`}
-                    disabled={isDone(m)}
-                    value={isDone(m) ? '✓ recorded' : (values[m.meterId] ?? '')}
-                    onChange={e => {
-                      const v = e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12)
-                      setValues(prev => ({ ...prev, [m.meterId]: v }))
-                    }}
-                    onKeyDown={e => { if (e.key === 'Enter' && stepComplete && !saving) next() }}
-                    style={{ width:'100%', fontSize:'1.05rem', letterSpacing:'.12em' }}
-                  />
-                  {/* S607 (Nic): the master step is the one place in the walk
-                      where the number asked for is NOT the number on the meter
-                      face. A master records the cycle's TOTAL USE off the
-                      utility's own bill — the engine bills it directly, with no
-                      prior read subtracted — so an odometer typed here prices
-                      the whole park off a lifetime total. Say so at the field. */}
-                  {m.billingMethod === 'rubs' && (
-                    <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4, lineHeight:1.45 }}>
-                      {usageOptional(m)
-                        ? 'Optional — leave blank if the bill has no single usage figure. The bill amount below is divided on its own.'
-                        : 'Total used this cycle, from the utility bill — not the reading on the meter face. Required here: submetered units on this meter are subtracted from the pool.'}
-                    </div>
-                  )}
-                  {/* S607: the dollar figure off the same bill. Entered here so
-                      both numbers come from the one document in front of you —
-                      splitting them across two screens is how they end up from
-                      two different cycles. */}
-                  {m.rubsBasis === 'bill_amount' && !isDone(m) && (
-                    <div style={{ marginTop:10 }}>
-                      <span style={lbl}>Amount the utility charged</span>
-                      <input
-                        className="form-input mono"
-                        type="text"
-                        inputMode="decimal"
-                        autoComplete="off"
-                        placeholder="total on the bill, e.g. 1284.50"
-                        value={bills[m.meterId] ?? ''}
-                        onChange={e => {
-                          const v = e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1')
-                          setBills(prev => ({ ...prev, [m.meterId]: v }))
-                        }}
-                        onKeyDown={e => { if (e.key === 'Enter' && stepComplete && !saving) next() }}
-                        style={{ width:'100%', fontSize:'1.05rem', letterSpacing:'.12em' }}
-                      />
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4, lineHeight:1.45 }}>
-                        The whole bill — service charges and taxes included. It is divided across
-                        the units on this meter, so the tenants see one blended rate.
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-
-            {error && <div style={{ marginTop:10, fontSize:'.8rem', color:'var(--red)' }}>{error}</div>}
-
-            <div className="modal-footer" style={{ display:'flex', justifyContent:'flex-end' }}>
-              <button className="btn btn-primary" disabled={!stepComplete || saving} onClick={next}>
-                {saving ? '…' : 'Next'} <ChevronRight size={13}/>
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
-
 // ── OPENING READS (S632) ─────────────────────────────────────────────
 //
 // Nic: "We should choose a date for all the meters and type them all in and save
@@ -1051,191 +848,6 @@ function OpeningReadsModal({ propertyId, meters, onClose, onSaved }: {
 //
 // PRIOR READINGS ARE NOT SHOWN, deliberately (blind entry, S533) — seeing last
 // month's number is how a hurried read becomes last month's number.
-function ReadingListForm({ run, meters, onDone, onClose }: {
-  run: any; meters: any[]; onDone: (summary: any) => void; onClose: () => void
-}) {
-  const qc = useQueryClient()
-  const [values, setValues] = useState<Record<string, string>>({})
-  const [bills, setBills] = useState<Record<string, string>>({})
-  const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
-  const [savingIds, setSavingIds] = useState<Set<string>>(new Set())
-  const [rowErr, setRowErr] = useState<Record<string, string>>({})
-  const [filter, setFilter] = useState<string>('all')
-  const inputs = useRef<(HTMLInputElement | null)[]>([])
-
-  // One row per meter, units in natural order, masters last — a master is read
-  // off a bill at a desk, not on the walk, so it does not belong mid-list.
-  const rows = useMemo(() => {
-    const byMeter = new Map<string, any>()
-    for (const m of meters) {
-      if (!byMeter.has(m.meterId)) byMeter.set(m.meterId, { ...m, unitNumbers: [] })
-      if (m.unitNumber) byMeter.get(m.meterId).unitNumbers.push(m.unitNumber)
-    }
-    const all = [...byMeter.values()].map(m => ({
-      ...m,
-      title: m.unitNumbers.length === 1 ? m.unitNumbers[0] : m.label,
-      isMaster: m.billingMethod === 'rubs',
-    }))
-    return all.sort((a, b) =>
-      (a.isMaster ? 1 : 0) - (b.isMaster ? 1 : 0)
-      || a.title.localeCompare(b.title, undefined, { numeric: true })
-      || String(a.utilityType).localeCompare(String(b.utilityType)))
-  }, [meters])
-
-  // S631 (Nic, DIRECTIVE): "When I open the list again, I don't wanna see what's
-  // already been done, just what still needs to be done... I don't want two
-  // people reading meters and accidentally overwriting each other by typoing on
-  // a spot that was already done."
-  //
-  // So the list is what is LEFT. `isRead` is the server's answer at load, which
-  // means anything a partner finished before you opened this is simply not here
-  // to be typed over. A row you complete in this sitting stays put, ticked, so
-  // you can see your own work land — it disappears next time the window opens.
-  // The count of the hidden ones is stated, because a list that silently omits
-  // things is its own kind of confusing.
-  const alreadyRead = rows.filter(r => r.isRead).length
-  const outstanding = rows.filter(r => !r.isRead)
-  const utilitiesLeft = [...new Set(outstanding.map(r => String(r.utilityType)))].sort()
-  const shown = outstanding.filter(r =>
-    filter === 'all' ? true
-    : filter === 'masters' ? r.isMaster
-    : filter === 'submeters' ? !r.isMaster
-    : r.utilityType === filter)
-
-  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount' && !m.hasSubmeteredUnits
-  const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
-    ? new RegExp(`^\\d{${m.digits}}$`).test(v)
-    : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
-  const billOk = (m: any, v: string) => m.rubsBasis !== 'bill_amount' || /^\d+(\.\d{1,2})?$/.test(v)
-  const done = (m: any) => m.isRead || savedIds.has(m.meterId)
-
-  const save = async (m: any) => {
-    const v = values[m.meterId] ?? ''
-    const b = bills[m.meterId] ?? ''
-    if (savingIds.has(m.meterId)) return
-    if (!readOk(m, v) || !billOk(m, b)) return
-    if (v === '' && !usageOptional(m)) return
-    setSavingIds(prev => new Set(prev).add(m.meterId))
-    setRowErr(prev => ({ ...prev, [m.meterId]: '' }))
-    try {
-      const r: any = await apiPost(`/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
-        { readingValue: Number(v || 0), ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(b) } : {}) })
-      setSavedIds(prev => new Set(prev).add(m.meterId))
-      // S631: keep the count on the page behind honest as each line lands —
-      // two people work this list at once, and a stale number reads as a lost save.
-      qc.invalidateQueries(['reading-runs'])
-      // The last meter tips the run into its verification phase — surface that
-      // rather than leaving somebody staring at a full list wondering.
-      if (r?.data?.run?.status === 'double_check') onDone({ kind: 'verify_ready', dcTotal: r.data.dcTotal })
-      if (r?.data?.run?.status === 'completed') onDone({ kind: 'completed', ...r.data.run })
-    } catch (e: any) {
-      setRowErr(prev => ({ ...prev, [m.meterId]: e?.response?.data?.error || 'Could not save' }))
-    } finally {
-      setSavingIds(prev => { const n = new Set(prev); n.delete(m.meterId); return n })
-    }
-  }
-
-  const doneCount = rows.filter(done).length
-  const leftCount = outstanding.filter(r => !savedIds.has(r.meterId)).length
-  const chip = (key: string, label: string) => (
-    <button key={key} type="button" onClick={() => setFilter(key)}
-      style={{ padding:'3px 10px', borderRadius:20, fontSize:'.72rem', fontWeight:700, cursor:'pointer',
-        border:`1px solid ${filter === key ? 'var(--gold)' : 'var(--border-0)'}`,
-        background: filter === key ? 'rgba(201,162,39,.1)' : 'var(--bg-2)',
-        color: filter === key ? 'var(--gold)' : 'var(--text-2)' }}>{label}</button>
-  )
-
-  return (
-    <>
-      <div className="modal-title" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
-        <span>Meter readings — {monthLabel(run.billingCycleMonth)}</span>
-        <span className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{doneCount}/{rows.length}</span>
-      </div>
-
-      <div style={{ fontSize:'.74rem', color:'var(--text-2)', marginBottom:10, lineHeight:1.5 }}>
-        What&apos;s still to read. Each line saves on its own, so anyone can pick up the rest later,
-        in any order — nothing waits on anything else.
-        {alreadyRead > 0 && (
-          <> <span style={{ color:'var(--text-3)' }}>
-            {alreadyRead} already read this cycle and not shown.
-          </span></>
-        )}
-      </div>
-
-      <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginBottom:12 }}>
-        {chip('all', `All (${outstanding.length})`)}
-        {utilitiesLeft.length > 1 && utilitiesLeft.map(u =>
-          chip(u, `${UTILITY_ICONS[u] ?? ''} ${u[0].toUpperCase() + u.slice(1)}`))}
-        {outstanding.some(r => r.isMaster) && chip('masters', 'Master bills')}
-        {outstanding.some(r => r.isMaster) && outstanding.some(r => !r.isMaster) && chip('submeters', 'Submeters')}
-      </div>
-
-      <div style={{ maxHeight:'52vh', overflowY:'auto', margin:'0 -4px', padding:'0 4px' }}>
-        {shown.map((m, i) => {
-          const isDone = done(m)
-          const saving = savingIds.has(m.meterId)
-          return (
-            <div key={m.meterId} style={{ display:'grid', gridTemplateColumns:'1fr 150px',
-              gap:10, alignItems:'center', padding:'7px 0',
-              borderBottom:'1px solid var(--border-1, rgba(255,255,255,.06))', opacity: isDone ? .55 : 1 }}>
-              <div style={{ minWidth:0 }}>
-                <div style={{ fontSize:'.84rem', fontWeight:600, color:'var(--text-0)',
-                  overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-                  {isDone && <span style={{ color:'var(--green)' }}>✓ </span>}{m.title}
-                </div>
-                <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>
-                  {UTILITY_ICONS[m.utilityType]} {m.utilityType}
-                  {m.isMaster ? ' · master — total used this cycle, off the bill' : ` · ${m.digits}-digit read`}
-                </div>
-                {rowErr[m.meterId] && (
-                  <div style={{ fontSize:'.68rem', color:'var(--red)' }}>{rowErr[m.meterId]}</div>
-                )}
-              </div>
-              <div>
-                <input
-                  ref={el => { inputs.current[i] = el }}
-                  className="form-input mono" type="text" inputMode="numeric" autoComplete="off"
-                  maxLength={m.billingMethod === 'submeter' ? m.digits : 12}
-                  // S631: once it is in, it is in. Locking the field is what stops
-                  // a stray keystroke on a row you already finished — and this row
-                  // is gone entirely next time the window opens.
-                  disabled={isDone}
-                  placeholder={isDone ? 'recorded' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
-                  value={values[m.meterId] ?? ''}
-                  onChange={e => setValues(prev => ({ ...prev,
-                    [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12) }))}
-                  onBlur={() => save(m)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') { e.preventDefault(); save(m); inputs.current[i + 1]?.focus() }
-                  }}
-                  style={{ width:'100%', fontSize:'.95rem', letterSpacing:'.08em',
-                    borderColor: saving ? 'var(--gold)' : undefined }} />
-                {m.rubsBasis === 'bill_amount' && (
-                  <input
-                    className="form-input mono" type="text" inputMode="decimal" autoComplete="off"
-                    disabled={isDone}
-                    placeholder="bill $" value={bills[m.meterId] ?? ''}
-                    onChange={e => setBills(prev => ({ ...prev,
-                      [m.meterId]: e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1') }))}
-                    onBlur={() => save(m)}
-                    style={{ width:'100%', fontSize:'.9rem', marginTop:5 }} />
-                )}
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      <div className="modal-footer" style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-        <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
-          {leftCount === 0 ? 'Nothing left to read.' : `${leftCount} still to read`}
-        </span>
-        <button className="btn btn-primary" onClick={onClose}>Done for now</button>
-      </div>
-    </>
-  )
-}
-
 // ── PROPANE (Nic, S533) ──────────────────────────────────────────────
 // RV gas = propane tank fills billed in gallons at a per-fill PPG
 // (independent of POS pricing). Splits are 2 or 4 only and
@@ -1258,11 +870,16 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
   const [fourDraft, setFourDraft] = useState(String(splitFourMin))
   useEffect(() => { setMinDraft(String(splitMin)); setFourDraft(String(splitFourMin)) }, [propertyId, splitMin, splitFourMin])
 
+  // S652 (Nic): "there's nowhere to click save anywhere. I don't know if it's
+  // actually recording anything." These saved the moment you clicked away —
+  // and said nothing. They still save on their own; now they say so.
+  const [savedAt, setSavedAt] = useState<number | null>(null)
   const settingsMut = useMutation(
     (p: any) => apiPost('/propane/settings', { propertyId, ...p }),
-    { onSuccess: () => { qc.invalidateQueries('properties'); onChanged() },
+    { onSuccess: () => { qc.invalidateQueries('properties'); onChanged(); setSavedAt(Date.now()); setTimeout(() => setSavedAt(null), 3000) },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save setting') }
   )
+  const thresholdsChanged = (minDraft !== '' && Number(minDraft) !== splitMin) || (fourDraft !== '' && Number(fourDraft) !== splitFourMin)
   const saveThreshold = (key: 'splitMinGallons' | 'splitFourMinGallons', draft: string, current: number) => {
     const v = Math.trunc(Number(draft))
     if (!draft || !Number.isFinite(v) || v < 1 || v === current) {
@@ -1282,8 +899,10 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
       <div className="card" style={{ padding:0 }}>
         <div style={{ display:'flex', gap:24, padding:'10px 16px', borderBottom:'1px solid var(--border-1)', flexWrap:'wrap' }}>
           <label style={{ display:'flex', alignItems:'center', gap:8, fontSize:'.8rem', cursor:'pointer' }}>
-            <input type="checkbox" checked={allowSplits} disabled={settingsMut.isLoading}
-              onChange={e=>settingsMut.mutate({ allowInstallments: e.target.checked })}/>
+            {/* S652: not disabled while it saves — that is what flashed the
+                "not allowed" cursor on every click. */}
+            <input type="checkbox" checked={allowSplits}
+              onChange={e=>{ if (!settingsMut.isLoading) settingsMut.mutate({ allowInstallments: e.target.checked }) }}/>
             Allow tenants to split fills into payments (2 or 4)
           </label>
           {allowSplits && (
@@ -1306,6 +925,14 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
               </label>
             </>
           )}
+          {allowSplits && thresholdsChanged && (
+            <button className="btn btn-primary btn-sm" disabled={settingsMut.isLoading}
+              onClick={() => settingsMut.mutate({
+                ...(Number(minDraft) !== splitMin ? { splitMinGallons: Math.trunc(Number(minDraft)) } : {}),
+                ...(Number(fourDraft) !== splitFourMin ? { splitFourMinGallons: Math.trunc(Number(fourDraft)) } : {}),
+              })}>Save</button>
+          )}
+          {savedAt && <span style={{ fontSize:'.74rem', color:'var(--green)', alignSelf:'center' }}>✓ Saved</span>}
           <span style={{ fontSize:'.72rem', color:'var(--text-3)', alignSelf:'center' }}>
             A new fill makes any prior fill balance due immediately.
           </span>
@@ -1375,6 +1002,13 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
   useEffect(() => {
     if (ppg === '' && propaneRate != null) setPpg(String(Number(propaneRate)))
   }, [propaneRate])
+  // S652 (Nic): "I just need to put the gallons. The rate is already set. So why
+  // would I put the price per gallon on the supplier's bill? Unless we're
+  // keeping track of our profit margin." Exactly that, and only if he wants to:
+  // the supplier's invoice is optional and changes nothing a tenant is charged.
+  const [supplierOpen, setSupplierOpen] = useState(false)
+  const [invoiceTotal, setInvoiceTotal] = useState('')
+  const [invoiceGallons, setInvoiceGallons] = useState('')
   const [gallonsBy, setGallonsBy] = useState<Record<string, string>>({})
   // S609: what each unit still owes on EARLIER fills. Recording a new fill
   // ACCELERATES that balance — every unbilled installment becomes due at once
@@ -1416,9 +1050,12 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
   const splitOpts = allowSplits && lines.length ? propaneSplitOptions(smallest, splitMin, splitFourMin) : [1]
   useEffect(() => { if (!splitOpts.includes(installments)) setInstallments(1) }, [totalGallons, allowSplits, smallest])
 
+  const supplierCost = Number(invoiceTotal) > 0 && Number(invoiceGallons) > 0 ? Number(invoiceTotal) / Number(invoiceGallons) : null
+  const margin = supplierCost != null ? Math.round((Number(ppg) - supplierCost) * totalGallons * 100) / 100 : null
   const mut = useMutation(
     () => apiPost('/propane/deliveries', {
       ...(fee > 0 ? { deliveryCharge: fee, deliveryChargeSplit: feeSplit } : {}),
+      ...(supplierCost != null ? { invoiceTotal: Number(invoiceTotal), invoiceGallons: Number(invoiceGallons) } : {}),
       propertyId, pricePerGallon: Number(ppg), installments, lines, clientKey,
     }),
     { onSuccess: onClose,
@@ -1432,17 +1069,42 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
       <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
         <div className="modal-title">Record propane delivery</div>
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-          Straight off the delivery invoice: the price once, then the gallons that went into each
-          tank. Leave a unit blank if it wasn&apos;t filled.
+          Type the gallons that went into each tank. Leave a unit blank if it wasn&apos;t filled.
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Price per gallon (from the invoice)</label>
-          <input className="input" type="number" step="0.001" value={ppg} autoFocus
-            onChange={e => setPpg(e.target.value)} placeholder="e.g. 3.25" style={{ width: 140 }} />
-          {propaneRate != null && (
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
-              Prefilled from this property&apos;s propane rate. Change it if this delivery was priced differently.
+          <label style={lbl}>What tenants pay per gallon</label>
+          <input className="input" type="number" step="0.001" value={ppg}
+            onChange={e => setPpg(e.target.value)} placeholder="e.g. 2.25" style={{ width: 140 }} />
+          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
+            {propaneRate != null
+              ? <>This property&apos;s propane rate. It&apos;s already set — change it only if this delivery is priced differently.</>
+              : <>No propane rate is set for this property yet. Set one under Rates and it fills in here.</>}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          {!supplierOpen ? (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setSupplierOpen(true)}>
+              + Track what it cost you (optional)
+            </button>
+          ) : (
+            <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-1)' }}>
+              <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginBottom: 8 }}>
+                From the supplier&apos;s invoice. Only for your own margin — it changes nothing a tenant is charged.
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div><label style={lbl}>Invoice total</label>
+                  <input className="input" type="number" step="0.01" value={invoiceTotal} onChange={e => setInvoiceTotal(e.target.value)} placeholder="e.g. 925.00" style={{ width: 130 }} /></div>
+                <div><label style={lbl}>Gallons delivered</label>
+                  <input className="input" type="number" step="0.1" value={invoiceGallons} onChange={e => setInvoiceGallons(e.target.value)} placeholder="e.g. 500" style={{ width: 130 }} /></div>
+                {supplierCost != null && (
+                  <div style={{ fontSize: '.78rem', color: 'var(--text-1)' }}>
+                    Cost <strong className="mono">${supplierCost.toFixed(3)}</strong>/gal
+                    {margin != null && totalGallons > 0 && <> · margin on this delivery <strong className="mono" style={{ color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>{fmt(margin)}</strong></>}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -1743,11 +1405,24 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
   const lines: any[] = data?.lines ?? []
   const t = data?.totals
   if (!t || (t.spent === 0 && t.recovered === 0)) return null
-
+  // S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
+  // $1,588.65… I want to fix this table so it's not confusing on anything."
+  // Four plain numbers, in the order the money moves: what the utility charged
+  // you, what you billed your tenants, what they have paid, what they still
+  // owe. The gap (charged but never billed) only shows where a charge was
+  // recorded — with nothing entered there is nothing to measure against.
+  const stat = (label: string, value: React.ReactNode, color?: string, hint?: string) => (
+    <div style={{ minWidth: 150 }}>
+      <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>{label}</div>
+      <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color }}>{value}</div>
+      {hint && <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 2 }}>{hint}</div>}
+    </div>
+  )
+  const th: React.CSSProperties = { textAlign: 'right' }
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <h2 style={{ fontSize: '.95rem', margin: 0 }}>What the utilities cost, and what came back</h2>
+        <h2 style={{ fontSize: '.95rem', margin: 0 }}>Utilities: billed, paid, and owed</h2>
         <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }}
           value={year} onChange={e => setYear(Number(e.target.value))}>
           {[thisYear, thisYear - 1, thisYear - 2].map(y => <option key={y} value={y}>{y}</option>)}
@@ -1755,35 +1430,24 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
       </div>
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Spent</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.spent)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Billed back</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--green)' }}>{fmt(t.recovered)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Not recovered</div>
-            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: t.notRecovered > 0 ? 'var(--gold)' : 'var(--text-1)' }}>
-              {fmt(t.notRecovered)}
-            </div>
-          </div>
-          {t.ownerOccupied > 0 && (
-            <div>
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Of that, your own units</div>
-              <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.ownerOccupied)}</div>
-            </div>
-          )}
+          {stat('Billed to tenants', fmt(t.recovered))}
+          {stat('Tenants have paid', fmt(t.collected), 'var(--green)')}
+          {t.workTrade > 0 && stat('Covered by work trade', fmt(t.workTrade), undefined, 'worked off, not owed')}
+          {stat('Tenants still owe', fmt(t.stillOwed), t.stillOwed > 0 ? 'var(--gold)' : undefined)}
+          {stat('The utility charged you', t.spent > 0 ? fmt(t.spent) : '—', undefined, t.spent > 0 ? undefined : 'none recorded yet')}
+          {t.notRecovered != null && stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)), t.notRecovered > 0 ? 'var(--gold)' : undefined)}
+          {t.ownerOccupied > 0 && stat('Of that, your own units', fmt(t.ownerOccupied))}
         </div>
         <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
               <th style={{ textAlign: 'left', padding: '4px 0' }}>Utility</th>
-              <th style={{ textAlign: 'right' }}>Spent</th>
-              <th style={{ textAlign: 'right' }}>Billed back</th>
-              <th style={{ textAlign: 'right' }}>Not recovered</th>
-              <th style={{ textAlign: 'right' }}>Your units</th>
+              <th style={th}>Billed to tenants</th>
+              <th style={th}>Paid</th>
+              {t.workTrade > 0 && <th style={th}>Work trade</th>}
+              <th style={th}>Still owed</th>
+              <th style={th}>Utility charged you</th>
+              <th style={th}>Never billed</th>
             </tr>
           </thead>
           <tbody>
@@ -1793,21 +1457,24 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
                   {UTILITY_ICONS[l.utilityType] || ''}{' '}
                   {l.utilityType === 'unspecified' ? 'Unspecified' : (UTILITY_TYPE_LABEL[l.utilityType as UtilityType] ?? l.utilityType)}
                 </td>
-                <td className="mono" style={{ textAlign: 'right' }}>{l.spent ? fmt(l.spent) : '—'}</td>
-                <td className="mono" style={{ textAlign: 'right', color: 'var(--green)' }}>{l.recovered ? fmt(l.recovered) : '—'}</td>
-                <td className="mono" style={{ textAlign: 'right', color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
-                  {l.notRecovered == null ? '—' : fmt(l.notRecovered)}
+                <td className="mono" style={th}>{l.recovered ? fmt(l.recovered) : '—'}</td>
+                <td className="mono" style={{ ...th, color: 'var(--green)' }}>{l.collected ? fmt(l.collected) : '—'}</td>
+                {t.workTrade > 0 && <td className="mono" style={th}>{l.workTrade ? fmt(l.workTrade) : '—'}</td>}
+                <td className="mono" style={{ ...th, color: l.stillOwed > 0 ? 'var(--gold)' : undefined }}>{l.stillOwed ? fmt(l.stillOwed) : '—'}</td>
+                <td className="mono" style={th}>{l.spent ? fmt(l.spent) : '—'}</td>
+                <td className="mono" style={{ ...th, color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
+                  {l.notRecovered == null ? '—' : fmt(Math.max(0, l.notRecovered))}
                 </td>
-                <td className="mono" style={{ textAlign: 'right' }}>{l.ownerOccupied ? fmt(l.ownerOccupied) : '—'}</td>
               </tr>
             ))}
           </tbody>
         </table>
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
-          &ldquo;Spent&rdquo; is what you recorded under <strong>Expenses → Utilities</strong> for this property; tag each
-          bill with its utility and these lines split out. A dash means no bill was recorded, so there
-          is nothing to compare against. What isn&apos;t your own units is common areas, stays with
-          utilities in the rate, vacancies, and anything a lease doesn&apos;t pass through.
+          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices and utility lines sent on a pay link or rung
+          up at the register. &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
+          this property. Until a bill is recorded there, the last two columns show a dash — there is nothing to
+          compare against. &ldquo;Never billed&rdquo; is common areas, stays with utilities in the rate, vacancies, and
+          anything a lease doesn&apos;t pass through.
         </div>
       </div>
     </div>
@@ -2049,7 +1716,7 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
 }
 
 /*
- * S616: the "Link to a neighbour's landlord" button and its candidate picker
+ * S616: the "Link to a neighbor's landlord" button and its candidate picker
  * lived here and are gone. Nic: "We are gonna be linking the units on the back
  * end automatically, so you can remove the link user interface." GAM matches
  * the service address against other landlords' property addresses on a daily
@@ -2309,8 +1976,24 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const assign = useMutation(({ id, unitId }: any) => apiPost(`/utility/meters/${id}/units`, { unitId }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not assign unit') })
   const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
-  const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
+  const setBroken = useMutation(({ id, broken, startingReading }: any) => apiPatch(`/utility/meters/${id}`, {
+      outOfService: broken,
+      ...(startingReading != null ? { repairedStartingReading: startingReading } : {}),
+    }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  // S648 (Nic): a repaired or replaced meter starts from what it reads NOW —
+  // 0 for a new one, whatever is on the dial for a refurbished one.
+  const markRepaired = (m: any) => {
+    appPrompt(
+      'What does the repaired or replaced meter read right now? Enter 0 for a brand-new meter. Its next bill is measured from this number.',
+      { title: `Mark ${m.label} repaired` },
+    ).then(v => {
+      if (v == null) return
+      const n = Number(String(v).replace(/[,\s]/g, ''))
+      if (String(v).trim() === '' || !Number.isFinite(n) || n < 0) { toast.error('Enter the number shown on the meter.'); return }
+      setBroken.mutate({ id: m.id, broken: false, startingReading: n })
+    })
+  }
   // S613 (Nic): a meter can be configured perfectly and bill nothing, because a
   // unit bills a utility only where its LEASE passes it through. Assigning
   // twenty-seven units to a brand-new trash charge hits that on twenty-seven
@@ -2521,7 +2204,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         ) : (
           <div style={{ marginTop: 6 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* S613: TEXT, not number — a number input normalises away the
+              {/* S613: TEXT, not number — a number input normalizes away the
                   leading zeros as you type, so a padded 0000400 would collapse
                   to 400 the moment you touched it. Digits only, capped at the
                   meter face, matching how the reading-run walk takes a read. */}
@@ -2565,13 +2248,17 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
               {methodLabel(m)}
-              {m.outOfService && <> · billed from the lowest comparable spot until repaired</>}
+              {m.outOfService && (m.estimatesStuckMeters
+                ? <> · billed from the lowest comparable spot until repaired</>
+                : <> · not billing until repaired</>)}
             </div>
             {(m.hasBaseline === false || m.openingRead) && <BaselineFixer m={m} />}
           </div>
           {m.billingMethod === 'submeter' && (
-            <button className="btn btn-ghost btn-sm" title={m.outOfService ? 'Mark repaired' : 'Mark broken — bills from comparable spots'}
-              onClick={() => setBroken.mutate({ id: m.id, broken: !m.outOfService })}>
+            <button className="btn btn-ghost btn-sm"
+              title={m.outOfService ? 'Mark repaired — enter the new reading'
+                : m.estimatesStuckMeters ? 'Mark broken — bills from comparable spots' : 'Mark broken — stops billing until repaired'}
+              onClick={() => m.outOfService ? markRepaired(m) : setBroken.mutate({ id: m.id, broken: true })}>
               <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
             </button>
           )}
@@ -2695,7 +2382,7 @@ function UnitPickerModal({ meter, units, unitHasSubmeter, unitLabel, conflicting
 }) {
   const assigned: string[] = meter.assignedUnitIds || []
   // ONLY the units that can actually be picked. S609 (Nic) — he overruled the
-  // first version, which greyed out the taken ones and kept them in the list:
+  // first version, which grayed out the taken ones and kept them in the list:
   //
   //   "The drop down is still too long. You have all the list in there of all
   //    the units just not selectable, and that looks like shit. It only needs to
@@ -2868,6 +2555,10 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
   const locked = editing && meter.hasHistory === true
   const [utilityType, setUtilityType] = useState(meter?.utilityType ?? 'water')
   const [label, setLabel] = useState(meter?.label ?? '')
+  // S652 (Nic): "If we discover that one of those is actually six digits later
+  // on, can the landlord get on there and just change it?" Yes — past reads are
+  // untouched; the width only sets the largest read and where the dial wraps.
+  const [digitsSel, setDigitsSel] = useState(String(meter?.digits ?? METER_READING_DEFAULT_DIGITS))
   const [method, setMethod] = useState(meter?.billingMethod ?? 'rubs')
   const [basis, setBasis] = useState(meter?.rubsBasis ?? 'usage_rate')
   const [subRate, setSubRate] = useState(meter?.rubsSubmeterRate ?? 'property_rate')
@@ -2913,6 +2604,7 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
       ? apiPatch(`/utility/meters/${meter.id}`, {
           label,
           baseFee: Number(baseFee || 0),
+          ...((method === 'submeter' || method === 'rubs') ? { digits: Number(digitsSel) } : {}),
           // S609: until a meter has readings or bills, the utility and billing
           // method are fixable too — sending them only when they are actually
           // editable keeps a locked meter's payload identical to before.
@@ -2931,6 +2623,7 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
       : apiPost('/utility/meters', {
       propertyId, utilityType, label,
       billingMethod: method,
+      ...((method === 'submeter' || method === 'rubs') ? { digits: Number(digitsSel) } : {}),
       ratePerUnit: method === 'flat_rate' || method === 'master_bill_to_landlord' ? null : (rate === '' ? null : Number(rate)),
       baseFee: method === 'flat_rate' ? Number(baseFee || 0) : Number(baseFee || 0),
       rubsAllocationMethod: method === 'rubs' ? alloc : null,
@@ -2989,6 +2682,15 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
           <label style={lbl}>Label</label>
           <input className="input" value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Master C — city water" style={{ width: '100%' }} autoFocus />
         </div>
+        {(method === 'submeter' || method === 'rubs') && (
+        <div style={{ marginBottom: 10 }}>
+          <label style={lbl}>Digits on the meter face</label>
+          <select className="form-select" value={digitsSel} onChange={e => setDigitsSel(e.target.value)} style={{ width: '100%' }}>
+            {(METER_READING_DIGIT_OPTIONS as readonly number[]).map(d => <option key={d} value={d}>{d} digits</option>)}
+          </select>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>Changing this never alters past reads — it sets the largest number a read can be and where the dial rolls over.</div>
+        </div>
+        )}
         {!locked && (
         <div style={{ marginBottom: 10 }}>
           <label style={lbl}>Billing method</label>
@@ -3160,6 +2862,233 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
           <button className="btn btn-primary" disabled={!canSave || save.isLoading} onClick={() => save.mutate()}>
             {save.isLoading ? (editing ? 'Saving…' : 'Adding…') : (editing ? 'Save changes' : 'Add meter')}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S652 (Nic, for Blu): "he wants to know how much people are gonna owe... if
+// anything gets fat fingered he'd rather fix it before the people get billed."
+// Every bill this month's readings produce, priced by the same engine the
+// invoice uses, with the reading editable in place until it is approved.
+function ReviewBillsModal({ runId, onClose, onDone }: { runId: string; onClose: () => void; onDone: () => void }) {
+  const qc = useQueryClient()
+  const { data, isLoading } = useQuery<any>(['bill-review', runId], () => apiGet(`/utility/reading-runs/${runId}/review`))
+  const [edit, setEdit] = useState<{ meterId: string; readingId: string; value: string } | null>(null)
+  const refresh = () => { qc.invalidateQueries(['bill-review', runId]); onDone() }
+  const fix = useMutation(
+    ({ meterId, readingId, value }: any) => apiPatch(`/utility/meters/${meterId}/readings/${readingId}`, { readingValue: Number(value), note: 'Corrected on bill review' }),
+    { onSuccess: () => { setEdit(null); refresh(); toast('Reading corrected — bills recalculated') },
+      onError: (e: any) => toast.error(e?.message || 'Could not correct that reading') })
+  const approve = useMutation(() => apiPost(`/utility/reading-runs/${runId}/approve`, {}),
+    { onSuccess: () => { refresh(); toast('Approved — these bills go out on each tenant\'s invoice'); onClose() },
+      onError: (e: any) => toast.error(e?.message || 'Could not approve') })
+  const run = data?.run, lines: any[] = data?.lines ?? [], totals = data?.totals
+  const approved = run?.status === 'completed' || !!run?.approvedAt
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 980, width: '96vw', maxHeight: '92vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Review bills — {run ? monthLabel(run.cycle) : ''}{run?.utilityType ? ` · ${UTILITY_TYPE_LABEL[run.utilityType as UtilityType] ?? run.utilityType}` : ''}</div>
+        {isLoading || !data ? <div style={{ color:'var(--text-3)', padding:16 }}>Pricing this month's readings…</div> : (
+          <>
+            <div style={{ display:'flex', gap:18, flexWrap:'wrap', margin:'6px 0 12px', fontSize:'.82rem' }}>
+              <span><b>{totals.bills}</b> bills</span>
+              <span>Total <b>{fmt(totals.amount)}</b></span>
+              {totals.unread > 0 && <span style={{ color:'var(--amber, #d97706)' }}>{totals.unread} not read yet</span>}
+              {totals.flagged > 0 && <span style={{ color:'var(--red)' }}>{totals.flagged} flagged as a possible typo</span>}
+            </div>
+            <table className="data-table">
+              <thead><tr><th>Site</th><th>Meter</th><th>Tenant</th><th style={{textAlign:'right'}}>Previous</th><th style={{textAlign:'right'}}>This month</th><th style={{textAlign:'right'}}>Usage</th><th style={{textAlign:'right'}}>Bill</th></tr></thead>
+              <tbody>
+                {lines.map((l: any) => (
+                  <tr key={l.meterId + (l.unitNumber ?? '')} style={l.flagged ? { background:'rgba(239,68,68,.06)' } : undefined}>
+                    <td className="mono">{l.unitNumber ?? '—'}</td>
+                    <td style={{ fontSize:'.76rem' }}>{l.label}</td>
+                    <td style={{ fontSize:'.76rem' }}>{l.tenant ?? <span style={{ color:'var(--text-3)' }}>—</span>}</td>
+                    <td className="mono" style={{ textAlign:'right' }}>{l.prior != null ? fmtRead(l.prior, l.digits) : '—'}</td>
+                    <td className="mono" style={{ textAlign:'right' }}>
+                      {edit && edit.meterId === l.meterId ? (
+                        <span style={{ display:'inline-flex', gap:4 }}>
+                          <input className="input mono" style={{ width: 110, textAlign:'right' }} autoFocus inputMode="numeric"
+                            value={edit.value} onChange={e => setEdit({ ...edit, value: e.target.value.replace(/\D/g, '').slice(0, Number(l.digits) || 8) })}
+                            onKeyDown={e => { if (e.key === 'Enter' && edit.value) fix.mutate(edit) }} />
+                          <button className="btn btn-primary btn-sm" disabled={!edit.value || fix.isLoading} onClick={() => fix.mutate(edit)}><Check size={12}/></button>
+                          <button className="btn btn-ghost btn-sm" onClick={() => setEdit(null)}>✕</button>
+                        </span>
+                      ) : l.reading == null ? <span style={{ color:'var(--amber, #d97706)' }}>not read</span> : (
+                        <span>
+                          {fmtRead(l.reading, l.digits)}
+                          {!approved && !l.issued && l.readingId && (
+                            <button className="btn btn-ghost btn-sm" style={{ marginLeft:4, padding:'0 4px', fontSize:'.66rem' }}
+                              onClick={() => setEdit({ meterId: l.meterId, readingId: l.readingId, value: String(Math.trunc(l.reading)) })}>Fix</button>
+                          )}
+                        </span>
+                      )}
+                      {l.flagged && <div style={{ fontSize:'.64rem', color:'var(--red)' }}>Possible typo{l.flagNote ? ` — ${l.flagNote}` : ''}</div>}
+                    </td>
+                    <td className="mono" style={{ textAlign:'right' }}>{l.usage != null ? Number(l.usage).toLocaleString() : '—'}</td>
+                    <td className="mono" style={{ textAlign:'right', fontWeight:600 }}>{l.charge != null ? fmt(l.charge) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ display:'flex', justifyContent:'flex-end', alignItems:'center', gap:10, marginTop:14 }}>
+              {approved ? <span style={{ fontSize:'.8rem', color:'var(--green)' }}>Approved — these went out on each tenant's invoice.</span> : (
+                <>
+                  <span style={{ fontSize:'.74rem', color:'var(--text-3)', flex:1 }}>
+                    {run.reviewRequired
+                      ? 'Nothing from this month goes to tenants until you approve. An unread or flagged meter bills nothing and holds only its own unit — approving never waits on it.'
+                      : 'Bills go out on their own as meters are read. Approving now closes the month and issues what is read; unread meters bill nothing this month.'}
+                  </span>
+                  <button className="btn btn-ghost" onClick={onClose}>Close</button>
+                  <button className="btn btn-primary" disabled={approve.isLoading} onClick={() => approve.mutate()}>
+                    Approve {fmt(totals.amount)}
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+
+// ── READING HISTORY (S652) ───────────────────────────────────────────────
+// Nic: "I don't want to download readings… a spot to view the history as some
+// sort of spreadsheet, but make it look good, a nice curated report type of
+// thing." One row per meter in space order; one column per month with the
+// reading and what it used; tap a row for every reading on that meter with its
+// date, reason, note and photo. The download survives as a quiet link for an
+// accountant — nothing requires it.
+const READ_REASON_SHORT: Record<string, string> = {
+  monthly_cycle: 'Monthly', baseline: 'Opening', move_out_final: 'Move-out', stay_turnover: 'Turnover',
+  meter_replaced: 'New meter', billed_off_platform: 'Off platform', other: 'Other',
+}
+function ReadingHistoryModal({ propertyId, propertyName, onDownload, onClose }: {
+  propertyId: string; propertyName: string; onDownload: () => void; onClose: () => void
+}) {
+  const navigate = useNavigate()
+  const [months, setMonths] = useState(6)
+  const [utility, setUtility] = useState('all')
+  const [open, setOpen] = useState<string | null>(null)
+  const { data, isLoading } = useQuery<any>(
+    ['reading-history', propertyId, months],
+    () => apiGet(`/utility/reading-history?propertyId=${propertyId}&months=${months}`))
+  const meters: any[] = data?.meters ?? []
+  const utilities = [...new Set(meters.map(m => String(m.utilityType)))].sort()
+  const shown = meters.filter(m => utility === 'all' || m.utilityType === utility)
+  // Month columns, newest first, from the readings themselves (by the day read).
+  const monthKeys = [...new Set(meters.flatMap(m => m.readings.map((r: any) => String(r.date).slice(0, 7))))].sort().reverse().slice(0, months)
+  const monthName = (k: string) => new Date(k + '-15T12:00:00').toLocaleDateString('en-US', { month: 'short', year: '2-digit' })
+  const face = (v: number, d: number) => String(Math.trunc(Number(v))).padStart(Number(d) || 5, '0')
+  const usageText = (r: any, m: any) => r.usage == null ? '' : `${Number(r.usage).toLocaleString()} ${UTILITY_UNITS[m.utilityType] || ''}`.trim()
+  const cell: React.CSSProperties = { padding: '8px 10px', borderTop: '1px solid var(--border-0)', verticalAlign: 'top' }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 1080, width: '96vw' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
+          <div>
+            <div className="modal-title" style={{ marginBottom: 2 }}>Meter reading history</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{propertyName} · every reading on file, newest first</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {utilities.length > 1 && (
+              <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }} value={utility} onChange={e => setUtility(e.target.value)}>
+                <option value="all">All utilities</option>
+                {utilities.map(u => <option key={u} value={u}>{UTILITY_TYPE_LABEL[u as UtilityType] ?? u}</option>)}
+              </select>
+            )}
+            <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }} value={months} onChange={e => setMonths(Number(e.target.value))}>
+              <option value={3}>Last 3 months</option><option value={6}>Last 6 months</option>
+              <option value={12}>Last 12 months</option><option value={24}>Last 2 years</option>
+            </select>
+            <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+          </div>
+        </div>
+        {isLoading ? <div style={{ padding: 24, color: 'var(--text-3)' }}>Loading…</div> : shown.length === 0 ? (
+          <div style={{ padding: 24, color: 'var(--text-3)' }}>No meters with readings here yet.</div>
+        ) : (
+          <div style={{ maxHeight: '68vh', overflow: 'auto', border: '1px solid var(--border-0)', borderRadius: 10 }}>
+            <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: 0, fontSize: '.8rem' }}>
+              <thead>
+                <tr style={{ fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--text-3)' }}>
+                  <th style={{ position: 'sticky', top: 0, left: 0, zIndex: 3, background: 'var(--bg-1)', textAlign: 'left', padding: '10px' }}>Space</th>
+                  {monthKeys.map(k => (
+                    <th key={k} style={{ position: 'sticky', top: 0, zIndex: 2, background: 'var(--bg-1)', textAlign: 'right', padding: '10px', whiteSpace: 'nowrap' }}>{monthName(k)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map(m => (
+                  <Fragment key={m.meterId}>
+                    <tr onClick={() => setOpen(o => o === m.meterId ? null : m.meterId)} style={{ cursor: 'pointer' }} className="row-clickable">
+                      <td style={{ ...cell, position: 'sticky', left: 0, background: 'var(--bg-1)', zIndex: 1, whiteSpace: 'nowrap' }}>
+                        <div style={{ fontWeight: 700 }}>{m.unitNumbers || m.label}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                          {UTILITY_ICONS[m.utilityType]} {UTILITY_TYPE_LABEL[m.utilityType as UtilityType] ?? m.utilityType}
+                          {m.billingMethod === 'rubs' ? ' · master' : ''}{m.outOfService ? ' · out of service' : ''}
+                        </div>
+                      </td>
+                      {monthKeys.map(k => {
+                        const inMonth = m.readings.filter((r: any) => String(r.date).slice(0, 7) === k)
+                        const r = inMonth[0]
+                        return (
+                          <td key={k} style={{ ...cell, textAlign: 'right' }}>
+                            {!r ? <span style={{ color: 'var(--text-3)' }}>—</span> : (
+                              <>
+                                <div className="mono" style={{ fontWeight: 600, letterSpacing: '.04em' }}>{m.billingMethod === 'rubs' ? Number(r.value).toLocaleString() : face(r.value, m.digits)}</div>
+                                <div style={{ fontSize: '.7rem', color: r.needsReview ? 'var(--amber, #d97706)' : 'var(--text-3)' }}>
+                                  {m.billingMethod === 'rubs' ? 'used this cycle' : (usageText(r, m) || READ_REASON_SHORT[r.reason] || '')}
+                                  {inMonth.length > 1 ? ` · +${inMonth.length - 1}` : ''}
+                                </div>
+                              </>
+                            )}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                    {open === m.meterId && (
+                      <tr>
+                        <td colSpan={monthKeys.length + 1} style={{ background: 'var(--bg-2)', padding: '10px 14px' }}>
+                          {m.readings.length === 0 ? <span style={{ color: 'var(--text-3)', fontSize: '.78rem' }}>No readings in this window.</span> : (
+                            <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
+                              <thead><tr style={{ color: 'var(--text-3)', fontSize: '.66rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                                <th style={{ textAlign: 'left', padding: '3px 0' }}>Read on</th><th style={{ textAlign: 'right' }}>Reading</th>
+                                <th style={{ textAlign: 'right' }}>Used since the one before</th><th style={{ textAlign: 'left', paddingLeft: 14 }}>Why</th>
+                                <th style={{ textAlign: 'left' }}>Note</th><th></th>
+                              </tr></thead>
+                              <tbody>
+                                {m.readings.map((r: any) => (
+                                  <tr key={r.id} style={{ borderTop: '1px solid var(--border-0)' }}>
+                                    <td style={{ padding: '5px 0', whiteSpace: 'nowrap' }}>{new Date(r.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</td>
+                                    <td className="mono" style={{ textAlign: 'right' }}>{m.billingMethod === 'rubs' ? Number(r.value).toLocaleString() : face(r.value, m.digits)}</td>
+                                    <td className="mono" style={{ textAlign: 'right' }}>{m.billingMethod === 'rubs' ? '—' : (usageText(r, m) || '—')}</td>
+                                    <td style={{ paddingLeft: 14 }}>{METER_READ_REASON_LABEL[r.reason as keyof typeof METER_READ_REASON_LABEL] ?? r.reason}{r.needsReview ? ' · needs review' : ''}{r.isRollover ? ' · rolled over' : ''}</td>
+                                    <td style={{ color: 'var(--text-3)', maxWidth: 320 }}>{r.note || ''}</td>
+                                    <td style={{ textAlign: 'right' }}>{r.hasPhoto && (
+                                      <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/view?src=${encodeURIComponent(`/utility/readings/${r.id}/photo`)}&title=${encodeURIComponent('Meter photo')}`)}>📷 Photo</button>
+                                    )}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, fontSize: '.72rem', color: 'var(--text-3)' }}>
+          <span>Each month shows the latest reading taken in it and what that reading used. Click a space for every reading.</span>
+          <button className="btn btn-ghost btn-sm" onClick={onDownload}>Download a copy</button>
         </div>
       </div>
     </div>

@@ -43,6 +43,8 @@ export function MaintenancePage() {
   // S571: tenant picks a category (title is derived server-side) and does NOT
   // set priority — the in-house agent recommends it, the landlord can override.
   const [form, setForm] = useState({ category:'', description:'', photos:[] as string[] })
+  // S652: the property decides which kinds a tenant may file, and says why.
+  const [cfg, setCfg] = useState<{ categories: string[]; note: string | null } | null>(null)
 
   const load = async () => {
     try { setRequests(await apiGet('/maintenance')) }
@@ -89,6 +91,7 @@ export function MaintenancePage() {
     setSubmitting(true)
     try {
       const me: any = await apiGet('/tenants/me')
+      if (me?.unitId) { try { setCfg(await apiGet(`/maintenance/config?unitId=${me.unitId}`)) } catch { setCfg(null) } }
       await apiPost('/maintenance', { category: form.category, description: form.description, photos: form.photos, unitId: me.unitId })
       setShowAdd(false)
       setForm({ category:'', description:'', photos:[] })
@@ -302,10 +305,11 @@ export function MaintenancePage() {
               <label style={s.label}>Category *</label>
               <select style={{ ...s.input, cursor:'pointer' }} value={form.category} onChange={e => setForm(f=>({...f,category:e.target.value}))} autoFocus>
                 <option value="" disabled>Select a category…</option>
-                {MAINTENANCE_CATEGORIES.map(c => (
+                {MAINTENANCE_CATEGORIES.filter(c => !cfg?.categories?.length || cfg.categories.includes(c)).map(c => (
                   <option key={c} value={c}>{MAINTENANCE_CATEGORY_LABEL[c]}</option>
                 ))}
               </select>
+              {cfg?.note && <div style={{ fontSize:'.74rem', color:'#b8c4d8', marginTop:6, lineHeight:1.5 }}>{cfg.note}</div>}
             </div>
             <div style={{ marginBottom:16 }}>
               <label style={s.label}>What's wrong? *</label>

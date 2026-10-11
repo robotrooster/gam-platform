@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NotificationBell } from '../NotificationBell'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
-import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
+import { Outlet, NavLink, Navigate, useNavigate, useLocation } from 'react-router-dom'
 import { DialogHost } from '../dialogs'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
@@ -13,8 +13,7 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe
-} from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera, Gauge } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -38,10 +37,14 @@ const NAV_ITEMS: Array<{
   section: string | null
   category?: string
   hub?: 'financials' | 'screening'
+  // 10/11 (Nic): the shared financial pages a bookkeeper sees — and the only
+  // ones. 'only' = the bookkeeper's read-only view of something the owner
+  // already has a fuller page for (Bank, Disbursements), so the owner's hub
+  // does not carry it twice.
+  bookkeeper?: true | 'only'
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
-  { to: '/refer',         icon: HeartHandshake,   label: 'Refer & Earn',     section: null },
   { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          category: 'pos' },
   // Portfolio
   // S605 (Nic, DIRECTIVE): Utilities and Amenities were removed from top-level
@@ -51,10 +54,24 @@ const NAV_ITEMS: Array<{
   // and bookmarks still resolve.
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          category: 'units' },
+  // S652 (Nic): "build the meter readings top level nav entry for front
+  // counter staff." Straight to the reading walk for the properties they are
+  // assigned to; anyone holding "Enter meter readings" sees it. (S605 folded
+  // Utilities SETUP into the property page; this is the walk, not the setup.)
+  { to: '/utilities',     icon: Gauge,            label: 'Meter Readings',   section: null,          category: 'utilities' },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
   { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
+  // S639 (Nic): "I need my front desk person to go to one page, see all the
+  // people that need to be contacted, and what phase they're in." Sits with
+  // onboarding because that is the process it reports on, and under the same
+  // permission — it shows the same people, without the destructive buttons.
+  // S640 (Nic): its own category, so a front-desk person can be given the call
+  // list without the import flows, the pending pool and the Tenants tab that
+  // came with it. Anyone who already holds tenant_onboarding.view keeps seeing
+  // it — the filter below accepts either category for this one item.
+  { to: '/front-desk',    icon: Headphones,       label: 'Front Desk',       section: null,          category: 'front_desk' },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
   { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
   { to: '/esign',         icon: PenTool,          label: 'GoldSign',           section: null,          category: 'esign' },
@@ -66,9 +83,19 @@ const NAV_ITEMS: Array<{
   // W-2 (S531): owner-only — matches the API canViewLandlordFinances gate.
   { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials' },
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
-  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports' },
+  // 10/11 (Nic): money in by type — by month and by day, no names.
+  { to: '/income',        icon: BarChart2,        label: 'Money In',         section: null, hub: 'financials', bookkeeper: true },
+  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports', bookkeeper: true },
   // S568: landlord expense entry (feeds the P&L). Owner-level.
-  { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
+  { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials', bookkeeper: true },
+  // 10/11 (Nic): "maintenance... the maintenance costs." Cost lines only.
+  { to: '/maintenance-costs', icon: Wrench,       label: 'Maintenance Costs', section: null, hub: 'financials', bookkeeper: true },
+  { to: '/bank-activity', icon: Landmark,         label: 'Bank Activity',    section: null, hub: 'financials', bookkeeper: 'only' },
+  { to: '/payouts',       icon: ArrowDownToLine,  label: 'Payouts',          section: null, hub: 'financials', bookkeeper: 'only' },
+  // S645 (Nic): an owner whose book is split between managers reads it here,
+  // in one place, with the managers side by side. Owner-level like the rest of
+  // the financials hub — it is a judgment about the people they hired.
+  { to: '/my-managers',   icon: BarChart2,        label: 'My Managers',      section: null, hub: 'financials' },
   // S605 (Nic): ONE Bank tab. Feed (S570) + reconciliation (S568) were two nav
   // items answering one question — "is my bank money right?" — because
   // reconciliation was built as the manual stand-in before the feed existed and
@@ -91,6 +118,10 @@ const NAV_ITEMS: Array<{
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
+  // S652 (Nic): a maintenance worker's way to put a posted notice or a record
+  // photo onto a resident's file, from the phone. Same category as Documents:
+  // holding "Add photos & posted notices" is enough to see it.
+  { to: '/tenant-photos', icon: Camera,           label: 'Photos & Notices', section: null,          category: 'documents' },
   { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          category: 'inventory' },
   // W-36 (S531): sub-meter management — meters CRUD is gated on
   // properties.edit / units.* server-side; 'units' is the closest catalog
@@ -131,7 +162,7 @@ const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 // (main.tsx) so staff always LAND on a page they can actually see. Owners see
 // everything; staff see an item iff they hold ANY catalog key in its category
 // (plus the S168 banking special case). Items with no category are owner-only.
-export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean } | null | undefined) {
+export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean; allProperties?: boolean } | null | undefined) {
   const role = user?.role || 'landlord'
   const perms = (user?.permissions || {}) as Record<string, boolean | string>
   const isOwner = OWNER_ROLES.has(role)
@@ -139,6 +170,16 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
   const hasMobileHomeUnits = (user as any)?.hasMobileHomeUnits === true
   return NAV_ITEMS.filter(item => {
     if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
+    // 10/11 (Nic): a bookkeeper sees the shared financial pages and nothing
+    // else — "money coming in, money going out... the maintenance costs".
+    // The API refuses them everything else too (lib/bookkeeperAccess).
+    // The bank account and payouts are company-wide: a bookkeeper kept to some
+    // of the company's properties is refused both, so they are not offered.
+    if (role === 'bookkeeper') {
+      if (item.bookkeeper === 'only' && user?.allProperties === false) return false
+      return !!item.bookkeeper
+    }
+    if (item.bookkeeper === 'only') return false
     // S575: Lot Rent & Net is a mobile-home concept (lot rent + investor-operator
     // net for homes-only parks). Landlords see it only once they have a
     // mobile-home unit; admin/super_admin (platform oversight) always see it;
@@ -157,8 +198,15 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // S168: /banking for property_manager — only when direct-deposit is on.
     if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
     if (!item.category) return false               // owner-only items (Team, Work Trade)
-    const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
-    return !!keys && keys.some(k => perms[k] === true)
+    // S640: Front Desk moved to its own category; onboarding staff who already
+    // had it keep it rather than silently losing a page they use daily.
+    const cats = item.to === '/front-desk' ? ['front_desk', 'tenant_onboarding'] : [item.category]
+    // decisions.md #48.2: whoever takes payments makes the bank deposit for the
+    // cash they took, on the Front Desk page — so take_payment alone shows it.
+    // The API camelizes the dotless key to takePayment (see lib/permissions.ts);
+    // both spellings count.
+    if (item.to === '/front-desk' && (perms['take_payment'] === true || perms.takePayment === true)) return true
+    return cats.some(c => (CATALOG_KEYS_BY_CATEGORY[c] || []).some(k => perms[k] === true))
   })
 }
 
@@ -241,6 +289,7 @@ const LL_FONTS: Record<string, { imp: string; family: string; display: string }>
 
 const ROLE_BADGE: Record<string, string> = {
   landlord:         '',
+  bookkeeper:       'Bookkeeper',
   property_manager: 'PM',
   onsite_manager:   'On-Site',
   maintenance:      'Maintenance',
@@ -267,10 +316,14 @@ function PendingSignBanner() {
   // state to phrase. The landlord's pending signature is always the
   // document's first.
   const doc = (pending as any[])[0]
-  const isRenewal = (doc.title || '').startsWith('Lease Renewal')
-  const subtitle = isRenewal
-    ? `${doc.title} · Upcoming lease for your renewal — sign now and send to the tenant`
-    : `${doc.title} · You sign first — then it goes to the tenant`
+  // S655: a new lease for a household already living here is told apart by its
+  // link to the lease it follows, never by the title's wording.
+  const isRenewal = !!doc.renewsLeaseId
+  const others = (pending as any[]).length - 1
+  const subtitle = (isRenewal
+    ? `${doc.title} · New lease for a household already living here — sign it and it goes to them`
+    : `${doc.title} · You sign first — then it goes to the tenant`)
+    + (others > 0 ? ` · ${others} more waiting on you` : '')
   return (
     <div onClick={() => navigate('/sign/' + doc.documentId)}
       style={{ background:'rgba(201,162,39,.1)', border:'1px solid rgba(201,162,39,.3)', borderRadius:10, padding:'12px 16px', marginBottom:16, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
@@ -360,10 +413,20 @@ export function Layout() {
   }
 
   const handleLogout = () => { logout(); navigate('/login') }
+  // 10/11: a bookkeeper's portal is the financial pages alone — no signing
+  // queue, notifications, assistant or settings (each would only be refused).
+  const isBookkeeper = role === 'bookkeeper'
 
   // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect); the
   // sidebar collapses the Financials/Screening clusters into one item each (S575).
   const visibleItems = sidebarNavItemsFor(user)
+
+  // 10/11: a bookkeeper who follows an old link or types a path lands back on
+  // their pages rather than on a screen the API will refuse piece by piece.
+  if (isBookkeeper) {
+    const theirs = visibleNavItemsFor(user).map(i => i.to)
+    if (!theirs.includes(layoutLocation.pathname)) return <Navigate to={theirs[0] ?? '/income'} replace />
+  }
 
   // Track section headers without side effects
   const renderedSections = new Set<string>()
@@ -441,11 +504,11 @@ export function Layout() {
       </aside>
 
       <div className="main-content">
-        <PendingSignBanner />
+        {!isBookkeeper && <PendingSignBanner />}
         <header className="topbar" style={{ position:'sticky', top:0, zIndex:100 }}>
           <AnnouncementBar />
           <div style={{ flex:1 }} />
-          <NotificationBell />
+          {!isBookkeeper && <NotificationBell />}
           <button
             className="btn btn-ghost btn-sm"
             style={{ padding:'6px' }}
@@ -455,16 +518,18 @@ export function Layout() {
           >
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
-          <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
-            <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
-          </button>
+          {!isBookkeeper && (
+            <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
+              <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
+            </button>
+          )}
         </header>
         <div className={"page-content" + (fullBleed ? " page-content-wide" : "")}>
           <Outlet />
           <DialogHost />
         </div>
       </div>
-      <ChatWidget />
+      {!isBookkeeper && <ChatWidget />}
     </div>
   )
 }

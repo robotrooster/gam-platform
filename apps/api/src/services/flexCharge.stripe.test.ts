@@ -342,10 +342,23 @@ describe('generateMonthlyStatement', () => {
 // ─── processFlexChargeStatementGeneration ──────────────────────
 
 describe('processFlexChargeStatementGeneration', () => {
+  // S654: the cycle is GAM's (Phoenix) previous month. The cron runs at noon
+  // Phoenix on the 1st; midnight UTC on June 1 is still May 31 in Phoenix.
+  const JUNE_1_NOON_PHOENIX = new Date('2026-06-01T19:00:00Z')
+
+  it('cycle is the Phoenix month that just closed, not the UTC one', async () => {
+    // Sept 30, 6 pm Phoenix: UTC already reads Oct 1, but September is still open.
+    const evening = await processFlexChargeStatementGeneration(new Date('2026-10-01T01:00:00Z'))
+    expect(evening.cycle_month).toBe('2026-08-01')
+    // Oct 1, noon Phoenix: September has closed.
+    const noon = await processFlexChargeStatementGeneration(new Date('2026-10-01T19:00:00Z'))
+    expect(noon.cycle_month).toBe('2026-09-01')
+  })
+
   it('feature flag off → zeros, no accounts scanned', async () => {
     const a = await seedAccount()
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-05-15T00:00:00Z' })
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.accounts_scanned).toBe(0)
     expect(r.statements_created).toBe(0)
   })
@@ -355,8 +368,8 @@ describe('processFlexChargeStatementGeneration', () => {
     const a = await seedAccount()
     await seedTx({ accountId: a.accountId, amount: 200, createdAt: '2026-05-15T00:00:00Z' })
 
-    // Running on June 1 → generates the May cycle ('2026-05-01').
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    // Running at noon Phoenix on June 1 → generates the May cycle ('2026-05-01').
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.cycle_month).toBe('2026-05-01')
     expect(r.accounts_scanned).toBe(1)
     expect(r.statements_created).toBe(1)
@@ -369,7 +382,7 @@ describe('processFlexChargeStatementGeneration', () => {
     const a = await seedAccount()
     // Tx in WRONG month — outside the May cycle.
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-04-10T00:00:00Z' })
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.accounts_scanned).toBe(1)
     expect(r.statements_created).toBe(0)
     expect(r.skipped_no_pending).toBe(1)
@@ -379,7 +392,7 @@ describe('processFlexChargeStatementGeneration', () => {
     await enablePlatform()
     const a = await seedAccount({ status: 'suspended' })
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-05-15T00:00:00Z' })
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.accounts_scanned).toBe(1)
     expect(r.statements_created).toBe(1)
   })
@@ -388,7 +401,7 @@ describe('processFlexChargeStatementGeneration', () => {
     await enablePlatform()
     const a = await seedAccount({ status: 'disqualified' })
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-05-15T00:00:00Z' })
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.accounts_scanned).toBe(0)
   })
 
@@ -396,11 +409,11 @@ describe('processFlexChargeStatementGeneration', () => {
     await enablePlatform()
     const a = await seedAccount()
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-05-15T00:00:00Z' })
-    await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     // Add another pending so the re-run gets past the no-pending bail.
     await seedTx({ accountId: a.accountId, amount: 30, createdAt: '2026-05-22T00:00:00Z' })
 
-    const r = await processFlexChargeStatementGeneration(new Date(Date.UTC(2026, 5, 1)))
+    const r = await processFlexChargeStatementGeneration(JUNE_1_NOON_PHOENIX)
     expect(r.accounts_scanned).toBe(1)
     expect(r.statements_created).toBe(0)
     expect(r.skipped_no_pending).toBe(1)

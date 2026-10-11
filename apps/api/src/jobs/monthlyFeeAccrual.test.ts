@@ -169,4 +169,15 @@ describe('processMonthlyFeeAccrual', () => {
     )
     expect(accrual.rows[0].n).toBe('0')
   })
+
+  // S654: the month comes from the Phoenix calendar. 1 am UTC on Oct 1 is
+  // 6 pm Sep 30 in Phoenix, so a run then accrues September, not October.
+  it('a run on the evening of Sep 30 in Phoenix accrues September', async () => {
+    const stack = await buildManagerStack({ flatMonthlyFee: 50, perUnitFee: 0 })
+    const result = await processMonthlyFeeAccrual(new Date('2026-10-01T01:00:00Z'))
+    expect(result.monthScanned).toBe('2026-09-01')
+    const accrual = await db.query<{ accrual_month: string }>(
+      `SELECT accrual_month::text FROM monthly_fee_accruals WHERE property_id=$1`, [stack.propertyId])
+    expect(accrual.rows.map((r) => r.accrual_month)).toEqual(['2026-09-01'])
+  })
 })

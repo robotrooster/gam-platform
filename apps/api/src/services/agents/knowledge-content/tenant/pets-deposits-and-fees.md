@@ -30,9 +30,9 @@ them rather than assuming a typical amount, because there isn't one.
 
 ## If a pet is causing a problem
 
-A neighbour's animal — barking, mess, an animal somewhere it shouldn't be — is a
+A neighbor's animal — barking, mess, an animal somewhere it shouldn't be — is a
 complaint, filed under **pets**, and goes to your landlord. See *Reporting a
-problem with a neighbour, a pet, parking, or the property*.
+problem with a neighbor, a pet, parking, or the property*.
 
 ## Assistance animals
 

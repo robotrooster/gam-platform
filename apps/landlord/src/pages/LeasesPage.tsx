@@ -1,15 +1,17 @@
-import { useState, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useState, useEffect, Fragment } from 'react'
+import type React from 'react'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
-import { apiGet, apiPost } from '../lib/api'
-import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play } from 'lucide-react'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, ArrowRight } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
-import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
+import { NewLeaseForEveryoneModal } from '../components/NewLeaseForEveryoneModal'
+import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
 import { usePerms } from '../lib/permissions'
-import { PropertySelect } from '../components/ListControls'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -39,7 +41,6 @@ export function LeasesPage() {
   const [editingLeaseId, setEditingLeaseId] = useState<string | undefined>(undefined)
   // S511 #15: confirmed leases open read-only (terms locked once signed); only
   // needs-review imports open editable so the owner can confirm defaults.
-  const [viewOnly, setViewOnly] = useState(false)
   const [carriedLease, setCarriedLease] = useState<any | null>(null)
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
@@ -50,13 +51,31 @@ export function LeasesPage() {
   // lease." Separate state from Bill fee, which bills a fee the lease already
   // carries.
   const [chargeLease, setChargeLease] = useState<any | null>(null)
+  const [moveLease, setMoveLease] = useState<any | null>(null)
+  // S653: "they're leaving on…" — a desk mark, never on the document.
+  const [leavingLease, setLeavingLease] = useState<LeavingLease | null>(null)
+  // S653: how much paid-ahead credit a month may use.
+  const [drawLease, setDrawLease] = useState<any | null>(null)
+  // 10/4 (decisions #46.4): "They never moved in — end the lease".
+  const [neverMovedInLease, setNeverMovedInLease] = useState<any | null>(null)
+  // Fix pass 2 (review): why the window opened when it opened from Discard
+  // (a tenant signed since the list was read) — shown once, in the window;
+  // cleared when the window closes, so no other door shows it.
+  const [neverMovedInNote, setNeverMovedInNote] = useState<string | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
-  const [propertyId, setPropertyId] = useState('')
+  // S655: the park-wide sender — a new lease for every household at a property.
+  const [everyoneAt, setEveryoneAt] = useState<{ id: string; name: string } | null>(null)
+  // S652 (Nic): "the leases page should be broken down like the sign page
+  // where each property is a menu and when you click on it it drops down
+  // everything for that." One folder per property, closed until opened; the
+  // property dropdown is gone because the folders ARE the filter.
+  const [openProps, setOpenProps] = useState<Set<string>>(() => new Set())
+  const toggleProp = (id: string) => setOpenProps(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
   const leasesQc = useQueryClient()
@@ -70,7 +89,10 @@ export function LeasesPage() {
   )
   const { can } = usePerms()
 
-  // Deep-link: ?open=<leaseId> opens the edit modal directly
+  // Deep-link: ?open=<leaseId> opens the lease DETAILS. S653 (Nic): "You
+  // should not be able to edit a lease in any way, shape, or form from a screen
+  // like that." The edit form is gone — a lease changes only through a signed
+  // document (addendum, renewal, new lease).
   useEffect(() => {
     const openId = searchParams.get('open')
     if (openId && !modalOpen) {
@@ -116,28 +138,47 @@ export function LeasesPage() {
   // opens the editable confirm form for staff who can edit — that row is
   // flagged for action, not reading. Lease details moved to the Details
   // row button.
-  const openLease = (l: any) => {
-    if (l.needsReview && can('leases.edit')) {
-      setViewOnly(false)
-      setEditingLeaseId(l.id)
-      setModalOpen(true)
-      return
+  // S640: discard an unsigned draft. Soft — the row stays, marked canceled.
+  const discardDraft = async (l: any) => {
+    const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
+    if (!await appConfirm(
+      `The unsigned draft lease${where ? ` for ${where}` : ''} will be canceled. `
+      + 'It stays on record. A signing link already sent for it stops working, and nothing new is sent to anyone.',
+      { title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true },
+    )) return
+    try {
+      await apiPost(`/leases/${l.id}/discard`, {})
+      toast('Draft discarded.')
+      refreshAfterLeaseClose(leasesQc)
+    } catch (e: any) {
+      // Fix pass 2: a tenant signed since this list was read — it is no
+      // longer an unsigned draft. Nothing was changed; the list reads again in
+      // place and "They never moved in — end the lease" opens, which shows
+      // exactly what would be zeroed before anything is.
+      if (e?.response?.status === 409 && e?.response?.data?.code === 'tenant_signed') {
+        leasesQc.invalidateQueries('leases')
+        setNeverMovedInNote(DISCARD_BECAME_SIGNED_NOTE)
+        setNeverMovedInLease(l)
+        return
+      }
+      // Fix pass 3: any other refusal (the landlord signed since the list was
+      // read — 409 'landlord_signed' — or it is no longer a draft) reads the
+      // list again in place, so the row redraws with the right button ("Void
+      // on the GoldSign page") instead of a Discard every press of which fails.
+      const status = e?.response?.status
+      if (status === 400 || status === 409) leasesQc.invalidateQueries('leases')
+      toast.error(e?.response?.data?.error || 'Could not discard that draft. Nothing changed. Try again.')
     }
-    if (can('leases.view_pdf')) {
-      navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)
-      return
-    }
-    openDetails(l)
   }
+
   const openDetails = (l: any) => {
-    setViewOnly(!l.needsReview || !can('leases.edit'))
+    // S639/S653: always read-only — the edit form no longer exists.
     setEditingLeaseId(l.id)
     setModalOpen(true)
   }
   const closeModal = () => {
     setModalOpen(false)
     setEditingLeaseId(undefined)
-    setViewOnly(false)
     if (searchParams.get('open')) {
       searchParams.delete('open')
       setSearchParams(searchParams, { replace: true })
@@ -148,7 +189,21 @@ export function LeasesPage() {
   // force (active + pending). Expired/terminated history stays reachable
   // behind the toggle, not mixed into the default list.
   const [showHistory, setShowHistory] = useState(false)
+  // S652 (Nic): a row opens the PACKET — every document signed with this lease —
+  // not one PDF. "I click on his name and it would expand a little bit
+  // underneath his name and show all the documents."
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const currentLeases = (leases as any[]).filter(l => l.status === 'active' || l.status === 'pending')
+  // S655: a NEW LEASE the landlord has signed for a household already living
+  // here, keyed by the lease it follows — shown on that lease's row ("New lease
+  // Nov 1 · not signed yet"), whatever order the rows are in.
+  const newLeaseFor = new Map<string, any>()
+  for (const l of leases as any[]) {
+    if (l.supersedesLeaseId && l.signedByLandlord && (l.status === 'pending' || l.status === 'active')) {
+      newLeaseFor.set(l.supersedesLeaseId, l)
+    }
+  }
+  const shortDate = (d: any) => new Date(String(d).slice(0, 10) + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
   // S536: count over CURRENT leases (matches the dashboard alert and the
   // default table) — a needs_review flag on an expired lease shouldn't
   // inflate a banner above rows that aren't shown.
@@ -179,9 +234,24 @@ export function LeasesPage() {
   // it — one control, and it answers the question the landlord actually asks
   // of this page ("show me this park"). Options derive from the full lease set
   // so the History toggle never changes what the dropdown offers.
-  const propertyOptions = (leases as any[]).map(l => ({ id: l.propertyId, name: l.propertyName }))
-  const displayLeases = visibleLeases.filter((l: any) =>
-    propertyId === '' || l.propertyId === propertyId)
+  const displayLeases = visibleLeases
+  // Folders in property-name order; leases inside keep the page's own order.
+  const groups: Array<{ id: string; name: string; leases: any[] }> = []
+  for (const l of displayLeases as any[]) {
+    const id = l.propertyId || 'none'
+    let g = groups.find(x => x.id === id)
+    if (!g) { g = { id, name: l.propertyName || 'No property', leases: [] }; groups.push(g) }
+    g.leases.push(l)
+  }
+  groups.sort((a, b) => a.name.localeCompare(b.name))
+  // S652 (Nic): "it needs to be sorted in space number order, not just signing
+  // order." RV 2 before RV 10 — numbers read as numbers.
+  for (const g of groups) {
+    g.leases.sort((a: any, b: any) =>
+      String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true, sensitivity: 'base' }))
+  }
+  // A single-property account has nothing to fold — its one folder starts open.
+  const singleFolder = groups.length === 1
 
   return (
     <div>
@@ -224,7 +294,7 @@ export function LeasesPage() {
           <AlertTriangle size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
           <div>
             <strong style={{ color: 'var(--amber)' }}>{needsReviewCount} lease{needsReviewCount === 1 ? '' : 's'} need review.</strong>
-            {' '}These were imported with default values. Click a row to review and confirm.
+            {' '}These were imported with default values. Click a row to review and confirm, or Discard one that should never have existed.
           </div>
           <span style={{ marginLeft: 'auto', fontSize: '.78rem', fontWeight: 600, color: 'var(--amber)', flexShrink: 0 }}>
             {reviewOnly ? 'Show all leases' : 'View →'}
@@ -238,10 +308,6 @@ export function LeasesPage() {
           <button className="btn btn-ghost btn-sm" onClick={() => { searchParams.delete('expiring'); setSearchParams(searchParams) }}>Show all leases</button>
         </div>
       )}
-
-      <div className="filter-bar">
-        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
-      </div>
 
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
@@ -261,7 +327,32 @@ export function LeasesPage() {
               </tr>
             </thead>
             <tbody>
-              {displayLeases.length ? displayLeases.map((l: any) => {
+              {displayLeases.length ? groups.flatMap(g => {
+                const isOpen = singleFolder || openProps.has(g.id)
+                const active = g.leases.filter((l: any) => l.status === 'active').length
+                const folder = (
+                  <tr key={`folder-${g.id}`} onClick={() => toggleProp(g.id)} className="row-clickable"
+                      style={{ cursor: 'pointer', background: 'var(--bg-2)' }}>
+                    <td colSpan={8} style={{ fontWeight: 700, padding: '12px 16px' }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        {isOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                        {g.name}
+                        <span style={{ fontWeight: 400, fontSize: '.78rem', color: 'var(--text-3)' }}>
+                          {g.leases.length} lease{g.leases.length === 1 ? '' : 's'}{active !== g.leases.length ? ` · ${active} active` : ''}
+                        </span>
+                      </span>
+                      {/* S655: a new lease for every household here, starting one date. */}
+                      {can('leases.create') && active > 0 && g.id !== 'none' && (
+                        <button className="btn btn-primary btn-sm" style={{ float: 'right', padding: '3px 10px', fontSize: '.72rem' }}
+                          onClick={e => { e.stopPropagation(); setEveryoneAt({ id: g.id, name: g.name }) }}>
+                          New lease for everyone…
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+                if (!isOpen) return [folder]
+                return [folder, ...g.leases.map((l: any) => {
                 // S527 fix: the API returns a tenants[] array (multi-tenant
                 // lease model); the old flat tenantFirst/tenantLast fields
                 // were never sent, so this column rendered "—" for every
@@ -273,13 +364,18 @@ export function LeasesPage() {
                     + (activeTenants.length > 1 ? ` +${activeTenants.length - 1}` : '')
                   : '—'
                 return (
+                  <Fragment key={l.id}>
                   <tr
-                    key={l.id}
-                    onClick={() => openLease(l)}
+                    onClick={() => setExpandedId(id => id === l.id ? null : l.id)}
                     style={{ cursor: 'pointer' }}
                     className="row-clickable"
                   >
-                    <td className="mono">{l.unitNumber || '—'}</td>
+                    <td className="mono">
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {expandedId === l.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        {l.unitNumber || '—'}
+                      </span>
+                    </td>
                     <td>
                       {tenantName}
                       {/* S609 (Nic): autopay VISIBILITY only. Knowing a payment
@@ -329,10 +425,12 @@ export function LeasesPage() {
                           Review
                         </span>
                       )}
-                      {/* S526: auto-drafted from a 30+/7+ day reservation. */}
+                      {/* 10/5 (Nic, R3): drafted from a long stay because a lease was
+                          chosen for it (by the guest online, or the front counter) —
+                          never automatically any more. */}
                       {l.leaseSource === 'booking_draft' && (
                         <span
-                          title="Drafted automatically from a long-stay reservation — attach the tenant and complete the terms"
+                          title="Drafted from a long-stay reservation when a lease was chosen for it — attach the tenant, check the terms and send it for signature"
                           style={{
                             display: 'inline-flex',
                             alignItems: 'center',
@@ -378,9 +476,57 @@ export function LeasesPage() {
                       {l.isHibernating && (
                         <span className="badge badge-amber" title="Seasonally paused — no rent billed, deposit held, spot bookable off-season" style={{ marginLeft: 4 }}>Hibernating</span>
                       )}
+                      {l.status === 'active' && l.moveOutNoticeAt && l.endDate && (
+                        <span className="badge badge-gold" title={l.moveOutNoticeNote ? `They said: ${l.moveOutNoticeNote}` : 'Written down at the front desk'} style={{ marginLeft: 4 }}>
+                          Leaving {new Date(l.endDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                        </span>
+                      )}
+                      {/* S655: the household's new lease, on the lease it follows. */}
+                      {newLeaseFor.has(l.id) && (() => {
+                        const n = newLeaseFor.get(l.id)
+                        // The server's call (new_lease_wont_start): this lease ended
+                        // early and nobody signed the new one — it never takes over.
+                        if (n.newLeaseWontStart) {
+                          return (
+                            <span className="badge badge-muted" style={{ marginLeft: 4 }}
+                              title="This lease ended early and nobody in the household signed the new lease that was to follow it, so that new lease never starts. It is canceled automatically — nothing to do.">
+                              New lease will be canceled
+                            </span>
+                          )
+                        }
+                        return (
+                          <span className="badge badge-gold" style={{ marginLeft: 4 }}
+                            title={`New lease at ${fmt(n.rentAmount)} a month. This lease carries on at today's rent until the day before it starts.${n.signedByTenant ? '' : ' The tenant has not signed it yet — it takes over on its date either way.'}`}>
+                            New lease {shortDate(n.startDate)}{n.signedByTenant ? '' : ' · tenant has not signed'}
+                          </span>
+                        )
+                      })()}
+                      {l.supersedesLeaseId && l.signedByLandlord && l.status === 'pending' && (l.newLeaseWontStart ? (
+                        <span className="badge badge-muted" style={{ marginLeft: 4 }}
+                          title="The lease before it ended early and nobody in the household signed this one, so it never takes over. It is canceled automatically. If money was already paid on it, it waits until that money is returned — GAM has been told; to speed it up, email support@goldassetmanagement.com.">
+                          Will be canceled — the lease before it ended early
+                        </span>
+                      ) : (
+                        <span className="badge badge-amber" style={{ marginLeft: 4 }}
+                          title="A new lease for a household already living here. It takes over on its start date whether or not they have signed.">
+                          Starts {shortDate(l.startDate)}{l.signedByTenant ? '' : ' · tenant has not signed'}
+                        </span>
+                      ))}
+                      {l.supersedesLeaseId && l.signedByLandlord && l.status === 'active' && !l.signedByTenant && (
+                        <span className="badge badge-amber" style={{ marginLeft: 4 }}
+                          title="This new lease is in force and billing; it stays open for the tenant's signature.">
+                          Tenant has not signed
+                        </span>
+                      )}
                     </td>
                     <td onClick={e => e.stopPropagation()}>
-                      <div style={{ display: 'flex', gap: 6 }}>
+                      {/* S652 (Nic): "this page just feels like it has too much
+                          information" — eight buttons ran off the right edge.
+                          Three now: Details, one Charge menu (fee, one-off
+                          amount, recurring add-on or rent change, carried
+                          balance), one Change menu (move spot, move out,
+                          hibernate / resume). A draft keeps its Discard. */}
+                      <div style={{ display: 'flex', gap: 6, position: 'relative' }}>
                         <button
                           className="btn btn-ghost btn-sm"
                           title="Lease details (terms, fees, addendum history)"
@@ -389,77 +535,130 @@ export function LeasesPage() {
                         >
                           <Eye size={12} /> Details
                         </button>
-                        {can('leases.bill_fee') && l.status === 'active' && (
+                        {/* Fix pass 2: which button a waiting lease shows follows the
+                            server's own "who signed" test (tenantSignedAny /
+                            anyoneSigned — the one Discard uses), never
+                            signedByTenant, which is set only once EVERYONE signed. */}
+                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && !tenantSigned(l) && !anyoneSigned(l) && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            title="Bill the tenant a one-off fee on this lease"
-                            onClick={() => setBillFeeLease(l)}
+                            title="Discard this unsigned draft — it stays on record as canceled"
+                            onClick={() => discardDraft(l)}
                             style={{ padding: '3px 8px' }}
                           >
-                            <FileText size={12} /> Bill fee
+                            <X size={12} /> Discard
                           </button>
                         )}
-                        {can('leases.bill_fee') && l.status === 'active' && (
+                        {/* Signed only by the landlord (S647: their signature issued
+                            it): the way out is voiding its document, which takes the
+                            lease and its bill back and tells the tenant. */}
+                        {can('esign.void') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && !tenantSigned(l) && anyoneSigned(l) && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            title="Charge this tenant a one-off amount — parking violation, damage, anything not in the lease"
-                            onClick={() => setChargeLease(l)}
+                            title="You signed this lease and the tenant hasn’t yet. Void its document on the GoldSign page — that takes the lease and its bill back and tells the tenant."
+                            onClick={() => navigate('/esign')}
                             style={{ padding: '3px 8px' }}
                           >
-                            <FileText size={12} /> Charge
+                            Void on the GoldSign page <ArrowRight size={12} />
                           </button>
                         )}
-                        {/* S605 (Nic): arrears from the landlord's previous
-                            system. Sits beside Bill fee because it is the same
-                            act — a landlord adding a charge — but it is entered
-                            ONCE per lease at migration, not recurring. */}
-                        {can('leases.bill_fee') && l.status === 'active' && (
+                        {/* 10/4 (decisions #46.4): a lease a tenant signed can't be
+                            discarded or voided — if they never came, this zeroes their
+                            unpaid move-in bill and ends it, showing exactly what first
+                            (decisions #53: a later bill stays owed). */}
+                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft')
+                          && !(l.supersedesLeaseId && l.signedByLandlord) && tenantSigned(l) && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            title="Record a balance this tenant already owed before moving onto GAM"
-                            onClick={() => setCarriedLease(l)}
+                            title="A tenant signed but they never moved in — zero their unpaid move-in bill and end the lease (shows exactly what first)"
+                            onClick={() => setNeverMovedInLease(l)}
                             style={{ padding: '3px 8px' }}
                           >
-                            <FileText size={12} /> Carried balance
+                            <X size={12} /> They never moved in — end the lease
                           </button>
                         )}
-                        {can('leases.create') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Add a recurring charge (parking, storage) or change the rent — as an agreement the tenant signs, or a notice you issue. Takes effect on the date you set."
-                            onClick={() => setAddonLease(l)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <DollarSign size={12} /> Add-on / rent change
-                          </button>
+                        {l.status === 'active' && (can('leases.bill_fee') || can('leases.create')) && (
+                          <RowMenu label={<><DollarSign size={12} /> Charge</>} items={[
+                            ...(can('leases.bill_fee') ? [
+                              { label: 'Bill a fee', hint: 'A one-off fee from this lease\'s fee schedule', onClick: () => setBillFeeLease(l) },
+                              { label: 'Charge an amount', hint: 'Anything not in the lease — damage, a violation', onClick: () => setChargeLease(l) },
+                            ] : []),
+                            ...(can('leases.create') ? [
+                              { label: 'Recurring add-on or rent change', hint: 'Parking, storage, a new rent — as an agreement or a notice', onClick: () => setAddonLease(l) },
+                            ] : []),
+                            ...(can('leases.bill_fee') ? [
+                              { label: 'Carried balance', hint: 'What they already owed before GAM', onClick: () => setCarriedLease(l) },
+                            ] : []),
+                          ]} />
                         )}
-                        {can('leases.deposit_return') && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="Process move-out / deposit return"
-                            onClick={() => navigate(`/leases/${l.id}/deposit-return`)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <DollarSign size={12} /> Move-out
-                          </button>
-                        )}
-                        {can('leases.edit') && l.status === 'active' && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title={l.isHibernating
-                              ? 'Resume this seasonal lease — restart billing'
-                              : 'Hibernate for the off-season — pause billing, hold the spot, deposit stays. Snowbirds.'}
-                            disabled={hibernateMut.isLoading}
-                            onClick={() => hibernateMut.mutate({ id: l.id, action: l.isHibernating ? 'resume' : 'hibernate' })}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            {l.isHibernating ? <><Play size={12} /> Resume</> : <><Pause size={12} /> Hibernate</>}
-                          </button>
+                        {(can('leases.edit') || can('leases.deposit_return') || can('front_desk.mark_leaving') || can('leases.create') || can('leases.terminate')) && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                          <RowMenu label={<><ArrowRight size={12} /> Change</>} items={[
+                            // S655: a new lease from a date — month-to-month included.
+                            // Never on a stay booked at the front desk (a guest's
+                            // stay, changed from the booking). A signed fixed term
+                            // runs to its end, so its new lease starts the day after
+                            // or later — later, and the household stays on this one
+                            // at today's rent until then (never a gap). One already
+                            // holding over past its signed end is past its term: its
+                            // new lease can start on any day of the holdover.
+                            ...(can('leases.create') && l.status === 'active' && l.leaseSource !== 'booking_draft' ? [
+                              newLeaseFor.has(l.id)
+                                ? { label: 'New lease — view or cancel', hint: `Starts ${shortDate(newLeaseFor.get(l.id).startDate)}`, onClick: () => setRenewalLeaseId(l.id) }
+                                : { label: 'New lease from a date…',
+                                    hint: l.endDate && l.leaseType !== 'month_to_month' && l.holdoverSignedEndDate
+                                      ? `New rent or terms — the signed term ended ${shortDate(l.holdoverSignedEndDate)}; this lease runs until the new one starts`
+                                      : l.endDate && l.leaseType !== 'month_to_month'
+                                      ? `New rent or terms — from the day after this lease ends (${shortDate(l.endDate)}) or later`
+                                      : 'New rent or terms — this lease runs until the new one starts',
+                                    onClick: () => setRenewalLeaseId(l.id) },
+                            ] : []),
+                            ...((can('leases.edit') || can('front_desk.mark_leaving')) && l.status === 'active' ? [
+                              l.moveOutNoticeAt
+                                ? { label: 'Leaving date — change or call off', hint: `On file: ${new Date(l.endDate).toLocaleDateString()}`, onClick: () => setLeavingLease(toLeaving(l, tenantName)) }
+                                : { label: 'They\'re leaving on…', hint: 'Write down the day they said; the final read and move-out follow', onClick: () => setLeavingLease(toLeaving(l, tenantName)) },
+                            ] : []),
+                            ...(can('leases.edit') && l.status === 'active' ? [
+                              { label: 'Move to another space', hint: 'Same lease, same rent, same terms', onClick: () => setMoveLease(l) },
+                            ] : []),
+                            ...((can('leases.edit') || can('take_payment')) && l.status === 'active' ? [
+                              { label: 'Credit draw per month…', hint: l.prepaidMonthlyDraw ? `Uses ${fmt(l.prepaidMonthlyDraw)} of their paid-ahead money each month` : 'How much paid-ahead money each bill may use', onClick: () => setDrawLease(l) },
+                            ] : []),
+                            ...(can('leases.deposit_return') ? [
+                              { label: 'Move out', hint: 'Move-out and deposit return', onClick: () => navigate(`/leases/${l.id}/deposit-return`) },
+                            ] : []),
+                            // 10/4 (decisions #46.4): the scheduler makes a lease
+                            // active on its start date whether or not anyone came.
+                            ...(can('leases.terminate') && l.status === 'active' ? [
+                              { label: 'They never moved in — end the lease', hint: 'Zero their unpaid move-in bill and end it — shows exactly what first', onClick: () => setNeverMovedInLease(l) },
+                            ] : []),
+                            // Step 9 final fix (fix pass 1): a lease that ended with a
+                            // bill nothing was ever paid on still owed (the server's
+                            // endedBillOpen) — zero what is left, never "nothing to do".
+                            ...(can('leases.terminate') && (l.status === 'expired' || l.status === 'terminated') && l.endedBillOpen === true ? [
+                              { label: 'They never moved in — zero the bill', hint: 'The lease ended with its bill still owed — shows exactly what would be zeroed first', onClick: () => setNeverMovedInLease(l) },
+                            ] : []),
+                            ...(can('leases.edit') && l.status === 'active' ? [
+                              l.isHibernating
+                                ? { label: 'Resume from hibernation', hint: 'Restart billing', onClick: () => hibernateMut.mutate({ id: l.id, action: 'resume' }) }
+                                : { label: 'Hibernate for the season', hint: 'Pause billing, hold the spot, deposit stays', onClick: () => hibernateMut.mutate({ id: l.id, action: 'hibernate' }) },
+                            ] : []),
+                          ]} />
                         )}
                       </div>
                     </td>
                   </tr>
+                  {expandedId === l.id && (
+                    <tr>
+                      <td colSpan={8} style={{ background: 'var(--bg-2)', padding: '10px 16px 14px' }} onClick={e => e.stopPropagation()}>
+                        <LeasePacket lease={l} canViewPdf={can('leases.view_pdf')} />
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 )
+              })]
               }) : (
                 <tr>
                   <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
@@ -476,21 +675,32 @@ export function LeasesPage() {
           disabled inputs). The editable needs-review confirm path keeps the
           full form. */}
       {renewalLeaseId && <RenewalDecisionModal leaseId={renewalLeaseId} onClose={closeRenewal} />}
-      {modalOpen && (viewOnly && editingLeaseId ? (
+      {everyoneAt && <NewLeaseForEveryoneModal propertyId={everyoneAt.id} propertyName={everyoneAt.name} onClose={() => setEveryoneAt(null)} />}
+      {modalOpen && editingLeaseId && (
         <LeaseOverviewModal leaseId={editingLeaseId} onClose={closeModal} />
-      ) : (
-        <LeaseFormModal
-          onClose={closeModal}
-          leaseId={editingLeaseId}
-          readOnly={viewOnly}
-        />
-      ))}
+      )}
 
       {billFeeLease && (
         <BillFeeModal
           lease={billFeeLease}
           onClose={() => setBillFeeLease(null)}
         />
+      )}
+      {moveLease && (
+        <MoveSpotModal
+          lease={moveLease}
+          onClose={() => setMoveLease(null)}
+        />
+      )}
+      {leavingLease && (
+        <LeavingModal lease={leavingLease} onClose={() => setLeavingLease(null)} />
+      )}
+      {drawLease && (
+        <PrepaidDrawModal lease={drawLease} onClose={() => setDrawLease(null)} />
+      )}
+      {neverMovedInLease && (
+        <NeverMovedInModal lease={neverMovedInLease} note={neverMovedInNote}
+          onClose={() => { setNeverMovedInLease(null); setNeverMovedInNote(null) }} />
       )}
       {chargeLease && (
         <OneOffChargeModal
@@ -988,6 +1198,702 @@ function CarriedBalanceModal({ lease, onClose }: { lease: any; onClose: () => vo
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * S641 (Nic) — move a resident to a different space.
+ *
+ *   "Moving sites at an RV park is very common, especially when somebody with a
+ *    nice shade tree leaves and somebody else wants to take that spot. I don't
+ *    wanna have to terminate their lease, send them a new lease for the new
+ *    spot, etcetera. I want to just be able to move them in the system and say,
+ *    as of this date, they moved from this spot to this spot."
+ *
+ * The screen says plainly what does NOT change, because the fear it is
+ * answering is that moving somebody means redoing their paperwork. And it ends
+ * on the meters, since a move only bills correctly if somebody reads both.
+ */
+function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [toUnitId, setToUnitId] = useState('')
+  const [movedOn, setMovedOn] = useState(() => new Date().toISOString().slice(0, 10))
+  const [reason, setReason] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+  const [done, setDone] = useState<any>(null)
+  // S652 (Nic): "moving somebody in the system should initiate two meter
+  // reads… it needs to happen at the time of move." The numbers are asked for
+  // here, before the Move button lights, and travel with the move.
+  const [readValues, setReadValues] = useState<Record<string, string>>({})
+
+  // Only spaces at the SAME property — a resident moving parks is a new
+  // tenancy, not a move.
+  const { data: units = [] } = useQuery<any[]>(
+    ['units-for-move', lease.propertyId],
+    () => apiGet(`/units?propertyId=${lease.propertyId}`),
+    { enabled: !!lease.propertyId })
+  const { data: needed = [], isFetching: loadingReads } = useQuery<any[]>(
+    ['move-reads', lease.id, toUnitId],
+    () => apiGet(`/leases/${lease.id}/move-reads?toUnitId=${toUnitId}`),
+    { enabled: !!toUnitId })
+
+  const open = (units as any[]).filter(u =>
+    u.id !== lease.unitId && ['vacant', 'available'].includes(String(u.status)))
+    .sort((a, b) => String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true, sensitivity: 'base' }))
+  const allRead = (needed as any[]).every(m => (readValues[m.meterId] ?? '') !== '')
+
+  const move = useMutation(
+    () => apiPost(`/leases/${lease.id}/move`, {
+      toUnitId, movedOn, reason: reason.trim() || null,
+      reads: (needed as any[]).map(m => ({ meterId: m.meterId, value: Number(readValues[m.meterId]) })),
+    }),
+    {
+      onSuccess: (r: any) => {
+        setDone(r?.data ?? r)
+        qc.invalidateQueries('leases')
+        qc.invalidateQueries('units')
+        qc.invalidateQueries('utility-meters')
+      },
+      onError: (e: any) =>
+        setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not move them.'),
+    })
+
+  if (done) {
+    const n = (done.closingReadsNeeded?.length ?? 0) + (done.openingReadsNeeded?.length ?? 0)
+    return (
+      <div className="modal-overlay" onClick={onClose}>
+        <div className="modal" style={{ maxWidth: 470 }} onClick={e => e.stopPropagation()}>
+          <div className="modal-header">
+            <span className="modal-title" style={{ marginBottom: 0 }}>Moved</span>
+            <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+          </div>
+          <p style={{ fontSize: '.86rem', color: 'var(--text-1)' }}>
+            Their tenancy continues unchanged — same lease, same rent, same terms.
+            {n > 0 ? ` ${n} meter reading${n === 1 ? '' : 's'} recorded for ${done.movedOn}.` : ' No submeters on either space, so there was nothing to read.'}
+          </p>
+          <div className="modal-footer">
+            <button className="btn btn-primary" onClick={onClose}>Done</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 470 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Move to another space</span>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12 }}>
+          {lease.tenantName || 'This resident'} is in <strong>{lease.unitNumber}</strong>. Their lease,
+          rent and terms all stay exactly as they are — only the space changes.
+        </div>
+
+        <div style={{ display: 'grid', gap: 10 }}>
+          <label>
+            <div className="form-label">MOVE TO</div>
+            <select className="input" style={{ width: '100%' }} value={toUnitId}
+              onChange={e => { setToUnitId(e.target.value); setReadValues({}) }}>
+              <option value="">Choose a space…</option>
+              {open.map(u => <option key={u.id} value={u.id}>{u.unitNumber}</option>)}
+            </select>
+            {open.length === 0 && (
+              <div style={{ fontSize: '.72rem', color: 'var(--amber)', marginTop: 4 }}>
+                Nothing vacant at this property right now.
+              </div>
+            )}
+          </label>
+          <label>
+            <div className="form-label">AS OF</div>
+            <input type="date" className="input" style={{ width: '100%' }}
+              value={movedOn} onChange={e => setMovedOn(e.target.value)} />
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+              The day they actually change spaces. Utilities split on this date.
+            </div>
+          </label>
+          <label>
+            <div className="form-label">WHY (OPTIONAL)</div>
+            <input className="input" style={{ width: '100%' }} value={reason}
+              placeholder="Pedestal failed / wanted the shade"
+              onChange={e => setReason(e.target.value)} />
+          </label>
+          {toUnitId && (needed as any[]).length > 0 && (
+            <div className="alert" style={{ borderColor: 'var(--gold)', fontSize: '.82rem' }}>
+              <strong>Meter readings as of {movedOn}</strong> — closing on the space they leave, opening on
+              the space they take. Both are required: without them the month bills as one blended charge.
+              <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+                {(needed as any[]).map((m: any) => (
+                  <div key={m.meterId} style={{ fontSize: '.8rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{ flex: 1 }}>{m.label} <span style={{ color: 'var(--text-3)' }}>— {m.kind}</span></span>
+                      <input className="input mono" type="text" inputMode="numeric" autoComplete="off"
+                        value={readValues[m.meterId] ?? ''} placeholder="meter face"
+                        onChange={e => setReadValues(v => ({ ...v, [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, Number(m.digits) || 9) }))}
+                        style={{ width: 150, letterSpacing: '.08em' }} />
+                    </label>
+                    {/* S652 (Nic): the last reading on file, so an empty space
+                        doesn't need a walk. Offered as a one-tap only on the
+                        space they are moving INTO — the one they leave has
+                        been in use and has to be read. */}
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                      {m.lastValue != null
+                        ? <>Last on file: <span className="mono" style={{ color: 'var(--text-1)' }}>{String(m.lastValue).padStart(Number(m.digits) || 5, '0')}</span> on {new Date(m.lastDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</>
+                        : <>No reading on file for this meter yet.</>}
+                      {m.kind === 'opening' && m.lastValue != null && (
+                        <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '0 8px', fontSize: '.7rem' }}
+                          onClick={() => setReadValues(v => ({ ...v, [m.meterId]: String(m.lastValue) }))}>
+                          Nobody's been there — use it
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {toUnitId && !loadingReads && (needed as any[]).length === 0 && (
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>No submeters on either space — nothing to read.</div>
+          )}
+        </div>
+
+        {err && <div style={{ fontSize: '.78rem', color: 'var(--red)', marginTop: 10 }}>{err}</div>}
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!toUnitId || loadingReads || !allRead || move.isLoading}
+            onClick={() => { setErr(null); move.mutate() }}>
+            {move.isLoading ? 'Moving…' : 'Move'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S652 (Nic): "I only wanted to see that package — what was sent to who when
+// you expand their name, and what they got and what they signed." Every
+// document drafted with this lease, when it went out, and each signer's
+// answer. Nothing else lives here.
+function LeasePacket({ lease, canViewPdf }: { lease: any; canViewPdf: boolean }) {
+  const navigate = useNavigate()
+  const { data: docs = [], isLoading } = useQuery<any[]>(['lease-packet', lease.id], () => apiGet(`/leases/${lease.id}/documents`))
+  const open = (src: string, title: string) =>
+    navigate(`/view?src=${encodeURIComponent(src.replace(/^\/api/, ''))}&title=${encodeURIComponent(title)}`)
+  const day = (d: string | null) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null
+  const [addendumOpen, setAddendumOpen] = useState(false)
+  if (isLoading) return <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Loading the packet…</div>
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+          {docs.length ? `${docs.length} document${docs.length === 1 ? '' : 's'} sent with this lease` : 'No documents were sent with this lease.'}
+        </div>
+        {/* S652 (Nic, Blu): "there is no way to add an addendum document that
+            would go into their package." From here: pick a template, it is
+            drafted onto this lease and lands in your signing queue first; the
+            tenant is invited once you have signed. */}
+        {lease.status === 'active' && (
+          <button className="btn btn-primary btn-sm" onClick={() => setAddendumOpen(true)}>Send an addendum</button>
+        )}
+      </div>
+      {addendumOpen && <SendAddendumModal lease={lease} onClose={() => setAddendumOpen(false)} />}
+      {docs.map((d: any) => {
+        const signers: any[] = d.signers || []
+        return (
+          <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '7px 10px', borderTop: '1px solid var(--border-1)', fontSize: '.8rem' }}>
+            <FileText size={14} style={{ color: d.status === 'completed' ? 'var(--green)' : 'var(--text-3)', flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.title}</div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                {d.sentAt ? `Sent ${day(d.sentAt)}` : 'Not sent yet'}
+                {signers.length > 0 && ' · ' + signers.map((s: any) =>
+                  `${s.name || humanize(s.role)}: ${s.status === 'signed' ? `signed${s.signedAt ? ' ' + day(s.signedAt) : ''}` : s.status === 'declined' ? 'declined' : 'not signed'}`).join(' · ')}
+              </div>
+            </div>
+            {canViewPdf && d.fileUrl && (
+              <button className="btn btn-ghost btn-sm" onClick={() => open(d.fileUrl, d.title)}>
+                {d.executed ? 'Open signed copy' : 'Open'}
+              </button>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// S652 (Nic): "Blue went and created an addendum as a template but how do you
+// actually go about sending that addendum?" One of the landlord's templates,
+// drafted onto this lease as an addendum. Everyone on the lease signs it (an
+// agreement), or only the landlord (a notice). It is sent the moment it is
+// drafted: the landlord signs first, and the tenant is invited after that.
+function SendAddendumModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const { data: templates = [] } = useQuery<any[]>('esign-templates', () => apiGet('/esign/templates'))
+  const usable = (templates as any[])
+    .filter((t: any) => t.purpose !== 'installment_sale' && t.purpose !== 'work_trade_addendum' && t.basePdfUrl)
+    .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
+  const [templateId, setTemplateId] = useState('')
+  const [title, setTitle] = useState('')
+  const [mode, setMode] = useState<'agreement' | 'notice'>('agreement')
+  const [error, setError] = useState<string | null>(null)
+  const chosen = usable.find((t: any) => t.id === templateId)
+  const pick = (id: string) => {
+    setTemplateId(id)
+    const t = usable.find((x: any) => x.id === id)
+    if (t) setTitle(`${t.name} — ${lease.unitNumber || ''}`.trim())
+  }
+  const mut = useMutation(
+    async () => {
+      const created: any = await apiPost('/esign/documents/addendum-terms', { leaseId: lease.id, templateId, title: title.trim(), mode })
+      await apiPost(`/esign/documents/${created.data.id}/send`, {})
+    },
+    {
+      onSuccess: () => {
+        qc.invalidateQueries(['lease-packet', lease.id]); qc.invalidateQueries('esign-documents')
+        toast(mode === 'agreement'
+          ? 'Sent. It is in your signing queue first; the tenant is invited once you have signed.'
+          : 'Sent. It is in your signing queue; the tenant receives it once you have signed.')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not send that'),
+    })
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Send an addendum</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 14 }}>
+          {lease.unitNumber ? `Unit ${lease.unitNumber}` : 'This lease'}{lease.propertyName ? ` · ${lease.propertyName}` : ''}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Template</span>
+            <select className="form-select" value={templateId} onChange={e => pick(e.target.value)} style={{ width: '100%' }}>
+              <option value="" disabled>Pick a template…</option>
+              {usable.map((t: any) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            {!usable.length && <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 4 }}>No templates yet — build one under Documents first.</div>}
+          </div>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Title on the document</span>
+            <input className="form-input" value={title} onChange={e => setTitle(e.target.value)} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 6 }}>Who signs</span>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: '.82rem', marginBottom: 6, cursor: 'pointer' }}>
+              <input type="radio" checked={mode === 'agreement'} onChange={() => setMode('agreement')} />
+              <span><b>Everyone on the lease</b> — you sign first, then each tenant.</span>
+            </label>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: '.82rem', cursor: 'pointer' }}>
+              <input type="radio" checked={mode === 'notice'} onChange={() => setMode('notice')} />
+              <span><b>Notice only</b> — you sign, the tenant receives a copy.</span>
+            </label>
+          </div>
+          {error && <div style={{ fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" disabled={!chosen || !title.trim() || mut.isLoading} onClick={() => mut.mutate()}>
+              {mut.isLoading ? 'Sending…' : 'Draft and send'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S653: what the leaving-on modal needs from a leases-table row.
+function toLeaving(l: any, tenantName: string): LeavingLease {
+  return {
+    leaseId: l.id, unitNumber: l.unitNumber, propertyName: l.propertyName, names: tenantName === '—' ? '' : tenantName,
+    startDate: l.startDate, endDate: l.endDate ? String(l.endDate).slice(0, 10) : null,
+    moveOutNoticeAt: l.moveOutNoticeAt ?? null, moveOutNoticeNote: l.moveOutNoticeNote ?? null,
+    moveOutNoticePrevEndDate: l.moveOutNoticePrevEndDate ? String(l.moveOutNoticePrevEndDate).slice(0, 10) : null,
+  }
+}
+
+// ── S653 (Nic): A MONTHLY DRAW ON PAID-AHEAD CREDIT ─────────────────────────
+// "she likes part of the tax return to be credited on her bill each month so
+// she still pays a little bit out of pocket each month." One number: the most
+// of their paid-ahead money each month's bill may use. Cleared = the credit
+// covers whole bills until it runs out.
+function PrepaidDrawModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [amount, setAmount] = useState<string>(lease.prepaidMonthlyDraw ? String(Number(lease.prepaidMonthlyDraw)) : '')
+  const [error, setError] = useState('')
+  const credit = Number(lease.prepaidCreditRemaining || 0)
+  const save = useMutation(
+    (monthlyDraw: number | null) => apiPatch(`/leases/${lease.id}/prepaid-draw`, { monthlyDraw }),
+    {
+      onSuccess: (_d, monthlyDraw) => {
+        qc.invalidateQueries('leases')
+        toast(monthlyDraw ? `Each month's bill will use up to ${fmt(monthlyDraw)} of their paid-ahead money.` : 'Their paid-ahead money now covers whole bills until it runs out.')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not save that.'),
+    })
+  const n = Number(amount)
+  const valid = amount.trim() !== '' && Number.isFinite(n) && n > 0
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Credit draw per month</span>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          <strong>{lease.unitNumber}</strong>{lease.propertyName ? <span style={{ color: 'var(--text-3)' }}> · {lease.propertyName}</span> : null}
+          <div style={{ marginTop: 6 }}>Paid ahead on account: <strong style={{ color: 'var(--gold)' }}>{fmt(credit)}</strong></div>
+        </div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 12 }}>
+          Left blank, their paid-ahead money covers each bill in full until it runs out. Enter an amount and each month's bill uses only that much of it — they pay the rest themselves, online or at the desk.
+        </div>
+        <label style={{ display: 'block', fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 12 }}>
+          Use per month
+          <input className="input" type="number" min="1" step="1" value={amount} placeholder="e.g. 200"
+            onChange={e => setAmount(e.target.value)} style={{ display: 'block', marginTop: 4, width: '100%' }} />
+        </label>
+        {valid && credit > 0 && (
+          <div style={{ fontSize: '.76rem', color: 'var(--text-2)', marginBottom: 12 }}>
+            At {fmt(n)} a month, {fmt(credit)} lasts about {Math.ceil(credit / n)} month{Math.ceil(credit / n) === 1 ? '' : 's'}.
+          </div>
+        )}
+        {error && <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{error}</div>}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {lease.prepaidMonthlyDraw && (
+            <button className="btn btn-ghost" disabled={save.isLoading} onClick={() => save.mutate(null)}>Use it all as needed</button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!valid || save.isLoading} onClick={() => save.mutate(Math.round(n * 100) / 100)}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── 10/4 (decisions #46.4, Nic): "If they never pay the deposit or never move
+// in, you would just zero it out and end the lease." ─────────────────────────
+// Staff say "they never moved in"; the window reads, fresh at the moment it
+// opens, exactly what would be zeroed (or why it can't be, with the real next
+// step), and the gold button does the one close: the unpaid MOVE-IN bill
+// zeroed and voided (decisions #53 — a later bill stays owed and is listed as
+// "Stays owed"), the lease ended. A 409 (what the lease owes changed, or money
+// arrived) reads it again in place; Cancel backs out with nothing sent.
+export type NeverMovedInPreview = {
+  applies: boolean
+  words: string | null
+  status: string | null
+  startDate: string | null
+  lines: Array<{ paymentId: string; label: string; amount: number; dueDate: string | null; utility: boolean }>
+  total: number
+  /**
+   * Step 9 final fix (fix pass 1): what stays owed — GAM's own fees (the
+   * declined-card fee, the returned-payment fee) and charges billed on purpose
+   * — never zeroed, with the server's plain words for them.
+   */
+  kept?: Array<{ paymentId: string; label: string; amount: number; why: 'gam_fee' | 'billed_charge' | 'later_bill'; dueDate?: string | null
+                  /** Fix pass 2 (review): the days a later month's rent covers. */
+                  periodStart?: string | null; periodEnd?: string | null }>
+  keptTotal?: number
+  keptWords?: string | null
+  /** The reservation canceled with the lease, in words (null when none). */
+  reservationWords?: string | null
+  /** The lease had already ended: only what is left on it is closed. */
+  alreadyEnded?: boolean
+  household?: { tenantNames: string[]; unitNumber: string | null; propertyName: string | null } | null
+}
+
+/**
+ * Fix pass 2: whether a tenant (anyone but the landlord) signed any document
+ * of this lease, and whether anyone did — the server's leaseSignedBySql, the
+ * one test Discard uses. A list from an older server without them falls back
+ * to the lease's own flags.
+ */
+export const tenantSigned = (l: any): boolean => (l.tenantSignedAny ?? l.signedByTenant) === true
+export const anyoneSigned = (l: any): boolean => (l.anyoneSigned ?? (l.signedByTenant || l.signedByLandlord)) === true
+
+/** "Oct 4, 2026" from a calendar day (YYYY-MM-DD) — never moved by a time zone. */
+const dueDay = (ymd: string) =>
+  new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+
+/** A start date more than a month before today (a calendar day — never moved by a time zone). */
+function startedOverAMonthAgo(ymd: string | null): boolean {
+  if (!ymd) return false
+  const start = new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`)
+  if (Number.isNaN(start.getTime())) return false
+  const monthLater = new Date(start)
+  monthLater.setUTCMonth(monthLater.getUTCMonth() + 1)
+  return monthLater.getTime() < Date.now()
+}
+
+/**
+ * What the window says first when Discard found a tenant had signed since the
+ * list was read (409 'tenant_signed'): why a different window opened, once.
+ */
+export const DISCARD_BECAME_SIGNED_NOTE =
+  'A tenant signed this lease since the list was read, so it can’t be discarded as an unsigned draft. Nothing was changed. ' +
+  'Ending it as never moved in is below — exactly what would be zeroed, before anything is.'
+
+/** What POST /leases/:id/never-moved-in answers (camelCased): what the close zeroed and what stays owed. */
+type NeverMovedInDone = {
+  zeroedTotal?: number
+  reservationCanceled?: boolean
+  kept?: Array<{ paymentId: string; label: string; amount: number; why: string; dueDate?: string | null }>
+  keptTotal?: number
+  keptWords?: string | null
+}
+
+/**
+ * Fix pass 3 (review): the refund sentence is true in every case — GAM's own
+ * fee (which stays owed) may have been paid, so never "Nothing was paid"
+ * while one is on the lease.
+ */
+const refundWords = (zeroedLines: number, keptLines: number): string =>
+  zeroedLines > 0 ? 'Nothing was paid toward what is zeroed, so nothing is refunded.'
+    : keptLines > 0 ? 'Nothing is refunded.'
+    : 'Nothing was paid, so nothing is refunded.'
+
+/** "Declined card fee $1.00 and Rent due Nov 1, 2026 $1,000.00" — what stays owed, by name. */
+const keptInWords = (kept: Array<{ label: string; amount: number; dueDate?: string | null }>): string => {
+  const items = kept.map(k => `${k.label}${k.dueDate ? ` due ${dueDay(k.dueDate)}` : ''} ${fmt(k.amount)}`)
+  return items.length <= 1 ? (items[0] ?? '') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
+/** Why a line stays owed, beside it on the confirm (decisions #46.4, #53). */
+const KEPT_WHY_LABEL: Record<string, string> = {
+  later_bill: 'not on the move-in bill',
+  gam_fee: 'GAM’s own fee — ending the lease never takes it off',
+  billed_charge: 'billed on purpose',
+}
+
+/**
+ * The body of the never-moved-in confirm for ONE lease: what is zeroed (the
+ * move-in bill's lines), what stays owed, the reservation canceled with it,
+ * and what else happens. One copy for the Leases page's window and the
+ * Schedule's Cancel reservation confirm (final fix, fix pass 1 — decisions
+ * #53: "Cancel reservation on the Schedule opens the same confirm").
+ */
+export function NeverMovedInBody({ d, ended }: { d: NeverMovedInPreview; ended: boolean }) {
+  const kept = d.kept ?? []
+  const keptTotal = kept.reduce((t, k) => t + Math.round(k.amount * 100), 0) / 100
+  return (
+    <div data-testid="nmi-zeroed" style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+      {startedOverAMonthAgo(d.startDate) && (
+        <div data-testid="nmi-old-lease" role="note" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--amber)', fontSize: '.8rem' }}>
+          This lease started on {dueDay(d.startDate!)} — only use this if nobody ever lived there. If they lived there, end it with a move-out instead.
+        </div>
+      )}
+      {d.lines.length > 0 ? (
+        <>
+          <div data-testid="nmi-lead" style={{ marginBottom: 8 }}>
+            {ended
+              ? 'The tenant never paid or moved in, so this zeroes their unpaid move-in bill:'
+              : 'The tenant never paid or moved in, so ending the lease zeroes their unpaid move-in bill:'}
+          </div>
+          {d.lines.map(l => (
+            <div key={l.paymentId} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '4px 0', borderBottom: '1px solid var(--border-0)' }}>
+              <span style={{ color: 'var(--text-1)' }}>
+                {l.label}{l.dueDate ? <span style={{ color: 'var(--text-3)' }}> · due {dueDay(l.dueDate)}</span> : null}
+                {l.utility ? <span style={{ color: 'var(--text-3)' }}> · goes back on hold for whoever the space is billed to next</span> : null}
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(l.amount)}</span>
+            </div>
+          ))}
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', fontWeight: 600, color: 'var(--text-0)' }}>
+            <span>No longer owed</span><span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(d.total)}</span>
+          </div>
+        </>
+      ) : (
+        // Fix pass 3 (review): "Nothing is owed" only when nothing stays owed either.
+        <div data-testid="nmi-lead" style={{ marginBottom: 8 }}>{kept.length > 0 ? 'Nothing on this lease is zeroed.' : 'Nothing is owed on this lease.'}</div>
+      )}
+      {kept.length > 0 && (
+        // Decisions #53: every line that stays owed is listed as "Stays owed",
+        // by name, with why — a later month's rent, GAM's own fee, a charge
+        // billed on purpose. It stays on the household's balance.
+        <div data-testid="nmi-kept" role="note" style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-0)', color: 'var(--text-1)', fontSize: '.8rem' }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Stays owed — on the household’s balance</div>
+          {kept.map(k => (
+            <div key={k.paymentId} data-testid="nmi-kept-line" style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '2px 0' }}>
+              <span>
+                {k.label}
+                {k.periodStart && k.periodEnd && k.why === 'later_bill' ? <span data-testid="nmi-kept-period" style={{ color: 'var(--text-3)' }}> · for {dueDay(k.periodStart)} – {dueDay(k.periodEnd)}</span> : null}
+                {k.dueDate && k.why === 'later_bill' ? <span style={{ color: 'var(--text-3)' }}> · due {dueDay(k.dueDate)}</span> : null}
+                <span style={{ color: 'var(--text-3)' }}> · {KEPT_WHY_LABEL[k.why] ?? 'stays owed'}</span>
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(k.amount)}</span>
+            </div>
+          ))}
+          {kept.length > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', paddingTop: 4, fontWeight: 600 }}>
+              <span>Stays owed</span><span style={{ fontFamily: 'var(--font-mono)' }}>{fmt(keptTotal)}</span>
+            </div>
+          )}
+        </div>
+      )}
+      {d.reservationWords && (
+        <div data-testid="nmi-reservation" style={{ marginTop: 8 }}>{d.reservationWords}</div>
+      )}
+      <div style={{ marginTop: 6 }}>
+        {ended
+          ? `${d.lines.length > 0 ? 'The move-in bill is voided. ' : ''}The lease already ended, so nothing else about it changes. ${refundWords(d.lines.length, kept.length)}`
+          : `${d.lines.length > 0 ? 'The move-in bill is voided, the' : 'The'} lease ends today and the household is taken off it. Lease paperwork still waiting for signatures is canceled, so it can’t be signed later. ${refundWords(d.lines.length, kept.length)}`}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Final fix (fix pass 2, review): what reads again after a stay is canceled or
+ * a lease is closed as never moved in (or discarded). The real keys, each
+ * matched by its prefix: the Leases page ('leases'), the Schedule and its
+ * history, the Schedule's Reservations list ('bookings' — fix pass 1 of the
+ * #53 close: a stay canceled on the calendar showed its old status there for
+ * up to 30 seconds), the dashboard (DashboardPage's ['dashboard', propertyId, basis],
+ * kept with staleTime Infinity) and its to-dos ('landlord-todos'), and the
+ * Payments page's ledger ('payments-ledger'). `refetchInactive`: the app's
+ * client never refetches on mount (main.tsx), so a page visited a minute ago
+ * and not on screen now would otherwise open showing the lease still pending
+ * and the zeroed bill still owed.
+ */
+export const LEASE_CLOSE_REFRESH_KEYS = ['leases', 'schedule', 'schedule-history', 'bookings', 'dashboard', 'landlord-todos', 'payments-ledger'] as const
+export function refreshAfterLeaseClose(qc: QueryClient): void {
+  for (const k of LEASE_CLOSE_REFRESH_KEYS) qc.invalidateQueries(k, { refetchInactive: true })
+}
+
+export function NeverMovedInModal({ lease, note, onClose }: { lease: any; note?: string | null; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const preview = useQuery<NeverMovedInPreview>(
+    ['never-moved-in', lease.id],
+    () => apiGet<NeverMovedInPreview>(`/leases/${lease.id}/never-moved-in`),
+    { staleTime: 0, cacheTime: 0, retry: false, refetchOnWindowFocus: false },
+  )
+  // The total the confirm showed goes with the press (the server checks it).
+  // What the toast says comes from the close's own answer (fix pass 3,
+  // review): what it zeroed and what stays owed as the close read them under
+  // its locks — a GAM fee added after the window opened is named too.
+  const end = useMutation(
+    (v: { total: number }) =>
+      apiPost<any>(`/leases/${lease.id}/never-moved-in`, { expectedTotal: v.total }),
+    {
+      onSuccess: (r: any, v) => {
+        refreshAfterLeaseClose(qc)
+        // apiPost hands back the whole answer ({ success, data }), camelCased.
+        const done: NeverMovedInDone = r?.data ?? {}
+        const zeroed = typeof done.zeroedTotal === 'number' ? done.zeroedTotal : v.total
+        const stillOwed = done.kept ?? []
+        const lead = ended ? 'Bill closed.' : done.reservationCanceled ? 'Lease ended and its reservation canceled.' : 'Lease ended.'
+        // Fix pass 2 (review): GAM's own fees (and charges billed on purpose)
+        // are never zeroed — the toast says they stay owed, by name. So does
+        // a later month's bill (decisions #53: only the move-in bill is zeroed).
+        const stays = (done.keptTotal ?? 0) > 0 && stillOwed.length > 0 ? ` Still owed on their balance: ${keptInWords(stillOwed)}.` : ''
+        toast(zeroed > 0
+          ? `${lead} The ${fmt(zeroed)} move-in bill they never paid is no longer owed.${stays}`
+          : stays ? `${lead} Nothing was zeroed.${stays}` : `${lead} Nothing was owed on it.`)
+        onClose()
+      },
+      onError: (e: any) => {
+        setError(e?.response?.data?.error || 'The lease could not be ended. Nothing changed. Try again.')
+        // Read it again in place — what it owes, or why it can't be ended now.
+        preview.refetch()
+      },
+    },
+  )
+  const d = preview.data
+  // Step 9 final fix (fix pass 1): a lease that already ended only has its
+  // bill closed — said so in the title, the words and the button.
+  const ended = d?.alreadyEnded === true || lease.status === 'terminated' || lease.status === 'expired'
+  const title = ended ? 'They never moved in — zero the bill' : 'They never moved in — end the lease'
+  const names = (d?.household?.tenantNames ?? []).filter(Boolean)
+  const people = names.length === 0 ? 'this lease'
+    : names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+  const space = [d?.household?.unitNumber ?? lease.unitNumber, d?.household?.propertyName ?? lease.propertyName].filter(Boolean).join(', ')
+  // Each error once: a refusal the fresh read now shows is not repeated above
+  // it, and when the fresh read itself failed (access removed, the lease
+  // gone, no network) its own error is the one message shown — never the
+  // press's error above it as well (fix pass 1).
+  const shownError = error && error !== d?.words && !preview.isError ? error : null
+  // Fix pass 3: while the close is running the window stays open (a click
+  // outside, × and Cancel do nothing), so a refusal or a 409 that comes back
+  // is shown — never set on a window that is already gone.
+  const close = () => { if (!end.isLoading) onClose() }
+  return (
+    <div className="modal-overlay" onClick={close}>
+      <div className="modal" role="dialog" aria-label={title} style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>{title}</span>
+          <button className="btn btn-ghost btn-sm" aria-label="Close" disabled={end.isLoading} onClick={close}><X size={14} /></button>
+        </div>
+        <div data-testid="nmi-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          {people}{space ? <span style={{ color: 'var(--text-3)' }}> — {space}</span> : null}
+        </div>
+        {note && !shownError && (
+          <div data-testid="nmi-note" role="note" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--amber)', fontSize: '.78rem' }}>{note}</div>
+        )}
+        {shownError && (
+          <div role="alert" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{shownError}</div>
+        )}
+        {preview.isLoading ? (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-3)', padding: '8px 0' }}>Reading what this lease owes…</div>
+        ) : preview.isError || !d ? (
+          // Fix pass 2 (review): the error once, with its next step — Read again.
+          <div role="alert" style={{ fontSize: '.84rem', color: 'var(--red)', padding: '8px 0' }}>
+            {(preview.error as any)?.response?.data?.error || 'What this lease owes could not be read, so nothing was changed. Press Read again.'}
+          </div>
+        ) : !d.applies ? (
+          <div data-testid="nmi-refusal" style={{ fontSize: '.84rem', color: 'var(--text-1)', lineHeight: 1.5, padding: '4px 0 8px' }}>{d.words}</div>
+        ) : (
+          <NeverMovedInBody d={d} ended={ended} />
+        )}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {/* Fix pass 3 (review): Read again is the next step and the only
+              action while the read has failed, so it is the gold button. */}
+          {preview.isError && (
+            <button className="btn btn-primary" disabled={preview.isFetching} onClick={() => { setError(null); preview.refetch() }}>
+              {preview.isFetching ? 'Reading…' : 'Read again'}
+            </button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} disabled={end.isLoading} onClick={close}>{d && !d.applies ? 'Close' : 'Cancel'}</button>
+          {d?.applies && (
+            <button className="btn btn-primary" disabled={end.isLoading || preview.isFetching}
+              onClick={() => { setError(null); end.mutate({ total: d.total }) }}>
+              {end.isLoading ? (ended ? 'Closing…' : 'Ending…')
+                : ended ? `Zero the bill — ${fmt(d.total)} no longer owed`
+                : d.total > 0 ? `End the lease — ${fmt(d.total)} no longer owed` : 'End the lease'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// A small menu button for the leases table: one button, a list of actions.
+function RowMenu({ label, items }: { label: React.ReactNode; items: Array<{ label: string; hint?: string; onClick: () => void }> }) {
+  const [open, setOpen] = useState(false)
+  if (!items.length) return null
+  return (
+    <div style={{ position: 'relative' }}>
+      <button className="btn btn-ghost btn-sm" style={{ padding: '3px 8px' }} onClick={() => setOpen(o => !o)}>{label} ▾</button>
+      {open && (
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 40 }} onClick={() => setOpen(false)} />
+          <div style={{ position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 41, minWidth: 250, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.25)', padding: 4 }}>
+            {items.map(it => (
+              <button key={it.label} type="button" onClick={() => { setOpen(false); it.onClick() }}
+                style={{ display: 'block', width: '100%', textAlign: 'left', background: 'transparent', border: 'none', borderRadius: 7, padding: '8px 10px', cursor: 'pointer', color: 'var(--text-0)' }}>
+                <div style={{ fontSize: '.82rem', fontWeight: 600 }}>{it.label}</div>
+                {it.hint && <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{it.hint}</div>}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
 }

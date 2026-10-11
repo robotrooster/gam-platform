@@ -143,7 +143,7 @@ describe('GET /api/tenants/lease — S483 state-law warnings', () => {
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
-  it('uncatalogued state → state_law_warnings empty (no false alarm)', async () => {
+  it('uncataloged state → state_law_warnings empty (no false alarm)', async () => {
     const f = await seedFixture({ rentAmount: 1500, depositAmount: 5000, state: 'XX' })
     const res = await request(buildApp())
       .get('/api/tenants/lease')

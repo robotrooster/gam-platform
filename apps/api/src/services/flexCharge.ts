@@ -15,6 +15,7 @@ import {
   type FlexChargeAccountStatus,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { dateIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 const LANDLORD_DISPUTE_THRESHOLD_COUNT = 3       // distinct customers
 const LANDLORD_DISPUTE_THRESHOLD_DAYS = 90        // rolling window
@@ -820,9 +821,12 @@ export interface StatementGenerationResult {
  * with created_at between Jan 1 and Feb 1 aggregate together.
  */
 export async function processFlexChargeStatementGeneration(now: Date = new Date()): Promise<StatementGenerationResult> {
-  // Previous month's first-of-month UTC.
-  const prevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
-  const cycle = prevMonth.toISOString().slice(0, 10)
+  // S654: the month that just closed, on GAM's (Phoenix) calendar, not UTC's.
+  // Phoenix rather than the property's zone because generateMonthlyStatement
+  // cuts its purchase window with $2::date in the database's Phoenix zone; a
+  // cycle from another zone could close before Phoenix does and strand late
+  // purchases. UTC is already next month after 5 pm on the last day.
+  const cycle = monthStartOf(addDaysTo(monthStartOf(dateIn(null, now)), -1))
 
   const out: StatementGenerationResult = {
     cycle_month:        cycle,
@@ -890,7 +894,9 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
   const out: StatementBillingResult = { scanned: 0, billed: 0, skipped: 0, errors: 0, failed: 0 }
   if (!await isFlexChargeVisible()) return out
 
-  const today = now.toISOString().slice(0, 10)
+  // S654: a statement's due date is the merchant property's date, so "due
+  // today" is asked on that property's calendar. UTC turns over at 5 pm in
+  // Phoenix, which pulled a day early and dated the payment tomorrow.
   const rows = await query<{
     statement_id:        string
     account_id:          string
@@ -903,6 +909,7 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
     pos_customer_id:     string | null
     customer_stripe_id:  string | null
     customer_label:      string
+    timezone:            string
   }>(
     `SELECT s.id AS statement_id, s.account_id, s.cycle_month::text AS cycle_month,
             s.minimum_due::text AS minimum_due, s.amount_paid::text AS amount_paid,
@@ -911,22 +918,25 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
             COALESCE(
               tu.first_name || ' ' || tu.last_name,
               pc.first_name || ' ' || pc.last_name
-            ) AS customer_label
+            ) AS customer_label,
+            p.timezone
        FROM flex_charge_statements s
        JOIN flex_charge_accounts a ON a.id = s.account_id
+       JOIN properties  p  ON p.id  = a.property_id
        LEFT JOIN tenants     t  ON t.id  = a.tenant_id
        LEFT JOIN users       tu ON tu.id = t.user_id
        LEFT JOIN pos_customers pc ON pc.id = a.pos_customer_id
       WHERE s.status   = 'open'
-        AND s.due_date <= $1::date
+        AND s.due_date <= ($1::timestamptz AT TIME ZONE p.timezone)::date
         AND s.payment_id IS NULL`,
-    [today],
+    [now],
   )
   out.scanned = rows.length
 
   const stripe = getStripe()
   for (const r of rows) {
     try {
+      const today = dateIn(r.timezone, now)
       if (!r.customer_stripe_id) {
         await markStatementFailed(r.statement_id, 'customer has no stripe_customer_id — ACH not set up')
         out.failed += 1

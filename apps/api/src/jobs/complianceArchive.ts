@@ -12,6 +12,11 @@ import { logger } from '../lib/logger'
 // admin_notifications has an extra filter: only acknowledged rows
 // archive. An unacked notification is by definition still actionable;
 // archiving it would hide an active alert.
+//
+// email_send_log likewise skips correspondence (S654): a trigger refuses to
+// delete any row email_log_is_permanent(category) names ("the log is the
+// log", S637), so one such row past the cutoff would abort the whole table's
+// archive every month. Same predicate the daily prune uses.
 
 const CUTOFF_MONTHS = 24
 
@@ -61,19 +66,21 @@ async function archiveTable(table: string, extraWhere = ''): Promise<ArchiveStat
   }
 }
 
+// Exported so a test can hold every live table's columns against its archive
+// (S654: three columns added to email_send_log alone broke the monthly run).
+export const ARCHIVE_TARGETS: ReadonlyArray<{ table: string; extraWhere?: string }> = [
+  { table: 'admin_action_log' },
+  { table: 'audit_log' },
+  { table: 'ach_monitoring_log' },
+  { table: 'admin_notifications', extraWhere: 'acknowledged_at IS NOT NULL' },
+  { table: 'email_send_log', extraWhere: 'NOT email_log_is_permanent(category)' },
+]
+
 export async function processComplianceArchive(): Promise<{ stats: ArchiveStats[]; errors: string[] }> {
   const stats: ArchiveStats[] = []
   const errors: string[] = []
 
-  const targets: Array<{ table: string; extraWhere?: string }> = [
-    { table: 'admin_action_log' },
-    { table: 'audit_log' },
-    { table: 'ach_monitoring_log' },
-    { table: 'admin_notifications', extraWhere: 'acknowledged_at IS NOT NULL' },
-    { table: 'email_send_log' },
-  ]
-
-  for (const t of targets) {
+  for (const t of ARCHIVE_TARGETS) {
     try {
       stats.push(await archiveTable(t.table, t.extraWhere))
     } catch (e) {

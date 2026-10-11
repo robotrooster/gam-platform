@@ -23,9 +23,15 @@ const API_BASE = process.env.API_URL || 'http://localhost:4000'
 // from the API host when LANDLORD_URL isn't set explicitly; dev falls back to :3001.
 const LANDLORD_URL = process.env.LANDLORD_URL ||
   (API_BASE.includes('goldassetmanagement.com') ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001')
+// S642 (Nic): "The marketing page should have a thing — hey, looking for a spot
+// to live, view properties in your area, do a background check." Every CTA on
+// this site pointed at the LANDLORD portal; a renter had nowhere to go. The
+// tenant host has to be injected the same way for the renter section's links.
+const TENANT_URL = process.env.TENANT_URL ||
+  (API_BASE.includes('goldassetmanagement.com') ? 'https://tenant.goldassetmanagement.com' : 'http://localhost:3002')
 const HTML_WITH_API = HTML.replace(
   '</head>',
-  `<script>window.GAM_API_BASE=${JSON.stringify(API_BASE)};window.GAM_LANDLORD_URL=${JSON.stringify(LANDLORD_URL)}</script>\n</head>`
+  `<script>window.GAM_API_BASE=${JSON.stringify(API_BASE)};window.GAM_LANDLORD_URL=${JSON.stringify(LANDLORD_URL)};window.GAM_TENANT_URL=${JSON.stringify(TENANT_URL)}</script>\n</head>`
 )
 
 // Legal docs live in /legal at repo root. Resolve from this server.js
@@ -333,6 +339,15 @@ http.createServer((req, res) => {
     return redirect(LANDLORD + '/register')
   }
   if (url === '/tenant' || url === '/tenants') return redirect(TENANT + '/login')
+
+  // S642 (Nic): the tenant login page is sign-in only now — a "Create account"
+  // link beside it read as an instruction to residents who could not get in,
+  // and one of them made a second, lease-less account he could not pay from.
+  // The renter pool kept its own route but lost its only discoverable entry
+  // when that card came off the login page, so it gets one here instead.
+  if (url === '/renters' || url === '/renter-pool' || url === '/find-a-place') {
+    return redirect(TENANT + '/background-check')
+  }
 
   // S603: support page — the URL Stripe prints on receipts + dispute evidence.
   if (url === '/support' || url === '/help') return send(SUPPORT_HTML)
@@ -1309,7 +1324,19 @@ INPUT.addEventListener('keydown', (e) => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
 });
 
-addMsg('bot', "Hi! I'm Skye, your stay assistant. I can help with your booking details, check-in, the property, and requests like a late checkout. What can I do for you?");
+// 10/4 (Nic): every AI assistant is off until it is retrained. Until the
+// platform switch is on, the page says so plainly and the box stays locked.
+fetch(API + '/api/sales/assistant').then(r => r.json()).then(j => {
+  if (j && j.data && j.data.visible === true) {
+    addMsg('bot', "Hi! I'm Skye, your stay assistant. I can help with your booking details, check-in, the property, and requests like a late checkout. What can I do for you?");
+  } else {
+    addMsg('bot', 'Our stay assistant is turned off for now. For anything about your stay, please call or email the park directly.');
+    lock('The stay assistant is off for now.');
+  }
+}).catch(() => {
+  addMsg('bot', 'Our stay assistant is turned off for now. For anything about your stay, please call or email the park directly.');
+  lock('The stay assistant is off for now.');
+});
 INPUT.focus();
 </script>
 </body>

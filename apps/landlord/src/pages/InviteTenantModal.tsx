@@ -1,8 +1,10 @@
 import { useState } from 'react'
+import { HomeSaleToggle, homeSalePayload, homeSaleComplete, PacketChecklist, tickedIds, type HomeSaleForm } from './TenantOnboardingPage'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
+import { X, Mail, DoorOpen, Check, ChevronRight, ChevronLeft } from 'lucide-react'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
+import { reachedBy, unitInviteFallbackLine, screeningInviteLine, inviteResultTitle } from '../lib/inviteOutcome'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void }
@@ -37,12 +39,26 @@ export function InviteTenantModal({ onClose }: Props) {
   const [residents, setResidents] = useState<Resident[]>([blankResident()])
   const [form, setForm] = useState({ unitId: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string; screened: boolean; sent?: { email: string; acceptUrl: string }[]; draft?: { drafted: boolean; reason?: string } | null } | null>(null)
-  const [copied, setCopied] = useState(false)
+  // S655 (Nic, 10/2): invites are EMAIL-ONLY. The setup link sets the
+  // person's password, so it goes only to their own inbox and never comes back
+  // to this screen. Someone who didn't get it: Resend on the Front Desk.
+  // notified: what actually reached them — an email, a notice in the GAM
+  // account they already use, or nothing (null).
+  type InviteOutcome = {
+    email: string; name: string; inviteSent: boolean; alreadyOnPlatform: boolean; needsOwnSignature: boolean
+    notified: 'email' | 'notice' | null
+  }
+  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; drafted: boolean; draftBlocked: string[] } | null>(null)
   // S579: a person invited to a vacant unit is a NEW applicant by default — they
   // create an account + complete a background check before a unit is assigned
   // (property-level invite). Uncheck only for someone who doesn't need screening.
-  const [requireScreening, setRequireScreening] = useState(true)
+  // S652 (Nic, option 2): three doors, none of them a free "no screening".
+  //   screen     — new applicant, background check first (default)
+  //   returning  — lived here before; the landlord attests it, recorded and capped
+  //   sitting    — already living here during the onboarding window (grandfather)
+  const [screenMode, setScreenMode] = useState<'screen' | 'returning' | 'sitting'>('screen')
+  const requireScreening = screenMode === 'screen'
+  const { data: windows = [] } = useQuery<any[]>('onboarding-windows', () => apiGet('/landlords/me/onboarding-windows'), { retry: false })
 
   // S613 (Nic): "Do the occupied units disappear from this list the same way
   // our submeter units disappear after they're selected?"
@@ -59,23 +75,46 @@ export function InviteTenantModal({ onClose }: Props) {
   //   · an OWNER-OCCUPIED unit, which has no lease at all, so it read as free.
   //   · a unit already holding a signed-but-not-active lease.
   //
-  // Hidden rather than greyed, per the rule Nic set for the meter pickers ("I
+  // Hidden rather than grayed, per the rule Nic set for the meter pickers ("I
   // don't want them grayed out because then I still have to scroll around
   // looking for just the odd one or two"), with a count of what was hidden
   // underneath so nothing vanishes unexplained.
   const { data: allUnits = [] } = useQuery<any[]>('vacant-units', () => apiGet('/units'))
   // S629: the predicate moved to lib/inviteEligibility so the Tenant Onboarding
-  // roster form applies exactly the same rule. Behaviour here is unchanged.
+  // roster form applies exactly the same rule. Behavior here is unchanged.
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
   const units = (allUnits as any[]).filter(canInviteToUnit)
 
+  // S655: a household invited to a UNIT goes in one call — its lease drafts
+  // once with everyone on it and waits for your signature; nobody is emailed
+  // until you sign. Applicants invited to a PROPERTY (they screen first) are
+  // invited one at a time and get their invite email now.
   const inviteMut = useMutation(
-    async (payloads: any[]) => {
-      const out: any[] = []
-      for (const [i, payload] of payloads.entries()) {
+    async (req: { unit: any | null; property: any[] | null }) => {
+      if (req.unit) {
+        const res: any = await apiPost('/tenants/invite', req.unit)
+        const d = res?.data ?? {}
+        const people: any[] = Array.isArray(d.people) ? d.people : []
+        return {
+          drafted: d.leaseDrafted === true,
+          draftBlocked: Array.isArray(d.draftBlocked) ? d.draftBlocked : [],
+          sent: people.map(p => ({
+            email: p.email, name: p.name || p.email, inviteSent: p.inviteSent === true,
+            alreadyOnPlatform: p.alreadyOnPlatform === true, needsOwnSignature: p.needsOwnSignature === true,
+            notified: reachedBy(p),
+          })) as InviteOutcome[],
+        }
+      }
+      const out: InviteOutcome[] = []
+      for (const [i, payload] of (req.property ?? []).entries()) {
         try {
           const res: any = await apiPost('/tenants/invite', payload)
-          out.push({ email: payload.email, acceptUrl: res.data.acceptUrl })
+          const d = res?.data ?? {}
+          out.push({
+            email: payload.email, name: [payload.firstName, payload.lastName].filter(Boolean).join(' '),
+            inviteSent: d.inviteSent === true, alreadyOnPlatform: d.alreadyOnPlatform === true, needsOwnSignature: false,
+            notified: reachedBy(d),
+          })
         } catch (e: any) {
           const msg = e?.response?.data?.error || e?.message || 'Invite failed'
           // Name WHICH resident failed — "invite failed" on a four-person
@@ -83,26 +122,14 @@ export function InviteTenantModal({ onClose }: Props) {
           throw new Error(`${payload.email}: ${msg}${i > 0 ? ` (${i} invite${i > 1 ? 's' : ''} already sent)` : ''}`)
         }
       }
-      return out
+      return { drafted: false, draftBlocked: [] as string[], sent: out }
     },
     {
-      onSuccess: async (out: any[]) => {
+      onSuccess: (r) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
-        // S605: draft the lease for the whole household off the unit type's
-        // default template. Best-effort — the invites already went out, so a
-        // landlord who hasn't set a template yet is TOLD, not failed.
-        let draft: { drafted: boolean; reason?: string } | null = null
-        if (form.unitId) {
-          try {
-            const r: any = await apiPost('/esign/draft-household', {
-              unitId: form.unitId, emails: out.map(o => o.email),
-            })
-            draft = r?.data ?? r
-          } catch { draft = null }
-        }
-        setInviteResult({ acceptUrl: out[0].acceptUrl, email: out[0].email,
-          screened: requireScreening, sent: out, draft })
+        qc.invalidateQueries('vacant-units')
+        setInviteResult({ screened: requireScreening, sent: r.sent, drafted: r.drafted, draftBlocked: r.draftBlocked })
       },
       onError: (e: any) => setErrors(er => ({ ...er, submit: e?.message || 'Could not send the invites' })),
     }
@@ -120,6 +147,10 @@ export function InviteTenantModal({ onClose }: Props) {
   const removeResident = (i: number) => setResidents(rs => rs.filter((_, idx) => idx !== i))
 
   const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
+  // S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home.
+  const [homeSale, setHomeSale] = useState<HomeSaleForm | null>(null)
+  const [packet, setPacket] = useState<Record<string, boolean> | null>(null)
+  const askSale = selectedUnit?.dwellingOwnership === 'landlord' && selectedUnit?.unitType === 'mobile_home'
 
   const validateStep = () => {
     const errs: Record<string, string> = {}
@@ -137,6 +168,7 @@ export function InviteTenantModal({ onClose }: Props) {
       })
     }
     if (step === 1 && !form.unitId) errs.unitId = 'Select a unit'
+    if (step === 1 && askSale && !homeSaleComplete(homeSale)) errs.unitId = 'Fill in the home sale terms, or untick the box'
     setErrors(errs)
     return Object.keys(errs).length === 0
   }
@@ -145,66 +177,90 @@ export function InviteTenantModal({ onClose }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
-    // Sequential, not parallel: they hit the same unit and the same landlord
-    // scope, and a partially-applied household is worse than a slow one — the
-    // caller sees exactly which resident failed.
-    inviteMut.mutate(residents.map((r, i) => {
-      const base = {
-        email: r.email.trim(),
-        firstName: r.firstName.trim(),
-        lastName: r.lastName.trim(),
-        phone: r.phone.trim() || undefined,
-        // First listed holds the lease; the rest ride as co-tenants.
-        householdRole: i === 0 ? 'primary' : 'co_tenant',
-      }
-      // S579: screening → property-level invite (they screen, unit assigned
-      // later at lease). Otherwise the unit-bound invite.
-      return requireScreening && selectedUnit?.propertyId
-        ? { ...base, propertyId: selectedUnit.propertyId }
-        : { ...base, unitId: form.unitId }
+    const people = residents.map(r => ({
+      email: r.email.trim(),
+      firstName: r.firstName.trim(),
+      lastName: r.lastName.trim(),
+      phone: r.phone.trim() || undefined,
     }))
-  }
-
-  const copyLink = () => {
-    if (!inviteResult) return
-    navigator.clipboard.writeText(inviteResult.acceptUrl)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    // S579: screening → property-level invite (they screen, unit assigned
+    // later at lease). Sequential: the caller sees exactly which one failed.
+    if (requireScreening && selectedUnit?.propertyId) {
+      inviteMut.mutate({ unit: null, property: people.map(p => ({ ...p, propertyId: selectedUnit.propertyId })) })
+      return
+    }
+    // The household on its unit, in one call. The first person listed holds
+    // the lease; the rest are co-tenants on it.
+    inviteMut.mutate({ property: null, unit: {
+      ...people[0], residents: people, unitId: form.unitId,
+      ...(screenMode === 'returning' ? { returningResident: true } : {}),
+      ...(screenMode === 'sitting' ? { existingResident: true } : {}),
+      homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,
+      packageTemplateIds: tickedIds(packet),
+    } })
   }
 
   // Success screen
   if (inviteResult) {
+    const r = inviteResult
+    const title = inviteResultTitle(r)
+    // Green only when everything went; amber when something is left to do.
+    const allWent = title === 'Lease drafted' || title === 'Invite Sent' || title === 'Already on GAM'
+    const tone = allWent ? 'var(--green)' : 'var(--amber, #d97706)'
     return (
       <div className="modal-overlay" onClick={onClose}>
         <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
           <div style={{ textAlign: 'center', padding: '8px 0 20px' }}>
-            <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <Check size={24} style={{ color: 'var(--green)' }} />
+            <div style={{ width: 56, height: 56, borderRadius: '50%', background: allWent ? 'rgba(30,219,122,.12)' : 'rgba(217,119,6,.12)', border: `2px solid ${tone}`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <Check size={24} style={{ color: tone }} />
             </div>
-            <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Invite Sent</div>
-            <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-              {inviteResult.email} will receive an email to set up their account.
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
+              {title}
             </div>
-          </div>
-
-          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
-            <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 8 }}>
-              Invite Link — share directly if needed
-            </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <div style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '.68rem', color: 'var(--text-2)', background: 'var(--bg-3)', border: '1px solid var(--border-0)', borderRadius: 6, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {inviteResult.acceptUrl}
+            {r.screened ? r.sent.map(x => (
+              <div key={x.email} style={{ fontSize: '.82rem', color: x.notified ? 'var(--text-3)' : 'var(--amber, #d97706)', marginTop: 4 }}>
+                {screeningInviteLine(x)}
               </div>
-              <button className="btn btn-ghost btn-sm" onClick={copyLink} style={{ flexShrink: 0, gap: 5 }}>
-                {copied ? <><Check size={13} style={{ color: 'var(--green)' }} /> Copied</> : <><Copy size={13} /> Copy</>}
-              </button>
-            </div>
+            )) : r.drafted ? (
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4, lineHeight: 1.6 }}>
+                {r.draftBlocked.length === 0
+                  ? <>The lease for {r.sent.map(x => x.name).join(', ')} is waiting for your signature in Front Desk.</>
+                  // A by-room unit drafts a lease per person: some can draft
+                  // while others are refused. Each reason names whose it is.
+                  : <>The leases that drafted are waiting for your signature in Front Desk. These did not draft yet:</>}
+                {r.draftBlocked.map((b, i) => <div key={i} style={{ color: 'var(--amber, #d97706)', marginTop: 4 }}>{b}</div>)}
+                <div style={{ marginTop: 4 }}>
+                  Nobody has been emailed yet — each person gets one email when you sign their lease.
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4, lineHeight: 1.6 }}>
+                {r.draftBlocked.map((b, i) => <div key={i} style={{ color: 'var(--amber, #d97706)' }}>{b}</div>)}
+                {/* The usual invite was tried instead: say who it reached, and
+                    for anyone it did not, what to press. */}
+                {r.sent.map(x => (
+                  <div key={x.email} style={{ marginTop: 4, color: x.notified ? undefined : 'var(--amber, #d97706)' }}>
+                    {unitInviteFallbackLine(x)}
+                  </div>
+                ))}
+              </div>
+            )}
+            {!r.screened && r.sent.some(x => x.needsOwnSignature) && (
+              <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 8, lineHeight: 1.6 }}>
+                {r.sent.filter(x => x.needsOwnSignature).map(x => x.name).join(', ')} already
+                {r.sent.filter(x => x.needsOwnSignature).length === 1 ? ' has' : ' have'} a GAM account with another
+                company, so the lease starts when they sign it themselves.
+              </div>
+            )}
           </div>
 
           <div style={{ fontSize: '.75rem', color: 'var(--text-3)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 20, lineHeight: 1.6 }}>
-            {inviteResult.screened
-              ? <>⚡ They&apos;ll create an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
-              : <>⚡ Unit has been assigned. The tenant will appear as <strong style={{ color: 'var(--amber)' }}>Pending</strong> until they complete their account setup and verify their bank account.</>}
+            {r.screened
+              ? <>They&apos;ll set up an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
+              : <>Sign the lease in <strong style={{ color: 'var(--amber)' }}>Front Desk → Waiting on you to sign</strong>. Rent bills from the lease once it is signed.</>}
+            {r.screened
+              ? <>{' '}If someone doesn&apos;t get their email, press <strong>Re-send invite</strong> next to them on the Front Desk.</>
+              : <>{' '}If someone doesn&apos;t get their email after you sign, send a reminder from the lease&apos;s row in <strong>E-Sign</strong>.</>}
           </div>
 
           <button className="btn btn-primary" style={{ width: '100%' }} onClick={onClose}>Done</button>
@@ -374,19 +430,38 @@ export function InviteTenantModal({ onClose }: Props) {
                 Not shown: {hiddenReasons.join(', ')}.
               </div>
             )}
+            {/* S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home. */}
+            {askSale && <div style={{ marginTop: 12 }}><HomeSaleToggle sale={homeSale} setSale={setHomeSale} /></div>}
+            {form.unitId && <div style={{ marginTop: 12 }}><PacketChecklist unitId={form.unitId} sale={askSale && !!homeSale} ticked={packet} setTicked={setPacket} /></div>}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
 
-            {form.unitId && (
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginTop: 14, padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
-                <input type="checkbox" checked={requireScreening} onChange={e => setRequireScreening(e.target.checked)} style={{ marginTop: 2, flexShrink: 0 }} />
-                <div>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Require background check (new applicant)</div>
-                  <div style={{ fontSize: '.74rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 2 }}>
-                    They create an account and complete a background check before you assign the unit. Uncheck only for someone who doesn&apos;t need screening.
+            {form.unitId && (() => {
+              const win = (windows as any[]).find((w: any) => w.propertyId === selectedUnit?.propertyId)
+              const windowOpen = !!win?.open
+              if (!windowOpen && screenMode === 'sitting') setScreenMode('screen')
+              if (win?.returningAllowanceLeft === 0 && screenMode === 'returning') setScreenMode('screen')
+              const opt = (mode: 'screen' | 'returning' | 'sitting', title: string, body: string) => (
+                <label key={mode} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', padding: '10px 12px', background: screenMode === mode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)', border: `1px solid ${screenMode === mode ? 'var(--gold)' : 'var(--border-0)'}`, borderRadius: 8 }}>
+                  <input type="radio" checked={screenMode === mode} onChange={() => setScreenMode(mode)} style={{ marginTop: 2, flexShrink: 0 }} />
+                  <div>
+                    <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{title}</div>
+                    <div style={{ fontSize: '.74rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 2 }}>{body}</div>
                   </div>
+                </label>
+              )
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
+                  {opt('screen', 'New applicant — background check first', 'They create an account and complete a background check before you assign the space.')}
+                  {win?.returningAllowanceLeft === 0
+                    ? <div style={{ padding: '10px 12px', border: '1px solid var(--border-0)', borderRadius: 8, opacity: .6, fontSize: '.78rem', color: 'var(--text-3)' }}>
+                        <b style={{ color: 'var(--text-1)' }}>Returning resident</b> — not available at this property right now. New residents complete a background check.
+                      </div>
+                    : opt('returning', 'Returning resident — lived here before', 'You are attesting this person has lived at this property before. No background check. GAM records the attestation.')}
+                  {windowOpen && opt('sitting', 'Already lives here', 'A resident who was here when this property came onto GAM. Onboarding window is open.')}
                 </div>
-              </label>
-            )}
+              )
+            })()}
+
           </div>
         )}
 
@@ -428,15 +503,19 @@ export function InviteTenantModal({ onClose }: Props) {
                 </div>
               )}
 
-              {/* What happens next */}
-              {[
-                { icon: '📧', text: 'Invite email sent to tenant' },
-                { icon: '🔐', text: 'Tenant sets password and verifies identity' },
-                { icon: '🏦', text: 'Tenant connects bank account for ACH' },
-                { icon: '✅', text: 'Unit goes active — rent collection begins' },
-              ].map((item, i) => (
-                <div key={i} style={{ padding: '8px 16px', borderBottom: i < 3 ? '1px solid var(--border-0)' : 'none', display: 'flex', alignItems: 'center', gap: 10, fontSize: '.75rem', color: 'var(--text-3)' }}>
-                  <span>{item.icon}</span> {item.text}
+              {/* What happens next — S647: you sign first, then they get one email. */}
+              {(requireScreening ? [
+                'An invite email goes to each of them now',
+                'They set up an account and complete a background check',
+                'Once it clears, you assign their space and send the lease',
+              ] : [
+                'Their lease drafts now, from this unit\'s rent and your default lease',
+                'You sign it in Front Desk → Waiting on you to sign',
+                'Each of them gets one email: set up their account and sign',
+                'Rent bills from the lease once it is signed',
+              ]).map((text, i, arr) => (
+                <div key={i} style={{ padding: '8px 16px', borderBottom: i < arr.length - 1 ? '1px solid var(--border-0)' : 'none', display: 'flex', alignItems: 'center', gap: 10, fontSize: '.75rem', color: 'var(--text-3)' }}>
+                  <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{i + 1}</span> {text}
                 </div>
               ))}
             </div>
@@ -466,7 +545,9 @@ export function InviteTenantModal({ onClose }: Props) {
           ) : (
             <button className="btn btn-primary" onClick={submit} disabled={inviteMut.isLoading}>
               {inviteMut.isLoading ? <span className="spinner" />
-                : <><Mail size={14} /> Send {residents.length > 1 ? `${residents.length} invites` : 'invite'}</>}
+                : requireScreening
+                  ? <><Mail size={14} /> Send {residents.length > 1 ? `${residents.length} invites` : 'invite'}</>
+                  : <>Invite and draft the lease</>}
             </button>
           )}
         </div>

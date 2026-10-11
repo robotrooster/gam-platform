@@ -16,5 +16,6 @@
     "noUnusedParameters": true
   },
   "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/__fixtures__"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

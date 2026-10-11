@@ -92,6 +92,8 @@ export async function sendCardUpdateEmail(args: {
       businessId: args.businessId,
       customerId: args.customerId,
       invoiceId: args.triggeredByInvoiceId ?? null,
+      // 10/5: replies reach the business, not GAM (services/replyRouting).
+      replyTo: { kind: 'business', businessId: args.businessId },
     },
   })
   return true

@@ -26,14 +26,6 @@ import { validateFillLine, recordFill } from '../services/propaneFill'
 export const propaneRouter = Router()
 propaneRouter.use(requireAuth)
 
-const monthStart = (d: Date) =>
-  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-const addMonths = (iso: string, n: number) => {
-  const d = new Date(iso + 'T00:00:00Z')
-  d.setUTCMonth(d.getUTCMonth() + n)
-  return monthStart(d)
-}
-
 // ── FILLS ────────────────────────────────────────────────────
 propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {
@@ -73,7 +65,8 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
 const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
               u.has_propane_tank,
               p.propane_allow_installments,
-              p.propane_split_min_gallons, p.propane_split_four_min_gallons`
+              p.propane_split_min_gallons, p.propane_split_four_min_gallons,
+              p.timezone`
 
 // PUT /api/propane/tanks — S613 (Nic): set which spaces have a tank, all at once.
 //
@@ -88,7 +81,7 @@ const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
 // not being a meter. MEMBERSHIP semantics, like the trash picker: ticked spaces
 // have a tank, unticked ones don't.
 //
-// Removing a tank never touches money already owed — instalments on propane
+// Removing a tank never touches money already owed — installments on propane
 // already delivered keep billing. It only stops the space being offered on
 // Record Delivery.
 // GET /api/propane/mine — S613 (Nic): the TENANT's own propane ledger.
@@ -345,7 +338,13 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       // Full precision on purpose — rounding the rate here loses real money
       // across a large delivery. The per-fill totals round to the cent.
       trueCost = body.invoiceTotal / body.invoiceGallons
-      billedRate = trueCost + markup
+      // S652 (Nic): "The rate is already set… we're getting it for about a
+      // dollar eighty to a dollar ninety a gallon, and we're charging the
+      // tenants two twenty-five." A property with a SET price charges that
+      // price; the supplier's invoice is recorded beside it only so the margin
+      // is known. Cost-plus (cost + the property's markup) remains for a
+      // delivery that names no price.
+      billedRate = body.pricePerGallon != null ? body.pricePerGallon : trueCost + markup
     } else if (body.pricePerGallon != null) {
       billedRate = body.pricePerGallon
     } else {
@@ -409,7 +408,7 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
           gallons: p.gallons, pricePerGallon: billedRate,
           deliveryFeeShare: feeShares[i],
           trueCostPerGallon: trueCost,
-          markupPerGallon: trueCost != null ? markup : null,
+          markupPerGallon: trueCost != null ? Math.round((billedRate - trueCost) * 10000) / 10000 : null,
           invoiceTotal: body.invoiceTotal ?? null,
           invoiceGallons: body.invoiceGallons ?? null,
           installments: body.installments, createdByUserId: req.user!.userId,
@@ -429,9 +428,9 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
         totalAmount: Math.round(fills.reduce((s, f) => s + Number(f.total_amount), 0) * 100) / 100,
         // S632: the margin, stated rather than inferred.
         trueCostPerGallon: trueCost != null ? Math.round(trueCost * 10000) / 10000 : null,
-        markupPerGallon: trueCost != null ? markup : null,
+        markupPerGallon: trueCost != null ? Math.round((billedRate - trueCost) * 10000) / 10000 : null,
         billedPerGallon: Math.round(billedRate * 10000) / 10000,
-        margin: trueCost != null ? Math.round(markup * allocated * 100) / 100 : null,
+        margin: trueCost != null ? Math.round((billedRate - trueCost) * allocated * 100) / 100 : null,
         // Gallons on the invoice that were NOT put on a tank — the park's own
         // usage, or a line missed. Surfaced because it is the number that
         // silently eats a margin.

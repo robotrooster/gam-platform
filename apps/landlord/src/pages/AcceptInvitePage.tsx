@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
+import { BOOKKEEPER_ACCESS_SUMMARY } from '@gam/shared'
+
+// 10/11 (Nic): a bookkeeper's portal is GAM Books, so their invite ends there.
+const ENV = (import.meta as any).env || {}
+const BOOKS_URL: string = ENV.VITE_BOOKS_APP_URL || (ENV.PROD ? 'https://books.goldassetmanagement.com' : 'http://localhost:3006')
 
 // Staff-invitation accept page. The landlord adds a staff member on the Team
 // page → this is the "next page" the invitee lands on from their email link
@@ -9,6 +14,7 @@ import { apiGet, apiPost } from '../lib/api'
 // accept endpoint returns no session token, so we route to /login on success.
 interface InviteInfo {
   email: string
+  role?: string
   status: string
   inviterName: string
   userExists: boolean
@@ -85,6 +91,28 @@ export function AcceptInvitePage() {
     </div>
   )
 
+  const isBookkeeper = info?.role === 'bookkeeper'
+
+  if (done && isBookkeeper) return (
+    <div style={wrap}>
+      <div style={{ ...card, textAlign: 'center' }}>
+        <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 8 }}>You're all set</div>
+        <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 20 }}>
+          Your account is ready. You keep the books in GAM Books — sign in there with this email and password.
+        </div>
+        <a href={`${BOOKS_URL}/login`} style={{ display: 'inline-block', padding: '12px 28px', borderRadius: 10, background: 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, fontSize: '.9rem', textDecoration: 'none' }}>
+          Open GAM Books →
+        </a>
+        <div style={{ marginTop: 14 }}>
+          <button onClick={() => navigate('/login')} style={{ background: 'none', border: 'none', color: 'var(--text-2)', fontSize: '.78rem', cursor: 'pointer', textDecoration: 'underline' }}>
+            Or sign in to the landlord portal
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+
   if (done) return (
     <div style={wrap}>
       <div style={{ ...card, textAlign: 'center' }}>
@@ -112,9 +140,14 @@ export function AcceptInvitePage() {
             {info?.userExists ? 'Join the team' : 'Create your account'}
           </div>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 20, lineHeight: 1.6 }}>
-            <strong style={{ color: 'var(--text-1)' }}>{info?.inviterName}</strong> invited you to join their team on GAM.
+            <strong style={{ color: 'var(--text-1)' }}>{info?.inviterName}</strong> invited you to {isBookkeeper ? 'keep their books' : 'join their team'} on GAM.
             {' '}Signing in as <strong style={{ color: 'var(--text-1)' }}>{info?.email}</strong>.
           </div>
+          {isBookkeeper && (
+            <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 20, lineHeight: 1.6, background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 8, padding: '10px 12px' }}>
+              <strong style={{ color: 'var(--text-0)' }}>Bookkeeper.</strong> {BOOKKEEPER_ACCESS_SUMMARY}
+            </div>
+          )}
 
           {info?.userExists ? (
             <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 20, lineHeight: 1.6 }}>

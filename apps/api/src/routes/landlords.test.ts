@@ -140,6 +140,41 @@ describe('GET /api/landlords/:id/dashboard', () => {
     expect(typeof res.body.data.otp_units).toBe('number')
   })
 
+  // S655: the income card follows the switch and carries both pairs:
+  // Money received (what arrived, paid ahead inside, clearing beside) and
+  // Money billed (the bill, collected so far, clearing, still owed).
+  it('S655: the income card follows the switch; money still clearing sits beside what arrived', async () => {
+    const f = await seedLFixture()
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      const u = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      const d = (await client.query(`SELECT (now() AT TIME ZONE 'America/Phoenix')::date::text AS d`)).rows[0].d
+      await client.query(
+        `INSERT INTO payments (unit_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+         VALUES ($1,$2,'rent',800,'settled','RENT',$3::date,now()),
+                ($1,$2,'utility',60,'processing','UTILITY',$3::date,NULL)`,
+        [u, f.landlordId, d])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const rx = (await request(buildApp()).get('/api/landlords/me/dashboard')
+      .set('Authorization', `Bearer ${token}`)).body.data
+    expect(rx.basis).toMatchObject({ basis: 'received', label: 'Money received' })
+    expect(rx.income_card.received).toEqual({ amount: 800, paidAhead: 0, clearing: 60 })
+    expect(rx.collected_mtd).toBe(800)
+    const bx = (await request(buildApp()).get('/api/landlords/me/dashboard?basis=billed')
+      .set('Authorization', `Bearer ${token}`)).body.data
+    expect(bx.basis.label).toBe('Money billed')
+    expect(bx.income_card.billed).toEqual({ amount: 860, collected: 800, clearing: 60, stillOwed: 0 })
+  })
+
   it('PM (team role) → 403 (canViewLandlordFinances rejects team roles)', async () => {
     const f = await seedLFixture()
     const pmToken = await seedPmTokenFor(f)
@@ -202,45 +237,69 @@ describe('POST /api/landlords/complete-onboarding', () => {
     expect(row.rows[0].agreement_signed_at).not.toBeNull()
   })
 
-  it('no coverTenantAch → default_ach_fee_payer stays tenant (S513 #2)', async () => {
-    const f = await seedLFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/complete-onboarding')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ signature: 'Nic Rhoades' })
-    expect(res.status).toBe(200)
-    const ll = await db.query<{ default_ach_fee_payer: string }>(
-      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
-    expect(ll.rows[0].default_ach_fee_payer).toBe('tenant')
-  })
-
-  it('coverTenantAch=true → default landlord + applies to existing properties; card stays tenant (S513 #2)', async () => {
-    const f = await seedLFixture()
+  // 10/5 (Nic): the fee choice is the PROPERTY's own. Onboarding answers it
+  // for the property being set up and touches nothing else — no company default.
+  async function propertyWithRule(f: any) {
     const client = await db.connect()
-    let propertyId = ''
     try {
       await client.query('BEGIN')
-      propertyId = await seedProperty(client, {
+      const propertyId = await seedProperty(client, {
         landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
       })
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
       await client.query('COMMIT')
+      return propertyId
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+  const feesAt = async (propertyId: string) => ({
+    ...(await db.query(`SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [propertyId])).rows[0],
+    ...(await db.query(`SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id=$1`, [propertyId])).rows[0],
+  })
+  const covered = { ach_fee_payer: 'landlord', card_fee_payer: 'landlord', register_card_fee_payer: 'landlord', booking_card_fee_payer: 'landlord' }
+  const passedOn = { ach_fee_payer: 'tenant', card_fee_payer: 'tenant', register_card_fee_payer: 'customer', booking_card_fee_payer: 'customer' }
+  const finish = (f: any, body: any) => request(buildApp())
+    .post('/api/landlords/complete-onboarding')
+    .set('Authorization', `Bearer ${f.landlordToken}`)
+    .send({ signature: 'Nic Rhoades', ...body })
 
-    const res = await request(buildApp())
-      .post('/api/landlords/complete-onboarding')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ signature: 'Nic Rhoades', coverTenantAch: true })
-    expect(res.status).toBe(200)
+  it('no answer → the property passes the fees on, and no company default is written', async () => {
+    const f = await seedLFixture()
+    const propertyId = await propertyWithRule(f)
+    expect((await finish(f, { propertyId })).status).toBe(200)
+    expect(await feesAt(propertyId)).toEqual(passedOn)
+    const ll = await db.query(`SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(ll.rows[0].default_ach_fee_payer).toBe('tenant')
+  })
 
-    const ll = await db.query<{ default_ach_fee_payer: string }>(
-      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
-    expect(ll.rows[0].default_ach_fee_payer).toBe('landlord')
+  it('"cover them" covers card and bank at the property being onboarded — and only that property', async () => {
+    const f = await seedLFixture()
+    const onboarding = await propertyWithRule(f)
+    const other = await propertyWithRule(f)
+    expect((await finish(f, { coverFees: true, propertyId: onboarding })).status).toBe(200)
+    expect(await feesAt(onboarding)).toEqual(covered)
+    expect(await feesAt(other)).toEqual(passedOn)
+    const ll = await db.query(`SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(ll.rows[0].default_ach_fee_payer).toBe('tenant')
+  })
 
-    const ar = await db.query<{ ach_fee_payer: string; card_fee_payer: string }>(
-      `SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [propertyId])
-    expect(ar.rows[0].ach_fee_payer).toBe('landlord')  // election applied to the portfolio
-    expect(ar.rows[0].card_fee_payer).toBe('tenant')   // card never covered
+  it('a page from before (coverTenantAch, no property named) covers the company\u2019s only property', async () => {
+    const f = await seedLFixture()
+    const propertyId = await propertyWithRule(f)
+    expect((await finish(f, { coverTenantAch: true })).status).toBe(200)
+    expect(await feesAt(propertyId)).toEqual(covered)
+  })
+
+  it('with several properties and none named, nothing is changed; another company\u2019s property is refused', async () => {
+    const f = await seedLFixture()
+    const a = await propertyWithRule(f)
+    const b = await propertyWithRule(f)
+    expect((await finish(f, { coverFees: true })).status).toBe(200)
+    expect(await feesAt(a)).toEqual(passedOn)
+    expect(await feesAt(b)).toEqual(passedOn)
+    const g = await seedLFixture()
+    const theirs = await propertyWithRule(g)
+    expect((await finish(f, { coverFees: true, propertyId: theirs })).status).toBe(403)
+    expect(await feesAt(theirs)).toEqual(passedOn)
   })
 })
 

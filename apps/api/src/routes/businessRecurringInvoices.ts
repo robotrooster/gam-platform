@@ -35,10 +35,6 @@ const requireSend  = async (req: any) => (await requireBusinessAccess(req, { per
 
 // ── helpers ────────────────────────────────────────────────────
 
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10)
-}
-
 // Compute the first next_due_date >= start_date that matches the
 // cadence. Used at create time.
 function computeInitialNextDue(
@@ -351,5 +347,3 @@ businessRecurringInvoicesRouter.post('/:id/generate-now', requireAuth, async (re
     res.json({ success: true, data: inv })
   } catch (e) { next(e) }
 })
-
-void todayIso  // reserved for future "include start_date in current cycle" logic

@@ -30,6 +30,7 @@
 
 import type { PoolClient } from 'pg'
 import { query } from '../db'
+import { logger } from '../lib/logger'
 
 export type SupersedenceSource =
   | 'flexdeposit_installment'
@@ -409,6 +410,16 @@ async function satisfyFlexChargeStatement(
   }
 }
 
+/**
+ * A written-off FlexPay advance recovered by GAM-first routing. The flip holds
+ * the advance row, so exactly one payment recovers it; that payment also books
+ * the advance's $25 as GAM earnings ('flexpay_subscription'), which the
+ * write-off left off the book (or a taken-back pull reversed). bookFlexPayFee
+ * books it once while it stands, and again after a reversal. The returned-pull
+ * and dispute fees recovered with it are Stripe's cost passed on, never
+ * earnings. Booking is best-effort inside a savepoint: failing to write the
+ * fee down never fails the payment that recovered it.
+ */
 async function satisfyFlexPayAdvance(
   client: PoolClient,
   advanceId: string,
@@ -423,7 +434,19 @@ async function satisfyFlexPayAdvance(
       WHERE id = $1 AND status = 'defaulted'`,
     [advanceId, payerPaymentId],
   )
-  return (r.rowCount ?? 0) > 0
+  if ((r.rowCount ?? 0) === 0) return false
+  // flexpay.ts imports this file, so the fee helper is loaded when called.
+  await client.query('SAVEPOINT flexpay_recovered_fee')
+  try {
+    const { bookFlexPayFee } = await import('./flexpay')
+    await bookFlexPayFee(advanceId, client)
+    await client.query('RELEASE SAVEPOINT flexpay_recovered_fee')
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT flexpay_recovered_fee').catch(() => {})
+    logger.error({ err: e, advance_id: advanceId, payment_id: payerPaymentId },
+      '[supersedence] FlexPay fee not booked for a recovered advance')
+  }
+  return true
 }
 
 async function satisfyCustodyCharge(

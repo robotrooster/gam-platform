@@ -105,12 +105,28 @@ function text(doc: Doc, str: string, x: number, y: number, opts: {
   const font = opts.mono ? doc.fontMono : opts.bold ? doc.fontBold : doc.font
   const size = opts.size ?? FONT_SIZE_BODY
   const color = opts.color ?? TEXT_DARK
+  str = pdfSafe(font, str)
   let drawX = x
   if (opts.align === 'right') {
     const w = font.widthOfTextAtSize(str, size)
     drawX = x - w
   }
   doc.page.drawText(str, { x: drawX, y, size, font, color })
+}
+
+/**
+ * 10/5: the built-in PDF fonts print only the WinAnsi characters. A stay line
+ * names its dates with an arrow ("Jun 1 → Jul 1"), which threw and failed the
+ * whole receipt — so arrows become "to", and any other character the font
+ * cannot print becomes "?" instead of failing the document.
+ */
+const pdfCharsets = new WeakMap<PDFFont, Set<number>>()
+function pdfSafe(font: PDFFont, str: string): string {
+  let ok = pdfCharsets.get(font)
+  if (!ok) { ok = new Set(font.getCharacterSet()); pdfCharsets.set(font, ok) }
+  const set = ok
+  return Array.from(String(str ?? '').replace(/\s*[→⟶➔]\s*/g, ' to '))
+    .map((ch) => (ch === '\n' || ch === '\t' || set.has(ch.codePointAt(0)!) ? ch : '?')).join('')
 }
 
 function ruleH(doc: Doc, y: number, color: ReturnType<typeof rgb> = RULE) {
@@ -346,6 +362,7 @@ function drawFooter(doc: Doc, lines: string[]) {
 }
 
 function truncToWidth(s: string, font: PDFFont, size: number, maxW: number): string {
+  s = pdfSafe(font, s)
   if (font.widthOfTextAtSize(s, size) <= maxW) return s
   let out = s
   while (out.length > 0 && font.widthOfTextAtSize(out + '…', size) > maxW) {
@@ -634,6 +651,11 @@ export interface PosReceiptPdfInput {
   taxAmount:       number
   tipAmount?:      number   // S512 — gratuity, separate from the sale
   totalAmount:     number
+  /**
+   * 10/5 (Nic, R13): a sentence printed under the totals — "Your site is held
+   * through …" for a stay of 30+ nights with no lease (stayHeldWords).
+   */
+  note?:           string | null
 }
 
 export async function renderPosReceiptPdf(args: PosReceiptPdfInput): Promise<Buffer> {
@@ -675,6 +697,12 @@ export async function renderPosReceiptPdf(args: PosReceiptPdfInput): Promise<Buf
   }
   drawTotals(doc, totals)
 
+  if (args.note) {
+    doc.cursorY -= 8
+    ensurePage(doc, 40)
+    drawWrappedText(doc, args.note, PAGE_W - MARGIN_L - MARGIN_R)
+  }
+
   const footer: string[] = []
   if (args.status === 'refunded' && args.refundReason) {
     footer.push(`Refunded: ${args.refundReason}`)
@@ -688,7 +716,7 @@ export async function renderPosReceiptPdf(args: PosReceiptPdfInput): Promise<Buf
 // ── Wrapped text helper ───────────────────────────────────────
 
 function drawWrappedText(doc: Doc, raw: string, maxWidth: number) {
-  const words = raw.split(/\s+/)
+  const words = pdfSafe(doc.font, raw).split(/\s+/)
   let line = ''
   for (const w of words) {
     const candidate = line ? `${line} ${w}` : w

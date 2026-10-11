@@ -30,6 +30,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision, seedTenant,
+  seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -287,6 +288,94 @@ describe('PATCH /api/units/:id/bookings/:bookingId — update', () => {
     expect(res.body.data.nights).toBe(7)  // 07-01 to 07-08
   })
 
+  // 10/6 (Nic): "would anything inadvertently push her into spot 14...? We
+  // need it to actually do something in the schedule." When the extending
+  // guest is the one moved, a site they asked not to have is never where they
+  // go — and with nothing else open, the extension is refused rather than
+  // landing them there.
+  it('W-20 extension fallback never moves the extending guest onto a site they asked not to have', async () => {
+    const f = await seedUnitsFixture()
+    const mk = async (n: string) => (await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, is_bookable, lease_types_allowed)
+       VALUES ($1, $2, $3, 900, TRUE, ARRAY['nightly','weekly']) RETURNING id`,
+      [f.propertyId, f.landlordId, n])).rows[0].id
+    const rv98 = await mk('RV 98')
+    const rv99 = await mk('RV 99')
+    await db.query(`UPDATE units SET is_bookable=TRUE WHERE id=$1`, [f.unitId])
+    const sit = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-01', checkOut: '2026-08-05', guestName: 'Jo Avery', avoidedUnitIds: [rv98] })
+    expect(sit.status, JSON.stringify(sit.body)).toBe(201)
+    const inc = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-05', checkOut: '2026-08-09', guestName: 'Incoming' })
+    // The incoming guest was told their site, so they cannot be moved.
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc.body.data.id])
+    const ext = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07' })
+    expect(ext.status, JSON.stringify(ext.body)).toBe(200)
+    // RV 98 is the first open site, but it is on Jo's list.
+    expect(ext.body.extendedGuestMovedTo?.unitNumber).toBe('RV 99')
+    expect((await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [sit.body.data.id])).rows[0].unit_id).toBe(rv99)
+
+    // Only the avoided site open: the extension is refused, nobody is moved there.
+    const sit2 = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-12', checkOut: '2026-08-15', guestName: 'Jo Avery', avoidedUnitIds: [rv98] })
+    const inc2 = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-15', checkOut: '2026-08-18', guestName: 'Incoming 2' })
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc2.body.data.id])
+    await db.query(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, status, site_reveal_sent_at)
+       VALUES ($1, $2, 'nightly', '2026-08-10', '2026-08-20', 'confirmed', now())`, [rv99, f.landlordId])
+    const ext2 = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit2.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-17' })
+    expect(ext2.status).toBe(409)
+    expect(ext2.body.error).toMatch(/no open site fits the extended stay/)
+    expect((await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [sit2.body.data.id])).rows[0].unit_id).toBe(f.unitId)
+  })
+
+  // 10/6 (review): the avoid list sent WITH the extension is the one honored —
+  // a site added to it in the same save is never where the guest is moved.
+  it('W-20 extension fallback honors a site added to the avoid list in the same save', async () => {
+    const f = await seedUnitsFixture()
+    const mk = async (n: string) => (await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, is_bookable, lease_types_allowed)
+       VALUES ($1, $2, $3, 900, TRUE, ARRAY['nightly','weekly']) RETURNING id`,
+      [f.propertyId, f.landlordId, n])).rows[0].id
+    const rv98 = await mk('RV 98')
+    const rv99 = await mk('RV 99')
+    await db.query(`UPDATE units SET is_bookable=TRUE WHERE id=$1`, [f.unitId])
+    const sit = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-01', checkOut: '2026-08-05', guestName: 'Pat Ruiz' })
+    expect(sit.status, JSON.stringify(sit.body)).toBe(201)
+    const inc = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-05', checkOut: '2026-08-09', guestName: 'Incoming' })
+    await db.query(`UPDATE unit_bookings SET site_reveal_sent_at=now() WHERE id=$1`, [inc.body.data.id])
+    const ext = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sit.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07', avoidedUnitIds: [rv98] })
+    expect(ext.status, JSON.stringify(ext.body)).toBe(200)
+    expect(ext.body.extendedGuestMovedTo?.unitNumber).toBe('RV 99')
+    const row = (await db.query(`SELECT unit_id, avoided_unit_ids FROM unit_bookings WHERE id=$1`, [sit.body.data.id])).rows[0]
+    expect(row.unit_id).toBe(rv99)
+    expect(row.avoided_unit_ids).toEqual([rv98])
+  })
+
   it('W-20 extension protection: boots the following unrevealed reservation; falls back to MOVING THE EXTENDING GUEST; 409s when neither works', async () => {
     const f = await seedUnitsFixture()
     // A second bookable site at the property.
@@ -485,9 +574,12 @@ describe('S605 renumbering during onboarding', () => {
     expect(rows[0].label).toBe('APT 14A electric')   // not the stale 'RV 03 electric'
   })
 
-  // The original protection must survive: once a meter has a reading, the number
-  // is genuinely load-bearing on records and stays locked.
-  it('a meter WITH a reading still blocks the renumber', async () => {
+  // S641: the number is no longer locked by history. A reading is exactly the
+  // case Nic had in mind — "would we just say that we're changing the unit
+  // number in the system, show a timeline" — and unit_number_history keeps what
+  // the space was called when that reading was taken, so the record still reads
+  // correctly after the rename.
+  it('renumbers even with a meter reading on record, and keeps the old name', async () => {
     const f = await seedUnitsFixture()
     const meter = await db.query<any>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
@@ -502,7 +594,14 @@ describe('S605 renumbering during onboarding', () => {
 
     const res = await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
       .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: 'RV 14' })
-    expect(res.status).toBe(409)
+    expect(res.status).toBe(200)
+
+    const hist = await db.query<any>(
+      `SELECT unit_number, effective_to FROM unit_number_history
+        WHERE unit_id=$1 ORDER BY effective_from`, [f.unitId])
+    expect(hist.rows.length).toBeGreaterThanOrEqual(2)
+    expect(hist.rows.at(-1).effective_to).toBeNull()
+    expect(hist.rows.at(-2).effective_to).not.toBeNull()
   })
 })
 
@@ -510,7 +609,7 @@ describe('S605 renumbering during onboarding', () => {
 // ── S605: a bare number can no longer be CREATED, because the platform supplies
 // the prefix (see the standardized-numbering describe below). The earlier
 // reject-on-bare-number rule was superseded by canonicalisation — kept here as
-// the behaviour it became, so nobody re-adds a 400 that can never fire.
+// the behavior it became, so nobody re-adds a 400 that can never fire.
 describe('S605 bare numbers are canonicalised, not rejected', () => {
   it('a bare number is accepted and gains the type prefix', async () => {
     const f = await seedUnitsFixture()
@@ -557,7 +656,7 @@ describe('S605 standardized unit numbering', () => {
     expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 07')
   })
 
-  it('normalises a spelled-out label to the standard prefix', async () => {
+  it('normalizes a spelled-out label to the standard prefix', async () => {
     const f = await seedUnitsFixture()
     const res = await create(f, { unitNumber: 'Mobile Home Site 1', unitType: 'mobile_home' })
     expect(res.status).toBe(201)
@@ -682,5 +781,125 @@ describe('pending_invite_count sees both invite flows', () => {
     // This harness mounts the router without the camelize interceptor, so the
     // response keeps the column's own name.
     expect(unit.pending_invite_count ?? unit.pendingInviteCount).toBe(1)
+  })
+})
+
+// S653 (Nic): "on the space for mobile home three that I marked as owner use,
+// there's no way to put an occupant name in there just for contact information."
+describe('S653 owner-use occupant', () => {
+  it('stores who is in an owner-use space and lists them on the emergency roster', async () => {
+    const { seedLandlord, seedProperty, seedUnit } = await import('../test/dbHelpers')
+    const jwt = (await import('jsonwebtoken')).default
+    const c = await db.connect()
+    let landlordId = '', userId = '', unitId = ''
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c); landlordId = ll.landlordId; userId = ll.userId
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      await c.query(`UPDATE units SET status='owner_use', unit_number='MH 03' WHERE id=$1`, [unitId])
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const token = jwt.sign({ userId, role: 'landlord', email: 'x@t.dev', landlordIds: [landlordId], permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp()).patch(`/api/units/${unitId}/details`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ ownerOccupantName: 'Grandpa Rhoades', ownerOccupantPhone: '520-555-0100', ownerOccupantEmail: ' gp@example.com ' })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const u = (await db.query(`SELECT owner_occupant_name, owner_occupant_phone, owner_occupant_email FROM units WHERE id=$1`, [unitId])).rows[0]
+    expect(u).toEqual({ owner_occupant_name: 'Grandpa Rhoades', owner_occupant_phone: '520-555-0100', owner_occupant_email: 'gp@example.com' })
+    const { emergencyContactRoster } = await import('../services/emergencyContacts')
+    const roster = await emergencyContactRoster({ landlordIds: [landlordId], propertyIds: null })
+    expect(roster.some((r: any) => r.tenant_id === null && r.tenant_first === 'Grandpa Rhoades' && r.unit_number === 'MH 03' && r.tenant_phone === '520-555-0100')).toBe(true)
+  })
+})
+
+// ── S655: who sees which units ───────────────────────────────────────────────
+//
+// Two parks under one company, a resident living at each. The resident at
+// park 1 is flagged SSI/SSDI.
+async function seedTwoParks() {
+  const f = await seedUnitsFixture()
+  const c = await db.connect()
+  try {
+    const p2 = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+    const u2 = await seedUnit(c, { propertyId: p2, landlordId: f.landlordId })
+    const t1 = await seedTenant(c)
+    const t2 = await seedTenant(c)
+    await seedLeaseTenant(c, { leaseId: await seedLease(c, { unitId: f.unitId, landlordId: f.landlordId }), tenantId: t1 })
+    await seedLeaseTenant(c, { leaseId: await seedLease(c, { unitId: u2, landlordId: f.landlordId }), tenantId: t2 })
+    await c.query(`UPDATE tenants SET ssi_ssdi = TRUE WHERE id = $1`, [t1])
+    const { rows: [staff] } = await c.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Park', 'Two', TRUE) RETURNING id`, [`os-${randomUUID()}@test.dev`])
+    await c.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3::uuid[], FALSE)`, [staff.id, f.landlordId, [p2]])
+    const staffToken = jwt.sign(
+      { userId: staff.id, role: 'onsite_manager', email: 'os@test.dev', profileId: null,
+        landlordId: f.landlordId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    return { ...f, p2, u2, t1, t2, staffId: staff.id, staffToken }
+  } finally { c.release() }
+}
+
+describe('S655: SSI/SSDI never reaches a landlord or staff member', () => {
+  // Nic, 10/2: "That's our check for the flex products." It stays GAM-side.
+  it('the unit page and the unit list carry no SSI/SSDI flag, for the owner or for staff', async () => {
+    const f = await seedTwoParks()
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = TRUE WHERE user_id = $1`, [f.staffId])
+    for (const token of [f.landlordToken, f.staffToken]) {
+      const one = await request(buildApp()).get(`/api/units/${f.unitId}`).set('Authorization', `Bearer ${token}`)
+      expect(one.status).toBe(200)
+      expect(one.body.data.tenant_id).toBe(f.t1)          // the flagged resident lives here
+      expect(JSON.stringify(one.body)).not.toMatch(/ssi_ssdi|ssiSsdi/i)
+      const list = await request(buildApp()).get('/api/units').set('Authorization', `Bearer ${token}`)
+      expect(list.status).toBe(200)
+      expect(list.body.data.map((u: any) => u.tenant_id)).toContain(f.t1)
+      expect(JSON.stringify(list.body)).not.toMatch(/ssi_ssdi|ssiSsdi/i)
+    }
+  })
+})
+
+describe('S655: a staff member assigned to one property sees that property\'s units only', () => {
+  it('the unit list (the Tenants page) shows their property\'s units and residents; all-properties staff and the owner see both parks; no properties shows none', async () => {
+    const f = await seedTwoParks()
+    const list = async (token: string) => {
+      const res = await request(buildApp()).get('/api/units').set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      return res.body.data as any[]
+    }
+
+    const scoped = await list(f.staffToken)
+    expect(scoped.map(u => u.id)).toEqual([f.u2])
+    expect(scoped.map(u => u.tenant_id)).toEqual([f.t2])
+    // Asking for the other park by name does not get around it.
+    const res = await request(buildApp()).get(`/api/units?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${f.staffToken}`)
+    expect(res.body.data).toEqual([])
+
+    expect((await list(f.landlordToken)).map(u => u.id).sort()).toEqual([f.unitId, f.u2].sort())
+
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = TRUE WHERE user_id = $1`, [f.staffId])
+    expect((await list(f.staffToken)).map(u => u.id).sort()).toEqual([f.unitId, f.u2].sort())
+
+    await db.query(`UPDATE onsite_manager_scopes SET all_properties = FALSE, property_ids = '{}'::uuid[] WHERE user_id = $1`, [f.staffId])
+    expect(await list(f.staffToken)).toEqual([])
+  })
+
+  it('opening a unit at another property is refused in plain words; their own property\'s unit opens', async () => {
+    const f = await seedTwoParks()
+    const open = (unitId: string) => request(buildApp()).get(`/api/units/${unitId}`).set('Authorization', `Bearer ${f.staffToken}`)
+
+    const refused = await open(f.unitId)
+    expect(refused.status).toBe(403)
+    expect(refused.body.error).toMatch(/at a property you're not assigned to/)
+    expect(JSON.stringify(refused.body)).not.toContain('@')   // no resident contact rides along
+
+    const mine = await open(f.u2)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data.tenant_id).toBe(f.t2)
+
+    // The owner is never property-limited.
+    const owner = await request(buildApp()).get(`/api/units/${f.unitId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(owner.status).toBe(200)
   })
 })

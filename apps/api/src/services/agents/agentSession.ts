@@ -43,6 +43,17 @@ export interface AgentSessionInput {
   /** correlation id to group turns of one chat thread (for logging).
    *  Generated per-turn if a caller doesn't supply it. */
   conversationId?: string
+  /**
+   * S651: an opaque, client-chosen id for THIS turn, used for one thing —
+   * letting the waiting person ask where they are in the queue.
+   *
+   * Not `conversationId`, which the server mints on a brand-new thread and the
+   * client therefore cannot know until the turn has already answered — by which
+   * point the wait it would have explained is over. Deliberately never used to
+   * look anything up: it keys an in-memory array and nothing else, so an
+   * attacker guessing one learns only that somebody is queued.
+   */
+  gateKey?: string
 }
 
 export interface EscalationStep {
@@ -124,7 +135,14 @@ const HIGH_VOLUME_REPLY =
  * dominates it.
  */
 export async function runAgentSession(input: AgentSessionInput): Promise<AgentSessionResult> {
-  return withConcurrencySlot(() => runAgentSessionInner(input))
+  // S651: the conversation id is handed to the gate so a status poll can tell
+  // THIS person where they actually are, rather than reporting a global
+  // "we're busy" that may have nothing to do with them.
+  return withConcurrencySlot(
+    () => runAgentSessionInner(input),
+    undefined,
+    input.gateKey ?? input.conversationId,
+  )
 }
 
 async function runAgentSessionInner(input: AgentSessionInput): Promise<AgentSessionResult> {

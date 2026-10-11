@@ -164,6 +164,30 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
 })
 
 // POST /api/maintenance — create request (tenant or landlord)
+// S652: what kinds of request this unit's property accepts, and the note to
+// show. Everything, when the property has not limited it.
+maintenanceRouter.get('/config', async (req, res, next) => {
+  try {
+    const unitId = String(req.query.unitId || '')
+    if (!/^[0-9a-f-]{36}$/i.test(unitId)) throw new AppError(400, 'unitId required')
+    const row = await queryOne<any>(
+      `SELECT p.maintenance_categories, p.maintenance_note, u.landlord_id
+         FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
+    if (!row) throw new AppError(404, 'Unit not found')
+    if (req.user!.role === 'tenant') {
+      const on = await queryOne<any>(
+        `SELECT 1 FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+          WHERE l.unit_id = $1 AND lt.tenant_id = $2 AND lt.status IN ('active','pending_add','pending_remove') LIMIT 1`,
+        [unitId, req.user!.profileId])
+      if (!on) throw new AppError(403, 'Forbidden')
+    } else if (!canManageLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
+    res.json({ success: true, data: {
+      categories: row.maintenance_categories?.length ? row.maintenance_categories : [...MAINTENANCE_CATEGORIES],
+      note: row.maintenance_note ?? null,
+    } })
+  } catch (e) { next(e) }
+})
+
 maintenanceRouter.post('/', async (req, res, next) => {
   try {
     // S571: tenants pick a category (title is derived) and do NOT set priority —
@@ -181,6 +205,18 @@ maintenanceRouter.post('/', async (req, res, next) => {
     // A tenant may not self-assign priority — it's agent-recommended and
     // landlord-overridable. Strip any priority a tenant tries to send.
     const priority = req.user!.role === 'tenant' ? undefined : body.priority
+    
+    // S652 (Nic): a tenant-owned park does not take "my stove is broken". The
+    // property says which kinds it accepts; anything else is refused with the
+    // landlord's own words, so the record stays clean and the tenant knows why.
+    if (req.user!.role === 'tenant' && body.category) {
+      const cfg = await queryOne<{ maintenance_categories: string[] | null; maintenance_note: string | null }>(
+        `SELECT p.maintenance_categories, p.maintenance_note FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+        [body.unitId])
+      if (cfg?.maintenance_categories?.length && !cfg.maintenance_categories.includes(body.category)) {
+        throw new AppError(400, cfg.maintenance_note || 'This property does not take that kind of request.')
+      }
+    }
 
     // Ownership gate for NON-tenant callers. The tenant path is scoped inside
     // the service (must be on the unit's active lease); a landlord/staff caller
@@ -220,6 +256,11 @@ maintenanceRouter.post('/', async (req, res, next) => {
 maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, res, next) => {
   try {
     const { status: rawStatus, assignedTo, estimatedCost, actualCost, scheduledAt, landlordNotes, manHours, priority: rawPriority, category: rawCategory } = req.body
+    // S652: who may see an unassigned job among the property's work traders.
+    const workTradeAccess = ['auto', 'anyone', 'none'].includes(req.body?.workTradeAccess) ? req.body.workTradeAccess : null
+    // S652: "— Unassigned —" sends null, which COALESCE used to swallow — the
+    // old person stayed on the job. An explicit null now clears it.
+    const assignTouched = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'assignedTo')
 
     // S571: landlord may override the agent-recommended priority + category.
     const priority = rawPriority && MAINTENANCE_PRIORITIES.includes(rawPriority) ? rawPriority : null
@@ -230,6 +271,24 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     if (!request) throw new AppError(404, 'Request not found')
     if (!canManageLandlordResource(req.user, request.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+    // S652: an assignee must be someone who works this job's property — the
+    // landlord's own team, or a live work trader there. It used to accept any
+    // user id at all.
+    if (assignTouched && assignedTo) {
+      const ok = await queryOne<{ ok: boolean }>(`
+        SELECT (
+          EXISTS (SELECT 1 FROM landlords l WHERE l.id = $2 AND l.user_id = $1)
+          OR EXISTS (SELECT 1 FROM landlord_members m WHERE m.landlord_id = $2 AND m.user_id = $1)
+          OR EXISTS (SELECT 1 FROM maintenance_worker_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM property_manager_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM onsite_manager_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM work_trade_agreements a JOIN tenants t ON t.id = a.tenant_id
+                       JOIN units au ON au.id = a.unit_id
+                      WHERE t.user_id = $1 AND a.status = 'active'
+                        AND au.property_id = (SELECT property_id FROM units WHERE id = $3))
+        ) AS ok`, [assignedTo, request.landlord_id, request.unit_id])
+      if (!ok?.ok) throw new AppError(400, 'That person does not work at this property')
     }
 
     // Auto-approval gate: if a new estimated cost is being set AND it exceeds the
@@ -267,8 +326,9 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     const updated = await queryOne<any>(`
       UPDATE maintenance_requests SET
         status         = COALESCE($1, status),
-        assigned_to    = COALESCE($2, assigned_to),
-        assigned_at    = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE assigned_at END,
+        assigned_to    = CASE WHEN $12::boolean THEN $2::uuid ELSE assigned_to END,
+        assigned_at    = CASE WHEN $12::boolean AND $2 IS NOT NULL THEN NOW() ELSE assigned_at END,
+        work_trade_access = COALESCE($13, work_trade_access),
         estimated_cost = COALESCE($3, estimated_cost),
         actual_cost    = COALESCE($4, actual_cost),
         platform_fee   = COALESCE($5, platform_fee),
@@ -282,7 +342,8 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
       WHERE id=$8 RETURNING *`,
       [effectiveStatus, assignedTo||null, estimatedCostNum,
        actualCost||null, platformFee, scheduledAt||null,
-       landlordNotes||null, req.params.id, manHours||null, priority, category])
+       landlordNotes||null, req.params.id, manHours||null, priority, category,
+       assignTouched, workTradeAccess])
 
     // Auto-add status change comment
     if (effectiveStatus && effectiveStatus !== request.status) {
@@ -302,12 +363,13 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     try {
       if (effectiveStatus && effectiveStatus !== request.status && effectiveStatus !== 'awaiting_approval') {
         const tenant = await queryOne<any>(`SELECT u.id, u.email, u.phone FROM users u JOIN tenants t ON t.user_id=u.id WHERE t.id=$1`, [request.tenant_id])
-        const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id=$1`, [request.unit_id])
+        const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id=$1`, [request.unit_id])
         if (tenant) await notifyMaintenanceUpdated({
           tenantUserId: tenant.id,
           tenantEmail: tenant.email,
           tenantPhone: tenant.phone,
           unitNumber: unit?.unit_number,
+          propertyId: unit?.property_id,  // 10/5: the tenant's reply reaches the property
           requestTitle: request.title,
           newStatus: effectiveStatus,
           scheduledAt: scheduledAt,
@@ -432,12 +494,13 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
     // Notify tenant — their request is moving forward
     try {
       const tenant = await queryOne<any>(`SELECT u.id, u.email, u.phone FROM users u JOIN tenants t ON t.user_id=u.id WHERE t.id=$1`, [request.tenant_id])
-      const unit = await queryOne<any>(`SELECT unit_number FROM units WHERE id=$1`, [request.unit_id])
+      const unit = await queryOne<any>(`SELECT unit_number, property_id FROM units WHERE id=$1`, [request.unit_id])
       if (tenant) await notifyMaintenanceUpdated({
         tenantUserId: tenant.id,
         tenantEmail: tenant.email,
         tenantPhone: tenant.phone,
         unitNumber: unit?.unit_number,
+        propertyId: unit?.property_id,  // 10/5: the tenant's reply reaches the property
         requestTitle: request.title,
         newStatus: nextStatus,
         scheduledAt: undefined,

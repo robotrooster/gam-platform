@@ -33,6 +33,7 @@ vi.mock('../lib/stripe', () => ({
   getStripe: () => ({
     terminal: {
       connectionTokens: { create: connectionTokensCreateMock },
+      locations: { create: vi.fn(async () => ({ id: 'tml_mock' })) },
       readers: {
         create: terminalReadersCreateMock,
         processPaymentIntent: terminalProcessPaymentIntentMock,
@@ -109,18 +110,21 @@ describe('posTerminal', () => {
     finally { c.release() }
   }
 
-  it('createConnectionToken: returns secret + fires under stripeAccount', async () => {
+  // S648: register card money lands with GAM, so the reader runs on GAM's
+  // account, scoped to the property's reader location.
+  it('createConnectionToken: returns secret on the platform account, scoped to the property', async () => {
+    const ctx = await seedLandlordProperty()
     connectionTokensCreateMock.mockResolvedValueOnce({ secret: 'pst_real' } as any)
-    const secret = await createConnectionToken('acct_landlord')
+    const secret = await createConnectionToken(ctx.propertyId)
     expect(secret).toBe('pst_real')
-    expect(connectionTokensCreateMock).toHaveBeenCalledWith(
-      {},
-      { stripeAccount: 'acct_landlord' })
+    expect(connectionTokensCreateMock).toHaveBeenCalledWith({ location: 'tml_mock' })
+    const p = await db.query(`SELECT stripe_terminal_location_id FROM properties WHERE id = $1`, [ctx.propertyId])
+    expect(p.rows[0].stripe_terminal_location_id).toBe('tml_mock')
   })
 
   it('createConnectionToken: missing secret → 500', async () => {
     connectionTokensCreateMock.mockResolvedValueOnce({ secret: null } as any)
-    await expect(createConnectionToken('acct_x')).rejects.toThrow(/no secret/)
+    await expect(createConnectionToken()).rejects.toThrow(/no secret/)
   })
 
   it('registerReader: happy — creates Stripe reader + inserts pos_terminal_readers row', async () => {
@@ -128,7 +132,6 @@ describe('posTerminal', () => {
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_new' } as any)
     const row = await registerReader({
       landlordId: ctx.landlordId,
-      landlordConnectAccountId: 'acct_landlord',
       propertyId: ctx.propertyId,
       registrationCode: 'pair-1234',
       nickname: 'Front Counter',
@@ -137,8 +140,8 @@ describe('posTerminal', () => {
     expect(row.nickname).toBe('Front Counter')
     expect(row.status).toBe('active')
     expect(terminalReadersCreateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ registration_code: 'pair-1234', label: 'Front Counter' }),
-      { stripeAccount: 'acct_landlord' })
+      expect.objectContaining({ registration_code: 'pair-1234', label: 'Front Counter', location: 'tml_mock' }))
+    expect(terminalReadersCreateMock.mock.calls[0]).toHaveLength(1)
   })
 
   it('registerReader: 23505 duplicate → 409', async () => {
@@ -146,13 +149,13 @@ describe('posTerminal', () => {
     // First registration.
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_dup' } as any)
     await registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: ctx.propertyId, registrationCode: 'pair-1', nickname: 'R1',
     })
     // Same reader id again → UNIQUE catch
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_dup' } as any)
     await expect(registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: ctx.propertyId, registrationCode: 'pair-1', nickname: 'R1 dup',
     })).rejects.toThrow(/already registered with this landlord/)
   })
@@ -161,7 +164,7 @@ describe('posTerminal', () => {
     const ctx = await seedLandlordProperty()
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_a' } as any)
     await registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: ctx.propertyId, registrationCode: 'pair-a', nickname: 'A',
     })
     // Second property + reader on it.
@@ -177,7 +180,7 @@ describe('posTerminal', () => {
     } finally { c.release() }
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_b' } as any)
     await registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: p2, registrationCode: 'pair-b', nickname: 'B',
     })
     const filteredA = await listReaders(ctx.landlordId, ctx.propertyId)
@@ -190,7 +193,7 @@ describe('posTerminal', () => {
     const ctx = await seedLandlordProperty()
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_x' } as any)
     const row = await registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: ctx.propertyId, registrationCode: 'pair', nickname: 'X',
     })
     const archived = await archiveReader(ctx.landlordId, row.id)
@@ -201,7 +204,7 @@ describe('posTerminal', () => {
     const ctx = await seedLandlordProperty()
     terminalReadersCreateMock.mockResolvedValueOnce({ id: 'tmr_x' } as any)
     const row = await registerReader({
-      landlordId: ctx.landlordId, landlordConnectAccountId: 'acct',
+      landlordId: ctx.landlordId,
       propertyId: ctx.propertyId, registrationCode: 'pair', nickname: 'X',
     })
     await archiveReader(ctx.landlordId, row.id)
@@ -210,10 +213,7 @@ describe('posTerminal', () => {
   })
 
   it('createCardPresentPaymentIntent: amountCents validation (must be positive integer)', async () => {
-    const args = {
-      landlordConnectAccountId: 'acct', landlordId: 'l', propertyId: 'p',
-      amountCents: 0,
-    }
+    const args = { landlordId: 'l', propertyId: 'p', amountCents: 0, cardFeeCents: 0 }
     await expect(createCardPresentPaymentIntent(args)).rejects.toThrow(/positive integer/)
     await expect(createCardPresentPaymentIntent({ ...args, amountCents: -100 }))
       .rejects.toThrow(/positive integer/)
@@ -221,12 +221,11 @@ describe('posTerminal', () => {
       .rejects.toThrow(/positive integer/)
   })
 
-  it('createCardPresentPaymentIntent: shape (card_present + manual capture + metadata + stripeAccount)', async () => {
+  it('createCardPresentPaymentIntent: a platform charge (card_present + manual capture + metadata, no Connect account, no transfer)', async () => {
     paymentIntentsCreateMock.mockResolvedValueOnce({ id: 'pi_card_present' } as any)
     await createCardPresentPaymentIntent({
-      landlordConnectAccountId: 'acct_l',
       landlordId: 'l_1', propertyId: 'p_1',
-      amountCents: 2500,
+      amountCents: 2500, cardFeeCents: 143,
       posDraftRef: 'draft_abc',
     })
     expect(paymentIntentsCreateMock).toHaveBeenCalledWith(
@@ -239,18 +238,19 @@ describe('posTerminal', () => {
           gam_landlord_id: 'l_1',
           gam_property_id: 'p_1',
           gam_pos_draft_ref: 'draft_abc',
+          gam_card_fee_cents: '143',
         }),
-      }),
-      { stripeAccount: 'acct_l' })
+      }))
+    const args = (paymentIntentsCreateMock.mock.calls[0] as any[])
+    expect(args).toHaveLength(1)
+    expect(args[0].transfer_data).toBeUndefined()
+    expect(args[0].application_fee_amount).toBeUndefined()
   })
 
-  it('captureTerminalPaymentIntent: fires under stripeAccount', async () => {
+  it('captureTerminalPaymentIntent: captures on the platform account', async () => {
     paymentIntentsCaptureMock.mockResolvedValueOnce({ id: 'pi_x', status: 'succeeded' } as any)
-    await captureTerminalPaymentIntent({
-      landlordConnectAccountId: 'acct_l', paymentIntentId: 'pi_x',
-    })
-    expect(paymentIntentsCaptureMock).toHaveBeenCalledWith(
-      'pi_x', {}, { stripeAccount: 'acct_l' })
+    await captureTerminalPaymentIntent({ paymentIntentId: 'pi_x' })
+    expect(paymentIntentsCaptureMock).toHaveBeenCalledWith('pi_x')
   })
 })
 

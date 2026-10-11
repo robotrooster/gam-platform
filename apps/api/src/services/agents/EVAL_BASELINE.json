@@ -18,7 +18,7 @@
   "passing": 45,
   "knownFailures": [],
   "notes": {
-    "howThisWasReached": "45/45 across two paced blocks (21 tenant, 24 landlord/guest/prospect). Four of the six problems fixed to get here were GUARDS OR ASSERTIONS punishing correct behaviour, not agents being wrong.",
+    "howThisWasReached": "45/45 across two paced blocks (21 tenant, 24 landlord/guest/prospect). Four of the six problems fixed to get here were GUARDS OR ASSERTIONS punishing correct behavior, not agents being wrong.",
     "readItAsADiff": "One seeded run is ONE DRAW. It makes a change comparable before and after, which is what regression detection needs. It is not a grade \u2014 a clean score is not proof the agents are good.",
     "doNotChunkAndCompare": "The seed is per PROCESS, so a chunked run and a single run are not comparable to each other. Compare like with like."
   },

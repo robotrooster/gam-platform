@@ -4,13 +4,14 @@
 // document says as INFORMATION — parties, term, rent, deposit, fees — with a
 // link to the full lease PDF (the W-29 /view route). Editing happens only
 // through the proper flows (renewal, bill-fee, termination), never here.
-// The editable path (needs-review import confirm) still uses LeaseFormModal.
+// S653: the edit form is gone; a needs-review import is confirmed here, read-only.
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { FileText, X, Plus, Trash2 } from 'lucide-react'
 import { humanize, RENT_COMPONENT_KINDS, RENT_COMPONENT_KIND_LABEL } from '@gam/shared'
-import { apiGet, apiPut } from '../lib/api'
+import { apiGet, apiPut, apiPatch } from '../lib/api'
+import { toast } from '../components/dialogs'
 
 const fmtMoney = (n: any) =>
   n != null && n !== '' ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'
@@ -124,6 +125,11 @@ function RentBreakdownSection({ leaseId, rentAmount, components }: {
 export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onClose: () => void }) {
   const navigate = useNavigate()
   const { data: lease, isLoading } = useQuery(['lease-overview', leaseId], () => apiGet<any>(`/leases/${leaseId}`))
+  const oqc = useQueryClient()
+  const confirmReview = useMutation(() => apiPatch(`/leases/${leaseId}`, { needsReview: false }), {
+    onSuccess: () => { oqc.invalidateQueries('leases'); oqc.invalidateQueries(['lease-overview', leaseId]); toast('Lease confirmed.'); onClose() },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not confirm the lease.'),
+  })
 
   const tenants: any[] = lease?.tenants || []
   const fees: any[] = (lease?.fees || []).filter((f: any) => f.feeType !== 'security_deposit')
@@ -204,6 +210,14 @@ export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onCl
               <div>{lease.noticeDaysRequired} days required to end</div>
             </div>
 
+            {/* S653: an imported lease flagged for review is CONFIRMED here, read-only.
+                Nothing on it is editable — if the import is wrong, discard it from
+                the Leases page and draft the real one. */}
+            {lease.needsReview && (
+              <div style={{ marginTop: 16, padding: '10px 12px', borderRadius: 10, background: 'rgba(245,158,11,.08)', border: '1px solid var(--amber)', fontSize: '.8rem', color: 'var(--text-1)' }}>
+                Imported with default values. If what's above matches the signed paper, confirm it; if not, discard it from the list and draft the real lease.
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
               <button
                 className="btn btn-primary btn-sm"
@@ -211,6 +225,11 @@ export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onCl
               >
                 <FileText size={14} /> View Full Lease
               </button>
+              {lease.needsReview && (
+                <button className="btn btn-primary btn-sm" disabled={confirmReview.isLoading} onClick={() => confirmReview.mutate()}>
+                  {confirmReview.isLoading ? 'Confirming…' : 'Confirm — looks right'}
+                </button>
+              )}
               <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto' }} onClick={onClose}>Close</button>
             </div>
           </div>

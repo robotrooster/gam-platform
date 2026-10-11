@@ -83,3 +83,16 @@ describe('addBusinessDays', () => {
     expect(addBusinessDays('2031-07-03', 1)).toBe('2031-07-07');
   });
 });
+
+// 10/5 (Nic): when a bank posts a branch deposit — the Federal Reserve's
+// holiday rule (a Saturday holiday leaves the Friday before open).
+import { usBankHolidays, addBankBusinessDays } from './businessDay'
+describe('bank holidays (deposit posting)', () => {
+  it('a Saturday holiday is not moved to Friday; a Sunday one closes Monday', () => {
+    expect(usBankHolidays(2026)).not.toContain('2026-07-03')   // Jul 4, 2026 is a Saturday
+    expect(usBankHolidays(2027)).toContain('2027-07-05')       // Jul 4, 2027 is a Sunday
+    expect(addBankBusinessDays('2026-07-02', 1)).toBe('2026-07-03')
+    expect(addBankBusinessDays('2027-07-02', 1)).toBe('2027-07-06')
+    expect(addBankBusinessDays('2026-10-09', 1)).toBe('2026-10-13')   // Columbus Day
+  })
+})

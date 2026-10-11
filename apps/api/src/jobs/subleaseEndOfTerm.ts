@@ -18,6 +18,7 @@
 import { query, queryOne } from '../db'
 import { appendEvent } from '../services/creditLedger'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export interface SubleaseEndOfTermResult {
   terminated_count: number
@@ -44,7 +45,9 @@ interface ExpiredSublease {
 }
 
 export async function processSubleaseEndOfTerm(): Promise<SubleaseEndOfTermResult> {
-  const today = new Date().toISOString().slice(0, 10)
+  // S654: the run date the SQL below means — CURRENT_DATE is Phoenix, GAM's
+  // home zone; the UTC date ran a day ahead after 5 pm.
+  const today = todayIn(null)
   const result: SubleaseEndOfTermResult = {
     terminated_count: 0,
     notification_errors: 0,

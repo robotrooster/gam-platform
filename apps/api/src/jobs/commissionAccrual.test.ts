@@ -18,7 +18,9 @@ import { db, getClient } from '../db'
 import { processCommissionAccrual } from './commissionAccrual'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 
-const MONTH = new Date(Date.UTC(2026, 6, 1)) // 2026-07-01
+// S654: the job takes the month from the Phoenix calendar. Midnight UTC on
+// Jul 1 is still 5 pm Jun 30 in Phoenix, so pin a moment that is Jul 1 there.
+const MONTH = new Date('2026-07-01T08:00:00Z') // 1 am Jul 1 Phoenix
 
 async function seedRep(role: 'admin' | 'super_admin' = 'admin'): Promise<string> {
   const r = await db.query<{ id: string }>(
@@ -74,6 +76,7 @@ describe('commission accrual', () => {
     const closer = await seedRep()
     await seedLandlordWithUnits({ occupied: 2, closerId: closer })
     const res = await processCommissionAccrual(MONTH)
+    expect(res.monthScanned).toBe('2026-07-01')
 
     // 2 units: closing 0.50 + service 0.50 to closer = 1.00; pot 0.20.
     expect(await sum('manager_id=$1 AND NOT to_pot', [closer])).toBe(1.00)

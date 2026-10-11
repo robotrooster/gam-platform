@@ -1,18 +1,22 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
+import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
-// S526: PropertyFeeScheduleSection RETIRED — fees are charged per tenant's
-// signed lease (lease_fees), not property-wide. S527: pricing lives in
+// S526: fees are charged per tenant's signed lease (lease_fees). S648: the
+// property fee list is back, per unit type, as what a new lease's fee boxes
+// start from (PropertyFeeScheduleSection). S527: pricing lives in
 // OWNER-DEFINED subtypes (UnitSubtypesSection) — blank until the owner
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyLateFeeSection } from './PropertyLateFeeSection'
+import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyLeaseSigningSection } from './PropertyLeaseSigningSection'
+import { PropertyOfficeEmailSection } from './PropertyOfficeEmailSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { UtilityMetersPage } from './UtilityMetersPage'
@@ -58,6 +62,10 @@ export function PropertyDetailPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const [showAddUnit, setShowAddUnit] = useState(false)
+  // S655: where the OWNER's signing requests for this property go is the
+  // owner's call alone; staff never see the setting (the server refuses them
+  // too). Hook kept above the early returns — see S609 below.
+  const { isOwner } = usePerms()
 
   const { data: property, isLoading: propLoading } = useQuery(
     ['property', id], () => apiGet<any>(`/properties/${id}`)
@@ -164,7 +172,7 @@ export function PropertyDetailPage() {
       {tab === 'utilities' && <UtilityMetersPage embeddedPropertyId={id!} />}
       {tab === 'amenities' && <AmenitiesPage embeddedPropertyId={id!} />}
       {/* S605 (Nic): "Property inventory is equipment. It's small tractors, weed
-          whackers, tools" — labelled Equipment here so it can't be confused with
+          whackers, tools" — labeled Equipment here so it can't be confused with
           POS resale stock, which is a different table entirely. */}
       {tab === 'inventory' && <InventoryPage embeddedPropertyId={id!} />}
       {tab === 'maintenance' && <MaintenancePage embeddedPropertyId={id!} />}
@@ -210,7 +218,14 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
-      <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
+      <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PropertyFeeScheduleSection propertyId={property.id}
+        unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
+      <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      {isOwner && <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />}
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a
             property setting — the S556 property-level section was removed. */}
@@ -710,6 +725,143 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
           <button className="btn btn-primary" onClick={() => onGoTab(a.tab)}>{a.cta}</button>
         </div>
       ))}
+    </div>
+  )
+}
+
+// S648 (Nic): WHEN RENT IS DUE, AND WHAT A MID-MONTH MOVE-IN PAYS.
+//   "Calendar month: prorate from the move-in date... Move-in anniversary: bill
+//    on the day of the month the tenant moved in with no proration." "Maybe
+//    their due date is just going to be the 15th of each month."
+//   "billing a new move-in collects the mid-month and the next month all at the
+//    same time, or they just want the prorated amount."
+// One answer per property, so everyone moving in there is treated alike. A
+// landlord can still set one tenant's own due day on that tenant's lease.
+// 10/5 (Nic): "The only thing the landlord chooses is if they absorb the cost
+// or if they pass it through ... they cannot absorb it for some people and pass
+// it through to other people." ONE choice per property, card and bank alike, for
+// rent, the front counter, pay links and the booking site.
+function CardFeePayerCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (choice: ProcessingFeeChoice) => apiPatch(`/properties/${property.id}/processing-fee-payers`, { choice }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the payment fee setting') })
+  const current = feeChoiceFromPayer(property.registerCardFeePayer)
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card and bank payment fees</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        Do you want to pass them on, or cover them? This applies to everyone who pays at this property —
+        rent, the front counter, pay links and the booking site.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {PROCESSING_FEE_CHOICES.map(v => (
+          <button key={v} className={`btn btn-sm ${current === v ? 'btn-primary' : 'btn-ghost'}`} disabled={save.isLoading}
+            title={PROCESSING_FEE_CHOICE_HINT[v]}
+            onClick={() => current !== v && save.mutate(v)}>{PROCESSING_FEE_CHOICE_LABEL[v]}</button>
+        ))}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PROCESSING_FEE_CHOICE_HINT[current]}.</div>
+    </div>
+  )
+}
+
+// 10/5 (Nic): "Maybe that's something we set at the property level settings and
+// let his property be set to take partial payments because there's really no way
+// to stop somebody from going into the bank and making a partial." Default off.
+// Payments RECORDED here (cash, check, money order, bank deposit) may then be
+// less than the bill; online payments still pay in full.
+export function PartialPaymentsCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (accept: boolean) => apiPatch(`/properties/${property.id}/partial-payments`, { accept }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the partial payments setting') })
+  const on = !!property.acceptPartialPayments
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Accept partial payments
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'A payment you record here — cash, check, money order or bank deposit — can be less than what is owed. It pays the oldest bills first; what is left stays owed, and late fees still apply to it. Tenants paying online still pay in full.'
+          : 'Off: a payment you record here has to cover everything owed. Turn it on if tenants can pay part of their rent — for example by depositing less than the bill at your bank.'}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>{PARTIAL_PAYMENTS_LAW_NOTE}</div>
+    </div>
+  )
+}
+
+// 10/6 (Nic): "Do you allow tenants to go into the bank and deposit their rent
+// for this unit or for this property? We don't do that here at Mountain View."
+// Default off. On: tenants may report a bank deposit, Record payment offers
+// "Bank deposit", and the bank feed matches each deposit to the tenant's bill
+// (the bank's date decides late fees). Off: none of those; the office's own
+// deposit slips still match.
+export function TenantsDepositAtBankCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (allowed: boolean) => apiPatch(`/properties/${property.id}/tenants-deposit-at-bank`, { allowed }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the bank deposit setting') })
+  const on = !!property.tenantsDepositAtBank
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        {TENANTS_DEPOSIT_AT_BANK_LABEL}
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{TENANTS_DEPOSIT_AT_BANK_HINT}</div>
+    </div>
+  )
+}
+
+function MoveInCollectionCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const collect = useMutation(
+    (collectsNextPeriod: boolean) => apiPatch(`/properties/${property.id}/move-in-collection`, { collectsNextPeriod }),
+    { onSuccess: onSaved })
+  const rule = useMutation(
+    (b: { mode: string; day?: number }) => apiPatch(`/properties/${property.id}/rent-due-rule`, b),
+    { onSuccess: onSaved })
+  const on = !!property.moveInCollectsNextPeriod
+  const mode = property.rentDueMode || 'fixed_day'
+  const day = Number(property.rentDueDay || 1)
+  const busy = collect.isLoading || rule.isLoading
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When rent is due</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        Applies to leases drafted from now on. You can still give one tenant their own due day on their lease.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+        <button className={`btn btn-sm ${mode === 'fixed_day' ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => mode !== 'fixed_day' && rule.mutate({ mode: 'fixed_day', day })}>Everyone on the same day</button>
+        <button className={`btn btn-sm ${mode === 'move_in_day' ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => mode !== 'move_in_day' && rule.mutate({ mode: 'move_in_day' })}>Each tenant&apos;s move-in day</button>
+        {mode === 'fixed_day' && (
+          <label style={{ fontSize: '.8rem', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            Due on the
+            <select className="input" value={day} disabled={busy} style={{ width: 80, fontSize: '.8rem', padding: '4px 6px' }}
+              onChange={e => rule.mutate({ mode: 'fixed_day', day: Number(e.target.value) })}>
+              {Array.from({ length: 28 }, (_, i) => i + 1).map(d => <option key={d} value={d}>{dueDayLabel(d)}</option>)}
+            </select>
+          </label>
+        )}
+      </div>
+      {mode === 'move_in_day' ? (
+        <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+          No proration: the first month runs from the move-in day. Anyone moving in on the 29th–31st is due on the 1st.
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 6 }}>New tenants moving in between due dates pay:</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+              onClick={() => on && collect.mutate(false)}>Prorated rent only</button>
+            <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+              onClick={() => !on && collect.mutate(true)}>Prorated rent plus the next month</button>
+          </div>
+        </>
+      )}
     </div>
   )
 }

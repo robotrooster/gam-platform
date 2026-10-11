@@ -7,7 +7,7 @@
 //
 // And the landlord's side (Nic, S624): "at some point, a landlord's gonna know
 // that somebody's never gonna be able to physically catch up. There's just not
-// that many hours in a month." That judgement should not require arithmetic in
+// that many hours in a month." That judgment should not require arithmetic in
 // someone's head, so `catchUpHours` is stated plainly and `catchUpPlausible`
 // says whether a human could actually work it.
 
@@ -34,8 +34,17 @@ export interface WorkTradeStanding {
   /**
    * What the carried hours would cost in cash if the agreement ended today —
    * each period at its own frozen rate.
+   *
+   * S643 (Nic, DIRECTIVE): NULL for the tenant. "Don't show the tenant any sort
+   * of hourly rate — that's when they decide it's not worth it. They're bad at
+   * calculation, some people think they're getting three dollars an hour in rent
+   * but they forget all the conveniences they get along the way."
+   *
+   * A dollar figure printed beside an hour count IS an hourly rate; it is one
+   * division away. The landlord still gets it — they are pricing an arrangement
+   * and need to know what a shortfall is worth.
    */
-  carriedValue: number
+  carriedValue: number | null
   /**
    * Is `catchUpHours` something a person could actually work this month?
    *
@@ -65,6 +74,8 @@ export function workTradeStanding(input: {
   currentMonthApplied: number
   carried: CarriedPeriod[]
   bankedHours: number
+  /** Who is reading. Defaults to the landlord's full view. */
+  audience?: 'tenant' | 'landlord'
 }): WorkTradeStanding {
   const currentMonthHours = Math.max(0,
     round2h(input.currentMonthTarget - input.currentMonthApplied))
@@ -84,11 +95,15 @@ export function workTradeStanding(input: {
     .filter(c => c.hoursOutstanding > 0)
     .sort((a, b) => a.closesRemaining - b.closesRemaining)[0] ?? null
 
+  const forTenant = input.audience === 'tenant'
   return {
     currentMonthHours, carriedHours, catchUpHours, bankedHours: banked,
-    carriedValue, catchUpPlausible,
-    nextBillingMonth: soonest ? soonest.periodMonth : null,
-    summary: summarise({ currentMonthHours, carriedHours, catchUpHours, banked, carriedValue }),
+    carriedValue: forTenant ? null : carriedValue,
+    catchUpPlausible,
+    nextBillingMonth: soonest && soonest.closesRemaining < Number.MAX_SAFE_INTEGER ? soonest.periodMonth : null,
+    summary: summarize({
+      currentMonthHours, carriedHours, catchUpHours, banked, carriedValue, forTenant,
+    }),
   }
 }
 
@@ -97,9 +112,9 @@ function hrs(n: number): string {
   return `${s} ${n === 1 ? 'hour' : 'hours'}`
 }
 
-function summarise(x: {
+function summarize(x: {
   currentMonthHours: number; carriedHours: number; catchUpHours: number
-  banked: number; carriedValue: number
+  banked: number; carriedValue: number; forTenant?: boolean
 }): string {
   if (x.currentMonthHours === 0 && x.carriedHours === 0) {
     return x.banked > 0
@@ -112,8 +127,13 @@ function summarise(x: {
   }
   // The case the whole thing exists for: say BOTH numbers, and the total.
   const ahead = x.banked > 0 ? ` ${hrs(x.banked)} banked comes off that.` : ''
+  // S643: the tenant's version carries no dollar figure. Hours beside dollars is
+  // an hourly rate whether or not it is labeled one, and the tenant page's own
+  // language is fractions of the bill for exactly that reason. They are still
+  // told plainly that an unworked hour becomes a balance — just not priced.
+  const cost = x.forTenant ? '' : ` — $${x.carriedValue.toFixed(2)} if it isn't worked`
   return `${hrs(x.currentMonthHours)} covers this month, and ${hrs(x.carriedHours)} ` +
-    `is still owed from earlier — $${x.carriedValue.toFixed(2)} if it isn't worked. ` +
+    `is still owed from earlier${cost}. ` +
     `${hrs(x.catchUpHours)} in total gets you straight.${ahead}`
 }
 
@@ -133,12 +153,13 @@ import { DateTime } from 'luxon'
  */
 export async function loadWorkTradeStanding(
   agreementId: string, asOfMonth?: string,
+  audience: 'tenant' | 'landlord' = 'landlord',
 ): Promise<WorkTradeStanding | null> {
   const month = asOfMonth
     ?? DateTime.now().setZone('America/Phoenix').startOf('month').toISODate()!
 
-  const ag = await queryOne<{ banked_hours: string; carry_forward_months: number }>(
-    `SELECT banked_hours, carry_forward_months
+  const ag = await queryOne<{ banked_hours: string; carry_forward_months: number; carry_forward_indefinite: boolean }>(
+    `SELECT banked_hours, carry_forward_months, carry_forward_indefinite
        FROM work_trade_agreements WHERE id = $1`, [agreementId])
   if (!ag) return null
 
@@ -165,7 +186,8 @@ export async function loadWorkTradeStanding(
       periodMonth: r.period_month,
       hoursOutstanding: Math.max(0, round2h(Number(r.target_hours) - Number(r.hours_applied))),
       hourRate: Number(r.hour_rate),
-      closesRemaining: Math.max(0,
+      // S652: floated indefinitely — no close ever bills it.
+      closesRemaining: ag.carry_forward_indefinite ? Number.MAX_SAFE_INTEGER : Math.max(0,
         Number(ag.carry_forward_months) - Number(r.aged_closes)),
     }))
     .filter(c => c.hoursOutstanding > 0)
@@ -176,5 +198,6 @@ export async function loadWorkTradeStanding(
     currentMonthApplied: current ? Number(current.hours_applied) : 0,
     carried,
     bankedHours: Number(ag.banked_hours),
+    audience,
   })
 }

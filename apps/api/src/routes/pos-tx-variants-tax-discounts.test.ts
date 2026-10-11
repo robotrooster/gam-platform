@@ -515,3 +515,65 @@ describe('PATCH /discounts/:id', () => {
     expect(res.body.data.name).toBe('Promo')
   })
 })
+
+// ───────────────────────────────────────────────────────────────────
+// S650 (Nic): named taxes, applied to whole categories and/or single items.
+// "We're not charging sales tax on the electricity. We are on the propane.
+//  They're both utilities ... I'd like to just be able to choose to add it to
+//  the whole category simultaneously."
+// ───────────────────────────────────────────────────────────────────
+describe('S650 taxes apply to categories and items, and sales record them by name', () => {
+  const tax = (f: Fixture, body: any) => request(buildApp()).post('/api/pos/tax-rates')
+    .set('Authorization', `Bearer ${f.tokenA}`).send({ propertyId: f.propertyAId, ...body })
+  const sell = (f: Fixture, itemId: string) => request(buildApp()).post('/api/pos/transactions')
+    .set('Authorization', `Bearer ${f.tokenA}`)
+    .send({ paymentMethod: 'cash', propertyId: f.propertyAId, items: [{ id: itemId, name: 'x', qty: 1, price: 10, tax: 0 }] })
+  async function secondItem(f: Fixture): Promise<string> {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO pos_items (landlord_id, property_id, category_id, name, sell_price, stock_qty, stock_min, stock_max)
+       VALUES ($1, $2, $3, 'Electric', 10, 5, 2, 50) RETURNING id`, [f.landlordAId, f.propertyAId, f.categoryAId])
+    return r.rows[0].id
+  }
+
+  it('a tax on ONE item charges that item, not its category-mate, and names itself on the sale', async () => {
+    const f = await seed()
+    const electric = await secondItem(f)
+    const t = await tax(f, { name: 'Transaction privilege tax', rate: 0.0635, itemIds: [f.itemAId] })
+    expect(t.status).toBe(201)
+    expect(t.body.data.applies_to ?? t.body.data.appliesTo).toEqual([])
+
+    const propane = await sell(f, f.itemAId)
+    expect(propane.status).toBe(201)
+    expect(Number(propane.body.data.tax_amount)).toBeCloseTo(0.64, 2)
+    expect(propane.body.data.tax_breakdown).toEqual([{ name: 'Transaction privilege tax', rate: 0.0635, amount: 0.64 }])
+
+    const power = await sell(f, electric)
+    expect(Number(power.body.data.tax_amount)).toBe(0)
+  })
+
+  it('a tax on a CATEGORY charges every item in it', async () => {
+    const f = await seed()
+    const electric = await secondItem(f)
+    await tax(f, { name: 'Utility tax', rate: 0.05, categoryIds: [f.categoryAId] })
+    for (const id of [f.itemAId, electric]) {
+      const res = await sell(f, id)
+      expect(Number(res.body.data.tax_amount)).toBeCloseTo(0.5, 2)
+    }
+  })
+
+  it('the item list carries the tax each item will actually be charged', async () => {
+    const f = await seed()
+    await tax(f, { name: 'Lodging tax', rate: 0.0635, itemIds: [f.itemAId] })
+    const res = await request(buildApp()).get(`/api/pos/items?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    const a = res.body.data.find((i: any) => i.id === f.itemAId)
+    expect(Number(a.tax_rate)).toBeCloseTo(0.0635, 4)
+    expect(a.taxes.map((t: any) => t.name)).toEqual(['Lodging tax'])
+  })
+
+  it('refuses another landlord\'s item as a target', async () => {
+    const f = await seed()
+    const res = await tax(f, { name: 'Sneaky', rate: 0.1, itemIds: [f.itemBId] })
+    expect(res.status).toBe(400)
+  })
+})

@@ -12,6 +12,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
 import { adminRouter, adminInviteRouter } from './admin'
+import { authRouter } from './auth'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
@@ -83,14 +84,36 @@ describe('S631 admin invitations', () => {
       .send({ firstName: 'New', lastName: 'Admin', password: 'a-long-enough-pw' })
     expect(ok.status).toBe(201)
 
-    const u = await db.query<{ role: string }>(
-      `SELECT role FROM users WHERE lower(email)='newadmin@gam.dev'`)
+    const u = await db.query<{ role: string; email_verified: boolean; email_verified_at: string | null }>(
+      `SELECT role, email_verified, email_verified_at FROM users WHERE lower(email)='newadmin@gam.dev'`)
     expect(u.rows[0].role).toBe('admin')
+    // S655: the link reached that inbox, which proves the address — so the new
+    // admin's first sign-in is not refused with "Please verify your email".
+    expect(u.rows[0].email_verified).toBe(true)
+    expect(u.rows[0].email_verified_at).not.toBeNull()
 
     // Single use — the same link cannot mint a second account.
     const again = await request(app).post(`/api/admin-invite/${token}/accept`)
       .send({ firstName: 'Imposter', lastName: 'X', password: 'a-long-enough-pw' })
     expect(again.status).toBe(404)
+  })
+
+  it('S655: the new admin signs in straight after accepting — no "verify your email" dead end', async () => {
+    const app = buildApp()
+    app.use('/api/auth', authRouter)
+    app.use(errorHandler)
+    const su = await seedUser('boss4@gam.dev', 'super_admin')
+    await request(app).post('/api/admin/invitations')
+      .set('Authorization', `Bearer ${tok(su, 'super_admin')}`)
+      .send({ email: 'firstday@gam.dev', role: 'admin' })
+    const token = (await db.query<{ token: string }>(
+      `SELECT token FROM admin_invitations WHERE lower(email)='firstday@gam.dev'`)).rows[0].token
+    await request(app).post(`/api/admin-invite/${token}/accept`)
+      .send({ firstName: 'First', lastName: 'Day', password: 'a-long-enough-pw' })
+    const login = await request(app).post('/api/auth/login')
+      .send({ email: 'firstday@gam.dev', password: 'a-long-enough-pw', portal: 'admin' })
+    expect(login.status).toBe(200)
+    expect(login.body.data.requiresEmailOtp).toBe(true)
   })
 
   it('a revoked invitation stops working', async () => {

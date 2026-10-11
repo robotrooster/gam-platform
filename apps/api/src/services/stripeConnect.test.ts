@@ -40,13 +40,20 @@ vi.mock('./adminNotifications', () => ({
   createAdminNotification: adminNotifyMock,
 }))
 
+// S652: the payout-paid email is asserted, not sent.
+const { payoutPaidMock } = vi.hoisted(() => ({ payoutPaidMock: vi.fn(async () => undefined) }))
+vi.mock('./notifications', () => ({
+  notifyConnectPayoutPaid: payoutPaidMock,
+  notifyConnectPayoutFailed: vi.fn(async () => undefined),
+}))
+
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedUserBankAccount, seedPmCompany,
 } from '../test/dbHelpers'
 import {
   ensureConnectAccount, createOnboardingSession, fetchAccountStatus,
-  computePlatformCut, recordAccountUpdated,
+  computePlatformCut, recordAccountUpdated, recordPayoutEvent,
 } from './stripeConnect'
 
 beforeEach(async () => {
@@ -510,5 +517,33 @@ describe('recordAccountUpdated — landlord entity (S554 re-anchor)', () => {
     expect(la.connect_payouts_enabled).toBe(true)
     expect(la.connect_details_submitted).toBe(true)
     expect(la.stripe_connect_status_synced_at).not.toBeNull()
+  })
+})
+
+// S652: a payout Stripe reports on a company-held Connect account is filed
+// on the landlord's page at once, and the landlord is told exactly once no
+// matter how many times Stripe delivers the same event.
+describe('recordPayoutEvent — company-held account, once-only notice (S652)', () => {
+  it('files a stripe_dashboard row and emails once across redeliveries', async () => {
+    const c = await db.connect()
+    let landlordId = '', userId = ''
+    try {
+      await c.query('BEGIN')
+      const r = await seedLandlord(c)
+      landlordId = r.landlordId; userId = r.userId
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(`UPDATE landlords SET stripe_connect_account_id='acct_company_only' WHERE id=$1`, [landlordId])
+    payoutPaidMock.mockReset()
+    const paid = { id: 'po_s652', amount: 415489, currency: 'usd', status: 'paid', destination: 'ba_x',
+                   arrival_date: 1_790_000_000, created: 1_789_900_000 } as any
+    await recordPayoutEvent(paid, 'acct_company_only')
+    await recordPayoutEvent(paid, 'acct_company_only')   // Stripe redelivery
+    const cp = await db.query(`SELECT user_id, status FROM connect_payouts WHERE stripe_payout_id='po_s652'`)
+    expect(cp.rows).toEqual([{ user_id: userId, status: 'paid' }])
+    const d = await db.query(
+      `SELECT trigger_type, amount::text, status, landlord_id FROM disbursements WHERE stripe_payout_id='po_s652'`)
+    expect(d.rows).toEqual([{ trigger_type: 'stripe_dashboard', amount: '4154.89', status: 'settled', landlord_id: landlordId }])
+    expect(payoutPaidMock).toHaveBeenCalledTimes(1)
   })
 })

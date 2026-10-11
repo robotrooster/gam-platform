@@ -19,6 +19,8 @@ import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
 import { insertInspectionWithChecklist } from './inspections'
 import { US_FEDERAL_HOLIDAYS } from '../jobs/autoPayouts'
+import { todayIn } from '../lib/timezone'
+import { followsLeaseEndedEarlyUnsigned } from './renewalSuccessor'
 
 /** date + n business days (skips weekends + US federal holidays). */
 export function addBusinessDays(isoDate: string, n: number): string {
@@ -62,7 +64,7 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
     SELECT l.id AS lease_id, l.unit_id, l.landlord_id,
            to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
            u.unit_number, u.unit_type, u.bedrooms, u.bathrooms, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features, u.property_id,
-           p.name AS property_name,
+           p.name AS property_name, p.timezone,
            (SELECT lt.tenant_id FROM lease_tenants lt
              WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS tenant_id
       FROM leases l
@@ -75,6 +77,33 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
          SELECT 1 FROM unit_inspections i
           WHERE i.lease_id = l.id AND i.inspection_type = 'move_out'
             AND i.status <> 'cancelled')
+       -- S655: a household handed over to its own NEW LEASE is staying, not
+       -- moving out. Its old lease gets an end date (the day before the new
+       -- one starts; a held-over fixed term too) and is then expired by the
+       -- hand-off — which put it squarely in this window, so a park-wide new
+       -- lease produced an "OVERDUE move-out walkthrough" for every household
+       -- that stayed. The same test the lease-end job uses for a hand-off
+       -- (scheduler.processLeaseEnds): a landlord-signed lease on this space,
+       -- starting later, that follows this one or has someone from it on it.
+       AND NOT EXISTS (
+         SELECT 1 FROM leases s
+          WHERE s.unit_id = l.unit_id AND s.id <> l.id
+            AND s.status IN ('pending', 'active') AND s.signed_by_landlord = TRUE
+            AND s.start_date > l.start_date
+            AND (s.supersedes_lease_id = l.id
+                 OR EXISTS (SELECT 1 FROM lease_documents d
+                             WHERE d.lease_id = s.id AND d.renews_lease_id = l.id)
+                 OR EXISTS (SELECT 1 FROM lease_tenants nt
+                              JOIN lease_tenants ot ON ot.tenant_id = nt.tenant_id
+                             WHERE nt.lease_id = s.id AND nt.status IN ('active', 'pending_add')
+                               AND ot.lease_id = l.id
+                               AND (ot.status IN ('active', 'pending_add', 'pending_remove')
+                                    OR (ot.status = 'removed' AND ot.removed_reason = 'lease_ended'))))
+            -- ...but not a household that ENDED this lease early while its new
+            -- lease waited unsigned: nobody is staying on to take that one up
+            -- (it never starts, and is canceled), so this is a real move-out —
+            -- and its deposit return waits on this very walkthrough.
+            AND NOT ${followsLeaseEndedEarlyUnsigned('s')})
      ORDER BY l.end_date`,
     [[...MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES]])
 
@@ -90,10 +119,10 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
   // inspections a day early, with a deadline computed off the wrong "today".
   // It surfaced as a suite that passed in the afternoon and failed after 5pm.
   //
-  // Asking the database keeps the two halves of the same decision on one clock.
-  const today = (await queryOne<{ d: string }>(
-    `SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`))!.d
-  const due = candidates.filter((l: any) => subtractBusinessDays(l.end_date, 3) <= today)
+  // S654: "today" is the PROPERTY's calendar day, never the UTC one. The SQL
+  // window above (CURRENT_DATE − 2 … + 7) is only a coarse superset; this
+  // precise filter decides, so it reads each lease's own property clock.
+  const due = candidates.filter((l: any) => subtractBusinessDays(l.end_date, 3) <= todayIn(l.timezone))
 
   let scheduled = 0
   for (const l of due) {
@@ -156,7 +185,7 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
       ...(landlord ? [landlord] : []),
       ...staff.filter(s => s.user_id !== landlord?.user_id),
     ]
-    const overdue = l.end_date < today
+    const overdue = l.end_date < todayIn(l.timezone)
     const body = overdue
       ? `Unit ${l.unit_number} at ${l.property_name} — the lease ended ${l.end_date} and the in-person ` +
         `move-out walkthrough is OVERDUE. Complete it with photos now; the deposit return cannot start until it's finalized.`

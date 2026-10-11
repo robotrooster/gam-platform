@@ -38,7 +38,157 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/4: move-out money, check-outs, and a card waiting on its bank ───────
+  // Every one of these moves money or says where money went, and each is a
+  // press on a screen that read the figures fresh at that moment (a 409 reads
+  // them again in place). decisions #38 Q6: the assistant makes no money
+  // decision; #46: the paid-ahead choice is the landlord's, never GAM's or an
+  // agent's. And as of #44 (10/4) every AI assistant is off until retrained,
+  // so none of these could be reached by one today anyway.
+  // 10/4 (gate review): the assistant's finalize_deposit_return and
+  // confirm_deposit_match were removed under #38 Q6. Finalizing sends the
+  // GAM-held refund by itself (#47a) and settles what is deducted; confirming
+  // a bank-deposit match settles charges. Both are money decisions.
+  'leases POST /:id/deposit-return/finalize':
+    'finalizes a move-out: settles what is deducted and sends the GAM-held refund back the way it was paid (decisions #47a). The owner\'s press on the move-out page with the deposit, every deduction and the refund on screen, read fresh; the assistant makes no money decision (#38 Q6).',
+  'bankFeed POST /deposits/:id/recorded-deposit':
+    'says which deposit the office recorded by hand a bank line is, which lets the bank\'s date take late fees off and re-date the tenant\'s payment history (10/6). The owner\'s press on the Bank page with the line and each recorded deposit on screen; two residents with the same rent make an amount name nobody, and the assistant makes no money decision (#38 Q6).',
+  'bankFeed POST /deposits/:id/confirm':
+    'says which charges a bank deposit paid, which settles them. The owner\'s press on the Bank feed with the deposit and the shortlist on screen; in a park where every lot pays the same rent an amount names nobody, and the assistant makes no money decision (#38 Q6).',
+  'leases POST /:id/deposit-return/send-back':
+    'the owner sends a deposit return a team member parked for approval back to a draft, to change it. The owner\'s own approval decision, made on the move-out page with every deduction on screen.',
+  'leases POST /:id/deposit-return/refund-parts/:partId/try-again':
+    'sends a deposit refund that did not go out to the card or bank again. Pressed on the move-out page (or from the owner\'s to-do) on the one refund line it names, read fresh; a misheard line is money sent twice.',
+  'leases POST /:id/deposit-return/refund-parts/:partId/cash':
+    'says a deposit refund that could not go back to the card or bank is being handed over in cash at the office instead. Pressed with the cash in hand and the refund line on screen; the amount the page showed is checked again.',
+  'leases POST /:id/deposit-return/landlord-part/handed-back':
+    'records the day the landlord handed back the part of a deposit they hold themselves. The landlord\'s statement about their own money, with the day picked and the amount on the move-out page.',
+  'leases POST /:id/deposit-return/landlord-part/undo':
+    'takes back a "handed back" mark on the landlord\'s part of a deposit. The one-button back-out of the same move-out page.',
+  'leases POST /:id/never-moved-in':
+    'ends a lease whose tenant signed but never moved in and zeroes ONLY the unpaid move-in bill (deposit, move-in fees, first rent); later unpaid bills stay owed, and it is refused if the guest was ever checked in (decisions #46.4, #53). Confirmed in a window that lists every line it zeroes and what stays owed, and the server checks that total again; a misheard name ends somebody\'s real tenancy.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice':
+    'the landlord\'s choice for paid-ahead money left on an ended lease: no refund, the unused days, or another amount, then keep it or leave it as their credit (decisions #46.1 — the landlord decides it, never GAM). Made on a page showing the money, how it was paid and the exact cost, read fresh.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice/parts/:partId/retry':
+    'sends a paid-ahead refund that did not go out to the card or bank again. Pressed on the refund line it names, on the same page, read fresh.',
+  'paidAheadChoice POST /:leaseId/paid-ahead-choice/parts/:partId/cash':
+    'gives a paid-ahead refund that could not go back to the card or bank in cash at the office instead. Pressed before the hand-back, and the reply says how much to hand over — a person at the desk with the money.',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out':
+    'checks a guest out and records the money decision for the unused nights in one step. Done from the schedule\'s check-out window with what was booked, stayed and paid on screen (the booking tool already refuses to record a check-out).',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out/parts/:partId/retry':
+    'sends a check-out card refund that failed to the card again. Pressed on that refund line from the done screen, the schedule or the owner\'s to-do.',
+  'stayCheckOut POST /:unitId/bookings/:bookingId/check-out/parts/:partId/cash-instead':
+    'records a check-out card refund that failed as handed back in cash at the desk, so it is never sent to the card too. A person at the desk with the money.',
+  'bankFeed POST /deposits/:id/not-rent/undo':
+    'puts a deposit set aside as "not rent" back on the rent-matching list. The one-button back-out on that list, right where the deposit was set aside, read fresh.',
+  'payments POST /pay-balance/release':
+    'cancels a card payment the card\'s bank has not confirmed and opens the bill again — the tenant\'s "Cancel it and pay another way" on the pay screen. Nothing to ask an agent for: the sweep releases it by itself after the hold (decisions #48.4).',
+  'payments POST /pay-balance/resume':
+    'brings back the card bank\'s confirmation window for a payment waiting on it. That window opens in the tenant\'s own browser on the pay screen; an agent cannot show it.',
+
+  // ── S654: a card on the counter reader ────────────────────────────────────
+  // The person holding the card is standing at the desk and the clerk is
+  // watching the reader's screen. A misheard name sends someone else's balance
+  // to the reader; the flow lives in the record-a-payment window with the
+  // balance, the card fee and the reader's name on screen. The agent still
+  // records a cash, check or money-order payment (record_cash_payment).
+  'payments POST /:id/reader/charge':
+    'sends a resident\'s balance to the physical card reader on the counter. Done from the record-a-payment window with the balance and the reader on screen; a misheard name is someone else\'s balance on the reader.',
+  'payments POST /:id/reader/show':
+    'puts a resident\'s balance breakdown on the counter reader\'s screen, or takes it down. Display only, driven by the record-a-payment window that is open — nothing to ask for out loud.',
+  'payments POST /reader/intents/:pi/capture':
+    'books and captures a card the reader has approved — the second half of the same on-screen flow, nothing to say out loud.',
+  'payments POST /reader/intents/:pi/cancel':
+    'clears the reader\'s screen and releases the hold on a card — the escape hatch of the same on-screen flow.',
+  'payments POST /reader/intents/:pi/clear-reader':
+    'takes the prompt off the reader without voiding the charge — the same on-screen flow\'s "they stepped away" button.',
+  'payments POST /reader/intents/:pi/resend':
+    'puts a kept charge back on the reader when the customer is back — the same on-screen flow.',
+  'pos POST /terminal/payment-intents/:id/clear-reader':
+    'takes a sale\'s prompt off the register\'s reader without voiding the charge. Part of ringing a card sale at the register, where the reader and the cart are on screen.',
+  'pos POST /terminal/readers/:stripeReaderId/cancel-action':
+    'takes whatever is on a reader\'s screen off it. A register-side control for the reader at the counter.',
+  'pos POST /terminal/readers/:stripeReaderId/cart':
+    'puts the cart being rung up on the counter reader\'s screen as it changes. Display only, driven by the register\'s own cart — there is nothing to ask for out loud.',
+  'pos POST /customers':
+    'adds a customer at the register, named by the person standing at the counter. Typed there with the sale on screen; a misheard name or email files purchases under a stranger.',
+  'pos POST /transactions/:id/email-receipt':
+    'emails a receipt for a sale the register just rang up, to an address typed at the counter — a misheard address sends someone\'s purchase to a stranger.',
+  'pos PATCH /transactions/:id/customer':
+    'changes which person a rung-up sale belongs to. Done from the sale\'s own line in History by typing their name into the type-ahead and picking them — the wrong name is a purchase on the wrong person\'s record.',
+  'pos PATCH /customers/:id':
+    'edits a register customer\'s name, email or phone. Done on the Customers tab with the record on screen.',
+  'pos POST /customers/:id/merge':
+    'folds one customer record into another — purchases, cards and charge account move, the folded record is archived. Done on the Customers tab with both records on screen; the wrong pair is two people\'s histories tangled.',
+  // ── S648: register pay links ──────────────────────────────────────────────
+  // A pay link is a register cart sent as a card charge to someone's inbox. The
+  // amount is whatever the desk rang up, and the email goes to an address typed
+  // at the counter — both are exactly what a spoken sentence gets wrong, and a
+  // wrong one is a real charge landing on a stranger. Rung up on the register,
+  // where the cart and the address are on screen.
+  'posPayLinks POST /':
+    'sends a card charge to an email address for whatever the desk rang up. Rung up at the register with the cart and the address on screen; a misheard amount or address is a real charge sent to a stranger.',
+  'posPayLinks POST /:id/resend':
+    'emails an existing charge again. Done from the open-links list at the register, next to the address it goes to.',
+  'posPayLinks POST /:id/cancel':
+    'closes a link somebody may be about to pay. Done from the open-links list, where the desk can see whether it has already been paid.',
+  // S652: adjusting an open link (a final meter read, extra days stayed) changes
+  // what a person is about to be charged. Done from the outstanding list with
+  // the lines on screen, never from a spoken figure.
+  'posPayLinks PATCH /:id':
+    'changes the lines and total of an unpaid link. Done from the outstanding list with every line on screen; a misheard number is a real charge.',
+  // ── S652: posting a check that arrived before its bill ────────────────────
+  'payments POST /post-payment':
+    'writes down cash, a check or a money order handed over at the office and banks what is beyond the open balance as paid ahead. Done at the desk with the check in hand — the amount, the check number and the date come off the paper, and a misheard figure is money the books say arrived and did not. The agent records a payment against an open charge (record_cash_payment); money ahead of any bill is the desk\'s to post.',
+  // ── S642: pushing a signing reminder ───────────────────────────────────────
+  'esign POST /documents/:id/remind':
+    'emails a reminder to whoever is holding up a lease. Reachable by an agent would defeat the point: the automatic reminder already has a ceiling precisely so nobody is chased forever, and an agent that can push on request is a ceiling with a loophole. This is the landlord deciding one person is worth another nudge, on a screen showing how many have already gone.',
+
+  // ── S641: moving a resident between spaces ─────────────────────────────────
+  'leases POST /:id/move':
+    'moves a household to a different space mid-tenancy. Two reasons it stays typed. Unit numbers REPEAT across parks, and the error here — putting somebody on a space another household occupies — is the one thing the history cannot repair afterwards. And the move only bills correctly if somebody physically reads the meters on BOTH spaces on the move date; the response names those meters, which is a worklist for a person, not a sentence for an agent to acknowledge.',
+
+  // ── S653: the day a resident said they are leaving ─────────────────────────
+  'leases POST /:id/leaving':
+    'writes down the day a household said they are pulling out, which ends their lease that day: the space opens on the schedule, the final read is asked for that morning, the closing utility invoice and deposit return follow. A misheard "Saturday" vacates somebody who is not leaving. Done at the desk, face to face, with the calendar on screen.',
+  'leases DELETE /:id/leaving':
+    'calls off a leaving date and puts the lease back as it was. Done from the same screen, where the desk can see whether anyone has since been booked behind them.',
+  // ── S653: how much paid-ahead credit a month may use ───────────────────────
+  'leases PATCH /:id/prepaid-draw':
+    'sets how much of a resident\'s paid-ahead money each month\'s bill may use — a number that changes what they are asked to pay every month from here on. Set on the lease with the credit balance on screen, by the landlord or the desk, when the resident asks for it.',
+  // ── S653: an approved applicant set aside ──────────────────────────────────
+  'background POST /:id/park':
+    'marks an approved applicant as not moving in for now, taking them off the screening to-do list. A judgment the landlord makes looking at the person\'s record; nothing a conversation should do on its own.',
+  'background POST /:id/unpark':
+    'puts a set-aside applicant back on the to-do list. Same screen, same judgment.',
+  // ── S641: the filing cabinet ───────────────────────────────────────────────
+  'documents PUT /:id/properties':
+    'pins a document to the properties it applies to. The mistake this guards against is exactly a mis-pin — Nic: "assigned parking spots in one place and that gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud is where that mistake happens. Ticked on a screen that lists every park.',
+
+  // ── S641: signing packages ─────────────────────────────────────────────────
+  // A package decides what a resident is asked to put their name to. Nic:
+  // "some things are pertinent to some tenants and some things are not." That
+  // judgment is the landlord's, made once on a screen showing the whole list
+  // in order — not assembled from a spoken sentence where a missing phrase
+  // silently drops a disclosure from somebody's lease. The agent can still say
+  // what a package contains; it just cannot author one.
+  'signingPackages POST /':
+    'defines which documents a resident is asked to sign. Composing that from speech is how a state disclosure quietly goes missing from a lease — the landlord builds it on a screen that shows the whole list in signing order.',
+  'signingPackages PUT /:id':
+    'same authorship as creating one, and it silently changes what every FUTURE resident signs. A package is edited where its current contents are visible.',
+  'signingPackages DELETE /:id':
+    'archives a package so it stops being offered. Reversible and low-stakes, but it is the same editing surface as the two above and belongs with them rather than in a sentence.',
+  'signingPackages PUT /templates/:templateId/properties':
+    'pins a document to the properties it applies to. Nic\'s worry is precisely the mis-pin — "assigned parking gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud are exactly where that mistake happens.',
   // ── S633 ──────────────────────────────────────────────────────────────────
+  // ── S652 ──────────────────────────────────────────────────────────────────
+  'pos POST /reader-orders': 'ordering hardware to a property is the landlord\'s own act, with their address',
+  'pos POST /reader-orders/:id/cancel': 'the counterpart of that request',
+  'admin PATCH /reader-orders/:id': 'GAM\'s own desk',
+  'properties PATCH /:id/meter-photo-config': 'a landlord setting about their own crew\'s walk — not an agent\'s call',
+  'utility POST /reading-runs/:id/meters/:meterId/photo': 'a camera on a phone at the meter — nothing an agent can do',
+  'properties PATCH /:id/maintenance-config':
+    'which kinds of maintenance request a property accepts and the note tenants see — a policy the landlord sets once under Settings, with the consequence explained on screen; an agent should never narrow what a tenant is allowed to report.',
   'properties PATCH /:id/first-billing-cycle':
     'declares which month GAM starts invoicing a property\'s EXISTING tenants — it moves money for every onboarded tenancy at once, and only the landlord knows which months they already collected off-platform. Not derivable, not delegable, and answered once during onboarding on a screen that explains the consequence.',
   // ── Named while closing S633\'s parity failure; all five predate it. ───────
@@ -52,6 +202,17 @@ const DELIBERATE = new Map(Object.entries({
     'creates a unit CLASS, a structural piece of a property\'s setup that every later unit inherits its facts from. Named and shaped on the property setup screen where the existing classes are visible; spoken creation would quietly grow near-duplicate classes.',
   'utility POST /opening-reads':
     'records the starting number on physical meters, hundreds at a time, transcribed off the dials on site. It is a bulk data-entry screen with a date picker and one save — dictating three hundred five-digit readings is not a thing anybody would do, and a misheard digit becomes a wrong bill.',
+  // ── S640: emergency contacts ───────────────────────────────────────────
+  'emergencyContacts PUT /':
+    'records the number somebody dials on the worst day of a resident\'s life. Transcribing a phone number from a spoken sentence is the single highest-risk thing an agent can do with a contact detail — it is why editing an invite\'s email was kept away from the agent too — and here the failure mode is nobody answering in an emergency. Typed at the counter, read back off the screen.',
+  'emergencyContacts POST /confirm':
+    'asserts that a resident\'s emergency contact is still current. Only the RESIDENT can know that; a staff-side agent confirming it on their behalf would manufacture a fact. When the annual re-check reaches the tenant portal this becomes the tenant answering for themselves, not an agent answering for them.',
+  'emergencyContacts GET /mine':
+    'a tenant reading their own emergency contact in their portal. Read-only and self-scoped; there is nothing for an agent to do with it that the page does not already do.',
+  'emergencyContacts PUT /mine':
+    'the resident answering "who should we call" for themselves. Same reason the staff-side write is not an agent action, and more so: transcribing a phone number from speech is the highest-risk thing an agent can do with a contact detail, and the failure mode is nobody answering in an emergency. They type it in their portal.',
+  'emergencyContacts POST /import':
+    'a bulk write across every resident at once, reading the lease field for the whole portfolio. It is an owner-level one-off, idempotent, and there is nothing to say to it in a sentence.',
   'background PATCH /:id/decision':
     'record-intent-only by directive (FCRA / fair housing) — flag_applicant_decision captures the landlord\'s intent and routes them to record it themselves',
   'background POST /:id/adverse-action':
@@ -81,12 +242,25 @@ const DELIBERATE = new Map(Object.entries({
   'documents POST /': 'a document is a file the person uploads',
   'tenantWalkthroughs POST /media': 'walkthrough photos and video are files taken on site',
   'expenses POST /:id/receipt': 'a receipt is a file the landlord uploads',
+  // 10/11: correcting an expense (the owner's, or a bookkeeper's own) is done
+  // with the row and its receipt in front of you; the agent logs new ones.
+  'expenses PATCH /:id': 'correcting an expense is done looking at the row and its receipt',
   'maintenance POST /:id/media': 'photos of the job are files taken on site',
   'maintenance POST /:id/receipts': 'a receipt is a file the worker uploads',
   'inspections POST /:id/photos': 'inspection photos are taken on site and uploaded there',
   'inspections POST /:id/videos': 'inspection video is taken on site and uploaded there',
   'esign POST /upload': 'the template PDF is a file the landlord uploads',
   'tenants POST /avatar': 'a profile photo is a file the tenant chooses',
+  // 10/5 (Nic): photos of a bank's deposit receipt are files taken of paper.
+  'payments POST /remittances/:id/deposit-photo': 'a photo of the bank\'s receipt is a file the landlord takes and uploads',
+  // 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's discretion."
+  'payments POST /:id/delete-late-fee': 'deleting an onboarding late fee is the landlord\'s own discretion, done by a person from Payment History — never by the assistant',
+  'declaredDeposits POST /:id/receipt-photo': 'a photo of the bank\'s receipt is a file the tenant takes and uploads',
+  // 10/5 (Nic): taking part payments has local-law weight; the landlord turns
+  // it on beside the screen's "check your local laws" note.
+  'properties PATCH /:id/tenants-deposit-at-bank':
+    'whether tenants may deposit rent at the landlord\'s bank is the landlord\'s money policy for the property (10/6), set on the property screen beside the payment settings; it decides what the bank feed may match by itself',
+  'properties PATCH /:id/partial-payments': 'accepting part of the rent is a landlord\'s money policy, set on the property screen beside its local-laws note',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a
@@ -97,19 +271,18 @@ const DELIBERATE = new Map(Object.entries({
   'inspections POST /:id/sign': 'signing is the person\'s own act',
   'inspections POST /:id/submit': 'the tenant submits their own periodic inspection',
   'tenants POST /lease/sign': 'signing a lease is the person\'s own act',
-  'tenants POST /flexpay/enroll': 'enrolment records an acceptance of terms with their IP',
-  'tenants POST /flexdeposit/enroll': 'enrolment records an acceptance of terms with their IP',
+  'tenants POST /flexpay/enroll': 'enrollment records an acceptance of terms with their IP',
+  'tenants POST /flexdeposit/enroll': 'enrollment records an acceptance of terms with their IP',
   'tenants POST /flexsuite/re-accept': 'accepting revised terms is the person\'s own act',
   'tenants POST /enroll-credit-reporting': 'consent to report to bureaus is the person\'s own act',
   'tenants POST /me/deposit/portability/authorize': 'takes a signature',
-  'tenants POST /me/deposit/portability/decline': 'the counterpart of a signed authorisation',
+  'tenants POST /me/deposit/portability/decline': 'the counterpart of a signed authorization',
   'landlords POST /complete-onboarding': 'takes the landlord\'s signature on the platform terms',
   'credit POST /attest': 'an attestation is the person\'s own statement, signed',
 
   // CREDENTIALS AND BANK VERIFICATION.
   'tenants POST /accept-invite': 'sets a password',
   'tenants PATCH /password': 'credential change',
-  'tenants POST /verify-ach': 'bank verification — microdeposit amounts are entered by the person',
   'bankFeed POST /link-session': 'opens a bank-linking session; the person authenticates to their bank',
   'bankFeed POST /finalize': 'completes that bank-linking session',
 
@@ -123,6 +296,15 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /flex-charge/accounts': 'FlexCharge account setup is a financing product, not a portal chore',
   'landlords PATCH /flex-charge/accounts/:id': 'editing a FlexCharge account is the same financing decision as opening one',
   'landlords PATCH /flex-charge/finance-rate': 'setting a finance rate is a lending decision',
+  // S655 bank reconciliation (decisions #38 Q6: the assistant makes no money
+  // decision). Each of these says which cash went to the bank, or settles or
+  // un-settles charges against a bank deposit — done by staff with the bag and
+  // the bank feed on screen.
+  'bankFeed POST /deposit-slips': 'records which cash and checks went into the bank bag; staff tick them with the money in hand',
+  'bankFeed POST /deposit-slips/:id/void': 'says a bank bag did not go; counterpart of making the slip',
+  'bankFeed POST /deposit-slips/:id/match': 'the owner says a bank deposit IS this slip, which settles money',
+  'bankFeed POST /deposits/:id/undo': 'takes a bank-deposit match back, which un-settles charges',
+  'bankFeed POST /transactions/:id/undo-auto-file': 'takes back a deposit the bank feed filed by itself; the owner decides',
 
   // ADMIN-ONLY, DEV-ONLY, OR ANOTHER SURFACE ENTIRELY.
   'payments POST /initiate-rent-collection': 'requireAdmin — platform operations',
@@ -139,8 +321,22 @@ const DELIBERATE = new Map(Object.entries({
   'tenants POST /:id/transfer': 'retired at S20 — returns 501; a transfer is terminate + re-sign',
   'units DELETE /:id': 'GAM never erases — retire_unit is how a unit is removed',
   'books DELETE /transactions/:id': 'GAM never erases — correct it with update_book_transaction',
-  'properties POST /:id/transfer': 'moves ownership of a property to another account by email; owner-only, and too easy to aim at a mistyped address',
+  'properties POST /:id/transfer': 'raises a transfer of a property to another account by email; owner-only, and too easy to aim at a mistyped address',
+  // S655: confirming a sale (a selling owner) or accepting one (the buyer) is
+  // that owner's own consent, given with the code emailed to them. The agent
+  // never accepts anything on someone's behalf; it can stop a transfer.
+  'properties POST /transfer-request/:requestId/approve':
+    'confirms or accepts a property transfer with the code emailed to that owner — the owner\'s own consent, never the agent\'s',
   'esign PUT /templates/:id/fields': 'field geometry on a PDF — placed visually, not described',
+  // S652: marking a document slot as "already in my lease" is bookkeeping for
+  // what the Templates page shows — done on the page, where the slots and the
+  // landlord's documents are side by side. Nothing is sent, signed or billed.
+  'signingPackages POST /for-unit/:unitId/build-default': 'assembles a signing packet from the landlord\'s filled document slots at the invite — page bookkeeping the landlord does looking at the list; the agent drafts leases through draft_household_lease',
+  'utility POST /reading-runs/:id/approve': 'approving a month of utility bills is the landlord looking at every number first; the agent can say the bills are waiting, never approve them',
+  'workTrade POST /jobs/:jobId/take': 'a work trader claiming a repair commits their own hands to it; they claim it on the job list where they can see the job',
+  'workTrade POST /jobs/:jobId/done': 'saying physical work is finished is the worker\'s own attestation, never the agent\'s',
+  'workTrade POST /jobs/:jobId/check': 'confirming someone else\'s repair was done right is a person\'s judgment on site, never the agent\'s',
+  'esign PUT /sleeves/:id/cover': 'says which of their own documents already contain a document slot on the Templates page — page bookkeeping, done where the slots and documents are side by side',
   'esign DELETE /templates/:id/fields/:fieldId': 'field geometry on a PDF — removed visually, not described',
   'esign POST /documents': 'takes a hand-assembled signer list; draft_household_lease is the safe path',
   'esign POST /standalone-documents': 'takes the same hand-assembled signer list as POST /documents',
@@ -152,8 +348,20 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /me/onboard-properties-csv/validate': 'a CSV is a file the landlord uploads and reviews',
   'landlords POST /me/onboard-properties-csv/commit': 'commits an import the landlord reviewed on screen',
   'landlords POST /me/onboard-tenants-csv/validate': 'a CSV is a file the landlord uploads and reviews',
-  'landlords POST /me/onboard-tenants-csv/commit': 'commits an import the landlord reviewed on screen; a bad one lands on hundreds of rows',
-  'landlords POST /me/onboard-tenants-csv/commit-pending': 'commits an import the landlord reviewed on screen',
+  // S655 (decisions 10/2): the park-wide new-lease sender. Added here by the
+  // owner of this file so the parity test stays closed; the routes are the
+  // renewals work's (routes/esign.ts).
+  'esign POST /documents/renewal-batch/preview':
+    'shows, per household, the new rent and start date a park-wide new lease would carry. It is the review step of the on-screen sender, with every household listed — nothing to ask for out loud.',
+  'esign POST /documents/renewal-batch':
+    'drafts a new lease for every household at a property at once, at a new rent. Pressed on the screen that lists each household and its new rent; a misheard date or amount would reach the whole park.',
+  // S655: the tenant CSV is a DRAFT ROSTER reviewed and confirmed on screen.
+  'landlords POST /me/onboard-tenants-csv/commit': 'retired: the tenant import saves a draft roster now, and this answers 410 with that next step',
+  'landlords POST /me/onboard-tenants-csv/commit-pending': 'retired: the tenant import saves a draft roster now, and this answers 410 with that next step',
+  'landlords POST /me/onboard-tenants-csv/draft': 'saves a CSV file the landlord uploads to a draft roster they then review on screen; a file is not something said out loud',
+  'landlords PATCH /me/tenant-roster/:id': 'edits one person on a draft roster the landlord is reviewing on screen, unit by unit, with the file\'s own values beside it',
+  'landlords DELETE /me/tenant-roster/:id': 'removes one person from a draft roster the landlord is reviewing on screen',
+  'landlords POST /me/tenant-roster/confirm': 'confirms a whole property\'s roster at once and drafts a lease per household; it is pressed on the review screen where every unit and its problems are listed',
   'landlords POST /me/onboard-payment-history-csv/validate': 'a CSV is a file the landlord uploads and reviews',
   'landlords POST /me/onboard-payment-history-csv/commit': 'commits imported payment history the landlord reviewed on screen',
   'tenants POST /flexpay/inquiry/proof': 'proof of income is a file the tenant uploads',
@@ -183,13 +391,21 @@ function routerAreas(): Record<string, string> {
   return out
 }
 
-/** '/api/units' -> router variable. Mounts may have more than two segments. */
-function mounts(): Record<string, string> {
+/**
+ * Every [base path, router variable] mount. Mounts may have more than two
+ * segments. A LIST, not a map keyed by path: several routers share one base
+ * ('/api/leases' serves paidAheadChoiceRouter and leasesRouter, '/api/units'
+ * serves stayCheckOutRouter and unitsRouter). Keyed by path, the last router
+ * won and every earlier one read as "not mounted — dead router", so its
+ * endpoints silently left the count (10/4 gate: the paid-ahead choice routes
+ * were invisible this way).
+ */
+export function mounts(): Array<[string, string]> {
   const src = readFileSync(join(API, 'index.ts'), 'utf8')
-  const out: Record<string, string> = {}
+  const out: Array<[string, string]> = []
   for (const m of src.matchAll(/app\.use\(\s*'(\/api\/[a-z0-9/-]+)'\s*,\s*([\s\S]{0,140}?)\)/g)) {
     const r = (m[2].match(/(\w+Router)/) || [])[1]
-    if (r) out[m[1]] = r
+    if (r) out.push([m[1], r])
   }
   return out
 }
@@ -199,7 +415,7 @@ const norm = (p: string) => (p.replace(/:[A-Za-z0-9_]+/g, ':x') || '/')
 const AREAS = routerAreas()
 const MOUNTS = mounts()
 const MOUNT_OF: Record<string, string> = {}          // router -> longest mount serving it
-for (const [base, r] of Object.entries(MOUNTS)) {
+for (const [base, r] of MOUNTS) {
   if (!MOUNT_OF[r] || base.length > MOUNT_OF[r].length) MOUNT_OF[r] = base
 }
 
@@ -209,7 +425,7 @@ export interface Endpoint {
   method: string
   /** METHOD + the path the route file declares, e.g. 'POST /:id/cancel'. */
   declared: string
-  /** METHOD + the full normalised path, matched against the manifest. */
+  /** METHOD + the full normalized path, matched against the manifest. */
   key: string
 }
 
@@ -296,6 +512,23 @@ const missingTools = [...new Set<string>(Object.values(HAND_BUILT))]
   .filter((n: string) => !toolSrc.includes(`name: '${n}'`))
 for (const k of Object.keys(HAND_BUILT)) reached.add(k)
 
+/**
+ * 10/4 gate review: a DELIBERATE entry whose route was removed or renamed
+ * left its reason behind, and nothing noticed — the siloed areas (pos, admin)
+ * are not in the endpoint count at all, so "matches nothing counted" could not
+ * tell stale from siloed. This checks every entry against what the route files
+ * still DECLARE, every verb and every area, siloed or not.
+ */
+const declaredAnywhere = new Set<string>()
+for (const fn of readdirSync(ROUTES)) {
+  if (!fn.endsWith('.ts') || fn.endsWith('.test.ts')) continue
+  const src = readFileSync(join(ROUTES, fn), 'utf8')
+  for (const m of src.matchAll(/^\s*\w+Router\.(get|post|patch|put|delete)\(\s*'([^']*)'/gm)) {
+    declaredAnywhere.add(`${fn.slice(0, -3)} ${m[1].toUpperCase()} ${m[2] || '/'}`)
+  }
+}
+const staleDeliberate = [...DELIBERATE.keys()].filter((k) => !declaredAnywhere.has(k))
+
 const openOnes = endpoints.filter((e) =>
   !reached.has(e.key) && !DELIBERATE.has(`${e.area} ${e.declared}`))
 const deliberate = endpoints.filter((e) => DELIBERATE.has(`${e.area} ${e.declared}`))
@@ -312,6 +545,8 @@ export interface ActionGap {
   open: Endpoint[]
   /** HAND_BUILT names that no tool defines — the map has rotted. */
   missingTools: string[]
+  /** DELIBERATE keys no route file declares any more — a reason left behind by a removed or renamed route. */
+  staleDeliberate: string[]
 }
 
 export function computeActionGap(): ActionGap {
@@ -322,6 +557,7 @@ export function computeActionGap(): ActionGap {
     deliberate: deliberate.map((e) => ({ ...e, why: DELIBERATE.get(`${e.area} ${e.declared}`)! })),
     open: openOnes,
     missingTools,
+    staleDeliberate,
   }
 }
 

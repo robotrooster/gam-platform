@@ -12,27 +12,31 @@
 //     reader prompts the customer; the frontend polls the PI
 //     status until auth completes; backend captures.
 //
-// All four lifecycle routes (create / process / capture / cancel)
-// fire under the landlord's Stripe Connect account. POS sales are
-// landlord revenue; GAM's POS revenue is the monthly per-unit
-// platform fee, not a per-transaction cut.
+// S648: every register card charge runs on GAM's account (readers pair
+// inside the property's Terminal Location); the landlord's share is paid
+// in the weekly payout batch, the card fee on top is GAM's.
 
 import { loadStripeTerminal } from '@stripe/terminal-js'
 import { api, apiGet, apiPost, apiDel } from './api'
 
 let terminal: any = null
+// The SDK's connection token is scoped to one property's reader location.
+let terminalPropertyId: string | null = null
 
 // ── Stripe Terminal JS SDK (Bluetooth path) ─────────────────────────
 
-export async function getTerminal() {
-  if (terminal) return terminal
+export async function getTerminal(propertyId?: string) {
+  if (terminal && (!propertyId || propertyId === terminalPropertyId)) return terminal
+  if (terminal) { try { await terminal.disconnectReader() } catch { /* not connected */ } }
+  terminalPropertyId = propertyId ?? terminalPropertyId
   const StripeTerminal = await loadStripeTerminal()
   if (!StripeTerminal) throw new Error('Stripe Terminal failed to load')
   terminal = StripeTerminal.create({
     onFetchConnectionToken: async () => {
       // S243: endpoint moved to /pos/terminal/connection-token (S241).
       // Pre-S243 this called /terminal/connection-token which 404'd.
-      const res = await api.post('/pos/terminal/connection-token')
+      const res = await api.post('/pos/terminal/connection-token',
+        terminalPropertyId ? { propertyId: terminalPropertyId } : {})
       return res.data.data.secret
     },
     onUnexpectedReaderDisconnect: () => {
@@ -43,8 +47,8 @@ export async function getTerminal() {
   return terminal
 }
 
-export async function discoverReaders() {
-  const t = await getTerminal()
+export async function discoverReaders(propertyId: string) {
+  const t = await getTerminal(propertyId)
   // Vite exposes DEV via import.meta.env; process.env.NODE_ENV is
   // not defined in the browser bundle.
   const simulated = (import.meta as any).env?.DEV ?? false
@@ -83,7 +87,9 @@ export interface TerminalIntent {
 }
 
 export async function createTerminalIntent(args: {
-  amountCents: number
+  // S648: the server prices the charge from the cart (plus the card fee).
+  items:       Array<{ id: string | null; qty: number; price: number; tax?: number; name?: string }>
+  discountAmount?: number
   propertyId:  string
   description?: string
   posDraftRef?: string
@@ -95,11 +101,56 @@ export async function createTerminalIntent(args: {
 export async function processIntentOnReader(args: {
   paymentIntentId: string
   stripeReaderId:  string
+  // S654: the cart, so the reader can show the lines, tax, fee and total
+  // before it asks for the card. The server re-prices it; a changed cart is refused.
+  items?: any[]
+  discountAmount?: number
+  // S654: who the sale is for — their name leads the breakdown on the reader.
+  tenantId?: string | null
+  posCustomerId?: string | null
+  // S654: the breakdown has been up while the cart was rung, so the customer
+  // has had it to tap on; the charge completes at once instead of holding it.
+  cartOnReader?: boolean
 }): Promise<{ readerId: string; action: any }> {
   const res = await apiPost(
     `/pos/terminal/payment-intents/${args.paymentIntentId}/process`,
-    { stripeReaderId: args.stripeReaderId },
+    { stripeReaderId: args.stripeReaderId, items: args.items, discountAmount: args.discountAmount,
+      tenantId: args.tenantId || null, posCustomerId: args.posCustomerId || null, cartOnReader: !!args.cartOnReader },
   )
+  return res.data
+}
+
+/**
+ * S654 (Nic): "Can the tap happen in the background while the display is still
+ * up for the breakdown? Can you just leave it going for like thirty to
+ * forty-five seconds?" … "change it to just thirty seconds." Then (10/2):
+ * "Nobody needs to look at their breakdown for a full 30 seconds... the screen
+ * is populating as the [cashier] is updating the register... 10 seconds is
+ * probably fine." After Charge the breakdown stays up this long for the tap;
+ * the reader keeps a card tapped on it and the charge goes through with it. A
+ * customer who hasn't tapped by then still can: the charge goes to the reader,
+ * which keeps asking for the card. "They tapped — finish now" ends it early.
+ */
+export const TAP_WINDOW_SECONDS = 10
+
+/**
+ * S654 (Nic): "link it to be always on the screen until the payment is
+ * processed." The cart, as it is rung, goes on the reader — the breakdown and
+ * the customer's name — and the customer taps on it. An empty item list takes
+ * the breakdown down. Display only; nothing is charged.
+ */
+export async function showCartOnReader(args: {
+  stripeReaderId: string
+  propertyId:     string
+  items:          any[]
+  discountAmount?: number
+  tenantId?:      string | null
+  posCustomerId?: string | null
+}): Promise<{ shown: boolean; busy?: string; totalCents?: number }> {
+  const res = await apiPost(`/pos/terminal/readers/${args.stripeReaderId}/cart`, {
+    propertyId: args.propertyId, items: args.items, discountAmount: args.discountAmount ?? 0,
+    tenantId: args.tenantId || null, posCustomerId: args.posCustomerId || null,
+  })
   return res.data
 }
 
@@ -112,9 +163,16 @@ export async function captureTerminalIntent(
 
 export async function cancelTerminalIntent(
   paymentIntentId: string,
+  // S654: the reader to clear ("tap or insert" stays on screen otherwise).
+  stripeReaderId?: string,
 ): Promise<{ id: string; status: string }> {
-  const res = await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/cancel`)
+  const res = await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/cancel`, stripeReaderId ? { stripeReaderId } : {})
   return res.data
+}
+
+/** S654: clear the reader's prompt WITHOUT voiding the charge — the cart stays and Charge sends it again. */
+export async function clearReaderPrompt(paymentIntentId: string, stripeReaderId: string): Promise<void> {
+  await apiPost(`/pos/terminal/payment-intents/${paymentIntentId}/clear-reader`, { stripeReaderId })
 }
 
 export interface PiStatus {
@@ -140,7 +198,7 @@ export async function pollPiUntilTerminal(
   paymentIntentId: string,
   opts: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<PiStatus> {
-  const timeoutMs  = opts.timeoutMs  ?? 60_000  // 60s default — customer-walk-up time
+  const timeoutMs  = opts.timeoutMs  ?? 180_000  // S654: three minutes — a card dug out of a wallet at the counter; then the reader is cleared
   const intervalMs = opts.intervalMs ?? 2_000
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {

@@ -1,12 +1,40 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import path from 'path'
+import crypto from 'crypto'
+import multer from 'multer'
+import { storage, sendStoredFile, uploadKeyFromStored } from '../lib/storage'
 import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+import { landlordScopeIds } from '../lib/landlordScope'
+import { traderHasFieldPermission } from '../services/workTradeJobs'
+
+// S652 (Nic): "Curtis needs to be able to do and initiate the meter reading."
+// A work trader whose landlord ticked Read meters on their agreement takes the
+// same walk the front desk does — at their own property only. Staff pass the
+// way they always did (their permission, then their property scope).
+const METER_READ_PERMS = ['units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters']
+function requireMeterReader(req: any, res: any, next: any) {
+  const u = req.user
+  if (!u) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (u.role === 'tenant') return next()   // the handler checks the agreement
+  return requirePerm(...METER_READ_PERMS)(req, res, next)
+}
+async function assertMeterReadAccess(user: any, propertyId: string, landlordId: string) {
+  if (user?.role === 'tenant') {
+    if (!(await traderHasFieldPermission(user.userId, propertyId, 'read_meters'))) {
+      throw new AppError(403, 'Reading meters is not part of your work trade agreement')
+    }
+    return
+  }
+  if (!canAccessLandlordResource(user, landlordId)) throw new AppError(403, 'Forbidden')
+  await assertPropertyInScope(user, propertyId)  // S560: property-lock
+}
 import {
   generateBillsForMeter,
   generateBillsForProperty,
@@ -18,10 +46,9 @@ import {
   getRunMeters,
   completeReadingRun,
   isRunFullyRead,
-  startDoubleCheckPhase,
-  getDoubleChecks,
-  enterDoubleCheck,
-  countEscalations,
+  finishReadingPhase,
+  settleFlaggedOnRun,
+  countFlaggedOnRun,
   getReadsDue,
 } from '../services/utilityReadingRuns'
 
@@ -39,9 +66,14 @@ utilityRouter.get('/bills', async (req, res, next) => {
     const params: any[] = []
     let where = ''
     if (role === 'tenant') {
-      where = `WHERE ub.tenant_id = $${params.push(req.user!.profileId)}`
+      // S652: a bill the landlord has not issued yet — computed early for their
+      // review — is not the tenant's to see until it goes out.
+      where = `WHERE ub.tenant_id = $${params.push(req.user!.profileId)}
+                 AND (ub.status <> 'unbilled' OR ub.payment_id IS NOT NULL)`
     } else if (role === 'landlord') {
-      where = `WHERE ub.landlord_id = $${params.push(req.user!.profileId)}`
+      // S652: a landlord's session names no company (S633) — this read
+      // profileId and so returned nothing for every landlord.
+      where = `WHERE ub.landlord_id = ANY($${params.push(landlordScopeIds(req.user!))}::uuid[])`
     } else if (['property_manager','onsite_manager','maintenance'].includes(role)) {
       if (!req.user!.landlordId) return res.json({ success: true, data: [] })
       where = `WHERE ub.landlord_id = $${params.push(req.user!.landlordId)}`
@@ -128,6 +160,9 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
     }
     const meters = await query<any>(`
       SELECT m.*, p.name AS property_name,
+        -- S648: whether a broken meter here bills an estimate (Mountain View's
+        -- stopgap) or nothing — only so the page describes it truthfully.
+        p.estimates_stuck_meters,
         (SELECT COUNT(*)::int FROM utility_meter_units WHERE meter_id = m.id) AS unit_count,
         (SELECT MAX(billing_cycle_month) FROM utility_meter_readings WHERE meter_id = m.id) AS last_reading_cycle,
         -- S605 (Nic): a submeter with no read at all cannot produce a bill —
@@ -202,7 +237,20 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
       ${where}
       ORDER BY p.name, m.utility_type, m.label
     `, params)
-    res.json({ success: true, data: meters })
+    // 10/3: blind entry (S559). Someone who cannot change meter setup never gets
+    // a reading value back — the opening read keeps its id and date, not its
+    // number. A staffer who only reads meters (no unit access) gets no prices
+    // either; they need the meter, not what it bills at.
+    if (userHasPerm(req.user, 'properties.edit', 'units.edit')) return res.json({ success: true, data: meters })
+    const seesPrices = userHasPerm(req.user, 'units.view_status')
+    res.json({ success: true, data: meters.map((m: any) => {
+      const { opening_read, rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights, ...rest } = m
+      return {
+        ...rest,
+        opening_read: opening_read ? { id: opening_read.id, date: opening_read.date } : null,
+        ...(seesPrices ? { rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights } : {}),
+      }
+    }) })
   } catch (e) { next(e) }
 })
 
@@ -301,6 +349,39 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
         throw new AppError(400,
           `This unit is already on "${clash.label}" for ${body.utilityType}. ` +
           `A unit can only be on one ${body.utilityType} meter — remove it from that one first.`)
+      }
+
+      // ── 10/3 (final sweep): AN OCCUPIED UNIT'S OWN METER NEEDS ITS OPENING READ ──
+      //
+      // Oak Park RV 24 was moved onto a new water submeter on 9/30 with no
+      // starting read. A submeter's first cycle read is only a starting point
+      // (services/utilityBilling: "no prior reading — first cycle baseline, no
+      // bill produced"), so the first month on the new meter would bill no water
+      // at all for a space somebody lives in, and nothing would say so until the
+      // bill went out without it. On an empty space the first read is the right
+      // starting point; on an occupied one the number on the face today is
+      // required with the meter. Occupied = the same test the stuck-meter rule
+      // uses: not vacant or available, or an active lease, or residents invited.
+      if (body.billingMethod === 'submeter' && body.baselineReading == null) {
+        const occ = await queryOne<{ unit_number: string; occupied: boolean }>(
+          `SELECT u.unit_number,
+                  (u.status NOT IN ('vacant', 'available')
+                   OR EXISTS (SELECT 1 FROM leases l
+                               WHERE l.unit_id = u.id AND l.status IN ('active', 'delinquent', 'suspended'))
+                   OR EXISTS (SELECT 1 FROM pending_tenant_intents pti
+                               WHERE pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL)
+                  ) AS occupied
+             FROM units u WHERE u.id = $1`,
+          [body.assignUnitId])
+        if (occ?.occupied) {
+          // utilityType is a plain word (water, electric, gas...) — said as-is,
+          // like the clash message above.
+          throw new AppError(400,
+            `Someone lives in ${occ.unit_number}, so its new ${body.utilityType} meter needs an opening read: ` +
+            `the number on the meter face today and the date you read it. Without it, their first month on this ` +
+            `meter would not bill. Nothing was added. To add it, open the Utilities page, choose "Add meter", ` +
+            `fill in the opening read and the date you read it, then assign the meter to ${occ.unit_number}.`)
+        }
       }
     }
 
@@ -401,7 +482,27 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // comparable usage and are never flagged for reread. Stamps the "since"
       // date going in, clears it on repair.
       outOfService:   z.boolean().optional(),
+      // S648 (Nic): "for the meters marked broken and then marked as repaired,
+      // they also need a new fresh meter read. If they bought a brand new
+      // meter, the read's going to be zero. But if they bought a refurbished
+      // one somewhere, it may have some number on it. And we need to set that
+      // as the starting point for the next billing cycle."
+      repairedStartingReading: z.number().nonnegative().optional(),
     }).parse(req.body)
+    // S648: marking a broken meter repaired REQUIRES what the new meter reads
+    // now. Without it, the first bill after the repair would be measured from
+    // the old meter's last number — a meaningless difference between two
+    // different devices.
+    const repairing = body.outOfService === false && meter.out_of_service === true
+    if (repairing && body.repairedStartingReading == null) {
+      throw new AppError(400,
+        'Enter what the repaired or replaced meter reads right now (0 for a brand-new meter). Its next bill is measured from that number.')
+    }
+    if (repairing && meter.digits != null
+        && body.repairedStartingReading! >= meterReadingModulus(Number(meter.digits))) {
+      throw new AppError(400,
+        `${body.repairedStartingReading} does not fit on a ${meter.digits}-digit meter — check the number, or change the meter's digits first.`)
+    }
     // What a meter has actually DONE. Unit and lease assignments are config, not
     // history — they deliberately survive an edit, which is the whole point:
     // fixing a wrong setup must not mean redoing the assignments too.
@@ -475,58 +576,79 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       }
     }
 
-    const updated = await queryOne<any>(`
-      UPDATE utility_meters SET
-        utility_type = COALESCE($16, utility_type),
-        billing_method = COALESCE($17, billing_method),
-        label = COALESCE($1, label),
-        rate_per_unit = COALESCE($2, rate_per_unit),
-        base_fee = COALESCE($3, base_fee),
-        rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
-        -- S613: a meter that BECOMES trash or a flat rate loses its width (the
-        -- constraint requires NULL there); one that stops being either needs a
-        -- width again, so it falls back to the default rather than failing the
-        -- save with a constraint error the landlord can do nothing about.
-        reading_multiplier = COALESCE($20, reading_multiplier),
-        digits = CASE
-          WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
-          ELSE COALESCE($6, digits, 6)
-        END,
-        sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
-        rubs_basis = COALESCE($11, rubs_basis),
-        rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
-        rubs_exclusion_mode = COALESCE($13, rubs_exclusion_mode),
-        rubs_weights = CASE WHEN $14::text = '__keep__' THEN rubs_weights ELSE $15::jsonb END,
-        out_of_service = COALESCE($10, out_of_service),
-        out_of_service_since = CASE
-          WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
-          WHEN $10::boolean IS FALSE THEN NULL
-          ELSE out_of_service_since END,
-        updated_at = NOW()
-      WHERE id = $9 RETURNING *`,
-      [
-        body.label ?? null,
-        body.ratePerUnit ?? null,
-        body.baseFee ?? null,
-        body.rubsAllocationMethod === undefined ? '__keep__' : 'set',
-        body.rubsAllocationMethod === undefined ? null : (body.rubsAllocationMethod ?? null),
-        body.digits ?? null,
-        body.sewerRatePerUnit === undefined ? '__keep__' : 'set',
-        body.sewerRatePerUnit === undefined ? null : body.sewerRatePerUnit,
-        req.params.id,
-        body.outOfService ?? null,
-        body.rubsBasis ?? null,
-        body.rubsSubmeterRate ?? null,
-        body.rubsExclusionMode ?? null,
-        body.rubsWeights === undefined ? '__keep__' : 'set',
-        body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
-        body.utilityType ?? null,
-        body.billingMethod ?? null,
-        // $18/$19: what the meter is BECOMING, for the digits rule above.
-        nextUtility,
-        nextMethod,
-        body.readingMultiplier ?? null,
-      ])
+    const tx = await getClient()
+    let updated: any
+    try {
+      await tx.query('BEGIN')
+      updated = (await tx.query(`
+        UPDATE utility_meters SET
+          utility_type = COALESCE($16, utility_type),
+          billing_method = COALESCE($17, billing_method),
+          label = COALESCE($1, label),
+          rate_per_unit = COALESCE($2, rate_per_unit),
+          base_fee = COALESCE($3, base_fee),
+          rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
+          -- S613: a meter that BECOMES trash or a flat rate loses its width (the
+          -- constraint requires NULL there); one that stops being either needs a
+          -- width again, so it falls back to the default rather than failing the
+          -- save with a constraint error the landlord can do nothing about.
+          reading_multiplier = COALESCE($20, reading_multiplier),
+          digits = CASE
+            WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
+            ELSE COALESCE($6, digits, 6)
+          END,
+          sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
+          rubs_basis = COALESCE($11, rubs_basis),
+          rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
+          rubs_exclusion_mode = COALESCE($13, rubs_exclusion_mode),
+          rubs_weights = CASE WHEN $14::text = '__keep__' THEN rubs_weights ELSE $15::jsonb END,
+          out_of_service = COALESCE($10, out_of_service),
+          out_of_service_since = CASE
+            WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
+            WHEN $10::boolean IS FALSE THEN NULL
+            ELSE out_of_service_since END,
+          updated_at = NOW()
+        WHERE id = $9 RETURNING *`,
+        [
+          body.label ?? null,
+          body.ratePerUnit ?? null,
+          body.baseFee ?? null,
+          body.rubsAllocationMethod === undefined ? '__keep__' : 'set',
+          body.rubsAllocationMethod === undefined ? null : (body.rubsAllocationMethod ?? null),
+          body.digits ?? null,
+          body.sewerRatePerUnit === undefined ? '__keep__' : 'set',
+          body.sewerRatePerUnit === undefined ? null : body.sewerRatePerUnit,
+          req.params.id,
+          body.outOfService ?? null,
+          body.rubsBasis ?? null,
+          body.rubsSubmeterRate ?? null,
+          body.rubsExclusionMode ?? null,
+          body.rubsWeights === undefined ? '__keep__' : 'set',
+          body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
+          body.utilityType ?? null,
+          body.billingMethod ?? null,
+          // $18/$19: what the meter is BECOMING, for the digits rule above.
+          nextUtility,
+          nextMethod,
+          body.readingMultiplier ?? null,
+        ])).rows[0]
+      if (repairing) {
+        // The fresh starting point, dated today at the property. Recorded as a
+        // replacement read: it starts the next measurement and bills nothing.
+        await tx.query(`
+          INSERT INTO utility_meter_readings
+            (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+          SELECT $1, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, $2,
+                 date_trunc('month', NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date,
+                 'meter_replaced', $3
+            FROM properties p WHERE p.id = $4`,
+          [req.params.id, body.repairedStartingReading, req.user!.userId, meter.property_id])
+      }
+      await tx.query('COMMIT')
+    } catch (e) {
+      await tx.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { tx.release() }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -805,6 +927,21 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
+// Which metered utility a register / pay-link line is, or NULL when it is not
+// one. The register has no utility column — a line is utility billed back when
+// it sits in the Utilities category AND names a metered utility. Propane there
+// is the pump price, a retail sale, and deliberately matches nothing.
+function registerUtilityType(catExpr: string, nameExpr: string): string {
+  return `SELECT CASE
+            WHEN COALESCE(${catExpr}, '') NOT ILIKE 'utilit%' THEN NULL
+            WHEN ${nameExpr} ~* '\\melectric' THEN 'electric'
+            WHEN ${nameExpr} ~* '\\mwater'    THEN 'water'
+            WHEN ${nameExpr} ~* '\\msewer'    THEN 'sewer'
+            WHEN ${nameExpr} ~* '\\m(trash|garbage)' THEN 'trash'
+            WHEN ${nameExpr} ~* '\\mgas\\M' THEN 'gas'
+          END AS utility_type`
+}
+
 // GET /api/utility/recovery?propertyId=&from=&to= — S613 (Nic).
 //
 // "Unbilled utility tracking would just be the difference between an owner
@@ -840,13 +977,81 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
            AND e.expense_date BETWEEN $2::date AND $3::date
          GROUP BY 1
       ),
-      recovered AS (
-        SELECT ub.utility_type, SUM(ub.charge_amount)::numeric AS amount
+      -- S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
+      -- $1,588.65. Those are an exact match and I don't know why it's saying
+      -- it's not recovered. Most people at Mountain View have paid." Three
+      -- things were wrong at once: VOIDED bills were counted as billed back;
+      -- the total subtracted from a spend nobody had entered; and nothing said
+      -- how much of what was billed had actually been PAID. Billed excludes
+      -- void; collected is what tenants paid; the gap only exists where the
+      -- property recorded what the utility charged it.
+      --
+      -- S652 (Nic): "He is on a work trade. It's unpaid because of a work
+      -- trade." A charge the work trade covers is not money a tenant owes — it
+      -- is being worked off. It gets its own column: parked under the agreement
+      -- while the hours are worked, or closed by the work-trade credit at month
+      -- end. Neither one is "paid" and neither one is "still owed".
+      --
+      -- S652 (Nic): "It needs to count the 387 kilowatts for $81.27 as still
+      -- outstanding. It's billed back and not paid." A tenant with no lease is
+      -- billed his meter on a PAY LINK — Andres Razo, leaving, got a link
+      -- instead of a lease. That is utility billed back exactly like a bill
+      -- on an invoice, so it is counted the same: an open link is still owed,
+      -- and a utility line rung up and paid (a paid link is a register sale)
+      -- is paid. Only lines in the register's Utilities category that name a
+      -- metered utility count — propane at the pump is a retail sale.
+      billed AS (
+        SELECT ub.utility_type,
+               (ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
+               CASE WHEN wt.covered THEN 'work_trade'
+                    WHEN ub.status = 'paid' THEN 'paid'
+                    ELSE 'owed' END AS bucket
           FROM utility_bills ub
           JOIN units u ON u.id = ub.unit_id
+          LEFT JOIN payments pay ON pay.id = ub.payment_id
+          CROSS JOIN LATERAL (
+            SELECT COALESCE(
+              (pay.status = 'pending' AND pay.work_trade_suspended_at IS NOT NULL)
+              OR (pay.status = 'settled' AND pay.amount = 0 AND pay.notes ILIKE '%work-trade credit%'),
+              false) AS covered
+          ) wt
          WHERE u.property_id = $1
+           AND ub.status <> 'void'
            AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                           AND date_trunc('month', $3::date)::date
+        UNION ALL
+        SELECT k.utility_type,
+               ROUND((it->>'qty')::numeric * (it->>'price')::numeric
+                     * (1 + COALESCE((it->>'tax')::numeric, 0)), 2) AS amount,
+               'owed' AS bucket
+          FROM pos_pay_links l
+          CROSS JOIN LATERAL jsonb_array_elements(l.items) it
+          CROSS JOIN LATERAL (${registerUtilityType(`it->>'cat'`, `it->>'name'`)}) k
+         WHERE l.property_id = $1
+           AND l.kind = 'one_time' AND l.status = 'open'
+           AND (l.expires_at IS NULL OR l.expires_at > NOW())
+           AND k.utility_type IS NOT NULL
+           AND date_trunc('month', l.created_at)::date BETWEEN date_trunc('month', $2::date)::date
+                                                           AND date_trunc('month', $3::date)::date
+        UNION ALL
+        SELECT k.utility_type,
+               ROUND(ti.subtotal * (1 + COALESCE(ti.tax_rate, 0)), 2) AS amount,
+               'paid' AS bucket
+          FROM pos_transaction_items ti
+          JOIN pos_transactions t ON t.id = ti.transaction_id
+          CROSS JOIN LATERAL (${registerUtilityType('ti.item_category', 'ti.item_name')}) k
+         WHERE t.property_id = $1
+           AND t.status = 'completed'
+           AND k.utility_type IS NOT NULL
+           AND date_trunc('month', t.created_at)::date BETWEEN date_trunc('month', $2::date)::date
+                                                           AND date_trunc('month', $3::date)::date
+      ),
+      recovered AS (
+        SELECT b.utility_type,
+               SUM(b.amount)::numeric AS amount,
+               SUM(b.amount) FILTER (WHERE b.bucket = 'work_trade')::numeric AS work_trade,
+               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected
+          FROM billed b
          GROUP BY 1
       ),
       owner_use AS (
@@ -861,6 +1066,8 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       SELECT t.utility_type,
              COALESCE(s.amount, 0)::float  AS spent,
              COALESCE(r.amount, 0)::float  AS recovered,
+             COALESCE(r.collected, 0)::float AS collected,
+             COALESCE(r.work_trade, 0)::float AS work_trade,
              COALESCE(o.amount, 0)::float  AS owner_occupied
         FROM (SELECT utility_type FROM spent
               UNION SELECT utility_type FROM recovered
@@ -875,6 +1082,9 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       utilityType: r.utility_type,
       spent: Number(r.spent),
       recovered: Number(r.recovered),
+      collected: Number(r.collected),
+      workTrade: Number(r.work_trade),
+      stillOwed: Math.round((Number(r.recovered) - Number(r.collected) - Number(r.work_trade)) * 100) / 100,
       ownerOccupied: Number(r.owner_occupied),
       // Only meaningful where the landlord recorded what he SPENT. Without the
       // bill on the expense side there is nothing to subtract from, so this
@@ -883,15 +1093,82 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
         ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
         : null,
     }))
-    const sum = (k: 'spent' | 'recovered' | 'ownerOccupied') =>
+    const sum = (k: 'spent' | 'recovered' | 'collected' | 'workTrade' | 'stillOwed' | 'ownerOccupied') =>
       Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
+    // The gap is only a number where a spend was recorded — summed over those
+    // utilities alone, so a utility with no bill entered cannot make the
+    // total claim a shortfall (or a surplus) that nobody measured.
+    const measured = lines.filter((l: any) => l.notRecovered != null)
     res.json({ success: true, data: {
       from, to, lines,
       totals: {
-        spent: sum('spent'), recovered: sum('recovered'), ownerOccupied: sum('ownerOccupied'),
-        notRecovered: Math.round((sum('spent') - sum('recovered')) * 100) / 100,
+        spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), workTrade: sum('workTrade'), stillOwed: sum('stillOwed'),
+        ownerOccupied: sum('ownerOccupied'),
+        notRecovered: measured.length
+          ? Math.round(measured.reduce((n: number, l: any) => n + l.notRecovered, 0) * 100) / 100
+          : null,
       },
     } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/utility/reading-history?propertyId=&months= — S652 (Nic): "I don't
+// want to download readings… I want stuff to stay in the system, visible
+// without downloading external reports… a spot to view the history as some
+// sort of spreadsheet, but make it look good." Every submeter at the property
+// with its readings, newest first, and the usage each one closed. LANDLORD-ONLY
+// for the same reason as /meters/:id/readings: a blind reader never sees values.
+utilityRouter.get('/reading-history', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const months = Math.min(36, Math.max(1, Number(req.query.months) || 12))
+    const property = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(`
+      SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits, m.reading_multiplier,
+             COALESCE(m.out_of_service, FALSE) AS out_of_service,
+             (SELECT string_agg(u.unit_number, ', ' ORDER BY u.unit_number)
+                FROM utility_meter_units mu JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = m.id) AS unit_numbers,
+             r.id AS reading_id, to_char(r.reading_date, 'YYYY-MM-DD') AS reading_date,
+             to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle_month,
+             r.reading_value, r.reason, r.reason_note, r.needs_review, r.is_rollover,
+             (r.photo_url IS NOT NULL) AS has_photo,
+             (SELECT pr.reading_value FROM utility_meter_readings pr
+               WHERE pr.meter_id = m.id AND (pr.reading_date, pr.created_at) < (r.reading_date, r.created_at)
+               ORDER BY pr.reading_date DESC, pr.created_at DESC LIMIT 1) AS prior_value
+        FROM utility_meters m
+        LEFT JOIN utility_meter_readings r
+               ON r.meter_id = m.id AND r.reading_date >= (CURRENT_DATE - ($2::int * INTERVAL '1 month'))
+       WHERE m.property_id = $1 AND m.billing_method IN ('submeter', 'rubs')
+       ORDER BY m.utility_type, m.label, r.reading_date DESC NULLS LAST, r.created_at DESC NULLS LAST`,
+      [propertyId, months])
+    const byMeter = new Map<string, any>()
+    for (const r of rows) {
+      if (!byMeter.has(r.meter_id)) {
+        byMeter.set(r.meter_id, {
+          meterId: r.meter_id, label: r.label, utilityType: r.utility_type, billingMethod: r.billing_method,
+          digits: Number(r.digits) || 6, outOfService: r.out_of_service, unitNumbers: r.unit_numbers, readings: [],
+        })
+      }
+      if (!r.reading_id) continue
+      const value = Number(r.reading_value)
+      const prior = r.prior_value != null ? Number(r.prior_value) : null
+      // A master's number IS the cycle's usage; a submeter's usage is the turn
+      // since the read before it (a rollover or a swap shows no figure rather
+      // than a negative one).
+      const usage = r.billing_method === 'rubs' ? value
+        : prior == null || value < prior ? null
+        : Math.round((value - prior) * Number(r.reading_multiplier) * 1000) / 1000
+      byMeter.get(r.meter_id).readings.push({
+        id: r.reading_id, date: r.reading_date, cycleMonth: r.cycle_month, value, usage,
+        reason: r.reason, note: r.reason_note, needsReview: r.needs_review, isRollover: r.is_rollover, hasPhoto: r.has_photo,
+      })
+    }
+    const meters = [...byMeter.values()].sort((a, b) =>
+      String(a.unitNumbers ?? a.label).localeCompare(String(b.unitNumbers ?? b.label), undefined, { numeric: true, sensitivity: 'base' })
+      || String(a.utilityType).localeCompare(String(b.utilityType)))
+    res.json({ success: true, data: { months, meters } })
   } catch (e) { next(e) }
 })
 
@@ -1050,12 +1327,12 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
         `That is more than a ${meter.digits}-digit meter can show. Check the odometer size on the meter if the face is wider.`)
     }
 
-    // Anything billed from this read, or from the span that starts at it.
-    const billed = await queryOne<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM utility_bills
-        WHERE meter_id = $1 AND billing_cycle_month >= $2::date`,
-      [req.params.id, reading.billing_cycle_month])
-    if (Number(billed?.n ?? 0) > 0) {
+    // Anything ISSUED from this read, or from the span that starts at it.
+    // S652: a bill computed for the landlord's review and not yet sent is
+    // not a charge anyone has seen — it is dropped and priced again from the
+    // corrected read, which is the whole point of reviewing before billing.
+    const { dropUnissuedBillsFrom } = await import('../services/utilityReview')
+    if (!(await dropUnissuedBillsFrom(req.params.id, reading.billing_cycle_month))) {
       throw new AppError(409,
         'A bill has already been issued from this read, so changing it would rewrite a charge a tenant has already seen. ' +
         'Enter a correcting read instead, or reverse that bill first.')
@@ -1074,17 +1351,17 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
   } catch (e) { next(e) }
 })
 
-utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.get('/reading-runs', requireMeterReader, async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
-    if (!canAccessLandlordResource(req.user, property.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
+    await assertMeterReadAccess(req.user, propertyId, property.landlord_id)
     const runs = await query<any>(
       `SELECT r.*,
+              -- S652: does this company hold the month for the landlord's approval?
+              (SELECT l.review_utility_bills FROM landlords l WHERE l.id = r.landlord_id) AS needs_approval,
               (SELECT COUNT(*)::int FROM utility_meters m
                 WHERE m.property_id = r.property_id
                   AND m.billing_method IN ('submeter','rubs')) AS meters_total,
@@ -1094,10 +1371,15 @@ utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status'
                   AND rd.reason = 'monthly_cycle'
                 WHERE m.property_id = r.property_id
                   AND m.billing_method IN ('submeter','rubs')) AS meters_read,
-              (SELECT COUNT(*)::int FROM utility_reading_double_checks dc
-                WHERE dc.run_id = r.id) AS dc_total,
-              (SELECT COUNT(*)::int FROM utility_reading_double_checks dc
-                WHERE dc.run_id = r.id AND dc.second_value IS NOT NULL) AS dc_done
+              -- S652: reads flagged for the landlord's review this cycle — the
+              -- one thing a fully-read run can still be waiting on.
+              (SELECT COUNT(*)::int FROM utility_meters m
+                 JOIN utility_meter_readings rd
+                   ON rd.meter_id = m.id AND rd.billing_cycle_month = r.billing_cycle_month
+                  AND rd.reason = 'monthly_cycle' AND rd.needs_review
+                WHERE m.property_id = r.property_id
+                  AND m.billing_method IN ('submeter','rubs')
+                  AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)) AS flagged_count
          FROM utility_reading_runs r
         WHERE r.property_id = $1
         ORDER BY (r.status IN ('open','double_check')) DESC, r.billing_cycle_month DESC
@@ -1109,22 +1391,19 @@ utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status'
 
 // Manual open — lets a landlord start the run before the scheduled last
 // business day (or re-open coverage for a property added mid-month).
-utilityRouter.post('/reading-runs', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.post('/reading-runs', requireMeterReader, async (req, res, next) => {
   try {
     const body = z.object({
       propertyId: z.string().uuid(),
       cycleMonth: z.string().regex(/^\d{4}-\d{2}-01$/, 'cycleMonth must be YYYY-MM-01').optional(),
       // S631: open a run for ONE utility so it bills as soon as its own reads
-      // are in. Omitted = every readable meter, the original behaviour.
+      // are in. Omitted = every readable meter, the original behavior.
       utilityType: z.string().min(1).max(40).optional(),
     }).parse(req.body)
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
-    if (!canAccessLandlordResource(req.user, property.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, body.propertyId)  // S560: property-lock
+    await assertMeterReadAccess(req.user, body.propertyId, property.landlord_id)
     const cycle = body.cycleMonth
       ?? new Date().toISOString().slice(0, 7) + '-01'
     const run = await openReadingRun(body.propertyId, cycle,
@@ -1141,14 +1420,12 @@ utilityRouter.post('/reading-runs', requirePerm('properties.edit', 'utility.read
 // Guided-walk payload: every readable meter with unit, prior reading,
 // this-cycle reading (if entered) and whether a lease makes the tenant
 // responsible (the auto-calc/bill preview).
-utilityRouter.get('/reading-runs/:id/meters', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.get('/reading-runs/:id/meters', requireMeterReader, async (req, res, next) => {
   try {
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     res.json({ success: true, data: await getRunMeters(req.params.id) })
   } catch (e) { next(e) }
 })
@@ -1156,7 +1433,55 @@ utilityRouter.get('/reading-runs/:id/meters', requirePerm('units.edit', 'units.v
 // Enter one meter's reading inside a run. Cycle comes from the run —
 // the reader never picks dates. Auto-completes the run (generate +
 // finalize bills) when this was the last unread meter.
-utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+// ── S652: THE METER FACE ────────────────────────────────────────────────────
+// Nic: "add the option for the maintenance person to take a picture of each
+// meter for historical accuracy." Anyone who may read the meter may photograph
+// it — no separate permission. The photo lands beside the reading it belongs
+// to (this cycle's monthly read, if it already exists) and is served only to
+// people who could see the reading.
+// A1: held in memory and saved through the storage driver only after the
+// caller is confirmed to read this meter — a refused request writes nothing.
+const meterPhotoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^image\/(jpeg|png|webp|heic)$/.test(file.mimetype)) cb(null, true)
+    else cb(new AppError(400, 'A photo (JPEG, PNG, WebP or HEIC) is required'))
+  },
+})
+utilityRouter.post('/reading-runs/:id/meters/:meterId/photo', requireMeterReader, meterPhotoUpload.single('file'), async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No photo uploaded')
+    const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
+    const meter = await queryOne<{ id: string }>(`SELECT id FROM utility_meters WHERE id = $1 AND property_id = $2`, [req.params.meterId, run.property_id])
+    if (!meter) throw new AppError(404, 'Meter not found on this run')
+    const ext = path.extname(req.file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 10) || '.jpg'
+    const filename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`
+    await storage.save(`meters/${filename}`, req.file.buffer)
+    const url = `/uploads/meters/${filename}`
+    // A reading already taken this cycle gets the photo now; otherwise the
+    // reading that follows carries it in.
+    const attached = await queryOne<{ id: string }>(
+      `UPDATE utility_meter_readings SET photo_url = $3
+        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' RETURNING id`,
+      [meter.id, run.billing_cycle_month, url])
+    res.status(201).json({ success: true, data: { url, attachedToReadingId: attached?.id ?? null } })
+  } catch (e) { next(e) }
+})
+utilityRouter.get('/readings/:id/photo', async (req: any, res, next) => {
+  try {
+    const r = await queryOne<any>(
+      `SELECT r.photo_url, m.property_id, p.landlord_id FROM utility_meter_readings r
+         JOIN utility_meters m ON m.id = r.meter_id JOIN properties p ON p.id = m.property_id WHERE r.id = $1`, [req.params.id])
+    if (!r?.photo_url) throw new AppError(404, 'No photo on this reading')
+    await assertMeterReadAccess(req.user, r.property_id, r.landlord_id)
+    await sendStoredFile(res, uploadKeyFromStored('meters', r.photo_url))
+  } catch (e) { next(e) }
+})
+
+utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterReader, async (req, res, next) => {
   try {
     // Reads are odometer values; the digit width is per-meter (landlord
     // setting). Bounds are checked against the meter's own capacity
@@ -1171,15 +1496,25 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
       // Replacing somebody else's read is a deliberate act, never a side effect
       // of a stray keystroke on the wrong row.
       replace: z.boolean().optional(),
+      // S652: the meter face, uploaded a moment earlier via .../photo.
+      photoUrl: z.string().regex(/^\/uploads\/meters\/[A-Za-z0-9._-]+$/).optional(),
     }).parse(req.body)
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, run.property_id)  // S560: property-lock
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     if (run.status !== 'open') throw new AppError(409, 'Reading run is already completed')
+    // S652 (Nic): "set it at the property level" — a property that requires
+    // the photo will not take a number without one (a photo already on this
+    // cycle's reading counts, so a re-read after a photo is not asked twice).
+    const propPhoto = await queryOne<{ meter_photo_required: boolean }>(
+      `SELECT meter_photo_required FROM properties WHERE id = $1`, [run.property_id])
+    if (propPhoto?.meter_photo_required && !body.photoUrl) {
+      const already = await queryOne<{ id: string }>(
+        `SELECT id FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' AND photo_url IS NOT NULL`,
+        [req.params.meterId, run.billing_cycle_month])
+      if (!already) throw new AppError(400, 'This property requires a photo of the meter face with every reading — take the photo, then enter the number.')
+    }
     const meter = await queryOne<any>(
       `SELECT m.* FROM utility_meters m
         WHERE m.id = $1 AND m.property_id = $2`, [req.params.meterId, run.property_id])
@@ -1193,6 +1528,17 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     // to tell why.
     if (meter.billing_method !== 'rubs' && body.readingValue >= modulus) {
       throw new AppError(400, `Reading exceeds this meter's ${meter.digits}-digit capacity`)
+    }
+    // S648 (Nic): a tenant billed on their own day is read the last business
+    // day before it. Reading early would cut their period short and push the
+    // difference onto next month's bill.
+    if (meter.billing_method === 'submeter') {
+      const { getRunMeters } = await import('../services/utilityReadingRuns')
+      const row = (await getRunMeters(run.id)).find((x: any) => x.meter_id === meter.id && x.not_yet)
+      if (row) {
+        throw new AppError(409,
+          `${row.unit_number || meter.label} is read on ${row.read_by}, the last business day before that tenant's due date.`)
+      }
     }
     const isDollarMaster = meter.billing_method === 'rubs' && meter.rubs_basis === 'bill_amount'
     if (isDollarMaster && body.billAmount == null) {
@@ -1297,10 +1643,11 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     const reading = await queryOne<any>(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id,
-          needs_review, review_note, is_rollover, reason, bill_amount)
-       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle', $8)
+          needs_review, review_note, is_rollover, reason, bill_amount, photo_url)
+       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle', $8, $9)
        ON CONFLICT (meter_id, billing_cycle_month) WHERE reason = 'monthly_cycle'
-       DO UPDATE SET reading_value = EXCLUDED.reading_value,
+       DO UPDATE SET photo_url = COALESCE(EXCLUDED.photo_url, utility_meter_readings.photo_url),
+                     reading_value = EXCLUDED.reading_value,
                      reading_date = EXCLUDED.reading_date,
                      created_by_user_id = EXCLUDED.created_by_user_id,
                      needs_review = EXCLUDED.needs_review,
@@ -1309,66 +1656,23 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
                      bill_amount = EXCLUDED.bill_amount
        RETURNING id, meter_id, billing_cycle_month`,
       [meter.id, body.readingValue, run.billing_cycle_month, req.user!.userId,
-       needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null])
+       needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null, body.photoUrl ?? null])
 
-    // When the last meter is read, the run moves to its VERIFICATION
-    // phase (S533) — the system builds the blind double-check list and
-    // billing waits for it. No mid-walk interruptions ever.
+    // S652 (Nic): the last meter read finishes the run — unless something is
+    // flagged, in which case it waits on the landlord's ONE review window.
+    // No mid-walk interruptions ever.
     let updatedRun = null
     if (await isRunFullyRead(run.id)) {
-      updatedRun = await startDoubleCheckPhase(run.id)
+      updatedRun = await finishReadingPhase(run.id, req.user!.userId)
     }
-    // Response deliberately excludes reading_value/needs_review — the
-    // walk client needs only confirmation + run state (+ the size of
-    // the freshly generated verification list for the summary screen).
-    const dcTotal = updatedRun?.status === 'double_check'
-      ? (await getDoubleChecks(run.id)).length : 0
-    res.status(201).json({ success: true, data: { reading, run: updatedRun ?? run, dcTotal } })
-  } catch (e) { next(e) }
-})
-
-// ── DOUBLE-CHECK VERIFICATION (blind re-read walk) ───────────
-utilityRouter.get('/reading-runs/:id/double-checks', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
-  try {
-    const run = await queryOne<any>(
-      `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
-    if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    res.json({ success: true, data: await getDoubleChecks(req.params.id) })
-  } catch (e) { next(e) }
-})
-
-utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
-  try {
-    const body = z.object({
-      readingValue: z.number().int().min(0),
-      // S607: a RUBS master on the bill_amount basis also carries the utility
-      // provider's dollar charge for the cycle. Ignored on every other meter.
-      billAmount: z.number().min(0).max(10_000_000).optional(),
-    }).parse(req.body)
-    const run = await queryOne<any>(
-      `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
-    if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, run.property_id)  // S560: property-lock
-    if (run.status !== 'double_check') throw new AppError(409, 'Run is not in its verification phase')
-    const meter = await queryOne<any>(
-      `SELECT * FROM utility_meters WHERE id = $1 AND property_id = $2`,
-      [req.params.meterId, run.property_id])
-    if (!meter) throw new AppError(404, 'Meter not found on this run')
-    if (body.readingValue >= meterReadingModulus(meter.digits)) {
-      throw new AppError(400, `Reading exceeds this meter's ${meter.digits}-digit capacity`)
-    }
-    const result = await enterDoubleCheck(run.id, meter.id, body.readingValue, req.user!.userId)
-    if (!result) throw new AppError(404, 'Meter is not on this run\'s verification list')
-    // Blind on the way out too: no values, no outcome — just run state
-    // (+ escalation count once completed, for the landlord-facing summary).
-    const escalated = result.run?.status === 'completed' ? await countEscalations(run.id) : 0
-    res.status(201).json({ success: true, data: { run: result.run, escalated } })
+    // Response deliberately excludes reading_value/needs_review — the walk
+    // client needs only confirmation + run state (+ how many reads the
+    // landlord has to look at, for the summary screen; never which ones).
+    const flagged = updatedRun?.status === 'double_check' ? await countFlaggedOnRun(run.id) : 0
+    // Fully read, nothing flagged, and the company reviews its bills first:
+    // the run stays open until the landlord approves.
+    const awaitingApproval = !!updatedRun && updatedRun.status === 'open'
+    res.status(201).json({ success: true, data: { reading, run: updatedRun ?? run, flagged, awaitingApproval } })
   } catch (e) { next(e) }
 })
 
@@ -1399,7 +1703,10 @@ utilityRouter.get('/reads-due', requirePerm('properties.edit', 'utility.read_met
 // This returns one row per master reading per cycle — what the provider
 // billed, what was measured, and how much of it was pushed back out to
 // tenants (so the un-recovered remainder is visible at a glance).
-utilityRouter.get('/master-bills', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+// 10/3: owners / properties.edit only. A staffer who only reads meters reads
+// them blind (S559) — past master readings and the provider's dollars are not
+// theirs to see.
+utilityRouter.get('/master-bills', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<{ landlord_id: string }>(
@@ -1443,6 +1750,10 @@ utilityRouter.post('/meters/:id/reads', requirePerm('properties.edit', 'utility.
       readingValue: z.number().int().min(0),
       reason: z.enum(METER_READ_REASONS as unknown as [string, ...string[]]),
       reasonNote: z.string().max(500).optional(),
+      // 10/3: the reads-due row says whose move-out this is. It only breaks a
+      // tie between households the move-out rule already counts — it can never
+      // put a bill on someone the rule would skip.
+      leaseId: z.string().uuid().optional(),
     }).parse(req.body)
     if (body.reason === 'monthly_cycle') {
       throw new AppError(400, 'Monthly-cycle reads are entered through the reading run, not as a special read')
@@ -1468,12 +1779,24 @@ utilityRouter.post('/meters/:id/reads', requirePerm('properties.edit', 'utility.
       [meter.id, body.readingValue, req.user!.userId, body.reason, body.reasonNote ?? null])
 
     let billed = false
+    let billingNote: string | undefined
     if (body.reason === 'move_out_final') {
-      const r = await billMoveOutRead(meter.id, reading.id)
+      // A lease from another company is ignored, never an error — the read
+      // still bills by the normal rule.
+      const named = body.leaseId
+        ? await queryOne<{ id: string }>(
+            `SELECT l.id FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties p ON p.id = u.property_id
+              WHERE l.id = $1 AND p.landlord_id = $2`, [body.leaseId, property.landlord_id])
+        : null
+      const r = await billMoveOutRead(meter.id, reading.id, { leaseId: named?.id ?? null })
       billed = r.billed
+      // S639: say WHY it did not bill. Rollover refusals, an unattached meter
+      // and an already-billed cycle all looked identical (a bare false) to the
+      // person standing at the meter.
+      if (!billed) billingNote = r.reason
     }
-    // Blind response — id + reason + whether it billed, never the values.
-    res.status(201).json({ success: true, data: { id: reading.id, reason: body.reason, billed } })
+    // Blind response — id + reason + whether it billed (and why not), never the values.
+    res.status(201).json({ success: true, data: { id: reading.id, reason: body.reason, billed, billingNote } })
   } catch (e) { next(e) }
 })
 
@@ -1558,10 +1881,25 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
          + (body.rollover ? ' (rollover)' : ''),
        !!body.rollover])
 
+    // S652 (Nic): "get rid of the clean meters random blind reread. Just flag
+    // the ones that need flagging, with limited to one window." This IS that
+    // window. A bill built on the superseded value and not yet on an invoice
+    // is stale; and if this was the last flagged read on a waiting run, the
+    // run completes here.
+    if (body.correctedValue != null && Number(reading.reading_value) !== body.correctedValue) {
+      await query(
+        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
+        [reading.meter_id, reading.billing_cycle_month])
+    }
+    const cycleIso = reading.billing_cycle_month instanceof Date
+      ? `${reading.billing_cycle_month.getFullYear()}-${String(reading.billing_cycle_month.getMonth() + 1).padStart(2, '0')}-${String(reading.billing_cycle_month.getDate()).padStart(2, '0')}`
+      : String(reading.billing_cycle_month).slice(0, 10)
+    const walkRun = await settleFlaggedOnRun(reading.property_id, cycleIso, req.user!.userId)
+
     // If this cycle's run already completed, the flagged meter was
     // skipped by the engine (negative usage) — re-run it now.
     let billsCreated = 0
-    const run = await queryOne<any>(
+    const run = walkRun ? null : await queryOne<any>(
       `SELECT * FROM utility_reading_runs
         WHERE property_id = $1 AND billing_cycle_month = $2 AND status = 'completed'`,
       [reading.property_id, reading.billing_cycle_month])
@@ -1578,7 +1916,7 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
           [reading.meter_id, reading.billing_cycle_month])
       }
     }
-    res.json({ success: true, data: { reading: updated, billsCreated } })
+    res.json({ success: true, data: { reading: updated, billsCreated, run: walkRun } })
   } catch (e) { next(e) }
 })
 
@@ -1597,8 +1935,86 @@ utilityRouter.post('/reading-runs/:id/complete', requirePerm('properties.edit'),
       throw new AppError(403, 'Forbidden')
     }
     if (run.status === 'completed') throw new AppError(409, 'Reading run is already completed')
-    const completed = await completeReadingRun(run.id, req.user!.userId)
+    // S652: the landlord completing the run IS the approval of its bills.
+    const completed = await completeReadingRun(run.id, req.user!.userId, { approve: true })
     res.json({ success: true, data: completed })
+  } catch (e) { next(e) }
+})
+
+// ── S652: REVIEW THE BILLS BEFORE THEY GO OUT ─────────────────
+// Blu: see what everybody will owe, fix a fat-fingered read, then approve.
+
+utilityRouter.get('/reading-runs/:id/review', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const run = await queryOne<any>(`SELECT landlord_id FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    const { billReview } = await import('../services/utilityReview')
+    res.json({ success: true, data: await billReview(req.params.id) })
+  } catch (e) { next(e) }
+})
+
+utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (run.status === 'completed') throw new AppError(409, 'These bills already went out')
+    // A reading still flagged as a possible typo bills nothing and holds only
+    // its own unit's invoice (S534) — it never holds the park (Nic).
+    const done = await completeReadingRun(run.id, req.user!.userId, { approve: true })
+    res.json({ success: true, data: { ...done, flagged: await countFlaggedOnRun(run.id) } })
+  } catch (e) { next(e) }
+})
+
+// Every read at a property as a spreadsheet — one row per meter, a reading and
+// a usage column per month (Nic: "your sites and your reads at different dates
+// for total evaluation history of overall utility usage"). CSV opens in Excel.
+utilityRouter.get('/readings/export', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const prop = await queryOne<any>(`SELECT name, landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!prop || !canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
+    const reads = await query<any>(`
+      SELECT m.id AS meter_id, m.label, m.utility_type, m.digits, COALESCE(m.reading_multiplier, 1) AS mult,
+             (SELECT string_agg(u.unit_number, ' / ' ORDER BY u.unit_number) FROM utility_meter_units mu
+                JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = m.id) AS sites,
+             to_char(rd.billing_cycle_month, 'YYYY-MM') AS month, rd.reading_date, rd.reading_value, rd.is_rollover, rd.reason
+        FROM utility_meters m
+        JOIN utility_meter_readings rd ON rd.meter_id = m.id
+       WHERE m.property_id = $1
+       ORDER BY m.utility_type, sites NULLS LAST, m.label, rd.reading_date, rd.created_at`, [propertyId])
+    const months = [...new Set(reads.filter(r => r.reason === 'monthly_cycle').map(r => r.month))].sort()
+    type Row = { sites: string; label: string; type: string; byMonth: Map<string, { read: number; usage: number | null }> }
+    const meters = new Map<string, Row>()
+    const lastRead = new Map<string, any>()
+    for (const r of reads) {
+      let row = meters.get(r.meter_id)
+      if (!row) meters.set(r.meter_id, row = { sites: r.sites ?? '', label: r.label ?? '', type: r.utility_type, byMonth: new Map() })
+      const prev = lastRead.get(r.meter_id)
+      lastRead.set(r.meter_id, r)
+      if (r.reason !== 'monthly_cycle') continue
+      const cur = Number(r.reading_value)
+      let usage: number | null = null
+      if (prev) {
+        const mod = Math.pow(10, Number(r.digits) || 7)
+        const diff = cur >= Number(prev.reading_value) ? cur - Number(prev.reading_value)
+          : (r.is_rollover ? cur + mod - Number(prev.reading_value) : null)
+        usage = diff == null ? null : Math.round(diff * Number(r.mult) * 100) / 100
+      }
+      row.byMonth.set(r.month, { read: cur, usage })
+    }
+    const esc = (v: any) => { const t = v == null ? '' : String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t }
+    const header = ['Site', 'Meter', 'Utility', ...months.flatMap(m => [`${m} reading`, `${m} usage`])]
+    const lines = [header.map(esc).join(',')]
+    for (const row of meters.values()) {
+      lines.push([row.sites, row.label, row.type,
+        ...months.flatMap(m => { const c = row.byMonth.get(m); return [c?.read ?? '', c?.usage ?? ''] })].map(esc).join(','))
+    }
+    const file = `${String(prop.name).replace(/[^A-Za-z0-9]+/g, '-')}-meter-readings.csv`
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="${file}"`)
+    res.send('\ufeff' + lines.join('\r\n'))
   } catch (e) { next(e) }
 })
 
@@ -1691,10 +2107,10 @@ utilityRouter.post('/bills/:id/finalize', requirePerm('properties.edit'), async 
 //
 // S178 fixed-forward by wiring utility_bills into invoiceGeneration:
 // utilities now ride the rent invoice as type='utility' child payment
-// rows linked via invoice_id. Tenants pay them through the standard
-// /api/payments/:id/pay flow against the utility-typed payment row;
-// the existing S122 webhook handler still flips utility_bills.status='paid'
-// on settlement.
+// rows linked via invoice_id. Tenants pay them with the rest of the bill
+// through POST /api/payments/pay-balance (S655: the one-row /payments/:id/pay
+// is retired too); the S122 webhook handler still flips
+// utility_bills.status='paid' on settlement.
 //
 // This handler returns 410 Gone with a pointer to the new path. Kept
 // registered so any cached frontend or third-party integration calling
@@ -1704,8 +2120,8 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Only tenants can call this endpoint')
     }
-    // Look up the linked invoice payment so the error message can point
-    // the caller directly at the correct /payments/:id/pay path.
+    // Look up the linked invoice payment: a bill not yet on an invoice gets
+    // its own answer (it will be on the next one).
     const linked = await queryOne<{ payment_id: string | null }>(
       `SELECT payment_id FROM utility_bills WHERE id = $1 AND tenant_id = $2`,
       [req.params.id, req.user!.profileId],
@@ -1718,7 +2134,7 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
     }
     throw new AppError(
       410,
-      `This endpoint was retired in S178. Pay this utility through POST /api/payments/${linked.payment_id}/pay (utility now invoices as a line item on the rent invoice).`,
+      'This endpoint was retired. Utilities are a line on the rent bill now — pay the whole bill with POST /api/payments/pay-balance (Pay Now on the Payments page).',
     )
   } catch (e) { next(e) }
 })
@@ -1729,7 +2145,7 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
 //
 // Pricing is policy, decided once per property per utility, not per tenant. The
 // billing engine reads these and they override the meter columns — so two
-// neighbours on the same water main cannot be charged different rates because
+// neighbors on the same water main cannot be charged different rates because
 // of who entered their unit. Same posture as the S535 property-level late fees.
 utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {

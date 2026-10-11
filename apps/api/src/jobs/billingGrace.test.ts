@@ -5,8 +5,9 @@
  *   1. platformFeeAccrual gate — a landlord in grace (billing_starts_at NULL)
  *      or not-yet-started (billing_starts_at in a future cycle) is NOT billed,
  *      even with an occupied unit; a live landlord IS billed.
- *   2. activateBillingForSettledRent — first settled rent flips a NULL landlord
- *      to the current cycle; already-live landlords are untouched (idempotent).
+ *   2. activateBillingForSettledPayments — first settled payment (10/5: of any
+ *      kind, not only rent) flips a NULL landlord to the current cycle;
+ *      already-live landlords are untouched (idempotent).
  *   3. applyBillingGraceCaps — flips a NULL landlord to billing once the cap
  *      cycle arrives (explicit billing_grace_until, or the created_at+2mo
  *      fallback); leaves a landlord whose cap is still in the future alone.
@@ -15,7 +16,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { processPlatformFeeAccrual, applyBillingGraceCaps } from './platformFeeAccrual'
-import { activateBillingForSettledRent } from '../services/billingActivation'
+import { activateBillingForSettledPayments } from '../services/billingActivation'
 import {
   cleanupAllSchema,
   seedLandlord, seedTenant,
@@ -142,7 +143,7 @@ describe('S600 platform-fee accrual gate', () => {
   })
 })
 
-describe('S600 activateBillingForSettledRent', () => {
+describe('S600 / 10/5 activateBillingForSettledPayments', () => {
   it('flips a landlord in grace to the current cycle on first settled rent', async () => {
     const { landlordId, unitId, tenantId } = await buildOccupiedStack()
     await setBilling(landlordId, null)
@@ -152,7 +153,7 @@ describe('S600 activateBillingForSettledRent', () => {
       const paymentId = await seedRentPayment(client, {
         unitId, tenantId, landlordId, amount: 1000, status: 'settled',
       })
-      const n = await activateBillingForSettledRent(client, [paymentId])
+      const n = await activateBillingForSettledPayments(client, [paymentId])
       expect(n).toBe(1)
     } finally {
       client.release()
@@ -172,7 +173,7 @@ describe('S600 activateBillingForSettledRent', () => {
     const client = await getClient()
     try {
       const paymentId = await seedRentPayment(client, { unitId, tenantId, landlordId, amount: 1000, status: 'settled' })
-      const n = await activateBillingForSettledRent(client, [paymentId])
+      const n = await activateBillingForSettledPayments(client, [paymentId])
       expect(n).toBe(0)
     } finally {
       client.release()
@@ -185,10 +186,10 @@ describe('S600 activateBillingForSettledRent', () => {
     expect(r.rows[0].unchanged).toBe(true)
   })
 
-  it('is a no-op with no rent payment ids', async () => {
+  it('is a no-op with no payment ids', async () => {
     const client = await getClient()
     try {
-      expect(await activateBillingForSettledRent(client, [])).toBe(0)
+      expect(await activateBillingForSettledPayments(client, [])).toBe(0)
     } finally {
       client.release()
     }
@@ -277,6 +278,27 @@ describe('S631 grace cap skips landlords who never started', () => {
     const r = await db.query<{ starts: string | null }>(
       `SELECT billing_starts_at::text AS starts FROM landlords WHERE id=$1`, [landlordId!])
     expect(r.rows[0].starts).toBeNull()
+  })
+
+  // 10/5 (Nic): "money movement is the end of onboarding" — any money, not
+  // only settled rent, marks a landlord who started.
+  it('DOES flip a landlord with no lease whose register took money', async () => {
+    const client = await getClient()
+    let landlordId: string
+    try {
+      const { userId, landlordId: lid } = await seedLandlord(client)
+      landlordId = lid
+      await client.query(
+        `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total, created_at)
+         VALUES ($1, $2, 'cash', 12, 12, '2026-03-04T17:00:00Z')`, [landlordId, userId])
+      await client.query(
+        `UPDATE landlords SET billing_starts_at = NULL, billing_grace_until = '2026-01-01' WHERE id = $1`, [landlordId])
+    } finally { client.release() }
+
+    await applyBillingGraceCaps(new Date('2026-06-15T08:00:00Z'))
+    const r = await db.query<{ starts: string | null }>(
+      `SELECT billing_starts_at::text AS starts FROM landlords WHERE id=$1`, [landlordId!])
+    expect(r.rows[0].starts).toBe('2026-01-01')
   })
 
   it('DOES flip a landlord holding an active lease, even with no payment through GAM', async () => {

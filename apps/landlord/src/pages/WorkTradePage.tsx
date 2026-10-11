@@ -1,7 +1,9 @@
 import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { Link } from 'react-router-dom'
+import { WorkTradePanel } from '../../../../packages/shared-ui/WorkTradePanel'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
+const panelApi = { get: apiGet, post: apiPost, patch: apiPatch }
 import { ChevronDown, Plus, X } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { WORK_TRADE_COVERABLE, WORK_TRADE_COVERABLE_LABEL } from '@gam/shared'
@@ -42,12 +44,14 @@ function PropertyTargetRow({ propertyId, name }: { propertyId: string; name: str
 
 export function WorkTradePage() {
   const [showNew, setShowNew] = useState(false)
+  // S652 (Nic): clicking a person opens THEIR work-trade window here, on this
+  // page — never the lease editor, never a trip to another tab.
+  const [openId, setOpenId] = useState<string | null>(null)
   const { data: agreements = [], isLoading } = useQuery<any[]>('work-trade', () => apiGet('/work-trade'))
   // S576 (B-8): the landlord's own work-trade addendum forms (Form Type =
   // Work-Trade Addendum). Fetched once, passed to each row's addendum cell.
   const { data: addendumTemplates = [] } = useQuery<any[]>('wt-addendum-templates', () => apiGet('/esign/templates?purpose=work_trade_addendum'))
 
-  const navigate = useNavigate()
   // Distinct properties for the new-agreement DEFAULT editor. a.target is
   // now the per-agreement value, so fetch nothing extra — the default
   // editor reads its own value lazily per property row.
@@ -65,6 +69,15 @@ export function WorkTradePage() {
       </div>
 
       {showNew && <NewAgreementModal onClose={() => setShowNew(false)} />}
+      {openId && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.5)', zIndex:1000, display:'flex', justifyContent:'center', alignItems:'flex-start', padding:'4vh 16px', overflowY:'auto' }}
+          onClick={() => setOpenId(null)}>
+          <div style={{ width:'100%', maxWidth:760 }} onClick={e => e.stopPropagation()}>
+            <WorkTradePanel agreementId={openId} side="landlord" api={panelApi} onClose={() => setOpenId(null)}
+              notify={(m, kind) => kind === 'error' ? toast.error(m) : toast(m)} />
+          </div>
+        </div>
+      )}
 
       {properties.length > 0 && (
         <div className="card" style={{ marginBottom: 16, padding: 16 }}>
@@ -81,20 +94,20 @@ export function WorkTradePage() {
       <div className="card" style={{ padding: 0 }}>
         {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
           <table className="data-table">
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Grace</th><th>Covers</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Grace</th><th>Covers</th><th>Logged</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
             <tbody>
               {agreements.length ? agreements.map((a: any) => (
-                // W-56: the row pulls up the tenant's LEASE; the target cell
-                // edits inline without triggering the row click.
-                <tr key={a.id} style={{ cursor: a.leaseId ? 'pointer' : undefined }}
-                  onClick={() => a.leaseId && navigate(`/leases?open=${a.leaseId}`)}
-                  title={a.leaseId ? 'Open lease' : undefined}>
-                  <td style={{ fontWeight: 500, color: a.leaseId ? 'var(--gold)' : undefined }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
+                // S652: the row opens this person's work-trade window in place.
+                <tr key={a.id} style={{ cursor: 'pointer' }} onClick={() => setOpenId(a.id)} title="Open their work trade">
+                  <td style={{ fontWeight: 500, color: 'var(--gold)' }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{a.unitNumber || '—'}</td>
                   <td>{a.propertyName || '—'}</td>
-                  <td className="mono">{Number(a.hoursThisMonth || 0).toFixed(1)} / {a.target} hrs</td>
-                  <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)} /></td>
-                  <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} /></td>
+                  <td className="mono">{a.tracksHours === false
+                    ? <span style={{ color:'var(--text-3)' }}>Trusted — no hours</span>
+                    : `${Number(a.hoursThisMonth || 0).toFixed(1)} / ${a.target} hrs`}</td>
+                  <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)}
+                    tracksHours={a.tracksHours !== false} /></td>
+                  <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} indefinite={a.carryForwardIndefinite === true} /></td>
                   <td onClick={e => e.stopPropagation()}><AgreementCoversCell agreement={a} /></td>
                   <td className="mono">{Number(a.pendingCount) > 0
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
@@ -278,21 +291,33 @@ function AgreementCoversCell({ agreement }: { agreement: any }) {
 }
 
 // W-56: per-person monthly hours target, edited inline on the roster row.
-function AgreementTargetCell({ agreementId, target }: { agreementId: string; target: number }) {
+// S637: the target sits UNDER a parent switch — when the agreement doesn't track
+// hours the box is disabled rather than hidden, so the stored figure stays
+// visible and comes straight back if tracking is switched on again.
+function AgreementTargetCell(
+  { agreementId, target, tracksHours }:
+  { agreementId: string; target: number; tracksHours: boolean },
+) {
   const qc = useQueryClient()
   const [value, setValue] = useState<string | null>(null)
   const shown = value ?? String(target)
+  const done = { onSuccess: () => { qc.invalidateQueries('work-trade'); setValue(null) } }
   const save = useMutation(
-    (t: number) => apiPatch(`/work-trade/${agreementId}`, { monthlyHoursTarget: t }),
-    { onSuccess: () => { qc.invalidateQueries('work-trade'); setValue(null) } }
-  )
+    (t: number) => apiPatch(`/work-trade/${agreementId}`, { monthlyHoursTarget: t }), done)
+  const toggle = useMutation(
+    (on: boolean) => apiPatch(`/work-trade/${agreementId}`, { tracksHours: on }), done)
   const dirty = value != null && Number(value) !== target && Number(value) > 0
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <input type="number" min={1} value={shown} onChange={e => setValue(e.target.value)}
-        style={{ width: 64, padding: '4px 6px', textAlign: 'right' }} className="input" />
+      <input type="checkbox" checked={tracksHours} disabled={toggle.isLoading}
+        onChange={e => toggle.mutate(e.target.checked)}
+        title={tracksHours ? 'Tracking hours — uncheck for a trusted trade' : 'Trusted — no hours logged'} />
+      <input type="number" min={1} value={shown} disabled={!tracksHours}
+        onChange={e => setValue(e.target.value)}
+        style={{ width: 64, padding: '4px 6px', textAlign: 'right', opacity: tracksHours ? 1 : .4 }}
+        className="input" />
       <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>hrs</span>
-      {dirty && (
+      {dirty && tracksHours && (
         <button className="btn btn-primary btn-sm" disabled={save.isLoading}
           onClick={() => save.mutate(Number(shown))}>
           {save.isLoading ? '…' : 'Save'}
@@ -313,8 +338,13 @@ function AgreementTargetCell({ agreementId, target }: { agreementId: string; tar
  * So it is a setting, not a constant — and the copy names the consequence rather
  * than the mechanism, because "carry_forward_months" means nothing to anybody.
  */
-function CarryForwardCell({ agreementId, months }: { agreementId: string; months: number }) {
+function CarryForwardCell({ agreementId, months, indefinite }: { agreementId: string; months: number; indefinite?: boolean }) {
   const qc = useQueryClient()
+  // S652 (Nic, for Blu and Curtis): "carry it forward... He's willing to float
+  // that for an indefinite time."
+  const setIndefinite = useMutation(
+    (on: boolean) => apiPatch(`/work-trade/${agreementId}`, { carryForwardIndefinite: on }),
+    { onSuccess: () => qc.invalidateQueries('work-trade') })
   const [value, setValue] = useState<string | null>(null)
   const shown = value ?? String(months ?? 1)
   const save = useMutation(
@@ -323,6 +353,19 @@ function CarryForwardCell({ agreementId, months }: { agreementId: string; months
   )
   const n = Number(shown)
   const dirty = value != null && n !== months && n >= 0 && n <= 24
+  if (indefinite) {
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: '.8rem', fontWeight: 600 }}>No limit</span>
+          <button className="btn btn-ghost btn-sm" disabled={setIndefinite.isLoading} onClick={() => setIndefinite.mutate(false)}>Set a limit</button>
+        </div>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+          Unworked hours carry forward with no deadline and are never billed while the agreement runs.
+        </div>
+      </div>
+    )
+  }
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -343,6 +386,8 @@ function CarryForwardCell({ agreementId, months }: { agreementId: string; months
         {n === 0
           ? 'Unworked hours are billed at the end of the month they were owed.'
           : `Unworked hours carry for ${n} more ${n === 1 ? 'month' : 'months'}. After that they're billed and the agreement ends.`}
+        {' '}<button className="btn btn-ghost btn-sm" style={{ padding: '0 4px', fontSize: '.66rem' }} disabled={setIndefinite.isLoading}
+          onClick={() => setIndefinite.mutate(true)}>No limit</button>
       </div>
     </div>
   )
@@ -367,6 +412,7 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient()
   const [leaseKey, setLeaseKey] = useState('')
   const [hours, setHours] = useState('')
+  const [tracksHours, setTracksHours] = useState(true)   // S637: parent switch
   const [duties, setDuties] = useState('')
   const [startDate, setStartDate] = useState(new Date().toISOString().slice(0, 10))
   const [covers, setCovers] = useState<string[]>([])
@@ -396,6 +442,7 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
       tenantId: picked!.tenantId,
       startDate,
       duties: duties.trim() || undefined,
+      tracksHours,
       monthlyHoursTarget: hours.trim() ? Number(hours) : undefined,
       // Omitted = covers everything, which is what every agreement before S613 did.
       coveredCharges: covers.length ? covers : undefined,
@@ -433,6 +480,23 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
+        {/* S637 (Nic): the parent switch. "Do we track hours for this work trade?
+            If yes, then set the hours. If no, no hours." Off is for someone the
+            landlord trusts to get the work done without counting — their covered
+            charges clear every month with nothing to log or approve. */}
+        <label style={{ display:'flex', alignItems:'flex-start', gap:8, marginBottom:12, fontSize:'.8rem' }}>
+          <input type="checkbox" checked={tracksHours}
+            onChange={e => setTracksHours(e.target.checked)} style={{ marginTop:2 }} />
+          <span>
+            Track hours for this agreement
+            <span style={{ display:'block', color:'var(--text-3)', fontSize:'.72rem' }}>
+              {tracksHours
+                ? 'They log hours and you approve them each month.'
+                : 'Trusted — covered charges clear every month with no hours logged.'}
+            </span>
+          </span>
+        </label>
+
         <div style={{ display:'flex', gap:12, marginBottom:12 }}>
           <div style={{ flex:1 }}>
             <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Start date</label>
@@ -440,8 +504,10 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
           </div>
           <div style={{ flex:1 }}>
             <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Monthly hours target</label>
-            <input className="input" inputMode="numeric" placeholder="property default" value={hours}
-              onChange={e => setHours(e.target.value.replace(/[^0-9]/g, ''))} style={{ width:'100%' }} />
+            <input className="input" inputMode="numeric" placeholder="property default"
+              value={hours} disabled={!tracksHours}
+              onChange={e => setHours(e.target.value.replace(/[^0-9]/g, ''))}
+              style={{ width:'100%', opacity: tracksHours ? 1 : .4 }} />
           </div>
         </div>
 

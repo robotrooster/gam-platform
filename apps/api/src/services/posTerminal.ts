@@ -13,19 +13,20 @@
 //   - Card-present PaymentIntents — create, push-to-reader (server-
 //     driven flow), capture, cancel
 //
-// All Stripe API calls fire under the LANDLORD's Connect account
-// (stripeAccount override). The Terminal reader belongs to the
-// landlord's Stripe account, not GAM's platform — same posture as the
-// rest of the POS revenue model (POS sales are landlord revenue, not
-// GAM revenue). The PaymentIntent is therefore created directly on the
-// landlord's Connect account; NO `transfer_data` / `application_fee_amount`
-// — gross stays on the landlord's balance, Stripe's IC+ fee is netted
-// by Stripe automatically, GAM's revenue from POS is the monthly per-
-// unit platform fee (billed separately via the platform subscription
-// engine), NOT a per-transaction cut.
+// S648 (Nic): "All money pools to Stripe the same way that people pay rent
+// and then that batches and pays out to the landlord on a cycle... All that
+// money needs to flow directly to GAM first." Landlord registers now work like
+// the business register (S536): readers pair to GAM's PLATFORM account inside a
+// per-property Terminal Location, card-present PaymentIntents are platform
+// charges (no transfer, no Connect account), and the landlord's share of each
+// sale — the total less the card fee, which is GAM's — is paid in the weekly
+// payout batch (services/landlordPassthrough.ts, pos_transactions.payout_owed).
+// Before S648 these ran as direct charges on the landlord's Connect account;
+// no reader was ever paired and no sale ever recorded that way.
 
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
+import { logger } from '../lib/logger'
 import { AppError } from '../middleware/errorHandler'
 import type Stripe from 'stripe'
 
@@ -46,18 +47,37 @@ interface ReaderRow {
  * this to authenticate with Stripe Terminal — short-lived (a few
  * minutes); the SDK fetches a fresh one on each connection attempt.
  */
-export async function createConnectionToken(
-  landlordConnectAccountId: string,
-): Promise<string> {
+export async function createConnectionToken(propertyId?: string): Promise<string> {
   const stripe = getStripe()
-  const token = await stripe.terminal.connectionTokens.create(
-    {},
-    { stripeAccount: landlordConnectAccountId },
-  )
+  const location = propertyId ? await getOrCreatePropertyLocation(propertyId) : undefined
+  const token = await stripe.terminal.connectionTokens.create(location ? { location } : {})
   if (!token.secret) {
     throw new AppError(500, 'Stripe returned a Connection Token with no secret')
   }
   return token.secret
+}
+
+/**
+ * The property's Terminal Location on GAM's platform account (Stripe requires
+ * one to pair a reader there). Made once from the property's address.
+ */
+export async function getOrCreatePropertyLocation(propertyId: string): Promise<string> {
+  const p = await queryOne<any>(
+    `SELECT name, street1, street2, city, state, zip, stripe_terminal_location_id
+       FROM properties WHERE id = $1`, [propertyId])
+  if (!p) throw new AppError(404, 'Property not found')
+  if (p.stripe_terminal_location_id) return p.stripe_terminal_location_id
+  if (!p.street1 || !p.city || !p.state || !p.zip) {
+    throw new AppError(409, 'Add the property\'s street address, city, state and ZIP before pairing a card reader')
+  }
+  const loc = await getStripe().terminal.locations.create({
+    display_name: p.name,
+    // Stripe refuses an EMPTY line2 ("cannot be unset") — send it only when there is one.
+    address: { line1: p.street1, ...(p.street2 && String(p.street2).trim() ? { line2: String(p.street2).trim() } : {}), city: p.city, state: p.state, postal_code: p.zip, country: 'US' },
+    metadata: { gam_property_id: propertyId },
+  })
+  await query(`UPDATE properties SET stripe_terminal_location_id = $1 WHERE id = $2`, [loc.id, propertyId])
+  return loc.id
 }
 
 /**
@@ -72,20 +92,19 @@ export async function createConnectionToken(
  */
 export async function registerReader(opts: {
   landlordId: string
-  landlordConnectAccountId: string
   propertyId: string
   registrationCode: string
   nickname: string
   label?: string  // optional Stripe-side label
 }): Promise<ReaderRow> {
   const stripe = getStripe()
-  const stripeReader = await stripe.terminal.readers.create(
-    {
-      registration_code: opts.registrationCode,
-      label: opts.label ?? opts.nickname,
-    },
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
+  const location = await getOrCreatePropertyLocation(opts.propertyId)
+  const stripeReader = await stripe.terminal.readers.create({
+    registration_code: opts.registrationCode,
+    label: opts.label ?? opts.nickname,
+    location,
+    metadata: { gam_landlord_id: opts.landlordId, gam_property_id: opts.propertyId },
+  })
 
   // Persist locally. UNIQUE on (landlord_id, stripe_reader_id) catches
   // race / re-registration; turn 23505 into a clean conflict message.
@@ -153,56 +172,86 @@ export async function archiveReader(
 // ── CARD-PRESENT PAYMENT INTENTS (S242) ──────────────────────────────
 
 /**
- * Create a card-present PaymentIntent for a POS terminal sale.
- *
- * Runs under the landlord's Connect account — the PI lives there
- * entirely. `capture_method='manual'` is the card-present default;
- * the reader auths on tap/insert/swipe, transitioning the PI to
- * `requires_capture`, and the caller flips to `succeeded` via
- * `captureTerminalPaymentIntent` once the sale is finalized in POS
- * (allows cancel-after-auth if the operator voids the sale before
- * recording the transaction).
- *
- * Metadata is the dispatch key for the platform webhook handler:
- * Connect-account `payment_intent.succeeded` events with
- * `metadata.gam_purpose='pos_terminal'` are skipped by the rent
- * allocation path (defensive — they have no matching `payments` row
- * anyway, but the metadata makes the intent explicit and audit-
- * friendly).
+ * Create a card-present PaymentIntent for a register sale, on GAM's platform
+ * account. `capture_method='manual'`: the reader authorizes, the register
+ * captures once the sale is confirmed (so a voided sale can be cancelled).
+ * The amount already includes the card fee (the server priced it from the
+ * cart); GAM keeps the fee and owes the landlord the rest in the weekly batch.
+ * `gam_purpose='pos_terminal'` keeps the rent webhook path away from it.
  */
 export async function createCardPresentPaymentIntent(opts: {
-  landlordConnectAccountId: string
   landlordId:               string
   propertyId:               string
-  amountCents:              number       // total to charge in cents
+  amountCents:              number       // total to charge in cents, card fee included
+  cardFeeCents:             number       // GAM's part of it
   currency?:                string       // default 'usd'
   description?:             string
-  // Optional: stamp a draft tx id from the POS UI so the eventual
-  // POST /pos/transactions can de-dupe on PI id (we already have a
-  // UNIQUE on pos_transactions.stripe_payment_intent_id).
   posDraftRef?:             string
 }): Promise<Stripe.PaymentIntent> {
   if (!Number.isInteger(opts.amountCents) || opts.amountCents <= 0) {
     throw new AppError(400, 'amountCents must be a positive integer')
   }
   const stripe = getStripe()
-  const intent = await stripe.paymentIntents.create(
-    {
-      amount:               opts.amountCents,
-      currency:             opts.currency ?? 'usd',
-      payment_method_types: ['card_present'],
-      capture_method:       'manual',
-      description:          opts.description ?? 'GAM POS sale',
-      metadata: {
-        gam_purpose:     'pos_terminal',
-        gam_landlord_id: opts.landlordId,
-        gam_property_id: opts.propertyId,
-        ...(opts.posDraftRef ? { gam_pos_draft_ref: opts.posDraftRef } : {}),
-      },
+  return stripe.paymentIntents.create({
+    // S654 (Nic): the customer base. Stripe only produces the reusable
+    // `generated_card` from a tap when the intent asked for it (verified on
+    // the first live tap: none without this). Nothing is KEPT unless the
+    // customer presses Yes on the reader afterward — this only makes Yes
+    // possible. Register sales only; the desk (tenants) never saves cards.
+    setup_future_usage:   'off_session',
+    amount:               opts.amountCents,
+    currency:             opts.currency ?? 'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'GAM POS sale',
+    metadata: {
+      gam_purpose:     'pos_terminal',
+      gam_landlord_id: opts.landlordId,
+      gam_property_id: opts.propertyId,
+      gam_card_fee_cents: String(Math.max(0, Math.round(opts.cardFeeCents))),
+      ...(opts.posDraftRef ? { gam_pos_draft_ref: opts.posDraftRef } : {}),
     },
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
-  return intent
+  })
+}
+
+/**
+ * S654 (Nic): "somebody stops by to pay their rent… it needs to be both" — the
+ * counter reader takes a lease balance, not only a register sale.
+ *
+ * The intent is born HELD ('rent_terminal_pending', ignored by the webhook) so
+ * a declined or abandoned tap touches nothing. When the reader approves, the
+ * capture route runs the same accounting as an online card payment, rewrites
+ * the purpose to 'rent_terminal', and only then captures — so
+ * payment_intent.succeeded settles the rows exactly as it does for Pay Now.
+ */
+export async function createRentReaderPaymentIntent(opts: {
+  landlordId:       string
+  propertyId:       string
+  tenantId:         string
+  anchorPaymentId:  string
+  amountCents:      number       // balance + card fee, in cents
+  cardFeeCents:     number
+  description?:     string
+}): Promise<Stripe.PaymentIntent> {
+  if (!Number.isInteger(opts.amountCents) || opts.amountCents <= 0) {
+    throw new AppError(400, 'amountCents must be a positive integer')
+  }
+  const stripe = getStripe()
+  return stripe.paymentIntents.create({
+    amount:               opts.amountCents,
+    currency:             'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'Balance - Gold Asset Management',
+    metadata: {
+      gam_purpose:           'rent_terminal_pending',
+      gam_landlord_id:       opts.landlordId,
+      gam_property_id:       opts.propertyId,
+      gam_tenant_id:         opts.tenantId,
+      gam_anchor_payment_id: opts.anchorPaymentId,
+      gam_card_fee_cents:    String(Math.max(0, Math.round(opts.cardFeeCents))),
+    },
+  })
 }
 
 /**
@@ -219,15 +268,26 @@ export async function createCardPresentPaymentIntent(opts: {
  * smart readers (S700, WisePOS E, etc.).
  */
 export async function processPaymentIntentOnReader(opts: {
-  landlordConnectAccountId: string
   stripeReaderId:           string
   paymentIntentId:          string
+  // S654: the register passes this so the tap yields a reusable card. Stripe
+  // requires API 2024-09-30+ for the parameter; the SDK is pinned older, so
+  // the one call names its version. The card is kept only on the customer's
+  // Yes (an attach) — this flag alone saves nothing.
+  allowRedisplay?:          boolean
 }): Promise<Stripe.Terminal.Reader> {
   const stripe = getStripe()
+  displayOwner.delete(opts.stripeReaderId)   // the breakdown gives way to the payment
+  if (opts.allowRedisplay) {
+    return stripe.terminal.readers.processPaymentIntent(
+      opts.stripeReaderId,
+      { payment_intent: opts.paymentIntentId, process_config: { allow_redisplay: 'always' } } as any,
+      { apiVersion: '2024-09-30.acacia' } as any,
+    )
+  }
   const reader = await stripe.terminal.readers.processPaymentIntent(
     opts.stripeReaderId,
     { payment_intent: opts.paymentIntentId },
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return reader
 }
@@ -235,18 +295,15 @@ export async function processPaymentIntentOnReader(opts: {
 /**
  * Capture a card-present PaymentIntent that's in `requires_capture`
  * after a successful reader auth. Settles the auth → flips PI to
- * `succeeded` → funds land in the landlord's Connect balance per
- * their payout schedule.
+ * `succeeded` → funds land on GAM's balance; the landlord's share goes
+ * out in the weekly payout batch.
  */
 export async function captureTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
   const intent = await stripe.paymentIntents.capture(
     opts.paymentIntentId,
-    {},
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return intent
 }
@@ -259,35 +316,35 @@ export async function captureTerminalPaymentIntent(opts: {
  * already-`canceled`. Caller handles those branches.
  */
 export async function cancelTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
   const intent = await stripe.paymentIntents.cancel(
     opts.paymentIntentId,
-    undefined,
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return intent
 }
 
 /**
- * Retrieve a PaymentIntent under the landlord's Connect account.
+ * Retrieve a register PaymentIntent (GAM platform account).
  * Used by POST /pos/transactions to verify a terminal-paid sale: the
- * caller-supplied PI id must exist on the landlord's Connect, must
+ * caller-supplied PI id must exist on GAM's account, must
  * carry the POS-terminal metadata, must be in `succeeded` status, and
  * the amount must match the POS-computed total.
  */
 export async function retrieveTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
-  return stripe.paymentIntents.retrieve(
-    opts.paymentIntentId,
-    {},
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
+  return stripe.paymentIntents.retrieve(opts.paymentIntentId)
+}
+
+/** S654: the same, with the charge expanded — the card's fingerprint, printed name, last4 and reusable card ride on it. */
+export async function retrieveTerminalPaymentIntentWithCharge(opts: {
+  paymentIntentId:          string
+}): Promise<Stripe.PaymentIntent> {
+  const stripe = getStripe()
+  return stripe.paymentIntents.retrieve(opts.paymentIntentId, { expand: ['latest_charge'] })
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -312,8 +369,8 @@ interface BusinessReaderRow {
 
 // S536 rework: ALL money flows through GAM. Readers register on the
 // PLATFORM account (not the business's Connect), inside a per-business
-// Terminal Location built from the business address; charges are
-// platform destination charges. Friday payouts batch the balance out.
+// Terminal Location built from the business address. S648: charges are plain
+// platform charges, held for the business and paid in its weekly payout.
 async function getOrCreateBusinessLocation(businessId: string): Promise<string> {
   const biz = await queryOne<any>(
     `SELECT name, street1, street2, city, state, zip, stripe_terminal_location_id
@@ -387,11 +444,18 @@ export async function assertBusinessReader(businessId: string, stripeReaderId: s
   if (!row) throw new AppError(404, 'Reader not paired to this business')
 }
 
+/** Terminal SDK token for a business register, scoped to its reader location. */
+export async function createBusinessConnectionToken(businessId: string): Promise<string> {
+  const location = await getOrCreateBusinessLocation(businessId)
+  const token = await getStripe().terminal.connectionTokens.create({ location })
+  if (!token.secret) throw new AppError(500, 'Stripe returned a Connection Token with no secret')
+  return token.secret
+}
+
 export async function createBusinessCardPresentPaymentIntent(opts: {
-  businessConnectAccountId: string
   businessId:               string
   amountCents:              number
-  platformCutCents:      number
+  cardFeeCents:             number     // GAM's cut of this charge
   currency?:                string
   description?:             string
 }): Promise<Stripe.PaymentIntent> {
@@ -399,25 +463,21 @@ export async function createBusinessCardPresentPaymentIntent(opts: {
     throw new AppError(400, 'amountCents must be a positive integer')
   }
   const stripe = getStripe()
-  // Platform destination charge: GAM is the merchant, the gross (minus
-  // GAM's application fee) transfers to the business's Connect balance,
-  // and the Friday payout batch moves it to their bank.
-  return stripe.paymentIntents.create(
-    {
-      amount:                 opts.amountCents,
-      currency:               opts.currency ?? 'usd',
-      payment_method_types:   ['card_present'],
-      capture_method:         'manual',
-      application_fee_amount: Math.max(0, Math.round(opts.platformCutCents)),
-      transfer_data:          { destination: opts.businessConnectAccountId },
-      on_behalf_of:           opts.businessConnectAccountId,
-      description:            opts.description ?? 'POS sale',
-      metadata: {
-        gam_purpose:     'business_pos_terminal',
-        gam_business_id: opts.businessId,
-      },
+  // S648 (Nic): "every single cent" through GAM — a platform charge. When
+  // the sale is recorded GAM holds the total less its cut for the business,
+  // and the weekly payout sends it (services/heldPayouts.ts).
+  return stripe.paymentIntents.create({
+    amount:               opts.amountCents,
+    currency:             opts.currency ?? 'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'POS sale',
+    metadata: {
+      gam_purpose:        'business_pos_terminal',
+      gam_business_id:    opts.businessId,
+      gam_card_fee_cents: String(Math.max(0, Math.round(opts.cardFeeCents))),
     },
-  )
+  })
 }
 
 // Platform-account variants of the PI lifecycle (business terminal
@@ -435,4 +495,135 @@ export async function captureBusinessPI(paymentIntentId: string): Promise<Stripe
 }
 export async function cancelBusinessPI(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
   return getStripe().paymentIntents.cancel(paymentIntentId)
+}
+
+/**
+ * S654 (Nic, live): "the screen is still showing tap or insert" after the
+ * register gave up. Canceling the PaymentIntent does not clear the reader; the
+ * reader's own in-progress action must be canceled too. Best-effort: a reader
+ * with nothing in progress answers with an error we do not care about.
+ */
+export async function cancelReaderAction(stripeReaderId: string): Promise<void> {
+  displayOwner.delete(stripeReaderId)
+  try {
+    await getStripe().terminal.readers.cancelAction(stripeReaderId)
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId }, '[terminal] cancelAction')
+  }
+}
+
+export interface ReaderCartLine { description: string; amountCents: number; quantity: number }
+
+/**
+ * S654 (Nic): "it needs to be on the screen the whole time — while they are
+ * tapping to pay." In the US the S700/S710 cart screen IS a pay screen: Stripe
+ * calls it pre-dip — "your customer can present a payment method at any point
+ * after set_reader_display is called… the reader captures the presented
+ * payment method and saves it to use later… process the PaymentIntent to
+ * complete the transaction." So the breakdown is held up for this long; a
+ * card tapped on it completes the moment we process, and the plain
+ * "tap or insert" screen only appears if nobody has tapped by then.
+ */
+export const READER_CART_PAUSE_MS = process.env.NODE_ENV === 'test' ? 0 : 15000
+export const holdForTheCart = () => new Promise<void>(r => setTimeout(r, READER_CART_PAUSE_MS))
+
+/**
+ * S654 (Nic): "it'd be nice to see on the screen a little bit of a breakdown."
+ * The reader shows the lines, the tax, the card fee and the total before it
+ * asks for the card. Best-effort — a display that fails never stops a sale;
+ * the answer says whether the breakdown is up.
+ *
+ * S654 (Nic): "it doesn't show a customer name." The person the sale is for
+ * leads the list on a line of its own. Stripe's reference does not say whether
+ * a $0 line is accepted, so if it is refused the name goes in front of the
+ * first line instead, and every later display does that straight away.
+ */
+let zeroLineRefused = false
+
+/**
+ * S654 (review): one reader, two flows — the register and the front desk's
+ * rent. A card tapped on one flow's breakdown is held by the reader and would
+ * pay whatever charge is processed next, and Stripe keeps a tap through any
+ * display update. So the reader remembers whose breakdown is up; when another
+ * flow takes the screen, the reader is cleared first (dropping any tap), and
+ * a flow may only take down its own breakdown. In memory: one API process.
+ */
+const displayOwner = new Map<string, string>()
+export type CartShown = 'kept' | 'took_over' | false
+const cartLineItems = (lines: ReaderCartLine[]) => lines.slice(0, 40).map(l => ({
+  description: String(l.description).slice(0, 60),
+  amount:      Math.max(0, Math.round(l.amountCents)),
+  quantity:    Math.max(1, Math.round(l.quantity)),
+}))
+export async function showCartOnReader(opts: {
+  stripeReaderId: string; lines: ReaderCartLine[]; taxCents: number; totalCents: number; who?: string | null
+  /** Whose breakdown this is — `register:<user>:<property>` or `rent:<payment>`. */
+  owner?: string
+}): Promise<CartShown> {
+  const send = (lines: ReaderCartLine[]) => getStripe().terminal.readers.setReaderDisplay(opts.stripeReaderId, {
+    type: 'cart',
+    cart: {
+      currency: 'usd',
+      line_items: cartLineItems(lines),
+      tax:   Math.max(0, Math.round(opts.taxCents)),
+      total: Math.max(0, Math.round(opts.totalCents)),
+    },
+  })
+  const who = opts.who?.trim() || null
+  const prefixed = (): ReaderCartLine[] => who && opts.lines.length
+    ? [{ ...opts.lines[0], description: `${who} · ${opts.lines[0].description}` }, ...opts.lines.slice(1)]
+    : opts.lines
+  let tookOver = false
+  if (opts.owner && displayOwner.get(opts.stripeReaderId) !== opts.owner) {
+    const prev = displayOwner.get(opts.stripeReaderId)
+    const up = prev !== undefined || (await readerAction(opts.stripeReaderId).catch(() => null))?.type === 'set_reader_display'
+    if (up) { await cancelReaderAction(opts.stripeReaderId); tookOver = true }
+  }
+  const mine = (): CartShown => { if (opts.owner) displayOwner.set(opts.stripeReaderId, opts.owner); return tookOver ? 'took_over' : 'kept' }
+  try {
+    if (who && !zeroLineRefused) {
+      try {
+        await send([{ description: `Customer: ${who}`, amountCents: 0, quantity: 1 }, ...opts.lines])
+        return mine()
+      } catch (e: any) {
+        // Only a refusal of the line itself — a busy or offline reader is not that.
+        if (e?.type !== 'StripeInvalidRequestError' || !/line_items|amount/i.test(`${e?.param ?? ''} ${e?.message ?? ''}`)) throw e
+        zeroLineRefused = true
+        logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] $0 name line refused; naming the first line instead')
+      }
+    }
+    await send(prefixed())
+    return mine()
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId: opts.stripeReaderId }, '[terminal] setReaderDisplay')
+    return false
+  }
+}
+
+/**
+ * What the reader is doing right now — null when idle. A breakdown is an
+ * in-progress set_reader_display; anything else in progress (a payment, the
+ * last customer's "save this card?" question) is the reader being busy.
+ */
+export async function readerAction(stripeReaderId: string): Promise<{ type: string; status: string } | null> {
+  const r: any = await getStripe().terminal.readers.retrieve(stripeReaderId)
+  return r?.action ? { type: String(r.action.type), status: String(r.action.status) } : null
+}
+
+/**
+ * Take a breakdown off the reader — only a breakdown. A payment in progress or
+ * a question the last customer is answering is left alone.
+ */
+export async function clearCartOnReader(stripeReaderId: string, owner?: string): Promise<boolean> {
+  const holder = displayOwner.get(stripeReaderId)
+  if (owner && holder && holder !== owner) return false   // another flow's breakdown — not ours to take down
+  try {
+    const a = await readerAction(stripeReaderId)
+    if (a?.type !== 'set_reader_display' || a.status !== 'in_progress') return false
+    await getStripe().terminal.readers.cancelAction(stripeReaderId)
+    return true
+  } catch (e) {
+    logger.warn({ err: e, stripeReaderId }, '[terminal] clear cart')
+    return false
+  }
 }

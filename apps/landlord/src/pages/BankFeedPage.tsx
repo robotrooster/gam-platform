@@ -5,13 +5,20 @@
 // picks scope (a unit, or the property split/common across units); auto-suggest
 // only pre-fills from what this landlord chose for the same merchant before.
 import { useMemo, useState, useEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useNavigate } from 'react-router-dom'
 import { loadStripe } from '@stripe/stripe-js'
 import { EntityPicker } from '../components/EntityPicker'
 import { apiGet, apiPost , apiPut } from '../lib/api'
-import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
-import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL } from '@gam/shared'
+import {
+  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL,
+  BANK_TXN_IGNORED_REASON_LABEL, BANK_TXN_MATCH_KIND_LABEL, DEPOSIT_SLIP_SOURCE_LABEL,
+  type BankTxnIgnoredReason, type DepositSlipSource,
+} from '@gam/shared'
+import '../styles/bank-reconciliation.css'
 import { toast, appConfirm } from '../components/dialogs'
+import { PayoutBreakdown } from '../components/PayoutBreakdown'
 import { Landmark, RefreshCw, Check, X, Plus } from 'lucide-react'
 
 const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY as string | undefined
@@ -47,10 +54,19 @@ type Draft = { category: string; scopeKind: string; propertyId: string; unitId: 
 // S605 (Nic): merged into a single "Bank" tab alongside reconciliation.
 // `embedded` renders this as a section of BankPage rather than its own screen.
 export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const [linking, setLinking] = useState(false)
   const [linkErr, setLinkErr] = useState<string | null>(null)
-  const [view, setView] = useState<'needs_review' | 'categorized' | 'ignored'>('needs_review')
+  // S652 (Nic): "that $4,154.89 is not showing up on the transactions tab."
+  // It was there — imported at midnight and MATCHED to GAM's own payout, which
+  // is exactly right (a payout landing is never income) — but no view showed
+  // matched rows. Now one does.
+  // S652 (Nic): "the transaction log of the bank account is all money going in
+  // and out of that bank account." The log opens on everything, newest first —
+  // GAM's payouts landing included, labeled as matched so nothing is booked
+  // twice. The buttons are filters over it, not separate pages.
+  const [view, setView] = useUrlTab('view', 'all', ['all','needs_review','categorized','ignored'] as const)
 
   // S629 (Nic): "a property selector or entity selector, to view the
   // transaction logs and stuff specific to that entity." The feed was pinned
@@ -65,7 +81,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const { data: txns = [], isLoading } = useQuery<any[]>(
     ['bank-txns', view, entityId],
-    () => apiGet(`/bank-feed/transactions?status=${view}${entityQS ? `&${entityQS}` : ''}`))
+    () => apiGet(`/bank-feed/transactions?${view === 'all' ? '' : `status=${view}&`}${entityQS}`))
 
   const propOf = (u: any) => u.propertyId
   const unitsForProp = (pid: string) => (units as any[]).filter(u => propOf(u) === pid)
@@ -126,6 +142,26 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // which company the user is looking at. Without the id, /landlords/me now asks
   // an account that owns several which one it means — so pass the one already
   // selected above rather than making them answer twice.
+  // S637 (Nic, DIRECTIVE): THE PAYOUT ACCOUNT COMES FIRST.
+  //
+  //   "Both places where they connect an account, whether it says connect feed
+  //    or connect account on the disbursement page — that should just take them
+  //    to the connect account. The feed can come after. It can be completely
+  //    hidden until they set up the connect account. That way they never
+  //    accidentally do it out of order."
+  //
+  // Two people in a row linked the read-only FEED believing they had set up
+  // payouts, and a co-owner locked himself out of his bank re-linking an
+  // institution that was already connected. The feed reads transactions; only
+  // the Connect account moves money. Ordering them removes the choice that was
+  // being got wrong, rather than explaining the difference again.
+  const connectStatusQ = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean }>(
+    ['stripe-connect-status', 'landlord', entityId],
+    () => apiGet(`/stripe/connect/status?entity=landlord&entityId=${entityId}`),
+    { enabled: !!entityId },
+  )
+  const payoutsReady = !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+
   const { data: me } = useQuery<any>(
     ['landlord-books-start', entityId],
     () => apiGet(`/landlords/me?landlordId=${entityId}`),
@@ -136,10 +172,12 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   }, [me?.booksStartDate])
 
   const saveBooksStart = useMutation(
-    (date: string | null) => apiPut('/bank-feed/books-start-date', { date }),
+    (date: string | null) => apiPut('/bank-feed/books-start-date', { date, entityId }),
     { onSuccess: (r: any) => {
         qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('landlord-books-start')
-        const ig = r?.data?.ignored ?? 0, re = r?.data?.restored ?? 0
+        // S655: apiPut already unwraps the response's `data` — reading
+        // r.data.ignored was always undefined, so the count never showed.
+        const ig = r?.ignored ?? 0, re = r?.restored ?? 0
         toast(ig || re
           ? `Updated — ${ig} hidden, ${re} brought back for review.`
           : 'Start date saved.')
@@ -147,18 +185,60 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       onError: (e: any) => toast(e?.response?.data?.error || 'Could not save the start date.') },
   )
 
-  const sync = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/sync`, {}), {
+  const sync = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/sync`, { entityId }), {
     onSuccess: (d: any) => { qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('bank-connections')
       const n = d?.data?.inserted; toast(n ? `${n} new transaction(s).` : 'Up to date.') },
     onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Sync failed.'),
   })
 
-  const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, {}), {
-    onSuccess: () => { qc.invalidateQueries('bank-connections'); toast('Bank disconnected.') },
+  // S655 (Step 12): the last bank GAM can collect its fees from is refused, in
+  // the server's words; when the fee debit moves to the bank that stays, say so.
+  const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, { entityId }), {
+    onSuccess: (r: any) => {
+      qc.invalidateQueries('bank-connections')
+      const moved = r?.data?.debitMovedTo
+      toast(moved
+        ? `Bank disconnected. GAM now collects its fees from ${moved.name}${moved.last4 ? ` ••${moved.last4}` : ''}.`
+        : 'Bank disconnected.')
+    },
+    onError: (e: any) => toast.error(e?.message || 'That bank could not be disconnected.'),
   })
 
+  // S655 (Step 12, K-C / K-D): take a match or a filing back, exactly.
+  const undoMatch = useMutation((id: string) => apiPost(`/bank-feed/deposits/${id}/undo`, { entityId }), {
+    onSuccess: (r: any) => {
+      qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('unmatched-deposits')
+      qc.invalidateQueries('cash-position'); qc.invalidateQueries('deposit-slips'); qc.invalidateQueries('undeposited-cash')
+      const d = r?.data
+      toast(d?.kind === 'deposit_slip'
+        ? (d?.slipReopened ? 'Match undone. The deposit slip is waiting for the bank again.' : 'Match undone. Those payments are back on the "not banked" list.')
+        // 10/6: a line tied to a deposit the office recorded by hand — the payments stay as recorded.
+        : d?.kind === 'recorded_deposit'
+          ? 'Match undone. The deposit you recorded stays as you recorded it, late fees and all; the bank line is back in review.'
+          : `Match undone. ${d?.reopenedChargeIds?.length ?? 0} bill line(s) are owed again; the deposit is back in review.`)
+    },
+    onError: (e: any) => toast.error(e?.message || 'That match could not be undone.'),
+  })
+  const undoFiling = useMutation(
+    ({ id, stop }: { id: string; stop: boolean }) => apiPost(`/bank-feed/transactions/${id}/undo-auto-file`, { entityId, stopAutoFiling: stop }), {
+    onSuccess: (r: any) => {
+      qc.invalidateQueries(['bank-txns'])
+      const payer = r?.data?.stoppedForPayer
+      toast(payer ? `Undone. Deposits from ${payer} will no longer file themselves.` : 'Undone. The deposit is back in review.')
+    },
+    onError: (e: any) => toast.error(e?.message || 'That filing could not be undone.'),
+  })
+  const askUndoMatch = async (t: any) => {
+    const ok = await appConfirm(
+      t.matchKind === 'deposit_slip'
+        ? 'Undo this match? The deposit goes back to review and its slip waits for the bank again. Any "other money" on the slip comes back out of your income.'
+        : 'Undo this match? The bills it paid are owed again, any late fees it took off come back, credit it created is withdrawn, and the deposit goes back to review. Nothing is undone if any of that changed since.',
+      { title: 'Undo this match', confirmLabel: 'Undo it' })
+    if (ok) undoMatch.mutate(t.id)
+  }
+
   const categorize = useMutation(
-    ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, body), {
+    ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, { ...body, entityId }), {
     onSuccess: (r: any) => { qc.invalidateQueries(['bank-txns'])
       // The API returns incomeId for money in, expenseId for money out — say
       // which side it landed on rather than always claiming "expenses".
@@ -166,7 +246,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Could not categorize.'),
   })
 
-  const ignore = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/ignore`, {}), {
+  const ignore = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/ignore`, { entityId }), {
     onSuccess: () => { qc.invalidateQueries(['bank-txns']); toast('Ignored.') },
   })
 
@@ -187,7 +267,25 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       {/* S629: the feed, the connections and every categorization below belong
           to the entity chosen here. Hidden for a one-entity portfolio. */}
       <EntityPicker value={entityId} onChange={setEntityId} label="Transactions for" />
-      {embedded ? (
+
+      {/* S637: until the payout account exists there is nothing to show here and
+          no button to press — the only bank worth connecting first is the one
+          rent lands in. */}
+      {entityId && !connectStatusQ.isLoading && !payoutsReady ? (
+        <div className="card" style={{ marginTop: 20, padding: '18px 20px' }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>
+            Set up your payout account first
+          </div>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
+            This page reads your bank transactions so you can categorize spending — it doesn't move
+            any money. Before it's useful, connect the account your rent is deposited into.
+            Once that's live, you can turn this feed on here.
+          </div>
+          <button className="btn btn-primary" onClick={() => navigate('/banking')}>
+            Go to payout setup
+          </button>
+        </div>
+      ) : embedded ? (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, margin: '26px 0 12px' }}>
           <div>
             <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Your spending</div>
@@ -224,26 +322,6 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
         </div>
       )}
 
-      {/* S624 — DEPOSITS THAT PAID RENT, above the expense queue on purpose.
-          A tenant's rent sitting unattributed is time-sensitive in a way a
-          Home Depot receipt is not: late fees are accruing on it while it waits,
-          and every day it sits is a day of fees that will have to be reversed. */}
-      <div style={{ marginBottom: 20 }}>
-        <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
-        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
-          Money paid in at a branch, matched to what each tenant owes. Recording it
-          here dates the payment to when the deposit was actually made — so any late
-          fee charged while it was in transit comes back off.
-        </div>
-        <DepositMatchPanel />
-      </div>
-
-      {/* The other side of the same question: cash marked collected in person
-          that no deposit has accounted for. */}
-      <div style={{ marginBottom: 20 }}>
-        <CashPositionPanel />
-      </div>
-
       {/* Linked banks */}
       <div className="card" style={{ marginBottom: 20 }}>
         <div className="card-title" style={{ marginBottom: 12 }}>Linked banks</div>
@@ -277,6 +355,14 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       {c.lastSyncedAt ? `Last synced ${fmtDate(c.lastSyncedAt)}` : 'Not yet synced'}
                       {c.status === 'error' && c.lastSyncError ? ` · error: ${c.lastSyncError}` : ''}
                     </div>
+                    {/* S652 (Nic): linking a bank authorizes payouts AND debits. A link
+                        GAM cannot pull from says so here, with the fix beside it. */}
+                    {c.debitReady
+                      ? <div style={{ fontSize: '.7rem', color: 'var(--green)', marginTop: 2 }}>GAM can pay out to and debit this account.</div>
+                      : <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <span>GAM cannot debit this account: {c.debitProblem || 'unknown reason'}</span>
+                          <button className="btn btn-primary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }} onClick={link} disabled={linking}>{linking ? 'Linking…' : 'Relink'}</button>
+                        </div>}
                   </div>
                   {/* S605: the account balance, which is what a landlord looks
                       for first on a page about their bank. Absent for links made
@@ -313,7 +399,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
             <div style={{ fontWeight: 600, fontSize: '.82rem' }}>Start my books from</div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
               Anything before this stays on file but is hidden from review — use it to skip spending
-              from before you joined GAM. Already-categorized transactions are never changed.
+              from before you joined GAM. Already-categorized transactions are never changed, and
+              nothing you ignored yourself comes back.
             </div>
           </div>
           <input className="form-input" type="date" value={booksStart} style={{ width: 'auto' }}
@@ -329,9 +416,11 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
 
       {/* Transaction views */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        {(['needs_review', 'categorized', 'ignored'] as const).map(v => (
+        {(['all', 'needs_review', 'categorized', 'ignored'] as const).map(v => (
           <button key={v} className={`btn btn-sm ${view === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setView(v)}>
-            {v === 'needs_review' ? `Needs review${reviewCount && view === v ? ` (${reviewCount})` : ''}` : v === 'categorized' ? 'Categorized' : 'Ignored'}
+            {v === 'all' ? 'All transactions'
+              : v === 'needs_review' ? `Needs review${reviewCount ? ` (${reviewCount})` : ''}`
+              : v === 'categorized' ? 'Categorized' : 'Ignored'}
           </button>
         ))}
       </div>
@@ -339,7 +428,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       <div className="card">
         {isLoading ? <div style={{ color: 'var(--text-3)' }}>Loading…</div>
           : txns.length === 0 ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>
-              {view === 'needs_review' ? 'Nothing to review. Sync a linked bank to pull new transactions.' : 'None.'}
+              {view === 'needs_review' ? 'Nothing to review.'
+                : view === 'all' ? 'No transactions yet. Sync a linked bank to pull them in.' : 'None.'}
             </div>
           : <div style={{ display: 'grid', gap: 10 }}>
               {txns.map((t: any) => {
@@ -355,7 +445,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                           {t.description && t.description !== t.normalizedMerchant ? ` · ${t.description}` : ''}
                         </div>
                       </div>
-                      {/* S605 (Nic): colour alone didn't say which way the money
+                      {/* S605 (Nic): color alone didn't say which way the money
                           went — "green numbers and white numbers" was a guess.
                           Label it. These are single transaction amounts, not a
                           running balance. */}
@@ -371,7 +461,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                         showing it on this page?" — money in used to be a dead end here.
                         It now categorizes as income exactly like money out categorizes as
                         an expense; only the category list differs. */}
-                    {view === 'needs_review' && (
+                    {t.status === 'needs_review' && (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' }}>
                         <select className="input input-sm" value={d.category} onChange={e => setDraft(t.id, { category: e.target.value })}>
                           {isExpense
@@ -406,9 +496,56 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       </div>
                     )}
 
-                    {view === 'categorized' && (
+                    {/* S655: a transaction the bank has not posted yet can still
+                        change its amount or wording when it does. */}
+                    {t.status === 'needs_review' && t.bankStatus === 'pending' && (
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        Still pending at your bank — the amount or wording can change when it posts.
+                      </div>
+                    )}
+                    {t.status === 'categorized' && t.matchKind !== 'auto_filed' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         Added to your {isExpense ? 'expenses' : 'income'}.
+                      </div>
+                    )}
+                    {/* S655 (Step 12): a deposit that filed itself, labeled, with one-click undo. */}
+                    {t.status === 'categorized' && t.matchKind === 'auto_filed' && (
+                      <div className="bankrec-matched">
+                        <span>
+                          {BANK_TXN_MATCH_KIND_LABEL['auto_filed']} — added to your income like the last deposit from {t.normalizedMerchant || 'this payer'}.
+                        </span>
+                        <span className="bankrec-undo-box">
+                          <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
+                            onClick={() => undoFiling.mutate({ id: t.id, stop: false })}>Undo</button>
+                          <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
+                            onClick={() => undoFiling.mutate({ id: t.id, stop: true })}>
+                            Undo and stop filing {t.normalizedMerchant || 'this payer'} by itself
+                          </button>
+                        </span>
+                      </div>
+                    )}
+                    {/* S655: a row already filed or matched that the bank later
+                        voided stays (it is in the books), and says so. */}
+                    {t.bankStatus === 'void' && t.status !== 'ignored' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--amber)', marginTop: 4 }}>
+                        {t.status === 'matched'
+                          ? 'Your bank voided this deposit after it was matched. Check what it was matched to — the money may never have arrived.'
+                          : `Your bank voided this transaction after it was filed. Check the ${isExpense ? 'expense' : 'income'} it created — the money may never have moved.`}
+                      </div>
+                    )}
+                    {t.status === 'matched' && <MatchedLine t={t} />}
+                    {t.status === 'matched' && t.canUndo && (
+                      <div className="bankrec-undo-box">
+                        <button className="btn btn-primary btn-sm" disabled={undoMatch.isLoading} onClick={() => askUndoMatch(t)}>
+                          {undoMatch.isLoading ? 'Undoing…' : 'Undo this match'}
+                        </button>
+                      </div>
+                    )}
+                    {t.status === 'ignored' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        {t.ignoredReason && t.ignoredReason in BANK_TXN_IGNORED_REASON_LABEL
+                          ? `${BANK_TXN_IGNORED_REASON_LABEL[t.ignoredReason as BankTxnIgnoredReason]}.`
+                          : 'Ignored.'}
                       </div>
                     )}
                   </div>
@@ -418,4 +555,56 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       </div>
     </div>
   )
+}
+
+// S655: what a matched row was matched TO. Every matched row used to read "GAM
+// payout", including a tenant's own cash deposit. A payout now lists the
+// payments inside it; a tenant's deposit names whose rent it paid.
+function MatchedLine({ t }: { t: any }) {
+  const [open, setOpen] = useState(false)
+  const line = { fontSize: '.72rem', color: 'var(--gold, #c9a227)', marginTop: 4 } as const
+  if (t.matchKind === 'gam_payout') {
+    const b = t.payoutBreakdown
+    const n = b?.payments?.length ?? 0
+    return (
+      <div>
+        <div style={{ ...line, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span>
+            {BANK_TXN_MATCH_KIND_LABEL['gam_payout']}
+            {b?.traced ? ` — ${n} payment${n === 1 ? '' : 's'}` : ''}; already in your books, never counted twice.
+          </span>
+          {b && (
+            <button className="btn btn-primary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }}
+                    onClick={() => setOpen(v => !v)}>
+              {open ? 'Hide' : 'Show'} what it paid
+            </button>
+          )}
+        </div>
+        {open && b && <div style={{ marginTop: 8 }}><PayoutBreakdown breakdown={b} /></div>}
+      </div>
+    )
+  }
+  if (t.matchKind === 'tenant_deposit') {
+    const who = [t.matchedUnitNumber, t.matchedTenantName].filter(Boolean).join(' · ')
+    const more = Number(t.matchedChargeCount) > 1 ? ` (${t.matchedChargeCount} charges)` : ''
+    return (
+      <div style={line}>
+        {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — applied to {who ? `${who}’s` : 'a tenant’s'} rent{more}
+        {t.autoSettledAt ? ' by itself (it was exactly their whole bill, and nothing else fit)' : ''};
+        already in your books, never counted twice.
+      </div>
+    )
+  }
+  if (t.matchKind === 'deposit_slip') {
+    const n = Number(t.slipItemCount) || 0
+    return (
+      <div style={line}>
+        {BANK_TXN_MATCH_KIND_LABEL['deposit_slip']} of {t.slipDepositDate}
+        {t.slipSource === 'inferred' ? ` (${DEPOSIT_SLIP_SOURCE_LABEL['inferred' as DepositSlipSource].toLowerCase()})` : ''} —
+        {' '}{n} payment{n === 1 ? '' : 's'} already in your books
+        {Number(t.slipOtherAmount) > 0 ? `, plus ${fmt(t.slipOtherAmount)} of other money added to your income` : ''}; never counted twice.
+      </div>
+    )
+  }
+  return <div style={line}>Matched to money GAM already has on record — never counted twice.</div>
 }

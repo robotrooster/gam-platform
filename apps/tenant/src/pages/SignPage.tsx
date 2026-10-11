@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery, useMutation } from 'react-query'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -53,7 +53,7 @@ function authFetch(path: string, opts: RequestInit = {}) {
 // S637 (Nic): "the ones that need something that's a licensing pick, just
 // remove those." Script and Cursive are gone.
 //
-// They were the two options a PDF could not honour. Every style here is stamped
+// They were the two options a PDF could not honor. Every style here is stamped
 // into the executed lease by services/pdfStamp.ts, which can only use fonts the
 // PDF standard already carries — the remaining three are italic serif faces and
 // Times-Italic represents them faithfully. Snell Roundhand and Brush Script are
@@ -103,7 +103,7 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
       {/* S629 (Nic): "the page is locked from scrolling. I cannot scroll down
           far enough to confirm my selection." On a phone this card is taller
-          than the viewport; centred and overflow:hidden, it was clipped at both
+          than the viewport; centered and overflow:hidden, it was clipped at both
           ends with nothing scrollable, so the confirm button existed and could
           not be reached. 100dvh rather than 100vh because mobile browser chrome
           makes vh taller than what is actually visible. */}
@@ -268,24 +268,57 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
   )
 }
 
-type Stage = 'signing'|'review'|'done'|'declined'
+type Stage = 'signing'|'review'|'done'
 
 // S534: a 'date' field is auto-stampable only when it records WHEN the
 // signer signed. Term dates (lease start/end) are deliberate inputs.
 
 /** S629: the largest font that fits a value inside its box, both ways. */
+/**
+ * S652 — the same shrink the stamper applies, so the screen is not a different
+ * document from the one that prints.
+ *
+ * Blu read Lot 1 and reported the tenant's name as "S-H-E dot dot dot". That was
+ * this function's floor plus a CSS ellipsis: the name did not fit, it stopped
+ * shrinking at 6px, and the browser hid the rest. Meanwhile the PDF stamper
+ * sized on height alone and drew the whole name straight out of its box — so
+ * the page he was asked to approve and the page that would be filed disagreed
+ * about what it said.
+ *
+ * Floor lowered to match MIN_PT in services/pdfStamp, and the ellipsis is gone
+ * from value rendering. A name that overflows is visibly wrong and gets fixed;
+ * a name silently shortened is a different person on a lease.
+ */
 function fitFontSize(text: string, boxW: number, boxH: number): number {
   const byHeight = boxH * 0.5
   const byWidth = text.length ? (boxW - 4) / (text.length * 0.55) : byHeight
-  return Math.max(6, Math.min(byHeight, byWidth))
+  return Math.max(5, Math.min(byHeight, byWidth))
 }
 
 const isDateSignedField = (f: any) =>
   f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
 
+// S637: canvas scale for a crisp page on a high-density screen. Past the
+// device's own pixel ratio we add zoom headroom, then clamp total canvas area —
+// mobile Safari silently returns a BLANK canvas past its size limit, which
+// would turn a blurry lease into a missing one.
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
+
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
+  const qc = useQueryClient()
   // S633 (Nic): a tenant on a phone could not scroll far enough to confirm their
   // signature font. This portal locks the document on purpose — `.shell` is the
   // scrolling region and body is overflow:hidden — but a lease opened from an
@@ -296,15 +329,24 @@ export function SignPage() {
   useEffect(() => unlockScrollIfStandalone(), [])
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [fieldFonts, setFieldFonts]   = useState<Record<string,string>>({})
   const [savedSig, setSavedSig]       = useState<{value:string,font?:string}|null>(null)
   const [savedInit, setSavedInit]     = useState<{value:string,font?:string}|null>(null)
   const [activeField, setActiveField] = useState<any>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [showBundle, setShowBundle] = useState(false)
   const [pdfPageCount, setPdfPageCount] = useState(1)
   const [pdfDims, setPdfDims]         = useState<{width:number,height:number}|null>(null)
   const [allDone, setAllDone]         = useState(false)
   const [setupDone, setSetupDone]     = useState(false)
+  // S652: the route changes the token but React keeps this component, so every
+  // per-document state starts over here (page, boxes, stage). Same fix as the
+  // landlord side — "4/2" and no boxes on the second document of a packet.
+  useEffect(() => {
+    setCurrentPage(1); setActiveField(null); setFieldValues({}); setFieldFonts({})
+    setStage('signing'); setSubmitError(null); setAllDone(false); setShowBundle(false)
+  }, [documentId])
   const containerRef = useRef<HTMLDivElement>(null)
   const pdfRef       = useRef<any>(null)
   const canvasRef    = useRef<HTMLCanvasElement>(null)
@@ -314,6 +356,7 @@ export function SignPage() {
     () => authFetch('/esign/sign/'+documentId).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
     { retry:false }
   )
+
 
   // S234: tenant draft persistence. Save in-progress field values to
   // localStorage keyed by document id so an accidental refresh / nav-
@@ -372,8 +415,16 @@ export function SignPage() {
         .map(([fieldId,value])=>({ fieldId, value, fontCss: fieldFonts[fieldId] || null })) }) })
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
-    { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },
-      onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
+    { onSuccess:(res:any)=>{
+        clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done')
+        // S648: the portal holds a resident on this page until they have
+        // signed. Drop the cached "still to sign" so it lets them in now.
+        qc.invalidateQueries('tenant-me-theme'); qc.invalidateQueries('tenant-me'); qc.invalidateQueries('pending-docs')
+      },
+      // S652 (Blu, MH 18): a rejected submit used to drop back to the document
+      // with a toast that nobody saw — "it just reloads to the same page." The
+      // review sheet stays open and says what the server said.
+      onError:(e:any)=>{ setSubmitError(e?.message || 'Signing failed — try again.'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
   // ── S636: A SIGNING PAGE HEALS ITSELF, IT DOES NOT ASK ──────────────
   //
@@ -404,26 +455,9 @@ export function SignPage() {
     },
   }), [])
 
-  // S234: decline path. The tenant can refuse a sent doc with a reason.
-  // Backend voids the document on success — no path back.
-  const [showDeclineModal, setShowDeclineModal] = useState(false)
-  const [declineErr, setDeclineErr] = useState<string | null>(null)
-  const declineMut = useMutation(
-    (reason: string) => authFetch('/esign/sign/'+documentId+'/decline', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ reason }),
-    }).then(r=>r.json()),
-    {
-      onSuccess: (res:any) => {
-        if (!res?.success) { setDeclineErr(res?.error || 'Could not record decline'); return }
-        clearDraft()
-        setShowDeclineModal(false)
-        setStage('declined')
-      },
-      onError: (e:any) => setDeclineErr(e?.message || 'Could not record decline'),
-    },
-  )
+  // S652 (Nic): "make it so that nobody can ever decline any document. They
+  // just don't complete the signature if they're choosing not to." No decline
+  // path on any sign page; an unsigned document simply stays unsigned.
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
     if (!canvasRef.current || !containerRef.current) return
@@ -431,15 +465,24 @@ export function SignPage() {
     const containerWidth = containerRef.current.clientWidth
     const vp = page.getViewport({ scale:1 })
     const scale = containerWidth / vp.width
+    // CSS scale stays exactly as it was — every signature/initial box on this
+    // page is positioned with it, so it must keep meaning "CSS pixels".
     scaleRef.current = scale
-    const sv = page.getViewport({ scale })
+    const cssVp = page.getViewport({ scale })
+    // S637 (Nic): "the lease is blurry when people zoom in on phone." The
+    // canvas was sized in CSS pixels, so a phone at devicePixelRatio 3 showed a
+    // third-resolution render of the document someone is about to SIGN. Only
+    // the backing store grows; the drawn size and the field overlay are
+    // unchanged.
+    const sv = page.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     canvas.width = sv.width
     canvas.height = sv.height
     canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     canvas.style.display = 'block'
     await page.render({ canvasContext:canvas.getContext('2d')!, viewport:sv }).promise
-    setPdfDims({ width:sv.width, height:sv.height })
+    setPdfDims({ width:cssVp.width, height:cssVp.height })
   }, [])
 
   const loadPdf = useCallback(async (url:string) => {
@@ -447,7 +490,7 @@ export function SignPage() {
     // S629 (Nic): a tenant signing from an emailed link has no session, so
     // `Authorization: Bearer null` 401'd the file and the page drew signature
     // fields over a blank canvas. The signer's token goes on the query string
-    // instead; the file route's per-row check authorises it exactly as it does
+    // instead; the file route's per-row check authorizes it exactly as it does
     // a landlord's session.
     const base = url.startsWith('http') ? url : API+url
     const byToken = SIGNER_TOKEN_RE.test(documentId || '')
@@ -486,13 +529,21 @@ export function SignPage() {
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
       <AlertCircle size={40} style={{ color:'var(--red)' }}/>
       <h2 style={{ color:'var(--text-0)' }}>Invalid Signing Link</h2>
-      <p style={{ color:'var(--text-3)', maxWidth:380 }}>This link may be invalid or not associated with your account.</p>
+      <p style={{ color:'var(--text-3)', maxWidth:380 }}>{(error as any)?.message || 'This link may be invalid or not associated with your account.'}</p>
       <button className="btn btn-ghost" onClick={()=>navigate('/')}>Back to Portal</button>
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly } = data
+  const { signer, document:doc, fields, readOnly, waitingOn, closedReason, packageDocs } = data
   const allFields = fields || []
+
+  // S652: the next document in this packet that still needs THIS signer. Blu
+  // signed nine leases and never saw the eight documents behind each one.
+  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
+  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
+  const needsMe = (d:any) => d.mine && d.mine.status !== 'signed' && d.mine.status !== 'declined' && d.status !== 'completed' && d.status !== 'voided'
+  const nextForMe = [...bundle.slice(selfAt + 1), ...bundle.slice(0, Math.max(selfAt, 0))].find((d:any)=> !d.isSelf && needsMe(d))
+  const leftForMe = bundle.filter((d:any)=> !d.isSelf && needsMe(d)).length
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
   // child to its parent by (child.parentFieldId == parent.templateFieldId).
@@ -500,6 +551,8 @@ export function SignPage() {
     if (!f.parentFieldId) return true
     const parent = allFields.find((p:any)=> p.templateFieldId && p.templateFieldId === f.parentFieldId)
     if (!parent) return true
+    // S652: a child of a CHOICE box shows when that box is the one chosen.
+    if (parent.fieldType === 'choice') return !!(fieldValues[parent.id] ?? parent.value)
     return (fieldValues[parent.id] ?? parent.value ?? null) === f.parentOption
   }
   const setFieldValue = (fieldId:string, value:string) => {
@@ -521,7 +574,8 @@ export function SignPage() {
   // standalone view with the PDF + a status banner; no editable
   // fields, no Sign button, no draft persistence.
   if (readOnly) {
-    return <ReadOnlyView doc={doc} signer={signer} fields={allFields} onBack={()=>navigate('/')} />
+    return <ReadOnlyView doc={doc} signer={signer} fields={allFields}
+             waitingOn={waitingOn} closedReason={closedReason} onBack={()=>navigate('/')} />
   }
 
   const activeFields = allFields.filter(isFieldActive)
@@ -531,12 +585,43 @@ export function SignPage() {
   // every field; the counters use only this signer's. Payloads without `mine`
   // predate the change and contained only this signer's fields anyway.
   const isMine = (f:any) => f.mine !== false
+  // S652: a choice box marked X/check shows the glyph, not the option text it stores.
+  const shown = (f:any, v:string) => f.fieldType==='choice' && f.checkboxMark!=='initials' ? (f.checkboxMark==='check' ? '✓' : 'X') : v
   const myFields = activeFields.filter(isMine)
   const requiredFields = myFields.filter((f:any)=>f.required)
-  const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
+  // S652 (Nic): a CHOICE group is required as a group — one box marked, not
+  // each. Counted once, by its first box, so "3 required left" means three
+  // things to do.
+  const choiceKey = (f:any) => String(f.options ?? f.id)
+  const groupChosen = (f:any) => myFields.some((g:any)=> g.fieldType==='choice' && choiceKey(g)===choiceKey(f) && (fieldValues[g.id]??'').trim())
+  const seenGroups = new Set<string>()
+  const unfilledRequired = requiredFields.filter((f:any)=> {
+    if (f.fieldType!=='choice') return !fieldValues[f.id]?.trim()
+    if (seenGroups.has(choiceKey(f))) return false
+    seenGroups.add(choiceKey(f)); return !groupChosen(f)
+  })
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
+
+  // S655: A NEW LEASE for the home they already live in. The server works out
+  // the first bill under it (GET /sign renewal_billing — the bill run's own
+  // arithmetic), so a tenant who opened the emailed link with no session sees
+  // the real date and amount, not a general rule.
+  const renewalBilling: any = (data as any)?.renewalBilling ?? null
+  const renewalLine: string | null = doc?.renewsLeaseId ? (renewalBilling?.summary ?? null) : null
+  const newLeaseStart: string | null = renewalBilling?.startDate ?? null
+  const longDay = (iso: string, year = true) => new Date(iso.slice(0, 10) + 'T12:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', ...(year ? { year: 'numeric' } : {}), timeZone: 'UTC' } as any)
+  const dayBeforeStart = newLeaseStart
+    ? longDay(new Date(new Date(newLeaseStart.slice(0, 10) + 'T12:00:00Z').getTime() - 86400000).toISOString(), false)
+    : null
+  // Its start date has come: it is their lease now (it took over whether or not
+  // they had signed). The server says so by the park's calendar; the tenant's
+  // own clock is the fallback for an older response.
+  const nowLocal = new Date()
+  const todayLocal = `${nowLocal.getFullYear()}-${String(nowLocal.getMonth() + 1).padStart(2, '0')}-${String(nowLocal.getDate()).padStart(2, '0')}`
+  const newLeaseStarted: boolean = !!newLeaseStart && (renewalBilling?.started ?? (newLeaseStart.slice(0, 10) <= todayLocal))
 
   const handleFieldClick = (field:any) => {
     if (field.fieldType==='signature' && savedSig) {
@@ -548,6 +633,19 @@ export function SignPage() {
     if (field.fieldType==='initials' && savedInit) {
       setFieldValues(p=>({...p,[field.id]:savedInit.value}))
       if(savedInit.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
+      setTimeout(()=>jumpToNext(field.id), 150)
+      return
+    }
+    // S652 (Nic): a CHOICE box — one of a group. Marking it clears the others in
+    // the group; the mark is X, a check, or the signer's own initials.
+    if (field.fieldType==='choice') {
+      const mark = field.checkboxMark === 'initials' ? (savedInit?.value ?? '') : (field.label || 'X')
+      if (!mark) { setActiveField(field); return }
+      const key = String(field.options ?? field.id)
+      setFieldValues(p=>{ const n:Record<string,string> = {...p}
+        for (const g of allFields) if (g.fieldType==='choice' && String(g.options ?? g.id)===key && g.id!==field.id && isMine(g)) delete n[g.id]
+        n[field.id]=mark; return n })
+      if (field.checkboxMark === 'initials' && savedInit?.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
@@ -574,7 +672,14 @@ export function SignPage() {
   }
 
   const jumpToNext = (justFilledId: string) => {
-    const stillUnfilled = requiredFields.filter((f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim())
+    // S652 (Blu): initialing one box on page 1 threw him to page 2, because the
+    // jump only ever chased the next REQUIRED field. Finish the page you are on
+    // first — every box of yours on it, optional or not, top to bottom — and
+    // only leave the page when nothing of yours is left on it.
+    const unfilled = (f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim()
+    const onThisPage = myFields.filter((f:any) => f.page === currentPage && unfilled(f))
+      .sort((a:any, b:any) => Number(a.y) - Number(b.y))
+    const stillUnfilled = onThisPage.length ? onThisPage : requiredFields.filter(unfilled)
     const next = stillUnfilled[0]
     if (!next) return
     if (next.page !== currentPage) {
@@ -611,20 +716,6 @@ export function SignPage() {
     return <SignatureSetup name={signer.name} initials={initials} onComplete={(sig,init,font)=>{ setSavedSig({value:sig,font}); setSavedInit({value:init,font}); setSetupDone(true) }}/>
   }
 
-  if (stage==='declined') return (
-    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
-      <div style={{ width:80, height:80, borderRadius:'50%', background:'rgba(220,76,76,.1)', border:'2px solid var(--red, #dc4c4c)', display:'flex', alignItems:'center', justifyContent:'center' }}>
-        <AlertCircle size={36} style={{ color:'var(--red, #dc4c4c)' }}/>
-      </div>
-      <h2 style={{ color:'var(--text-0)', margin:0 }}>You declined this document</h2>
-      <p style={{ color:'var(--text-3)', maxWidth:420, lineHeight:1.6 }}>
-        The document has been voided. {data?.document?.landlordName ? `${data.document.landlordName} has been notified` : 'The landlord has been notified'}
-        {' '}with your reason. If you'd like to revisit, contact them directly so they can prepare a new document.
-      </p>
-      <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Declined: {new Date().toLocaleString()}</div>
-      <button onClick={()=>navigate('/')} className="btn btn-ghost" style={{ marginTop:8 }}>Back to portal</button>
-    </div>
-  )
 
   if (stage==='done') return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
@@ -632,15 +723,52 @@ export function SignPage() {
       <h2 style={{ color:'var(--text-0)', margin:0 }}>{allDone?'Document Fully Executed!':'Signatures Submitted!'}</h2>
       <p style={{ color:'var(--text-3)', maxWidth:400, lineHeight:1.6 }}>{allDone?'All parties have signed. A copy will be sent to your email.':'Your signatures have been recorded. The next party will be notified.'}</p>
       <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Signed: {new Date().toLocaleString()} · UETA & E-SIGN Act compliant</div>
-      <button className="btn btn-primary" onClick={()=>navigate('/lease')}>Back to Lease</button>
+      {nextForMe && nextForMe.mine?.token && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          This is part of a packet — {leftForMe} more document{leftForMe===1?'':'s'} in it still need your signature.
+        </div>
+      )}
+      {nextForMe && nextForMe.mine?.token
+        ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+nextForMe.mine.token) }}>Next: {nextForMe.title} →</button>
+        : <button className="btn btn-primary" onClick={()=>navigate('/lease')}>Back to Lease</button>}
     </div>
   )
+
 
   return (
     <div>
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
+          {/* S641: when this document is part of a package, say so up front.
+              Nic: "a lot of people are gonna be like, well, I already signed the
+              lease, what's this for?" Knowing there are four documents and this
+              is the second answers that before it is asked. */}
+          {bundle.length > 1 && selfAt >= 0 && (
+            <div>
+              <div onClick={()=>setShowBundle(v=>!v)} style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600, cursor:'pointer' }}>
+                Document {selfAt + 1} of {bundle.length}{leftForMe > 0 ? ` · ${leftForMe} more for you to sign` : ' · the last one for you'} {showBundle ? '▴' : '▾'}
+              </div>
+              {/* S652 (Nic): "let him just scroll through and do them in any
+                  order he desires" — the whole packet, any document a click away. */}
+              {showBundle && (
+                <div style={{ marginTop:6, background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderRadius:8, padding:'6px 8px', maxWidth:440 }}>
+                  {bundle.map((d:any, i:number) => {
+                    const state = d.isSelf ? 'this one' : d.status==='completed' ? 'done' : !d.mine ? 'not yours yet' : d.mine.status==='signed' ? 'you signed' : 'needs you'
+                    const canOpen = !d.isSelf && !!d.mine?.token
+                    return (
+                      <div key={d.id} onClick={()=>{ if (canOpen) { setShowBundle(false); setStage('signing'); navigate('/sign/'+d.mine.token) } }}
+                           style={{ display:'flex', justifyContent:'space-between', gap:10, padding:'4px 2px', fontSize:'.74rem', cursor: canOpen?'pointer':'default',
+                                    color: d.isSelf?'var(--gold,#c9a227)':'var(--text-1,#ddd)', borderBottom: i<bundle.length-1?'1px solid var(--border-0)':'none' }}>
+                        <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{i+1}. {d.title}</span>
+                        <span style={{ flexShrink:0, color: state==='needs you'?'var(--gold,#c9a227)':'var(--text-3)' }}>{state}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
           <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {requiredFields.length-unfilledRequired.length}/{requiredFields.length} required fields complete</div>
         </div>
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>
@@ -654,24 +782,25 @@ export function SignPage() {
           </>}
           {!allFilled && nextField && <button onClick={goToNextField} className="btn btn-primary btn-sm">Next Field <ArrowRight size={13}/></button>}
           {allFilled && <button onClick={()=>setStage('review')} className="btn btn-primary">Review & Sign <ArrowRight size={14}/></button>}
-          {/* S234: decline path. Always available pre-sign so a tenant
-              who can't proceed (wrong terms, wrong unit, etc.) doesn't
-              need to ghost the landlord — they can refuse with reason
-              and the landlord knows to follow up. */}
-          <button
-            onClick={() => { setDeclineErr(null); setShowDeclineModal(true) }}
-            className="btn btn-ghost btn-sm"
-            style={{ color:'var(--red, #dc4c4c)' }}
-            title="Refuse to sign — voids the document"
-          >
-            Decline
-          </button>
         </div>
       </div>
 
       <div style={{ height:3, background:'var(--bg-3)', borderRadius:2, marginBottom:12, overflow:'hidden' }}>
         <div style={{ height:'100%', background:'var(--gold,#c9a227)', borderRadius:2, width:`${requiredFields.length?Math.round((requiredFields.length-unfilledRequired.length)/requiredFields.length*100):0}%`, transition:'width .3s' }}/>
       </div>
+
+      {doc?.renewsLeaseId && (
+        <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>
+            Your new lease{newLeaseStart ? (newLeaseStarted ? ` — it started ${longDay(newLeaseStart)}` : ` — starts ${longDay(newLeaseStart)}`) : ''}
+          </div>
+          {newLeaseStarted
+            ? <>It is your lease now. Please read it and sign it. </>
+            : newLeaseStart && dayBeforeStart && <>Nothing changes before then: your current lease stays as it is through {dayBeforeStart}. </>}
+          {renewalLine ?? 'Your rent picks up where your current lease\'s bills leave off, so no stretch is billed twice.'}
+          {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
+        </div>
+      )}
 
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'78vh', marginBottom:16 }}>
         <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
@@ -686,6 +815,21 @@ export function SignPage() {
             // out as not a box to be filled out. It just needs to show it as
             // plain text data, not an actual box." A value somebody else already
             // entered is part of the page being read, not an input.
+            // S652 (Nic): FIXED TEXT prints as text, never a box. The landlord —
+            // and only the landlord, only while it is his turn — gets a pencil
+            // to change it on this one document; the tenant reads it.
+            if (f.fieldType==='fixed_text') {
+              const editable = isMine(f) && !data.readOnly
+              return (
+                <div key={f.id} id={'field-'+f.id} title={editable ? 'Set on the template — click to change it on this document only' : undefined}
+                  onClick={()=>{ if (editable) setActiveField(f) }}
+                  style={{ position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s, display:'flex', alignItems:'center',
+                           overflow:'hidden', boxSizing:'border-box' as const, zIndex:3, cursor: editable?'pointer':'default', pointerEvents: editable?'auto':'none' }}>
+                  <span style={{ fontSize:fitFontSize(String(val||' '), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', flex:1 }}>{String(val)}</span>
+                  {editable && <span style={{ fontSize:Math.max(8,f.height*s*0.5), color:'#c9a227', opacity:.75, paddingRight:2, flexShrink:0 }}>✎</span>}
+                </div>
+              )
+            }
             if (!isMine(f) && val) {
               return (
                 <div key={f.id} id={'field-'+f.id}
@@ -700,7 +844,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
                                      fontSize:fitFontSize(String(val), f.width*s, f.height*s),
                                      color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
-                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                                     overflow:'visible' }}>{shown(f,val)}</span>}
                 </div>
               )
             }
@@ -725,10 +869,10 @@ export function SignPage() {
                     // wide values ("29" became "2", a full name became "Jon…"),
                     // and the clipped text is what gets stamped into the
                     // executed PDF.
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'visible' }}>{shown(f,val)}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':f.fieldType==='year'?'Year':'Click'}
                   </span>
                 )}
               </div>
@@ -765,7 +909,17 @@ export function SignPage() {
                 ))}
               </div>
             )}
-            {activeField.fieldType==='text' && (
+            {activeField.fieldType==='year' && (
+              // S652 (Blu): a year is picked from a list — the current year and
+              // back a century — and the editor stays open until Save.
+              <select autoFocus className="input" value={fieldValues[activeField.id]||''}
+                onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
+                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14, background:'white', color:'#1a1a1a' }}>
+                <option value="">Pick a year…</option>
+                {Array.from({ length: 111 }, (_, i) => String(new Date().getFullYear() + 1 - i)).map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
+            )}
+            {(activeField.fieldType==='text'||activeField.fieldType==='fixed_text') && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
@@ -796,7 +950,7 @@ export function SignPage() {
                   // entered.
                   //
                   // Keying on the field id gives each one its own instance,
-                  // initialised from its own value. (The component was also
+                  // initialized from its own value. (The component was also
                   // hardened to re-sync — see its useEffect on `value` — so a
                   // future caller that forgets the key cannot lose an answer.)
                   key={activeField.id}
@@ -835,7 +989,7 @@ export function SignPage() {
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
-              {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
+              {allFields.filter((f:any)=>fieldValues[f.id] && f.fieldType!=='fixed_text').map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
                   <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
@@ -872,9 +1026,14 @@ export function SignPage() {
             <div style={{ padding:'11px 14px', background:'#fffdf5', border:'1px solid rgba(201,162,39,.3)', borderRadius:9, fontSize:'.73rem', color:'#999', lineHeight:1.6, marginBottom:18 }}>
               By clicking Submit, you confirm your electronic signature is legally binding under UETA and the federal E-SIGN Act.
             </div>
+            {submitError && (
+              <div role="alert" style={{ padding:'11px 14px', background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:9, fontSize:'.8rem', color:'#991b1b', lineHeight:1.5, marginBottom:14 }}>
+                <strong>Not submitted.</strong> {submitError}
+              </div>
+            )}
             <div style={{ display:'flex', gap:9 }}>
-              <button onClick={()=>setStage('signing')} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
-              <button onClick={()=>submitMut.mutate()} disabled={submitMut.isLoading}
+              <button onClick={()=>{ setSubmitError(null); setStage('signing') }} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
+              <button onClick={()=>{ setSubmitError(null); submitMut.mutate() }} disabled={submitMut.isLoading}
                 style={{ flex:2, padding:'12px', borderRadius:10, border:'none', background:'#c9a227', color:'white', fontWeight:800, cursor:'pointer' }}>
                 {submitMut.isLoading?'Submitting...':'✓ Submit Signatures'}
               </button>
@@ -883,68 +1042,6 @@ export function SignPage() {
         </div>
       )}
 
-      {showDeclineModal && (
-        <DeclineModal
-          documentTitle={doc.title}
-          isLoading={declineMut.isLoading}
-          error={declineErr}
-          onCancel={() => setShowDeclineModal(false)}
-          onConfirm={(reason) => declineMut.mutate(reason)}
-        />
-      )}
-    </div>
-  )
-}
-
-function DeclineModal({
-  documentTitle, isLoading, error, onCancel, onConfirm,
-}: {
-  documentTitle: string
-  isLoading: boolean
-  error: string | null
-  onCancel: () => void
-  onConfirm: (reason: string) => void
-}) {
-  const [reason, setReason] = useState('')
-
-  return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
-      <div style={{ background:'white', borderRadius:14, width:'100%', margin:'auto', maxWidth:460, padding:'22px 24px', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
-          <AlertCircle size={20} style={{ color:'#dc4c4c' }}/>
-          <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a' }}>Decline this document?</div>
-        </div>
-        <p style={{ fontSize:'.82rem', color:'#666', lineHeight:1.5, margin:'0 0 14px' }}>
-          Declining voids "<strong>{documentTitle}</strong>" — it can't be signed by anyone. Your landlord is notified with the reason you provide. There's no path to undo this; if the issue is fixable, the landlord prepares a new document and re-sends it.
-        </p>
-        <label style={{ fontSize:'.72rem', fontWeight:700, color:'#666', textTransform:'uppercase', letterSpacing:'.05em', display:'block', marginBottom:5 }}>
-          Reason <span style={{ fontWeight:400, textTransform:'none', letterSpacing:0 }}>(optional, but strongly recommended)</span>
-        </label>
-        <textarea
-          value={reason}
-          onChange={e => setReason(e.target.value)}
-          rows={4}
-          maxLength={1000}
-          placeholder="What about this document doesn't work? E.g. wrong unit, wrong dates, terms changed since we discussed."
-          style={{ width:'100%', padding:'10px 12px', borderRadius:8, border:'1px solid #e5e7eb', fontSize:'.85rem', fontFamily:'inherit', resize:'vertical', boxSizing:'border-box', color:'#1a1a1a', background:'#fafafa' }}
-        />
-        <div style={{ fontSize:'.7rem', color:'#999', marginTop:4, textAlign:'right' }}>{reason.length}/1000</div>
-        {error && (
-          <div style={{ marginTop:10, padding:'8px 12px', borderRadius:6, background:'rgba(220,76,76,.08)', border:'1px solid rgba(220,76,76,.25)', color:'#dc4c4c', fontSize:'.78rem' }}>
-            {error}
-          </div>
-        )}
-        <div style={{ display:'flex', gap:9, marginTop:16 }}>
-          <button onClick={onCancel} disabled={isLoading}
-            style={{ flex:1, padding:'11px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600, color:'#1a1a1a' }}>
-            Cancel
-          </button>
-          <button onClick={() => onConfirm(reason.trim())} disabled={isLoading}
-            style={{ flex:1, padding:'11px', borderRadius:10, border:'none', background:'#dc4c4c', color:'white', fontWeight:700, cursor: isLoading?'wait':'pointer' }}>
-            {isLoading ? 'Declining…' : 'Decline document'}
-          </button>
-        </div>
-      </div>
     </div>
   )
 }
@@ -957,11 +1054,18 @@ function DeclineModal({
 // — surfaced inline below the PDF for context, since not every viewer
 // has a PDF reader plugin available in-browser.
 function ReadOnlyView({
-  doc, signer, fields, onBack,
+  doc, signer, fields, waitingOn, closedReason, onBack,
 }: {
   doc: any
   signer: any
   fields: any[]
+  /** S637: set when the document simply is not this signer's turn yet. */
+  waitingOn?: string | null
+  /**
+   * S655: why this document can't be signed at all — a new lease whose lease
+   * before it ended early with nobody signed. The server's words, shown as is.
+   */
+  closedReason?: string | null
   onBack: () => void
 }) {
   const status = doc?.status as string
@@ -972,6 +1076,14 @@ function ReadOnlyView({
     status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Contact your landlord for details.' } :
     signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
     signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
+    // S655: a new lease that is being canceled — its lease before it ended
+    // early and nobody signed. No turn is coming, so this wins over waitingOn.
+    closedReason                   ? { tone:'red',   label:'Can\u2019t be signed', sub: closedReason } :
+    // S637 (Nic): say plainly that it is not their turn. People were filling
+    // the whole document in before the landlord had signed, being refused at
+    // the end, and then telling him they had signed it.
+    waitingOn                      ? { tone:'gold',  label:`Waiting on ${waitingOn}`,
+                                       sub:'You can read the lease now. We\u2019ll email you the moment it\u2019s your turn to sign — there is nothing to do until then.' } :
                                      { tone:'muted', label:'Read-only',       sub:'' }
   const pdfUrl = doc?.executedPdfUrl || doc?.basePdfUrl
   const filledFields = (fields || []).filter((f:any) => f.value != null && String(f.value).trim() !== '')

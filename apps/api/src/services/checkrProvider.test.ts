@@ -83,12 +83,21 @@ describe('CheckrProvider.initiate (Tenant orders)', () => {
     expect(res.status).toBe(mapped)
   })
 
-  it('missing consents → failed without calling Checkr', async () => {
-    const spy = vi.spyOn(globalThis, 'fetch' as any)
-    const res = await provider.initiate({ ...happyIntake(), consentCriminal: false })
-    expect(res.status).toBe('failed')
-    expect(res.failureReason).toMatch(/consent/i)
-    expect(spy).not.toHaveBeenCalled()
+  // S637 — REVERSES the gate this test used to assert.
+  //
+  // Checkr collects the FCRA disclosure and authorization on its OWN hosted
+  // apply flow (S578), which is why GAM's intake stopped rendering consent
+  // boxes and the route stopped requiring them. This adapter kept demanding
+  // them anyway, so it rejected every order before Checkr was ever called —
+  // AFTER the applicant had paid. Anastacio Erreguin paid $44.99 and got
+  // nothing; he was the first person to use the link.
+  it('submits without GAM-side consent flags — Checkr collects consent itself', async () => {
+    mockOrderResponse({ id: 'ord_consent', status: 'pending', application_url: null })
+    const res = await provider.initiate({
+      ...happyIntake(), consentCredit: false, consentCriminal: false,
+    })
+    expect(res.status).not.toBe('failed')
+    expect(res.providerRef).toBe('ord_consent')
   })
 
   it('missing rental property → failed with explicit reason (Tenant orders require it)', async () => {
@@ -100,6 +109,28 @@ describe('CheckrProvider.initiate (Tenant orders)', () => {
   it('missing CHECKR_API_KEY → clean throw', async () => {
     delete process.env.CHECKR_API_KEY
     await expect(provider.initiate(happyIntake())).rejects.toThrow(/CHECKR_API_KEY/)
+  })
+
+  // 10/5 (Nic): "Order the ID scan." The applicant's price includes it.
+  it('every order asks for the live ID scan add-on', async () => {
+    const spy = mockOrderResponse({ id: 'ord_1', status: 'waiting_for_applicant' })
+    await provider.initiate(happyIntake())
+    const body = JSON.parse((spy.mock.calls[0] as any)[1].body)
+    expect(body.order.add_on_products).toEqual(['identity_verification'])
+  })
+
+  it('Checkr refusing the add-on: the order still goes through without it, and GAM is told', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch' as any)
+      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => '{"error":"identity_verification is not an available add-on"}' } as any)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ id: 'ord_2', status: 'waiting_for_applicant' }) } as any)
+    const notes = await import('./adminNotifications')
+    const told = vi.spyOn(notes, 'createAdminNotification').mockResolvedValue(undefined as any)
+    const res = await provider.initiate(happyIntake())
+    expect(res.providerRef).toBe('ord_2')
+    const second = JSON.parse((spy.mock.calls[1] as any)[1].body)
+    expect(second.order.add_on_products).toBeUndefined()
+    expect((spy.mock.calls[1] as any)[1].headers['Idempotency-Key']).toBe('gam-bgc-bg-1-no-id-scan')
+    expect(told).toHaveBeenCalledWith(expect.objectContaining({ category: 'checkr_id_scan_refused', severity: 'critical' }))
   })
 
   it('order API non-2xx → failed with status + body excerpt', async () => {
@@ -144,19 +175,48 @@ describe('CheckrProvider.parseWebhook (Tenant events)', () => {
     expect(provider.parseWebhook(evt('order.applicant.completed', { id: 'ord_1' }))).toMatchObject({
       providerRef: 'ord_1', status: 'processing',
     })
-    expect(provider.parseWebhook(evt('report.product.completed', { order_id: 'ord_1' }))).toMatchObject({
-      providerRef: 'ord_1', status: 'processing',
-    })
   })
 
-  it('report.completed → complete, keyed by ORDER id, carrying the report ref for fetchReport', () => {
+  // ── S640: THE PER-PRODUCT PING IS NOTHING TO APPLY ──────────────────────
+  //
+  // This used to expect an update keyed by order_id. The event does not carry
+  // one — its payload is the report ITEM — so in production it threw, the route
+  // answered 500, and Checkr redelivered: 75 failures against 4 successes in 25
+  // hours, burying the report.completed that finishes a screening. And there
+  // was nothing to apply even if it had parsed; the check is already
+  // processing. Null means acknowledged.
+  it('report.product.completed is acknowledged, not applied', () => {
+    expect(provider.parseWebhook(evt('report.product.completed', { id: 'rpi_1', report_id: 'rep_9' }))).toBeNull()
+  })
+
+  it('report.completed → complete, carrying the report ref for fetchReport', () => {
     const upd = provider.parseWebhook(evt('report.completed', { id: 'rep_9', order_id: 'ord_1' }))
     expect(upd).toMatchObject({ providerRef: 'ord_1', status: 'complete', reportRef: 'rep_9' })
   })
 
-  it('unhandled event types and missing order ids throw', () => {
-    expect(() => provider.parseWebhook(evt('order.mystery', { id: 'ord_1' }))).toThrow(/Unhandled/)
-    expect(() => provider.parseWebhook(evt('report.completed', { id: 'rep_9' }))).toThrow(/missing order id/)
+  // ── S640: CHECKR PROMISES A REPORT ID, NOT AN ORDER ID ──────────────────
+  //
+  //   "we POST a report.completed event ... including the report_id"
+  //   "fetch it via GET /reports/{id} using the report_id from the payload"
+  //
+  // Demanding an order_id threw on the one event that matters. An empty
+  // providerRef tells the route to resolve the order from the report body,
+  // which does carry order_id.
+  it('report.completed without an order id still yields the report ref', () => {
+    const upd = provider.parseWebhook(evt('report.completed', { id: 'rep_9' }))
+    expect(upd).toMatchObject({ providerRef: '', status: 'complete', reportRef: 'rep_9' })
+  })
+
+  it('accepts report_id as the pointer when that is the field they send', () => {
+    const upd = provider.parseWebhook(evt('report.completed', { report_id: 'rep_9' }))
+    expect(upd?.reportRef).toBe('rep_9')
+  })
+
+  // Checkr sends more event types than they document — report.product.completed
+  // and the whole order.applicant.* family are absent from the published list.
+  // An unknown event is acknowledged, never retried.
+  it('an undocumented event type is acknowledged, not thrown', () => {
+    expect(provider.parseWebhook(evt('order.mystery', { id: 'ord_1' }))).toBeNull()
   })
 })
 

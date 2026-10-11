@@ -1,6 +1,7 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
+import { useQueryClient } from 'react-query'
 
 interface AuthUser {
   id: string
@@ -61,12 +62,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [pmCompanies, setPmCompanies] = useState<ActivePmCompany[]>([])
   const [activePmCompany, setActivePmCompanyState] = useState<ActivePmCompany | null>(null)
 
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
   const logout = useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_token')
     localStorage.removeItem('gam_active_pm_company')
     setToken(null); setUser(null)
     setPmCompanies([]); setActivePmCompanyState(null)
   }, [])
+
+  // S654: same renewal as the landlord portal. A session was a fixed 7-day pass
+  // from the last sign-in; renew one older than a day on load and whenever the
+  // portal comes back into view, so it ends only after seven idle days.
+  const renewSession = useCallback(async () => {
+    const current = localStorage.getItem('gam_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await apiPost<{ token: string }>('/auth/refresh')
+      // S654 (review): a sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem('gam_token') !== current) return
+      localStorage.setItem('gam_token', r.data.token)
+      setToken(r.data.token)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
 
   const setActivePmCompany = useCallback((c: ActivePmCompany) => {
     localStorage.setItem('gam_active_pm_company', c.id)
@@ -83,7 +108,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setPmCompanies(companies)
         if (companies.length > 0) {
           const stored = localStorage.getItem('gam_active_pm_company')
-          const match = companies.find(c => c.id === stored) ?? companies[0]
+          // S654 (Nic, DIRECTIVE): no default company. One company is simply
+          // the company; with several, the person chooses (the app asks).
+          const match = companies.find(c => c.id === stored) ?? (companies.length === 1 ? companies[0] : null)
           setActivePmCompanyState(match)
         } else {
           setActivePmCompanyState(null)
@@ -93,15 +120,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setPmCompanies([])
         setActivePmCompanyState(null)
       }
+      // Renewed last, so a refused renewal signs out without a request still in flight.
+      await renewSession()
     } catch (e) {
       // S540: only a real auth rejection ends the session. API
       // restarts / network blips keep the token; next load recovers.
       if (isAuthRejection(e)) logout()
     }
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // Post-credentials login. Returns a discriminated result so LoginPage
   // can pivot into the TOTP second step when 2FA is enabled on the
@@ -117,7 +151,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresEmailOtp) {
       return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
     }
-    localStorage.setItem('gam_token', data.token)
+    wipeCache(); localStorage.setItem('gam_token', data.token)
     setToken(data.token)
     setUser(data.user ?? data)
     return { kind: 'success' }
@@ -126,7 +160,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // S578: email-code second-step exchange (universal 2FA).
   const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }
@@ -140,7 +174,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // loads /auth/me + the pm_staff memberships.
   const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/totp/verify', { totpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }

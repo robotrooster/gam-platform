@@ -1,0 +1,210 @@
+/* S655 money plan, Step 15: the "Money received" / "Money billed" switch and
+   the report pieces that follow it (Reports page, dashboard income card and
+   property-health card). Every class used by those screens' new markup has its
+   rule here; globals.css is not touched. */
+
+/* ── The switch ──────────────────────────────────────────── */
+.basis-switch { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.basis-switch-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.basis-switch-label {
+  font-size: .7rem; color: var(--text-3); text-transform: uppercase;
+  letter-spacing: .08em; font-weight: 600;
+}
+.basis-toggle {
+  display: inline-flex; padding: 3px; gap: 3px;
+  background: var(--bg-3); border: 1px solid var(--border-1); border-radius: 999px;
+}
+.basis-toggle-btn {
+  border: none; background: transparent; color: var(--text-2);
+  font-family: var(--font-body); font-size: .8rem; font-weight: 600;
+  padding: 7px 14px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+  transition: background .15s, color .15s;
+}
+.basis-toggle-btn:hover { color: var(--text-0); }
+.basis-toggle-btn.on { background: var(--gold); color: #0a0b0e; }
+.basis-toggle-btn:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.basis-note { margin: 0; font-size: .74rem; color: var(--text-3); line-height: 1.5; max-width: 760px; }
+.basis-print-note { display: none; font-size: .72rem; color: var(--text-2); margin: 0 0 10px; }
+@media print {
+  .basis-print-note { display: block; }
+}
+
+/* ── Reports: KPI rows and stat tiles that wrap on a phone ─ */
+.rb-kpis {
+  display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+.rb-kpis .kpi-card { min-width: 0; }
+.rb-kpi-notes { display: flex; flex-direction: column; gap: 2px; }
+.rb-stats {
+  display: grid; gap: 10px; margin-bottom: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.rb-stats .kpi-card { padding: 12px; min-width: 0; }
+.rb-stat-value { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 600; }
+.rb-stat-value.bold { font-weight: 700; }
+
+/* ── P&L lines ───────────────────────────────────────────── */
+.rb-heading {
+  font-size: .66rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-3); font-weight: 600; padding: 12px 4px 2px;
+}
+.rb-line {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  padding: 5px 6px; font-size: .82rem;
+}
+.rb-line-label { color: var(--text-2); min-width: 0; }
+.rb-line-amount { font-family: var(--font-mono); font-weight: 600; white-space: nowrap; }
+.rb-line.total { border-top: 1px solid var(--border-0); }
+.rb-line.total .rb-line-label { color: var(--text-0); font-weight: 700; }
+.rb-line.total .rb-line-amount { font-weight: 700; }
+.rb-line.net { border-top: 2px solid var(--border-1); margin-top: 6px; padding-top: 8px; font-size: .96rem; }
+.rb-line.net .rb-line-label { color: var(--text-0); font-weight: 700; }
+.rb-line.net .rb-line-amount { font-weight: 700; }
+.rb-amt-in { color: var(--green); }
+.rb-amt-out { color: var(--red); }
+.rb-amt-net { color: var(--gold); }
+.rb-amt-neg { color: var(--red); }
+.rb-amt-muted { color: var(--text-3); }
+
+/* Figures shown BESIDE a total, never inside it. */
+.rb-beside {
+  margin: 8px 6px 0; padding: 8px 10px; border-radius: var(--r-md);
+  background: var(--bg-3); border: 1px dashed var(--border-1);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.rb-beside-title {
+  font-size: .62rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-3); font-weight: 600;
+}
+.rb-beside-row { display: flex; justify-content: space-between; gap: 12px; font-size: .76rem; color: var(--text-2); }
+.rb-beside-row .rb-line-amount { color: var(--text-1); font-weight: 500; }
+.rb-small-note { font-size: .7rem; color: var(--text-3); padding: 6px 6px 0; line-height: 1.5; }
+/* Money received: paid-ahead money not used yet. It already counted on the
+   day it arrived, so it sits apart from the dashed "not in it" box, in a
+   solid one, with a note that says so. */
+.rb-counted {
+  margin: 8px 6px 0; padding: 8px 10px; border-radius: var(--r-md);
+  background: var(--bg-3); border: 1px solid var(--border-1);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.rb-counted-note { font-size: .68rem; color: var(--text-3); line-height: 1.4; }
+
+/* ── Income by category ──────────────────────────────────── */
+.rb-num { text-align: right; font-family: var(--font-mono); white-space: nowrap; }
+th.rb-num { font-family: var(--font-body); }
+.rb-cat-table tfoot td { border-top: 2px solid var(--border-1); font-weight: 700; color: var(--text-0); }
+.rb-cat-table td.rb-cat-name { color: var(--text-0); font-weight: 600; }
+.rb-cat-lines td { color: var(--text-2); }
+.rb-nowrap { white-space: nowrap; }
+/* Money received: a dispute or bank return listed on the day it took money back. */
+.rb-taken-back { font-family: var(--font-body); font-size: .64rem; color: var(--red, #e06666); white-space: nowrap; }
+
+/* On a phone the category table stacks: one block per category, each figure
+   on its own line with its column's name (data-label), so nothing hides
+   behind a sideways scroll. */
+@media (max-width: 640px) {
+  .data-table.rb-cat-table thead { display: none; }
+  .data-table.rb-cat-table,
+  .data-table.rb-cat-table tbody,
+  .data-table.rb-cat-table tfoot,
+  .data-table.rb-cat-table tr { display: block; width: 100%; }
+  .data-table.rb-cat-table tr { padding: 8px 2px; border-bottom: 1px solid var(--border-0); }
+  .data-table.rb-cat-table td {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+    padding: 2px 4px; border: none; text-align: right;
+  }
+  .data-table.rb-cat-table td:first-child { padding-bottom: 4px; text-align: left; }
+  .data-table.rb-cat-table td[data-label]::before {
+    content: attr(data-label); font-family: var(--font-body); font-weight: 400;
+    font-size: .74rem; color: var(--text-3); text-align: left;
+  }
+  .data-table.rb-cat-table td.rb-cat-blank { display: none; }
+  .data-table.rb-cat-table tfoot tr { border-top: 2px solid var(--border-1); border-bottom: none; }
+  .data-table.rb-cat-table tfoot td { border-top: none; }
+}
+
+/* ── Lists after the breakdown: collapsed by default ─────── */
+.rb-collapse { margin-bottom: 14px; }
+.rb-collapse > summary {
+  list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 12px 16px; border: 1px solid var(--border-1); border-radius: var(--r-lg);
+  background: var(--bg-2); color: var(--text-1); font-weight: 600; font-size: .84rem;
+}
+.rb-collapse > summary::-webkit-details-marker { display: none; }
+.rb-collapse > summary::after { content: 'Show'; font-size: .72rem; color: var(--gold); font-weight: 600; }
+.rb-collapse[open] > summary::after { content: 'Hide'; }
+.rb-collapse[open] > summary { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.rb-collapse-body {
+  border: 1px solid var(--border-1); border-top: none; border-radius: 0 0 var(--r-lg) var(--r-lg);
+  background: var(--bg-2); padding: 4px 0 8px;
+}
+
+/* ── Modals that must fit a phone ────────────────────────── */
+/* Two classes, so it wins over globals' `.modal { max-width: 520px }` whatever
+   order the stylesheets load in: at 520px the category table's last columns
+   were cut off behind a sideways scroll. */
+.modal.rb-modal {
+  width: 760px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.rb-modal-body { overflow-y: auto; min-height: 0; padding: 4px 2px 8px; }
+.rb-group-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 6px 4px; border-bottom: 1px solid var(--border-0);
+}
+.rb-group-row {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  padding: 5px 4px; font-size: .74rem;
+}
+.rb-group-who { color: var(--text-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rb-group-detail { color: var(--text-3); }
+
+/* ── Dashboard ───────────────────────────────────────────── */
+.dash-basis-bar {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+}
+.dash-basis-bar .basis-switch { margin-bottom: 0; }
+.dash-prop-filter { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dash-prop-note { font-size: .76rem; color: var(--text-3); }
+.phm-cats { margin-top: 12px; display: flex; flex-direction: column; gap: 2px; }
+.phm-cats-head {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-size: .62rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3);
+  font-weight: 600; padding: 0 2px 4px; border-bottom: 1px solid var(--border-0);
+}
+.phm-cat-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px;
+  font-size: .76rem; padding: 3px 2px; color: var(--text-2);
+}
+.phm-cat-row span:not(:first-child) { font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+.phm-cat-row.total { border-top: 1px solid var(--border-0); color: var(--text-0); font-weight: 700; padding-top: 5px; }
+.phm-health-note { font-size: .7rem; color: var(--text-3); margin-top: 8px; }
+
+@media (max-width: 640px) {
+  .basis-toggle-btn { padding: 7px 11px; font-size: .76rem; }
+  .rb-line { font-size: .78rem; }
+  .modal.rb-modal { max-height: 92vh; }
+}
+
+/* The dashboard's 12-column KPI grid stacks two-up on a narrow screen (the
+   cards set their spans inline, so the override has to win over them). The
+   sidebar takes 240px, so "narrow" starts well above a phone. */
+@media (max-width: 900px) {
+  .dash-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .dash-kpis > .kpi-card { grid-column: span 1 !important; }
+  .dash-kpis > .kpi-card:last-child { grid-column: 1 / -1 !important; }
+}
+@media (max-width: 420px) {
+  .dash-kpis { grid-template-columns: minmax(0, 1fr) !important; }
+}
+
+/* A tab's stacked cards. One column that may shrink below its widest table
+   (the tables scroll inside their own wrapper), so nothing pushes the page
+   wider than the screen. */
+.rb-stack { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 640px) {
+  .modal.rb-modal { padding: 16px; }
+  .rb-modal .card { padding: 12px; }
+}

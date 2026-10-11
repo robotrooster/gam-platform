@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { sendBulkNotification } from '../services/notifications'
-import { resolveLandlordTarget, landlordIdForProperty } from '../lib/landlordScope'
+import { landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 
 export const notificationsRouter = Router()
@@ -100,12 +100,20 @@ notificationsRouter.post('/bulk', requirePerm('notifications.send_bulk'), async 
     // wrong. Otherwise the account must say which, because "every tenant" at the
     // entity the session happened to sit on is the wrong set of people to
     // message, and messages cannot be unsent.
-    const landlordId = propertyId
-      ? await landlordIdForProperty(req.user!, String(propertyId), query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'announcement')
-    const result = await sendBulkNotification({
-      landlordId, propertyId: propertyId || undefined, title, body, sendEmail
-    })
+    // S654 (Nic, DIRECTIVE): no default company. A property names its company;
+    // "all properties" on an account that owns several means ALL of them —
+    // every company the account acts for — never the one it happened to found.
+    const targets = propertyId
+      ? [await landlordIdForProperty(req.user!, String(propertyId), query)]
+      : landlordScopeIds(req.user!)
+    if (!targets.length) throw new AppError(400, 'No landlord scope on this user')
+    const results = await Promise.all(targets.map(landlordId => sendBulkNotification({
+      landlordId, propertyId: propertyId || undefined, title, body, sendEmail,
+    })))
+    const result = results.reduce((acc: any, r: any) => {
+      for (const [k, v] of Object.entries(r ?? {})) acc[k] = typeof v === 'number' ? (Number(acc[k] ?? 0) + v) : (acc[k] ?? v)
+      return acc
+    }, {})
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })

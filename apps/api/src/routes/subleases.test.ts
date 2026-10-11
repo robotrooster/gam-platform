@@ -40,6 +40,7 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { todayIn } from '../lib/timezone'
 
 const {
   appendEventMock,
@@ -99,7 +100,7 @@ beforeEach(async () => {
   // S605: subleasing is SHELVED behind `subleasing_enabled` (see the migration).
   // cleanupAllSchema wipes system_features, so turn it on here — these suites
   // exercise the feature itself, which still works when enabled. The gate's own
-  // behaviour is asserted separately below.
+  // behavior is asserted separately below.
   await db.query(
     `INSERT INTO system_features (key, enabled, description)
      VALUES ('subleasing_enabled', TRUE, 'test')
@@ -401,6 +402,28 @@ describe('PATCH /subleases/:id/decision', () => {
     expect(ev.eventData.decision_note).toBe('Okay with us')
   })
 
+  // S654: approval was dated CURRENT_DATE (the database's day) while the
+  // auto-approve path on create used the property's. A park in a zone far from
+  // the server's shows the difference most of the day.
+  it("approve dates the consent on the PROPERTY's calendar", async () => {
+    const f = await seedFixture({ subleasingAllowed: 'with_consent' })
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
+    const sl = await db.query<{ id: string }>(
+      `INSERT INTO subleases (master_lease_id, sublessor_tenant_id, sublessee_tenant_id,
+                              status, start_date, end_date, sub_monthly_amount, master_share_amount)
+       VALUES ($1, $2, $3, 'pending', '2026-07-01', '2026-12-31', 1200, 1200) RETURNING id`,
+      [f.leaseId, f.sublessorTenantId, f.sublesseeTenantId],
+    )
+    const res = await request(buildApp())
+      .patch(`/api/subleases/${sl.rows[0].id}/decision`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ decision: 'approve' })
+    expect(res.status).toBe(200)
+    const row = await db.query<{ d: string }>(
+      `SELECT landlord_consent_date::text AS d FROM subleases WHERE id = $1`, [sl.rows[0].id])
+    expect(row.rows[0].d).toBe(todayIn('Pacific/Kiritimati'))
+  })
+
   it('deny flips pending → terminated, sets reason, no doc generated, emits sublease_denied event', async () => {
     const f = await seedFixture()
     const sl = await db.query<{ id: string }>(
@@ -651,11 +674,11 @@ describe('GET /subleases — list scoping', () => {
     expect(res.body.data).toEqual([])
   })
 
-  it('unknown role (bookkeeper) gets empty list', async () => {
+  it('unknown role (business staff) gets empty list', async () => {
     const f = await seedFixture()
     await seedActiveSublease(f)
     const bkToken = jwt.sign(
-      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      { userId: randomUUID(), role: 'business_staff', email: 'bs@test.dev', profileId: randomUUID(), permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     const res = await request(buildApp())
@@ -663,6 +686,17 @@ describe('GET /subleases — list scoping', () => {
       .set('Authorization', `Bearer ${bkToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toEqual([])
+  })
+
+  it('a bookkeeper is refused outright (10/11, lib/bookkeeperAccess)', async () => {
+    const bkToken = jwt.sign(
+      { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/subleases')
+      .set('Authorization', `Bearer ${bkToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

@@ -108,6 +108,84 @@ describe('GET /api/background/pool/search — proximity ordering', () => {
     expect(res.body.data[0].proximity_rank).toBe(0)
   })
 
+  it('ranks against EVERY company the account owns, not just the first', async () => {
+    // S651. The route took landlordIds[0] and passed one id. An account holding
+    // two LLCs had every applicant ranked against whichever came back first, so
+    // a renter standing next door to the second park sorted as though they were
+    // in another state — and `already_contacted` read FALSE for anyone the
+    // other company had already paid the dollar to unlock, which is a second
+    // dollar for the same person. (memory: gam-account-is-not-an-entity)
+    const c = await db.connect()
+    let userId = '', companyA = '', companyB = ''
+    try {
+      await c.query('BEGIN')
+      const l = await seedLandlord(c)
+      userId = l.userId; companyA = l.landlordId
+      // Phoenix park under the first company.
+      await seedProperty(c, { landlordId: companyA, ownerUserId: userId, managedByUserId: userId })
+      // A SECOND company under the same account, with a park in Yarnell.
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Second LLC') RETURNING id`,
+        [userId])
+      companyB = b.rows[0].id
+      await c.query(
+        `INSERT INTO properties (landlord_id, name, street1, city, state, zip,
+                                 owner_user_id, managed_by_user_id)
+         VALUES ($1, 'Yarnell Park', '2 Test St', 'Yarnell', 'AZ', '85362', $2, $2)`,
+        [companyB, userId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+
+    const nextDoorToB = await seedPoolEntry(companyA, { city: 'Yarnell', state: 'AZ', zip: '85362' })
+    const farAway     = await seedPoolEntry(companyA, { city: 'Denver',  state: 'CO', zip: '80014' })
+
+    const token = sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: companyA,
+                         landlordIds: [companyA], permissions: {} })
+    const res = await request(buildApp()).get('/api/background/pool/search')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+
+    const byId = Object.fromEntries(res.body.data.map((r: any) => [r.id, r]))
+    // Same ZIP as the SECOND company's park — tier 0, not "somewhere in AZ".
+    expect(byId[nextDoorToB].proximity_rank).toBe(0)
+    expect(byId[farAway].proximity_rank).toBe(4)
+  })
+
+  it('shows a renter as already contacted when the account\'s OTHER company paid for them', async () => {
+    const c = await db.connect()
+    let userId = '', companyA = '', companyB = ''
+    try {
+      await c.query('BEGIN')
+      const l = await seedLandlord(c)
+      userId = l.userId; companyA = l.landlordId
+      await seedProperty(c, { landlordId: companyA, ownerUserId: userId, managedByUserId: userId })
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Second LLC') RETURNING id`,
+        [userId])
+      companyB = b.rows[0].id
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+
+    const entry = await seedPoolEntry(companyA, { city: 'Phoenix', state: 'AZ', zip: '85001' })
+    // The other company already paid the $1 to unlock this person.
+    await db.query(
+      `INSERT INTO pool_match_requests (pool_entry_id, landlord_id) VALUES ($1, $2)`,
+      [entry, companyB])
+
+    // landlordIds is pinned so companyA is unambiguously FIRST in the scope.
+    // Without it the order comes from a UNION and is arbitrary — the test would
+    // pass against the old landlordIds[0] code roughly half the time, which is
+    // worse than no test at all.
+    const token = sign({ userId, role: 'landlord', email: 'dupe@t.dev', profileId: companyA,
+                         landlordIds: [companyA], permissions: {} })
+    const res = await request(buildApp()).get('/api/background/pool/search')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.find((r: any) => r.id === entry).already_contacted).toBe(true)
+  })
+
   it('landlord with no properties → all rank 4, no crash', async () => {
     const c = await db.connect()
     let landlordId = '', userId = ''

@@ -45,7 +45,7 @@ export async function processMaintenanceCreditDetectors(): Promise<DetectorResul
   let errors = 0
 
   // 1. recurring_repair_same_issue
-  const recentResolved = await query<{
+  const recentersolved = await query<{
     id: string
     unit_id: string
     landlord_id: string
@@ -60,7 +60,7 @@ export async function processMaintenanceCreditDetectors(): Promise<DetectorResul
         AND completed_at >= NOW() - INTERVAL '1 day'`,
   )
 
-  for (const cur of recentResolved) {
+  for (const cur of recentersolved) {
     try {
       const prior = await query<{ id: string }>(
         `SELECT id

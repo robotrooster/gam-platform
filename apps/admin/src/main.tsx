@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -18,25 +18,24 @@ import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useContext, useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
-  Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, DollarSign, Sun, Moon,
+  Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
-const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
 const api = axios.create({ baseURL: `${API}/api` })
 api.interceptors.request.use(c => { const t=localStorage.getItem('gam_admin_token'); if(t)c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{if(e.response?.status===401&&!e.config.url.includes('/auth/me')&&!e.config.url.includes('/auth/login')){localStorage.removeItem('gam_admin_token');window.location.href='/login'}return Promise.reject(e)})
+api.interceptors.response.use(r=>r, e=>{if(e.response?.status===401&&!String(e.config?.url||'').includes('/auth/')){localStorage.removeItem('gam_admin_token');window.location.href='/login'}return Promise.reject(e)})
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>{const t=localStorage.getItem('gam_admin_token');if(t)api.defaults.headers.common['Authorization']='Bearer '+t;return api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)}
@@ -50,7 +49,7 @@ interface AuthCtx{
   user:AuthUser|null
   token:string|null
   loading:boolean
-  login:(e:string,p:string)=>Promise<LoginResult>
+  login:(e:string,p:string,keepSignedIn:boolean)=>Promise<LoginResult>
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
   loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
   resendEmailOtp:(emailOtpSession:string)=>Promise<void>
@@ -65,12 +64,42 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('gam_admin_token'))
   const [loading, setLoading] = useState(true)
 
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
   const logout = React.useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
     setToken(null)
     setUser(null)
   }, [])
+
+  // S655: a sign-in here ends 7 days after it started, even mid-task, unless
+  // "Keep me signed in on this device" was ticked. The choice rides inside the
+  // pass, and sessionRenewalDue() says no for a fixed one — so this only ever
+  // renews a kept sign-in (the server would refuse to extend a fixed one
+  // anyway). Same renewal as the landlord portal (S654): on load and whenever
+  // the console comes back into view, once the pass is more than a day old.
+  const renewSession = React.useCallback(async () => {
+    const current = localStorage.getItem('gam_admin_token')
+    if (!sessionRenewalDue(current)) return
+    try {
+      const r = await api.post('/auth/refresh', {}, { headers: { Authorization: 'Bearer ' + current } })
+      // A sign-out (or another sign-in) while this was in flight wins.
+      if (localStorage.getItem('gam_admin_token') !== current) return
+      const tk = r.data?.data?.token
+      if (!tk) return
+      localStorage.setItem('gam_admin_token', tk)
+      api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+      setToken(tk)
+    } catch (e) { if (isAuthRejection(e)) logout() }
+  }, [logout])
 
   const refresh = React.useCallback(async () => {
     const t = localStorage.getItem('gam_admin_token')
@@ -87,18 +116,26 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
         totpEnabled: !!u.totpEnabled,
         mustEnrollTotp: !!u.mustEnrollTotp,
       })
+      // Renewed last, so a refused renewal signs out without a request still in flight.
+      await renewSession()
     } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
-  }, [logout])
+  }, [logout, renewSession])
 
   React.useEffect(() => { refresh() }, [refresh])
+  React.useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [renewSession])
 
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
-  const login = async (email: string, password: string): Promise<LoginResult> => {
-    const res = await axios.post(API + '/api/auth/login', { email, password })
+  const login = async (email: string, password: string, keepSignedIn: boolean): Promise<LoginResult> => {
+    // S655: the choice rides inside the pending pass, so the code step needs nothing new.
+    const res = await axios.post(API + '/api/auth/login', { email, password, portal: 'admin', keepSignedIn })
     const data = res.data.data
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
@@ -108,7 +145,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const { token: tk, user: u } = data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({
       id: u.id, email: u.email, role: u.role,
@@ -130,7 +167,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(API + '/api/auth/totp/verify', { totpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     // /verify doesn't currently return totpEnabled / mustEnrollTotp on
     // the user payload — fetch them from /me so the layout gate has
@@ -150,7 +187,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(API + '/api/auth/email-otp/verify', { emailOtpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({
       id: u.id, email: u.email, role: u.role,
@@ -297,7 +334,7 @@ function Layout(){
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
-          <NavLink to="/commissions" className={({isActive})=>`ni${isActive?' active':''}`}><DollarSign size={15}/> Commissions</NavLink>
+          {isSuperAdmin&&<NavLink to="/screenings" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={15}/> Screenings</NavLink>}
           {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
           {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
@@ -306,6 +343,7 @@ function Layout(){
           <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={15}/> Payments</NavLink>
           <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}><ArrowDownToLine size={15}/> Disbursements</NavLink>
           <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
+          {isSuperAdmin&&<NavLink to="/reader-orders" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Reader Orders<ReaderOrdersBadge/></NavLink>}
           {isSuperAdmin&&<NavLink to="/deposit-interest" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={15}/> Deposit Interest</NavLink>}
           <NavLink to="/outreach" className={({isActive})=>`ni${isActive?' active':''}`}><Mail size={15}/> Signup Outreach</NavLink>
           <NavLink to="/send-email" className={({isActive})=>`ni${isActive?' active':''}`}><Send size={15}/> Send Email</NavLink>
@@ -318,8 +356,11 @@ function Layout(){
           {/* S508 (#6): these sections only hold super-admin items — don't
               render the section label for regular admins (was an empty "dead"
               header). */}
-          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Tools</div>}
-          {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open(BOOKS_URL+(t?'?token='+t:''),'_blank')}}><BookOpen size={15}/> GAM Books</button>}
+          {/* S655: the "GAM Books" button that lived here is gone. It opened
+              Books with this console's pass in the web address (?token=…),
+              which left the most powerful pass on the platform in browser
+              history — and Books then refused it anyway, because admins are
+              kept out of Books on purpose (S568). A dead button that leaked. */}
 
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Sales</div>}
           {isSuperAdmin&&<NavLink to="/leads" className={({isActive})=>`ni${isActive?' active':''}`}><Target size={15}/> Leads</NavLink>}
@@ -494,7 +535,7 @@ function AdminOnboardingOverview(){
                       <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
                       <td style={{fontSize:'.72rem'}}>{t.propertyName?`${t.propertyName} · ${t.unitNumber}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
                       <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                      <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                      <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'Active':'None'}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -1001,33 +1042,300 @@ function AgentAnalytics(){
 const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600'}
 const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
 
+// ── 10/3 (Nic): the two admin money cards ──────────────────────────────────
+// Server shapes: GET /admin/platform-balance and GET /admin/processing-margin
+// (+ /payments?month=). The API camelizes, so everything here is camelCase.
+
+const money=(n:number|null|undefined)=>n==null?'—':formatCurrency(n)
+
+/** GAM's own money: what is GAM's, what sits beside it, and the check against GAM's records. */
+function GamsOwnMoneyCard({bal}:{bal:any}){
+  const[showCheck,setShowCheck]=useState(false)
+  const r=bal.reconciliation
+  const c=bal.clearing||{}
+  const gap=r?.gap
+  const ties=gap!=null&&Math.abs(gap)<0.005
+  return(
+    <div className="kpi"><div className="kl">GAM's Own Money</div>
+      <div className="kv g">{money(bal.gamsOwn)}</div>
+      <div className="ks">{bal.gamsOwn==null?'Stripe could not be read just now, so the balance cannot be split — try again in a moment':'earned, and on the Stripe balance now'}</div>
+      {(bal.checkrHeld||0)>0&&<div className="ks" style={{marginTop:4}}>Background-check money held for Checkr: <strong style={{color:'var(--t1)'}}>{money(bal.checkrHeld)}</strong></div>}
+      {(c.gamTotal||0)>0&&<div className="ks" style={{marginTop:2}}>GAM's money still clearing: <strong style={{color:'var(--t1)'}}>{money(c.gamTotal)}</strong> — counted once it clears
+        <div style={{fontSize:'.68rem',color:'var(--t3)'}}>{[
+          (c.gamOnBalance||0)>0||(c.stripeTook||0)>0?`${money(c.gamOnBalance||0)} of it on the balance now, after Stripe's ${money(c.stripeTook||0)} cut`:null,
+          (c.gamNotYetOnBalance||0)>0?`${money(c.gamNotYetOnBalance)} not on the balance yet`:null,
+        ].filter(Boolean).join(' · ')}</div>
+      </div>}
+      {r&&<div className="ks" style={{marginTop:6,color:ties?'var(--green)':'var(--amber)'}}>
+        {ties?'Matches GAM’s records to the cent'
+          :gap>0?`The balance holds ${money(gap)} more than GAM’s records say (${money(r.book)})`
+          :`The balance is ${money(-gap)} short of what GAM’s records say (${money(r.book)})`}
+      </div>}
+      <div className="ks" style={{marginTop:2}}>book: {money(bal.revenueThisMonth||0)} earned this month, {money(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${money(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div>
+      {r&&<button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>}
+      {r&&showCheck&&<div style={{marginTop:8}}>
+        <div className="dr"><span className="dk">Bank and card fees on payments that cleared</span><span className="dv mono">{money(r.collectedParts?.processingFees)}</span></div>
+        <div className="dr"><span className="dk">Register and pay-link card fees</span><span className="dv mono">{money(r.collectedParts?.registerCardFees)}</span></div>
+        <div className="dr"><span className="dk">Background checks — GAM's part</span><span className="dv mono">{money(r.collectedParts?.screeningKept)}</span></div>
+        <div className="dr"><span className="dk">GAM fees collected from landlords</span><span className="dv mono">{money(r.collectedParts?.landlordChargesCollected)}</span></div>
+        {(r.collectedParts?.flexpayKept||0)!==0&&<div className="dr"><span className="dk">FlexPay fees</span><span className="dv mono">{money(r.collectedParts?.flexpayKept)}</span></div>}
+        {(r.collectedParts?.sweptIn||0)!==0&&<div className="dr"><span className="dk">August test payments kept by GAM</span><span className="dv mono">{money(r.collectedParts?.sweptIn)}</span></div>}
+        {(r.collectedParts?.keptFeesRecovered||0)!==0&&<div className="dr"><span className="dk">Stripe's fees on refunded held payments, taken back from landlords</span><span className="dv mono">{money(r.collectedParts?.keptFeesRecovered)}</span></div>}
+        {(r.collectedParts?.stayDepositFees||0)!==0&&<div className="dr"><span className="dk">Card fees on stay deposits paid online</span><span className="dv mono">{money(r.collectedParts?.stayDepositFees)}</span></div>}
+        {(r.collectedParts?.businessPaymentFees||0)!==0&&<div className="dr"><span className="dk">GAM's cut of business invoice and register card payments</span><span className="dv mono">{money(r.collectedParts?.businessPaymentFees)}</span></div>}
+        {(r.collectedParts?.businessInvoicingFees||0)!==0&&<div className="dr"><span className="dk">Business invoicing fees collected</span><span className="dv mono">{money(r.collectedParts?.businessInvoicingFees)}</span></div>}
+        {(r.collectedParts?.tenantPaidPlatformFees||0)!==0&&<div className="dr"><span className="dk">Platform fees properties pass to tenants, paid with rent</span><span className="dv mono">{money(r.collectedParts?.tenantPaidPlatformFees)}</span></div>}
+        {(r.gamOwnedBillLinesByKind||[]).map((b:any)=>(
+          <div key={b.kind} className="dr"><span className="dk">{b.label}</span><span className="dv mono">{money(b.amount)}</span></div>
+        ))}
+        <div className="dr"><span className="dk">Collected</span><span className="dv mono">{money(r.collected)}</span></div>
+        {(r.takenBack?.feesGivenBack||0)!==0&&<div className="dr"><span className="dk">Less fees on top given back to payers in disputes</span><span className="dv mono">−{money(r.takenBack.feesGivenBack)}</span></div>}
+        {(r.takenBack?.feesChargedToLandlords||0)!==0&&<div className="dr"><span className="dk">Fees on disputed payments, charged to landlords' payouts</span><span className="dv mono">{money(r.takenBack.feesChargedToLandlords)}</span></div>}
+        {(r.takenBack?.feesOwedBackOnWins||0)!==0&&<div className="dr"><span className="dk">Less those fees owed back to landlords on disputes GAM won</span><span className="dv mono">−{money(r.takenBack.feesOwedBackOnWins)}</span></div>}
+        {(r.takenBack?.chargebackFeesFromPayees||0)!==0&&<div className="dr"><span className="dk">Dispute fees on register sales, stay deposits and business payments, charged to the landlord or business</span><span className="dv mono">{money(r.takenBack.chargebackFeesFromPayees)}</span></div>}
+        {(r.takenBack?.gamLinesTakenBack||0)!==0&&<div className="dr"><span className="dk">Less GAM's own bill lines taken back in disputes (billed to the tenant again)</span><span className="dv mono">−{money(r.takenBack.gamLinesTakenBack)}</span></div>}
+        {(r.takenBack?.rentNotRepaid||0)!==0&&<div className="dr"><span className="dk">Less rent and bills taken back in disputes that landlords have not repaid yet</span><span className="dv mono">−{money(r.takenBack.rentNotRepaid)}</span></div>}
+        <div className="dr"><span className="dk">Less what Stripe charged GAM (bank feeds and sales tax included)</span><span className="dv mono">−{money((r.stripeCosts||0)+(r.stripeCostsNotYetRecorded||0))}</span></div>
+        {(r.paidOutToGamBank||0)>0&&<div className="dr"><span className="dk">Less paid out to GAM's own bank</span><span className="dv mono">−{money(r.paidOutToGamBank)}</span></div>}
+        {(r.flexpayFronted||0)>0&&<div className="dr"><span className="dk">Less FlexPay rent covered, not yet repaid</span><span className="dv mono">−{money(r.flexpayFronted)}</span></div>}
+        <div className="dr"><span className="dk">GAM's records say</span><span className="dv mono">{money(r.book)}</span></div>
+        <div className="dr"><span className="dk">The Stripe balance says</span><span className="dv mono">{money(r.onBalance)}</span></div>
+        <div className="dr"><span className="dk">Difference</span><span className="dv mono" style={{color:ties?'var(--green)':'var(--amber)'}}>{money(gap)}</span></div>
+        <div className="ks" style={{marginTop:6}}>Not in this check: money a tenant's payment carried toward an older FlexDeposit or FlexCharge balance, and what GAM has paid Checkr. The Checkr line is every background check applicants paid that was not refunded — once GAM pays Checkr, that line reads high and GAM's own reads low by what was paid. A dispute GAM wins puts the money back on the balance: the fee on top in it is counted here (and what the landlords were charged for it is owed back to them), but GAM's records do not undo the rent part of the dispute yet, so that part reads as a difference of its amount.</div>
+        <div className="ks" style={{marginTop:4}}>Not in the earnings book one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings book only through the nightly processing true-up; businesses' invoicing fees are not in the earnings book at all yet.</div>
+      </div>}
+    </div>)
+}
+
+/** Everything on the balance that is not GAM's own (or not GAM's yet). */
+function NotGamsMoneyCard({bal}:{bal:any}){
+  const c=bal.clearing||{}
+  const total=bal.onBalance!=null&&bal.gamsOwn!=null?bal.onBalance-bal.gamsOwn
+    :(bal.owedToLandlords||0)+(bal.depositsInTrust||0)+(bal.managerPmCutsOwed||0)+(bal.paidAheadHeld||0)+(bal.checkrHeld||0)+(bal.heldPayLinkPayments||0)+(c.netOnBalance||0)
+  return(
+    <div className="kpi"><div className="kl">Not GAM's (or not GAM's yet)</div>
+      <div className="kv gold">{money(total)}</div>
+      <div className="ks">{money(bal.owedToLandlords||0)} owed to landlords</div>
+      {(bal.reconciliation?.takenBack?.chargebacksOwedBackOnWins||0)>0&&<div className="ks">{money(bal.reconciliation.takenBack.chargebacksOwedBackOnWins)} of that came back on chargebacks GAM won — the landlord or business repaid it, so it goes back on their payout</div>}
+      {(c.landlordsOnBalance||0)>0&&<div className="ks">{money(c.landlordsOnBalance)} landlords' bank payments still clearing{(c.landlordsNotYetOnBalance||0)>0?` (+${money(c.landlordsNotYetOnBalance)} more on the way, not on the balance yet)`:''}</div>}
+      {(c.businessesOnBalance||0)>0&&<div className="ks">{money(c.businessesOnBalance)} businesses' invoice bank payments still clearing</div>}
+      {(c.unrecorded?.count||0)>0&&<div className="ks" style={{color:'var(--amber)'}}>{money(c.unrecorded.netOnBalance)} in {c.unrecorded.count} bank payment{c.unrecorded.count===1?'':'s'} still clearing that GAM's records do not list — not counted as GAM's</div>}
+      {(c.gamOnBalance||0)>0.004&&<div className="ks">{money(c.gamOnBalance)} of GAM's own money still clearing (after Stripe's cut) — not counted until it clears</div>}
+      {(bal.checkrHeld||0)>0&&<div className="ks">{money(bal.checkrHeld)} background-check money held for Checkr</div>}
+      {(bal.heldPayLinkPayments||0)>0&&<div className="ks">{money(bal.heldPayLinkPayments)} pay-link payments held until the landlord decides on a refund (paid twice or at the wrong amount)</div>}
+      {(bal.depositsInTrust||0)>0&&<div className="ks">{money(bal.depositsInTrust)} tenant deposits in trust</div>}
+      {(bal.managerPmCutsOwed||0)>0&&<div className="ks">{money(bal.managerPmCutsOwed)} owed to managers and PM companies</div>}
+      {(bal.paidAheadHeld||0)>0&&<div className="ks">{money(bal.paidAheadHeld)} paid ahead by tenants, held for later bills</div>}
+      <div className="ks" style={{marginTop:4}}>Stripe: {money(bal.stripeAvailable)} available, {money(bal.stripePending)} not yet available</div>
+    </div>)
+}
+
+/** What GAM keeps on processing, month by month and payment by payment. */
+function ProcessingMarginCard({m}:{m:any}){
+  const[showList,setShowList]=useState(false)
+  const{data:detail,isLoading}=useQuery(['processing-margin-payments',m.month],
+    ()=>get<any>(`/admin/processing-margin/payments?month=${m.month}`),{enabled:showList,staleTime:60000})
+  const cl=m.clearing||{count:0}
+  const back=m.feesBack||{total:0,byKind:[]}
+  const early=m.clearingEarlier||{count:0}
+  const other=m.otherClearing||{count:0}
+  // 10/3 (review): Stripe's days as "Oct 3", listed in words.
+  const estimateDays=(m.estimateDays||[]).map((d:string)=>new Date(`${d}T12:00:00Z`).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}))
+  const estimateDaysWords=estimateDays.length<=1?(estimateDays[0]||''):`${estimateDays.slice(0,-1).join(', ')} and ${estimateDays[estimateDays.length-1]}`
+  const rows:any[]=detail?.payments||[]
+  const backItems:any[]=detail?.feesBack?.items||[]
+  const backTotal=Number(detail?.feesBack?.total)||0
+  const cleared=rows.filter(p=>!p.clearing)
+  const sum=(xs:any[],k:string)=>Math.round(xs.reduce((a,p)=>a+(Number(p[k])||0),0)*100)/100
+  return(
+    <div className="card" style={{marginBottom:12}}>
+      <div className="ct" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <span>Processing Margin · {m.month}</span>
+        <span style={{fontSize:'.7rem',color:'var(--t3)',textTransform:'none',letterSpacing:0}}>what payers paid GAM in processing fees, minus what Stripe charged GAM</span>
+      </div>
+      <div style={{display:'flex',gap:28,flexWrap:'wrap',alignItems:'flex-end',margin:'10px 0 16px'}}>
+        <div>
+          <div className="kl">Fee revenue</div>
+          <div className="kv" style={{fontSize:'1.5rem'}}>{money(m.feeRevenue)}</div>
+          <div className="ks">on payments that cleared</div>
+        </div>
+        <div>
+          <div className="kl">Stripe took</div>
+          <div className="kv r" style={{fontSize:'1.5rem'}}>−{money(m.stripeCost)}</div>
+          {(m.bankFeedCost||0)>0&&<div className="ks">includes {money(m.bankFeedCost)} for landlords' bank feeds</div>}
+          {(m.estimatedCost||0)>0&&<div className="ks" style={{color:'var(--amber)'}}>includes {money(m.estimatedCost)} estimate until Stripe posts</div>}
+        </div>
+        <div>
+          <div className="kl">We keep</div>
+          <div className="kv gold" style={{fontSize:'1.9rem'}}>{money(m.margin)}</div>
+          {m.marginPct!==null&&<div className="ks">{m.marginPct}% of fees charged</div>}
+          {back.total!==0&&<div className="ks">{back.total>0?'includes':'after'} {money(Math.abs(back.total))} {back.total>0?'back from':'lost to'} disputes and returned payments</div>}
+        </div>
+      </div>
+      {(cl.count>0||early.count>0||other.count>0)&&<div className="alert aw" style={{marginBottom:12}}>
+        {cl.count>0&&<div>Still clearing: {cl.count} bank payment{cl.count===1?'':'s'} made this month ({money(cl.amount)}), {money(cl.fees)} of fees, Stripe's cut {money(cl.stripeCost)}.</div>}
+        {early.count>0&&<div>Still clearing from earlier months: {early.count} bank payment{early.count===1?'':'s'} ({money(early.amount)}), {money(early.fees)} of fees, Stripe's cut {money(early.stripeCost)}.</div>}
+        {other.count>0&&<div>Also still clearing: {other.count} other bank payment{other.count===1?'':'s'} (a FlexPay pull, a GAM fee charged on its own, or a business invoice paid by bank), Stripe's cut {money(other.stripeCost)}.</div>}
+        <div>Not counted above until {cl.count+early.count+other.count===1?'it clears':'they clear'} — each counts in the month it clears.</div>
+      </div>}
+      {(m.estimatedCost||0)>0&&<div className="ks" style={{marginBottom:10}}>
+        Stripe posts each day's card costs the next day (its days run on UTC time). Card payments on {estimateDaysWords} are estimated at {m.estimateRateLabel||'a card cost rate'} until it does.
+      </div>}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}>
+        <div>
+          <div className="kl" style={{marginBottom:6}}>Charged to payers</div>
+          {(m.byRail||[]).map((r:any)=>(
+            <div key={r.rail} className="dr">
+              <span className="dk">{r.label} · {r.count}</span>
+              <span className="dv mono">{money(r.charged)}</span>
+            </div>
+          ))}
+        </div>
+        <div>
+          <div className="kl" style={{marginBottom:6}}>What Stripe charged us</div>
+          {(m.byCategory||[]).map((c:any)=>(
+            <div key={c.category} className="dr">
+              <span className="dk">{c.label}</span>
+              <span className="dv mono">{money(c.amount)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      {(back.byKind||[]).length>0&&<div style={{marginTop:14}}>
+        <div className="kl" style={{marginBottom:6}}>Disputes and returned payments</div>
+        {(back.byKind||[]).map((k:any)=>(
+          <div key={k.kind} className="dr">
+            <span className="dk">{k.label} · {k.count}</span>
+            <span className="dv mono">{k.amount<0?'−':'+'}{money(Math.abs(k.amount))}</span>
+          </div>
+        ))}
+        <div className="ks" style={{marginTop:4}}>Stripe's own fee for a dispute or a returned payment is in what Stripe charged us. What came back for it — off a payout, or the fee billed to the tenant once paid — counts here, in the month it came back.</div>
+      </div>}
+      <button className="btn btn-primary btn-sm" style={{marginTop:12}} onClick={()=>setShowList(v=>!v)}>
+        {showList?'Hide each payment':'Show each payment'}
+      </button>
+      {showList&&(isLoading&&!detail?<div className="ks" style={{marginTop:10}}>Loading the month's payments…</div>:
+        <div style={{overflowX:'auto',marginTop:10}}>
+          <table className="tbl" style={{minWidth:760}}>
+            <thead><tr>
+              <th>Date</th><th>Who</th><th>Card or bank</th>
+              <th style={{textAlign:'right'}}>Paid</th><th style={{textAlign:'right'}}>Fee charged</th>
+              <th style={{textAlign:'right'}}>Stripe took</th><th style={{textAlign:'right'}}>GAM kept</th>
+            </tr></thead>
+            <tbody>
+              {rows.length===0&&backItems.length===0&&<tr><td colSpan={7} style={{color:'var(--t3)'}}>No payments this month.</td></tr>}
+              {rows.map((p:any)=>(
+                <tr key={`${p.kind}:${p.id}`} style={p.clearing?{opacity:.75}:undefined}>
+                  <td className="mono">{new Date(p.at).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/Phoenix'})}</td>
+                  <td>{p.who}{p.clearing&&<span className="badge ba" style={{marginLeft:6}}>Clearing</span>}{p.disputed&&<span className="badge ba" style={{marginLeft:6}}>{p.disputeWon?'Dispute won':'Disputed'}</span>}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{p.kindLabel}</div></td>
+                  <td>{p.methodLabel}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(p.amount)}</td>
+                  <td className="mono" style={{textAlign:'right'}}>
+                    {money(p.feeCharged)}
+                    {(p.feeGivenBack||0)>0&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>fee given back: {money(p.feeGivenBack)} (see Disputes)</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}} title={p.costBasisLabel}>
+                    {money(p.stripeCost)}{p.costBasis==='estimate_unposted'&&<span className="badge ba" style={{marginLeft:6}}>Estimate</span>}
+                    {p.costBasis==='estimate_unposted'&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>until Stripe posts</div>}
+                    {p.costBasis==='day_share'&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>estimate · share of the day</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(p.gamKeeps)}</td>
+                </tr>
+              ))}
+              {(detail?.notTiedToAPayment||[]).map((c:any)=>(
+                <tr key={`not-tied:${c.category}`}>
+                  <td/><td colSpan={4} style={{color:'var(--t3)'}}>{c.label} — a Stripe charge not tied to one payment</td>
+                  <td className="mono" style={{textAlign:'right'}}>{money(c.amount)}</td>
+                  <td className="mono" style={{textAlign:'right'}}>−{money(c.amount)}</td>
+                </tr>
+              ))}
+              {backItems.map((f:any)=>(
+                <tr key={`back:${f.id}`}>
+                  <td className="mono">{new Date(f.at).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/Phoenix'})}</td>
+                  <td colSpan={4}>{f.who}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{f.label}</div></td>
+                  <td/>
+                  <td className="mono" style={{textAlign:'right'}}>{f.amount<0?'−':'+'}{money(Math.abs(f.amount))}</td>
+                </tr>
+              ))}
+              {(rows.length>0||backItems.length>0)&&<tr>
+                <td/><td colSpan={3} style={{fontWeight:700,color:'var(--t0)'}}>Cleared this month — same as the card above</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(sum(cleared,'feeCharged'))}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(Math.round((sum(cleared,'stripeCost')+(detail?.notTiedTotal||0))*100)/100)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{money(Math.round((sum(cleared,'feeCharged')-sum(cleared,'stripeCost')-(detail?.notTiedTotal||0)+backTotal)*100)/100)}</td>
+              </tr>}
+            </tbody>
+          </table>
+          <div className="ks" style={{marginTop:6}}>A bank payment shows Stripe's own fee on it. Stripe bills card costs only as each day's total, so a card payment's cost is an estimate: its share of that day's card costs, by size.</div>
+        </div>)}
+    </div>)
+}
+
 function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
   const isSuperAdmin=user?.role==='super_admin'
-  const{data:income}=useQuery('income-projection',()=>get<any>('/admin/income/projection'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  // S652: the income PROJECTION is no longer fetched here. It is a forecast —
+  // occupancy-derived run-rates and counts times constants — and having it on
+  // the same screen as the ledger is what let this page disagree with itself:
+  // "$172.72 versus the KPI card up near the top... $218.87 all time." Every
+  // number on this page now comes from platform_revenue_ledger. The endpoint
+  // still exists for forecasting work; it just does not feed a card that reads
+  // as fact.
   const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
   const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
   const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // S650 (Nic): whose money is actually on the Stripe balance, and what part of it is GAM's.
+  const{data:bal}=useQuery('platform-balance',()=>get<any>('/admin/platform-balance'),{enabled:!!user&&isSuperAdmin,staleTime:60000})
   const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
   const{data:openDisputes=[]}=useQuery<any[]>('overview-open-disputes',()=>get<any[]>('/credit/disputes?status=open'),{enabled:!!user,staleTime:60000,refetchInterval:60000})
   // FlexPay float bankroll = rent of INCOME-VERIFIED FlexPay tenants (approved
   // inquiries) — the money GAM would actually front. No phases; scales with
   // enrollment.
   const floatBankroll=stats?.flexpayBankroll||0
-  // Default reserve target = flat 3% default rate applied to the FlexPay FLOAT
-  // (the money at risk), NOT total platform rent. Covers FlexPay defaults.
-  const DEFAULT_RESERVE_RATE=0.03
-  const reserveTarget=floatBankroll*DEFAULT_RESERVE_RATE
-  const reservePct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(reserveTarget,1))*100,100):0
+  // ── S642 (Nic): TWO DIFFERENT RISKS, TWO DIFFERENT TARGETS ──────────────
+  //
+  // The FLOAT is working capital GAM advances and gets back — Nic's formula:
+  // "30% of all base lease totals plus 20% on utilities", from live leases.
+  // ONE month's worth, because the float revolves: advanced on the 1st,
+  // recovered through the month, advanced again from what came back.
+  //
+  // The DEFAULT RESERVE is money GAM does NOT get back — tenants who never
+  // repay. Conflating the two would size a default reserve as if every advance
+  // defaulted.
+  //
+  // 10% of enrolled dollars (Nic: "5%, 10% of enrolled dollars for an extra
+  // reserve buffer"). The number is NOT an expected-loss estimate — nobody has
+  // FlexPay history yet. It buys DECISION TIME, which is what Nic actually
+  // described wanting: "we should know about the last week of the month how
+  // many more people we can approve for the next month." At 3% a single bad
+  // month empties it and enrollment stops that day; at 10%, against a ~3% real
+  // loss rate, there is roughly a quarter's cushion — enough to see a trend,
+  // tighten underwriting and taper deliberately rather than telling people who
+  // were just approved no. Revisit once real loss data exists.
+  //
+  // Both previously keyed off `flexpayBankroll`, which is $0 and always has
+  // been: there has never been a single flexpay_inquiry. So the card divided a
+  // seeded $4,200 balance by nothing and reported full coverage of a target
+  // that did not exist.
+  const DEFAULT_RESERVE_RATE=0.10
+  const floatTarget=stats?.flexpayFloatTarget||0
+  const reserveTarget=floatTarget*DEFAULT_RESERVE_RATE
+  const reservePct=reserveTarget>0?Math.min(((stats?.reserveBalance||0)/reserveTarget)*100,100):0
 
   // S609: this WAS a hardcoded array — five invented months plus one real value
-  // labelled with a month it wasn't, drawing a tidy rising line whatever the
+  // labeled with a month it wasn't, drawing a tidy rising line whatever the
   // platform actually did. Now the real thing, from the settled ledger.
   const [trendMonths, setTrendMonths] = useState(6)
   const { data: trendData = [] } = useQuery<any[]>(
     ['rent-volume-trend', trendMonths],
     () => get(`/admin/rent-volume-trend?months=${trendMonths}`),
+    { enabled: isSuperAdmin },
+  )
+  // S642 (Nic): "Instead of showing $199 fees from Stripe I want to see our
+  // margin on that too."
+  const { data: marginData = [] } = useQuery<any[]>(
+    ['processing-margin', trendMonths],
+    () => get(`/admin/processing-margin?months=${trendMonths}`),
     { enabled: isSuperAdmin },
   )
 
@@ -1059,7 +1367,7 @@ function Overview(){
 
       {/* ── Row 1: Landlords + Tenants ── */}
       <div className="grid2" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Landlords</div><div className="kv gold">{(stats?.totalLandlords||0).toLocaleString()}</div><div className="ks">on platform</div></div>
+        <div className="kpi"><div className="kl">Landlords</div><div className="kv gold">{(stats?.totalLandlords||0).toLocaleString()}</div><div className="ks">brought a property{(stats?.landlordsWithoutProperty||0)>0?` · ${stats.landlordsWithoutProperty} more signed up, no property yet`:''}</div></div>
         <div className="kpi"><div className="kl">Total Tenants</div><div className="kv b">{(stats?.totalTenants||0).toLocaleString()}</div><div className="ks">across all properties</div></div>
       </div>
 
@@ -1075,20 +1383,44 @@ function Overview(){
             <span>💸 Pay: <strong style={{color:'var(--t0)'}}>{stats?.flexPay||0}</strong></span>
           </div>
         </div>
-        {isSuperAdmin&&<div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">across {stats?.activeUnits||0} units</div></div>}
+        {/* S639 (Nic): "monthly rent volume should only be money that actually
+            moved... delinquent people are only important to the landlord."
+            The landlord's card asks what they are OWED; this one asks what came
+            across the rails. Different lenses, so they stop sharing a name. */}
+        {isSuperAdmin&&<div className="kpi"><div className="kl">Rent Volume · This Month</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">rent that moved, from {stats?.payingLeases||0} lease{(stats?.payingLeases||0)===1?'':'s'}{(stats?.paymentsInFlight||0)>0?' · incl. ACH clearing':''}</div></div>}
         {!isSuperAdmin&&<div className="kpi"><div className="kl">Vacant Units</div><div className="kv b">{stats?.vacantUnits||0}</div><div className="ks">available to fill</div></div>}
       </div>
 
       {/* ── Row 3: Super admin financial ── */}
       {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target (3% of FlexPay float)</div></div>
-        <div className="kpi"><div className="kl">FlexPay Float Bankroll</div><div className="kv b">{formatCurrency(floatBankroll)}</div><div className="ks">rent of income-verified tenants who requested FlexPay</div></div>
-        <div className="kpi"><div className="kl">Pending Payments</div><div className={`kv ${(stats?.pendingPayments||0)>20?'r':'a'}`}>{stats?.pendingPayments||0}</div><div className="ks">awaiting ACH settlement</div></div>
+        <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target · 10% buffer on enrolled dollars</div></div>
+        <div className="kpi"><div className="kl">FlexPay Float Target</div><div className="kv b">{formatCurrency(floatTarget)}</div><div className="ks">30% adoption + 20% utilities, from live leases</div></div>
+        {/* S642 (Nic): "We have a KPI card on the admin portal for unpaid
+            invoices. That seems like a landlord specific thing. We should
+            replace that with a KPI card for something beneficial to this view."
+            Right — who owes their landlord rent is the landlord's problem. What
+            belongs here is GAM's own position: money COLLECTED and allocated to
+            landlords that has not left the platform balance yet. It also gives
+            the Pending Disbursements count beside it an amount, which it never
+            had. */}
+        <div className="kpi"><div className="kl">Held for Landlords</div><div className="kv gold">{formatCurrency(stats?.heldForLandlords||0)}</div><div className="ks">collected, not yet paid out{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} more in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
+        {/* S650 (Nic): "I want to see somewhere where our subscription to the
+            platform fee and our card markups — where that money is pooling."
+            10/3 (Nic): the balance holds landlords' rent (some of it still
+            clearing), Checkr's background-check money, and GAM's own; each is
+            named, and GAM's own is checked against GAM's records to the cent. */}
+        {isSuperAdmin&&bal&&<GamsOwnMoneyCard bal={bal}/>}
+        {isSuperAdmin&&bal&&<NotGamsMoneyCard bal={bal}/>}
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 
 
 
+      {/* ── S642: WHAT WE KEEP ON PROCESSING ────────────────────────────────
+          Nic: "I want to see our margin on that too… if they got charged a $26
+          fee, how much of that comes to us." 10/3 ("Is that actually
+          accurate?"): every payment on GAM's balance, payment by payment. */}
+      {isSuperAdmin&&marginData.length>0&&<ProcessingMarginCard m={marginData[0]}/>}
       {isSuperAdmin&&<div className="grid2">
         <RentVolumeMonitor months={trendData} windowMonths={trendMonths} onWindowChange={setTrendMonths} />
         <div className="card">
@@ -1104,18 +1436,25 @@ function Overview(){
       {/* ── Platform Revenue: recurring ARR + full income composition ── */}
       {(()=>{
         const colorOf=incomeColorOf
-        const SRC=[
-          {key:'platform_unit',label:'Platform Fees',recurring:true},
-          {key:'processing',label:'Processing / ACH',recurring:true},
-          {key:'flexpay',label:'FlexPay',recurring:true},
-          {key:'flex_deposit',label:'FlexDeposit Custody',recurring:true},
-          {key:'flex_credit',label:'FlexCredit',recurring:true},
-          {key:'business_pos',label:'Business Fees',recurring:true},
-          {key:'placement',label:'Placement Fees',recurring:false},
-          {key:'instant_withdrawal',label:'Instant Withdrawals',recurring:false},
-          {key:'background_checks',label:'Background Checks',recurring:false},
-        ]
-        const recurringMonthly=income?.monthly?.total||0
+        // S652: the legend is built from what the SERVER actually returned, not
+        // from a list kept in parallel here. A hand-maintained copy is how a
+        // slice ends up on the chart with no name beside it, or a name with no
+        // slice — and the whole point of this pass is that the page agrees with
+        // itself.
+        const SRC=Array.from(new Map(
+          ((compositionAll?.periods||[]) as any[])
+            .flatMap((p:any)=>p.sources||[])
+            .filter((s:any)=>s.amount!==0)
+            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
+        ).values())
+        // S652 (Nic): "just reconcile all the different KPI cards where they're
+        // getting their numbers from the same source. That way, everything
+        // balances out." This used to read a re-derived run-rate ($120) while
+        // the bill that actually went out was $130. It now comes from the same
+        // ledger the pies below are drawn from.
+        const recurringMonthly=compositionAll?.recurringMonthly??0
+        const recurringMonth=compositionAll?.recurringMonth as string|undefined
+        const recurringAnnual=compositionAll?.recurringAnnual??0
         const periods:any[]=compositionAll?.periods||[]
         // Small-donut geometry (stroke-dasharray technique).
         const R=40,SW=12,C=2*Math.PI*R
@@ -1126,12 +1465,14 @@ function Overview(){
               <div>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
-                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>per month · recurring only</div>
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>
+                  {recurringMonth?`platform fees billed ${recurringMonth} · $2 per occupied space`:'platform fees per month · $2 per occupied space'}
+                </div>
               </div>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(income?.annual||0)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · recurring × 12</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(recurringAnnual)}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
               </div>
             </div>
             {/* Income composition — a wall of pies, one per time window */}
@@ -1236,6 +1577,42 @@ function DepositTrust(){
           <div style={{fontFamily:'var(--font-d)',fontSize:'2.4rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(d.totalPrincipal)}</div>
           <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>{d.heldCount} deposit{d.heldCount===1?'':'s'} · should be in the trust account now</div>
           {d.totalInterestAccrued>0&&<div style={{fontSize:'.74rem',color:'var(--t2)',marginTop:8}}>+ {formatCurrency(d.totalInterestAccrued)} interest owed → {formatCurrency(d.totalLiability)} total liability</div>}
+          {/* ── S642: IS THE MONEY ACTUALLY THERE? ──────────────────────────
+              The figure above is what the LEDGER says GAM owes tenants. Until
+              now nothing compared it to a real bank balance, because no bank
+              was connected. A SHORTFALL is the failure the segregated-trust
+              model exists to prevent, so it is stated in words and in red
+              rather than left as a negative number somebody has to notice.
+              Dormant until COLUMN_API_KEY is set. */}
+          {(()=>{
+            const rec=d.reconciliation
+            if(!rec)return null
+            if(rec.status==='not_configured')return(
+              <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:10}}>
+                Bank not connected — nothing is checking this figure against a real balance yet.
+              </div>)
+            if(rec.status==='unreachable')return(
+              <div style={{fontSize:'.72rem',color:'var(--a)',marginTop:10}}>
+                ⚠ Could not reach Column — {rec.error}
+              </div>)
+            const short=rec.status==='SHORT'
+            return(
+              <div style={{marginTop:10,padding:'10px 14px',borderRadius:8,
+                background:short?'rgba(239,68,68,.10)':'rgba(34,197,94,.08)',
+                border:`1px solid ${short?'rgba(239,68,68,.35)':'rgba(34,197,94,.25)'}`}}>
+                <div style={{fontSize:'.78rem',fontWeight:800,color:short?'var(--r)':'var(--g)'}}>
+                  {short?'SHORTFALL':rec.status==='surplus'?'Surplus in trust':'Trust balanced'}
+                  {rec.environment==='sandbox'&&<span style={{color:'var(--t3)',fontWeight:600}}> · sandbox</span>}
+                </div>
+                <div style={{fontSize:'.74rem',color:'var(--t2)',marginTop:4}}>
+                  Bank holds {formatCurrency(rec.bankBalance)} against {formatCurrency(rec.onBookLiability)} owed
+                  {Math.abs(rec.difference)>=0.01&&<> · {short?'short by':'over by'} {formatCurrency(Math.abs(rec.difference))}</>}
+                </div>
+                {short&&<div style={{fontSize:'.72rem',color:'var(--r)',marginTop:4}}>
+                  GAM owes tenants more than it is holding. This is the condition the trust exists to make impossible.
+                </div>}
+              </div>)
+          })()}
         </div>
         {g>0&&(
           <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
@@ -1423,6 +1800,110 @@ function Landlords(){
 }
 
 // ── UNITS ─────────────────────────────────────────────────────
+// ── S653 (Nic): THE PLATFORM'S SCREENING DATABASE ────────────────────────────
+// "I want a full database of everybody that the platform ever does background
+// checks on system-wide for the admin portal." Every check under every
+// landlord, read-only. The decision is the landlord's and is made on their page.
+const SCREEN_STATUS_CLASS: Record<string,string> = {
+  approved:'bg2', denied:'br', pending:'ba', awaiting_applicant:'ba', submitted:'bb',
+  processing:'bb', complete:'bg2', failed:'br', cancelled:'bmu', expired:'bmu',
+}
+const SCREEN_STATUS_LABEL: Record<string,string> = {
+  approved:'Approved', denied:'Denied', pending:'Pending', awaiting_applicant:'Awaiting applicant', submitted:'Submitted',
+  processing:'Processing', complete:'Report in', failed:'Failed', cancelled:'Cancelled', expired:'Expired',
+}
+function Screenings(){
+  const{user}=useAuth()
+  const[q,setQ]=React.useState('')
+  const[status,setStatus]=React.useState('')
+  const[landlordId,setLandlordId]=React.useState('')
+  const[offset,setOffset]=React.useState(0)
+  const limit=200
+  const params=new URLSearchParams({limit:String(limit),offset:String(offset)})
+  if(q.trim())params.set('q',q.trim()); if(status)params.set('status',status); if(landlordId)params.set('landlordId',landlordId)
+  const{data,isLoading}=useQuery<any>(['admin-screenings',q,status,landlordId,offset],()=>get('/admin/screenings?'+params.toString()),{enabled:!!user,keepPreviousData:true,refetchOnWindowFocus:false})
+  const rows:any[]=data?.rows||[]; const total:number=data?.total||0
+  const byStatus:Record<string,number>=Object.fromEntries((data?.byStatus||[]).map((r:any)=>[r.status,r.c]))
+  const[sel,setSel]=React.useState<any>(null)
+  const money=(n:any)=>n==null?'—':'$'+Number(n).toFixed(2)
+  const day=(d:any)=>d?new Date(d).toLocaleDateString():'—'
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">Screenings</h1><p className="ps">{total.toLocaleString()} background check{total===1?'':'s'} across every landlord</p></div></div>
+      <div className="card" style={{padding:'10px 12px',marginBottom:12,display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <input type="text" placeholder="Applicant, email, property, landlord…" value={q} onChange={e=>{setQ(e.target.value);setOffset(0)}} style={{flex:1,minWidth:220}}/>
+        <select value={status} onChange={e=>{setStatus(e.target.value);setOffset(0)}}>
+          <option value="">Every status</option>
+          {Object.keys(SCREEN_STATUS_LABEL).map(k=><option key={k} value={k}>{SCREEN_STATUS_LABEL[k]}{byStatus[k]?` (${byStatus[k]})`:''}</option>)}
+        </select>
+        <select value={landlordId} onChange={e=>{setLandlordId(e.target.value);setOffset(0)}}>
+          <option value="">Every landlord</option>
+          {(data?.landlords||[]).map((l:any)=><option key={l.id} value={l.id}>{l.name} ({l.checks})</option>)}
+        </select>
+      </div>
+      <div className="grid2" style={{gap:16,alignItems:'start'}}>
+        <div className="card" style={{padding:0}}>
+          {isLoading&&!data?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+            <table className="tbl">
+              <thead><tr><th>Applicant</th><th>Landlord · Property</th><th>Started</th><th>Verdict</th><th>Status</th><th>Fee</th></tr></thead>
+              <tbody>
+                {rows.length?rows.map((r:any)=>(
+                  <tr key={r.id} style={{cursor:'pointer',background:sel?.id===r.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSel(r)}>
+                    <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.firstName} {r.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.email}</div></td>
+                    <td style={{fontSize:'.72rem'}}><div>{r.landlordName||'—'}</div><div style={{color:'var(--t3)'}}>{r.propertyName||'—'}{r.unitNumber?` · ${r.unitNumber}`:''}</div></td>
+                    <td className="mono" style={{fontSize:'.72rem'}}>{day(r.createdAt)}</td>
+                    <td><span className={`badge ${r.providerResult==='clear'?'bg2':r.providerResult==='consider'?'ba':'bmu'}`}>{r.providerResult==='clear'?'Clear':r.providerResult==='consider'?'Consider':'Not back'}</span></td>
+                    <td><span className={`badge ${SCREEN_STATUS_CLASS[r.status]||'bmu'}`}>{SCREEN_STATUS_LABEL[r.status]||r.status}</span>{r.status==='approved'&&r.housed&&<span className="badge bmu" style={{marginLeft:4}}>Housed</span>}</td>
+                    <td className="mono" style={{fontSize:'.72rem'}}>{money(r.amountCharged)}{r.refundedAt?<span style={{color:'var(--amber)'}}> refunded</span>:''}</td>
+                  </tr>
+                )):<tr><td colSpan={6} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No screenings match.</td></tr>}
+              </tbody>
+            </table>
+          )}
+          {total>limit&&(
+            <div style={{display:'flex',gap:8,alignItems:'center',padding:'10px 12px',borderTop:'1px solid var(--b0)',fontSize:'.72rem',color:'var(--t3)'}}>
+              <span>{offset+1}–{Math.min(offset+limit,total)} of {total}</span>
+              <button className="btn bsm" disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-limit))}>← Newer</button>
+              <button className="btn bsm" disabled={offset+limit>=total} onClick={()=>setOffset(offset+limit)}>Older →</button>
+            </div>
+          )}
+        </div>
+        <div>
+          {!sel&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a screening to see its record</div>}
+          {sel&&(
+            <div className="card">
+              <div style={{marginBottom:14,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{sel.firstName} {sel.lastName}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{sel.email}{sel.phone?` · ${sel.phone}`:''}</div>
+                <div style={{marginTop:8,display:'flex',gap:6,flexWrap:'wrap'}}>
+                  <span className={`badge ${SCREEN_STATUS_CLASS[sel.status]||'bmu'}`}>{SCREEN_STATUS_LABEL[sel.status]||sel.status}</span>
+                  <span className={`badge ${sel.providerResult==='clear'?'bg2':sel.providerResult==='consider'?'ba':'bmu'}`}>{sel.providerName||'provider'}: {sel.providerResult||'not back'}</span>
+                  {sel.housed&&<span className="badge bmu">Housed</span>}
+                </div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'6px 14px',fontSize:'.78rem'}}>
+                <div style={{color:'var(--t3)'}}>Landlord</div><div>{sel.landlordName||'—'}<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{sel.landlordEmail}</div></div>
+                <div style={{color:'var(--t3)'}}>Property</div><div>{sel.propertyName||'—'}{sel.unitNumber?` · ${sel.unitNumber}`:''}</div>
+                <div style={{color:'var(--t3)'}}>Started</div><div>{day(sel.createdAt)}</div>
+                <div style={{color:'var(--t3)'}}>Report in</div><div>{day(sel.webhookReceivedAt)}</div>
+                <div style={{color:'var(--t3)'}}>Decided</div><div>{day(sel.decidedAt)}{sel.decidedByName?.trim()?` by ${sel.decidedByName}`:''}</div>
+                {sel.decisionNotes&&<><div style={{color:'var(--t3)'}}>Notes</div><div>{sel.decisionNotes}</div></>}
+                <div style={{color:'var(--t3)'}}>Expires</div><div>{day(sel.expiresAt)}</div>
+                <div style={{color:'var(--t3)'}}>Wanted</div><div>{sel.desiredMoveIn?`move in ${day(sel.desiredMoveIn)}`:'—'}{sel.desiredMonthToMonth?' · month to month':sel.desiredTermMonths?` · ${sel.desiredTermMonths} months`:''}</div>
+                <div style={{color:'var(--t3)'}}>Intake score</div><div>{sel.riskLevel?`${sel.riskLevel}${sel.riskScore!=null?` · ${sel.riskScore}`:''}`:'—'}</div>
+                <div style={{color:'var(--t3)'}}>Applicant paid</div><div className="mono">{money(sel.amountCharged)}{sel.refundedAt?` · refunded ${day(sel.refundedAt)}`:''}</div>
+                <div style={{color:'var(--t3)'}}>GAM net</div><div className="mono">{money(sel.platformNet)}</div>
+                <div style={{color:'var(--t3)'}}>Provider ref</div><div className="mono" style={{fontSize:'.68rem'}}>{sel.providerRef||'—'}</div>
+              </div>
+              <div style={{marginTop:14,fontSize:'.68rem',color:'var(--t3)'}}>The report itself stays with the landlord who ordered it; this is the platform's record of the screening and its decision.</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Units(){
   const{user}=useAuth()
   const{data:units=[],isLoading}=useQuery<any[]>('units',()=>get('/units'),{enabled:!!user,refetchOnWindowFocus:false})
@@ -1680,8 +2161,28 @@ function Payments(){
   const{data:payments=[],isLoading}=useQuery<any[]>('payments',()=>get('/payments'),{enabled:!!user})
   const[selected,setSelected]=React.useState<any>(null)
   const[pSearch,setPSearch]=React.useState('')
+  const[showWorkTrade,setShowWorkTrade]=React.useState(false)
   const filteredPayments=React.useMemo(()=>pSearch?((payments as any[]).filter((p:any)=>`${p.propertyName||''} ${p.unitNumber||''} ${p.tenantFirst||''} ${p.tenantLast||''} ${p.type} ${p.status}`.toLowerCase().includes(pSearch.toLowerCase()))):(payments as any[]),[payments,pSearch])
   const ST:Record<string,string>={settled:'bg2',pending:'ba',failed:'br',returned:'br',processing:'bb'}
+  // ── S642 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT PENDING ─────────────
+  //
+  // "I don't want a landlord to think it's outstanding… it shouldn't show
+  // pending anywhere. It comes into existence after the hours shortfall, if one
+  // exists."
+  //
+  // The row IS still `pending` in the database, and correctly so: if the tenant
+  // falls short on hours they get billed the difference at month close, so the
+  // charge has to survive until reconciliation decides. What is wrong is
+  // showing that intermediate state to a human as an unpaid bill — it is labor
+  // already being done, not money owed.
+  //
+  // workTradeSettlement (1st of the month, 02:15) zeroes what the hours covered
+  // and raises a fresh charge for any shortfall. Until it runs, these are
+  // shown as what they are and kept out of the outstanding count.
+  const isWorkTrade=(p:any)=>!!p.workTradeSuspendedAt
+  const workTradeRows=filteredPayments.filter(isWorkTrade)
+  const moneyRows=filteredPayments.filter((p:any)=>!isWorkTrade(p))
+  const workTradeTotal=workTradeRows.reduce((s:number,p:any)=>s+Number(p.amount||0),0)
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Payments</h1><p className="ps">All ACH collections platform-wide</p></div></div>
@@ -1691,7 +2192,7 @@ function Payments(){
           <table className="tbl">
             <thead><tr><th>Due</th><th>Property · Unit</th><th>Tenant</th><th>Type</th><th>Amount</th><th>Status</th><th>Return</th></tr></thead>
             <tbody>
-              {filteredPayments.length?filteredPayments.map((p:any)=>(
+              {moneyRows.length?moneyRows.map((p:any)=>(
                 <tr key={p.id} style={{cursor:'pointer',background:p.zeroToleranceFlag?'rgba(239,68,68,.03)':selected?.id===p.id?'rgba(201,162,39,.04)':''}} onClick={()=>setSelected(p)}>
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
                   <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
@@ -1704,6 +2205,40 @@ function Payments(){
               )):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--t3)',padding:32}}>{pSearch?'No payments match your search.':'No payments yet.'}</td></tr>}
             </tbody>
           </table>
+        )}
+        {/* S642: work trade in its own band, below the money. Said out loud
+            rather than filed under a heading that misdescribes it — the same
+            treatment the landlord payments page has had since S637. Collapsed
+            by default because these rows grow every month and none of them is
+            a bill; one click opens them, so nothing is hidden from an admin. */}
+        {workTradeRows.length>0&&(
+          <div style={{borderTop:'1px solid var(--b0)',padding:'12px 14px'}}>
+            <button onClick={()=>setShowWorkTrade(v=>!v)}
+              style={{background:'none',border:'none',padding:0,cursor:'pointer',color:'var(--t2)',fontSize:'.78rem',textAlign:'left'}}>
+              <strong style={{color:'var(--t0)'}}>{workTradeRows.length} work-trade charge{workTradeRows.length===1?'':'s'}</strong>
+              {' · '}{formatCurrency(workTradeTotal)} covered by hours, not owed
+              <span style={{color:'var(--gold)'}}> · {showWorkTrade?'hide':'show'}</span>
+            </button>
+            <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:4}}>
+              Settles on the 1st — hours worked zero these out, and any shortfall becomes a real charge then.
+            </div>
+            {showWorkTrade&&(
+              <table className="tbl" style={{marginTop:10}}>
+                <thead><tr><th>Due</th><th>Property · Unit</th><th>Tenant</th><th>Type</th><th>Amount</th></tr></thead>
+                <tbody>
+                  {workTradeRows.map((p:any)=>(
+                    <tr key={p.id}>
+                      <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
+                      <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
+                      <td style={{fontSize:'.75rem'}}>{p.tenantFirst?`${p.tenantFirst} ${p.tenantLast}`:'—'}</td>
+                      <td><span className="badge bmu">{humanize(p.type)}</span></td>
+                      <td className="mono" style={{color:'var(--t2)'}}>{formatCurrency(p.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         )}
       </div>
       {selected&&(
@@ -1769,6 +2304,83 @@ function Disbursements(){
 // bearing user / pm_company with cached readiness flags. Admin uses this
 // for support — when a landlord calls saying "tenants can't pay," admin
 // can verify if it's a Connect issue at a glance.
+// S652 (Nic): GAM's reader desk. A landlord asks for a card reader from the
+// register; here it gets ordered in Stripe's shop — pre-registered to the
+// property's Terminal location on the row — and the Stripe order, serial and
+// tracking are written down. Payments start the 1st of the month after it
+// ships (10/5). The reader closes its own row: it turns up at the location
+// (shipped) and Stripe sees it switched on (registered) — no typed serial.
+// S652 (Nic): "I don't want to… say, oh, I missed this." The count of requests
+// nobody has ordered yet sits on the sidebar, on every admin page.
+function ReaderOrdersBadge() {
+  const { data: orders = [] } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'), { refetchInterval: 5 * 60 * 1000 })
+  const n = (orders as any[]).filter(o => o.status === 'requested').length
+  if (!n) return null
+  return <span style={{ marginLeft: 'auto', background: '#c9a227', color: '#060809', borderRadius: 10, padding: '0 7px', fontSize: '.68rem', fontWeight: 800 }}>{n}</span>
+}
+
+function ReaderOrders() {
+  const qc = useQueryClient()
+  const { data: orders = [], isLoading } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'))
+  const [draft, setDraft] = React.useState<Record<string, any>>({})
+  const [busy, setBusy] = React.useState<string | null>(null)
+  const [msg, setMsg] = React.useState<string | null>(null)
+  const STATUSES = ['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']
+  const LABEL: Record<string, string> = { requested: 'Requested', ordered: 'Ordered from Stripe', shipped: 'Shipped', delivered: 'Delivered', registered: 'Registered — ready', cancelled: 'Cancelled' }
+  const save = async (o: any) => {
+    const d = draft[o.id] || {}
+    setBusy(o.id); setMsg(null)
+    try {
+      await api.patch(`/admin/reader-orders/${o.id}`, {
+        status: d.status ?? o.status, stripeHardwareOrderId: d.stripeHardwareOrderId ?? o.stripeHardwareOrderId ?? null,
+        serial: d.serial ?? o.serial ?? null, trackingUrl: d.trackingUrl ?? o.trackingUrl ?? null,
+      })
+      setDraft(prev => { const n = { ...prev }; delete n[o.id]; return n })
+      qc.invalidateQueries('admin-reader-orders'); setMsg('Saved')
+    } catch (e: any) { setMsg(e?.response?.data?.error || 'Could not save') } finally { setBusy(null) }
+  }
+  const field = (o: any, k: string, placeholder: string) => (
+    <input className="inp" style={{ width: '100%', fontSize: '.78rem' }} placeholder={placeholder}
+      value={draft[o.id]?.[k] ?? o[k] ?? ''} onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), [k]: e.target.value } }))} />
+  )
+  return (
+    <div>
+      <div className="ph"><div><h1 className="pt">Reader Orders</h1><p className="ps">Card readers landlords asked for — order in Stripe's shop, pre-registered to the location shown, shipped to the address shown</p></div></div>
+      {msg && <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 8 }}>{msg}</div>}
+      {isLoading ? <div style={{ color: 'var(--t3)' }}>Loading…</div> : (orders as any[]).length === 0 ? (
+        <div className="card" style={{ padding: 24, color: 'var(--t3)' }}>No reader requests yet.</div>
+      ) : (
+        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <table className="tbl" style={{ minWidth: 1100 }}>
+            <thead><tr><th>Requested</th><th>Landlord · property</th><th>Ship to</th><th>Stripe location</th><th>Plan</th><th>Status</th><th>Stripe order</th><th>Serial</th><th>Tracking</th><th></th></tr></thead>
+            <tbody>
+              {(orders as any[]).map(o => (
+                <tr key={o.id}>
+                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>{new Date(o.createdAt).toLocaleDateString()}</td>
+                  <td style={{ fontSize: '.82rem' }}><div style={{ fontWeight: 600 }}>{o.businessName || o.landlordEmail}</div><div style={{ color: 'var(--t3)', fontSize: '.74rem' }}>{o.propertyName}</div></td>
+                  <td style={{ fontSize: '.74rem', color: 'var(--t2)' }}>{o.shipName}{o.shipCompany ? ` · ${o.shipCompany}` : ''}<br />{o.shipLine1}{o.shipLine2 ? `, ${o.shipLine2}` : ''}<br />{o.shipCity}, {o.shipState} {o.shipZip}{o.shipPhone ? <><br />{o.shipPhone}</> : null}</td>
+                  <td className="mono" style={{ fontSize: '.72rem', color: o.stripeTerminalLocationId ? 'var(--t2)' : 'var(--red)' }}>{o.stripeTerminalLocationId || 'no location — open the property'}</td>
+                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>${Number(o.price).toFixed(2)} · {o.installments} × ${Number(o.installmentAmount).toFixed(2)}<br /><span style={{ color: 'var(--t3)' }}>{o.installmentsRaised} of {o.installments} raised</span></td>
+                  <td>
+                    <select className="inp" style={{ fontSize: '.78rem' }} value={draft[o.id]?.status ?? o.status}
+                      onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), status: e.target.value } }))}>
+                      {STATUSES.map(st => <option key={st} value={st}>{LABEL[st]}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ minWidth: 150 }}>{field(o, 'stripeHardwareOrderId', 'thor_…')}</td>
+                  <td style={{ minWidth: 140 }}>{field(o, 'serial', 'serial number')}</td>
+                  <td style={{ minWidth: 160 }}>{field(o, 'trackingUrl', 'tracking link')}</td>
+                  <td><button className="btn btn-primary btn-sm" disabled={busy === o.id} onClick={() => save(o)}>{busy === o.id ? '…' : 'Save'}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ConnectAccounts() {
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -1977,61 +2589,31 @@ function Bool({ v }: { v: boolean }) {
   )
 }
 
-function Commissions(){
-  const{user}=useAuth()
-  const qc=useQueryClient()
-  const isSuper=user?.role==='super_admin'
-  const{data,isLoading}=useQuery<any>('commissions-summary',()=>get('/admin/commissions/summary'),{enabled:!!user})
-  const[running,setRunning]=React.useState(false)
-  const[msg,setMsg]=React.useState('')
-  const runAccrual=async()=>{ setRunning(true)
-    try{ const r=await post<any>('/admin/commissions/accrue'); setMsg(`Accrued ${r?.data?.landlordsAccrued??0} landlords for ${r?.data?.monthScanned}`); qc.invalidateQueries('commissions-summary') }
-    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
-    finally{ setRunning(false); setTimeout(()=>setMsg(''),5000) }
-  }
-  return(
-    <div>
-      <div className="ph"><div><h1 className="pt">Commissions</h1><p className="ps">{isSuper?'Portfolio-manager earnings + platform pot':'Your portfolio-manager earnings'}</p></div></div>
-      {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
-      {isLoading?<div className="card" style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
-      <>
-        <div className="grid4" style={{marginBottom:14}}>
-          <div className="kpi"><div className="kl">Your earnings — this month</div><div className="kv gold">{formatCurrency(data?.myEarnings?.thisMonth||0)}</div><div className="ks">closing + customer service</div></div>
-          <div className="kpi"><div className="kl">Your earnings — all time</div><div className="kv">{formatCurrency(data?.myEarnings?.allTime||0)}</div><div className="ks">residual while landlords stay</div></div>
-          {isSuper&&<div className="kpi"><div className="kl">Pot — this month</div><div className="kv b">{formatCurrency(data?.pot?.thisMonth||0)}</div><div className="ks">10¢/occ always + orphaned closing</div></div>}
-          {isSuper&&<div className="kpi"><div className="kl">Pot — all time</div><div className="kv b">{formatCurrency(data?.pot?.allTime||0)}</div><div className="ks">held for later use</div></div>}
-        </div>
-        <div className="card" style={{padding:0,marginBottom:14}}>
-          <div className="ct" style={{padding:'10px 14px',margin:0,borderBottom:'1px solid var(--b0)'}}>Your commissions by landlord</div>
-          <table className="tbl">
-            <thead><tr><th>Landlord</th><th>Occupied units</th><th>This month</th><th>All time</th></tr></thead>
-            <tbody>
-              {(data?.myByLandlord||[]).length?(data.myByLandlord as any[]).map((m:any)=>(
-                <tr key={m.landlordId}><td style={{color:'var(--t0)'}}>{m.businessName||`${m.firstName} ${m.lastName}`}</td><td className="mono">{m.occupiedUnits||0}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
-              )):<tr><td colSpan={4} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions yet — you earn once you close or service a landlord with occupied units.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-        {isSuper&&(
-        <div className="card" style={{padding:0,marginBottom:14}}>
-          <div style={{display:'flex',alignItems:'center',padding:'10px 14px',borderBottom:'1px solid var(--b0)'}}>
-            <div className="ct" style={{margin:0}}>Earnings by portfolio strategist</div>
-            <button className="btn bg-btn" style={{marginLeft:'auto',padding:'5px 12px'}} disabled={running} onClick={runAccrual}>{running?'Running…':'Run accrual now'}</button>
-          </div>
-          <table className="tbl">
-            <thead><tr><th>Portfolio strategist</th><th>This month</th><th>All time</th></tr></thead>
-            <tbody>
-              {(data?.byManager||[]).length?(data.byManager as any[]).map((m:any)=>(
-                <tr key={m.managerId}><td style={{color:'var(--t0)'}}>{m.firstName} {m.lastName}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
-              )):<tr><td colSpan={3} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions accrued yet.</td></tr>}
-            </tbody>
-          </table>
-        </div>)}
-      </>
-      )}
-    </div>
-  )
-}
+// ── S642 (Nic): THE COMMISSION PROGRAM IS SCRAPPED ─────────────────────
+//
+// "Scrap commissions completely. The $10 a month does not even begin to cover
+// the book that somebody would have had under their belt with us doing a
+// quarter of the commission on residual for salesmen or customer service. That
+// 50 cents per unit was going to go a long way to helping people build up their
+// recurring revenue. $10 a month is never going to get somebody there."
+//
+// The model paid closing and service managers a per-occupied-unit residual out
+// of the platform subscription. With the fee moving to a flat $10/month per
+// Connect account — which barely covers Connect fees, bank linking and the
+// other per-account costs — there is nothing left to split, and a residual
+// nobody can live on is worse than no offer at all. Same reasoning that
+// retired the landlord referral program earlier this session.
+//
+// The page, its nav item and its route are gone. NOT removed: commission_accruals
+// and the engine behind it (the table is EMPTY — nothing was ever earned or
+// owed), users.referral_code, referred_by_user_id, and the ?ref= signup path.
+// Those are history and plumbing, and GAM does not erase history.
+//
+// Nic on what might replace it, when there are people to pay: commission for
+// ENROLLING tenants in FlexPay, FlexCredit and whatever follows — paying for an
+// action that creates revenue rather than for an account continuing to exist.
+// Worth designing at hiring time, not before.
+
 
 function Reserve(){
   const{user}=useAuth()
@@ -2039,10 +2621,12 @@ function Reserve(){
   // Matches the Overview reserve/float model (S566): reserve target = 3% of the
   // FlexPay FLOAT (money at risk), NOT total platform rent; bankroll = rent of
   // income-verified FlexPay tenants; no phases; float yield waits for ODFI.
-  const floatBankroll=stats?.flexpayBankroll||0
-  const DEFAULT_RESERVE_RATE=0.03
+  // S642: same two-target model as the Overview, read from the same server
+  // figure, so the two pages cannot drift.
+  const floatBankroll=stats?.flexpayFloatTarget||0
+  const DEFAULT_RESERVE_RATE=0.10
   const target=floatBankroll*DEFAULT_RESERVE_RATE
-  const pct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(target,1))*100,100):0
+  const pct=target>0?Math.min(((stats?.reserveBalance||0)/target)*100,100):0
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">Scales with FlexPay enrollment — $0 until the first income-verified enrollment</p></div></div>
@@ -2072,8 +2656,8 @@ function Tenants(){
   const{user}=useAuth()
   const{data:tenants=[],isLoading}=useQuery<any[]>('admin-tenants-page',()=>get('/admin/tenants'),{enabled:!!user,refetchOnWindowFocus:false})
   const sortedTenants=React.useMemo(()=>[...(tenants as any[])].sort((a,b)=>{
-    const aInc=(!a.achVerified||(!!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.floatFeeActive))?0:1
-    const bInc=(!b.achVerified||(!!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.floatFeeActive))?0:1
+    const aInc=(!a.achVerified||(!!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.flexpayEnrolled))?0:1
+    const bInc=(!b.achVerified||(!!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.flexpayEnrolled))?0:1
     return aInc-bInc
   }),[tenants])
   const[tSearch,setTSearch]=React.useState('')
@@ -2111,7 +2695,7 @@ function Tenants(){
                     <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
                     <td style={{fontSize:'.72rem'}}>{t.unitNumber?<span><span style={{color:'var(--t3)'}}>{t.propertyName}</span> · {t.unitNumber}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                     <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.flexpayEnrolled)?'Active':'None'}</span></td>
                     <td className="mono" style={{color:(t.latePaymentCount||0)>1?'var(--amber)':'var(--t3)'}}>{t.latePaymentCount||0}</td>
                   </tr>
                 ))}
@@ -2791,8 +3375,182 @@ function CsvImportDetail({id,onClose,onNavigate,onMarkReviewed}:{id:string;onClo
 // component state — never persisted — so a refresh between steps
 // drops the user back to step 1, which is the desired safety
 // posture.
+// ── S639: THE ADMIN PORTAL HAD NO VERIFY-EMAIL PAGE ─────────────────────────
+//
+// Nic: "add the other admins on the admin portal. Point their login to not the
+// local host. Point it to the right thing. Every time they log in, it just shows
+// them nothing."
+//
+// Login refuses an unverified account and re-sends a verification link, and that
+// link was being built for the TENANT app for every role except landlord — so
+// two super_admins were sent to a product they have no account in, over and over
+// (Ben has three of them from 2026-09-05). Even pointed at the right host there
+// was nothing here to land on: this portal had no /verify-email route, exactly
+// the gap the landlord portal had until S637.
+// ── S639: THE ADMIN PORTAL HAD NO PASSWORD RECOVERY EITHER ──────────────────
+//
+// Nic: "the link you sent me is a password reset request for the landlord page,
+// not for my admin login. Why is that the case?"
+//
+// Because I sent it with the landlord origin on purpose — an admin-origin link
+// would have 404'd, since this portal had no /reset-password route to land on.
+// The reset itself works either way (the token is consumed by the API, not by
+// the page), but being bounced into a different product to recover a login you
+// do not use there is a bad answer to give somebody who is locked out.
+//
+// Third time for this shape now: the landlord portal had no verify page (S637),
+// this portal had no verify page (earlier tonight), and this is recovery. A
+// portal that can log you in has to be able to let you back in.
+function AdminForgotPasswordPage(){
+  const [email,setEmail]=useState('')
+  const [sent,setSent]=useState(false)
+  const [busy,setBusy]=useState(false)
+  const [err,setErr]=useState('')
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();setBusy(true);setErr('')
+    try{ await post('/auth/forgot-password',{email:email.trim()}); setSent(true) }
+    catch(ex:any){ setErr(ex?.response?.data?.error||'Could not send the reset link.') }
+    finally{ setBusy(false) }
+  }
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · reset your password</div>
+        <div className="card" style={{padding:28,textAlign:'left'}}>
+          {sent?(
+            <>
+              <div style={{fontWeight:700,color:'var(--g)',marginBottom:8}}>Check your email</div>
+              <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:16}}>
+                If an account exists for that address, a reset link is on its way. It is good
+                for one hour — use it before it expires or request another.
+              </div>
+              <Link to="/login" className="btn btn-ghost">Back to sign in</Link>
+            </>
+          ):(
+            <form onSubmit={submit}>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>Email address</label>
+              <input className="input" type="email" value={email} autoFocus required
+                onChange={e=>setEmail(e.target.value)} style={{width:'100%',marginBottom:14}}/>
+              {err&&<div style={{color:'var(--r)',fontSize:'.82rem',marginBottom:12}}>{err}</div>}
+              <button className="btn btn-primary" type="submit" disabled={busy||!email.trim()} style={{width:'100%'}}>
+                {busy?'Sending…':'Send reset link'}
+              </button>
+              <div style={{marginTop:14,textAlign:'center'}}>
+                <Link to="/login" style={{color:'var(--t3)',fontSize:'.8rem'}}>Back to sign in</Link>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AdminResetPasswordPage(){
+  const [params]=useSearchParams()
+  const token=params.get('token')??''
+  const [pw,setPw]=useState('');const [pw2,setPw2]=useState('')
+  const [done,setDone]=useState(false);const [busy,setBusy]=useState(false);const [err,setErr]=useState('')
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();setErr('')
+    // Matches the backend: 12 characters, no composition rules (NIST 800-63B).
+    if(pw.length<12){setErr('Password must be at least 12 characters.');return}
+    if(pw!==pw2){setErr('Those two passwords do not match.');return}
+    setBusy(true)
+    try{ await post('/auth/reset-password',{token,newPassword:pw}); setDone(true) }
+    catch(ex:any){ setErr(ex?.response?.data?.error||'That link is invalid or has expired.') }
+    finally{ setBusy(false) }
+  }
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · choose a new password</div>
+        <div className="card" style={{padding:28,textAlign:'left'}}>
+          {!token?(
+            <div style={{color:'var(--r)',fontSize:'.88rem'}}>This link is missing its token.</div>
+          ):done?(
+            <>
+              <div style={{fontWeight:700,color:'var(--g)',marginBottom:8}}>Password updated</div>
+              <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:16}}>
+                Sign in with your new password. You&rsquo;ll get a six-digit code by email to finish.
+              </div>
+              <Link to="/login" className="btn btn-primary">Go to sign in</Link>
+            </>
+          ):(
+            <form onSubmit={submit}>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>New password</label>
+              <input className="input" type="password" value={pw} autoFocus required
+                onChange={e=>setPw(e.target.value)} style={{width:'100%',marginBottom:12}}/>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>Confirm new password</label>
+              <input className="input" type="password" value={pw2} required
+                onChange={e=>setPw2(e.target.value)} style={{width:'100%',marginBottom:8}}/>
+              <div style={{fontSize:'.76rem',color:'var(--t3)',marginBottom:14}}>At least 12 characters.</div>
+              {err&&<div style={{color:'var(--r)',fontSize:'.82rem',marginBottom:12}}>{err}</div>}
+              <button className="btn btn-primary" type="submit" disabled={busy} style={{width:'100%'}}>
+                {busy?'Saving…':'Set new password'}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function VerifyEmailPage(){
+  const [params]=useSearchParams()
+  const token=params.get('token')??''
+  const [status,setStatus]=useState<'verifying'|'success'|'error'>('verifying')
+  const [errMsg,setErrMsg]=useState('')
+  useEffect(()=>{
+    if(!token){setStatus('error');setErrMsg('This verification link is missing its token.');return}
+    let cancelled=false
+    post('/auth/verify-email',{token})
+      .then(()=>{if(!cancelled)setStatus('success')})
+      .catch((e:any)=>{
+        if(cancelled)return
+        setStatus('error')
+        const m=e?.response?.data?.error
+        setErrMsg(typeof m==='string'?m:'Verification failed. The link may have expired or already been used.')
+      })
+    return()=>{cancelled=true}
+  },[token])
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · email verification</div>
+        <div className="card" style={{padding:28}}>
+          {status==='verifying'&&<div style={{color:'var(--t2)'}}>Verifying your email…</div>}
+          {status==='success'&&<>
+            <div style={{fontSize:'1.1rem',fontWeight:700,color:'var(--g)',marginBottom:8}}>Email verified</div>
+            <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:18}}>
+              Your admin account is ready. Sign in and you&rsquo;ll get a code by email to finish.
+            </div>
+            <Link to="/login" className="btn btn-primary">Go to sign in</Link>
+          </>}
+          {status==='error'&&<>
+            <div style={{fontSize:'1.1rem',fontWeight:700,color:'var(--r)',marginBottom:8}}>Could not verify</div>
+            <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:18}}>{errMsg}</div>
+            <div style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:14}}>
+              Signing in with your password sends a fresh link automatically.
+            </div>
+            <Link to="/login" className="btn btn-ghost">Back to sign in</Link>
+          </>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S655: remembered per browser so the box starts the way it was last left.
+const KEEP_SIGNED_IN_KEY='gam_admin_keep_signed_in'
+
 function LoginPage(){
   const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth()
+  const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
   React.useEffect(()=>{
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
@@ -2806,7 +3564,8 @@ function LoginPage(){
   const onCredentialsSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
     try{
-      const r=await login(email,pw)
+      rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY,keepSignedIn)
+      const r=await login(email,pw,keepSignedIn)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
       else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResentMsg('')}
     }
@@ -2951,11 +3710,24 @@ function LoginPage(){
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <form onSubmit={onCredentialsSubmit}>
-            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
-            <div style={{marginBottom:16}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="email" name="gam-admin-login" autoComplete="off" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
+            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            {/* S655: off by default. Off, this sign-in ends 7 days after it
+                starts, even mid-task; on, it stays signed in while in use. */}
+            <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45}}>
+              <input type="checkbox" checked={keepSignedIn} onChange={e=>setKeepSignedIn(e.target.checked)} style={{marginTop:3,accentColor:'var(--gold)'}}/>
+              <span>Keep me signed in on this device
+                <span style={{display:'block',color:'var(--t3)',fontSize:'.74rem'}}>Leave this off on a shared computer. Off, you are signed out 7 days after you sign in.</span>
+              </span>
+            </label>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center'}}>
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
+            {/* S639 (Nic, locked out of this very portal): there was no way
+                back in from here at all — no reset page and no link to one. */}
+            <div style={{marginTop:12,textAlign:'center'}}>
+              <Link to="/forgot-password" style={{color:'var(--t3)',fontSize:'.8rem'}}>Forgot your password?</Link>
+            </div>
           </form>
         </div>
       </div>
@@ -2979,7 +3751,7 @@ function LoginPage(){
 // only credential, so the page shows the invited address read-only: it cannot be
 // pointed at a different one, and the role was fixed when the invitation was
 // sent. On success it hands off to the normal login, which runs straight into
-// the mandatory 2FA enrolment every admin must pass.
+// the mandatory 2FA enrollment every admin must pass.
 function AcceptInvite(){
   const token=window.location.pathname.split('/').pop()||''
   const navigate=useNavigate()
@@ -3267,7 +4039,7 @@ function TotpEnrollPage(){
       // it (the api interceptor reads gam_admin_token) before refreshing.
       const cr=await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
       const fullTok=cr.data?.data?.token
-      if(fullTok)localStorage.setItem('gam_admin_token',fullTok)
+      if(fullTok) localStorage.setItem('gam_admin_token',fullTok)
       await refresh()
       setState('done')
       // Small delay so the user sees the success state before nav.
@@ -3571,6 +4343,13 @@ function App(){
       <VersionWatch/>
       <Routes>
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
+        {/* S639: PUBLIC — somebody arriving here cannot sign in yet; that is
+            the whole reason they were sent the link. */}
+        <Route path="/verify-email" element={<VerifyEmailPage/>}/>
+        {/* S639: recovery is public by definition — somebody using it cannot
+            sign in, which is the whole reason they are here. */}
+        <Route path="/forgot-password" element={<AdminForgotPasswordPage/>}/>
+        <Route path="/reset-password" element={<AdminResetPasswordPage/>}/>
         {/* S631: public — no session exists until the invitation is accepted. */}
         <Route path="/accept-invite/:token" element={<AcceptInvite/>}/>
         {/* S289: TOTP enrollment lives outside the Layout — it's the only
@@ -3590,7 +4369,7 @@ function App(){
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
-          <Route path="commissions"   element={<Commissions/>}/>
+          <Route path="screenings"    element={<SuperAdminGuard><Screenings/></SuperAdminGuard>}/>
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
@@ -3599,6 +4378,7 @@ function App(){
           <Route path="payments"      element={<Payments/>}/>
           <Route path="disbursements" element={<Disbursements/>}/>
           <Route path="connect-accounts" element={<ConnectAccounts/>}/>
+          <Route path="reader-orders" element={<SuperAdminGuard><ReaderOrders/></SuperAdminGuard>}/>
           <Route path="reserve"       element={<SuperAdminGuard><Reserve/></SuperAdminGuard>}/>
           <Route path="nacha"         element={<SuperAdminGuard><NachaMonitor/></SuperAdminGuard>}/>
           <Route path="nexus"         element={<SuperAdminGuard><NexusMonitor/></SuperAdminGuard>}/>
@@ -4604,7 +5384,7 @@ function FlexPayRequests() {
           <div className="kpi">
             <div className="kpi-l">Monthly front commitment</div>
             <div className="kpi-v" style={{ color: 'var(--gold)' }}>{fmt(funnel.monthlyFloat)}</div>
-            <div className="kpi-s">Sum of enrolled tenants' rent — bankroll out each cycle</div>
+            <div className="kpi-s">Enrolled tenants' rent — FlexPay pays their whole monthly bill, so utilities and fees come on top</div>
           </div>
         </div>
       )}
@@ -4657,6 +5437,23 @@ function FlexPayRequests() {
 
         {renderTable(decided, "Decided")}
       </>}
+
+      {/* S655: the FlexPay terms tenants see, from the ONE shared set
+          (FLEXPAY_TERMS) — the same words as the tenant app, the PDF and the
+          emails, so a review here is a review of what the tenant agreed to. */}
+      <details className="card" style={{ padding: 14, marginBottom: 16 }}>
+        <summary style={{ cursor: 'pointer', fontWeight: 700, color: 'var(--t0)', fontSize: '.85rem' }}>
+          FlexPay terms — what tenants agree to
+        </summary>
+        <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+          {FLEXPAY_TERMS.map(sec => (
+            <div key={sec.key}>
+              <div style={{ fontWeight: 600, color: 'var(--t0)', fontSize: '.8rem' }}>{sec.title}</div>
+              <div style={{ fontSize: '.78rem', color: 'var(--t2)', lineHeight: 1.5 }}>{sec.body}</div>
+            </div>
+          ))}
+        </div>
+      </details>
 
       {review && (
         <div className="modal-ov" onClick={() => setReview(null)}>

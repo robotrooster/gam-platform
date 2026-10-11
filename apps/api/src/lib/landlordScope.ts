@@ -26,6 +26,7 @@
  * landlord's own book.
  */
 import type { AuthPayload } from '../middleware/auth'
+import { query } from '../db'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 
@@ -119,7 +120,7 @@ export async function isEntityMember(
  * The replacement is two rules, and every landlord call site is one of them:
  *
  *   READS  span every entity the account owns   -> landlordScopeIds()
- *   WRITES take an explicit target, authorised  -> the resolvers below
+ *   WRITES take an explicit target, authorized  -> the resolvers below
  *
  * Once both hold, `profileId` no longer decides what a landlord can see or
  * touch, which is exactly what "the account sits outside the entities" means.
@@ -150,6 +151,11 @@ export function resolveLandlordTarget(
   user: AuthPayload,
   explicit: string | null | undefined,
   what = 'record',
+  // S652: a NEW property or a NEW bank link is an attribute of one LLC — that
+  // is the one write where the account must still say which company, because
+  // filing it under the wrong one is unwound by hand. Everything else lands on
+  // the account's own company.
+  mustName = false,
 ): string {
   if (explicit) {
     if (!canManageLandlordResource(user, explicit, [])) {
@@ -158,7 +164,16 @@ export function resolveLandlordTarget(
     return explicit
   }
   const owned = landlordScopeIds(user)
+  // Exactly one company is not a default: there is nothing to choose.
   if (owned.length === 1) return owned[0]
+  // S654 (Nic, DIRECTIVE — reverses the S652 "home company"): "My account
+  // should not have a default company… The companies sit outside, set apart
+  // from the account… None is the default. They should not be merged in any
+  // way." A request that names nothing a company can be derived from — no
+  // company, no property, no row — is ASKED, never guessed. The old fallback
+  // filed Mountain View's register under Oak Park and told Nic his own open
+  // tab did not exist. Derivation order lives in landlordForRequest.
+  void mustName
   // 400, not 403, and deliberately: this is the long-standing "No landlord scope
   // on this user" contract that admins, tenants and unscoped callers have always
   // received from these endpoints. The refactor changes WHICH company a write
@@ -169,17 +184,90 @@ export function resolveLandlordTarget(
 }
 
 /**
+ * S654: the company a request acts for, DERIVED from what the request names,
+ * in this order: an explicit company (landlordId / entityId), the property
+ * (propertyId), the unit (unitId), the lease (leaseId). Nothing named → the
+ * account's one company, or a 400 asking which — never a default. Every
+ * derivation is ownership-checked; nothing here widens what the account may
+ * touch.
+ */
+export async function landlordForRequest(req: any, what = 'record'): Promise<string> {
+  const u = req.user as AuthPayload
+  const pick = (...vals: unknown[]) => vals.find(v => typeof v === 'string' && v.trim() !== '') as string | undefined
+  const explicit = pick(req.body?.landlordId, req.query?.landlordId, req.body?.entityId, req.query?.entityId)
+  if (explicit) return resolveLandlordTarget(u, explicit, what)
+  const UUID = /^[0-9a-f-]{36}$/i
+  const propertyId = pick(req.body?.propertyId, req.query?.propertyId)
+  if (propertyId && UUID.test(propertyId)) return landlordIdForProperty(u, propertyId, query)
+  const unitId = pick(req.body?.unitId, req.query?.unitId)
+  if (unitId && UUID.test(unitId)) return landlordIdForUnit(u, unitId, query)
+  const leaseId = pick(req.body?.leaseId, req.query?.leaseId)
+  if (leaseId && UUID.test(leaseId)) {
+    const rows = await query<{ landlord_id: string }>(`SELECT landlord_id FROM leases WHERE id = $1`, [leaseId])
+    if (!rows.length) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(u, rows[0].landlord_id, [])) throw new AppError(403, 'That lease is not yours to act on.')
+    return rows[0].landlord_id
+  }
+  return resolveLandlordTarget(u, undefined, what)
+}
+
+/**
  * The entity a write lands on, DERIVED FROM THE PROPERTY it concerns.
  *
  * The best answer to "which company?" is almost always "the one that owns the
  * property you just named", and most write paths already carry a propertyId.
  * Deriving beats asking: there is nothing for the caller to get wrong, and the
- * authorisation is the same check either way.
+ * authorization is the same check either way.
  *
  * 403, never 404, when the property exists but belongs to someone else — the
  * distinction is deliberate. A 404 tells a landlord their own property does not
  * exist, which is what sent Nic looking for a banner that could not render.
  */
+/**
+ * S652 — the one company, of those this account acts for, that runs property in
+ * `state`. Blu owns Country Acres (Illinois) and is an owner-member of Oak Park
+ * (Arizona): an Illinois package, an Illinois form, an upload into an Illinois
+ * slot can only be Country Acres', so nobody should be asked. Null when no
+ * company or more than one runs property there — the caller falls back.
+ */
+export async function landlordOperatingIn(
+  user: AuthPayload,
+  state: string | null | undefined,
+  q: <T>(sql: string, params: unknown[]) => Promise<T[]>,
+): Promise<string | null> {
+  const scope = landlordScopeIds(user)
+  if (!state || !/^[A-Z]{2}$/.test(state) || scope.length === 0) return null
+  const rows = await q<{ landlord_id: string }>(
+    `SELECT DISTINCT landlord_id FROM properties WHERE landlord_id = ANY($1::uuid[]) AND state = $2`,
+    [scope, state])
+  return rows.length === 1 ? rows[0].landlord_id : null
+}
+
+/**
+ * S652 — where to FILE a document, template or package. Never asks.
+ *
+ * Nic: "Doesn't matter what company it's for... The landlord portal is linked
+ * to everything that's under their purview." These things belong to the
+ * account; landlord_id only records a filing place, and every use checks the
+ * account (landlordScopeIds / account_companies()), never an exact match. So
+ * unlike resolveLandlordTarget — right for a PROPERTY, which really belongs to
+ * one LLC — this picks sensibly and moves on: a named company, else the
+ * property's, else the one running that state, else the account's first.
+ */
+export async function fileUnderCompany(
+  user: AuthPayload,
+  hint: { explicit?: string | null; propertyId?: string | null; state?: string | null },
+  q: <T>(sql: string, params: unknown[]) => Promise<T[]>,
+): Promise<string> {
+  if (hint.explicit) return resolveLandlordTarget(user, hint.explicit)
+  if (hint.propertyId) return landlordIdForProperty(user, hint.propertyId, q)
+  const byState = await landlordOperatingIn(user, hint.state, q)
+  if (byState) return byState
+  const scope = landlordScopeIds(user)
+  if (!scope.length) throw new AppError(400, 'No landlord scope on this user')
+  return scope[0]
+}
+
 export async function landlordIdForProperty(
   user: AuthPayload,
   propertyId: string,
@@ -212,7 +300,7 @@ export function ownsLandlord(user: AuthPayload, landlordId: string | null | unde
  * The entity a write lands on, DERIVED FROM THE UNIT it concerns.
  *
  * Same reasoning as landlordIdForProperty: most unit-level writes already name
- * the unit, and the unit knows its company. `units.landlord_id` is denormalised
+ * the unit, and the unit knows its company. `units.landlord_id` is denormalized
  * from the property, so this is one lookup rather than a join.
  */
 export async function landlordIdForUnit(

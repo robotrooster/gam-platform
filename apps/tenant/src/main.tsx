@@ -1,4 +1,6 @@
 import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { renewTenantSession } from './lib/sessionRenewal'
+import { utilityLine } from './lib/utilityLine'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -29,19 +31,36 @@ function DefaultPage() {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
     }).then(r=>r.json()).then(r=>r.data)
   )
+  // S651: a renter in the pool passed their screening, so the check above sends
+  // them to /home — a page built entirely around a lease they do not have. Home
+  // is not in their nav either, so this was the one way to reach it. They came
+  // here to look for somewhere to live; land them there.
+  const { data: me } = useQuery<any>('tenant-me-default', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data).catch(() => null)
+  )
   if (!status) return null
   if (status.status === 'denied') return <BackgroundCheckPage />
   if (status.status === 'not_started' || status.status === 'submitted') return <BackgroundCheckPage />
+  if (me && me.renterPoolEntryId && !me.unitId && !me.pendingLeaseDocumentId
+      && !me.onboardingUnitNumber && !me.utilityServiceAgreementId) {
+    return <Navigate to="/find-a-place" replace />
+  }
   return <Navigate to="/home" replace />
 }
 import { SignPage } from './pages/SignPage'
 import { LeasePage } from './pages/LeasePage'
+import { LawsPage } from './pages/LawsPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
+import { MeterReadingsPage } from './pages/MeterReadingsPage'
 import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
+// S651: the renter pool's only screen — places near the address on their ID.
+import { FindAPlacePage } from './pages/FindAPlacePage'
 import React, { useContext, useState, useEffect, useCallback, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
@@ -52,8 +71,7 @@ import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
-} from 'lucide-react'
-import { CONSUMER_TERMS_URL, CONSUMER_PRIVACY_URL } from './lib/marketing'
+  UserSearch, Gauge } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -67,10 +85,12 @@ function TelemetryPing() {
   return null
 }
 import { DialogHost, toast } from './components/dialogs'
+import { leaseReachedMe, pendingDocHome, showsSigningNotice, signingNoticeHeading, waitingLeaseNavItem } from './lib/pendingLease'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, INSPECTION_ITEM_CONDITION_LABEL } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, INSPECTION_ITEM_CONDITION_LABEL, FLEXPAY_TERMS } from '@gam/shared'
+import { FLEXPAY_FIRST_PULL_DAY, FLEXPAY_LAST_PULL_DAY, offeredPullDay, ordinal, pullDayRangeText, flexPayBillCard, localToday, type TenantNotice, type FlexPayCycle } from './lib/flexpayCard'
 import { AgentChatWidget } from './components/AgentChatWidget'
 import { CameraCapture } from './components/CameraCapture'
 
@@ -129,7 +149,11 @@ function AuthedVideo({ path, style }: { path: string; style?: React.CSSPropertie
 const LAUNCH_HIDDEN = new Set<string>(['/credit', '/my-disputes'])
 const LAUNCH_HIDE_FITNESS = true
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e => { if(e.response?.status===401){localStorage.removeItem('gam_tenant_token');window.location.href='/login'} return Promise.reject(e) })
+// S650 (Ellen Gregory, Oak Park MH 02): REMOVED — a SECOND 401 handler on the
+// same axios client, without lib/api.ts's /auth/ carve-out. A refused sign-in
+// (hers: "verify your email first") wiped the token and reloaded /login before
+// the form could show the message, so the page just blinked and said nothing.
+// lib/api.ts already installs the correct one.
 // S312: snake_case → camelCase response transform (see lib/api.ts comment + packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
@@ -157,15 +181,34 @@ interface AuthUser { id:string;email:string;role:string;firstName:string;lastNam
 // into the TOTP second step when the backend gates on 2FA.
 type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
 type SignupInput = { firstName:string;lastName:string;email:string;password:string;acceptedTerms:boolean;landlordId?:string|null;unitId?:string|null }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string,emailFactor?:string|null)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
 function AuthProvider({children}:{children:React.ReactNode}) {
+  // ── S639 SECURITY: A NEW SESSION MUST NOT INHERIT THE OLD ONE'S DATA ───────
+  //
+  // Nick Platt clicked his fresh invite link on a browser where his wife Judy
+  // was already signed in, and landed in HER profile — her unit, her balance,
+  // her lease. Nic: "it fully signed into her profile. So you fucked something
+  // up."
+  //
+  // The token swap was correct: separate users, separate tenant rows, separate
+  // invite tokens, and the API resolved every request as Nick. What leaked was
+  // the CLIENT cache. logout() dropped the token and the React state and left
+  // react-query untouched, so 'tenant-me', 'tenant-payment-health' and the rest
+  // still held Judy's responses under the same keys — and react-query served
+  // them to Nick instantly, before any request went out. The 304s in the API log
+  // are the tell: the app was revalidating her cached entries, not fetching his.
+  //
+  // Any change of identity now empties the cache. Nothing that belonged to the
+  // previous person survives into the next session.
+  const qcRef = useQueryClient()
+  const wipeCache = useCallback(() => { try { qcRef.clear() } catch { /* no cache yet */ } }, [qcRef])
   const [user,setUser]=useState<AuthUser|null>(null)
   const [token,setToken]=useState<string|null>(()=>localStorage.getItem('gam_tenant_token'))
   const [loading,setLoading]=useState(true)
-  const logout = useCallback(()=>{localStorage.removeItem('gam_tenant_token');setToken(null);setUser(null)},[])
+  const logout = useCallback(()=>{wipeCache();localStorage.removeItem('gam_tenant_token');setToken(null);setUser(null)},[wipeCache])
   const refresh = useCallback(async()=>{
     const t = localStorage.getItem('gam_tenant_token')
     if(!t){setLoading(false);return}
@@ -173,22 +216,42 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     catch(e){ if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally{ setLoading(false) }
   },[logout])
+  // S654 (Nic): a session was a fixed 7-day pass from the last password sign-in,
+  // never renewed — people were thrown out on the seventh day mid-task. Renew a
+  // pass older than a day on load and whenever the app comes back into view
+  // (the phone's return from the mail app), so a session ends only after seven
+  // idle days. See sessionRenewalDue.
+  // Final sweep (10/3): a temporary lock answers the renewal with "locked", and
+  // that KEEPS the pass the app holds — never a sign-out. The whole routine
+  // (lock, blip, refusal, a sign-out mid-flight) lives in lib/sessionRenewal.
+  const renewSession = useCallback(()=>renewTenantSession({
+    readToken: ()=>localStorage.getItem('gam_tenant_token'),
+    requestRenewal: ()=>post<{token:string}>('/auth/refresh').then(r=>r.data.token),
+    storeToken: (tk)=>{ localStorage.setItem('gam_tenant_token', tk); setToken(tk) },
+    signOut: logout,
+  }),[logout])
   useEffect(()=>{
     if(!token){setLoading(false);return}
-    fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>setUser(u)).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
-  },[token,logout])
+    fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>{ setUser(u); return renewSession() }).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
+  },[token,logout,renewSession])
+  useEffect(()=>{
+    const onVisible = ()=>{ if(document.visibilityState==='visible') renewSession() }
+    document.addEventListener('visibilitychange', onVisible)
+    return ()=>document.removeEventListener('visibilitychange', onVisible)
+  },[renewSession])
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
-  const login = async(email:string,password:string):Promise<LoginResult>=>{
-    const res=await post<any>('/auth/login',{email,password})
+  const login = async(email:string,password:string,emailFactor?:string|null):Promise<LoginResult>=>{
+    // S654: emailFactor is the bill link's proof of the inbox — see LoginPage.
+    const res=await post<any>('/auth/login',{email,password,...(emailFactor?{emailFactor}:{})})
     const data=res.data!
     if(data.requiresTotp){ return { kind:'totp_required', totpSession:data.totpSession as string } }
     // S571: tenants with ACH set up get email-code 2FA (like admin).
     if(data.requiresEmailOtp){ return { kind:'email_otp_required', emailOtpSession:data.emailOtpSession as string } }
     const { token:tk, user:u } = data as { token:string; user:AuthUser }
-    localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
     return { kind:'success' }
   }
   // S289: TOTP second-step exchange. Trades the short-lived totp_session
@@ -197,7 +260,7 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const loginWithTotp = async(totpSession:string,code:string):Promise<void>=>{
     const res=await post<{token:string}>('/auth/totp/verify',{totpSession,code})
     const tk=res.data!.token
-    localStorage.setItem('gam_tenant_token',tk)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
     const u=await get<AuthUser>('/auth/me')
     setUser(u);setToken(tk)
@@ -207,7 +270,7 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const loginWithEmailOtp = async(emailOtpSession:string,code:string):Promise<void>=>{
     const res=await post<{token:string}>('/auth/email-otp/verify',{emailOtpSession,code})
     const tk=res.data!.token
-    localStorage.setItem('gam_tenant_token',tk)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
     const u=await get<AuthUser>('/auth/me')
     setUser(u);setToken(tk)
@@ -346,16 +409,36 @@ html{font-size:17px}
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
 // ── LAYOUT ────────────────────────────────────────────────────
-function LeaseNavLink() {
-  const { data: pendingDocs = [] } = useQuery('pending-docs', () =>
-    fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/pending', {
-      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
-    }).then(r=>r.json()).then(r=>r.data||[])
-  )
-  const pendingDocId = (pendingDocs as any[])[0]?.documentId
-  return pendingDocId
-    ? <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
-    : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+// The documents waiting on this person's signature (GET /esign/pending). One
+// fetcher for every reader of the 'pending-docs' cache key, so they share it.
+const fetchPendingDocs = () =>
+  fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/pending', {
+    headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+  }).then(r=>r.json()).then(r=>r.data||[])
+
+function LeaseNavLink({ hasLease, me }: { hasLease: boolean; me: any }) {
+  const { data: pendingDocs = [] } = useQuery('pending-docs', fetchPendingDocs)
+  const rows = pendingDocs as any[]
+  // S655: a NEW LEASE for the home they already live in is not "the lease" —
+  // the Lease page shows it as their next lease, with its own Sign button.
+  const pendingDocId = rows.find((d: any) => !d.renewsLeaseId)?.documentId
+  const leaseLink = <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+  if (!pendingDocId) return leaseLink
+  // S655: somebody who already lives under a lease — including another
+  // company's resident a new landlord has sent a lease to (nobody is attached
+  // without their own signature) — keeps "Lease" on the lease they live under.
+  //
+  // The document waiting for them gets its own item, and only that one, once
+  // it has reached them, labeled with its own title (waitingLeaseNavItem).
+  if (hasLease) {
+    const waiting = waitingLeaseNavItem(rows, me)
+    if (!waiting) return leaseLink
+    return <>
+      {leaseLink}
+      <NavLink to={'/sign/'+waiting.documentId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>{waiting.label}</NavLink>
+    </>
+  }
+  return <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
 }
 
 const FONTS: Record<string, string> = {
@@ -520,7 +603,7 @@ function Layout() {
   // honest state is the full nav, not the most restrictive one.
   //
   // Failing open costs nothing that matters: the nav is a list of links, and
-  // every page behind it authorises itself against the API. A link someone
+  // every page behind it authorizes itself against the API. A link someone
   // cannot use is a dead end; a hidden portal is a tenant who cannot pay rent.
   // The screen was never the security boundary — the API response is.
   const tenantMeUnknown = tenantMeLoading || tenantMeFailed || tenantMe === undefined
@@ -535,13 +618,44 @@ function Layout() {
   // A person a lease document has been sent to is inside the tenancy, not
   // applying for one. The nav opens from the moment it reaches them.
   const isMidSigning = !!(tenantMe as any)?.pendingLeaseDocumentId
+  // S639 (Nic): ACCEPTING IS NOT APPLYING EITHER.
+  //
+  // "I have people trying to log in and sign their lease when other household
+  // members have not accepted the portal invite yet, and it's trying to offer
+  // them to pay for a background check."
+  //
+  // A lease only drafts once everyone invited to the space has accepted, so
+  // whoever accepts first sits with no lease, no document and no screening
+  // result — every other signal here false — and the nav collapsed to
+  // Application. Somebody who has already been onboarded by their landlord was
+  // then shown a $44.99 background check and quite reasonably read it as a bill.
+  // Same principle as the two cases above: a person the landlord has invited to
+  // a specific space is inside the tenancy.
+  const isOnboarding = !!(tenantMe as any)?.onboardingUnitNumber
   const showFullNav = tenantMeUnknown || bgApproved || isExistingTenant
-    || isUtilityServicePayer || isMidSigning
+    || isUtilityServicePayer || isMidSigning || isOnboarding
   // …and only what applies to them. Someone who buys electricity from this
   // landlord has no lease to read, no maintenance to request, no amenities to
   // reserve and no deposit — a nav full of doors that open onto nothing is its
   // own kind of broken. Home + Payments + Profile is the whole surface.
   const serviceOnly = isUtilityServicePayer && !isExistingTenant
+  // ── S651: IN THE RENTER POOL, LOOKING FOR SOMEWHERE TO LIVE ──────────────
+  //
+  // Somebody who took a background check with no landlord behind it is
+  // screening-approved and nothing else: no unit, no lease, no invite, no
+  // utility agreement. bgApproved alone therefore opened the ENTIRE portal to
+  // them — Payments with nothing to pay, Communication with no landlord to
+  // communicate with, a Lease tab with no lease. Every door opens onto nothing.
+  //
+  // Nic: they get "a real tenant-portal login in a suspended state — no lease,
+  // nothing to do — until they connect with a landlord", and what they can do
+  // is browse places near them. So the nav is Find a place + Profile, the same
+  // shape as serviceOnly above and for the same reason.
+  //
+  // The moment a landlord signs them, unitId or an invite appears and every
+  // check below stops firing on its own — there is no state to clean up.
+  const isRenterPoolOnly = !!(tenantMe as any)?.renterPoolEntryId
+    && !isExistingTenant && !isMidSigning && !isOnboarding && !isUtilityServicePayer
   const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -572,6 +686,33 @@ function Layout() {
   // S571: My Walkthroughs is now a permanent tab inside the Communication
   // dashboard (its own empty state covers the no-videos case), so the old
   // conditional top-level nav link + its probe query were removed.
+
+  // S648 (Nic): A LEASE WAITING ON THEM IS THE ONLY THING THEY SEE.
+  //
+  //   "When they sign in, and they have not signed the lease, the lease is the
+  //    only thing to see. It just takes them straight into signing flow.
+  //    There's no way to back out of it. There's no way to log out of it. They
+  //    just have to close out the window."
+  //
+  // Only when it is THEIR turn: a resident who has signed and is waiting on a
+  // co-tenant, or whose landlord has not signed yet, has nothing to do there.
+  // The signing page lives outside this shell, so it has no nav and no sign-out;
+  // every portal route sends them back to it until their signature is in.
+  //
+  // S655 (Nic, 10/2): NOT FOR ANOTHER COMPANY'S RESIDENT. Nobody is attached
+  // to a company without their own signature, so a lease from a new landlord
+  // can reach a person who already lives somewhere on GAM — a tenant of
+  // another park, a neighbor paying another company's utilities. Taking their
+  // portal over would stop them paying the rent and bills they owe THERE; they
+  // see the lease as a notice with a Sign button instead. The server decides
+  // (pendingLeaseLocks: false only for a tenancy with another account). A new
+  // tenant whose lease the landlord's signature already issued has a unit
+  // now, and that is no reason to let them skip signing — they stay locked in.
+  const mustSign = !!(tenantMe as any)?.pendingLeaseDocumentId
+    && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true
+    && (tenantMe as any)?.pendingLeaseLocks !== false
+  if (mustSign) return <Navigate to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} replace />
+
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
@@ -587,9 +728,18 @@ function Layout() {
           {serviceOnly && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Billing</NavLink>
+            {/* S655: a new lease waiting on their signature (they only take
+                utilities here, so it does not take their portal over). */}
+            {(tenantMe as any)?.pendingLeaseDocumentId && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true && (
+              <NavLink to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+            )}
             <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
           </>}
-          {showFullNav && !serviceOnly && <>
+          {isRenterPoolOnly && !serviceOnly && <>
+            <NavLink to="/find-a-place" className={({isActive})=>`ni${isActive?' active':''}`}><UserSearch size={16}/>Find a place</NavLink>
+            <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
+          </>}
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
             {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}><Star size={16}/>Flex Advantage</NavLink>}
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Payments</NavLink>
@@ -601,19 +751,25 @@ function Layout() {
             <NavLink to="/communication" className={({isActive})=>`ni${isActive?' active':''}`}><MessagesSquare size={16}/>Communication</NavLink>
             {hasAmenities && <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}><CalendarClock size={16}/>Amenities</NavLink>}
             {hasWorkTrade && <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}><HeartHandshake size={16}/>Work Trade</NavLink>}
+            {/* S652: a work trader whose agreement carries "Read meters" takes the property's reading walk from here. */}
+            {hasWorkTrade && Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
+              <NavLink to="/meter-readings" className={({isActive})=>`ni${isActive?' active':''}`}><Gauge size={16}/>Meter Readings</NavLink>}
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
-            <LeaseNavLink/>
+            <LeaseNavLink hasLease={isExistingTenant || (tenantMe as any)?.pendingLeaseLocks === false} me={tenantMe}/>
+            {/* S652 (Nic): the landlord-tenant act for their home, from the
+                government library, by state and unit type — automatic. */}
+            <NavLink to="/laws" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>Landlord-Tenant Act</NavLink>
           </>}
           {/* S570 (Nic): Preferences + Security folded into Profile (which already
               has Notification-prefs + Security tabs). Notifications feed → Home. */}
-          {showFullNav && !serviceOnly && tenantMe?.stripeConnectAccountId && (
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && tenantMe?.stripeConnectAccountId && (
             <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={16}/>Payouts</NavLink>
           )}
-          {showFullNav && !serviceOnly && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
           {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
               via ?sso= so the tenant lands signed-in without re-auth. */}
-          {!LAUNCH_HIDE_FITNESS && !serviceOnly && (
+          {!LAUNCH_HIDE_FITNESS && !serviceOnly && !isRenterPoolOnly && (
           <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}><Dumbbell size={16}/>Fitness</a>
           )}
         </nav>
@@ -631,11 +787,11 @@ function Layout() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </header>
-        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
+        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><Outlet /></>}</div>
         <DialogHost />
       </div>
-      {showFullNav && !serviceOnly && <FlexsuiteReAcceptanceGate />}
-      {showFullNav && !serviceOnly && <LeaseNoticeGate />}
+      {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
+      {showFullNav && !serviceOnly && !isRenterPoolOnly && <LeaseNoticeGate />}
       <AgentChatWidget />
     </div>
   )
@@ -936,14 +1092,14 @@ function HomeAlerts() {
  * behind it, and says plainly what the arrangement is.
  */
 /**
- * S616 (Nic) — the neighbour tells us they are leaving.
+ * S616 (Nic) — the neighbor tells us they are leaving.
  *
  *   "Maybe that tenant portal profile that only has the utilities gets a big
  *    button that says 'hey, I need my final bill because I'm moving out', and
  *    then it's gonna look for more utilities to go onto a new person after that
  *    final billing period."
  *
- * Nobody is watching the neighbour's front door. This person is the only one
+ * Nobody is watching the neighbor's front door. This person is the only one
  * who reliably knows, so it is their button. It gives NOTICE — the landlord
  * still takes the closing read and sets up whoever moves in. Letting a payer
  * close their own account would let somebody walk away from a balance.
@@ -1020,8 +1176,9 @@ function MoveOutNotice({ me }: { me: any }) {
 }
 
 function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
-  const { data: balanceCtx } = useQuery<any>('balance-context',
-    () => get<any>('/payments/balance-context'))
+  // Read through readBalanceContext like every 'balance-context' query: the
+  // pay screen tells a read that started after a lost payment by its stamp.
+  const { data: balanceCtx } = useQuery<any>('balance-context', () => readBalanceContext())
   const charges: any[] = (balanceCtx?.serviceAgreements ?? []).flatMap((a: any) => a.rows ?? [])
   const owed = charges.reduce((s: number, c: any) => s + Number(c.amount || 0), 0)
   const where = me.utilityServiceAddress || me.utilityServiceSpace || 'your address'
@@ -1034,6 +1191,13 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
           <p className="ps">Utility service at {where}</p>
         </div>
       </div>
+
+      {/* S655: a lease from a new landlord can reach someone who only takes
+          utilities here (nobody is attached without their own signature, so
+          their portal is not taken over). Once it reaches them, this is their
+          way in. The header names their utility address, so the notice names
+          the home the lease is for. */}
+      {leaseReachedMe(me) && <LeaseSigningTurnNotice me={me} nameTheHome />}
 
       <div className="grid3" style={{marginBottom:24}}>
         <a href="/payments" style={{textDecoration:'none'}} className="kpi"
@@ -1079,11 +1243,12 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
               {charges.map((c: any) => (
                 <tr key={c.id} style={{borderTop:'1px solid var(--b0)'}}>
                   <td style={{padding:'8px 0'}}>
+                    {/* decisions #17: the line names the utility — never "Utilities". */}
                     <div style={{fontWeight:600}}>
-                      {c.type === 'late_fee' ? 'Late fee' : 'Utilities'}
+                      {utilityLine(c).label}
                     </div>
-                    {c.notes && (
-                      <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{c.notes}</div>
+                    {utilityLine(c).detail && (
+                      <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{utilityLine(c).detail}</div>
                     )}
                   </td>
                   <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
@@ -1100,6 +1265,221 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
           is only for the utilities they supply to {where}. Each bill shows the meter readings and
           the dates they were taken.
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── S639: WHAT HAPPENS NEXT, AND WHAT YOU DO NOT OWE ─────────────────────────
+//
+// Nic: "when people accept the invite, it needs to say, please watch for your
+// lease to be drafted as soon as all members of your household accept the portal
+// invite... I have people trying to log in and sign their lease when other
+// household members have not accepted yet, and it's trying to offer them to pay
+// for a background check, and I've told them no, you don't have to do that...
+// a lot of people think that is about to happen to them."
+//
+// Somebody who accepts first lands in a portal with no lease and nothing to do,
+// and silence there reads as "something is wrong" or "something is being asked
+// of me". Two sentences fix both: what they are waiting on, and that they are
+// not about to be charged. The money sentence is unconditional for an invited
+// resident — the landlord onboarded them, and a screening they were never asked
+// to take is not something to leave ambiguous.
+/** "Ana", "Ana and Luis", "Ana, Luis and Marta" — a sentence, not a list. */
+function joinNames(list: string[]): string {
+  if (list.length === 1) return list[0]
+  if (list.length === 2) return `${list[0]} and ${list[1]}`
+  return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`
+}
+
+// ── S639 (Nic): WHOSE TURN IS IT ─────────────────────────────────────────────
+//
+// "If there's, like, three adults in the system, they can see who is supposed to
+// be next. That way the household can help propel itself to completion instead
+// of each individual person keep trying to talk to the office."
+//
+// Signing runs in order, so at any moment exactly one person is holding the
+// lease up. The household could not see who, so each of them phoned the office
+// to ask — and the answer was always "one of the other people you live with".
+// Naming them hands the chase to the people who can actually do something about
+// it. A tenant who has already signed still sees this: knowing they are done and
+// who is next is the whole point.
+// ── S655 (Nic, 10/2): A NEW LEASE FOR THE HOME THEY ALREADY LIVE IN ─────────
+//
+// A sitting tenant with a new lease waiting sees a banner — never the signing
+// lock-in, which stays for brand-new tenants. They keep paying rent and using
+// the portal while it waits. The words are a new lease / a rent update: their
+// current lease stays as it is until the new one starts. It never reads as
+// "your lease is ending".
+function NewLeaseBanner({ me }: { me: any }) {
+  const location = useLocation()
+  const docId = me?.pendingRenewalDocumentId
+  if (!docId || me?.pendingRenewalWaitingOnIsMe !== true) return null
+  if (location.pathname.startsWith('/sign')) return null
+  const start: string | null = me.pendingRenewalStartDate ?? null
+  const when = start
+    ? new Date(start + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+    : null
+  const before = start
+    ? new Date(new Date(start + 'T12:00:00Z').getTime() - 86400000)
+        .toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'UTC' })
+    : null
+  const rent = me.pendingRenewalRent != null
+    ? '$' + Number(me.pendingRenewalRent).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : null
+  // The tenant's own calendar day (not UTC's, which turns over at 5 pm in Phoenix).
+  const now = new Date()
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const started = !!start && start <= todayLocal
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.10)', border: '1px solid rgba(201,162,39,.35)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap',
+    }}>
+      <div>
+        <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 2 }}>
+          Your new lease is ready to sign{when ? (started ? ` — it started ${when}` : ` — it starts ${when}`) : ''}
+        </div>
+        <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+          {started
+            ? <>It is your lease now{rent ? <>, at {rent} a month</> : null}. Please read it and add your signature.</>
+            : <>Nothing changes before then — your current lease stays as it is{before ? <> through {before}</> : null}.
+               {rent ? <> From {when}, your rent is {rent} a month.</> : null} Please read it and sign it.</>}
+        </div>
+      </div>
+      <Link to={'/sign/' + docId} className="btn btn-primary" style={{ whiteSpace: 'nowrap' }}>Review &amp; sign</Link>
+    </div>
+  )
+}
+
+/**
+ * S655: which home the waiting lease is for, e.g. "Mountain View RV Ranch,
+ * Unit RV 47". Someone who already lives somewhere on GAM gets a lease from a
+ * new landlord as a notice on the Home page they already have — whose header
+ * names the home they live in NOW. So the notice names the new one.
+ *
+ * Their pending list carries it while the lease waits on them; once they have
+ * signed it leaves that list, and the document itself (which every signer may
+ * read) still does.
+ */
+function usePendingLeaseHome(me: any, enabled: boolean): string | null {
+  const docId: string | undefined = me?.pendingLeaseDocumentId || undefined
+  const on = enabled && !!docId
+  const { data: pendingDocs } = useQuery('pending-docs', fetchPendingDocs, { enabled: on })
+  const listed = Array.isArray(pendingDocs) ? pendingDocs : null
+  const row = listed?.find((d: any) => d.documentId === docId) ?? null
+  const { data: doc } = useQuery(['pending-lease-home', docId],
+    () => get<any>('/esign/documents/' + docId),
+    { enabled: on && !!listed && !row, staleTime: 300000, retry: false })
+  if (!on) return null
+  return pendingDocHome(row) ?? pendingDocHome(doc)
+}
+
+function LeaseSigningTurnNotice({ me, nameTheHome = false }: { me: any; nameTheHome?: boolean }) {
+  const home = usePendingLeaseHome(me, nameTheHome)
+  const who = me?.pendingLeaseWaitingOnName
+  if (!me?.pendingLeaseDocumentId || !who) return null
+  const mine = !!me.pendingLeaseWaitingOnIsMe
+  const roster: any[] = Array.isArray(me.pendingLeaseSigners) ? me.pendingLeaseSigners : []
+  const landlordTurn = me.pendingLeaseWaitingOnRole === 'landlord'
+    || me.pendingLeaseWaitingOnRole === 'witness'
+  // The landlord signs first (S647), so a landlord's turn usually means they
+  // have not signed either — "your part is done" would be untrue for them.
+  const iSigned = roster.some((r: any) => r.isMe && r.signed)
+  return (
+    <div style={{
+      background: mine ? 'rgba(201,162,39,.10)' : 'rgba(38,167,90,.07)',
+      border: `1px solid ${mine ? 'rgba(201,162,39,.35)' : 'rgba(38,167,90,.28)'}`,
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+    }}>
+      <div style={{ fontWeight: 700, color: mine ? 'var(--gold)' : 'var(--text-0)', marginBottom: 4 }}>
+        {signingNoticeHeading(mine, home)}
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+        {mine ? (
+          <>You're next to sign. Everyone after you is waiting on this, so the sooner it's
+          done the sooner your lease is final.
+          {/* S655: someone who already lives somewhere on GAM is not taken
+              over by the signing page; this is their way in. */}
+          <div style={{ marginTop: 10 }}>
+            <Link to={'/sign/' + me.pendingLeaseDocumentId} className="btn btn-primary">Sign your lease</Link>
+          </div></>
+        ) : landlordTurn && iSigned ? (
+          <>Your part is done. It's with your landlord now for their signature — nothing
+          further is needed from you.</>
+        ) : landlordTurn ? (
+          <>Your landlord signs it first. You'll get an email when it's your turn to sign —
+          nothing is needed from you yet.</>
+        ) : (
+          <>It's <strong>{who}</strong>'s turn to sign next. Signing goes in order, so the
+          lease reaches everyone after them once they're done — a nudge from you will move it
+          along faster than a call to the office.</>
+        )}
+      </div>
+      {/* S639 (Nic): "does the middle tenant project their name onto the first
+          and third tenant so that everybody can know full transparency where
+          everything's at?" The next name alone is only the front of the queue.
+          The whole roster, in signing order, lets any one of three adults see
+          the entire state of their own lease without calling the office. */}
+      {roster.length > 1 && (
+        <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {roster.map((r: any, i: number) => {
+            const isNext = !r.signed && roster.findIndex((x: any) => !x.signed) === i
+            return (
+              <span key={i} style={{
+                fontSize: '.78rem', padding: '3px 9px', borderRadius: 999,
+                border: `1px solid ${r.signed ? 'rgba(38,167,90,.35)' : isNext ? 'rgba(201,162,39,.45)' : 'var(--border-0)'}`,
+                background: r.signed ? 'rgba(38,167,90,.08)' : isNext ? 'rgba(201,162,39,.10)' : 'transparent',
+                color: r.signed ? 'var(--green, #5fbf7f)' : isNext ? 'var(--gold)' : 'var(--text-3)',
+                fontWeight: r.signed || isNext ? 600 : 500,
+              }}>
+                {r.signed ? '✓ ' : isNext ? '→ ' : ''}
+                {r.isMe ? 'You' : r.name}
+                {r.role === 'landlord' ? ' (landlord)' : r.role === 'witness' ? ' (witness)' : ''}
+                {r.signed ? ' signed' : isNext ? ' — signing now' : ' — after'}
+              </span>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function OnboardingWaitingNotice({ me }: { me: any }) {
+  if (!me?.onboardingUnitNumber) return null
+  const waiting = Number(me.onboardingHouseholdPending || 0)
+  const names: string[] = (me.onboardingHouseholdPendingNames || []).filter(Boolean)
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.32)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+    }}>
+      <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 4 }}>
+        You're all set — your lease is on its way
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+        {waiting > 0 ? (
+          // S639 (Nic): "does the person from that household get the name of who
+          // the next signer is that it's waiting on?... That way the household
+          // can help propel itself to completion instead of each individual
+          // person keep trying to talk to the office." Naming them turns a
+          // dead wait into something the household can act on themselves.
+          <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is drafted and sent for
+          signature as soon as {names.length > 0 ? <strong>{joinNames(names)}</strong>
+            : (waiting === 1 ? 'the other person on your household' : `all ${waiting} other people on your household`)}
+          {' '}{waiting === 1 ? 'accepts' : 'accept'} their portal invite. We'll email you the
+          moment it's ready to sign.</>
+        ) : (
+          <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is being prepared. We'll
+          email you the moment it's ready to sign — nothing else is needed from you right now.</>
+        )}
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)', marginTop: 8 }}>
+        <strong style={{ color: 'var(--green)' }}>You do not owe anything for a background
+        check.</strong> Your landlord has already onboarded you, so there is nothing to pay
+        and nothing to apply for.
       </div>
     </div>
   )
@@ -1128,12 +1508,27 @@ function HomePage() {
       <div className="ph">
         <div>
           <h1 className="pt">Hi, {user?.firstName} 👋</h1>
-          <p className="ps">{me?.propertyName} · Unit {me?.unitNumber}</p>
+          <p className="ps">
+            {me?.propertyName || me?.onboardingPropertyName}
+            {(me?.unitNumber || me?.onboardingUnitNumber)
+              ? ` · Unit ${me?.unitNumber || me?.onboardingUnitNumber}` : ''}
+          </p>
         </div>
       </div>
 
       <ServiceOutageBanner />
+      <OnboardingWaitingNotice me={me} />
+      {/* S655: a lease from ANOTHER company (pendingLeaseLocks false — they
+          live somewhere else on GAM, so it does not take their portal over)
+          shows only once it has reached them, like UtilityServiceHome: the
+          landlord signs first (S647) and nothing was sent to them before
+          that. The header above names the home they live in now, so the
+          notice names the home the new lease is for. */}
+      {showsSigningNotice(me) && (
+        <LeaseSigningTurnNotice me={me} nameTheHome={me?.pendingLeaseLocks === false} />
+      )}
       <HomeAlerts />
+      {flexVis.flexpay && me?.flexpayEnrolled && <FlexPayBillNotice />}
 
       {/* S542: private platform questionnaire — landlord never sees it. */}
       <QuestionnairePrompt />
@@ -1384,6 +1779,48 @@ function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: 
 // real Pay Now flow + Stripe Financial Connections bank add via the
 // /api/payments/:id/pay destination charge backend.
 import { PaymentsPage as PaymentsPageImpl } from './pages/PaymentsPage'
+import { readBalanceContext } from './pages/payShared'
+
+// ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
+//
+// Nic: "on mobile browser, as soon as they leave the page to check the email to
+// get the two factor authentication code, it signs them out or it takes them
+// back to the sign in page."
+//
+// Right, and it is not a sign-out — nothing was ever signed in. The pending OTP
+// session lived in React state only. Switching to the mail app to read the code
+// lets a phone browser discard and reload the page, and the component came back
+// with a fresh empty state: the email/password form again, with the code they
+// are now holding useless. Every tenant hits this, because email 2FA is on for
+// every login.
+//
+// sessionStorage survives that reload, so they return to the code box they left.
+// It holds the short-lived PRE-auth OTP session, never a real session token —
+// and that is worthless without the code from their inbox, the same trust level
+// as the page holding it in memory. Cleared as soon as the code is accepted or
+// the step is abandoned.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  // S654 (Nic): "they go back out to get the two-factor authentication code,
+  // [and] it boots them out." sessionStorage is PER TAB: a resident who reads
+  // the code in their mail app and comes back through the bill email's link
+  // lands in a NEW tab with no pending session, so the code screen is gone and
+  // they are back at the password form. localStorage is shared by every tab on
+  // this origin, so whichever tab they come back in resumes the code step. The
+  // pending token is useless without the emailed code and expires in 15 minutes,
+  // so leaving it in localStorage gives nothing away.
+  const [v, setV] = useState<string | null>(() => {
+    try { return localStorage.getItem(key) ?? sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) localStorage.setItem(key, next)
+      else { localStorage.removeItem(key); sessionStorage.removeItem(key) }
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
 function PaymentsPage() {
   // S570 (Nic): removed the "landlord banking not ready" banner — tenant money
   // sweeps to GAM's platform balance and is held until the landlord onboards,
@@ -1392,40 +1829,33 @@ function PaymentsPage() {
 }
 
 
-// ── ACH VERIFY FORM ───────────────────────────────────────────────────────
-function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
-  const [last4, setLast4] = useState('')
-  const [error, setError] = useState('')
-
-  // S554 (button-sweep bug #13): the "Bank Name" input was dropped — the
-  // verify-ach route never read bankName (no bank_name column; Stripe feeds
-  // the real display name). Only last4 is used.
-  const mut = useMutation(
-    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/verify-ach', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
-      body: JSON.stringify({ last4 })
-    }).then(r => r.json()),
-    {
-      onSuccess: (data) => {
-        if (!data.success) { setError(data.error || 'Verification failed'); return }
-        onSuccess()
-      },
-      onError: () => setError('Verification failed. Please try again.')
-    }
-  )
-
+// ── FLEXPAY BILL CARD (S655) ──────────────────────────────────────────────
+// "Your October bill was paid on time by FlexPay. $X will be drawn from your
+// bank on Oct 20." Read from the tenant's own FlexPay notice (lib/flexpayCard),
+// shown while that draw is still ahead. (S655, Step 5: the mock "enter the last
+// four digits" bank verification that stood here is gone — POST
+// /tenants/verify-ach no longer exists. A bank is verified only by the
+// microdeposit flow on the Payments page; never by instant verification.)
+function FlexPayBillNotice() {
+  // The server's current cycle first (GET /tenants/flexpay `currentCycle`, the
+  // same query the FlexPay card reads); the tenant's own notice only while the
+  // server does not send it — an in-app notice can be turned off.
+  const { data: fp } = useQuery<any>('tenant-flexpay', () => get<any>('/tenants/flexpay'))
+  const { data: notices = [] } = useQuery<TenantNotice[]>('tenant-notifications-flexpay',
+    () => get<TenantNotice[]>('/notifications?limit=100').then((r: any) => Array.isArray(r) ? r : []))
+  const card = flexPayBillCard(notices, localToday(), (fp?.currentCycle ?? null) as FlexPayCycle | null)
+  if (!card) return null
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:12,maxWidth:400}}>
-      {error && <div className="alert a-warn">{error}</div>}
-      <div className="fg">
-        <label className="fl">Last 4 digits of account number</label>
-        <input className="fi" value={last4} onChange={e=>setLast4(e.target.value.replace(/\D/g,'').slice(0,4))} placeholder="1234" maxLength={4} style={{maxWidth:120,fontFamily:'var(--font-m)'}} />
+    <div className="card" style={{ padding: '14px 16px', marginBottom: 16, borderLeft: '3px solid var(--gold)' }}>
+      <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+        FlexPay
       </div>
-      <button className="btn btn-p" disabled={mut.isLoading || last4.length !== 4} onClick={()=>mut.mutate()}>
-        {mut.isLoading ? <span className="spinner"/> : '✓ Verify Bank Account'}
-      </button>
-      <p style={{fontSize:'.72rem',color:'var(--t3)'}}>This connects your bank account for automated rent collection via ACH.</p>
+      <div style={{ fontSize: '.88rem', color: 'var(--t1)', lineHeight: 1.5 }}>{card.headline}</div>
+      {card.stillDue && (
+        <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginTop: 6, lineHeight: 1.5 }}>
+          {card.stillDue} <Link to="/payments" style={{ color: 'var(--gold)' }}>Pay it on the Payments page</Link>
+        </div>
+      )}
     </div>
   )
 }
@@ -1487,6 +1917,28 @@ function LeaseNoticeGate() {
       onError: () => setError('Could not save. Try again.'),
     },
   )
+  // S641 (Nic): "when somebody logs in to see their rent, I want that to be
+  // hidden behind whatever notices were released. So they have to see it,
+  // scroll down, and acknowledge it."
+  //
+  // It already blocked the portal. What it did not do was make anyone read:
+  // Acknowledge was live the instant the box appeared, so a long notice could be
+  // dismissed unseen — and an acknowledgment nobody read is worth nothing as
+  // proof. The button now waits until the notice has actually been scrolled
+  // through. A notice short enough to fit needs no scrolling, so it enables
+  // immediately rather than trapping somebody on a box with no scrollbar.
+  const [readToEnd, setReadToEnd] = useState(false)
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => { setReadToEnd(false) }, [current?.id])
+
+  // Measure AFTER the notice renders: a short one is already read.
+  useEffect(() => {
+    const el = bodyRef.current
+    if (!el || !current) return
+    if (el.scrollHeight <= el.clientHeight + 4) setReadToEnd(true)
+  }, [current?.id, current?.body])
+
   if (!current) return null
   return (
     // Blocking overlay: no onClick-to-dismiss — the tenant must Acknowledge.
@@ -1496,14 +1948,27 @@ function LeaseNoticeGate() {
         <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginBottom: 12 }}>
           {current.propertyName}{current.unitNumber ? ` · Unit ${current.unitNumber}` : ''}
         </div>
-        <p style={{ fontSize: '.92rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 16 }}>{current.body}</p>
+        <div
+          ref={bodyRef}
+          onScroll={e => {
+            const el = e.currentTarget
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 12) setReadToEnd(true)
+          }}
+          style={{ maxHeight: '45vh', overflowY: 'auto', marginBottom: 12, paddingRight: 6 }}
+        >
+          <p style={{ fontSize: '.92rem', color: 'var(--t1)', lineHeight: 1.6, margin: 0, whiteSpace: 'pre-wrap' }}>
+            {current.body}
+          </p>
+        </div>
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginBottom: 16 }}>
-          This is a formal notice from your landlord. Acknowledging confirms you have seen it.
+          {readToEnd
+            ? 'This is a formal notice from your landlord. Acknowledging confirms you have seen it.'
+            : 'Scroll to the end of the notice to continue.'}
         </div>
         {error && <div className="alert a-warn" style={{ marginBottom: 12 }}>{error}</div>}
-        <button className="btn btn-p" style={{ width: '100%' }} disabled={ack.isLoading}
+        <button className="btn btn-p" style={{ width: '100%' }} disabled={ack.isLoading || !readToEnd}
           onClick={() => ack.mutate(current.id)}>
-          {ack.isLoading ? 'Saving…' : 'Acknowledge'}
+          {ack.isLoading ? 'Saving…' : readToEnd ? 'Acknowledge' : 'Scroll to read'}
         </button>
       </div>
     </div>
@@ -1813,12 +2278,15 @@ function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean;
 }
 
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
-// (1-28); fee is a FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
+// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS); fee is a
+// FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
-// click-accept of the Subscription Terms is required + persisted.
+// click-accept of the Subscription Terms is required + persisted. S655: the
+// terms summary is FLEXPAY_TERMS (shared) — the same sections the PDF, emails
+// and admin render, so none of them can drift from the code.
 
 function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [pullDay, setPullDay] = useState(15)
+  const [pullDay, setPullDay] = useState(offeredPullDay(15))
   const [tosAck, setTosAck] = useState(false)
   const [showFullTerms, setShowFullTerms] = useState(false)
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
@@ -1866,17 +2334,17 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
         <div className="modal-t">⚡ Enroll in FlexPay</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
+          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
         </p>
 
         <div className="fg">
           <label className="fl">Pull day of month</label>
           <div style={{display:'flex',alignItems:'center',gap:12}}>
-            <input type="range" min={1} max={28} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+            <input type="range" aria-label="Pull day of month" min={FLEXPAY_FIRST_PULL_DAY} max={FLEXPAY_LAST_PULL_DAY} value={pullDay} onChange={e=>setPullDay(offeredPullDay(parseInt(e.target.value)))}
               style={{flex:1,accentColor:'var(--gold)'}} />
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
           </div>
-          <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>Rent will be pulled on day {pullDay} of every month.</div>
+          <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>GAM collects on the {ordinal(pullDay)} of every month. Any day from the {pullDayRangeText()} — the 1st through the 5th aren&apos;t offered.</div>
         </div>
 
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16,marginTop:16}}>
@@ -1895,12 +2363,11 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
           <p style={{marginBottom:8}}>
             <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is a flat $25 regardless of that day.
           </p>
-          <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Failed pulls retry.</strong> ACH is all-or-nothing (banks reject the whole pull on insufficient funds). If your scheduled pull fails, GAM retries on a later day. Your FlexPay fee stays a flat $25 — it does not change on a retry. Stripe's actual ACH-return fee (about $4) is passed through to you at cost, with no GAM markup.
-          </p>
-          <p style={{marginBottom:0}}>
-            <strong style={{color:'var(--t1)'}}>Doesn't change your lease.</strong> FlexPay schedules when your ACH pull runs; it does not change the rent amount you owe or any landlord remedy (late fees, default notices) under your lease. A later pull day does not waive late-fee accrual against your rent due date.
-          </p>
+          {FLEXPAY_TERMS.map((t, i) => (
+            <p key={t.key} style={{marginBottom: i === FLEXPAY_TERMS.length - 1 ? 0 : 8}}>
+              <strong style={{color:'var(--t1)'}}>{t.title}.</strong> {t.body}
+            </p>
+          ))}
           <div style={{marginTop:10}}>
             <button
               type="button"
@@ -1950,7 +2417,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 function FlexPayChangeDayModal({
   currentDay, onClose, onSuccess,
 }: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
-  const [pullDay, setPullDay] = useState(currentDay || 15)
+  // S655 (Nic 10/2): the 1st-5th are not offered; a day stored before that
+  // rule starts the picker at the nearest offered day.
+  const [pullDay, setPullDay] = useState(offeredPullDay(currentDay || 15))
   const [error, setError] = useState('')
   const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
@@ -1974,12 +2443,12 @@ function FlexPayChangeDayModal({
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
         <div className="modal-t">⚡ Change FlexPay pull day</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick a new day of the month. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
+          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
         </p>
         <div className="fg">
           <label className="fl">Pull day of month</label>
           <div style={{display:'flex',alignItems:'center',gap:12}}>
-            <input type="range" min={1} max={28} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+            <input type="range" aria-label="Pull day of month" min={FLEXPAY_FIRST_PULL_DAY} max={FLEXPAY_LAST_PULL_DAY} value={pullDay} onChange={e=>setPullDay(offeredPullDay(parseInt(e.target.value)))}
               style={{flex:1,accentColor:'var(--gold)'}} />
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
           </div>
@@ -2546,7 +3015,9 @@ function ServicesPage() {
     {
       id: 'flexpay',
       name: 'FlexPay',
-      desc: 'Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
+      // S655 (decisions #35.8): a payment-date coordination subscription —
+      // never described as advancing, fronting or lending money.
+      desc: 'FlexPay pays your monthly bill to your landlord on time, and GAM collects it from your bank on the day you choose — matched to when your income lands. A payment-date subscription: not a loan, no interest, no penalties.',
       price: '$25/month',
       enrolled: me?.flexpayEnrolled,
       // S581: paused because the tenant now holds more than one lease.
@@ -2576,7 +3047,7 @@ function ServicesPage() {
               : 'You’re in line — we’ll reach out when it’s your turn')
         : fpInquiry?.status === 'declined' ? null
         : fpApproved
-          ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : '✓ Approved — pick your pull date 1–28')
+          ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : `✓ Approved — pick your pull day (the ${pullDayRangeText()})`)
           : 'For SSI/SSDI recipients — tap to request access',
       locked: fpLaunched && fpApproved && !me?.achVerified,
       ctaLabel: !fpLaunched ? 'Take the survey' : fpApproved ? 'Enroll' : 'I’m interested',
@@ -2620,6 +3091,7 @@ function ServicesPage() {
       <div className="alert a-blue" style={{marginBottom:24}}>
         ℹ️ None of these services are required as a condition of your tenancy. Subscribe only if they benefit you.
       </div>
+      {flexVis.flexpay && me?.flexpayEnrolled && <FlexPayBillNotice />}
       <div className="grid3">
         {visibleServices.map(s => (
           <div key={s.id} className={`service-card${s.enrolled?' enrolled':''}`}>
@@ -2661,20 +3133,19 @@ function ServicesPage() {
         />
       )}
 
-      {/* ── ACH Verification ─────────────────────────────────────── */}
+      {/* ── Bank account (S655) ─────────────────────────────────────
+          FlexPay and FlexDeposit need a verified bank. A bank is added and
+          verified in ONE place — the Payments page (microdeposits only, never
+          instant verification). The old "type the last four digits" form here
+          posted to a route that no longer exists. */}
       {!me?.achVerified && (
         <div className="card" style={{marginTop:24}}>
-          <h3 style={{marginBottom:4}}>🏦 Bank Account Verification</h3>
-          <p style={{fontSize:'.82rem',color:'var(--t3)',marginBottom:16}}>
-            {me?.depositFullyFunded
-              ? 'Verify your bank account to enable FlexPay / FlexDeposit.'
-              : 'Your security deposit must be fully funded before you can verify your bank account.'}
+          <h3 style={{marginBottom:4}}>🏦 Bank account</h3>
+          <p style={{fontSize:'.82rem',color:'var(--t3)',marginBottom:16,lineHeight:1.5}}>
+            FlexPay and FlexDeposit need a verified bank account. Add your bank on the Payments page —
+            we send a small deposit to it, and you confirm that deposit there.
           </p>
-          {!me?.depositFullyFunded ? (
-            <div className="alert a-warn">⚠ Complete your security deposit payment first.</div>
-          ) : (
-            <AchVerifyForm onSuccess={()=>qc2.refetch()} />
-          )}
+          <Link to="/payments" className="btn btn-p btn-sm" style={{textDecoration:'none'}}>Add a bank on the Payments page</Link>
         </div>
       )}
 
@@ -4253,27 +4724,43 @@ function DocumentsPage() {
 
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
-  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, token:signedIn, loading:authLoading } = useAuth(); const navigate = useNavigate()
+  // S654 (Nic): the bill's Pay now link arrives as /login?ef=…&to=/payments —
+  // `ef` is proof of the inbox (signEmailFactorToken on the API) so the
+  // password alone finishes the sign-in; `to` is where to land. Read once and
+  // taken off the address bar. A bounce from a signed-out page (ToSignIn)
+  // passes its own destination in router state.
+  const [entry] = useState(()=>{
+    try{
+      const q = new URLSearchParams(window.location.search)
+      const ef = q.get('ef'); const to = q.get('to')
+      if(ef||to) window.history.replaceState(null,'',window.location.pathname)
+      return { ef: ef||null, to: safeLanding(to) }
+    }catch{ return { ef:null, to:null } }
+  })
+  const location = useLocation()
+  const landing = entry.to || safeLanding((location.state as any)?.to) || '/home'
+  useEffect(()=>{ if(signedIn && !authLoading) navigate(landing,{replace:true}) },[signedIn,authLoading])  // already signed in on this device
   const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string|null>(null)
-  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.tenant.login')
   const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
   const { register, handleSubmit } = useForm<{email:string;password:string}>()
   const onSubmit = async(d:{email:string;password:string})=>{
     setLoading(true);setErr('')
     try{
-      const r = await login(d.email,d.password)
+      const r = await login(d.email,d.password,entry.ef)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
       else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResent(false)}
-      else navigate('/home')
+      else navigate(landing)
     }
     catch(e:any){setErr(e.response?.data?.error||'Login failed')}
     finally{setLoading(false)}
   }
   const onEmailOtpSubmit = async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); navigate('/home') }
+    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); setEmailOtpSession(null); navigate(landing) }
     catch(ex:any){
       const msg=ex.response?.data?.error||'Invalid code.'
       setErr(msg)
@@ -4288,7 +4775,7 @@ function LoginPage() {
   }
   const onTotpSubmit = async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithTotp(totpSession!,code.trim()); navigate('/home') }
+    try{ await loginWithTotp(totpSession!,code.trim()); navigate(landing) }
     catch(ex:any){
       const msg=ex.response?.data?.error||'Invalid code.'
       setErr(msg)
@@ -4412,152 +4899,26 @@ function LoginPage() {
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
           </form>
-          <div style={{ marginTop: 16, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+          {/* S642 (Nic, DIRECTIVE): "Tenants shouldn't be able to sign up for
+              just a random account. We designed it to be invite only… One flow
+              per route so nothing is confusing. No choices to be made by
+              tenants."
+
+              This route is for people who already live somewhere: sign in, or
+              recover the password. Nothing else. A "Create account" link used
+              to sit right here beside Sign in, and a resident who could not get
+              in read it as the thing he was supposed to do — he made a second,
+              lease-less account, then could not pay rent from it because it had
+              no lease and no bill. That is the only way self-signup has ever
+              been used by a resident.
+
+              Housing-seekers still create accounts; that door lives on the
+              screening route (/signup, which /background-check redirects into),
+              reached from marketing, not from the residents' login page. */}
+          <div style={{ marginTop: 16 }}>
             <Link to="/forgot-password" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
               Forgot password?
             </Link>
-            <Link to="/signup" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
-              Create account
-            </Link>
-          </div>
-        </div>
-        {/* S578: renter-pool entry is now account-first — create an account
-            (with 2FA), then get screened from inside the gated portal. */}
-        <div className="card" style={{ padding: 20, marginTop: 16, textAlign: 'center' }}>
-          <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>Looking for a place to live?</div>
-          <div style={{ fontSize: '.8rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 14 }}>
-            Create your account, get background-checked once, and join the renter pool — landlords with open units find you. No chosen property needed to start.
-          </div>
-          <Link to="/signup" className="btn btn-p" style={{ width: '100%', justifyContent: 'center', textDecoration: 'none' }}>
-            Get started
-          </Link>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// S578: prospect self-signup — account created FIRST, with mandatory email-2FA,
-// as its own step (NOT inline in the background check). name/email/password →
-// emailed 6-digit code → verify → land in the gated portal, which shows only
-// "complete your background check" until it's done. A landlordId/unitId in the
-// URL (from a landlord invite / listing) rides along for property attribution.
-function SignupPage() {
-  const { signup, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
-  const params = new URLSearchParams(window.location.search)
-  const landlordId = params.get('landlordId'); const unitId = params.get('unitId')
-  const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
-  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
-  const [resent, setResent] = useState(false); const [code, setCode] = useState('')
-  const { register, handleSubmit, watch } = useForm<{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean}>()
-  const pw = watch('password')
-  const onSubmit = async(d:{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean})=>{
-    setErr('')
-    if(d.password!==d.confirmPassword){setErr('Passwords do not match');return}
-    if(d.password.length<12){setErr('Password must be at least 12 characters');return}
-    if(!d.acceptedTerms){setErr('You must accept the Terms of Service and Privacy Policy');return}
-    setLoading(true)
-    try{
-      const r = await signup({ firstName:d.firstName, lastName:d.lastName, email:d.email, password:d.password, acceptedTerms:true, landlordId, unitId })
-      setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false)
-    }
-    catch(e:any){setErr(e.response?.data?.error||'Could not create your account')}
-    finally{setLoading(false)}
-  }
-  const onEmailOtpSubmit = async(e:React.FormEvent)=>{
-    e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); navigate('/') }
-    catch(ex:any){
-      const msg=ex.response?.data?.error||'Invalid code.'
-      setErr(msg)
-      if(/session/i.test(msg)){setEmailOtpSession(null);setCode('')}
-    }
-    finally{setLoading(false)}
-  }
-  const onResend = async()=>{
-    setErr('')
-    try{ await resendEmailOtp(emailOtpSession!); setResent(true) }
-    catch{ setErr('Could not resend the code. Please try again.') }
-  }
-
-  // ── Step 2: emailed 2FA code ──────────────────────────────────
-  if(emailOtpSession){
-    return (
-      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
-        <div style={{width:'100%',maxWidth:400}}>
-          <div style={{textAlign:'center',marginBottom:40}}>
-            <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-            <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Verify your email</div>
-          </div>
-          <div className="card" style={{padding:28}}>
-            <h2 style={{marginBottom:14}}>Check your email</h2>
-            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
-              We sent a 6-digit code to your email. Enter it to finish creating your account.
-            </div>
-            {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
-            {resent && !err && <div className="alert a-green" style={{marginBottom:16}}>A new code is on its way.</div>}
-            <form onSubmit={onEmailOtpSubmit}>
-              <div className="fg">
-                <label className="fl">Code</label>
-                <input className="fi" type="text" value={code} onChange={e=>setCode(e.target.value)} autoFocus required autoComplete="one-time-code" inputMode="numeric" placeholder="123 456" style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}} />
-              </div>
-              <button className="btn btn-p" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:8}}>
-                {loading?<span className="spinner"/>:'Verify'}
-              </button>
-            </form>
-            <div style={{marginTop:16,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <button onClick={()=>{setEmailOtpSession(null);setCode('');setErr('');setResent(false)}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>← Back</button>
-              <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Step 1: account details ───────────────────────────────────
-  return (
-    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
-      <div style={{width:'100%',maxWidth:400}}>
-        <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-          <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Create your account</div>
-        </div>
-        <div className="card" style={{padding:28}}>
-          <h2 style={{marginBottom:20}}>Sign up</h2>
-          {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
-          <form onSubmit={handleSubmit(onSubmit)}>
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-              <div className="fg"><label className="fl">First name</label><input className="fi" {...register('firstName',{required:true})} autoFocus /></div>
-              <div className="fg"><label className="fl">Last name</label><input className="fi" {...register('lastName',{required:true})} /></div>
-            </div>
-            <div className="fg"><label className="fl">Email</label><input className="fi" type="email" {...register('email',{required:true})} /></div>
-            <div className="fg"><label className="fl">Password</label><input className="fi" type="password" {...register('password',{required:true})} placeholder="At least 12 characters" /></div>
-            <div className="fg"><label className="fl">Confirm password</label><input className="fi" type="password" {...register('confirmPassword',{required:true})} /></div>
-            {pw && pw.length>0 && pw.length<12 && <div style={{fontSize:'.72rem',color:'var(--warn,#f59e0b)',marginTop:-6,marginBottom:10}}>{12-pw.length} more character{12-pw.length===1?'':'s'} required</div>}
-            <label style={{display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer',fontSize:'.8rem',color:'var(--t1)',lineHeight:1.5,margin:'4px 0 12px'}}>
-              <input type="checkbox" {...register('acceptedTerms',{required:true})} style={{marginTop:2,flexShrink:0}} />
-              {/* S636: same two defects as the invite acceptance page — a click
-                  inside the <label> was going to the checkbox, and the URL was
-                  built from a fallback that shipped as localhost. */}
-              <span>I agree to the{' '}
-                <a href={CONSUMER_TERMS_URL} target="_blank" rel="noopener noreferrer"
-                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Terms of Service</a>
-                {' '}and{' '}
-                <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer"
-                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Privacy Policy</a>.
-              </span>
-            </label>
-            <div style={{fontSize:'.63rem',color:'var(--t3,#5a6a86)',lineHeight:1.6,
-                         wordBreak:'break-all',margin:'0 0 12px'}}>
-              Prefer to read them directly?<br />{CONSUMER_TERMS_URL}<br />{CONSUMER_PRIVACY_URL}
-            </div>
-            <button className="btn btn-p" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:8}}>
-              {loading?<span className="spinner"/>:'Create account'}
-            </button>
-          </form>
-          <div style={{marginTop:16,textAlign:'center'}}>
-            <Link to="/login" style={{color:'var(--gold)',fontSize:'.85rem',textDecoration:'none'}}>Already have an account? Sign in</Link>
           </div>
         </div>
       </div>
@@ -4565,8 +4926,23 @@ function SignupPage() {
   )
 }
 
+// S642: /signup is no longer its own flow — it forwards into the screening
+// form, carrying any landlord/unit attribution from the URL so a QR code or a
+// listing link still credits the right property.
+function SignupRedirect() {
+  useEffect(() => {
+    window.location.replace('/background-check' + window.location.search)
+  }, [])
+  return null
+}
 
-// ── APP ───────────────────────────────────────────────────────
+// S642: the standalone SignupPage that used to live here is GONE, not disabled.
+// It was the second way to make a tenant account — name/email/password, then a
+// 6-digit code, then a gated portal, then find the background check again. Nic:
+// "One flow per route so nothing is confusing. No choices to be made by tenants."
+// Account creation is now the first step of the screening form itself; /signup
+// forwards there via SignupRedirect above. Left as a comment rather than dead
+// code so it cannot drift back into a second flow.
 
 // S605 (Nic): "we should be doing that automatically... that way we're not
 // working on old visuals." A bfcache-restored tab on an outdated build reloads
@@ -4610,6 +4986,21 @@ function VersionWatch() {
 // Fixed for the class at the router. unlockScrollIfStandalone re-checks the
 // DOM for the shell on every navigation and is a no-op inside it, so signed-in
 // pages keep their own scrolling exactly as before.
+// S654: where a sign-in may land. ONLY a path on this portal: one leading
+// slash and never a second slash or a backslash after it, because the router
+// treats "//evil.example/x" as an absolute URL and would carry a freshly
+// signed-in resident off to another site. Anything else falls back to Home.
+function safeLanding(p: unknown): string | null {
+  return typeof p === 'string' && /^\/(?![\/\\])[A-Za-z0-9\-_\/?=&%.]*$/.test(p) ? p : null
+}
+
+// S654: a signed-out visit to a real page (the bill's Pay now link, a bookmark)
+// signs in and then lands THERE, not on Home.
+function ToSignIn() {
+  const loc = useLocation()
+  return <Navigate to="/login" replace state={{ to: loc.pathname + loc.search }} />
+}
+
 function ScrollUnlock() {
   const location = useLocation()
   useEffect(() => unlockScrollIfStandalone(), [location.pathname])
@@ -4626,7 +5017,11 @@ function App() {
       <ScrollUnlock />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/signup" element={<SignupPage />} />
+        {/* S642 (Nic): "One flow per route so nothing is confusing." Account
+            creation for a housing-seeker is now the first step of the screening
+            form itself, not a page in front of it. /signup stays only so older
+            links and bookmarks land somewhere sensible. */}
+        <Route path="/signup" element={<SignupRedirect />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/verify-email" element={<VerifyEmailPage />} />
@@ -4640,14 +5035,16 @@ function App() {
             they are being asked to sign. The authenticated route below stays
             for signing from inside the portal. */}
         <Route path="/sign/:documentId" element={<SignPage />} />
-        <Route path="/" element={token ? <Layout /> : <Navigate to="/login" replace />}>
+        <Route path="/" element={token ? <Layout /> : <ToSignIn />}>
           <Route index element={<DefaultPage />} />
           <Route path="notifications"    element={<TenantNotificationsPage />} />
           <Route path="home"             element={<HomePage />} />
+          <Route path="find-a-place"     element={<FindAPlacePage />} />
           <Route path="payments"         element={<PaymentsPage />} />
           <Route path="communication"   element={<CommunicationPage />} />
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
+          <Route path="laws"             element={<LawsPage />} />
           <Route path="sign/:documentId" element={<SignPage />} />
           <Route path="services"         element={<ServicesPage />} />
           {/* S571: Documents folded into the Communication dashboard (it's
@@ -4659,6 +5056,7 @@ function App() {
           <Route path="entry-requests"      element={<TenantEntryRequestsPage />} />
           <Route path="amenities"           element={<TenantAmenitiesPage />} />
           <Route path="work-trade"          element={<WorkTradePage />} />
+          <Route path="meter-readings"      element={<MeterReadingsPage />} />
           <Route path="entry-requests/:id"  element={<TenantEntryRequestDetailPage />} />
           <Route path="credit"              element={LAUNCH_HIDDEN.has('/credit') ? <Navigate to="/home" replace /> : <CreditPage />} />
           <Route path="my-disputes"         element={LAUNCH_HIDDEN.has('/my-disputes') ? <Navigate to="/home" replace /> : <MyDisputesPage />} />

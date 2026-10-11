@@ -9,6 +9,7 @@
  *     preview (used by the accept-invite page)
  *
  * Slice 1 (S374): /me + landlord-banking + verify-ach + deposit-interest.
+ *   (S655: the mock POST /verify-ach was removed — banks verify through Stripe only.)
  * Slice 2 (S375): all Flex (FlexCharge/FlexPay/FlexDeposit/FlexSuite
  *   re-accept + DELETE flex*) + portability eligibility/authorize.
  * Slice 3 (S376): OTP-deprecated + credit-reporting + payments +
@@ -142,7 +143,8 @@ describe('POST /invite — landlord invites tenant', () => {
     expect(res.body.error).toMatch(/forbidden/i)
   })
 
-  it('happy: creates user + tenant + invite token; URL uses TENANT_APP_URL', async () => {
+  // S655 (Nic, 10/2): email-only — the token is stamped and mailed, never returned.
+  it('happy: creates user + tenant + invite token, and returns no link', async () => {
     const f = await seedLandlordFixture()
     process.env.TENANT_APP_URL = 'https://tenant.test.gam'
     const res = await request(buildApp())
@@ -153,8 +155,9 @@ describe('POST /invite — landlord invites tenant', () => {
     expect(res.status).toBe(200)
     expect(res.body.success).toBe(true)
     expect(res.body.data.email).toBe('new-tenant@test.dev')
-    expect(res.body.data.inviteToken).toMatch(/^[0-9a-f]{64}$/)
-    expect(res.body.data.acceptUrl).toContain('https://tenant.test.gam/accept-invite?token=')
+    expect(res.body.data).not.toHaveProperty('inviteToken')
+    expect(res.body.data).not.toHaveProperty('acceptUrl')
+    expect(res.body.data.inviteSent).toBe(true)
 
     // Side effects: user row + tenants row + token stamped on users.
     // S410 (S377): read tenant_invite_token + expiry, not email_verify_token.
@@ -166,7 +169,7 @@ describe('POST /invite — landlord invites tenant', () => {
       ['new-tenant@test.dev'])
     expect(u.rows[0].first_name).toBe('New')
     expect(u.rows[0].phone).toBe('5555550100')
-    expect(u.rows[0].tenant_invite_token).toBe(res.body.data.inviteToken)
+    expect(u.rows[0].tenant_invite_token).toMatch(/^[0-9a-f]{64}$/)
     // S410: 7-day expiry stamped at invite time.
     const expiresAt = new Date(u.rows[0].tenant_invite_expires_at)
     const expectedExpiry = Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -222,7 +225,7 @@ describe('POST /accept-invite — tenant activates account', () => {
   // Laurel Rhoades, MH 02 Mountain View. She set a password and a phone number,
   // the page told her it failed, and her retry said "invalid or expired invite
   // link" — because the token was cleared two statements in, before the work it
-  // authorised was done, in a route with no transaction. Her password, phone and
+  // authorized was done, in a route with no transaction. Her password, phone and
   // terms acceptance were saved; her invite was never marked accepted and her
   // lease was never drafted. She had an account she could not reach and a link
   // that was already spent.
@@ -255,9 +258,11 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(u.rows[0].phone).toBe('5205551234')
     expect(u.rows[0].tos).not.toBeNull()
     expect(u.rows[0].twofa).toBe(true)
-    // S637 (b51aa57): spent means MARKED accepted, not deleted — the token is
-    // kept so a tenant reopening their own invite is told "already set up"
-    // instead of "expired". It authorises nothing once accepted.
+    // S637: the token is RETAINED and the acceptance is stamped instead. A
+    // spent link used to be indistinguishable from a bad one, so tenants who had
+    // already set up their account were told the invite "expired" and asked Nic
+    // for a new one. The row now knows the difference — and the kept token
+    // authorizes nothing once accepted.
     expect(u.rows[0].tok).toBe(f.token)
     expect(u.rows[0].accepted).not.toBeNull()
   })
@@ -301,14 +306,17 @@ describe('POST /accept-invite — tenant activates account', () => {
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
     expect(ok.status).toBe(200)
 
-    // And it is single-use: a replay of a SPENT link is refused, rather than
-    // activating twice and drafting a second lease. S637 (b51aa57): refused
-    // with 409 "already set up" — the token survives, marked accepted, so the
-    // tenant is told the truth instead of "invalid or expired".
+    // Still single-use — a replay of a SPENT link is refused with 409 rather
+    // than activating twice or drafting a second lease — but it is now told
+    // WHICH thing happened. Nic (S637): "several more people tell me that their
+    // invite expired when they already accepted it... tell them to look for a
+    // separate email for their lease." 
     const replay = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
     expect(replay.status).toBe(409)
+    expect(replay.body.code).toBe('ALREADY_ACCEPTED')
+    expect(replay.body.error).toMatch(/already set up|sign in/i)
   })
 
   it('missing token → 400', async () => {
@@ -368,15 +376,19 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(decoded.role).toBe('tenant')
     expect(decoded.purpose).toBe('email_otp_pending')
 
-    // S410 (S377): accept clears tenant_invite_token + expiry. Email
-    // verification column is independent.
+    // S410 (S377) / S637: accept clears the EXPIRY and stamps
+    // tenant_invite_accepted_at, but KEEPS the token so a second click can be
+    // told "you already set this up" instead of "expired". Email verification
+    // column is independent.
     const u = await db.query<{
       password_hash: string; tenant_invite_token: string | null;
-      tenant_invite_expires_at: Date | null; email_verified: boolean;
+      tenant_invite_expires_at: Date | null; tenant_invite_accepted_at: Date | null;
+      email_verified: boolean;
       phone: string | null; accepted_tos_at: Date | null; accepted_privacy_at: Date | null;
     }>(
       `SELECT password_hash, tenant_invite_token, tenant_invite_expires_at,
-              email_verified, phone, accepted_tos_at, accepted_privacy_at
+              tenant_invite_accepted_at, email_verified, phone,
+              accepted_tos_at, accepted_privacy_at
          FROM users WHERE id=$1`, [userId])
     expect(u.rows[0].password_hash).not.toBe('$2b$10$placeholder_invite_pending')
     expect(u.rows[0].password_hash).toMatch(/^\$2[aby]\$/)  // bcrypt envelope
@@ -385,10 +397,28 @@ describe('POST /accept-invite — tenant activates account', () => {
     // accepted invite can never also report as timed out.
     expect(u.rows[0].tenant_invite_token).not.toBeNull()
     expect(u.rows[0].tenant_invite_expires_at).toBeNull()
+    expect(u.rows[0].tenant_invite_accepted_at).not.toBeNull()
     expect(u.rows[0].email_verified).toBe(true)
     expect(u.rows[0].phone).toBe('5555550199')
     expect(u.rows[0].accepted_tos_at).not.toBeNull()
     expect(u.rows[0].accepted_privacy_at).not.toBeNull()
+  })
+
+  // S654: a token with no clock was treated as live for ever. Every invite
+  // door writes an expiry, and activation clears it only once the link is
+  // spent, so an unaccepted token with none is dead, never a way in.
+  it('S654: an unaccepted token with no expiry is refused, and nothing is written', async () => {
+    const { token, userId } = await seedPendingInvite()
+    await db.query(`UPDATE users SET tenant_invite_expires_at = NULL WHERE id = $1`, [userId])
+    const before = (await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [userId])).rows[0]
+    const res = await request(buildApp())
+      .post('/api/tenants/accept-invite')
+      .send({ token, password: 'newpass8chars', acceptedTerms: true })
+    expect(res.status).toBe(404)
+    expect((await db.query(`SELECT password_hash, tenant_invite_accepted_at FROM users WHERE id=$1`, [userId])).rows[0])
+      .toEqual(before)
+    const info = await request(buildApp()).get(`/api/tenants/invite-info?token=${token}`)
+    expect(info.status).toBe(404)
   })
 
   it('happy with ssiSsdi=true: flips tenants.ssi_ssdi flag', async () => {
@@ -421,11 +451,13 @@ describe('GET /invite-info — unauthenticated preview', () => {
   it('happy without active lease: returns user, unit=null', async () => {
     // S410 (S377): seed on tenant_invite_token + 7d expiry, not the
     // overloaded email_verify_token column.
+    // S654: seeded as a never-set-up invitee (the placeholder password every
+    // invite door writes); the preview is shown only for one of those.
     const inviteToken = 'preview_' + randomUUID().replace(/-/g, '')
     await db.query(
       `INSERT INTO users (email, password_hash, role, first_name, last_name,
                           tenant_invite_token, tenant_invite_expires_at)
-       VALUES ($1, 'x', 'tenant', 'Preview', 'User', $2, NOW() + INTERVAL '7 days')`,
+       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Preview', 'User', $2, NOW() + INTERVAL '7 days')`,
       ['preview@test.dev', inviteToken])
 
     const res = await request(buildApp())

@@ -1,3 +1,5 @@
+import { PERMISSION_CATALOG } from '@gam/shared'
+
 /**
  * Case conversion utility — snake_case -> camelCase for outgoing API responses.
  * Used by the response middleware in index.ts to ensure the API wire format
@@ -18,16 +20,39 @@ function snakeToCamel(key: string): string {
 }
 
 // A `permissions` value is a scope permission MAP, not a normal field object.
-// Its keys are semantic identifiers: catalog permission keys are DOTTED
-// (e.g. 'pos.ring_sale') and must survive verbatim — camelCasing them to
-// 'pos.ringSale' silently breaks every underscore permission on the frontend.
-// Non-dotted keys inside it (e.g. bookkeeper's 'access_level') are config and
-// still camelCase. Values are primitives (boolean / string), never recursed.
+// Its keys are semantic identifiers and must survive verbatim — camelCasing
+// 'pos.ring_sale' to 'pos.ringSale' silently breaks the frontend's check.
+//
+// S641: this used to test for a DOT, on the assumption that every catalog key
+// has one and anything without is config (bookkeeper's 'access_level'). Two
+// catalog keys have no dot — `take_payment` and `guest_access` — so both were
+// being rewritten to camelCase on the wire while every `can('take_payment')`
+// in the frontend kept asking for the underscore, and got undefined.
+//
+// It hid for as long as it did because the Record payment button was ungated:
+// it rendered for everyone, so nobody could tell the permission never
+// answered. The moment Nic's on-site manager was correctly gated, the button
+// vanished for the one person who was supposed to have it.
+//
+// So the question is now the real one — IS THIS A CATALOG KEY? — answered from
+// the catalog rather than from the shape of the string. A new key without a
+// dot cannot reintroduce this.
+const CATALOG_PERMISSION_KEYS: Set<string> = (() => {
+  const keys = new Set<string>()
+  for (const group of PERMISSION_CATALOG) {
+    for (const section of group.sections ?? []) {
+      for (const item of section.items ?? []) keys.add(item.key)
+    }
+  }
+  return keys
+})()
+
 function camelCasePermissionsMap(perms: any): any {
   if (!perms || typeof perms !== 'object' || Array.isArray(perms)) return camelCaseKeys(perms)
   const out: Record<string, any> = {}
   for (const [k, v] of Object.entries(perms)) {
-    out[k.includes('.') ? k : snakeToCamel(k)] = v
+    const verbatim = k.includes('.') || CATALOG_PERMISSION_KEYS.has(k)
+    out[verbatim ? k : snakeToCamel(k)] = v
   }
   return out
 }

@@ -5,6 +5,8 @@ import { FileText, Download, PenTool, CheckCircle, AlertCircle, RotateCcw } from
 import { ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
+import { pendingDocHome } from '../lib/pendingLease'
+import { awaitingSignatureRow, leaseOnItsWay } from '../lib/awaitingSignature'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -40,6 +42,26 @@ function post<T>(path: string, body: any): Promise<T> {
   const token = localStorage.getItem('gam_tenant_token')
   return fetch(`${API_URL}/api${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) })
     .then(r => r.json()).then(r => r.data ?? r)
+}
+
+
+// S637: pick the canvas scale for a crisp page on a high-density screen.
+//
+// Beyond the device's own pixel ratio we add zoom headroom, then clamp the
+// total canvas area: mobile Safari refuses to paint a canvas past its size
+// limit and silently hands back a BLANK one, which would turn "blurry lease"
+// into "no lease at all".
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
 }
 
 // ── SIGNATURE CANVAS ─────────────────────────────────────────
@@ -140,10 +162,20 @@ function PdfViewer({ url, token }: { url:string; token:string }) {
     const p2 = await pdf.getPage(pageNum)
     const vp = p2.getViewport({ scale:1 })
     const scale = containerRef.current.clientWidth / vp.width
-    const sv = p2.getViewport({ scale })
+    // S637 (Nic): "the lease is blurry when people zoom in on phone."
+    //
+    // The canvas was sized in CSS pixels, so on a phone at devicePixelRatio 3
+    // the tenant was reading a one-third-resolution image stretched to fit —
+    // soft before they touched it, and properly blurry once they pinched in to
+    // read a clause. Render at the screen's real density, with headroom on top
+    // so zooming has detail to reveal rather than magnifying the same pixels.
+    const sv = p2.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')!
     canvas.width = sv.width; canvas.height = sv.height
+    // Backing store grew; the drawn size must stay the container width.
+    canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     ctx.clearRect(0, 0, canvas.width, canvas.height)
     const task = p2.render({ canvasContext:ctx, viewport:sv })
     renderTaskRef.current = task
@@ -166,11 +198,62 @@ function PdfViewer({ url, token }: { url:string; token:string }) {
   )
 }
 
+/** "January 1, 2027" from 'YYYY-MM-DD', read as that calendar day. */
+function longDate(iso: string): string {
+  return new Date(String(iso).slice(0, 10) + 'T12:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+
+// S655 (Nic, 10/2): a new lease for the home they already live in. It reads as
+// what comes next — never as their lease ending.
+function NextLeaseCard({ next, onOpen }: { next: any; onOpen: (docId: string) => void }) {
+  const rent = next.rentAmount != null
+    ? '$' + Number(next.rentAmount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : null
+  const now = new Date()
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const started = String(next.startDate).slice(0, 10) <= todayLocal
+  const signed = !!next.signedByTenant
+  return (
+    <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16, flexWrap:'wrap' as const }}>
+      <div>
+        <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>
+          {started ? 'Your new lease started' : 'Your next lease starts'} {longDate(next.startDate)}{rent ? ` — ${rent} a month` : ''}
+        </div>
+        <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>
+          {signed
+            ? 'Signed by everyone. Nothing more is needed from you.'
+            : started
+              ? 'It is your lease now. Please read it and add your signature.'
+              : 'Your current lease stays as it is until then. Please read the new one and sign it.'}
+        </div>
+      </div>
+      {next.documentId && (
+        <button onClick={() => onOpen(next.documentId)}
+          style={{ padding:'10px 20px', borderRadius:8, border: signed ? '1px solid var(--border-0)' : 'none', background: signed ? 'transparent' : 'var(--gold, #c9a227)', color: signed ? 'var(--text-1)' : '#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
+          {signed ? 'View it' : 'Review & sign →'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function LeasePage() {
   const navigate = useNavigate()
-  const { data: pendingDocs = [] } = useQuery('pending-docs', () =>
-    get('/esign/pending?t=' + Date.now()).then((r: any) => r)
+  // Always an array: the nav (main.tsx) reads this same cache key as a list.
+  const { data: allPendingDocs = [] } = useQuery('pending-docs', () =>
+    get('/esign/pending?t=' + Date.now()).then((r: any) => (Array.isArray(r) ? r : []))
   )
+  // Final sweep (10/3): the one document that is waiting on THEM — sent to
+  // them (signer status sent/viewed), the portal's own waiting lease first
+  // (me.pendingLeaseDocumentId). The list also holds documents that have not
+  // reached them yet (S636), and its first row could be a lease the landlord
+  // had not signed, or a purchase agreement ahead of the lease. A NEW LEASE for
+  // the home they already live in (S655) shows as their next lease, below.
+  const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
+  const waitingDoc = awaitingSignatureRow(allPendingDocs as any[], me)
+  const waitingHome = pendingDocHome(waitingDoc)
+  const onItsWay = !waitingDoc && leaseOnItsWay(allPendingDocs as any[])
   const qc = useQueryClient()
   const [signMode, setSignMode] = useState<'type'|'draw'>('type')
   const [typedSig, setTypedSig] = useState('')
@@ -221,15 +304,15 @@ export function LeasePage() {
   // the portal and no reason to think one existed. The banner comes first now.
   if (!lease) return (
     <div style={{ padding:32, maxWidth:720, margin:'0 auto' }}>
-      {(pendingDocs as any[]).length > 0 ? (
+      {waitingDoc ? (
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'20px 24px', display:'flex', alignItems:'center', justifyContent:'space-between', gap:16, flexWrap:'wrap' as const }}>
           <div>
-            <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Your lease is ready to sign</div>
+            <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Ready for your signature</div>
             <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>
-              {(pendingDocs as any[])[0].title}{(pendingDocs as any[])[0].propertyName ? ` · ${(pendingDocs as any[])[0].propertyName}` : ''}
+              {waitingDoc.title}{waitingHome ? ` · ${waitingHome}` : ''}
             </div>
             <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginTop:4 }}>
-              Your landlord has already signed. Open it to read the terms and add your signature.
+              It is your turn. Open it to read it and add your signature.
             </div>
           </div>
           {/* S637: was `.token`, a field GET /esign/pending has never returned —
@@ -239,10 +322,18 @@ export function LeasePage() {
               have been waiting all day to sign" actually was. The identical bug
               was fixed on the LANDLORD banner in S535 and this copy of it was
               missed. */}
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
+          <button onClick={()=>navigate('/sign/'+waitingDoc.documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Review &amp; Sign →
           </button>
+        </div>
+      ) : onItsWay ? (
+        <div style={{ padding:16, textAlign:'center' }}>
+          <FileText size={48} style={{ opacity:.2, display:'block', margin:'0 auto 12px' }} />
+          <div style={{ fontSize:'.9rem', color:'var(--text-2)' }}>Your lease is on its way.</div>
+          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:4 }}>
+            It needs another signature before it reaches you. You'll get an email when it's your turn to sign.
+          </div>
         </div>
       ) : (
         <div style={{ padding:16, textAlign:'center' }}>
@@ -270,7 +361,10 @@ export function LeasePage() {
   // until it is too late for either side to act on it.
   //
   // The offer is still a real event — it just no longer gates the question.
-  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
+  // S655: a lease with a NEW LEASE to follow it is not ending — the household
+  // is staying on the new one. No countdown, no "are you staying?".
+  const nextLease = (lease as any).nextLease ?? null
+  const showRenewalSurvey = !nextLease && daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
 
   return (
     <div>
@@ -295,10 +389,12 @@ export function LeasePage() {
           <h1 style={{ fontFamily:'var(--font-display)', fontSize:'1.4rem', fontWeight:800, color:'var(--text-0)', marginBottom:4 }}>Lease Agreement</h1>
           <p style={{ fontSize:'.82rem', color:'var(--text-3)' }}>
             {lease.propertyName} · Unit {lease.unitNumber}
-            {lease.startDate && ` · ${new Date(lease.startDate).toLocaleDateString()} – ${new Date(lease.endDate).toLocaleDateString()}`}
+            {lease.startDate && ` · ${new Date(lease.startDate).toLocaleDateString()} – ${lease.endDate ? new Date(lease.endDate).toLocaleDateString() : 'month to month'}`}
           </p>
         </div>
-        {fullyExecuted && lease.id && (lease.status === 'active' || lease.status === 'pending') && (
+        {/* S655: not while a new lease for this home waits to follow it — the
+            household is staying on that one (the server refuses it too). */}
+        {fullyExecuted && lease.id && !nextLease && (lease.status === 'active' || lease.status === 'pending') && (
           <EarlyTerminationSurface leaseId={lease.id} />
         )}
       </div>
@@ -318,13 +414,13 @@ export function LeasePage() {
       {lease.id && (lease.status === 'active' || lease.status === 'pending') && (
         <DepositPortabilitySection leaseId={lease.id} />
       )}
-      {(pendingDocs as any[]).length > 0 && (
+      {waitingDoc && (
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16 }}>
           <div>
             <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Document Awaiting Your Signature</div>
-            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{(pendingDocs as any[])[0].title} · {(pendingDocs as any[])[0].propertyName}</div>
+            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{waitingDoc.title}{waitingHome ? ` · ${waitingHome}` : ''}</div>
           </div>
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
+          <button onClick={()=>navigate('/sign/'+waitingDoc.documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Sign Now →
           </button>
@@ -408,8 +504,12 @@ export function LeasePage() {
         </div>
       )}
 
+      {/* S655: the next lease — a new lease for this home, signed by the
+          landlord. It takes over on its start date. */}
+      {nextLease && <NextLeaseCard next={nextLease} onOpen={(id: string) => navigate('/sign/' + id)} />}
+
       {/* Expiry countdown */}
-      {lease.endDate && daysToExpiry !== null && daysToExpiry > 0 && (
+      {!nextLease && lease.endDate && daysToExpiry !== null && daysToExpiry > 0 && (
         <div style={{ padding:'16px 20px', background: daysToExpiry <= 30 ? 'rgba(239,68,68,.06)' : daysToExpiry <= 60 ? 'rgba(245,158,11,.06)' : 'rgba(201,162,39,.04)', border:`1px solid ${daysToExpiry<=30?'rgba(239,68,68,.25)':daysToExpiry<=60?'rgba(245,158,11,.25)':'rgba(201,162,39,.2)'}`, borderRadius:12, marginBottom:20 }}>
           <div style={{ fontSize:'.65rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.1em', fontWeight:600, marginBottom:10 }}>
             {daysToExpiry <= 30 ? '🚨 Lease Expires Soon' : daysToExpiry <= 60 ? '⚠️ Lease Expiring' : '📅 Lease Term Remaining'}

@@ -14,6 +14,7 @@
 import Stripe from 'stripe'
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 function isMockIntentId(id: string): boolean {
   return id.startsWith('pi_intake_mock_') || id.startsWith('pi_pool_mock_')
@@ -55,7 +56,7 @@ export async function refundBackgroundCheckPayment(backgroundCheckId: string): P
     return { refunded: false, reason: 'Stripe not configured' }
   }
 
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' })
   const refund = await stripe.refunds.create({ payment_intent: pi })
   await query(
     `UPDATE background_checks SET stripe_refund_id = $1, refunded_at = NOW() WHERE id = $2`,
@@ -113,6 +114,13 @@ export async function sweepStaleBackgroundChecks(): Promise<{ swept: number; ref
         `UPDATE tenants SET background_check_status='cancelled' WHERE background_check_id=$1`,
         [row.id]
       )
+      // 10/5 (Nic, R8 — F12): a check paid with a stay has no payment of its
+      // own to refund. Its screening goes back to waiting for the guest (and
+      // the margin booked for it comes back off the book), the same as when
+      // the guest cancels it themselves (routes/background /:id/cancel).
+      const { restorePrepaidScreening } = await import('./stayTerms')
+      const prepaid = await restorePrepaidScreening(row.id)
+      if (prepaid.restored) continue
       const r = await refundBackgroundCheckPayment(row.id)
       if (r.refunded) refunded++
     } catch (e) {

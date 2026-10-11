@@ -44,7 +44,7 @@ export async function recordLotRentPaid(chargeId: string, landlordId: string): P
  * "an account is not an entity" (S633). See routes/lotRent.ts for why.
  */
 export async function getInvestorPortfolio(landlordId: string | string[]) {
-  // One id or many — normalised once, so every query below binds the same shape.
+  // One id or many — normalized once, so every query below binds the same shape.
   const ids = Array.isArray(landlordId) ? landlordId : [landlordId]
 
   const homes = await query<any>(

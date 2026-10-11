@@ -21,6 +21,7 @@ import {
   type FlexDepositInstallment,
 } from './flexsuiteAcceptance'
 import { logger } from '../lib/logger'
+import { dateIn, todayIn, monthStartOf } from '../lib/timezone'
 
 // ============================================================
 // FlexDeposit — deposit-custody installment product (S246; reworked
@@ -656,7 +657,9 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
   const out: InstallmentDueResult = { candidates_scanned: 0, pulls_initiated: 0, errors: 0 }
   if (!await isFlexDepositVisible()) return out
 
-  const today = now.toISOString().slice(0, 10)
+  // S654: pull dates sit on the tenant's lease, so "due today" is asked on the
+  // property's calendar. UTC turns over at 5 pm in Phoenix, which pulled a day
+  // early and stamped the payment with tomorrow's date.
   const rows = await query<{
     installment_id:    string
     security_deposit_id: string
@@ -668,31 +671,38 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
     stripe_customer_id: string | null
     attempt_count:     number
     pull_kind:         'primary' | 'retry'
+    timezone:          string
   }>(
     `SELECT i.id AS installment_id, i.security_deposit_id, i.tenant_id,
             i.amount::text, i.attempt_count,
             l.landlord_id, l.id AS lease_id, l.unit_id,
             t.stripe_customer_id,
-            CASE WHEN i.attempt_count = 0 THEN 'primary' ELSE 'retry' END AS pull_kind
+            CASE WHEN i.attempt_count = 0 THEN 'primary' ELSE 'retry' END AS pull_kind,
+            p.timezone
        FROM flex_deposit_installments i
        JOIN security_deposits sd ON sd.id = i.security_deposit_id
        JOIN leases l ON l.id = sd.lease_id
+       JOIN units u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
        JOIN tenants t ON t.id = i.tenant_id
       WHERE i.status = 'pending'
         AND i.installment_number > 1
         AND sd.flex_deposit_plan_status = 'active'
         AND (
-          (i.attempt_count = 0 AND i.primary_pull_date IS NOT NULL AND i.primary_pull_date <= $1)
+          (i.attempt_count = 0 AND i.primary_pull_date IS NOT NULL
+             AND i.primary_pull_date <= ($1::timestamptz AT TIME ZONE p.timezone)::date)
           OR
-          (i.attempt_count = 1 AND i.retry_pull_date   IS NOT NULL AND i.retry_pull_date   <= $1)
+          (i.attempt_count = 1 AND i.retry_pull_date   IS NOT NULL
+             AND i.retry_pull_date   <= ($1::timestamptz AT TIME ZONE p.timezone)::date)
         )`,
-    [today],
+    [now],
   )
   out.candidates_scanned = rows.length
 
   const stripe = getStripe()
   for (const r of rows) {
     try {
+      const today = dateIn(r.timezone, now)
       if (!r.stripe_customer_id) {
         await markInstallmentMissed(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_stripe_customer')
         out.errors += 1
@@ -826,7 +836,10 @@ export interface CustodyChargeResult {
  * Idempotent via UNIQUE (cycle_month, tenant_id).
  */
 export async function processFlexDepositCustodyFee(now: Date = new Date()): Promise<CustodyChargeResult> {
-  const cycle = firstOfMonth(now)
+  // S654: the custody fee is GAM's own monthly fee, so its month is GAM's
+  // (Phoenix, the database's zone) — not UTC, which is already next month
+  // after 5 pm on the last day.
+  const cycle = monthStartOf(dateIn(null, now))
   const out: CustodyChargeResult = {
     cycle_month: cycle, candidates_scanned: 0, charges_created: 0,
     charges_skipped_existing: 0, errors: 0,
@@ -1106,12 +1119,14 @@ export async function payAheadFlexDeposit(args: {
 }): Promise<{ ok: boolean; reason?: string; balance_remaining?: number; payment_id?: string | null }> {
   const dep = await queryOne<{
     id: string; lease_id: string; landlord_id: string; unit_id: string;
-    stripe_customer_id: string | null;
+    stripe_customer_id: string | null; timezone: string;
   }>(
     `SELECT sd.id, sd.lease_id, l.landlord_id, sd.unit_id,
-            t.stripe_customer_id
+            t.stripe_customer_id, p.timezone
        FROM security_deposits sd
        JOIN leases   l ON l.id = sd.lease_id
+       JOIN units    u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
        JOIN tenants  t ON t.id = sd.tenant_id
       WHERE sd.tenant_id = $1
         AND sd.flex_deposit_enabled = TRUE
@@ -1161,7 +1176,8 @@ export async function payAheadFlexDeposit(args: {
       },
     })
 
-    const today = new Date().toISOString().slice(0, 10)
+    // S654: the payment is dated on the property's calendar, not UTC's.
+    const today = todayIn(dep.timezone)
     const pay = await queryOne<{ id: string }>(
       `INSERT INTO payments (
          landlord_id, tenant_id, lease_id, unit_id,
@@ -1251,13 +1267,17 @@ export async function scheduleFlexDepositTopUp(
   const info = await client.query<{
     tenant_id: string; rent_due_day: number;
     risk_level: FlexDepositRiskLevel | null; max_num: number;
+    timezone: string;
   }>(
     `SELECT sd.tenant_id, l.rent_due_day, bc.risk_level,
             COALESCE((SELECT MAX(installment_number)
                         FROM flex_deposit_installments
-                       WHERE security_deposit_id = sd.id), 0) AS max_num
+                       WHERE security_deposit_id = sd.id), 0) AS max_num,
+            p.timezone
        FROM security_deposits sd
        JOIN leases l ON l.id = sd.lease_id
+       JOIN units u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
        LEFT JOIN tenants t ON t.id = sd.tenant_id
        LEFT JOIN background_checks bc ON bc.id = t.background_check_id
       WHERE sd.id = $1`,
@@ -1267,7 +1287,9 @@ export async function scheduleFlexDepositTopUp(
 
   const count = getFlexDepositMaxInstallments(args.topUpAmount, info.risk_level) ?? 2
   // Anchor to next month so the first top-up pull is upcoming, not overdue.
-  const startDate = addMonths(firstOfMonth(new Date()), 1)
+  // S654: "this month" is the property's month; UTC is already next month
+  // after 5 pm on the last day in Phoenix, which would skip a month.
+  const startDate = addMonths(monthStartOf(todayIn(info.timezone)), 1)
   const schedule = computeFlexDepositSchedule({
     depositTotal:     args.topUpAmount,
     installmentCount: count,
@@ -1323,10 +1345,6 @@ function addMonths(isoDate: string, months: number): string {
   const [y, m, d] = isoDate.split('-').map(Number)
   const date = new Date(Date.UTC(y, m - 1 + months, d))
   return date.toISOString().slice(0, 10)
-}
-
-function firstOfMonth(d: Date): string {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString().slice(0, 10)
 }
 
 /**

@@ -99,7 +99,9 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.email).toBe(email)
-    expect(res.body.data.activationUrl).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
+    // S655 (Nic, 10/2): email-only — the setup link is never in the response.
+    expect(res.body.data).not.toHaveProperty('activationUrl')
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
 
     // Full chain landed
     const u = await db.query<{ role: string }>(
@@ -123,6 +125,8 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
 
     expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
     expect(emailTenantOnboardedMock.mock.calls[0]![0]).toBe(email)
+    const token = (await db.query(`SELECT tenant_invite_token FROM users WHERE email=$1`, [email])).rows[0].tenant_invite_token
+    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
   })
 
   it('no leaseEnd → lease_type defaults to month_to_month', async () => {
@@ -267,40 +271,83 @@ describe('POST /me/onboard-tenant-pending — limbo entry', () => {
   })
 })
 
-describe('POST /me/onboard-tenants-csv/commit-pending — batch limbo', () => {
-  it('empty rows → 400', async () => {
+// S629 (Nic): "I don't have everybody's phone number, just emails." Phone is
+// optional on every resident door, including these two.
+describe('a phone number is optional', () => {
+  const phoneOf = async (email: string) =>
+    (await db.query(`SELECT phone FROM users WHERE email=$1`, [email])).rows[0]?.phone
+
+  it('Add One Tenant (onboard-tenant-pending) takes a name and email; no phone, or a blank one, is stored as none', async () => {
     const f = await seedTOFixture()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit-pending')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ rows: [] })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/rows array required/)
+    const none = `nophone-${randomUUID().slice(0, 6)}@test.dev`
+    const blank = `blank-${randomUUID().slice(0, 6)}@test.dev`
+    const r1 = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'No', lastName: 'Phone', email: none })
+    expect(r1.status).toBe(200)
+    expect(await phoneOf(none)).toBeNull()
+    const r2 = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'Blank', lastName: 'Phone', email: blank, phone: '   ' })
+    expect(r2.status).toBe(200)
+    expect(await phoneOf(blank)).toBeNull()
   })
 
-  it('mixed batch: 1 valid + 1 missing-fields → per-row results; valid row landed', async () => {
+  it('a missing name or email is still refused, in plain words', async () => {
+    const f = await seedTOFixture()
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ firstName: 'Only', phone: '555' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Add their first name, last name and email.')
+  })
+
+  it('the paper-lease door (onboard-tenant) takes no phone too', async () => {
+    const f = await seedTOFixture()
+    const email = `paper-${randomUUID().slice(0, 6)}@test.dev`
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'Pa', lastName: 'Per', email, unitId: f.unitId, leaseStart: '2026-01-01', monthlyRent: 900 })
+    expect(res.status).toBe(200)
+    expect(await phoneOf(email)).toBeNull()
+  })
+})
+
+describe('Add One Tenant with no unit, for a person another company has parked without one', () => {
+  it('says what to do in plain words and never names the other company', async () => {
+    const a = await seedTOFixture()
+    const b = await seedTOFixture()
+    const email = `parked-${randomUUID().slice(0, 6)}@test.dev`
+    expect((await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${a.landlordToken}`).send({ firstName: 'P', lastName: 'K', email })).status).toBe(200)
+    const res = await request(buildApp()).post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${b.landlordToken}`).send({ firstName: 'P', lastName: 'K', email })
+    // Until the post-deploy step drops the old tenant-only index the second
+    // company's no-unit row collides with the first; after it, each company
+    // keeps its own.
+    const oldIndex = (await db.query(
+      `SELECT 1 FROM pg_indexes WHERE indexname = 'pending_tenant_intents_tenant_nounit_live_key'`)).rows.length > 0
+    if (oldIndex) {
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe("This person can't be added without a unit yet. Pick the unit they live in and add them again.")
+      expect(res.body.error).not.toMatch(/company/i)
+    } else {
+      expect(res.status).toBe(200)
+    }
+  })
+})
+
+// S655: the tenant CSV is a draft roster now; the old "limbo" batch route
+// that made users, tenants and invites the moment a file validated is retired.
+describe('POST /me/onboard-tenants-csv/commit-pending — retired', () => {
+  it('answers 410 with the next step and creates nobody', async () => {
     const f = await seedTOFixture()
     const okEmail = `ok-${randomUUID().slice(0,6)}@test.dev`
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-tenants-csv/commit-pending')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({
-        rows: [
-          { rowIndex: 0, firstName: 'Good', lastName: 'Row', email: okEmail, phone: '555-1111' },
-          { rowIndex: 1, firstName: 'Bad', lastName: '', email: '', phone: '' },  // missing fields
-        ],
-      })
-    expect(res.status).toBe(200)
-    expect(res.body.data.created).toBe(1)
-    expect(res.body.data.skipped).toBe(1)
-    expect(res.body.data.results[0].status).toBe('created')
-    expect(res.body.data.results[1].status).toBe('error')
-    expect(res.body.data.results[1].message).toMatch(/required/)
-
-    // The good row's intent persisted (rollback isolation)
-    const intents = await db.query(
-      `SELECT id FROM pending_tenant_intents WHERE landlord_id=$1`, [f.landlordId])
-    expect(intents.rows.length).toBe(1)
+      .send({ rows: [{ rowIndex: 0, firstName: 'Good', lastName: 'Row', email: okEmail, phone: '555-1111' }] })
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/draft roster/)
+    expect((await db.query(`SELECT id FROM users WHERE email=$1`, [okEmail])).rows).toEqual([])
+    expect((await db.query(`SELECT id FROM pending_tenant_intents WHERE landlord_id=$1`, [f.landlordId])).rows).toEqual([])
   })
 })
 
@@ -336,6 +383,124 @@ describe('GET /me/pending-tenants', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].email).toBe(okEmail)
+  })
+})
+
+// ── S639: WHAT "NOT INVITED YET" MEANS ───────────────────────────────────────
+//
+// Nic, twice: "you still have it listed as eight people not invited yet... We
+// have literally sent invites to every single person", then "you're still
+// showing the pending pool as three people not invited yet... the creation of
+// that lease tells me that she accepted the invite."
+//
+// Both rounds were the same mistake in different clothes: reading acceptance
+// off a column that had been cleared, or off the USER when the invite row in
+// front of us already recorded it. These hold the rule where it is cheap to
+// check.
+describe('S639 pending pool — invite state tells the truth', () => {
+  async function pendingIntent(f: any, email: string) {
+    const r = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'P', lastName: 'P', email, phone: '555' })
+    return r.body.data.intentId as string
+  }
+  const poolFor = async (f: any) => (await request(buildApp())
+    .get('/api/landlords/me/pending-tenants')
+    .set('Authorization', `Bearer ${f.landlordToken}`)).body.data
+
+  it('an invite whose token was consumed still reads as sent, not as never invited', async () => {
+    const f = await seedTOFixture()
+    const email = `s639a-${randomUUID().slice(0, 6)}@test.dev`
+    await pendingIntent(f, email)
+    // Exactly the pre-S637 shape: activation cleared the token and the newer
+    // accepted marker was never written. This read 'not_invited' for a week.
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              last_login_at = NULL, tenant_invite_sent_at = NOW() - INTERVAL '8 days'
+        WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).not.toBe('not_invited')
+  })
+
+  it("the invite row's own accepted_at is what decides — not the user record", async () => {
+    const f = await seedTOFixture()
+    const email = `s639b-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    // Glenda Greek and Dakota Lane exactly: accepted on the intent, nothing on
+    // the user, and the pool called them uninvited.
+    await db.query(`UPDATE pending_tenant_intents SET accepted_at = NOW() WHERE id = $1`, [intentId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              last_login_at = NULL WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).toBe('accepted')
+  })
+
+  it('somebody genuinely never written to still reads as not invited', async () => {
+    const f = await seedTOFixture()
+    const email = `s639c-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    await db.query(`UPDATE pending_tenant_intents SET accepted_at = NULL WHERE id = $1`, [intentId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              tenant_invite_sent_at = NULL, last_login_at = NULL
+        WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).toBe('not_invited')
+  })
+
+  it('a waiver audit row left behind by a cancelled invite is not a person to chase', async () => {
+    const f = await seedTOFixture()
+    const email = `s639d-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    const { rows } = await db.query<any>(
+      `SELECT tenant_id, landlord_id FROM pending_tenant_intents WHERE id = $1`, [intentId])
+    // Bind the real invite to a unit first — only one live unit-less row per
+    // person is allowed, and the waiver row is the one that has to be it.
+    await db.query(
+      `UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [intentId, f.unitId])
+    // The screening waive writes a second, unit-less row purely to hold the audit.
+    await db.query(
+      `INSERT INTO pending_tenant_intents (tenant_id, landlord_id, unit_id, screening_waived)
+       VALUES ($1, $2, NULL, TRUE)`, [rows[0].tenant_id, rows[0].landlord_id])
+    // Illyana Gonzalez: her address was corrected, the unit invite cancelled,
+    // and the orphaned waiver row surfaced as a ghost in the pool for a week.
+    await request(buildApp())
+      .delete(`/api/landlords/me/pending-tenants/${intentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    const pool = await poolFor(f)
+    expect(pool.filter((i: any) => i.email === email)).toHaveLength(0)
+    // The audit record itself survives — it is hidden, never erased.
+    const kept = await db.query<any>(
+      `SELECT cancelled_at FROM pending_tenant_intents
+        WHERE tenant_id = $1 AND screening_waived`, [rows[0].tenant_id])
+    expect(kept.rows).toHaveLength(1)
+  })
+
+  // S655: the waiver close used to match on the PERSON alone, so one company
+  // backing out of its invite cancelled another company's grandfather record.
+  it('cancelling an invite closes only this company’s waiver row, never another company’s', async () => {
+    const x = await seedTOFixture()
+    const y = await seedTOFixture()
+    const email = `s655-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(x, email)
+    const { rows: [xi] } = await db.query<any>(
+      `SELECT tenant_id FROM pending_tenant_intents WHERE id = $1`, [intentId])
+    await db.query(`UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [intentId, x.unitId])
+    // Company Y grandfathered the same person at its own park.
+    const { rows: [yWaiver] } = await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (tenant_id, landlord_id, unit_id, screening_waived)
+       VALUES ($1, $2, NULL, TRUE) RETURNING id`, [xi.tenant_id, y.landlordId])
+
+    const res = await request(buildApp())
+      .delete(`/api/landlords/me/pending-tenants/${intentId}`)
+      .set('Authorization', `Bearer ${x.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.waiverRowsClosed).toBe(0)
+    const { rows: [after] } = await db.query<{ cancelled_at: string | null }>(
+      `SELECT cancelled_at FROM pending_tenant_intents WHERE id = $1`, [yWaiver.id])
+    expect(after.cancelled_at).toBeNull()
   })
 })
 
@@ -455,7 +620,7 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
 // that that person already is on the platform. And instead of giving them the
 // tenant portal invite, it just drafts up the lease."
 //
-// The neighbour who has been paying for trash and electric for months already
+// The neighbor who has been paying for trash and electric for months already
 // has a GAM login. Both onboarding routes reused their user row and then
 // mailed them "activate your account and set a password" for an account they
 // already use — and following it would overwrite their working password.
@@ -492,8 +657,9 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(true)
-    // No activation link, because there is nothing to activate.
-    expect(res.body.data.activationUrl).toBeNull()
+    // No activation link, because there is nothing to activate (and S655:
+    // never one in a response at all).
+    expect(res.body.data).not.toHaveProperty('activationUrl')
 
     // And no invite token was minted against their live account — that token is
     // what makes the "set a password" mail possible in the first place.
@@ -506,7 +672,7 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
     expect(res.body.data.leaseId).toBeTruthy()
   })
 
-  it('a brand-new person still gets the invite, unchanged', async () => {
+  it('a brand-new person still gets the invite — by email only (S655)', async () => {
     const f = await seedTOFixture()
     const email = `brand-new-${randomUUID().slice(0,6)}@test.dev`
     const res = await request(buildApp())
@@ -520,21 +686,26 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(false)
-    expect(res.body.data.activationUrl).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
+    expect(res.body.data).not.toHaveProperty('activationUrl')
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(emailTenantOnboardedMock.mock.calls[0]![5]).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
   })
 
   // An invite that was SENT but never accepted still needs re-sending — that
   // account is not "on the platform", it is waiting.
+  // S654: the call did not create this account, so the link is never handed
+  // back in the response; it is minted and emailed only to the address the
+  // account holds (stored here in another letter case than the one typed).
   it('re-invites someone who never accepted', async () => {
     const f = await seedTOFixture()
-    const email = `pending-${randomUUID().slice(0,6)}@test.dev`
+    const stored = `Pending-${randomUUID().slice(0,6)}@Test.dev`
     const c = await db.connect()
     try {
       await c.query('BEGIN')
       await c.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Wait', 'Ing', '555-0111')`,
-        [email])
+        [stored])
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
@@ -542,14 +713,23 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
       .post('/api/landlords/me/onboard-tenant')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
-        firstName: 'Wait', lastName: 'Ing', email, phone: '555-0111',
+        firstName: 'Wait', lastName: 'Ing', email: stored.toLowerCase(), phone: '555-0111',
         unitId: f.unitId,
         leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
         monthlyRent: 1500, securityDeposit: 1000,
       })
     expect(res.status).toBe(200)
     expect(res.body.data.alreadyOnPlatform).toBe(false)
-    expect(res.body.data.activationUrl).toBeTruthy()
+    expect(res.body.data).not.toHaveProperty('activationUrl')
+    expect(JSON.stringify(res.body)).not.toMatch(/accept-invite/)
+
+    const token = (await db.query<{ tenant_invite_token: string | null }>(
+      `SELECT tenant_invite_token FROM users WHERE email=$1`, [stored])).rows[0].tenant_invite_token
+    expect(token).toMatch(/^[0-9a-f]{64}$/)
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    const call = emailTenantOnboardedMock.mock.calls[0]!
+    expect(call[0]).toBe(stored)
+    expect(call[5]).toMatch(new RegExp(`/accept-invite\\?token=${token}$`))
   })
 
   // ── S618: importing a lease must mark the unit OCCUPIED ────────────────
@@ -589,5 +769,85 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
     const after = await db.query<{ status: string }>(
       `SELECT status FROM units WHERE id = $1`, [f.unitId])
     expect(after.rows[0].status).toBe('active')
+  })
+})
+
+// ─── S639: STAFF SEE THEIR OWN PARK AND NOTHING ELSE ────────────────────────
+//
+// Nic: "When I scope a front desk person to the front desk tab, I want them
+// scoped to the specific property. Because I own Mountain View and Oak Park, I
+// want my front desk person here to only see Mountain View. I don't want any
+// filters that they have to choose... the less things that it's possible for
+// somebody to screw up, the bigger your talent pool is."
+//
+// This list was filtered by LANDLORD only, so an onsite manager scoped to one
+// park was served the other park's residents — names, emails and phone numbers
+// for somewhere they do not work. The scope row already existed and every other
+// property-bound surface consulted it; this one never did.
+describe('S639 pending pool is scoped to the properties a worker actually works at', () => {
+  it('an onsite manager scoped to one property never sees the other', async () => {
+    const f = await seedTOFixture()
+    // Two properties under the same landlord, one invited person at each.
+    const client = await db.connect()
+    let propA = '', propB = ''
+    try {
+      await client.query('BEGIN')
+      propA = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      propB = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const mk = async (propertyId: string, tag: string) => {
+      const email = `s639-scope-${tag}-${randomUUID().slice(0, 6)}@test.dev`
+      const r = await request(buildApp())
+        .post('/api/landlords/me/onboard-tenant-pending')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ firstName: tag, lastName: 'X', email, phone: '555' })
+      const unitId = await (async () => {
+        const c = await db.connect()
+        try { return await seedUnit(c, { propertyId, landlordId: f.landlordId }) }
+        finally { c.release() }
+      })()
+      await db.query(
+        `UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [r.body.data.intentId, unitId])
+      return email
+    }
+    const emailA = await mk(propA, 'AAA')
+    const emailB = await mk(propB, 'BBB')
+
+    // A worker scoped to property A only.
+    const { rows: [w] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','onsite_manager','Desk','Person',TRUE) RETURNING id`,
+      [`s639-desk-${randomUUID().slice(0, 6)}@test.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, permissions)
+       VALUES ($1, $2, FALSE, ARRAY[$3::uuid], '{"tenants.create": true}'::jsonb)`,
+      [w.id, f.landlordId, propA])
+    const token = jwt.sign(
+      { userId: w.id, role: 'onsite_manager', email: 'desk@test.dev',
+        profileId: w.id, landlordId: f.landlordId, landlordIds: [f.landlordId],
+        permissions: { 'tenants.create': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    const res = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    // Addresses are stored lowercased, so compare that way.
+    const emails = (res.body.data as any[]).map(r => String(r.email).toLowerCase())
+    expect(emails).toContain(emailA.toLowerCase())
+    // The whole point: the other park's resident is not on this person's screen.
+    expect(emails).not.toContain(emailB.toLowerCase())
+  })
+
+  it('the owner still sees both', async () => {
+    const f = await seedTOFixture()
+    const res = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
   })
 })

@@ -1,8 +1,7 @@
 /**
  * What a landlord owes GAM, and how GAM gets it.
  *
- * S620 (Nic): "if six people pay cash and then four people pay card for the
- * remainder, we'll just take it all out of the card balance. It doesn't make
+ * S620 (Nic): "we'll just take it all out of the card balance. It doesn't make
  * sense to debit the account of the landlord — that's just more money moving
  * back and forth, and we wanna eliminate moves."
  *
@@ -13,10 +12,9 @@
  *   2. DEBIT the landlord — only when the balance crosses the property's
  *      threshold and there is no disbursement to take it from. Last resort.
  *
- * Nic on why (2) should almost never happen: at Oak Park a single ACH rent
- * payment offsets roughly 44 cash fees, and the park does not have 44 spaces.
- * "You're gonna have a mix of cash, card, ACH, and I don't think you're ever
- * gonna really hit that threshold." The high-water mark exists so that claim is
+ * Nic on why (2) should almost never happen: "You're gonna have a mix of cash,
+ * card, ACH, and I don't think you're ever gonna really hit that threshold."
+ * (S654: cash itself costs nothing.) The high-water mark exists so that claim is
  * measured rather than assumed — a property peaking at $80 shows up before
  * anyone has to guess whether $100 is the right number.
  *
@@ -36,7 +34,16 @@ export const DEFAULT_DEBIT_THRESHOLD = 100
 export interface GamCharge {
   landlordId: string
   propertyId?: string | null
-  kind: 'subscription' | 'manual_payment_fee'
+  /**
+   * subscription       — the monthly platform fee
+   * bank_debit_cost    — S651: what an ACH pull cost, kept as its own line so
+   *                      the landlord sees two numbers they can each check
+   *                      rather than one lump they can only dispute
+   * screening_fee      — 10/5 (Nic): a background check paid inside a stay's
+   *                      payment is GAM's money, card or cash; it comes out of
+   *                      the landlord's next payout (services/stayTerms)
+   */
+  kind: 'subscription' | 'bank_debit_cost' | 'device_installment' | 'screening_fee'
   amount: number
   /** what produced this, so a retry cannot bill twice */
   sourceType: string

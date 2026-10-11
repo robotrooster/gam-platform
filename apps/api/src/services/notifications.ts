@@ -1,13 +1,20 @@
 import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
+import { replyToProperty, type ReplyTo } from './replyRouting'
 import { logger } from '../lib/logger'
 import { isCriticalNotificationType } from '@gam/shared'
+import { portalLink } from '../lib/portalUrls'
 
 // S536 (Nic): SMS is REMOVED platform-wide — notifications and
 // receipts go by email or in-app only. Do not reintroduce an SMS
 // channel or provider.
 
-function emailTemplate(title: string, body: string, cta?: { label: string; url: string }) {
+/**
+ * The notification email shell. `title` and `body` go into the HTML as they
+ * are (callers pass markup), so a caller putting in anything a person typed —
+ * a name, a guest name from the public booking form — escapes it first.
+ */
+export function emailTemplate(title: string, body: string, cta?: { label: string; url: string }) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     body{font-family:system-ui,sans-serif;background:#060809;color:#b8c4d8;margin:0;padding:20px}
     .c{max-width:560px;margin:0 auto;background:#0a0d10;border:1px solid #1e2530;border-radius:12px;overflow:hidden}
@@ -37,6 +44,12 @@ export async function createNotification(p: {
   // the bell falls back to a per-type route when absent.
   actionUrl?: string
   sendEmail?: boolean; emailTo?: string; emailSubject?: string; emailHtml?: string
+  /**
+   * 10/5: who gets a reply to the email (services/replyRouting). Omitted = GAM
+   * support. A notice to a resident about their home passes the property, so a
+   * reply reaches the people who run it — never GAM.
+   */
+  replyTo?: ReplyTo
 }) {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
@@ -74,6 +87,7 @@ export async function createNotification(p: {
         userId: p.userId,
         landlordId: p.landlordId ?? null,
         notificationId,
+        replyTo: p.replyTo,
       })
       if (notificationId && messageId) {
         await query("UPDATE notifications SET email_sent=TRUE, email_sent_at=NOW() WHERE id=$1", [notificationId])
@@ -82,8 +96,49 @@ export async function createNotification(p: {
   } catch (e) { logger.error({ err: e }, '[NOTIFY]') }
 }
 
-export async function notifyRentCollected(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amount:number }) {
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:`${o.tenantName} paid $${o.amount.toFixed(2)} for Unit ${o.unitNumber} at ${o.propertyName}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, `<b>${o.tenantName}</b> paid <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`)})
+/**
+ * 10/5: the property a resident's notice is about, so a reply reaches the
+ * people who run it (services/replyRouting). `sql` returns one property_id for
+ * the given params. Nothing found, or a failed lookup, leaves GAM support as
+ * the reply address — the notice itself always goes out.
+ */
+async function residentReplyTo(sql: string, params: unknown[]): Promise<ReplyTo | undefined> {
+  if (params.some(p => p == null || p === '')) return undefined
+  try {
+    const row = await queryOne<{ property_id: string | null }>(sql, params)
+    return replyToProperty(row?.property_id)
+  } catch (e) {
+    logger.warn({ err: e }, '[NOTIFY] reply-to property lookup failed — GAM support keeps the reply')
+    return undefined
+  }
+}
+
+// S642 (Nic): `amount` is the TOTAL that arrived in the payment event, not the
+// lease's base rent. `breakdown` is set whenever that total covers more than
+// one charge, so the card can say where the money went — a landlord reading
+// "$520.20" against a $495 lease needs the $25.20 named or the figure looks
+// wrong. Rent-only payments pass no breakdown and read exactly as before.
+export async function notifyRentCollected(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amount:number; breakdown?: Array<{ label:string; amount:number }> }) {
+  const money = (n:number) => `$${n.toFixed(2)}`
+  const lead = `${o.tenantName} paid ${money(o.amount)} for Unit ${o.unitNumber} at ${o.propertyName}.`
+  const leadHtml = `<b>${o.tenantName}</b> paid <b>${money(o.amount)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`
+  const items = o.breakdown ?? []
+  const plain = items.length
+    ? `${lead}\n\n${items.map(i => `  ${i.label}: ${money(i.amount)}`).join('\n')}`
+    : lead
+  const html = items.length
+    ? leadHtml +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">` +
+      items.map(i =>
+        `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+           <span>${i.label}</span><span>${money(i.amount)}</span>
+         </div>`).join('') +
+      `<div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                   border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+         <span>Total paid</span><span>${money(o.amount)}</span>
+       </div></div>`
+    : leadHtml
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:plain, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, html)})
 }
 
 // S561: bold landlord alert when a tenant's already-paid rent REVERSES (late
@@ -102,98 +157,331 @@ export async function notifyRentReversed(o: { landlordUserId:string; landlordId:
 // retry-eligible NACHA code (R01 insufficient funds, R09 uncollected) and
 // retry_count < 2. Tenant gets the heads-up + retry date; landlord gets a
 // shorter info copy. Terminal-failure path is notifyAchRetriesExhausted.
+//
+// S654: one call per failed payment. The tenant's copy goes out once; each
+// landlord-side contact gets their own copy. Callers used to loop over the
+// landlord contacts and the tenant got one email per contact (none at all
+// when the property had no contact). Each audience's data carries only its
+// own fields.
+//
+// S654: `amount` is the whole bank pull (every line it covered), `reason` is
+// the bank's reason in plain words ("there was not enough money in the
+// account"), and the date reads "Sunday, October 4", not "2026-10-04".
 export async function notifyAchRetryScheduled(o: {
-  tenantUserId: string; tenantEmail: string; tenantPhone?: string; tenantName: string;
-  landlordUserId: string; landlordId: string; landlordEmail: string;
+  tenantUserId: string; tenantEmail: string; tenantName: string;
+  landlordId: string;
+  landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
-  amount: number; reason: string;          // human-readable description from ACH_RETURN_CONFIG
+  amount: number;
+  reason: string | null;                   // plain-words reason (ACH_RETURN_CONFIG.plain); null = unreadable
   retryDate: string;                       // ISO date string (YYYY-MM-DD)
   retryAttempt: 1 | 2;                     // which retry this is
+  propertyId?: string | null;              // the tenant's reply reaches this property's people; omitted = GAM support
 }) {
+  const shared = {
+    tenantName: o.tenantName, unitNumber: o.unitNumber, propertyName: o.propertyName,
+    amount: o.amount, reason: o.reason, retryDate: o.retryDate, retryAttempt: o.retryAttempt,
+  }
+  const day = retryDayLabel(o.retryDate)
+  const amt = `$${o.amount.toFixed(2)}`
+  const because = o.reason ? ` because ${o.reason}` : ''
+
   // Tenant: actionable — tells them what failed, why, and when we'll try again
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retry_scheduled',
-    title: `Payment retry scheduled — ${o.retryDate}`,
-    body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed (${o.reason}). We'll automatically retry on ${o.retryDate}. Make sure your bank account has sufficient funds.`,
-    data: o,
+    title: `Payment retry scheduled — ${day}`,
+    body: `Your ${amt} payment for Unit ${o.unitNumber} didn't go through${because}. We'll try your bank again on ${day}. Please make sure the money is in the account by then.`,
+    data: { ...shared, tenantUserId: o.tenantUserId },
+    actionUrl: '/payments',
     sendEmail: true, emailTo: o.tenantEmail,
-    emailSubject: `Payment retry scheduled — ${o.retryDate}`,
+    emailSubject: `Payment retry scheduled — ${day}`,
     emailHtml: emailTemplate(
-      `Your Payment Will Retry on ${o.retryDate}`,
-      `<p>Your <b>$${o.amount.toFixed(2)}</b> payment for ${o.propertyName} Unit ${o.unitNumber} failed:</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-left:3px solid #f59e0b;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>We'll automatically retry the charge on <b>${o.retryDate}</b>. Please make sure your bank account has sufficient funds before then.</p>` +
-      `<p style="font-size:.85rem;color:#4a5568">This is retry attempt ${o.retryAttempt} of 2 permitted by NACHA. If this retry also fails you'll need to update your payment method.</p>`
-    )
+      `We'll Try Your Payment Again on ${day}`,
+      `<p>Your <b>${amt}</b> payment for ${o.propertyName} Unit ${o.unitNumber} didn't go through${because}.</p>` +
+      `<p>We'll try your bank again on <b>${day}</b>. Please make sure the money is in the account before then.</p>` +
+      `<p style="font-size:.85rem;color:#4a5568">${retryFootnote(o.retryAttempt)}</p>`
+    ),
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    replyTo: replyToProperty(o.propertyId),
   })
 
-  // Landlord: shorter info-only copy
-  await createNotification({
-    userId: o.landlordUserId, landlordId: o.landlordId,
-    type: 'ach_retry_scheduled_info',
-    title: `${o.tenantName} payment retry — ${o.retryDate}`,
-    body: `${o.tenantName} (Unit ${o.unitNumber}) payment of $${o.amount.toFixed(2)} failed (${o.reason}). Auto-retry scheduled ${o.retryDate}.`,
-    data: o,
-    sendEmail: true, emailTo: o.landlordEmail,
-    emailSubject: `Tenant payment retry scheduled — Unit ${o.unitNumber}`,
-    emailHtml: emailTemplate(
-      `Tenant Payment Retry Scheduled`,
-      `<b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} failed (${o.reason}). GAM will automatically retry on <b>${o.retryDate}</b>. No action required.`
-    ),
-  })
+  // Landlord side: shorter info-only copy, one per contact
+  for (const r of o.landlordRecipients) {
+    await createNotification({
+      userId: r.userId, landlordId: o.landlordId,
+      type: 'ach_retry_scheduled_info',
+      title: `${o.tenantName} payment retry — ${day}`,
+      body: `${o.tenantName}'s ${amt} payment for Unit ${o.unitNumber} didn't go through${because}. GAM will try their bank again on ${day}.`,
+      data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `Tenant payment retry scheduled — Unit ${o.unitNumber}`,
+      emailHtml: emailTemplate(
+        `Tenant Payment Retry Scheduled`,
+        `<b>${o.tenantName}</b>'s payment of <b>${amt}</b> for Unit ${o.unitNumber} didn't go through${because}. GAM will try their bank again on <b>${day}</b>. Nothing for you to do.`
+      ),
+    })
+  }
 }
 
-// S125: ACH retry-cap-reached alert. Fires when the second retry also
-// fails (or any failure on a non-retry-eligible code on retry_count = 2).
-// Landlord + tenant both get notified the payment is permanently failed
-// and needs manual intervention; admin in-app notification flags the
-// payment for review.
+/**
+ * What happens if this retry fails too. A short-of-money bounce gets two
+ * retries (the webhook schedules another while retry_count < 2), so after the
+ * FIRST one there is still one more — "we can't try again" is only true of the
+ * second. A first retry that bounces for a different reason (a closed account)
+ * is not retried, hence "for the same reason".
+ */
+function retryFootnote(attempt: 1 | 2): string {
+  return attempt === 1
+    ? `This is the first of two retries. If it doesn't go through for the same reason, we'll try one last time three days later. We'll email you either way.`
+    : `This is the last retry. If it doesn't go through, we can't try your bank again and you'll need to pay another way.`
+}
+
+/** 'YYYY-MM-DD' → "Sunday, October 4" (a calendar date, so read in UTC). */
+function retryDayLabel(ymd: string): string {
+  const [y, m, d] = ymd.slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return ymd
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC', weekday: 'long', month: 'long', day: 'numeric',
+  }).format(new Date(Date.UTC(y, m - 1, d)))
+}
+
+/**
+ * Why a payment is final, in the words each audience is told.
+ *   retries_used  — a short-of-money bounce that used all its tries (3)
+ *   bank_refused  — the bank will not take this debit at all (closed account,
+ *                   no account, not authorized, or a reason we could not read)
+ *   card_declined — a card payment the card issuer refused
+ *   partly_paid   — a bounced pull that was due a retry, but part of it was
+ *                   paid another way in the meantime (cash at the desk, a
+ *                   matched bank deposit). The retry would pull the WHOLE
+ *                   original amount, so it is not fired; the rest is owed.
+ */
+export type PaymentFinalReason = 'retries_used' | 'bank_refused' | 'card_declined' | 'partly_paid'
+
+// S125: final-failure notice. Fires on EVERY payment failure that will not be
+// retried: a short-of-money bounce whose second retry also failed, or the
+// first failure of a debit the bank will not take at all (closed, not found,
+// not authorized, unreadable). Tenant and landlord-side contacts are told it is
+// still owed.
+//
+// S654: same shape as notifyAchRetryScheduled — the tenant's copy once, then
+// one copy per landlord-side contact.
+//
+// S654 (Nic): the tenant's email gets a Pay now button, and says what actually
+// happened. It used to say "failed multiple times ... NACHA limits us to 2
+// retries. Both have now been exhausted" even when it fired on the FIRST bounce
+// (a closed account is never retried), and quoted only the first line of a
+// payment that covered several. Now: two true versions (plus a card one, and one
+// for a retry skipped because part of the pull was paid another way), the
+// whole amount, and the signed sign-in link the bill email uses (`payUrl`),
+// which lands on Payments. The link is never stored in either audience's data.
 export async function notifyAchRetriesExhausted(o: {
   paymentId: string;
-  tenantUserId: string; tenantEmail: string; tenantPhone?: string; tenantName: string;
-  landlordUserId: string; landlordId: string; landlordEmail: string; landlordPhone?: string;
+  tenantUserId: string; tenantEmail: string; tenantName: string;
+  landlordId: string;
+  landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
-  amount: number; reason: string;
+  amount: number;                          // the whole pull — every line it covered
+  reason: string | null;                   // plain-words reason; null = unreadable
+  finalReason: PaymentFinalReason;
+  attempts: number;                        // tries made, the first included
+  payUrl?: string | null;                  // signed Pay now link; falls back to the plain Payments link
 }) {
-  // Tenant: action-required
+  const shared = {
+    paymentId: o.paymentId, tenantName: o.tenantName, unitNumber: o.unitNumber,
+    propertyName: o.propertyName, amount: o.amount, reason: o.reason,
+    finalReason: o.finalReason, attempts: o.attempts,
+  }
+  const amt = `$${o.amount.toFixed(2)}`
+  const where = `${o.propertyName} Unit ${o.unitNumber}`
+  const times = `${o.attempts} time${o.attempts === 1 ? '' : 's'}`
+  const payUrl = o.payUrl || portalLink('tenant', 'payments')
+
+  // Tenant: what happened, that it is still owed, and a button to pay it.
+  const tenantLead =
+    o.finalReason === 'retries_used'
+      ? `We tried to collect your <b>${amt}</b> payment for ${where} from your bank ${times}, and it didn't go through${o.reason ? ` — the last time because ${o.reason}` : ''}.`
+    : o.finalReason === 'card_declined'
+      ? `Your card was declined for your <b>${amt}</b> payment for ${where}.`
+    : o.finalReason === 'partly_paid'
+      ? `Part of the bank payment we were going to try again for ${where} has since been paid another way, so we didn't try your bank again.`
+      : `Your bank turned down your <b>${amt}</b> payment for ${where}${o.reason ? ` because ${o.reason}` : ''}, so we can't try that account again.`
+  const tenantNext =
+    o.finalReason === 'retries_used'
+      ? `We won't try again on our own, so the <b>${amt}</b> is still owed. You can pay it now with a bank account or a card.`
+    : o.finalReason === 'card_declined'
+      ? `The <b>${amt}</b> is still owed. Please pay it now with another card or a bank account.`
+    : o.finalReason === 'partly_paid'
+      ? `The rest, <b>${amt}</b>, is still owed. You can pay it now with a bank account or a card.`
+      : `The <b>${amt}</b> is still owed. Please pay it now with a different bank account or a card.`
+  const plain = (html: string) => html.replace(/<[^>]+>/g, '')
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT COALESCE(un.property_id, lu.property_id) AS property_id
+       FROM payments p
+       LEFT JOIN units  un ON un.id = p.unit_id
+       LEFT JOIN leases l  ON l.id = p.lease_id
+       LEFT JOIN units  lu ON lu.id = l.unit_id
+      WHERE p.id = $1 AND p.revenue_owner = 'landlord'`, [o.paymentId])
+
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retries_exhausted',
-    title: `Payment cannot be retried — manual action required`,
-    body: `Your $${o.amount.toFixed(2)} payment for Unit ${o.unitNumber} failed after multiple retry attempts (${o.reason}). Please update your payment method or contact your landlord directly.`,
-    data: o,
+    title: `Your payment didn't go through — Unit ${o.unitNumber}`,
+    body: `${plain(tenantLead)} ${plain(tenantNext)}`,
+    data: { ...shared, tenantUserId: o.tenantUserId },
+    actionUrl: '/payments',
     sendEmail: true, emailTo: o.tenantEmail,
-    emailSubject: `Payment cannot be retried — Unit ${o.unitNumber}`,
+    emailSubject: `Your payment didn't go through — Unit ${o.unitNumber}`,
     emailHtml: emailTemplate(
-      `Payment Cannot Be Retried`,
-      `<p>Your <b>$${o.amount.toFixed(2)}</b> payment for ${o.propertyName} Unit ${o.unitNumber} failed multiple times:</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-left:3px solid #ef4444;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>NACHA limits us to 2 retries per failed transaction. Both have now been exhausted.</p>` +
-      `<p><b>What to do next:</b></p>` +
-      `<ul style="color:#b8c4d8;line-height:1.7">` +
-      `<li>Update your payment method or bank account in the tenant portal</li>` +
-      `<li>Contact your landlord directly to arrange payment</li>` +
-      `</ul>`
-    )
+      `Your Payment Didn't Go Through`,
+      `<p>${tenantLead}</p><p>${tenantNext}</p>`,
+      { label: 'Pay now', url: payUrl },
+    ),
+    replyTo,
   })
 
-  // Landlord: action-required, urgent
+  // Landlord side: one per contact. Same total, same reason, no pay link.
+  const landlordLine =
+    o.finalReason === 'retries_used'
+      ? `${o.tenantName}'s ${amt} payment for Unit ${o.unitNumber} didn't go through after ${times}${o.reason ? ` (the last time, ${o.reason})` : ''}. It won't be tried again.`
+    : o.finalReason === 'card_declined'
+      ? `${o.tenantName}'s card was declined for their ${amt} payment for Unit ${o.unitNumber}.`
+    : o.finalReason === 'partly_paid'
+      ? `Part of ${o.tenantName}'s bounced bank payment for Unit ${o.unitNumber} was paid another way before its retry, so GAM didn't try their bank again.`
+      : `${o.tenantName}'s bank turned down their ${amt} payment for Unit ${o.unitNumber}${o.reason ? ` (${o.reason})` : ''}, so it can't be tried again.`
+  for (const r of o.landlordRecipients) {
+    await createNotification({
+      userId: r.userId, landlordId: o.landlordId,
+      type: 'ach_retries_exhausted_landlord',
+      title: `${o.tenantName}'s payment didn't go through — Unit ${o.unitNumber}`,
+      body: `${landlordLine} The ${amt} is still owed, and they've been asked to pay it now.`,
+      data: { ...shared, tenantUserId: o.tenantUserId, landlordId: o.landlordId },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `Tenant payment didn't go through — Unit ${o.unitNumber}`,
+      emailHtml: emailTemplate(
+        `Tenant Payment Didn't Go Through`,
+        `<p>${landlordLine}</p>` +
+        `<p>The <b>${amt}</b> is still owed. ${o.tenantName} has been asked to pay it now. You may also want to contact them directly.</p>`
+      )
+    })
+  }
+}
+
+/**
+ * Why a scheduled (autopay) payment could not be started.
+ *   payment_method  — the tenant's side: no usable payment method, a card
+ *                     refused on the spot, a bank account that can't be used.
+ *                     Paying another way fixes it.
+ *   payments_paused — the space is in eviction mode; payments to the landlord
+ *                     are paused, so the Payments page would refuse it too.
+ *   our_side        — anything else: a GAM or Stripe error. Nothing was taken,
+ *                     and nothing about their account is wrong.
+ */
+export type AutopayFailureKind = 'payment_method' | 'payments_paused' | 'our_side'
+
+// S654: a scheduled (autopay) payment that couldn't even be started. This was an
+// in-app notice only, and a tenant who believes rent paid itself does not open
+// the app to check.
+//
+// Each kind says what is true of it. "Check the account you pay from, then pay"
+// is only true of 'payment_method'. An error on our side is not their account's
+// fault — they are told so, and still emailed with the Pay now button, because
+// the rent is still owed and they think it paid itself (the runner also raises
+// an admin alert). A paused space gets an in-app notice only and no pay
+// button: its Payments page refuses the payment, and the next step is the
+// landlord. autopay_failed is a critical type, so a tenant's email preference
+// cannot stop the emailed ones.
+export async function notifyAutopayFailed(o: {
+  tenantUserId: string; tenantEmail: string | null;
+  disarming: boolean;
+  kind?: AutopayFailureKind;
+  payUrl?: string | null;
+  propertyId?: string | null;              // the tenant's reply reaches this property's people; omitted = GAM support
+}) {
+  const kind = o.kind ?? 'payment_method'
+  const title = o.disarming ? 'Autopay has been turned off' : 'Your scheduled rent payment didn’t go through'
+  const switchedOff = 'Two scheduled payments in a row couldn’t be completed, so we’ve switched autopay off'
+  const body =
+    kind === 'payments_paused'
+      ? (o.disarming ? `${switchedOff}. ` : '') +
+        'Your scheduled rent payment wasn’t taken because payments for your space are paused right now. Please contact your landlord about your rent.'
+    : kind === 'our_side'
+      ? (o.disarming ? `${switchedOff}. ` : '') +
+        'Your scheduled rent payment couldn’t be started because of a problem on our end — nothing was taken from your account, and nothing is wrong with it. Your rent is still owed. You can pay it from the Payments page.' +
+        (o.disarming ? ' You can turn autopay back on there too.' : ' Autopay is still on for next month.')
+    : o.disarming
+      ? `${switchedOff} to stop your bank charging you for further attempts. Your rent is still owed — pay it from the Payments page, then turn autopay back on.`
+      : 'Your scheduled rent payment couldn’t be completed, so your rent is still owed. Check the account you pay from, then pay from the Payments page. Autopay is still on and will try again next month.'
+  const emailIt = kind !== 'payments_paused' && !!o.tenantEmail
   await createNotification({
-    userId: o.landlordUserId, landlordId: o.landlordId,
-    type: 'ach_retries_exhausted_landlord',
-    title: `🚨 ${o.tenantName} payment failed permanently — Unit ${o.unitNumber}`,
-    body: `${o.tenantName} payment of $${o.amount.toFixed(2)} failed all retry attempts (${o.reason}). Manual intervention needed.`,
-    data: o,
-    sendEmail: true, emailTo: o.landlordEmail,
-    emailSubject: `🚨 Tenant payment failed permanently — Unit ${o.unitNumber}`,
-    emailHtml: emailTemplate(
-      `Tenant Payment Failed Permanently`,
-      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;color:#ef4444;font-size:.85rem">⚠️ Manual intervention required</div>` +
-      `<p><b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} has failed all NACHA-permitted retry attempts.</p>` +
-      `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
-      `<p>The tenant has been notified to update their payment method. You may also want to contact them directly.</p>`
-    )
+    userId: o.tenantUserId,
+    type: 'autopay_failed',
+    title, body,
+    actionUrl: kind === 'payments_paused' ? '/lease' : '/payments',
+    sendEmail: emailIt, emailTo: emailIt ? o.tenantEmail! : undefined,
+    emailSubject: title,
+    emailHtml: emailIt
+      ? emailTemplate(title, body, { label: 'Pay now', url: o.payUrl || portalLink('tenant', 'payments') })
+      : undefined,
+    // 10/5: replies reach the people who run this property (services/replyRouting); a problem on our end stays with GAM.
+    replyTo: kind === 'payment_method' ? replyToProperty(o.propertyId) : undefined,
+  })
+}
+
+/**
+ * S654: a FlexDeposit pull that bounced. The generic "payment didn't go through"
+ * notices are not this one's to send — a FlexDeposit retry is a pull scheduled
+ * at enrollment, not three days out, and it is a GAM product the landlord side
+ * never hears about (product siloing). So the TENANT alone is told, in words
+ * true to the plan:
+ *   will_retry — the first pull of an installment bounced; its retry is set
+ *   missed     — the retry bounced too; the installment is marked missed (the
+ *                plan stays on — no acceleration, no default)
+ *   pay_ahead  — a deposit payment they started themselves bounced; nothing
+ *                else changes
+ * The button (missed / pay_ahead) lands on the Lease page, where the deposit is
+ * funded — never Payments.
+ */
+export type FlexDepositPullOutcome = 'will_retry' | 'missed' | 'pay_ahead'
+
+export async function notifyFlexDepositPullFailed(o: {
+  tenantUserId: string; tenantEmail: string | null;
+  amount: number;
+  reason: string | null;                   // plain-words reason; null = unreadable
+  outcome: FlexDepositPullOutcome;
+  retryDate?: string | null;               // 'YYYY-MM-DD' — the scheduled retry pull (will_retry)
+  leaseUrl?: string | null;                // signed link to the Lease page
+}) {
+  const amt = `$${o.amount.toFixed(2)}`
+  const because = o.reason ? ` because ${o.reason}` : ''
+  const day = o.retryDate ? retryDayLabel(o.retryDate) : null
+  const title =
+    o.outcome === 'missed' ? 'A deposit installment was missed'
+    : 'Your deposit payment didn’t go through'
+  const html =
+    o.outcome === 'will_retry'
+      ? `<p>Your <b>${amt}</b> deposit installment payment didn't go through${because}.</p>` +
+        `<p>We'll try your bank again ${day ? `on <b>${day}</b>` : 'in the next few days'}. Please make sure the money is in the account by then.</p>`
+    : o.outcome === 'missed'
+      ? `<p>Your <b>${amt}</b> deposit installment payment didn't go through${because}, and the second try didn't either, so this installment is marked missed.</p>` +
+        `<p>Your deposit plan stays on. You can fund the rest of your deposit any time from your Lease page.</p>`
+      : `<p>Your <b>${amt}</b> payment toward your deposit didn't go through${because}.</p>` +
+        `<p>Nothing else changes — your scheduled deposit installments continue as planned. You can try again any time from your Lease page.</p>`
+  const plain = html.replace(/<\/p><p>/g, ' ').replace(/<[^>]+>/g, '')
+  const cta = o.outcome === 'will_retry'
+    ? undefined
+    : { label: 'Go to your lease', url: o.leaseUrl || portalLink('tenant', 'lease') }
+  await createNotification({
+    userId: o.tenantUserId,
+    type: 'flexdeposit_payment_failed',
+    title, body: plain,
+    data: { amount: o.amount, reason: o.reason, outcome: o.outcome, retryDate: o.retryDate ?? null },
+    actionUrl: '/lease',
+    sendEmail: !!o.tenantEmail, emailTo: o.tenantEmail ?? undefined,
+    emailSubject: title,
+    emailHtml: emailTemplate(title, html, cta),
   })
 }
 
@@ -342,10 +630,11 @@ export async function notifyConnectPayoutFailed(o: {
   })
 }
 
-export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; requestTitle:string; newStatus:string; scheduledAt?:string; notes?:string }) {
+export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; requestTitle:string; newStatus:string; scheduledAt?:string; notes?:string; propertyId?:string|null }) {
   const labels: Record<string,string> = { assigned:'assigned', in_progress:'in progress', completed:'completed ✅', cancelled:'cancelled' }
   const label = labels[o.newStatus]||o.newStatus
-  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`) })
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`), replyTo:replyToProperty(o.propertyId) })
 }
 
 // S68: collapsed pre-S18 split (lease_expiring_60 / lease_expiring_30) into
@@ -366,7 +655,7 @@ export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantE
  * their list; a complaint is not an emergency and does not belong in an inbox.
  *
  * Deliberately quotes the tenant rather than paraphrasing: the landlord should
- * read what was actually said, and no summary of "my neighbour plays music
+ * read what was actually said, and no summary of "my neighbor plays music
  * until 2am" is better than the sentence itself.
  */
 export async function notifyTenantComplaint(o: {
@@ -396,8 +685,8 @@ export async function notifyLeaseExpiring(o: { landlordUserId:string; landlordId
 }
 
 export async function notifyLowStock(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{name:string;stock_qty:number;stock_min:number;vendor_name?:string}> }) {
-  const itemList = o.items.map(i=>`${i.name} (${i.stock_qty} left)`).join(', ')
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'pos_low_stock', title:`Low Stock — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 POS Low Stock Alert`, emailHtml:emailTemplate('Low Stock Alert', `Items below minimum:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${i.stock_qty} left (min ${i.stock_min})${i.vendor_name?` · Vendor: ${i.vendor_name}`:''}`).join('<br>')}`) })
+  const itemList = o.items.map(i=>`${i.name} (${Number(i.stock_qty)} left)`).join(', ')
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'pos_low_stock', title:`Low Stock — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 POS Low Stock Alert`, emailHtml:emailTemplate('Low Stock Alert', `Items below minimum:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${Number(i.stock_qty)} left (min ${i.stock_min})${i.vendor_name?` · Vendor: ${i.vendor_name}`:''}`).join('<br>')}`) })
 }
 
 // W-46: business-use supplies (parts_inventory), distinct from POS resale
@@ -421,6 +710,9 @@ export async function notifyInspectionReadyForTenant(o: {
   propertyName?: string; unitNumber?: string
 }) {
   const typeLabel = o.inspectionType === 'move_in' ? 'Move-in' : o.inspectionType === 'move_out' ? 'Move-out' : 'Periodic'
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
   await createNotification({
     userId: o.tenantUserId,
     type: 'inspection_ready',
@@ -431,6 +723,7 @@ export async function notifyInspectionReadyForTenant(o: {
     emailTo: o.tenantEmail,
     emailSubject: `📋 ${typeLabel} Inspection Ready — Sign Now`,
     emailHtml: emailTemplate(`${typeLabel} Inspection Ready`, `Your landlord has completed the ${typeLabel.toLowerCase()} checklist${o.unitNumber ? ` for <b>Unit ${o.unitNumber}</b>` : ''}. Review and sign it in your tenant portal so it can be finalized.`),
+    replyTo,
   })
 }
 
@@ -469,6 +762,9 @@ export async function notifyInspectionFinalized(o: {
 
   // Tenant ping (if applicable)
   if (o.tenantUserId && o.tenantEmail) {
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyTo = await residentReplyTo(
+      `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
     await createNotification({
       userId: o.tenantUserId,
       type: 'inspection_finalized',
@@ -479,6 +775,7 @@ export async function notifyInspectionFinalized(o: {
       emailTo: o.tenantEmail,
       emailSubject: `${typeLabel} Inspection Finalized`,
       emailHtml: emailTemplate(`${typeLabel} Inspection Finalized`, `Your ${typeLabel.toLowerCase()} inspection has been finalized.${outcomeBlurb} The credit-ledger events have been recorded.`),
+      replyTo,
     })
   }
 
@@ -506,6 +803,9 @@ export async function notifyInspectionScheduledReminder(o: {
   const typeLabel = o.inspectionType === 'move_in' ? 'Move-in' : o.inspectionType === 'move_out' ? 'Move-out' : 'Periodic'
   const timestr = new Date(o.scheduledFor).toLocaleString()
   if (o.tenantUserId && o.tenantEmail) {
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyTo = await residentReplyTo(
+      `SELECT u.property_id FROM unit_inspections i JOIN units u ON u.id = i.unit_id WHERE i.id = $1`, [o.inspectionId])
     await createNotification({
       userId: o.tenantUserId,
       type: 'inspection_scheduled_reminder',
@@ -516,6 +816,7 @@ export async function notifyInspectionScheduledReminder(o: {
       emailTo: o.tenantEmail,
       emailSubject: `🔔 Inspection Tomorrow`,
       emailHtml: emailTemplate(`Inspection Tomorrow`, `Your ${typeLabel.toLowerCase()} inspection is scheduled for <b>${timestr}</b>${o.unitNumber ? ` (Unit ${o.unitNumber})` : ''}.`),
+      replyTo,
     })
   }
   await createNotification({
@@ -541,6 +842,9 @@ export async function notifyEntryRequestNew(o: {
 }) {
   const start = new Date(o.windowStart).toLocaleString()
   const subUrgent = o.noticeWindowHours < 24
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM unit_entry_requests r JOIN units u ON u.id = r.unit_id WHERE r.id = $1`, [o.requestId])
   await createNotification({
     userId: o.tenantUserId,
     type: 'entry_request_new',
@@ -551,6 +855,7 @@ export async function notifyEntryRequestNew(o: {
     emailTo: o.tenantEmail,
     emailSubject: `${subUrgent ? '⚠️' : '🚪'} Entry Request — Respond Promptly`,
     emailHtml: emailTemplate(`Entry Request`, `Your landlord requests entry for <b>${o.reasonCategory}</b>: "${o.reason}".<br>Proposed window starts <b>${start}</b> (${o.noticeWindowHours}h notice).<br>Granting access promptly credits your record; denying does not penalize you.`),
+    replyTo,
   })
 }
 
@@ -581,6 +886,11 @@ export async function notifyEntryRecorded(o: {
 }) {
   if (!o.tenantUserId || !o.tenantEmail) return
   const t = new Date(o.enteredAt).toLocaleString()
+  // 10/5: replies reach the people who run this property (services/replyRouting); a breach says "Contact GAM", so it stays with GAM.
+  const replyTo = o.outcome === 'compliant'
+    ? await residentReplyTo(
+        `SELECT u.property_id FROM unit_entry_requests r JOIN units u ON u.id = r.unit_id WHERE r.id = $1`, [o.requestId])
+    : undefined
   await createNotification({
     userId: o.tenantUserId,
     type: 'entry_recorded',
@@ -591,6 +901,7 @@ export async function notifyEntryRecorded(o: {
     emailTo: o.tenantEmail,
     emailSubject: `Entry Recorded`,
     emailHtml: emailTemplate(`Entry Recorded`, `Your landlord entered the unit at <b>${t}</b>.${o.outcome === 'breach' ? '<br><br>This was outside the agreed-upon window. Contact GAM if there is a concern.' : ''}`),
+    replyTo,
   })
 }
 
@@ -654,6 +965,10 @@ export async function notifySubleaseDecision(o: {
   unitNumber: string; propertyName: string; landlordNote?: string | null
 }) {
   const verb = o.decision === 'approved' ? '✅ Approved' : '✗ Denied'
+  // 10/5: replies reach the people who run this property (services/replyRouting).
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id FROM subleases s JOIN leases l ON l.id = s.master_lease_id JOIN units u ON u.id = l.unit_id WHERE s.id = $1`,
+    [o.subleaseId])
   await createNotification({
     userId: o.sublessorUserId,
     type: o.decision === 'approved' ? 'sublease_approved' : 'sublease_denied',
@@ -667,6 +982,7 @@ export async function notifySubleaseDecision(o: {
       `Sublease ${verb}`,
       `Your landlord has <b>${o.decision}</b> your sublease request for Unit ${o.unitNumber} at ${o.propertyName}.${o.landlordNote ? `<br><br>Note from landlord: ${o.landlordNote}` : ''}`
     ),
+    replyTo,
   })
 }
 
@@ -680,6 +996,16 @@ export async function notifySubleaseTerminated(o: {
     o.triggeredBy === 'sublessor_terminated' ? 'the sublessor' :
     o.triggeredBy === 'sublessee_terminated' ? 'the sublessee' :
     'the landlord'
+  // 10/5: a resident's reply reaches the people who run this property (services/replyRouting); the landlord's copy matches no row and stays with GAM.
+  const replyTo = await residentReplyTo(
+    `SELECT u.property_id
+       FROM subleases s
+       JOIN leases  l    ON l.id = s.master_lease_id
+       JOIN units   u    ON u.id = l.unit_id
+       LEFT JOIN tenants t_or ON t_or.id = s.sublessor_tenant_id
+       LEFT JOIN tenants t_ee ON t_ee.id = s.sublessee_tenant_id
+      WHERE s.id = $1 AND $2::uuid IN (t_or.user_id, t_ee.user_id)`,
+    [o.subleaseId, o.recipientUserId])
   await createNotification({
     userId: o.recipientUserId,
     type: 'sublease_terminated',
@@ -693,16 +1019,12 @@ export async function notifySubleaseTerminated(o: {
       `Sublease Terminated`,
       `The sublease for Unit ${o.unitNumber} at ${o.propertyName} was terminated by <b>${triggerLabel}</b>.<br><br>Reason: ${o.reason}`
     ),
+    replyTo,
   })
 }
 
 export async function notifyTenantInviteAccepted(o: { landlordUserId:string; landlordId:string; landlordEmail:string; tenantName:string; tenantEmail:string; unitNumber:string; propertyName:string }) {
   await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'tenant_invite_accepted', title:`Tenant Activated — Unit ${o.unitNumber}`, body:`${o.tenantName} accepted their invite for Unit ${o.unitNumber}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Tenant Activated — Unit ${o.unitNumber}`, emailHtml:emailTemplate('Tenant Joined', `<b>${o.tenantName}</b> activated their account for Unit ${o.unitNumber} at ${o.propertyName}.`) })
-}
-
-export async function notifyWorkTradeHours(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; hoursCommitted:number; hoursWorked:number; daysLeft:number }) {
-  const short = o.hoursCommitted - o.hoursWorked
-  await createNotification({ userId:o.tenantUserId, type:'work_trade_reminder', title:`Work Trade: ${short}hrs remaining`, body:`${o.hoursWorked}/${o.hoursCommitted} hours logged. ${short} hours left with ${o.daysLeft} days remaining.`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`⚡ Work Trade Reminder — ${short} hours remaining`, emailHtml:emailTemplate('Work Trade Reminder', `<b>${short} hours remaining</b> this month.<br>Logged: ${o.hoursWorked} / ${o.hoursCommitted}<br>Days left: ${o.daysLeft}`) })
 }
 
 export async function sendBulkNotification(o: { landlordId:string; propertyId?:string; title:string; body:string; sendEmail?:boolean }) {
@@ -729,7 +1051,8 @@ export async function sendBulkNotification(o: { landlordId:string; propertyId?:s
       vuo.primary_email    AS email,
       vuo.primary_phone    AS phone,
       un.unit_number,
-      p.name               AS property_name
+      p.name               AS property_name,
+      p.id                 AS property_id
     FROM units un
     JOIN properties p ON p.id = un.property_id
     JOIN v_unit_occupancy vuo ON vuo.unit_id = un.id
@@ -740,7 +1063,8 @@ export async function sendBulkNotification(o: { landlordId:string; propertyId?:s
   `, params)
   let sent = 0
   for (const t of tenants) {
-    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body) })
+    // 10/5: replies reach the people who run this tenant's property (services/replyRouting).
+    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body), replyTo:replyToProperty(t.property_id) })
     sent++
   }
   return { sent }
@@ -859,6 +1183,8 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: true, emailTo: member.email,
         emailSubject: `${isEmergency ? '🚨 EMERGENCY: ' : ''}Maintenance Request — Unit ${req.unit_number}`,
         emailHtml: `New ${req.priority} request from ${tenantName}: "${req.title}"${overThreshold ? '<br><b>APPROVAL REQUIRED before proceeding.</b>' : ''}`,
+        // 10/5: a worker's reply reaches the people who run this property (services/replyRouting).
+        replyTo: replyToProperty(req.property_id),
       })
     }
 
@@ -980,6 +1306,7 @@ export async function notifyReservationDecision(o: {
   tenantUserId: string; tenantEmail: string;
   areaName: string; propertyName: string; approved: boolean;
   startsAt: string | Date; endsAt: string | Date; decisionNote?: string | null
+  propertyId?: string | null   // the resident's reply reaches this property's people; omitted = GAM support
 }) {
   const when = fmtWindow(o.startsAt, o.endsAt)
   const verb = o.approved ? 'approved' : 'declined'
@@ -993,6 +1320,8 @@ export async function notifyReservationDecision(o: {
     emailSubject: `Reservation ${verb} — ${o.areaName}`,
     emailHtml: emailTemplate(`Reservation ${verb}`,
       `Your reservation for <b>${o.areaName}</b> at ${o.propertyName} was <b>${verb}</b>.<br>${when}${note}`),
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    replyTo: replyToProperty(o.propertyId),
   })
 }
 
@@ -1043,6 +1372,8 @@ export async function notifyAmenityUnavailable(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline} — ${when}`,
       emailHtml: emailTemplate(headline, `${sentence}<br><b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1075,6 +1406,8 @@ export async function notifyAmenityEventReleased(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${o.areaName} open again — ${when}`,
       emailHtml: emailTemplate(`${o.areaName} open again`, `The private event at <b>${o.areaName}</b> was cancelled — the space is open as usual.<br><b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1134,6 +1467,8 @@ export async function notifyServiceInterruption(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline}`,
       emailHtml: emailTemplate(headline, `${detail ? detail + '<br><br>' : ''}<b>${when}</b>`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length
@@ -1154,6 +1489,8 @@ export async function notifyServiceRestored(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `✅ ${o.utilityLabel} restored`,
       emailHtml: emailTemplate(`${o.utilityLabel} restored`, `<b>${o.utilityLabel}</b> service has been restored. Thank you for your patience.`),
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      replyTo: replyToProperty(o.propertyId),
     })
   }
   return recipients.length

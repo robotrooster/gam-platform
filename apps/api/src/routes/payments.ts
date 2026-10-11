@@ -1,42 +1,244 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { chargeLandlord } from '../services/landlordGamAccount'
-import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
+import { requireAuth, requireAdmin, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
+import { takeBankReceiptPhoto, landlordsOwnUser } from '../lib/bankReceiptPhotos'
+import { sendStoredFile, uploadKeyFromStored } from '../lib/storage'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
-         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE, paymentMethodCosts,
-         PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
+         MANUAL_PAYMENT_METHODS,
+         PRIOR_ARRANGEMENT_METHOD, LATE_FEE_DELETED_LANDLORD_TEXT, LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computePlatformCut, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
-         suggestedPayAheadFor } from '../services/rentCharge'
-import { allocateOldestFirst } from '@gam/shared'
+         suggestedPayAheadFor, quoteLeaseCharge, planLeaseCharge, billMethodCosts, tenantPassthroughFor,
+         payAllRunCreditWaiting, payAllRunCreditRest, creditWaitingSentence,
+         CARD_CONFIRM_HOLD_MINUTES } from '../services/rentCharge'
+import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_RELEASE_NOTE,
+         confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
+import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
+import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, tenantsDepositAtBank, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { canDeleteLateFees, deleteLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '../services/lateFeeDelete'
+import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
+         usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
 
-// POST /api/payments/quote — pre-charge fee disclosure (S601, Nic). Given the rent
-// amount + method + lease, returns EXACTLY what the tenant will be charged: base rent
-// plus the processing fee when the property routes the fee to the tenant (card is
-// ALWAYS tenant-paid; ACH depends on the property's ach_fee_payer). Mirrors the charge
-// math in POST /:id/pay so the pay UI shows the real total BEFORE the tenant confirms —
-// no tenant should be blindsided by a card surcharge they never saw.
+// ─── 10/5 (Nic): the photo of a bank's deposit receipt ───────────────────────
+//
+// "maybe ... add a picture of the receipt" — for a payment recorded as a BANK
+// DEPOSIT only (the resident's cash put straight into the landlord's bank).
+// Stored like expense receipts (routes/expenses.ts): one directory, an
+// unguessable file name, and one authed serve route that authorizes PER ROW —
+// the receipt the file belongs to must be the caller's company's, at a
+// property the caller works at. Only the landlord's own people ever see it:
+// never a GAM admin from here, never the tenant, never a static URL.
+// Registered before the '/:id/...' routes so nothing reads 'deposit-photos'
+// as a payment id.
+const depositPhotoSubdir = 'bank-deposit-receipts'
+const takeDepositPhoto = takeBankReceiptPhoto(depositPhotoSubdir)
+
+/** The bank-deposit receipt a photo belongs to, with where it was taken. */
+async function bankDepositReceipt(where: 'id' | 'photo', key: string) {
+  return queryOne<{ id: string; landlord_id: string; payment_method: string | null; status: string; property_id: string | null }>(
+    `SELECT r.id, r.landlord_id, r.payment_method, r.status,
+            COALESCE(u.property_id,
+                     (SELECT pu.property_id FROM remittance_applications ra
+                        JOIN payments pp ON pp.id = ra.payment_id JOIN units pu ON pu.id = pp.unit_id
+                       WHERE ra.remittance_id = r.id ORDER BY pp.due_date, pp.id LIMIT 1)) AS property_id
+       FROM tenant_remittances r
+       LEFT JOIN leases l ON l.id = r.lease_id
+       LEFT JOIN units u  ON u.id = l.unit_id
+      WHERE ${where === 'id' ? 'r.id = $1::uuid' : 'r.deposit_photo_url = $1'}`, [key])
+}
+
+// POST /api/payments/remittances/:id/deposit-photo — attach (or replace) the
+// photo of the bank's receipt on a recorded bank deposit. multipart, field 'photo'.
+paymentsRouter.post('/remittances/:id/deposit-photo', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, 'Payment not found')
+    const rem = await bankDepositReceipt('id', req.params.id)
+    if (!rem || !landlordsOwnUser(req.user, rem.landlord_id)) throw new AppError(404, 'Payment not found')
+    await assertChargeInStaffScope(req.user, rem.property_id)
+    if (rem.payment_method !== 'bank_deposit' || rem.status !== 'settled') {
+      throw new AppError(409, 'A photo of the bank\'s receipt goes only on a payment recorded as a bank deposit.')
+    }
+    next()
+  } catch (e) { next(e) }
+}, takeDepositPhoto, async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'Choose a photo of the bank\'s receipt.')
+    const url = '/api/payments/deposit-photos/' + req.file.filename
+    const row = await queryOne<{ id: string; deposit_photo_url: string }>(
+      `UPDATE tenant_remittances
+          SET deposit_photo_url = $2, deposit_photo_name = $3, deposit_photo_mime = $4, deposit_photo_size = $5,
+              deposit_photo_uploaded_by = $6, deposit_photo_uploaded_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND payment_method = 'bank_deposit'
+       RETURNING id, deposit_photo_url`,
+      [req.params.id, url, String(req.file.originalname || 'receipt').slice(0, 200), req.file.mimetype, req.file.size,
+       req.user!.userId])
+    if (!row) throw new AppError(404, 'Payment not found')
+    res.json({ success: true, data: { receiptId: row.id, depositPhotoUrl: row.deposit_photo_url } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/payments/deposit-photos/:filename — the photo, to the landlord's own people only.
+paymentsRouter.get('/deposit-photos/:filename', async (req: any, res, next) => {
+  try {
+    const url = '/api/payments/deposit-photos/' + req.params.filename
+    const rem = await bankDepositReceipt('photo', url)
+    // Someone else's photo reads as missing, never as "forbidden".
+    if (!rem || !landlordsOwnUser(req.user, rem.landlord_id)) throw new AppError(404, 'Not found')
+    await assertChargeInStaffScope(req.user, rem.property_id)
+    const key = uploadKeyFromStored(depositPhotoSubdir, req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key, { cacheControl: 'private, no-store' })
+  } catch (e) { next(e) }
+})
+
+/**
+ * S655 (10/3): a staffer assigned to one property takes money only on charges
+ * at that property — the scope the payments list and the balances list read
+ * (getScopedPropertyIds: null = every property). Owners and all-properties
+ * staff pass. A charge with no space on it cannot be placed in a scope.
+ */
+async function assertChargeInStaffScope(user: any, propertyId: string | null | undefined): Promise<void> {
+  const scoped = await getScopedPropertyIds(user)
+  if (scoped === null) return
+  if (!propertyId || !scoped.includes(propertyId)) {
+    throw new AppError(403, 'This charge is at a property you are not assigned to. Ask the owner or a property manager to record it.')
+  }
+}
+
+// POST /api/payments/quote — what a payment will ACTUALLY cost (S601, Nic),
+// before anything is charged.
+//
+// S655 (Nic, 10/2): for a tenant this is their bill — the full balance, the
+// credit that may pay part of it ("Use all $X — pay $Y" / "Save it for later —
+// pay $Z", or "Pay with credit — nothing charged" when it covers the whole
+// bill), GAM's own charges as their own line, any bank retry already scheduled,
+// and the fee on the money for the method chosen. It is the same arithmetic
+// /pay-balance enforces and autopay charges (services/rentCharge
+// quoteLeaseCharge), so the figure read back is the figure charged.
+// expectedCredit is what to send back with the payment.
+//
+// Anyone else (or a tenant naming only an amount with no bill to quote) gets
+// the plain fee on that amount, as before.
 paymentsRouter.post('/quote', async (req, res, next) => {
   try {
     const body = z.object({
-      amount:  z.number().positive(),
+      amount:  z.number().nonnegative().optional(),
       method:  z.enum(['ach', 'card']),
       leaseId: z.string().uuid().optional(),
+      serviceAgreementId: z.string().uuid().optional(),
+      useCredit: z.boolean().optional(),
+      // "Pay all" with "Use all": the leases this run charges before this one,
+      // in order (balance-context payAll.order). The quote is this lease's
+      // charge as it will be when its turn comes — the figure it is sent.
+      afterLeaseIds: z.array(z.string().uuid()).max(50).optional(),
+      // Fix pass 3: the pay screen's bills when they are not the run
+      // balance-context sequenced (payAll.order), in the order they will be
+      // charged. Answers only the credit another bank payment still holds
+      // that the whole run would have used — one figure for the run.
+      runLeaseIds: z.array(z.string().uuid()).min(1).max(50).optional(),
     }).parse(req.body)
 
-    let feePayer: string = 'tenant'   // default when no rule (mirrors /pay: null → tenant pays)
+    if (req.user!.role === 'tenant' && body.runLeaseIds && !body.leaseId && !body.serviceAgreementId && body.amount == null) {
+      const tenantId = req.user!.profileId as string
+      const client = await getClient()
+      try {
+        // Only this tenant's household leases count (payAllRunCreditWaiting
+        // reads the household quote); any other id adds nothing.
+        const runCreditWaiting = await payAllRunCreditWaiting(client, { tenantId, order: body.runLeaseIds })
+        return res.json({ success: true, data: {
+          runLeaseIds: body.runLeaseIds,
+          runCreditWaiting,
+          runCreditWaitingNote: creditWaitingSentence(Math.round(runCreditWaiting * 100)),
+        } })
+      } finally { client.release() }
+    }
+
+    if (req.user!.role === 'tenant') {
+      const tenantId = req.user!.profileId as string
+      let leaseId: string | undefined
+      if (body.serviceAgreementId) {
+        const owns = await queryOne<{ id: string }>(
+          `SELECT id FROM utility_service_agreements WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+          [body.serviceAgreementId, tenantId])
+        if (!owns) throw new AppError(404, 'Service agreement not found')
+      } else {
+        leaseId = await resolveTargetLease(tenantId, body.leaseId ?? null).catch((e) => {
+          // Nothing owed: fall through to the plain fee on the amount asked.
+          if (e instanceof AppError && e.statusCode === 409 && body.amount != null) return undefined
+          throw e
+        })
+      }
+      if (leaseId || body.serviceAgreementId) {
+        const q = await quoteLeaseCharge({
+          tenantId, leaseId, serviceAgreementId: leaseId ? undefined : body.serviceAgreementId,
+          useCredit: body.useCredit === true, paymentMethodType: body.method,
+          afterLeaseIds: leaseId ? body.afterLeaseIds : undefined,
+        })
+        const usable = q.usableCredit
+        const useCredit = body.useCredit === true && usable > 0
+        const due = q.landing.dueCents / 100
+        // Paying ahead (no credit used): the fee is on what they choose to send.
+        const base = !useCredit && body.amount != null && body.amount > due ? body.amount : due
+        // q.fee is the processing fee on the bill plus the tenant-payer platform
+        // fee the charge adds on top of any payment with money in it; paying
+        // ahead moves the processing fee to the larger amount, not the platform fee.
+        const payer = body.method === 'ach' ? q.ctx.achFeePayer : q.ctx.cardFeePayer
+        const fee = base === due ? q.fee
+          : Math.round(((payer !== 'landlord' ? computePlatformCut({ amount: base, paymentMethod: body.method }) : 0)
+              + (base > 0 ? await tenantPassthroughFor(q.ctx.propertyId) : 0)) * 100) / 100
+        const saved = (q.requiredTotal * 100 - q.creditAlreadyApplied * 100) / 100
+        return res.json({ success: true, data: {
+          base, method: body.method, fee,
+          tenantPaysFee: (body.method === 'ach' ? q.ctx.achFeePayer : q.ctx.cardFeePayer) !== 'landlord',
+          total: Math.round((base + fee) * 100) / 100,
+          intlCardSurcharge: body.method === 'card',
+          leaseId: leaseId ?? null,
+          serviceAgreementId: leaseId ? null : body.serviceAgreementId ?? null,
+          // The whole bill now, before any credit.
+          outstanding: Math.round((q.requiredTotal + q.carriedTotal) * 100) / 100,
+          requiredNow: Math.round(saved * 100) / 100,
+          carriedBalance: q.carriedTotal,
+          usableCredit: usable,
+          expectedCredit: usable,
+          creditOnFile: q.creditOnFile,
+          useCredit,
+          creditUsed: q.landing.creditUsedCents / 100,
+          payIfUsed: Math.round((saved - usable) * 100) / 100,
+          payIfSaved: Math.round(saved * 100) / 100,
+          coversWholeBill: q.coversWholeBill,
+          // Credit another bank payment still holds, and why, in plain words:
+          // why only part of the credit on file can pay this bill.
+          creditWaiting: q.creditStillHeldElsewhere,
+          creditWaitingNote: q.creditWaitingNote,
+          // Fix pass 3: the rest of the credit on file and where it goes, in
+          // plain words — every dollar of creditOnFile is explained.
+          creditKeptElsewhere: q.creditKeptElsewhere,
+          creditKeptForLater: q.creditKeptForLater,
+          creditAlsoHeld: q.creditAlsoHeld,
+          creditRestNote: q.creditRestNote,
+          payWithCreditNothingCharged: useCredit && due === 0,
+          gamCharges: q.gamTotal,
+          inFlight: q.inFlightTotal,
+          scheduledRetries: q.scheduledRetries.map(r => ({ nextRetryAt: r.nextRetryAt })),
+          amountRequested: body.amount ?? null,
+        } })
+      }
+    }
+
+    let feePayer: string = 'tenant'   // default when no rule (mirrors allocation: null → tenant pays)
     if (body.leaseId) {
       const row = await queryOne<{ ach_fee_payer: string | null; card_fee_payer: string | null }>(
         `SELECT r.ach_fee_payer, r.card_fee_payer
@@ -46,12 +248,13 @@ paymentsRouter.post('/quote', async (req, res, next) => {
           WHERE l.id = $1`, [body.leaseId])
       feePayer = (body.method === 'ach' ? row?.ach_fee_payer : row?.card_fee_payer) ?? 'tenant'
     }
+    const amount = body.amount ?? 0
     const tenantPaysFee = feePayer !== 'landlord'
     // cardCountry omitted → US base rate; a non-US card adds 1.5% at charge time (flagged in the UI).
-    const fee = tenantPaysFee ? computePlatformCut({ amount: body.amount, paymentMethod: body.method }) : 0
-    const total = Math.round((body.amount + fee) * 100) / 100
+    const fee = tenantPaysFee && amount > 0 ? computePlatformCut({ amount, paymentMethod: body.method }) : 0
+    const total = Math.round((amount + fee) * 100) / 100
     res.json({ success: true, data: {
-      base: body.amount, method: body.method, fee, tenantPaysFee, total,
+      base: amount, method: body.method, fee, tenantPaysFee, total,
       intlCardSurcharge: body.method === 'card',
     } })
   } catch (e) { next(e) }
@@ -60,8 +263,25 @@ paymentsRouter.post('/quote', async (req, res, next) => {
 // GET /api/payments — filtered by landlord or tenant
 paymentsRouter.get('/', async (req, res, next) => {
   try {
+    // ── S639: A TIE IS NOT AN ORDER ────────────────────────────────────────
+    //
+    // Nic: "on the outstanding balances tab six leases that are all overdue,
+    // and on the payments tab it's only showing five... The outstanding balance
+    // still has Steven Starr. The payments tab, his name is removed from."
+    //
+    // 52 payments, LIMIT 50, and every single one of them due 2026-09-01 —
+    // rent and utilities are all billed on the 1st, so `ORDER BY due_date DESC`
+    // was one flat tie across the whole table. Postgres may return a tie in any
+    // order it likes, so which two rows fell off the page was arbitrary and
+    // could differ between refreshes. Steven Starr's $589 rent and $264.39
+    // utilities were two of them, on the screen the desk collects money from.
+    //
+    // Two things were wrong and both are fixed: the sort now has a deterministic
+    // tiebreaker, and the caller can ask for the whole set (clamped, so a large
+    // portfolio cannot be turned into a table scan by a query string).
     const { status, type, from, to, page = '1', limit = '50' } = req.query as Record<string,string>
-    const offset = (parseInt(page) - 1) * parseInt(limit)
+    const limitN = Math.min(Math.max(parseInt(limit) || 50, 1), 1000)
+    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limitN
     const conditions: string[] = []
     const params: any[] = []
     let pi = 1
@@ -82,10 +302,37 @@ paymentsRouter.get('/', async (req, res, next) => {
       if (!req.user!.landlordId) {
         return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
       }
-      if (req.user!.permissions?.['payments.view_all'] !== true) {
+      // S641 (Nic): "the outstanding balances section of the payments tab is
+      // where you have to record a payment. My front desk needs to be able to
+      // record the damn payment."
+      //
+      // This used to return an EMPTY LIST to anyone without payments.view_all,
+      // which is why the front desk saw a blank tab: the page renders three
+      // sections off one query, and the one she needs came back with nothing.
+      //
+      // So `payments.view` is the narrow grant it always read like — the money
+      // still to collect, and nothing else. No settled history ("I don't want
+      // her seeing the histories at all") and no work-trade rows, which are a
+      // private arrangement between the landlord and that resident. Neither is
+      // needed to take cash across a counter.
+      const seesAll = req.user!.permissions?.['payments.view_all'] === true
+      if (!seesAll && req.user!.permissions?.['payments.view'] !== true) {
         return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
       }
       conditions.push(`p.landlord_id = $${pi++}`); params.push(req.user!.landlordId)
+      // S655 (10/3): a staffer assigned to one property sees that property's
+      // charges only — the same scope the balances list applies
+      // (getScopedPropertyIds: null = every property, [] = none). A charge
+      // with no space on it cannot be placed in their scope, so it is left out.
+      const scoped = await getScopedPropertyIds(req.user)
+      if (scoped !== null) {
+        conditions.push(`p.unit_id IN (SELECT su.id FROM units su WHERE su.property_id = ANY($${pi++}::uuid[]))`)
+        params.push(scoped)
+      }
+      if (!seesAll) {
+        conditions.push(`p.status IN ('pending', 'failed')`)
+        conditions.push(`p.work_trade_suspended_at IS NULL`)
+      }
     } else if (!isAdmin) {
       // Unknown role with no scope — empty rather than leak.
       return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
@@ -96,6 +343,11 @@ paymentsRouter.get('/', async (req, res, next) => {
       conditions.push(`p.landlord_id IN (SELECT id FROM landlords WHERE portfolio_manager_id = $${pi} OR service_manager_id = $${pi})`)
       params.push(req.user!.userId); pi++
     }
+    // FlexPay never appears in the landlord portal (CLAUDE.md, S541): GAM's
+    // FlexPay pull is the tenant's business with GAM, not a charge of the
+    // landlord's, so the landlord and their staff never see that row.
+    const landlordFacing = role === 'landlord' || isTeamRole
+    if (landlordFacing) conditions.push(`p.entry_description IS DISTINCT FROM 'FLEXPAY'`)
     if (status)  { conditions.push(`p.status = $${pi++}`);       params.push(status) }
     if (type)    { conditions.push(`p.type = $${pi++}`);         params.push(type) }
     if (from)    { conditions.push(`p.due_date >= $${pi++}`);    params.push(from) }
@@ -105,10 +357,20 @@ paymentsRouter.get('/', async (req, res, next) => {
     const [{ total }] = await query<any>(
       `SELECT COUNT(*)::int AS total FROM payments p ${where}`, params
     )
-    params.push(parseInt(limit), offset)
+    params.push(limitN, offset)
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name AS property_name,
         tu.first_name AS tenant_first, tu.last_name AS tenant_last,
+        -- S654: how it was paid, for the history's "Paid by" column.
+        -- 10/6 (Nic): a late fee netted out by its late-fee credit reads
+        -- "Late fee credited"; a line paid by credit alone, "Account credit".
+        COALESCE(p.manual_method, rm.payment_method,
+          CASE WHEN EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id
+                              AND cu.source = 'late_fee_credit' AND cu.status = 'applied') THEN 'late_fee_credit'
+               -- 10/6 (Nic): a late fee a matched bank line showed was never owed, taken off at $0.00.
+               WHEN p.type = 'late_fee' AND p.amount = 0 AND p.notes LIKE '%Came off: the bank shows the deposit on %' THEN 'late_fee_off_bank'
+               WHEN p.status = 'settled' AND p.amount > 0 AND p.issued_credit_amount >= p.amount THEN 'credit'
+          END) AS paid_by,
         -- S568: is this the FIRST open rent charge of a lease while the LANDLORD
         -- is still inside their onboarding reconciliation window? If so the
         -- landlord may mark it paid off-platform (old-system autopay overlap),
@@ -121,16 +383,77 @@ paymentsRouter.get('/', async (req, res, next) => {
                AND p2.status IN ('settled', 'paid_via_deposit') AND p2.id <> p.id)
         ) AS prior_arrangement_eligible
       FROM payments p
+      -- A failed pull paid nothing: a row it was on that account credit paid
+      -- later is never "Paid by" that bank or card.
+      LEFT JOIN tenant_remittances rm ON p.stripe_payment_intent_id IS NOT NULL
+                                     AND rm.stripe_payment_intent_id = p.stripe_payment_intent_id
+                                     AND NOT (rm.status = 'failed' AND p.status = 'settled')
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       LEFT JOIN landlords ld ON ld.id = p.landlord_id
       LEFT JOIN tenants t ON t.id = p.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
       ${where}
-      ORDER BY p.due_date DESC
+      -- S639: created_at then id break the due-date tie, so the same query
+      -- returns the same rows in the same order every time. Without this a
+      -- paginated list can show one row twice and hide another entirely.
+      ORDER BY p.due_date DESC, p.created_at DESC, p.id
       LIMIT $${pi} OFFSET $${pi+1}`, params
     )
-    res.json({ success: true, data: payments, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) })
+    // S655 (Nic, 10/2): landlord screens show the FULL balance with the credit
+    // on file BESIDE it — never netted off the bill. credit_on_file is every
+    // dollar of credit this person's household has with this company, read
+    // once per household on the page: what the landlord gave (tenant_credits:
+    // theirs, or tied to a lease they are on) and what was paid ahead on a
+    // lease they are on (lease_prepaid_credits; withdrawn credit left out).
+    // Credit a payment still clearing has set aside is not on file, and nor is
+    // paid-ahead money a dispute or return of its own funding still claims
+    // (creditUse.usablePaidAheadSql — the one rule the portal, the desk and the
+    // monthly draw share). What part of it can pay the bill now is the desk
+    // window's answer (GET /payments/:id/record-manual/quote).
+    const pairs = [...new Map(payments
+      .filter((p: any) => p.tenant_id && p.landlord_id)
+      .map((p: any) => [`${p.tenant_id}|${p.landlord_id}`, [p.tenant_id, p.landlord_id]])).values()]
+    const creditByHousehold = new Map<string, number>()
+    if (pairs.length > 0) {
+      const credit = await query<{ tenant_id: string; landlord_id: string; credit: string }>(
+        `WITH h AS (SELECT DISTINCT x.t AS tenant_id, x.l AS landlord_id
+                      FROM unnest($1::uuid[], $2::uuid[]) AS x(t, l)),
+              member AS (SELECT h.tenant_id, h.landlord_id, lt.lease_id
+                           FROM h JOIN lease_tenants lt ON lt.tenant_id = h.tenant_id
+                                  AND lt.status IN ('active','pending_add','pending_remove')
+                           JOIN leases ml ON ml.id = lt.lease_id AND ml.landlord_id = h.landlord_id),
+              pa AS (SELECT h.tenant_id, h.landlord_id, ${usablePaidAheadSql('pc', 'dc')} AS usable
+                       FROM h
+                       JOIN lease_prepaid_credits pc ON pc.voided_at IS NULL AND pc.amount_remaining > 0
+                       JOIN leases pcl ON pcl.id = pc.lease_id AND pcl.landlord_id = h.landlord_id
+                       ${disputeClaimJoinSql('pc', 'dc')}
+                      WHERE pc.tenant_id = h.tenant_id
+                         OR pc.lease_id IN (SELECT m.lease_id FROM member m
+                                             WHERE m.tenant_id = h.tenant_id AND m.landlord_id = h.landlord_id))
+         SELECT h.tenant_id, h.landlord_id,
+                (COALESCE((SELECT SUM(tc.amount_remaining) FROM tenant_credits tc
+                            WHERE tc.status = 'active' AND tc.amount_remaining > 0 AND tc.landlord_id = h.landlord_id
+                              AND (tc.tenant_id = h.tenant_id
+                                   OR tc.lease_id IN (SELECT m.lease_id FROM member m
+                                                       WHERE m.tenant_id = h.tenant_id AND m.landlord_id = h.landlord_id))), 0)
+                 + COALESCE((SELECT SUM(pa.usable) FROM pa
+                              WHERE pa.tenant_id = h.tenant_id AND pa.landlord_id = h.landlord_id), 0)
+                )::text AS credit
+           FROM h`,
+        [pairs.map(x => x[0]), pairs.map(x => x[1])])
+      for (const c of credit) {
+        creditByHousehold.set(`${c.tenant_id}|${c.landlord_id}`, Math.max(0, Math.round(Number(c.credit) * 100)) / 100)
+      }
+    }
+    const data = payments.map((p: any) => {
+      const row: any = { ...p, credit_on_file: creditByHousehold.get(`${p.tenant_id}|${p.landlord_id}`) ?? 0 }
+      // FlexPay never appears in the landlord portal: a bill line FlexPay
+      // covered reads as paid, with no trace of which product paid it.
+      if (landlordFacing) delete row.flexpay_advance_id
+      return row
+    })
+    res.json({ success: true, data, total, page: Math.max(parseInt(page) || 1, 1), totalPages: Math.ceil(total / limitN) })
   } catch (e) { next(e) }
 })
 
@@ -152,17 +475,31 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
       JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       JOIN tenants t ON t.id = vuo.primary_tenant_id
       JOIN landlords l ON l.id = u.landlord_id
-      WHERE u.status = 'active'
+      -- ── S638: A DELINQUENT UNIT STILL OWES NEXT MONTH'S RENT ───────────────
+      --
+      -- This collected only from units marked 'active', so the moment a unit
+      -- flipped to 'delinquent' GAM stopped pulling its rent — the tenant who
+      -- was already behind became the one nobody billed. It was survivable
+      -- while delinquency was set once a day and never cleared; now that the
+      -- status tracks the ledger in real time it would have bitten immediately.
+      --
+      -- 'suspended' stays excluded on purpose: that is a unit taken out of
+      -- service, not a resident who is late. Matches how the rent roll counts
+      -- occupancy (services/reportEngine.ts).
+      WHERE u.status IN ('active', 'delinquent')
         AND u.payment_block = FALSE
         AND t.ach_verified = TRUE
+        -- S655: a NACHA zero-tolerance suspension blocks bank pulls.
+        AND t.ach_suspended_at IS NULL
         AND EXISTS (
           SELECT 1 FROM user_bank_accounts ba
            WHERE ba.user_id = l.user_id AND ba.status = 'active'
         )
     `)
 
-    const [year, month] = targetMonth.split('-').map(Number)
-    const dueDate = new Date(year, month - 1, 1) // 1st of target month
+    // S654: the 1st as a plain calendar string, so the due date never depends
+    // on the host clock or the database session's zone.
+    const dueDate = `${targetMonth}-01` // 1st of target month
 
     let initiated = 0
     const errors: string[] = []
@@ -230,537 +567,592 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
   } catch (e) { next(e) }
 })
 
-// POST /api/payments/:id/handle-return — process ACH return codes
-// Zero tolerance: R05, R07, R10, R29 — immediate block
-paymentsRouter.post('/:id/handle-return', requireAdmin, async (req, res, next) => {
+// POST /api/payments/:id/handle-return — record a bank (ACH) return by hand.
+// Zero tolerance: R05, R07, R10, R29 — bank payments are blocked at once.
+//
+// Fix pass (Step 8, money plan §3 two-row model): a return the bank sent for a
+// bank debit that had SETTLED reopens through paymentReversal — the original
+// rows go 'returned' and a fresh owed row is written at each row's money part
+// (payments.reversal_id), so the amount is owed exactly once: on Outstanding,
+// the digest, the reminder, the bill email and every agent (openBalanceSql
+// never counts a 'returned' original). The old code only marked the row
+// 'returned', which dropped the money out of what is owed. Every row the debit
+// paid reopens (a bank return takes the whole debit back), any paid-ahead money
+// it banked is taken back first, and the bank's return fee (`returnFee`, what
+// Stripe charged for it) is passed to the tenant at cost.
+//
+// A debit that never settled ('failed') keeps owing on its own row: the code is
+// written on it, and a code the bank says not to retry (closed account,
+// unauthorized) cancels any retry still scheduled — its set-aside credit given
+// back the way paying over a retry gives it back.
+//
+// A row an earlier event marked 'returned' only for its paid-ahead part (a
+// reversed credit use) still holds its own bank money; the bank's return of
+// that money reopens it the way a settled debit reopens.
+//
+// Refused, with nothing written: a debit still on its way (Stripe reports its
+// own failure), a charge never sent to the bank, a card payment, settled or
+// failed (a chargeback arrives as a dispute), money recorded by hand, and a
+// return already recorded — two presses at the same moment included: each
+// return writes one NACHA log row (keyed in its notes), and the second press
+// gets a 409.
+const MANUAL_RETURN_EVENT = (pi: string) => `manual_return:${pi}`
+/** A NACHA return code (R01…R99), as this tool writes it; paymentReversal writes its own type there first. */
+const BANK_RETURN_CODE = /^R[0-9]{2}$/
+const ALREADY_RECORDED = 'This return is already recorded. The amount is owed again on its reopened charge.'
+/**
+ * Whether a row's own bank money still stands (paymentReversal's money part:
+ * its money less what earlier records already took back of it). Asked of a
+ * row an earlier event marked 'returned' only for its paid-ahead part — one
+ * with a reversed credit use.
+ */
+async function ownMoneyStands(client: { query: (sql: string, params: unknown[]) => Promise<{ rows: any[] }> }, paymentId: string): Promise<boolean> {
+  const row = (await client.query(
+    `SELECT GREATEST(0, vm.money_part - GREATEST(0,
+              COALESCE((SELECT SUM(pr.reversed_amount) FROM payment_reversals pr WHERE pr.payment_id = p.id), 0)
+              - COALESCE((SELECT SUM(cu.amount) FROM credit_uses cu
+                           WHERE cu.payment_id = p.id AND cu.status = 'reversed'), 0)))::text AS money_part
+       FROM payments p JOIN v_payment_money vm ON vm.payment_id = p.id
+      WHERE p.id = $1
+        AND EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id AND cu.status = 'reversed')`,
+    [paymentId])).rows[0]
+  return !!row && Math.round(Number(row.money_part) * 100) > 0
+}
+paymentsRouter.post('/:id/handle-return', requireAdmin, async (req: any, res, next) => {
+  const client = await getClient()
+  let zeroToleranceTenant: string | null = null
+  let cancelAfterCommit: string[] = []
   try {
-    const { returnCode, returnReason } = z.object({
+    const { returnCode, returnReason, returnFee } = z.object({
       returnCode:   z.nativeEnum(AchReturnCode),
-      returnReason: z.string().optional(),
+      returnReason: z.string().max(500).optional(),
+      // What Stripe charged GAM for this return. Required for a settled debit
+      // (0 when it charged nothing): GAM never absorbs it.
+      returnFee:    z.number().nonnegative().max(1000).optional(),
     }).parse(req.body)
-
     const config = ACH_RETURN_CONFIG[returnCode]
-    const payment = await queryOne<any>(
-      `SELECT * FROM payments WHERE id = $1`, [req.params.id]
-    )
+    const reason = returnReason ?? config.description
+
+    await client.query('BEGIN')
+    const head = (await client.query<{ tenant_id: string | null; landlord_id: string }>(
+      `SELECT tenant_id, landlord_id FROM payments WHERE id = $1`, [req.params.id])).rows[0]
+    if (!head) throw new AppError(404, 'Payment not found')
+    // S655 lock order (§1.5): the household, then the row.
+    if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
+    const payment = (await client.query<any>(
+      `SELECT * FROM payments WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0]
     if (!payment) throw new AppError(404, 'Payment not found')
+    const pi: string | null = payment.stripe_payment_intent_id ?? null
 
-    await query(`
-      UPDATE payments SET status='returned', return_code=$1, return_reason=$2,
-        zero_tolerance_flag=$3 WHERE id=$4`,
-      [returnCode, returnReason ?? config.description, config.zeroTolerance, req.params.id]
-    )
+    type Path = 'reverse' | 'resume' | 'failed'
+    let path: Path
+    /** The refusals a settled bank debit must pass before it is reopened. */
+    const mustBeBankDebitWithFee = async () => {
+      if (payment.manual_method || !pi) {
+        throw new AppError(409,
+          'This payment was not a bank debit GAM sent (it was recorded by hand or paid from credit), so there is no bank return to record here.')
+      }
+      await mustNotBeCard()
+      if (returnFee == null) {
+        throw new AppError(400,
+          'Enter what Stripe charged for this return (returnFee — 0 if it charged nothing). It is passed to the tenant at cost.')
+      }
+    }
+    /** A card payment has no bank return: its chargeback comes from Stripe as a dispute. */
+    const mustNotBeCard = async () => {
+      if (!pi) return
+      const rem = (await client.query<{ payment_method: string | null }>(
+        `SELECT payment_method FROM tenant_remittances WHERE stripe_payment_intent_id = $1 ORDER BY created_at, id LIMIT 1`,
+        [pi])).rows[0]
+      if (rem && rem.payment_method !== 'ach') {
+        throw new AppError(409,
+          'This was a card payment. A card chargeback comes from Stripe as a dispute and is handled there, not recorded here.')
+      }
+    }
+    if (payment.status === 'returned') {
+      // Three kinds of 'returned' row:
+      //  - one this tool reopened whose bank code was not yet written (the
+      //    second step failed — paymentReversal writes its own type there,
+      //    e.g. 'ach_return'): finish it;
+      //  - one an earlier event marked 'returned' only for its paid-ahead part
+      //    (a reversed credit use) while its own bank money still stands, and
+      //    no return is recorded on the debit yet: the bank's return of that
+      //    money reopens it like a settled debit (paymentReversal reopens such
+      //    a row for its money part);
+      //  - anything else is already recorded.
+      const recorded = pi
+        ? ((await client.query(`SELECT 1 FROM payment_reversals WHERE stripe_event_id = $1 LIMIT 1`,
+            [MANUAL_RETURN_EVENT(pi)])).rowCount ?? 0) > 0
+        : false
+      const ours = recorded && !BANK_RETURN_CODE.test(payment.return_code ?? '')
+        ? ((await client.query(
+            `SELECT 1 FROM payment_reversals WHERE payment_id = $1 AND stripe_event_id = $2 LIMIT 1`,
+            [payment.id, MANUAL_RETURN_EVENT(pi!)])).rowCount ?? 0) > 0
+        : false
+      if (ours) {
+        path = 'resume'
+      } else if (!recorded && pi && !payment.manual_method && await ownMoneyStands(client, payment.id)) {
+        await mustBeBankDebitWithFee()
+        path = 'reverse'
+      } else {
+        throw new AppError(409, ALREADY_RECORDED)
+      }
+    } else if (payment.status === 'failed') {
+      // Fix pass 3: a failed row is a bank return only when GAM sent it to the
+      // bank. Money recorded by hand, or a row with no debit behind it, is
+      // refused before any code, NACHA row or bank-payment block is written.
+      if (payment.manual_method) {
+        throw new AppError(409,
+          'This payment was not a bank debit GAM sent (it was recorded by hand or paid from credit), so there is no bank return to record here.')
+      }
+      if (!pi) {
+        throw new AppError(409, 'This charge was never sent to the bank, so there is no return to record. It is still owed as it is.')
+      }
+      await mustNotBeCard()
+      path = 'failed'
+    } else {
+      // S655: account credit a payment in flight set aside is the credit
+      // ledger's to give back (Stripe's own failure or return event does it,
+      // row by row). Marking the row here would leave that credit set aside.
+      const held = await client.query(
+        `SELECT 1 FROM credit_uses WHERE payment_id = $1 AND status = 'held' LIMIT 1`, [payment.id])
+      if ((held.rowCount ?? 0) > 0) {
+        throw new AppError(409,
+          'This payment has account credit set aside on it. Let Stripe\'s own failure or return event close it, ' +
+          'so the credit goes back to the tenant; this tool only records returns with no credit on them.')
+      }
+      if (payment.status === 'processing' || (payment.status === 'pending' && pi)) {
+        throw new AppError(409,
+          'This payment is still on its way through the bank, and Stripe reports a failure on it by itself. ' +
+          'Record a return here only once the payment shows as settled or failed.')
+      }
+      if (payment.status === 'pending') {
+        throw new AppError(409, 'This charge was never sent to the bank, so there is no return to record. It is still owed as it is.')
+      }
+      if (payment.status !== 'settled') {
+        throw new AppError(409, 'This charge was not paid by a bank debit, so there is no bank return to record.')
+      }
+      await mustBeBankDebitWithFee()
+      path = 'reverse'
+    }
 
-    // Log to NACHA monitoring
-    await query(`
+    // The rows of this debit: every row on its intent (one bank debit, one
+    // return), or the row alone when it carries no intent.
+    const debitRows = (sql: string) => pi
+      ? { sql: `${sql} WHERE stripe_payment_intent_id = $1`, params: [pi] as unknown[] }
+      : { sql: `${sql} WHERE id = $1`, params: [payment.id] as unknown[] }
+
+    // Which bank return this is, for the NACHA log: a settled debit is
+    // returned once; a failed debit once per attempt (a retry confirms the
+    // same intent again, and its failure is a new return).
+    let returnKey: string
+    if (path === 'failed') {
+      const q = debitRows(`SELECT COALESCE(MAX(retry_count), 0)::int AS n FROM payments`)
+      const attempt = (await client.query<{ n: number }>(`${q.sql} AND status = 'failed'`, q.params)).rows[0]?.n ?? 0
+      returnKey = `${MANUAL_RETURN_EVENT(pi!)}:attempt${attempt}`
+    } else {
+      returnKey = MANUAL_RETURN_EVENT(pi!)
+    }
+    // Two presses of this tool are one return: the second is refused, and
+    // nothing is written twice (the NACHA return rate counts each one).
+    const refuseIfLogged = async () => {
+      const logged = await client.query(
+        `SELECT 1 FROM ach_monitoring_log WHERE event_type = 'return_received' AND notes = $1
+          UNION ALL
+         SELECT 1 FROM ach_monitoring_log_archive WHERE event_type = 'return_received' AND notes = $1
+          LIMIT 1`, [returnKey])
+      if ((logged.rowCount ?? 0) > 0) {
+        throw new AppError(409, path === 'failed'
+          ? 'This return is already recorded on this failed payment. It is still owed on its own charge.'
+          : ALREADY_RECORDED)
+      }
+    }
+    if (path !== 'reverse') await refuseIfLogged()
+
+    let reopened: Array<{ paymentId: string; newPaymentId: string | null; owedAgain: number }> = []
+    let owedAgain = 0
+    let retryScheduled = false
+    if (path === 'failed') {
+      // Still owed on its own rows: write the code on every failed row of the
+      // debit. A code the bank says not to retry ends any retry still
+      // scheduled on it (and gives back the credit it set aside), canceled at
+      // Stripe after the commit.
+      const upd = debitRows(`UPDATE payments SET return_code = $2, return_reason = $3, zero_tolerance_flag = $4`)
+      await client.query(`${upd.sql} AND status = 'failed'`, [...upd.params, returnCode, reason, config.zeroTolerance])
+      if (!config.retryEligible && pi) {
+        const rows = (await client.query<{ id: string }>(
+          `SELECT id FROM payments WHERE stripe_payment_intent_id = $1 AND status = 'failed' ORDER BY id`, [pi])).rows.map(r => r.id)
+        cancelAfterCommit = (await supersedeScheduledRetry(client, rows)).cancelAfterCommit
+      }
+      const next = debitRows(`SELECT 1 FROM payments`)
+      retryScheduled = ((await client.query(
+        `${next.sql} AND status = 'failed' AND next_retry_at IS NOT NULL LIMIT 1`, next.params)).rowCount ?? 0) > 0
+    } else {
+      if (path === 'reverse') {
+        // paymentReversal takes its own locks in the same order (household,
+        // payouts, charge, rows) on its own connection, so this lock is let go
+        // first; this connection waits idle and takes the household again after.
+        await client.query('ROLLBACK')
+        const { handlePaymentReversal } = await import('../services/paymentReversal')
+        const result = await handlePaymentReversal({
+          paymentIntentId: pi,
+          reversalType:    config.zeroTolerance ? 'ach_unauthorized' : 'ach_return',
+          reversedAmount:  null,
+          reversalFee:     returnFee ?? 0,
+          stripeEventId:   MANUAL_RETURN_EVENT(pi!),
+          stripeObjectId:  null,
+          rawEvent:        { source: 'admin_handle_return', payment_id: payment.id, return_code: returnCode,
+                             return_reason: reason, recorded_by: req.user?.userId ?? null, recorded_at: new Date().toISOString() },
+        }).catch((e: any) => {
+          // Until contract step C0 drops the old UNIQUE(stripe_event_id), a
+          // debit that paid two or more charges cannot get one record per
+          // charge: the whole return rolls back (paymentReversal's deploy note).
+          if (e?.code === '23505' && e?.constraint === 'payment_reversals_stripe_event_id_key') {
+            throw new AppError(409,
+              'This debit paid more than one charge, and returns like that can be recorded only after this release\'s ' +
+              'database step C0 has run. Nothing was changed — record it again once C0 is in.')
+          }
+          throw e
+        })
+        // A second press at the same moment: the first one's return is the
+        // record (a finished or half-finished one is caught above, by status).
+        if (!result.handled && result.reason === 'already_processed') throw new AppError(409, ALREADY_RECORDED)
+        if (!result.handled) {
+          throw new AppError(409, result.reason === 'not_settled'
+            ? 'Nothing this debit paid is still settled, so there is nothing to reopen. Look at the charge again.'
+            : 'GAM could not match this debit to a payment it can reopen. Nothing was changed.')
+        }
+        reopened = result.rows.filter(r => r.newPaymentId)
+          .map(r => ({ paymentId: r.paymentId, newPaymentId: r.newPaymentId, owedAgain: r.owedAgain }))
+        owedAgain = result.reopenedTotal
+        await client.query('BEGIN')
+        if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
+        // A press that finished this return's second step while this one
+        // waited has already written the codes and the NACHA log.
+        await refuseIfLogged()
+      } else {
+        // Finishing a return: the charges it reopened, as they were written.
+        reopened = (await client.query<{ paymentId: string; newPaymentId: string; owedAgain: number }>(
+          `SELECT pr.payment_id::text AS "paymentId", n.id::text AS "newPaymentId", n.amount::float AS "owedAgain"
+             FROM payment_reversals pr JOIN payments n ON n.reversal_id = pr.id
+            WHERE pr.stripe_event_id = $1 ORDER BY n.created_at, n.id`, [MANUAL_RETURN_EVENT(pi!)])).rows
+        owedAgain = Math.round(reopened.reduce((s, r) => s + r.owedAgain, 0) * 100) / 100
+      }
+      // The code on every row this return reopened (theirs, not another event's).
+      await client.query(
+        `UPDATE payments p SET return_code = $1, return_reason = $2, zero_tolerance_flag = $3
+          WHERE p.stripe_payment_intent_id = $4 AND p.status = 'returned'
+            AND (p.return_code IS NULL OR p.return_code !~ '^R[0-9]{2}$')
+            AND EXISTS (SELECT 1 FROM payment_reversals pr WHERE pr.payment_id = p.id AND pr.stripe_event_id = $5)`,
+        [returnCode, reason, config.zeroTolerance, pi, MANUAL_RETURN_EVENT(pi!)])
+    }
+
+    // Log to NACHA monitoring — once per return (returnKey in notes), at the
+    // whole debit's amount whichever of its rows was pressed (fix pass 3): what
+    // the bank pulled (the receipt's gross, fee on top included), else the
+    // receipt's amount, else the money parts of the debit's own rows.
+    const debit = (await client.query<{ amt: string | null }>(
+      `SELECT COALESCE(
+          (SELECT COALESCE(tr.gross_amount, tr.amount) FROM tenant_remittances tr
+            WHERE tr.stripe_payment_intent_id = $1 ORDER BY tr.created_at, tr.id LIMIT 1),
+          (SELECT SUM(vm.money_part) FROM payments p JOIN v_payment_money vm ON vm.payment_id = p.id
+            WHERE p.stripe_payment_intent_id = $1 AND p.reversal_id IS NULL))::text AS amt`,
+      [pi])).rows[0]?.amt ?? null
+    await client.query(`
       INSERT INTO ach_monitoring_log
-        (payment_id, event_type, tenant_id, amount, return_code, flagged)
-      VALUES ($1,'return_received',$2,$3,$4,$5)`,
-      [payment.id, payment.tenant_id, payment.amount, returnCode, config.zeroTolerance]
+        (payment_id, event_type, tenant_id, amount, return_code, flagged, notes)
+      VALUES ($1,'return_received',$2,$3,$4,$5,$6)`,
+      [payment.id, payment.tenant_id, debit ?? payment.amount, returnCode, config.zeroTolerance, returnKey]
     )
 
-    if (config.zeroTolerance) {
-      // Zero tolerance — suspend ACH for this tenant immediately
-      await query(`UPDATE tenants SET ach_verified = FALSE WHERE id = $1`, [payment.tenant_id])
-      await query(`
+    if (config.zeroTolerance && payment.tenant_id) {
+      // Zero tolerance — suspend ACH for this tenant immediately. S655: the
+      // block is its own column (ach_verified now only says "has a verified
+      // bank"); chargeLeaseBalance and autopay refuse bank payments while set.
+      await client.query(`UPDATE tenants SET ach_suspended_at = COALESCE(ach_suspended_at, NOW()) WHERE id = $1`, [payment.tenant_id])
+      await client.query(`
         INSERT INTO ach_monitoring_log
           (payment_id, event_type, tenant_id, return_code, flagged, notes)
         VALUES ($1,'zero_tolerance_block',$2,$3,TRUE,'Tenant ACH suspended per NACHA zero-tolerance policy')`,
         [payment.id, payment.tenant_id, returnCode]
       )
+      zeroToleranceTenant = payment.tenant_id
+    }
+    await client.query('COMMIT')
+    await cancelSupersededIntents(cancelAfterCommit)
+
+    // Fix pass (rev8): a bank return of a move-out balance charge (the gap
+    // charge a finalized move-out took) reopens its row here as the dispute
+    // webhook does — so the move-out is marked as not collected and the
+    // owner's move-out page says so, exactly as when Stripe reports it
+    // (webhooks.ts, charge.dispute.created). Every reopened row is checked;
+    // only a move-out balance charge is marked. Never throws, once per move-out.
+    if (path !== 'failed' && reopened.length > 0) {
+      const { noteGapChargeReturned } = await import('../services/depositReturn')
+      for (const r of reopened) {
+        if (!r.newPaymentId) continue
+        await noteGapChargeReturned(r.paymentId,
+          `the bank returned the move-out balance charge (${returnCode}: ${reason}), recorded by hand`, { how: 'came_back' })
+          .catch((err) => logger.error({ err, payment_id: r.paymentId }, '[ach-return] move-out balance charge note failed'))
+      }
+    }
+
+    if (zeroToleranceTenant) {
       // ACH is the operating rail for FlexPay + OTP — once it's suspended those
-      // subscriptions can't pull, so disenroll the tenant (best-effort; never
-      // block the return handler). These were previously dead code (exported,
-      // never called).
+      // subscriptions can't pull, so disenroll the tenant (best-effort, after
+      // the commit; never blocks the return handler). These were previously
+      // dead code (exported, never called).
       try {
         const { autoDisenrollFlexPayOnAchUnverified } = await import('../services/flexpay')
-        await autoDisenrollFlexPayOnAchUnverified(payment.tenant_id)
-      } catch (e) { logger.error({ err: e, tenant_id: payment.tenant_id }, '[ach-return] flexpay auto-disenroll failed') }
+        await autoDisenrollFlexPayOnAchUnverified(zeroToleranceTenant)
+      } catch (e) { logger.error({ err: e, tenant_id: zeroToleranceTenant }, '[ach-return] flexpay auto-disenroll failed') }
       // OTP auto-disenroll (gated/no-op while OTP is hidden; kept for re-enable).
       try {
         const { autoDisenrollOnAchUnverified } = await import('../services/otp')
-        await autoDisenrollOnAchUnverified(payment.tenant_id)
-      } catch (e) { logger.error({ err: e, tenant_id: payment.tenant_id }, '[ach-return] otp auto-disenroll failed') }
+        await autoDisenrollOnAchUnverified(zeroToleranceTenant)
+      } catch (e) { logger.error({ err: e, tenant_id: zeroToleranceTenant }, '[ach-return] otp auto-disenroll failed') }
     }
 
+    const owedLine = path === 'failed'
+      ? 'The payment stays failed and is still owed on its own charge'
+      : `Reopened — $${owedAgain.toFixed(2)} is owed again on ${reopened.length === 1 ? 'a new charge' : `${reopened.length} new charges`}`
+    const retryLine = path !== 'failed' ? ''
+      : !config.retryEligible ? ' (no retry: the bank says not to try this account again)'
+      : retryScheduled ? ' (a scheduled retry still runs)'
+      : ' (no retry is scheduled)'
     res.json({ success: true, data: {
       returnCode,
       zeroTolerance: config.zeroTolerance,
-      action: config.zeroTolerance ? 'Tenant ACH suspended — manual review required' : 'Return logged — retry eligible'
+      outcome: path === 'failed' ? 'failed' : 'reopened',
+      reopened,
+      owedAgain,
+      action: `${owedLine}${retryLine}.${config.zeroTolerance ? ' Bank payments for this tenant are suspended — manual review required.' : ''}`,
     }})
-  } catch (e) { next(e) }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
 })
 
-// POST /api/payments/:id/pay — tenant initiates a destination charge for
-// a pending rent payment row. (S117 — Stripe Connect destination charge
-// model. Replaces the pre-Connect "tenant has no way to pay" gap.)
+// POST /api/payments/:id/pay — RETIRED (S655, money plan Step 8).
 //
-// Flow:
-//   1. Tenant POSTs with their saved Stripe payment_method_id +
-//      payment_method_type ('ach' or 'card')
-//   2. Backend validates the payment row belongs to this tenant
-//   3. Looks up the landlord's stripe_connect_account_id
-//   4. Computes application_fee_amount via computePlatformCut
-//   5. Creates a destination charge — Stripe routes gross to landlord's
-//      Connect, application_fee_amount to GAM's platform balance
-//   6. Stamps stripe_payment_intent_id on the payment row, status →
-//      'processing'
-//   7. Webhook payment_intent.succeeded later flips to 'settled' and
-//      runs allocation engine for the audit trail
-paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
+// It charged ONE row on its own: no household lock, no pay-in-full check
+// across the bill, no credit choice, and nothing to stop a second charge on a
+// row Pay Now had already taken. Every payment goes through
+// POST /api/payments/pay-balance (services/rentCharge), which charges the
+// whole bill once. Kept registered so an old screen gets a plain answer
+// instead of a 404.
+paymentsRouter.post('/:id/pay', async (_req: any, _res, next) => {
+  next(new AppError(410,
+    'Paying one charge on its own has been retired. Pay the whole bill with POST /api/payments/pay-balance ' +
+    '(the Pay Now button on the Payments page).'))
+})
+
+// ── S537 (Nic): ONE "Pay now" ───────────────────────────────────────────
+// The tenant portal shows a read-only oldest-first ledger and a single Pay Now
+// per lease (S581: each lease is its own charge and receipt). Rent is
+// pay-in-full: the whole bill or more (paying ahead), never less (S616: there
+// is no setting for partials — "in the case of it going to two different
+// operators, how would you allocate that?").
+//
+// S655 (Nic, 10/2) — THE CREDIT PROMPT. The bill is shown IN FULL. When credit
+// could pay part of it the screen offers two buttons, both actions:
+//   "Use all $X — pay $Y"  (payIfUsed)   and   "Save it for later — pay $Z" (payIfSaved)
+// and when the credit covers the whole bill, "Pay with credit — nothing
+// charged" (coversWholeBill). The choice goes back to /pay-balance with
+// expectedCredit = usableCredit; a credit that moved is a 409 and the screen
+// asks again in place. Credit is applied by itself only when it covers a whole
+// bill (the bill run does that). GAM's own charges are listed as their own
+// line; a bank retry already scheduled says when it will run (paying now
+// replaces it); money already on its way is shown as clearing, not owed.
+//
+// Everything here is the same arithmetic /pay-balance enforces
+// (services/rentCharge planLeaseCharge), so the number shown is the number
+// charged.
+paymentsRouter.get('/balance-context', async (req: any, res, next) => {
+  const client = await getClient()
   try {
-    const body = z.object({
-      paymentMethodId:   z.string().min(1),
-      paymentMethodType: z.enum(['ach', 'card']),
-    }).parse(req.body)
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
+    const tenantId = req.user!.profileId
 
-    if (req.user!.role !== 'tenant') {
-      throw new AppError(403, 'Only tenants can call this endpoint')
-    }
+    // decisions.md #48.4: a card payment on this household's bills that nobody
+    // confirmed within the hold is released before the bill is read, so any
+    // look at the bill after the hold shows it open again — even if the
+    // payer closed the page and the sweep has not come round yet.
+    await releaseUnconfirmedCardCharges(getStripe, { tenantId }).catch((err) => {
+      logger.warn({ err, tenantId }, '[balance-context] unconfirmed card release failed; the sweep will retry')
+    })
 
-    // Fetch payment + verify ownership + status. S160+ cached Connect
-    // readiness flags on users let us decide destination-vs-platform charge
-    // without a live Stripe round-trip.
-    const pmt = await queryOne<any>(
-      `SELECT p.id, p.tenant_id, p.landlord_id, p.amount, p.status, p.type,
-              p.entry_description, p.stripe_payment_intent_id, p.unit_id,
-              p.due_date::text AS due_date,
-              u.property_id, u.payment_block,
-              t.stripe_customer_id,
-              l.user_id AS landlord_user_id,
-              -- S554 Connect re-anchor: prefer the landlord ENTITY's account +
-              -- its capability flags; fall back to the founding owner's user
-              -- account during the transition. The flags MUST come from the
-              -- same entity that owns the account being charged (a plain
-              -- COALESCE on the booleans would always pick landlords' false).
-              COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted,
-              -- S562: who bears the processing fee (must MATCH allocation.ts's
-              -- settle-time branch exactly, or GAM under/over-collects). Lives
-              -- on property_allocation_rules, not properties.
-              par.ach_fee_payer, par.card_fee_payer
+    // The leases with anything to pay: rows billed to this tenant, or any row
+    // on a lease they are on (one household balance), or a row on an invoice
+    // of such a lease (a neighbor landlord's utility, S616).
+    const leaseIds = (await client.query<{ lease_id: string }>(
+      `SELECT DISTINCT COALESCE(p.lease_id, inv.lease_id) AS lease_id
          FROM payments p
-         JOIN units u ON u.id = p.unit_id
-         JOIN tenants t ON t.id = p.tenant_id
-         JOIN landlords l ON l.id = p.landlord_id
-         JOIN users lu ON lu.id = l.user_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
-        WHERE p.id = $1`,
-      [req.params.id]
-    )
-    if (!pmt) throw new AppError(404, 'Payment not found')
-    if (pmt.tenant_id !== req.user!.profileId) {
-      throw new AppError(403, 'Not your payment')
-    }
-    // S511 #8b: eviction mode blocks ALL money routed to the landlord — every
-    // payments-row charge here is a destination charge to the landlord's Connect,
-    // and accepting any landlord-bound payment during an eviction can reset the
-    // eviction timeline. GAM-side balances (FlexDeposit installments, etc.) run
-    // through separate flows that aren't gated, so they keep collecting.
-    if (pmt.payment_block) {
-      throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
-    }
-    // S533/S534 payment priority (Nic): ACCELERATED propane outranks rent
-    // but NEVER interrupts the charge — the ACH pulls in full and settle-
-    // time redistribution (services/propaneRedistribution.ts, webhook)
-    // applies the funds propane-first, splitting the rent row. There is
-    // deliberately NO pay-time disclosure (S534): warning the tenant
-    // before/at confirmation invites backing out mid-flow and stranding
-    // failed ACH pulls. The tenant is informed AFTER the money moves, by
-    // the settle-time 'propane_priority_applied' notification in
-    // webhooks.ts. (GAM balances outrank both — supersedence skims at
-    // its own layer.)
-    if (pmt.status === 'settled') {
-      throw new AppError(409, 'Payment already settled')
-    }
-    if (pmt.status === 'processing' && pmt.stripe_payment_intent_id) {
-      throw new AppError(409, 'Payment already in flight')
-    }
-    if (!pmt.stripe_customer_id) {
-      throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
-    }
+         LEFT JOIN invoices inv ON inv.id = p.invoice_id
+        WHERE COALESCE(p.lease_id, inv.lease_id) IS NOT NULL
+          AND inv.service_agreement_id IS NULL
+          AND (p.tenant_id = $1
+               OR EXISTS (SELECT 1 FROM lease_tenants lt
+                           WHERE lt.lease_id = COALESCE(p.lease_id, inv.lease_id) AND lt.tenant_id = $1
+                             AND lt.status IN ('active','pending_add','pending_remove')))
+          AND (${payableRowSql('p')} OR p.status = 'processing')`,
+      [tenantId])).rows.map(r => r.lease_id)
 
-    // S113-PhaseA: don't fail the tenant payment when the destination Connect
-    // isn't ready. Fall back to a standard charge (gross to GAM platform);
-    // mark the payment platform_held; reconciliation Transfer fires when the
-    // landlord eventually completes Connect onboarding. Otherwise tenants
-    // hit a wall and spend the rent before we can collect.
-    const landlordConnectReady =
-      !!pmt.stripe_connect_account_id &&
-      pmt.connect_charges_enabled === true &&
-      pmt.connect_details_submitted === true
-
-    const stripe = getStripe()
-
-    // Read card country if relevant for the surcharge calculation
-    let cardCountry: string | null = null
-    if (body.paymentMethodType === 'card') {
-      const pm = await stripe.paymentMethods.retrieve(body.paymentMethodId)
-      cardCountry = pm.card?.country ?? null
-    }
-
-    const amount = parseFloat(pmt.amount)
-    const basePlatformCut = computePlatformCut({
-      amount,
-      paymentMethod: body.paymentMethodType,
-      cardCountry,
-    })
-
-    // S121: tenant-payer platform fee passthrough. Look up any unpaid
-    // platform_fee_accruals on this property where payer='tenant'.
-    // Sum their total_amount and add to application_fee_amount so GAM
-    // collects the SaaS subscription fee on top of rent. Mark them paid
-    // post-charge (after Stripe succeeds, so a charge failure leaves them
-    // unclaimed for the next attempt).
-    const unpaidAccruals = await query<{ id: string; total_amount: string }>(
-      `SELECT id, total_amount FROM platform_fee_accruals
-        WHERE property_id = $1
-          AND payer = 'tenant'
-          AND tenant_charge_id IS NULL
-          AND total_amount > 0`,
-      [pmt.property_id]
-    )
-    const passthroughAmount = unpaidAccruals.reduce(
-      (sum, r) => sum + parseFloat(r.total_amount), 0
-    )
-
-    // S248/S581: sublease markup detection. When this payment is for a unit
-    // with an active sublease where the payer is the sublessee, the landlord is
-    // owed `master_share_amount`, not `sub_monthly_amount` — the difference
-    // (markup) goes to the sublessor. Under platform-holds (S560) it is STAMPED
-    // on the payment (sublease_markup_amount) so services/allocation.ts subtracts
-    // it from owner_share and creditSublessorMarkupForPayment credits the
-    // sublessor that same amount at settle. (Pre-S581 it was added only to the
-    // now-dead application_fee_amount — see the migration: the markup was dropped
-    // from the landlord's payout, so GAM ate it.)
-    let subleaseMarkup = 0
-    if (pmt.type === 'rent') {
-      const sub = await queryOne<{ sub: string; master: string }>(
-        `SELECT s.sub_monthly_amount::text AS sub, s.master_share_amount::text AS master
-           FROM subleases s
-           JOIN leases l ON l.id = s.master_lease_id
-          WHERE l.unit_id = $1
-            AND s.sublessee_tenant_id = $2
-            AND s.status = 'active'
-            AND s.start_date <= $3::date
-            AND (s.end_date IS NULL OR s.end_date >= $3::date)
-          LIMIT 1`,
-        [pmt.unit_id, pmt.tenant_id, pmt.due_date ?? new Date().toISOString().slice(0, 10)],
-      )
-      if (sub) {
-        subleaseMarkup = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
-      }
-    }
-
-    // S261: GAM-supersedence boost. Compute the tenant's outstanding
-    // GAM-owed debt (FlexDeposit defaults + accelerated balance +
-    // FlexCharge balances + FlexPay fees + custody fees) and route as
-    // much of THIS rent payment as needed (oldest-first) into GAM's
-    // platform balance via additional application_fee_amount. The
-    // landlord receives gross - banking_fee - supersedence; the lease
-    // still shows the rent paid in full. On webhook settle,
-    // applyTenantSupersedence distributes the boost FIFO across the
-    // live debt list.
-    const gamSupersedenceAmount = pmt.tenant_id
-      ? Math.min(amount, await computeTenantGamOutstandingTotal(pmt.tenant_id))
-      : 0
-
-    const platformCutAmount = Math.round(
-      (basePlatformCut + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100
-    ) / 100
-
-    // S562: the tenant bears the processing fee UNLESS the property routes it to
-    // the landlord. Mirror allocation.ts EXACTLY (`=== 'landlord'` is the only
-    // landlord branch; null / 'tenant' → tenant pays). When the tenant pays, the
-    // fee must be ADDED to the charge — under platform-holds GAM keeps its cut by
-    // NOT transferring it, so if the fee isn't collected up front the landlord
-    // still gets full rent (allocation splittable=gross) and GAM eats Stripe's
-    // cost every payment (violates the #1 no-fee-absorption rule).
-    const feePayer = body.paymentMethodType === 'ach' ? pmt.ach_fee_payer : pmt.card_fee_payer
-    const tenantPaysProcessingFee = feePayer !== 'landlord'
-    // S562: the tenant-borne amounts that ride ON TOP of rent = the processing
-    // fee (when they're the fee payer) + the tenant-payer platform-fee
-    // passthrough (`passthroughAmount` is already the sum of payer='tenant'
-    // unclaimed accruals, so it's naturally $0 when the landlord pays the
-    // platform fee — the launch default). Same leak, same fix: under platform-
-    // holds these must be collected in the charge, or GAM eats them.
-    const tenantBorneOnTop = (tenantPaysProcessingFee ? basePlatformCut : 0) + passthroughAmount
-    const chargeAmount = Math.round((amount + tenantBorneOnTop) * 100) / 100
-
-    // S560 money-flow rebuild (Phase 1): ALWAYS charge to the platform balance —
-    // no destination charge. Rent is held by GAM and batched out to the landlord
-    // on the weekly (Friday-delivered) run. GAM keeps its cut by simply not
-    // transferring it, and the settle-time allocation ledger records who is owed
-    // what. The tenant-borne processing fee (S562) rides on top of the charge.
-    const intent = await createRentPlatformCharge({
-      amount: chargeAmount,
-      stripeCustomerId:        pmt.stripe_customer_id,
-      paymentMethodId:         body.paymentMethodId,
-      paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-      entryDescription:        pmt.entry_description,
-      metadata: {
-        gam_payment_id: pmt.id,
-        tenant_id:      pmt.tenant_id,
-        landlord_id:    pmt.landlord_id,
-      },
-    })
-
-    if (!landlordConnectReady) {
-      // The money is held fine, but this landlord has no payout-ready Connect
-      // account, so the weekly batch can't disburse to them yet. Nudge admin to
-      // get them onboarded; funds release on the batch once they're ready.
-      await createAdminNotification({
-        severity: 'warn',
-        category: 'platform_held_rent_charge',
-        title:    `Held rent can't batch out — landlord ${pmt.landlord_user_id} not Connect-ready`,
-        body:     `Payment ${pmt.id} for $${amount} is held on the GAM platform balance. It will be batched to the landlord once they finish Connect onboarding.`,
-        context: {
-          payment_id:        pmt.id,
-          landlord_id:       pmt.landlord_id,
-          landlord_user_id:  pmt.landlord_user_id,
-          amount,
-          stripe_payment_intent_id: intent.id,
-        },
+    const r2 = (n: number) => Math.round(n * 100) / 100
+    // decisions.md #48.4: card payments on this household's bills still
+    // waiting on their card's bank (3-D Secure) — held, not clearing. The payer
+    // is offered "Confirm with your bank" and "Cancel it and pay another way";
+    // the rest of the household is told whose bank it waits on.
+    const awaiting = await awaitingCardConfirmations(client, tenantId)
+    const leases: any[] = []
+    const allRows: any[] = []
+    for (const leaseId of leaseIds.sort()) {
+      const plan = await planLeaseCharge(client, { tenantId, scope: { kind: 'lease', leaseId } })
+      const rowsShown = [...plan.required, ...plan.carried]
+      if (rowsShown.length === 0 && plan.inFlightTotal === 0) continue
+      const head = (await client.query<any>(
+        `SELECT l.landlord_id, u.unit_number, pr.name AS property_name, COALESCE(u.payment_block, FALSE) AS payment_block,
+                pr.tenants_deposit_at_bank
+           FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties pr ON pr.id = u.property_id
+          WHERE l.id = $1`, [leaseId])).rows[0]
+      const ids = rowsShown.map(r => r.id)
+      const detail = ids.length ? (await client.query<any>(
+        `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
+                p.entry_description, p.notes, p.lease_id, p.landlord_id, p.revenue_owner,
+                p.status, p.next_retry_at, u.unit_number, pr.name AS property_name, u.payment_block
+           FROM payments p
+           LEFT JOIN units u ON u.id = p.unit_id
+           LEFT JOIN properties pr ON pr.id = u.property_id
+          WHERE p.id = ANY($1::uuid[])`, [ids])).rows : []
+      const byId = new Map(detail.map((d: any) => [d.id, d]))
+      const rows = rowsShown.map(r => ({ ...byId.get(r.id), creditAlreadyApplied: r.appliedCredit, carried: r.carried }))
+      allRows.push(...rows)
+      // What must be paid in full now if the credit is saved, and if it is used.
+      const payIfSaved = r2(plan.requiredTotal - plan.creditAlreadyApplied)
+      const payIfUsed = r2(payIfSaved - plan.usableCredit)
+      const outstanding = r2(plan.requiredTotal + plan.carriedTotal)
+      const passthrough = await tenantPassthroughFor(plan.ctx.propertyId, client)
+      leases.push({
+        leaseId,
+        propertyName: head?.property_name ?? null,
+        unitNumber: head?.unit_number ?? null,
+        landlordId: plan.landlordId,
+        paymentBlocked: head?.payment_block === true,
+        // 10/6 (Nic): the property takes rent its tenants deposit at the bank —
+        // only then is "I paid at the bank — report a deposit" offered.
+        bankDepositsTaken: head?.tenants_deposit_at_bank === true,
+        // The whole bill, before any credit (Nic: the full balance is shown).
+        outstanding,
+        grossOutstanding: outstanding,
+        // S622: the old balance is paid last and may be paid in part; the
+        // floor is everything else. Matches /pay-balance exactly.
+        carriedBalance: plan.carriedTotal,
+        requiredNow: payIfSaved,
+        // The credit prompt.
+        usableCredit: plan.usableCredit,
+        expectedCredit: plan.usableCredit,
+        creditOnFile: plan.creditOnFile,
+        payIfUsed: plan.usableCredit > 0 ? payIfUsed : payIfSaved,
+        payIfSaved,
+        coversWholeBill: plan.coversWholeBill,
+        // 10/4: credit another bank payment still holds (an earlier bill's
+        // scheduled retry) — left alone, the rest of the bill charged — and the
+        // sentence that tells the tenant why only part of their credit is used.
+        creditWaiting: plan.creditStillHeldElsewhere,
+        creditWaitingNote: plan.creditWaitingNote,
+        creditWaitingHeldBy: plan.creditWaitingHeldBy,
+        // Fix pass 3: the rest of the credit on file and where it goes (another
+        // lease's bill, or a later bill), in plain words — one bill.
+        creditKeptElsewhere: plan.creditKeptElsewhere,
+        creditKeptForLater: plan.creditKeptForLater,
+        creditAlsoHeld: plan.creditAlsoHeld,
+        creditRestNote: plan.creditRestNote,
+        // "Pay all" figures (set below when 2+ bills can be paid together).
+        payAll: null as any,
+        // GAM's own charges on this bill, as their own line.
+        gamCharges: plan.gamTotal,
+        // Already on its way — clearing, not owed. A card payment still
+        // waiting on its bank's confirmation is not on its way: it is listed
+        // apart (awaitingConfirmation), never called clearing.
+        clearing: r2(Math.max(0, plan.inFlightTotal - awaiting.filter(a => a.leaseId === leaseId).reduce((x, a) => x + a.heldOnLease, 0))),
+        awaitingConfirmation: awaiting.filter(a => a.leaseId === leaseId).map(awaitingView),
+        scheduledRetries: plan.scheduledRetries.map(r => ({ nextRetryAt: r.nextRetryAt })),
+        // Priced exactly as /pay-balance charges: the processing fee only when
+        // this property's tenant pays it, plus any tenant-payer platform fee on
+        // top of a payment with money in it. S654: cash, check and money order
+        // are free — the manual row is fee 0.
+        methodCosts: billMethodCosts(plan.ctx, payIfSaved, passthrough),
+        methodCostsIfUsed: plan.usableCredit > 0 ? billMethodCosts(plan.ctx, Math.max(0, payIfUsed), passthrough) : null,
+        // S609: a SUGGESTION for the amount box. NOT a limit.
+        suggestedPayAhead: r2(payIfSaved + await suggestedPayAheadFor(leaseId)),
+        rows,
       })
     }
 
-    // S560: card, like ACH, stays 'processing' until the webhook confirms —
-    // the webhook's settle path (gated on status != 'settled') is what runs
-    // allocation, supersedence, Flex crediting, and PM/manager transfers.
-    // Pre-fix, card was stamped 'settled' here, so the webhook skipped ALL of
-    // that for card payments. (Matches the /pay-balance FIFO route.)
-    await query(
-      `UPDATE payments
-          SET status = 'processing',
-              stripe_payment_intent_id = $1,
-              platform_held = TRUE,
-              gam_supersedence_amount = $3,
-              sublease_markup_amount = $4
-        WHERE id = $2`,
-      [intent.id, pmt.id, gamSupersedenceAmount.toFixed(2), subleaseMarkup.toFixed(2)]
-    )
-
-    // S121: claim the unpaid tenant-payer accruals atomically. The filter
-    // `AND tenant_charge_id IS NULL` defends against a concurrent rent-pay
-    // claiming the same rows — only one UPDATE wins. Loser rows already
-    // collected the surcharge from the tenant; over-collection scenario
-    // is flagged for the reconciliation job (future).
-    if (unpaidAccruals.length > 0) {
-      const accrualIds = unpaidAccruals.map(r => r.id)
-      await query(
-        `UPDATE platform_fee_accruals
-            SET tenant_charge_id = $1, updated_at = NOW()
-          WHERE id = ANY($2::uuid[])
-            AND tenant_charge_id IS NULL`,
-        [pmt.id, accrualIds]
-      )
+    // "Pay all" with "Use all" charges these bills one after another: each
+    // lease with a bank retry scheduled first (paying it replaces the retry and
+    // frees what it set aside), then the rest in this list's order. Each bill
+    // gets the credit figure its charge will find when its turn comes (the
+    // earlier charges played through first — rentCharge planLeaseCharge
+    // `after`), so the run never stops on "Your credit changed" and the same
+    // dollars are never offered on two bills. The screen sends these figures,
+    // and asks the quote with the same order.
+    // The same set the Payments page's "Pay all" sends (not paused, something owed).
+    const payAllSet = leases.filter(l => !l.paymentBlocked && r2(Math.max(0, l.requiredNow) + Math.max(0, l.carriedBalance)) > 0)
+    if (payAllSet.length >= 2) {
+      const retrying = (l: any) => (l.scheduledRetries?.length ?? 0) > 0
+      const order: string[] = [...payAllSet.filter(retrying), ...payAllSet.filter(l => !retrying(l))].map(l => l.leaseId)
+      // Fix pass 2: ONE waiting figure for the whole run. Each bill's own
+      // figure may count the same held dollars (a paused lease's retry holds
+      // credit every bill of the run could use), so the screen says this one.
+      const runCreditWaiting = await payAllRunCreditWaiting(client, { tenantId, order })
+      const runCreditWaitingNote = creditWaitingSentence(Math.round(runCreditWaiting * 100))
+      // The credit on file for the run's landlords and where the rest of it
+      // goes — so the Pay all box explains every dollar, as one bill's does.
+      const runRest = await payAllRunCreditRest(client, { tenantId, order })
+      for (let i = 0; i < order.length; i++) {
+        const plan = await planLeaseCharge(client, { tenantId, scope: { kind: 'lease', leaseId: order[i] }, after: order.slice(0, i) })
+        const l = leases.find(x => x.leaseId === order[i])!
+        l.payAll = {
+          order,
+          usableCredit: plan.usableCredit,
+          expectedCredit: plan.usableCredit,
+          payIfUsed: plan.usableCredit > 0 ? r2(l.payIfSaved - plan.usableCredit) : l.payIfSaved,
+          coversWholeBill: plan.coversWholeBill,
+          creditWaiting: plan.creditStillHeldElsewhere,
+          creditWaitingNote: plan.creditWaitingNote,
+          // The run's one figure (the same on every bill): what the pay screen says.
+          runCreditWaiting,
+          runCreditWaitingNote,
+          // The run's credit on file and the rest of it, in plain words (the
+          // same on every bill): "You have $X credit. $Y of it can pay these
+          // bills." followed by runCreditRestNote.
+          runCreditOnFile: runRest.onFile,
+          runCreditKeptElsewhere: runRest.elsewhere,
+          runCreditKeptForLater: runRest.later,
+          runCreditAlsoHeld: runRest.heldMore,
+          runCreditRestNote: runRest.note,
+        }
+      }
     }
 
-    res.json({
-      success: true,
-      data: {
-        paymentIntentId:       intent.id,
-        status:                intent.status,
-        platformCutAmount,
-        platformFeePassthrough: passthroughAmount,
-        accrualsClaimed:       unpaidAccruals.length,
-      },
-    })
-  } catch (e) { next(e) }
-})
-
-// ── S537 (Nic): ONE "Pay now" — FIFO oldest-first application ─────────
-// The tenant portal shows a READ-ONLY oldest-first ledger and a single
-// Pay Now. The tenant may pay the full balance or MORE (paying ahead) —
-// never less.
-//
-// S616 (Nic): this comment used to describe a per-property
-// accept_partial_payments setting. That column was dead — enforcement in
-// chargeLeaseBalance has always been unconditional — and it has been dropped,
-// because partial payments are not a setting: "in the case of it going to two
-// different operators, how would you allocate that? The charges happened at the
-// exact same time." A converged invoice carries one landlord's rent and
-// another's utilities, both due the same day; any rule for who gets paid first
-// is GAM picking a winner between two landlords.
-//
-// Mechanics: allocateOldestFirst plans the application. Rows covered in
-// FULL get this charge's PI stamped (status 'processing') — the standard
-// payment_intent.succeeded path then settles them all, running the
-// allocation engine + credit ledger per row unchanged. A PARTIALLY
-// covered row is SPLIT at initiation (the propaneRedistribution
-// pattern): the applied slice carries the PI, the remainder stays a
-// pending row so "short is short" late-fee mechanics remain truthful.
-// Any pay-ahead remainder is recorded on the remittance; the webhook
-// turns it into a lease_prepaid_credit on settlement.
-// S537: everything the tenant's Pay Now card needs in one fetch — the
-// outstanding oldest-first ledger + the total. Rent is pay-in-full only
-// (Nic) — no partial-payment concept, so nothing about partials is sent.
-// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
-// visible to them so they can track it. If the landlord is not covering the ten
-// dollars, it doesn't need to be visible to them."
-//
-// When the tenant reimburses it, the landlord is whole and the fee is none of
-// their business — it appears on the tenant's bill and nowhere else. When the
-// landlord ABSORBS it, it is a real cost that reduces their payout, and an
-// unexplained deduction is exactly the surprise the onboarding toggle exists to
-// prevent: ten cash payments is $100 off a disbursement with nothing naming it.
-//
-// Reads platform_revenue_ledger, which is otherwise admin-only (finances.ts
-// deliberately does not expose it) — so this endpoint is narrowly scoped to ONE
-// reference_type and to properties the caller actually owns or manages.
-paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
-  try {
-    const role = req.user!.role
-    // S633: every company the account owns.
-    const landlordIds = landlordScopeIds(req.user!)
-    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
-    const months = Math.min(24, Math.max(1, Number(req.query.months) || 6))
-
-    const rows = await query<any>(`
-      SELECT prl.id, prl.amount::float AS amount, prl.created_at, prl.notes,
-             p.id AS property_id, p.name AS property_name,
-             u.unit_number
-        FROM platform_revenue_ledger prl
-        JOIN properties p ON p.id = prl.property_id
-        LEFT JOIN payments pay ON pay.id = prl.reference_id
-        LEFT JOIN units u ON u.id = pay.unit_id
-       WHERE prl.reference_type = 'manual_payment_fee'
-         AND p.landlord_id = ANY($1::uuid[])
-         AND prl.created_at >= NOW() - ($2::int * INTERVAL '1 month')
-       ORDER BY prl.created_at DESC
-       LIMIT 500`, [landlordIds, months])
-
-    const total = Math.round(rows.reduce((s: number, r: any) => s + r.amount, 0) * 100) / 100
-    res.json({ success: true, data: { total, count: rows.length, months, rows } })
-  } catch (e) { next(e) }
-})
-
-paymentsRouter.get('/balance-context', async (req: any, res, next) => {
-  try {
-    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
-    const rows = await query<any>(
+    // S615/S616: a payer with no lease (the neighbor buying trash and
+    // electric) pays per AGREEMENT — one bill, however many utilities. No
+    // credit pays these (credit pays a lease's own charges).
+    const serviceRows = (await client.query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
-              p.entry_description, p.notes, p.lease_id, u.payment_block,
-              u.unit_number, pr.name AS property_name,
-              -- S615: the ONLY reliable mark of a utility-service charge. A
-              -- NULL lease_id is not it: ordinary tenants have lease-less
-              -- payment rows too, and treating those as service charges pulled
-              -- them out of their own balance group.
-              inv.service_agreement_id,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-              -- S607: has this tenant ever had rent satisfied? The first manual
-              -- payment is free, so the quote must know which side of that the
-              -- tenant is on rather than promising a discount they already spent.
-              --
-              -- Scoped EXACTLY as record-manual scopes it: by lease when the row
-              -- carries one, otherwise by tenant. record-manual falls back the
-              -- same way (scopeCol = lease_id when present, else tenant_id),
-              -- and a quote that scopes differently from the charge is the drift
-              -- this whole breakdown exists to avoid.
-              NOT EXISTS (
-                SELECT 1 FROM payments pp
-                 WHERE pp.type = 'rent'
-                   AND pp.status IN ('settled', 'paid_via_deposit')
-                   AND (CASE WHEN p.lease_id IS NOT NULL
-                             THEN pp.lease_id = p.lease_id
-                             ELSE pp.tenant_id = p.tenant_id END)) AS manual_first_free
+              p.notes, u.unit_number, pr.name AS property_name, inv.service_agreement_id
          FROM payments p
+         JOIN invoices inv ON inv.id = p.invoice_id
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
-         LEFT JOIN invoices inv ON inv.id = p.invoice_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
-        WHERE p.tenant_id = $1
-          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
-               OR p.status = 'failed')
-        ORDER BY p.due_date ASC, p.created_at ASC`,
-      [req.user!.profileId])
-    const total = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
-
-    // S581 (Nic): group the ledger BY LEASE. Each lease is paid as its own
-    // charge (see /pay-balance), so the portal renders one Pay button per
-    // lease. A tenant with a single lease (launch norm) gets exactly one group.
-    const byLease = new Map<string, {
-      leaseId: string; propertyName: string; unitNumber: string
-      paymentBlocked: boolean; outstanding: number; carriedBalance: number; rows: any[]
-      manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
-    }>()
-    // S615: a UTILITY-SERVICE payer's rows carry NO lease_id. Left in the
-    // grouping below they would all collapse into one group keyed `null`, and
-    // that group would render a Pay button that calls /pay-balance with a null
-    // lease — which resolves to a lease filter matching nothing and answers
-    // "Nothing outstanding to pay" on a bill the person is looking at. They are
-    // split out here and paid per charge instead (see serviceCharges below),
-    // which the pay modal already supports.
-    const serviceRows = rows.filter((r: any) => r.service_agreement_id != null)
-    const leaseRows   = rows.filter((r: any) => r.service_agreement_id == null)
-
-    for (const r of leaseRows) {
-      let g = byLease.get(r.lease_id)
-      if (!g) {
-        g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
-              paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [],
-              manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
-        byLease.set(r.lease_id, g)
-      }
-      g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
-      // S622: arrears carried in from the landlord's previous system are the one
-      // charge payable in part, so they are tracked separately from what must be
-      // paid in full right now. Without this split the tenant portal shows one
-      // figure, refuses anything under it, and a tenant $1,000 behind cannot pay
-      // their rent at all — the server would accept it, but the screen never
-      // lets them try.
-      if (r.type === 'carried_balance') {
-        g!.carriedBalance = Math.round((g!.carriedBalance + r.amount) * 100) / 100
-      }
-      g.rows.push(r)
-    }
-    // S607 (Nic): "maybe on the invoice, it can show a breakdown of what each
-    // bill would be by payment method... that way they see all the avenues and
-    // the price at the point the invoice comes out." Priced from the same
-    // formula that charges (processingFeeFor), so the quote is honoured.
-    const leases = await Promise.all([...byLease.values()].map(async l => {
-      const landlordCovers = l.manualFeePayer === 'landlord'
-      const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
-      return {
-        ...l,
-        methodCosts: paymentMethodCosts(l.outstanding, { manualFee }),
-        manualFeeCoveredByLandlord: landlordCovers,
-        manualFeeFirstFree: l.manualFirstFree,
-        // What the landlord is absorbing on their behalf, so the tenant can see
-        // it as a line rather than only as an absence.
-        manualFeeAbsorbed: landlordCovers ? MANUAL_PAYMENT_FEE : 0,
-        // S609: a SUGGESTION for the amount box — roughly what the balance plus
-        // the rest of the lease term's rent comes to. NOT a limit (Nic): a
-        // tenant may pay any amount above their balance, because utilities are
-        // unknowable until a meter is read and any ceiling lands wrong at the
-        // end of a lease.
-        suggestedPayAhead: Math.round((l.outstanding + await suggestedPayAheadFor(l.leaseId)) * 100) / 100,
-        // S622: the floor. Everything the lease itself billed, which stays
-        // all-or-nothing; the carried balance above it may be paid down in any
-        // amount. Matches rentCharge's `requiredInFull` exactly — one rule, two
-        // places, and the screen must not be stricter than the server.
-        requiredNow: Math.round((l.outstanding - l.carriedBalance) * 100) / 100,
-      }
-    }))
-
-    // S615: each open charge on a service agreement, paid on its own through
-    // the existing per-charge route. Deliberately NOT run through /pay-balance:
-    // that path is lease-keyed end to end (FIFO scope, pay-in-full guard,
-    // eviction hold, sublease markup), and widening the engine that moves every
-    // tenant's rent is a bigger change than billing the neighbour needs.
-    // S616 (Nic): the payer's outstanding balance, grouped PER AGREEMENT —
-    // exactly the way `leases` above groups a tenant's balance per lease.
-    //
-    // "Their trash and electric needs to be on one bill if they have more than
-    // one utility through this subsystem." The invoice already carries every
-    // utility for the cycle; what was wrong was handing the portal a flat list
-    // of ROWS, which rendered a Pay button per utility — two charges and two
-    // processing fees for one month at one address.
-    //
-    // Named for the agreement, not "bills": an invoice IS the bill (Nic), and a
-    // second name for it alongside `invoices` in the same payload would invent
-    // a distinction that does not exist.
+        WHERE p.tenant_id = $1 AND inv.service_agreement_id IS NOT NULL
+          AND ${payableRowSql('p')}
+        ORDER BY p.due_date ASC, p.created_at ASC, p.id`,
+      [tenantId])).rows
     const byAgreement = new Map<string, {
       serviceAgreementId: string; outstanding: number
       unitNumber: string; propertyName: string; dueDate: string
@@ -769,39 +1161,40 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     for (const r of serviceRows) {
       let g = byAgreement.get(r.service_agreement_id)
       if (!g) {
-        g = {
-          serviceAgreementId: r.service_agreement_id,
-          outstanding: 0,
-          unitNumber: r.unit_number,
-          propertyName: r.property_name,
-          dueDate: r.due_date,
-          rows: [],
-        }
+        g = { serviceAgreementId: r.service_agreement_id, outstanding: 0, unitNumber: r.unit_number,
+              propertyName: r.property_name, dueDate: r.due_date, rows: [] }
         byAgreement.set(r.service_agreement_id, g)
       }
-      g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
-      // The oldest date on the bill is the one that matters for lateness.
+      g.outstanding = r2(g.outstanding + r.amount)
       if (r.due_date < g.dueDate) g.dueDate = r.due_date
-      g.rows.push({
-        id: r.id, amount: r.amount, dueDate: r.due_date,
-        type: r.type, notes: r.notes,
+      g.rows.push({ id: r.id, amount: r.amount, dueDate: r.due_date, type: r.type, notes: r.notes })
+    }
+    // Priced as /pay-balance charges the agreement (its property's fee payer,
+    // any tenant-payer platform fee on top), the same as a lease's bill.
+    const serviceAgreements: any[] = []
+    for (const a of byAgreement.values()) {
+      const plan = await planLeaseCharge(client, { tenantId, scope: { kind: 'service', serviceAgreementId: a.serviceAgreementId } })
+      serviceAgreements.push({
+        ...a, methodCosts: billMethodCosts(plan.ctx, a.outstanding, await tenantPassthroughFor(plan.ctx.propertyId, client)),
+        awaitingConfirmation: awaiting.filter(x => x.serviceAgreementId === a.serviceAgreementId).map(awaitingView),
       })
     }
-    const serviceAgreements = [...byAgreement.values()].map(a => ({
-      ...a,
-      methodCosts: paymentMethodCosts(a.outstanding, { manualFee: 0 }),
-    }))
 
     res.json({ success: true, data: {
-      totalOutstanding: total,
-      // Legacy scalar retained for older clients: blocked only if EVERY lease
-      // is blocked (a per-lease `leases[].paymentBlocked` is the real signal).
+      totalOutstanding: r2(leases.reduce((s, l) => s + l.outstanding, 0)
+        + serviceAgreements.reduce((s, a) => s + a.outstanding, 0)),
+      // Legacy scalar: blocked only if EVERY lease is (leases[].paymentBlocked is the real signal).
       paymentBlocked: leases.length ? leases.every(l => l.paymentBlocked) : false,
       leases,
       serviceAgreements,
-      rows,
+      // decisions.md #48.4: every held card payment in one list, for the
+      // Payments page — a bill whose whole amount is held shows nothing owed,
+      // so its lease card (and the pay window) is not drawn; this is where the
+      // page offers Confirm / Cancel for it.
+      awaitingCardConfirmations: awaiting.map(awaitingView),
+      rows: [...allRows, ...serviceRows],
     } })
-  } catch (e) { next(e) }
+  } catch (e) { next(e) } finally { client.release() }
 })
 
 // S539: tenant-facing "where every dollar went" — the tenant's Pay Now
@@ -813,17 +1206,29 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
     const tenantId = req.user!.profileId
 
+    // S655: each receipt says how much MONEY it was and, apart from that, how
+    // much account credit it used (set aside while a payment clears, or used).
     const remits = await query<any>(
-      `SELECT id, amount::float AS amount,
-              applied_amount::float AS applied_amount,
-              unapplied_amount::float AS unapplied_amount,
-              status, payment_method,
-              created_at, settled_at
-         FROM tenant_remittances
-        WHERE tenant_id = $1
-        ORDER BY created_at DESC
+      `SELECT r.id, r.amount::float AS amount,
+              r.applied_amount::float AS applied_amount,
+              r.unapplied_amount::float AS unapplied_amount,
+              r.status, r.payment_method,
+              r.created_at, r.settled_at,
+              COALESCE((SELECT SUM(u.amount) FROM credit_uses u
+                         WHERE u.remittance_id = r.id AND u.status IN ('held','applied')), 0)::float AS credit_used,
+              -- decisions.md #48.4: a card payment released before anything
+              -- was charged has why on its receipt, recorded when it was
+              -- released (jobs/paymentReconcile CARD_RELEASE_NOTE): canceled
+              -- (its bank's confirmation closed, failed or ran out, or canceled
+              -- to pay another way), or declined by the card's bank. The page
+              -- says so instead of a red 'Failed'.
+              COALESCE(r.payment_method = 'card' AND r.status = 'failed' AND r.notes = $2, FALSE) AS canceled_before_charge,
+              COALESCE(r.payment_method = 'card' AND r.status = 'failed' AND r.notes = $3, FALSE) AS declined_before_charge
+         FROM tenant_remittances r
+        WHERE r.tenant_id = $1
+        ORDER BY r.created_at DESC
         LIMIT 50`,
-      [tenantId])
+      [tenantId, CARD_RELEASE_NOTE.canceled, CARD_RELEASE_NOTE.declined])
 
     const linesByRemit = new Map<string, any[]>()
     if (remits.length > 0) {
@@ -844,19 +1249,56 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
       }
     }
 
-    const credits = await query<any>(
-      `SELECT id, amount_original::float AS amount_original,
-              amount_remaining::float AS amount_remaining, created_at
-         FROM lease_prepaid_credits
-        WHERE tenant_id = $1 AND amount_remaining > 0
-        ORDER BY created_at ASC`,
+    // A withdrawn credit (an undone bank-deposit match) is out of every balance,
+    // and so is paid-ahead money a dispute or return of its own funding still
+    // claims (creditUse.usablePaidAheadSql, the one rule): it is not the
+    // tenant's to spend.
+    const paidAhead = await queryOne<{ usable: string }>(
+      `SELECT COALESCE(SUM(${usablePaidAheadSql('pc', 'dc')}), 0)::text AS usable
+         FROM lease_prepaid_credits pc
+         ${disputeClaimJoinSql('pc', 'dc')}
+        WHERE pc.tenant_id = $1 AND pc.amount_remaining > 0 AND pc.voided_at IS NULL`,
       [tenantId])
-    const prepaidRemaining = Math.round(
-      credits.reduce((sum: number, c: any) => sum + c.amount_remaining, 0) * 100) / 100
+    const prepaidRemaining = Math.max(0, Math.round(Number(paidAhead?.usable ?? 0) * 100) / 100)
 
+    // ── S642: CREDITS THAT ARE NOT PAY-AHEAD ──────────────────────────────
+    //
+    // This card read lease_prepaid_credits ONLY — money the tenant paid ahead.
+    // Statutory deposit interest is now credited to tenant_credits instead, and
+    // that table already reduces what they owe (see the balance query above).
+    // So the balance would drop and the card would explain nothing: money
+    // appearing from nowhere, which reads as a bug to the one person who can
+    // least afford to guess.
+    //
+    // Returned SEPARATELY rather than folded into prepaidRemaining, because
+    // "you paid ahead" and "your state owes you interest on your deposit" are
+    // different sentences and the second one is worth reading.
+    const otherCredits = await query<any>(
+      `SELECT category,
+              SUM(amount_remaining)::float AS remaining
+         FROM tenant_credits
+        WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+        GROUP BY category`,
+      [tenantId])
+    const depositInterestCredit = Math.round(
+      (otherCredits.find((c: any) => c.category === 'deposit_interest')?.remaining ?? 0) * 100) / 100
+    const otherCreditTotal = Math.round(
+      otherCredits.filter((c: any) => c.category !== 'deposit_interest')
+        .reduce((s: number, c: any) => s + Number(c.remaining), 0) * 100) / 100
+
+    // S653: if the resident asked for a monthly cap on their paid-ahead money,
+    // say so — "$200 of this goes on each bill" is the sentence they expect.
+    const drawRow = await queryOne<{ draw: string | null }>(
+      `SELECT MAX(prepaid_monthly_draw)::text AS draw FROM leases l
+        JOIN lease_tenants lt ON lt.lease_id = l.id
+       WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status = 'active'`, [tenantId])
+    const prepaidMonthlyDraw = drawRow?.draw != null ? Number(drawRow.draw) : null
     res.json({ success: true, data: {
       remittances: remits.map((r: any) => ({ ...r, lines: linesByRemit.get(r.id) ?? [] })),
       prepaidRemaining,
+      prepaidMonthlyDraw,
+      depositInterestCredit,
+      otherCreditTotal,
     } })
   } catch (e) { next(e) }
 })
@@ -868,8 +1310,23 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       throw new AppError(403, 'Only tenants can call this endpoint')
     }
     const tenantId = req.user!.profileId
+    // S655 (Nic, 10/2): "Use all $X" or "Save it for later", and the credit
+    // figure the screen showed. Required when credit could pay part of the
+    // bill; a moved figure is a 409 and the screen asks again in place. The
+    // answer never travels without the figure it answered (shelved 8).
+    if (body.useCredit != null && body.expectedCredit == null) {
+      throw new AppError(422, 'Send the credit figure you were shown (expectedCredit) with the answer to use or save it.')
+    }
+    const creditChoice = body.useCredit == null ? null
+      : { use: body.useCredit, expected: body.expectedCredit ?? null }
+    // decisions.md #48.4: a card payment of this payer's that nobody confirmed
+    // within the hold is released before anything else is read, so the bill
+    // it held can be paid now (the sweep does this every few minutes anyway).
+    await releaseUnconfirmedCardCharges(getStripe, { tenantId }).catch((err) => {
+      logger.warn({ err, tenantId }, '[pay-balance] unconfirmed card release failed; the sweep will retry')
+    })
 
-    // S616 (Nic): a payer with no lease — the neighbour buying trash and
+    // S616 (Nic): a payer with no lease — the neighbor buying trash and
     // electric — settles their agreement's whole bill in one charge. "Their
     // trash and electric needs to be on one bill if they have more than one
     // utility through this subsystem." Ownership is checked against the
@@ -887,6 +1344,9 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
         paymentMethodId:   body.paymentMethodId,
         paymentMethodType: body.paymentMethodType,
         source:            'portal',
+        credit:            creditChoice,
+        idempotencyKey:    body.idempotencyKey ?? null,
+        confirmOnScreen:   body.confirmOnScreen === true,
       })
       return res.json({ success: true, data: result })
     }
@@ -903,9 +1363,452 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       paymentMethodId:   body.paymentMethodId,
       paymentMethodType: body.paymentMethodType,
       source:            'portal',
+      credit:            creditChoice,
+      // One key per press of Pay: the same press re-sent is never charged twice.
+      idempotencyKey:    body.idempotencyKey ?? null,
+      // decisions.md #48.4: the pay screen finishes a card's 3-D Secure
+      // confirmation itself (the assistant does not send this).
+      confirmOnScreen:   body.confirmOnScreen === true,
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
+})
+
+/**
+ * decisions.md #48.4: a card payment of THIS payer's still waiting on their
+ * card's bank (3-D Secure). 404 for anyone else's (or none).
+ */
+async function ownUnconfirmedCardCharge(tenantId: string, paymentIntentId: string): Promise<{ status: string; createdAt: string; declined: boolean }> {
+  const rem = await queryOne<{ status: string; created_at: string; notes: string | null }>(
+    `SELECT status, created_at, notes FROM tenant_remittances
+      WHERE stripe_payment_intent_id = $1 AND tenant_id = $2 AND payment_method = 'card'
+      ORDER BY created_at LIMIT 1`, [paymentIntentId, tenantId])
+  if (!rem) throw new AppError(404, 'That card payment was not found on your account.')
+  return {
+    status: rem.status, createdAt: new Date(rem.created_at).toISOString(),
+    // Released because the card's bank declined it (jobs/paymentReconcile CARD_RELEASE_NOTE).
+    declined: rem.status === 'failed' && rem.notes === CARD_RELEASE_NOTE.declined,
+  }
+}
+
+/**
+ * decisions.md #48.4: said when a payer asks to confirm or cancel a card
+ * charge that is not a pay-screen charge (paymentReconcile.confirmedOnScreen
+ * — e.g. a move-out balance charge GAM finishes itself). Nothing is done.
+ */
+const NOT_HELD_FOR_YOU_TEXT =
+  'That card payment isn\'t waiting on your card\'s bank, so there is nothing to confirm or cancel here. Where it stands shows in your payment history.'
+
+const unconfirmedSchema = z.object({ paymentIntentId: z.string().regex(/^pi_[A-Za-z0-9_]+$/, 'paymentIntentId: a Stripe payment id') })
+
+// POST /api/payments/pay-balance/release — the pay screen's "the bank did not
+// confirm it" (the cardholder closed the bank's window, or the bank said no),
+// and its "Cancel it and pay another way": the charge is canceled and the bill
+// it held is open again at once, with the credit it set aside back. A charge
+// that went through meanwhile is left alone and said so. `declined`: the
+// card's bank refused the payment itself (after the cardholder confirmed it),
+// so the screen says "declined", not "didn't confirm" — released the same way.
+paymentsRouter.post('/pay-balance/release', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
+    const { paymentIntentId } = unconfirmedSchema.parse(req.body)
+    const rem = await ownUnconfirmedCardCharge(req.user!.profileId, paymentIntentId)
+    if (rem.status === 'settled') return res.json({ success: true, data: { outcome: 'went_through', declined: false } })
+    const { outcome, declined } = await releaseUnconfirmedChargeDetailed(getStripe(), paymentIntentId)
+    // Only the pay screen's own charge is the payer's to cancel; anything
+    // else is left exactly as it is.
+    if (outcome === 'not_held') throw new AppError(409, NOT_HELD_FOR_YOU_TEXT)
+    res.json({ success: true, data: { outcome, declined } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/payments/pay-balance/resume — a card payment still waiting on its
+// bank's confirmation, picked up again (the payer left the screen before
+// confirming): what the screen needs to show the bank's window again. Read
+// fresh from Stripe; never stored.
+//
+// A payment already released says why, so the screen never guesses it from
+// the clock: `expired` — released now because nobody confirmed it within the
+// time the screen showed; `declined` — the card's bank refused it; neither —
+// it was already canceled (another tab, the sweep, its bank's window).
+paymentsRouter.post('/pay-balance/resume', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
+    const { paymentIntentId } = unconfirmedSchema.parse(req.body)
+    const rem = await ownUnconfirmedCardCharge(req.user!.profileId, paymentIntentId)
+    const confirmBy = new Date(new Date(rem.createdAt).getTime() + CARD_CONFIRM_HOLD_MINUTES * 60_000)
+    // Already decided — the receipt says so first, then Stripe: a payment
+    // that went through (its webhook may not have landed yet), or one already
+    // canceled (another tab, the sweep). The screen says which; it never asks
+    // the payer to cancel something that is gone or that went through.
+    if (rem.status === 'settled') {
+      return res.json({ success: true, data: { status: 'succeeded', outcome: 'went_through', declined: false, expired: false, clientSecret: null, confirmBy: confirmBy.toISOString() } })
+    }
+    if (rem.status === 'failed') {
+      return res.json({ success: true, data: { status: 'canceled', outcome: 'released', declined: rem.declined, expired: false, clientSecret: null, confirmBy: confirmBy.toISOString() } })
+    }
+    const pi = await getStripe().paymentIntents.retrieve(paymentIntentId)
+    // Only the pay screen's own charge is the payer's to confirm.
+    if (!confirmedOnScreen(pi)) throw new AppError(409, NOT_HELD_FOR_YOU_TEXT)
+    // Past the time the screen promised: never offered again. Released now
+    // (as the sweep would), so the bill is open — unless it went through.
+    // `expired` only when the time ran out on a payment still waiting: one
+    // already canceled in Stripe (its dashboard, another tab) was canceled,
+    // and the screen says that, not that the time ran out.
+    if (rem.status === 'processing' && Date.now() >= confirmBy.getTime()) {
+      const canceledBefore = pi.status === 'canceled'
+      const { outcome, declined } = await releaseUnconfirmedChargeDetailed(getStripe(), paymentIntentId)
+      return res.json({ success: true, data: {
+        status: outcome === 'went_through' ? 'processing' : 'canceled',
+        outcome, declined, expired: outcome === 'released' && !declined && !canceledBefore,
+        clientSecret: null, confirmBy: confirmBy.toISOString(),
+      } })
+    }
+    // Canceled in Stripe (its dashboard, or a cancel whose bill side did not
+    // finish) while the receipt here still holds the bill: the bill side runs
+    // now (idempotent, under the household lock), so "your bill is open to
+    // pay" is true when the screen says it.
+    if (rem.status === 'processing' && pi.status === 'canceled') {
+      const { outcome, declined } = await releaseUnconfirmedChargeDetailed(getStripe(), paymentIntentId)
+      return res.json({ success: true, data: {
+        status: outcome === 'went_through' ? 'processing' : 'canceled',
+        outcome, declined, expired: false,
+        clientSecret: null, confirmBy: confirmBy.toISOString(),
+      } })
+    }
+    const outcome =['succeeded', 'processing', 'requires_capture'].includes(pi.status) ? 'went_through'
+      : pi.status === 'canceled' ? 'released'
+      : null
+    const canConfirm = rem.status === 'processing' && pi.status === 'requires_action'
+    res.json({ success: true, data: {
+      status: pi.status,
+      ...(outcome ? { outcome, declined: false, expired: false } : {}),
+      clientSecret: canConfirm ? pi.client_secret : null,
+      confirmBy: confirmBy.toISOString(),
+    } })
+  } catch (e) { next(e) }
+})
+
+/** A card payment held while its bank asks the cardholder to confirm it (decisions.md #48.4). */
+interface AwaitingCardConfirmationRow {
+  paymentIntentId: string
+  /** Its receipt (the Payments page's history marks it "Waiting on your bank"). */
+  remittanceId: string
+  /** The company the payment goes to (the desk shows only its own). */
+  landlordId: string
+  /** The lease whose bill it holds; null for a payer with no lease (a service agreement). */
+  leaseId: string | null
+  /** The service agreement whose bill it holds (a payer with no lease); null on a lease. */
+  serviceAgreementId: string | null
+  amount: number
+  heldOnLease: number
+  confirmBy: string
+  /** The viewer made this payment: only they can confirm or cancel it. */
+  mine: boolean
+  /** Who made it, by name (shown to the rest of the household); null when no name is on file (the screen words it). */
+  payerName: string | null
+  /** The bank's window can still be shown (Stripe 'requires_action') — the payer only. */
+  canConfirm: boolean
+  /** The park's clock (its property's time zone) for the time the bill opens; null when the charge is on no space. */
+  timezone: string | null
+}
+
+/**
+ * decisions.md #48.4: card payments still waiting on their card's bank
+ * (receipt 'processing', a row still waiting on it, and Stripe says it needs
+ * the cardholder) on any bill the viewer pays — their own, and those of their
+ * household on a lease they share (one household balance: a co-tenant's held
+ * payment is "waiting on <name>'s card bank", never "clearing"). Per lease, or
+ * per service agreement for a payer with no lease. Asked of Stripe only for
+ * these processing card receipts — normally none (a card settles in seconds).
+ */
+async function awaitingCardConfirmations(
+  client: import('pg').PoolClient, tenantId: string,
+): Promise<AwaitingCardConfirmationRow[]> {
+  const pending = (await client.query<{
+    pi: string; created_at: string; gross: string; lease_id: string | null; agreement_id: string | null
+    held: string; payer_id: string; first_name: string | null; last_name: string | null
+    remittance_id: string; landlord_id: string; tz: string | null
+  }>(
+    `SELECT r.stripe_payment_intent_id AS pi, r.created_at, r.id AS remittance_id, r.landlord_id,
+            COALESCE(r.gross_amount, r.amount)::text AS gross,
+            COALESCE(p.lease_id, inv.lease_id) AS lease_id, inv.service_agreement_id AS agreement_id,
+            SUM(p.amount)::text AS held, r.tenant_id AS payer_id, u.first_name, u.last_name,
+            MIN(pr.timezone) AS tz
+       FROM tenant_remittances r
+       JOIN payments p ON p.stripe_payment_intent_id = r.stripe_payment_intent_id AND p.status = 'processing'
+       LEFT JOIN invoices inv ON inv.id = p.invoice_id
+       LEFT JOIN units un ON un.id = p.unit_id
+       LEFT JOIN properties pr ON pr.id = un.property_id
+       LEFT JOIN tenants t ON t.id = r.tenant_id
+       LEFT JOIN users u ON u.id = t.user_id
+      WHERE r.status = 'processing' AND r.payment_method = 'card'
+        AND r.stripe_payment_intent_id IS NOT NULL
+        AND (r.tenant_id = $1
+             OR EXISTS (SELECT 1 FROM lease_tenants lt
+                         WHERE lt.lease_id = COALESCE(p.lease_id, inv.lease_id) AND lt.tenant_id = $1
+                           AND lt.status IN ('active','pending_add','pending_remove')))
+      GROUP BY r.stripe_payment_intent_id, r.created_at, r.id, r.landlord_id, 5, 6, 7, r.tenant_id, u.first_name, u.last_name`,
+    [tenantId])).rows
+  if (pending.length === 0) return []
+  const out: AwaitingCardConfirmationRow[] = []
+  const live = new Map<string, { status: string; metadata?: import('stripe').Stripe.Metadata | null } | null>()
+  for (const r of pending) {
+    if (!live.has(r.pi)) {
+      // Not readable just now: shown as it stands (clearing) — the sweep and
+      // the next read settle it.
+      let pi: { status: string; metadata?: import('stripe').Stripe.Metadata | null } | null = null
+      try { pi = await getStripe().paymentIntents.retrieve(r.pi) } catch { pi = null }
+      live.set(r.pi, pi)
+    }
+    const pi = live.get(r.pi) ?? null
+    // Only the pay screen's own charge waits on its cardholder; any other
+    // card charge (a move-out balance charge GAM is finishing) is never
+    // shown as waiting on the tenant's bank, nor offered to cancel.
+    if (!heldForCardholder(pi)) continue
+    const st = pi!.status
+    if (!r.lease_id && !r.agreement_id) continue
+    const mine = r.payer_id === tenantId
+    out.push({
+      paymentIntentId: r.pi,
+      remittanceId: r.remittance_id,
+      landlordId: r.landlord_id,
+      leaseId: r.lease_id,
+      serviceAgreementId: r.lease_id ? null : r.agreement_id,
+      amount: Math.round(Number(r.gross) * 100) / 100,
+      heldOnLease: Math.round(Number(r.held) * 100) / 100,
+      confirmBy: new Date(new Date(r.created_at).getTime() + CARD_CONFIRM_HOLD_MINUTES * 60_000).toISOString(),
+      mine,
+      payerName: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || null,
+      canConfirm: mine && st === 'requires_action',
+      timezone: r.tz,
+    })
+  }
+  return out
+}
+
+/**
+ * decisions.md #48.4: release the household's card holds that nobody confirmed
+ * within CARD_CONFIRM_HOLD_MINUTES before a desk screen or desk write reads the
+ * bill. Never throws (the five-minute sweep tries again). Call it outside any
+ * transaction that holds the household's lock or rows.
+ */
+async function releaseExpiredCardHolds(tenantId: string, where: string, landlordIds: string[]): Promise<void> {
+  // Only the caller's own companies' charges: staff act within their scope.
+  await releaseUnconfirmedCardCharges(getStripe, { tenantId, landlordIds }).catch((err) => {
+    logger.warn({ err, tenantId }, `[${where}] unconfirmed card release failed; the sweep will retry`)
+  })
+}
+
+/**
+ * Why the desk cannot take payment on a charge that is not open, in plain
+ * words with the next step — never a status value. A card payment still
+ * waiting on its card's bank (decisions.md #48.4) says when the bill opens
+ * and how the resident can pay another way now. Stripe decides which it is,
+ * however old the card payment is (a hold whose release failed — Stripe was
+ * down for the sweep — is still a hold, not a payment): a card that went
+ * through but whose success has not landed yet (a desk reader capture just
+ * booked, a portal card a moment ago) is "just paid", never "nothing has been
+ * charged"; a pay-screen card already canceled in Stripe, or past the time
+ * the hold promised, is released here and now (the same release the sweep
+ * makes, idempotent, under the household lock), so the bill the desk reads
+ * again is open. Stripe not readable: "in progress, try again in a minute" —
+ * never "just paid". Call it with no transaction open (it may ask Stripe and
+ * take the household lock).
+ */
+async function notOpenAtDeskText(paymentId: string, status: string): Promise<string> {
+  // The desk window reads the bill again by itself on every refusal, so the
+  // words never ask staff to close or reopen it.
+  if (status === 'processing') {
+    const held = await queryOne<{ pi: string; created_at: string; tz: string | null; same_company: boolean }>(
+      `SELECT r.stripe_payment_intent_id AS pi, r.created_at, pr.timezone AS tz,
+              (r.landlord_id = p.landlord_id) AS same_company
+         FROM payments p
+         JOIN tenant_remittances r ON r.stripe_payment_intent_id = p.stripe_payment_intent_id
+         LEFT JOIN units un ON un.id = p.unit_id LEFT JOIN properties pr ON pr.id = un.property_id
+        WHERE p.id = $1 AND p.status = 'processing' AND r.status = 'processing' AND r.payment_method = 'card'
+        ORDER BY r.created_at LIMIT 1`, [paymentId])
+    if (held) {
+      let pi: Awaited<ReturnType<ReturnType<typeof getStripe>['paymentIntents']['retrieve']>> | null = null
+      try { pi = await getStripe().paymentIntents.retrieve(held.pi) } catch (err) {
+        logger.warn({ err, paymentIntentId: held.pi }, '[desk] could not read the card payment on a bill that is not open')
+      }
+      if (!pi) {
+        return 'This charge has a card payment in progress that could not be checked just now — the bill above was read again. Try again in a minute.'
+      }
+      const confirmBy = new Date(new Date(held.created_at).getTime() + CARD_CONFIRM_HOLD_MINUTES * 60_000)
+      const canceled = confirmedOnScreen(pi) && pi.status === 'canceled'
+      const runOut = heldForCardholder(pi) && Date.now() >= confirmBy.getTime()
+      if ((canceled || runOut) && held.same_company) {
+        // Nothing was charged and nothing more will be: the bill opens now.
+        let outcome: string | null = null
+        try { outcome = (await releaseUnconfirmedChargeDetailed(getStripe(), held.pi)).outcome } catch (err) {
+          logger.warn({ err, paymentIntentId: held.pi }, '[desk] could not release a card payment nobody confirmed; the sweep will retry')
+        }
+        if (outcome === 'released') {
+          return 'The resident\'s card payment on this bill was canceled before anything was charged, so the bill is open again — the bill above was read again. Take the payment now.'
+        }
+        if (outcome === 'went_through') return 'This charge was just paid or is on its way — the bill above was read again.'
+        return 'The resident\'s card payment on this bill was not confirmed by their card\'s bank, so nothing has been charged and the bill is opening again. '
+          + 'It opens here in a few minutes — try again then.'
+      }
+      if (canceled) {
+        return 'The resident\'s card payment on this bill was canceled before anything was charged, so nothing has been charged and the bill is opening again. '
+          + 'It opens here in a few minutes — try again then.'
+      }
+      if (heldForCardholder(pi)) {
+        if (Date.now() >= confirmBy.getTime()) {
+          return 'This bill is waiting on the resident\'s card payment to be confirmed by their card\'s bank — nothing has been charged yet. '
+            + 'Its time to confirm has run out, so it opens here in a few minutes. '
+            + 'The bill above was read again.'
+        }
+        // The park's own clock; a charge on no space has no park, so no clock
+        // time is guessed for it.
+        const opensAt = held.tz
+          ? `at ${confirmBy.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: held.tz })}`
+          : `within ${CARD_CONFIRM_HOLD_MINUTES} minutes of when they paid`
+        return 'This bill is waiting on the resident\'s card payment to be confirmed by their card\'s bank — nothing has been charged yet. '
+          + `It opens here by itself ${opensAt} if they don't confirm it. `
+          + 'If they want to pay another way now, whoever made the card payment can tap \'Cancel it and pay another way\' on their Payments page, and the bill opens here. '
+          + 'The bill above was read again.'
+      }
+    }
+  }
+  return 'This charge was just paid or is on its way — the bill above was read again.'
+}
+
+/** What the pay screen is told about one held card payment. */
+function awaitingView(a: AwaitingCardConfirmationRow) {
+  return {
+    paymentIntentId: a.paymentIntentId, remittanceId: a.remittanceId, amount: a.amount, confirmBy: a.confirmBy,
+    canConfirm: a.canConfirm, mine: a.mine, payerName: a.mine ? null : a.payerName,
+    leaseId: a.leaseId, serviceAgreementId: a.serviceAgreementId,
+  }
+}
+
+// S652 (Nic): POST a payment that arrived before there was a bill — a check
+// paid ahead for October. Settles what is open, banks the rest as paid ahead.
+const postPaymentSchema = z.object({
+  tenantId:   z.string().uuid(),
+  method:     z.enum(MANUAL_PAYMENT_METHODS),
+  amount:     z.number().positive(),
+  // A check or money-order number, or (10/5) a bank deposit's reference number.
+  reference:  z.string().max(120).optional().nullable(),
+  notes:      z.string().max(500).optional().nullable(),
+  receivedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  // 10/6 (Nic): the onboarding box — "Delete the late fee completely
+  // (onboarding month)". Off unless ticked; owner or property manager only.
+  deleteOnboardingLateFees: z.boolean().optional(),
+})
+
+/** 10/6 (Nic): the household a posted payment goes to — its newest active lease with one of these companies. */
+async function postPaymentLease(tenantId: string, landlordIds: string[]) {
+  return queryOne<{ lease_id: string; landlord_id: string; property_id: string | null }>(
+    `SELECT l.id AS lease_id, l.landlord_id, u.property_id
+       FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+       LEFT JOIN units u ON u.id = l.unit_id
+      WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
+        AND l.landlord_id = ANY($2::uuid[])
+      ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
+    [tenantId, landlordIds])
+}
+
+// GET /api/payments/post-payment/quote?tenantId=&depositedOn= — 10/6 (Nic):
+// what "Post a payment" is told about a BANK DEPOSIT dated back: the late fees
+// that come off when it pays the bill in full, how much of that is on the
+// onboarding month's bill (where the box "Delete the late fee completely"
+// applies), and whether this person may tick it. A look: nothing changes.
+paymentsRouter.get('/post-payment/quote', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const q = z.object({
+      tenantId: z.string().uuid(),
+      // 10/6: optional — without it, only whether a bank deposit may be posted here.
+      depositedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }).parse(req.query)
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
+    const lease = await postPaymentLease(q.tenantId, landlordIds)
+    if (!lease) throw new AppError(409, 'This tenant has no active lease with you to hold a payment on.')
+    await assertChargeInStaffScope(req.user, lease.property_id)
+    // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
+    const bankDepositAllowed = await tenantsDepositAtBank(client, { leaseId: lease.lease_id })
+    let out = { lateFeesOffIfPaidInFull: 0, onboardingLateFeesOff: 0 }
+    // Review fix (10/6, Nic: never talk about credit that is not there): what
+    // they owe now, so the window speaks of money kept ahead only when the
+    // amount typed is more than that. A look: nothing is locked or changed.
+    const now = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id })
+    const owedNow = [...now.rows, ...now.carried]
+      .reduce((t, r) => t + Math.max(0, Math.round(Number(r.amount) * 100) - Math.round(Number(r.appliedCredit) * 100)), 0) / 100
+    if (q.depositedOn && bankDepositAllowed) {
+      depositedOnAsSettledAt('bank_deposit', q.depositedOn, await propertyToday(lease.property_id))
+      await client.query('BEGIN')
+      try {
+        await lockHousehold(client, q.tenantId, lease.landlord_id)
+        const q0 = await deskQuote(client, { tenantId: q.tenantId, landlordId: lease.landlord_id, lock: true })
+        const z0 = await backdatedLateFeesPreview(client, q0, q.depositedOn)
+        out = { lateFeesOffIfPaidInFull: z0.unbilled, onboardingLateFeesOff: z0.onboardingOff }
+      } finally {
+        await client.query('ROLLBACK').catch(() => {})
+      }
+    }
+    res.json({ success: true, data: { ...out, owedNow, bankDepositAllowed, canDeleteLateFees: canDeleteLateFees(req.user, lease.landlord_id) } })
+  } catch (e) { next(e) } finally { client.release() }
+})
+
+paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = postPaymentSchema.parse(req.body)
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
+    // 10/5 (Nic): a bank deposit's date cannot be after today where the
+    // resident's space is (the lease postTenantPayment posts to).
+    if (body.method === 'bank_deposit' && body.receivedAt) {
+      const where = await queryOne<{ property_id: string | null }>(
+        `SELECT u.property_id
+           FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+           LEFT JOIN units u ON u.id = l.unit_id
+          WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
+            AND l.landlord_id = ANY($2::uuid[])
+          ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
+        [body.tenantId, landlordIds])
+      depositedOnAsSettledAt(body.method, body.receivedAt, await propertyToday(where?.property_id))
+    }
+    // 10/6 (Nic): "the late fee is only deleted during onboarding at
+    // landlord's discretion" — the owner or a property manager.
+    if (body.deleteOnboardingLateFees === true) {
+      const lease = await postPaymentLease(body.tenantId, landlordIds)
+      if (!lease || !canDeleteLateFees(req.user, lease.landlord_id)) throw new AppError(403, LATE_FEE_DELETE_NOT_ALLOWED)
+    }
+    // decisions.md #48.4: an expired card hold on the household is released
+    // before the payment is posted against its bill (before BEGIN — the
+    // release takes the household lock on its own connection).
+    await releaseExpiredCardHolds(body.tenantId, 'post-payment', landlordIds)
+    await client.query('BEGIN')
+    const { postTenantPayment } = await import('../services/postPayment')
+    const { afterCommit, ...r } = await postTenantPayment(client, {
+      tenantId: body.tenantId, landlordIds, method: body.method, amount: body.amount,
+      reference: body.reference ?? null, notes: body.notes ?? null,
+      // S654: noon UTC is the same calendar day in every US zone, so the date
+      // the desk typed survives whatever clock the host runs on.
+      receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00Z') : null,
+      // 10/5 (Nic): a bank deposit dated back takes off the late fees charged after it, paid in full.
+      depositedOn: body.method === 'bank_deposit' ? (body.receivedAt ?? null) : null,
+      deleteOnboardingLateFees: body.method === 'bank_deposit' && body.deleteOnboardingLateFees === true,
+      postedBy: req.user!.userId,
+    })
+    // A staffer assigned to one property posts only for a resident there.
+    // Checked inside the transaction: a refusal rolls the whole post back.
+    const where = (await client.query<{ property_id: string | null }>(
+      `SELECT u.property_id FROM leases l LEFT JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [r.leaseId])).rows[0]
+    await assertChargeInStaffScope(req.user, where?.property_id ?? null)
+    await client.query('COMMIT')
+    // The receipt, and the whole-bill check for money paid ahead — after the
+    // commit, never able to undo a payment that happened.
+    await afterCommit()
+    res.json({ success: true, data: r })
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); next(e) } finally { client.release() }
 })
 
 // POST /api/payments/:id/record-manual — S562.
@@ -917,46 +1820,126 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 // everywhere that treats settled as paid (balance / FIFO / late-fee / rent-roll),
 // while the weekly batch (services/landlordPassthrough.ts) SKIPS it because that
 // path requires platform_held=TRUE — so the landlord, who already physically
-// holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
-// so the fee below stays GAM revenue (same as RETURNFEE). The amount is
-// MANUAL_PAYMENT_FEE, which is ZERO — cash is the cheapest way to pay, per
-// S630. (This prose has been wrong twice, claiming $10 and then $6 after the
-// constant had already moved. The constant is the truth; it is now named here
-// rather than quoted, so the two cannot drift again.)
+// holds the cash, is never double-paid.
 //
-// Each manual payment carries a flat fee (a tenant-owed 'fee' row,
-// entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the
-// lease — waived to give them time to onboard ACH. The tenant portal discloses
-// the future $10 charge.
+// S654 (Nic): "There's no fee. Paying cash or check is free." Recording a cash,
+// check or money-order payment charges nobody — no fee row, no waiver, no
+// fee-payer setting.
 //
 // Auth: requirePerm('take_payment') (owner roles auto-pass; staff need the
 // take_payment sub-permission). canManageLandlordResource confirms scope.
 const recordManualSchema = z.object({
-  method:    z.enum(MANUAL_PAYMENT_METHODS),   // 'cash' | 'check' | 'money_order'
-  reference: z.string().max(120).optional(),   // check # / money-order # for the audit trail
+  // S651 — CARD IS NOT AND WILL NOT BE ON THIS LIST. Nic: "record payment
+  // never does card. card is through pos/paylink for non tenants. invoices for
+  // tenants are through portal if electronic." record-manual writes down money
+  // that moved somewhere GAM was not; a card on the counter goes through the
+  // reader (POST /:id/reader/charge), which is a card payment like any other.
+  // 'cash' | 'check' | 'money_order' | 'bank_deposit' (10/5, Nic: residents who
+  // pay by depositing cash at the landlord's bank; the reference is required).
+  method:    z.enum(MANUAL_PAYMENT_METHODS),
+  reference: z.string().max(120).optional(),   // check # / money-order # / bank deposit reference, for the audit trail
+  // S655 (Step 8): what was handed over is REQUIRED — the receipt records it,
+  // pay-in-full is measured against it, and any surplus comes from it. A check
+  // or money order is identified by its amount as much as its number.
+  amountTendered:   z.number().nonnegative(),
+  // Cash over the bill: "Give $X change" or "Keep $X as credit — no change on
+  // hand". No default (S637): a surplus with no answer is refused.
+  surplusHandling:  z.enum(DESK_SURPLUS_HANDLING).optional(),
+  // S655 (Nic, 10/2): the desk's answer to "credit available $X" — the usable
+  // figure ("Use $X") or 0 ("Save"). Required when credit could pay part of
+  // the bill; a figure that moved is a 409 and the window refetches.
+  creditToUse:      z.number().nonnegative().optional(),
+  // Money toward the old (carried-forward) balance, paid last and in any
+  // amount. Cash: the desk says how much. A check's extra goes there first.
+  towardOldBalance: z.number().nonnegative().optional(),
+  // A check or money order over the bill: "is it really $X?" answered yes.
+  confirmWrittenAmount: z.boolean().optional(),
+  // S652 (Nic): one person, several leases, one balance. Always the household
+  // now; kept so an older screen's flag is accepted.
+  settleHousehold:  z.boolean().optional(),
+  // 10/5 (Nic): a bank deposit is logged after the fact, from the bank's
+  // receipt — the day the resident put the money in the bank (YYYY-MM-DD, not
+  // after today). The payment counts from that day (its on-time or late mark),
+  // never from the day the office typed it in. Bank deposits only; absent = today.
+  depositedOn:      z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
+  // discretion" — the box "Delete the late fee completely (onboarding month)",
+  // off unless ticked. A late fee this deposit's date takes off an ONBOARDING
+  // bill is deleted outright instead of left at $0 (services/lateFeeDelete).
+  // The owner or a property manager only — like waiving a late fee.
+  deleteOnboardingLateFees: z.boolean().optional(),
 })
+
+/** 10/5: the property's own calendar day today (its timezone; America/Phoenix when unknown). */
+async function propertyToday(propertyId: string | null | undefined): Promise<string> {
+  const tz = propertyId
+    ? (await queryOne<{ timezone: string | null }>(`SELECT timezone FROM properties WHERE id = $1`, [propertyId]))?.timezone
+    : null
+  return todayIn(tz)
+}
+
+/**
+ * 10/5: a typed deposit date as the moment the payment counts from (noon UTC:
+ * the same calendar day in every US zone). `today` is the PROPERTY's calendar
+ * day (propertyToday) — never UTC's, which is already tomorrow on a US
+ * evening and would let tomorrow's date through.
+ */
+function depositedOnAsSettledAt(method: string, depositedOn: string | undefined, today: string): Date | null {
+  if (depositedOn == null) return null
+  if (method !== 'bank_deposit') throw new AppError(422, 'A deposit date is taken only for a bank deposit.')
+  const at = new Date(depositedOn + 'T12:00:00Z')
+  if (Number.isNaN(at.getTime()) || at.toISOString().slice(0, 10) !== depositedOn) {
+    throw new AppError(422, 'Enter the date deposited as a real date, from the bank\'s receipt.')
+  }
+  if (depositedOn > today) {
+    throw new AppError(422, 'The date deposited cannot be after today.')
+  }
+  // Today's noon may not have come yet: a deposit made today counts from now.
+  return at.getTime() > Date.now() ? null : at
+}
 
 paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (req: any, res, next) => {
   const client = await getClient()
   try {
     const body = recordManualSchema.parse(req.body)
+    // decisions.md #48.4: a card hold on this household that nobody confirmed
+    // in time is released first, so the desk settles the bill as it really
+    // stands (never refused over a hold that has run out) — only once the
+    // caller may take payment on this charge. Before BEGIN: the release takes
+    // the household lock on its own connection.
+    const pre = await queryOne<{ tenant_id: string | null; landlord_id: string; property_id: string | null }>(
+      `SELECT p.tenant_id, p.landlord_id, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])
+    if (!pre) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, pre.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertChargeInStaffScope(req.user, pre.property_id)
+    // 10/5 (Nic): a bank deposit's date cannot be after today where the property is.
+    const depositedAt = body.depositedOn == null ? null
+      : depositedOnAsSettledAt(body.method, body.depositedOn, await propertyToday(pre.property_id))
+    if (body.deleteOnboardingLateFees === true && !canDeleteLateFees(req.user, pre.landlord_id)) {
+      throw new AppError(403, LATE_FEE_DELETE_NOT_ALLOWED)
+    }
+    if (pre.tenant_id) await releaseExpiredCardHolds(pre.tenant_id, 'record-manual', [pre.landlord_id])
     await client.query('BEGIN')
 
-    // Lock the rent row so a concurrent /pay can't settle it underneath us.
+    // S655 lock order (§1.5): the household first, then the rows. The charge is
+    // read once to learn whose household it is, then locked under that lock, so
+    // a portal payment, a webhook or a second desk on the same household waits.
+    const head = (await client.query<{ tenant_id: string | null; landlord_id: string; property_id: string | null }>(
+      `SELECT p.tenant_id, p.landlord_id, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])).rows[0]
+    if (!head) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, head.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    await assertChargeInStaffScope(req.user, head.property_id)
+    if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
     const pmt = (await client.query<any>(
-      // S607: the properties join is gone with the 21-day gate it fed — nothing
-      // else in this route needed it.
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
-              u.payment_block,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
-              -- S620: screened tenants do not get the free first manual
-              -- payment; see the waiver comment below.
-              t.background_check_status
+              COALESCE(u.payment_block, FALSE) AS payment_block
          FROM payments p
-         JOIN units u ON u.id = p.unit_id
-         LEFT JOIN tenants t ON t.id = p.tenant_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
+         LEFT JOIN units u ON u.id = p.unit_id
         WHERE p.id = $1
           FOR UPDATE OF p`,
       [req.params.id])).rows[0]
@@ -964,11 +1947,40 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
-    if (pmt.type !== 'rent') {
-      throw new AppError(409, 'Only rent charges can be recorded as a manual payment')
+    // S641 — TWO DIFFERENT THINGS, and only one of them is a manager's call.
+    //
+    // Nic: "Lisa should have all access to take payments in whatever form they
+    // come, including giving change out at the register… or applying credit to
+    // the next bill if that's what she wants. She cannot just issue random
+    // credits that a landlord would issue for, you know, waiving a late fee."
+    //
+    // An overpayment surplus is money ALREADY IN THE DRAWER. The resident handed
+    // over $500 against $460 and the desk records where the $40 went — change
+    // back, or sitting on the account for next month. Recording that is part of
+    // taking the payment, not an act of discretion, and take_payment covers it.
+    //
+    // A DISCRETIONARY credit — waiving a late fee, a goodwill adjustment —
+    // creates money that was never received. That stays owner / property
+    // manager, enforced on the tenant-credits route.
+    //
+    // I gated the surplus here first and was wrong: it read as "issuing credit"
+    // because the word matched, and blocked a desk from recording the truth
+    // about cash they were holding.
+    // S649 (Nic): "we need to be able to settle any outstanding balances at any
+    // time. If it's outstanding, we should be able to reconcile it." Jeremy
+    // Parker's September electric ($96.81) came after his rent was already
+    // paid, and with no open rent to anchor on it could not be recorded at all.
+    // The payment settles the household's whole balance either way (S636), so
+    // any open charge can carry it. A work-trade row is excluded: it is not owed
+    // now, it settles against hours at month close.
+    if ((await client.query(
+      `SELECT 1 FROM payments WHERE id = $1 AND work_trade_suspended_at IS NOT NULL`, [pmt.id])).rows.length) {
+      throw new AppError(409, 'This charge is covered by work trade and settles at month close')
     }
     if (pmt.status !== 'pending' && pmt.status !== 'failed') {
-      throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+      // Worded after the household lock is let go: it may ask Stripe.
+      await client.query('ROLLBACK')
+      throw new AppError(409, await notOpenAtDeskText(pmt.id, pmt.status))
     }
     // Eviction pause (matches the tenant pay routes): accepting/booking landlord-
     // bound money can reset the eviction timeline, so recording is blocked too.
@@ -976,46 +1988,82 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
     }
 
-    // S624: the waiver rules, the fee routing and the settle itself now live in
-    // services/manualPaymentSettle.ts, because the BANK-DEPOSIT match path has to
-    // settle a payment identically. Every rule that used to be inline here moved
-    // there verbatim, comments included — see that file's header for why a second
-    // copy was not acceptable.
-    //
-    // settledAt is null: a landlord recording a payment is recording it as they
-    // enter it, so it settles NOW. The deposit-match path passes the date the
-    // money actually moved instead.
-    const { settleManualRentPayment } = await import('../services/manualPaymentSettle')
-    const { feeWaived, feeBilledTo, feePaymentId, firstPayment } = await settleManualRentPayment(client, {
+    // S624: the settle itself lives in services/manualPaymentSettle.ts (one
+    // home for the desk, the assistant, a posted payment and the bank match).
+    // S655: the household's bank-payable balance, the credit choice, the old
+    // balance, the surplus and the receipt are all decided there, under the
+    // household lock, against figures read inside this transaction.
+    const result = await settleManualRentPayment(client, {
       payment: pmt,
       method: body.method,
-      settledAt: null,
+      settledAt: depositedAt,
       reference: body.reference ?? null,
-      // S636 (Nic): cash clears the whole balance, like a card does.
-      settleWholeBalance: true,
+      settleHousehold: true,
+      amountTendered: body.amountTendered,
+      surplusHandling: body.surplusHandling,
+      creditToUse: body.creditToUse ?? null,
+      towardOldBalance: body.towardOldBalance ?? null,
+      confirmWrittenAmount: body.confirmWrittenAmount === true,
+      takenBy: req.user!.userId,
+      source: 'desk',
+      // 10/5 (Nic): paid in full, late fees charged after the deposit come off.
+      depositedOn: body.method === 'bank_deposit' ? (body.depositedOn ?? null) : null,
+      deleteOnboardingLateFees: body.method === 'bank_deposit' && body.deleteOnboardingLateFees === true,
+      lateFeeDeleteVia: 'record_payment',
     })
-    const landlordCovers = pmt.manual_fee_payer === 'landlord'
 
     await client.query('COMMIT')
+
+    // S637 (Nic): "Fix it so that people get an email confirmation of their
+    // receipt." After the commit — a mail failure must never roll back a
+    // payment that physically happened. Then, if money was kept as credit, the
+    // whole-bill check (a credit that covers a whole bill pays it).
+    await result.afterCommit()
+    if (result.creditId && pmt.tenant_id) {
+      await runWholeBillCheckAfterCommit({ tenantId: pmt.tenant_id, landlordId: pmt.landlord_id })
+    }
+
     res.json({
       success: true,
       data: {
         paymentId:    pmt.id,
         status:       'settled',
         method:       body.method,
-        feeWaived,
-        feeAmount:    feeWaived ? 0 : MANUAL_PAYMENT_FEE,
-        // Who the fee landed on. 'tenant' raises a charge they must pay;
-        // 'landlord' posts it to GAM revenue and nets out of their payout;
-        // 'none' only ever means the free first payment.
-        feeBilledTo:  feeWaived ? 'none' : (landlordCovers ? 'landlord' : 'tenant'),
-        feePaymentId,
-        // S607: these are now TWO different reasons a fee was not raised, and
-        // the caller must be able to tell them apart — "your first one is free"
-        // and "your landlord covers this" are different things to say to a
-        // tenant, and only one of them stops being true next month.
-        firstPayment,
-        coveredByLandlord: landlordCovers,
+        settledPaymentIds: result.settledPaymentIds,
+        // Money that landed on charges (the bill and any old balance).
+        amountSettled: result.amountSettled,
+        // S638: how much of the bill an account credit covered.
+        creditUsed:   result.creditUsed,
+        towardOldBalance: result.towardOldBalance,
+        surplus:      result.surplus,
+        changeGiven:  result.changeGiven,
+        surplusHandling: result.surplus > 0 ? (result.creditId ? 'credit' : 'change') : null,
+        creditId:     result.creditId,
+        receiptId:    result.receiptId,
+        // 10/5 (Nic): a part payment (the property takes them) — what is still
+        // owed after it, and on which bills. 0 / [] when paid in full.
+        partial:      result.stillOwed > 0,
+        stillOwed:    result.stillOwed,
+        // 10/6 (Nic): what a part payment could not place, gone on the rest
+        // of what they owe (never said as credit while the balance is owed).
+        leftoverOnBalance: result.leftoverOnBalance,
+        stillOwedRows: result.stillOwedRows,
+        // 10/5 (Nic): late fees charged after a bank deposit's date that came
+        // off because it paid the bill in full — 10/6: credited (unbilled),
+        // and refunded as credit (already paid).
+        lateFeesUnbilled: result.lateFeesReversed.unbilled,
+        lateFeesRefunded: result.lateFeesReversed.refunded,
+        // 10/6 (Nic): late fees deleted from the onboarding bill (the box).
+        lateFeesDeleted: result.lateFeesDeleted.count,
+        // The box was ticked but a fee could not be deleted: why, in plain
+        // words (credited instead, or still owed). [] when nothing was refused.
+        lateFeeDeleteRefusals: result.lateFeeDeleteRefusals,
+        // 10/6 (Nic): a bill a late fee came off of still has a late fee on
+        // it, so the payment still counts late on their history ("No
+        // exceptions") — and whether that is so on a bill the box deleted a
+        // fee from (then "nothing shows on their record" would be false).
+        lateFeeCountsLate: result.lateFeeCountsLate,
+        lateFeeDeletedStillLate: result.lateFeeDeletedStillLate,
       },
     })
   } catch (e) {
@@ -1026,23 +2074,215 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
   }
 })
 
+// GET /api/payments/:id/record-manual/quote — what the desk window shows for
+// the household this charge belongs to (S655, money plan §3 desk row).
+//
+// The full balance, laid out the way the desk takes it: the current bill the
+// desk settles (this company's charges, oldest first), the old balance (paid
+// last, optional), GAM's own charges and another company's on the same bill
+// as a "Pay online" line (so the window's total equals the portal's), anything
+// paused by an eviction hold, money already clearing, and "credit available $X"
+// beside the bill — with what is owed if the desk uses it or saves it. Read
+// fresh every time the window opens and after any 409.
+paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const pmt = (await client.query<any>(
+      `SELECT p.id, p.landlord_id, p.tenant_id, p.unit_id, p.status, p.work_trade_suspended_at, u.payment_block, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])).rows[0]
+    if (!pmt) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, pmt.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertChargeInStaffScope(req.user, pmt.property_id)
+    if (!pmt.tenant_id) throw new AppError(409, 'This charge has no resident on it.')
+    // decisions.md #48.4: a card hold that ran out is released before the
+    // window reads the bill, so staff never see a stale hold as clearing.
+    await releaseExpiredCardHolds(pmt.tenant_id, 'record-manual/quote', [pmt.landlord_id])
+    // The charge itself may have been one the hold kept: read where it stands now.
+    pmt.status = (await client.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [pmt.id])).rows[0]?.status ?? pmt.status
+    // 10/5 (Nic): a bank deposit dated back (?depositedOn=YYYY-MM-DD): the
+    // bill as the record will take it when the deposit pays it in full —
+    // late fees charged after that day credited (manualPaymentSettle
+    // creditLateFeesAfterDeposit), inside a transaction that is rolled back.
+    const depositedOn = typeof req.query.depositedOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.depositedOn)
+      ? req.query.depositedOn : null
+    if (depositedOn) depositedOnAsSettledAt('bank_deposit', depositedOn, await propertyToday(pmt.property_id))
+    let lateFeesOffIfPaidInFull = 0
+    // 10/6 (Nic): how much of that is on the onboarding month's bill — where
+    // the window offers "Delete the late fee completely (onboarding month)".
+    let onboardingLateFeesOff = 0
+    // 10/5: the same, bill by bill — a bill a part payment pays only in part
+    // keeps its own late fees (manualPaymentSettle judges each bill).
+    const lateFeesOffByBill = new Map<string, number>()
+    let q: Awaited<ReturnType<typeof deskQuote>>
+    if (depositedOn) {
+      await client.query('BEGIN')
+      try {
+        await lockHousehold(client, pmt.tenant_id, pmt.landlord_id)
+        const q0 = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true })
+        const z = await backdatedLateFeesPreview(client, q0, depositedOn)
+        lateFeesOffIfPaidInFull = z.unbilled
+        for (const [invoiceId, amount] of z.byBill) lateFeesOffByBill.set(invoiceId, amount)
+        onboardingLateFeesOff = z.onboardingOff
+        q = z.offIds.length > 0 ? await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true }) : q0
+      } finally {
+        await client.query('ROLLBACK').catch(() => {})
+      }
+    } else {
+      q = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id })
+    }
+    // decisions.md #48.4: a card payment still waiting on its card's bank
+    // (inside its 30 minutes) has charged nothing yet. Its rows are held, so
+    // they stay inside `clearing` (the desk window shows that amount today);
+    // `awaitingCard` says which part of `clearing` is such a payment — by who
+    // made it and when the bill opens here by itself — so the window can say
+    // so plainly. Asked of Stripe only when a card payment of this
+    // household's is still processing.
+    const awaitingCard = (await awaitingCardConfirmations(client, pmt.tenant_id))
+      .filter(a => a.landlordId === pmt.landlord_id)
+    const ids = [...q.rows, ...q.carried, ...q.payOnline, ...q.paused].map(r => r.id)
+    const labels = ids.length ? await client.query<any>(
+      `SELECT p.id, p.notes, u.unit_number, pr.name AS property_name
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id LEFT JOIN properties pr ON pr.id = u.property_id
+        WHERE p.id = ANY($1::uuid[])`, [ids]) : { rows: [] as any[] }
+    const byId = new Map(labels.rows.map((r: any) => [r.id, r]))
+    const show = (rs: typeof q.rows) => rs.map(r => ({
+      id: r.id, leaseId: r.leaseId, invoiceId: r.invoiceId, type: r.type, entryDescription: r.entryDescription,
+      amount: r.amount, dueDate: r.dueDate, creditAlreadyApplied: r.appliedCredit,
+      // What "Use" would spend on this charge — so the window can say which
+      // bill a part payment leaves owed.
+      creditIfUsed: r.creditIfUsed,
+      notes: byId.get(r.id)?.notes ?? null, unitNumber: byId.get(r.id)?.unit_number ?? null,
+      propertyName: byId.get(r.id)?.property_name ?? null,
+    }))
+    res.json({ success: true, data: {
+      anchorPaymentId: pmt.id,
+      anchorOpen: (pmt.status === 'pending' || pmt.status === 'failed') && !pmt.work_trade_suspended_at,
+      paymentsPaused: pmt.payment_block === true,
+      rows: show(q.rows),
+      currentTotal: q.currentTotal,
+      oldBalance: show(q.carried),
+      oldBalanceTotal: q.carriedTotal,
+      payOnline: show(q.payOnline),
+      payOnlineTotal: q.payOnlineTotal,
+      paused: show(q.paused),
+      pausedTotal: q.pausedTotal,
+      clearing: q.inFlightTotal,
+      // The part of `clearing` that is a card payment waiting on the card's
+      // bank: nothing charged yet; the bill opens here by itself at confirmBy
+      // if nobody confirms it (heldAmount is what it holds on these bills).
+      awaitingCard: awaitingCard.map(a => ({
+        amount: a.amount, heldAmount: a.heldOnLease, confirmBy: a.confirmBy, payerName: a.payerName,
+        // The park's clock for "opens here at …"; null: the desk names its own zone.
+        timezone: a.timezone,
+      })),
+      creditAlreadyApplied: q.creditAlreadyApplied,
+      creditAvailable: q.usableCredit,
+      // Credit a bank payment retrying on a bill the desk does not take (an
+      // eviction hold, rent past a stay's end) still sets aside: not usable here.
+      creditSetAsideElsewhere: q.creditSetAsideElsewhere,
+      creditOnFile: q.creditOnFile,
+      owedIfUsed: q.owedIfUsed,
+      owedIfSaved: q.owedIfSaved,
+      fullBalance: q.fullBalance,
+      scheduledRetries: q.scheduledRetries.map(r => ({ nextRetryAt: r.nextRetryAt })),
+      surplusOptions: DESK_SURPLUS_HANDLING.map(v => ({ value: v, label: DESK_SURPLUS_HANDLING_LABEL[v] })),
+      // 10/5 (Nic): the property takes part payments — less than the bill may
+      // be recorded (oldest bills first; what is left stays owed, late fees and all).
+      partialPaymentsAllowed: q.partialAllowed,
+      // 10/5 (Nic): with ?depositedOn=, the late fees charged after that day
+      // that come off when the deposit pays this bill in full (0: none).
+      lateFeesOffIfPaidInFull,
+      lateFeesOffByBill: [...lateFeesOffByBill].map(([invoiceId, amount]) => ({ invoiceId, amount })),
+      // 10/6 (Nic): the box applies when this is above 0 and this person may tick it.
+      onboardingLateFeesOff,
+      canDeleteLateFees: canDeleteLateFees(req.user, pmt.landlord_id),
+      // 10/6 (Nic): "Bank deposit" is offered only where tenants deposit rent at the bank.
+      bankDepositAllowed: await tenantsDepositAtBank(client, { unitId: pmt.unit_id ?? null }),
+    } })
+  } catch (e) { next(e) } finally { client.release() }
+})
+
+// POST /api/payments/:id/delete-late-fee — 10/6 (Nic): "the late fee is only
+// available to be completely deleted during the onboarding month."
+// "Delete this late fee" on a late fee's line in the landlord's Payments
+// history, for a fee a reversal credited (or, before 10/6, zeroed) on the
+// onboarding month's bill. The fee AND the credit applied to it go, with the
+// full row kept in the audit log (services/lateFeeDelete); once no late fee is
+// left on the bill, its late mark is replaced by the mark from the deposit's
+// date. The owner or a property manager only (the people who may waive a late
+// fee); refused in plain words for any other fee, and for one money is
+// recorded against.
+paymentsRouter.post('/:id/delete-late-fee', async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Late fee not found')
+    const head = await queryOne<{ tenant_id: string | null; landlord_id: string; property_id: string | null }>(
+      `SELECT p.tenant_id, p.landlord_id, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])
+    if (!head) throw new AppError(404, 'Late fee not found')
+    if (!canDeleteLateFees(req.user, head.landlord_id)) {
+      throw new AppError(403, 'Only the owner or a property manager can delete a late fee.')
+    }
+    await assertChargeInStaffScope(req.user, head.property_id)
+    await client.query('BEGIN')
+    if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
+    const r = await deleteLateFee(client, req.params.id, { deletedBy: req.user!.userId, via: 'history_line' })
+    if (!r.deleted) {
+      await client.query('ROLLBACK')
+      throw new AppError(r.refusal === 'not_found' ? 404 : 409, r.message ?? 'This late fee can\'t be deleted.')
+    }
+    await client.query('COMMIT')
+    // The re-rated payment marks move the tenant's score: recomputed now (a
+    // failure is logged; the nightly run picks it up).
+    if (r.reRatedSubjects.length > 0) {
+      const { recomputeAndSnapshot } = await import('../services/creditScore')
+      for (const subjectId of r.reRatedSubjects) {
+        await recomputeAndSnapshot(subjectId).catch(err =>
+          logger.error({ err, subjectId }, '[delete-late-fee] score recompute failed; the nightly run picks it up'))
+      }
+    }
+    // "Nothing shows on their record" only when no late fee is left on the
+    // bill; with another one still there the payment still counts late.
+    res.json({ success: true, data: {
+      deleted: true, lateFeeLeftOnBill: r.lateFeeLeftOnBill,
+      message: r.lateFeeLeftOnBill ? LATE_FEE_DELETED_STILL_LATE_LANDLORD_TEXT : LATE_FEE_DELETED_LANDLORD_TEXT,
+    } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
 // POST /api/payments/:id/record-prior-arrangement — S568 (Nic).
 // Onboarding-transition ONLY: mark the FIRST rent charge of an IMPORTED lease as
-// paid via a prior off-platform arrangement. It comes off the books, no money
-// moves, and NO manual-payment fee is charged. Distinct from record-manual (a
+// paid via a prior off-platform arrangement. It comes off the books and no money
+// moves. Distinct from record-manual (a
 // cash/check received now) — this is "already paid before they came onto GAM."
 //
 // Hard gating (all enforced here, no landlord toggle): rent charge, still open,
 // lease_source='imported' (a brand-new GAM lease has no prior arrangement),
 // within PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding, and it must be the
-// FIRST rent charge (no already-satisfied rent on the lease). Fee-free always.
+// FIRST rent charge (no already-satisfied rent on the lease).
 paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment'), async (req: any, res, next) => {
   const client = await getClient()
   try {
     await client.query('BEGIN')
 
+    // S655 lock order (§1.5): the household first, then the row — a portal
+    // payment, a webhook or the desk on the same household waits.
+    const head = (await client.query<{ tenant_id: string | null; landlord_id: string; property_id: string | null }>(
+      `SELECT p.tenant_id, p.landlord_id, u.property_id
+         FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [req.params.id])).rows[0]
+    if (!head) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, head.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    await assertChargeInStaffScope(req.user, head.property_id)
+    if (head.tenant_id) await lockHousehold(client, head.tenant_id, head.landlord_id)
+
     const pmt = (await client.query<any>(
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.lease_id,
+              p.stripe_payment_intent_id,
               p.due_date::text AS due_date, u.payment_block,
               (ld.reconciliation_until IS NOT NULL AND ld.reconciliation_until > NOW()) AS within_window
          FROM payments p
@@ -1052,14 +2292,16 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
           FOR UPDATE OF p`,
       [req.params.id])).rows[0]
     if (!pmt) throw new AppError(404, 'Payment not found')
-    if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
     if (pmt.type !== 'rent') {
       throw new AppError(409, 'Only a rent charge can be marked as a prior arrangement')
     }
     if (pmt.status !== 'pending' && pmt.status !== 'failed') {
       throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+    }
+    // S655: a payment already on its way for this charge is not overruled by
+    // a note that it was paid before — wait for it to clear or fail.
+    if (pmt.status === 'pending' && pmt.stripe_payment_intent_id) {
+      throw new AppError(409, 'A payment for this charge is already on its way. Wait for it to clear or fail, then look again.')
     }
     if (pmt.payment_block) {
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused.')
@@ -1079,20 +2321,30 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
       throw new AppError(409, 'Prior-arrangement only applies to the first rent charge; a later rent charge has already been paid.')
     }
 
-    // Satisfy the obligation off-platform. platform_held FALSE, no fee row.
-    await client.query(
-      `UPDATE payments
+    // S655: a bank retry scheduled on this charge would pull money for rent
+    // already paid — it is replaced (its held credit given back, its schedule
+    // cleared, its pull canceled after commit).
+    const superseded = await supersedeScheduledRetry(client, [pmt.id])
+
+    // Satisfy the obligation off-platform. platform_held FALSE. Guarded: only a
+    // charge still payable is taken.
+    const done = await client.query(
+      `UPDATE payments p
           SET status = 'settled', settled_at = NOW(), manual_method = $2,
-              platform_held = FALSE,
-              notes = COALESCE(notes || ' — ', '') ||
+              platform_held = FALSE, next_retry_at = NULL,
+              notes = COALESCE(p.notes || ' — ', '') ||
                       'Paid off-platform via prior arrangement (onboarding transition)'
-        WHERE id = $1`,
+        WHERE p.id = $1 AND ${payableRowSql('p')}`,
       [pmt.id, PRIOR_ARRANGEMENT_METHOD])
+    if ((done.rowCount ?? 0) !== 1) {
+      throw new AppError(409, 'This charge changed while it was being marked. Nothing was recorded — look at it again.')
+    }
 
     await client.query('COMMIT')
+    await cancelSupersededIntents(superseded.cancelAfterCommit)
     res.json({
       success: true,
-      data: { paymentId: pmt.id, status: 'settled', method: PRIOR_ARRANGEMENT_METHOD, feeCharged: false },
+      data: { paymentId: pmt.id, status: 'settled', method: PRIOR_ARRANGEMENT_METHOD },
     })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -1100,4 +2352,426 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
   } finally {
     client.release()
   }
+})
+
+// ── S654 (Nic): A CARD ON THE COUNTER READER, FOR A LEASE BALANCE ────────────
+//
+//   "It needs to be both. It's going to be for the point of sale, ringing up
+//    propane transactions. It's also going to be somebody stops by to pay their
+//    rent because maybe they couldn't log in online and they don't know how
+//    much they owe."
+//
+// Four calls, same shape the register uses for a sale:
+//   GET  /:id/reader/readers          — the readers paired at this charge's property
+//   POST /:id/reader/charge           — quote the balance + card fee, create the
+//                                       (held) intent, push it to the reader
+//   GET  /reader/intents/:pi          — poll while the customer taps
+//   POST /reader/intents/:pi/capture  — book it like an online card payment,
+//                                       then capture; the webhook settles
+//   POST /reader/intents/:pi/cancel   — the customer walked, or the desk changed its mind
+//
+// Money: the intent lands on GAM's Stripe balance and rides Tuesday's payout,
+// exactly like Pay Now (2a). The card fee is the customer's at the same rate as
+// online (3). Nothing is booked until the reader has approved the card — a
+// decline or a walk-away leaves the ledger untouched.
+import { holdForTheCart, createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction, clearCartOnReader, readerAction } from '../services/posTerminal'
+import { chargeLabel, chargeDetail, chargeLabelColumnsSql, type ChargeLabelRow } from '../services/invoiceNotice'
+
+/** A charge's line on the reader: its name, then its detail (the meter read), kept short for the screen. */
+function readerLineName(row: ChargeLabelRow): string {
+  const label = chargeLabel(row)
+  const detail = chargeDetail(row)
+  const line = detail ? `${label} ${detail}` : label
+  return line.length > 60 ? `${line.slice(0, 57)}…` : line
+}
+
+async function readerAnchor(req: any, paymentId: string) {
+  const pmt = await queryOne<any>(
+    `SELECT p.id, p.landlord_id, p.tenant_id, p.lease_id, p.status, p.work_trade_suspended_at,
+            u.property_id, inv.service_agreement_id
+       FROM payments p
+       JOIN units u ON u.id = p.unit_id
+       LEFT JOIN invoices inv ON inv.id = p.invoice_id
+      WHERE p.id = $1`, [paymentId])
+  if (!pmt) throw new AppError(404, 'Payment not found')
+  if (!canManageLandlordResource(req.user, pmt.landlord_id)) throw new AppError(403, 'Forbidden')
+  await assertChargeInStaffScope(req.user, pmt.property_id)
+  if (!pmt.tenant_id) throw new AppError(409, 'This charge has no resident to take a card from')
+  if (pmt.work_trade_suspended_at) throw new AppError(409, 'This charge is covered by work trade and settles at month close')
+  // decisions.md #48.4: a card hold on this household that nobody confirmed in
+  // time is released before the reader is quoted, sent or captured — the same
+  // as the desk window — so the reader never asks for less than is owed over a
+  // hold that has already run out. The charge itself may have been one the
+  // hold kept: read where it stands now.
+  await releaseExpiredCardHolds(pmt.tenant_id, 'reader', [pmt.landlord_id])
+  pmt.status = (await queryOne<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [pmt.id]))?.status ?? pmt.status
+  if (pmt.status === 'processing') throw new AppError(409, await notOpenAtDeskText(pmt.id, pmt.status))
+  // Any other closed state: the desk screens put the status in plain words
+  // (landlord lib/creditDesk plainRefusal).
+  if (pmt.status !== 'pending' && pmt.status !== 'failed') throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+  return pmt
+}
+
+paymentsRouter.get('/:id/reader/readers', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pmt = await readerAnchor(req, req.params.id)
+    const readers = await query<any>(
+      `SELECT id, stripe_reader_id, nickname FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND property_id = $2 AND status = 'active'
+        ORDER BY nickname`, [pmt.landlord_id, pmt.property_id])
+    res.json({ success: true, data: readers })
+  } catch (e) { next(e) }
+})
+
+// S655 (Nic, 10/2): the desk asks "Use $X credit or Save it?" BEFORE the
+// amount goes to the reader, and may add "also pay $X toward the old balance"
+// (carried arrears, paid last; anything beyond them becomes paid-ahead money
+// GAM holds). The choice rides on the intent's metadata, so a resend and the
+// capture re-quote exactly what the reader was sent.
+const readerChoiceSchema = z.object({
+  useCredit:        z.boolean().optional(),
+  expectedCredit:   z.number().nonnegative().optional(),
+  towardOldBalance: z.number().nonnegative().optional(),
+})
+type ReaderChoice = z.infer<typeof readerChoiceSchema>
+
+function choiceFromIntent(pi: any): ReaderChoice {
+  const m = pi?.metadata ?? {}
+  return {
+    useCredit: m.gam_use_credit === 'true' ? true : m.gam_use_credit === 'false' ? false : undefined,
+    expectedCredit: m.gam_expected_credit != null && m.gam_expected_credit !== '' ? Number(m.gam_expected_credit) : undefined,
+    towardOldBalance: m.gam_toward_old != null && m.gam_toward_old !== '' ? Number(m.gam_toward_old) : undefined,
+  }
+}
+
+paymentsRouter.post('/:id/reader/charge', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId, cartOnReader, ...choice } = z.object({
+      stripeReaderId: z.string().min(1), cartOnReader: z.boolean().optional(),
+    }).merge(readerChoiceSchema).parse(req.body)
+    const pmt = await readerAnchor(req, req.params.id)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    // The answer never travels without the credit figure the desk read out
+    // (shelved 8): a credit that moved since is a 409 and the desk re-quotes.
+    if (choice.useCredit != null && choice.expectedCredit == null) {
+      throw new AppError(422, 'Send the credit figure the desk was shown (expectedCredit) with the answer to use or save it.')
+    }
+
+    const quote = await readerQuote(pmt, choice)
+    if (quote.usableCredit > 0 && choice.useCredit == null) {
+      throw new AppError(422,
+        `This account has $${quote.usableCredit.toFixed(2)} of credit. Ask whether to use it or save it before sending the amount to the reader.`)
+    }
+    if (!(quote.total > 0)) {
+      throw new AppError(409,
+        'The credit covers this whole bill — nothing goes on a card. Record it in the payment window and use the credit there.')
+    }
+    const intent = await createRentReaderPaymentIntent({
+      landlordId: pmt.landlord_id, propertyId: pmt.property_id, tenantId: pmt.tenant_id,
+      anchorPaymentId: pmt.id,
+      amountCents: Math.round(quote.total * 100),
+      cardFeeCents: Math.round(quote.cardFee * 100),
+    })
+    // What the DESK asked for, exactly as the reader was priced: the capture
+    // and a resend re-quote from these. The old-balance figure is the amount
+    // asked for, not the part of it the carried rows took — anything beyond
+    // the old balance is paid-ahead money, and dropping it here would make the
+    // capture re-price lower than the reader was sent and refuse every time.
+    await getStripe().paymentIntents.update(intent.id, { metadata: {
+      gam_use_credit: choice.useCredit == null ? '' : String(choice.useCredit),
+      gam_expected_credit: choice.useCredit == null || choice.expectedCredit == null ? '' : choice.expectedCredit.toFixed(2),
+      gam_toward_old: choice.towardOldBalance != null && choice.towardOldBalance > 0 ? choice.towardOldBalance.toFixed(2) : '',
+    } })
+    await sendToReader(pmt, quote, intent.id, stripeReaderId, cartOnReader === true)
+    res.status(201).json({ success: true, data: { paymentIntentId: intent.id, ...quote } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "it needs to be there the whole time … until the payment is
+// processed." Stripe's pay screen shows the total only and Stripe sends no word
+// of a tap on the breakdown, so the breakdown goes up as soon as the desk has
+// the total — the resident taps on it — and Send finishes with that tap.
+// Display only. `clear` takes the breakdown down (and only a breakdown); a
+// reader mid-payment or asking someone a question is left alone.
+paymentsRouter.post('/:id/reader/show', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId, clear, ...choice } = z.object({
+      stripeReaderId: z.string().min(1), clear: z.boolean().optional(),
+    }).merge(readerChoiceSchema).parse(req.body)
+    const pmt = await readerAnchor(req, req.params.id)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    if (clear) return res.json({ success: true, data: { shown: false, cleared: await clearCartOnReader(stripeReaderId, `rent:${pmt.id}`) } })
+    const quote = await readerQuote(pmt, choice)
+    const action = await readerAction(stripeReaderId).catch(() => null)
+    if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
+      return res.json({ success: true, data: { shown: false, busy: action.type } })
+    }
+    const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0,
+      totalCents: Math.round(quote.total * 100), owner: `rent:${pmt.id}` })
+    res.json({ success: true, data: { shown: !!shown, total: quote.total } })
+  } catch (e) { next(e) }
+})
+
+// S654 (Nic): "will it show somebody's name on this screen?" — the first line
+// carries the resident and the space; then each charge by name; then the fee;
+// then the reader asks for the card.
+async function rentReaderLines(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>) {
+  const who = await queryOne<{ first_name: string | null; last_name: string | null; unit_number: string | null }>(
+    `SELECT u.first_name, u.last_name, un.unit_number
+       FROM payments p JOIN tenants t ON t.id = p.tenant_id JOIN users u ON u.id = t.user_id JOIN units un ON un.id = p.unit_id
+      WHERE p.id = $1`, [pmt.id])
+  const name = who ? `${who.first_name ?? ''} ${who.last_name ?? ''}`.trim() : ''
+  const lines = quote.lineItems.map((l, i) => i === 0 && name
+    ? { ...l, description: `${l.description} — ${name}${who?.unit_number ? ` (${who.unit_number})` : ''}` }
+    : l)
+  if (quote.cardFee > 0) lines.push({ description: 'Card processing fee', amountCents: Math.round(quote.cardFee * 100), quantity: 1 })
+  return lines
+}
+async function sendToReader(pmt: any, quote: Awaited<ReturnType<typeof readerQuote>>, paymentIntentId: string, stripeReaderId: string, cartOnReader = false) {
+  const shown = await showCartOnReader({ stripeReaderId, lines: await rentReaderLines(pmt, quote), taxCents: 0,
+    totalCents: Math.round(quote.total * 100), owner: `rent:${pmt.id}` })
+  // A breakdown that has been up (POST /:id/reader/show) has had its tap; one
+  // that was not — or that another flow had taken over — is held so the
+  // resident reads it before the pay screen.
+  if (!cartOnReader || shown === 'took_over') await holdForTheCart()
+  await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
+}
+
+// S654 (Nic): "I don't want it to void the charge… revert back so they can try
+// again." A charge the reader timed out on, or a card it declined, is still
+// open: clear the reader, and send the SAME charge again when they are back —
+// provided the balance has not moved (a moved balance means start again).
+paymentsRouter.post('/reader/intents/:pi/clear-reader', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId } = z.object({ stripeReaderId: z.string().min(1) }).parse(req.body)
+    const pi = await ownReaderIntent(req, req.params.pi)
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pi.metadata?.gam_landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    await cancelReaderAction(stripeReaderId)
+    res.json({ success: true, data: { cleared: true } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/reader/intents/:pi/resend', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const { stripeReaderId, cartOnReader } = z.object({ stripeReaderId: z.string().min(1), cartOnReader: z.boolean().optional() }).parse(req.body)
+    const pi = await ownReaderIntent(req, req.params.pi)
+    if (pi.status !== 'requires_payment_method') {
+      throw new AppError(409, pi.status === 'requires_capture' || pi.status === 'succeeded'
+        ? 'The card was already approved — record it.'
+        : `This charge cannot be sent again (${pi.status}). Start again.`)
+    }
+    const pmt = await readerAnchor(req, String(pi.metadata?.gam_anchor_payment_id))
+    const reader = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_terminal_readers WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pmt.landlord_id, stripeReaderId])
+    if (!reader) throw new AppError(404, 'That reader is not paired to this company')
+    const quote = await readerQuote(pmt, choiceFromIntent(pi))
+    if (Math.round(quote.total * 100) !== pi.amount) {
+      throw new AppError(409, 'The balance changed since this charge was created — start again.')
+    }
+    await sendToReader(pmt, quote, pi.id, stripeReaderId, cartOnReader === true)
+    res.json({ success: true, data: { paymentIntentId: pi.id, ...quote } })
+  } catch (e) { next(e) }
+})
+
+// S654: the figure the desk shows is the SERVER's — the same arithmetic that
+// prices the online card payment and the property's fee rule — never a
+// client-side recomputation. S655: the bill is shown in full with the usable
+// credit beside it; the total follows the desk's Use / Save answer (Save until
+// they answer) and any amount added toward the old balance.
+async function readerQuote(pmt: any, choice: ReaderChoice = {}) {
+  const run = (useCredit: boolean | undefined) => chargeLeaseBalance({
+    tenantId: pmt.tenant_id,
+    leaseId: pmt.lease_id ?? undefined,
+    serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+    chargeEverything: true, dryRun: true,
+    credit: useCredit == null ? null : { use: useCredit, expected: choice.expectedCredit ?? null },
+    towardOldBalance: choice.towardOldBalance ?? null,
+    paymentMethodType: 'card_present', source: 'front_desk_reader',
+  })
+  const q = await run(choice.useCredit)
+  // S654 (Nic): the reader shows what the money is for — each charge by name,
+  // at what the CARD pays on it. 10/3 (decisions #17): a utility line names
+  // the utility from its bill ("Water", "Electric"), followed by the meter
+  // read when there is one — never a generic "Utilities".
+  const ids = (q.lines ?? []).map(l => l.payment_id)
+  const rows = ids.length ? await query<ChargeLabelRow & { id: string }>(
+    `SELECT p.id, p.type, p.notes, p.entry_description, ${chargeLabelColumnsSql('p')}
+       FROM payments p WHERE p.id = ANY($1::uuid[])`, [ids]) : []
+  const byId = new Map(rows.map(r => [r.id, r]))
+  const lineItems = (q.lines ?? []).map(l => ({
+    description: readerLineName(byId.get(l.payment_id) ?? { type: 'charge', notes: null }),
+    amountCents: Math.round(l.amount_applied * 100), quantity: 1,
+  }))
+  const figures = (x: typeof q) => ({
+    balance: Math.round((x.chargeAmount - x.processingFee) * 100) / 100,
+    cardFee: x.processingFee,
+    total: x.chargeAmount,
+  })
+  // Before the desk answers, both prices — "Use $X: card $Y" / "Save: card $Z".
+  const both = q.usableCredit > 0 && choice.useCredit == null
+    ? { ifUsed: figures(await run(true)), ifSaved: figures(q) } : {}
+  return {
+    // The whole bill, before any credit.
+    outstanding: q.outstanding,
+    usableCredit: q.usableCredit,
+    needsCreditChoice: q.usableCredit > 0 && choice.useCredit == null,
+    useCredit: q.creditUsed > 0,
+    creditUsed: q.creditUsed,
+    creditApplied: q.creditUsed,
+    oldBalance: q.carriedTotal,
+    towardOldBalance: q.towardOldBalance,
+    paidAhead: q.payAhead,
+    ...figures(q),
+    ...both,
+    lineItems,
+  }
+}
+
+paymentsRouter.get('/:id/reader/quote', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pmt = await readerAnchor(req, req.params.id)
+    const q = req.query as Record<string, string | undefined>
+    const choice = readerChoiceSchema.parse({
+      useCredit: q.useCredit === 'true' ? true : q.useCredit === 'false' ? false : undefined,
+      expectedCredit: q.expectedCredit != null && q.expectedCredit !== '' ? Number(q.expectedCredit) : undefined,
+      towardOldBalance: q.towardOldBalance != null && q.towardOldBalance !== '' ? Number(q.towardOldBalance) : undefined,
+    })
+    res.json({ success: true, data: await readerQuote(pmt, choice) })
+  } catch (e) { next(e) }
+})
+
+async function ownReaderIntent(req: any, paymentIntentId: string) {
+  const pi = await retrieveTerminalPaymentIntent({ paymentIntentId })
+  const purpose = pi.metadata?.gam_purpose
+  if ((purpose !== 'rent_terminal_pending' && purpose !== 'rent_terminal')
+      || !canManageLandlordResource(req.user, pi.metadata?.gam_landlord_id)) {
+    throw new AppError(404, 'Card charge not found')
+  }
+  // A staffer assigned to one property handles only that property's reader
+  // charges (the charge it was started from says where).
+  const anchorId = String(pi.metadata?.gam_anchor_payment_id ?? '')
+  const anchor = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(anchorId)
+    ? await queryOne<{ property_id: string | null }>(
+        `SELECT u.property_id FROM payments p LEFT JOIN units u ON u.id = p.unit_id WHERE p.id = $1`, [anchorId])
+    : null
+  await assertChargeInStaffScope(req.user, anchor?.property_id ?? null)
+  return pi
+}
+
+paymentsRouter.get('/reader/intents/:pi', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    res.json({ success: true, data: {
+      id: pi.id, status: pi.status, amount: pi.amount,
+      lastPaymentError: pi.last_payment_error?.message ?? null,
+    } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * Why a capture was refused, in one sentence — the first sentence of the
+ * charge path's refusal ("Your credit changed — it's now $50.00."), without
+ * its own "nothing was charged / look again" tail, so the desk reads each
+ * part once: the cause, then what happened to the hold, then the next step.
+ */
+function readerMovedCause(message: string): string {
+  const first = (message.split(/(?<=[.!?])\s+/)[0] ?? message).trim()
+  return /[.!?]$/.test(first) ? first : `${first}.`
+}
+
+paymentsRouter.post('/reader/intents/:pi/capture', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    // A double click, or a retried request: the first click booked and
+    // captured this card. Say it is done — never book it twice, and never try
+    // to release a hold that was already captured.
+    const alreadyBooked = async (live: { status?: string } | null) => {
+      const receipt = await queryOne<{ id: string }>(
+        `SELECT id FROM tenant_remittances WHERE stripe_payment_intent_id = $1 ORDER BY created_at, id LIMIT 1`, [pi.id])
+      if (!receipt && live?.status !== 'succeeded') return false
+      res.json({ success: true, data: {
+        paymentIntentId: pi.id, remittanceId: receipt?.id ?? null, status: 'succeeded', alreadyBooked: true,
+      } })
+      return true
+    }
+    if (await alreadyBooked(pi)) return
+    if (pi.status !== 'requires_capture') {
+      throw new AppError(409, pi.status === 'canceled' ? 'This charge was canceled' : 'The reader has not approved the card yet')
+    }
+    // Status, not the metadata label, decides: a 'rent_terminal' intent still at
+    // requires_capture is a capture that failed and was rolled back — it may be
+    // tried again or canceled, never treated as booked.
+    //
+    // Book it exactly as a portal card payment is booked — rows to processing,
+    // remittance, credit set aside, the intent's metadata rewritten to the rent
+    // shape — and capture inside that same transaction, so
+    // payment_intent.succeeded settles the rows down the one path every card
+    // payment takes and a failed capture leaves nothing behind. The credit
+    // choice and the old-balance amount are the ones the reader was sent.
+    const choice = choiceFromIntent(pi)
+    let booked
+    try {
+      const pmt = await readerAnchor(req, String(pi.metadata?.gam_anchor_payment_id))
+      booked = await chargeLeaseBalance({
+        tenantId: pmt.tenant_id,
+        leaseId: pmt.lease_id ?? undefined,
+        serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+        chargeEverything: true,
+        credit: choice.useCredit == null ? null : { use: choice.useCredit, expected: choice.expectedCredit ?? null },
+        towardOldBalance: choice.towardOldBalance ?? null,
+        paymentMethodType: 'card_present', source: 'front_desk_reader',
+        existingIntent: { id: pi.id, amountCents: pi.amount, capture: true },
+      })
+    } catch (e) {
+      if (e instanceof AppError && (e.statusCode === 409 || e.statusCode === 422)) {
+        // A second click that waited behind the first (on the charge, or on
+        // the household lock) finds it booked: done, not a moved balance.
+        const live = await retrieveTerminalPaymentIntent({ paymentIntentId: pi.id }).catch(() => null)
+        if (await alreadyBooked(live)) return
+        // S655: the balance or the credit moved since the reader was sent the
+        // amount. Nothing was booked; the hold on the card is released so the
+        // resident is not left with money set aside, and the desk re-quotes.
+        await cancelTerminalPaymentIntent({ paymentIntentId: pi.id }).catch((err) =>
+          logger.warn({ err, paymentIntentId: pi.id }, '[reader] could not release a hold after a moved balance'))
+        throw new AppError(409, `${readerMovedCause(e.message)} The hold on the card was released and nothing was charged — look at the balance again and start over.`)
+      }
+      throw e
+    }
+    res.json({ success: true, data: {
+      paymentIntentId: pi.id, remittanceId: booked.remittanceId,
+      total: booked.chargeAmount, cardFee: booked.processingFee, status: 'captured',
+    } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/reader/intents/:pi/cancel', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const pi = await ownReaderIntent(req, req.params.pi)
+    if (pi.status === 'succeeded') throw new AppError(409, 'This charge is already booked')
+    const bodyReaderId = typeof req.body?.stripeReaderId === 'string' ? req.body.stripeReaderId : null
+    // Only a reader paired to the company this charge belongs to — a body-supplied
+    // id is never trusted on its own.
+    const reader = bodyReaderId ? await queryOne<{ stripe_reader_id: string }>(
+      `SELECT stripe_reader_id FROM pos_terminal_readers
+        WHERE landlord_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+      [pi.metadata?.gam_landlord_id, bodyReaderId]) : null
+    if (reader) {
+      // Clear the prompt off the reader's screen; the intent cancel below is
+      // what matters for the money.
+      await getStripe().terminal.readers.cancelAction(reader.stripe_reader_id).catch(() => {})
+    }
+    const canceled = pi.status === 'canceled' ? pi : await cancelTerminalPaymentIntent({ paymentIntentId: pi.id })
+    res.json({ success: true, data: { paymentIntentId: canceled.id, status: canceled.status } })
+  } catch (e) { next(e) }
 })

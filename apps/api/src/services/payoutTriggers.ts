@@ -151,16 +151,24 @@ export async function claimMonthlySweep(
     : { claimed: false }
 }
 
-/** Triggers due to fire on or before `today` that have not fired yet. */
-export async function dueTriggers(today: string) {
+/**
+ * Triggers due to fire on or before `today` that have not fired yet.
+ *
+ * S640: `includeFuture` also returns ones scheduled ahead. Payouts went weekly
+ * and nothing claims a threshold any more, so a trigger already booked for a
+ * future date — Mountain View had one sitting on Sep 16 — would never come due
+ * on a day the engine looks, and would sit unfired forever. The weekly run
+ * closes them out instead.
+ */
+export async function dueTriggers(today: string, opts: { includeFuture?: boolean } = {}) {
   return query<{
     id: string; entity_kind: string; entity_id: string; trigger_kind: string
   }>(
     `SELECT id, entity_kind, entity_id, trigger_kind
        FROM payout_triggers
-      WHERE fired_at IS NULL AND scheduled_for <= $1::date
+      WHERE fired_at IS NULL AND ($2::boolean OR scheduled_for <= $1::date)
       ORDER BY scheduled_for ASC`,
-    [today])
+    [today, !!opts.includeFuture])
 }
 
 /**

@@ -143,7 +143,8 @@ async function main() {
       case 'tenant':
         return { userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id }
       case 'landlord':
-        return { userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id }
+        // S650: profileId empty, companies in landlordIds — the S634 shape.
+        return { userId: lord.user_id, role: 'landlord', profileId: '', landlordIds: [lord.landlord_id] }
       case 'prospect': {
         // Anonymous — the sales profile has no account-data tools, so there is
         // nothing to scope and the session id IS the identity.

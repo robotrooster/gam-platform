@@ -12,7 +12,7 @@
  * are mocked — this is a unit test of the handler's DB mechanics + wiring.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll, vi } from 'vitest'
 
 const lateFeeMock = vi.hoisted(() => vi.fn(async () => ({ invoicesScanned: 0, rowsWritten: 0, capsHit: 0, errors: [] })))
 const notifyReversedMock = vi.hoisted(() => vi.fn(async () => undefined))
@@ -26,18 +26,31 @@ vi.mock('../jobs/lateFees', () => ({ generateLateFeesForInvoice: lateFeeMock }))
 vi.mock('./notifications', () => ({ notifyRentReversed: notifyReversedMock }))
 vi.mock('./adminNotifications', () => ({ createAdminNotification: adminNotifyMock }))
 vi.mock('./responsibleParty', () => ({ getPropertyResponsibleParty: responsiblePartyMock }))
-vi.mock('./reversalRecovery', () => ({ decideReversalRecovery: decideRecoveryMock }))
+vi.mock('./reversalRecovery', () => ({ decideReversalRecovery: decideRecoveryMock, decideEventRecovery: decideRecoveryMock }))
+// Fix pass (rev8): a test can make the charge's paid-ahead take-back answer
+// "try again in a moment" (DisputeRetryLater); every other test runs the real one.
+const clawOverride = vi.hoisted(() => ({ fn: null as null | ((...a: any[]) => Promise<any>) }))
+vi.mock('./creditUse', async (importOriginal) => {
+  const actual = await importOriginal<any>()
+  return {
+    ...actual,
+    clawBackDisputedCharge: (...args: any[]) => (clawOverride.fn ? clawOverride.fn(...args) : actual.clawBackDisputedCharge(...args)),
+  }
+})
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease } from '../test/dbHelpers'
-import { handlePaymentReversal, resolveReversalOnTenantPayment, type PaymentReversalInput } from './paymentReversal'
+import {
+  handlePaymentReversal, resolveReversalOnTenantPayment, disputeFeeBorneCents, DISPUTE_FEE_RULE, type PaymentReversalInput,
+  disputeShareLineSql, disputeFeeLineSql,
+} from './paymentReversal'
 
 interface Ctx {
   landlordId: string; unitId: string; tenantId: string
   leaseId: string; invoiceId: string; paymentId: string
 }
 
-async function seedCtx(paymentStatus: 'settled' | 'pending' = 'settled'): Promise<Ctx> {
+async function seedCtx(paymentStatus: 'settled' | 'pending' = 'settled', o: { ownerShare?: boolean; unpaidShare?: boolean } = {}): Promise<Ctx> {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -46,6 +59,7 @@ async function seedCtx(paymentStatus: 'settled' | 'pending' = 'settled'): Promis
     const unitId = await seedUnit(c, { propertyId, landlordId })
     const tenantId = await seedTenant(c)
     const leaseId = await seedLease(c, { unitId, landlordId })
+    await c.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1, $2, 'primary')`, [leaseId, tenantId])
     const { rows: [inv] } = await c.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
        VALUES ($1,$2,$3,$4, CURRENT_DATE, 1000, 'settled') RETURNING id`,
@@ -61,6 +75,15 @@ async function seedCtx(paymentStatus: 'settled' | 'pending' = 'settled'): Promis
        RETURNING id`,
       [unitId, leaseId, tenantId, landlordId, paymentStatus, invoiceId]
     )
+    // S655: the landlord was paid an owner share on it (the batch carried it:
+    // its transfer is stamped), so GAM recovers it from them. `unpaidShare`:
+    // booked, still on GAM's balance (no batch ran yet).
+    if (o.ownerShare !== false && paymentStatus === 'settled') {
+      await c.query(
+        `INSERT INTO user_balance_ledger (user_id, type, amount, balance_after, reference_id, reference_type, stripe_transfer_id)
+         VALUES ($1, 'allocation_owner_share', 1000, 1000, $2, 'payment', $3)`,
+        [landlordUserId, pay.id, o.unpaidShare ? null : 'tr_paid_tuesday'])
+    }
     await c.query('COMMIT')
     return { landlordId, unitId, tenantId, leaseId, invoiceId, paymentId: pay.id }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
@@ -78,6 +101,23 @@ function inputFor(ctx: Ctx, eventId = 'evt_test_1'): PaymentReversalInput {
   }
 }
 
+// S655: one record per (event, row). The old one-per-event constraint goes in
+// contract step C0 (db/contract/20261003109000_credit_ledger_guards.sql); it is
+// dropped for this file only and put back after ONLY if it was there, so later
+// suites see the schema this file found — before C0 on a plain run, after C0
+// on the final run that applies it first (money plan Step 16).
+let hadOldConstraint = false
+beforeAll(async () => {
+  hadOldConstraint = (await db.query(
+    `SELECT 1 FROM pg_constraint WHERE conname = 'payment_reversals_stripe_event_id_key'`)).rowCount === 1
+  await db.query(`ALTER TABLE payment_reversals DROP CONSTRAINT IF EXISTS payment_reversals_stripe_event_id_key`)
+})
+afterAll(async () => {
+  if (!hadOldConstraint) return
+  await cleanupAllSchema()
+  await db.query(`ALTER TABLE payment_reversals ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id)`)
+})
+
 beforeEach(async () => {
   await cleanupAllSchema()
   lateFeeMock.mockClear()
@@ -85,6 +125,32 @@ beforeEach(async () => {
   adminNotifyMock.mockClear()
   responsiblePartyMock.mockClear()
   decideRecoveryMock.mockClear()
+})
+
+describe('handlePaymentReversal — "try again in a moment" (fix pass rev8)', () => {
+  it('a take-back that must wait (a refund of this money was being sent) writes nothing, raises no failure alert, and is thrown for the webhook to retry', async () => {
+    const ctx = await seedCtx('settled')
+    const { DisputeRetryLater } = await import('./creditUse')
+    clawOverride.fn = async () => { throw new DisputeRetryLater('refund_part_busy', 'A refund of this money was being sent at that same moment — try again in a moment.') }
+    try {
+      await expect(handlePaymentReversal(inputFor(ctx, 'evt_retry_later'))).rejects.toBeInstanceOf(DisputeRetryLater)
+    } finally { clawOverride.fn = null }
+    expect(adminNotifyMock.mock.calls.filter((c: any[]) => c[0]?.category === 'payment_reversal_failed')).toHaveLength(0)
+    expect((await db.query(`SELECT 1 FROM payment_reversals WHERE stripe_event_id = 'evt_retry_later'`)).rowCount).toBe(0)
+    expect((await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [ctx.paymentId])).rows[0].status).toBe('settled')
+    // The redelivery, once the refund is no longer being sent, goes through.
+    const again = await handlePaymentReversal(inputFor(ctx, 'evt_retry_later'))
+    expect(again.handled).toBe(true)
+  })
+
+  it('any other failure still raises the critical alert', async () => {
+    const ctx = await seedCtx('settled')
+    clawOverride.fn = async () => { throw new Error('boom') }
+    try {
+      await expect(handlePaymentReversal(inputFor(ctx, 'evt_boom'))).rejects.toThrow('boom')
+    } finally { clawOverride.fn = null }
+    expect(adminNotifyMock.mock.calls.filter((c: any[]) => c[0]?.category === 'payment_reversal_failed')).toHaveLength(1)
+  })
 })
 
 describe('handlePaymentReversal', () => {
@@ -157,6 +223,70 @@ describe('handlePaymentReversal', () => {
   })
 })
 
+describe('handlePaymentReversal — S655 per-row records', () => {
+  it('a reopened row keeps its lease fee and its owner: a disputed pet fee stays the landlord\'s, a GAM fee stays GAM\'s', async () => {
+    const ctx = await seedCtx('settled')
+    const fee = (await db.query<{ id: string }>(
+      `INSERT INTO lease_fees (lease_id, fee_type, amount, due_timing, is_refundable)
+       VALUES ($1, 'pet_deposit', 30, 'move_in', FALSE) RETURNING id`, [ctx.leaseId])).rows[0].id
+    const pet = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
+                             due_date, invoice_id, stripe_payment_intent_id, settled_at, lease_fee_id, notes)
+       VALUES ($1,$2,$3,$4,'fee',30,'settled','DEPOSIT',CURRENT_DATE,$5,'pi_orig',NOW(),$6,'Pet deposit') RETURNING id`,
+      [ctx.unitId, ctx.leaseId, ctx.tenantId, ctx.landlordId, ctx.invoiceId, fee])).rows[0].id
+    const gamFee = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
+                             due_date, invoice_id, stripe_payment_intent_id, settled_at, revenue_owner, notes)
+       VALUES ($1,$2,$3,$4,'fee',1,'settled','DECLINEFEE',CURRENT_DATE,$5,'pi_orig',NOW(),'gam','Declined card attempt — pi_x') RETURNING id`,
+      [ctx.unitId, ctx.leaseId, ctx.tenantId, ctx.landlordId, ctx.invoiceId])).rows[0].id
+
+    const res = await handlePaymentReversal({ ...inputFor(ctx), paymentId: null, paymentIntentId: 'pi_orig', reversedAmount: null })
+    expect(res.handled).toBe(true)
+    expect(res.rows).toHaveLength(3)
+    const reopened = await db.query<any>(
+      `SELECT r.payment_id AS orig, p.amount::float AS amount, p.lease_fee_id, p.revenue_owner, p.entry_description, p.notes
+         FROM payment_reversals r JOIN payments p ON p.reversal_id = r.id
+        WHERE r.stripe_event_id = 'evt_test_1' ORDER BY p.amount`)
+    expect(reopened.rows.map((r: any) => [r.orig, r.amount, r.lease_fee_id, r.revenue_owner, r.entry_description])).toEqual([
+      [gamFee, 1, null, 'gam', 'DECLINEFEE'],
+      [pet, 30, fee, 'landlord', 'DEPOSIT'],
+      [ctx.paymentId, 1000, null, 'landlord', 'RENT'],
+    ])
+    // The reopened line reads as the line it was.
+    expect(reopened.rows[1].notes).toBe('Pet deposit — reopened after a payment reversal')
+    // Recovery only where the landlord was paid: the rent (its owner share is booked).
+    const rec = await db.query<any>(
+      `SELECT payment_id, recovery_status FROM payment_reversals WHERE stripe_event_id = 'evt_test_1' ORDER BY reversed_amount`)
+    expect(rec.rows.map((r: any) => r.recovery_status)).toEqual(['not_needed', 'not_needed', 'pending'])
+    // One fee row, one landlord notice for the event.
+    expect((await db.query(`SELECT 1 FROM payments WHERE entry_description = 'RETURNFEE'`)).rowCount).toBe(1)
+    expect(notifyReversedMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('a row whose owner share is still on GAM\'s balance (no payout yet) is withheld, never also asked back', async () => {
+    const ctx = await seedCtx('settled', { unpaidShare: true })
+    const res = await handlePaymentReversal(inputFor(ctx))
+    expect(res.handled).toBe(true)
+    const rev = await db.query<any>(
+      `SELECT recovery_status, recovered_amount::float AS rec, outcome, status FROM payment_reversals WHERE stripe_event_id = 'evt_test_1'`)
+    expect(rev.rows).toEqual([{ recovery_status: 'recovered', rec: 1000, outcome: 'landlord_clawback', status: 'resolved' }])
+    // The share is withheld (never paid by a batch), and nothing is asked of the landlord.
+    const share = await db.query<any>(`SELECT stripe_transfer_id FROM user_balance_ledger WHERE reference_id = $1`, [ctx.paymentId])
+    expect(share.rows[0].stripe_transfer_id).toMatch(/^withheld:/)
+    expect(decideRecoveryMock).not.toHaveBeenCalled()
+    expect(res.rows[0]).toMatchObject({ landlordRecovery: false, withheld: 1000 })
+  })
+
+  it('a row whose owner share was never paid out needs no landlord recovery', async () => {
+    const ctx = await seedCtx('settled', { ownerShare: false })
+    const res = await handlePaymentReversal(inputFor(ctx))
+    expect(res.handled).toBe(true)
+    const rev = await db.query<any>(`SELECT recovery_status, status FROM payment_reversals WHERE stripe_event_id = 'evt_test_1'`)
+    expect(rev.rows).toEqual([{ recovery_status: 'not_needed', status: 'open' }])
+    expect(decideRecoveryMock).not.toHaveBeenCalled()
+  })
+})
+
 describe('resolveReversalOnTenantPayment', () => {
   async function seedRev(recoveryStatus: string, recoveredAmount: number, reversedAmount = 1000): Promise<string> {
     const c = await db.connect()
@@ -199,11 +329,87 @@ describe('resolveReversalOnTenantPayment', () => {
     expect(r).toMatchObject({ outcome: 'tenant_paid', late_fee_owner: 'gam', recovery_status: 'recovered' })
   })
 
+  it('the tenant pays again before the paid-out part was recovered: GAM keeps it and pays the landlord back the share it withheld', async () => {
+    // A second record on a row: $100 of it was withheld from the $100 the
+    // first record still owed the landlord (a netting line), the rest had
+    // gone out and was still to be recovered when the tenant paid again.
+    const revId = await seedRev('pending', 100, 300)
+    const { rows: [r0] } = await db.query<any>(`SELECT landlord_id FROM payment_reversals WHERE id = $1`, [revId])
+    await db.query(
+      `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description)
+       VALUES ($1, 'dispute', $2, -100, 'withheld')`, [r0.landlord_id, `owner_share_withheld:${revId}`])
+    const client = await db.connect()
+    try { expect(await resolveReversalOnTenantPayment(client, revId)).toBe(false) } finally { client.release() }
+    const back = await db.query<any>(
+      `SELECT landlord_id, amount::float AS a FROM held_payout_items WHERE source_type = 'dispute' AND source_id = $1`, [`owner_share_returned:${revId}`])
+    expect(back.rows).toEqual([{ landlord_id: r0.landlord_id, a: 100 }])
+    const { rows: [r] } = await db.query<any>(`SELECT recovery_status, outcome FROM payment_reversals WHERE id = $1`, [revId])
+    expect(r).toMatchObject({ recovery_status: 'not_needed', outcome: 'tenant_paid' })
+    expect(adminNotifyMock).not.toHaveBeenCalledWith(expect.objectContaining({ category: 'payment_reversal_partial_clawback_tenant_paid' }))
+    // A second call changes nothing.
+    const c2 = await db.connect()
+    try { await resolveReversalOnTenantPayment(c2, revId) } finally { c2.release() }
+    expect((await db.query(`SELECT 1 FROM held_payout_items WHERE source_id = $1`, [`owner_share_returned:${revId}`])).rowCount).toBe(1)
+  })
+
+  it('a reopened row paid from the security deposit leaves the landlord recovery standing (the deposit money is the landlord\'s)', async () => {
+    const revId = await seedRev('scheduled_netting', 0)
+    const { rows: [o] } = await db.query<any>(
+      `SELECT p.unit_id, p.tenant_id, p.landlord_id FROM payment_reversals r JOIN payments p ON p.id = r.payment_id WHERE r.id = $1`, [revId])
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, reversal_id, settled_at)
+       VALUES ($1,$2,$3,'rent',1000,'paid_via_deposit','RENT',CURRENT_DATE,$4,NOW())`, [o.unit_id, o.tenant_id, o.landlord_id, revId])
+    const client = await db.connect()
+    try { expect(await resolveReversalOnTenantPayment(client, revId)).toBe(true) } finally { client.release() }
+    const { rows: [r] } = await db.query<any>(`SELECT recovery_status, status, outcome FROM payment_reversals WHERE id = $1`, [revId])
+    expect(r).toMatchObject({ recovery_status: 'scheduled_netting', status: 'recovering', outcome: 'tenant_paid' })
+    expect((await db.query(`SELECT 1 FROM held_payout_items`)).rowCount).toBe(0)
+  })
+
   it('partial clawback → GAM keeps (false) + raises an admin reconciliation alert', async () => {
     const revId = await seedRev('scheduled_netting', 300)
     const client = await db.connect()
     try { expect(await resolveReversalOnTenantPayment(client, revId)).toBe(false) } finally { client.release() }
     expect(adminNotifyMock).toHaveBeenCalledWith(
       expect.objectContaining({ category: 'payment_reversal_partial_clawback_tenant_paid' }))
+  })
+})
+
+describe('who bears the fee a dispute took back (one rule, DISPUTE_FEE_RULE)', () => {
+  it('the rule in force is decisions #38 Q4 (Nic, FINAL): GAM keeps the fee it earned, the landlord carries the whole fee', () => {
+    expect(DISPUTE_FEE_RULE).toBe('landlord_bears_whole_fee')
+    // $6.00 fee charged, GAM's spread $3.00: the landlord carries all $6.00.
+    expect(disputeFeeBorneCents('landlord_bears_whole_fee', { feeCents: 600, spreadCents: 300, feeTaken: 600, feeTotal: 600 })).toBe(600)
+  })
+  it('under the superseded money-plan rule the landlord would carry only Stripe\'s kept cost', () => {
+    expect(disputeFeeBorneCents('gam_gives_up_spread', { feeCents: 600, spreadCents: 300, feeTaken: 600, feeTotal: 600 })).toBe(300)
+  })
+  it('a dispute that took back half the fee carries half', () => {
+    expect(disputeFeeBorneCents('gam_gives_up_spread', { feeCents: 600, spreadCents: 300, feeTaken: 300, feeTotal: 600 })).toBe(150)
+    expect(disputeFeeBorneCents('landlord_bears_whole_fee', { feeCents: 600, spreadCents: 300, feeTaken: 300, feeTotal: 600 })).toBe(300)
+  })
+})
+
+describe('the payout lines a dispute writes are told apart from a register chargeback', () => {
+  it('the share and fee predicates pick out only the reversal\'s own lines, never a chargeback on a sale', async () => {
+    const c = await db.connect()
+    let landlordId: string
+    try { landlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+    await db.query(
+      `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount) VALUES
+         ($1, 'dispute', 'owner_share_untouched:r1', 300),
+         ($1, 'dispute', 'owner_share_withheld:r2', -100),
+         ($1, 'dispute', 'owner_share_returned:r3', 994),
+         ($1, 'dispute', 'stripe_fee_kept:pi_x:' || $1::text, -6),
+         ($1, 'dispute', 'du_register_chargeback', -45),
+         ($1, 'refund', 'owner_share_untouched:not_a_dispute', 5)`, [landlordId])
+    const pick = async (where: string) => (await db.query<{ source_id: string }>(
+      `SELECT h.source_id FROM held_payout_items h WHERE ${where} ORDER BY h.source_id`)).rows.map(r => r.source_id)
+    expect(await pick(disputeShareLineSql('h'))).toEqual(
+      ['owner_share_returned:r3', 'owner_share_untouched:r1', 'owner_share_withheld:r2'])
+    expect(await pick(disputeFeeLineSql('h'))).toEqual([`stripe_fee_kept:pi_x:${landlordId}`])
+    // What is left of 'dispute' is the chargeback alone.
+    expect(await pick(`h.source_type = 'dispute' AND NOT ${disputeShareLineSql('h')} AND NOT ${disputeFeeLineSql('h')}`))
+      .toEqual(['du_register_chargeback'])
   })
 })

@@ -4,19 +4,11 @@ import { Router } from 'express'
 import { query } from '../db'
 import { requireAuth, requireLandlord, requireAdmin } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordTarget, landlordScopeIds } from '../lib/landlordScope'
+import { resolveLandlordTarget, landlordScopeIds, ownsLandlord } from '../lib/landlordScope'
 import { getInvestorPortfolio, recordLotRentPaid, accrueLotRentCharges } from '../services/lotRent'
 
 export const lotRentRouter = Router()
 lotRentRouter.use(requireAuth)
-
-function landlordScope(req: any): string {
-  // S633: an account is not an entity. `?entityId=` names one; otherwise the
-  // account's only company is used, and an account that owns several is asked
-  // which rather than being silently put on whichever one the session sat on.
-  // resolveLandlordTarget does the ownership check either way.
-  return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
-}
 
 /**
  * S637 (Nic, on a two-company account): GET /lot-rent/portfolio answered
@@ -25,7 +17,7 @@ function landlordScope(req: any): string {
  * Expenses tab could not; the WRITE resolver was scoping a list.
  *
  * S633's rule has two halves and this route only had one: READS span every
- * entity the account owns, WRITES take an explicit authorised target. A read
+ * entity the account owns, WRITES take an explicit authorized target. A read
  * narrows only when ?entityId= names one, and that path still goes through the
  * same resolver, so an entity the account does not own is still a 403.
  */
@@ -64,7 +56,18 @@ lotRentRouter.get('/charges', requireLandlord, async (req: any, res, next) => {
 // (the operator paid the external park directly; GAM moves no money).
 lotRentRouter.post('/charges/:id/record-paid', requireLandlord, async (req: any, res, next) => {
   try {
-    await recordLotRentPaid(req.params.id, landlordScope(req))
+    // S654: the charge row names its company, so a several-company account is
+    // never asked which. Another account's charge reads as missing (404).
+    const id = String(req.params.id || '')
+    const rows = /^[0-9a-f-]{36}$/i.test(id)
+      ? await query<{ landlord_id: string }>(`SELECT landlord_id FROM lot_rent_charges WHERE id = $1`, [id])
+      : []
+    // S654 (review): a GAM admin acting from the landlord screens keeps the access it had.
+    const admin = req.user?.role === 'admin' || req.user?.role === 'super_admin'
+    if (!rows.length || !(ownsLandlord(req.user, rows[0].landlord_id) || admin)) {
+      throw new AppError(404, 'Lot-rent charge not found, already paid, or not yours')
+    }
+    await recordLotRentPaid(id, rows[0].landlord_id)
     res.json({ success: true, data: { id: req.params.id, status: 'paid' } })
   } catch (e) { next(e) }
 })

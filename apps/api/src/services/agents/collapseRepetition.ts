@@ -23,7 +23,7 @@
  * touched, because neither produces the same sentence twice in a row.
  */
 
-/** Normalised for comparison only — the ORIGINAL text is what survives. */
+/** Normalized for comparison only — the ORIGINAL text is what survives. */
 function key(sentence: string): string {
   return sentence.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 }
@@ -47,7 +47,7 @@ export function collapseRepetition(reply: string): CollapseResult {
   if (!parts || parts.length < 3) return { reply, removed: 0, degenerate: false }
 
   // A SLIDING WINDOW, not an adjacency check. The real Lucy loop alternated —
-  // "A. B. A. B. A. B." — so no two IDENTICAL sentences were ever neighbours and
+  // "A. B. A. B. A. B." — so no two IDENTICAL sentences were ever neighbors and
   // a naive lastKey comparison caught nothing. What identifies a loop is a
   // sentence reappearing SOON, not immediately.
   //

@@ -21,11 +21,12 @@ import { z } from 'zod'
 import { db, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 export const publicCardUpdateRouter = Router()
 
 function stripe(): Stripe {
-  return new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' })
+  return new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' })
 }
 
 interface TokenRow {

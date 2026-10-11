@@ -20,7 +20,7 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant,
   seedProperty, seedUnit,
-  seedLease, seedLeaseTenant,
+  seedLease, seedLeaseTenant, seedUserBankAccount, seedPmCompany,
 } from '../test/dbHelpers'
 
 beforeEach(async () => {
@@ -225,6 +225,47 @@ describe('processPlatformFeeAccrual', () => {
     })
   })
 
+  // S650 (Nic): the fee was recognized as revenue and never charged to anybody
+  // — the payout nets what the landlord OWES, and nothing wrote that down.
+  it('charges the landlord for the fee, so a payout can net it out', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await processPlatformFeeAccrual(RUN_DATE)
+
+    const charge = await db.query<{ kind: string; amount: string; collected_amount: string }>(
+      `SELECT kind, amount::text, collected_amount::text FROM landlord_gam_charges
+        WHERE landlord_id = $1`, [stack.landlordId])
+    expect(charge.rows).toHaveLength(1)
+    expect(charge.rows[0]).toMatchObject({ kind: 'subscription', amount: '12.00', collected_amount: '0.00' })
+  })
+
+  it('re-running the month does not charge the landlord twice', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    await processPlatformFeeAccrual(RUN_DATE)
+    const charge = await db.query(`SELECT id FROM landlord_gam_charges WHERE landlord_id = $1`, [stack.landlordId])
+    expect(charge.rows).toHaveLength(1)
+  })
+
+  // ── S650 (Nic), REPLACING S576 ──────────────────────────────────────────
+  // "The hibernating leases don't get billed anything from the landlord to the
+  // tenant, but we bill from the platform to the landlord. Those are still an
+  // active spot... I cannot put another lease in that spot while there's the
+  // hibernated spot."
+  it('a hibernating lease still carries the platform fee — the spot is occupied', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await db.query(
+      `UPDATE leases SET is_hibernating = TRUE, hibernated_at = NOW() - interval '90 days'
+        WHERE unit_id IN (SELECT id FROM units WHERE property_id = $1 LIMIT 2)`,
+      [stack.propertyId])
+
+    const result = await processPlatformFeeAccrual(RUN_DATE)
+    expect(result.feesAccrued).toBe(1)
+    const accrual = await db.query<{ total_billable: number; total_amount: string }>(
+      `SELECT total_billable, total_amount::text FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(accrual.rows[0]).toMatchObject({ total_billable: 6, total_amount: '12.00' })
+  })
+
   // S607 (Nic, DIRECTIVE): the tenant-payer branch is GONE — not by deleting the
   // code path, but by making the state unreachable. "The landlord cannot toggle
   // the platform fee because when we change for volume discounts or things like
@@ -245,6 +286,17 @@ describe('processPlatformFeeAccrual', () => {
     const accrual = await db.query<{ payer: string }>(
       `SELECT payer FROM platform_fee_accruals WHERE property_id=$1`, [stack.propertyId])
     expect(accrual.rows[0].payer).toBe('landlord')
+  })
+
+  // S654: the billing month comes from the Phoenix calendar. 1 am UTC on
+  // Oct 1 is 6 pm Sep 30 in Phoenix, so a run then bills September.
+  it('a run on the evening of Sep 30 in Phoenix bills September, not October', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    const result = await processPlatformFeeAccrual(new Date('2026-10-01T01:00:00Z'))
+    expect(result.monthScanned).toBe('2026-09-01')
+    const accrual = await db.query<{ accrual_month: string }>(
+      `SELECT accrual_month::text FROM platform_fee_accruals WHERE property_id=$1`, [stack.propertyId])
+    expect(accrual.rows.map((r) => r.accrual_month)).toEqual(['2026-09-01'])
   })
 
   it('idempotent: re-running the same month returns skippedAlreadyAccrued and writes no extra rows', async () => {
@@ -371,11 +423,15 @@ describe('processPlatformFeeAccrual', () => {
       )
       unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
       await client.query(
+        // S652: cancelled BEFORE arrival, which is what this test has always
+        // meant by "cancelled" — the guest never came. A cancellation stamped
+        // after check-in is a different animal and bills (see the S652 block
+        // at the end of this file).
         `INSERT INTO unit_bookings
            (unit_id, landlord_id, lease_type, status,
-            check_in, check_out, nights)
+            check_in, check_out, nights, cancelled_at)
          VALUES ($1, $2, 'nightly', 'cancelled',
-                 '2026-05-05', '2026-05-15', 10)`,
+                 '2026-05-05', '2026-05-15', 10, '2026-05-01T12:00:00Z')`,
         [unitId, landlordId]
       )
     } finally {
@@ -701,7 +757,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
-    // Trash AND electric on the one neighbour space.
+    // Trash AND electric on the one neighbor space.
     expect(rows[0].utility_service_unit_count).toBe(1)
   })
 
@@ -860,18 +916,19 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
         [agreementId, bLeaseId])
     } finally { c2.release() }
 
-    // A fresh cycle, so both properties accrue again. In arrears the 1 July
-    // run is the one that bills June — RUN_DATE above already billed May.
+    // A fresh cycle, so both properties accrue again. S650: the lease side is
+    // billed for the month the run is IN, so the 1 July run bills July —
+    // RUN_DATE above already billed June.
     await processPlatformFeeAccrual(new Date('2026-07-01T08:00:00Z'))
 
     const { rows: aAfter } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals
-        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [A.propertyId])
+        WHERE property_id = $1 AND accrual_month = '2026-07-01'`, [A.propertyId])
     const { rows: bAfter } = await db.query<any>(
       `SELECT long_term_unit_count, total_billable
          FROM platform_fee_accruals
-        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [B.propertyId])
+        WHERE property_id = $1 AND accrual_month = '2026-07-01'`, [B.propertyId])
 
     // It left A…
     if (aAfter.length > 0) expect(aAfter[0].utility_service_unit_count).toBe(0)
@@ -888,5 +945,204 @@ describe('the STR revenue fee is 3% (S616)', () => {
     const { rows } = await db.query<any>(
       `SELECT str_fee_pct::text FROM platform_fee_config WHERE effective_until IS NULL`)
     expect(Number(rows[0].str_fee_pct)).toBe(0.03)
+  })
+})
+
+// ── S645 — A MANAGED PROPERTY IS BILLED TO THE MANAGER ────────────────────
+//
+// Nic (S644, DIRECTIVE): GAM bills "the PM company — one bill" for every
+// occupied unit across all their owners. And (S645) the manager decides whether
+// that cost lives in their management contract or is handed to the owner:
+// "I'm assuming most people will choose to have it included in the contract —
+// they've priced in software to do their business. But in case anybody wants to
+// pass it through, it lets the owner know exactly where part of that money is
+// going."
+describe('a property under a property manager', () => {
+  async function managed(opts: {
+    unitCount?: number
+    pmRate?: number | null            // GAM's negotiated rate TO the manager
+  }) {
+    const stack = await buildPlatformStack({ unitCount: opts.unitCount ?? 1 })
+    const client = await getClient()
+    try {
+      const bankId = await seedUserBankAccount(client, { userId: stack.ownerUserId })
+      const pmId = await seedPmCompany(client, { bankAccountId: bankId, name: 'Big PM' })
+      // The trigger opens the relationship when the property joins the manager.
+      await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`,
+        [stack.propertyId, pmId])
+      if (opts.pmRate != null) {
+        await client.query(
+          `INSERT INTO pm_company_platform_fee_overrides (pm_company_id, rate_per_unit, reason)
+           VALUES ($1,$2,'bulk deal')`, [pmId, opts.pmRate])
+      }
+      return { ...stack, pmCompanyId: pmId }
+    } finally { client.release() }
+  }
+
+  it('sends the bill to the manager, not the owner', async () => {
+    const s = await managed({})
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT billed_pm_company_id, landlord_id FROM platform_fee_accruals
+        WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].billed_pm_company_id).toBe(s.pmCompanyId)
+    // The owner's id stays on it. That is what lets ONE bill be broken down by
+    // owner without a second table.
+    expect(row.rows[0].landlord_id).toBe(s.landlordId)
+  })
+
+  it('prices it on the manager\'s deal, not the list rate', async () => {
+    // Nic's own example: 11,000 units at 50 cents rather than $2. Enough units
+    // here that the $10 per-Connect-account floor does not bind, so the rate is
+    // what is actually being tested: 25 × $0.50 = $12.50.
+    const s = await managed({ unitCount: 25, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT rate_per_unit::float AS rate, total_amount::float AS total
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].rate).toBe(0.5)
+    expect(row.rows[0].total).toBe(12.5)
+  })
+
+  it('still floors a small manager-rate property at the Connect minimum', async () => {
+    // Worth pinning because a bulk rate makes the floor bite far more often:
+    // 3 units at 50 cents is $1.50, and the $10 minimum per PAYOUT SETUP (S630)
+    // tops it up. That is existing, deliberate behavior — the floor is on the
+    // banking setup, not the address — but a manager negotiating cents per unit
+    // should know the floor is what they will actually pay on small owners.
+    const s = await managed({ unitCount: 3, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT rate_per_unit::float AS rate, total_amount::float AS total,
+              connect_min_topup::float AS topup
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].rate).toBe(0.5)
+    expect(row.rows[0].total).toBe(10)
+    expect(row.rows[0].topup).toBe(8.5)
+  })
+
+
+
+
+  it('leaves an unmanaged property billed to its owner exactly as before', async () => {
+    const s = await buildPlatformStack({ unitCount: 2 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT billed_pm_company_id, rate_per_unit::float AS rate
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].billed_pm_company_id).toBeNull()
+    expect(row.rows[0].rate).toBe(2)
+  })
+})
+
+/**
+ * S652 — owner-occupied spaces are occupied.
+ *
+ * Nic, correcting me: "we absolutely charge the landlords for owner occupied
+ * units. We don't charge for vacant units. We charge for anything occupied, no
+ * matter the status."
+ *
+ * The count is lease-driven and an owner_use space deliberately has no lease —
+ * that is the anti-cheat, so nobody can park a relative in a spot and call it
+ * rented. "No lease" was quietly doing a second job it was never meant to do:
+ * making the space free to run.
+ */
+describe('S652: an owner-occupied space is billed', () => {
+  it('bills a space the landlord lives in, which has no lease by design', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    // A second space, owner-occupied: no lease, not vacant.
+    await db.query(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type)
+       VALUES ($1, $2, 'OWNER 1', 'owner_use', 0, 'mobile_home')`,
+      [stack.propertyId, stack.landlordId])
+
+    const result = await processPlatformFeeAccrual(RUN_DATE)
+    expect(result.errors).toHaveLength(0)
+
+    const { rows } = await db.query<{ total_billable: number }>(
+      `SELECT total_billable FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    // The leased one plus the owner-occupied one.
+    expect(rows[0].total_billable).toBe(2)
+  })
+
+  it('still charges nothing for a vacant space', async () => {
+    // The only free space is an empty one.
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await db.query(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type)
+       VALUES ($1, $2, 'EMPTY 1', 'vacant', 0, 'mobile_home')`,
+      [stack.propertyId, stack.landlordId])
+
+    await processPlatformFeeAccrual(RUN_DATE)
+    const { rows } = await db.query<{ total_billable: number }>(
+      `SELECT total_billable FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(rows[0].total_billable).toBe(1)
+  })
+})
+
+/**
+ * S652 — a stay cancelled after arrival is a stay.
+ *
+ * Nights bill in arrears and the accrual runs on the 1st, so excluding any
+ * booking whose status said 'cancelled' — with no check on WHEN — was a free
+ * month for the asking: let them stay, take the money, cancel on the 30th.
+ *
+ * Nic's rule: "If somebody cancels that stay prior to the date of the
+ * reservation, then those nights don't get counted for the aggregate... if the
+ * reservation was never cancelled, we have no way to know." Cutoff, after he
+ * thought about it aloud: "before check-in day, the day before check-in."
+ *
+ * And no-show is out of billing entirely — "if they just don't show up, that's
+ * not really GAM's problem." The site was held either way.
+ */
+describe('S652: when a booking was cancelled decides whether its nights bill', () => {
+  async function rvStay(stack: any, opts: { status?: string; cancelledAt?: string | null }) {
+    const unit = await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type, nightly_rate)
+       VALUES ($1,$2,$3,'vacant',0,'rv_spot',40) RETURNING id`,
+      [stack.propertyId, stack.landlordId, `RV-${Math.random().toString(36).slice(2, 7)}`])
+    await db.query(
+      `INSERT INTO unit_bookings
+         (unit_id, landlord_id, guest_name, lease_type, check_in, check_out, nights,
+          total_amount, status, cancelled_at)
+       VALUES ($1,$2,'Dale Carter','nightly','2026-05-10','2026-05-20',10,400,$3,$4)`,
+      [unit.rows[0].id, stack.landlordId, opts.status ?? 'confirmed', opts.cancelledAt ?? null])
+  }
+
+  const nightsBilled = async (propertyId: string) => {
+    const { rows } = await db.query<{ n: number }>(
+      `SELECT short_stay_nights AS n FROM platform_fee_accruals WHERE property_id=$1`, [propertyId])
+    return rows[0]?.n ?? 0
+  }
+
+  it('bills nights for a stay cancelled the day it started', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-10T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
+  })
+
+  it('bills nights for a stay cancelled after it ended', async () => {
+    // The whole exploit: let them stay, then cancel before the 1st.
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-30T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
+  })
+
+  it('does NOT bill a stay cancelled the day before arrival', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-09T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(0)
+  })
+
+  it('bills a no-show, because the site was held either way', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'no_show' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
   })
 })

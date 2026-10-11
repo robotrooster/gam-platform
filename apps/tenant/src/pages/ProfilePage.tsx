@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
-import { isCriticalNotificationType } from '@gam/shared'
+import { isCriticalNotificationType, PASSWORD_MIN_LEN } from '@gam/shared'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -9,6 +10,14 @@ const api = axios.create({ baseURL: `${API_URL}/api` })
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 function get<T>(path: string): Promise<T> { return api.get(path).then(r => r.data?.data ?? r.data) }
 function patchReq(path: string, body: any) { return api.patch(path, body).then(r => r.data) }
+function putReq(path: string, body: any) { return api.put(path, body).then(r => r.data?.data ?? r.data) }
+
+// The server's sentences for a 401 that means the session itself has ended:
+// no pass ("No token provided"), a bad or expired one ("Invalid or expired
+// token", "Unauthenticated"), or one minted before a password change ("Your
+// password was changed. Please sign in again."). A locked account is also a
+// 401, but the pass still works, so it is NOT one of these.
+const SESSION_ENDED = /password was changed|session|token|unauthenticated/i
 
 const NOTIF_TYPES = [
   { type:'payment_failed',              label:'Payment Failed',         desc:'When your rent payment fails' },
@@ -20,7 +29,7 @@ const NOTIF_TYPES = [
 
 export function ProfilePage() {
   const qc = useQueryClient()
-  const [tab, setTab]     = useState<'profile'|'notifications'|'security'|'customize'>('profile')
+  const [tab, setTab]     = useUrlTab('tab', 'profile', ['profile','notifications','security','customize'] as const)
   const [saved, setSaved] = useState('')
   const [bio, setBio]           = useState('')
   const [accent, setAccent]     = useState('#c9a227')
@@ -80,10 +89,36 @@ export function ProfilePage() {
     { onSuccess: () => { qc.invalidateQueries('notif-prefs-tenant'); setSaved('pref'); setTimeout(() => setSaved(''), 2000) } }
   )
 
+  // A password change ends every session minted before it — including the one
+  // this page is using — so the server hands back a fresh pass and it replaces
+  // the old one here. Without that, the next check of the session signed the
+  // tenant out for changing their own password. Every request reads the pass
+  // from storage, so nothing else needs telling.
   const pwMut = useMutation(
     () => patchReq('/tenants/password', { currentPassword: pwCurrent, newPassword: pwNew }),
-    { onSuccess: () => { setPwCurrent(''); setPwNew(''); setPwConfirm(''); setSaved('pw'); setTimeout(() => setSaved(''), 2500) },
-      onError: () => setPwError('Incorrect current password') }
+    { onSuccess: (res: any) => {
+        const fresh = res?.data?.token
+        if (typeof fresh === 'string' && fresh) localStorage.setItem('gam_tenant_token', fresh)
+        setPwError(''); setPwCurrent(''); setPwNew(''); setPwConfirm(''); setSaved('pw'); setTimeout(() => setSaved(''), 4000)
+      },
+      // This page's own client has no sign-out-on-401 and does not copy the
+      // server's sentence into err.message, so both are done here. Only a
+      // session that has itself ended signs the tenant out: the pass is gone,
+      // expired, or older than a password change. Every other refusal — a
+      // wrong current password (400), or an account locked by too many
+      // sign-in attempts (401, while this pass still works) — shows the
+      // server's own sentence here and keeps the pass, so the tenant is never
+      // thrown out of the portal without being told why.
+      onError: (err: any) => {
+        const said = err?.response?.data?.error
+        const sentence = typeof said === 'string' ? said.trim() : ''
+        if (err?.response?.status === 401 && (!sentence || SESSION_ENDED.test(sentence))) {
+          localStorage.removeItem('gam_tenant_token')
+          window.location.href = '/login'
+          return
+        }
+        setPwError(sentence || 'Could not change your password. Please try again.')
+      } }
   )
 
   // ── Email-2FA (S571) ────────────────────────────────────────────────────
@@ -137,6 +172,7 @@ export function ProfilePage() {
 
       {tab === 'profile' && (
         <div style={{ maxWidth:440 }}>
+          <EmergencyContactCard />
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
             <div>
               <label style={s('First Name')}>First Name</label>
@@ -299,21 +335,29 @@ export function ProfilePage() {
 
           {[
             { label:'Current Password', val:pwCurrent, set:setPwCurrent, type:'password' },
-            { label:'New Password', val:pwNew, set:setPwNew, type:'password' },
+            { label:'New Password', val:pwNew, set:setPwNew, type:'password', minHint:true },
             { label:'Confirm New Password', val:pwConfirm, set:setPwConfirm, type:'password' },
           ].map(f => (
             <div key={f.label} style={{ marginBottom:14 }}>
               <label style={s(f.label)}>{f.label}</label>
               <input className="input" type={f.type} value={f.val} onChange={e => { f.set(e.target.value); setPwError('') }} style={{ width:'100%' }} />
+              {/* The same minimum the server enforces (PASSWORD_MIN_LEN) — every password door uses one number. */}
+              {f.minHint && (
+                <div style={{ fontSize:'.72rem', marginTop:5, color: pwNew && pwNew.length < PASSWORD_MIN_LEN ? 'var(--red)' : 'var(--text-3)' }}>
+                  {pwNew && pwNew.length < PASSWORD_MIN_LEN
+                    ? `At least ${PASSWORD_MIN_LEN} characters. Add ${PASSWORD_MIN_LEN - pwNew.length} more.`
+                    : `At least ${PASSWORD_MIN_LEN} characters.`}
+                </div>
+              )}
             </div>
           ))}
           {pwError && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10, display:'flex', alignItems:'center', gap:6 }}><AlertCircle size={12} /> {pwError}</div>}
-          {pwNew && pwConfirm && pwNew !== pwConfirm && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>Passwords do not match</div>}
+          {pwNew && pwConfirm && pwNew !== pwConfirm && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>The two new passwords do not match. Type the same new password in both boxes.</div>}
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            <button className="btn btn-primary" disabled={!pwCurrent || !pwNew || pwNew !== pwConfirm || pwMut.isLoading} onClick={() => pwMut.mutate()}>
+            <button className="btn btn-primary" disabled={!pwCurrent || !pwNew || pwNew.length < PASSWORD_MIN_LEN || pwNew !== pwConfirm || pwMut.isLoading} onClick={() => pwMut.mutate()}>
               {pwMut.isLoading ? <span className="spinner" /> : 'Update Password'}
             </button>
-            {saved==='pw' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Updated</span>}
+            {saved==='pw' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Password changed. You stay signed in here; other devices will need to sign in again.</span>}
           </div>
         </div>
       )}
@@ -342,6 +386,93 @@ export function ProfilePage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * S640 — "who should we call?", answered by the person themselves.
+ *
+ * Nic: "if there's no emergency contact on the leases, then we send the sort of
+ * survey in the tenant portal... just a name and phone number and that basic
+ * stuff."
+ *
+ * The other end of the yearly check. Sits at the top of the profile tab when
+ * there is nothing on file, because that is the state worth interrupting for,
+ * and quietly further down once it is answered. Saving counts as confirming —
+ * a resident telling us it is right IS the confirmation, and asking them to
+ * click a second button to say so would be inventing a step.
+ */
+function EmergencyContactCard() {
+  const qc = useQueryClient()
+  const { data: ec, isLoading } = useQuery<any>('tenant-emergency-contact',
+    () => get<any>('/emergency-contacts/mine'))
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [rel, setRel] = useState('')
+  const [touched, setTouched] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (ec && !touched) {
+      setName(ec.name ?? ''); setPhone(ec.phone ?? ''); setRel(ec.relationship ?? '')
+    }
+  }, [ec, touched])
+
+  const save = useMutation(
+    () => putReq('/emergency-contacts/mine', { name, phone, relationship: rel }),
+    {
+      onSuccess: () => { setErr(null); setTouched(false); qc.invalidateQueries('tenant-emergency-contact') },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save that.'),
+    })
+
+  if (isLoading) return null
+  const missing = !ec?.phone
+  // The API camelizes on the way out — reading confirmed_at here would be
+  // undefined forever, which is the exact bug the wire-contract guard exists
+  // to catch (it caught this one).
+  const confirmed = ec?.confirmedAt
+
+  return (
+    <div style={{
+      marginBottom: 18, padding: '14px 16px', borderRadius: 10,
+      background: missing ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+      border: `1px solid ${missing ? 'rgba(201,162,39,.3)' : 'var(--border-0)'}`,
+    }}>
+      <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
+        Emergency contact
+      </div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        {missing
+          ? 'If there were ever an emergency here, who should we call for you?'
+          : confirmed
+            ? `Confirmed ${new Date(confirmed).toLocaleDateString()}. Update it any time it changes.`
+            : 'Please check this is still right.'}
+      </div>
+      <div style={{ display: 'grid', gap: 8 }}>
+        <input value={name} placeholder="Their name"
+          onChange={e => { setTouched(true); setName(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+        <input value={phone} placeholder="Their phone number" inputMode="tel"
+          onChange={e => { setTouched(true); setPhone(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+        <input value={rel} placeholder="How you know them (optional)"
+          onChange={e => { setTouched(true); setRel(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+      </div>
+      {err && (
+        <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #ef4444)', display:'flex', gap:5, alignItems:'center' }}>
+          <AlertCircle size={12} /> {err}
+        </div>
+      )}
+      <button type="button" disabled={save.isLoading || (!touched && !missing)}
+        onClick={() => save.mutate()}
+        style={{ marginTop: 10, padding:'8px 16px', borderRadius:8, border:'none', fontSize:'.8rem', fontWeight:700,
+                 cursor: save.isLoading ? 'default' : 'pointer',
+                 background: (touched || missing) ? 'var(--gold)' : 'var(--bg-3)',
+                 color: (touched || missing) ? 'var(--bg-0)' : 'var(--text-3)' }}>
+        {save.isLoading ? 'Saving…' : touched ? 'Save' : missing ? 'Save' : 'Saved'}
+      </button>
     </div>
   )
 }

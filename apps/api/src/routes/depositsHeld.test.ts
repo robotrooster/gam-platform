@@ -97,3 +97,23 @@ describe('GET /reports/tax-summary — deposits held', () => {
     expect(await held()).toBe(0)
   })
 })
+
+// S655: a deposit is held for the tenant under either switch — never inside
+// the income total, always beside it.
+describe('deposits stay out of income under both bases', () => {
+  it('a settled deposit is beside the tax summary total, never in it', async () => {
+    const y = new Date().getFullYear()
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, revenue_owner)
+       VALUES ($1,$2,$3,$4,'deposit',500,'settled','DEPOSIT',$5::date,($5::date + TIME '12:00') AT TIME ZONE 'America/Phoenix','held')`,
+      [unitId, leaseId, tenantId, landlordId, `${y}-02-01`])
+    for (const basis of ['received', 'billed']) {
+      const res = await request(buildApp())
+        .get(`/api/reports/tax-summary?year=${y}&landlordId=${landlordId}&basis=${basis}`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.income.totalRent).toBe(0)
+      expect(res.body.data.beside.find((b: any) => b.key === 'depositsHeld').amount).toBe(500)
+    }
+  })
+})

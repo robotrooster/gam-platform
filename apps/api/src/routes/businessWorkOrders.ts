@@ -648,7 +648,7 @@ businessWorkOrdersRouter.post('/:id/transition', requireAuth, async (req, res, n
       throw new AppError(409, `Cannot transition from ${wo.status} to ${body.toStatus}`)
     }
     if (body.toStatus === 'cancelled' && !body.cancelReason) {
-      throw new AppError(400, 'cancelReason required when cancelling')
+      throw new AppError(400, 'cancelReason required when canceling')
     }
 
     const setClauses: string[] = [`status = $1`]

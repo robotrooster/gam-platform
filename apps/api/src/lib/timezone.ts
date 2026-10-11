@@ -53,3 +53,42 @@ export function localDateTimeToUtc(localISO: string, tz: string): Date {
   const asUTC = new Date(localISO + 'Z')
   return new Date(asUTC.getTime() - offsetMin * 60 * 1000)
 }
+
+/**
+ * S654: today's calendar date where the PROPERTY is. A final utility invoice
+ * written at 5:30 pm in Phoenix was dated tomorrow, because `new Date()
+ * .toISOString()` is UTC and UTC had already turned over. Any "today" that
+ * lands on an invoice, a due date or a bill must come from the property's
+ * clock, never the server's UTC clock.
+ */
+export function todayIn(tz: string | null | undefined): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || 'America/Phoenix', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date())
+}
+
+/**
+ * S654: the calendar date of an INSTANT where the property is — e.g. the day a
+ * payment landed, in the property's own calendar. `instant` defaults to now.
+ */
+export function dateIn(tz: string | null | undefined, instant: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || 'America/Phoenix', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(instant)
+}
+
+/**
+ * S654: calendar arithmetic on a 'YYYY-MM-DD' date. No clock and no zone is
+ * involved — the date is treated as a plain calendar day, so adding 30 days to
+ * a local "today" gives a local date 30 days on, on any server.
+ */
+export function addDaysTo(ymd: string, days: number): string {
+  const [y, m, d] = ymd.slice(0, 10).split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d + days))
+  return t.toISOString().slice(0, 10)
+}
+
+/** S654: the first day of the month a 'YYYY-MM-DD' date falls in. */
+export function monthStartOf(ymd: string): string {
+  return `${ymd.slice(0, 7)}-01`
+}

@@ -4,6 +4,10 @@ import { UserRole, LandlordAssignableRole } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { AppError } from './errorHandler'
 import { isPosLimitedRequestAllowed } from '../lib/posLock'
+import {
+  isBookkeeperRequestAllowed, bookkeeperResponseIsScrubbed, scrubPersonFields,
+  BOOKKEEPER_REFUSAL, BOOKKEEPER_GRANTED_PERMS,
+} from '../lib/bookkeeperAccess'
 
 export interface AuthPayload {
   userId:      string
@@ -39,6 +43,20 @@ export interface AuthPayload {
   // requireAuth constrains such sessions to the register surface (see
   // isPosLimitedRequestAllowed). Absent/false on every normal session.
   posLimited?: boolean
+  // 10/11 (Nic): a bookkeeper's properties within their company, read fresh
+  // from bookkeeper_scopes by requireAuth on every request. null = every
+  // property the company owns; [] = no scope row (sees nothing). Absent on
+  // every other role. See lib/bookkeeperAccess.ts.
+  bookkeeperPropertyIds?: string[] | null
+  // S655: 'fixed' — ends SESSION_TTL_SECONDS after sign-in, never extended;
+  // 'rolling' — renewed while in use. Absent on a pass minted before S655 (read
+  // through policyOfPass in lib/sessionToken.ts). Type only: requireAuth does
+  // not enforce it; jwt.verify already enforces exp, and /auth/refresh refuses
+  // to extend a fixed pass.
+  sp?: 'fixed' | 'rolling'
+  // Standard JWT times, present on every verified pass.
+  iat?: number
+  exp?: number
 }
 
 declare global {
@@ -74,7 +92,50 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     if ((payload as any).posLimited && !isPosLimitedRequestAllowed(req.method, req.originalUrl)) {
       return res.status(403).json({ success: false, error: 'This action requires a full sign-in, not a register passcode.' })
     }
+    // 10/5 — a pass minted before the account's sessions_valid_from is dead on
+    // EVERY route, not only at /auth/me and /auth/refresh. A password reset, a
+    // retired account and a reset applicant all stamp that column; before this,
+    // the old pass kept working on every other endpoint until it expired or the
+    // portal happened to reload. Whole-second compare: iat is whole seconds and
+    // the invite activation stamps the column and mints the new pass in the
+    // same request (see assertPassPostdatesPasswordChange in routes/auth.ts).
+    if (payload.userId && typeof payload.iat === 'number') {
+      const cutoffMs = await sessionCutoffMs(payload.userId)
+      if (cutoffMs !== null && payload.iat < Math.floor(cutoffMs / 1000)) {
+        return res.status(401).json({ success: false, error: 'Your session has ended. Please sign in again.' })
+      }
+    }
     req.user = payload
+    // 10/11 (Nic): a bookkeeper sees money in, money out, receipts and
+    // maintenance costs — nothing else. Deny by default, the cashier's rule
+    // (lib/bookkeeperAccess.ts), then pin the request to their company and
+    // properties as the scope table says NOW (a revoke or a narrowed scope
+    // takes effect on the next request, not at the next sign-in).
+    if (payload.role === 'bookkeeper') {
+      if (!isBookkeeperRequestAllowed(req.method, req.originalUrl)) {
+        return res.status(403).json({ success: false, error: BOOKKEEPER_REFUSAL })
+      }
+      const scoped = await bookkeeperScopeFor(payload, req.headers['x-client-id'])
+      // Their own sign-in, and the list of clients they keep, answer even when
+      // Books remembers a company they no longer keep: the client list is how
+      // they pick again, so refusing it would strand them with no switcher.
+      const path = (req.originalUrl || '').split('?')[0]
+      const pickAgain = /^\/api\/auth(\/|$)/.test(path) || /^\/api\/books\/bookkeeper\/clients\/?$/.test(path)
+      if (scoped === 'not_theirs' && !pickAgain) {
+        return res.status(403).json({ success: false, error: 'You are not assigned to that company\'s books.' })
+      }
+      const row = scoped === 'not_theirs' ? null : scoped
+      req.user = {
+        ...payload,
+        landlordId: row?.landlord_id ?? null,
+        bookkeeperPropertyIds: row ? (row.property_ids ?? null) : [],
+      }
+      if (bookkeeperResponseIsScrubbed(req.originalUrl)) {
+        const send = res.json.bind(res)
+        res.json = (body: any) => send(scrubPersonFields(body))
+      }
+      return next()
+    }
     // S629 (CRITICAL) — ENTITY MEMBERSHIP IS REFRESHED FROM THE DATABASE.
     //
     // `landlordIds` is minted at login and then frozen for the life of the
@@ -100,11 +161,91 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       try {
         req.user = { ...payload, landlordIds: await currentLandlordIds(payload) }
       } catch { /* the token's own list still stands */ }
+      // S652: a landlord GAM cannot collect from loses the portal until they
+      // sort it out. Checked here so it covers every endpoint at once rather
+      // than being remembered at a few hundred call sites.
+      const locked = await lockedLandlordFor(req.user!)
+      if (locked && !isLockEscapeRoute(req.method, req.originalUrl)) {
+        return res.status(402).json({
+          success: false,
+          error: 'Your account is on hold. Please contact GAM support to restore access.',
+          code: 'ACCOUNT_LOCKED',
+          lockedReason: locked.reason,
+        })
+      }
     }
     next()
   } catch {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' })
   }
+}
+
+/**
+ * 10/11: the bookkeeper_scopes row a bookkeeper's request acts under.
+ *
+ * GAM Books names the company with X-Client-Id (a bookkeeper may keep more
+ * than one client's books there); a header naming a company they do not keep
+ * is 'not_theirs'. With no header: the company on their pass, else their
+ * oldest assignment. null = no assignment at all (they see nothing).
+ */
+async function bookkeeperScopeFor(
+  payload: AuthPayload,
+  header: string | string[] | undefined,
+): Promise<{ landlord_id: string; property_ids: string[] | null } | null | 'not_theirs'> {
+  const named = Array.isArray(header) ? header[0] : header
+  const rows = await query<{ landlord_id: string; property_ids: string[] | null }>(
+    `SELECT landlord_id, property_ids FROM bookkeeper_scopes
+      WHERE user_id = $1 ORDER BY created_at, id`, [payload.userId])
+  if (named) return rows.find(r => r.landlord_id === named) ?? 'not_theirs'
+  return rows.find(r => r.landlord_id === payload.landlordId) ?? rows[0] ?? null
+}
+
+/**
+ * S652 — the handful of things a locked-out landlord may still do.
+ *
+ * A lock whose only remedy sits BEHIND the lock is a deadlock, and the fastest
+ * way to turn a collections problem into a support ticket. So the routes that
+ * FIX it stay open: linking a bank, reading who you are, and signing out. Their
+ * own data — tenants, rent, reports, settings, the register — does not.
+ *
+ * Deliberately a short, explicit list rather than a pattern. Every addition to
+ * it is somebody deciding that a locked account may do one more thing.
+ */
+const LOCK_ESCAPE_ROUTES: Array<{ method: string; test: RegExp }> = [
+  // Who am I, and am I locked — the portal needs this to draw the lock screen.
+  { method: 'GET',  test: /^\/api\/auth\/me\b/ },
+  { method: 'POST', test: /^\/api\/auth\/logout\b/ },
+  { method: 'POST', test: /^\/api\/auth\/refresh\b/ },
+  // The remedy: connect a bank GAM can actually collect from.
+  { method: 'GET',  test: /^\/api\/bank-feed\b/ },
+  { method: 'POST', test: /^\/api\/bank-feed\b/ },
+  // What they owe, so the number on the lock screen is not a mystery.
+  { method: 'GET',  test: /^\/api\/landlords\/me\/gam-charges\b/ },
+]
+
+export function isLockEscapeRoute(method: string, url: string): boolean {
+  const path = (url || '').split('?')[0]
+  return LOCK_ESCAPE_ROUTES.some((r) => r.method === method.toUpperCase() && r.test.test(path))
+}
+
+/**
+ * Is every company this session can act for locked?
+ *
+ * ALL, not any: an account with two parks, one of them settled, is not locked
+ * out of the settled one. The scope checks downstream already keep them out of
+ * the locked company's data.
+ */
+export async function lockedLandlordFor(
+  user: AuthPayload,
+): Promise<{ reason: string | null } | null> {
+  const ids = (user.landlordIds ?? []).filter(Boolean)
+  if (!ids.length) return null
+  const rows = await query<{ platform_locked_at: string | null; platform_locked_reason: string | null }>(
+    `SELECT platform_locked_at, platform_locked_reason FROM landlords WHERE id = ANY($1::uuid[])`,
+    [ids])
+  if (!rows.length) return null
+  if (!rows.every((r) => r.platform_locked_at)) return null
+  return { reason: rows[0].platform_locked_reason ?? null }
 }
 
 export function requireRole(...roles: UserRole[]) {
@@ -216,6 +357,13 @@ export async function assertPropertyInScope(
 ): Promise<void> {
   if (!user) throw new AppError(401, 'Unauthenticated')
   if (OWNER_ROLES.includes(user.role)) return
+  if (user.role === 'bookkeeper') {
+    const ids = await bookkeeperPropertyIdsOf(user)
+    if (ids === null) return
+    if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
+    if (!ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
+    return
+  }
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) throw new AppError(403, 'Not authorized for property-scoped actions')
   const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
@@ -240,6 +388,10 @@ export async function getScopedPropertyIds(
 ): Promise<string[] | null> {
   if (!user) throw new AppError(401, 'Unauthenticated')
   if (OWNER_ROLES.includes(user.role)) return null
+  // 10/11: a bookkeeper narrowed to some of the company's properties reads
+  // those properties' money only — every report that already honors this
+  // (S655 audience isolation) narrows for them with no change of its own.
+  if (user.role === 'bookkeeper') return bookkeeperPropertyIdsOf(user)
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) return null
   const rows = await query<{ property_ids: string[] | null; all_properties: boolean }>(
@@ -252,6 +404,20 @@ export async function getScopedPropertyIds(
   return row.property_ids || []
 }
 
+/**
+ * 10/11: a bookkeeper's properties. requireAuth puts them on the request; a
+ * caller holding a bare pass (a job, a test) reads the scope row instead.
+ * null = the whole company; [] = no assignment.
+ */
+export async function bookkeeperPropertyIdsOf(user: AuthPayload): Promise<string[] | null> {
+  if (user.bookkeeperPropertyIds !== undefined) return user.bookkeeperPropertyIds
+  const row = await queryOne<{ property_ids: string[] | null }>(
+    `SELECT property_ids FROM bookkeeper_scopes
+      WHERE user_id = $1 AND ($2::uuid IS NULL OR landlord_id = $2::uuid)
+      ORDER BY created_at, id LIMIT 1`, [user.userId, user.landlordId ?? null])
+  return row ? (row.property_ids ?? null) : []
+}
+
 // requirePerm — gate a worker route by sub-permission key. Owner roles
 // always pass. Worker roles pass if JWT.permissions[key] === true for
 // any of the listed keys (OR semantics — useful when a single endpoint
@@ -259,10 +425,31 @@ export async function getScopedPropertyIds(
 //
 // Sub-permission keys come from packages/shared SUB_PERMISSIONS_BY_ROLE.
 // Absent / false / non-true value = denied.
+/**
+ * S641 — does this caller hold any of these permissions? Same rule requirePerm
+ * uses, exposed for shaping a RESPONSE rather than gating a route.
+ *
+ * Nic, on his on-site manager: "I don't want her to see the covered by work
+ * trade or the payment histories from people." The balances list is a screen she
+ * legitimately needs, carrying one figure she should not — which is a response
+ * to shape, not a door to lock. Doing it here rather than in the frontend is the
+ * point: data the viewer should not have never leaves the building.
+ */
+export function userHasPerm(user: Request['user'], ...keys: string[]): boolean {
+  if (!user) return false
+  if (OWNER_ROLES.includes(user.role)) return true
+  if (user.role === 'bookkeeper') return keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))
+  const perms = user.permissions || {}
+  return keys.some(k => perms[k] === true)
+}
+
 export function requirePerm(...keys: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
     if (OWNER_ROLES.includes(req.user.role)) return next()
+    // 10/11: a bookkeeper holds a fixed set (lib/bookkeeperAccess); requireAuth
+    // has already kept them to the routes those keys may open.
+    if (req.user.role === 'bookkeeper' && keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))) return next()
     const perms = req.user.permissions || {}
     for (const k of keys) if (perms[k] === true) return next()
     return res.status(403).json({ success: false, error: 'Insufficient permissions' })
@@ -309,8 +496,50 @@ export function requireBooksWrite(req: Request, res: Response, next: NextFunctio
  */
 const MEMBERSHIP_TTL_MS = 15_000
 const membershipCache = new Map<string, { ids: string[]; at: number }>()
-
+// S654 (Nic): there is NO home company. The S652 "company the account founded"
+// was a default by another name; it is gone from the session, so nothing can
+// read it. See resolveLandlordTarget / landlordForRequest.
 export function _clearMembershipCache(): void { membershipCache.clear() }
+/**
+ * S655: drop one account's cached company list. Called right after something
+ * GIVES an account a company (accepting a co-owner invitation, the claim when
+ * an address is proven). The 15s TTL is the right bound for a removal, but a
+ * person who just accepted is told the company is in their account and clicks
+ * straight through to it — the page load before the accept filled this cache,
+ * so without this their next request would still be missing the company.
+ * Call it only AFTER the commit, or a concurrent request can refill it from
+ * the pre-commit rows.
+ */
+export function forgetMembership(userId: string): void { membershipCache.delete(userId) }
+
+/**
+ * 10/5: users.sessions_valid_from, read fresh and cached briefly (same bound as
+ * company membership). Every place that stamps the column calls
+ * forgetSessionCutoff after its commit, so the cache never hides a reset; the
+ * TTL only covers a write that forgets to. A failed read lets the request
+ * through — the route behind it needs the same database and fails on its own;
+ * a 401 here would sign every user out on a database blip.
+ */
+const CUTOFF_TTL_MS = 15_000
+const cutoffCache = new Map<string, { ms: number | null; at: number }>()
+export function forgetSessionCutoff(userId: string): void { cutoffCache.delete(userId) }
+export function _clearSessionCutoffCache(): void { cutoffCache.clear() }
+
+async function sessionCutoffMs(userId: string): Promise<number | null> {
+  const now = Date.now()
+  const hit = cutoffCache.get(userId)
+  if (hit && now - hit.at < CUTOFF_TTL_MS) return hit.ms
+  try {
+    const row = await queryOne<{ sessions_valid_from: Date | null }>(
+      `SELECT sessions_valid_from FROM users WHERE id = $1`, [userId])
+    const ms = row?.sessions_valid_from ? new Date(row.sessions_valid_from).getTime() : null
+    cutoffCache.set(userId, { ms, at: now })
+    if (cutoffCache.size > 5000) cutoffCache.clear()
+    return ms
+  } catch {
+    return null
+  }
+}
 
 async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
   const key = payload.userId

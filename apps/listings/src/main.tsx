@@ -31,7 +31,10 @@ const setTok = (t: string) => { try { localStorage.setItem(TOK_KEY, t) } catch {
 const clearTok = () => { try { localStorage.removeItem(TOK_KEY) } catch { /* ignore */ } }
 const authCfg = () => { const t = getTok(); return t ? { headers: { Authorization: `Bearer ${t}` } } : {} }
 
-const BG_APPROVED = ['approved', 'waived']
+// Only a completed background check counts here. A landlord's grandfather
+// waiver is that company's own decision and never opens other listings; the
+// server's apply gate enforces the same rule.
+const BG_APPROVED = ['approved']
 
 function money(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
@@ -441,7 +444,9 @@ function App() {
 
   const loadBgStatus = useCallback(async () => {
     if (!getTok()) { setBgStatus(null); return }
-    try { const r = await axios.get(`${API}/api/background/status`, authCfg()); setBgStatus(r.data.data?.status ?? 'not_started') }
+    // screenedStatus is the person's own result; `status` can read 'waived'
+    // for a grandfathered resident, which is one company's decision only.
+    try { const r = await axios.get(`${API}/api/background/status`, authCfg()); setBgStatus(r.data.data?.screenedStatus ?? r.data.data?.status ?? 'not_started') }
     catch { setBgStatus(null) }
   }, [])
 

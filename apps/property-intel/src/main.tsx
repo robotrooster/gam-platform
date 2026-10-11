@@ -24,7 +24,7 @@ const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean
 
 const api = axios.create({ baseURL: PROP_API })
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
+api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401 && !String(e.config?.url||'').includes('/auth/')){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 

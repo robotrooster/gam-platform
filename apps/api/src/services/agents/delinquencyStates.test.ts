@@ -118,7 +118,12 @@ describe('the single-tenant lookup — "what is Chen\'s balance?"', () => {
     const { lookupTenantPaymentStatus } = await import('./tools/lookupTenantPaymentStatus')
     const src = String(lookupTenantPaymentStatus.execute)
     expect(src).toMatch(/ofWhichReturned/)
-    expect(src).toMatch(/FILTER \(WHERE status IN \('failed','returned'\)\)/)
+    // S655 two-row model: a bounce is owed on the row the reversal reopened
+    // (payments.reversal_id), never on the 'returned' original as well, so
+    // "came back" is the reopened row (or a failed attempt) inside what is owed.
+    expect(src).toMatch(/reversal_id IS NOT NULL/)
+    // What is owed is the Outstanding page's one rule, not a status list here.
+    expect(src).toContain('openBalanceSql')
   })
 
   it('tells the agent the three figures are not interchangeable', async () => {
@@ -129,14 +134,21 @@ describe('the single-tenant lookup — "what is Chen\'s balance?"', () => {
 })
 
 describe("the tenant's own balance", () => {
-  it('counts a RETURNED payment as still owed', async () => {
-    // paymentReversal.ts sets status='returned' with the bank's code when an
-    // ACH comes back. It was missing from the tenant's balance, so a bounced
-    // payment dropped out as though it had settled — the tenant is told they
-    // owe less than they do and finds out when the late fee lands.
+  it('owes a bounce once, on the reopened row, never on the returned original too', async () => {
+    // S655 (money plan, two-row model): paymentReversal.handlePaymentReversal
+    // marks the original 'returned' and writes a reopened row (reversal_id) at
+    // its money part. The reopened row is what is owed; counting the 'returned'
+    // original as well would bill the bounce twice. So the tool reads the one
+    // rule (openBalanceSql) and never names 'returned' itself. The rule itself is
+    // checked with real rows in openBalances.test.ts ("money in flight, a
+    // bounced original and the FlexPay pull are never owed; the reopened row
+    // is"), and getMyBalanceBreakdown with real rows in
+    // tools/balanceTools.test.ts ("a settled row a real dispute reopens is owed
+    // once, through the reopened row, in every tool").
     const { getMyBalanceBreakdown } = await import('./tools/getMyBalanceBreakdown')
     const src = String(getMyBalanceBreakdown.execute)
-    expect(src).toContain("'returned'")
+    expect(src).toContain('openBalanceSql')
+    expect(src).not.toContain("'returned'")
   })
 
   it("still treats money in flight as PAID from the tenant's side", async () => {

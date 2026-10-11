@@ -21,7 +21,7 @@ beforeEach(cleanupAllSchema)
 describe('the onboarding migration window', () => {
   it('is 28 days, and the code agrees with the published Terms', () => {
     // Business Terms §9.1/§9.2 and Consumer §7.1/§7.2 state this figure. If it
-    // changes here without the legal documents changing, GAM's behaviour and its
+    // changes here without the legal documents changing, GAM's behavior and its
     // contract disagree — which is worse than either number being wrong.
     expect(MIGRATION_WINDOW_DAYS).toBe(28)
   })

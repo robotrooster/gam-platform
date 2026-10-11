@@ -119,7 +119,7 @@ describe('unit ↔ subtype linking (S613)', () => {
     expect(Number(lease.rent_amount)).toBe(380) // what the tenant actually pays
   })
 
-  // The behaviour Nic expected and did not have: raise the class, every unit
+  // The behavior Nic expected and did not have: raise the class, every unit
   // in it follows. Enforced by DB trigger, so it holds whichever door edits it.
   // S629 (Nic, DIRECTIVE — supersedes S613): "pricing should not necessarily be
   // linked to subtypes... the subtype is more just for classification,
@@ -129,7 +129,7 @@ describe('unit ↔ subtype linking (S613)', () => {
   //
   // These three tests asserted the S613 model — class owns the price, per-unit
   // pricing refused with a 400 — and are inverted rather than deleted, because
-  // the behaviour they describe is exactly what must NOT happen now.
+  // the behavior they describe is exactly what must NOT happen now.
   it('editing a class price leaves the units in it alone', async () => {
     const app = buildApp(); const f = await seed()
     const s = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 440 })
@@ -263,7 +263,7 @@ describe('unit ↔ subtype linking (S613)', () => {
     const rows = (await db.query(
       `SELECT id, rent_amount, subtype_id FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
     expect(Number(rows.find((r: any) => r.id === f.rvA).rent_amount)).toBe(700)
-    // The neighbour is untouched — at its OWN price, which joining the class
+    // The neighbor is untouched — at its OWN price, which joining the class
     // never overwrote (S630) — and both keep the classification.
     expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(1000)
     expect(rows.every((r: any) => r.subtype_id === s.id)).toBe(true)
@@ -360,8 +360,10 @@ describe('charges outside the lease (S613)', () => {
     expect(row.note).toMatch(/addendum/)
   })
 
-  // The half of the rule that stays: what the signed lease FIXES cannot move.
-  it('a responsibility that came from the signed lease cannot be switched off', async () => {
+  // S652 (Nic, Billy Miranda — two spaces, one trash can): a utility the lease
+  // bills CAN be turned off for this lease. It is recorded as an addendum, with
+  // who did it, and it lasts only as long as this lease.
+  it('a responsibility that came from the signed lease can be switched off for this lease, on record', async () => {
     const app = buildApp(); const f = await seed()
     const leaseId = await activeLease(f.rvA, f.landlordId)
     await db.query(
@@ -369,12 +371,15 @@ describe('charges outside the lease (S613)', () => {
        VALUES ($1, 'water', true, 'lease')`, [leaseId])
     const res = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ utilityType: 'water', tenantResponsible: false })
-    expect(res.status).toBe(409)
+      .send({ utilityType: 'water', tenantResponsible: false, note: 'shares one can with the next space' })
+    expect(res.status).toBe(200)
     const row = (await db.query(
-      `SELECT tenant_responsible FROM lease_utility_responsibilities
+      `SELECT tenant_responsible, source, set_by_user_id, note FROM lease_utility_responsibilities
         WHERE lease_id = $1 AND utility_type = 'water'`, [leaseId])).rows[0]
-    expect(row.tenant_responsible).toBe(true)
+    expect(row.tenant_responsible).toBe(false)
+    expect(row.source).toBe('addendum')
+    expect(row.set_by_user_id).toBeTruthy()
+    expect(row.note).toMatch(/one can/)
   })
 
   it('no active lease → says there is nobody to bill', async () => {

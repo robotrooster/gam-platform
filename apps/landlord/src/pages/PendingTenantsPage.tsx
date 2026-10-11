@@ -7,7 +7,7 @@ import {
 } from 'lucide-react'
 import { api, apiGet, apiDelete, apiPatch } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
-import { ConfirmIntentModal } from './ConfirmIntentModal'
+import { ConfirmIntentModal, type ResolveResponseData } from './ConfirmIntentModal'
 import {
   PARSER_STATUS_META,
   PARSER_FLAG_CATEGORY_META,
@@ -182,7 +182,7 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
         <div className="modal-title">Cancel this invite?</div>
-        {/* S636: this said cancelling "deletes the pending intent and any
+        {/* S636: this said canceling "deletes the pending intent and any
             uploaded lease document". It does not, and has not since the
             hard-delete path was removed on purpose — the person, their document
             and this record all stay. What actually changes is the link, which is
@@ -206,7 +206,7 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
             className="btn"
             style={{ background: COLOR_DANGER, color: '#fff', borderColor: COLOR_DANGER }}
           >
-            {busy ? 'Cancelling...' : 'Cancel invite'}
+            {busy ? 'Canceling...' : 'Cancel invite'}
           </button>
         </div>
       </div>
@@ -220,11 +220,24 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
 // the only way to fix a mistyped address was to cancel and start over — losing
 // the held space and any work-trade or screening state along with it. Correcting
 // it in place keeps all of that and issues a fresh link.
-function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, onConfirm }: {
+// S639 (Nic): "I accidentally put Gerald Logue as a lower case, and I have no
+// way to change that invite." The route has always accepted a name; this modal
+// only ever offered the address, so a mistyped name had no fix at all short of
+// canceling the invite and losing the held space. Names are normalized on save
+// (gerald → Gerald), so most of the time there is nothing to retype.
+function FixEmailModal({
+  name, current, value, onChange,
+  firstName, lastName, onFirstName, onLastName,
+  error, busy, onCancel, onConfirm,
+}: {
   name: string
   current: string
   value: string
   onChange: (v: string) => void
+  firstName: string
+  lastName: string
+  onFirstName: (v: string) => void
+  onLastName: (v: string) => void
   error: string | null
   busy: boolean
   onCancel: () => void
@@ -234,7 +247,7 @@ function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, 
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Send {name}'s invite somewhere else</div>
+        <div className="modal-title">Correct {name}&apos;s name or email</div>
         <div style={{ padding: 16, fontSize: '.88rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
           <p style={{ marginTop: 0, color: 'var(--text-2)' }}>
             Currently going to <strong style={{ color: 'var(--text-1)' }}>{current}</strong>.
@@ -248,9 +261,26 @@ function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, 
             onKeyDown={e => { if (e.key === 'Enter' && changed && !busy) onConfirm() }}
             style={{ width: '100%' }}
           />
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+                First name
+              </label>
+              <input className="input" value={firstName} style={{ width: '100%' }}
+                onChange={e => onFirstName(e.target.value)} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+                Last name
+              </label>
+              <input className="input" value={lastName} style={{ width: '100%' }}
+                onChange={e => onLastName(e.target.value)} />
+            </div>
+          </div>
           <p style={{ marginBottom: 0, marginTop: 12, fontSize: '.78rem', color: 'var(--text-3)' }}>
-            They keep their place in the queue and any space held for them. A fresh invite
-            goes to the new address and the old link stops working.
+            They keep their place in the queue and any space held for them. Nothing is emailed
+            until you sign their lease; if you already have, their lease email goes to the new
+            address and the old link stops working.
           </p>
           {error && (
             <div style={{ marginTop: 10, color: COLOR_DANGER, fontSize: '.8rem' }}>{error}</div>
@@ -258,8 +288,9 @@ function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, 
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
-          <button className="btn btn-primary" onClick={onConfirm} disabled={busy || !changed}>
-            {busy ? 'Sending...' : 'Save and re-send'}
+          <button className="btn btn-primary" onClick={onConfirm}
+            disabled={busy || (!changed && !firstName.trim() && !lastName.trim())}>
+            {busy ? 'Saving...' : 'Save'}
           </button>
         </div>
       </div>
@@ -578,7 +609,10 @@ function IntentCard({
   const fullName = `${intent.firstName} ${intent.lastName}`.trim() || '(no name)'
   const status = intent.parserStatus
   const isBusy = status === 'parsing' || uploading
-  const canOpen = status === 'parsed' || status === 'mismatch'
+  // S655: once a lease is drafted for them (another company's resident whose
+  // paper lease became a lease they sign), there is nothing left to build here.
+  const leaseOut = !!(intent as any).leaseDocStatus && (intent as any).leaseDocStatus !== 'voided'
+  const canOpen = (status === 'parsed' || status === 'mismatch') && !leaseOut
   const canViewPdf = !!intent.importedPdfUrl && status !== 'parsing'
   const canReupload = status === 'error' || status === 'mismatch'
 
@@ -603,6 +637,56 @@ function IntentCard({
                 Holding Unit {(intent as any).heldUnitNumber}{(intent as any).heldPropertyName ? ` — ${(intent as any).heldPropertyName}` : ''}
               </span>
             )}
+            {/* S638: which of these three states the person is in decides
+                whether anybody needs to phone them. */}
+            {(() => {
+              const st = (intent as any).inviteState
+              if (st === 'invited') return (
+                <span style={{ color: 'var(--gold)', fontWeight: 600 }}>
+                  Invite sent — waiting on them
+                </span>
+              )
+              if (st === 'accepted') return (
+                <span style={{ color: 'var(--green)' }}>Accepted</span>
+              )
+              // S655: a lease drafted and waiting on YOUR signature has sent
+              // them nothing on purpose — their one email goes when you sign.
+              if (st === 'not_invited' && (intent as any).leaseDocStatus && (intent as any).leaseDocStatus !== 'voided') return (
+                <span style={{ color: 'var(--text-2)' }}>Nothing sent yet — they get one email when you sign</span>
+              )
+              if (st === 'not_invited') return (
+                <span style={{ color: 'var(--red)', fontWeight: 600 }}>No invite sent yet</span>
+              )
+              return null
+            })()}
+            {/* S639 (Nic): "me sending it and them accepting it is two different
+                states. I need you to mark it how it really was." Accepting is
+                not the end of the process, and one word was standing in for the
+                whole pipeline — Dakota Lane read "accepted" while what mattered
+                was that his lease had been signed by Nic and had sat unsigned by
+                Dakota for a week. The lease stage sits beside the invite state
+                rather than replacing it: one says whether we reached them, the
+                other says what the next move is. */}
+            {(() => {
+              const ds = (intent as any).leaseDocStatus
+              if (!ds) return null
+              if (ds === 'completed') return (
+                <span style={{ color: 'var(--green)', fontWeight: 600 }}>Lease signed</span>
+              )
+              if (ds === 'voided') return (
+                <span style={{ color: 'var(--red)', fontWeight: 600 }}>Lease voided — needs re-sending</span>
+              )
+              const role = (intent as any).leaseWaitingOnRole
+              const who = (intent as any).leaseWaitingOnName
+              if (!role) return <span style={{ color: 'var(--gold)' }}>Lease drafted</span>
+              return (
+                <span style={{ color: 'var(--gold)', fontWeight: 600 }}>
+                  {role === 'landlord' || role === 'witness'
+                    ? `Lease waiting on YOU to sign`
+                    : `Lease sent — waiting on ${who || 'them'} to sign`}
+                </span>
+              )
+            })()}
             <span style={{ color: 'var(--text-3)' }}>
               Added {new Date(intent.createdAt).toLocaleDateString()}
             </span>
@@ -644,7 +728,7 @@ function IntentCard({
 
               Two endpoints existed for exactly this and NEITHER had a control.
               Correcting the address is the better of the two — it keeps the same
-              person on the same space and re-sends, where cancelling means
+              person on the same space and re-sends, where canceling means
               re-inviting from scratch — so it goes first and says so. */}
           {!isBusy && (
             <button onClick={onFixEmail} className="btn btn-ghost btn-sm"
@@ -690,6 +774,8 @@ export function PendingTenantsPage() {
   // person or the space they are held on.
   const [fixTarget, setFixTarget] = useState<PendingIntent | null>(null)
   const [fixEmail, setFixEmail] = useState('')
+  const [fixFirst, setFixFirst] = useState('')
+  const [fixLast, setFixLast] = useState('')
   const [fixError, setFixError] = useState<string | null>(null)
   const [fixDone, setFixDone] = useState<string | null>(null)
   const [uploadingId, setUploadingId] = useState<string | null>(null)
@@ -701,6 +787,26 @@ export function PendingTenantsPage() {
 
   // List with stop-when-idle polling. refetchInterval returns false when no
   // row is parsing — react-query then idles until something else invalidates.
+  // ── S638 (Nic): FILTER THE POOL BY PROPERTY AND BY INVITE STATE ──────────
+  //
+  //   "The pending pool should be filterable by property that they're invited
+  //    to, because you're showing me a pool of sixty people where I have
+  //    different people at different properties to reach out to... they need to
+  //    know who to contact."
+  //
+  // Sixty names in one undifferentiated list is not a work queue. Whoever runs
+  // Oak Park should be able to see Oak Park's, and see at a glance which of
+  // them are actually waiting on the resident.
+  const [poolProperty, setPoolProperty] = useState<string>('all')
+  const [poolState, setPoolState] = useState<'all' | 'invited' | 'accepted' | 'not_invited'>('all')
+  // S639 (Nic): "Pending pool also needs a search bar so I can type in
+  // somebody's name when I'm onboarding a shitload of people, and I don't know
+  // what state they're necessarily in. I need to be able to type their name and
+  // see where they're at." So the search deliberately IGNORES the state chips
+  // and the property filter — you type a name to find out where they are, which
+  // cannot work if you have to already know.
+  const [poolSearch, setPoolSearch] = useState('')
+
   const { data: intents = [], isLoading, error } = useQuery<PendingIntent[]>(
     'pending-tenants',
     () => apiGet<PendingIntent[]>('/landlords/me/pending-tenants'),
@@ -729,14 +835,23 @@ export function PendingTenantsPage() {
   )
 
   const fixEmailMut = useMutation(
-    (v: { intentId: string; email: string }) =>
-      apiPatch(`/landlords/me/pending-intents/${v.intentId}/contact`,
-               { email: v.email, resend: true }),
+    (v: { intentId: string; email?: string; firstName?: string; lastName?: string; resend: boolean }) =>
+      apiPatch(`/landlords/me/pending-intents/${v.intentId}/contact`, {
+        ...(v.email ? { email: v.email } : {}),
+        ...(v.firstName ? { firstName: v.firstName } : {}),
+        ...(v.lastName ? { lastName: v.lastName } : {}),
+        resend: v.resend,
+      }),
     {
-      onSuccess: (_d, v) => {
+      onSuccess: (d: any) => {
         qc.invalidateQueries('pending-tenants')
         qc.invalidateQueries('pending-tenants-count')
-        setFixDone(`Invite re-sent to ${v.email}`)
+        // S639: correcting only a spelling must not tell them an invite went out.
+        // S648: and nothing goes out before you sign their lease — say so.
+        setFixDone(
+          d?.resent ? `Lease email sent to ${d.email}`
+          : d?.heldUntilLandlordSigns ? `Saved. Their lease email goes to ${d.email} when you sign it.`
+          : 'Saved')
         setFixTarget(null)
         setTimeout(() => setFixDone(null), 6000)
       },
@@ -788,6 +903,24 @@ export function PendingTenantsPage() {
     }
   }
 
+  const poolProperties = [...new Set(
+    (intents as any[]).map(i => i.propertyName).filter(Boolean))].sort()
+  const q = poolSearch.trim().toLowerCase()
+  const matchesSearch = (i: any) => !q || [
+    i.firstName, i.lastName, `${i.firstName ?? ''} ${i.lastName ?? ''}`,
+    i.email, i.phone, i.heldUnitNumber, i.propertyName,
+  ].some(v => String(v ?? '').toLowerCase().includes(q))
+  const byProperty = poolProperty === 'all'
+    ? (intents as any[])
+    : (intents as any[]).filter(i => i.propertyName === poolProperty)
+  // A search overrides both filters — typing a name finds that person wherever
+  // they are and whatever state they are in.
+  const shown = q
+    ? (intents as any[]).filter(matchesSearch)
+    : poolState === 'all'
+      ? byProperty
+      : byProperty.filter(i => i.inviteState === poolState)
+
   return (
     <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <button
@@ -809,8 +942,41 @@ export function PendingTenantsPage() {
           </p>
         </div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-          {intents.length} pending
+          {shown.length}{shown.length !== intents.length ? ` of ${intents.length}` : ''} pending
         </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16, alignItems: 'center' }}>
+        <input className="input" value={poolSearch} onChange={e => setPoolSearch(e.target.value)}
+          placeholder="Search name, email, phone, unit…" style={{ maxWidth: 260 }} />
+        {q ? (
+          <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+            searching everyone · {shown.length} match{shown.length === 1 ? '' : 'es'}
+            <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft: 6 }}
+              onClick={() => setPoolSearch('')}>Clear</button>
+          </span>
+        ) : null}
+        <select className="input" value={poolProperty} onChange={e => setPoolProperty(e.target.value)}
+          style={{ maxWidth: 250 }} disabled={!!q}>
+          <option value="all">All properties</option>
+          {poolProperties.map(p => <option key={p} value={p}>{p}</option>)}
+        </select>
+        {([
+          { v: 'all' as const,         t: 'Everyone' },
+          { v: 'invited' as const,     t: 'Waiting on them' },
+          { v: 'accepted' as const,    t: 'Accepted' },
+          { v: 'not_invited' as const, t: 'Not invited yet' },
+        ]).map(o => {
+          const on = poolState === o.v && !q
+          const n = o.v === 'all' ? byProperty.length
+                                  : byProperty.filter(i => i.inviteState === o.v).length
+          return (
+            <button key={o.v} type="button" onClick={() => { setPoolSearch(''); setPoolState(o.v) }}
+              className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`}>
+              {o.t} ({n})
+            </button>
+          )
+        })}
       </div>
 
       <input
@@ -856,7 +1022,7 @@ export function PendingTenantsPage() {
             {(error as any)?.response?.data?.message || 'Try refreshing the page.'}
           </div>
         </div>
-      ) : intents.length === 0 ? (
+      ) : shown.length === 0 ? (
         <div style={{
           padding: 40, textAlign: 'center', background: 'var(--bg-1)',
           borderRadius: 10, border: '1px dashed var(--border-0)',
@@ -872,7 +1038,7 @@ export function PendingTenantsPage() {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {intents.map(intent => (
+          {shown.map(intent => (
             <IntentCard
               key={intent.intentId}
               intent={intent}
@@ -883,7 +1049,9 @@ export function PendingTenantsPage() {
                 name: `${intent.firstName} ${intent.lastName}`.trim() || intent.email,
               })}
               onDelete={() => setDeleteTarget(intent)}
-              onFixEmail={() => { setFixTarget(intent); setFixEmail(intent.email); setFixError(null) }}
+              onFixEmail={() => { setFixTarget(intent); setFixEmail(intent.email);
+                                  setFixFirst(intent.firstName || ''); setFixLast(intent.lastName || '');
+                                  setFixError(null) }}
               uploading={uploadingId === intent.intentId}
             />
           ))}
@@ -911,10 +1079,13 @@ export function PendingTenantsPage() {
         <ConfirmIntentModal
           intentId={confirmingId}
           onClose={() => setConfirmingId(null)}
-          onResolved={(result: { leaseId: string; tenantId: string; userId: string; email: string; activationUrl: string }) => {
+          onResolved={(result: ResolveResponseData) => {
             setConfirmingId(null)
             setReviewIntentId(null)
-            setResolvedToast(`Lease built for ${result.email}.`)
+            // S655: another company's resident gets the lease to sign instead.
+            setResolvedToast('sentToSign' in result
+              ? (result.draftBlocked?.[0] ?? result.message)
+              : `Lease built for ${result.email}.`)
             qc.invalidateQueries('pending-tenants')
             qc.invalidateQueries('pending-tenants-count')
             qc.invalidateQueries('leases')
@@ -952,12 +1123,33 @@ export function PendingTenantsPage() {
           current={fixTarget.email}
           value={fixEmail}
           onChange={setFixEmail}
+          firstName={fixFirst}
+          lastName={fixLast}
+          onFirstName={setFixFirst}
+          onLastName={setFixLast}
           error={fixError}
           busy={fixEmailMut.isLoading}
           onCancel={() => { setFixTarget(null); setFixError(null) }}
           onConfirm={() => {
             setFixError(null)
-            fixEmailMut.mutate({ intentId: fixTarget.intentId, email: fixEmail.trim() })
+            const email = fixEmail.trim()
+            const addressChanged = !!email && email.toLowerCase() !== fixTarget.email.toLowerCase()
+            // S648: send only what was actually changed. Sending every box
+            // re-saved whatever the row showed — which is how a corrected
+            // "Simpson" went back to "Simpsosn" from a stale list.
+            const first = fixFirst.trim(), last = fixLast.trim()
+            const nameChanged = (!!first && first !== (fixTarget.firstName || '').trim())
+              || (!!last && last !== (fixTarget.lastName || '').trim())
+            if (!addressChanged && !nameChanged) { setFixTarget(null); return }
+            fixEmailMut.mutate({
+              intentId: fixTarget.intentId,
+              email: addressChanged ? email : undefined,
+              firstName: first && first !== (fixTarget.firstName || '').trim() ? first : undefined,
+              lastName: last && last !== (fixTarget.lastName || '').trim() ? last : undefined,
+              // Only a NEW address needs a fresh link; a spelling fix does not
+              // invalidate the one they are already holding.
+              resend: addressChanged,
+            })
           }}
         />
       )}

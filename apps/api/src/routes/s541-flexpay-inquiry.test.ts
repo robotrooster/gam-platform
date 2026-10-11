@@ -189,14 +189,17 @@ describe('S541 FlexPay demand-test gate', () => {
     const trow = await db.query<any>(`SELECT ssi_ssdi FROM tenants WHERE id=$1`, [f.tenantId])
     expect(trow.rows[0].ssi_ssdi).toBe(true)
 
+    // S655 (Nic 10/2): pull days run 6th-28th; the 1st-5th are never offered.
+    // (The pending and declined tries above sent the 3rd and were told about
+    // their request first, never the day.)
     const enroll3 = await request(app).post('/api/tenants/flexpay/enroll')
-      .set('Authorization', `Bearer ${t}`).send({ pullDay: 3, acceptedTerms: true })
+      .set('Authorization', `Bearer ${t}`).send({ pullDay: 6, acceptedTerms: true })
     expect(enroll3.status).toBe(200)
     expect(enroll3.body.data.fee).toBe(25)  // S562: flat $25/mo (pull day is scheduling only)
 
     const enrolled = await db.query<any>(`SELECT flexpay_enrolled, flexpay_pull_day FROM tenants WHERE id=$1`, [f.tenantId])
     expect(enrolled.rows[0].flexpay_enrolled).toBe(true)
-    expect(enrolled.rows[0].flexpay_pull_day).toBe(3)
+    expect(enrolled.rows[0].flexpay_pull_day).toBe(6)
   })
 
   it('S542b: FCFS queue positions + state hold blocks approval until cleared + proof upload round-trip', async () => {

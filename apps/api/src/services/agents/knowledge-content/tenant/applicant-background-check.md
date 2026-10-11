@@ -10,6 +10,8 @@ Along the way you'll provide proof of income (two documents — pay stubs, bank 
 
 Where state law allows it, you pay the screening fee up front by card. The payment step always shows the correct amount for your situation automatically: some states cap what an applicant can be charged (you pay the capped amount and the landlord covers the remainder), and some states don't permit applicant-paid screening fees at all (you pay nothing and your landlord covers the screening).
 
+If your check was paid with your stay, the payment step says so and there is nothing more to pay — just submit. If you cancel it before it finishes, it stays paid and waits for you.
+
 ## If your landlord screens through Checkr
 
 When the screening runs through Checkr, sensitive identity details — including your SSN — are collected by Checkr on its own secure page, never by GAM's form, and the ID upload becomes optional. After you submit, you'll see a "Complete Screening with Checkr" link (Checkr also emails it to you). That step takes about two minutes and your screening can't run until you finish it. A check left unfinished for around 30 days is automatically cancelled and your fee automatically refunded in full. You can also cancel an in-progress check yourself before it completes, which triggers the same full refund.

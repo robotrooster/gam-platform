@@ -424,7 +424,10 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .send({ landlordOverrides: { rent_amount: 1600 } })
     expect(res.status).toBe(200)
     expect(res.body.data.leaseId).toBe('mock-lease-id')
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], { rent_amount: 1600 }, { confirmSupersede: false })
+    // S655: plus who pressed it — a paper lease for another company's
+    // resident becomes a lease sent to them, and its waiver records the user.
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], { rent_amount: 1600 },
+      { confirmSupersede: false, byUserId: expect.any(String) })
   })
 
   it('empty body: resolveIntent called with empty overrides', async () => {
@@ -435,6 +438,6 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({})
     expect(res.status).toBe(200)
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], {}, { confirmSupersede: false })
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], {}, { confirmSupersede: false, byUserId: expect.any(String) })
   })
 })

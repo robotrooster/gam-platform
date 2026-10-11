@@ -29,46 +29,95 @@
  *
  * WHAT DOES AND DOES NOT GET HANDED OVER. Whatever is the LANDLORD'S money —
  * rent, utilities, late fees off the lease, fees they billed by hand (S609,
- * Nic). GAM's own charges (a returned bank payment, a declined card, a
- * manual-payment recording, an opt-in product) are stamped revenue_owner='gam'
+ * Nic). GAM's own charges (a returned bank payment, a declined card, an
+ * opt-in product) are stamped revenue_owner='gam'
  * at creation and are not paid out through this rail. A row also needs a unit,
  * since that is how a property and therefore an owner is resolved.
+ *
+ * S654/S655 — ONLY MONEY GAM HOLDS IS RELEASED. A check the landlord deposited,
+ * cash at the desk, a typed-in carry-forward (funded_by 'landlord') and rent
+ * already paid on a shortened stay (funded_by 'reclassified': it went out with
+ * the original rent) settle the bill but pay out nothing. Spends are records in
+ * the credit ledger (credit_uses); the landlord's share is read from the row's
+ * gam_held_part (services/allocation).
  */
 
 import type { PoolClient } from 'pg'
-import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES, type PaymentMethod } from './allocation'
+import {
+  billHouseholdTenant, paidAheadDrawnByMonth, settleWholeBillIfCovered, usablePaidAheadSql, disputeClaimJoinSql,
+} from './creditUse'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
+/**
+ * S653 (Nic): "use only a dedicated amount of the credit each month, to where
+ * she would still get a partial bill each month."
+ *
+ * How much paid-ahead credit this lease may spend against `billingMonth`
+ * (YYYY-MM-01): the credit on hand, capped by leases.prepaid_monthly_draw less
+ * whatever this month has already drawn. NULL cap = the whole balance, which
+ * is how a year's prepayment has always worked.
+ *
+ * S655: "drawn" is the credit ledger — paid-ahead uses set aside or spent on
+ * this month's charges (credit_uses, held + applied) — and a withdrawn credit
+ * (voided_at) is out of the balance. `remaining` is the USABLE remaining
+ * (creditUse.usablePaidAheadSql): what a dispute or return of a credit's own
+ * Stripe funding still claims is not the tenant's to draw.
+ */
+export async function prepaidDrawAvailable(
+  client: PoolClient,
+  leaseId: string,
+  billingMonth: string,
+): Promise<{ remaining: number; cap: number | null; drawnThisMonth: number; available: number }> {
+  // Step 10: the usable remaining (creditUse.usablePaidAheadSql) — money a
+  // dispute or return of the credit's own funding still claims is never drawn.
+  const r = await client.query<{ remaining: string; cap: string | null }>(`
+    SELECT COALESCE((SELECT SUM(${usablePaidAheadSql('c', 'dc')})
+                       FROM lease_prepaid_credits c ${disputeClaimJoinSql('c', 'dc')}
+                      WHERE c.lease_id = $1 AND c.amount_remaining > 0 AND c.voided_at IS NULL), 0)::text AS remaining,
+           (SELECT prepaid_monthly_draw::text FROM leases WHERE id = $1) AS cap`,
+    [leaseId])
+  const row = r.rows[0]
+  const month = `${String(billingMonth).slice(0, 7)}-01`
+  const drawn = await paidAheadDrawnByMonth(client, [leaseId])
+  const remaining = Math.round(Number(row?.remaining ?? 0) * 100) / 100
+  const cap = row?.cap == null ? null : Math.round(Number(row.cap) * 100) / 100
+  const drawnThisMonth = Math.round((drawn.get(`${leaseId}|${month}`) ?? 0) * 100) / 100
+  const available = cap == null ? remaining : Math.max(0, Math.min(remaining, Math.round((cap - drawnThisMonth) * 100) / 100))
+  return { remaining, cap, drawnThisMonth, available }
+}
+
 export interface PrepaidReleaseResult {
-  /** Dollars of prepaid credit consumed. */
+  /** Dollars of credit spent. */
   consumed:      number
-  /** Charge rows settled or reduced by it. */
+  /** Charge rows settled by it. */
   rowsCovered:   number
-  /** Dollars booked to the landlord as earned this cycle. */
+  /** Dollars booked to the landlord (GAM-held credit only). */
   releasedToLandlord: number
 }
 
 /**
- * Draw a lease's prepaid credit down against a freshly-raised invoice, oldest
- * credit first, and hand the landlord the rent/utility portion of what it
- * covered.
+ * S537/S609 → S655: the bill run's credit step for one lease.
  *
- * Caller owns the transaction (invoice generation runs one per lease).
- */
-/**
+ * Now THE WHOLE-BILL RULE (creditUse.settleWholeBillIfCovered, Nic 10/2):
+ * credit — paid ahead, issued, deposit interest — settles the lease's bill
+ * only when it covers every required row in full; anything less settles
+ * nothing and the credit waits for the tenant's choice. A $200 monthly draw
+ * cap no longer picks off a $60 water line on its own: the bill is whole or
+ * untouched. GAM-held credit books the landlord's share with no second fee;
+ * landlord-held and issued credit book nothing (bug 1, S654).
+ *
+ * Thin wrapper: the bill run (jobs/invoiceGeneration) and the portal charge
+ * (services/rentCharge) now call the whole-bill rule themselves (Steps 7 and
+ * 8), so no production code calls this; only its tests do. Deleted in Step 18;
+ * do not add callers. Sends no receipt: it runs inside the caller's
+ * transaction, and a receipt goes only after a commit.
+ *
  * THE INVOICE ALWAYS WINS. This runs inside invoice generation's per-lease
- * transaction, so anything thrown here would roll back the whole invoice and the
- * tenant would get NO BILL AT ALL — a far worse outcome than the landlord's
- * money waiting another month.
- *
- * So the release runs inside a savepoint. If booking the landlord's share fails
- * (a property with no allocation rule, a missing processing rate, a PM plan with
- * no bank), everything this function did is undone: the credit is untouched and
- * the charge stays pending, exactly as if the tenant had no credit. The bill
- * still goes out, the tenant still owes the right amount, their money is still
- * theirs, and an admin is told loudly. Next month's run picks it up once the
- * configuration is fixed. Nothing is lost and nothing is silently wrong.
+ * transaction, so anything thrown here would roll back the whole invoice and
+ * the tenant would get NO BILL AT ALL. Everything runs inside a savepoint: a
+ * failure leaves the credit untouched and the charge open, an admin is told,
+ * and the bill still goes out.
  */
 export async function consumePrepaidCreditForInvoice(
   client: PoolClient,
@@ -77,136 +126,36 @@ export async function consumePrepaidCreditForInvoice(
   const NONE: PrepaidReleaseResult = { consumed: 0, rowsCovered: 0, releasedToLandlord: 0 }
   await client.query('SAVEPOINT prepaid_release')
   try {
-    const r = await releaseInner(client, opts)
+    const hh = await billHouseholdTenant(client, opts.leaseId, opts.invoiceId)
+    if (!hh) {
+      await client.query('RELEASE SAVEPOINT prepaid_release')
+      return NONE
+    }
+    const r = await settleWholeBillIfCovered(client, {
+      tenantId: hh.tenantId, landlordId: hh.landlordId, source: 'whole_bill',
+      onlyLeaseIds: [opts.leaseId], receipt: false,
+    })
     await client.query('RELEASE SAVEPOINT prepaid_release')
-    return r
+    const result: PrepaidReleaseResult = {
+      consumed: Math.round(r.leases.reduce((s, l) => s + l.creditUsed, 0) * 100) / 100,
+      rowsCovered: r.settledIds.length,
+      releasedToLandlord: Math.round(r.leases.reduce((s, l) => s + l.ownerShareBooked, 0) * 100) / 100,
+    }
+    if (result.consumed > 0) {
+      logger.info({ leaseId: opts.leaseId, invoiceId: opts.invoiceId, ...result },
+        '[prepaid-release] the whole bill was paid from credit')
+    }
+    return result
   } catch (e) {
     await client.query('ROLLBACK TO SAVEPOINT prepaid_release')
-    logger.error({ err: e, ...opts }, '[prepaid-release] could not book the landlord share — credit left untouched, invoice stands')
+    logger.error({ err: e, ...opts }, '[prepaid-release] credit step failed — credit left untouched, invoice stands')
     await createAdminNotification({
       severity: 'critical',
       category: 'prepaid_release_failed',
-      title: `Prepaid rent could not be released to the landlord on lease ${opts.leaseId}`,
-      body: `The tenant's prepaid credit was NOT applied to invoice ${opts.invoiceId} because the landlord's share could not be booked (${e instanceof Error ? e.message : String(e)}). The invoice went out in full and the tenant's credit is intact — but they are being asked to pay for a month they already paid for. Fix the property's payout configuration; the next invoice run will apply the credit.`,
+      title: `Credit could not be applied to the bill on lease ${opts.leaseId}`,
+      body: `The tenant's credit was NOT applied to invoice ${opts.invoiceId} (${e instanceof Error ? e.message : String(e)}). The invoice went out in full and the credit is intact. The next bill run or credit applies it once the cause is fixed.`,
       context: { lease_id: opts.leaseId, invoice_id: opts.invoiceId },
     }).catch(() => {})
     return NONE
   }
-}
-
-async function releaseInner(
-  client: PoolClient,
-  opts: { leaseId: string; invoiceId: string },
-): Promise<PrepaidReleaseResult> {
-  const credits = await client.query<{ id: string; amount_remaining: string; source_remittance_id: string | null }>(
-    `SELECT id, amount_remaining::text, source_remittance_id
-       FROM lease_prepaid_credits
-      WHERE lease_id = $1 AND amount_remaining > 0
-      ORDER BY created_at ASC
-      FOR UPDATE`,
-    [opts.leaseId])
-
-  let available = credits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
-  if (available <= 0.005) return { consumed: 0, rowsCovered: 0, releasedToLandlord: 0 }
-
-  // How the tenant originally paid. Only used to pick which rate row the
-  // allocation engine reads; the fee itself is suppressed on a release, so this
-  // cannot change what anyone is charged. Defaults to bank when the credit came
-  // from somewhere other than a remittance (a shortened stay, for instance).
-  const methodRow = await client.query<{ payment_method: string }>(
-    `SELECT payment_method FROM tenant_remittances
-      WHERE id = ANY($1::uuid[]) AND payment_method IN ('ach','card')
-      ORDER BY created_at DESC LIMIT 1`,
-    [credits.rows.map(c => c.source_remittance_id).filter(Boolean)])
-  const paymentMethod: PaymentMethod =
-    methodRow.rows[0]?.payment_method === 'card' ? 'card' : 'ach'
-
-  const fresh = await client.query<{ id: string; amount: string; type: string; revenue_owner: string; unit_id: string | null }>(
-    `SELECT id, amount::text, type, revenue_owner, unit_id FROM payments
-      WHERE invoice_id = $1 AND status = 'pending'
-      ORDER BY due_date ASC, created_at ASC
-      FOR UPDATE`,
-    [opts.invoiceId])
-
-  let consumed = 0
-  let rowsCovered = 0
-  // Rows the landlord has now earned. Collected as we go, allocated after the
-  // draw-down so every covered row is already settled when allocation reads it.
-  const earned: string[] = []
-
-  for (const row of fresh.rows) {
-    if (available <= 0.005) break
-    const rowAmt = Number(row.amount)
-    // S609: the landlord's money is anything owed under the lease — rent,
-    // utilities, late fees, fees they billed. GAM's own charges are stamped at
-    // creation and stay with GAM; a row with no unit has no property to resolve
-    // an owner from.
-    const landlordsMoney =
-      (ALLOCATABLE_PAYMENT_TYPES as readonly string[]).includes(row.type) &&
-      row.revenue_owner === 'landlord' &&
-      !!row.unit_id
-
-    // S637 — MONEY PAID AHEAD DOES NOT SPLIT A CHARGE EITHER.
-    //
-    // Nic (DIRECTIVE): "we don't do partial payments." This did the same split
-    // as the landlord-credit path — covered slice settled, `Remainder after…`
-    // row inserted — and defended it in a comment as keeping "the ledger"
-    // honest, which is backwards: it rewrote the rent row instead of leaving
-    // the balance to carry.
-    //
-    // Prepaid money differs from a landlord credit in one way that matters: the
-    // tenant really did hand it over and GAM is holding it, so settling a bill
-    // out of it IS a real settlement and the landlord genuinely earns that
-    // month's share. That part is untouched. What changes is that a bill is
-    // cleared WHOLE or left alone, with the rest staying on the account as the
-    // tenant's money — exactly what a year's prepayment is supposed to do while
-    // it waits for next month's bill.
-    if (rowAmt > available + 0.005) continue
-
-    await client.query(
-      `UPDATE payments
-          SET status='settled', settled_at=NOW(), platform_held = $2,
-              notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
-        WHERE id = $1`, [row.id, landlordsMoney])
-    if (landlordsMoney) earned.push(row.id)
-    available -= rowAmt
-    consumed += rowAmt
-    rowsCovered++
-  }
-
-  // Draw the consumed total down across the credits themselves, oldest first.
-  let toDraw = consumed
-  for (const c of credits.rows) {
-    if (toDraw <= 0.005) break
-    const draw = Math.min(Number(c.amount_remaining), toDraw)
-    await client.query(
-      `UPDATE lease_prepaid_credits
-          SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
-        WHERE id = $1`, [c.id, draw.toFixed(2)])
-    toDraw -= draw
-  }
-
-  // Book the landlord's share of what they just earned. Without this the money
-  // stays on GAM's balance forever — the whole point of the service.
-  let releasedToLandlord = 0
-  for (const paymentId of earned) {
-    await executeRentAllocation(client, paymentId, paymentMethod, { feeAlreadyCollected: true })
-    const owner = await client.query<{ amount: string }>(
-      `SELECT amount::text FROM user_balance_ledger
-        WHERE reference_id = $1 AND reference_type = 'payment'
-          AND type = 'allocation_owner_share'`,
-      [paymentId])
-    releasedToLandlord += owner.rows.reduce((s, r) => s + Number(r.amount), 0)
-  }
-
-  const result = {
-    consumed: Math.round(consumed * 100) / 100,
-    rowsCovered,
-    releasedToLandlord: Math.round(releasedToLandlord * 100) / 100,
-  }
-  if (result.consumed > 0) {
-    logger.info({ leaseId: opts.leaseId, invoiceId: opts.invoiceId, ...result },
-      '[prepaid-release] prepaid credit applied and landlord share booked')
-  }
-  return result
 }

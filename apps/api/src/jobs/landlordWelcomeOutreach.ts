@@ -13,7 +13,7 @@
  * An email that lands the instant you hit "create account" is transparently
  * automated, and it competes with the 2FA code the account is waiting on. A
  * note that shows up ~90 minutes later reads like a person noticed. That delay
- * IS the feature — do not "optimise" it into the signup handler.
+ * IS the feature — do not "optimize" it into the signup handler.
  *
  * ── Who gets it ─────────────────────────────────────────────────────────
  *   • ORGANIC only — no closer (portfolio_manager_id) and no referring landlord

@@ -1,21 +1,21 @@
 ---
 scope: tenant
-title: Reporting a problem with a neighbour, a pet, parking, or the property
+title: Reporting a problem with a neighbor, a pet, parking, or the property
 ---
 
 Not everything that goes wrong is a repair. If the trouble is someone else's
-behaviour — noise at night, a dog barking, somebody parked in your space, smoke
+behavior — noise at night, a dog barking, somebody parked in your space, smoke
 or a smell drifting over, bins left out — that's a **complaint**, and it goes to
 your landlord as a separate thing from maintenance.
 
 You can raise one by telling the assistant in your own words. You don't need to
-categorise it or use particular wording: "the people upstairs are up until 3am
+categorize it or use particular wording: "the people upstairs are up until 3am
 every night" is enough. It's recorded against your unit and your lease, in the
 words you used, and your landlord is notified.
 
 ## What GAM records it as
 
-Every complaint is filed under one of these: **noise, neighbour, parking, pets,
+Every complaint is filed under one of these: **noise, neighbor, parking, pets,
 smell, trash, property condition, harassment,** or **safety** — and **other**
 when none of those fit. The category is just how it's sorted on your landlord's
 list; it doesn't change how seriously it's treated, and it doesn't limit what
@@ -44,7 +44,7 @@ come on, a lock that doesn't catch — that's a **maintenance request**, not a
 complaint, and it goes down a different path with its own status you *can*
 follow. Report it as maintenance and it reaches whoever actually fixes things.
 
-The rule of thumb: a complaint is about somebody's behaviour or the state of
+The rule of thumb: a complaint is about somebody's behavior or the state of
 shared space. A maintenance request is about something that needs repairing.
 
 ## Safety and emergencies

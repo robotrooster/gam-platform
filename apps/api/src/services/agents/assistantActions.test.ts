@@ -104,7 +104,7 @@ describe("a tenant can send their landlord a message — Nic's own example", () 
     const ACTOR = { userId: 'u', role: 'tenant', profileId: 't1' } as any
     for (const [msg, expected] of [
       ['the kitchen sink is leaking again', 'file_maintenance_request'],
-      ['my neighbour upstairs plays loud music every night', 'log_complaint'],
+      ['my neighbor upstairs plays loud music every night', 'log_complaint'],
       ['I want to renew for another year', 'request_lease_renewal'],
     ] as const) {
       const r: any = await t.execute({ message: msg }, ACTOR)

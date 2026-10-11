@@ -23,6 +23,7 @@
 import Stripe from 'stripe'
 import { PROCESSING_FEES, processingFeeFor } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
+import { connectPayoutOwner, fileConnectPayout } from './connectPayoutSync'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { createAdminNotification } from './adminNotifications'
@@ -232,6 +233,26 @@ interface CreateRentPlatformChargeOpts {
   paymentMethodTypes: ('us_bank_account' | 'card')[]
   entryDescription: string
   metadata?: Record<string, string>
+  /**
+   * S655 (money plan Step 4): Stripe's idempotency key for this create. A
+   * retry of the SAME request with the same key (a lost reply, a dropped
+   * connection) returns the intent Stripe already made instead of pulling the
+   * bank a second time. The FlexPay pull passes `flexpay_pull_<paymentId>`;
+   * the caller must send identical parameters on every retry with one key.
+   */
+  idempotencyKey?: string
+  /**
+   * S655 (decisions.md #48.4): the cardholder is not here — an autopay card
+   * pull. Sent to Stripe as `off_session: true`, which tells the card's bank
+   * the customer is away and lets it accept the payment on the saved card's
+   * standing authorization instead of asking for a confirmation nobody can
+   * give (3-D Secure). If the bank still insists, Stripe refuses the charge
+   * (authentication_required) and the pull fails through the normal failure
+   * path. The card was saved for later use when the tenant set it up, so
+   * setup_future_usage is left out. Cards only: a bank account debit runs on
+   * its mandate, so this is ignored for one.
+   */
+  offSession?: boolean
 }
 
 /**
@@ -241,13 +262,16 @@ interface CreateRentPlatformChargeOpts {
  */
 export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpts) {
   const stripe = getStripe()
-  const intent = await stripe.paymentIntents.create({
+  const isCard = opts.paymentMethodTypes.includes('card')
+  const offSession = opts.offSession === true && isCard
+  const params: Stripe.PaymentIntentCreateParams = {
     amount: Math.round(opts.amount * 100),
     currency: 'usd',
     customer: opts.stripeCustomerId,
     payment_method: opts.paymentMethodId,
     payment_method_types: opts.paymentMethodTypes,
     confirm: true,
+    ...(offSession ? { off_session: true } : {}),
     // S603 (Nic): save the card on THIS authorization instead of spending a
     // separate one on a SetupIntent. Stripe bills $0.26 per authorization — per
     // BANK ASK, not per successful payment — so the old "add a card, then pay
@@ -260,7 +284,10 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
     //
     // Harmless when the card is ALREADY saved — Stripe reaffirms the existing
     // payment method rather than duplicating it.
-    ...(opts.paymentMethodTypes.includes('card')
+    //
+    // Not on an off-session pull (autopay): the card was saved for later use
+    // when the tenant set it up; there is nobody here to save it again.
+    ...(isCard && !offSession
       ? { setup_future_usage: 'off_session' as const }
       : {}),
     description: `${opts.entryDescription} - Gold Asset Management`,
@@ -280,7 +307,11 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
           },
         }
       : {}),
-  })
+  }
+  // Only a caller that names a key sends one; every other call is unchanged.
+  const intent = opts.idempotencyKey
+    ? await stripe.paymentIntents.create(params, { idempotencyKey: opts.idempotencyKey })
+    : await stripe.paymentIntents.create(params)
   return intent
 }
 
@@ -323,7 +354,7 @@ export function computePlatformCut(opts: {
   // S607: delegates to the shared formula so the fee a tenant is QUOTED on the
   // invoice and the fee they are CHARGED come from one definition. Two copies
   // of this arithmetic is how a repricing lands in one place and not the other,
-  // and the tenant picks a method on a number we then do not honour.
+  // and the tenant picks a method on a number we then do not honor.
   return processingFeeFor(opts)
 }
 
@@ -592,8 +623,13 @@ export async function fireManagerTransfersForReference(
  */
 export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string): Promise<void> {
   // Resolve which GAM entity owns the Connect account
+  // S652: a landlord's Connect account is stamped on the COMPANY (landlords),
+  // and only sometimes on the user — Mountain View's is on the company alone,
+  // so this used to drop every one of its payout events as "unknown".
   const userRow = await queryOne<{ id: string }>(
-    `SELECT id FROM users WHERE stripe_connect_account_id = $1`, [accountId]
+    `SELECT id FROM users WHERE stripe_connect_account_id = $1
+     UNION SELECT user_id FROM landlords WHERE stripe_connect_account_id = $1 AND user_id IS NOT NULL
+     LIMIT 1`, [accountId]
   )
   const pmRow = userRow ? null : await queryOne<{ id: string }>(
     `SELECT id FROM pm_companies WHERE stripe_connect_account_id = $1`, [accountId]
@@ -601,6 +637,11 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
   if (!userRow && !pmRow) return  // Unknown Connect account — silent no-op
 
   const status = payout.status as string  // pending | paid | failed | canceled | in_transit
+  // S652: Stripe redelivers events and GAM replays stored ones; the landlord
+  // is told about a payout ONCE — only when its status actually changes.
+  const before = await queryOne<{ status: string }>(
+    `SELECT status FROM connect_payouts WHERE stripe_payout_id = $1`, [payout.id])
+  const statusChanged = before?.status !== status
   const amountDollars = (payout.amount ?? 0) / 100
   const arrivalDate = payout.arrival_date
     ? new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)
@@ -657,6 +698,19 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
     )
   }
 
+  // S652 (Nic: "if it's free, do it"): file the payout on the landlord's
+  // page the moment Stripe reports it — with the bank it went to, and as a
+  // 'stripe_dashboard' row when the landlord made it in Stripe themselves.
+  // Same row the nightly sync writes; this just makes it instant.
+  if (userRow) {
+    try {
+      const owner = await connectPayoutOwner(accountId)
+      if (owner) await fileConnectPayout(getStripe() as any, owner, payout)
+    } catch (e) {
+      logger.warn({ err: e, payout_id: payout.id }, '[payout] could not file on the disbursements page; the nightly sync will')
+    }
+  }
+
   // S175 / S176: notify the recipient when a Connect payout reaches a
   // terminal status. Two routing paths:
   //   - userRow match (landlord / opt-in manager): single recipient via
@@ -667,7 +721,7 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
   // Failures swallowed + logged: a bad notification call must not fail
   // the webhook, since Stripe would retry the whole event and re-write
   // the connect_payouts row.
-  if ((userRow || pmRow) && (status === 'paid' || status === 'failed')) {
+  if ((userRow || pmRow) && statusChanged && (status === 'paid' || status === 'failed')) {
     try {
       if (userRow) {
         const u = await queryOne<{ email: string; phone: string | null }>(
@@ -868,18 +922,16 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
 // link in their email, lands on Stripe's checkout page, pays card/ACH,
 // and Stripe routes the gross to the business's Connect account.
 //
-// Application fee (GAM platform cut) is set to 0 for now; the business
-// pays Stripe's processing fee (Stripe deducts before transfer). Per-
-// invoice fee tuning can dial this in later via a settings field.
+// S648 (Nic): "Every single cent" flows through GAM. The invoice is paid to
+// GAM's account; GAM's cut is taken when the payment is recorded (webhook →
+// held_payout_items) and the rest goes out in the business's weekly payout.
 
 interface CreateInvoiceCheckoutOpts {
   amountCents:                 number
-  businessConnectAccountId:    string
   invoiceNumber:                string
   customerEmail?:               string | null
   successUrl:                   string
   cancelUrl:                    string
-  platformCutCents?:         number
   metadata?:                    Record<string, string>
   // S508: when set, ask Stripe to create a Customer + save the card
   // for off-session charges (recurring cycles). The webhook persists
@@ -923,10 +975,6 @@ export async function createInvoiceCheckoutSession(
       },
     }],
     payment_intent_data: {
-      transfer_data: {
-        destination: opts.businessConnectAccountId,
-      },
-      application_fee_amount: opts.platformCutCents ?? 0,
       metadata: {
         gam_purpose: 'business_invoice',
         ...(opts.metadata ?? {}),
@@ -959,59 +1007,68 @@ export async function createInvoiceCheckoutSession(
   return { sessionId: session.id, hostedUrl: session.url }
 }
 
-// ── Booking deposit checkout (S517 / public property booking) ──
-// A public stay-booking guest pays a deposit on Stripe's hosted Checkout;
-// the gross routes to the landlord's Connect account (destination charge),
-// GAM takes its platform cut as the application fee. The webhook confirms the
-// booking on checkout.session.completed (gam_purpose='booking_deposit').
-export interface CreateBookingDepositCheckoutOpts {
-  amountCents:                 number
-  landlordConnectAccountId:    string
-  unitLabel:                   string
-  guestEmail?:                 string | null
-  successUrl:                  string
-  cancelUrl:                   string
-  platformCutCents?:        number
-  metadata?:                   Record<string, string>
+/**
+ * S648 — a register pay link's card page (routes/posPayLinks.ts). Card only,
+ * charged on GAM's account like rent: the landlord's share goes out in the
+ * weekly batch, GAM keeps the card fee the customer paid on top. A standing
+ * link (the dump-station QR) asks the payer's name, since nobody entered it.
+ */
+/**
+ * S652: an open pay link was edited. Close any card page the payer already has
+ * at the old amount, so the only amount that can be paid is the current one.
+ * Missing or already-closed sessions are not errors.
+ */
+export async function expirePayLinkCheckoutSession(_landlordId: string, sessionId: string): Promise<void> {
+  // Pay-link checkouts are made on the platform account (platform-held), so
+  // they are closed there too.
+  const stripe = getStripe()
+  const s = await stripe.checkout.sessions.retrieve(sessionId)
+  if (s.status === 'open') await stripe.checkout.sessions.expire(sessionId)
 }
 
-export async function createBookingDepositCheckoutSession(
-  opts: CreateBookingDepositCheckoutOpts,
-): Promise<InvoiceCheckoutResult> {
+export async function createPayLinkCheckoutSession(opts: {
+  lineItems: Array<{ name: string; amountCents: number }>
+  customerEmail?: string | null
+  askName?: boolean
+  successUrl: string
+  cancelUrl: string
+  metadata: Record<string, string>
+}): Promise<InvoiceCheckoutResult> {
   const stripe = getStripe()
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
-    payment_method_types: ['card', 'us_bank_account'],
-    line_items: [{
+    payment_method_types: ['card'],
+    line_items: opts.lineItems.filter(l => l.amountCents > 0).map(l => ({
       quantity: 1,
-      price_data: {
-        currency: 'usd',
-        unit_amount: opts.amountCents,
-        product_data: { name: `Stay deposit — ${opts.unitLabel}` },
-      },
-    }],
+      price_data: { currency: 'usd', unit_amount: l.amountCents, product_data: { name: l.name.slice(0, 250) } },
+    })),
+    // S648: a platform charge — no transfer. The landlord's share is paid in
+    // the weekly batch (pos_transactions.payout_owed).
     payment_intent_data: {
-      transfer_data: { destination: opts.landlordConnectAccountId },
-      application_fee_amount: opts.platformCutCents ?? 0,
-      metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
+      metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },
     },
-    metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
-    customer_email: opts.guestEmail ?? undefined,
+    metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },
+    customer_email: opts.customerEmail ?? undefined,
+    phone_number_collection: { enabled: !!opts.askName },
+    custom_fields: opts.askName
+      ? [{ key: 'name', label: { type: 'custom', custom: 'Your name' }, type: 'text' }]
+      : undefined,
     success_url: opts.successUrl,
-    cancel_url:  opts.cancelUrl,
+    cancel_url: opts.cancelUrl,
   })
   if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
   return { sessionId: session.id, hostedUrl: session.url }
 }
 
 /**
- * Refund a business-invoice PaymentIntent (a Connect destination charge).
+ * Refund a business-invoice PaymentIntent.
  *
- * `reverse_transfer: true` is REQUIRED: the gross landed in the business's
- * Connect balance, so the refund must pull the money back from there — never
- * from GAM's platform balance. `refund_application_fee` is intentionally
- * OMITTED (Nic, S502): GAM keeps its platform fee on a refund, so the business
- * bears GAM's cut on the refunded amount.
+ * S648: the charge is GAM's (every cent flows through the platform), so the
+ * refund leaves GAM's balance and the caller records it against the business
+ * as a negative held item — it nets from their next payout. GAM keeps its cut
+ * on a refund (Nic, S502), so the business bears the whole refunded amount.
+ * Charges from before S648 were destination charges; `reverse_transfer` pulls
+ * those back from the business's Stripe balance as before.
  *
  * `amountCents` omitted = full remaining refund. Returns the Stripe refund id.
  * `idempotencyKey` makes a retried request safe (no double refund).
@@ -1022,11 +1079,12 @@ export async function refundBusinessInvoicePayment(opts: {
   reason?: string
   idempotencyKey?: string
   metadata?: Record<string, string>
-}): Promise<{ refundId: string; status: string | null }> {
+}): Promise<{ refundId: string; status: string | null; heldOnPlatform: boolean }> {
   const stripe = getStripe()
+  const pi = await stripe.paymentIntents.retrieve(opts.paymentIntentId)
   const params: Stripe.RefundCreateParams = {
     payment_intent: opts.paymentIntentId,
-    reverse_transfer: true,
+    ...(pi.transfer_data ? { reverse_transfer: true } : {}),
     metadata: { gam_purpose: 'business_invoice_refund', ...(opts.metadata ?? {}) },
   }
   if (opts.amountCents != null) params.amount = opts.amountCents
@@ -1036,7 +1094,7 @@ export async function refundBusinessInvoicePayment(opts: {
     params,
     opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : undefined,
   )
-  return { refundId: refund.id, status: refund.status }
+  return { refundId: refund.id, status: refund.status, heldOnPlatform: !pi.transfer_data }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────

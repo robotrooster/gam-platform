@@ -85,12 +85,34 @@ export interface BackgroundProvider {
   readonly name: string
   initiate(req: BackgroundProviderInitiateRequest): Promise<BackgroundProviderInitiateResult>
   verifyWebhook(headers: Record<string, string | string[] | undefined>, rawBody: string): boolean
-  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate
+  /**
+   * S640: returns null for an event that is genuinely nothing to act on.
+   *
+   * Throwing made the route 500, which tells the provider to RETRY — so an
+   * event we simply did not need was redelivered forever. Checkr sent 79
+   * webhooks in 25 hours and 75 of them 500'd on one such event, burying the
+   * `report.completed` that actually mattered. An endpoint should acknowledge
+   * what it can safely ignore and reserve failure for things worth retrying.
+   */
+  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate | null
   craDisclosure(): CraDisclosure
   // S551: optional — pull the full report when the webhook only carries a
   // report id (see BackgroundProviderWebhookUpdate.reportRef). Returns the
   // normalized summary to store on the row, or null if unavailable.
   fetchReport?(reportRef: string): Promise<Record<string, unknown> | null>
+  /**
+   * S640: ask the provider where an order stands, without waiting to be told.
+   *
+   * A webhook is one HTTP request that either arrives or does not. Checkr
+   * finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9 and GAM
+   * never heard — his screening sat at `processing` for twenty-two hours until
+   * Nic went in and decided it by hand. A $44.99 report that gates somebody's
+   * tenancy cannot depend on a single delivery.
+   */
+  fetchStatus?(providerRef: string): Promise<{
+    status: BackgroundCheckStatus
+    reportRef: string | null
+  } | null>
 }
 
 // ── MOCK PROVIDER ─────────────────────────────────────────────
@@ -215,6 +237,20 @@ function mapProviderStatus(raw: string): BackgroundCheckStatus {
 
 // The report's per-product items. Each non-null product carries a status of
 // 'clear' | 'consider'; products not in the ordered package come back null.
+/**
+ * S640 — what Checkr's own docs call "fully resolved".
+ *
+ *   "inspect the `status` field on each non-null product for values `clear` or
+ *    `consider` to determine when the screening is fully resolved."
+ *
+ * Anything else — pending, suspended, a status they add later — is a product
+ * still running. See summariseProducts: a report with one of those in it is NOT
+ * a clear report, and must never be shown to a landlord as one.
+ */
+const TERMINAL_PRODUCT_STATUSES = new Set(['clear', 'consider'])
+
+/** 10/5 (Nic): the live ID scan every order asks for — see initiate(). */
+export const CHECKR_ID_SCAN_ADD_ON = 'identity_verification'
 const CHECKR_TENANT_PRODUCTS = [
   'criminal_history', 'credit_report', 'eviction_history',
   'identity_verification', 'income_verification',
@@ -223,6 +259,8 @@ const CHECKR_TENANT_PRODUCTS = [
 
 class CheckrProvider implements BackgroundProvider {
   readonly name = 'checkr'
+  /** S639: the last raw report body fetched, for the archive. */
+  rawReport: Record<string, unknown> | null = null
 
   private get baseUrl(): string {
     return process.env.CHECKR_TENANT_BASE_URL || 'https://tenant.checkr.com/api'
@@ -240,13 +278,22 @@ class CheckrProvider implements BackgroundProvider {
   }
 
   async initiate(req: BackgroundProviderInitiateRequest): Promise<BackgroundProviderInitiateResult> {
-    if (!req.consentCredit || !req.consentCriminal) {
-      return {
-        providerRef: '',
-        status: 'failed',
-        failureReason: 'Provider rejected: missing required consents',
-      }
-    }
+    // S637: NO CONSENT GATE HERE — Checkr collects FCRA consent itself.
+    //
+    // This guard was written when GAM's own intake gathered consent, and it
+    // outlived that. S578 moved DOB, SSN, address AND the FCRA disclosure and
+    // authorization onto Checkr's hosted apply flow, so the intake form stopped
+    // rendering those checkboxes and the route stopped requiring them — but
+    // this line kept demanding them. Three layers, and the middle one changed.
+    //
+    // The result was a screening product that failed 100% of the time AFTER
+    // taking the applicant's money: Anastacio Erreguin paid $44.99, the order
+    // was rejected here before Checkr was ever called, and nothing told anyone.
+    // He was the first person to use the link.
+    //
+    // Consent is still obtained — on Checkr's page, by Checkr, which is what
+    // makes them the CRA of record for it. The mock provider below keeps its
+    // own gate, because that path really does collect consent in GAM.
     // S564 (Nic): ONE package platform-wide, hardcoded — never env- or
     // landlord-configurable. A single Essential screen for every applicant on
     // every route/state removes any lever for a landlord to order a lighter or
@@ -264,9 +311,14 @@ class CheckrProvider implements BackgroundProvider {
     // Applicant identity: name + email (+ DOB when the intake captured it).
     // SSN is deliberately NEVER sent — the applicant supplies it on Checkr's
     // hosted consent form, so screening PII stays off GAM servers.
-    const body = {
+    // 10/5 (Nic): "Order the ID scan." The price applicants pay has always
+    // been built on Checkr's $2.95 live ID scan (identity_verification — an
+    // add-on; Essential does not bundle it), but no order ever asked for it, so
+    // every applicant paid for a check that never ran. Every order asks now.
+    const body: { order: Record<string, unknown> } = {
       order: {
         package: pkg,
+        add_on_products: [CHECKR_ID_SCAN_ADD_ON],
         property: {
           name:    req.property.name || null,
           street:  req.property.street,
@@ -283,17 +335,53 @@ class CheckrProvider implements BackgroundProvider {
       },
     }
 
-    const res = await fetch(`${this.baseUrl}/orders`, {
+    // S637: Checkr's Tenant API REQUIRES an Idempotency-Key on order create —
+    // without it the call is rejected 422 "Header is required" before any
+    // validation of the order itself. Nothing in our stack sent one, so no
+    // order could ever be placed.
+    //
+    // Keyed on the background check id, which is the right idempotency unit:
+    // a retry of the SAME check (this one was retried by hand after being
+    // wrongly rejected) must never create a second order the applicant is
+    // charged for or asked to complete twice.
+    const post = (b: unknown, key: string) => fetch(`${this.baseUrl}/orders`, {
       method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify(body),
+      headers: { ...this.headers(), 'Idempotency-Key': key },
+      body: JSON.stringify(b),
     })
+    let res = await post(body, `gam-bgc-${req.backgroundCheckId}`)
     if (!res.ok) {
       const text = await res.text()
-      return {
-        providerRef: '',
-        status: 'failed',
-        failureReason: `Checkr order create failed: ${res.status} ${text.slice(0, 200)}`,
+      // Checkr refuses an add-on the account is not set up for (422). The
+      // applicant is standing at the counter: run the check without it rather
+      // than stop them, and tell GAM at once so the add-on gets turned on.
+      // A new idempotency key — the same key with a different body is refused.
+      if (res.status === 422 && /add_on|identity_verification/i.test(text)) {
+        const { add_on_products: _dropped, ...withoutAddOn } = body.order
+        res = await post({ order: withoutAddOn }, `gam-bgc-${req.backgroundCheckId}-no-id-scan`)
+        try {
+          const { createAdminNotification } = await import('./adminNotifications')
+          await createAdminNotification({
+            severity: 'critical', category: 'checkr_id_scan_refused', emailSuperAdmins: true,
+            title: 'Checkr refused the ID scan — turn it on in Checkr',
+            body: `Checkr would not add the live ID scan (identity_verification) to a screening order, so this applicant's check ran without it. Enable the ID-scan add-on for the organization in the Checkr dashboard. Checkr said: ${text.slice(0, 300)}`,
+            context: { background_check_id: req.backgroundCheckId },
+          })
+        } catch { /* the order matters more than the notice */ }
+      } else {
+        return {
+          providerRef: '',
+          status: 'failed',
+          failureReason: `Checkr order create failed: ${res.status} ${text.slice(0, 200)}`,
+        }
+      }
+      if (!res.ok) {
+        const again = await res.text()
+        return {
+          providerRef: '',
+          status: 'failed',
+          failureReason: `Checkr order create failed: ${res.status} ${again.slice(0, 200)}`,
+        }
       }
     }
     const order = await res.json() as { id: string; status: string; application_url?: string | null }
@@ -329,7 +417,7 @@ class CheckrProvider implements BackgroundProvider {
     }
   }
 
-  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate {
+  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate | null {
     // Event envelope: { id, object:'event', type, created_at, data }
     const evt = JSON.parse(rawBody) as {
       id: string
@@ -346,47 +434,163 @@ class CheckrProvider implements BackgroundProvider {
       case 'order.applicant.started':
       case 'order.applicant.completed':
         return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
-      // Individual product done — report not complete yet; stay processing.
+      // ── S640: A PER-PRODUCT PING IS NOT AN UPDATE ────────────────────────
+      //
+      // This asked requireOrderRef for an order id the event does not carry:
+      // the payload is the report ITEM (rpi_…), which references a report, not
+      // an order. So it threw, the route 500'd, and Checkr redelivered — 75
+      // failures against 4 successes, one per product per report, forever.
+      //
+      // And there was nothing to apply even if it had parsed. The check is
+      // already `processing`; a product finishing does not change that. Checkr
+      // sends `report.completed` when the whole thing is done, which is the
+      // event that matters. Acknowledge this one and move on.
       case 'report.product.completed':
-        return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
-      // Full report ready: data carries { id: report_id, order_id }. The route
-      // fetches the actual results via fetchReport(reportRef).
+        return null
+      // ── S640: THE COMPLETION EVENT CARRIES A REPORT ID, NOT AN ORDER ID ──
+      //
+      // Checkr's Tenant docs: "we POST a report.completed event ... including
+      // the report_id", and "fetch it via GET /reports/{id} using the report_id
+      // from the webhook payload". Nowhere do they promise an order_id.
+      //
+      // This demanded one and threw without it — the same failure that made 75
+      // of 79 deliveries 500, one level up and on the only event that finishes a
+      // screening. An empty providerRef tells the route to resolve the order
+      // FROM the report, which carries order_id in its body.
       case 'report.completed':
         return {
-          providerRef: requireOrderRef(d, evt.type),
+          providerRef: d.order_id || '',
           status:      'complete',
-          reportRef:   d.id || null,
+          reportRef:   d.id || d.report_id || null,
           receivedAt:  new Date(),
         }
+      // S640: an event we do not recognize is acknowledged, not retried.
+      // Providers add event types without asking; the alternative is a retry
+      // storm on every one of them, which is exactly what happened here.
       default:
-        throw new Error(`Unhandled Checkr Tenant event type: ${evt.type}`)
+        return null
     }
   }
 
   // Pull the report and normalize into the row's report_summary jsonb:
   // { result: 'clear'|'consider', products: { <product>: 'clear'|'consider' } }
   // Overall result is 'consider' if ANY included product is consider.
+  /**
+   * S640: the order's own view of itself, plus its report when there is one.
+   *
+   * `GET /orders/{id}` carries the status but no pointer to the report;
+   * `GET /orders/{id}/report` returns the report directly. Two calls, and the
+   * second only once the first says completed.
+   */
+  async fetchStatus(providerRef: string): Promise<{ status: BackgroundCheckStatus; reportRef: string | null } | null> {
+    const res = await fetch(`${this.baseUrl}/orders/${encodeURIComponent(providerRef)}`, {
+      headers: this.headers(),
+    })
+    if (!res.ok) return null
+    const order = await res.json() as Record<string, any>
+    const status = mapCheckrTenantStatus(String(order.status || ''))
+    if (status !== 'complete') return { status, reportRef: null }
+
+    // S640: the order saying completed is not the same as the screening being
+    // resolved — Checkr's docs put terminal status on each PRODUCT. Pull the
+    // report and check. A report that is not there yet is a documented 404
+    // meaning "not ready", not a broken link, so it stays processing.
+    try {
+      const rep = await fetch(`${this.baseUrl}/orders/${encodeURIComponent(providerRef)}/report`, {
+        headers: this.headers(),
+      })
+      if (!rep.ok) return { status: 'processing', reportRef: null }
+      const body = await rep.json() as Record<string, any>
+      const unresolved = CHECKR_TENANT_PRODUCTS.some((p) => {
+        const item = body[p]
+        return item && typeof item === 'object' && typeof item.status === 'string'
+          && !TERMINAL_PRODUCT_STATUSES.has(item.status)
+      })
+      if (unresolved) return { status: 'processing', reportRef: null }
+      return { status, reportRef: typeof body.id === 'string' ? body.id : null }
+    } catch {
+      // Reaching Checkr failed, which says nothing about the screening. Leave it
+      // where it is and try again on the next pass.
+      return { status: 'processing', reportRef: null }
+    }
+  }
+
   async fetchReport(reportRef: string): Promise<Record<string, unknown> | null> {
     const res = await fetch(`${this.baseUrl}/reports/${encodeURIComponent(reportRef)}`, {
       headers: this.headers(),
     })
     if (!res.ok) return null
     const report = await res.json() as Record<string, any>
+    // S639: the payload verbatim, before it is narrowed to a summary. The
+    // normalization below answers today's question; the archive answers the ones
+    // that come later — a dispute, a re-screen, "what did it actually say".
+    this.rawReport = report
     const products: Record<string, string> = {}
+    const details: Record<string, Record<string, unknown>> = {}
+    // ── S640: A HALF-FINISHED REPORT IS NOT A CLEAR REPORT ─────────────────
+    //
+    // This started at 'clear' and only moved on a 'consider', so a product
+    // still PENDING left the overall result reading clear. A landlord could
+    // have approved somebody on a screening that had not finished running, and
+    // nothing on the page would have said so. Checkr's docs are explicit that
+    // resolution is per product; unresolved is its own answer, not a pass.
     let overall: 'clear' | 'consider' = 'clear'
+    let allTerminal = true
     for (const p of CHECKR_TENANT_PRODUCTS) {
       const item = report[p]
       if (item && typeof item === 'object' && typeof item.status === 'string') {
         products[p] = item.status
+        if (!TERMINAL_PRODUCT_STATUSES.has(item.status)) allTerminal = false
         if (item.status === 'consider') overall = 'consider'
+        // ── S639 (Nic): "I'm just wondering why Checkr is considering a seven
+        // twenty credit score as consider instead of good." ─────────────────
+        //
+        // A fair question that nobody could answer, because this kept the
+        // one-word status and threw the rest away. Checkr had in fact returned
+        // credit_score 720 and credit_file_status "available" alongside that
+        // "consider", and neither ever reached the database, let alone the
+        // landlord — so "consider" arrived looking like a verdict on the number
+        // when it is a verdict against the criteria configured on the account.
+        //
+        // An explicit ALLOWLIST rather than the whole object: a consumer report
+        // carries far more about a person than a tenancy decision needs, and
+        // the reason to hold a field is that it explains the status.
+        const KEEP = [
+          'credit_score', 'credit_file_status',
+          'score', 'assessment', 'decision', 'reason', 'reasons',
+          'records_count', 'result',
+        ]
+        const kept: Record<string, unknown> = {}
+        for (const k of KEEP) {
+          const v = (item as Record<string, unknown>)[k]
+          if (v !== undefined && v !== null && (typeof v !== 'object' || Array.isArray(v))) kept[k] = v
+        }
+        if (Object.keys(kept).length) details[p] = kept
       }
     }
+    // S642 (Nic): "We're gonna generate accounts off a legal name." An applicant
+    // account is created from email + password and carries only the provisional
+    // name typed to open the order. The screener is the authority on who this
+    // person legally is, so the matched name comes back with the report and
+    // replaces it. Narrow on purpose — a name, nothing else from the candidate
+    // record, in keeping with the allowlist above.
+    const cand = (report.candidate ?? report.applicant ?? {}) as Record<string, any>
+    const matchedFirst = typeof cand.first_name === 'string' ? cand.first_name.trim() : ''
+    const matchedLast  = typeof cand.last_name  === 'string' ? cand.last_name.trim()  : ''
+
     return {
       provider:   'checkr',
       report_id:  report.id ?? reportRef,
       order_id:   report.order_id ?? null,
-      result:     overall,
+      result:     allTerminal ? overall : 'pending',
+      matched_first_name: matchedFirst || null,
+      matched_last_name:  matchedLast  || null,
+      // S640: stated outright so a reader never has to infer it from the
+      // per-product map, and so the landlord page can say "still running"
+      // instead of rendering a verdict that is not one yet.
+      all_products_resolved: allTerminal,
       products,
+      details,
       fetched_at: new Date().toISOString(),
     }
   }

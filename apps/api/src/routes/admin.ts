@@ -1,10 +1,14 @@
 import os from 'os'
+// S641: portal links resolve in one place — never localhost in production.
+import { portalLink } from '../lib/portalUrls'
+import { payNowLink } from '../services/invoiceNotice'
 import path from 'path'
 import fs from 'fs'
 import { Router, type Request } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL, isPlatformOwner } from '../middleware/auth'
+import { logger } from '../lib/logger'
 import { latencyP95, sampleSize, MIN_SAMPLES } from '../lib/apiMetrics'
 import { SUPPORT_TEMPLATES } from '../services/supportTemplates'
 import { AppError } from '../middleware/errorHandler'
@@ -18,7 +22,9 @@ import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -38,12 +44,111 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
   try {
     const [platform] = await query<any>(`
       SELECT
-        (SELECT COUNT(*)::int FROM landlords) AS total_landlords,
+        -- S650 (Nic): a LANDLORD is a person who brought a property to GAM.
+        -- Not a company (Nic's two LLCs counted him twice), and not a co-owner
+        -- of somebody else's property (Tyler Rhoades on Oak Park). Counting
+        -- only; portal access is unaffected.
+        (SELECT COUNT(DISTINCT l.user_id)::int
+           FROM landlords l
+           JOIN users u ON u.id = l.user_id
+          WHERE u.email NOT LIKE '%@gam.internal'
+            AND EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = l.id)) AS total_landlords,
+        -- ...and the accounts that signed up but have no property on GAM at
+        -- all, under their own company or as a co-owner, shown beside it.
+        (SELECT COUNT(*)::int FROM users u
+          WHERE u.role = 'landlord' AND u.email NOT LIKE '%@gam.internal'
+            AND NOT EXISTS (
+              SELECT 1 FROM landlords l JOIN properties p ON p.landlord_id = l.id
+               WHERE l.user_id = u.id
+                  OR l.id IN (SELECT m.landlord_id FROM landlord_members m WHERE m.user_id = u.id))
+        ) AS landlords_without_property,
         (SELECT COUNT(*)::int FROM users WHERE role='tenant')   AS total_tenants,
         (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
         (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
         (SELECT COUNT(*)::int FROM units WHERE payment_block=TRUE) AS eviction_mode_units,
-        (SELECT COALESCE(SUM(rent_amount),0) FROM units WHERE status='active') AS monthly_rent_volume,
+        -- ── S639: THE ADMIN LENS IS MONEY THAT MOVED ───────────────────────
+        --
+        -- Nic, correcting my first pass: "I'm not wanting to exclude the
+        -- delinquent. On the admin view, the KPI card that says monthly rent
+        -- volume, I want that to show the money that moved through the platform.
+        -- Delinquent people are only important to the landlord. That's not
+        -- important to the admin side of things. We're thinking about it through
+        -- two different lenses."
+        --
+        -- Right, and it makes the earlier disagreement a non-question. A
+        -- landlord's dashboard asks "what am I owed this month" — contracted
+        -- rent on every occupied unit, delinquent included, because a delinquent
+        -- tenant still owes. The platform asks "what came across the rails" —
+        -- and a charge nobody paid moved no money, whatever its unit's status.
+        -- They were never the same figure and should not be reconciled; they
+        -- should stop sharing a name.
+        --
+        -- Rent only, so this stays distinguishable from the heartbeat beside it,
+        -- which counts rent + utilities + fees. Includes ACH still clearing, on
+        -- the same S616 reasoning the heartbeat uses: the tenant's bank has
+        -- already been debited, and excluding it makes the card read near zero
+        -- during the first week of every month, which is when rent arrives.
+        (SELECT COALESCE(SUM(amount),0) FROM payments
+          WHERE type = 'rent'
+            AND status IN ('settled','processing','paid_via_deposit')
+            AND date_trunc('month', COALESCE(settled_at, created_at))
+                = date_trunc('month', CURRENT_DATE)) AS monthly_rent_volume,
+        (SELECT COUNT(DISTINCT lease_id)::int FROM payments
+          WHERE type = 'rent'
+            AND status IN ('settled','processing','paid_via_deposit')
+            AND date_trunc('month', COALESCE(settled_at, created_at))
+                = date_trunc('month', CURRENT_DATE)) AS paying_leases,
+        (SELECT COUNT(*)::int FROM units
+          WHERE status IN ('active','delinquent','suspended')) AS occupied_units,
+        -- S642 (Nic): "Unpaid invoices seems like a landlord specific thing. We
+        -- should replace that with a KPI card for something beneficial to this
+        -- view." Money GAM is HOLDING for landlords — collected, allocated as
+        -- owner share, and not yet transferred out. That is the platform's own
+        -- position, not a landlord's collections problem, and it pairs with the
+        -- Pending Disbursements COUNT beside it, which gives no amount.
+        --
+        -- Identical ledger conditions to heldOwnerShareForUser() in
+        -- landlordPassthrough (Ben's S639 landlord-facing twin), minus the user
+        -- filter. Deposits need no exclusion: they never get an
+        -- allocation_owner_share entry, because they are never the landlord's.
+        (SELECT COALESCE(SUM(ubl.amount), 0)
+           FROM payments p
+           JOIN user_balance_ledger ubl
+             ON ubl.reference_id = p.id
+            AND ubl.reference_type = 'payment'
+            AND ubl.type = 'allocation_owner_share'
+            AND ubl.stripe_transfer_id IS NULL
+          WHERE p.platform_held = true
+            AND p.status = 'settled') AS held_for_landlords,
+        -- ── S642 (Nic): THE FLEXPAY FLOAT TARGET, FROM REAL LEASES ──────────
+        --
+        -- "Our goal is 30% adoption, so our target should be 30% of total
+        -- active leases… plus 20% on utilities. Then we'll know if demand
+        -- actually gets to 30% that we can fund it."
+        --
+        -- Computed, never stored: a stored target goes stale the day a unit is
+        -- leased, which is how the old target_balance ($12,600) ended up
+        -- disagreeing with the 3%-of-bankroll figure the card actually showed.
+        --
+        -- ONE MONTH's rent, not a cumulative pile. S642 correction (Nic):
+        -- flexpay_pull_day is when GAM pulls BACK from the tenant, not when it
+        -- funds. GAM funds by the grace deadline — the 5th in Arizona, initiated
+        -- by the 3rd — because "the tenant was going to be late anyway, so as
+        -- long as we aren't late for the tenant they have no issue". Repayment
+        -- lands the 15th-20th, so the money is out 10-15 days, not 30.
+        --
+        -- That shortens EXPOSURE, not the target. Every tenancy shares the
+        -- cycle, so the float is fully deployed the 5th to the 20th and idle
+        -- the rest — it recycles month to month, not within a month. Peak
+        -- capital is still one month of enrolled rent.
+        --
+        -- The 20% utility uplift is PEAK protection, not an average: measured
+        -- September was 12.5% of rent, but that is a mild Arizona month and the
+        -- float has to survive a July of air conditioning. Revisit after a
+        -- summer of real data.
+        (SELECT COALESCE(SUM(rent_amount), 0) * 0.30 * 1.20
+           FROM units WHERE status IN ('active','delinquent','suspended'))
+          AS flexpay_float_target,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
         (SELECT COALESCE(balance,0) FROM float_account_state LIMIT 1) AS float_balance,
         -- FlexPay float BANKROLL NEEDED: total monthly rent of the distinct
@@ -59,13 +164,52 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
             JOIN v_unit_occupancy vuo ON vuo.primary_tenant_id = fi.tenant_id
             JOIN units u ON u.id = vuo.unit_id AND u.status = 'active'
         ) AS flexpay_bankroll,
+        -- S639 (Nic): "I'm showing also twenty pending payments awaiting ACH
+        -- settlement. Where is that card reading from?"
+        --
+        -- From every payment row with status='pending' — which is an UNPAID
+        -- CHARGE. Nobody has sent anything and no ACH exists; the tenant has
+        -- simply not paid yet. Money genuinely in transit is 'processing',
+        -- and there are 3 of those, not 20. The count was right for a question
+        -- nobody asked and wrong for the one printed under it.
+        -- S639 (Nic): "if it's really just unpaid charges, then it needs to be
+        -- grouped together by lease. Remember, once line items go on an invoice,
+        -- they are bundled together as one item."
+        --
+        -- Rent and its utilities are separate payment ROWS but arrive as one
+        -- bill and get paid as one act, so counting rows counted the same debt
+        -- two or three times: 21 rows are 10 invoices. Every unpaid row on the
+        -- platform carries an invoice_id, so this needs no fallback — but it is
+        -- written to count an invoice-less row on its own rather than silently
+        -- drop it if that ever changes.
+        -- S639 (Nic): "are you counting the work trade agreements? Because
+        -- there's five other invoices that would equate to your ten." He is
+        -- right — 5 real + 5 work-trade = 10, and 12 + 9 = 21 line items.
+        --
+        -- Work-trade rent is suspended, not owed: it settles in HOURS at month
+        -- close, not in cash. He has already had to say twice this session that
+        -- showing it as owed is "a false number", and the landlord surfaces were
+        -- fixed for it — the platform card was still doing it. Same rule here,
+        -- so this reads 5 and ties out to his outstanding-balances page.
+        (SELECT COUNT(*)::int FROM (
+            SELECT DISTINCT COALESCE(invoice_id::text, 'row:' || id::text) AS k
+              FROM payments
+             WHERE status = 'pending' AND work_trade_suspended_at IS NULL) q) AS unpaid_charges,
+        (SELECT COUNT(*)::int FROM payments
+          WHERE status='pending' AND work_trade_suspended_at IS NULL) AS unpaid_line_items,
+        (SELECT COUNT(*)::int FROM (
+            SELECT DISTINCT invoice_id FROM payments
+             WHERE status = 'pending' AND work_trade_suspended_at IS NOT NULL) q) AS work_trade_invoices,
+        (SELECT COUNT(*)::int FROM payments WHERE status='processing') AS payments_in_flight,
+        (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='processing') AS payments_in_flight_amount,
         (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS pending_payments,
         (SELECT COUNT(*)::int FROM disbursements WHERE status='pending') AS pending_disbursements,
         (SELECT COUNT(*)::int FROM maintenance_requests WHERE status='open') AS open_maintenance,
         (SELECT COUNT(*)::int FROM tenants WHERE on_time_pay_enrolled=TRUE) AS flex_otp,
         (SELECT COUNT(*)::int FROM tenants WHERE credit_reporting_enrolled=TRUE) AS flex_credit,
         (SELECT COUNT(*)::int FROM tenants WHERE flex_deposit_enrolled=TRUE) AS flex_deposit,
-        (SELECT COUNT(*)::int FROM tenants WHERE float_fee_active=TRUE) AS flex_pay,
+        -- S655: FlexPay's own flag. float_fee_active is On-Time Pay's (otp.ts).
+        (SELECT COUNT(*)::int FROM tenants WHERE flexpay_enrolled=TRUE) AS flex_pay,
         (SELECT COUNT(*)::int FROM ach_monitoring_log WHERE flagged=TRUE AND resolved=FALSE) AS zero_tolerance_events,
         -- S316: pending CSV imports awaiting review where the
         -- platform/import-type slot is unverified. Matches the
@@ -93,6 +237,48 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
 // Powers the admin Overview trust tile + by-state pie so we can reconcile the
 // on-book liability against the actual account balance once it's stood up.
 /**
+ * GET /api/admin/processing-margin?months=6 — S642 (Nic).
+ *
+ * "Instead of showing $199 fees from Stripe I want to see our margin on that
+ * too… I want to know when somebody pays a card, if they got charged a $26 fee,
+ * how much of that comes to us."
+ *
+ * 10/3 (Nic: "Is that actually accurate?"): every payment on GAM's balance is
+ * on it (register, pay-link, background-check and landlord-fee-debit fees
+ * beside rent); a bank payment's fee counts once it has cleared and shows as
+ * "still clearing" until then; bank-feed charges are a GAM cost; card days
+ * Stripe has not posted yet are an estimate, labeled. services/stripeCosts.
+ */
+adminRouter.get('/processing-margin', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const months = Math.min(24, Math.max(1, parseInt(String(req.query.months ?? '6'), 10) || 6))
+    const { marginByMonth } = await import('../services/stripeCosts')
+    res.json({ success: true, data: await marginByMonth(months) })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/admin/processing-margin/payments?month=YYYY-MM — 10/3 (Nic).
+ *
+ * The card's month, payment by payment: when, who (tenant and space, or the
+ * register sale), card or bank, what they paid, the fee GAM charged, what
+ * Stripe took on it, what GAM kept; clearing payments marked. The list and the
+ * card are one computation: the cleared payments' fees are the card's fee
+ * revenue, and their Stripe costs plus the month's charges that belong to no
+ * one payment (listed with it) are the card's "Stripe took". Super admin only;
+ * read-only.
+ */
+const marginPaymentsQuery = z.object({ month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) })
+adminRouter.get('/processing-margin/payments', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const parsed = marginPaymentsQuery.safeParse(req.query)
+    if (!parsed.success) throw new AppError(400, 'Pick a month to list, like 2026-10.')
+    const { marginForMonth } = await import('../services/stripeCosts')
+    res.json({ success: true, data: await marginForMonth(parsed.data.month) })
+  } catch (e) { next(e) }
+})
+
+/**
  * GET /api/admin/rent-volume-trend?months=6 — platform rent ACTUALLY COLLECTED,
  * month by month.
  *
@@ -102,7 +288,7 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  *     [{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},
  *      {m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:<the one real number>}]
  *
- * Five invented points and one real one, mislabelled with a month it wasn't.
+ * Five invented points and one real one, mislabeled with a month it wasn't.
  * It drew a tidy upward line no matter what the platform actually did — the
  * worst kind of wrong on a financial dashboard, because it looks like
  * information. Nic spotted it as "the graph stops in March".
@@ -113,7 +299,7 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  *
  * The card said "Rent Collected" while the query has always summed four types.
  * They coincided only because rent was the sole kind of row that existed. The
- * moment Oak Park bills a trash can or a parking violation, a card labelled
+ * moment Oak Park bills a trash can or a parking violation, a card labeled
  * "rent" would quietly start including them. Renamed rather than narrowed: for
  * a platform-health heartbeat, what matters is money crossing the rails, and
  * narrowing it to rent would have hidden the utility billing this session
@@ -153,10 +339,17 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
               -- month independently of the payments sum — a remittance and the
               -- rows it settles can fall either side of a month boundary, and
               -- forcing them together would make both figures wrong.
+              --
+              -- S655: only money Stripe actually moved. A desk receipt, a posted
+              -- check and a matched bank deposit are tenant_remittances rows too,
+              -- and the old manual post wrote gross_amount = amount on them
+              -- (Glenda's $460 check sat inside this card). A Stripe charge is
+              -- the one that carries a payment intent.
               COALESCE((
                 SELECT SUM(r.gross_amount) FROM tenant_remittances r
                  WHERE date_trunc('month', COALESCE(r.settled_at, r.created_at)) = span.month_start
                    AND r.status IN ('settled','processing')
+                   AND r.stripe_payment_intent_id IS NOT NULL
                    AND r.gross_amount IS NOT NULL), 0)::text AS gross,
               COALESCE((
                 SELECT SUM(r.processing_fee_amount) FROM tenant_remittances r
@@ -244,11 +437,24 @@ adminRouter.get('/deposit-trust/summary', requireSuperAdmin, async (_req, res, n
        GROUP BY COALESCE(NULLIF(p.state,''),'—')
        ORDER BY principal DESC
     `)
+    // S642 (Nic): "On confirmed Column FBO account… let's take a look at that."
+    //
+    // The liability below has never been checked against a real bank balance —
+    // there was no bank connected. A SHORTFALL (owing tenants more than is
+    // actually held) is the failure the segregated-trust model exists to
+    // prevent, and until now nothing anywhere would have noticed one.
+    //
+    // Read-only and dormant without COLUMN_API_KEY, so this is inert until the
+    // sandbox key is in place and cannot move a cent either way.
+    const { reconcileTrust } = await import('../services/columnBank')
+    const reconciliation = await reconcileTrust(Number(totals.total_liability))
+
     res.json({ success: true, data: {
       heldCount:            totals.held_count,
       totalPrincipal:       Number(totals.total_principal),
       totalInterestAccrued: Number(totals.total_interest),
       totalLiability:       Number(totals.total_liability),
+      reconciliation,
       byState: byState.map((r: any) => ({
         state: r.state, count: r.count,
         principal: Number(r.principal), interest: Number(r.interest),
@@ -795,7 +1001,7 @@ export const onboardingOverviewHandler = async (req: any, res: any, next: any) =
              WHERE vlat.tenant_id=t.id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS tenants_no_ach,
         (SELECT COUNT(*)::int FROM tenants t
            WHERE t.on_time_pay_enrolled=FALSE AND t.credit_reporting_enrolled=FALSE
-             AND t.flex_deposit_enrolled=FALSE AND t.float_fee_active=FALSE
+             AND t.flex_deposit_enrolled=FALSE AND t.flexpay_enrolled=FALSE
              AND ($1::uuid IS NULL OR EXISTS (
                SELECT 1 FROM v_lease_active_tenants vlat
                JOIN leases le ON le.id=vlat.lease_id AND le.status='active'
@@ -978,7 +1184,8 @@ export const myReferralHandler = async (req: any, res: any, next: any) => {
         } catch { /* collision — try next */ }
       }
     }
-    const base = process.env.LANDLORD_SIGNUP_URL || 'https://app.goldassetmanagement.com/signup'
+    // S641: app.goldassetmanagement.com does not resolve — see routes/landlords.
+    const base = process.env.LANDLORD_SIGNUP_URL || portalLink('landlord', 'signup')
     res.json({ success: true, data: {
       referralCode: row?.referral_code ?? null,
       referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
@@ -1102,7 +1309,8 @@ export const onboardingTenantDetailHandler = async (req: any, res: any, next: an
       // Key kept as `flex_credit` to avoid breaking the admin frontend
       // checklist key map; label is the user-visible string.
       { key: 'flex_credit',       label: 'Rent reporting enrolled', done: tenant.credit_reporting_enrolled },
-      { key: 'flex_pay',          label: 'FlexPay enrolled',        done: tenant.float_fee_active },
+      // S655: FlexPay's own flag (float_fee_active is On-Time Pay's).
+      { key: 'flex_pay',          label: 'FlexPay enrolled',        done: !!tenant.flexpay_enrolled },
     ]
 
     res.json({ success: true, data: { tenant, checklist } })
@@ -1225,7 +1433,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
     if (type === 'tenant_invite' || type === 'tenant_invite_reminder') {
       const t = await queryOne<any>(
         `SELECT u.id AS user_id, u.email, u.first_name, u.email_verified,
-                un.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip,
+                un.unit_number, p.id AS property_id, p.name AS property_name, p.street1, p.city, p.state, p.zip,
                 p.landlord_id, (llu.first_name || ' ' || llu.last_name) AS landlord_name
            FROM tenants t
            JOIN users u ON u.id = t.user_id
@@ -1257,13 +1465,14 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
       await query(
         `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=now()+interval '7 days', updated_at=now() WHERE id=$2`,
         [inviteToken, t.user_id])
-      const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-      const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+      // S654: portalLink, never a localhost fallback (S641 rule).
+      const activationUrl = portalLink('tenant', `accept-invite?token=${inviteToken}`)
       const propertyAddress = [t.street1, t.city, t.state, t.zip].filter(Boolean).join(', ')
       const unitLabel = t.property_name ? `${t.property_name} — Unit ${t.unit_number}` : 'your unit'
       await emailTenantOnboarded(
         t.email, t.first_name, t.landlord_name || 'Your landlord', propertyAddress, unitLabel, activationUrl,
-        { landlordId: t.landlord_id, tenantId: targetId })
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        { landlordId: t.landlord_id, tenantId: targetId, replyTo: replyToProperty(t.property_id) })
 
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_tenant_invite',
@@ -1279,7 +1488,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
         `SELECT l.id AS landlord_id, u.email, (u.first_name || ' ' || u.last_name) AS name
            FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [targetId])
       if (!ll?.email) throw new AppError(404, 'Landlord not found')
-      const bankingUrl = `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/banking`
+      const bankingUrl = portalLink('landlord', 'banking')
       await emailLandlordBankingSetup({ to: ll.email, landlordName: ll.name || 'there', bankingUrl, ctx: { landlordId: ll.landlord_id } })
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_bank_verification',
@@ -1292,7 +1501,7 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
     // bank account so they can pay rent online.
     if (type === 'ach_enrollment') {
       const t = await queryOne<any>(
-        `SELECT u.email, u.first_name AS name, p.landlord_id
+        `SELECT u.id AS user_id, u.email, u.first_name AS name, p.landlord_id
            FROM tenants t
            JOIN users u ON u.id = t.user_id
            LEFT JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status IN ('active','pending_add')
@@ -1301,7 +1510,9 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
            LEFT JOIN properties p ON p.id = un.property_id
           WHERE t.id = $1 ORDER BY lt.added_at DESC NULLS LAST LIMIT 1`, [targetId])
       if (!t?.email) throw new AppError(404, 'Tenant not found')
-      const paymentsUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/payments`
+      // S654: the bill's own Pay now link (signs them in with just the password,
+      // and never a localhost address).
+      const paymentsUrl = payNowLink({ tenant_user_id: t.user_id, tenant_email: t.email })
       await emailTenantAchSetup({ to: t.email, tenantName: t.name || 'there', paymentsUrl, ctx: { landlordId: t.landlord_id ?? null, tenantId: targetId } })
       await logAdminAction({
         adminUserId: req.user!.userId, actionType: 'resend_ach_enrollment',
@@ -1327,7 +1538,15 @@ export const tenantsListHandler = async (req: any, res: any, next: any) => {
     const tenants = await query<any>(`
       SELECT t.id, t.ach_verified, t.bank_last4, t.on_time_pay_enrolled,
              t.credit_reporting_enrolled, t.flex_deposit_enrolled, t.float_fee_active,
-             t.ssi_ssdi, t.late_payment_count, t.created_at,
+             -- S655: FlexPay's own flag; float_fee_active above is On-Time Pay's.
+             t.flexpay_enrolled,
+             t.ssi_ssdi, t.created_at,
+             -- S652: late payments = charges the credit ledger recorded as paid past grace, once each
+             (SELECT COUNT(*) FROM credit_events ce
+                JOIN credit_subjects cs ON cs.id = ce.subject_id
+               WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = t.id
+                 AND ce.superseded_by IS NULL
+                 AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe')) AS late_payment_count,
              u.first_name, u.last_name, u.email, u.phone,
              un.unit_number, p.name AS property_name,
              lu.first_name AS landlord_first, lu.last_name AS landlord_last
@@ -1355,7 +1574,206 @@ export const tenantsListHandler = async (req: any, res: any, next: any) => {
 }
 adminRouter.get('/tenants', tenantsListHandler)
 
+// ── S653 (Nic): THE PLATFORM'S SCREENING DATABASE ────────────────────────────
+//
+//   "I want a full database of everybody that the platform ever does
+//    background checks on system-wide for the admin portal."
+//
+// Every check ever run, under every landlord, in one place. Read-only: the
+// decision belongs to the landlord (the FCRA "user" of the report) and is made
+// on their own page; this is the platform's record of it. Filters are server-
+// side so the list stays fast at any size. The report itself is never inlined
+// here — only the provider's verdict — the full report stays behind the
+// landlord's own review page.
+adminRouter.get('/screenings', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const q = z.object({
+      q:          z.string().max(120).optional(),
+      status:     z.string().max(40).optional(),
+      landlordId: z.string().uuid().optional(),
+      limit:      z.coerce.number().int().min(1).max(500).default(200),
+      offset:     z.coerce.number().int().min(0).default(0),
+    }).parse(req.query)
+    const term = (q.q ?? '').trim().toLowerCase()
+    const where = `
+      WHERE ($1 = '' OR lower(concat(bc.first_name, ' ', bc.last_name)) LIKE '%' || $1 || '%'
+             OR lower(u.email) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(p.name, bcp.name, '')) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(ll.business_name, '')) LIKE '%' || $1 || '%'
+             OR lower(COALESCE(lu.email, '')) LIKE '%' || $1 || '%')
+        AND ($2::text IS NULL OR bc.status = $2)
+        AND ($3::uuid IS NULL OR bc.landlord_id = $3)`
+    const from = `
+      FROM background_checks bc
+      JOIN users u ON u.id = bc.user_id
+      LEFT JOIN landlords ll ON ll.id = bc.landlord_id
+      LEFT JOIN users lu ON lu.id = ll.user_id
+      LEFT JOIN units un ON un.id = bc.unit_id
+      LEFT JOIN properties p ON p.id = un.property_id
+      LEFT JOIN properties bcp ON bcp.id = bc.property_id
+      LEFT JOIN users du ON du.id = bc.decided_by`
+    const params = [term, q.status ?? null, q.landlordId ?? null]
+    const [total] = await query<{ c: number }>(`SELECT COUNT(*)::int AS c ${from} ${where}`, params)
+    const byStatus = await query<{ status: string; c: number }>(
+      `SELECT bc.status, COUNT(*)::int AS c ${from} ${where.replace("AND ($2::text IS NULL OR bc.status = $2)", "AND ($2::text IS NULL OR TRUE)")} GROUP BY bc.status`, params)
+    const rows = await query<any>(`
+      SELECT bc.id, bc.status, bc.first_name, bc.last_name, u.email, u.phone,
+             bc.created_at, bc.webhook_received_at, bc.decided_at, bc.expires_at,
+             bc.decision_notes, bc.provider_name, bc.provider_ref, bc.parked_at, bc.parked_note,
+             bc.report_summary ->> 'result' AS provider_result,
+             bc.risk_level, bc.risk_score,
+             bc.amount_charged, bc.platform_net, bc.refunded_at,
+             bc.desired_move_in, bc.desired_term_months, bc.desired_month_to_month,
+             bc.landlord_id, COALESCE(ll.business_name, lu.email) AS landlord_name, lu.email AS landlord_email,
+             COALESCE(p.id, bcp.id) AS property_id, COALESCE(p.name, bcp.name) AS property_name,
+             un.unit_number, un.id AS unit_id,
+             concat(du.first_name, ' ', du.last_name) AS decided_by_name,
+             EXISTS (
+               SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id JOIN tenants t ON t.id = lt.tenant_id
+                WHERE t.user_id = bc.user_id AND l.landlord_id = bc.landlord_id AND l.status IN ('pending','active')
+             ) AS housed
+      ${from} ${where}
+      ORDER BY bc.created_at DESC
+      LIMIT $4 OFFSET $5`, [...params, q.limit, q.offset])
+    const landlords = await query<any>(`
+      SELECT ll.id, COALESCE(ll.business_name, lu.email) AS name, COUNT(bc.id)::int AS checks
+        FROM landlords ll JOIN users lu ON lu.id = ll.user_id
+        JOIN background_checks bc ON bc.landlord_id = ll.id
+       GROUP BY ll.id, lu.email ORDER BY 2`)
+    res.json({ success: true, data: { rows, total: total.c, byStatus, landlords, limit: q.limit, offset: q.offset } })
+  } catch (e) { next(e) }
+})
+
 // ── PROJECTED PLATFORM INCOME ─────────────────────────────────
+/**
+ * S650 (Nic): "I want to see somewhere where our subscription to the platform
+ * fee and our card markups — where that money is pooling. I don't want it to
+ * just sit in the payments balance and then just look like money has to be
+ * paid out."
+ *
+ * One balance holds several people's money: rent on its way to landlords,
+ * tenant deposits GAM holds in trust, managers' and PM companies' cuts, bank
+ * payments still clearing, background-check money that is Checkr's, and GAM's
+ * own earnings. This splits it (services/stripeCosts.splitPlatformBalance), so
+ * the number that is actually GAM's is a number you can see.
+ *
+ * 10/3 (Nic): the card said $1,336.55 while GAM's own was $318.76 — it counted
+ * $1,017.79 of two tenants' clearing bank payments as GAM's, and $75.88 of
+ * applicants' Checkr money. Nic's calls: Checkr money is not GAM's (its own
+ * line), a bank payment's fee is earned when it clears ("clearing" until
+ * then), and bank-feed charges are GAM costs. The card now also checks itself
+ * against GAM's own records — collected less what Stripe took — and shows any
+ * gap with its amount. Pay-link payments GAM holds until the landlord refunds
+ * them (decisions #13) are not GAM's either; a refunded one's kept fee, taken
+ * back from the landlord's payout (#22), is GAM's money back. 10/3 (review):
+ * the check also names GAM's card fee on online stay deposits, its cut of
+ * business payments and businesses' invoicing fees, and a platform fee passed
+ * to tenants; a business invoice paid by bank, or any bank payment GAM's
+ * records do not list as clearing, is not GAM's while it clears.
+ */
+adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { platformBalance } = await import('../services/stripeCosts')
+    let stripe: any = null
+    try {
+      const { getStripe } = await import('../lib/stripe')
+      stripe = getStripe()
+    } catch {
+      // Stripe unreachable or not configured — the split still renders from
+      // GAM's own records, without the headline.
+    }
+    const split = await platformBalance(stripe)
+    const revenue = await query<any>(`
+      SELECT type,
+             COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0)::float AS this_month,
+             COALESCE(SUM(amount), 0)::float AS all_time
+        FROM platform_revenue_ledger GROUP BY type ORDER BY all_time DESC`)
+    const r = split.reconciliation
+    res.json({ success: true, data: {
+      stripe_available: split.stripeAvailable,
+      stripe_pending: split.stripePending,
+      on_balance: split.onBalance,
+      stripe_error: split.stripeError,
+      gams_own: split.gamsOwn,
+      owed_to_landlords: split.owedToLandlords,
+      deposits_in_trust: split.depositsInTrust,
+      manager_pm_cuts_owed: split.managerPmCutsOwed,
+      paid_ahead_held: split.paidAheadHeld,
+      checkr_held: split.checkrHeld,
+      held_pay_link_payments: split.heldPayLinkPayments,
+      clearing: {
+        count: split.clearing.count,
+        landlords_on_balance: split.clearing.landlordsOnBalance,
+        landlords_not_yet_on_balance: split.clearing.landlordsNotYetOnBalance,
+        // 10/3 (review): businesses' invoice bank payments still clearing, and
+        // bank payments GAM's records do not list as clearing — neither is GAM's.
+        businesses_on_balance: split.clearing.businessesOnBalance,
+        unrecorded: { count: split.clearing.unrecorded.count, net_on_balance: split.clearing.unrecorded.netOnBalance },
+        gam_fees: split.clearing.gamFees,
+        stripe_took: split.clearing.stripeTook,
+        net_on_balance: split.clearing.netOnBalance,
+        // 10/3 (review): GAM's money in the clearing payments, on one basis
+        // for both cards — on the balance now (after Stripe's cut), and not
+        // on it yet; gam_total = gam_on_balance + stripe_took + gam_not_yet_on_balance.
+        gam_on_balance: split.clearing.gamOnBalance,
+        gam_total: split.clearing.gamTotal,
+        gam_not_yet_on_balance: split.clearing.gamNotYetOnBalance,
+        // Not "items": the camelizer passes an `items` value through untouched.
+        payments: split.clearing.items.map(i => ({
+          kind: i.kind, id: i.id, who: i.who, gross: i.gross, others_share: i.othersShare,
+          gam_fee: i.gamFee, on_balance: i.onBalance,
+        })),
+      },
+      reconciliation: r ? {
+        collected: r.collected,
+        collected_parts: {
+          processing_fees: r.collectedParts.processingFees,
+          register_card_fees: r.collectedParts.registerCardFees,
+          screening_kept: r.collectedParts.screeningKept,
+          landlord_charges_collected: r.collectedParts.landlordChargesCollected,
+          flexpay_kept: r.collectedParts.flexpayKept,
+          swept_in: r.collectedParts.sweptIn,
+          kept_fees_recovered: r.collectedParts.keptFeesRecovered,
+          gam_owned_bill_lines: r.collectedParts.gamOwnedBillLines,
+          // 10/3 (review): each its own line, so the check names every kind of money it counts.
+          tenant_paid_platform_fees: r.collectedParts.tenantPaidPlatformFees,
+          stay_deposit_fees: r.collectedParts.stayDepositFees,
+          business_payment_fees: r.collectedParts.businessPaymentFees,
+          business_invoicing_fees: r.collectedParts.businessInvoicingFees,
+        },
+        // GAM's own lines on tenants' bills (a returned-payment fee, …), kind by kind.
+        gam_owned_bill_lines_by_kind: r.gamOwnedBillLinesByKind,
+        // 10/4 (review, pass 3): payments Stripe took back after they settled
+        // (disputes), each part on its own line; net = what they add to the book.
+        taken_back: {
+          fees_given_back: r.takenBack.feesGivenBack,
+          fees_charged_to_landlords: r.takenBack.feesChargedToLandlords,
+          chargeback_fees_from_payees: r.takenBack.chargebackFeesFromPayees,
+          rent_not_repaid: r.takenBack.rentNotRepaid,
+          gam_lines_taken_back: r.takenBack.gamLinesTakenBack,
+          // 10/4 (review, fix pass 2): those fees a won dispute made the landlords' again.
+          fees_owed_back_on_wins: r.takenBack.feesOwedBackOnWins,
+          // 10/4 (review, fix pass 3): what a won chargeback on a held charge put
+          // back that the payee had repaid — owed to them (in owed_to_landlords), not on the book.
+          chargebacks_owed_back_on_wins: r.takenBack.chargebacksOwedBackOnWins,
+          net: r.takenBack.net,
+        },
+        stripe_costs: r.stripeCosts,
+        stripe_costs_not_yet_recorded: r.stripeCostsNotYetRecorded,
+        paid_out_to_gam_bank: r.paidOutToGamBank,
+        flexpay_fronted: r.flexpayFronted,
+        book: r.book,
+        on_balance: r.onBalance,
+        gap: r.gap,
+      } : null,
+      owed_by_landlords_uncollected: split.owedByLandlordsUncollected,
+      revenue_by_type: revenue,
+      revenue_this_month: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.this_month), 0) * 100) / 100,
+      revenue_all_time: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.all_time), 0) * 100) / 100,
+    } })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/income/projection', requireSuperAdmin, async (_req, res, next) => {
   try {
     // Unit counts
@@ -1374,7 +1792,8 @@ adminRouter.get('/income/projection', requireSuperAdmin, async (_req, res, next)
     // Flex product counts
     const [flex] = await query<any>(`
       SELECT
-        COUNT(*) FILTER (WHERE float_fee_active=TRUE)::int   AS flex_pay,
+        -- S655: FlexPay's own flag. float_fee_active is On-Time Pay's.
+        COUNT(*) FILTER (WHERE flexpay_enrolled=TRUE)::int   AS flex_pay,
         COUNT(*) FILTER (WHERE ssi_ssdi=TRUE)::int           AS ssi_ssdi,
         COUNT(*) FILTER (WHERE flex_deposit_enrolled=TRUE)::int AS flex_deposit,
         COUNT(*) FILTER (WHERE credit_reporting_enrolled=TRUE)::int AS flex_credit
@@ -1463,80 +1882,122 @@ const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
   all:       { start: `'1970-01-01'::timestamptz`,             label: 'All time' },
 }
 
+/**
+ * S652 — the forward estimate stopped computing anything.
+ *
+ * This asked the database its own question and got a different answer from the
+ * bill. First it counted `status='active'`, dropping ten DELINQUENT spaces —
+ * somebody lives in each and owes rent, which is the opposite of vacant — and
+ * showed $120 where $130 was billed. Then I "fixed" it to count everything not
+ * vacant, and it invented $10 for Springville, whose single unit is marked
+ * active and has no lease at all. Nic: "The Springville property is not being
+ * billed $10 right now. It has nobody in it."
+ *
+ * A unit's status is a label somebody typed. A lease is a thing that happened.
+ * So this no longer decides — it runs the same `billableUnitsForProperty` the
+ * accrual runs, against the same months, and applies the same per-property
+ * floor. A property GAM would not bill contributes nothing, because the
+ * function that says what GAM bills is the one being asked.
+ */
 async function currentPlatformRunRate(): Promise<number> {
-  const propRows = await query<{ occ: string }>(`
-    SELECT COUNT(*) FILTER (WHERE u.status='active')::int AS occ
+  const props = await query<{ id: string }>(`
+    SELECT p.id
       FROM properties p
       JOIN landlords l ON l.id = p.landlord_id
-      LEFT JOIN units u ON u.property_id = p.id
      WHERE l.is_system IS NOT TRUE
-     GROUP BY p.id
-    HAVING COUNT(*) FILTER (WHERE u.status='active') > 0
-  `)
-  return propRows.reduce((s, r) => s + launchPlatformFeeForProperty(+r.occ), 0)
+       -- Only landlords GAM has actually started billing. Somebody still in
+       -- the money-movement grace is not revenue, forecast or otherwise.
+       AND l.billing_starts_at IS NOT NULL
+       AND l.billing_starts_at <= date_trunc('month', CURRENT_DATE)::date`)
+  if (!props.length) return 0
+
+  const { billableUnitsForProperty } = await import('../services/billableUnits')
+  const { NIGHTS_AGGREGATION_UNIT_TYPES } = await import('@gam/shared')
+  // S654: this month and last by the Phoenix calendar — the same calendar as the
+  // CURRENT_DATE filter above. The UTC month turns over at 5 pm on the last day,
+  // which priced next month against this month's landlords.
+  const monthIso = monthStartOf(todayIn(null))
+  const arrears = monthStartOf(addDaysTo(monthIso, -1))
+
+  const client = await getClient()
+  try {
+    let total = 0
+    for (const p of props) {
+      const b = await billableUnitsForProperty(client, p.id, monthIso, arrears, NIGHTS_AGGREGATION_UNIT_TYPES)
+      if (b.total > 0) total += launchPlatformFeeForProperty(b.total)
+    }
+    return total
+  } finally { client.release() }
 }
 
-async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
-  const [pfa] = await query<any>(`
-    SELECT COALESCE(SUM(pfa.total_amount), 0)::float AS amt
-      FROM platform_fee_accruals pfa JOIN landlords l ON l.id = pfa.landlord_id
-     WHERE l.is_system IS NOT TRUE
-       AND pfa.accrual_month >= ${startSql}
-       AND pfa.accrual_month <  date_trunc('month', CURRENT_DATE)
-  `).catch(() => [{ amt: 0 }])
-  const platform = +((pfa?.amt || 0) + platformRunRate).toFixed(2)
-  const [fp] = await query<any>(`
-    SELECT COALESCE(SUM(tenant_fee_amount), 0)::float AS amt
-      FROM flexpay_advances WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
-  const flexpay = +(fp?.amt || 0).toFixed(2)
-  const [bg] = await query<any>(`
-    SELECT COUNT(*)::int AS n FROM background_checks WHERE created_at >= ${startSql}
-  `).catch(() => [{ n: 0 }])
-  const bgRevenue = +((bg?.n || 0) * PLATFORM_FEES.BG_CHECK_NET).toFixed(2)
-  // Processing spread + instant-withdrawal + placement income — all live on the
-  // platform_revenue_ledger, keyed by type. (platform_fee_subscription is NOT
-  // pulled here — the platform fee is already counted above via run-rate +
-  // accruals; pulling it again would double-count.)
-  const [led] = await query<any>(`
-    SELECT
-      COALESCE(SUM(amount) FILTER (WHERE type='banking_spread'),       0)::float AS processing,
-      COALESCE(SUM(amount) FILTER (WHERE type='manual_withdrawal_fee'),0)::float AS withdrawals,
-      COALESCE(SUM(amount) FILTER (WHERE type='placement_fee_share'),  0)::float AS placement
-    FROM platform_revenue_ledger WHERE created_at >= ${startSql}
-  `).catch(() => [{ processing: 0, withdrawals: 0, placement: 0 }])
-  // Business/POS platform fees (month is 'YYYY-MM' text — lexicographic compare).
-  const [bpos] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM business_platform_fee_accruals
-     WHERE month >= to_char((${startSql})::timestamptz, 'YYYY-MM')
-  `).catch(() => [{ amt: 0 }])
-  // FlexDeposit custody fee ($3/mo per FLEX_DEPOSIT_CUSTODY_FEE) while GAM holds
-  // a tenant's deposit in custody. Recurring GAM revenue.
-  const [fd] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flex_deposit_custody_charges
-     WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
-  // FlexCredit ($5/mo rent-reporting subscription). Wired but invisible until
-  // launch — $0 until the first enrollment. GROSS $5 shown here (the ~$1.50
-  // Esusu provider cost is COGS, tracked separately, not yet wired).
-  const [fc] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flexcredit_charges
-     WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
+const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recurring: boolean }> = [
+  { key: 'platform_unit',      label: 'Platform Fees',       types: ['platform_fee_subscription'], recurring: true },
+  // S653 (Nic): "why are we showing $171.75 when our price is $2 per unit that's
+  // occupied?" The processing spread rides every rent payment, but it is not
+  // the subscription — the card that says "recurring" is read as the $2/unit
+  // bill, and it was quietly adding $41.75 of ACH margin to it. Processing
+  // stays in every pie; it just does not pose as subscription revenue.
+  { key: 'processing',         label: 'Processing / ACH',    types: ['banking_spread'],            recurring: false },
+  { key: 'background_checks',  label: 'Background Checks',   types: ['screening_margin'],          recurring: false },
+  // S655: FlexPay's $25, booked when a month's pull is collected. Kept out of
+  // the recurring card, which reads as the platform subscription bill (S653).
+  { key: 'flexpay',            label: 'FlexPay',             types: ['flexpay_subscription'],      recurring: false },
+  { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
+  { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },
+  { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
+]
 
-  const sources = [
-    { key: 'platform_unit',       label: 'Platform Fees',        amount: platform,                        recurring: true },
-    { key: 'processing',          label: 'Processing / ACH',     amount: +(led?.processing || 0).toFixed(2), recurring: true },
-    { key: 'flexpay',             label: 'FlexPay',              amount: flexpay,                         recurring: true },
-    { key: 'flex_deposit',        label: 'FlexDeposit Custody',  amount: +(fd?.amt || 0).toFixed(2),      recurring: true },
-    { key: 'flex_credit',         label: 'FlexCredit',           amount: +(fc?.amt || 0).toFixed(2),      recurring: true },
-    { key: 'business_pos',        label: 'Business Fees' ,         amount: +(bpos?.amt || 0).toFixed(2),    recurring: true },
-    { key: 'placement',           label: 'Placement Fees',       amount: +(led?.placement || 0).toFixed(2),   recurring: false },
-    { key: 'instant_withdrawal',  label: 'Instant Withdrawals',  amount: +(led?.withdrawals || 0).toFixed(2), recurring: false },
-    { key: 'background_checks',   label: 'Background Checks',    amount: bgRevenue,                       recurring: false },
-  ]
+// S653 (Nic): "Where are those adjustments coming from? Because we are not
+// spending any money." The monthly processing true-up (services/platformRevenue
+// trueUpProcessingMargin) is typed 'adjustment' with its own reference_type, but
+// it IS processing income — it is the correction that makes the estimated
+// per-payment spreads equal Stripe's real invoice. It belongs in the slice it
+// corrects, or the Processing slice under-reads every month and an unexplained
+// "adjustment" appears beside it.
+//
+// S655: likewise a FlexPay $25 taken back because its pull was taken back by
+// the bank (services/flexpay handleFlexPayPullReversed) is an 'adjustment' that
+// corrects the FlexPay slice, so it nets inside it.
+// 10/5 (Nic, prepaid stays): a screening margin taken back because the check
+// paid with a stay was cancelled before a report (services/stayTerms
+// restorePrepaidScreening) corrects the Background Checks slice.
+const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
+                             THEN 'banking_spread'
+                             WHEN type = 'adjustment' AND reference_type = 'screening_margin_reversal'
+                             THEN 'screening_margin'
+                             WHEN type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%'
+                             THEN 'flexpay_subscription'
+                             ELSE type END`
+
+async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
+  const rows = await query<{ type: string; amt: number }>(`
+    SELECT ${SLICE_TYPE_SQL} AS type, COALESCE(SUM(amount), 0)::float AS amt
+      FROM platform_revenue_ledger
+     WHERE created_at >= ${startSql}
+     GROUP BY 1`)
+  const byType = new Map(rows.map(r => [r.type, Number(r.amt)]))
+
+  const sources = REVENUE_SLICES.map(sl => ({
+    key: sl.key,
+    label: sl.label,
+    amount: +sl.types.reduce((sum, t) => sum + (byType.get(t) ?? 0), 0).toFixed(2),
+    recurring: sl.recurring,
+  }))
+
+  // Anything earning money under a type nobody has named yet still has to show
+  // up, or the pie quietly stops equaling the card the first time a new
+  // revenue type is added and nobody remembers this list.
+  const named = new Set(REVENUE_SLICES.flatMap(sl => sl.types))
+  const otherAmt = +rows.filter(r => !named.has(r.type))
+    .reduce((sum, r) => sum + Number(r.amt), 0).toFixed(2)
+  if (otherAmt !== 0) sources.push({ key: 'other', label: 'Other', amount: otherAmt, recurring: false })
+
   const gross = +sources.reduce((s, x) => s + x.amount, 0).toFixed(2)
-  return { window: key, label, gross, sources }
+  return {
+    window: key, label, gross, sources,
+    // Forward-looking, and kept apart from the history on purpose.
+    runRate: +platformRunRate.toFixed(2),
+  }
 }
 
 // GET /api/admin/income/composition?window=month|quarter|ytd|rolling12|all
@@ -1551,14 +2012,56 @@ adminRouter.get('/income/composition', requireSuperAdmin, async (req, res, next)
 
 // GET /api/admin/income/composition/all — every window at once (the "wall of
 // clocks": one pie per period, all on the page together).
+/**
+ * S652 — recurring revenue is the LAST BILL, not a re-derivation of it.
+ *
+ * Nic: "The recurring revenue is showing only $120 per month off of the
+ * subscription fees." September was billed $130 — $48 at Oak Park for 24
+ * billable units and $82 at Mountain View for 41. The $120 came from re-deriving
+ * the fee out of units that are `active` right now, which is not the same set as
+ * the units that were billable when the bill was raised: owner-occupied spaces
+ * are excluded, properties inside their onboarding grace are excluded, and
+ * occupancy moves between the two moments anyway.
+ *
+ * Two ways to compute one number is one way too many. The bill that actually
+ * went out is the answer — it is a fact, and it is the number a landlord would
+ * quote back at us.
+ */
+async function recurringMonthlyFromLedger(): Promise<{ amount: number; month: string | null }> {
+  const recurringTypes = REVENUE_SLICES.filter(sl => sl.recurring).flatMap(sl => sl.types)
+  const rows = await query<{ month: string; amt: number }>(`
+    SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+           COALESCE(SUM(amount), 0)::float AS amt
+      FROM platform_revenue_ledger
+     WHERE type = ANY($1::text[])
+     GROUP BY 1
+     -- The most recent month that actually billed something. An empty current
+     -- month (the 2nd, before the accrual runs) must not read as a collapse in
+     -- recurring revenue.
+     HAVING COALESCE(SUM(amount), 0) > 0
+     ORDER BY 1 DESC
+     LIMIT 1`, [recurringTypes])
+  const r = rows[0]
+  return { amount: r ? Math.round(Number(r.amt) * 100) / 100 : 0, month: r?.month ?? null }
+}
+
 adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rr = await currentPlatformRunRate()
     const keys = ['month', 'quarter', 'ytd', 'rolling12', 'all']
-    const periods = await Promise.all(
-      keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))
-    )
-    res.json({ success: true, data: { periods } })
+    const [periods, recurring] = await Promise.all([
+      Promise.all(keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))),
+      recurringMonthlyFromLedger(),
+    ])
+    res.json({ success: true, data: {
+      periods,
+      // Same book as the pies above it, so the page cannot contradict itself.
+      recurringMonthly: recurring.amount,
+      recurringMonth:   recurring.month,
+      recurringAnnual:  Math.round(recurring.amount * 12 * 100) / 100,
+      // The forward number, kept separate and named as what it is.
+      platformRunRate:  +rr.toFixed(2),
+    } })
   } catch (e) { next(e) }
 })
 
@@ -1570,58 +2073,45 @@ adminRouter.get('/income/breakdown', requireSuperAdmin, async (req, res, next) =
   try {
     const key = String(req.query.window || 'month')
     const win = INCOME_WINDOWS[key] || INCOME_WINDOWS.month
-    const S = win.start
-    const runRate = await currentPlatformRunRate()
-    const q = (sql: string) => query<any>(sql).catch(() => [] as any[])
 
-    const [platform, processing, flexpay, bpos, placement, withdrawals, bgc, fdc, fcc] = await Promise.all([
-      q(`SELECT to_char(pfa.accrual_month,'Mon YYYY') AS date, p.name AS label, pfa.total_amount::float AS amount
-           FROM platform_fee_accruals pfa JOIN landlords l ON l.id=pfa.landlord_id JOIN properties p ON p.id=pfa.property_id
-          WHERE l.is_system IS NOT TRUE AND pfa.accrual_month >= ${S} AND pfa.accrual_month < date_trunc('month',CURRENT_DATE)
-          ORDER BY pfa.accrual_month DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Processing spread') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='banking_spread' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexPay fee' AS label, tenant_fee_amount::float AS amount
-           FROM flexpay_advances WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT bpfa.month AS date, 'Business POS fee' AS label, bpfa.amount::float AS amount
-           FROM business_platform_fee_accruals bpfa WHERE bpfa.month >= to_char((${S})::timestamptz,'YYYY-MM') ORDER BY bpfa.month DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Placement fee') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='placement_fee_share' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Instant withdrawal') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='manual_withdrawal_fee' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS label
-           FROM background_checks WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexDeposit custody' AS label, amount::float AS amount
-           FROM flex_deposit_custody_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexCredit reporting' AS label, amount::float AS amount
-           FROM flexcredit_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-    ])
+    // S652: the same rows the pie is drawn from, listed. This used to read
+    // accruals, a synthetic run-rate line and a count of background checks
+    // times a constant — so a slice worth $5 could open onto items worth
+    // something else, and nobody could tell which number was the real one.
+    const rows = await query<any>(`
+      SELECT ${SLICE_TYPE_SQL} AS type,
+             to_char(created_at, 'Mon DD') AS date,
+             COALESCE(NULLIF(notes, ''), reference_type, type) AS label,
+             amount::float AS amount,
+             created_at
+        FROM platform_revenue_ledger
+       WHERE created_at >= ${win.start}
+       ORDER BY created_at DESC
+       LIMIT 2000`)
 
-    // Current-month platform fee accrues on the 1st — surface the in-progress
-    // run-rate as a synthetic "accruing" line so the total matches the pie.
-    const platItems = [
-      ...(runRate > 0 ? [{ date: 'This month', label: 'Current run-rate (accruing)', amount: runRate }] : []),
-      ...platform,
-    ]
-    const bgItems = bgc.map((r: any) => ({ date: r.date, label: r.label || 'Screening', amount: PLATFORM_FEES.BG_CHECK_NET }))
-
+    const named = new Set(REVENUE_SLICES.flatMap(sl => sl.types))
     const sources = [
-      { key: 'platform_unit',      label: 'Platform Fees',       items: platItems },
-      { key: 'processing',         label: 'Processing / ACH',    items: processing },
-      { key: 'flexpay',            label: 'FlexPay',             items: flexpay },
-      { key: 'flex_deposit',       label: 'FlexDeposit Custody', items: fdc },
-      { key: 'flex_credit',        label: 'FlexCredit',          items: fcc },
-      { key: 'business_pos',       label: 'Business Fees' ,        items: bpos },
-      { key: 'placement',          label: 'Placement Fees',      items: placement },
-      { key: 'instant_withdrawal', label: 'Instant Withdrawals', items: withdrawals },
-      { key: 'background_checks',  label: 'Background Checks',    items: bgItems },
-    ].map(s => ({
-      ...s,
-      count: s.items.length,
-      amount: +s.items.reduce((a: number, x: any) => a + (x.amount || 0), 0).toFixed(2),
-    }))
-    const gross = +sources.reduce((a, s) => a + s.amount, 0).toFixed(2)
+      ...REVENUE_SLICES.map(sl => ({
+        key: sl.key,
+        label: sl.label,
+        items: rows.filter((r: any) => sl.types.includes(r.type))
+          .map((r: any) => ({ date: r.date, label: r.label, amount: r.amount })),
+      })),
+      {
+        key: 'other',
+        label: 'Other',
+        items: rows.filter((r: any) => !named.has(r.type))
+          .map((r: any) => ({ date: r.date, label: r.label, amount: r.amount })),
+      },
+    ]
+      .map(s => ({
+        ...s,
+        count: s.items.length,
+        amount: +s.items.reduce((a: number, x: any) => a + (x.amount || 0), 0).toFixed(2),
+      }))
+      .filter(s => s.count > 0)
 
+    const gross = +sources.reduce((a, s) => a + s.amount, 0).toFixed(2)
     res.json({ success: true, data: { window: key, label: win.label, gross, sources } })
   } catch (e) { next(e) }
 })
@@ -2101,6 +2591,11 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
     // expansion flag opens; they always sort behind tier 1.
     const { isFeatureEnabled } = await import('../services/systemFeatures')
     const otherIncomeOpen = await isFeatureEnabled('flexpay_other_income_open')
+    // S578: a "returner" has a counted lifetime write-off — recovered since or
+    // not, never one GAM could not even create the pull for (the service's
+    // one definition, also behind the ban and the rehab clock).
+    const { flexPayCountedDefaultSql } = await import('../services/flexpay')
+    const countedDefault = flexPayCountedDefaultSql('fa')
     // S542c (Nic): queue ordered by FLOAT NEED — shortest float first,
     // FIFO created_at as tiebreak. Float = days between GAM's front
     // (lease grace-period end, default 5) and the tenant's benefit-
@@ -2144,7 +2639,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
               -- Permanent for now (any lifetime default marks them a returner).
               (EXISTS (SELECT 1 FROM flexpay_advances fa
                         WHERE fa.tenant_id = fi.tenant_id
-                          AND fa.status = 'defaulted')
+                          AND ${countedDefault})
                AND NOT COALESCE(t.flexpay_returner_cleared, false)) AS is_flexpay_returner,
               -- S545c: lease-holder names for the document-name check.
               (SELECT string_agg(u2.first_name || ' ' || u2.last_name, ', ' ORDER BY u2.last_name)
@@ -2162,7 +2657,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
                   -- to first-timer standing and is no longer demoted.
                   (EXISTS (SELECT 1 FROM flexpay_advances fa
                             WHERE fa.tenant_id = fi.tenant_id
-                              AND fa.status = 'defaulted')
+                              AND ${countedDefault})
                    AND NOT COALESCE(t.flexpay_returner_cleared, false)) ASC,
                   (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                   CASE WHEN fi.desired_pull_day IS NULL THEN NULL
@@ -3586,7 +4081,7 @@ adminRouter.delete('/invitations/:id', requireSuperAdmin, async (req, res, next)
 // is single-use, it dies in 72 hours, and it can only ever create the ONE email
 // address the super_admin typed. A stolen link cannot be pointed at a different
 // address, cannot choose its own role, and cannot reach anything before the
-// mandatory 2FA enrolment gate.
+// mandatory 2FA enrollment gate.
 export const adminInviteRouter = Router()
 
 const liveInvite = (token: string) => queryOne<any>(
@@ -3636,9 +4131,16 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       }
 
       const hash = await bcrypt.hash(body.password, 12)
+      // S655: the address is verified at creation. This link was mailed only to
+      // that address and is 64 random characters, so opening it proves the inbox
+      // exactly as a verification link would (the S650 password-reset reasoning).
+      // Without it the new admin's first sign-in was refused with "Please verify
+      // your email" — Ben Layton accepted on Sept 5 and was still locked out,
+      // unverified, a month later.
       const user = (await client.query(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name)
-         VALUES (lower($1), $2, $3, $4, $5) RETURNING id, email, role`,
+        `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                            email_verified, email_verified_at)
+         VALUES (lower($1), $2, $3, $4, $5, TRUE, NOW()) RETURNING id, email, role`,
         [inv.email, hash, inv.role, body.firstName, body.lastName])).rows[0]
 
       await client.query(
@@ -3648,12 +4150,98 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       await client.query('COMMIT')
 
       // No session is issued here on purpose. They sign in normally, which runs
-      // them straight into the mandatory 2FA enrolment every admin must pass —
+      // them straight into the mandatory 2FA enrollment every admin must pass —
       // handing back a token would route around the one gate that matters.
       res.status(201).json({ success: true, data: { email: user.email, role: user.role } })
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})
       throw e
     } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+/**
+ * S652 — GAM's own collections desk.
+ *
+ * GET  /api/admin/uncollectable        — who owes GAM with no way to collect
+ * POST /api/admin/landlords/:id/unlock — restore access by hand
+ *
+ * THERE IS NO MANUAL LOCK, AND THAT IS THE POINT. I built one, on the reasoning
+ * that a sweep which suspends accounts by itself is one bug from taking a paying
+ * customer offline. Nic threw it out: "I don't want it flipped by a person. Like,
+ * that means somebody manually had to go in there and do that and make a choice.
+ * And choice creates the opportunity for discrimination. We need to have a
+ * standing company rule and a sweep that happens when that threshold is reached."
+ *
+ * He is right and the reasoning is not really about bugs. A lock a human chooses
+ * to apply is a lock a human can choose NOT to apply, and every instance of
+ * either is a decision somebody could be asked to justify. A rule that runs
+ * itself is the same for the 3-lot duplex and the 41-space park.
+ *
+ * The rule lives in services/portalLockSweep. Unlocking stays available by hand
+ * because restoring access is not the decision anybody would abuse, and it also
+ * happens automatically the moment the balance is settled.
+ */
+adminRouter.get('/uncollectable', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { uncollectableLandlords } = await import('../services/landlordGamDebit')
+    res.json({ success: true, data: await uncollectableLandlords() })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/landlords/:id/unlock', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const l = await queryOne<any>(
+      `SELECT id, platform_locked_at FROM landlords WHERE id = $1`, [req.params.id])
+    if (!l) throw new AppError(404, 'No such company')
+    if (!l.platform_locked_at) return res.json({ success: true, data: { locked: false } })
+    // The reason is kept, not blanked: the history of a lock is the answer to
+    // "has this happened before", and GAM does not erase records.
+    await query(
+      `UPDATE landlords SET platform_locked_at = NULL, updated_at = NOW() WHERE id = $1`, [l.id])
+    logger.warn({ landlordId: l.id, by: req.user.userId }, '[admin] a landlord portal was unlocked')
+    res.json({ success: true, data: { locked: false } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/admin/collections — S652: what GAM was owed against what arrived.
+ *
+ * Nic: "we need a log on the admin side that money that we are actually
+ * expected to take in is taken in. We need to operate bookkeeping on our own
+ * stats." Distinct from /earnings, which books a fee when it is EARNED and is
+ * silent on whether it was ever received.
+ */
+/**
+ * S652 — GAM's reader desk. A landlord asked for a card reader from the
+ * register; here it is ordered in Stripe's shop (pre-registered to the
+ * property's Terminal location shown on the row), and the Stripe order,
+ * serial and tracking are recorded. Marking it shipped raises the first
+ * payment; Stripe registering the device flips it to "registered" on its own.
+ */
+adminRouter.get('/reader-orders', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { adminListReaderOrders } = await import('../services/readerOrders')
+    res.json({ success: true, data: await adminListReaderOrders() })
+  } catch (e) { next(e) }
+})
+adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      status: z.enum(['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']).optional(),
+      stripeHardwareOrderId: z.string().trim().max(80).nullable().optional(),
+      serial: z.string().trim().max(80).nullable().optional(),
+      trackingUrl: z.string().trim().max(400).nullable().optional(),
+      note: z.string().trim().max(500).nullable().optional(),
+    }).parse(req.body)
+    const { adminUpdateReaderOrder } = await import('../services/readerOrders')
+    res.json({ success: true, data: await adminUpdateReaderOrder(req.params.id, body) })
+  } catch (e) { next(e) }
+})
+
+adminRouter.get('/collections', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { collectionsBook } = await import('../services/gamCollections')
+    res.json({ success: true, data: await collectionsBook() })
   } catch (e) { next(e) }
 })

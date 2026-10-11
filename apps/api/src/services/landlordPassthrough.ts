@@ -41,6 +41,8 @@ import { createPmCompanyTransfer } from './stripeConnect'
 import { netAgainstDisbursement, markBalance } from './landlordGamAccount'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
+import { lockHeldItems, stampHeldItems } from './heldPayouts'
+import { lockPayoutCut } from './payoutCut'
 
 export interface PassthroughResult {
   attempted:        boolean
@@ -140,7 +142,31 @@ export async function heldOwnerShareForUser(landlordUserId: string): Promise<num
         AND p.platform_held = true
         AND p.status = 'settled'`,
     [landlordUserId])
-  return Math.round(parseFloat(row?.owed_amount ?? '0') * 100) / 100
+  const held = await queryOne<{ owed_amount: string }>(
+    `SELECT COALESCE(SUM(h.amount), 0)::numeric AS owed_amount
+       FROM held_payout_items h
+       JOIN landlords l ON l.id = h.landlord_id
+      WHERE l.user_id = $1 AND h.payout_intent_id IS NULL`,
+    [landlordUserId])
+  return Math.round((parseFloat(row?.owed_amount ?? '0') + parseFloat(held?.owed_amount ?? '0')) * 100) / 100
+}
+
+/**
+ * S650: GAM's own AVAILABLE balance at Stripe, in cents — what can actually be
+ * transferred right now. `null` means we could not ask (no key, Stripe down),
+ * and the caller then behaves exactly as it did before rather than stalling
+ * every payout on a failed balance call.
+ */
+async function platformAvailableCents(): Promise<number | null> {
+  try {
+    const { getStripe } = await import('../lib/stripe')
+    const bal = await getStripe().balance.retrieve()
+    const usd = (bal.available ?? []).filter((b: any) => b.currency === 'usd')
+    return usd.reduce((a: number, b: any) => a + Number(b.amount || 0), 0)
+  } catch (e) {
+    logger.error({ err: e }, '[platform_held_passthrough] could not read the platform balance — proceeding uncapped')
+    return null
+  }
 }
 
 /**
@@ -148,14 +174,35 @@ export async function heldOwnerShareForUser(landlordUserId: string): Promise<num
  * intent inside one transaction, then commit. Returns null when there is
  * nothing to do (unknown user, no Connect account, nothing owed).
  */
-async function reservePlatformHeldBatch(landlordUserId: string): Promise<ReservedBatch | null> {
+async function reservePlatformHeldBatch(
+  landlordUserId: string,
+  onlyLandlordId?: string,
+): Promise<ReservedBatch | null> {
+  // ── S640: ONE ACCOUNT OWNS SEVERAL COMPANIES ───────────────────────────
+  //
+  // This was a queryOne over `users JOIN landlords` — and an account that owns
+  // two companies matches TWICE, so it silently took whichever row Postgres
+  // returned first and the other company's rent could never be swept off the
+  // platform balance at all. Nic's account owns Mountain View and Oak Park;
+  // Mountain View happens to sort first, so Oak Park's card and ACH money would
+  // have sat on GAM's balance forever, with nothing anywhere saying so.
+  //
+  // Not currently biting only because Oak Park's residents have all paid cash
+  // so far. The first one who pays online would have found out the hard way.
+  //
+  // The caller now names the company (see reconcilePlatformHeldPayments, which
+  // loops over all of them); the bare-user form still resolves when an account
+  // owns exactly one.
   const landlordRow = await queryOne<{ landlord_id: string; stripe_connect_account_id: string | null }>(
     `SELECT l.id AS landlord_id,
             COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
        FROM users u
        JOIN landlords l ON l.user_id = u.id
-      WHERE u.id = $1`,
-    [landlordUserId]
+      WHERE u.id = $1
+        AND ($2::uuid IS NULL OR l.id = $2::uuid)
+      ORDER BY l.created_at ASC
+      LIMIT 1`,
+    [landlordUserId, onlyLandlordId ?? null]
   )
   if (!landlordRow || !landlordRow.stripe_connect_account_id) return null
 
@@ -167,8 +214,12 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
       [`platform_held_reconcile:${landlordRow.landlord_id}`]
     )
 
-    const sumRow = await client.query<{ owed_amount: string }>(
-      `SELECT COALESCE(SUM(ubl.amount), 0)::numeric AS owed_amount
+    // S648: lock and read the EXACT rows this batch pays, then stamp those ids.
+    // Summing and later stamping "everything currently held" let a payment or
+    // sale that landed between the two be marked paid out without being in
+    // the transfer — the landlord would never have been paid for it.
+    const allShareRows = await client.query<{ id: string; amount: string }>(
+      `SELECT ubl.id, ubl.amount::text AS amount
          FROM payments p
          JOIN user_balance_ledger ubl
            ON ubl.reference_id = p.id
@@ -177,10 +228,48 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
           AND ubl.stripe_transfer_id IS NULL
         WHERE p.landlord_id = $1
           AND p.platform_held = true
-          AND p.status = 'settled'`,
+          AND p.status = 'settled'
+        ORDER BY ubl.created_at ASC
+          FOR UPDATE OF ubl`,
       [landlordRow.landlord_id]
     )
-    const owed = Math.round(parseFloat(sumRow.rows[0]?.owed_amount ?? '0') * 100) / 100
+    // ── S650 (Nic): NEVER RESERVE MORE THAN GAM ACTUALLY HAS ────────────────
+    //
+    //   "Why the fuck would money fail to move for insufficient funds? We only
+    //    move the money that was paid to us."
+    //
+    // Because a payment is `settled` here the moment the tenant's bank clears
+    // it, and Stripe does not make an ACH's funds AVAILABLE for about four
+    // business days after that. The batch was built from GAM's records alone,
+    // so on 2026-09-16 it claimed $4,154.89 of rent whose newest $1,300 was
+    // still ripening at Stripe. A Transfer is all-or-nothing: Stripe refused
+    // the whole thing, and the older money that WAS available sat stuck behind
+    // the newest — twelve payments, three days, no payout.
+    //
+    // So the batch is now capped by GAM's own available balance, oldest money
+    // first. What is not yet available is simply not claimed; it goes out on
+    // the next run, the day it ripens. Nothing is lost and nothing is stuck.
+    const cents = (v: string) => Math.round(parseFloat(v) * 100)
+    const availableCents = await platformAvailableCents()
+    const shareRows = { rows: [] as { id: string; amount: string }[] }
+    let claimedCents = 0
+    for (const r of allShareRows.rows) {
+      const c = cents(r.amount)
+      if (availableCents != null && claimedCents + c > availableCents) break
+      shareRows.rows.push(r)
+      claimedCents += c
+    }
+    const skippedShares = allShareRows.rows.length - shareRows.rows.length
+    // S648: everything else GAM holds for this landlord — register sales, stay
+    // deposits, and the chargebacks/refunds that net against them.
+    const held = await lockHeldItems(client, { landlordId: landlordRow.landlord_id },
+      availableCents == null ? undefined : Math.max(0, availableCents - claimedCents))
+    if (skippedShares > 0 || (availableCents != null && claimedCents === 0)) {
+      logger.info({ landlordId: landlordRow.landlord_id, availableCents, claimedCents, skippedShares },
+        '[platform_held_passthrough] capped to GAM\'s available balance — the rest goes out when it clears')
+    }
+    const owedCents = claimedCents + held.totalCents
+    const owed = owedCents / 100
     if (owed <= 0) {
       await client.query('ROLLBACK')
       return null
@@ -207,32 +296,28 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
     const transferAmount = Math.round((owed - netted - gamTaken) * 100) / 100
     const fullyNetted = transferAmount <= 0
 
-    // S620: record where this landlord's GAM balance stands after the netting,
-    // trip or no trip. Nic: "we should flag those properties when that happens
-    // and see how close it was to happening. Maybe we raise the limit per
-    // property... if the fees are not worth the extra money movement."
-    // A property that peaks at $80 and never crosses is the useful signal, and
-    // it only exists if the near-misses are written down too.
-    void markBalance(landlordRow.landlord_id).then((b) => {
-      if (b.overThreshold) {
-        logger.warn({ landlordId: landlordRow.landlord_id, owed: b.owed, threshold: b.threshold },
-          '[gam-account] still over threshold after netting — a direct debit is the only route left')
-      }
-    }).catch(() => {})
 
     // Create the durable intent. For a fully-netted batch there is no Stripe
-    // Transfer to make, so it's born already 'transferred'.
+    // Transfer to make, so it's born already 'transferred' — and dated here,
+    // so it follows the same rule as confirmIntent (services/payoutCut.ts):
+    // take the account's cut lock first (a payout taking its cut waits for
+    // this to commit), then date it by the database clock at the moment it is
+    // written. Dated by the app's clock without the lock, it could sit before
+    // a sweep's cut yet commit after that sweep looked: in no payout, ever,
+    // with the payments netted inside it listed nowhere.
+    if (fullyNetted) await lockPayoutCut(client, landlordRow.stripe_connect_account_id)
     const intentRow = await client.query<{ id: string }>(
       `INSERT INTO platform_transfer_intents
          (landlord_id, landlord_user_id, destination_connect_account_id,
           amount, gross_owed, netted_amount, status, stripe_transfer_id, transferred_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+               CASE WHEN $7::text = 'transferred' THEN clock_timestamp() END)
        RETURNING id`,
       [
         landlordRow.landlord_id, landlordUserId, landlordRow.stripe_connect_account_id,
         transferAmount, owed, netted,
         fullyNetted ? 'transferred' : 'pending',
-        null, fullyNetted ? new Date() : null,
+        null,
       ]
     )
     const intentId = intentRow.rows[0].id
@@ -244,17 +329,11 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
 
     // Stamp the reserved owner-share rows so they can never be re-summed.
     await client.query(
-      `UPDATE user_balance_ledger
-          SET stripe_transfer_id = $1
-        WHERE type = 'allocation_owner_share'
-          AND reference_type = 'payment'
-          AND stripe_transfer_id IS NULL
-          AND reference_id IN (
-            SELECT id FROM payments
-             WHERE landlord_id = $2 AND platform_held = true AND status = 'settled'
-          )`,
-      [sentinel, landlordRow.landlord_id]
+      `UPDATE user_balance_ledger SET stripe_transfer_id = $1 WHERE id = ANY($2::uuid[])`,
+      [sentinel, shareRows.rows.map(r => r.id)]
     )
+    // Claim the held items this batch carries.
+    await stampHeldItems(client, held.ids, intentId)
     // S602 deposit-trust: NEVER pass a deposit through to the landlord on the
     // weekly batch. A tenant deposit is held by GAM in the segregated trust pool
     // (held_by='gam_escrow') and only leaves at move-out, when depositReturn
@@ -266,7 +345,13 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
       `UPDATE payments
           SET platform_held = false
         WHERE landlord_id = $1 AND platform_held = true AND status = 'settled'
-          AND type <> 'deposit'`,
+          AND type <> 'deposit'
+          -- a payment whose owner share landed after this batch was read keeps
+          -- waiting for the next one
+          AND NOT EXISTS (
+            SELECT 1 FROM user_balance_ledger ubl
+             WHERE ubl.reference_id = payments.id AND ubl.reference_type = 'payment'
+               AND ubl.type = 'allocation_owner_share' AND ubl.stripe_transfer_id IS NULL)`,
       [landlordRow.landlord_id]
     )
 
@@ -277,6 +362,22 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
     )
 
     await client.query('COMMIT')
+    // S620: record where this landlord's GAM balance stands after the netting,
+    // trip or no trip. Nic: "we should flag those properties when that happens
+    // and see how close it was to happening. Maybe we raise the limit per
+    // property... if the fees are not worth the extra money movement."
+    // A property that peaks at $80 and never crosses is the useful signal, and
+    // it only exists if the near-misses are written down too.
+    // 10/5: AFTER the commit. Read on its own connection before it, it saw the
+    // balance the netting had just paid off — Mountain View's $175.50, netted
+    // in full, was recorded as a peak over the $100 line with a warning that a
+    // direct debit was the only route left.
+    void markBalance(landlordRow.landlord_id).then((b) => {
+      if (b.overThreshold) {
+        logger.warn({ landlordId: landlordRow.landlord_id, owed: b.owed, threshold: b.threshold },
+          '[gam-account] still over threshold after netting — a direct debit is the only route left')
+      }
+    }).catch(() => {})
     return {
       intentId,
       landlordId: landlordRow.landlord_id,
@@ -303,7 +404,7 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
  */
 export async function executePlatformTransferIntent(intentId: string): Promise<string | null> {
   const intent = await queryOne<{
-    id: string; landlord_id: string; landlord_user_id: string
+    id: string; landlord_id: string | null; landlord_user_id: string | null; business_id: string | null
     destination_connect_account_id: string; amount: string
     netted_amount: string; status: string; attempts: number
   }>(`SELECT * FROM platform_transfer_intents WHERE id = $1`, [intentId])
@@ -328,11 +429,11 @@ export async function executePlatformTransferIntent(intentId: string): Promise<s
       metadata: {
         gam_kind:             'platform_held_passthrough',
         gam_intent_id:        intentId,
-        gam_landlord_id:      intent.landlord_id,
-        gam_landlord_user_id: intent.landlord_user_id,
+        ...(intent.landlord_id ? { gam_landlord_id: intent.landlord_id, gam_landlord_user_id: intent.landlord_user_id ?? '' } : {}),
+        ...(intent.business_id ? { gam_business_id: intent.business_id } : {}),
         ...(netted > 0 ? { gam_reversal_netted: String(netted) } : {}),
       },
-      description: 'Platform-held rent passthrough',
+      description: intent.business_id ? 'GAM weekly payout (business)' : 'Platform-held rent passthrough',
     })
     transferId = transfer.id
   } catch (e) {
@@ -351,7 +452,7 @@ export async function executePlatformTransferIntent(intentId: string): Promise<s
         category: 'platform_held_transfer_stuck',
         title:    `Platform-held passthrough transfer stuck after ${attempts} attempts (intent ${intentId})`,
         body:     e instanceof Error ? e.message : String(e),
-        context:  { intent_id: intentId, landlord_id: intent.landlord_id, landlord_user_id: intent.landlord_user_id, amount },
+        context:  { intent_id: intentId, landlord_id: intent.landlord_id, business_id: intent.business_id, landlord_user_id: intent.landlord_user_id, amount },
       })
     }
     logger.error({ err: e, intentId, attempts }, '[platform_held_passthrough] transfer failed (will retry)')
@@ -367,11 +468,22 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
   const client = await getClient()
   try {
     await client.query('BEGIN')
+    // S655 review: a GAM payout carries every transfer dated before its cut,
+    // and the next payout starts at that cut (services/payoutCut.ts). NOW() is
+    // when this transaction BEGAN, and the row is invisible until it commits —
+    // begun before a cut and committed after the payout looked, a transfer was
+    // in neither payout, for good. So take the account's cut lock first (a
+    // payout taking its cut waits for this to commit), then date the transfer
+    // by the clock at the moment it is written.
+    const dest = (await client.query<{ destination_connect_account_id: string | null }>(
+      `SELECT destination_connect_account_id FROM platform_transfer_intents WHERE id = $1`,
+      [intentId])).rows[0]?.destination_connect_account_id
+    if (dest) await lockPayoutCut(client, dest)
     // Only advance a still-pending intent (concurrent execute/recover safe).
     const upd = await client.query(
       `UPDATE platform_transfer_intents
           SET status = 'transferred', stripe_transfer_id = $1,
-              transferred_at = COALESCE(transferred_at, NOW()), updated_at = NOW()
+              transferred_at = COALESCE(transferred_at, clock_timestamp()), updated_at = NOW()
         WHERE id = $2 AND status = 'pending'
         RETURNING id`,
       [transferId, intentId]
@@ -406,20 +518,65 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
 export async function reconcilePlatformHeldPayments(
   landlordUserId: string
 ): Promise<PassthroughResult> {
-  const reserved = await reservePlatformHeldBatch(landlordUserId)
-  if (!reserved) {
+  // S640: EVERY company the account owns, not the first one. Each has its own
+  // Connect account and its own owed balance, so each gets its own intent and
+  // its own transfer; the results are summed so the caller's shape is unchanged.
+  const companies = await query<{ id: string }>(
+    `SELECT id FROM landlords WHERE user_id = $1 ORDER BY created_at ASC`, [landlordUserId])
+  if (companies.length === 0) {
     return { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
   }
-  if (reserved.fullyNetted) {
-    return { attempted: true, payments_settled: reserved.payments_settled, transfer_id: `netted:${reserved.intentId}`, amount: 0 }
+
+  const out: PassthroughResult = { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
+  for (const c of companies) {
+    const reserved = await reservePlatformHeldBatch(landlordUserId, c.id)
+    if (!reserved) continue
+    out.attempted = true
+    out.payments_settled += reserved.payments_settled
+    if (reserved.fullyNetted) {
+      out.transfer_id = out.transfer_id ?? `netted:${reserved.intentId}`
+      continue
+    }
+    const transferId = await executePlatformTransferIntent(reserved.intentId)
+    // null → the intent stays pending and RECOVER retries it; the money is
+    // claimed either way, so a failure on one company never blocks the next.
+    out.transfer_id = out.transfer_id ?? transferId
+    out.amount += reserved.transferAmount
   }
-  const transferId = await executePlatformTransferIntent(reserved.intentId)
-  return {
-    attempted:        true,
-    payments_settled: reserved.payments_settled,
-    transfer_id:      transferId,   // null → pending, RECOVER will retry
-    amount:           reserved.transferAmount,
+  return out
+}
+
+/**
+ * 10/5 (Nic): payouts are per Stripe CONNECT ACCOUNT — "It's not per property.
+ * It's not per company. It's per connect account... A login sits outside of the
+ * portfolio." Move the held rent of every company whose money lands in this
+ * account (one company, or several sharing one bank through one account), each
+ * with its own intent and transfer exactly as reconcilePlatformHeldPayments
+ * does — only found by the account, never by a login.
+ */
+export async function reconcilePlatformHeldForAccount(
+  stripeAccountId: string,
+): Promise<PassthroughResult> {
+  const companies = await query<{ id: string; user_id: string }>(
+    `SELECT l.id, l.user_id
+       FROM landlords l JOIN users u ON u.id = l.user_id
+      WHERE COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) = $1
+      ORDER BY l.created_at ASC`, [stripeAccountId])
+  const out: PassthroughResult = { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
+  for (const c of companies) {
+    const reserved = await reservePlatformHeldBatch(c.user_id, c.id)
+    if (!reserved) continue
+    out.attempted = true
+    out.payments_settled += reserved.payments_settled
+    if (reserved.fullyNetted) {
+      out.transfer_id = out.transfer_id ?? `netted:${reserved.intentId}`
+      continue
+    }
+    const transferId = await executePlatformTransferIntent(reserved.intentId)
+    out.transfer_id = out.transfer_id ?? transferId
+    out.amount += reserved.transferAmount
   }
+  return out
 }
 
 /**
@@ -442,6 +599,24 @@ export async function recoverPendingPlatformTransfers(graceMinutes = 5): Promise
     const tid = await executePlatformTransferIntent(r.id)
     if (tid && tid !== 'already') recovered++
     else if (!tid) stillPending++
+  }
+  // S650 (Nic): money owed to a landlord must never sit quietly. Mountain
+  // View's $4,154.89 was reserved on the 16th, failed twice on GAM's available
+  // balance, and nothing said so — the escalation only fires at three attempts,
+  // and a retry that never ran cannot reach three. A day is the alarm.
+  const stale = await query<{ id: string; amount: string; landlord_id: string; hours: string }>(
+    `SELECT id, amount::text AS amount, landlord_id,
+            ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)::text AS hours
+       FROM platform_transfer_intents
+      WHERE status = 'pending' AND amount > 0 AND created_at < NOW() - interval '24 hours'`)
+  for (const st of stale) {
+    await createAdminNotification({
+      severity: 'critical',
+      category: 'platform_held_transfer_stuck',
+      title:    `$${Number(st.amount).toFixed(2)} owed to a landlord has been stuck ${st.hours}h`,
+      body:     'A platform→Connect batch is still pending. Most often GAM\'s Stripe balance had not caught up; it retries daily, but check it.',
+      context:  { intent_id: st.id, landlord_id: st.landlord_id, amount: st.amount, hours: st.hours },
+    }).catch(() => {})
   }
   return { scanned: rows.length, recovered, stillPending }
 }

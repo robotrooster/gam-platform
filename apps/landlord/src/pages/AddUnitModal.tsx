@@ -149,7 +149,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const subtypesForType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === form.unitType)
   // S630 DIRECTIVE (Nic): "Units need to be able to handle multiple subtypes as a
   // checkbox... 'fifty amp back in' should not be one subtype. It's two." Each
-  // categorisation toggles on its own, so a spot is "pull through" AND "50 amp"
+  // categorization toggles on its own, so a spot is "pull through" AND "50 amp"
   // AND "facing west" without anyone pre-bundling a row for that combination.
   const selectedSubtypes = subtypesForType.filter(s => s.id != null && form.subtypeIds.includes(s.id))
   // The first is what prefills unit facts; the rest are classification.
@@ -427,7 +427,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   style={{ width: '100%' }}
                 />
                 {errors.unitNumber && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unitNumber}</div>}
-                {/* S604 (Nic): the prefix behaviour was only ever shown in the
+                {/* S604 (Nic): the prefix behavior was only ever shown in the
                     PLACEHOLDER, which disappears the moment you type — so a
                     landlord bulk-adding 20 spots had no idea whether the field
                     wanted a prefix or a comma-separated list. Show the actual
@@ -641,7 +641,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               <label style={labelStyle}>Initial Status</label>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 {[
-                  // S604 (Nic): 'vacant' rendered in muted grey read as DISABLED —
+                  // S604 (Nic): 'vacant' rendered in muted gray read as DISABLED —
                   // and it is the correct choice in almost every case, because
                   // esign + the lease-start scheduler flip a unit to 'active'
                   // automatically. Gold matches the selected state of every other

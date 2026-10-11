@@ -82,7 +82,7 @@ describe('books.ts — business_owner scope (S459)', () => {
       await client.query('COMMIT')
     } finally { client.release() }
     const landlordToken = sign({ userId: landlordUserId, role: 'landlord',
-      email: 'll@t.dev', profileId: landlordId, permissions: {} })
+      email: 'll@t.dev', profileId: null, landlordIds: [landlordId], permissions: {} })
 
     await request(buildApp()).post('/api/books/accounts')
       .set('Authorization', `Bearer ${landlordToken}`)
@@ -168,7 +168,7 @@ describe('books.ts — business_owner scope (S459)', () => {
       await client.query('COMMIT')
     } finally { client.release() }
     const token = sign({ userId: landlordUserId, role: 'landlord',
-      email: 'll@t.dev', profileId: landlordId, permissions: {} })
+      email: 'll@t.dev', profileId: null, landlordIds: [landlordId], permissions: {} })
     const pl = await request(buildApp()).get('/api/books/reports/pl')
       .set('Authorization', `Bearer ${token}`)
     expect(pl.status).toBe(200)
@@ -217,5 +217,36 @@ describe('books.ts — business_owner scope (S459)', () => {
         .set('Authorization', `Bearer ${o.token}`)
       expect(res.status).toBe(403)
     }
+  })
+})
+
+// S655: Books' landlord income facts (services/incomeBasis) never reach a
+// business owner — not in the P&L under either switch, not in cash flow.
+describe('books.ts — business_owner never reads landlord income (S655)', () => {
+  it('P&L under both bases and cash flow carry no landlord money', async () => {
+    const o = await seedBusinessOwner()
+    // A landlord with real income in the same window.
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const s = await seedLandlord(client)
+      await client.query(
+        `INSERT INTO landlord_other_income (landlord_id, category, amount, income_date) VALUES ($1,'laundry',90,'2026-06-02')`,
+        [s.landlordId])
+      await client.query('COMMIT')
+    } finally { client.release() }
+    for (const basis of ['received', 'billed']) {
+      const pl = await request(buildApp())
+        .get(`/api/books/reports/pl?startDate=2026-01-01&endDate=2026-12-31&basis=${basis}`)
+        .set('Authorization', `Bearer ${o.token}`)
+      expect(pl.status).toBe(200)
+      expect(pl.body.data.gamRentIncome).toBe(0)
+      expect(pl.body.data.gamPL).toBeNull()
+    }
+    const cf = await request(buildApp())
+      .get('/api/books/reports/cash-flow?startDate=2026-01-01&endDate=2026-12-31')
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(cf.status).toBe(200)
+    expect(cf.body.data.operating.inflows).toMatchObject({ rentCollected: 0, paidAhead: 0, registerAndStays: 0 })
   })
 })

@@ -25,12 +25,17 @@ import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { emailLoginCode } from '../services/email'
 import { logger } from '../lib/logger'
+import { signSessionToken, policyOfPass } from '../lib/sessionToken'
+import { claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
+// Circular with routes/auth.ts (which imports this file), same as
+// routes/totp.ts: used only inside a handler, never at load.
+import { assertPassPostdatesPasswordChange } from './auth'
+import type { SessionPolicy } from '@gam/shared'
 
 export const emailOtpRouter = Router()
 
 const OTP_TTL_MINUTES = 10
 const PENDING_TTL_SECONDS = 15 * 60   // the session may outlive one code (allows a resend)
-const FULL_SESSION_TTL = '7d'
 const MAX_ATTEMPTS = 5
 const BCRYPT_ROUNDS = 10
 
@@ -44,6 +49,8 @@ interface EmailOtpClaims {
   businessId?: string | null
   staffRole?: string | null
   permissions?: unknown
+  /** S655: the session policy chosen at sign-in, carried to the full pass. */
+  sp?: SessionPolicy
 }
 
 export function signEmailOtpSessionToken(claims: EmailOtpClaims): string {
@@ -52,10 +59,6 @@ export function signEmailOtpSessionToken(claims: EmailOtpClaims): string {
     process.env.JWT_SECRET!,
     { expiresIn: PENDING_TTL_SECONDS }
   )
-}
-
-function signFullToken(payload: object): string {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: FULL_SESSION_TTL })
 }
 
 /**
@@ -114,12 +117,70 @@ function readPendingSession(token: string): EmailOtpClaims & { purpose: string }
   return session
 }
 
+/**
+ * S655: the account behind a pending pass, refused (401) when the pass was
+ * minted before the password last changed. A password change ends every pass
+ * minted before it (routes/auth.ts), and the code step turns a pending pass into
+ * a full one, so a pending pass must not outlive a password change either.
+ *
+ * Both /verify and /resend run this BEFORE touching the live code. /verify:
+ * a dead pass neither spends nor counts against the code the real person is
+ * about to type. /resend: a dead pass cannot retire that code and mail a new one
+ * (it could otherwise keep cancelling the real person's code, once a click).
+ *
+ * Whole-second precision: tenant invite activation stamps sessions_valid_from
+ * and mints this pass in the same request (routes/tenants.ts accept-invite).
+ *
+ * The pass is also bound to the login address it was minted for, the same way
+ * it is bound to the password. Every minting site copies users.email into the
+ * pass, and the code /login mailed went to that address. If the login address
+ * has changed since (a confirmed change of email, or a landlord correcting a
+ * resident's mistyped address, which also drops email_verified and kills every
+ * other key mailed to the old address), that code proves the OLD inbox, so it
+ * must not mark the new address verified or start a session naming it. The
+ * person signs in again and the code goes to the address they have now.
+ * Compared case-insensitively, as login matches addresses.
+ *
+ * Both refusals say "session" ON PURPOSE. Every portal's code screen (landlord,
+ * tenant, invite, business, POS, admin, Support, GAM Books, PM) drops a dead
+ * pending pass and returns the person to the sign-in form only when the
+ * server's message matches /session/i. Without the word they stayed on the code
+ * screen typing codes that could never work, and a reload brought the dead pass
+ * back. The sentences still say why, then what to do.
+ */
+export const PENDING_PASS_PASSWORD_CHANGED =
+  'Your password was changed, so this sign-in session has ended. Please sign in again.'
+export const PENDING_PASS_EMAIL_CHANGED =
+  'Your sign-in email changed, so this sign-in session has ended. Please sign in again.'
+
+async function liveAccountForPendingPass(
+  session: EmailOtpClaims & { purpose: string },
+): Promise<{ email: string }> {
+  const account = await queryOne<{ email: string; sessions_valid_from: Date | null }>(
+    `SELECT email, sessions_valid_from FROM users WHERE id = $1`, [session.userId])
+  if (!account) throw new AppError(401, 'Invalid sign-in session.')
+  try {
+    assertPassPostdatesPasswordChange(session, account.sessions_valid_from, { wholeSecond: true })
+  } catch (e) {
+    // auth.ts words this for a FULL pass (/auth/me, /refresh), where the
+    // portal's 401 handler signs the person out whatever it says. Here the
+    // pending-pass wording is what sends them back to the sign-in form.
+    if (e instanceof AppError && e.statusCode === 401) throw new AppError(401, PENDING_PASS_PASSWORD_CHANGED)
+    throw e
+  }
+  if (String(account.email ?? '').toLowerCase() !== String(session.email ?? '').toLowerCase()) {
+    throw new AppError(401, PENDING_PASS_EMAIL_CHANGED)
+  }
+  return account
+}
+
 // POST /api/auth/email-otp/verify
 emailOtpRouter.post('/verify', async (req, res, next) => {
   try {
     const { emailOtpSession, code } = verifySchema.parse(req.body)
     const session = readPendingSession(emailOtpSession)
     const userId = session.userId
+    const account = await liveAccountForPendingPass(session)
 
     const otp = await queryOne<{
       id: string; code_hash: string; expires_at: string; attempts: number
@@ -152,33 +213,62 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
     // S578: completing an emailed code proves the user controls the address, so
     // it doubles as email verification. This lets signup's mandatory-2FA step
     // also verify the email (no separate link), and is a harmless no-op for an
-    // already-verified login.
-    await query(
+    // already-verified login. S655: RETURNING says whether THIS code was the
+    // address's first proof.
+    //
+    // Only for the address liveAccountForPendingPass checked. That check ran
+    // before the code lookup and the bcrypt compare; a landlord correcting the
+    // resident's address (new address, email_verified=FALSE) can land in
+    // between, and the code — which proves the OLD inbox — must not mark the
+    // NEW, unproven address verified. If the address moved, nothing is marked,
+    // firstVerification stays false, and no co-owner invitation is claimed.
+    const firstVerification = (await query(
       `UPDATE users
           SET email_verified = TRUE,
               email_verified_at = COALESCE(email_verified_at, NOW()),
               updated_at = NOW()
-        WHERE id = $1 AND email_verified IS NOT TRUE`,
-      [userId],
-    )
+        WHERE id = $1 AND email_verified IS NOT TRUE
+          AND lower(email) = lower($2)
+        RETURNING id`,
+      [userId, account.email],
+    )).length > 0
 
-    const token = signFullToken({
+    // S655 SECURITY: the address is proven NOW, so this — not the signup form —
+    // is where an invited co-owner becomes an owner (services/coOwnerInvites.ts).
+    // Only for a landlord account with no company; never blocks the sign-in (the
+    // invite link still works if this fails). requireAuth refreshes landlordIds
+    // on every request anyway (S629); merging them here just makes the first
+    // pass right too.
+    let landlordIds = session.landlordIds ?? null
+    if (session.role === 'landlord') {
+      try {
+        const gained = await claimInvitationsOnProvenAddress(userId, { firstVerification })
+        if (gained.length > 0) landlordIds = Array.from(new Set([...(landlordIds ?? []), ...gained]))
+      } catch (err) {
+        logger.error({ err, userId }, '[emailOtp] co-owner invitation claim failed')
+      }
+    }
+
+    // The login address as stored (liveAccountForPendingPass has already
+    // refused a pass minted for a different one), so the pass and the user
+    // object name the same address /auth/me will.
+    const token = signSessionToken({
       userId:      session.userId,
       role:        session.role,
-      email:       session.email,
+      email:       account.email,
       profileId:   session.profileId,
       landlordId:  session.landlordId ?? null,
-      landlordIds: session.landlordIds ?? null,
+      landlordIds,
       businessId:  session.businessId ?? null,
       staffRole:   session.staffRole ?? null,
       permissions: session.permissions ?? null,
-    })
+    }, policyOfPass(session))
     res.json({
       success: true,
       data: {
         token,
         user: {
-          id: session.userId, email: session.email, role: session.role,
+          id: session.userId, email: account.email, role: session.role,
           profileId: session.profileId, landlordId: session.landlordId ?? null,
           permissions: session.permissions ?? null,
         },
@@ -192,7 +282,12 @@ emailOtpRouter.post('/resend', async (req, res, next) => {
   try {
     const { emailOtpSession } = z.object({ emailOtpSession: z.string() }).parse(req.body)
     const session = readPendingSession(emailOtpSession)
-    await issueEmailOtp(session.userId, session.email)
+    const account = await liveAccountForPendingPass(session)
+    // The code goes to the account's login address as stored (see GET /status
+    // below), the same address /login mails. liveAccountForPendingPass has
+    // already refused a pass minted for a different address, so this differs
+    // from the pass's copy at most in letter case.
+    await issueEmailOtp(session.userId, account.email)
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -221,3 +316,34 @@ emailOtpRouter.get('/status', requireAuth, async (req, res, next) => {
     })
   } catch (e) { next(e) }
 })
+
+/**
+ * S654 (Nic): "if there's a way that the … invoice link email can contain a
+ * bypass where they can just get on and pay their bill."
+ *
+ * The emailed code proves one thing: the person holds the inbox. Opening a
+ * link that arrived in that same inbox proves the same thing. So the bill's
+ * Pay now link carries this token, and a sign-in that presents it needs only
+ * the password — both factors, and no leaving the app to go read a code (which
+ * is where phones were losing people). It is bound to one account, lives for
+ * a billing cycle, and does nothing on its own: without the password it is a
+ * link to the sign-in page. It never stands in for an authenticator app.
+ */
+const EMAIL_FACTOR_TTL = '35d'
+
+export function signEmailFactorToken(claims: { userId: string; email: string }): string {
+  return jwt.sign(
+    { userId: claims.userId, email: claims.email, purpose: 'email_factor' },
+    process.env.JWT_SECRET!,
+    { expiresIn: EMAIL_FACTOR_TTL },
+  )
+}
+
+/** The account an email-factor token vouches for; null when it is not one (expired, forged, or some other kind of token). */
+export function verifyEmailFactorToken(token: string): { userId: string; email: string } | null {
+  try {
+    const p = jwt.verify(token, process.env.JWT_SECRET!) as any
+    if (!p || p.purpose !== 'email_factor' || !p.userId || !p.email) return null
+    return { userId: String(p.userId), email: String(p.email) }
+  } catch { return null }
+}

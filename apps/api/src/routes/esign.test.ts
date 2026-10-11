@@ -42,6 +42,7 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
+import { todayIn, addDaysTo } from '../lib/timezone'
 import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit,
@@ -51,7 +52,6 @@ import {
 const {
   emailSigningRequestMock,
   emailSigningCompletedMock,
-  emailDocumentDeclinedMock,
   createNotificationMock,
   createAdminNotificationMock,
   generateMoveInInvoiceMock,
@@ -60,7 +60,6 @@ const {
 } = vi.hoisted(() => ({
   emailSigningRequestMock:    vi.fn(async () => 'msg'),
   emailSigningCompletedMock:  vi.fn(async () => 'msg'),
-  emailDocumentDeclinedMock:  vi.fn(async () => 'msg'),
   createNotificationMock:     vi.fn(async () => ({ id: 'n_mock' })),
   createAdminNotificationMock: vi.fn(async () => {}),
   // S334: completion handler dependencies. generateMoveInInvoice is
@@ -83,7 +82,6 @@ vi.mock('../services/email', async (importOriginal) => {
     ...actual,
     emailSigningRequest:    emailSigningRequestMock,
     emailSigningCompleted:  emailSigningCompletedMock,
-    emailDocumentDeclined:  emailDocumentDeclinedMock,
   }
 })
 vi.mock('../services/notifications', async (importOriginal) => {
@@ -107,7 +105,8 @@ vi.mock('../services/pdfStamp', async (importOriginal) => {
   return { ...actual, stampPdf: stampPdfMock }
 })
 
-import { esignRouter, buildLeaseFromDocument, signingUrlFor } from './esign'
+import { esignRouter, buildLeaseFromDocument, signingUrlFor, createDocumentRecord } from './esign'
+import { NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
 import { WRITABLE_LEASE_COLUMN_SPECS } from '@gam/shared'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -123,7 +122,6 @@ beforeEach(async () => {
   await cleanupAllSchema()
   emailSigningRequestMock.mockClear()
   emailSigningCompletedMock.mockClear()
-  emailDocumentDeclinedMock.mockClear()
   createNotificationMock.mockClear()
   createAdminNotificationMock.mockClear()
   generateMoveInInvoiceMock.mockClear()
@@ -146,6 +144,9 @@ beforeEach(async () => {
 interface SeedFixture {
   landlordUserId: string
   landlordId:     string
+  /** S654: the landlord login's own address — the only one (besides the
+   *  property's lease-signing address) its signing seat may be sent to. */
+  landlordEmail:  string
   tenantUserId:   string
   tenantId:       string
   tenantEmail:    string
@@ -190,6 +191,8 @@ async function seedFixture(): Promise<SeedFixture> {
     const tenantUserId = tu.rows[0].user_id
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: landlordUserId, managedByUserId: landlordUserId })
     const unitId     = await seedUnit(client, { propertyId, landlordId })
+    const landlordEmail = (await client.query<{ email: string }>(
+      `SELECT email FROM users WHERE id = $1`, [landlordUserId])).rows[0].email
     await client.query('COMMIT')
 
     const landlordToken = jwt.sign(
@@ -200,9 +203,18 @@ async function seedFixture(): Promise<SeedFixture> {
       { userId: tenantUserId, role: 'tenant', email: tenantEmail, profileId: tenantId, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
-    return { landlordUserId, landlordId, tenantUserId, tenantId, tenantEmail, unitId, propertyId, landlordToken, tenantToken }
+    return { landlordUserId, landlordId, landlordEmail, tenantUserId, tenantId, tenantEmail, unitId, propertyId, landlordToken, tenantToken }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
+}
+
+/** S654: a resident goes on a company's document only once they are that
+ *  company's — here, a live property-level invite (no unit, so nothing the
+ *  unit-based prefills read). */
+async function inviteToLandlord(f: SeedFixture): Promise<void> {
+  await db.query(
+    `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id)
+     VALUES ($1, $2, 'not_uploaded', $3)`, [f.landlordId, f.tenantId, f.propertyId])
 }
 
 /** Seed a lease_documents row + two signers (landlord first, tenant second). */
@@ -235,6 +247,29 @@ async function seedDoc(f: SeedFixture, opts: {
   return { documentId, landlordSignerId: ls.rows[0].id, tenantSignerId: ts.rows[0].id }
 }
 
+// ─── S652 (Blu, MH 18): the landlord's typed sale terms are read at submit ──
+//
+// The submit route's field query did not select lease_column, so the
+// installment-contract pre-check saw no tagged boxes and rejected every
+// contract with "needs the number of payments" — after he had typed it.
+describe('POST /sign — installment contract reads the typed terms', () => {
+  it('a landlord signs an installment contract whose sale boxes are filled', async () => {
+    const f = await seedFixture()
+    const d = await seedDoc(f, { status: 'sent', landlordSignerStatus: 'viewed', documentType: 'purchase_agreement' as any })
+    await seedDocFields(d.documentId, {
+      sale_monthly_payment: '100.00', sale_term_months: '60', sale_first_payment_month: '10/1/2026',
+    })
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${d.documentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    const signer = await db.query<{ status: string }>(
+      `SELECT status FROM lease_document_signers WHERE id = $1`, [d.landlordSignerId])
+    expect(signer.rows[0].status).toBe('signed')
+  })
+})
+
 // ─── POST /documents — validation gates ─────────────────────────
 
 describe('POST /documents — validation', () => {
@@ -243,7 +278,7 @@ describe('POST /documents — validation', () => {
     const res = await request(buildApp())
       .post('/api/esign/documents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ signers: [{ role: 'landlord', userId: f.landlordUserId, name: 'L', email: 'l@x' }] })
+      .send({ signers: [{ role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail }] })
     expect(res.status).toBe(400)
   })
 
@@ -264,7 +299,7 @@ describe('POST /documents — validation', () => {
       .send({
         title: 'X',
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail },
           { role: 'witness',  userId: f.landlordUserId, name: 'W', email: 'w@x' },
         ],
       })
@@ -293,7 +328,7 @@ describe('POST /documents — validation', () => {
       .send({
         title: 'X',
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail },
           { role: 'primary',                            name: 'T', email: 'unknown@x' },
         ],
       })
@@ -301,17 +336,38 @@ describe('POST /documents — validation', () => {
     expect(res.body.error).toMatch(/userId/i)
   })
 
-  it('rejects tenant signer whose user has no tenants row', async () => {
+  // S654: a landlord's login is never a resident, whatever the role says.
+  it('refuses a landlord login as the tenant signer (409, not a resident account)', async () => {
     const f = await seedFixture()
-    // A landlord user has no tenants row → flagging them as primary tenant is invalid.
     const res = await request(buildApp())
       .post('/api/esign/documents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
         title: 'X',
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail },
           { role: 'primary',  userId: f.landlordUserId, name: 'T', email: 't@x' },  // not a tenant
+        ],
+      })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe(NOT_A_RESIDENT_ACCOUNT)
+  })
+
+  it('rejects tenant signer whose user has no tenants row', async () => {
+    const f = await seedFixture()
+    // A resident-type login with no tenants row (a witness login) can't sign as the tenant.
+    const w = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Wit', 'Ness') RETURNING id`,
+      [`witness-${randomUUID()}@test.dev`])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'X',
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail },
+          { role: 'primary',  userId: w.rows[0].id,      name: 'T', email: 't@x' },
         ],
       })
     expect(res.status).toBe(400)
@@ -326,7 +382,7 @@ describe('POST /documents — validation', () => {
       .send({
         title: 'X',
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T', email: f.tenantEmail },
           // Third signer with an invalid role — primary/landlord counts both satisfy, so
           // we reach the per-signer role check.
@@ -339,6 +395,7 @@ describe('POST /documents — validation', () => {
 
   it('happy path: creates document + signers, returns the doc', async () => {
     const f = await seedFixture()
+    await inviteToLandlord(f)
     const res = await request(buildApp())
       .post('/api/esign/documents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -346,7 +403,7 @@ describe('POST /documents — validation', () => {
         title: 'Test Lease',
         unitId: f.unitId,
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -391,6 +448,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
 
   it('seeds rent, derived deposit (rent × template deposit_months), and unit_number from the unit', async () => {
     const f = await seedFixture()  // unit rent defaults to 1000, unit_type apartment
+    await inviteToLandlord(f)
     // S558: the multiplier lives on the TEMPLATE, not a property setting.
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit', 'unit_number'], 1.5)
 
@@ -400,7 +458,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
       .send({
         title: 'Auto Lease', templateId: tid, unitId: f.unitId,
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -419,6 +477,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
   // and correct but had NO test; this is that test.
   it('S622: prunes template fields for tenant slots nobody fills (4-slot template, 2 signers)', async () => {
     const f = await seedFixture()
+    await inviteToLandlord(f)
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount'])
     // Per-page initials for all four tenant slots, on 3 pages — what auto-place produces.
     for (const role of ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']) {
@@ -435,7 +494,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
       .send({
         title: 'Two Tenant Lease', templateId: tid, unitId: f.unitId,
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -463,6 +522,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
 
   it('S582: rent_due_day is auto-filled to "1st" so the signed lease STATES the due day (document-first)', async () => {
     const f = await seedFixture()
+    await inviteToLandlord(f)
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'rent_due_day'])
     const res = await request(buildApp())
       .post('/api/esign/documents')
@@ -470,7 +530,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
       .send({
         title: 'Auto Lease', templateId: tid, unitId: f.unitId,
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -479,15 +539,46 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     expect(vals.rent_due_day).toBe('1st') // landlord never chooses it — forced onto the doc
   })
 
-  it('S582: rent_due_day billing is LOCKED to 1 regardless of any document value', () => {
+  // S652 (Nic): "they let their due date be whenever they come in." A park
+  // onboarding residents who are ALREADY on their own dates says the day on
+  // the invite, and the drafted lease states it.
+  it('S652: the due day stated on the invite is the one the lease states', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'rent_due_day'])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy, rent_due_day)
+       SELECT $1, t.id, 'not_uploaded', $2, true, 23 FROM tenants t WHERE t.user_id = $3`,
+      [f.landlordId, f.unitId, f.tenantUserId])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    expect((await docFieldValues(res.body.data.id)).rent_due_day).toBe('23rd')
+  })
+
+  // S648 (Nic) lifted the S582 lock: the lease's due day is what bills; a
+  // missing or unreadable one falls back to the property's rule at build.
+  it('S648: rent_due_day bills the day the lease states', () => {
     const parse = (WRITABLE_LEASE_COLUMN_SPECS as any).rent_due_day.parse
-    expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 1 })
-    expect(parse({ rent_due_day: '1st' })).toEqual({ rent_due_day: 1 })
-    expect(parse({})).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 15 })
+    expect(parse({ rent_due_day: 'the 1st' })).toEqual({ rent_due_day: 1 })
+    // Nic: "the 29th through the 31st are moved to be due on the first
+    // because not every month has those days and we don't want any skips."
+    expect(parse({ rent_due_day: '31st' })).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '45th' })).toEqual({})
+    expect(parse({})).toEqual({})
   })
 
   it('leaves the deposit BLANK when the template states no deposit_months (never invents one)', async () => {
     const f = await seedFixture()
+    await inviteToLandlord(f)
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit']) // no deposit_months
     const res = await request(buildApp())
       .post('/api/esign/documents')
@@ -495,7 +586,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
       .send({
         title: 'Auto Lease', templateId: tid, unitId: f.unitId,
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -507,6 +598,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
 
   it('caller-supplied prefill wins over unit auto-seed', async () => {
     const f = await seedFixture()
+    await inviteToLandlord(f)
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount'])
     const res = await request(buildApp())
       .post('/api/esign/documents')
@@ -515,7 +607,7 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
         title: 'Auto Lease', templateId: tid, unitId: f.unitId,
         prefillValues: { rent_amount: '2500.00' },
         signers: [
-          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
           { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
         ],
       })
@@ -590,6 +682,63 @@ describe('template unit-type default (S558)', () => {
 // ─── POST /documents/:id/send ──────────────────────────────────
 
 describe('POST /documents/:id/send', () => {
+  // ─── S651: sending a lease leaves a record of who sent it ────────────
+  //
+  // It left none. A legal document went to a real person and nothing recorded
+  // who caused it. Found the hard way: I signed in as a landlord to send his
+  // own leases and then could not prove from the system what I had touched.
+  //
+  // Nic, on why it matters past that one incident: "when I authorize you to do
+  // something like this on behalf of a landlord down the road — I had
+  // permission from him because we're friends. Another landlord may not grant
+  // me that permission... And I want a record of when that happened, so we can
+  // corroborate emails or phone calls to the time that something actually
+  // happened."
+  describe('S651 audit trail', () => {
+    it('records who sent it, to whom, and when', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+
+      const rows = await db.query<any>(
+        `SELECT user_id, action, entity_type, entity_id, new_value
+           FROM audit_log WHERE entity_id = $1 AND action = 'document.sent_for_signature'`,
+        [documentId])
+      expect(rows.rows).toHaveLength(1)
+      const a = rows.rows[0]
+      expect(a.entity_type).toBe('lease_document')
+      expect(a.user_id).toBe(f.landlordUserId)
+      // Enough to line up against a phone log or an email thread months later:
+      // the acting account, and who the thing actually went to.
+      expect(a.new_value.sentTo).toBeTruthy()
+      expect(a.new_value.sentToRole).toBe('landlord')
+      expect(a.new_value.actingRole).toBe('landlord')
+    })
+
+    it('writes nothing when the send is refused', async () => {
+      // A blocked send is not a send. An audit row for one would make the log
+      // lie in the direction that matters most.
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await db.query(
+        `UPDATE lease_documents SET status='voided', voided_at=NOW() WHERE id=$1`, [documentId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(400)
+
+      const rows = await db.query<any>(
+        `SELECT 1 FROM audit_log WHERE entity_id = $1 AND action = 'document.sent_for_signature'`,
+        [documentId])
+      expect(rows.rows).toHaveLength(0)
+    })
+  })
+
   // ─── S622 screening gate (Business Terms §9.2) ───────────────────────
   //
   // Nic: "after the onboarding window is closed, all applicants must complete
@@ -612,10 +761,9 @@ describe('POST /documents/:id/send', () => {
          VALUES ($1,$2,'date','landlord','start_date',1,10,10,80,20,TRUE,$3)`,
         [documentId, signer.rows[0]?.id ?? null, startDate])
     }
-    const tomorrow = () => {
-      const d = new Date(); d.setDate(d.getDate() + 1)
-      return d.toISOString().slice(0, 10)
-    }
+    // S654: tomorrow on the property's calendar (fixtures sit in the default
+    // Phoenix zone) — the UTC date made this the day after after 5 pm.
+    const tomorrow = () => addDaysTo(todayIn(null), 1)
 
     // Closing the window is what turns a migration into ordinary leasing.
     const closeWindow = (landlordId: string) =>
@@ -687,6 +835,74 @@ describe('POST /documents/:id/send', () => {
         `INSERT INTO background_checks (tenant_id, user_id, landlord_id, unit_id, status, amount_charged, platform_net)
          VALUES ($1, $2, $3, $4, 'approved', 35, 35)`,
         [t.rows[0].id, f.tenantUserId, f.landlordId, f.unitId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    // S655: each company's screening decision is its own. An approval another
+    // company ran never lets this company send a lease — even when the
+    // applicant ticked "share my screening" on it; a check run through GAM's
+    // renter-pool intake (the is_system pool account) with that consent does.
+    it('another company’s approval does not pass the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let otherLandlordId: string
+      try { otherLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net)
+         VALUES ($1, $2, $3, 'approved', 35, 35)`,
+        [t.rows[0].id, f.tenantUserId, otherLandlordId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(409)
+      expect(res.body.error || res.body.message).toMatch(/background check/i)
+    })
+
+    it('another company’s approval with the share box ticked still does not pass the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let otherLandlordId: string
+      try { otherLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net, consent_pool)
+         VALUES ($1, $2, $3, 'approved', 35, 35, TRUE)`,
+        [t.rows[0].id, f.tenantUserId, otherLandlordId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(409)
+      expect(res.body.error || res.body.message).toMatch(/background check/i)
+      expect(emailSigningRequestMock).not.toHaveBeenCalled()
+    })
+
+    it('a check the applicant ran through GAM’s renter pool passes the gate', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(`SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      const c = await db.connect()
+      let poolLandlordId: string
+      try { poolLandlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+      await db.query(`UPDATE landlords SET is_system = true WHERE id = $1`, [poolLandlordId])
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, status, amount_charged, platform_net, consent_pool)
+         VALUES ($1, $2, $3, 'approved', 35, 35, TRUE)`,
+        [t.rows[0].id, f.tenantUserId, poolLandlordId])
 
       const res = await request(buildApp())
         .post(`/api/esign/documents/${documentId}/send`)
@@ -982,83 +1198,36 @@ describe('POST /sign/:documentId — partial signing transitions', () => {
 
 // ─── POST /sign/:documentId/decline ────────────────────────────
 
+// S652 (Nic): nobody can decline any document. The route answers 410 and
+// touches nothing — signer row, document, landlord's inbox all untouched.
 describe('POST /sign/:documentId/decline', () => {
-  it('happy path: tenant declines → signer declined, document voided, landlord notified', async () => {
+  it('is refused for a signer (410), and the document and signer are untouched', async () => {
     const f = await seedFixture()
     const { documentId, tenantSignerId } = await seedDoc(f, { status: 'sent', tenantSignerStatus: 'viewed' })
     const res = await request(buildApp())
       .post(`/api/esign/sign/${documentId}/decline`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
       .send({ reason: 'Rent too high' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.status).toBe('declined')
-    expect(res.body.data.documentVoided).toBe(true)
-    const sr = await db.query<{ status: string; decline_reason: string }>(
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/cannot be declined/i)
+    const sr = await db.query<{ status: string; decline_reason: string | null }>(
       `SELECT status, decline_reason FROM lease_document_signers WHERE id = $1`, [tenantSignerId],
     )
-    expect(sr.rows[0].status).toBe('declined')
-    expect(sr.rows[0].decline_reason).toBe('Rent too high')
+    expect(sr.rows[0].status).toBe('viewed')
+    expect(sr.rows[0].decline_reason).toBeNull()
     const doc = await db.query<{ status: string }>(
       `SELECT status FROM lease_documents WHERE id = $1`, [documentId],
     )
-    expect(doc.rows[0].status).toBe('voided')
+    expect(doc.rows[0].status).toBe('sent')
   })
 
-  it('non-signer rejected (403)', async () => {
+  it('is refused for the landlord too (410)', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'sent' })
-    const otherUserId = (await db.query<{ id: string }>(
-      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-       VALUES ($1, 'x', 'tenant', 'O', 'T', TRUE) RETURNING id`,
-      [`o-${randomUUID()}@x`],
-    )).rows[0].id
-    const outsider = jwt.sign(
-      { userId: otherUserId, role: 'tenant', email: 'o@x', profileId: randomUUID(), permissions: {} },
-      process.env.JWT_SECRET!, { expiresIn: '1h' },
-    )
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${outsider}`)
-    expect(res.status).toBe(403)
-  })
-
-  it('rejects already-signed signer', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
     const res = await request(buildApp())
       .post(`/api/esign/sign/${documentId}/decline`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/already signed/i)
-  })
-
-  it('idempotent: re-decline returns alreadyDeclined=true without re-firing notifications', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'voided', tenantSignerStatus: 'declined' })
-    // Stamp declined_at so the idempotent path's data echo has a value
-    await db.query(
-      `UPDATE lease_document_signers SET declined_at = NOW(), decline_reason = 'orig' WHERE document_id = $1 AND role = 'primary'`,
-      [documentId],
-    )
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ reason: 'another reason' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.alreadyDeclined).toBe(true)
-    expect(res.body.data.decline_reason).toBe('orig')
-    expect(emailDocumentDeclinedMock).not.toHaveBeenCalled()
-  })
-
-  it('rejects when document is already voided (and signer is still pending)', async () => {
-    const f = await seedFixture()
-    const { documentId } = await seedDoc(f, { status: 'voided' })
-    // Signer is still 'pending', not 'declined', but doc is voided.
-    const res = await request(buildApp())
-      .post(`/api/esign/sign/${documentId}/decline`)
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/already voided/)
+    expect(res.status).toBe(410)
   })
 })
 
@@ -1118,6 +1287,17 @@ describe('GET /sign/:documentId', () => {
 
 // ─── GET /documents/:id ────────────────────────────────────────
 
+/** S654: a signing token is a full stand-in for its signer, so reading a
+ *  document never returns one — not to the owner, not to a co-signer. */
+async function expectNoSigningTokens(documentId: string, body: unknown): Promise<void> {
+  const json = JSON.stringify(body)
+  const { rows } = await db.query<{ token: string }>(
+    `SELECT token FROM lease_document_signers WHERE document_id = $1`, [documentId])
+  expect(rows.length).toBeGreaterThan(0)
+  for (const r of rows) expect(json).not.toContain(r.token)
+  for (const s of (body as any).data.signers) expect(s).not.toHaveProperty('token')
+}
+
 describe('GET /documents/:id', () => {
   it('landlord owner can read', async () => {
     const f = await seedFixture()
@@ -1128,6 +1308,7 @@ describe('GET /documents/:id', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.id).toBe(documentId)
     expect(res.body.data.signers).toHaveLength(2)
+    await expectNoSigningTokens(documentId, res.body)
   })
 
   it('signer (tenant) can read', async () => {
@@ -1137,6 +1318,8 @@ describe('GET /documents/:id', () => {
       .get(`/api/esign/documents/${documentId}`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
+    expect(res.body.data.signers).toHaveLength(2)
+    await expectNoSigningTokens(documentId, res.body)
   })
 
   it('non-signer non-owner rejected', async () => {
@@ -1252,11 +1435,12 @@ async function seedDocFields(
 }
 
 /** Default lease data set — start in the past so the lease activates and
- *  the unit-status flip + activation branches are exercised. */
+ *  the unit-status flip + activation branches are exercised. The end date is
+ *  ahead of today on purpose: S652 refuses to issue a lease already over. */
 function defaultLeaseFields(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     start_date:       '2025-01-01',
-    end_date:         '2025-12-31',
+    end_date:         '2027-12-31',
     rent_amount:      '1200.00',
     security_deposit: '1200.00',
     rent_due_day:     '1',
@@ -1592,10 +1776,43 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     expect(r.alreadyBuilt).toBe(true)
   })
 
+  // S652 (Blu, MH 06): a packet's disclosures are drafted beside the lease before
+  // the lease exists. Signing one first must not raise "Addendum has no parent
+  // lease_id" — it waits; and once the packet's lease has issued, a sibling
+  // binds to it on its own.
+  it('S652: a packet sibling waits for its lease, then binds to it', async () => {
+    const f = await seedFixture()
+    const group = randomUUID()
+    const { documentId: sibling } = await seedDoc(f, { documentType: 'addendum_terms', status: 'in_progress', landlordSignerStatus: 'signed' })
+    const { documentId: leaseDoc } = await seedDoc(f, { documentType: 'original_lease', status: 'in_progress', landlordSignerStatus: 'signed' })
+    await db.query(`UPDATE lease_documents SET package_group_id = $1, lease_id = NULL WHERE id = ANY($2::uuid[])`, [group, [sibling, leaseDoc]])
+
+    const early = await buildLeaseFromDocument(sibling)
+    expect(early.deferred).toBe(true)
+    expect((await db.query(`SELECT finalized_at FROM lease_documents WHERE id = $1`, [sibling])).rows[0].finalized_at).toBeNull()
+
+    // The packet's lease issues (stand in for executeOriginalLease's result).
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, { unitId: f.unitId, landlordId: f.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId: f.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(`UPDATE lease_documents SET lease_id = $2 WHERE id = $1`, [leaseDoc, leaseId])
+
+    const later = await buildLeaseFromDocument(sibling)
+    expect(later.deferred).toBeFalsy()
+    expect(later.leaseId).toBe(leaseId)
+    expect((await db.query(`SELECT lease_id FROM lease_documents WHERE id = $1`, [sibling])).rows[0].lease_id).toBe(leaseId)
+  })
+
   it('future start_date → lease.status=pending, unit stays vacant', async () => {
     const f = await seedFixture()
     // Use a date safely in the future relative to test runtime.
-    const futureDate = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString().slice(0, 10)
+    // S654: counted from the property's today (default Phoenix), not UTC's.
+    const futureDate = addDaysTo(todayIn(null), 30)
     const { documentId } = await seedCompleteableDoc(f, {
       fields: defaultLeaseFields({ start_date: futureDate, end_date: '2099-12-31' }),
     })
@@ -1631,7 +1848,8 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
   it('S622: a lease signed AFTER its start date still completes the whole chain', async () => {
     const f = await seedFixture()
     // Signed today, but the lease began four days ago — the delayed-signature case.
-    const backdated = new Date(Date.now() - 1000 * 60 * 60 * 24 * 4).toISOString().slice(0, 10)
+    // S654: counted from the property's today (default Phoenix), not UTC's.
+    const backdated = addDaysTo(todayIn(null), -4)
     const { documentId } = await seedCompleteableDoc(f, {
       fields: defaultLeaseFields({ start_date: backdated, end_date: '2099-12-31' }),
     })
@@ -2827,8 +3045,10 @@ async function seedSubleaseDoc(
 }
 
 describe('POST /sign/:documentId — sublease_agreement completion', () => {
-  it('happy path: sublease flips to active, doc URL stamped, landlord_consent_date set to today', async () => {
+  it("happy path: sublease flips to active, doc URL stamped, landlord_consent_date set to the property's today", async () => {
     const f = await seedFixture()
+    // S654: a zone far from the server's, so the database's day would differ.
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
     const masterLeaseId = await seedParentLease(f)
     const { documentId, subleaseId, sublessee } = await seedSubleaseDoc(f, {
       masterLeaseId,
@@ -2847,17 +3067,12 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
     // Sublease row flipped
     const sub = await db.query<{
       status: string; sublease_document_url: string | null; landlord_consent_date: string | null
-    }>(`SELECT status, sublease_document_url, landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
+    }>(`SELECT status, sublease_document_url, landlord_consent_date::text AS landlord_consent_date
+          FROM subleases WHERE id = $1`, [subleaseId])
     expect(sub.rows[0].status).toBe('active')
     expect(sub.rows[0].sublease_document_url).toBe('/api/esign/files/sublease-base.pdf')
-    expect(sub.rows[0].landlord_consent_date).toBeTruthy()
-    // landlord_consent_date is set via CURRENT_DATE — pull "today"
-    // from the DB so the assertion uses the same timezone the column
-    // was stamped in (avoids a UTC-vs-local boundary flake when the
-    // local clock straddles UTC midnight; pre-S454 used `new Date()`).
-    const { rows: [{ today }] } = await db.query<{ today: string }>(
-      `SELECT CURRENT_DATE::text AS today`)
-    expect(new Date(sub.rows[0].landlord_consent_date!).toISOString().slice(0, 10)).toBe(today)
+    // S654: dated on the property's calendar, compared as text.
+    expect(sub.rows[0].landlord_consent_date).toBe(todayIn('Pacific/Kiritimati'))
 
     // Doc flips completed
     const doc = await db.query<{ status: string }>(
@@ -2896,9 +3111,9 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
       .send({ fieldValues: [] })
     expect(res.status).toBe(200)
     const sub = await db.query<{ status: string; landlord_consent_date: string | null }>(
-      `SELECT status, landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
+      `SELECT status, landlord_consent_date::text AS landlord_consent_date FROM subleases WHERE id = $1`, [subleaseId])
     expect(sub.rows[0].status).toBe('active')
-    expect(new Date(sub.rows[0].landlord_consent_date!).toISOString().slice(0, 10)).toBe('2025-04-15')
+    expect(sub.rows[0].landlord_consent_date).toBe('2025-04-15')
   })
 
   it('no sublease row references the document → execution_failed', async () => {
@@ -3195,6 +3410,190 @@ describe("S535 '-' end date convention", () => {
   })
 })
 
+// ─── S654: the overlap check compares calendar days ─────────────────────
+//
+// It mixed document dates read at UTC midnight with pg dates at local
+// midnight, and the build path handed it a '-' (month-to-month) end date that
+// became an Invalid Date — which overlapped nothing, so an open-ended lease
+// sailed past an existing one. These go through the finalizer directly: the
+// sign route's own pre-check already maps '-' to no end date.
+async function seedOtherLandlordLease(tenantId: string, start: string, end: string | null): Promise<void> {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    const { userId, landlordId } = await seedLandlord(client)
+    const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    const unitId = await seedUnit(client, { propertyId, landlordId })
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1, $2, 1000, 'fixed_term', 'active', $3, $4) RETURNING id`,
+      [unitId, landlordId, start, end])
+    await client.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
+       VALUES ($1, $2, 'primary', 'active', NOW(), 'original', 'joint_several')`,
+      [r.rows[0].id, tenantId])
+    await client.query('COMMIT')
+  } catch (e) { await client.query('ROLLBACK'); throw e }
+  finally { client.release() }
+}
+
+describe('S654 lease overlap on calendar days', () => {
+  it("a month-to-month new lease ('-' end) overlapping another landlord's lease is refused at build", async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '6/1/2025', end_date: '-', lease_type: 'month_to_month' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow(/overlap/i)
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(leases.rows).toHaveLength(0)
+  })
+
+  it('a lease starting the day another ends still overlaps (the rule is inclusive, as before)', async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '12/31/2025', end_date: '12/31/2027' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow(/overlap/i)
+  })
+
+  it('a lease starting the day after another ends does not overlap', async () => {
+    const f = await seedFixture()
+    await seedOtherLandlordLease(f.tenantId, '2025-01-01', '2025-12-31')
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: '1/1/2026', end_date: '-', lease_type: 'month_to_month' }),
+    })
+    const built = await buildLeaseFromDocument(documentId)
+    expect(built.alreadyBuilt).toBe(false)
+    const lease = await db.query<{ start_date: string; end_date: string | null }>(
+      `SELECT start_date::text AS start_date, end_date::text AS end_date FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(lease.rows).toEqual([{ start_date: '2026-01-01', end_date: null }])
+  })
+
+  // S654: an unreadable start used to count as overlapping any open-ended
+  // lease; the calendar-day rewrite briefly let it through. It is refused.
+  it('an unreadable start date is refused at build', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: 'TBD' }),
+    })
+    await expect(buildLeaseFromDocument(documentId)).rejects.toThrow('The lease start date is not a date.')
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(leases.rows).toHaveLength(0)
+  })
+
+  it('an unreadable start date is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'TBD')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease start date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
+
+  // S654: '2/30/2027' read as '2027-02-30' passed send and sign, then the
+  // lease INSERT failed in Postgres after everyone had signed.
+  it('a start date that names no real day is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'2/30/2027')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease start date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('an end date that names no real day is refused at send', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f)
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+       VALUES ($1,'date','landlord','start_date',1,10,10,80,20,TRUE,'3/1/2027'),
+              ($1,'date','landlord','end_date',1,10,40,80,20,TRUE,'2/30/2028')`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error || res.body.message).toBe('Cannot send: The lease end date is not a date.')
+    expect(emailSigningRequestMock).not.toHaveBeenCalled()
+  })
+})
+
+// S654: a move_in_day property dues each lease on its start day. The build
+// read the start as `String(start).slice(0, 10)`, which for the document's
+// M/D/YYYY ("3/15/2025") is not a date, so every lease fell back to the 1st.
+describe('S654 move-in-day due day reads the document date', () => {
+  it('a 3/15/2025 start on a move_in_day property is due on the 15th', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE properties SET rent_due_mode = 'move_in_day' WHERE id = $1`, [f.propertyId])
+    const fields = defaultLeaseFields({ start_date: '3/15/2025' })
+    delete fields.rent_due_day
+    const { documentId } = await seedCompleteableDoc(f, { fields })
+    await buildLeaseFromDocument(documentId)
+    const lease = await db.query<{ rent_due_day: number }>(
+      `SELECT rent_due_day FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(lease.rows).toHaveLength(1)
+    expect(Number(lease.rows[0].rent_due_day)).toBe(15)
+  })
+})
+
+// S654: document dates are M/D/YYYY. Page 8's proration read the start with
+// an ISO-only parser, so a new tenant moving in mid-month showed $0 proration
+// and full rent.
+describe('S654 page 8 proration reads a M/D/YYYY start', () => {
+  it('a new tenant starting 6/15/2027 on a property due the 1st prorates the half month', async () => {
+    const f = await seedFixture()
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Proration ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`, [f.landlordId])
+    for (const col of ['start_date', 'rent_amount', 'move_in_first_month_rent', 'move_in_proration']) {
+      await db.query(
+        `INSERT INTO lease_template_fields
+           (template_id, field_type, signer_role, lease_column, page, x, y, width, height, required)
+         VALUES ($1,'text','landlord',$2,1,10,10,100,20,FALSE)`, [tpl.rows[0].id, col])
+    }
+    const client = await db.connect()
+    let documentId: string
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'New lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'L L', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'T T', email: f.tenantEmail, orderIndex: 2 },
+        ],
+        prefillValues: { start_date: '6/15/2027', rent_amount: '1000.00' },
+      } as any)
+      await client.query('COMMIT')
+      documentId = doc.id
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+    const { rows } = await db.query<{ lease_column: string; value: string }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [documentId])
+    const v = Object.fromEntries(rows.map(r => [r.lease_column, r.value]))
+    // 16 of June's 30 days on $1,000.
+    expect(v.move_in_proration).toBe('533.33')
+    expect(Number(v.move_in_proration)).toBeGreaterThan(0)
+  })
+})
+
 // ─── S535: property-level late fees override per-lease values ────────
 describe('S535 property late-fee policy stamping', () => {
   it("no per-unit-type row → late-fee fields stamp 'N/A' (no property-wide default, no predecessor carry)", async () => {
@@ -3461,9 +3860,17 @@ describe('POST /documents/addendum-terms — S582 money add-on', () => {
     expect(res.status).toBe(201)
     const docId = res.body.data.id
 
-    const signers = await db.query<{ role: string }>(
-      `SELECT role FROM lease_document_signers WHERE document_id = $1`, [docId])
+    const signers = await db.query<{ role: string; order_index: number }>(
+      `SELECT role, order_index FROM lease_document_signers WHERE document_id = $1 ORDER BY order_index, role`, [docId])
     expect(signers.rows.map(r => r.role).sort()).toEqual(['co_tenant_1', 'landlord', 'primary'])
+    // S652 (Blu): every signer sat at position 1 and the send step refused the
+    // document. Landlord first, tenants after, like every other drafting path.
+    expect(signers.rows.map(r => `${r.role}:${r.order_index}`)).toEqual(['landlord:1', 'primary:2', 'co_tenant_1:3'])
+    const sent = await request(buildApp())
+      .post(`/api/esign/documents/${docId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({})
+    expect(sent.status).toBe(200)
 
     // document-first: base PDF generated (not null)
     const doc = await db.query<{ base_pdf_url: string }>(
@@ -3674,4 +4081,352 @@ describe('S637 — GET /esign/sign/:id rejects a malformed id cleanly', () => {
       expect(String(res.body.error)).toMatch(/not valid/i)
     })
   }
+})
+
+
+// ─── S637: an existing tenancy is never prefilled a deposit ──────────────────
+//
+// S636 seeded the unit's rent onto a new document (Nic wanted a per-unit rent
+// arrangement to reach the paper). The same loop also seeded the unit's
+// SECURITY DEPOSIT — and every Oak Park space carries a standing $350 for new
+// residents. Cameron Gaefcke signed an onboarding lease that papers a tenancy
+// already in place and was billed $350 he never owed; the fifteen residents who
+// signed before the change were billed nothing, because nothing prefilled the
+// box. ~50 more onboarding invites were outstanding when it was caught.
+//
+// Rent stays unconditional — it is owed either way. A deposit is a one-time
+// charge an existing tenancy does not generate.
+describe('S637 deposit prefill skips an existing tenancy', () => {
+  async function draftOffUnit(f: any, cols: string[]) {
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1,'DepGate',1) RETURNING id`,
+      [f.landlordId])
+    for (const col of cols) {
+      await db.query(
+        `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+         VALUES ($1,'text','landlord',$2,1,10,10,100,20)`, [t.rows[0].id, col])
+    }
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Onboarding Lease', templateId: t.rows[0].id, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: f.landlordEmail },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const r = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [res.body.data.id])
+    return Object.fromEntries(r.rows.map(x => [x.lease_column, x.value])) as Record<string, string | null>
+  }
+
+  it('leaves the deposit blank when the invite says the tenancy already exists', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET security_deposit = 350 WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,TRUE)`, [f.landlordId, f.tenantId, f.unitId])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit ?? '').toBe('')     // nothing to bill
+    expect(vals.rent_amount).toBe('1000.00')         // rent still seeds
+  })
+
+  // A real new move-in, months after onboarding. `trg_intent_default_existing_tenancy`
+  // force-flags every invite written in a landlord's first 28 days as an existing
+  // tenancy, so the landlord has to be aged past that window for this branch to
+  // exist at all — which is exactly the shape Nic described: nothing during
+  // onboarding, deposits on new people once the park is running.
+  // S652 (Nic): "people that are using a returning slot get an exemption on
+  // security deposit. New people have the security deposit."
+  it('leaves the deposit blank for a returning resident (the landlord\'s attested invite)', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE landlords SET created_at = now() - INTERVAL '200 days' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE units SET security_deposit = 200 WHERE id = $1`, [f.unitId])
+    const prop = await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id, waive_reason, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,NULL,'returning_resident',FALSE)`, [f.landlordId, f.tenantId, prop.rows[0].property_id])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit ?? '').toBe('')     // exempt
+    expect(vals.rent_amount).toBe('1000.00')         // rent still seeds
+  })
+
+  it('still seeds the deposit for a genuinely new tenancy', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE landlords SET created_at = now() - INTERVAL '200 days' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE units SET security_deposit = 350 WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,FALSE)`, [f.landlordId, f.tenantId, f.unitId])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit).toBe('350.00')
+  })
+})
+
+// ─── S637: you cannot fill in a document that is not your turn ───────────────
+//
+// Nic: "I've had multiple people today tell me they signed the lease, and I
+// know they didn't... it's letting them fill it all out, but they just can't
+// complete it for signature until after I do."
+//
+// The invite relay was already strictly sequential — the next signer is only
+// emailed once the previous one signs. What was ungated was the READ: any
+// signer reaching the document early got a fully editable page, filled it in,
+// hit the submit wall, and reported themselves as done.
+describe('S637 the signing view respects the turn', () => {
+  const tokenOf = async (signerId: string) => (await db.query<{ token: string }>(
+    `SELECT token FROM lease_document_signers WHERE id=$1`, [signerId])).rows[0].token
+
+  it('a tenant before the landlord gets a read-only page naming who it waits on', async () => {
+    const f = await seedFixture()
+    const { landlordSignerId, tenantSignerId } = await seedCompleteableDoc(f)
+    // Put the landlord back to unsigned: this is a document sent out where the
+    // landlord has not yet done his pass.
+    await db.query(
+      `UPDATE lease_document_signers SET status='sent', signed_at=NULL WHERE id=$1`,
+      [landlordSignerId])
+
+    const res = await request(buildApp()).get(`/api/esign/sign/${await tokenOf(tenantSignerId)}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.readOnly).toBe(true)
+    expect(res.body.data.waitingOn).toBe('the landlord')
+    // Nothing on the page is theirs to fill while they wait.
+    expect((res.body.data.fields as any[]).every(x => x.mine === false)).toBe(true)
+  })
+
+  it('once the landlord has signed, the same tenant gets an editable page', async () => {
+    const f = await seedFixture()
+    const { tenantSignerId } = await seedCompleteableDoc(f)   // landlord pre-signed
+    const res = await request(buildApp()).get(`/api/esign/sign/${await tokenOf(tenantSignerId)}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.readOnly).toBe(false)
+    expect(res.body.data.waitingOn).toBeNull()
+    // The page is live for them. (Which individual boxes are theirs depends on
+    // the template's roles — this fixture's fields are all the landlord's.)
+  })
+})
+
+/**
+ * S652 — a home sale drafted before its lease existed gets the lease when one
+ * is created.
+ *
+ * Nic, on sending a lease and an installment contract as one packet to a
+ * brand-new tenant: "I don't understand why it's any different for a brand new
+ * tenancy or onboarding. It's still two signatures for two separate documents.
+ * What does being a new tenant have to do with it?"
+ *
+ * Nothing — but the contract had nowhere to point until the lease existed, and
+ * would otherwise have billed its whole term against a null lease: charges with
+ * nothing to group them under, on a portal built around a lease.
+ */
+describe('the lease adopts a home sale that predates it', () => {
+  it('fills in lease_id the moment the lease is created', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='mobile_home', dwelling_ownership='landlord' WHERE id=$1`, [f.unitId])
+    const contract = await db.query<{ id: string }>(
+      `INSERT INTO home_sale_contracts
+         (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1, NULL, $2, $3, 24000, 2000, 22000, 0, 55, 400, '2026-11-01', 'pending_signature', 55)
+       RETURNING id`,
+      [f.unitId, f.tenantId, f.landlordId])
+
+    const { documentId } = await seedCompleteableDoc(f, { fields: defaultLeaseFields() })
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+
+    const leaseId = (await db.query<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])).rows[0].id
+    const { rows } = await db.query<{ lease_id: string | null }>(
+      `SELECT lease_id FROM home_sale_contracts WHERE id = $1`, [contract.rows[0].id])
+    expect(rows[0].lease_id).toBe(leaseId)
+  })
+
+  it('does not drag somebody else\'s contract onto this lease', async () => {
+    // The previous owner may still be paying off the home on this very lot.
+    // Their contract is not the new resident's problem, and pointing it at the
+    // new lease would bill the wrong household.
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='mobile_home', dwelling_ownership='landlord' WHERE id=$1`, [f.unitId])
+    const strangerUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('prev-owner-652@t.dev','x','tenant','Prev','Owner') RETURNING id`)
+    const stranger = await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [strangerUser.rows[0].id])
+    const contract = await db.query<{ id: string }>(
+      `INSERT INTO home_sale_contracts
+         (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1, NULL, $2, $3, 24000, 2000, 22000, 0, 55, 400, '2026-11-01', 'pending_signature', 55)
+       RETURNING id`,
+      [f.unitId, stranger.rows[0].id, f.landlordId])
+
+    const { documentId } = await seedCompleteableDoc(f, { fields: defaultLeaseFields() })
+    await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+
+    const { rows } = await db.query<{ lease_id: string | null }>(
+      `SELECT lease_id FROM home_sale_contracts WHERE id = $1`, [contract.rows[0].id])
+    expect(rows[0].lease_id).toBeNull()
+  })
+})
+
+/**
+ * S652 — the adults who do not sign are still on the lease.
+ *
+ * Nic, catching the same omission a second time: "you didn't add john as
+ * authorized occupant. why?" Because the packet was built from SIGNERS, and
+ * John Sheptock has no email so he is not one.
+ *
+ * The occupant box was filled from the signer roster and sat ABOVE the caller's
+ * own value in the precedence chain, so a caller who knew the household — the
+ * only party who can know about somebody with no account — had their answer
+ * discarded without a word.
+ */
+describe('S652: the occupant box names the whole household', () => {
+  async function docWithOccupantField(f: SeedFixture, occupantNames?: string) {
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Occupants ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`,
+      [f.landlordId])
+    await db.query(
+      `INSERT INTO lease_template_fields
+         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+       VALUES ($1,'text',NULL,'Authorized occupants','occupant_names',1,10,10,200,20,FALSE,99)`,
+      [tpl.rows[0].id])
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'Blu Haws', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'Nancy Sheptock', email: f.tenantEmail, orderIndex: 2 },
+        ],
+        ...(occupantNames ? { prefillValues: { occupant_names: occupantNames } } : {}),
+      } as any)
+      await client.query('COMMIT')
+      return doc.id
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+  }
+
+  const occupantValue = async (documentId: string) => {
+    const { rows } = await db.query<{ value: string }>(
+      `SELECT value FROM lease_document_fields
+        WHERE document_id=$1 AND lease_column='occupant_names'`, [documentId])
+    return rows[0]?.value ?? ''
+  }
+
+  it('keeps a named adult who has no account, alongside the signer', async () => {
+    const f = await seedFixture()
+    const id = await docWithOccupantField(f, 'John Sheptock')
+    const value = await occupantValue(id)
+    // The form asks who lives here. The answer is everybody.
+    expect(value).toMatch(/Nancy Sheptock/)
+    expect(value).toMatch(/John Sheptock/)
+  })
+
+  it('does not print the same person twice', async () => {
+    const f = await seedFixture()
+    // A household sheet naming somebody who is already a signer, in other case.
+    const id = await docWithOccupantField(f, 'nancy sheptock, John Sheptock')
+    const value = (await occupantValue(id)).toLowerCase()
+    expect((value.match(/nancy sheptock/g) || []).length).toBe(1)
+    expect(value).toMatch(/john sheptock/)
+  })
+
+  it('still names the roster when the caller says nothing', async () => {
+    const f = await seedFixture()
+    const id = await docWithOccupantField(f)
+    expect(await occupantValue(id)).toMatch(/Nancy Sheptock/)
+  })
+})
+
+/**
+ * S652 — the back end name and the printed name are different jobs.
+ *
+ * Nic: "We need the system to distinguish unit type. Whatever they print on the
+ * lease can be whatever. They can call it lot one on the lease, but it needs to
+ * be mobile home one in the system so that we are accurately treating like unit
+ * types the same consistency platform wide... if it was technically an RV spot
+ * and they called it lot one, then it would be compatible on the scheduler to
+ * move around with other short-term stay sites, versus a mobile home. You
+ * cannot put an RV in there, which is why the distinction on the back end
+ * matters."
+ */
+describe('S652: a lease prints what the park calls the space', () => {
+  async function docFor(f: SeedFixture) {
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Unit label ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`,
+      [f.landlordId])
+    await db.query(
+      `INSERT INTO lease_template_fields
+         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+       VALUES ($1,'text',NULL,'Lot #','unit_number',1,10,10,80,20,FALSE,1)`,
+      [tpl.rows[0].id])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'Owner', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'T T', email: f.tenantEmail, orderIndex: 2 },
+        ],
+      } as any)
+      await client.query('COMMIT')
+      const { rows } = await db.query<{ value: string }>(
+        `SELECT value FROM lease_document_fields WHERE document_id=$1 AND lease_column='unit_number'`,
+        [doc.id])
+      return rows[0]?.value
+    } finally { client.release() }
+  }
+
+  it('prints the word the park uses, when the unit carries one', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_number='MH 07', display_label='Lot 7' WHERE id=$1`, [f.unitId])
+    // S632: the box gets the number — the form already prints "Lot #" beside it.
+    expect(await docFor(f)).toBe('7')
+  })
+
+  it('falls back to the system name when the park has no other word', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_number='MH 07', display_label=NULL WHERE id=$1`, [f.unitId])
+    expect(await docFor(f)).toBe('07')
+  })
+
+  it('the label never decides what the space IS', async () => {
+    // A space called "Lot 1" that is genuinely an RV spot stays an RV spot, and
+    // the scheduler keeps treating it as short-stay inventory.
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='rv_spot', unit_number='RV 01', display_label='Lot 1' WHERE id=$1`,
+      [f.unitId])
+    const { rows } = await db.query<{ unit_type: string }>(
+      `SELECT unit_type FROM units WHERE id=$1`, [f.unitId])
+    expect(rows[0].unit_type).toBe('rv_spot')
+  })
 })

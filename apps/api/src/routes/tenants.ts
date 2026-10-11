@@ -6,16 +6,18 @@ import fs from 'fs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm, forgetSessionCutoff } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantInvite } from '../services/email'
+import { replyToProperty } from '../services/replyRouting'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
-import { applyScreeningWaive } from '../services/onboardingWindow'
+import { applyScreeningWaive, WAIVER_NOT_RECORDED_MESSAGE } from '../services/onboardingWindow'
 import { landlordScopeIds } from '../lib/landlordScope'
+import { portalLink } from '../lib/portalUrls'
 
 export const tenantsRouter = Router()
 
@@ -62,6 +64,35 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S654: the only accounts an invite link may activate.
+const INVITE_ACCOUNT_ROLES: readonly string[] = ['tenant', 'contact']
+
+const PLACEHOLDER_HASH = '$2b$10$placeholder_invite_pending'
+
+/**
+ * S654: accept-invite is FIRST-TIME SETUP only. The link sets the account's
+ * password, so it works only on an account still waiting for its first one:
+ * the placeholder password every invite door writes. Landlord B's utility
+ * agreement once minted a token on a resident who had signed up through
+ * screening with a password of their own (so had never "accepted" an invite),
+ * and this route took that token and replaced their working password.
+ *
+ * One other shape is still first-time: an e-sign contact minted by
+ * services/signerAccounts (S568) carries an unguessable random hash instead of
+ * the placeholder. Contacts are only ever created that way, and every route
+ * that sets a password (this one, reset-password, change-password) stamps
+ * sessions_valid_from, so a contact with none — and no sign-in — has never had
+ * a password anyone knows.
+ *
+ * Mirrored in SQL by FIRST_TIME_SETUP_SQL for /invite-info.
+ */
+function stillFirstTimeSetup(u: { password_hash: string; role: string; sessions_valid_from: Date | null; last_login_at: Date | null }): boolean {
+  if (u.password_hash === PLACEHOLDER_HASH) return true
+  return u.role === 'contact' && !u.sessions_valid_from && !u.last_login_at
+}
+const FIRST_TIME_SETUP_SQL = `(password_hash = '${PLACEHOLDER_HASH}'
+   OR (role = 'contact' AND sessions_valid_from IS NULL AND last_login_at IS NULL))`
+
 tenantsRouter.post('/accept-invite', async (req, res, next) => {
   try {
     const { token, password, phone, ssiSsdi, acceptedTerms } = req.body
@@ -83,7 +114,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     // The route ran with no transaction at all, and three statements after that
     // UPDATE were unguarded while every other side effect in it sat in a
     // try/catch. One of them threw. Which one hardly matters: the shape was
-    // that a single-use credential was consumed BEFORE the work it authorised
+    // that a single-use credential was consumed BEFORE the work it authorized
     // was done, so any failure anywhere after it cost the tenant their only
     // route in.
     //
@@ -103,12 +134,28 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     try {
       await client.query('BEGIN')
 
+      // S654: a live link has a clock. An unaccepted token with no expiry is
+      // dead (every invite door writes one); the NULL case is kept only for a
+      // link already spent, whose expiry activation clears, so its holder
+      // still hears ALREADY_ACCEPTED below.
       user = (await client.query(
         `SELECT * FROM users
           WHERE tenant_invite_token = $1
-            AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
+            AND (tenant_invite_expires_at > NOW() OR tenant_invite_accepted_at IS NOT NULL)
           FOR UPDATE`,
         [token])).rows[0]
+
+      // S654: an invite link only sets up a resident's account, or an e-sign
+      // signer's contact account (S568 activates those here too). Any other
+      // login is an invalid link: a token that reached a landlord's or staff
+      // account must never set its password.
+      if (user && !INVITE_ACCOUNT_ROLES.includes(user.role)) user = undefined
+
+      // S654: and only while the account still needs its first password. An
+      // account that finished setup through this link is told so just below
+      // (ALREADY_ACCEPTED); any other account with a password of its own gets
+      // the same answer as a link that never existed, and nothing is written.
+      if (user && !user.tenant_invite_accepted_at && !stillFirstTimeSetup(user)) user = undefined
 
       // ── S637: "ALREADY DONE" IS NOT "EXPIRED" ──────────────────────────
       //
@@ -122,7 +169,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // somebody who had just successfully set a password, that is false and it
       // reads as being locked out of an account that exists and works.
       //
-      // The token is kept now and marked accepted instead. It authorises
+      // The token is kept now and marked accepted instead. It authorizes
       // nothing once accepted — this branch refuses it — so a forwarded link is
       // not a way in. It exists only so we can tell them the truth.
       if (user?.tenant_invite_accepted_at) {
@@ -151,11 +198,11 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // account whose state depended on how far the request happened to get.
       //
       // S637: the token is spent HERE, in the transaction, so it is spent only
-      // if the activation it authorises actually commits. It is MARKED rather
+      // if the activation it authorizes actually commits. It is MARKED rather
       // than deleted — see the ALREADY_ACCEPTED branch above. The expiry is
       // cleared so an accepted invite never also reports as timed out.
       await client.query(
-        `UPDATE users SET password_hash=$1,
+        `UPDATE users SET password_hash=$1, sessions_valid_from=NOW(),
                           tenant_invite_accepted_at=NOW(),
                           tenant_invite_expires_at=NULL,
                           email_verified=TRUE,
@@ -193,6 +240,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       tenant = (await client.query('SELECT id FROM tenants WHERE user_id=$1', [user.id])).rows[0] ?? null
 
       await client.query('COMMIT')
+      forgetSessionCutoff(user.id)
     } catch (e) {
       // The token is still on the user, so the link the tenant already has in
       // their inbox keeps working. That is the whole point.
@@ -211,6 +259,16 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // the newest invite and left the other sitting there for ever, with the
       // tenant given no way to reach it. Every open invite is accepted and
       // drafted on the way in.
+      // S652 (Nic, Shannon Gregory): the invite is ACCEPTED the moment the person
+      // sets their account up — whether or not the lease already issued on the
+      // landlord's signature. Only the invites still waiting to draft were being
+      // stamped, so a co-tenant whose lease had existed since the 16th accepted
+      // on the 22nd and the front desk kept saying she had not.
+      await query(
+        `UPDATE pending_tenant_intents pti SET accepted_at = NOW(), updated_at = NOW()
+           FROM tenants t
+          WHERE t.id = pti.tenant_id AND t.user_id = $1
+            AND pti.cancelled_at IS NULL AND pti.accepted_at IS NULL`, [user.id])
       const intents = await query<{ id: string; unit_id: string }>(
         `SELECT pti.id, pti.unit_id
            FROM pending_tenant_intents pti JOIN tenants t ON t.id = pti.tenant_id
@@ -342,11 +400,15 @@ tenantsRouter.get('/invite-info', async (req, res, next) => {
     if (!token) return res.status(400).json({ success: false, error: 'Token required' })
 
     // S410 (S377): read tenant_invite_token + enforce expiry.
+    // S654: the same accounts accept-invite would take — first-time setup, or
+    // one that finished setup through this link (the page then says so).
     const user = await queryOne<any>(
       `SELECT id, email, first_name, last_name FROM users
         WHERE tenant_invite_token = $1
-          AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())`,
-      [token as string])
+          AND (tenant_invite_expires_at > NOW() OR tenant_invite_accepted_at IS NOT NULL)
+          AND role = ANY($2::text[])
+          AND (tenant_invite_accepted_at IS NOT NULL OR ${FIRST_TIME_SETUP_SQL})`,
+      [token as string, INVITE_ACCOUNT_ROLES])
     if (!user) return res.status(404).json({ success: false, error: 'Invalid or expired invite' })
 
     const unit = await queryOne<any>(`
@@ -435,6 +497,8 @@ tenantsRouter.use(requireAuth)
 
 tenantsRouter.get('/me', async (req, res, next) => {
   try {
+    // S655: a new lease whose lease before it ended early, nobody signed — not theirs to sign.
+    const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
     const tenant = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         u.stripe_connect_account_id,
@@ -447,11 +511,22 @@ tenantsRouter.get('/me', async (req, res, next) => {
         --
         -- Signing is not applying. This is the signal that says so, and it holds
         -- from the moment a document reaches them until the lease exists.
+        --
+        -- S655: a NEW LEASE for the home they already live in (renews_lease_id)
+        -- is not this. It comes back as pending_renewal_* below and shows as a
+        -- banner — never the signing lock-in, which stays for new tenants.
         (SELECT d.id FROM lease_document_signers lds
            JOIN lease_documents d ON d.id = lds.document_id
           WHERE lds.user_id = u.id
             AND d.status IN ('sent','in_progress')
+            AND d.renews_lease_id IS NULL
           ORDER BY d.created_at DESC LIMIT 1) AS pending_lease_document_id,
+        -- S655 (Nic, 10/2): their new lease, signed by the landlord and waiting
+        -- on them. They keep paying rent and using the portal meanwhile.
+        nlw.document_id AS pending_renewal_document_id,
+        nlw.start_date  AS pending_renewal_start_date,
+        nlw.rent_amount AS pending_renewal_rent,
+        nlw.is_my_turn  AS pending_renewal_waiting_on_is_me,
         un.id AS unit_id, un.unit_number, un.rent_amount, un.status AS unit_status,
         pr.name AS property_name, pr.street1, pr.city, pr.state,
         sd.total_amount AS deposit_total, sd.collected_amount AS deposit_collected,
@@ -474,6 +549,12 @@ tenantsRouter.get('/me', async (req, res, next) => {
            WHERE lt2.tenant_id = t.id
              AND lt2.status = 'active'
              AND l2.status IN ('active', 'pending')
+             -- S655: a new lease of their own home is the same tenancy, not a
+             -- second lease.
+             AND NOT EXISTS (
+               SELECT 1 FROM lease_tenants lt3 JOIN leases l3 ON l3.id = lt3.lease_id
+                WHERE l3.id = l2.supersedes_lease_id AND lt3.tenant_id = t.id
+                  AND lt3.status = 'active' AND l3.status IN ('active', 'pending'))
         ) > 1) AS flexpay_paused_multi_lease,
         -- S579: the live invite/onboarding binding, so an APPLICANT (no lease yet)
         -- has a landlord + property to attribute their background check to. Falls
@@ -498,7 +579,91 @@ tenantsRouter.get('/me', async (req, res, next) => {
         sa.moveout_notice_at,
         to_char(sa.moveout_expected_on, 'YYYY-MM-DD') AS moveout_expected_on,
         sau.unit_number      AS utility_service_space,
-        sap.name             AS utility_service_property_name
+        sap.name             AS utility_service_property_name,
+        -- ── S639: ACCEPTED THE INVITE, WAITING ON THE HOUSEHOLD ─────────────
+        --
+        -- Nic: "I have people trying to log in and sign their lease when other
+        -- household members have not accepted the portal invite yet, and it's
+        -- trying to offer them to pay for a background check, and I've told
+        -- them, no, you don't have to do that... a lot of people think that is
+        -- about to happen to them."
+        --
+        -- A lease only drafts once EVERY invited person on the unit has
+        -- accepted, so whoever accepts first waits — with no lease, no lease
+        -- document, and no background-check approval. Every existing signal was
+        -- therefore false for them, the nav collapsed to Application, and a
+        -- grandfathered resident who owes nothing was shown a $44.99 screening
+        -- and reasonably concluded it was being demanded of them.
+        --
+        -- They are inside a tenancy, not applying for one. This says so, and
+        -- carries what they are waiting on so the portal can tell them.
+        -- ── S651: IN THE RENTER POOL, NOT IN A TENANCY ─────────────────────
+        --
+        -- Someone who took a background check without a landlord behind it is
+        -- looking for somewhere to live. They have no unit, no lease, no
+        -- invite and no utility agreement — but they ARE screening-approved,
+        -- which made every gate above treat them as a fully housed tenant and
+        -- hand them the whole portal: Payments with nothing to pay,
+        -- Maintenance with nothing to fix, a Lease tab with no lease.
+        --
+        -- Nic: they get "a real tenant-portal login in a suspended state — no
+        -- lease, nothing to do — until they connect with a landlord", and what
+        -- they CAN do is browse places near them. This is the signal that says
+        -- which of those two people is logged in.
+        (SELECT ap.id FROM application_pool ap
+          WHERE ap.user_id = t.user_id AND ap.status = 'available'
+          ORDER BY ap.created_at DESC LIMIT 1) AS renter_pool_entry_id,
+        ob.unit_number       AS onboarding_unit_number,
+        ob.property_name     AS onboarding_property_name,
+        ob.household_pending AS onboarding_household_pending,
+        ob.household_pending_names AS onboarding_household_pending_names,
+        ob.screening_waived  AS onboarding_screening_waived,
+        -- S639 (Nic): "does the person from that household get the name of who
+        -- the next signer is that it's waiting on?... That way the household can
+        -- help propel itself to completion instead of each individual person
+        -- keep trying to talk to the office."
+        --
+        -- Who the open lease document is actually waiting on — the lowest
+        -- unsigned signer in signing order, the same rule the e-sign page and
+        -- the reminder job use. Names only, and only people on this person's own
+        -- unit: a household already knows who lives there, and the alternative
+        -- is three adults each phoning the office to ask the same question.
+        sig.name             AS pending_lease_waiting_on_name,
+        sig.role             AS pending_lease_waiting_on_role,
+        (sig.user_id = u.id) AS pending_lease_waiting_on_is_me,
+        -- S655 (Nic, 10/2): whether that unsigned lease takes their portal
+        -- over (the S648 signing lock-in). It does, unless they already rent
+        -- or take utilities from ANOTHER company on GAM: a lease from a new
+        -- landlord can reach someone who lives elsewhere on GAM (nobody is
+        -- attached without their own signature), and the lock-in would stop
+        -- them paying what they owe there. A tenancy with the lease's own
+        -- account — including the very lease they are signing, which the
+        -- landlord's signature already issued — keeps the lock-in. NULL when
+        -- nothing is waiting.
+        (SELECT NOT EXISTS (
+                  SELECT 1 FROM lease_tenants lkt JOIN leases lkl ON lkl.id = lkt.lease_id
+                   WHERE lkt.tenant_id = t.id AND lkt.status = 'active'
+                     AND lkl.status IN ('active', 'pending')
+                     AND lkl.landlord_id NOT IN (SELECT public.account_companies(lkd.landlord_id)))
+            AND NOT EXISTS (
+                  SELECT 1 FROM utility_service_agreements lks
+                   WHERE lks.tenant_id = t.id AND lks.status = 'active'
+                     AND lks.landlord_id NOT IN (SELECT public.account_companies(lkd.landlord_id)))
+           FROM lease_document_signers lkds
+           JOIN lease_documents lkd ON lkd.id = lkds.document_id
+          WHERE lkds.user_id = u.id
+            AND lkd.status IN ('sent','in_progress')
+            AND lkd.renews_lease_id IS NULL
+          ORDER BY lkd.created_at DESC LIMIT 1) AS pending_lease_locks,
+        -- S639 (Nic): "does the middle tenant project their name onto the first
+        -- and third tenant so that everybody can know full transparency where
+        -- everything's at?"
+        --
+        -- Yes — and the next name alone only tells you the front of the queue.
+        -- The whole roster in signing order, with who has signed, lets any one
+        -- of three adults see the entire state of their own lease: what is done,
+        -- who is holding it, and who comes after. Same view the landlord has.
+        roster.signers       AS pending_lease_signers
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN LATERAL (
@@ -529,6 +694,93 @@ tenantsRouter.get('/me', async (req, res, next) => {
       ) sa ON TRUE
       LEFT JOIN units sau      ON sau.id = sa.unit_id
       LEFT JOIN properties sap ON sap.id = sau.property_id
+      -- S639: their accepted, unit-bound, still-open invite — and how many
+      -- people on that same space have not accepted yet, which is the only
+      -- thing standing between them and a lease.
+      LEFT JOIN LATERAL (
+        SELECT obu.unit_number, obp.name AS property_name,
+               (SELECT COUNT(*)::int FROM pending_tenant_intents o
+                 WHERE o.unit_id = ob2.unit_id
+                   AND o.cancelled_at IS NULL AND o.resolved_at IS NULL
+                   AND o.accepted_at IS NULL) AS household_pending,
+               EXISTS (SELECT 1 FROM pending_tenant_intents w
+                        WHERE w.tenant_id = t.id AND w.screening_waived
+                          AND w.cancelled_at IS NULL) AS screening_waived,
+               -- S639: by name, so the household can chase each other rather
+               -- than the office. Excludes the person asking — telling somebody
+               -- they are waiting on themselves is how you lose them.
+               (SELECT COALESCE(
+                   ARRAY_AGG(TRIM(CONCAT_WS(' ', ou.first_name, ou.last_name))
+                             ORDER BY ou.first_name), '{}')
+                  FROM pending_tenant_intents o
+                  JOIN tenants ot ON ot.id = o.tenant_id
+                  JOIN users ou ON ou.id = ot.user_id
+                 WHERE o.unit_id = ob2.unit_id
+                   AND o.cancelled_at IS NULL AND o.resolved_at IS NULL
+                   AND o.accepted_at IS NULL
+                   AND ot.id <> t.id) AS household_pending_names
+          FROM pending_tenant_intents ob2
+          JOIN units obu      ON obu.id = ob2.unit_id
+          JOIN properties obp ON obp.id = obu.property_id
+         WHERE ob2.tenant_id = t.id
+           AND ob2.unit_id IS NOT NULL
+           AND ob2.accepted_at IS NOT NULL
+           AND ob2.cancelled_at IS NULL
+           AND ob2.resolved_at IS NULL
+         ORDER BY ob2.created_at DESC
+         LIMIT 1
+      ) ob ON TRUE
+      -- S639: the next person owed a signature on the lease document this
+      -- person is a signer on.
+      LEFT JOIN LATERAL (
+        SELECT lds2.name, lds2.role, lds2.user_id
+          FROM lease_document_signers lds2
+         WHERE lds2.document_id = (
+                 SELECT d.id FROM lease_document_signers lds3
+                   JOIN lease_documents d ON d.id = lds3.document_id
+                  WHERE lds3.user_id = u.id AND d.status IN ('sent','in_progress')
+                    AND d.renews_lease_id IS NULL
+                  ORDER BY d.created_at DESC LIMIT 1)
+           AND lds2.status <> 'signed'
+         ORDER BY lds2.order_index
+         LIMIT 1
+      ) sig ON TRUE
+      -- S639: every signer on that same document, in signing order.
+      LEFT JOIN LATERAL (
+        SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                 'name', r.name, 'role', r.role,
+                 'signed', r.status = 'signed',
+                 'isMe', r.user_id = u.id
+               ) ORDER BY r.order_index) AS signers
+          FROM lease_document_signers r
+         WHERE r.document_id = (
+                 SELECT d.id FROM lease_document_signers lds4
+                   JOIN lease_documents d ON d.id = lds4.document_id
+                  WHERE lds4.user_id = u.id AND d.status IN ('sent','in_progress')
+                    AND d.renews_lease_id IS NULL
+                  ORDER BY d.created_at DESC LIMIT 1)
+      ) roster ON TRUE
+      -- S655: the new lease waiting on them, once the landlord has signed it
+      -- (issued: it has a lease). Before that there is nothing for them to see.
+      LEFT JOIN LATERAL (
+        SELECT d.id AS document_id,
+               to_char(nl.start_date, 'YYYY-MM-DD') AS start_date,
+               nl.rent_amount::text AS rent_amount,
+               NOT EXISTS (SELECT 1 FROM lease_document_signers e
+                            WHERE e.document_id = d.id AND e.status <> 'signed'
+                              AND (e.order_index < lds5.order_index OR e.role = 'landlord')) AS is_my_turn
+          FROM lease_document_signers lds5
+          JOIN lease_documents d ON d.id = lds5.document_id
+          JOIN leases nl ON nl.id = d.lease_id
+         WHERE lds5.user_id = u.id AND lds5.status <> 'signed'
+           AND d.renews_lease_id IS NOT NULL
+           AND d.status IN ('sent','in_progress')
+           AND nl.status IN ('pending','active')
+           -- Not one whose lease before it ENDED EARLY with nobody signed: it
+           -- never starts and is being canceled — no banner asking them to sign.
+           AND NOT ${followsLeaseEndedEarlyUnsigned('nl')}
+         ORDER BY d.created_at DESC LIMIT 1
+      ) nlw ON TRUE
       WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })
@@ -604,7 +856,9 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'failed')  AS failed,
         COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) AS total_paid,
         MIN(due_date) AS first_payment
-      FROM payments WHERE tenant_id = $1`, [req.user!.profileId!])
+      FROM payments WHERE tenant_id = $1
+        -- A voided charge (decisions #48.5) was owed by nobody: it is not a payment.
+        AND status <> 'voided'`, [req.user!.profileId!])
     const total = parseInt(s?.total_payments || 0)
     const settled = parseInt(s?.settled || 0)
     const firstPayment = s?.first_payment ? new Date(s.first_payment) : null
@@ -630,6 +884,8 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
           LEFT JOIN leases l ON l.id = p.lease_id
          WHERE p.tenant_id = $1
            AND p.type IN ('rent','utility','fee','home_payment')
+           -- A voided charge was owed by nobody: never an on-time or late mark.
+           AND p.status <> 'voided'
            AND p.due_date >= (date_trunc('month', CURRENT_DATE) - interval '5 months')::date
       )
       SELECT to_char(m, 'Mon') AS month, to_char(m, 'YYYY-MM') AS ym,
@@ -732,6 +988,59 @@ tenantsRouter.get('/me/move-in-gate', async (req, res, next) => {
 // Returns empty rate / accruals when the deposit's state has no
 // hardcoded statutory rate (tenant in NV, AZ, etc.) — UI shows the
 // principal but no interest line.
+/**
+ * S652 — THE LAW FOR YOUR HOME.
+ *
+ * Nic: "upload each Landlord Tenant Act... where relevant to that unit type and
+ * to that state, the applicable Landlord Tenant Act shows up in the tenant's
+ * portal as a side menu option... show the version so that it can be updated
+ * when we update it. That should be accessible automatically to all tenants
+ * based on how the unit type is set up. As long as the landlord sets the unit
+ * type the right way, the tenant will automatically get the correct thing, with
+ * us providing it on the landlord's behalf."
+ *
+ * For each home the tenant has a lease on: the state's landlord-tenant act for
+ * that kind of space, as the agency prints it, and the state's plain-language
+ * guides. Straight from the government library — so a new edition shelved there
+ * is what every tenant sees next time, with its edition shown.
+ */
+tenantsRouter.get('/me/laws', async (req, res, next) => {
+  try {
+    const tenantId = req.user!.profileId!
+    const homes = await query<{ lease_id: string; state: string; unit_type: string; property_name: string; unit_number: string }>(
+      `SELECT DISTINCT l.id AS lease_id, p.state, u.unit_type, p.name AS property_name,
+              COALESCE(NULLIF(u.display_label, ''), u.unit_number) AS unit_number
+         FROM lease_tenants lt
+         JOIN leases l ON l.id = lt.lease_id
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE lt.tenant_id = $1 AND l.status IN ('active','pending') AND p.state IS NOT NULL`,
+      [tenantId])
+    const out = []
+    for (const h of homes) {
+      const docs = await query<any>(
+        `SELECT id, name, description, disclosure_type, source_name, publication_ref, effective_from, base_pdf_url, page_count
+           FROM disclosure_library_documents
+          WHERE jurisdiction = $1
+            AND disclosure_type IN ('landlord_tenant_act', 'tenant_rights_guide')
+            AND retired_at IS NULL AND superseded_by_id IS NULL
+            AND (unit_types IS NULL OR $2 = ANY(unit_types))
+          ORDER BY (disclosure_type = 'landlord_tenant_act') DESC, lower(name)`,
+        [h.state, h.unit_type])
+      out.push({
+        leaseId: h.lease_id, state: h.state, propertyName: h.property_name, unitNumber: h.unit_number,
+        documents: docs.map(d => ({
+          id: d.id, name: d.name, description: d.description,
+          kind: d.disclosure_type === 'landlord_tenant_act' ? 'act' : 'guide',
+          publishedBy: d.source_name, edition: d.publication_ref, effectiveFrom: d.effective_from,
+          pdfUrl: d.base_pdf_url, pageCount: d.page_count,
+        })),
+      })
+    }
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
   try {
     const tenantId = req.user!.profileId!
@@ -828,50 +1137,13 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// ── POST /api/tenants/verify-ach ──────────────────────────────────────────
-// Simulates ACH verification (real impl would use Plaid/Stripe).
-// Sets ach_verified=true and reports whether the security deposit is fully funded.
-tenantsRouter.post('/verify-ach', async (req, res, next) => {
-  try {
-    const { bankName, last4 } = req.body
-    if (!last4 || last4.length !== 4) {
-      return res.status(400).json({ success: false, error: 'Valid bank last 4 digits required' })
-    }
-
-    // Check deposit status
-    const row = await queryOne<any>(`
-      SELECT
-        CASE
-          WHEN sd.id IS NULL THEN false
-          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
-          WHEN sd.collected_amount >= sd.total_amount THEN true
-          ELSE false
-        END AS deposit_fully_funded
-      FROM tenants t
-      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
-      WHERE t.id = $1`, [req.user!.profileId!])
-
-    const qualifies = row?.deposit_fully_funded === true
-
-    await query(`
-      UPDATE tenants
-         SET ach_verified = TRUE,
-             bank_last4   = $1
-       WHERE id = $2`,
-      [last4, req.user!.profileId!])
-
-    res.json({
-      success: true,
-      data: {
-        ach_verified: true,
-        deposit_fully_funded: qualifies,
-        message: qualifies
-          ? 'Bank verified!'
-          : 'Bank verified. Your security deposit is not yet fully funded.'
-      }
-    })
-  } catch (e) { next(e) }
-})
+// ── POST /api/tenants/verify-ach — REMOVED (S655, money plan Step 5) ──────
+// It was a mock left from before Stripe: any tenant could type four digits and
+// mark themselves bank-verified with no bank behind it, which is the gate for
+// FlexPay and FlexDeposit. A bank is verified only by Stripe's microdeposits
+// (routes/stripe.ts confirm-setup and microdeposits/verify; the
+// setup_intent.succeeded webhook), and recorded by
+// services/tenantBankMethods.recordVerifiedTenantBank.
 
 
 
@@ -1615,36 +1887,220 @@ tenantsRouter.post('/flexcredit/inquiry', async (req, res, next) => {
 tenantsRouter.get('/payments', async (req, res, next) => {
   try {
     const payments = await query<any>(`
-      SELECT p.*, u.unit_number, pr.name AS property_name
+      SELECT p.*, u.unit_number, pr.name AS property_name,
+             -- S654: how it was paid, for the history's "Paid by" column.
+             -- 10/6 (Nic): a late fee netted out by its late-fee credit reads
+             -- "Late fee credited"; a line paid by credit alone, "Account credit".
+             COALESCE(p.manual_method, rm.payment_method,
+               CASE WHEN EXISTS (SELECT 1 FROM credit_uses cu WHERE cu.payment_id = p.id
+                                   AND cu.source = 'late_fee_credit' AND cu.status = 'applied') THEN 'late_fee_credit'
+                    -- 10/6 (Nic): a late fee a matched bank line showed was never owed, taken off at $0.00.
+                    WHEN p.type = 'late_fee' AND p.amount = 0 AND p.notes LIKE '%Came off: the bank shows the deposit on %' THEN 'late_fee_off_bank'
+                    WHEN p.status = 'settled' AND p.amount > 0 AND p.issued_credit_amount >= p.amount THEN 'credit'
+               END) AS paid_by
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
+      LEFT JOIN tenant_remittances rm ON p.stripe_payment_intent_id IS NOT NULL
+                                     AND rm.stripe_payment_intent_id = p.stripe_payment_intent_id
       WHERE p.tenant_id = $1
       ORDER BY p.due_date DESC LIMIT 24`, [req.user!.profileId!])
     res.json({ success: true, data: payments })
   } catch (e) { next(e) }
 })
 
+// ── S654: every tie an account has to a company, read from the schema ──────
+//
+// Round 8, reproduced: landlord B re-addressed a never-set-up account whose
+// only ties to company A were a cancelled invite, A's background check on them
+// and a $250 one-off charge. The hand-written list here counted leases, open
+// invites, drafts, utility agreements, payments and signer seats, so it said
+// "not tied": the address moved to B's mailbox, the setup link mailed there
+// set the password, and A's screening decision came with the login.
+//
+// So the list is no longer written by hand. Every column in the database that
+// points at a person (a foreign key to users or tenants) is a tie to the
+// company on that row: its landlord_id, any column that references landlords,
+// businesses or pm_companies, or a company table's own id. A row with no
+// company of its own ties through the row it hangs off (a signer seat through
+// its document, a lease's tenant row through the lease, a work-trade log
+// through its agreement). Cancelled, voided and finished rows count the same
+// as live ones. A table added later counts the day it exists. The query is
+// built once per process from the catalog.
+const COMPANY_TABLES = new Set(['landlords', 'businesses', 'pm_companies'])
+// Person columns the schema gives no foreign key; named so they count too.
+const UNKEYED_PERSON_COLUMNS: Array<[table: string, column: string, refers: 'users' | 'tenants']> = [
+  ['payment_reversals', 'tenant_id', 'tenants'],
+  ['landlord_member_history', 'user_id', 'users'],
+  ['product_events', 'user_id', 'users'],
+]
+const SQL_IDENT = /^[a-z_][a-z0-9_]*$/
+
+interface TieQuery { sql: string; sources: string[] }
+let tieQuery: Promise<TieQuery> | null = null
+
+async function buildTieQuery(): Promise<TieQuery> {
+  const fks = await query<{ tbl: string; col: string; reftbl: string; refcol: string }>(
+    `SELECT cl.relname AS tbl, a.attname AS col, rcl.relname AS reftbl, ra.attname AS refcol
+       FROM pg_constraint c
+       JOIN pg_class cl ON cl.oid = c.conrelid
+       JOIN pg_namespace n ON n.oid = cl.relnamespace AND n.nspname = 'public'
+       JOIN pg_class rcl ON rcl.oid = c.confrelid
+       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+       JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = c.confkey[1]
+      WHERE c.contype = 'f' AND cardinality(c.conkey) = 1
+        AND c.conparentid = 0 AND NOT cl.relispartition`)
+  const cols = await query<{ tbl: string; col: string; type: string }>(
+    `SELECT c.table_name AS tbl, c.column_name AS col, c.udt_name AS type
+       FROM information_schema.columns c
+       JOIN information_schema.tables t
+         ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
+      WHERE c.table_schema = 'public'`)
+  const uuidCols = new Set(cols.filter(c => c.type === 'uuid').map(c => `${c.tbl}.${c.col}`))
+  const safe = (...names: string[]) => names.every(n => SQL_IDENT.test(n))
+
+  // The company columns a table carries itself.
+  const companyCols = (tbl: string): string[] => {
+    const out = new Set<string>()
+    if (COMPANY_TABLES.has(tbl)) out.add('id')
+    if (uuidCols.has(`${tbl}.landlord_id`)) out.add('landlord_id')
+    for (const f of fks) if (f.tbl === tbl && COMPANY_TABLES.has(f.reftbl)) out.add(f.col)
+    return [...out].filter(c => safe(c))
+  }
+
+  const people: Array<{ tbl: string; col: string; refers: string }> = fks
+    .filter(f => (f.reftbl === 'users' || f.reftbl === 'tenants') && f.refcol === 'id' && f.tbl !== 'users')
+    .map(f => ({ tbl: f.tbl, col: f.col, refers: f.reftbl }))
+  for (const [tbl, col, refers] of UNKEYED_PERSON_COLUMNS) {
+    if (uuidCols.has(`${tbl}.${col}`)) people.push({ tbl, col, refers })
+  }
+
+  const branches: string[] = []
+  const sources: string[] = []
+  for (const p of people) {
+    if (!safe(p.tbl, p.col)) continue
+    const who = p.refers === 'users'
+      ? `x."${p.col}" = $1::uuid`
+      : `x."${p.col}" IN (SELECT id FROM mine)`
+    const own = companyCols(p.tbl)
+    if (own.length > 0) {
+      for (const c of own) {
+        const source = `${p.tbl}.${p.col}`
+        branches.push(`SELECT x."${c}"::text AS company_id, '${source}' AS source FROM "${p.tbl}" x WHERE ${who}`)
+        sources.push(source)
+      }
+      continue
+    }
+    for (const f of fks) {
+      if (f.tbl !== p.tbl || f.col === p.col || f.reftbl === 'users' || f.reftbl === 'tenants') continue
+      if (!safe(f.col, f.reftbl, f.refcol)) continue
+      for (const c of companyCols(f.reftbl)) {
+        const source = `${p.tbl}.${p.col} > ${f.reftbl}`
+        branches.push(
+          `SELECT r."${c}"::text AS company_id, '${source}' AS source FROM "${p.tbl}" x ` +
+          `JOIN "${f.reftbl}" r ON r."${f.refcol}" = x."${f.col}" WHERE ${who}`)
+        sources.push(source)
+      }
+    }
+  }
+  const sql =
+    `WITH mine AS MATERIALIZED (SELECT id FROM tenants WHERE user_id = $1::uuid)
+     SELECT company_id, source FROM (
+       ${branches.join('\n       UNION ALL ')}
+     ) ties
+     WHERE company_id IS NOT NULL AND NOT (company_id = ANY($2::text[]))
+     LIMIT $3`
+  return { sql, sources: Array.from(new Set(sources)).sort() }
+}
+
+function tieQueryOnce(): Promise<TieQuery> {
+  if (!tieQuery) tieQuery = buildTieQuery().catch(e => { tieQuery = null; throw e })
+  return tieQuery
+}
+
+/** S654: where the tie check looks (table.column, "> parent" when it ties through the row it hangs off). */
+export async function companyTieSources(): Promise<string[]> {
+  return (await tieQueryOnce()).sources
+}
+
+/**
+ * S654: the ties this account has to companies outside `own`, of ANY kind
+ * (see above). `limit` 1 answers "is there one" without reading the rest.
+ */
+export async function companyTiesOutside(
+  userId: string, own: Iterable<string>, limit = 1000,
+): Promise<Array<{ companyId: string; source: string }>> {
+  const { sql } = await tieQueryOnce()
+  const rows = await query<{ company_id: string; source: string }>(
+    sql, [userId, Array.from(new Set(own)), limit])
+  const seen = new Set<string>()
+  return rows
+    .filter(r => { const k = `${r.company_id} ${r.source}`; if (seen.has(k)) return false; seen.add(k); return true })
+    .map(r => ({ companyId: r.company_id, source: r.source }))
+}
+
+// S654: does this account belong to a company outside `own`? Any tie at all
+// counts (companyTiesOutside): a lease, an invite (cancelled ones too), a
+// draft, a signer seat on any of its documents, a background check, a charge,
+// an invoice, a document, a booking, a staff or owner seat. Such an account is
+// never re-addressed, renamed or handed a fresh password link by another
+// company. accountTiedElsewhere (resolveIntent.ts) asks this first.
+export async function residentTiedElsewhere(userId: string, own: Iterable<string>): Promise<boolean> {
+  return (await companyTiesOutside(userId, own, 1)).length > 0
+}
+
 // POST /api/tenants/invite — landlord invites a tenant.
 // S81: gated by tenants.create. Pre-S81 the route had bare requireAuth
 // (router-level), so any authenticated user including the tenant being
 // invited could call it. canAccessLandlordResource still enforces unit
 // scope after admission.
+//
+// Two kinds of invite:
+//   - to a UNIT (a household that is moving in, has lived here before, or —
+//     during the onboarding window — already lives here). S655: these go
+//     through the one invite function every door uses (services/newLeaseInvite):
+//     the whole household in one call (`residents`), the lease drafted at once
+//     and waiting for the landlord's signature, NOBODY emailed until he signs
+//     (S647). This route used to email the tenant "set up your account" at
+//     invite time even when the lease had drafted — an email before the
+//     landlord signed and a second one when he did — and it drafted the lease
+//     for the first person only: a second person invited to the same home was
+//     left off the lease.
+//   - to a PROPERTY (a new applicant who screens first; no unit yet). They get
+//     the invite email now, because their next step is theirs.
+//
+// S655 (Nic, 10/2): invites are EMAIL-ONLY. A setup link sets the account's
+// password, so it goes only to the person's own address and never comes back
+// in a response — not even for an account this invite just made.
 tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, next) => {
   try {
-    // S579: invites are now PROPERTY-level as well as unit-level. A prospective
-    // applicant is invited to a property (`propertyId`, no unit yet — the unit is
-    // chosen later at lease); the legacy unit-bound invite still works and is
-    // left behaviourally untouched (no intent, no auto-draft change).
     const { email, firstName, lastName, unitId, phone, propertyId } = req.body
-    if (!email || !firstName || (!unitId && !propertyId)) {
+    // S652 (Nic, option 2): "This person has lived here before" — the landlord
+    // attests it, the check is skipped, the attestation is recorded and counted
+    // against the property's rolling allowance (see applyReturningResidentWaive).
+    const returningResident = req.body.returningResident === true
+    // S655: a household invited to its unit together; one person still works.
+    const residents: Array<{ email?: string; firstName?: string; lastName?: string; phone?: string }> =
+      Array.isArray(req.body.residents) && req.body.residents.length
+        ? req.body.residents
+        : [{ email, firstName, lastName, phone }]
+    const lead = residents[0] ?? {}
+    if (!lead.email || !lead.firstName || (!unitId && !propertyId)) {
       return res.status(400).json({ success: false, error: 'Email, name and a unit or property are required' })
+    }
+    if (returningResident && !unitId) {
+      return res.status(400).json({ success: false, error: 'A returning resident is invited to their space.' })
+    }
+    if (!unitId && residents.length > 1) {
+      return res.status(400).json({ success: false, error: 'Invite applicants to a property one at a time. A household is invited to its unit together.' })
     }
     // S417: block disposable email domains so invites can't be sent to
     // throwaway addresses. Defeats the verification gate downstream.
-    if (typeof email === 'string' && isDisposableEmail(email)) {
-      return res.status(400).json({ success: false,
-        error: 'Disposable / temporary email addresses are not allowed' })
+    for (const r of residents) {
+      if (typeof r.email === 'string' && isDisposableEmail(r.email)) {
+        return res.status(400).json({ success: false,
+          error: 'Disposable / temporary email addresses are not allowed' })
+      }
     }
 
     // Resolve the landlord + property the invite binds to. Inviting a tenant
@@ -1666,34 +2122,129 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
     if (!canAccessLandlordResource(req.user, inviteLandlordId)) {
       return res.status(403).json({ success: false, error: 'Forbidden' })
     }
-    const crypto = require('crypto')
-    const inviteToken = crypto.randomBytes(32).toString('hex')
+
+    // ── A UNIT: the one invite function ────────────────────────────────────
+    if (unitId) {
+      if (returningResident) {
+        // Over the allowance the option is simply refused (S652) — before
+        // anything is written, so no half-made invite is left behind.
+        // 10/6 (Nic): one count per person per property per rolling year — the
+        // household's lead, already attested here (an invite or a reservation),
+        // is returning again for free.
+        const { returningAllowanceFor, RETURNING_ALLOWANCE_USED_MESSAGE } = await import('../services/onboardingWindow')
+        if (!(await returningAllowanceFor(inviterPropertyId!, { email: lead.email ?? null })).available) {
+          throw new AppError(409, RETURNING_ALLOWANCE_USED_MESSAGE)
+        }
+      }
+      const { inviteHouseholdToNewLease, packetIds } = await import('../services/newLeaseInvite')
+      const out = await inviteHouseholdToNewLease({
+        unitId,
+        people: residents.map(r => ({
+          firstName: String(r.firstName ?? ''), lastName: String(r.lastName ?? ''),
+          email: String(r.email ?? ''), phone: r.phone ?? null,
+        })),
+        authorize: () => {},   // canAccessLandlordResource, above
+        ownCompanies: [inviteLandlordId, ...landlordScopeIds(req.user!)],
+        byUserId: req.user!.userId,
+        // "Already lives here" (onboarding window open) grandfathers past the
+        // background check and papers an existing tenancy, the same as the
+        // Tenant Onboarding page.
+        existingResident: req.body.existingResident === true,
+        returningResident,
+        homeSale: req.body.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null,
+        packageTemplateIds: packetIds(req.body.packageTemplateIds),
+        source: 'invite',
+        requireUnitSetup: false,
+        requireLastName: false,
+        fallbackEmail: 'invite',
+      })
+
+      // S605 (Nic): remember the unit this invite was for, household order
+      // preserved — setting a unit type's default lease later refires drafting
+      // for every unit still waiting.
+      for (const p of out.people) {
+        const seq = await queryOne<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM pending_lease_drafts WHERE unit_id = $1`, [unitId])
+        await query(
+          `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (unit_id, tenant_user_id) DO NOTHING`,
+          [out.landlordId, unitId, p.userId, Number(seq?.n ?? 0)])
+      }
+      logger.info({ unitId, people: out.people.length, drafted: out.draftedDocumentIds.length }, '[INVITE] household invited to a unit')
+
+      const first = out.people[0]
+      return res.json({
+        success: true,
+        data: {
+          userId: first.userId,
+          tenantId: first.tenantId,
+          email: first.email,
+          // An invite email went out only when the lease could not draft.
+          inviteSent: first.notified === 'email',
+          // S616: so the screen never says "invite sent" for someone already on GAM.
+          alreadyOnPlatform: first.alreadyOnPlatform,
+          leaseDrafted: out.draftedDocumentIds.length > 0,
+          draftBlocked: out.draftBlocked,
+          people: out.people.map(p => ({
+            email: p.email, name: `${p.firstName} ${p.lastName}`.trim(),
+            inviteSent: p.notified === 'email', alreadyOnPlatform: p.alreadyOnPlatform,
+            screeningWaived: p.screeningWaived, needsOwnSignature: p.needsOwnSignature,
+            // S655: what actually reached them — 'email', 'notice', or null for
+            // nothing (a lease drafted, or the fallback could not be sent). The
+            // screen says "told there" only for a notice that went.
+            notified: p.notified,
+          })),
+        },
+      })
+    }
+
+    // ── A PROPERTY: a new applicant who screens first ──────────────────────
     const tempHash = '$2b$10$placeholder_invite_pending'
 
-    // Create or find user
-    let user = await queryOne<any>('SELECT id FROM users WHERE email=$1', [email])
+    // S654: one account per address, whatever its letter case. An exact match
+    // missed 'LANDLORD@X.DEV' for a landlord stored lowercase, and a second
+    // login was made on their address with its link handed to the inviter.
+    const emailNorm = typeof email === 'string' ? email.trim().toLowerCase() : ''
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ success: false, error: 'Invalid email format' })
+    }
+    const matches = await query<{ id: string; role: string; email: string; needs_setup: boolean }>(
+      `SELECT id, role, email,
+              (password_hash = $2 AND tenant_invite_accepted_at IS NULL) AS needs_setup
+         FROM users WHERE lower(email) = $1
+        ORDER BY (email = lower(email)) DESC, created_at`,
+      [emailNorm, tempHash])
+    // S654: only a resident's account can be invited, never a landlord's,
+    // staff's or an e-sign contact's.
+    if (matches.some(m => m.role !== 'tenant')) {
+      return res.status(409).json({ success: false,
+        error: "This email belongs to a GAM account that isn't a resident's, so it can't be invited as a tenant. Use the resident's own email." })
+    }
+    let user: { id: string; email: string } | null = matches[0] ?? null
+
+    // S654: a password link is minted only for an account that still needs
+    // setting up and belongs to no other landlord. Anyone else is already on
+    // GAM (S616): no link, and an existing link another landlord sent keeps
+    // working.
+    let mintToken = false
+    if (user && matches[0].needs_setup) {
+      mintToken = !(await residentTiedElsewhere(user.id, [inviteLandlordId, ...landlordScopeIds(req.user!)]))
+    }
     if (!user) {
-      user = await queryOne<any>(`
+      user = await queryOne<{ id: string; email: string }>(`
         INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-        VALUES ($1,$2,'tenant',$3,$4,$5) RETURNING id`,
-        [email, tempHash, firstName, lastName || '', phone || null])
+        VALUES ($1,$2,'tenant',$3,$4,$5) RETURNING id, email`,
+        [emailNorm, tempHash, firstName, lastName || '', phone || null])
+      mintToken = true
     }
 
     // Create the tenant record — but only if there is not one already.
     //
     // S628: this was `INSERT ... ON CONFLICT DO NOTHING`, and tenants.user_id
-    // carries a PLAIN index (idx_tenants_user_id), not a unique one. With no
-    // constraint to violate there was no conflict to do nothing about, so a
+    // carries a PLAIN index (idx_tenants_user_id), not a unique one, so a
     // second invite to the same address minted a SECOND tenants row for the
-    // same user. Everything downstream resolves a tenant by
-    // `SELECT id FROM tenants WHERE user_id = ...` and would then get whichever
-    // row came back first — the lease could attach to one and the payments to
-    // the other. A characterisation test caught it (tenantInvite.test.ts,
-    // "re-inviting the same address reuses the account"); nothing had
-    // re-invited the same address in the dev data, which is why it was quiet.
-    //
-    // Look up first, then insert. Every sibling onboarding route in
-    // routes/landlords.ts already does exactly this.
+    // same user. Look up first, then insert.
     let tenantId: string | undefined =
       (await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1 ORDER BY created_at ASC LIMIT 1',
         [user!.id]))?.id
@@ -1702,98 +2253,90 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [user!.id]))?.id
     }
 
-    // S579: for a PROPERTY-level screening invite (no unit yet), record a
+    // S579: a PROPERTY-level screening invite (no unit yet) records a
     // property-bound intent so the background check the applicant completes
-    // links to this property. unit_id stays NULL — this is a prospective
-    // applicant, so there is NO unit assignment and NO lease auto-draft (that
-    // fires only for unit-bound intents on accept). The legacy unit-bound invite
-    // path is deliberately left as-is (no intent) to avoid double-drafting a
-    // lease alongside the e-sign onboarding flow. Upsert the tenant's single
-    // LIVE intent (partial-unique on tenant_id WHERE cancelled_at IS NULL).
-    if (propertyId && !unitId && tenantId) {
-      await query(
-        `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
-         VALUES ($1, $2, 'not_uploaded', $3, NULL)
-         -- S629: targets the NO-UNIT index. Uniqueness moved to
-         -- (tenant, unit) so one person can hold invites to two spots; this
-         -- path invites to a PROPERTY with no unit yet, and there is still
-         -- only ever one of those per tenant.
-         ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL
-         DO UPDATE SET property_id = EXCLUDED.property_id, resolved_at = NULL, updated_at = NOW()`,
-        [inviteLandlordId, tenantId, inviterPropertyId])
+    // links to this property. unit_id stays NULL: no unit, no lease draft.
+    //
+    // S655: one live no-unit row per person PER COMPANY — the conflict target
+    // is (tenant_id, landlord_id). Keyed on the tenant alone, company Y's
+    // invite re-pointed company X's row at Y's park, and X's row is where X's
+    // screening waiver lives. Until the post-deploy step drops the old
+    // tenant-only index, a person whose live no-unit row belongs to ANOTHER
+    // company collides with it (23505): their row is left untouched, the
+    // invite still goes, and this one simply isn't recorded on a row yet.
+    if (tenantId) {
+      try {
+        await query(
+          `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
+           VALUES ($1, $2, 'not_uploaded', $3, NULL)
+           ON CONFLICT (tenant_id, landlord_id) WHERE cancelled_at IS NULL AND unit_id IS NULL
+           DO UPDATE SET property_id = EXCLUDED.property_id, resolved_at = NULL, updated_at = NOW()`,
+          [inviteLandlordId, tenantId, inviterPropertyId])
+      } catch (err: any) {
+        if (err?.code !== '23505') throw err
+        logger.warn({ tenantId, landlordId: inviteLandlordId },
+          '[INVITE] another company holds this person\'s open no-unit row; left untouched')
+      }
     }
 
-    // S605 (Nic): remember the unit this invite was for. The lease itself is
-    // still created through e-sign — but without this row nothing knew WHO was
-    // waiting on WHICH unit, so a landlord who invited before setting a lease
-    // template could never have the draft catch up. Setting the default template
-    // for a unit type now refires drafting for every unit still waiting.
-    //
-    // household_order preserves who was invited first: the primary resident
-    // holds the lease, co-tenants follow.
-    if (unitId && tenantId) {
-      const seq = await queryOne<{ n: string }>(
-        `SELECT COUNT(*)::text AS n FROM pending_lease_drafts WHERE unit_id = $1`, [unitId])
+    // S410 (S377): the purpose-scoped column, 7-day expiry.
+    let inviteToken: string | null = null
+    if (mintToken) {
+      inviteToken = crypto.randomBytes(32).toString('hex')
       await query(
-        `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (unit_id, tenant_user_id) DO NOTHING`,
-        [inviteLandlordId, unitId, user!.id, Number(seq?.n ?? 0)])
+        `UPDATE users
+            SET tenant_invite_token = $1,
+                tenant_invite_expires_at = NOW() + INTERVAL '7 days'
+          WHERE id = $2`,
+        [inviteToken, user!.id])
     }
 
-    // S410 (S377): store on the purpose-scoped column with a 7-day
-    // expiry. Pre-S410 this wrote to email_verify_token (which was
-    // overloaded across email-verification + tenant invites + landlord
-    // invites). The accept route below now reads tenant_invite_token
-    // and enforces tenant_invite_expires_at > NOW().
-    await query(
-      `UPDATE users
-          SET tenant_invite_token = $1,
-              tenant_invite_expires_at = NOW() + INTERVAL '7 days'
-        WHERE id = $2`,
-      [inviteToken, user!.id])
+    // S654: portalLink, never a localhost fallback (S641 rule).
+    const acceptUrl = inviteToken ? portalLink('tenant', `accept-invite?token=${inviteToken}`) : null
+    logger.info(`[INVITE] Tenant invite: ${emailNorm}`)
 
-    const acceptUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/accept-invite?token=${inviteToken}`
-    logger.info(`[INVITE] Tenant invite: ${email}`)
-
-    // S628: SEND IT. The landlord's screen says "Invite Sent" and "they will
-    // receive an email to set up their account", and until now nothing was
-    // sent — the token was logged and the URL handed back for the landlord to
-    // copy. The reminder job (jobs/inviteNudge.ts) did not cover it either: it
-    // only walks unit-bound pending_tenant_intents, and this route creates a
-    // pending_lease_draft for those instead. So an invited resident heard
-    // nothing at all, and the invite lapsed after seven days in silence.
+    // S628: SEND IT. Best-effort: the account and the token already exist, so
+    // failing the request would leave a half-made invite behind. Their next
+    // step is a background check.
     //
-    // Best-effort, exactly like the sibling onboarding route: the account and
-    // the token already exist, so failing the request would leave a half-made
-    // invite behind and tell the landlord to try again on something that had
-    // already worked. A property-level invite means a background check is
-    // still ahead of them; a unit-bound one does not.
+    // S655: what actually reached them, so the screen never says an email or
+    // a notice went when the send failed ('email' | 'notice' | null).
+    let notified: 'email' | 'notice' | null = null
     try {
       const ctxRow = await queryOne<any>(
         `SELECT p.name AS property_name,
-                un.unit_number,
                 COALESCE(NULLIF(la.business_name, ''),
                          NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
                          'Your landlord') AS landlord_name
            FROM landlords la
            JOIN users lu ON lu.id = la.user_id
-           LEFT JOIN units un ON un.id = $2::uuid
-           LEFT JOIN properties p ON p.id = COALESCE(un.property_id, $3::uuid)
+           LEFT JOIN properties p ON p.id = $2::uuid
           WHERE la.id = $1`,
-        [inviteLandlordId, unitId ?? null, inviterPropertyId])
-      await emailTenantInvite(
-        email,
-        firstName,
-        ctxRow?.landlord_name || 'Your landlord',
-        ctxRow?.property_name || 'their property',
-        ctxRow?.unit_number ? `Unit ${ctxRow.unit_number}` : null,
-        acceptUrl,
-        !unitId,
-        { landlordId: inviteLandlordId, tenantId },
-      )
+        [inviteLandlordId, inviterPropertyId])
+      const landlordName = ctxRow?.landlord_name || 'Your landlord'
+      const propertyName = ctxRow?.property_name || 'their property'
+      if (acceptUrl) {
+        // S654: to the address on the account, never the one typed.
+        await emailTenantInvite(user!.email, firstName, landlordName, propertyName, null, acceptUrl, true,
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          { landlordId: inviteLandlordId, tenantId, replyTo: replyToProperty(inviterPropertyId) })
+        notified = 'email'
+      } else {
+        // S616/S654: already on GAM. Tell them in the account they have.
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId: user!.id,
+          landlordId: inviteLandlordId,
+          type: 'invited_to_apply',
+          title: `${landlordName} invited you to apply at ${propertyName}`,
+          body: 'Sign in to your GAM account as usual to continue.',
+          data: { unitId: null, propertyId: inviterPropertyId, tenantId },
+          actionUrl: '/',
+        })
+        notified = 'notice'
+      }
     } catch (emailErr) {
-      logger.error({ err: emailErr, ctx: email }, '[INVITE] invite email failed for')
+      logger.error({ err: emailErr, ctx: emailNorm }, '[INVITE] invite notice failed for')
     }
 
     res.json({
@@ -1801,9 +2344,13 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       data: {
         userId: user!.id,
         tenantId,
-        email,
-        inviteToken,
-        acceptUrl,
+        email: user!.email,
+        // S655: email-only — no link in the response, for anyone. True only
+        // when the email actually went.
+        inviteSent: notified === 'email',
+        notified,
+        // S616: so the screen never says "invite sent" for someone already on GAM.
+        alreadyOnPlatform: !mintToken,
       }
     })
   } catch (e) { next(e) }
@@ -1816,8 +2363,9 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
 // the property's onboarding window is OPEN, only for an occupied unit's sitting
 // tenant, and only with the landlord's attestation that the person is an
 // existing resident. Outside the window there is no waive — every new applicant
-// screens. It sets background_check_status='waived' (the portal gate treats
-// that as pass) and records an audit trail. It deliberately does NOT touch the
+// screens. It records the waiver on this company's intent row (only this
+// account reads it as "screened"; the person's own screening status is never
+// touched) and records an audit trail. It deliberately does NOT touch the
 // tenant's intent unit_id (that would auto-draft a lease colliding with the
 // e-sign onboarding) — the grandfathered unit is recorded in a dedicated column.
 // See services/onboardingWindow.ts + memory gam-screening-grandfather-onboarding-window.
@@ -1842,8 +2390,28 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
     if (!unit || unit.property_id !== propertyId) {
       return res.status(400).json({ success: false, error: 'Unit does not belong to that property' })
     }
-    const tenant = await queryOne<{ id: string }>(`SELECT id FROM tenants WHERE id = $1`, [tenantId])
-    if (!tenant) return res.status(404).json({ success: false, error: 'Tenant not found' })
+    // The person must actually be coming onto THIS unit with THIS company: a
+    // live invite to it, or a lease on it. Before, any tenant id on GAM could
+    // be waived by any landlord with an open window — a brand-new landlord
+    // could mark a stranger (or someone denied elsewhere) as screened. Same 404
+    // for "no such person" and "not yours to waive", so it reveals nothing.
+    const onboarding = await queryOne<{ one: number }>(
+      `SELECT 1 AS one
+         FROM tenants t
+        WHERE t.id = $1
+          AND (EXISTS (SELECT 1 FROM pending_tenant_intents i
+                        WHERE i.tenant_id = t.id AND i.unit_id = $2
+                          AND i.landlord_id = $3 AND i.cancelled_at IS NULL)
+               OR EXISTS (SELECT 1 FROM lease_tenants lt
+                            JOIN leases l ON l.id = lt.lease_id
+                           WHERE lt.tenant_id = t.id AND l.unit_id = $2
+                             AND l.landlord_id = $3
+                             AND l.status IN ('active', 'pending')))`,
+      [tenantId, unitId, property.landlord_id])
+    if (!onboarding) {
+      return res.status(404).json({ success: false,
+        error: 'Tenant not found. Invite them to this unit first, then waive their screening.' })
+    }
 
     const result = await applyScreeningWaive({
       tenantId, landlordId: property.landlord_id, propertyId, unitId, byUserId: req.user!.userId,
@@ -1856,7 +2424,12 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
       if (result.reason === 'unit_taken') {
         return res.status(409).json({ success: false, error: 'This unit already has a grandfathered resident.' })
       }
+      if (result.reason === 'not_recorded') {
+        return res.status(409).json({ success: false, error: WAIVER_NOT_RECORDED_MESSAGE })
+      }
     }
+    // The waiver is this company's record; the person's own screening status
+    // is untouched (see services/onboardingWindow.ts recordWaiver).
     res.json({ success: true, data: { tenantId, status: 'waived' } })
   } catch (e) { next(e) }
 })
@@ -1865,40 +2438,116 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
 // this file, BEFORE tenantsRouter.use(requireAuth). See header
 // comment on the pre-auth public routes section.
 
-// GET /api/tenants/:id/profile — full lifetime tenant profile.
-// Authorization: tenant viewing themselves; admin/super_admin; or landlord
-// (or scoped team role) on any property where the tenant has a lease_tenants
-// row. Cross-tenant data (payments, maintenance, work-trade) is gated on this
-// check — pre-S71 the endpoint had no auth at all.
+// GET /api/tenants/:id/profile — a resident's profile.
+//
+// Who sees what:
+//  - the resident themselves and GAM admin: the person's whole GAM life;
+//  - a landlord, or a scoped staff member, who has had this person on one of
+//    their leases: ONLY what happened with their own company (or the other
+//    companies of the same account). Never another company's units, payments,
+//    maintenance, work trade or late marks. A staff member assigned to
+//    particular properties sees only what happened at those properties, and
+//    cannot open someone who has never had a lease or invitation there.
+//
+// Before this the gate asked "is this landlord related to the person at all?"
+// and then every query filtered on tenant_id alone, so a landlord who got the
+// person onto one lease could read another company's rent history, its
+// payment notes, its maintenance notes and costs, plus the person's bank
+// last-4, date of birth and Stripe id off the whole tenants row. Every block
+// below now carries the same company scope, and a landlord or staff viewer
+// gets named fields only — the ones the Tenant page draws.
+//
+// S641 (Nic, on his on-site manager): "I don't want her to see ... the payment
+// histories from people." Staff without payments.view_all or books.view get no
+// payment history, no work trade and no money figures here — except the
+// paid-ahead figure for a front desk that posts payments (take_payment).
+// A landlord or staff viewer never gets the SSI/SSDI flag (GAM-side only).
 tenantsRouter.get('/:id/profile', async (req, res, next) => {
   try {
-    // Basic tenant info
-    const tenant = await queryOne<any>(`
+    const tenantRow = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         u.created_at as account_created
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       WHERE t.id = $1`, [req.params.id])
-    if (!tenant) throw new AppError(404, 'Tenant not found')
+    if (!tenantRow) throw new AppError(404, 'Tenant not found')
 
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isSelf = role === 'tenant' && req.user!.profileId! === req.params.id
+    // null = unrestricted (admin, self). Otherwise the companies this viewer
+    // may see that the person has actually been on a lease with.
+    let scope: string[] | null = null
     if (!isAdmin && !isSelf) {
-      // Find any landlord this tenant has a lease relationship with, then
-      // check if the calling user has access to that landlord's resources.
       const relatedLandlords = await query<{ landlord_id: string }>(`
         SELECT DISTINCT l.landlord_id
           FROM lease_tenants lt
           JOIN leases l ON l.id = lt.lease_id
          WHERE lt.tenant_id = $1
       `, [req.params.id])
-      const allowed = relatedLandlords.some(r =>
-        canAccessLandlordResource(req.user, r.landlord_id))
-      if (!allowed) throw new AppError(403, 'Forbidden')
+      scope = relatedLandlords
+        .map(r => r.landlord_id)
+        .filter(id => canAccessLandlordResource(req.user, id))
+      if (!scope.length) throw new AppError(403, 'Forbidden')
+    }
+    const scoped = scope !== null
+    const seesPayments = !scoped || userHasPerm(req.user, 'payments.view_all', 'books.view')
+    // S655: a staff member assigned to particular properties (a property
+    // manager, on-site manager or maintenance worker whose scope is not "all
+    // properties") sees this person's time at THOSE properties only — never
+    // the company's other parks. null = no property limit (owners, GAM admin,
+    // all-properties staff, the resident themselves); [] = sees no history.
+    const propScope: string[] | null = scoped
+      ? await (await import('../middleware/auth')).getScopedPropertyIds(req.user)
+      : null
+    // ...and such a staff member opens the person at all only when the person
+    // has had a lease, or has an open invitation, at one of those properties.
+    // The history lists below are already limited to them, but the contact
+    // card (name, email, phone) would still have shown someone from the
+    // company's other parks.
+    if (propScope !== null) {
+      const atAssignedProperty = await queryOne<{ ok: boolean }>(`
+        SELECT (EXISTS (SELECT 1 FROM lease_tenants lt
+                          JOIN leases l ON l.id = lt.lease_id
+                          JOIN units u ON u.id = l.unit_id
+                         WHERE lt.tenant_id = $1
+                           AND l.landlord_id = ANY($2::uuid[])
+                           AND u.property_id = ANY($3::uuid[]))
+             OR EXISTS (SELECT 1 FROM pending_tenant_intents i
+                          LEFT JOIN units iu ON iu.id = i.unit_id
+                         WHERE i.tenant_id = $1
+                           AND i.cancelled_at IS NULL
+                           AND i.landlord_id = ANY($2::uuid[])
+                           AND COALESCE(iu.property_id, i.property_id) = ANY($3::uuid[]))) AS ok`,
+        [req.params.id, scope, propScope])
+      if (!atAssignedProperty?.ok) {
+        throw new AppError(403,
+          "This resident has never had a lease at the properties you're assigned to. Ask the owner if you need their details.")
+      }
     }
 
-    // All units ever occupied (current + historical via lease_tenants)
+    // A landlord or staff viewer gets the fields the Tenant page uses and
+    // nothing else: no Stripe id, bank or routing digits, date of birth,
+    // mailing address, Flex enrollment or screening fields.
+    // S655 (Nic, 10/2): no SSI/SSDI flag either. "That's our check for the
+    // flex products" — it is GAM's eligibility check, kept GAM-side (the
+    // resident themselves and GAM admin still get it on the whole row). Source
+    // of income is nothing a landlord decides anything on.
+    const tenant = scoped
+      ? {
+          id: tenantRow.id,
+          user_id: tenantRow.user_id,
+          first_name: tenantRow.first_name,
+          last_name: tenantRow.last_name,
+          email: tenantRow.email,
+          phone: tenantRow.phone,
+          ach_verified: tenantRow.ach_verified,
+          avatar_url: tenantRow.avatar_url,
+          account_created: tenantRow.account_created,
+        }
+      : tenantRow
+
+    // Units occupied — with this company only, for a scoped viewer.
     const units = await query<any>(`
       SELECT DISTINCT u.id, u.unit_number, u.rent_amount, u.status,
         p.name as property_name, p.street1, p.city, p.state,
@@ -1909,51 +2558,177 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
       WHERE lt.tenant_id = $1
-      ORDER BY is_current DESC, start_date DESC`, [req.params.id])
+        AND ($2::uuid[] IS NULL OR l.landlord_id = ANY($2::uuid[]))
+        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+      ORDER BY is_current DESC, start_date DESC`, [req.params.id, scope, propScope])
 
-    // Full payment history across all units
-    const payments = await query<any>(`
-      SELECT p.*, u.unit_number, pr.name as property_name
+    // FlexPay never surfaces to the landlord (CLAUDE.md S541): GAM's FlexPay
+    // pull rows are left out of the list and the stats for every viewer, and
+    // the unscoped branch (GAM admin, the resident) names its columns so
+    // flexpay_advance_id is never sent.
+    const payments = !seesPayments ? [] : await query<any>(`
+      SELECT ${scoped
+        ? `p.id, p.type, p.amount, p.status, p.due_date, p.settled_at, p.processed_at,
+           p.manual_method, p.work_trade_suspended_at`
+        : `p.id, p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, p.type, p.amount, p.status,
+           p.stripe_payment_intent_id, p.stripe_charge_id, p.ach_trace_number, p.entry_description,
+           p.return_code, p.return_reason, p.zero_tolerance_flag, p.due_date, p.processed_at,
+           p.settled_at, p.retry_count, p.notes, p.created_at, p.lease_fee_id, p.invoice_id,
+           p.next_retry_at, p.last_retry_at, p.platform_held, p.sublease_credit_applied,
+           p.gam_supersedence_amount, p.gam_supersedence_breakdown, p.gam_supersedence_applied_at,
+           p.import_source, p.imported_at, p.import_extra_data, p.is_remainder, p.reversal_id,
+           p.manual_method, p.sublease_markup_amount, p.home_sale_installment_id, p.revenue_owner,
+           p.work_trade_suspended_at, p.payment_channel, p.issued_credit_amount`}, u.unit_number, pr.name as property_name
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE p.tenant_id = $1
+        AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+        AND ($2::uuid[] IS NULL OR p.landlord_id = ANY($2::uuid[]))
+        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
       ORDER BY p.due_date DESC
-      LIMIT 36`, [req.params.id])
+      LIMIT 36`, [req.params.id, scope, propScope])
 
-    // Lifetime payment stats. lateCount sources from
-    // tenants.late_payment_count (maintained by the daily late-fee
-    // job in scheduler.ts) — payments.status has no 'late' value
-    // so a FILTER on it always returns 0.
-    const paymentStats = await queryOne<any>(`
+    // 10/6 (Nic): "Delete this late fee" on the line of a late fee a reversal
+    // credited (or, before 10/6, zeroed) on the onboarding month's bill — said
+    // per line, and only to a viewer who may delete one (the owner or a
+    // property manager: services/lateFeeDelete). Everyone else gets no flag.
+    const zeroedFees = payments.filter((p: any) => p.type === 'late_fee' && p.status === 'settled')
+    if (scoped && zeroedFees.length > 0) {
+      const { canDeleteLateFees, deletableLateFeeIds } = await import('../services/lateFeeDelete')
+      const owners = await query<{ id: string; landlord_id: string }>(
+        `SELECT id, landlord_id FROM payments WHERE id = ANY($1::uuid[])`, [zeroedFees.map((p: any) => p.id)])
+      const mayFor = owners.filter(o => canDeleteLateFees(req.user, o.landlord_id)).map(o => o.id)
+      if (mayFor.length > 0) {
+        const c = await getClient()
+        try {
+          const ok = await deletableLateFeeIds(c, mayFor)
+          for (const p of payments) if (ok.has(p.id)) p.can_delete_late_fee = true
+        } finally { c.release() }
+      }
+    }
+
+    // Lifetime payment stats. S652 (Nic): lateCount is the number of charges
+    // the credit ledger recorded as paid past grace — once per charge, the
+    // same events the score reads. The old tenants.late_payment_count column
+    // was bumped every morning a balance stayed open and is no longer kept.
+    // A scoped viewer counts only late marks on THIS company's charges: the
+    // ledger event names the payment it was raised for. The ledger itself is
+    // unchanged.
+    const lateRow = !seesPayments ? null : await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM credit_events ce
+         JOIN credit_subjects cs ON cs.id = ce.subject_id
+        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1
+          AND ce.superseded_by IS NULL
+          AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe')
+          AND ($2::uuid[] IS NULL OR EXISTS (
+                SELECT 1 FROM payments p
+                  LEFT JOIN units pu ON pu.id = p.unit_id
+                 WHERE p.id::text = ce.event_data->>'payment_id'
+                   AND p.landlord_id = ANY($2::uuid[])
+                   AND ($3::uuid[] IS NULL OR pu.property_id = ANY($3::uuid[]))))`,
+      [req.params.id, scope, propScope])
+    // S652 (Nic): a work-trade charge is paid in hours — it counts as paid.
+    const paymentStats = !seesPayments ? null : await queryOne<any>(`
       SELECT
         COUNT(*) as total_payments,
-        COUNT(*) FILTER (WHERE status = 'settled') as settled,
+        COUNT(*) FILTER (WHERE status = 'settled' OR work_trade_suspended_at IS NOT NULL) as settled,
         COUNT(*) FILTER (WHERE status = 'failed') as failed,
         COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) as total_paid,
         COALESCE(AVG(amount) FILTER (WHERE status = 'settled'), 0) as avg_payment,
         MIN(due_date) as first_payment,
         MAX(due_date) as last_payment
-      FROM payments WHERE tenant_id = $1`, [req.params.id])
+      FROM payments
+      WHERE tenant_id = $1
+        AND entry_description IS DISTINCT FROM 'FLEXPAY'
+        -- A voided charge (decisions #48.5) was owed by nobody and paid by
+        -- nothing: it stays in the list above as a record, but it is never a
+        -- payment in these counts (it would drag the on-time rate down).
+        AND status <> 'voided'
+        AND ($2::uuid[] IS NULL OR landlord_id = ANY($2::uuid[]))
+        AND ($3::uuid[] IS NULL OR unit_id IN (SELECT id FROM units WHERE property_id = ANY($3::uuid[])))`,
+      [req.params.id, scope, propScope])
 
-    // Maintenance requests
+    // Maintenance requests — this company's only, for a scoped viewer, and
+    // never its internal notes.
     const maintenance = await query<any>(`
-      SELECT mr.*, u.unit_number, p.name as property_name
+      SELECT ${scoped
+        ? 'mr.id, mr.title, mr.status, mr.priority, mr.created_at, mr.actual_cost'
+        : 'mr.*'}, u.unit_number, p.name as property_name
       FROM maintenance_requests mr
       LEFT JOIN units u ON u.id = mr.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
       WHERE mr.tenant_id = $1
+        AND ($2::uuid[] IS NULL OR mr.landlord_id = ANY($2::uuid[]))
+        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
       ORDER BY mr.created_at DESC
-      LIMIT 20`, [req.params.id])
+      LIMIT 20`, [req.params.id, scope, propScope])
 
-    // Work trade agreements
-    const workTrade = await query<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name
+    // Work trade agreements (S641: a private arrangement — staff without the
+    // payment permissions do not get it).
+    const workTrade = !seesPayments ? [] : await query<any>(`
+      SELECT ${scoped
+        ? `wta.id, wta.status, wta.start_date, wta.end_date, wta.monthly_hours_target,
+           wta.tracks_hours, wta.covered_charges, wta.landlord_id`
+        : 'wta.*'}, u.unit_number, p.name as property_name
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id
       WHERE wta.tenant_id = $1
-      ORDER BY wta.created_at DESC`, [req.params.id])
+        AND ($2::uuid[] IS NULL OR wta.landlord_id = ANY($2::uuid[]))
+        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+      ORDER BY wta.created_at DESC`, [req.params.id, scope, propScope])
+
+    // S652: money that arrived before its bill — shown on the Tenant page so
+    // nobody posts it twice. (S652 wrote this into the avatar upload by
+    // mistake, so the page's "Paid ahead" line never had a number.) Scoped to
+    // this company's leases.
+    // S655: it is a money figure, so it follows the S641 rule above — only a
+    // viewer who may see payments gets it, plus the front desk that posts them
+    // (take_payment), which needs it so the same check is not posted twice.
+    // Everyone else gets null, never a number.
+    const seesPaidAhead = seesPayments || userHasPerm(req.user, 'take_payment')
+
+    // S655 (Nic, 10/2): ALL the credit on their account, and what of it would
+    // pay their bills right now. They differ: paid-ahead money stops at a
+    // monthly draw cap, credit pays only the landlord's own rent, utilities and
+    // fees (never a GAM fee, a home payment or a neighbor's utility), and
+    // credit tied to one lease pays only that lease. Usable is the household
+    // plan the tenant's Pay Now and the desk offer ("credit available $X"); the
+    // balance itself is never netted. Same money rule as seesPaidAhead above: only
+    // a viewer who may see payments, or the desk that takes them. A
+    // property-locked viewer sees only the credit of the leases at their
+    // properties (a general credit is the person's with this company, shown).
+    let credit: null | {
+      total: number; usable: number; paidAhead: number; fromLandlord: number; depositInterest: number
+    } = null
+    // "Paid ahead: $X — covers their next invoice" (the post-payment card).
+    // S655: the same household money the credit figures read (creditBeside —
+    // one rule): a withdrawn credit is not in it, and neither is paid-ahead
+    // money a dispute or bank return of its own funding still claims (it is
+    // not the tenant's; creditUse.householdQuote withholds it). Money a
+    // scheduled retry is holding is already set against a bill, so it is not
+    // "paid ahead" here (credit.paidAhead, everything on file, includes it).
+    let paidAhead: number | null = null
+    if (seesPaidAhead) {
+      const companies = scope ?? (await query<{ landlord_id: string }>(
+        `SELECT DISTINCT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1
+         UNION SELECT DISTINCT tc.landlord_id FROM tenant_credits tc WHERE tc.tenant_id = $1
+         UNION SELECT DISTINCT l.landlord_id FROM lease_prepaid_credits c JOIN leases l ON l.id = c.lease_id WHERE c.tenant_id = $1`,
+        [req.params.id])).map(r => r.landlord_id)
+      const leaseScope = propScope === null ? null : (await query<{ id: string }>(
+        `SELECT l.id FROM leases l JOIN units u ON u.id = l.unit_id
+          WHERE l.landlord_id = ANY($1::uuid[]) AND u.property_id = ANY($2::uuid[])`,
+        [companies, propScope])).map(r => r.id)
+      const { creditBeside } = await import('../services/openBalances')
+      const c = await creditBeside({ tenantId: req.params.id, landlordIds: companies, leaseIds: leaseScope })
+      credit = {
+        total: c.onFile, usable: c.usable,
+        paidAhead: c.paidAhead, fromLandlord: c.fromLandlord, depositInterest: c.depositInterest,
+      }
+      paidAhead = c.paidAheadRemaining
+    }
 
     // Lifetime metrics
     const firstPayment = paymentStats?.first_payment ? new Date(paymentStats.first_payment) : null
@@ -1972,17 +2747,35 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         payments,
         maintenance,
         workTrade,
-        stats: {
+        paidAhead,
+        credit,
+        // True when this viewer may not see payment history (S641). The page
+        // hides the payment cards rather than drawing zeros.
+        paymentsHidden: !seesPayments,
+        stats: seesPayments ? {
           tenantMonths,
           totalPaid:    parseFloat(paymentStats?.total_paid || 0),
           avgPayment:   parseFloat(paymentStats?.avg_payment || 0),
           settledCount: settled,
           failedCount:  parseInt(paymentStats?.failed || 0),
-          lateCount:    tenant.late_payment_count ?? 0,
+          lateCount:    parseInt(lateRow?.n || '0', 10),
           totalPayments: total,
           onTimeRate,
           firstPayment: paymentStats?.first_payment,
           lastPayment:  paymentStats?.last_payment,
+          unitsOccupied: units.length,
+          maintenanceCount: maintenance.length,
+        } : {
+          tenantMonths: null,
+          totalPaid:    null,
+          avgPayment:   null,
+          settledCount: null,
+          failedCount:  null,
+          lateCount:    null,
+          totalPayments: null,
+          onTimeRate:   null,
+          firstPayment: null,
+          lastPayment:  null,
           unitsOccupied: units.length,
           maintenanceCount: maintenance.length,
         }
@@ -2101,6 +2894,9 @@ tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (r
     await storage.save(`avatars/${avatarName}`, req.file.buffer)
     const url = '/api/tenants/avatar-files/' + avatarName
     if (req.user!.profileId!) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId!])
+    // S655: the S652 paid-ahead figure lives on GET /:id/profile only. A copy
+    // of its query sat here, reading req.params.id — which this route does not
+    // have — on every photo upload.
     res.json({ success: true, data: { url } })
   } catch(e) { next(e) }
 })
@@ -2108,21 +2904,101 @@ tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (r
 // /avatar-files/:filename is declared at the top of this file,
 // BEFORE tenantsRouter.use(requireAuth). See pre-auth header.
 
+// S654: a password change ends every OTHER session (every pass minted before
+// it). It used to end the tenant's own too: the stamp was NOW() and the reply
+// carried no new pass, so the very next /auth/me or /auth/refresh refused the
+// pass they had just used and threw them out of the portal for changing their
+// own password. Now:
+//   - the stamp is a WHOLE second, taken from the clock that stamps passes
+//     (a pass's iat is whole seconds; /auth/me and /refresh compare exactly),
+//     and the fresh pass is minted after it, so it can never read as "before";
+//   - the reply carries that fresh pass, and the Profile page stores it;
+//   - the pass asking must itself postdate the last change (the /refresh rule):
+//     this mints a pass, and a pass a previous change ended must not trade the
+//     password for a new one without the emailed code;
+//   - a wrong current password is 400, not 401, so no portal reads a typo as
+//     "your session ended" and signs the person out;
+//   - a pass minted earlier in the SAME whole second as the change is not
+//     ended by it. The window is under a second, and closing it would also end
+//     a real new sign-in made in the rest of that second.
+//
+// S655 (final sweep): the fresh pass goes to a TENANT only, built from the
+// database. This route is open to every signed-in role, and the pass used to be
+// copied from the asking pass's own claims. A team member whose access the
+// landlord had pulled (scope row deleted, so /auth/refresh answers 403
+// "deactivated") could trade their own password for a fresh seven days still
+// carrying the pulled permissions, and repeat it every week. Now:
+//   - only a tenant (the pass AND the account) gets a pass back — the tenant
+//     Profile page is the only caller. Its claims are the ones /auth/refresh
+//     builds for a tenant, read from the database, never copied forward;
+//   - every other role still changes the password and gets no pass, as before:
+//     the change ends their current pass, and signing in again runs the scope
+//     check;
+//   - a locked account (users.locked_until still ahead) is refused with 401
+//     before anything changes, as /auth/refresh refuses it. The pass still
+//     works, so the sentence says how many minutes are left and never "sign in
+//     again"; the Profile page shows it and keeps the pass;
+//   - the new password follows the one minimum every password door uses
+//     (PASSWORD_MIN_LEN, S631).
 tenantsRouter.patch('/password', requireAuth, async (req, res, next) => {
   try {
-    const { currentPassword, newPassword } = req.body
-    if (!currentPassword || !newPassword) throw new AppError(400, 'Current and new password required')
-    if (typeof newPassword !== 'string' || newPassword.length < 8) {
-      throw new AppError(400, 'New password must be at least 8 characters')
+    const { currentPassword, newPassword } = req.body ?? {}
+    if (!currentPassword || !newPassword || typeof currentPassword !== 'string') {
+      throw new AppError(400, 'Current and new password required')
+    }
+    const { PASSWORD_MIN_LEN } = await import('@gam/shared')
+    if (typeof newPassword !== 'string' || newPassword.length < PASSWORD_MIN_LEN) {
+      throw new AppError(400, `New password must be at least ${PASSWORD_MIN_LEN} characters`)
     }
     const bcrypt = require('bcryptjs')
-    const user = await queryOne<any>('SELECT * FROM users WHERE id=$1', [req.user!.userId])
+    const user = await queryOne<{
+      password_hash: string; sessions_valid_from: Date | null; locked_until: Date | null
+      role: string; email: string; tenant_id: string | null
+    }>(
+      `SELECT u.password_hash, u.sessions_valid_from, u.locked_until, u.role, u.email,
+              (SELECT t.id FROM tenants t WHERE t.user_id = u.id LIMIT 1) AS tenant_id
+         FROM users u WHERE u.id=$1`, [req.user!.userId])
     if (!user) throw new AppError(404, 'User not found')
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      // The pass itself still works, so the sentence never says "sign in
+      // again" — the tenant is still signed in and only this change waits.
+      // It says how long, in whole minutes, so the next step is plain.
+      const minutesLeft = Math.max(1, Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / 60_000))
+      throw new AppError(401,
+        `Your account is temporarily locked after too many sign-in attempts. ` +
+        `Try again in ${minutesLeft} ${minutesLeft === 1 ? 'minute' : 'minutes'}, or reset your password from the sign-in page.`)
+    }
+    const { assertPassPostdatesPasswordChange } = await import('./auth')
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
     const valid = await bcrypt.compare(currentPassword, user.password_hash)
-    if (!valid) throw new AppError(401, 'Incorrect current password')
+    if (!valid) throw new AppError(400, 'Your current password is incorrect. Check it and try again.')
     const hash = await bcrypt.hash(newPassword, 10)
-    await query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user!.userId])
-    res.json({ success: true })
+    const changedAtSecond = Math.floor(Date.now() / 1000)
+    await query(
+      'UPDATE users SET password_hash=$1, sessions_valid_from=to_timestamp($3::double precision) WHERE id=$2',
+      [hash, req.user!.userId, changedAtSecond])
+    forgetSessionCutoff(req.user!.userId)
+    if (req.user!.role !== 'tenant' || user.role !== 'tenant') {
+      return res.json({ success: true })
+    }
+    // A tenant's claims as /auth/refresh builds them (sessionClaimsFor): no
+    // scope, no company, nothing carried over from the asking pass. Same
+    // policy: a rolling pass gets a fresh seven days, a fixed one keeps its
+    // original end (lib/sessionToken.ts).
+    const { renewSessionToken } = await import('../lib/sessionToken')
+    const tenantClaims = {
+      userId:      req.user!.userId,
+      role:        user.role,
+      email:       user.email,
+      profileId:   user.tenant_id,
+      landlordId:  null,
+      landlordIds: null,
+      businessId:  null,
+      staffRole:   null,
+      permissions: null,
+    }
+    const token = renewSessionToken(tenantClaims, req.user!)
+    res.json({ success: true, data: { token } })
   } catch (e) { next(e) }
 })
 
@@ -2140,6 +3016,7 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
     // S483: extended SELECT pulls property state + security_deposit
     // (from lease_fees post-S196) so the state-law compute below has
     // all the inputs it needs without a second round-trip.
+    const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
     const lease = await queryOne<any>(`
       SELECT l.*, p.name as property_name, p.state as property_state,
         u.unit_number,
@@ -2157,7 +3034,13 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
       JOIN users lu ON lu.id = la.user_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE l.unit_id = $1 AND l.status IN ('pending','active')
-      ORDER BY l.created_at DESC LIMIT 1`, [unit.id])
+        -- S655: never a new lease whose lease before it ENDED EARLY with nobody
+        -- signed — nobody is staying on; it never starts and is being canceled.
+        AND NOT ${followsLeaseEndedEarlyUnsigned('l')}
+      -- S655: the lease in force first. A new lease waiting to start is the
+      -- NEXT lease (attached below), not "their lease".
+      ORDER BY (l.status = 'active') DESC, l.created_at DESC LIMIT 1`, [unit.id])
+    const nextLease = lease ? await nextLeaseFor(lease.id) : null
 
     // S483: state-law warnings recomputed against the persisted lease.
     // The tenant sees the same hedged factual notice the landlord saw
@@ -2185,11 +3068,32 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
       // so the in-browser viewer renders every lease (generated from terms when
       // there's no e-signed/imported PDF). camelized → lease.documentUrl.
       data: lease
-        ? { ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings }
+        ? { ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings, next_lease: nextLease }
         : lease,
     })
   } catch (e) { next(e) }
 })
+
+/**
+ * S655 (Nic, 10/2): the household's NEW LEASE, once the landlord has signed it
+ * — it takes over on its start date whether or not they have signed, so the
+ * lease page shows it as what comes next ("Your next lease starts …") instead of
+ * a second, identical lease, and without the expiring-lease countdown or the
+ * "are you staying?" question on the one it follows.
+ */
+async function nextLeaseFor(leaseId: string): Promise<any | null> {
+  return queryOne<any>(`
+    SELECT s.id, to_char(s.start_date, 'YYYY-MM-DD') AS start_date, s.rent_amount, s.rent_due_day,
+           s.status, s.signed_by_tenant,
+           (SELECT d.id FROM lease_documents d
+             WHERE d.lease_id = s.id AND d.status IN ('sent','in_progress','completed')
+             ORDER BY d.created_at DESC LIMIT 1) AS document_id
+      FROM leases s
+     WHERE s.supersedes_lease_id = $1
+       AND s.status IN ('pending','active')
+       AND s.signed_by_landlord = TRUE
+     ORDER BY s.start_date ASC LIMIT 1`, [leaseId])
+}
 
 // S554 (Oak Park): a tenant can hold MORE THAN ONE active lease — e.g. space
 // rent on two mobile homes under the same landlord (the same-landlord overlap
@@ -2201,6 +3105,7 @@ tenantsRouter.get('/leases', requireAuth, async (req, res, next) => {
   try {
     const tenant = await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
+    const { followsLeaseEndedEarlyUnsigned } = await import('../services/renewalSuccessor')
     const leases = await query<any>(`
       SELECT l.*, p.name as property_name, p.state as property_state,
         u.unit_number,
@@ -2221,10 +3126,23 @@ tenantsRouter.get('/leases', requireAuth, async (req, res, next) => {
       WHERE lt.tenant_id = $1
         AND lt.status = 'active'
         AND l.status IN ('pending', 'active')
-      ORDER BY l.created_at DESC`, [tenant.id])
+        -- S655: never a new lease whose lease before it ENDED EARLY with nobody
+        -- signed. With the lease it follows gone from this list it used to show
+        -- as their own lease, offered for signing — and a signature made it
+        -- stand and bill a household that had left.
+        AND NOT ${followsLeaseEndedEarlyUnsigned('l')}
+      ORDER BY (l.status = 'active') DESC, l.created_at DESC`, [tenant.id])
+
+    // S655: a new lease of a lease in this list is that lease's NEXT lease, not
+    // a second lease — it rides on the one it follows (next_lease) instead of
+    // showing as a second, identical "Property · Unit" in the switcher.
+    const listed = new Set((leases as any[]).map((l: any) => l.id))
+    const followers = (leases as any[]).filter((l: any) =>
+      l.supersedes_lease_id && listed.has(l.supersedes_lease_id) && l.signed_by_landlord)
+    const folded = new Set(followers.map((l: any) => l.id))
 
     const enriched = []
-    for (const lease of leases as any[]) {
+    for (const lease of (leases as any[]).filter((l: any) => !folded.has(l.id))) {
       let stateLawWarnings: LawFlag[] = []
       try {
         stateLawWarnings = await checkLeaseAgainstStateLaw({
@@ -2238,7 +3156,9 @@ tenantsRouter.get('/leases', requireAuth, async (req, res, next) => {
       } catch (e) {
         logger.error({ err: e, lease_id: lease.id }, '[stateLaw] tenant leases GET checks failed')
       }
-      enriched.push({ ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings })
+      const nextLease = followers.some((f: any) => f.supersedes_lease_id === lease.id)
+        ? await nextLeaseFor(lease.id) : null
+      enriched.push({ ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings, next_lease: nextLease })
     }
 
     res.json({ success: true, data: enriched })
@@ -2276,7 +3196,8 @@ tenantsRouter.get('/lease/addendums', requireAuth, async (req, res, next) => {
        WHERE lt.tenant_id = $1
          AND lt.status = 'active'
          AND l.status IN ('active', 'pending')
-       ORDER BY l.created_at DESC
+       -- S655: the lease in force, not a new lease still waiting to start.
+       ORDER BY (l.status = 'active') DESC, l.created_at DESC
        LIMIT 1`,
       [tenant.id]
     )
@@ -2332,7 +3253,7 @@ tenantsRouter.get('/work-trade', requireAuth, async (req, res, next) => {
     const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     const agreement = await queryOne<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name
+      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id

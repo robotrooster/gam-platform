@@ -1,10 +1,13 @@
 import { DateTime } from 'luxon'
+import { prorateMoveInRent, nextDueDateAfter, dayBefore, LEASE_COLUMN_LABEL } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { hourRateFor } from '../services/workTradeSettlement'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
+import { RESERVATION_PAID_SQL } from '../services/bookingLeaseDraft'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
@@ -35,6 +38,15 @@ export interface MoveInBundleResult {
   rentAmount: number
   moveInFeesInserted: number
   depositInserted: boolean
+  /**
+   * 10/3 (decisions #15): money already paid toward the reservation this lease
+   * was drafted from (its deposit, taken at the register or on the booking
+   * site) that came off this bill's rent, and the part the rent did not use —
+   * kept on the lease as paid-ahead credit for the next bill. Both 0 for any
+   * other lease.
+   */
+  stayDepositCredited?: number
+  stayDepositLeftover?: number
 }
 
 /**
@@ -44,10 +56,17 @@ export interface MoveInBundleResult {
  * everything else to 'SUBSCRIP'.
  */
 function entryDescriptionForFeeType(feeType: string): 'DEPOSIT' | 'RENT' | 'SUBSCRIP' {
-  if (feeType === 'pet_deposit' || feeType === 'key_deposit' || feeType === 'cleaning_deposit') return 'DEPOSIT'
+  if (feeType === 'pet_deposit' || feeType === 'key_deposit' || feeType === 'cleaning_deposit'
+    || feeType === 'utility_deposit') return 'DEPOSIT'
   if (feeType === 'last_month_rent') return 'RENT'
   return 'SUBSCRIP'
 }
+
+/** Dollars as a bill prints them. */
+const money2 = (n: number) => `$${n.toFixed(2)}`
+
+/** 10/3 (decisions #15): the note on the credit a reservation deposit leaves on its lease — also how a re-issue finds it. */
+export const STAY_DEPOSIT_CREDIT_NOTE = "Reservation deposit paid before the lease — the part the first bill's rent did not use"
 
 /** Banker's rounding (half-even) to cents. */
 export function roundHalfEvenCents(value: number): number {
@@ -90,12 +109,17 @@ export function moveInRentAmount(
   rentAmount: number,
   startDate: string,
   isExistingTenancy = false,
+  // S648: the lease's due day. Proration runs to the NEXT due date, which is
+  // the 1st of next month only when rent is due on the 1st.
+  dueDay = 1,
 ): number {
+  assertIsoDate(startDate, 'moveInRentAmount')
   // An existing tenancy always owes a whole month — the cycle it lands on is
   // decided by existingTenancyCycle(), not by how much of it had elapsed.
   if (isExistingTenancy) return roundHalfEvenCents(rentAmount)
   const dt = DateTime.fromISO(startDate, { zone: 'utc' })
-  if (dt.day === 1) return roundHalfEvenCents(rentAmount)
+  if (dt.day === dueDay) return roundHalfEvenCents(rentAmount)
+  if (dueDay !== 1) return prorateMoveInRent(rentAmount, startDate, dueDay)
   const dim = daysInMonth(dt.year, dt.month)
   const daysRemaining = dim - dt.day + 1
   return roundHalfEvenCents(rentAmount * daysRemaining / dim)
@@ -120,10 +144,29 @@ export function moveInRentAmount(
  * residents up in September is normally billing them for September, and that is
  * also the reading that never silently skips a month.
  */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}/
+
+/**
+ * S647: refuse a date this function cannot reason about.
+ *
+ * Both helpers below slice and string-compare dates, which silently produces a
+ * wrong ANSWER rather than an error when handed "10/01/2026" — and the answer
+ * is which month a resident is billed for. It cost RV 09 a September invoice on
+ * an October tenancy. Callers pass the stored column now; this makes sure a
+ * future one that doesn't finds out immediately.
+ */
+function assertIsoDate(d: string, fn: string): void {
+  if (!ISO_DATE.test(d)) {
+    throw new Error(`${fn}: expected an ISO date (YYYY-MM-DD), got "${d}". ` +
+      'Pass the stored lease column, not a raw document field.')
+  }
+}
+
 export function existingTenancyCycle(
   startDate: string,
   firstBillingCycle: string | null,
 ): string {
+  assertIsoDate(startDate, 'existingTenancyCycle')
   const leaseMonth = startDate.slice(0, 8) + '01'
   if (!firstBillingCycle) return leaseMonth
   const declared = String(firstBillingCycle).slice(0, 8) + '01'
@@ -131,11 +174,64 @@ export function existingTenancyCycle(
 }
 
 
+/**
+ * S652 (Nic): "they let their due date be whenever they come in." The DATE of an
+ * existing tenancy's first invoice, for a resident with their OWN due day.
+ *
+ * Nic: "we're only going to bill going forward from the day the property was
+ * added... if I onboard the 15th of the month and I choose October 1st as the
+ * first billing cycle... if somebody's on the 20th or 25th, that is occurring
+ * after the onboarding of the 15th, and so they would be billed before the 1st
+ * of the month." So: the first time their day comes round on or after the day
+ * the property was added to GAM. Not the signing date — a resident who signs
+ * on the 25th at a park added on the 15th is billed for the 20th, the way a
+ * resident on the 1st who signed on the 23rd was billed for the 1st. And not
+ * the first billing cycle, which is the rule for the 1st.
+ *
+ * Due on the 1st keeps the S631 rule — the 1st of the cycle month named by
+ * the property's first billing cycle, which may already be past.
+ */
+export function existingTenancyFirstDue(
+  startDate: string,
+  firstBillingCycle: string | null,
+  dueDay: number | null | undefined,
+  propertyAddedOn?: string | null,
+): string {
+  const day = Math.min(Math.max(Math.trunc(Number(dueDay)) || 1, 1), 28)
+  if (day === 1) return existingTenancyCycle(startDate, firstBillingCycle)
+  assertIsoDate(startDate, 'existingTenancyFirstDue')
+  const anchor = propertyAddedOn && ISO_DATE.test(propertyAddedOn) ? propertyAddedOn.slice(0, 10) : startDate
+  const due = anchor.slice(0, 8) + String(day).padStart(2, '0')
+  return due >= anchor ? due : nextDueDateAfter(anchor, day)
+}
+
+export interface MoveInOpts {
+  /**
+   * The lease RENEWS one the household is already on (lease_documents.renews_lease_id).
+   *
+   * Nic: "people get billed on their due date according to how the landlord
+   * sets the property." A renewal is not a move-in, so this bill carries NO
+   * rent — the nightly run bills the renewal's rent on the household's own
+   * due dates (invoiceGeneration, isRenewalSuccessor). It bills only one-time
+   * money the landlord put on the renewal: a deposit increase (the S534
+   * top-up row) and any one-time fee typed on the form. With none of that,
+   * no invoice is written at all.
+   *
+   * It is dated the day before the new lease starts — the old lease's last
+   * day. That date can never be one of the new lease's rent dates (it bills
+   * nothing before its start), so the (lease, due date) slot stays free for
+   * the regular bill.
+   */
+  renewal?: boolean
+}
+
 export async function generateMoveInInvoice(
   inputs: MoveInInputs,
-  externalClient?: PoolClient
+  externalClient?: PoolClient,
+  opts: MoveInOpts = {},
 ): Promise<MoveInBundleResult> {
-  // S548: booking-sourced leases prorate the arrival month at monthly/30
+  const renewal = opts.renewal === true
+  // S548: booking-sourced leases prorate the arrival month by the days in it
   // (the calendar schedule the guest was quoted); regular leases keep the
   // long-standing days-remaining/days-in-month proration.
   // S28: optional caller-owned transaction. When externalClient is provided,
@@ -176,10 +272,27 @@ export async function generateMoveInInvoice(
   const leaseMetaRes = await client.query<{
     lease_source: string | null; end_date: string | null
     is_existing_tenancy: boolean; first_billing_cycle: string | null
+    onboarding_late_fee_waiver: boolean
+    move_in_first_month_rent: string | null; move_in_proration: string | null
+    rent_due_day: number
+    property_added_on: string | null
+    lease_start_date: string; property_tz: string
+    source_booking_id: string | null
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
+            l.source_booking_id,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
-            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle
+            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+            COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver,
+            l.move_in_first_month_rent::text AS move_in_first_month_rent,
+            l.move_in_proration::text AS move_in_proration,
+            COALESCE(l.rent_due_day, 1) AS rent_due_day,
+            -- S652: the day the property was added to GAM, in its own time zone.
+            to_char((COALESCE(p.onboarding_started_at, p.created_at)
+                     AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
+            -- S654: read exactly as invoiceGeneration's ACTIVE_LEASE_SELECT does.
+            to_char(l.start_date, 'YYYY-MM-DD') AS lease_start_date,
+            COALESCE(p.timezone, 'America/Phoenix') AS property_tz
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -189,9 +302,53 @@ export async function generateMoveInInvoice(
   const bookingArrival = leaseMeta && isBookingScheduleLease(leaseMeta)
     ? bookingRentForDueDate(inputs.start_date, leaseMeta.end_date!, inputs.rent_amount, inputs.start_date)
     : null
-  const rentForMoveIn = bookingArrival != null
+  const rentBeforeStayDeposit = renewal ? 0
+    : bookingArrival != null
     ? roundHalfEvenCents(bookingArrival)
-    : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy)
+    // S648 (Nic): page 8 IS the move-in invoice. A new tenant is billed the
+    // first month's rent and proration the landlord signed (specials
+    // included). An onboarding resident keeps the full-month rule — their
+    // page 8 is locked to exactly that. A lease with no page 8 values (older
+    // template) keeps the original rule.
+    : (!leaseMeta?.is_existing_tenancy && leaseMeta?.move_in_first_month_rent != null
+        && leaseMeta?.move_in_proration != null)
+      ? roundHalfEvenCents(Number(leaseMeta.move_in_first_month_rent) + Number(leaseMeta.move_in_proration))
+      : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy,
+          leaseMeta?.rent_due_day ?? 1)
+
+  // ── 10/3 (decisions #15): A RESERVATION'S DEPOSIT COMES OFF THE LEASE'S FIRST BILL ──
+  //
+  // "A reservation that becomes a lease is never charged its whole quoted price
+  // at the counter: the counter takes only what is due now (the deposit), and
+  // the lease bills the rest; never both." The register (and the booking site)
+  // take that deposit and stamp it on the reservation (unit_bookings
+  // .deposit_amount, deposit_paid_at). The lease drafted from the reservation
+  // (services/bookingLeaseDraft) then billed its arrival rent in full, so the
+  // deposit was paid once at the counter and billed again here.
+  //
+  // What was paid toward the stay comes off this bill's RENT — the line it was
+  // paid toward — and the rent line says so. A deposit bigger than the arrival
+  // rent (a late-month arrival) leaves the rest as paid-ahead credit on the
+  // lease for the next bill. That money is already the landlord's (a register
+  // sale or a booking deposit, paid out as such) and already counted in the
+  // reports as a stay, so it is the "already paid, already counted" kind of
+  // credit (funded_by 'reclassified'): it settles a bill but is never paid out
+  // a second time. A renewal or an onboarding resident has no reservation.
+  let stayPaid: { amount: number; paidAt: Date | null } | null = null
+  if (!renewal && !leaseMeta?.is_existing_tenancy && leaseMeta?.source_booking_id) {
+    const b = await client.query<{ paid: string | null; paid_at: Date | null }>(
+      // The same amount the landlord's notice named when the lease was drafted
+      // (services/bookingLeaseDraft RESERVATION_PAID_SQL — one definition).
+      `SELECT ${RESERVATION_PAID_SQL}::text AS paid,
+              COALESCE(b.deposit_paid_at, b.balance_paid_at) AS paid_at
+         FROM unit_bookings b WHERE b.id = $1`,
+      [leaseMeta.source_booking_id])
+    const paid = roundHalfEvenCents(Number(b.rows[0]?.paid ?? 0))
+    if (paid > 0) stayPaid = { amount: paid, paidAt: b.rows[0]?.paid_at ?? null }
+  }
+  const stayDepositCredited = stayPaid ? Math.min(stayPaid.amount, rentBeforeStayDeposit) : 0
+  const rentForMoveIn = roundHalfEvenCents(rentBeforeStayDeposit - stayDepositCredited)
+  const stayDepositLeftover = stayPaid ? roundHalfEvenCents(stayPaid.amount - stayDepositCredited) : 0
 
   // S631: an existing tenancy's first invoice is dated the 1st of its billing
   // cycle, not the signing date. That is what makes it a September invoice for
@@ -199,9 +356,29 @@ export async function generateMoveInInvoice(
   // already be past, because an existing tenant knows when rent is due. Nic:
   // "For existing tenants, the anticipation of due date and bill pay and all
   // that stuff is known. It's an existing tenancy. Late fees are there."
-  const invoiceDueDate = leaseMeta?.is_existing_tenancy
-    ? existingTenancyCycle(inputs.start_date, leaseMeta.first_billing_cycle)
+  // S652: the first time the resident's own due day comes round after signing
+  // — the 1st of the cycle only when the 1st is their day.
+  const invoiceDueDate = renewal
+    ? dayBefore(inputs.start_date)
+    : leaseMeta?.is_existing_tenancy
+    ? existingTenancyFirstDue(inputs.start_date, leaseMeta.first_billing_cycle, leaseMeta.rent_due_day, leaseMeta.property_added_on)
     : inputs.start_date
+
+  // S652 (Nic): "We are not in October. There shouldn't be open bills at all."
+  // An existing resident's first bill belongs to the first billing cycle, and
+  // it is made by the nightly job WHEN that cycle arrives — with the month's
+  // meter reads on it. Making it at signing, weeks early, put an empty October
+  // statement in Curtis Clabough's inbox on September 23rd.
+  if (leaseMeta?.is_existing_tenancy && !renewal) {
+    const tzRow = await client.query<{ tz: string }>(
+      `SELECT COALESCE(p.timezone, 'America/Phoenix') AS tz FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+      [inputs.unit_id])
+    const today = DateTime.now().setZone(tzRow.rows[0]?.tz || 'America/Phoenix').toISODate()!
+    if (invoiceDueDate > today) {
+      if (ownsTx) client.release()
+      return { invoiceCreated: false, invoiceId: null, invoiceNumber: null, rentAmount: inputs.rent_amount, moveInFeesInserted: 0, depositInserted: false }
+    }
+  }
 
   // S631 (Nic): a work-trade tenant must not be fined while they are working the
   // month off. The monthly cron has stamped late_fee_exempt for this since S623;
@@ -243,14 +420,32 @@ export async function generateMoveInInvoice(
   // separate pool connection at READ COMMITTED. Reading via `client` ensures
   // we see the in-flight inserts.
   const feesRes = await client.query(
-    `SELECT id, fee_type, amount, description
+    `SELECT id, fee_type, amount, description, money_kind
      FROM lease_fees
      WHERE lease_id = $1 AND due_timing = 'move_in'`,
     [inputs.lease_id]
   )
-  const fees = feesRes.rows as Array<{
+  const fees = (feesRes.rows as Array<{
     id: string; fee_type: string; amount: string; description: string | null
-  }>
+    // S653: what the landlord tagged the box as — fee / deposit / prepaid.
+    money_kind: 'fee' | 'deposit' | 'prepaid'
+  }>)
+    // A renewal's carried deposits are copied onto the new lease AFTER this
+    // runs (routes/esign.ts), and a $0 box is no charge; only what is owed now.
+    .filter(f => !renewal || Number(f.amount) > 0)
+
+  // A renewal with nothing one-time to bill writes no invoice at all — an
+  // empty bill is still a document in the tenant's portal and the landlord's
+  // books. Checked before an invoice number is spent.
+  if (renewal) {
+    const utilitiesWaiting = await client.query(
+      `SELECT 1 FROM utility_bills WHERE lease_id = $1 AND payment_id IS NULL
+          AND status IN ('unbilled','billed') AND charge_amount > 0 LIMIT 1`, [inputs.lease_id])
+    if (fees.length === 0 && utilitiesWaiting.rows.length === 0) {
+      if (ownsTx) client.release()
+      return { invoiceCreated: false, invoiceId: null, invoiceNumber: null, rentAmount: 0, moveInFeesInserted: 0, depositInserted: false }
+    }
+  }
 
   try {
     if (ownsTx) await client.query('BEGIN')
@@ -314,13 +509,42 @@ export async function generateMoveInInvoice(
     const totalAmount = (rentSuspended ? 0 : rentForMoveIn)
       + feesTotal + depositAmountForInvoice + firstInstallmentAmount
 
+    // S654: the late-fee stamp is decided the same way the nightly generator
+    // decides it (invoiceGeneration.ts, lateStartExempt): work trade, OR the
+    // first bill of an existing tenancy where the landlord waived it. A voided
+    // history invoice is not a prior bill (S654).
+    //
+    // Nic (10/2): the S638 "started after the 20th" exemption is gone. "That
+    // late fee waiver was just my personal preference... That should be a
+    // landlord preference, not a platform setting." The property's onboarding
+    // answer (onboarding_late_fee_waiver) is the only thing that waives a first
+    // bill now. A renewal is nobody's first bill on the platform.
+    const priorInvoice = await client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
+      [inputs.lease_id, invoiceDueDate])
+    const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
+    const onboardingWaived =
+      !renewal && !!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver
+    // A renewal signed after its own start is dated a day already gone; a fee
+    // for missing a bill nobody had sent yet is not a late fee (S647's reasoning).
+    const renewalBackdated = renewal
+      && invoiceDueDate < DateTime.now().setZone(leaseMeta?.property_tz ?? 'America/Phoenix').toISODate()!
+    const lateFeeExempt = !!wtAgreement || renewalBackdated
+      || (isFirstInvoice && onboardingWaived)
+
+    // 10/3 (decisions #15): the bill says what the reservation's deposit did.
+    const keepsLeftover = stayDepositLeftover > 0 && !!inputs.tenant_id
+    const stayDepositNote = !stayPaid ? null
+      : `The ${money2(stayPaid.amount)} already paid toward the reservation `
+        + (stayDepositCredited > 0 ? `covers ${money2(stayDepositCredited)} of this bill's rent` : 'was not used on this bill')
+        + (keepsLeftover ? `; the other ${money2(stayDepositLeftover)} is kept as credit toward the next bill.` : '.')
     const invoiceRes = await client.query(
       `INSERT INTO invoices (
          landlord_id, tenant_id, lease_id, unit_id,
          invoice_number, due_date,
          subtotal_rent, subtotal_fees, subtotal_deposits, total_amount,
-         work_trade_agreement_id, late_fee_exempt
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         work_trade_agreement_id, late_fee_exempt, notes
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (lease_id, due_date) DO NOTHING
        RETURNING id`,
       [
@@ -331,7 +555,25 @@ export async function generateMoveInInvoice(
         depositAmountForInvoice.toFixed(2),
         totalAmount.toFixed(2),
         wtAgreement?.id ?? null,
-        !!wtAgreement,
+        // S647: work trade, OR an existing tenancy's first invoice.
+        //
+        // invoiceGeneration has exempted the latter since S637 on reasoning
+        // that applies here word for word — "their first bill here was late
+        // because onboarding took time, which is our doing and not theirs,
+        // however long they take to get signed." The MOVE-IN invoice never got
+        // the same carve-out, and issuance is what makes that bite: an existing
+        // tenancy's first invoice is deliberately dated the 1st of its cycle,
+        // which can already be weeks past. Billing someone a late fee for
+        // missing a bill nobody had sent them yet is indefensible, and it is
+        // the first thing they would ever see from this platform.
+        //
+        // Only the FIRST one. After a full cycle they are an ordinary resident
+        // and their lease's own late-fee terms apply, exactly as configured.
+        //
+        // S648 (Nic): and only where the landlord chose to waive it for this
+        // property. Unanswered = the resident is billed late fees.
+        lateFeeExempt,
+        stayDepositNote,
       ]
     )
 
@@ -370,23 +612,63 @@ export async function generateMoveInInvoice(
           rentForMoveIn.toFixed(2), invoiceDueDate,
           // S634: suspended while the hours are being worked — see totalAmount.
           rentSuspended ? new Date().toISOString() : null,
-          rentSuspended ? 'Work trade — suspended while the hours are worked; settled at month close' : null,
+          rentSuspended ? 'Work trade — suspended while the hours are worked; settled at month close'
+            : stayDepositCredited > 0
+            ? `Rent ${money2(rentBeforeStayDeposit)} less the ${money2(stayDepositCredited)} reservation deposit already paid`
+            : null,
         ]
       )
     }
 
+    // 10/3 (decisions #15): what the arrival rent did not use is the tenant's,
+    // kept on the lease for the next bill — never billed again, never paid out
+    // again (it reached the landlord with the reservation). Once per lease: a
+    // re-issued lease (unwound and signed again) finds it already there.
+    if (keepsLeftover) {
+      const had = await client.query(
+        `SELECT 1 FROM lease_prepaid_credits
+          WHERE lease_id = $1 AND note = $2 AND voided_at IS NULL LIMIT 1`,
+        [inputs.lease_id, STAY_DEPOSIT_CREDIT_NOTE])
+      if (!had.rows.length) {
+        const { createPaidAhead } = await import('../services/creditUse')
+        await createPaidAhead(client, {
+          leaseId: inputs.lease_id, tenantId: inputs.tenant_id!, amount: stayDepositLeftover,
+          fundedBy: 'reclassified', receivedAt: stayPaid!.paidAt ?? new Date(),
+          note: STAY_DEPOSIT_CREDIT_NOTE,
+        })
+      }
+    } else if (stayDepositLeftover > 0) {
+      logger.warn({ leaseId: inputs.lease_id, leftover: stayDepositLeftover },
+        '[moveIn] reservation deposit larger than the arrival rent, but the lease has no tenant to keep the credit for')
+    }
+
     let moveInFeesInserted = 0
     for (const fee of nonDepositFees) {
+      // S653 (Nic): the box's TAG decides what the money is, never its name.
+      //   deposit — a type='deposit' row: held in trust like the security
+      //             deposit (the allocation never pays it to the landlord), and
+      //             returned at move-out by services/depositReturn.
+      //   prepaid — a fee row GAM HOLDS for the tenant (revenue_owner='held'):
+      //             not the landlord's at settlement, not GAM's revenue. When it
+      //             settles, the payments trigger banks it as paid-ahead credit
+      //             and the next rent invoices draw it down, releasing each
+      //             month's share to the landlord then.
+      //   fee     — the landlord's money, as before.
+      const kind = fee.money_kind ?? 'fee'
       await client.query(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, lease_fee_id
-         ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, 'pending', $7, $8, $9)`,
+           type, amount, status, due_date, entry_description, lease_fee_id, revenue_owner, notes
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11, $12)`,
         [
           invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          kind === 'deposit' ? 'deposit' : 'fee',
           fee.amount, invoiceDueDate,
-          entryDescriptionForFeeType(fee.fee_type),
+          kind === 'deposit' ? 'DEPOSIT' : entryDescriptionForFeeType(fee.fee_type),
           fee.id,
+          kind === 'prepaid' ? 'held' : 'landlord',
+          // The box's printed label, so the tenant's invoice says what the lease said.
+          fee.description || (LEASE_COLUMN_LABEL as Record<string, string>)[fee.fee_type] || null,
         ]
       )
       moveInFeesInserted++
@@ -474,7 +756,11 @@ export async function generateMoveInInvoice(
       const amount = Number(ub.charge_amount)
       if (!(amount > 0)) continue
       const covered = wtCovers(String(ub.utility_type))
-      const label = `${String(ub.utility_type)[0].toUpperCase()}${String(ub.utility_type).slice(1)} — ${ub.cycle_label} (used before the lease was signed)`
+      // S654 (Nic): an onboarding resident already lived there — "nobody moves
+      // in during onboarding" — so their earlier usage is just that month's
+      // usage. Only a genuinely new tenancy gets the before-signing note.
+      const label = `${String(ub.utility_type)[0].toUpperCase()}${String(ub.utility_type).slice(1)} — ${ub.cycle_label}`
+        + (leaseMeta?.is_existing_tenancy ? '' : ' (used before the lease was signed)')
       const up = await client.query<{ id: string }>(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,
@@ -525,25 +811,42 @@ export async function generateMoveInInvoice(
       const basis = (rentSuspended ? rentForMoveIn : 0) + wtUtilityBasis
       if (basis > 0) {
         const monthStart = invoiceDueDate.slice(0, 8) + '01'
+        // S637: tracks_hours is the parent switch. A trusted agreement reports
+        // an effective target of 0 — nothing is asked, and settlement credits
+        // the whole basis.
         const wtRow = await client.query<{ monthly_hours_target: string | null }>(
-          `SELECT monthly_hours_target FROM work_trade_agreements WHERE id = $1`,
+          `SELECT CASE WHEN tracks_hours THEN monthly_hours_target ELSE 0 END
+                    AS monthly_hours_target
+             FROM work_trade_agreements WHERE id = $1`,
           [wtAgreement.id])
         const fullTarget = Number(wtRow.rows[0]?.monthly_hours_target ?? 0)
         // Prorate the hours by how much of the month the rent covers: a half
-        // month of rent cannot ask for a full month of labour.
+        // month of rent cannot ask for a full month of labor.
         const fullMonthRent = Number(inputs.rent_amount) || rentForMoveIn
         const target = fullTarget > 0 && fullMonthRent > 0 && rentForMoveIn > 0
           ? Math.round((fullTarget * (rentForMoveIn / fullMonthRent)) * 100) / 100
           : fullTarget
-        if (target > 0) {
-          await client.query(
-            `INSERT INTO work_trade_settlements
-               (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount)
-             VALUES ($1, $2, $3::date, $4, $5, $6)
-             ON CONFLICT (agreement_id, period_month) DO NOTHING`,
-            [wtAgreement.id, invoiceId, monthStart, target.toFixed(2),
-             (basis / target).toFixed(4), basis.toFixed(2)])
-        }
+        // S637: a ZERO-hour agreement still opens a period. It has nothing to
+        // settle, but the period is what carries the credit onto the invoice —
+        // skipping it would leave the move-in charges suspended forever with
+        // nothing to release them.
+        // S648: a tenant due on another day works from move-in to the day
+        // before their first due date; the 1st keeps the calendar month.
+        // S652: an onboarding resident's first invoice is dated their own due
+        // day now, so their work period runs from it like anyone else's.
+        const wtDueDay = leaseMeta?.rent_due_day ?? 1
+        const periodStart = wtDueDay === 1 ? monthStart : invoiceDueDate
+        const periodEnd = wtDueDay === 1
+          ? DateTime.fromISO(monthStart).endOf('month').toISODate()!
+          : DateTime.fromISO(nextDueDateAfter(invoiceDueDate, wtDueDay)).minus({ days: 1 }).toISODate()!
+        await client.query(
+          `INSERT INTO work_trade_settlements
+             (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount,
+              period_start, period_end)
+           VALUES ($1, $2, $3::date, $4, $5, $6, $7::date, $8::date)
+           ON CONFLICT (agreement_id, period_start) DO NOTHING`,
+          [wtAgreement.id, invoiceId, monthStart, target.toFixed(2),
+           hourRateFor(basis, target).toFixed(4), basis.toFixed(2), periodStart, periodEnd])
       }
     }
 
@@ -581,6 +884,8 @@ export async function generateMoveInInvoice(
       rentAmount: rentForMoveIn,
       moveInFeesInserted,
       depositInserted,
+      stayDepositCredited,
+      stayDepositLeftover: keepsLeftover ? stayDepositLeftover : 0,
     }
   } catch (e) {
     if (ownsTx) await client.query('ROLLBACK')

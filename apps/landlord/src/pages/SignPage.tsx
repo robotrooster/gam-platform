@@ -2,9 +2,13 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
-import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone } from '@gam/shared'
+import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso,
+  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent,
+  leaseDueDay, dueDayLabel, parseDueDay, renewalSchedule, renewalBillingSummary, dayBefore, defaultMoneyKind,
+  type FeeType } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
+import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -41,6 +45,22 @@ const SIG_FONTS = [
   { id:'classic',  name:'Classic',  css:"italic 40px 'Palatino Linotype', 'Book Antiqua', Palatino, serif" },
   { id:'modern',   name:'Modern',   css:"italic 38px Garamond, 'Times New Roman', serif" },
 ]
+
+// S637: canvas scale for a crisp page on a high-density screen. Past the
+// device's pixel ratio we add zoom headroom, then clamp total canvas area —
+// mobile Safari hands back a BLANK canvas past its size limit.
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
 
 // Canvas-rendered signature preview — visually distinct styles regardless of system fonts
 function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; small?:boolean }) {
@@ -297,17 +317,33 @@ export function SignPage() {
   // packages/shared/src/standaloneScroll.ts for the whole story.
   useEffect(() => unlockScrollIfStandalone(), [])
   const navigate = useNavigate()
+  // S655: documents still to sign after this one, when the park-wide sender
+  // opened a batch (?queue=id,id,…) — document ids from the screen, or the
+  // landlord's own signing tokens from the morning reminder email (so its one
+  // link works without a session). Read on every document change.
+  const signingQueue: string[] = (new URLSearchParams(window.location.search).get('queue') || '')
+    .split(',').map(x => x.trim()).filter(x => /^([0-9a-f-]{36}|[0-9a-f]{64})$/i.test(x))
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [fieldFonts, setFieldFonts]   = useState<Record<string,string>>({})
   const [savedSig, setSavedSig]       = useState<{value:string,font?:string}|null>(null)
   const [savedInit, setSavedInit]     = useState<{value:string,font?:string}|null>(null)
   const [activeField, setActiveField] = useState<any>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [showBundle, setShowBundle] = useState(false)
   const [pdfPageCount, setPdfPageCount] = useState(1)
   const [pdfDims, setPdfDims]         = useState<{width:number,height:number}|null>(null)
   const [allDone, setAllDone]         = useState(false)
   const [setupDone, setSetupDone]     = useState(false)
+  // S652 (Blu): walking from page 4 of the installment contract into the
+  // two-page lead-paint disclosure showed "4/2" and no boxes until he paged
+  // away and back. The route changes the token but React keeps this same
+  // component, so every per-document state has to start over here.
+  useEffect(() => {
+    setCurrentPage(1); setActiveField(null); setFieldValues({}); setFieldFonts({})
+    setStage('signing'); setSubmitError(null); setAllDone(false); setShowBundle(false)
+  }, [token])
   const containerRef = useRef<HTMLDivElement>(null)
   const pdfRef       = useRef<any>(null)
   const canvasRef    = useRef<HTMLCanvasElement>(null)
@@ -325,7 +361,10 @@ export function SignPage() {
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
     { onSuccess:(res:any)=>{ setAllDone(res.data?.completed ?? res.completed); setStage('done') },
-      onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
+      // S652 (Blu, MH 18): a rejected submit used to drop back to the document
+      // with a toast that nobody saw — "it just reloads to the same page." The
+      // review sheet stays open and says what the server said.
+      onError:(e:any)=>{ setSubmitError(e?.message || 'Signing failed — try again.'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
@@ -334,15 +373,20 @@ export function SignPage() {
     const containerWidth = containerRef.current.clientWidth
     const vp = page.getViewport({ scale:1 })
     const scale = containerWidth / vp.width
+    // CSS scale is what positions every field box — unchanged.
     scaleRef.current = scale
-    const sv = page.getViewport({ scale })
+    const cssVp = page.getViewport({ scale })
+    // S637: render at real screen density with zoom headroom. Sized in CSS
+    // pixels, a phone at devicePixelRatio 3 drew a third-resolution lease.
+    const sv = page.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     canvas.width = sv.width
     canvas.height = sv.height
     canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     canvas.style.display = 'block'
     await page.render({ canvasContext:canvas.getContext('2d')!, viewport:sv }).promise
-    setPdfDims({ width:sv.width, height:sv.height })
+    setPdfDims({ width:cssVp.width, height:cssVp.height })
   }, [])
 
   const loadPdf = useCallback(async (url:string) => {
@@ -353,7 +397,7 @@ export function SignPage() {
     // rendered signature fields over a blank canvas.
     //
     // The signer's token goes on the query string instead, and the file route's
-    // per-row check authorises it the same way it authorises the landlord: the
+    // per-row check authorizes it the same way it authorizes the landlord: the
     // token says who is asking, the document says what they may see.
     const base = url.startsWith('http') ? url : API+url
     const byToken = isSignerToken(token)
@@ -367,7 +411,114 @@ export function SignPage() {
   }, [renderPageImperative, token])
 
   useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
+
+  // RENEWAL (Nic: "people get billed on their due date according to how the
+  // landlord sets the property"). S655: a NEW LEASE for a household already
+  // living here. The lease it follows — its last day, due day and the deposits
+  // it holds — and how each money box on this form is tagged come from the
+  // server with the document (GET /sign renewal_billing), so the page is right
+  // whether it was opened signed in or from the emailed link. A deposit-type box
+  // bills only its increase, by the same tag the server reads when it stamps
+  // page 8 and bills the increase.
+  const renewalBilling: any = data?.renewalBilling ?? null
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
+
+  // ── S648 (Nic): PAGE 8 ADDS ITSELF UP AS YOU TYPE ─────────────────────
+  //   "The total should still calculate everything from those and not be
+  //    typable." "Page eight security deposit copies page two."
+  // The server recomputes the same numbers when you sign (moveInBoxes.ts);
+  // this is so the page you are signing already shows them.
+  const autoProration = useRef<string | null>(null)
+  const autoDueDay = useRef<string | null>(null)
+  useEffect(() => {
+    if (!data?.fields) return
+    const fs: any[] = data.fields
+    const existing = !!data.existingTenancy
+    const val = (col: string) => {
+      const f = fs.find(x => x.leaseColumn === col && (fieldValues[x.id] ?? '').trim() !== '')
+      return f ? fieldValues[f.id] : null
+    }
+    const toIso = (v: string | null) => {
+      if (!v) return null
+      if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v.slice(0, 10)
+      const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(v.trim())
+      return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : null
+    }
+    const moveInFeeTags = FEE_TYPES.filter(t => t !== 'security_deposit' && t !== 'other_fee'
+      && FEE_TYPE_META[t].dueTiming === 'move_in')
+    const want: Record<string, string> = {}
+    const rent = moneyBoxValue(val('rent_amount'))
+    // A renewal is not a move-in: page 8 bills no rent (the bill run bills it
+    // on the household's own due dates), the due day is the household's (never
+    // re-read from the renewal's start date), and a deposit-type box bills only
+    // what rises above what the old lease already holds.
+    const renewal = !!data.document?.renewsLeaseId
+    const carried: Record<string, number> = {}
+    if (renewal) {
+      carried['security_deposit'] = Number(data.carriedDeposit || 0)
+      for (const d of (data.renewalBilling?.carriedDeposits ?? []) as any[]) {
+        if (d.feeType === 'security_deposit') continue
+        carried[d.feeType] = (carried[d.feeType] ?? 0) + Number(d.amount || 0)
+      }
+    }
+    const kinds: Record<string, string> = Object.fromEntries(
+      ((data.renewalBilling?.boxMoneyKinds ?? []) as any[]).map((k: any) => [k.leaseColumn, k.moneyKind]))
+    const billedOnRenewal = (tag: string, raw: string | null) => {
+      const typed = moneyBoxValue(raw)
+      if (!renewal || (kinds[tag] ?? defaultMoneyKind(tag as FeeType)) === 'fee') return typed
+      return Math.max(0, Math.round((typed - (carried[tag] ?? 0)) * 100) / 100)
+    }
+    if (renewal) {
+      want['move_in_first_month_rent'] = '0.00'
+      want['move_in_proration'] = '0.00'
+    } else if (existing) {
+      want['move_in_first_month_rent'] = rent.toFixed(2)
+      want['move_in_proration'] = '0.00'
+      for (const t of moveInFeeTags) want[t] = '0.00'
+    } else {
+      const start = toIso(val('start_date'))
+      // S648: billed on the move-in day → the due day follows the start date
+      // until the landlord types a different day for this tenant.
+      const moveInDay = data.rentDueMode === 'move_in_day'
+      if (moveInDay && start) {
+        const curDay = val('rent_due_day')
+        const autoDay = dueDayLabel(leaseDueDay({ mode: 'move_in_day', propertyDay: 1, startIso: start }))
+        if (curDay == null || curDay === autoDueDay.current || autoDueDay.current == null) {
+          want['rent_due_day'] = autoDay
+          autoDueDay.current = autoDay
+        }
+      }
+      const dueDay = parseDueDay(want['rent_due_day'] ?? val('rent_due_day')) ?? 1
+      // Proration follows the start date and rent until the landlord types
+      // their own figure over it (a special) — then it is theirs. Billed on
+      // the move-in day, there is nothing to prorate.
+      const current = val('move_in_proration')
+      const auto = !start ? null
+        : (moveInDay || Number(start.slice(8, 10)) === dueDay) ? '0.00'
+        : prorateMoveInRent(rent, start, dueDay).toFixed(2)
+      if (auto != null && (current == null || current === autoProration.current)) {
+        want['move_in_proration'] = auto
+        autoProration.current = auto
+      }
+    }
+    const first = want['move_in_first_month_rent'] ?? val('move_in_first_month_rent')
+    const prorate = want['move_in_proration'] ?? val('move_in_proration')
+    const deposit = renewal
+      ? billedOnRenewal('security_deposit', val('security_deposit'))
+      : moveInDepositMirror(val('security_deposit'), existing)
+    want['move_in_security_deposit'] = deposit.toFixed(2)
+    want['move_in_total_due'] = moveInTotalDue({
+      firstMonthRent: first, proration: prorate, depositMirror: deposit,
+      moveInFees: moveInFeeTags.map(t => renewal ? billedOnRenewal(t, want[t] ?? val(t)) : (want[t] ?? val(t))),
+    }).toFixed(2)
+    const updates: Record<string, string> = {}
+    for (const f of fs) {
+      if (!f.leaseColumn || !(f.leaseColumn in want)) continue
+      if (f.signerRole !== 'landlord' || f.mine === false || data.readOnly) continue
+      if ((fieldValues[f.id] ?? '') !== want[f.leaseColumn]) updates[f.id] = want[f.leaseColumn]
+    }
+    if (Object.keys(updates).length) setFieldValues(prev => ({ ...prev, ...updates }))
+  }, [data, fieldValues])
   useEffect(() => {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
@@ -409,13 +560,21 @@ export function SignPage() {
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
       <AlertCircle size={40} style={{ color:'var(--red)' }}/>
       <h2 style={{ color:'var(--text-0)' }}>Invalid Signing Link</h2>
-      <p style={{ color:'var(--text-3)', maxWidth:380 }}>This link may be invalid or not associated with your account.</p>
+      <p style={{ color:'var(--text-3)', maxWidth:380 }}>{(error as any)?.message || 'This link may be invalid or not associated with your account.'}</p>
       <button className="btn btn-ghost" onClick={()=>navigate('/')}>Back to Portal</button>
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly } = data
+  const { signer, document:doc, fields, readOnly, packageDocs } = data
   const allFields = fields || []
+
+  // S652: the next document in this packet that still needs THIS signer. Blu
+  // signed nine leases and never saw the eight documents behind each one.
+  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
+  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
+  const needsMe = (d:any) => d.mine && d.mine.status !== 'signed' && d.mine.status !== 'declined' && d.status !== 'completed' && d.status !== 'voided'
+  const nextForMe = [...bundle.slice(selfAt + 1), ...bundle.slice(0, Math.max(selfAt, 0))].find((d:any)=> !d.isSelf && needsMe(d))
+  const leftForMe = bundle.filter((d:any)=> !d.isSelf && needsMe(d)).length
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
   // child to its parent by (child.parentFieldId == parent.templateFieldId).
@@ -423,6 +582,8 @@ export function SignPage() {
     if (!f.parentFieldId) return true
     const parent = allFields.find((p:any)=> p.templateFieldId && p.templateFieldId === f.parentFieldId)
     if (!parent) return true // parent not in this signer's set → always show
+    // S652: a child of a CHOICE box shows when that box is the one chosen.
+    if (parent.fieldType === 'choice') return !!(fieldValues[parent.id] ?? parent.value)
     return (fieldValues[parent.id] ?? parent.value ?? null) === f.parentOption
   }
   // Set a value and clear any children of this field whose trigger no longer
@@ -460,16 +621,51 @@ export function SignPage() {
   // DO uses only this signer's. Older payloads carry no `mine`, in which case
   // every field returned was already this signer's — treat it as true.
   const isMine = (f:any) => f.mine !== false
+  // S652: a choice box marked X/check shows the glyph, not the option text it stores.
+  const shown = (f:any, v:string) => f.fieldType==='choice' && f.checkboxMark!=='initials' ? (f.checkboxMark==='check' ? '✓' : 'X') : v
   const myFields = activeFields.filter(isMine)
   const requiredFields = myFields.filter((f:any)=>f.required)
   // Filled by the system rather than by this signer — lease data stamped at
   // draft time, plus the signing date. Counted separately so the header can say
   // what is actually left to do.
   const prefilledCount = requiredFields.filter((f:any)=>f.value || /^(date_signed|tenant_|sale_)/.test(f.leaseColumn || '')).length
-  const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
+  // S652 (Nic): a CHOICE group is required as a group — one box marked, not
+  // each. Counted once, by its first box, so "3 required left" means three
+  // things to do.
+  const choiceKey = (f:any) => String(f.options ?? f.id)
+  const groupChosen = (f:any) => myFields.some((g:any)=> g.fieldType==='choice' && choiceKey(g)===choiceKey(f) && (fieldValues[g.id]??'').trim())
+  const seenGroups = new Set<string>()
+  const unfilledRequired = requiredFields.filter((f:any)=> {
+    if (f.fieldType!=='choice') return !fieldValues[f.id]?.trim()
+    if (seenGroups.has(choiceKey(f))) return false
+    seenGroups.add(choiceKey(f)); return !groupChosen(f)
+  })
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
+
+  // RENEWAL: what the first bill under this lease will be, from the terms as
+  // typed right now — the same arithmetic the bill run uses, against the
+  // current lease's last day and due day from the server. A month-to-month has
+  // no last day yet: it ends the day before the new lease starts.
+  const renewalLine: string | null = (() => {
+    if (!doc?.renewsLeaseId || !renewalBilling) return null
+    const valOf = (col: string) => {
+      const f = allFields.find((x:any) => x.leaseColumn === col && (fieldValues[x.id] ?? x.value ?? '').trim() !== '')
+      return f ? (fieldValues[f.id] ?? f.value) : null
+    }
+    const startRaw = valOf('start_date')
+    const start = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : null
+    const rent = moneyBoxValue(valOf('rent_amount'))
+    if (!start || !(rent > 0)) return null
+    const priorDay = renewalBilling.previousDueDay != null ? Number(renewalBilling.previousDueDay) : null
+    const newDay = parseDueDay(valOf('rent_due_day')) ?? priorDay ?? 1
+    const sched = renewalSchedule({
+      oldEnd: renewalBilling.previousEndDate ? String(renewalBilling.previousEndDate).slice(0, 10) : dayBefore(start),
+      oldDueDay: priorDay ?? newDay, newStart: start, newDueDay: newDay, rent,
+    })
+    return renewalBillingSummary(sched, rent, newDay)
+  })()
 
   const handleFieldClick = (field:any) => {
     if (field.fieldType==='signature' && savedSig) {
@@ -481,6 +677,19 @@ export function SignPage() {
     if (field.fieldType==='initials' && savedInit) {
       setFieldValues(p=>({...p,[field.id]:savedInit.value}))
       if(savedInit.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
+      setTimeout(()=>jumpToNext(field.id), 150)
+      return
+    }
+    // S652 (Nic): a CHOICE box — one of a group. Marking it clears the others in
+    // the group; the mark is X, a check, or the signer's own initials.
+    if (field.fieldType==='choice') {
+      const mark = field.checkboxMark === 'initials' ? (savedInit?.value ?? '') : (field.label || 'X')
+      if (!mark) { setActiveField(field); return }
+      const key = String(field.options ?? field.id)
+      setFieldValues(p=>{ const n:Record<string,string> = {...p}
+        for (const g of allFields) if (g.fieldType==='choice' && String(g.options ?? g.id)===key && g.id!==field.id && isMine(g)) delete n[g.id]
+        n[field.id]=mark; return n })
+      if (field.checkboxMark === 'initials' && savedInit?.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
@@ -510,7 +719,14 @@ export function SignPage() {
   }
 
   const jumpToNext = (justFilledId: string) => {
-    const stillUnfilled = requiredFields.filter((f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim())
+    // S652 (Blu): initialing one box on page 1 threw him to page 2, because the
+    // jump only ever chased the next REQUIRED field. Finish the page you are on
+    // first — every box of yours on it, optional or not, top to bottom — and
+    // only leave the page when nothing of yours is left on it.
+    const unfilled = (f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim()
+    const onThisPage = myFields.filter((f:any) => f.page === currentPage && unfilled(f))
+      .sort((a:any, b:any) => Number(a.y) - Number(b.y))
+    const stillUnfilled = onThisPage.length ? onThisPage : requiredFields.filter(unfilled)
     const next = stillUnfilled[0]
     if (!next) return
     if (next.page !== currentPage) {
@@ -566,8 +782,24 @@ export function SignPage() {
           back to a list of finished ones between each is friction on repeat. The
           signing queue is the destination; Leases stays one click away for when
           the batch is actually done. */}
+      {nextForMe && nextForMe.mine?.token && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          This is part of a packet — {leftForMe} more document{leftForMe===1?'':'s'} in it still need your signature.
+        </div>
+      )}
+      {/* S655: the park-wide sender's one pass — the rest of the new leases it
+          drafted ride along in ?queue=, in space order. */}
+      {!nextForMe?.mine?.token && signingQueue.length > 0 && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          {signingQueue.length} more new lease{signingQueue.length===1?'':'s'} to sign in this batch.
+        </div>
+      )}
       <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', justifyContent:'center' }}>
-        <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>
+        {nextForMe && nextForMe.mine?.token
+          ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+nextForMe.mine.token) }}>Next: {nextForMe.title} →</button>
+          : signingQueue.length > 0
+            ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+signingQueue[0]+(signingQueue.length>1 ? '?queue='+signingQueue.slice(1).join(',') : '')) }}>Next new lease →</button>
+            : <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>}
         <button className="btn btn-ghost" onClick={()=>navigate('/leases')}>Back to Leases</button>
       </div>
     </div>
@@ -587,6 +819,31 @@ export function SignPage() {
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
+          {bundle.length > 1 && selfAt >= 0 && (
+            <div>
+              <div onClick={()=>setShowBundle(v=>!v)} style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600, cursor:'pointer' }}>
+                Document {selfAt + 1} of {bundle.length}{leftForMe > 0 ? ` · ${leftForMe} more for you to sign` : ' · the last one for you'} {showBundle ? '▴' : '▾'}
+              </div>
+              {/* S652 (Nic): "let him just scroll through and do them in any
+                  order he desires" — the whole packet, any document a click away. */}
+              {showBundle && (
+                <div style={{ marginTop:6, background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderRadius:8, padding:'6px 8px', maxWidth:440 }}>
+                  {bundle.map((d:any, i:number) => {
+                    const state = d.isSelf ? 'this one' : d.status==='completed' ? 'done' : !d.mine ? 'not yours yet' : d.mine.status==='signed' ? 'you signed' : 'needs you'
+                    const canOpen = !d.isSelf && !!d.mine?.token
+                    return (
+                      <div key={d.id} onClick={()=>{ if (canOpen) { setShowBundle(false); setStage('signing'); navigate('/sign/'+d.mine.token) } }}
+                           style={{ display:'flex', justifyContent:'space-between', gap:10, padding:'4px 2px', fontSize:'.74rem', cursor: canOpen?'pointer':'default',
+                                    color: d.isSelf?'var(--gold,#c9a227)':'var(--text-1,#ddd)', borderBottom: i<bundle.length-1?'1px solid var(--border-0)':'none' }}>
+                        <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{i+1}. {d.title}</span>
+                        <span style={{ flexShrink:0, color: state==='needs you'?'var(--gold,#c9a227)':'var(--text-3)' }}>{state}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
           {/* S629 (Nic): "it said four out of twenty three required fields
               complete without me completing anything." They were filled — by
               the lease data and the signing date — but calling machine-filled
@@ -621,6 +878,16 @@ export function SignPage() {
         <div style={{ height:'100%', background:'var(--gold,#c9a227)', borderRadius:2, width:`${requiredFields.length?Math.round((requiredFields.length-unfilledRequired.length)/requiredFields.length*100):0}%`, transition:'width .3s' }}/>
       </div>
 
+      {doc?.renewsLeaseId && (
+        <div style={{ background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderLeft:'3px solid var(--gold,#c9a227)', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.8rem', color:'var(--text-1,#ddd)', lineHeight:1.5 }}>
+          <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>A new lease for a household already living here</div>
+          The current lease keeps running until the day before this one starts, then ends on its own. From the start date
+          the household is billed this lease's rent whether or not they have signed; it stays open for their signature.{' '}
+          {renewalLine ?? 'Rent picks up where the current lease\'s bills leave off, on the household\'s due dates, so no stretch is billed twice.'}
+          {' '}Signing it bills no rent — only one-time money on it, like a deposit increase.
+        </div>
+      )}
+
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'82vh', marginBottom:16 }}>
         <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
           <canvas ref={canvasRef}/>
@@ -649,9 +916,22 @@ export function SignPage() {
             // change the term you change the template, and the document
             // follows.
             const DERIVED_LOCKED = new Set(['lease_type', 'end_date'])
+            // S648 (Nic): an onboarding resident's page 8 is not a move-in —
+            // their first month is the rent and every move-in fee is $0.
+            const ONBOARDING_LOCKED = data.existingTenancy && !doc?.renewsLeaseId && !!f.leaseColumn && (
+              f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration'
+              || (LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'fee_row'
+                  && f.leaseColumn !== 'security_deposit' && f.leaseColumn !== 'other_fee'
+                  && FEE_TYPE_META[f.leaseColumn as keyof typeof FEE_TYPE_META]?.dueTiming === 'move_in'))
+            // A renewal's page 8 bills no rent — those two lines are the
+            // system's, not a move-in special to type over.
+            const RENEWAL_LOCKED = !!doc?.renewsLeaseId && (
+              f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration')
             const locked = !!val && !!f.leaseColumn && (
               LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
               || DERIVED_LOCKED.has(f.leaseColumn)
+              || ONBOARDING_LOCKED
+              || RENEWAL_LOCKED
             )
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'
@@ -662,8 +942,23 @@ export function SignPage() {
             // Somebody else's completed field is part of the DOCUMENT now, not
             // an input — it belongs to the landlord's terms or to a co-signer who
             // already signed. Drawing it as a green box implies this signer did
-            // it, and drawing it as a grey one implies they still have to. It is
+            // it, and drawing it as a gray one implies they still have to. It is
             // neither: it is the page they are reading.
+            // S652 (Nic): FIXED TEXT prints as text, never a box. The landlord —
+            // and only the landlord, only while it is his turn — gets a pencil
+            // to change it on this one document; the tenant reads it.
+            if (f.fieldType==='fixed_text') {
+              const editable = isMine(f) && !data.readOnly
+              return (
+                <div key={f.id} id={'field-'+f.id} title={editable ? 'Set on the template — click to change it on this document only' : undefined}
+                  onClick={()=>{ if (editable) setActiveField(f) }}
+                  style={{ position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s, display:'flex', alignItems:'center',
+                           overflow:'hidden', boxSizing:'border-box' as const, zIndex:3, cursor: editable?'pointer':'default', pointerEvents: editable?'auto':'none' }}>
+                  <span style={{ fontSize:fitFontSize(String(val||' '), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', flex:1 }}>{String(val)}</span>
+                  {editable && <span style={{ fontSize:Math.max(8,f.height*s*0.5), color:'#c9a227', opacity:.75, paddingRight:2, flexShrink:0 }}>✎</span>}
+                </div>
+              )
+            }
             if (!isMine(f) && val) {
               return (
                 <div key={f.id} id={'field-'+f.id}
@@ -678,7 +973,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
                                      fontSize:fitFontSize(String(val), f.width*s, f.height*s),
                                      color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
-                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                                     overflow:'hidden', textOverflow:'ellipsis' }}>{shown(f,val)}</span>}
                 </div>
               )
             }
@@ -718,10 +1013,10 @@ export function SignPage() {
                     // usual average for proportional text and is deliberately
                     // conservative — slightly small beats truncated, because a
                     // number nobody can read is worse than a small one.
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{shown(f,val)}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':f.fieldType==='year'?'Year':'Click'}
                   </span>
                 )}
               </div>
@@ -736,12 +1031,12 @@ export function SignPage() {
           Click highlighted fields to sign. Use <strong>Next Field</strong> to jump to the next one.
           {/* S629 (Nic): "it's got some boxes highlighted different colors that
               appear to belong to different signing roles." They are all his —
-              the API serves only this signer's fields — so the colours are
+              the API serves only this signer's fields — so the colors are
               STATE, not people. Nothing said so. */}
           <span style={{ display:'block', marginTop:4, color:'var(--text-3)', fontSize:'.72rem' }}>
             <span style={{ color:'#22c55e', fontWeight:700 }}>Green</span> = done ·{' '}
             <span style={{ color:'var(--gold,#c9a227)', fontWeight:700 }}>Glowing</span> = next up ·{' '}
-            <span style={{ fontWeight:700 }}>Grey</span> = still to do. All of them are yours.
+            <span style={{ fontWeight:700 }}>Gray</span> = still to do. All of them are yours.
           </span>
         </span>
       </div>}
@@ -878,7 +1173,17 @@ export function SignPage() {
                 ))}
               </div>
             )}
-            {activeField.fieldType==='text' && (
+            {activeField.fieldType==='year' && (
+              // S652 (Blu): a year is picked from a list — the current year and
+              // back a century — and the editor stays open until Save.
+              <select autoFocus className="input" value={fieldValues[activeField.id]||''}
+                onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
+                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14, background:'white', color:'#1a1a1a' }}>
+                <option value="">Pick a year…</option>
+                {Array.from({ length: 111 }, (_, i) => String(new Date().getFullYear() + 1 - i)).map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
+            )}
+            {(activeField.fieldType==='text'||activeField.fieldType==='fixed_text') && (
               // S632 (Nic): "When it opens that little window to put in an
               // amount for security deposit or pet deposit or proration, it
               // should open with a cursor in the box already so I can just start
@@ -897,12 +1202,18 @@ export function SignPage() {
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             {activeField.fieldType==='date' && (
-              // S534: term dates (lease start/end) are picked deliberately —
-              // stored as the locale string the stamped PDF prints.
-              <input type="date" autoFocus
-                onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
-                onKeyDown={e=>{ if (e.key === 'Enter') { e.preventDefault(); setActiveField(null) } }}
-                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
+              // S534: term dates (lease start/end) are picked deliberately.
+              // S652 (Blu): the browser's own date box closed the editor on every
+              // part he changed — month, then day, then year, three trips in. The
+              // tenant page already uses three typed boxes that stay put until
+              // Save; the landlord page uses the same now.
+              <div style={{ marginBottom:14 }}>
+                <TypedDateInput key={activeField.id}
+                  value={documentDateToIso(fieldValues[activeField.id])}
+                  onChange={iso=>{ setFieldValues(p=>({...p,[activeField.id]:isoToDocumentDate(iso)})) }}
+                  inputStyle={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, background:'white', color:'#1a1a1a' }}
+                />
+              </div>
             )}
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setActiveField(null)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', cursor:'pointer' }}>Cancel</button>
@@ -918,7 +1229,7 @@ export function SignPage() {
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
-              {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
+              {allFields.filter((f:any)=>fieldValues[f.id] && f.fieldType!=='fixed_text').map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
                   <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
@@ -932,9 +1243,14 @@ export function SignPage() {
             <div style={{ padding:'11px 14px', background:'#fffdf5', border:'1px solid rgba(201,162,39,.3)', borderRadius:9, fontSize:'.73rem', color:'#999', lineHeight:1.6, marginBottom:18 }}>
               By clicking Submit, you confirm your electronic signature is legally binding under UETA and the federal E-SIGN Act.
             </div>
+            {submitError && (
+              <div role="alert" style={{ padding:'11px 14px', background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:9, fontSize:'.8rem', color:'#991b1b', lineHeight:1.5, marginBottom:14 }}>
+                <strong>Not submitted.</strong> {submitError}
+              </div>
+            )}
             <div style={{ display:'flex', gap:9 }}>
-              <button onClick={()=>setStage('signing')} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
-              <button onClick={()=>submitMut.mutate()} disabled={submitMut.isLoading}
+              <button onClick={()=>{ setSubmitError(null); setStage('signing') }} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
+              <button onClick={()=>{ setSubmitError(null); submitMut.mutate() }} disabled={submitMut.isLoading}
                 style={{ flex:2, padding:'12px', borderRadius:10, border:'none', background:'#c9a227', color:'white', fontWeight:800, cursor:'pointer' }}>
                 {submitMut.isLoading?'Submitting...':'✓ Submit Signatures'}
               </button>

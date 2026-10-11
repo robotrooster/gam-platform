@@ -1,5 +1,7 @@
 import { query, queryOne } from '../db'
 import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
+import { soldCheckOutSql } from './registerStay'
+import { feeCountedStaySql, feeCountedNightsStatusSql, occupiedSpacesSql } from './billableUnits'
 
 // SQL literal list of the nights/30-aggregation unit types ('rv_spot').
 // Short-stays on every OTHER type bill str_fee_pct of revenue instead.
@@ -13,6 +15,47 @@ const AGG_TYPES_SQL = NIGHTS_AGGREGATION_UNIT_TYPES.map(t => `'${t}'`).join(',')
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100
+}
+
+/**
+ * 10/3 (decisions #33) — A SHORT STAY'S REVENUE IN ONE MONTH, as SQL.
+ *
+ * Short stays on every type but the nights-aggregation ones bill str_fee_pct of
+ * revenue, attributed to each month by nights. The stay is split by the length
+ * it was SOLD for (services/registerStay soldCheckOutSql), never by an early
+ * check-out: each month gets the nights the guest was on the site in it, and
+ * the nights sold but not stayed (left early) count in the month the guest
+ * left (the month of their last night). Dividing by the shortened stay counted
+ * it less than once.
+ *
+ * The months add up to the stay's whole total ONLY when the check-out is
+ * recorded in the same month the guest left (or before any month of the stay
+ * is billed). Each month is billed once, from the check-out as it reads on
+ * billing day, and is never re-billed. So a check-out recorded after its month
+ * was billed, or an early check-out undone after a month was billed, counts the
+ * stay more or less than once: e.g. a stay Oct 25 to Nov 10, checked out Oct 28,
+ * October billed Nov 1, the check-out undone Nov 3, November billed Dec 1 —
+ * October already took the unstayed nights, and November takes them again.
+ * Fixing that needs a per-stay true-up (bill each month as the stay's share to
+ * date, less what earlier months already billed for that stay); that is a
+ * product choice for Nic, not made here.
+ *
+ * `b` is the unit_bookings alias; `monthStart` a SQL date expression for the
+ * first of the month. The caller keeps its row filter (check_in before the
+ * month ends, check_out after it starts) — every row this can give a share to
+ * passes it.
+ */
+export function stayRevenueInMonthSql(b: string, monthStart: string): string {
+  const sold = soldCheckOutSql(b)
+  // The day they left (never past the length sold).
+  const stayed = `LEAST(${b}.check_out, ${sold})`
+  const start = `(${monthStart})::date`
+  const end = `((${monthStart}) + INTERVAL '1 month')::date`
+  return `(COALESCE(${b}.total_amount, 0)
+      * (GREATEST(LEAST(${stayed}, ${end}) - GREATEST(${b}.check_in, ${start}), 0)
+         + CASE WHEN ${stayed} > ${start} AND ${stayed} <= ${end}
+                THEN GREATEST(${sold} - ${stayed}, 0) ELSE 0 END)::numeric
+      / GREATEST(${sold} - ${b}.check_in, 1)::numeric)`
 }
 
 // First-of-month ISO strings ('YYYY-MM-01') covered by a period. Months that
@@ -39,8 +82,9 @@ export function periodMonths(year: number, month: number | null, now: Date = new
 // jobs/platformFeeAccrual.ts). For any month with no accrual row yet — the
 // current in-progress month before the 1st-of-month cron, or environments
 // without accrual history — fall back to a live estimate using the SAME billable
-// basis the job uses: distinct units with a lease overlapping the month +
-// CEIL(short-stay nights / 30), then MAX(rate × billable, min).
+// basis the job uses: every space occupied in the month, once (leases, month
+// stays, owner use, utility spaces — services/billableUnits occupiedSpacesSql)
+// + CEIL(nightly and weekly nights / 30), then the per-payout-account floor.
 //
 // PRICING (locked): $2 per billable unit, floored at the $10 PER-PROPERTY
 // MINIMUM — full stop. A property is charged $10 for each month it has been ON
@@ -136,45 +180,44 @@ export async function platformFeesByProperty(
   // in which the property already existed (created_at) are billed.
   const est = await query<any>(`
     SELECT p.id AS property_id, to_char(m.month, 'YYYY-MM-01') AS m,
-      (SELECT COUNT(DISTINCT l.unit_id)::int
-         FROM leases l JOIN units u ON u.id = l.unit_id
-        WHERE u.property_id = p.id AND l.status='active'
-          AND l.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
-          AND (l.end_date IS NULL OR l.end_date >= m.month)) AS long_term,
+      -- 10/5 (Nic): every space occupied in the month, ONCE — a lease, a
+      -- month stay with no lease ("they get billed for october"), an
+      -- owner-occupied space, a utility-service space — the bill's own rule
+      -- (services/billableUnits occupiedSpacesSql), so the estimate quotes
+      -- what the bill charges.
+      --
+      -- S653 (Nic): "me marking mobile home three at Mountain View as owner
+      -- use... doesn't change the billing on the dashboard." Owner use is a
+      -- unit STATUS, so it is only known for the present: counted for this
+      -- month and later, never backdated onto a past month.
+      --
       -- S614 (Nic): a space this landlord bills utilities for is an OCCUPIED
       -- UNIT — "it is technically a unit, so it needs to be billed at two
-      -- dollars." Occupied by THIS landlord because of the utilities.
-      --
-      -- Dropped the moment a LEASE supersedes it: when the space's real owner
-      -- onboards and puts a tenancy on it, the $2 follows the unit to them and
-      -- is never charged twice for the one space. No mid-month conflict —
-      -- the incoming landlord is inside the no-double-bill grace until their
-      -- second cycle, and that cycle is wholly theirs.
-      (SELECT COUNT(DISTINCT sa.unit_id)::int
-         FROM utility_service_agreements sa JOIN units u ON u.id = sa.unit_id
-        WHERE u.property_id = p.id AND sa.status = 'active'
-          AND sa.superseded_by_lease_id IS NULL
-          AND sa.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
-          AND (sa.end_date IS NULL OR sa.end_date >= m.month)) AS utility_service,
+      -- dollars." Same two conditions the bill applies: the payer agreed or
+      -- the landlord attested, and not a stay's own agreement (R11).
+      (SELECT COUNT(*)::int FROM (${occupiedSpacesSql('p.id', 'm.month', {
+        ownerUseWhen: `m.month >= date_trunc('month', CURRENT_DATE)`,
+      })}) spaces) AS spaces,
       COALESCE((SELECT SUM(GREATEST(
             LEAST(b.check_out, m.month + INTERVAL '1 month')::date
               - GREATEST(b.check_in, m.month)::date, 0))
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
           AND u.unit_type IN (${AGG_TYPES_SQL})
-          AND b.lease_type IN ('nightly','weekly')
-          AND b.status NOT IN ('cancelled','no_show')
+          -- Which stays count by their nights, and by which status, is the
+          -- bill's own rule (services/billableUnits): nightly and weekly only
+          -- (10/5 — a month stay is a space, above); a stay cancelled on or
+          -- after arrival still held the site.
+          AND ${feeCountedStaySql('b', 'm.month')}
+          AND ${feeCountedNightsStatusSql('b')}
           AND b.check_in  < m.month + INTERVAL '1 month'
           AND b.check_out > m.month), 0)::int AS nights,
-      COALESCE((SELECT SUM(COALESCE(b.total_amount, 0)
-            * GREATEST(
-                LEAST(b.check_out, m.month + INTERVAL '1 month')::date
-                  - GREATEST(b.check_in, m.month)::date, 0)::numeric
-            / GREATEST((b.check_out - b.check_in), 1)::numeric)
+      -- 10/3 (decisions #33): split by the length sold (stayRevenueInMonthSql).
+      COALESCE((SELECT SUM(${stayRevenueInMonthSql('b', 'm.month')})
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
           AND u.unit_type NOT IN (${AGG_TYPES_SQL})
-          AND b.lease_type IN ('nightly','weekly')
+          AND ${feeCountedStaySql('b', 'm.month')}
           AND b.status NOT IN ('cancelled','no_show')
           AND b.check_in  < m.month + INTERVAL '1 month'
           AND b.check_out > m.month), 0) AS str_revenue
@@ -202,12 +245,11 @@ export async function platformFeesByProperty(
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
     // Still in onboarding grace, or this month predates the day billing began.
-    // An ACTUAL accrual (billed, above) is always honoured — if it was charged,
+    // An ACTUAL accrual (billed, above) is always honored — if it was charged,
     // it is owed, whatever the grace column says now.
     if (!billingStarts || r.m < billingStarts) continue
-    // S614: a serviced space counts exactly once, like any occupied unit.
-    const billable = parseInt(r.long_term, 10)
-      + parseInt(r.utility_service ?? '0', 10)
+    // S614 / 10/5: every occupied space counts exactly once.
+    const billable = parseInt(r.spaces, 10)
       + Math.ceil(parseInt(r.nights, 10) / 30)
     // S538: short-stays on non-rv_spot types bill str_pct of pro-rated revenue
     // instead of nights/30.

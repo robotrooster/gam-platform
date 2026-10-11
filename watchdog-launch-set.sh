@@ -83,7 +83,12 @@ if ! pgrep -f "tsc.*-b.*--watch" >/dev/null 2>&1; then
   sleep 4
 fi
 
-if ! up 4000; then
+# S652 (deploy 71): :4000 is PRODUCTION here — launchd's com.gam.api (KeepAlive)
+# owns it. During a deploy's bootout→bootstrap gap this watchdog saw the port
+# empty and started the DEV api (ts-node, source, no supervision) on it, and
+# the public API ran off that for four minutes. When launchd has the job, this
+# script never touches :4000; the dev api is only for a machine without it.
+if ! up 4000 && ! launchctl list 2>/dev/null | grep -q "com.gam.api$"; then
   echo "[watchdog] $(date '+%F %T') reviving API (:4000)"
   nohup npm run dev --workspace=apps/api > /tmp/gam-api.log 2>&1 &
   sleep 6

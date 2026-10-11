@@ -34,6 +34,10 @@ const TYPE_LABEL: Record<string, string> = {
   low_stock:                     'Low POS stock',
   tenant_invite_accepted:        'Tenant accepted invite',
   dispute_resolved:              'Dispute resolved',
+  // S651: mail to somebody is not arriving. humanize() would render this
+  // 'Email undeliverable', which is jargon for the one notice that has to be
+  // read and acted on. (memory: gam-no-raw-enums-in-ui)
+  email_undeliverable:           'Email not arriving',
 }
 
 function deepLinkFor(n: Notification): string | null {

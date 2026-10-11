@@ -1,5 +1,4 @@
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
-import * as fs from 'fs'
 
 interface FieldStamp {
   page: number
@@ -11,6 +10,8 @@ interface FieldStamp {
   value: string
   /** S637: the signature style the signer chose, as a CSS font shorthand. */
   font_css?: string | null
+  /** S641: how a ticked box is drawn — 'x' (default) or 'check'. */
+  checkbox_mark?: string | null
 }
 
 interface SignerInfo {
@@ -18,6 +19,39 @@ interface SignerInfo {
   email: string
   role: string
   signed_at: string
+}
+
+/**
+ * S652 — a value has to FIT ITS BOX, and nothing on a lease may be shortened.
+ *
+ * Blu, reading Lot 1: "the tenant name, Nancy Sheptock, was cut off. The last
+ * name just has S-H-E dot dot dot. The box in the template should have been big
+ * enough for that whole name to fit."
+ *
+ * He was looking at the signing screen, which shrinks text to fit and then
+ * CSS-ellipsises whatever still does not. This stamper did something different
+ * and arguably worse: it sized text by the box's HEIGHT alone and never its
+ * width, so a long name was drawn in full at up to 10pt and simply ran out past
+ * the box and across whatever was printed next to it.
+ *
+ * Two wrongs that disagreed with each other, which for an e-sign product is the
+ * real defect: what somebody reads before signing has to be what gets stamped.
+ * Both now shrink on width as well as height.
+ *
+ * NOTHING IS EVER TRUNCATED HERE. A name shortened on a lease is a different
+ * person, and a document that quietly drops half of one is worse than an ugly
+ * one. Below MIN_PT the text is drawn at MIN_PT and allowed to overflow, because
+ * a landlord seeing a name spill past its box will fix the template; a landlord
+ * seeing "She..." has no idea anything is wrong.
+ */
+const MIN_PT = 5
+function fitSize(font: any, text: string, boxW: number, boxH: number, maxPt: number): number {
+  const byHeight = Math.min(boxH * 0.55, maxPt)
+  if (!text) return byHeight
+  const w = font.widthOfTextAtSize(text, byHeight)
+  const usable = Math.max(boxW - 4, 1)
+  if (w <= usable) return byHeight
+  return Math.max(MIN_PT, byHeight * (usable / w))
 }
 
 // A1: bytes in, bytes out — no filesystem. Callers read the source from
@@ -56,6 +90,11 @@ export async function stampPdf(
   // and the executed PDF agree. The cursive keywords stay in the matcher below
   // to keep any already-signed document rendering as it did.
   const timesItalic = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic)
+  // S641 (Nic): "it needs to be a check or an x, not just a solid square,
+  // because that could be ambiguous." A filled square reads as redaction to one
+  // person and "not applicable" to another. ZapfDingbats is one of the fourteen
+  // fonts every PDF reader carries, and its '3' is a check mark — Helvetica's
+  // WinAnsi encoding has no such glyph, so a literal ✓ would stamp as garbage.
   const signatureFontFor = (fontCss: string | null | undefined) => {
     if (!fontCss) return helvetica
     const css = String(fontCss).toLowerCase()
@@ -72,7 +111,12 @@ export async function stampPdf(
     const { height: pageHeight } = page.getSize()
     const pdfY = pageHeight - field.y - field.height
 
-    if (field.field_type === 'signature' || field.field_type === 'initials') {
+    // S652: a CHOICE box marked with initials prints like an initial; marked
+    // with X or a check it prints like a ticked checkbox. Fixed text prints
+    // as text, in the default branch below.
+    const choiceAsInitials = field.field_type === 'choice' && field.checkbox_mark === 'initials'
+    const choiceAsMark = field.field_type === 'choice' && !choiceAsInitials
+    if (field.field_type === 'signature' || field.field_type === 'initials' || choiceAsInitials) {
       if (field.value.startsWith('data:image')) {
         try {
           const base64Data = field.value.split(',')[1]
@@ -82,19 +126,44 @@ export async function stampPdf(
             : await pdfDoc.embedJpg(imgBytes)
           page.drawImage(img, { x:field.x, y:pdfY, width:field.width, height:field.height })
         } catch(e) {
-          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.5) })
+          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25,
+            size:fitSize(signatureFontFor(field.font_css), field.value, field.width, field.height, 20),
+            font:signatureFontFor(field.font_css), color:rgb(0,0,0.5) })
         }
       } else {
         // S637: the signer's own style, not the body font.
-        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.4) })
+        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+          size:fitSize(signatureFontFor(field.font_css), field.value, field.width, field.height, 20),
+          font:signatureFontFor(field.font_css), color:rgb(0,0,0.4) })
       }
       page.drawLine({ start:{x:field.x,y:pdfY}, end:{x:field.x+field.width,y:pdfY}, thickness:0.5, color:rgb(0.4,0.4,0.4) })
     } else if (field.field_type === 'date') {
-      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
-    } else if (field.field_type === 'checkbox' && field.value === 'checked') {
-      page.drawText('X', { x:field.x+field.width*0.2, y:pdfY+field.height*0.15, size:field.height*0.65, font:helveticaBold, color:rgb(0,0.4,0) })
+      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+        size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })
+    } else if ((field.field_type === 'checkbox' && field.value === 'checked') || choiceAsMark) {
+      const useCheck = field.checkbox_mark === 'check'
+      if (useCheck) {
+        // S652: drawn as two strokes. ZapfDingbats' check glyph was addressed
+        // as '3', which pdf-lib cannot encode — every check-marked box threw.
+        const w = field.width, h = field.height
+        const p1 = { x: field.x + w * 0.2,  y: pdfY + h * 0.5 }
+        const p2 = { x: field.x + w * 0.42, y: pdfY + h * 0.2 }
+        const p3 = { x: field.x + w * 0.85, y: pdfY + h * 0.85 }
+        const t = Math.max(1, Math.min(w, h) * 0.12)
+        page.drawLine({ start: p1, end: p2, thickness: t, color: rgb(0, 0.4, 0) })
+        page.drawLine({ start: p2, end: p3, thickness: t, color: rgb(0, 0.4, 0) })
+      } else {
+        page.drawText('X', {
+          x: field.x + field.width * 0.2,
+          y: pdfY + field.height * 0.15,
+          size: field.height * 0.65,
+          font: helveticaBold,
+          color: rgb(0, 0.4, 0),
+        })
+      }
     } else if (field.value) {
-      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
+      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+        size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })
     }
   }
 

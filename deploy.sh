@@ -50,6 +50,17 @@ FRONTENDS=(
   # S605: PM-company went live because a landlord handing off to a property
   # manager is a lost landlord if the PM cannot even sign up.
   "pm-company:pm.goldassetmanagement.com"
+  # S648: the standalone register is the same screen as the landlord POS tab
+  # (pos-parity.test.ts) and was never shipped by this script, so it silently
+  # fell behind every register change.
+  "pos:pos.goldassetmanagement.com"
+  # S651: both of these were live on their own domains and shipped by NOBODY.
+  # admin-ops has been stale since S650 (its staff-only login change never went
+  # out); books since it was built. Same failure the storefront note below
+  # describes: a surface this script does not know about is a surface that
+  # silently keeps serving last month's code.
+  "admin-ops:ops.goldassetmanagement.com"
+  "books:books.goldassetmanagement.com"
 )
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
@@ -75,7 +86,7 @@ $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
 # The gate runs FIRST — before the shared build, before the API build — because
 # the point is to fail before anything is published, not after.
 if $CHECK_ONLY; then
-  echo; echo "── tests ──"; warn "would run the API suite (skipped in --check)"
+  echo; echo "── tests ──"; warn "would run the API, tenant portal and landlord portal suites (skipped in --check)"
 elif $SKIP_TESTS; then
   echo; echo "── tests ──"
   bad "SKIPPED (--skip-tests). You are shipping code nothing verified."
@@ -90,6 +101,35 @@ else
     grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests.log | head -20
     echo
     echo "Full output: /tmp/gam-deploy-tests.log"
+    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
+    exit 1
+  fi
+  # S655 review: the tenant portal's own tests (apps/tenant/vitest.config.ts) —
+  # its screens' wording and behavior, which nothing else runs. No database.
+  echo; echo "── tests (tenant portal) ──"
+  if (cd apps/tenant && npx vitest run --reporter=dot) >/tmp/gam-deploy-tests-tenant.log 2>&1; then
+    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests-tenant.log | tail -1) — suite green"
+  else
+    bad "TENANT TESTS FAILED — nothing has been deployed."
+    echo
+    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests-tenant.log | head -20
+    echo
+    echo "Full output: /tmp/gam-deploy-tests-tenant.log"
+    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
+    exit 1
+  fi
+  # S655: the landlord portal's own tests (apps/landlord/vitest.config.ts) —
+  # Record payment, Outstanding Balances, Payments, the Front Desk, Make a bank
+  # deposit, move-out and the paid-ahead choice. No database.
+  echo; echo "── tests (landlord portal) ──"
+  if (cd apps/landlord && npx vitest run --reporter=dot) >/tmp/gam-deploy-tests-landlord.log 2>&1; then
+    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests-landlord.log | tail -1) — suite green"
+  else
+    bad "LANDLORD TESTS FAILED — nothing has been deployed."
+    echo
+    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests-landlord.log | head -20
+    echo
+    echo "Full output: /tmp/gam-deploy-tests-landlord.log"
     echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
     exit 1
   fi
@@ -109,14 +149,49 @@ echo; echo "── API (launchd com.gam.api) ──"
 if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
   ok "built"
   if ! $CHECK_ONLY; then
-    launchctl kickstart -k "gui/$(id -u)/com.gam.api" >/dev/null 2>&1
+    # S652: bootout + bootstrap, not kickstart — a kickstart restarts the
+    # process but never re-reads the plist, so a changed log path or env var
+    # would sit unapplied until the next reboot.
+    # Deploy 71 lesson: the first bootstrap right after a bootout can fail with
+    # "Input/output error" while launchd is still tearing the old job down, and
+    # in that gap the watchdog (com.gam.watchdog) sees :4000 empty and starts
+    # the DEV api (ts-node) on the production port. So: bootout, wait for the
+    # port to be free, bootstrap until launchd lists the job, then insist on an
+    # answer — and if anything but our job holds :4000, say so loudly.
+    launchctl bootout "gui/$(id -u)/com.gam.api" >/dev/null 2>&1
+    for i in $(seq 1 20); do lsof -nP -iTCP:4000 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
+    # Deploy 72: launchd can take ~30 s after a bootout before it accepts the
+    # job again; the earlier 20 s window flagged a deploy that had in fact
+    # loaded a moment later. Wait up to two minutes, and re-check at the end.
+    # Deploy 73: the loop still reported "not loaded" on a deploy that WAS
+    # loaded seconds later, so each attempt now records launchctl's own words
+    # (/tmp/gam-deploy-launchd.log) — the next run tells us what launchd said.
+    : > /tmp/gam-deploy-launchd.log
+    for i in $(seq 1 60); do
+      out=$(launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.plist" 2>&1); rc=$?
+      echo "$(date '+%T') attempt $i rc=$rc ${out}" >> /tmp/gam-deploy-launchd.log
+      launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1 && { echo "$(date '+%T') listed after attempt $i" >> /tmp/gam-deploy-launchd.log; break; }
+      sleep 2
+    done
+    sleep 2
+    # Deploy 74 found the real cause of three false alarms: this script runs
+    # with pipefail, and `launchctl list | grep -q` lets grep exit on the first
+    # match, so launchctl dies of SIGPIPE and the PIPELINE reports failure —
+    # for a job that had loaded on attempt 1. `launchctl print` asks launchd
+    # directly and pipes nothing.
+    if ! launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
-    for i in $(seq 1 15); do
+    for i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4000/api/sales/demo/slots 2>/dev/null)
       [ "$code" = "200" ] && break
       sleep 1
     done
     if [ "${code:-}" = "200" ]; then ok "restarted and answering"; else bad "restarted but NOT answering (last code: ${code:-none})"; FAILED=1; fi
+    # The thing answering must be OUR job — a ts-node dev process on :4000 is
+    # the watchdog's doing and serves source, not the build.
+    if lsof -nP -iTCP:4000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -I{} ps -o command= -p {} 2>/dev/null | grep "ts-node" >/dev/null; then
+      bad "a DEV api (ts-node) holds :4000 — kill it and let launchd's com.gam.api take the port"; FAILED=1
+    fi
   fi
 else
   bad "BUILD FAILED — see /tmp/gam-deploy-api.log"; FAILED=1

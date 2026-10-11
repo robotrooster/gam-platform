@@ -159,11 +159,11 @@ describe('POST /api/background/webhook/checkr — Tenant events', () => {
       result:    'consider',
       products:  { criminal_history: 'consider', credit_report: 'clear' },
     })
-    // 6 calendar months out (Postgres INTERVAL '6 months' — 181..185 days
-    // depending on the months crossed).
+    // S653 (Nic): "background checks should be good for a year." A calendar
+    // year out (365..366 days).
     const days = (new Date(row.expires_at).getTime() - Date.now()) / 86400000
-    expect(days).toBeGreaterThan(175)
-    expect(days).toBeLessThan(190)
+    expect(days).toBeGreaterThan(360)
+    expect(days).toBeLessThan(370)
   })
 
   it('order.applicant.completed → processing, no expires, existing summary preserved', async () => {
@@ -247,5 +247,75 @@ describe('POST /api/background/webhook/checkr — rejections', () => {
       .set('Content-Type', 'application/json')
       .send(rawBody)
     expect(res.status).toBe(404)
+  })
+})
+
+/**
+ * S640 — the retry storm that buried the event that mattered.
+ *
+ * Checkr sent 79 webhooks between Sep 9 22:16 and Sep 10 23:21. Four returned
+ * 200. Seventy-five returned 500, every one of them the same error:
+ * "Checkr Tenant webhook report.product.completed missing order id". That event
+ * carries the report ITEM (rpi_…), which references a report, not an order — so
+ * requireOrderRef threw, Express answered 500, and Checkr redelivered forever.
+ *
+ * There was nothing to apply even if it had parsed: the check is already
+ * `processing` and a single product finishing does not change that. Meanwhile
+ * Anastacio Erreguin's screening sat unfinished for twenty-two hours.
+ *
+ * A webhook endpoint should acknowledge what it can safely ignore. A 500 is a
+ * request to be told again.
+ */
+describe('S640 events we do not act on are acknowledged, not retried', () => {
+  const post = async (raw: string) => request(buildApp())
+    .post('/api/background/webhook/checkr')
+    .set('Tenant-Signature', tenantSignature(raw, SECRET))
+    .set('Content-Type', 'application/json')
+    .send(raw)
+
+  it('200s a per-product progress ping that carries no order id', async () => {
+    // The real payload: a report ITEM, referencing a report and not an order.
+    const raw = JSON.stringify(tenantEvent('report.product.completed',
+      { id: 'rpi_abc', report_id: 'rp_abc', status: 'clear' }))
+    const res = await post(raw)
+    expect(res.status).toBe(200)
+    expect(res.body.applied).toBe(false)
+  })
+
+  // The point of acknowledging is not just to stop the retries — it is to find
+  // out what Checkr Tenant actually sends. Nobody can say: it is a different
+  // product from the staffing API the public docs describe, and the dashboard
+  // has no event list to read. The next real applicant is the answer, provided
+  // we keep what arrives.
+  it('keeps the ignored event, so the next applicant tells us what Checkr sends', async () => {
+    const raw = JSON.stringify(tenantEvent('report.product.completed',
+      { id: 'rpi_keep', report_id: 'rp_keep', status: 'clear' }))
+    await post(raw)
+    const { rows } = await db.query<any>(
+      `SELECT event_type, source, background_check_id FROM background_check_reports
+        WHERE event_type = 'report.product.completed'`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].source).toBe('webhook')
+    // Unattached: the event names a report item, not an order we know.
+    expect(rows[0].background_check_id).toBeNull()
+  })
+
+  it('200s an event type Checkr adds without telling anyone', async () => {
+    const raw = JSON.stringify(tenantEvent('order.something.brand_new', { id: 'ord_x' }))
+    const res = await post(raw)
+    expect(res.status).toBe(200)
+    expect(res.body.applied).toBe(false)
+  })
+
+  // The signature is the one thing that SHOULD fail loudly — a forged event is
+  // worth refusing, and a real sender never trips it.
+  it('still refuses a bad signature', async () => {
+    const raw = JSON.stringify(tenantEvent('report.product.completed', { id: 'rpi_abc' }))
+    const res = await request(buildApp())
+      .post('/api/background/webhook/checkr')
+      .set('Tenant-Signature', 't=1,v1=deadbeef')
+      .set('Content-Type', 'application/json')
+      .send(raw)
+    expect(res.status).toBe(401)
   })
 })

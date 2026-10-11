@@ -128,6 +128,20 @@ describe('onboard-new-lease-tenant (Flow B)', () => {
     expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
   })
 
+  // S652 (Nic): "they let their due date be whenever they come in."
+  it('carries the household\'s own due day on the invite, and refuses a day no lease can hold', async () => {
+    const f = await seedBase()
+    const send = (rentDueDay: any) => request(buildApp())
+      .post('/api/landlords/me/onboard-new-lease-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'A', lastName: 'Tester', email: `t-${randomUUID().slice(0, 6)}@x.dev`, unitId: f.unitId, rentDueDay })
+    expect((await send(31)).status).toBe(400)
+    expect((await send('soon')).status).toBe(400)
+    expect((await send(23)).status).toBe(200)
+    const intent = await db.query(`SELECT rent_due_day FROM pending_tenant_intents WHERE unit_id=$1`, [f.unitId])
+    expect(intent.rows.map(r => r.rent_due_day)).toEqual([23])
+  })
+
   it('refuses to invite before the unit has rent set', async () => {
     const f = await seedBase()
     await db.query(`UPDATE units SET rent_amount=0 WHERE id=$1`, [f.unitId])
@@ -149,19 +163,25 @@ describe('onboard-new-lease-tenant (Flow B)', () => {
 })
 
 describe('accept → auto-draft', () => {
-  it('whole_unit: drafts ONE shared lease once both co-tenants accept, deposit + term pre-filled', async () => {
+  // S647 (Nic, DIRECTIVE): "I want to sign my side of the lease for everybody
+  // even before they accept the portal invite." This test used to prove the
+  // opposite — that nothing drafted until the whole household had accepted.
+  it('whole_unit: drafts ONE shared lease for the household BEFORE anyone accepts, deposit + term pre-filled', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1.5, 12)
     const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, eA, 'Aaa'); await onboard(f, eB, 'Bbb')
 
-    // First accept: roster incomplete → no draft yet.
-    await accept(await inviteToken(eA))
-    expect((await draftsForUnit(f.unitId)).length).toBe(0)
+    // Nobody has accepted. The second invite voided the one-person draft and
+    // re-drafted it with both, so exactly one live lease is waiting on the
+    // landlord's signature.
+    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    expect(live.length).toBe(1)
 
-    // Second accept: roster complete → one draft.
+    // Accepting afterwards does not draft a second copy.
+    await accept(await inviteToken(eA))
     await accept(await inviteToken(eB))
-    const drafts = await draftsForUnit(f.unitId)
+    const drafts = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
     expect(drafts.length).toBe(1)
     const roles = await signerRoles(drafts[0].id)
     expect(roles).toContain('landlord')
@@ -203,22 +223,36 @@ describe('accept → auto-draft', () => {
     await seedDefaultTemplate(f.landlordId, 1, 12)
     const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`, eC = `c-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, eA, 'Aaa'); await onboard(f, eB, 'Bbb')
-    await accept(await inviteToken(eA)); await accept(await inviteToken(eB))
     const first = await draftsForUnit(f.unitId)
     expect(first.filter(d => d.status !== 'voided').length).toBe(1)
+    const firstLiveId = first.find(d => d.status !== 'voided')!.id
 
-    // Add a 3rd co-tenant → the unsigned draft voids.
+    // Add a 3rd co-tenant → the unsigned draft voids and re-drafts with all
+    // three straight away (S647: drafting no longer waits for acceptance).
     const add = await onboard(f, eC, 'Ccc')
     expect(add.status).toBe(200)
     const afterAdd = await draftsForUnit(f.unitId)
-    expect(afterAdd.every(d => d.status === 'voided')).toBe(true)
-
-    // 3rd accepts → re-draft now includes all three.
-    await accept(await inviteToken(eC))
-    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    expect(afterAdd.find(d => d.id === firstLiveId)!.status).toBe('voided')
+    const live = afterAdd.filter(d => d.status !== 'voided')
     expect(live.length).toBe(1)
     const roles = await signerRoles(live[0].id)
     expect(roles).toContain('co_tenant_2')
+  })
+
+  // S647: once the landlord has signed, the lease is issued and billing. Voiding
+  // it to re-draft with an extra person would orphan a live lease and invoice.
+  it('whole_unit: refuses to add a co-tenant once the landlord has signed', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    await db.query(`UPDATE lease_documents SET issued_at = NOW() WHERE id = $1`, [live[0].id])
+
+    const add = await onboard(f, `b-${randomUUID().slice(0, 6)}@x.dev`, 'Bbb')
+    expect(add.status).toBe(409)
+    expect(add.body.error).toMatch(/addendum/i)
+    const still = await db.query(`SELECT status FROM lease_documents WHERE id=$1`, [live[0].id])
+    expect(still.rows[0].status).not.toBe('voided')
   })
 })
 
@@ -231,6 +265,12 @@ describe('accept → auto-draft: draft failure is contained', () => {
     await seedDefaultTemplate(f.landlordId, 1.5, 12) // resolveDefaultTemplate returns a template
     const email = `fail-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, email) // creates the unit-bound pending intent (+ user + tenant)
+    // S647: the invite now drafts on its own. Clear that so this test still
+    // exercises what it is about — a draft that FAILS inside the accept txn.
+    await db.query(
+      `UPDATE lease_documents SET status='voided' WHERE unit_id=$1`, [f.unitId])
+    await db.query(
+      `UPDATE pending_tenant_intents SET draft_document_id=NULL WHERE unit_id=$1`, [f.unitId])
 
     const client = await db.connect()
     try {
@@ -276,7 +316,7 @@ describe('accept → auto-draft: draft failure is contained', () => {
 //
 // Every test here asserted the document EXISTS. None asserted anyone was told
 // about it, which is why a year of drafts could go out unsent without a failure.
-describe('S636 an accepted household gets a lease that is actually sent', () => {
+describe('S636 an invited household gets a lease that is actually sent', () => {
   it('the drafted document reaches status sent, and the landlord is the one invited', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1.5, 12)
@@ -285,8 +325,10 @@ describe('S636 an accepted household gets a lease that is actually sent', () => 
     await accept(await inviteToken(eA))
     await accept(await inviteToken(eB))
 
+    // S647: the household was drafted at invite time — the second invite voided
+    // the one-person copy — so only the live document counts.
     const { rows } = await db.query<any>(
-      `SELECT id, status FROM lease_documents WHERE unit_id = $1`, [f.unitId])
+      `SELECT id, status FROM lease_documents WHERE unit_id = $1 AND status <> 'voided'`, [f.unitId])
     expect(rows).toHaveLength(1)
     // THE POINT: not 'pending'. A draft nobody was told about helps no one.
     expect(rows[0].status).toBe('sent')
@@ -299,5 +341,463 @@ describe('S636 an accepted household gets a lease that is actually sent', () => 
     expect(signers.rows[0].role).toBe('landlord')
     expect(signers.rows[0].invite_sent).toBe(true)
     expect(signers.rows.slice(1).every((s: any) => s.invite_sent === false)).toBe(true)
+  })
+})
+
+// ─── S647: what the front desk sees ──────────────────────────────────────────
+//
+// Nic: "it's still saying waiting on them to accept the invite is 16 people. I
+// want to sign my end of the lease for… [them]." Two things had to become true
+// on the pending list for that to work, and neither had a test before.
+describe('S647 the front desk after drafting moved to invite time', () => {
+  async function pending(f: Base) {
+    const r = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(r.status).toBe(200)
+    return r.body.data as any[]
+  }
+
+  it('an invited, unaccepted person is not read as accepted, has been sent nothing, and waits on the landlord', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+
+    const [row] = await pending(f)
+    // Being named on a draft used to count as proof of acceptance. It isn't now.
+    // S655: and nothing — not even a silent setup link — exists for them until
+    // the landlord signs; their one email is minted and sent then.
+    expect(row.inviteState).toBe('not_invited')
+    expect((await db.query(
+      `SELECT u.tenant_invite_token FROM users u JOIN tenants t ON t.user_id = u.id WHERE t.id = $1`,
+      [row.tenantId])).rows[0].tenant_invite_token).toBeNull()
+    expect(row.leaseDocStatus).toBeTruthy()
+    expect(row.leaseWaitingOnRole).toBe('landlord')
+  })
+
+  it('stays on the list after the landlord signs, while the tenant still owes theirs', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    // Simulate issuance: the landlord has signed, the lease is built, and S638
+    // has closed the invite.
+    const [before] = await pending(f)
+    await db.query(
+      `UPDATE lease_document_signers SET status='signed', signed_at=NOW()
+        WHERE document_id=$1 AND role='landlord'`, [before.leaseDocId])
+    await db.query(
+      `UPDATE lease_documents SET status='in_progress', issued_at=NOW() WHERE id=$1`,
+      [before.leaseDocId])
+    await db.query(
+      `UPDATE pending_tenant_intents SET resolved_at=NOW() WHERE unit_id=$1`, [f.unitId])
+
+    const rows = await pending(f)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].leaseWaitingOnRole).toBe('primary')
+  })
+
+  it('drops off once the lease is fully signed', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    const [before] = await pending(f)
+    await db.query(`UPDATE lease_documents SET status='completed' WHERE id=$1`, [before.leaseDocId])
+    await db.query(`UPDATE pending_tenant_intents SET resolved_at=NOW() WHERE unit_id=$1`, [f.unitId])
+    expect(await pending(f)).toHaveLength(0)
+  })
+})
+
+// S647 (Nic, DIRECTIVE): "When I type in a bunch of names to send invites to,
+// it doesn't send them. It drafts up a bunch of leases for me to sign."
+describe('S647 onboarding sends the tenant nothing until the landlord signs', () => {
+  it('drafts the lease and does NOT email the tenant', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds.length).toBe(1)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('still sends the old invite if the lease could not be drafted, so nobody gets nothing', async () => {
+    const f = await seedBase('whole_unit')   // no default template
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds).toEqual([])
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+    expect(res.body.data.fallbackSent).toBe(true)
+    expect(res.body.data.people[0].notified).toBe('email')
+  })
+
+  // S655 review: the agent was told "each person was sent the usual invite
+  // instead" whenever the lease did not draft — but a setup email that fails
+  // leaves that person uncontacted, and the result has to say so.
+  it('a setup email that fails leaves that person marked not contacted', async () => {
+    const f = await seedBase('whole_unit')   // no default template
+    emailTenantOnboardedMock.mockImplementationOnce(async () => { throw new Error('mail provider down') })
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds).toEqual([])
+    expect(res.body.data.draftBlocked.length).toBeGreaterThan(0)
+    expect(res.body.data.fallbackSent).toBe(false)
+    expect(res.body.data.people[0].notified).toBeNull()
+  })
+})
+
+// S655 review: a by-room unit drafts a lease per person, so one person's can
+// draft while another's is refused, and no fallback invite goes (a lease did
+// draft). The refusal names whose lease it is, so the screen and the agent
+// can say which drafted and which did not.
+describe('by-room: one lease drafts, another is refused', () => {
+  it("names the person whose lease was refused, and drafts the other person's", async () => {
+    const f = await seedBase('by_room', 2)
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `good-${randomUUID().slice(0, 6)}@x.dev`, 'Goodie')
+    await onboard(f, `bad-${randomUUID().slice(0, 6)}@x.dev`, 'Baddie')
+    // Clear what the invites drafted, so the per-person draft runs again here.
+    await db.query(`UPDATE lease_documents SET status='voided' WHERE unit_id=$1`, [f.unitId])
+    await db.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL WHERE unit_id=$1`, [f.unitId])
+
+    const { createDocumentRecord } = await import('./esign')
+    const refuseBaddie = async (c: any, opts: any) => {
+      if ((opts.signers ?? []).some((x: any) => x.name === 'Baddie Tester')) {
+        throw new Error('the default lease is missing a required field')
+      }
+      return createDocumentRecord(c, opts)
+    }
+    const client = await db.connect()
+    let out: { draftedDocumentIds: string[]; blocked: string[] }
+    try {
+      await client.query('BEGIN')
+      out = await autoDraftLeasesForUnit(client as any, f.unitId, refuseBaddie, undefined, { quiet: true })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect(out!.draftedDocumentIds).toHaveLength(1)
+    expect(out!.blocked).toHaveLength(1)
+    expect(out!.blocked[0]).toMatch(/\(Baddie Tester\) could not be drafted/)
+    expect(out!.blocked[0]).not.toMatch(/Goodie/)
+    expect(out!.blocked[0]).toMatch(/drafts on its own/)
+  })
+})
+
+// Final sweep (10/3): a refusal's own words, said once. GAM's refusals already
+// end with a period and usually say what to do ("…Add one to the package
+// first."), so the reason read "first.. This is usually the unit's default
+// lease missing a required field. Fix it, then…": a double period, a guessed
+// cause that was wrong for that refusal, and a second instruction.
+describe('final sweep: a refused draft says its reason once, with one next step', () => {
+  const REFUSAL = 'This household is buying the home, but the package has no installment contract to sign. Add one to the package first.'
+
+  it('reasonSentence trims trailing punctuation and puts back exactly one period', async () => {
+    const { reasonSentence } = await import('../services/leaseOnboarding')
+    expect(reasonSentence('Add one first.')).toBe('Add one first.')
+    expect(reasonSentence('Add one first..  ')).toBe('Add one first.')
+    expect(reasonSentence('missing a field')).toBe('missing a field.')
+    expect(reasonSentence('missing a field;: ')).toBe('missing a field.')
+    expect(reasonSentence('Is the template saved?')).toBe('Is the template saved?')
+    expect(reasonSentence('')).toBe('an unexpected error.')
+    expect(reasonSentence(undefined)).toBe('an unexpected error.')
+    // Running it twice changes nothing.
+    expect(reasonSentence(reasonSentence('Add one first.'))).toBe('Add one first.')
+  })
+
+  async function draftWith(f: Base, refusal: string, quiet: boolean) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const out = await autoDraftLeasesForUnit(client as any, f.unitId,
+        async () => { throw new Error(refusal) }, undefined, { quiet })
+      await client.query('COMMIT')
+      return out
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+  async function cleared(f: Base) {
+    await db.query(`UPDATE lease_documents SET status='voided' WHERE unit_id=$1`, [f.unitId])
+    await db.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL WHERE unit_id=$1`, [f.unitId])
+  }
+
+  it('on the screen (quiet): the refusal as it reads, no "..", no guessed cause, one next step', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `q-${randomUUID().slice(0, 6)}@x.dev`, 'Quinn')
+    await cleared(f)
+    const out = await draftWith(f, REFUSAL, true)
+    expect(out.draftedDocumentIds).toEqual([])
+    expect(out.blocked).toHaveLength(1)
+    const reason = out.blocked[0]
+    expect(reason).toContain(REFUSAL)
+    expect(reason).not.toMatch(/\.\./)
+    expect(reason).not.toMatch(/usually/)
+    expect(reason.match(/drafts on its own/g)).toHaveLength(1)
+    expect(reason).toMatch(/first\. Once that is fixed, it drafts on its own\.$/)
+  })
+
+  it('in the landlord notice: the same, and it no longer claims a tenant accepted', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `n-${randomUUID().slice(0, 6)}@x.dev`, 'Noel')
+    await cleared(f)
+    await draftWith(f, REFUSAL, false)
+    const n = (await db.query<{ body: string }>(
+      `SELECT body FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked' ORDER BY created_at DESC LIMIT 1`,
+      [f.landlordUserId])).rows[0]
+    expect(n.body).toContain(REFUSAL)
+    expect(n.body).not.toMatch(/\.\./)
+    expect(n.body).not.toMatch(/usually/)
+    expect(n.body).not.toMatch(/accepted their invite/)
+    expect(n.body.match(/drafts it on its own|drafts on its own/g)).toHaveLength(1)
+  })
+
+  it('the invite\'s own draft failure (newLeaseInvite) keeps the refusal\'s one period too', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    const mod = await import('../services/leaseOnboarding')
+    const spy = vi.spyOn(mod, 'autoDraftLeasesForUnit').mockRejectedValueOnce(new Error(REFUSAL))
+    try {
+      const res = await onboard(f, `o-${randomUUID().slice(0, 6)}@x.dev`, 'Olive')
+      expect(res.status).toBe(200)
+      expect(spy).toHaveBeenCalled()
+      expect(res.body.data.draftedDocumentIds).toEqual([])
+      const reason: string = res.body.data.draftBlocked[0]
+      expect(reason).toContain(REFUSAL)
+      expect(reason).not.toMatch(/\.\./)
+      expect(reason.match(/drafts on its own/g)).toHaveLength(1)
+    } finally { spy.mockRestore() }
+  })
+})
+
+// Final sweep (10/3): the landlord's menu item is "GoldSign" (the Layout
+// sidebar), not "E-Sign". The screen reason and the emailed notice now name
+// the menu and the tab he actually clicks, in the same words.
+describe('final sweep: a blocked draft names the GoldSign menu the landlord sees', () => {
+  async function draft(unitId: string, quiet: boolean) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const out = await autoDraftLeasesForUnit(client as any, unitId,
+        async () => { throw new Error('nothing should draft here') }, undefined, { quiet })
+      await client.query('COMMIT')
+      return out
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+  async function lastNotice(userId: string) {
+    return (await db.query<{ title: string; body: string; action_url: string | null }>(
+      `SELECT title, body, action_url FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked' ORDER BY created_at DESC LIMIT 1`,
+      [userId])).rows[0]
+  }
+
+  it('no default lease: the screen and the email both say "Set one in GoldSign (Templates)"', async () => {
+    const f = await seedBase('whole_unit')   // no template for this kind of unit
+    const onScreen = await draft(f.unitId, true)
+    expect(onScreen.draftedDocumentIds).toEqual([])
+    expect(onScreen.blocked).toHaveLength(1)
+    expect(onScreen.blocked[0]).toMatch(/Set one in GoldSign \(Templates\), then it drafts on its own\.$/)
+    expect(onScreen.blocked[0]).not.toMatch(/E-Sign/)
+
+    await draft(f.unitId, false)
+    const n = await lastNotice(f.landlordUserId)
+    expect(n.title).toBe('Set a default lease template')
+    expect(n.body).toMatch(/Set one in GoldSign \(Templates\), then it drafts on its own\.$/)
+    expect(n.body).not.toMatch(/E-Sign/)
+    // Final sweep (10/3): clicking it in the bell opens the Templates tab, not
+    // Documents (ESignPage's default tab).
+    expect(n.action_url).toBe('/esign?tab=templates')
+  })
+
+  // Final sweep (10/3): "Draft this one by hand in GoldSign (Documents, then
+  // Send Document)" was a dead end — Send Document gives the fifth person
+  // co_tenant_4 and createDocumentRecord refuses it. The one step that works
+  // is moving someone, said the same way on the screen and in the email.
+  it('a household too big to draft: the screen and the email say the same thing, with the real limit and a step that works', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      for (let i = 0; i <= ROSTER_MAX_HOUSEHOLD; i++) {
+        const tenantId = await seedTenant(client)
+        await client.query(
+          `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+           VALUES ($1,$2,'not_uploaded',$3,$4)`, [f.landlordId, tenantId, f.unitId, f.propertyId])
+      }
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    const people = ROSTER_MAX_HOUSEHOLD + 1
+    const words = new RegExp(
+      `has ${people} people on one lease; a lease holds up to ${ROSTER_MAX_HOUSEHOLD}\\. ` +
+      `Move someone to another unit\\. To move someone, cancel their invite in Tenant Onboarding \\(Pending Pool\\), ` +
+      `then invite them to the other unit\\. The lease for the rest then drafts on its own within the hour\\.$`)
+
+    const onScreen = await draft(f.unitId, true)
+    expect(onScreen.draftedDocumentIds).toEqual([])
+    expect(onScreen.blocked).toHaveLength(1)
+    expect(onScreen.blocked[0]).toMatch(words)
+    expect(onScreen.blocked[0]).not.toMatch(/E-Sign|by hand|Send Document/)
+
+    await draft(f.unitId, false)
+    const n = await lastNotice(f.landlordUserId)
+    expect(n.title).toBe('Too many people for one lease')
+    expect(n.body).toMatch(words)
+    expect(n.body).not.toMatch(/auto-draft|manually|E-Sign|by hand|Send Document/)
+    // The bell opens where the invites are cancelled.
+    expect(n.action_url).toBe('/tenant-onboarding/pending')
+  })
+})
+
+// Final sweep (10/3): the hourly retry (draftAllPendingLeases) re-ran every
+// waiting unit and sent its "could not draft" notice again each time, emailed:
+// one email an hour for a cause nobody fixed, and never ending for a household
+// too big for one lease (the sweep can't fix that). Production held four
+// identical notices for one unit in a day. Now: once per unit and cause.
+describe('final sweep: the hourly retry sends each could-not-draft notice once', () => {
+  async function notices(userId: string) {
+    return (await db.query<{ id: string; title: string; body: string }>(
+      `SELECT id, title, body FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked' ORDER BY created_at`,
+      [userId])).rows
+  }
+  async function emails(userId: string) {
+    return Number((await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM email_send_log
+        WHERE category='notif_lease_draft_blocked' AND metadata->>'user_id'=$1`, [userId])).rows[0].n)
+  }
+  async function invitePeople(f: Base, n: number, unitId = f.unitId) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      for (let i = 0; i < n; i++) {
+        const tenantId = await seedTenant(client)
+        await client.query(
+          `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, property_id)
+           VALUES ($1,$2,'not_uploaded',$3,$4)`, [f.landlordId, tenantId, unitId, f.propertyId])
+      }
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+  async function sweep() {
+    const { draftAllPendingLeases } = await import('../services/householdLeaseDraft')
+    return draftAllPendingLeases()
+  }
+  async function refuse(f: Base, refusal: string) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await autoDraftLeasesForUnit(client as any, f.unitId, async () => { throw new Error(refusal) })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  it('a household too big for one lease: two sweeps send one notice and one email', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await invitePeople(f, ROSTER_MAX_HOUSEHOLD + 1)
+    await sweep()
+    await sweep()
+    const ns = await notices(f.landlordUserId)
+    expect(ns).toHaveLength(1)
+    expect(ns[0].title).toBe('Too many people for one lease')
+    expect(await emails(f.landlordUserId)).toBe(1)
+    // Nothing drafted: no lease GAM drafts holds them all.
+    expect(await draftsForUnit(f.unitId)).toEqual([])
+  })
+
+  it('a notice the landlord has read is not sent again for a week; after that, once more while the cause stands', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const { LEASE_DRAFT_BLOCKED_REMIND_DAYS } = await import('../services/leaseOnboarding')
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await invitePeople(f, ROSTER_MAX_HOUSEHOLD + 1)
+    await sweep()
+    await db.query(`UPDATE notifications SET read=TRUE, read_at=NOW() WHERE user_id=$1`, [f.landlordUserId])
+    await sweep()
+    expect(await notices(f.landlordUserId)).toHaveLength(1)
+
+    await db.query(
+      `UPDATE notifications SET created_at = NOW() - (($2::int + 1) * INTERVAL '1 day') WHERE user_id=$1`,
+      [f.landlordUserId, LEASE_DRAFT_BLOCKED_REMIND_DAYS])
+    await sweep()
+    await sweep()
+    expect(await notices(f.landlordUserId)).toHaveLength(2)
+    expect(await emails(f.landlordUserId)).toBe(2)
+  })
+
+  it('an unread notice is never repeated, however old', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await invitePeople(f, ROSTER_MAX_HOUSEHOLD + 1)
+    await sweep()
+    await db.query(`UPDATE notifications SET created_at = NOW() - INTERVAL '60 days' WHERE user_id=$1`, [f.landlordUserId])
+    await sweep()
+    expect(await notices(f.landlordUserId)).toHaveLength(1)
+  })
+
+  it('a refused draft: the same reason is sent once; a NEW reason on the same unit is sent', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await invitePeople(f, 1)
+    const FIRST = 'The default lease has no box for the late fee. Add one first.'
+    const SECOND = 'This household is buying the home, but the package has no installment contract to sign. Add one to the package first.'
+    await refuse(f, FIRST)
+    await refuse(f, FIRST)
+    let ns = await notices(f.landlordUserId)
+    expect(ns).toHaveLength(1)
+    expect(ns[0].title).toBe('Lease could not be drafted automatically')
+    expect(ns[0].body).toContain(FIRST)
+    expect(await emails(f.landlordUserId)).toBe(1)
+
+    // The landlord fixed the first cause and drafting now hits another: that
+    // is news, not a repeat.
+    await refuse(f, SECOND)
+    await refuse(f, SECOND)
+    ns = await notices(f.landlordUserId)
+    expect(ns).toHaveLength(2)
+    expect(ns[1].body).toContain(SECOND)
+    expect(await emails(f.landlordUserId)).toBe(2)
+  })
+
+  it('no default lease: one notice for every unit of that kind at the property, not one per unit, opening the Templates tab', async () => {
+    const f = await seedBase('whole_unit')   // no template for apartments
+    const client = await db.connect()
+    let unit2: string
+    try {
+      await client.query('BEGIN')
+      unit2 = await seedUnit(client as any, { propertyId: f.propertyId, landlordId: f.landlordId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    await invitePeople(f, 1)
+    await invitePeople(f, 1, unit2!)
+    await sweep()
+    await sweep()
+    const ns = (await db.query<{ title: string; action_url: string; data: any }>(
+      `SELECT title, action_url, data FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked'`,
+      [f.landlordUserId])).rows
+    expect(ns).toHaveLength(1)
+    expect(ns[0].title).toBe('Set a default lease template')
+    expect(ns[0].action_url).toBe('/esign?tab=templates')
+    expect(ns[0].data).toMatchObject({ propertyId: f.propertyId, unitType: 'apartment' })
+    expect(await emails(f.landlordUserId)).toBe(1)
+  })
+
+  it('a different unit with its own cause still gets its own notice', async () => {
+    const { ROSTER_MAX_HOUSEHOLD } = await import('@gam/shared')
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    const client = await db.connect()
+    let unit2: string
+    try {
+      await client.query('BEGIN')
+      unit2 = await seedUnit(client as any, { propertyId: f.propertyId, landlordId: f.landlordId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    await invitePeople(f, ROSTER_MAX_HOUSEHOLD + 1)
+    await invitePeople(f, ROSTER_MAX_HOUSEHOLD + 1, unit2!)
+    await sweep()
+    await sweep()
+    const ns = await notices(f.landlordUserId)
+    expect(ns).toHaveLength(2)
+    expect(ns.every(n => n.title === 'Too many people for one lease')).toBe(true)
   })
 })

@@ -65,6 +65,21 @@ describe('platform fee for one month', () => {
     const fees = await platformFeesByProperty(landlordId, ['2026-09-01'])
     expect(fees.get(propId)).toBe(16)
   })
+
+  // S653 (Nic): "me marking mobile home three at Mountain View as owner use...
+  // doesn't change the billing." The accrual counts an owner-occupied space; the
+  // estimate for a month not yet billed has to say the same number.
+  it('counts an owner-occupied space like a tenanted one — eight leases plus one owner-use is $18', async () => {
+    await occupy(8, '2026-08-01')
+    const c = await db.connect()
+    try {
+      const unitId = await seedUnit(c, { propertyId: propId, landlordId })
+      await c.query(`UPDATE units SET status = 'owner_use' WHERE id = $1`, [unitId])
+    } finally { c.release() }
+    const thisMonth = new Date().toISOString().slice(0, 7) + '-01'
+    const fees = await platformFeesByProperty(landlordId, [thisMonth])
+    expect(fees.get(propId)).toBe(18)
+  })
 })
 
 describe('a full-year figure is a RUNNING TOTAL, not a monthly charge', () => {

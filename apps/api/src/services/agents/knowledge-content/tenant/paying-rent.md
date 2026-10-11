@@ -20,15 +20,17 @@ A processing fee may apply depending on how you pay:
 - **Non-US-issued cards:** an additional 1.5%.
 - **Declined card attempt:** a flat $1.00 declined-payment fee.
 
-Because ACH and cash both cost a flat $6.00, either is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
+Of the electronic options, ACH's flat $6.00 is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
 
-There is no charge for paying this way, on any payment, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft. Not all landlords accept off-platform payment, so ask yours first.
+Paying by cash, check or money order is free on every payment — there is no fee for it, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft. Not all landlords accept off-platform payment, so ask yours first.
 
 ## If you deposit rent at the bank yourself
 
-If you pay by depositing straight into your landlord's account, tell us with **"I paid at the bank"** on your payments screen. Report the amount, the day you went, and whether it was cash, a check or a money order. When the deposit shows up in your landlord's bank feed we apply it automatically — **dated to the day you paid, not the day the bank posted it**, which matters if you deposited on a Friday and it didn't land until Monday.
+If you pay by depositing straight into your landlord's account, tell us with **"I paid at the bank"** on your payments screen. Report the amount, the day you went, about what time you were there (pick the hour, or after hours / ATM), whether it was cash, a check or a money order, and the deposit reference number from the bank's receipt (you can add a photo of the receipt too). The time helps us find your deposit when someone else deposits the same amount. When your landlord's bank is connected to GAM, we apply it automatically when the deposit shows up — **dated to the day you paid when the bank shows it that day or the next business day**, which matters if you deposited on a Friday and it didn't land until Monday. If the bank shows it later than that, the bank's date is used, and any late fees up to then stay. **The bank's date decides:** a late fee charged after the day the bank shows comes off — you don't owe it — and your payment counts as on time if it was on time. If your landlord records your deposit by hand before the bank shows it, a late fee that had already posted is credited against your bill and the payment counts as late until the bank shows the deposit; then the bank's date decides. If it isn't connected, your landlord checks their own bank and marks your bill paid. Let them know you paid and keep your deposit slip. The report doesn't expire.
 
-Two things to know. Report it **after** you've actually been to the bank and given it a few hours to show up — reporting it beforehand means there's nothing to match and the report expires. And reporting a deposit doesn't change your balance on its own: what you owe stays exactly the same until the deposit actually appears. If it never appears, you'll be told, and your balance will still be unchanged.
+Not every property takes rent deposited at the bank. If yours doesn't, you won't see "I paid at the bank" — pay online, or pay at the office.
+
+Two things to know. Report it **after** you've actually been to the bank. When your landlord's bank is connected, give the deposit a few hours to show up first — reporting it beforehand means there's nothing to match, and a report with nothing to match expires after a week. And reporting a deposit doesn't change your balance on its own: what you owe stays exactly the same until the deposit is applied or your landlord marks your bill paid. When your landlord's bank is connected and the deposit never appears there, you'll be told, and your balance will still be unchanged.
 
 ## If a card payment is declined
 
@@ -40,7 +42,13 @@ Whether you or your landlord covers this processing fee is set per property. You
 
 ## How to pay
 
-When a payment row shows as due, open it, pick your saved bank account or card, review the total (rent plus any fee that applies to you), and confirm. That's it.
+Open your payments screen and choose **Pay now**. Pick your saved bank account or card, review the total (everything you owe on the lease, plus any fee that applies to you), and confirm. Rent is paid in full, so the payment covers your whole current bill.
+
+## If you have credit on your account
+
+Money you paid ahead goes on your balance by itself, oldest bill first — part of a line when it can't cover all of it — so your bill shows the charges, "Credit applied", and what is still owed. If you have other credit — a credit from your landlord — you'll see "You have $X credit available" beside it, and two buttons: **Use all $X** (your credit comes off and you pay the rest) or **Save it for later** (you pay the whole bill and keep the credit). If your credit covers everything, you'll see **Pay with credit**, and nothing is charged. If your credit changed since the screen loaded, you'll be shown the new figure and asked again.
+
+Other credit pays a bill by itself only when it covers the whole bill. Your bill email says the same thing: each charge, any credit already applied, and what is still owed, with your available credit beside it.
 
 A note on roles: GAM is the platform that moves your payment — it is not your landlord and does not set your rent. The rent amount, due date, and any late fees come from your lease with your landlord.
 

@@ -5,7 +5,7 @@
 // logins (business_owner / business_staff) land here. Keep the two
 // copies in sync when register behavior changes.
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { humanize } from '@gam/shared'
+import { humanize, processingFeeFor } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { Modal } from '../components/Modal'
 import { useAuth } from '../context/AuthContext'
@@ -486,7 +486,7 @@ function CheckoutModal({
   const tipsAllowed = regCfg ? regCfg.tipsEnabled !== false : true
   const customerPaysCardFee = regCfg?.cardFeesPaidBy === 'customer'
 
-  const [method, setMethod] = useState<'cash' | 'card_recorded' | 'card_reader'>('cash')
+  const [method, setMethod] = useState<'cash' | 'card_reader'>('cash')
   // S536 (Nic): card payments run on a paired Stripe Terminal reader —
   // tap/swipe completes the sale, no double workflow. Readers are set
   // up in Settings; when at least one exists, "Card — reader" replaces
@@ -544,9 +544,10 @@ function CheckoutModal({
   const [err, setErr] = useState<string | null>(null)
 
   // Keep tendered tracking the grand total until the cashier edits it.
-  // Customer-paid card fee (2.9% + 10¢) — added on top at the reader;
+  // Customer-paid card fee (3.5% + $0.55, platform-wide) — added on top at the reader;
   // the server computes the authoritative amount, this mirrors it.
-  const cardFee = customerPaysCardFee ? Math.round(grandTotal * 2.9) / 100 + 0.10 : 0
+  // S649: one card fee platform-wide (3.5% + $0.55)
+  const cardFee = customerPaysCardFee ? processingFeeFor({ amount: grandTotal, paymentMethod: 'card' }) : 0
   const tenderedNum = tenderedTouched ? Number(tendered) : grandTotal
   const change = method === 'cash' ? Math.max(0, tenderedNum - grandTotal) : 0
 
@@ -565,10 +566,10 @@ function CheckoutModal({
     if (applied) payloadBase.discountCode = applied.code
 
     // Reader path: create+push the PaymentIntent, wait for the tap /
-    // swipe (polling; the GET auto-captures on success), then record
-    // the sale with the proven PI.
+    // swipe (polling), then record the sale with the approved PI — recording
+    // the sale is what takes the money (S648), so neither happens alone.
     if (method === 'card_reader') {
-      if (!readerId) { setErr('No reader selected'); return }
+      if (!readerId) { setErr(readers.length ? 'No reader selected' : 'Pair a card reader to take cards'); return }
       setSubmitting(true)
       chargeAbortRef.current = false
       let piId: string | null = null
@@ -581,11 +582,11 @@ function CheckoutModal({
         while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 1600))
           if (chargeAbortRef.current) {
-            await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+            await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
             setCharging(null); setSubmitting(false); return
           }
           const st = await apiGet<any>(`/business-pos/terminal/payment-intents/${piId}`)
-          if (st.status === 'succeeded') {
+          if (st.status === 'requires_capture' || st.status === 'succeeded') {
             const r = await apiPost<TransactionDetail>('/business-pos/transactions', {
               ...payloadBase, paymentMethod: 'stripe_terminal', stripePaymentIntentId: piId })
             setCharging(null)
@@ -596,10 +597,10 @@ function CheckoutModal({
             setErr('Payment was canceled at the reader'); setCharging(null); setSubmitting(false); return
           }
         }
-        await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+        await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
         setErr('Reader timed out — no card was presented'); setCharging(null); setSubmitting(false)
       } catch (e: any) {
-        if (piId) await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, {}).catch(() => {})
+        if (piId) await apiPost(`/business-pos/terminal/payment-intents/${piId}/cancel`, { stripeReaderId: readerId }).catch(() => {})
         setErr(e?.response?.data?.error || 'Card charge failed'); setCharging(null); setSubmitting(false)
       }
       return
@@ -703,7 +704,7 @@ function CheckoutModal({
 
       <label style={labelStyle}>Payment method</label>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        {((readers.length ? ['cash', 'card_reader'] : ['cash', 'card_recorded']) as any[]).map(m => (
+        {(['cash', 'card_reader'] as const).map(m => (
           <button key={m}
             onClick={() => setMethod(m)}
             style={{
@@ -716,7 +717,7 @@ function CheckoutModal({
               cursor: 'pointer',
               textAlign: 'center' as const,
             }}>
-            {m === 'cash' ? 'Cash' : m === 'card_reader' ? 'Card — reader' : 'Card (recorded)'}
+            {m === 'cash' ? 'Cash' : 'Card'}
           </button>
         ))}
       </div>
@@ -770,7 +771,7 @@ function CheckoutModal({
         </>
       )}
 
-      {method === 'card_recorded' && (
+      {method === 'card_reader' && readers.length === 0 && (
         <div style={{
           padding: 12, marginTop: 12,
           background: 'rgba(245,158,11,.08)',
@@ -780,7 +781,7 @@ function CheckoutModal({
           display: 'flex', gap: 8, alignItems: 'start',
         }}>
           <AlertTriangle size={14} style={{ color: 'var(--amber)', flexShrink: 0, marginTop: 2 }} />
-          <span>Run the card on your terminal first. GAM just records the sale + decrements stock — it does not charge the card.</span>
+          <span>Pair a card reader to take cards. Every card payment goes through GAM.</span>
         </div>
       )}
 

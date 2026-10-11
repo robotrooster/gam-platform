@@ -17,7 +17,7 @@
 // He is right, and the arithmetic says so. Grace periods are measured in DAYS.
 // An hour of drift only changes an outcome for a tenant paying within sixty
 // minutes of local midnight on the last day of grace — and the error, when it
-// happens, runs in the tenant's favour on a single day's fee. Against that: a
+// happens, runs in the tenant's favor on a single day's fee. Against that: a
 // ZIP table for fifteen states, wrong at the edges anyway (the boundary follows
 // counties, not postal ranges), going stale silently, and prompting landlords to
 // confirm something they neither know nor care about.
@@ -86,7 +86,7 @@ const STATE_TIMEZONE: Record<string, string> = {
 /**
  * Resolve the IANA timezone for a property from its state.
  *
- * Never throws and never returns null: an unrecognised state falls back to the
+ * Never throws and never returns null: an unrecognized state falls back to the
  * old default, because a property with no clock at all is worse than one an hour
  * out. The landlord can always set it.
  */

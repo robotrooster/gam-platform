@@ -9,6 +9,7 @@
  * CALLER's responsibility — this function only writes the row.
  */
 import { queryOne } from '../db'
+import { todayIn } from '../lib/timezone'
 
 // W-30: any lease_fees fee_type can be billed when its row carries
 // due_timing='other' — the row (already DB-CHECK-validated) is the source of
@@ -25,9 +26,23 @@ export async function createLeaseFeePayment(p: {
   amount: number
   description?: string
   dueDate?: string
+  /** The property's zone, when the caller already has it; looked up otherwise. */
+  timezone?: string | null
   source?: string // who initiated, for the internal notes trail
 }): Promise<{ paymentId: string; dueDate: string; description: string }> {
-  const dueDate = p.dueDate ?? new Date().toISOString().slice(0, 10)
+  // S654: a charge dated "today" is dated in the park's calendar. A UTC date
+  // runs a day ahead every evening in Phoenix.
+  let dueDate = p.dueDate
+  if (dueDate == null) {
+    let tz = p.timezone
+    if (tz === undefined) {
+      const row = await queryOne<{ timezone: string }>(
+        `SELECT p.timezone FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+        [p.unitId])
+      tz = row?.timezone ?? null
+    }
+    dueDate = todayIn(tz)
+  }
   const description =
     p.description ?? p.feeType.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
   const inserted = await queryOne<{ id: string }>(

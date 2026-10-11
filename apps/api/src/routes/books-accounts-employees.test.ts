@@ -107,8 +107,8 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       landlordAUserId, landlordAId, landlordBUserId, landlordBId,
       bkAUserId: bkA.rows[0].id,
       adminToken:     sign({ userId: admin.rows[0].id, role: 'admin', email: 'a@t.dev', profileId: null, permissions: {} }),
-      landlordAToken: sign({ userId: landlordAUserId, role: 'landlord', email: 'la@t.dev', profileId: landlordAId, permissions: {} }),
-      landlordBToken: sign({ userId: landlordBUserId, role: 'landlord', email: 'lb@t.dev', profileId: landlordBId, permissions: {} }),
+      landlordAToken: sign({ userId: landlordAUserId, role: 'landlord', email: 'la@t.dev', profileId: null, landlordIds: [landlordAId], permissions: {} }),
+      landlordBToken: sign({ userId: landlordBUserId, role: 'landlord', email: 'lb@t.dev', profileId: null, landlordIds: [landlordBId], permissions: {} }),
       // Bookkeeper JWTs carry the JWT-time access_level — middleware
       // re-stamps it from the live scope on each request anyway.
       bkAToken:       sign({ userId: bkA.rows[0].id, role: 'bookkeeper', email: 'bka@t.dev',

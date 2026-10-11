@@ -85,7 +85,7 @@ export const getMoneyInFlight: AgentTool = {
 
     const total = Math.round(rows.reduce((s, r) => s + Number(r.amount), 0) * 100) / 100
     // The oldest one is what a landlord actually worries about: a bank transfer
-    // that has been clearing for a fortnight is worth a look, one from Tuesday
+    // that has been clearing for a two weeks is worth a look, one from Tuesday
     // is not.
     const oldest = Math.max(...rows.map(r => r.days_clearing))
 

@@ -14,24 +14,61 @@
 // The backends are untouched — this composes the two existing page bodies in
 // `embedded` mode, so all the working logic stays where it was.
 import { BankReconciliationPage } from './BankReconciliationPage'
+import { useUrlTab } from '../lib/useUrlTab'
 import { BankFeedPage } from './BankFeedPage'
+import { useState } from 'react'
+import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
+import { EntityPicker } from '../components/EntityPicker'
 
+// S652 (Nic): "the bank feed and reconciliation need to be on a separate page
+// because this layout is retarded." Two tabs. The feed is the bank: linked
+// account, balance, transactions to categorize. Reconciliation is the month
+// check, and underneath it the deposits that may be a tenant's rent — a
+// matching job, not something to wade through on the way to the balance.
 export function BankPage() {
+  const [tab, setTab] = useUrlTab('tab', 'feed', ['feed','reconcile'] as const)
+  const [entityId, setEntityId] = useState('')
   return (
     <div>
       <div className="page-header">
         <div>
           <h1 className="page-title">Bank</h1>
           <p className="page-subtitle">
-            Check that GAM's payouts landed, and turn your own spending into expenses.
+            {tab === 'feed'
+              ? 'Your linked bank, its balance, and the transactions to turn into expenses.'
+              : 'Check that GAM\'s payouts landed, and match branch deposits to rent.'}
           </p>
         </div>
       </div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 18 }}>
+        <button className={`btn btn-sm ${tab === 'feed' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('feed')}>Bank feed</button>
+        <button className={`btn btn-sm ${tab === 'reconcile' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('reconcile')}>Reconciliation</button>
+      </div>
 
-      {/* Month check first: it answers the headline question in one glance.
-          The day-to-day work (categorizing transactions) sits underneath. */}
-      <BankReconciliationPage embedded />
-      <BankFeedPage embedded />
+      {tab === 'feed' && <BankFeedPage embedded />}
+
+      {tab === 'reconcile' && (
+        <div>
+          {/* S654 (Nic, DIRECTIVE): no default company. One choice at the top
+              of the tab drives the month check AND the deposit matching below. */}
+          <EntityPicker value={entityId} onChange={setEntityId} label="Company"
+            note="Each company has its own bank, so its month is checked and its deposits matched on their own." />
+          {/* S654 (review): keyed by company, so typed figures never carry over to another company's books. */}
+          <BankReconciliationPage key={entityId || 'none'} embedded entityId={entityId} />
+          <div style={{ marginTop: 28 }}>
+            <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
+            <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+              Money paid in at a branch that matches what a tenant owes to the dollar, or that a
+              tenant told us about. Recording it here dates the payment to the deposit, so any
+              late fee charged while it was in transit comes back off.
+            </div>
+            <DepositMatchPanel entityId={entityId} />
+            <div style={{ marginTop: 16 }}>
+              <CashPositionPanel entityId={entityId} />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

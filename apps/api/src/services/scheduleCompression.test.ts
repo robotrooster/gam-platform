@@ -8,13 +8,15 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 import { compressPropertySchedule, rankUnitsBestFit, slackScore, relocateBlockingBookings } from './scheduleCompression'
+import { todayIn, addDaysTo } from '../lib/timezone'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
+// S654: N days from the property's today (seeded properties default to
+// America/Phoenix, the test DB's zone too). Local setDate + UTC toISOString
+// jumped a day ahead after 5 pm in Phoenix.
 function plusDays(n: number): string {
-  const d = new Date()
-  d.setDate(d.getDate() + n)
-  return d.toISOString().slice(0, 10)
+  return addDaysTo(todayIn(null), n)
 }
 
 async function seedPark() {
@@ -86,6 +88,57 @@ describe('compressPropertySchedule', () => {
     // RV 01/02 are 30A back-in — incompatible. Packs to RV 03 (first 50A).
     expect(moves).toHaveLength(1)
     expect(await unitOf(b)).toBe(p.s3)
+  })
+
+  // S653 (Nic): "they didn't like the spot they were in last year... an
+  // avoidance type situation."
+  it('never packs a guest onto a site they asked not to have', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8),
+      { avoided_unit_ids: [p.s1] })
+    const moves = await compressPropertySchedule(p.propertyId)
+    expect(moves).toHaveLength(1)
+    expect(await unitOf(b)).toBe(p.s2)   // RV 01 is the best fit, but it is on the list
+  })
+
+  // 10/6 (Nic): "would anything inadvertently push her into spot 14 assuming it
+  // was open and that like that slot kind of became ideal?" No — and a guest a
+  // person did put there (confirmed) is moved off it when the packer can.
+  it('even when the avoided site becomes the ideal slot, the packer never uses it', async () => {
+    const p = await seedPark()
+    // Snug gap on RV 01 between two stays: the best fit by far — but avoided.
+    await booking(p.s1, p.landlordId, plusDays(2), plusDays(5), { site_reveal_sent_at: new Date() })
+    await booking(p.s1, p.landlordId, plusDays(8), plusDays(12), { site_reveal_sent_at: new Date() })
+    const her = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1] })
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(her)).not.toBe(p.s1)
+    expect(await compressPropertySchedule(p.propertyId)).toEqual([])   // and stays off it, run after run
+    expect(await unitOf(her)).not.toBe(p.s1)
+  })
+
+  it('a stay sitting on a site it asked not to have is moved off it by the packer', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1] })
+    const moves = await compressPropertySchedule(p.propertyId)
+    expect(moves).toHaveLength(1)
+    expect(await unitOf(b)).toBe(p.s2)
+  })
+
+  it('a stay whose every other site is avoided keeps its own', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s1, p.s2, p.s3] })
+    expect(await compressPropertySchedule(p.propertyId)).toEqual([])
+    expect(await unitOf(b)).toBe(p.s4)
+  })
+
+  it('relocation for an extension skips the avoided sites too', async () => {
+    const p = await seedPark()
+    const extending = await booking(p.s1, p.landlordId, plusDays(1), plusDays(5), { site_reveal_sent_at: new Date() })
+    const incoming = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s2, p.s3] })
+    const { relocateBlockingBookings } = await import('./scheduleCompression')
+    const r = await relocateBlockingBookings(p.s1, { checkIn: plusDays(1), checkOut: plusDays(7) }, extending)
+    expect(r.ok).toBe(true)
+    expect(await unitOf(incoming)).toBe(p.s4)   // RV 02 and 03 avoided → RV 04
   })
 
   it('never moves pinned bookings — the reveal stamp is THE fence (revealed / checked-in stay; same-day UNREVEALED may move)', async () => {
@@ -194,5 +247,65 @@ describe('compressPropertySchedule', () => {
     const second = await compressPropertySchedule(p.propertyId)
     expect(second).toHaveLength(0)
     expect(await unitOf(b1)).toBe(p.s1)
+  })
+})
+
+// ── S649 (Nic): out-of-order sites ───────────────────────────────────────
+//
+// "I want the compression and expansion to be able to detect out of order
+// sites and not push something in there when there's no reservation."
+describe('out-of-order sites', () => {
+  async function markOoo(p: any, unitId: string, startsOn: string, endsOn: string | null = null) {
+    const { markOutOfOrder } = await import('./outOfOrder')
+    const u = await db.query<any>(`SELECT l.user_id FROM landlords l WHERE l.id = $1`, [p.landlordId])
+    return markOutOfOrder({ unitId, landlordId: p.landlordId, userId: u.rows[0].user_id, startsOn, endsOn, reason: 'broken pedestal' })
+  }
+
+  it('the packer never moves a stay onto an out-of-order site', async () => {
+    const p = await seedPark()
+    await markOoo(p, p.s1, plusDays(0))
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8))
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(b)).toBe(p.s2)   // RV 01 would be best, but it's out of order
+  })
+
+  it('marking a site out of order moves a movable stay off it right away', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8))
+    await markOoo(p, p.s1, plusDays(1), plusDays(20))
+    expect(await unitOf(b)).not.toBe(p.s1)
+  })
+
+  it('a stay moved off an out-of-order site never lands on a site it asked not to have', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { avoided_unit_ids: [p.s2] })
+    await markOoo(p, p.s1, plusDays(1), plusDays(20))
+    expect(await unitOf(b)).toBe(p.s3)   // RV 02 is next in line, but on the list
+  })
+
+  it('a stay that cannot move is left in place and the landlord is told, once', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { locked_to_unit: true })
+    await markOoo(p, p.s1, plusDays(1))
+    expect(await unitOf(b)).toBe(p.s1)
+    const { alertStaysOnOutOfOrderSites } = await import('./outOfOrder')
+    expect(await alertStaysOnOutOfOrderSites(p.propertyId)).toBe(0)   // already told when it was marked
+    const n = await db.query(`SELECT 1 FROM notifications WHERE type = 'site_out_of_order_stay' AND data->>'bookingId' = $1`, [b])
+    expect(n.rows).toHaveLength(1)
+  })
+
+  it('new stays and the unit picker route around it; back in service, it books again', async () => {
+    const p = await seedPark()
+    const row = await markOoo(p, p.s1, plusDays(0), plusDays(10))
+    const { findStayConflict, findAvailableUnits } = await import('./unitAvailability')
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(2), checkOut: plusDays(4) })).toBe('out_of_order')
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(10), checkOut: plusDays(12) })).toBeNull()  // after it's back
+    expect(await rankUnitsBestFit([p.s1, p.s2], { checkIn: plusDays(2), checkOut: plusDays(4) })).toEqual([p.s2])
+    const avail = await findAvailableUnits({ landlordIds: [p.landlordId], window: { checkIn: plusDays(2), checkOut: plusDays(4) } })
+    expect(avail.map((u: any) => u.id)).not.toContain(p.s1)
+    const { clearOutOfOrder } = await import('./outOfOrder')
+    const u = await db.query<any>(`SELECT user_id FROM landlords WHERE id = $1`, [p.landlordId])
+    await clearOutOfOrder({ id: row.id, landlordId: p.landlordId, userId: u.rows[0].user_id })
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(2), checkOut: plusDays(4) })).toBeNull()
   })
 })

@@ -9,7 +9,8 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, MANUAL_PAYMENT_FEE_SCOPE, type FeePayer } from '@gam/shared'
+import { IncomingTransfersCard } from '../components/IncomingTransfersCard'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
@@ -57,20 +58,19 @@ const UNIT_TYPE_OPTIONS = UNIT_TYPES.map(value => ({
   icon:   UNIT_TYPE_ICON[value],
 }))
 
-// S173: compact display of the three fee_payer toggles on the property
+// S173: compact display of the fee_payer toggles on the property
 // card. Reads the same camelCase shape produced by GET /properties' jsonb
 // allocationRule join, with a legacy bankingFeePayer fallback for rows
 // created pre-S116. Renders nothing when no allocation rule is present
 // (defensive; every active property has one).
 function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
   if (!allocationRule) return null
+  // 10/5: card and bank fees are one choice per property.
   const ach      = (allocationRule.achFeePayer      || allocationRule.bankingFeePayer || 'tenant') as FeePayer
-  const card     = (allocationRule.cardFeePayer     || allocationRule.bankingFeePayer || 'tenant') as FeePayer
-  const manual   = (allocationRule.manualFeePayer   || 'tenant')                                    as FeePayer
   const chip = (label: string, payer: FeePayer) => (
     <span
       key={label}
-      title={`${label} fee: ${payer === 'tenant' ? 'tenant pays (added on top)' : 'landlord absorbs (deducted from gross)'}`}
+      title={`${label}: ${PROCESSING_FEE_CHOICE_HINT[feeChoiceFromPayer(payer)]}`}
       style={{
         fontSize:     '.62rem',
         padding:      '2px 7px',
@@ -86,22 +86,19 @@ function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
     >
       <span style={{ color: 'var(--text-3)' }}>{label}</span>
       <span style={{ color: payer === 'tenant' ? 'var(--gold)' : 'var(--text-1)', fontWeight: 600 }}>
-        {payer === 'tenant' ? 'tenant' : 'landlord'}
+        {payer === 'tenant' ? 'passed on' : 'covered'}
       </span>
     </span>
   )
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
-      {chip('ACH', ach)}
-      {chip('Card', card)}
-      {chip('Cash', manual)}
+      {chip('Card & bank fees', ach)}
     </div>
   )
 }
 
-// S172: per-property fee toggles. Each fee (ACH / card / platform) has an
-// independent "tenant pays" vs "landlord absorbs" setting. Reused in
-// AddEditModal for create + edit flows.
+// S172 / 10/5: the property's one card-and-bank fee choice — pass them on
+// ('tenant') or cover them ('landlord'). Used in AddEditModal for create + edit.
 function FeePayerToggle({
   label,
   hint,
@@ -137,7 +134,7 @@ function FeePayerToggle({
               textTransform: 'capitalize' as const,
             }}
           >
-            {v === 'tenant' ? 'Tenant pays' : 'Landlord absorbs'}
+            {PROCESSING_FEE_CHOICE_LABEL[feeChoiceFromPayer(v)]}
           </button>
         ))}
       </div>
@@ -190,9 +187,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // against the property record work correctly. Form-state keys
     // remain snake_case because the PATCH body expects them that way.
     requiresBookingAcknowledgment: property?.requiresBookingAcknowledgment ?? false,
-    // S526: weekly-lease jurisdictions — auto-drafts a lease at 7+ day stays
-    // instead of 30+ (see services/bookingLeaseDraft.ts).
-    weeklyLeaseMode: property?.weeklyLeaseMode ?? false,
+    // S652 (Nic): required when a property is created — the floor every bill's due month sits on.
+    firstBillingCycle: property?.firstBillingCycle ? String(property.firstBillingCycle).slice(0, 7) : nextMonthYm(),
+    // 10/5: where this property's residents' and guests' replies go. Asked when
+    // the property is set up; edited later on the property's page.
+    officeEmail: property?.officeEmail || '',
     // S247: per-property subleasing toggle. Drives the master switch
     // on whether tenants at this property can request subleases at
     // all. AND'd with leases.subleasingAllowed in the request route.
@@ -232,15 +231,13 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         (property?.allocationRule?.achFeePayer
           || property?.allocationRule?.bankingFeePayer
           || 'tenant') as FeePayer,
-      // S513 lock (#2): card is always the tenant's — never landlord. Pinned
-      // to 'tenant' regardless of any legacy 'landlord' row (the diff on save
-      // then heals such rows; the backend also clamps card to tenant).
-      cardFeePayer: 'tenant' as FeePayer,
+      // 10/5: card follows the one choice (the database keeps them equal).
+      cardFeePayer:
+        (property?.allocationRule?.achFeePayer
+          || property?.allocationRule?.bankingFeePayer
+          || 'tenant') as FeePayer,
       platformFeePayer:
         (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
-      // S607 (Nic): who reimburses the cash/check/money-order fee.
-      manualFeePayer:
-        (property?.allocationRule?.manualFeePayer || 'tenant') as FeePayer,
       rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',
       rentPercentFloor: property?.allocationRule?.rentPercentFloor != null ? String(property.allocationRule.rentPercentFloor) : '',
       rentPercentCeiling: property?.allocationRule?.rentPercentCeiling != null ? String(property.allocationRule.rentPercentCeiling) : '',
@@ -257,6 +254,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   const [addrSuggestions, setAddrSuggestions] = useState<any[]>([])
   const [showAddrSugg, setShowAddrSugg] = useState(false)
   const [addrVerified, setAddrVerified] = useState(false)
+  // S649: the address is shown read-only until the landlord chooses to change it
+  const [editAddress, setEditAddress] = useState(false)
   const MAPBOX_TOKEN = (import.meta as any).env?.VITE_MAPBOX_TOKEN || ''
   const addrTimer = useRef<any>(null)
   // Step 2: unit groups — one per selected type
@@ -315,13 +314,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         if (arNew.ownerBankAccountId !== (arOld.ownerBankAccountId ?? null)) {
           allocPatch.ownerBankAccountId = arNew.ownerBankAccountId
         }
+        // 10/5: one card-and-bank choice — achFeePayer carries it; the server
+        // sets card and the counter/booking-site columns to match.
         const oldAch       = arOld.achFeePayer       || arOld.bankingFeePayer || 'tenant'
-        const oldCard      = arOld.cardFeePayer      || arOld.bankingFeePayer || 'tenant'
         const oldPlatform  = arOld.platformFeePayer  || 'landlord'
-        const oldManual    = arOld.manualFeePayer    || 'tenant'
-        if (arNew.manualFeePayer   && arNew.manualFeePayer   !== oldManual)   allocPatch.manualFeePayer   = arNew.manualFeePayer
         if (arNew.achFeePayer      && arNew.achFeePayer      !== oldAch)      allocPatch.achFeePayer      = arNew.achFeePayer
-        if (arNew.cardFeePayer     && arNew.cardFeePayer     !== oldCard)     allocPatch.cardFeePayer     = arNew.cardFeePayer
         if (arNew.platformFeePayer && arNew.platformFeePayer !== oldPlatform) allocPatch.platformFeePayer = arNew.platformFeePayer
         if (Object.keys(allocPatch).length > 0) {
           await apiPatch(`/properties/${property.id}/allocation-rule`, allocPatch)
@@ -416,6 +413,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     const errs: Record<string, string> = {}
     if (!form.name.trim())    errs.name    = 'Required'
     if (!form.street1.trim()) errs.street1 = 'Required'
+    if (!property && !/^\d{4}-\d{2}$/.test(form.firstBillingCycle || '')) errs.firstBillingCycle = 'Pick the month GAM sends the first bill'
     if (!form.city.trim())    errs.city    = 'Required'
     if (!form.zip.trim())     errs.zip     = 'Required'
     setErrors(errs)
@@ -423,12 +421,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // 16a: convert string inputs to numbers/null for allocation rule
     const ar = form.allocationRule
     const num = (s: string) => s === '' ? null : parseFloat(s)
+    const { officeEmail, ...rest } = form
     const payload = {
-      ...form,
+      ...rest,
+      // Only a new property sends it; an existing one is edited on its page.
+      ...(property ? {} : { officeEmail: officeEmail.trim() || null }),
       allocationRule: {
         achFeePayer:       ar.achFeePayer,
-        manualFeePayer:    ar.manualFeePayer,
-        cardFeePayer:      ar.cardFeePayer,
+        cardFeePayer:      ar.achFeePayer,
         platformFeePayer:  ar.platformFeePayer,
         rentPercent: num(ar.rentPercent),
         rentPercentFloor: num(ar.rentPercentFloor),
@@ -541,7 +541,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 due in, and whether two landlords are claiming the same park — so
                 it is stated once and then read-only. The server refuses a change
                 too; this is the half that explains why. */}
-            {isEdit ? (
+            {isEdit && !editAddress ? (
               <div style={{ marginBottom: 10 }}>
                 <label style={lbl}>Address</label>
                 <div style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)',
@@ -549,9 +549,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                   {[form.street1, form.street2].filter(Boolean).join(' ')}<br />
                   {form.city}{form.city && form.state ? ', ' : ''}{form.state} {form.zip}
                 </div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
-                  Fixed once set — it decides which state&apos;s rules apply and which timezone rent is
-                  due in. If it&apos;s wrong, contact support and we&apos;ll correct it.
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', flex: 1 }}>
+                    It decides which state&apos;s rules apply and which timezone rent is due in.
+                  </div>
+                  {/* S649 (Nic): landlords can correct the address; the server
+                      re-checks it isn't another landlord's property, moves the
+                      timezone with the state, and keeps the old one on record. */}
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => setEditAddress(true)}>Change address</button>
                 </div>
               </div>
             ) : (<>
@@ -624,6 +629,22 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
               Reservation policy
             </div>
+            {!property && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>First bill from GAM *</label>
+                <input type="month" className="input" value={form.firstBillingCycle} onChange={e => setForm(f => ({ ...f, firstBillingCycle: e.target.value }))} style={{ width: 180 }} />
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>GAM sends the first bill for this month and nothing earlier. Existing residents you add mid-month get their first bill here; what happened before stays outside GAM.</div>
+                {errors.firstBillingCycle && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstBillingCycle}</div>}
+              </div>
+            )}
+            {!property && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Office email</label>
+                <input type="email" className="input" value={form.officeEmail} placeholder="office@yourproperty.com"
+                  onChange={e => setForm(f => ({ ...f, officeEmail: e.target.value }))} style={{ width: 280 }} />
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>When residents, guests or applicants reply to an email from us, it comes here. Leave it blank and replies go to whoever runs this property.</div>
+              </div>
+            )}
             <label style={{
               display:        'flex',
               alignItems:     'flex-start',
@@ -650,36 +671,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 </div>
               </div>
             </label>
-
-            {/* S526: weekly-lease mode. Long stays auto-draft a lease for
-                review — 30+ days by default; this drops the threshold to 7+
-                for jurisdictions where weekly leases are the norm. */}
-            <label style={{
-              display:        'flex',
-              alignItems:     'flex-start',
-              gap:            10,
-              padding:        12,
-              marginTop:      8,
-              borderRadius:   8,
-              border:         `1px solid ${form.weeklyLeaseMode ? 'var(--gold)' : 'var(--border-0)'}`,
-              background:     form.weeklyLeaseMode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-              cursor:         'pointer',
-              fontSize:       '.78rem',
-            }}>
-              <input
-                type="checkbox"
-                checked={form.weeklyLeaseMode}
-                onChange={e => setForm(f => ({ ...f, weeklyLeaseMode: e.target.checked }))}
-                style={{ marginTop: 3 }}
-              />
-              <div>
-                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Weekly leases</div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
-                  Stays of 30+ days automatically draft a lease for your review. Turn this on where you
-                  run weekly leases — the draft threshold drops to 7+ days instead.
-                </div>
-              </div>
-            </label>
+            {/* 10/5 (Nic, R14): no "Weekly leases" toggle — no lease is ever
+                drafted automatically, so there is no threshold for it to move.
+                A long stay's lease is the counter's or the guest's choice. */}
           </div>
 
           {/* S247: per-property subleasing toggle. Master switch driven
@@ -779,45 +773,23 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               interpretation. */}
           <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
-              Who pays each fee?
+              Fees
             </div>
             <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
-              Each can be passed through to the tenant (added on top of rent) or absorbed by the
-              landlord (deducted from gross). Toggles can be changed any time — they only affect
-              charges going forward.
+              Changes affect payments from then on.
             </div>
 
             <FeePayerToggle
-              label="ACH processing"
-              hint={`${achFeeLabel()} per bank debit`}
+              label="Card and bank payment fees"
+              hint="Pass them on, or cover them — for everyone who pays at this property: rent, the front counter, pay links and the booking site."
               value={form.allocationRule.achFeePayer}
-              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, achFeePayer: v } }))}
-            />
-            {/* S513 lock (#2): card is always the tenant's — not selectable. */}
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Card processing</div>
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>{cardFeeLabel({ intl: true })} per card charge</div>
-              <div style={{ padding: '6px 10px', borderRadius: 8, fontSize: '.74rem', border: '1px solid var(--border-0)', background: 'var(--bg-2)', color: 'var(--text-2)' }}>
-                Tenant pays — always (landlords never cover card)
-              </div>
-            </div>
-            {/* S607 (Nic): "we need a toggle for them to cover old-fashioned
-                payment costs if they want to... that way the landlord isn't
-                surprised." GAM recovers the $10 from the landlord's collections
-                either way; this decides only whether the TENANT is invoiced to
-                reimburse them. Every tenant's FIRST payment is free regardless. */}
-            <FeePayerToggle
-              label="Cash, check or money order"
-              hint={`No charge, to anyone: ${MANUAL_PAYMENT_FEE_SCOPE}. This setting has no effect while cash is free — it exists so the choice is already recorded if a handling fee ever returns.`}
-              value={form.allocationRule.manualFeePayer}
-              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, manualFeePayer: v } }))}
+              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, achFeePayer: v, cardFeePayer: v } }))}
             />
             {/* S607 lock (Nic): "the landlord cannot toggle the platform fee
                 because when we change for volume discounts or things like that,
                 that needs to not affect what the tenants are paying." GAM's
                 commercial terms with a landlord must never reach a tenant's
-                bill. Shown but not selectable — same treatment as the card lock,
-                for the mirror-image reason. */}
+                bill. Shown but not selectable. */}
             <div style={{ marginBottom: 12 }}>
               <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Platform SaaS fee</div>
               <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>$2 per occupied unit per month (min $10/property/mo)</div>
@@ -851,7 +823,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 </div>
                 <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
                   The account you verified with Stripe. Rent for this property pays out there on the
-                  weekly run — nothing to set up here.{' '}
+                  next payout day (Tuesday and Friday through the 10th, then Tuesdays) — nothing to set up here.{' '}
                   <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
                     Change it
                   </Link>
@@ -983,6 +955,10 @@ export function PropertiesPage() {
       </div>
 
       <ConnectReadinessBanner />
+
+      {/* S655: a property somebody is transferring to you waits here for you
+          to accept or decline — nothing moves until you do. */}
+      <IncomingTransfersCard />
 
       {/* Summary stats */}
       {(props as any[]).length > 0 && (
@@ -1287,4 +1263,10 @@ function ApplyQrModal({ property, onClose }: { property: any; onClose: () => voi
       </div>
     </div>
   )
+}
+
+/** The first of next month as YYYY-MM — the sensible default for a property's first bill. */
+function nextMonthYm(): string {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
 }

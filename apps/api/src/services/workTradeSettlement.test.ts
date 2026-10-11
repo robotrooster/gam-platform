@@ -44,6 +44,17 @@ describe('a prorated move-in month', () => {
 })
 
 describe('settling a month from its own hours', () => {
+  // S652 (Nic, for Blu and Curtis): "He's willing to float that for an
+  // indefinite time." A shortfall years old is still carried, never billed.
+  it('an indefinite float never bills a shortfall, however old', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2020-01-01', agedCloses: 80 } as any)],
+      hoursWorked: 0, bankedHours: 0, carryForwardMonths: Number.POSITIVE_INFINITY,
+    })
+    expect(r.periods[0].status).toBe('open')
+    expect(r.endsAgreement).toBe(false)
+  })
+
   it('a full target month covers the whole bill', () => {
     const r = settleMonth({
       periods: [period({ periodMonth: '2026-09-01' })],
@@ -204,7 +215,7 @@ describe('the leniency window', () => {
 })
 
 describe('a carried hour keeps its own month’s value', () => {
-  // Nic's answer, S624: a rent increase must not retroactively reprice labour
+  // Nic's answer, S624: a rent increase must not retroactively reprice labor
   // somebody already failed to do.
   it('prices a caught-up hour at the rate of the month it was owed for', () => {
     const r = settleMonth({
@@ -271,9 +282,59 @@ describe('the landlord ends the agreement by hand', () => {
     expect(r.billedAmount).toBe(225)
   })
 
+  // S654: hours worked in the month being ended in were never counted by a close.
+  it('counts a period\'s uncounted hours on it first, and banks the surplus', () => {
+    const r = settleOnEnd([
+      period({ periodMonth: '2026-09-01', hoursApplied: 60 }),                  // 20 owed
+      period({ periodMonth: '2026-10-01', hoursApplied: 0 }),                   // unclosed
+    ], 0, { '2026-10-01': 90 })
+    expect(r.periods[1]).toMatchObject({ status: 'settled', hoursAppliedNow: 80 })
+    // The 10-hour surplus catches September up by 10; 10 hours still billed.
+    expect(r.periods[0]).toMatchObject({ status: 'billed', hoursAppliedNow: 10 })
+    expect(r.billedAmount).toBe(62.5)
+  })
+
   it('does not pay out leftover banked hours — a trade is not wages', () => {
     const r = settleOnEnd([period({ periodMonth: '2026-09-01', hoursApplied: 80 })], 40)
     expect(r.billedAmount).toBe(0)
     expect(r.bankedHours).toBe(0)
+  })
+})
+
+// S637 (Nic): "you set a higher parent that says, do we track hours for this
+// work trade? If yes, then set the hours. If no, no hours." An untracked
+// agreement reaches settlement as a period asking for ZERO hours — for a
+// tenant the landlord trusts, an owner-occupied residence, or a purchase-credit
+// tenancy that must be signed and never billed.
+describe('an agreement that does not track hours', () => {
+  const untracked = (o: Partial<SettlementPeriod> = {}) => period({
+    periodMonth: '2026-09-01', targetHours: 0, hoursApplied: 0,
+    hourRate: hourRateFor(500, 0), ...o,
+  })
+
+  it('covers the whole bill without a single hour logged', () => {
+    const r = settleMonth({ periods: [untracked()], hoursWorked: 0, bankedHours: 0, carryForwardMonths: 1 })
+    expect(r.periods[0].creditTotal).toBe(500)      // the full basis
+    expect(r.periods[0].uncoveredAmount).toBe(0)
+    expect(r.periods[0].status).toBe('settled')
+    expect(r.billedAmount).toBe(0)
+  })
+
+  it('never bills a shortfall, however long it sits open', () => {
+    const r = settleMonth({
+      periods: [untracked({ agedCloses: 11 })],
+      hoursWorked: 0, bankedHours: 0, carryForwardMonths: 0,
+    })
+    expect(r.billedAmount).toBe(0)
+    expect(r.endsAgreement).toBe(false)
+  })
+
+  // The landlord ends it when the purchase credit is done. Nothing is owed for
+  // the months it ran, because nothing was ever asked for.
+  it('owes nothing when the landlord ends it', () => {
+    const r = settleOnEnd([untracked(), untracked({ periodMonth: '2026-10-01' })], 0)
+    expect(r.billedAmount).toBe(0)
+    expect(r.periods.every(p => p.status === 'settled')).toBe(true)
+    expect(r.periods.every(p => p.creditTotal === 500)).toBe(true)
   })
 })

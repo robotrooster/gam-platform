@@ -36,6 +36,8 @@ describe('getDelinquentTenants — who is actually behind', () => {
     } finally { client.release() }
   })
   beforeEach(async () => {
+    await query(`UPDATE payments SET reversal_id = NULL WHERE landlord_id = $1`, [landlordId])
+    await query(`DELETE FROM payment_reversals WHERE landlord_id = $1`, [landlordId])
     await query(`DELETE FROM payments WHERE landlord_id = $1`, [landlordId])
   })
 
@@ -68,10 +70,35 @@ describe('getDelinquentTenants — who is actually behind', () => {
     expect((await run()).count).toBe(1)
   })
 
-  it('still lists a tenant whose payment was returned by the bank', async () => {
-    // A returned payment came BACK. That money really is owed again.
+  it('still lists a tenant whose payment was returned by the bank — once, as a returned payment', async () => {
+    // A returned payment came BACK. That money really is owed again — on the
+    // row the reversal reopened (paymentReversal), never the original as well.
     await seedOverdue('returned')
-    expect((await run()).count).toBe(1)
+    const original = (await query<{ id: string }>(
+      `SELECT id FROM payments WHERE landlord_id = $1 AND status = 'returned'`, [landlordId]))[0].id
+    await query(`UPDATE payments SET return_code = 'R01', return_reason = 'Insufficient funds' WHERE id = $1`, [original])
+    const rv = await query<{ id: string }>(
+      `INSERT INTO payment_reversals (payment_id, landlord_id, tenant_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
+       VALUES ($1,$2,$3,'ach_return',750,$4,'{}') RETURNING id`, [original, landlordId, tenantId, `evt_dt_${Date.now()}`])
+    await query(
+      `INSERT INTO payments (landlord_id, tenant_id, type, amount, status, entry_description, due_date, reversal_id)
+       VALUES ($1,$2,'rent',750,'pending','RENT',CURRENT_DATE - 10,$3)`, [landlordId, tenantId, rv[0].id])
+    const res = await run()
+    expect(res.count).toBe(1)
+    expect(res.paymentReturned).toEqual([expect.objectContaining({ amountOverdue: 750, theyDidTryToPay: true, bankReason: 'Insufficient funds' })])
+    expect(res.noPaymentAttempted).toHaveLength(0)
+  })
+
+  it('a returned original with nothing reopened is not counted twice (S655 one rule)', async () => {
+    await seedOverdue('returned')
+    expect((await run()).count).toBe(0)
+  })
+
+  it('GAM\'s FlexPay pull is never somebody being behind on rent', async () => {
+    await query(
+      `INSERT INTO payments (landlord_id, tenant_id, type, amount, status, entry_description, due_date, revenue_owner)
+       VALUES ($1, $2, 'fee', 25, 'pending', 'FLEXPAY', CURRENT_DATE - 10, 'gam')`, [landlordId, tenantId])
+    expect((await run()).count).toBe(0)
   })
 
   it('does not list a tenant who has settled', async () => {

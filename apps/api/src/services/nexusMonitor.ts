@@ -18,6 +18,7 @@
  */
 import { query } from '../db'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export type NexusStatus =
   | 'registered'    // GAM has registered here — collection is live
@@ -53,7 +54,8 @@ export const NEXUS_WARN_FRACTION = 0.8
  * Full overwrite per (state, year). Idempotent — safe to run repeatedly.
  */
 export async function recomputeNexusTally(nowYear?: number): Promise<{ years: number[]; rows: number }> {
-  const currentYear = nowYear ?? new Date().getFullYear()
+  // S654: the calendar year by GAM's home (Phoenix) clock, not the server's zone.
+  const currentYear = nowYear ?? Number(todayIn(null).slice(0, 4))
   const priorYear = currentYear - 1
   const years = [priorYear, currentYear]
 
@@ -132,7 +134,8 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
   states: NexusStateRow[]
   summary: { crossed: number; approaching: number; registered: number; under: number }
 }> {
-  const currentYear = nowYear ?? new Date().getFullYear()
+  // S654: the calendar year by GAM's home (Phoenix) clock, not the server's zone.
+  const currentYear = nowYear ?? Number(todayIn(null).slice(0, 4))
   const priorYear = currentYear - 1
 
   const rows = await query<any>(
@@ -150,7 +153,7 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
       t.count_rule,
       COALESCE(tax.taxable, false) AS taxable,
       COALESCE(reg.registered, false) AS registered,
-      reg.registered_date,
+      reg.registered_date::text AS registered_date, -- S654: 'YYYY-MM-DD', not a JS Date
       COALESCE(cur.revenue_usd, 0)::numeric AS rev_current,
       COALESCE(pri.revenue_usd, 0)::numeric AS rev_prior,
       COALESCE(cur.txn_count, 0) AS txn_current,
@@ -241,7 +244,8 @@ export async function setStateRegistration(
   const st = stateCode.toUpperCase()
   if (st.length !== 2) throw new Error('Invalid state code')
   const source = opts?.source ?? 'manual'
-  const regDate = registered ? (opts?.registeredDate ?? new Date().toISOString().slice(0, 10)) : null
+  // S654: registered "today" in Phoenix — the UTC date is tomorrow after 5 pm.
+  const regDate = registered ? (opts?.registeredDate ?? todayIn(null)) : null
   await query(
     `INSERT INTO state_tax_registrations (state_code, registered, registered_date, source, notes, updated_at)
      VALUES ($1, $2, $3, $4, $5, NOW())

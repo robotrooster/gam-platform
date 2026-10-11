@@ -1,0 +1,38 @@
+-- ════════════════════════════════════════════════════════════════════════
+-- POST-DEPLOY CONTRACT STEP — NOT A MIGRATION. DO NOT MOVE INTO migrations/
+-- UNTIL THE CODE BELOW IS LIVE.
+--
+-- WHEN TO RUN: after the S655 deploy is live in production — the one that
+-- changed POST /api/tenants/invite's property-level invite to
+--   ON CONFLICT (tenant_id, landlord_id) WHERE cancelled_at IS NULL AND unit_id IS NULL
+-- (routes/tenants.ts) and services/onboardingWindow.ts recordWaiver to the same
+-- target. Both read the per-company index that migration
+-- 20261002221700_intent_nounit_per_company.sql (M1) creates, so M1 must be
+-- applied too. Confirm both with:
+--   SELECT indexname FROM pg_indexes WHERE tablename = 'pending_tenant_intents'
+--      AND indexname LIKE '%nounit%';
+-- (expect pending_tenant_intents_tenant_landlord_nounit_live_key present).
+--
+-- HOW: run it once against gam, then gam_demo, then copy this file into
+-- apps/api/src/db/migrations/ under a NEW timestamp so fresh databases get it,
+-- and regenerate schema.sql (npm run db:dump-schema). Nothing reads the old
+-- index by name.
+--
+-- WHY (security item 4, S655): a screening waiver belongs to the company that
+-- granted it, and its record is that company's live no-unit intent row. The
+-- old unique index allowed ONE live no-unit row per PERSON across all of GAM,
+-- so company X's waiver or property invite collided with — or, before S655,
+-- overwrote — company Y's row. While it stands, a second company's row is
+-- refused (the code answers in plain words, never a 500). Dropping it lets
+-- each company hold its own row. The per-company index M1 created keeps one
+-- live row per (person, company).
+--
+-- Running it before the deploy is what must NOT happen: the old code's
+-- property-level invite still targets ON CONFLICT (tenant_id) and would fail
+-- with 42P10 on every property-level invite once this index is gone.
+--
+-- SAFE: drops an index only; no data changes. The 95 'waived' screening
+-- statuses on tenants are not touched (Nic, 10/2: DO NOT RESET).
+-- ════════════════════════════════════════════════════════════════════════
+
+DROP INDEX IF EXISTS pending_tenant_intents_tenant_nounit_live_key;

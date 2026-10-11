@@ -10,7 +10,7 @@
  *   - attachments[] only present when passed
  *   - sender selection: noreply (default) vs support
  *   - logger.error swallow + email_send_log write on failures
- *   - escapeHtml: indirect via emailDocumentDeclined / emailAdverseActionNotice
+ *   - escapeHtml: indirect via emailAdverseActionNotice
  *
  * Senders pinned (each at one rep test):
  *   bg check (new + decision both branches), pool (match + interested),
@@ -35,7 +35,7 @@ vi.mock('resend', () => ({
 }))
 
 import { db } from '../db'
-import { cleanupAllSchema } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import * as email from './email'
 
 beforeEach(async () => {
@@ -128,7 +128,33 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   it('metadata field stored as jsonb (round-trips)', async () => {
     await email.emailInvitation('meta@mailer-test.co', 'X', 'bookkeeper', 'u')
     const log = await logRowFor('meta@mailer-test.co')
-    expect(log.metadata).toEqual({ role: 'bookkeeper' })
+    expect(log.metadata).toEqual({ role: 'bookkeeper', resend: false })
+  })
+
+  // S641: a resent invitation must NOT look like the first one. Outlook and
+  // Hotmail accept a duplicate at the boundary — so the provider reports it
+  // delivered — and then drop it or bury it in the original conversation. That
+  // is exactly what happened to Lisa Scheeler's resent invitation: correct link,
+  // reported delivered, never visible in her mailbox, not even in spam. The
+  // subject and the opening line have to differ for the message to survive.
+  it('a resend does not reuse the first invitation\'s subject or body', async () => {
+    // distinct ids: provider_message_id is UNIQUE, and the default mock
+    // returns one id for every call
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_first' }, error: null } as any)
+    await email.emailInvitation('first@mailer-test.co', 'Acme Ranch', 'onsite_manager', 'https://x/a')
+    const first = (resendSendMock.mock.calls.at(-1) as any[])![0]
+
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_again' }, error: null } as any)
+    await email.emailInvitation('again@mailer-test.co', 'Acme Ranch', 'onsite_manager', 'https://x/b', { resend: true })
+    const again = (resendSendMock.mock.calls.at(-1) as any[])![0]
+
+    expect(again.subject).not.toEqual(first.subject)
+    expect(again.html).not.toEqual(first.html)
+    // and it says plainly that the older link is dead
+    expect(again.html).toContain('no longer works')
+
+    const log = await logRowFor('again@mailer-test.co')
+    expect(log.metadata).toEqual({ role: 'onsite_manager', resend: true })
   })
 })
 
@@ -225,28 +251,6 @@ describe('e-sign emails', () => {
     expect(call.html).not.toContain('localhost')
   })
 
-  it('emailDocumentDeclined: HTML-escapes signer name + reason (prevents XSS)', async () => {
-    await email.emailDocumentDeclined(
-      'l@mailer-test.co', 'Landlord', '<script>Bad</script>', 'tenant',
-      'Lease', 'Unit A1', '<img src=x onerror=alert(1)>')
-    const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).not.toContain('<script>Bad</script>')
-    expect(call.html).toContain('&lt;script&gt;Bad&lt;/script&gt;')
-    // The <img> tag is neutralized as escaped text — the angle brackets are
-    // escaped so the browser won't parse it as an element. The onerror=
-    // substring still appears as literal text inside the escaped output, but
-    // it can't execute because the surrounding `<` was turned into `&lt;`.
-    expect(call.html).not.toContain('<img src=x')
-    expect(call.html).toContain('&lt;img src=x onerror=alert(1)&gt;')
-  })
-
-  it('emailDocumentDeclined: empty reason → "No reason provided"', async () => {
-    await email.emailDocumentDeclined(
-      'l@mailer-test.co', 'Landlord', 'Tenant', 'tenant', 'Lease', 'A1', null)
-    const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).toContain('No reason provided')
-  })
-
   it('emailDocumentAutoVoided: subject + category', async () => {
     await email.emailDocumentAutoVoided(
       'l@mailer-test.co', 'Landlord', 'Lease 2026', 'Unit A1')
@@ -340,19 +344,6 @@ describe('emailAdverseActionNotice', () => {
 
 // ═════════════════════════ Misc senders ═════════════════════════
 
-describe('emailLandlordBankingNudge', () => {
-  it('default sender (noreply); category=landlord_banking_nudge', async () => {
-    await email.emailLandlordBankingNudge({
-      to: 'l@mailer-test.co', landlordName: 'L', tenantName: 'T',
-      propertyName: 'Sunset', unitNumber: 'A1',
-      bankingUrl: 'https://banking/x',
-    })
-    const log = await logRowFor('l@mailer-test.co')
-    expect(log.category).toBe('landlord_banking_nudge')
-    expect(log.related_entity_type).toBe('tenant_landlord_nudge')
-  })
-})
-
 describe('late payment sender', () => {
   it('sendLatePaymentNotice: subject contains daysLate; category=late_payment_notice; metadata captures amount', async () => {
     await email.sendLatePaymentNotice({
@@ -365,6 +356,57 @@ describe('late payment sender', () => {
     const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('late_payment_notice')
     expect(log.metadata).toEqual({ days_late: 5, amount: 1200 })
+  })
+
+  // S652 (Nic): the morning email is ONE per landlord — "I don't need 15 emails."
+  // 10/5 (Nic): and it says only HOW MANY — no names, no amounts — with a link
+  // into the portal.
+  it('sendLatePaymentDigest: one email with the count only and a link to Outstanding Balances', async () => {
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'l@mailer-test.co', landlordName: 'L',
+      items: [
+        { tenantName: 'T One', unitNumber: 'A1', propertyName: 'Sunset', daysLate: 5, amount: 1200, paymentId: 'p1' },
+        { tenantName: 'T Two', unitNumber: 'B2', propertyName: 'Sunset', daysLate: 52, amount: 450.5, paymentId: 'p2' },
+      ],
+    })
+    expect(resendSendMock).toHaveBeenCalledTimes(1)
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.subject).toBe('2 tenants have an overdue balance')
+    expect(call.html).toContain('2 tenants have a balance five or more days past due')
+    expect(call.html).toContain('/balances')
+    for (const hidden of ['T One', 'T Two', 'A1', 'B2', 'Sunset', '1,200', '450.50', '1,650.50', '$']) {
+      expect(call.html).not.toContain(hidden)
+    }
+    const log = await logRowFor('l@mailer-test.co')
+    expect(log.category).toBe('late_payment_notice')
+    expect(log.metadata).toEqual({ count: 2, total: 1650.5, payment_ids: ['p2', 'p1'] })
+  })
+
+  // S654: one line per person (tenant ids in the log), and the total in cents —
+  // Oak Park's log carried a raw float sum. One person reads "1 tenant has".
+  it('sendLatePaymentDigest: the log keeps tenant ids and a cents total; one person reads in the singular', async () => {
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'l@mailer-test.co', landlordName: 'L',
+      items: [
+        { tenantName: 'Billy Miranda', unitNumber: 'RV 34, RV 35', propertyName: 'Oak Park', daysLate: 30, amount: 902.29, tenantId: 't1' },
+        { tenantName: 'Jay Jones', unitNumber: 'RV 25', propertyName: 'Oak Park', daysLate: 30, amount: 484.33, tenantId: 't2' },
+        { tenantName: 'A B', unitNumber: 'RV 1', propertyName: 'Oak Park', daysLate: 6, amount: 0.1, tenantId: 't3' },
+        { tenantName: 'C D', unitNumber: 'RV 2', propertyName: 'Oak Park', daysLate: 6, amount: 0.2, tenantId: 't4' },
+      ],
+    })
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.subject).toBe('4 tenants have an overdue balance')
+    expect(call.html).not.toContain('RV 34')
+    const log = await logRowFor('l@mailer-test.co')
+    expect(log.metadata).toEqual({ count: 4, total: 1386.92, tenant_ids: ['t1', 't2', 't3', 't4'] })
+
+    resendSendMock.mockClear()
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_singular' }, error: null } as any)
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'one@mailer-test.co', landlordName: 'L',
+      items: [{ tenantName: 'Solo', unitNumber: 'X', propertyName: 'P', daysLate: 9, amount: 10, tenantId: 't9' }],
+    })
+    expect(((resendSendMock.mock.calls[0] as any[])[0]).subject).toBe('1 tenant has an overdue balance')
   })
 })
 
@@ -414,6 +456,24 @@ describe('account-management senders', () => {
     const log = await logRowFor('tn@mailer-test.co')
     expect(log.category).toBe('tenant_onboarded')
     expect(log.metadata).toEqual({ unit_label: 'Unit A1' })
+  })
+
+  // S654: the name, address and unit come from a landlord's CSV file.
+  it('emailTenantOnboarded: every CSV-supplied value is escaped in the HTML', async () => {
+    await email.emailTenantOnboarded(
+      'tn-esc@mailer-test.co', '<img src=x onerror=alert(1)>', 'Dana "<b>Boss</b>"',
+      '1 <a href="https://evil.test">Main</a> St', 'Pines & Co <script>x()</script>\r\nBcc: x@evil.test',
+      'https://tenant.example.test/accept-invite?token=abc123')
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.html).not.toMatch(/<img|<script|<a href="https:\/\/evil|<b>Boss/)
+    expect(call.html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+    expect(call.html).toContain('Dana &quot;&lt;b&gt;Boss&lt;/b&gt;&quot;')
+    expect(call.html).toContain('1 &lt;a href=&quot;https://evil.test&quot;&gt;Main&lt;/a&gt; St')
+    expect(call.html).toContain('Pines &amp; Co &lt;script&gt;x()&lt;/script&gt;')
+    // The link GAM built still works as a link.
+    expect(call.html).toContain('href="https://tenant.example.test/accept-invite?token=abc123"')
+    // One line of subject, whatever the file said.
+    expect(call.subject).not.toMatch(/[\r\n]/)
   })
 })
 
@@ -489,12 +549,25 @@ describe('reserved-domain suppression (S605)', () => {
     }
   })
 
-  it('still writes the audit row, so suppression is visible rather than silent', async () => {
+  // S641: it used to log 'sent'. That made the audit row a lie — this log is
+  // the answer to "did the tenant get their notice?", and a record that cannot
+  // tell "delivered" from "never left the machine" is worse than none, because
+  // it is believed.
+  it('writes the audit row as SUPPRESSED, not sent', async () => {
     await email.emailInvitation('someone@example.com', 'Nic', 'property_manager', 'https://x.test/accept')
     const rows = await db.query(
       `SELECT status FROM email_send_log WHERE to_email = 'someone@example.com'`)
     expect(rows.rows.length).toBe(1)
-    expect(rows.rows[0].status).toBe('sent')   // attempted-and-suppressed, not failed
+    expect(rows.rows[0].status).toBe('suppressed')
+  })
+
+  it('a real send is still recorded as sent', async () => {
+    process.env.EMAIL_SEND_LIVE = '1'
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_real_one' }, error: null } as any)
+    await email.emailInvitation('live@mailer-test.co', 'Nic', 'property_manager', 'https://x.test/accept')
+    const rows = await db.query(
+      `SELECT status FROM email_send_log WHERE to_email = 'live@mailer-test.co'`)
+    expect(rows.rows[0].status).toBe('sent')
   })
 
   it('a real domain is unaffected', async () => {
@@ -669,5 +742,144 @@ describe('S637 — signing email deliverability', () => {
       's637c@mailer-test.co', 'Laurel', 'Lease — MH 02', 'MH 02')
     const call = (resendSendMock.mock.calls.at(-1) as any[])[0]
     expect(String(call.subject)).toMatch(/^Document fully signed/)
+  })
+})
+
+// ═════════════════════════ S655 (money plan, Step 11): money and credit ═════════════════════════
+describe('S655 bill, reminder and receipt emails: money and credit kept apart', () => {
+  const args = () => (resendSendMock.mock.calls.at(-1) as any[])[0]
+
+  it('emailPaymentReceipt: the credit is its own line and the total is the money handed over', async () => {
+    await email.emailPaymentReceipt('kim@mailer-test.co', {
+      tenantName: 'Kim', unitLabel: 'Unit RV 22 — Oak Park', amount: 486, method: 'money order',
+      reference: '55187081609', paidAt: new Date('2026-09-09T17:00:00Z'),
+      lines: [{ label: 'Rent', detail: 'due Oct 1, 2026', amount: 900 }, { label: 'Water', amount: 10.45 }, { label: 'Trash', amount: 25 }],
+      creditApplied: 450, creditBanked: 0.55,
+    })
+    const call = args()
+    expect(call.subject).toBe('Receipt — $486.00 for Unit RV 22 — Oak Park')
+    expect(call.html).toContain('Account credit applied')
+    expect(call.html).toContain('-$450.00')
+    expect(call.html).toContain('+$0.55')
+    expect(call.html).toContain('Total paid')
+    expect(call.html).toContain('Paid by money order')
+    // The surplus note no longer promises it "comes off your next bill automatically".
+    expect(call.html).not.toMatch(/automatically/)
+    expect(call.html).toContain('only when it covers the whole bill')
+  })
+
+  it('emailPaymentReceipt: a bill paid entirely with credit says so and charges nothing', async () => {
+    await email.emailPaymentReceipt('todd@mailer-test.co', {
+      tenantName: 'Todd', unitLabel: 'Unit MH 14 — Oak Park', amount: 0, method: 'your account credit',
+      paidAt: new Date('2026-10-01T14:00:00Z'), lines: [{ label: 'Rent', amount: 460 }],
+      creditApplied: 460, billLabel: 'October bill',
+    })
+    const call = args()
+    expect(call.subject).toBe('Your October bill was paid with your account credit — Unit MH 14 — Oak Park')
+    expect(call.html).toContain('Paid With Your Account Credit')
+    expect(call.html).toContain('Nothing was charged to you')
+    expect(call.html).not.toContain('Paid by your account credit')
+    const log = await logRowFor('todd@mailer-test.co')
+    expect(log.metadata).toMatchObject({ amount: 0, credit_applied: 460, credit_only: true })
+  })
+
+  it('emailInvoiceReady: the full bill, the credit Pay Now will offer said beside it', async () => {
+    await email.emailInvoiceReady('t@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', invoiceNumber: 'INV-1', dueDateLabel: 'October 1, 2026',
+      total: 460, lines: [{ label: 'Rent', amount: 450 }, { label: 'Water', detail: 'meter 03470 → 03537 · 6,700 gal', amount: 10 }],
+      creditAvailable: 10,
+    })
+    const call = args()
+    expect(call.subject).toContain('$460.00 due')
+    expect(call.html).toContain('You have <strong style="color:#eef1f8">$10.00</strong> credit available — you can use it when you pay.')
+    expect(call.html).toContain('meter 03470 → 03537 · 6,700 gal')
+    expect(call.html).not.toContain('-$10.00')
+  })
+
+  it('emailInvoiceReady: a statement with nothing due never mentions credit to use', async () => {
+    await email.emailInvoiceReady('t2@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', invoiceNumber: 'INV-2', dueDateLabel: 'October 1, 2026',
+      total: 0, lines: [], creditAvailable: 25,
+    })
+    expect(args().html).not.toContain('credit available')
+  })
+
+  it('emailBalanceDue: the full balance with credit available beside it, each line by name', async () => {
+    await email.emailBalanceDue('b@mailer-test.co', {
+      tenantName: 'Pat', unitLabel: 'Acme Ranch — RV 12', total: 482.47, creditAvailable: 50,
+      lines: [{ label: 'Rent', amount: 460, dueDate: 'Oct 1, 2026' }, { label: 'Electric', detail: '107 kWh', amount: 22.47 }],
+    })
+    const call = args()
+    expect(call.subject).toBe('Balance due — $482.47 for Acme Ranch — RV 12')
+    expect(call.html).toContain('$50.00</strong> credit available — you can use it when you pay.')
+    expect(call.html).toContain('Electric')
+    expect(call.html).not.toContain('Credit on your account')
+  })
+})
+
+describe('S655 the FlexPay enrollment email carries the terms the code keeps', () => {
+  it('every FLEXPAY_TERMS section is in the email, word for word', async () => {
+    await email.emailFlexsuiteEnrollment({
+      to: 'fx@mailer-test.co', tenantName: 'Alice Jones', product: 'flexpay',
+      acceptedAt: new Date('2026-06-01T12:00:00Z'), templateVersion: '2.0.0',
+      acceptanceId: '00000000-0000-0000-0000-000000000abd', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
+    })
+    const html: string = (resendSendMock.mock.calls.at(-1) as any[])[0].html
+    const { FLEXPAY_TERMS } = await import('@gam/shared')
+    const esc = (x: string) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    expect(FLEXPAY_TERMS.length).toBeGreaterThan(0)
+    for (const t of FLEXPAY_TERMS) {
+      expect(html).toContain(esc(t.title))
+      expect(html).toContain(esc(t.body))
+    }
+    expect(html).toContain('How FlexPay works')
+  })
+
+  it('FlexDeposit gets no FlexPay terms', async () => {
+    await email.emailFlexsuiteEnrollment({
+      to: 'fd2@mailer-test.co', tenantName: 'Bob', product: 'flexdeposit',
+      acceptedAt: new Date('2026-06-01T12:00:00Z'), templateVersion: '1.0.0',
+      acceptanceId: '00000000-0000-0000-0000-000000000abe', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
+    })
+    expect((resendSendMock.mock.calls.at(-1) as any[])[0].html).not.toContain('How FlexPay works')
+  })
+})
+
+// 10/5 (Nic): a reply about the landlord's business reaches the people who run
+// the property — never GAM. GAM's own mail still answers to GAM support.
+describe('where replies go', () => {
+  async function park() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c, { email: 'owner@mailer-park.co' })
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query('COMMIT')
+      return { propertyId, landlordId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const replyOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).reply_to
+
+  it('mail about a property: its office email, and the log says who hears back', async () => {
+    const p = await park()
+    await db.query(`UPDATE properties SET office_email = 'office@mailer-park.co' WHERE id = $1`, [p.propertyId])
+    await email.sendNotificationEmail({ to: 'resident@mailer-test.co', subject: 'Water off Tuesday', html: '<p>x</p>',
+      notificationType: 'service_interruption', landlordId: p.landlordId, replyTo: { kind: 'property', propertyId: p.propertyId } })
+    expect(replyOf()).toEqual(['office@mailer-park.co'])
+    expect((await logRowFor('resident@mailer-test.co')).metadata.reply_to).toEqual(['office@mailer-park.co'])
+  })
+
+  it('no office email: whoever runs the property (here, the owner)', async () => {
+    const p = await park()
+    await email.sendNotificationEmail({ to: 'resident@mailer-test.co', subject: 'x', html: '<p>x</p>',
+      notificationType: 'service_interruption', replyTo: { kind: 'property', propertyId: p.propertyId } })
+    expect(replyOf()).toEqual(['owner@mailer-park.co'])
+  })
+
+  it('nothing said: GAM support, as before', async () => {
+    await email.sendNotificationEmail({ to: 'someone@mailer-test.co', subject: 'x', html: '<p>x</p>', notificationType: 'x' })
+    expect(replyOf()).toBe('support@gam.test')
+    expect((await logRowFor('someone@mailer-test.co')).metadata?.reply_to).toBeUndefined()
   })
 })

@@ -1,0 +1,14 @@
+-- S652 — THE HOME SALE IS DECIDED ON THE INVITE.
+--
+-- Nic: "the rent to own or installments portion of the package needs to be
+-- toggled at invite. The unit itself is not going to know that somebody's
+-- buying the unit... before they sign anything, it needs to have a toggle: hey,
+-- are you adding a home to the sale?" And: only asked when the property marked
+-- the home PARK-OWNED (units.dwelling_ownership) — a tenant-owned home is never
+-- asked.
+--
+-- The terms ride on the invite so the packet drafts as a sale wherever it
+-- drafts — at invite, on acceptance, or when a missing template finally lands.
+-- Shape = homeSaleTermsSchema input (planType, monthlyAmount/numberOfPayments
+-- or salePrice/downPayment/rate/termMonths, startMonth). No backfill.
+ALTER TABLE pending_tenant_intents ADD COLUMN IF NOT EXISTS home_sale_terms jsonb;

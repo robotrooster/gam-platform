@@ -12,8 +12,8 @@
  * filed (notifyTenantComplaint); this is how they ask "what's outstanding" and
  * get it back in one place.
  *
- * Quotes the tenant VERBATIM. A complaint summarised is a complaint softened —
- * "my neighbour plays music until 2am every night" carries information that
+ * Quotes the tenant VERBATIM. A complaint summarized is a complaint softened —
+ * "my neighbor plays music until 2am every night" carries information that
  * "noise complaint" does not, and the landlord is the one who has to judge it.
  *
  * Hard-scoped to actor.profileId. Read-only — resolving a complaint is a
@@ -104,7 +104,7 @@ export const getOpenComplaints: AgentTool = {
       note:
         'These need the landlord’s attention — they are not repairs and no work order exists for ' +
         'them. Report what each tenant actually said. Do not judge whether a complaint is ' +
-        'reasonable, and do not suggest what to do about a neighbour dispute.',
+        'reasonable, and do not suggest what to do about a neighbor dispute.',
     }
   },
 }

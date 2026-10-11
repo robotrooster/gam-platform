@@ -72,7 +72,7 @@ export interface DispatchResult {
   data?: unknown
   error?: string
   /** Set when the refusal is ours rather than the API's. */
-  refused?: 'unknown_action' | 'wrong_audience' | 'no_credentials' | 'missing_param'
+  refused?: 'unknown_action' | 'wrong_audience' | 'no_credentials' | 'missing_param' | 'not_allowed'
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -220,6 +220,15 @@ export async function dispatchPortalAction(
     }
   }
 
+  // decisions #38 Q6 (Nic, 10/3, final): "the AI assistant must NOT check
+  // guests out or make any money decision." An action can carry its own
+  // refusal (PortalAction.refuse — update_unit_booking's refuseAgentCheckOut),
+  // decided from what the agent asked for; a refused call is never sent.
+  if (action.refuse) {
+    const why = await action.refuse(args)
+    if (why) return { ok: false, refused: 'not_allowed', error: why }
+  }
+
   // S630 — RESOLVE THE LANDLORD'S OWN WORDS INTO A UNIT ID.
   //
   // S628 stopped an invented id from reaching a mutating endpoint, which was
@@ -237,7 +246,7 @@ export async function dispatchPortalAction(
   //
   // So a non-uuid unitId is read as what it plainly is — a unit NUMBER — and
   // resolved here, against this landlord's own units only. Scoped by
-  // landlord_id, so it cannot reach a neighbour's unit no matter what the model
+  // landlord_id, so it cannot reach a neighbor's unit no matter what the model
   // passes. An ambiguous or unknown number is REFUSED with the real list, which
   // turns a dead end into a question the landlord can answer.
   if (actor.role === 'landlord') {

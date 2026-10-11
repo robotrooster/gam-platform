@@ -1,10 +1,18 @@
 import { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
+import { OutOfOrderModal } from './OutOfOrderModal'
+import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
+import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, workTradeTermsFrom, workTradeLine, workTradeEditPayload, type WorkTradeTerms } from '../components/WorkTradeTermsFields'
+import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RETURNING_GUEST_DETAIL, type ReturningOffer } from '../components/ReturningGuestChoice'
+import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -70,6 +78,15 @@ function getDaysInRange(from: string, to: string) {
 // (check_in = "2026-06-20T00:00:00.000Z"); slicing keeps the date math (which
 // appends T12:00:00) from producing an Invalid Date.
 const dayOnly = (s: any) => String(s ?? '').slice(0, 10)
+// A reservation's status in the schedule's own words (packages/shared).
+const bookingStatusWords = (s: string) => BOOKING_STATUS_LABEL[s as BookingStatus] ?? humanize(s)
+// The sticky Unit column. ONE width, used by the header cell, the table, the
+// floating names and the keyboard pan — it was written as a bare 180/184 in
+// five places. 200 since S652: at 180 "RV 08" wrapped under the "RV" while
+// "RV 11" (narrower digits) did not, so two sites looked different for no reason.
+const UNIT_COL_W = 200
+// Where a floating reservation name pins: just inside the timeline's left edge.
+const STICKY_LEFT = 4
 
 // W-22: which unit types rent by the stay (rates/min-stay/bookability apply).
 // Storage + commercial rent by lease only.
@@ -267,7 +284,7 @@ export function SchedulePage() {
   const qc = useQueryClient()
   const { can } = usePerms()
   const today = new Date().toISOString().split('T')[0]
-  const [view, setView] = useState<'timeline'|'list'|'units'|'history'|'reservations'|'requests'|'booking_page'>('timeline')
+  const [view, setView] = useUrlTab('view', 'timeline', ['timeline','list','units','history','reservations','requests','booking_page'] as const)
   // Perpetual calendar (S576): the window starts ~1 month back, ~5 months
   // forward, but the forward horizon EXTENDS on demand — infinite forward
   // scroll appends days as you near the right edge, and the Jump-to-date
@@ -298,8 +315,28 @@ export function SchedulePage() {
   const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
+  // 10/5 (Nic, R2): lease or no lease — asked when a save makes a stay 30+
+  // nights in a row. The answer rides on the same save, sent again.
+  const [termsAsk, setTermsAsk] = useState<{ question: string; resend: (t: StayTerms) => void } | null>(null)
+  const termsAnswer = useRef<StayTerms | null>(null)
+  // The answer the last save carried, kept so a save asked a second thing (how
+  // the background check is paid, below) is sent again with it.
+  const lastTerms = useRef<StayTerms | null>(null)
+  // 10/5 (Nic, A2): a stay that needs the background check's fee can't be
+  // confirmed straight onto the schedule — the desk picks how it is paid: a pay
+  // link emailed to the guest, or the register. The pick rides on the same save.
+  const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; returning: ReturningOffer | null; resend: (m: 'link' | 'register' | 'returning') => void } | null>(null)
+  const payRouteAnswer = useRef<'link' | 'register' | 'returning' | null>(null)
+  // 10/5 (Nic, R9): a check-in refused because the background check isn't
+  // back and decided yet — shown in its own window, with no override.
+  const [screeningWait, setScreeningWait] = useState<{ message: string; waitingOn: string } | null>(null)
+  // 10/5 (Nic, R6): the stay a month is being added to.
+  const [addMonthFor, setAddMonthFor] = useState<any | null>(null)
+  // Final fix (fix pass 1, decisions #53): the stay whose Cancel reservation
+  // confirm is open (it reads, fresh, what canceling it changes).
+  const [cancelFor, setCancelFor] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
-  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string} | null>(null)
+  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; avoid:string} | null>(null)
   const [editError, setEditError] = useState('')
   const [resvError, setResvError] = useState('')
   const [resvFirst, setResvFirst] = useState('')
@@ -308,6 +345,37 @@ export function SchedulePage() {
   // pull-through) + electrical service (30/50 amp). When set, mismatched units
   // are flagged (warn, not blocked).
   const [resvLayout, setResvLayout] = useState<string>('none')
+  // S653 (Nic): "they didn't like the spot they were in last year... an
+  // avoidance type situation." Typed as site numbers the way the customer says
+  // them; matched to units at the property the stay lands on.
+  const [resvAvoid, setResvAvoid] = useState('')
+  // S652: the counter's flow is a conversation, so the screen only reveals the
+  // next thing once the previous one is settled — availability after dates,
+  // names after a site. None of it is persisted; backing out drops all three.
+  const [showAvail, setShowAvail] = useState(false)
+  const [pickedUnit, setPickedUnit] = useState<any | null>(null)
+  const [lockSite, setLockSite] = useState(false)
+  const [payMode, setPayMode] = useState<'link' | 'register'>('link')
+  // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
+  // background check) and "Work trade" on the new-reservation form.
+  const [resvReturning, setResvReturning] = useState(false)
+  const [resvWorkTrade, setResvWorkTrade] = useState(false)
+  const [resvWt, setResvWt] = useState<WorkTradeTerms>(defaultWorkTradeTerms)
+  // …and on the reservation edit.
+  const [editReturning, setEditReturning] = useState(false)
+  const [editWorkTrade, setEditWorkTrade] = useState(false)
+  const [editWt, setEditWt] = useState<WorkTradeTerms>(defaultWorkTradeTerms)
+  // The returning-guest choice as the server offers it for the stay being
+  // made or edited (needs a check? may this desk use it? allowance left?).
+  const resvOffer = useReturningGuestOffer({
+    unitId: pickedUnit?.id, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut, email: newBooking.guestEmail,
+    enabled: newResvOpen && !!pickedUnit,
+  })
+  const editOffer = useReturningGuestOffer({
+    unitId: editForm?.unitId, checkIn: editForm?.checkIn ?? '', checkOut: editForm?.checkOut ?? '', email: editForm?.guestEmail,
+    bookingId: detailBooking?.id ?? null,
+    enabled: !!editForm && !!detailBooking && !detailBooking.isLease && !detailBooking.returningGuestAt,
+  })
   const [resvAmp, setResvAmp] = useState<string>('none')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
@@ -316,8 +384,27 @@ export function SchedulePage() {
     show:boolean; booking:any; loading:boolean; error:string|null;
     data:{url:string; expiresAt:string; emailed?:boolean}|null; emailing:boolean
   }>({show:false, booking:null, loading:false, error:null, data:null, emailing:false})
+  // S652 (Nic): "scrolling up and down on the schedule really fast... the
+  // overlay is overlapping the site numbers... it makes it look like it's
+  // lagging really bad."
+  //
+  // The site column used to be PINNED over the timeline (position:sticky), in
+  // the same scrolling box as the bars. A browser draws a pinned column as its
+  // own layer and draws it separately from what scrolls beneath — so on a fast
+  // scroll the bars of a newly-revealed row could be on screen a moment before
+  // the column that was supposed to cover them. Stacking order (tried twice)
+  // cannot fix that; it is about WHEN each piece gets drawn, not which is on top.
+  //
+  // So the column is no longer on top of anything. It sits BESIDE the timeline:
+  //   vScrollRef ......... scrolls up/down, and carries the site column and the
+  //                        timeline together, natively
+  //   scrollContainerRef . the timeline only; scrolls sideways
+  // A bar lives inside the timeline box and that box ends where the site column
+  // begins. There is nothing for it to overlap.
+  const vScrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const theadRef = useRef<HTMLTableSectionElement>(null)
+  const headerRef = useRef<HTMLDivElement>(null)
+  const headerStripRef = useRef<HTMLDivElement>(null)
   const legendRef = useRef<HTMLDivElement>(null)
 
   // ── Reservations tab (ported from BookingsPage) ──
@@ -342,8 +429,8 @@ export function SchedulePage() {
 
 
   useEffect(() => {
-    if (!selectedCell || !scrollContainerRef.current) return
-    const container = scrollContainerRef.current
+    const container = scrollContainerRef.current, vbox = vScrollRef.current
+    if (!selectedCell || !container || !vbox) return
     const cell = container.querySelector(
       `[data-unit="${selectedCell.unitId}"][data-date="${selectedCell.date}"]`
     ) as HTMLElement
@@ -351,29 +438,22 @@ export function SchedulePage() {
     const row = cell.closest('tr') as HTMLElement
     if (!row) return
 
-    const headerHeight = container.querySelector('thead')?.offsetHeight || 36
-    const rowTop = row.offsetTop
+    // Up/down is the outer box, whose content starts with the date header.
+    const headerHeight = headerRef.current?.offsetHeight || 36
+    const rowTop = headerHeight + row.offsetTop
     const rowBottom = rowTop + row.offsetHeight
-    const visibleTop = container.scrollTop + headerHeight
-    const visibleBottom = container.scrollTop + container.clientHeight
-
-    // Snap vertically — full row always visible
-    if (rowTop < visibleTop) {
-      container.scrollTop = rowTop - headerHeight
-    } else if (rowBottom > visibleBottom) {
-      container.scrollTop = rowBottom - container.clientHeight
+    if (rowTop < vbox.scrollTop + headerHeight) {
+      vbox.scrollTop = row.offsetTop
+    } else if (rowBottom > vbox.scrollTop + vbox.clientHeight) {
+      vbox.scrollTop = rowBottom - vbox.clientHeight
     }
 
-    // Pan horizontally — account for sticky unit column
-    const stickyWidth = 184
+    // Sideways is the timeline, which no longer has a column in front of it.
     const cellLeft = cell.offsetLeft
     const cellRight = cellLeft + cell.offsetWidth
-    const visLeft = container.scrollLeft + stickyWidth
-    const visRight = container.scrollLeft + container.clientWidth
-
-    if (cellLeft < visLeft) {
-      container.scrollLeft = cellLeft - stickyWidth - 4
-    } else if (cellRight > visRight) {
+    if (cellLeft < container.scrollLeft) {
+      container.scrollLeft = cellLeft - 4
+    } else if (cellRight > container.scrollLeft + container.clientWidth) {
       container.scrollLeft = cellRight - container.clientWidth + 4
     }
   }, [selectedCell])
@@ -388,14 +468,26 @@ export function SchedulePage() {
   const [preview, setPreview] = useState<{unitId:string; checkIn:string; checkOut:string; mismatch:boolean}|null>(null)
   const [dragging, setDragging] = useState<string|null>(null)
 
+  // S639 (Nic, DIRECTIVE): "Master schedule needs to be scoped to a property,
+  // not having all the different properties on one schedule." Spot numbers
+  // repeat across parks, so a merged timeline stacks several identically
+  // labeled rows — unreadable, and a way to book the wrong space. The park is
+  // picked once and remembered (shared with the Units page), and the fetch
+  // itself is scoped so a big account never pulls the whole portfolio.
+  const { data: allProperties = [] } = useQuery<any[]>(
+    'properties', () => apiGet('/properties'), { staleTime: 60000 })
+  const schedulePropertyOptions = allProperties.map((p: any) => ({ id: p.id, name: p.name }))
+  const [schedulePropertyId, setSchedulePropertyId] =
+    usePropertyScope('gam.scope.property', schedulePropertyOptions)
+
   const { data: schedule, isLoading } = useQuery(
-    ['schedule', fromDate, toDate, filterType],
-    () => apiGet(`/units/schedule/master?from=${fromDate}&to=${toDate}${filterType!=='all'?'&unitType='+filterType:''}`),
+    ['schedule', fromDate, toDate, filterType, schedulePropertyId],
+    () => apiGet(`/units/schedule/master?from=${fromDate}&to=${toDate}${filterType!=='all'?'&unitType='+filterType:''}&propertyId=${schedulePropertyId}`),
     // keepPreviousData: when the perpetual-calendar window extends (from/to
     // change → new query key), keep showing the current grid instead of
     // flashing the "Loading schedule…" state and losing scroll position. The
     // appended day columns pop in when the wider fetch resolves.
-    { staleTime: 30000, keepPreviousData: true }
+    { staleTime: 30000, keepPreviousData: true, enabled: !!schedulePropertyId }
   )
 
   const { data: history = [] } = useQuery(
@@ -580,10 +672,48 @@ export function SchedulePage() {
   const pendingAckCount = resvList.filter(needsAckResv).length
 
   const units: any[] = schedule?.units || []
+  // The property's work-trade hours setting, for the picker's placeholder.
+  const wtPropertyId = (resvWorkTrade && pickedUnit?.propertyId)
+    || (editWorkTrade && units.find((u: any) => u.id === editForm?.unitId)?.propertyId) || null
+  const { data: wtTarget } = useQuery<any>(['wt-target', wtPropertyId],
+    () => apiGet(`/work-trade/property/${wtPropertyId}/target`),
+    { enabled: !!wtPropertyId && can('work_trade.manage'), staleTime: 60_000, retry: false })
 
 
   const bookings: any[] = schedule?.bookings || []
   const leases: any[] = schedule?.leases || []
+  // S649: out-of-order windows — blocked time on a site (ends_on exclusive).
+  const outOfOrder: any[] = schedule?.outOfOrder || []
+  const oooFor = (unitId: string, date: string) =>
+    outOfOrder.find((o: any) => o.unitId === unitId && date >= o.startsOn && (!o.endsOn || date < o.endsOn))
+  const oooOverlaps = (unitId: string, ci: string, co: string) =>
+    outOfOrder.some((o: any) => o.unitId === unitId && o.startsOn < co && (!o.endsOn || o.endsOn > ci))
+  // S652 (Nic): "when you mark it back in service, have it still show that."
+  // Outages that are over — drawn, never blocking.
+  const outOfOrderHistory: any[] = schedule?.outOfOrderHistory || []
+  const oooPastFor = (unitId: string, date: string) =>
+    outOfOrderHistory.find((o: any) => o.unitId === unitId && date >= o.startsOn && date < o.endedOn)
+  const [oooUnit, setOooUnit] = useState<any | null>(null)
+  // 10/4 (decisions #38): the Check out window — opened from a stay, or from
+  // the owner's to-do / notification (?checkout=<booking>&unit=<site>).
+  const [checkOutFor, setCheckOutFor] = useState<{ unitId: string; bookingId: string } | null>(null)
+  const location = useLocation()
+  const navigate = useNavigate()
+  useEffect(() => {
+    const sp = new URLSearchParams(location.search)
+    const b = sp.get('checkout'), u = sp.get('unit')
+    if (b && u) setCheckOutFor({ unitId: u, bookingId: b })
+    // 10/5: the landlord's "Long stay — no lease" notice opens the stay itself
+    // (?booking=<stay>&unit=<site>), wherever it sits on the calendar.
+    const open = sp.get('booking')
+    if (open && u) {
+      apiGet<any[]>(`/units/${u}/bookings`).then((rows) => {
+        const hit = (rows || []).find((r: any) => r.id === open)
+        if (hit) setDetailBooking({ ...hit, checkIn: dayOnly(hit.checkIn), checkOut: dayOnly(hit.checkOut) })
+        else toast.error('That reservation is no longer on the schedule.')
+      }).catch(() => toast.error('That reservation could not be opened.'))
+    }
+  }, [location.search])
   const days = getDaysInRange(fromDate, toDate)
 
   // S526 (Nic): the create form is contact + dates ONLY. No total input (the
@@ -595,6 +725,61 @@ export function SchedulePage() {
     setBookingModal({show:false,unit:null})
     setBookFirst(''); setBookLast('')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
+  }
+  // 10/5 (Nic, R2): "it's the front counter person that's clicking lease or no
+  // lease." A save that makes a stay 30+ nights in a row is refused with
+  // 'stay_terms_needed' until the desk answers; the answer then goes with the
+  // same save, sent again (withTerms takes it once).
+  const withTerms = () => {
+    const t = termsAnswer.current
+    termsAnswer.current = null
+    lastTerms.current = t
+    return t ? { stayTerms: t } : {}
+  }
+  const askTermsIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'stay_terms_needed') return false
+    setTermsAsk({ question: body.error, resend: (t) => { termsAnswer.current = t; setTermsAsk(null); resend() } })
+    return true
+  }
+  // A2: the pay route picked in the window below, taken once by the next save.
+  const withPayRoute = (fallback: 'link' | 'register' | null) => {
+    const m = payRouteAnswer.current ?? fallback
+    payRouteAnswer.current = null
+    // 10/6 (Nic): the third choice — no background check, so nothing to pay for it.
+    if (m === 'returning') return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
+    return m ? { sendDepositLink: m === 'link', payAtRegister: m === 'register' } : {}
+  }
+  const askFeeRouteIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'screening_fee_route_needed') return false
+    const terms = lastTerms.current
+    setFeeRoute({
+      message: body.error, canSendLink: !!body.canSendLink, returning: body.returning ?? null,
+      resend: (m) => { payRouteAnswer.current = m; termsAnswer.current = terms; setFeeRoute(null); resend() },
+    })
+    return true
+  }
+  // What a new stay needs, said once it is saved — the server's own figures.
+  const sayStaySaved = (stay: any) => {
+    if (!stay) return
+    if (stay.terms === 'lease' && stay.leaseId) toast('Lease chosen — a draft lease is waiting on the Leases page.')
+    if (stay.screening === 'fee_due' && stay.screeningFee != null) {
+      // M3: a change that made the stay need the check emails a pay link for its fee.
+      if (stay.screeningFeeLink) {
+        toast(`This stay is now more than three weeks, so check-in waits for a background check. `
+          + `A pay link for its ${fmt(stay.screeningFee)} fee was emailed to ${stay.emailedTo || 'the guest'}.`)
+      } else {
+        toast(stay.screeningFeeUncollected
+          ? `This stay needs a background check before check-in. Its ${fmt(stay.screeningFee)} fee has not been sent to the guest — add their email, or ring it up at the register.`
+          : `This stay needs a background check before check-in. Its ${fmt(stay.screeningFee)} fee is on the stay's payment.`)
+      }
+    } else if (stay.screening === 'on_file') {
+      toast('This stay needs a background check before check-in — the guest already has one on file.')
+    } else if (stay.screening === 'returning') {
+      toast('Returning guest — no background check needed for this stay.')
+    }
+    if (stay.workTrade?.rentTraded) toast('Work trade — the site is covered, so there is nothing to pay for it.')
   }
   const createBookingMut = useMutation(
     () => {
@@ -608,35 +793,57 @@ export function SchedulePage() {
         guestPhone: newBooking.guestPhone.trim(),
         leaseType, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut,
         source: 'direct',
+        ...withTerms(),
+        ...withPayRoute(null),
       })
     },
-    { onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeBookModal() } }
+    {
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeBookModal() },
+      onError: (e: any) => {
+        if (askTermsIf(e, () => createBookingMut.mutate())) return
+        if (askFeeRouteIf(e, () => createBookingMut.mutate())) return
+        toast.error(e?.response?.data?.error || 'Could not create the reservation.')
+      },
+    }
   )
 
   // "New Reservation" flow: dates → contact → pick an available unit (the pick
   // completes it). The per-unit "+ Book" buttons keep their own unit context
   // via bookingModal.
+  // 10/6 (Nic): nights are check-out − check-in, the same count the server
+  // keeps ("leaving on the 5th" from the 30th is five nights, not six).
   const resvNights = (() => {
     const { checkIn, checkOut } = newBooking
     if (!checkIn || !checkOut || checkOut <= checkIn) return 0
-    return Math.round((new Date(checkOut+'T12:00:00').getTime() - new Date(checkIn+'T12:00:00').getTime())/86400000)
+    return stayNightsBetween(checkIn, checkOut)
   })()
-  // Rate is implied by the length of stay (≥30 → monthly, ≥7 → weekly, else
-  // nightly), prorated, with short-term tax. Pulled from the UNIT's rate, with
-  // the PROPERTY rate as the default fallback (Nic: a landlord can price a
-  // specific unit — e.g. pull-through vs back-in RV — separately). Mirrors the
-  // authoritative backend computation in POST /units/:id/bookings.
+  // The booking's lease type names its length (the server keeps it); the
+  // PRICE is not tiered by it (below).
   const resvType = resvNights >= 30 ? 'month_to_month' : resvNights >= 7 ? 'weekly' : 'nightly'
-  const stayPriceForUnit = (u: any) => computeStayPrice(
+  // 10/6 (Nic): "It should be charging them the price, the configuration
+  // that's going to be the cheapest option for them." The shared priceStay —
+  // the cheapest whole months, weeks and nights that cover the stay, at the
+  // UNIT's rate with the PROPERTY rate as the fallback, plus short-term tax —
+  // the same function POST /units/:id/bookings, the booking site, a pay link
+  // and the register price with.
+  const stayPriceForUnit = (u: any) => priceStay(
     { nightly: u.nightlyRate ?? u.propertyNightlyRate,
       weekly:  u.weeklyRate  ?? u.propertyWeeklyRate,
       monthly: u.monthlyRate ?? u.propertyMonthlyRate },
     Number(u.propertyTaxRate || 0),
+    newBooking.checkIn,
     resvNights,
   )
   const resvGuestName = `${resvFirst.trim()} ${resvLast.trim()}`.trim()
+  // S652 (Nic): "When I back out and it's not a completed reservation, it just
+  // abandons everything... It doesn't save all that stuff as a drafted state.
+  // It's more like a browser than anything else." Nothing was written to the
+  // database on the way here, so there is nothing to unwind — only screen state
+  // to drop, and all of it goes.
   const closeNewResv = () => {
-    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none')
+    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvAvoid('')
+    setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
+    setResvReturning(false); setResvWorkTrade(false); setResvWt(defaultWorkTradeTerms())
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
@@ -662,10 +869,27 @@ export function SchedulePage() {
       totalAmount:stayPriceForUnit(u).total, source:'direct',
       requiredSiteLayout: resvLayout,
       requiredAmpService: resvAmp,
+      // S652: movable unless the counter promised them that exact space.
+      lockedToUnit: lockSite,
+      // S653: the sites they asked not to have, at the property this stay is at.
+      avoidedUnitIds: avoidedIdsAt(u.propertyId),
+      // Nic's two exits. A deposit link is right for somebody who rang in
+      // February about March, and absurd for a man standing at the desk with
+      // his rig idling outside — he pays at the till, three feet away.
+      // 10/6: a work trade covering rent has nothing to pay for the site — the
+      // reservation is confirmed now (a check's fee, if due, asks how).
+      ...withPayRoute(resvWorkTrade && resvWt.coveredCharges.includes('rent') ? null : payMode),
+      ...withTerms(),
+      ...(resvReturning ? { returningGuest: true } : {}),
+      ...(resvWorkTrade ? { workTrade: workTradeTermsPayload(resvWt) } : {}),
     }),
     {
-      onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeNewResv() },
-      onError: (e: any) => setResvError(e?.response?.data?.error || e?.message || 'Could not create the reservation'),
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeNewResv() },
+      onError: (e: any, u: any) => {
+        if (askTermsIf(e, () => createResvMut.mutate(u))) return
+        if (askFeeRouteIf(e, () => createResvMut.mutate(u))) return
+        setResvError(e?.response?.data?.error || e?.message || 'Could not create the reservation')
+      },
     }
   )
   // All units full for the dates → add the guest to a property-wide waitlist
@@ -690,24 +914,78 @@ export function SchedulePage() {
     { onSuccess: () => { qc.invalidateQueries('schedule'); setTypeModal({show:false,unit:null}) } }
   )
 
+  // 10/3: a reservation as a save hands it back (camelized), laid over the open
+  // stay. The schedule's own rows are the same columns (b.*), so the whole row
+  // goes over; the site's number and park come from the site list.
+  const mergeLatestStay = (prev: any, b: any) => {
+    const site = units.find((u: any) => u.id === b?.unitId)
+    return {
+      ...prev, ...b,
+      checkIn: b?.checkIn ? dayOnly(b.checkIn) : prev.checkIn,
+      checkOut: b?.checkOut ? dayOnly(b.checkOut) : prev.checkOut,
+      unitNumber: site?.unitNumber ?? prev.unitNumber,
+      propertyName: site?.propertyName ?? prev.propertyName,
+    }
+  }
+  // 10/3 (staff screens self-heal): a save refused because somebody else
+  // changed the stay a moment before (409 'reservation_changed'). The schedule
+  // and its history are fetched again, the open stay shows the stay as it is
+  // now (the refusal carries it), an open Edit form is filled again from it so
+  // a second save can't write over the other change, and the refusal's words
+  // are shown once. True when that is what happened.
+  const takeLatestIfChanged = (e: any, opts: { inForm?: boolean } = {}): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'reservation_changed') return false
+    qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+    const latest = body?.data ? camelizeKeys(body.data) as any : null
+    const words = body?.error || 'This reservation was just changed by someone else, so your change was not saved.'
+    if (latest?.id) {
+      setDetailBooking((prev: any) => prev && prev.id === latest.id ? mergeLatestStay(prev, latest) : prev)
+    }
+    if (opts.inForm) {
+      if (latest?.id) startEdit(mergeLatestStay(detailBooking ?? {}, latest))
+      setEditError(words)
+    } else {
+      toast.error(words)
+    }
+    return true
+  }
+  const saveError = (e: any, fallback: string) => e?.response?.data?.error || fallback
+  // 10/6 (Nic): a site the guest asked not to have. The schedule's own moves
+  // skip it; a person moving them there is asked first — "She asked not to be
+  // on RV 14. Move her there anyway?" — and the move is sent again, confirmed.
+  const askAvoidedIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'avoided_site') return false
+    appConfirm(body.error, { confirmLabel: 'Move them there' }).then(ok => { if (ok) resend() })
+    return true
+  }
+  const avoidedWords = (b: any, unitNumber: string) =>
+    `${(b?.guestName || '').trim() || 'This guest'} asked not to be on ${unitNumber}.`
+
   const moveBookingMut = useMutation(
-    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string}) =>
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
-        unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut
+        unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
+        ...(payload.overrideAvoided ? { overrideAvoided: true } : {}),
       }),
     {
-      onSuccess: () => { qc.invalidateQueries('schedule') },
-      onError: () => { toast.error('Cannot move reservation — date conflict on that unit.') }
+      // 10/5 (M3): a drag that made the stay need a background check says what was sent.
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); sayStaySaved(r?.stay) },
+      onError: (e: any, payload) => {
+        if (takeLatestIfChanged(e)) return
+        if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
+        if (askAvoidedIf(e, () => moveBookingMut.mutate({ ...payload, overrideAvoided: true }))) return
+        toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
+      }
     }
   )
 
-  const cancelBookingMut = useMutation(
-    (b: any) => apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'cancelled' }),
-    {
-      onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setDetailBooking(null) },
-      onError: () => toast.error('Could not cancel the reservation.'),
-    }
-  )
+  // Final fix (fix pass 1, decisions #53): Cancel reservation no longer sends
+  // a bare {status:'cancelled'} after a one-line "Cancel this reservation?".
+  // It opens CancelReservationModal (below), which reads fresh what the cancel
+  // changes — the lease drafted with the stay, the people on it by name, the
+  // move-in bill it zeroes, what stays owed — and sends the total it showed.
 
   // S559: front-desk check-in. Blocked server-side when the previous guest's
   // submeter hasn't been read (same-day turnover) — the 409 carries the
@@ -717,9 +995,21 @@ export function SchedulePage() {
   const [checkInBusy, setCheckInBusy] = useState(false)
   const doCheckIn = (b: any, override = false) =>
     apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'checked_in', ...(override ? { overrideMeterRead: true } : {}) })
+  // 10/5 (Nic, R9): a stay of more than three weeks checks in only once its
+  // background check is back and decided. The refusal is shown as it is, in
+  // its own window — there is no override.
+  const screeningWaitIf = (e: any): boolean => {
+    const data = e?.response?.data
+    if (e?.response?.status !== 409 || data?.code !== 'screening_pending') return false
+    setScreeningWait({ message: data.error, waitingOn: data.waitingOn })
+    qc.invalidateQueries('schedule')
+    return true
+  }
   const checkInMut = useMutation((b: any) => doCheckIn(b), {
     onSuccess: () => { qc.invalidateQueries('schedule'); toast('Guest checked in'); setDetailBooking(null) },
     onError: (e: any) => {
+      if (takeLatestIfChanged(e)) return
+      if (screeningWaitIf(e)) return
       const data = e?.response?.data
       if (data?.code === 'meter_read_due') { setCheckInPrompt({ booking: detailBooking, meters: data.meters || [], canOverride: !!data.canOverride }); return }
       toast.error(data?.error || 'Could not check the guest in.')
@@ -730,13 +1020,17 @@ export function SchedulePage() {
     setCheckInBusy(true)
     try {
       for (const m of checkInPrompt.meters) {
-        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason })
+        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
       }
       await doCheckIn(checkInPrompt.booking)
       qc.invalidateQueries('schedule')
       toast('Read recorded — guest checked in')
       setCheckInPrompt(null); setDetailBooking(null)
-    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not complete check-in.') }
+    } catch (e: any) {
+      if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      if (screeningWaitIf(e)) { setCheckInPrompt(null); return }
+      toast.error(e?.response?.data?.error || 'Could not complete check-in.')
+    }
     finally { setCheckInBusy(false) }
   }
   const overrideCheckIn = async () => {
@@ -747,7 +1041,11 @@ export function SchedulePage() {
       qc.invalidateQueries('schedule')
       toast('Checked in — meter read still due')
       setCheckInPrompt(null); setDetailBooking(null)
-    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not check in.') }
+    } catch (e: any) {
+      if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
+      if (screeningWaitIf(e)) { setCheckInPrompt(null); return }
+      toast.error(e?.response?.data?.error || 'Could not check in.')
+    }
     finally { setCheckInBusy(false) }
   }
 
@@ -761,14 +1059,33 @@ export function SchedulePage() {
         setDetailBooking((prev: any) => prev ? { ...prev, lockedToUnit: updated?.lockedToUnit ?? !b.lockedToUnit } : prev)
         toast(updated?.lockedToUnit ?? !b.lockedToUnit ? 'Locked to its site — automatic scheduling will not move this stay.' : 'Unlocked — automatic scheduling may re-site this stay again.')
       },
-      onError: () => toast.error('Could not update the site lock.'),
+      onError: (e: any) => { if (!takeLatestIfChanged(e)) toast.error(saveError(e, 'Could not update the site lock.')) },
     }
   )
+
+  // 10/5 (Nic, R2/R4): a stay with no lease can be offered one later — the
+  // same month-to-month draft a lease chosen at booking makes. It waits on the
+  // Leases page for the landlord to review and send for signature.
+  const offerLease = async (d: any) => {
+    const ok = await appConfirm(
+      'Draft a lease for this stay? It is month-to-month with no end date, so it holds the site for as long as '
+      + 'they stay. The draft waits on your Leases page to be reviewed and sent for signature.',
+      { title: 'Offer a lease', confirmLabel: 'Draft the lease' })
+    if (!ok) return
+    try {
+      const r: any = await apiPost(`/units/${d.unitId}/bookings/${d.id}/offer-lease`)
+      qc.invalidateQueries('schedule'); qc.invalidateQueries('leases')
+      setDetailBooking((prev: any) => prev && prev.id === d.id ? { ...prev, stayLeaseId: r?.data?.leaseId, stayTerms: 'lease' } : prev)
+      toast('Draft lease ready on the Leases page.')
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'The lease could not be drafted.')
+    }
+  }
 
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
   const editBookingMut = useMutation(
-    (vars: {orig:any; form:NonNullable<typeof editForm>}) =>
+    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean}) =>
       apiPatch(`/units/${vars.orig.unitId}/bookings/${vars.orig.id}`, {
         guestName: vars.form.guestName.trim() || null,
         guestEmail: vars.form.guestEmail.trim() || null,
@@ -779,6 +1096,22 @@ export function SchedulePage() {
         notes: vars.form.notes.trim() || null,
         requiredSiteLayout: vars.form.requiredSiteLayout,
         requiredAmpService: vars.form.requiredAmpService,
+        // S653: typed numbers → ids at the stay's property; [] clears the list.
+        avoidedUnitIds: (() => {
+          const toks = vars.form.avoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
+          const propId = units.find((u:any)=>u.id===vars.form.unitId)?.propertyId
+          return units.filter((u:any)=>u.propertyId===propId && toks.includes(String(u.unitNumber||'').toLowerCase().replace(/\s+/g,''))).map((u:any)=>u.id)
+        })(),
+        ...withTerms(),
+        // 10/6: confirmed after "They asked not to be on …" (askAvoidedIf).
+        ...(vars.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/6 (Nic): returning guest, and the stay's work trade — ticked,
+        // changed, or taken off (null). Left out when nothing about it changed.
+        ...(editReturning && !vars.orig.returningGuestAt ? { returningGuest: true } : {}),
+        // 10/6 (review): only a desk that may change work trades sends it, and
+        // only when the tick or the terms changed — a desk without that
+        // permission can still save a traded reservation's notes and dates.
+        ...workTradeEditPayload({ canManage: can('work_trade.manage'), ticked: editWorkTrade, terms: editWt, original: vars.orig.workTrade }),
       }),
     {
       onSuccess: (resp:any) => {
@@ -787,22 +1120,19 @@ export function SchedulePage() {
         // global middleware + axios interceptor camelize every key — so `resp`
         // IS the booking and its fields are camelCase (matches lockBookingMut).
         const b = resp
-        setDetailBooking((prev:any)=> prev ? {
-          ...prev,
-          guestName: b?.guestName ?? prev.guestName,
-          guestEmail: b?.guestEmail ?? prev.guestEmail,
-          guestPhone: b?.guestPhone ?? prev.guestPhone,
-          checkIn: b?.checkIn ? String(b.checkIn).split('T')[0] : prev.checkIn,
-          checkOut: b?.checkOut ? String(b.checkOut).split('T')[0] : prev.checkOut,
-          nights: b?.nights ?? prev.nights,
-          totalAmount: b?.totalAmount ?? prev.totalAmount,
-          unitId: b?.unitId ?? prev.unitId,
-          unitNumber: units.find((u:any)=>u.id===(b?.unitId))?.unitNumber ?? prev.unitNumber,
-          notes: b?.notes ?? prev.notes,
-        } : prev)
+        setDetailBooking((prev:any)=> prev && b?.id ? mergeLatestStay(prev, b) : prev)
         setEditForm(null); setEditError('')
+        // 10/5: what the longer stay needs (M3: the check's pay link, when one was emailed).
+        sayStaySaved(b?.stay)
+        // 10/6 (review): a returning guest's check fee that had already gone out came off.
+        if (b?.returningFeeNote) toast(b.returningFeeNote)
       },
-      onError: (e:any) => setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.'),
+      onError: (e:any, vars) => {
+        if (takeLatestIfChanged(e, { inForm: true })) return
+        if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
+        if (askAvoidedIf(e, () => editBookingMut.mutate({ ...vars, overrideAvoided: true }))) return
+        setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
+      },
     }
   )
   const startEdit = (d:any) => {
@@ -815,7 +1145,11 @@ export function SchedulePage() {
       checkIn: dayOnly(d.checkIn), checkOut: dayOnly(d.checkOut), unitId: d.unitId, notes: d.notes || '',
       requiredSiteLayout: d.requiredSiteLayout || 'none',
       requiredAmpService: d.requiredAmpService || 'none',
+      avoid: (d.avoidedUnitIds || []).map((id:string)=>unitNumberOf(id)).filter(Boolean).join(', '),
     })
+    setEditReturning(false)
+    setEditWorkTrade(!!d.workTrade)
+    setEditWt(d.workTrade ? workTradeTermsFrom(d.workTrade) : defaultWorkTradeTerms())
   }
 
   // The stay link is auto-emailed when a reservation is created; this is for
@@ -882,8 +1216,6 @@ export function SchedulePage() {
   // within its own bar (Nic's end-of-reservation case). The layer is
   // pointer-events:none, so every drag/resize/click on the bars underneath is
   // untouched. UNIT_COL_W matches the sticky Unit column; STICKY_LEFT is the pin.
-  const UNIT_COL_W = 180
-  const STICKY_LEFT = 184
   // Per-row geometry (offsetTop + height). Rows AREN'T a uniform height — unit
   // cells with more content run taller (e.g. 85px vs 72px) — so assuming a fixed
   // row height drifts lower-row names a full row high. Measure each row's actual
@@ -931,7 +1263,7 @@ export function SchedulePage() {
         if (sIdx < 0 || eIdx < 0 || eIdx < sIdx) return
         out.push({
           key: id,
-          left: UNIT_COL_W + sIdx * colW,
+          left: sIdx * colW,
           top: rg.top,
           height: rg.h,
           width: (eIdx - sIdx + 1) * colW,
@@ -956,17 +1288,37 @@ export function SchedulePage() {
   // thumb scrolls the grid). thumb width/left are % of the full scrollWidth, so the
   // track maps 1:1 to the scrollable range.
   const hbarTrackRef = useRef<HTMLDivElement>(null)
-  const [hbar, setHbar] = useState({ thumbPct: 100, leftPct: 0, show: false })
+  // S652 (Nic): "when I scroll up or down really fast... it overlays those blue
+  // lines or the red lines straight across the RV site... it slightly renders in
+  // front of the RV spot until it realizes it needs to be behind it."
+  //
+  // The thumb's position used to live in React state, and it was set on EVERY
+  // scroll event — so every frame of a scroll re-rendered this whole page, all
+  // ~100 rows × every day column. The browser kept scrolling while that render
+  // was still running, and for those frames it had moved the bars but not yet
+  // re-pinned the Unit column over them. Now a scroll moves the thumb directly
+  // and renders nothing; state holds only whether the bar is shown at all.
+  const hbarThumbRef = useRef<HTMLDivElement>(null)
+  const hbarPos = useRef({ thumbPct: 100, leftPct: 0 })
+  const [hbar, setHbar] = useState({ show: false })
   const updateHbar = () => {
     const c = scrollContainerRef.current
     if (!c) return
     const { scrollWidth, clientWidth, scrollLeft } = c
     const show = scrollWidth > clientWidth + 1
-    setHbar({
-      show,
+    hbarPos.current = {
       thumbPct: show ? Math.max(5, (clientWidth / scrollWidth) * 100) : 100,
       leftPct:  show ? (scrollLeft / scrollWidth) * 100 : 0,
-    })
+    }
+    // The date header is outside the timeline box (it has to stay put when the
+    // page scrolls up and down), so it is slid sideways to match.
+    if (headerStripRef.current) headerStripRef.current.style.transform = `translate3d(${-scrollLeft}px,0,0)`
+    const thumb = hbarThumbRef.current
+    if (thumb) {
+      thumb.style.left = `${hbarPos.current.leftPct}%`
+      thumb.style.width = `${hbarPos.current.thumbPct}%`
+    }
+    setHbar(prev => prev.show === show ? prev : { show })
   }
   useEffect(() => {
     updateHbar()
@@ -975,6 +1327,13 @@ export function SchedulePage() {
     return () => window.removeEventListener('resize', onResize)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [days.length, filteredUnits.length, view, isLoading, rowGeom.length])
+  // A sideways swipe over the site column or the date header still moves the
+  // timeline — the pointer being a few pixels left of it shouldn't matter.
+  const forwardSidewaysWheel = (e: React.WheelEvent) => {
+    const r = scrollContainerRef.current
+    if (!r || r.contains(e.target as Node)) return
+    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) r.scrollLeft += e.deltaX
+  }
   // Drag the thumb: map thumb travel across the track to the full scrollWidth.
   const dragHbar = (e: React.MouseEvent) => {
     e.preventDefault(); e.stopPropagation()
@@ -1000,11 +1359,34 @@ export function SchedulePage() {
   // don't appear — enable a unit via its ⚙ Configure.
   const ci = newBooking.checkIn, co = newBooking.checkOut
   const datesValid = !!ci && !!co && co > ci
-  const availableUnits = !datesValid ? [] : units.filter((u: any) => {
+  // S652 (Nic): "there's no timer for deposit link but if it's not paid and
+  // someone else pays it boots them as unconfirmed when there's no other
+  // spaces." So a site somebody is holding WITHOUT a deposit is not free — but
+  // it is not off the table either. It is offered last, and only when the park
+  // has nothing else, which is exactly what "when there's no other spaces"
+  // says. Taking one moves the holder to an equivalent site, or, if the park
+  // really is full, costs them the reservation and earns somebody a phone call.
+  const overlapsStay = (b: any) => dayOnly(b.checkIn) < co && dayOnly(b.checkOut) > ci
+  const bookableFor = (u: any) => {
     if (!u.isBookable) return false
-    const bookingConflict = bookings.some((b: any) => b.unitId === u.id && b.status !== 'cancelled' && dayOnly(b.checkIn) < co && dayOnly(b.checkOut) > ci)
     const leaseConflict = leases.some((l: any) => l.unitId === u.id && dayOnly(l.startDate) < co && (!l.endDate || dayOnly(l.endDate) > ci))
-    return !bookingConflict && !leaseConflict
+    return !leaseConflict && !oooOverlaps(u.id, ci, co)
+  }
+  const blockingBookings = (u: any) => bookings.filter((b: any) =>
+    b.unitId === u.id && b.status !== 'cancelled' && overlapsStay(b))
+  // S653: "RV 12, RV 14" → the units at any listed property whose number
+  // matches. Ids are resolved per property at submit time (numbers repeat).
+  const avoidTokens = resvAvoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
+  const isAvoided = (u: any) => avoidTokens.includes(String(u.unitNumber || '').toLowerCase().replace(/\s+/g, ''))
+  const avoidedIdsAt = (propertyId: string) => units.filter((u: any) => u.propertyId === propertyId && isAvoided(u)).map((u: any) => u.id)
+  const freeUnits = !datesValid ? [] : units.filter((u: any) =>
+    bookableFor(u) && blockingBookings(u).length === 0 && !isAvoided(u))
+  // Blocked ONLY by holds nobody has paid for.
+  const heldUnpaidUnits = !datesValid ? [] : units.filter((u: any) => {
+    if (!bookableFor(u) || isAvoided(u)) return false
+    const blockers = blockingBookings(u)
+    return blockers.length > 0
+      && blockers.every((b: any) => b.status === 'tentative' && !b.depositPaidAt)
   })
 
   // Reservation search — match guest/tenant name, unit number, guest email or
@@ -1095,10 +1477,16 @@ export function SchedulePage() {
     const hasLeaseConflict = leases.some(l =>
       l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && (!l.endDate || d <= dayOnly(l.endDate))))
     if (hasBookingConflict || hasLeaseConflict) { toast.error('That unit is already occupied for those dates.'); return }
-    const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
+    if (oooOverlaps(tUnitId, newCheckIn, newCheckOut)) { toast.error('That site is out of order for those dates.'); return }
+    // 10/6 (Nic): a site the guest asked not to have is a plain question, never a quiet move.
+    const avoided = !sameUnit && ((b.avoidedUnitIds || []) as string[]).includes(tUnitId)
+    const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut,
+      ...(avoided ? { overrideAvoided: true } : {}) })
     const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
     if (mismatchReasons.length) {
-      appConfirm(`Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove it anyway?`, { confirmLabel: 'Move it' }).then(ok => { if (ok) doMove() })
+      appConfirm(`${avoided ? `${avoidedWords(b, targetUnit.unitNumber)}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+    } else if (avoided) {
+      appConfirm(`${avoidedWords(b, targetUnit.unitNumber)} Move them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else {
       doMove()
     }
@@ -1302,15 +1690,36 @@ export function SchedulePage() {
 
         {/* Stats + New Reservation */}
         <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+          <RequiredPropertySelect value={schedulePropertyId} onChange={setSchedulePropertyId}
+            properties={schedulePropertyOptions} />
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} reservations</span>
           {can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>}
         </div>
       </div>
 
-      {isLoading && <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>Loading schedule...</div>}
+      {/* S639: no park chosen — offer the parks, never a merged timeline. */}
+      {!schedulePropertyId && (
+        <div style={{padding:'32px 24px'}}>
+          <div style={{color:'var(--text-2)',fontSize:'.85rem',marginBottom:14}}>
+            Pick a property to see its schedule. Spot and unit numbers repeat across
+            properties, so each property keeps its own schedule.
+          </div>
+          <div style={{display:'flex',flexWrap:'wrap',gap:10}}>
+            {schedulePropertyOptions
+              .slice()
+              .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''))
+              .map((p: any) => (
+                <button key={p.id} className="btn btn-primary"
+                  onClick={() => setSchedulePropertyId(p.id)}>{p.name}</button>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {schedulePropertyId && isLoading && <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>Loading schedule...</div>}
 
       {/* ── TIMELINE VIEW ── */}
-      {!isLoading && view==='timeline' && (
+      {schedulePropertyId && !isLoading && view==='timeline' && (
         <div style={{display:'flex',flexDirection:'column',minWidth:0,flex:1,minHeight:0}}>
         {/* S575: the old JS row-snap (round scrollTop to a fixed 72px) was removed —
             it rounded DOWN below max-scroll at the bottom (cutting off the last row)
@@ -1325,13 +1734,58 @@ export function SchedulePage() {
           .schedule-scroll{scrollbar-width:none;-ms-overflow-style:none;}
         `}</style>
         <div
-          ref={scrollContainerRef}
+          ref={vScrollRef}
           className="card schedule-scroll"
-          onScroll={() => { updateHbar(); maybeExtendForward() }}
-          style={{padding:0,position:'relative',overflowX:'auto',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
+          onWheel={forwardSidewaysWheel}
+          style={{padding:0,position:'relative',overflowX:'hidden',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
         >
+          {/* Date header — pinned to the top of the up/down box. */}
+          <div ref={headerRef} style={{position:'sticky',top:0,zIndex:3,display:'flex',background:'var(--bg-3)',borderBottom:'1px solid var(--border-1)'}}>
+            <div style={{width:UNIT_COL_W,flexShrink:0,boxSizing:'border-box',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600}}>Unit</div>
+            <div style={{flex:1,minWidth:0,overflow:'hidden'}}>
+              <div ref={headerStripRef} style={{display:'flex',width:days.length*colW,willChange:'transform'}}>
+                {days.map(d => (
+                  <div key={d} style={{boxSizing:'border-box',width:colW,flexShrink:0,padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',borderLeft:'1px solid var(--border-1)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                    {new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{display:'flex',alignItems:'flex-start'}}>
+          {/* Site column — beside the timeline, never over it. Each row takes the
+              measured height of its timeline row so the two can't drift. */}
+          <div style={{width:UNIT_COL_W,flexShrink:0,background:'var(--bg-2)'}}>
+            {filteredUnits.map((unit, rowIdx) => (
+              <div key={unit.id} style={{height:rowGeom[rowIdx]?.h ?? 56,boxSizing:'border-box',padding:'6px 12px',borderBottom:'1px solid var(--border-1)',overflow:'hidden',display:'flex',alignItems:'center'}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:44,overflow:'hidden',width:'100%'}}>
+                      {/* S652 (Nic): "RV sites 11 and 17 display the number next to the
+                          RV moniker, and all the other RV sites display the number
+                          underneath... I want consistency." One line, always. */}
+                      <div style={{flexShrink:0}}>
+                        <div style={{fontWeight:700,fontSize:'.86rem',whiteSpace:'nowrap',color:TYPE_COLORS[unit.unitType]||'var(--text-0)'}} title={`${UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)} · ${unit.propertyName}`}>{unit.unitNumber}</div>
+                      </div>
+                      <div style={{display:'flex',gap:4,flexShrink:0}}>
+                        {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
+                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Set up this space" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
+                        {/* S652 (Nic): "the button should flip on a site that's marked
+                            out of order." Out today → the button puts it back. */}
+                        {can('schedule.configure_unit') && (oooFor(unit.id, today)
+                          ? <button className="btn btn-primary btn-sm" title="Out of order — put it back in service" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>↺</button>
+                          : <button className="btn btn-ghost btn-sm" title="Mark out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>)}
+                      </div>
+                    </div>
+              </div>
+            ))}
+          </div>
+          <div
+            ref={scrollContainerRef}
+            className="schedule-scroll"
+            onScroll={() => { updateHbar(); maybeExtendForward() }}
+            style={{flex:1,minWidth:0,position:'relative',overflowX:'auto',overflowY:'hidden',overscrollBehaviorX:'contain'}}
+          >
           <table
-            style={{borderCollapse:'collapse',tableLayout:'fixed',width:180+days.length*colW}}
+            style={{borderCollapse:'collapse',tableLayout:'fixed',width:days.length*colW}}
             tabIndex={0}
             onKeyDown={e => {
               if (!selectedCell) return
@@ -1350,16 +1804,6 @@ export function SchedulePage() {
               if (e.key === 'Escape') setSelectedCell(null)
             }}
           >
-            <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:3}}>
-              <tr>
-                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:4,width:180,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
-                {days.map(d => (
-                  <th key={d} style={{background:'var(--bg-3)',padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',width:colW,minWidth:colW,maxWidth:colW,borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)'}}>
-                    <div>{new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}</div>
-                  </th>
-                ))}
-              </tr>
-            </thead>
             <tbody>
               {/* S575: every row is a UNIFORM 88px. The only thing that made rows vary
                   was the sticky Unit cell's content — bookable units carry a "+ Book"
@@ -1369,23 +1813,7 @@ export function SchedulePage() {
                   overflow:hidden, so nothing can push the row taller and nothing is
                   truly hidden. */}
               {filteredUnits.map(unit => (
-                <tr key={unit.id} style={{height:88}}>
-                  {/* zIndex 3: must beat the day-cell bars (zIndex 1–2). When the grid
-                      is scrolled, past day-cells slide UNDER this sticky column — at
-                      zIndex 1 the bars painted over the unit info (S526 glitch). */}
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:3,height:88,boxSizing:'border-box',overflow:'hidden'}}>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:76,overflow:'hidden'}}>
-                      <div style={{minWidth:0}}>
-                        <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unitNumber}</div>
-                        <div style={{fontSize:'.68rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)}</div>
-                        <div title={unit.propertyName} style={{fontSize:'.65rem',color:'var(--text-3)',display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden',lineHeight:1.25}}>{unit.propertyName}</div>
-                      </div>
-                      <div style={{display:'flex',gap:4}}>
-                        {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
-                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
-                      </div>
-                    </div>
-                  </td>
+                <tr key={unit.id} style={{height:56}}>
                   {days.map(d => {
                     const booking = getBookingForDate(unit.id, d)
                     const isBooked = !!booking
@@ -1448,7 +1876,7 @@ export function SchedulePage() {
                           ;(e.currentTarget.closest('table') as HTMLElement)?.focus()
                         }}
                         onDoubleClick={() => {
-                          if (!isBooked && unit.isBookable) openBookingModal(unit, d)
+                          if (!isBooked && unit.isBookable && !oooFor(unit.id, d)) openBookingModal(unit, d)
                         }}
                       >
                         {showPreviewBlock ? (
@@ -1477,7 +1905,10 @@ export function SchedulePage() {
                             const bk = { ...booking, unitId: unit.id, unitNumber: unit.unitNumber, propertyName: unit.propertyName, isLease }
                             return (
                               <div
-                                draggable={!isLease}
+                                // 10/3 (fix pass 2): moving or stretching a stay is an edit. A desk
+                                // person who may only check guests in or out does not get a bar
+                                // that drags only to be refused.
+                                draggable={!isLease && can('schedule.edit_reservation')}
                                 onDragStart={e => {
                                   // Mode from grab position: the outer ~10px of a start/end
                                   // cell resizes that edge; anywhere else moves the stay.
@@ -1562,9 +1993,24 @@ export function SchedulePage() {
                             )
                           })()
                         ) : (
+                          oooFor(unit.id, d) ? (
+                            // S649: out of order — striped, never a place to drop a stay
+                            <div title={`Out of order${oooFor(unit.id, d)?.reason ? ` — ${oooFor(unit.id, d)?.reason}` : ''}`}
+                              style={{height:24, borderRadius:3, opacity:.55,
+                                background:'repeating-linear-gradient(45deg, var(--red) 0 4px, transparent 4px 9px)'}} />
+                          ) : oooPastFor(unit.id, d) ? (
+                            // S652: an outage that is over — same hazard stripe, faded,
+                            // so the calendar keeps the record of how long it was down.
+                            (() => { const h = oooPastFor(unit.id, d); return (
+                              <div title={`Was out of order ${fmtDate(h.startsOn)} – ${fmtDate(h.endedOn)} (${Number(h.daysOut) < 1 ? 'less than a day' : `${h.daysOut} day${Number(h.daysOut) === 1 ? '' : 's'}`})${h.reason ? ` — ${h.reason}` : ''}`}
+                                style={{height:24, borderRadius:3, opacity:.22,
+                                  background:'repeating-linear-gradient(45deg, var(--red) 0 4px, transparent 4px 9px)'}} />
+                            ) })()
+                          ) : (
                           <div
                             style={{height:24, background: unit.isBookable ? 'transparent' : 'var(--bg-3)', borderRadius:3, opacity:.3}}
                           />
+                          )
                         )}
                       </td>
                     )
@@ -1572,13 +2018,13 @@ export function SchedulePage() {
                 </tr>
               ))}
               {filteredUnits.length===0 && (
-                <tr><td colSpan={days.length+1} style={{textAlign:'center',padding:48,color:'var(--text-3)'}}>No units found.</td></tr>
+                <tr><td colSpan={days.length} style={{textAlign:'left',padding:48,color:'var(--text-3)'}}>No units found.</td></tr>
               )}
             </tbody>
           </table>
           {/* S575: floating-name overlay (see the nameOverlays comment). Sits above
-              the bars (zIndex 2) but below the sticky Unit column + header (zIndex 3),
-              so a name sliding left disappears cleanly under the Unit column. */}
+              the bars, inside the timeline box — a name sliding left is cut off at
+              the box's edge, where the site column begins. */}
           <div aria-hidden style={{position:'absolute',top:0,left:0,zIndex:2,pointerEvents:'none'}}>
             {nameOverlays.filter(o => o.key !== dragging).map(o => (
               <div key={o.key} style={{position:'absolute',left:o.left,top:o.top,width:o.width,height:o.height,display:'flex',alignItems:'center',pointerEvents:'none'}}>
@@ -1587,6 +2033,8 @@ export function SchedulePage() {
                 </div>
               </div>
             ))}
+          </div>
+          </div>
           </div>
         </div>
         {/* S575: always-visible horizontal scrollbar hovering just above the legend
@@ -1600,9 +2048,10 @@ export function SchedulePage() {
             style={{position:'relative',height:16,background:'var(--bg-3)',borderTop:'1px solid var(--border-1)',cursor:'pointer',flexShrink:0}}
           >
             <div
+              ref={hbarThumbRef}
               onMouseDown={dragHbar}
               className="hbar-thumb"
-              style={{position:'absolute',top:3,bottom:3,left:`${hbar.leftPct}%`,width:`${hbar.thumbPct}%`,minWidth:32,background:'var(--text-3)',borderRadius:5,cursor:'grab'}}
+              style={{position:'absolute',top:3,bottom:3,left:`${hbarPos.current.leftPct}%`,width:`${hbarPos.current.thumbPct}%`,minWidth:32,background:'var(--text-3)',borderRadius:5,cursor:'grab'}}
             />
           </div>
         )}
@@ -1610,6 +2059,7 @@ export function SchedulePage() {
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Reservation (draggable)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>🔒 Lease (managed on Leases page)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
+          <span><span style={{display:'inline-block',width:12,height:12,borderRadius:2,opacity:.6,marginRight:4,background:'repeating-linear-gradient(45deg, var(--red) 0 3px, transparent 3px 6px)'}}/>Out of order (faded = was out, now back)</span>
           <span><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'var(--amber)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
           <span>· Double-click empty cell to book · Drag block to move · Drag an edge to extend/shorten</span>
         </div>
@@ -1617,7 +2067,7 @@ export function SchedulePage() {
       )}
 
       {/* ── LIST VIEW ── */}
-      {!isLoading && view==='list' && (() => {
+      {schedulePropertyId && !isLoading && view==='list' && (() => {
         // S527 W-23: next incoming at the top; longer-term / already-arrived
         // below a divider. (Dates dayOnly-sliced per the ISO-timestamp rule —
         // the old rows built Invalid Dates.)
@@ -1644,7 +2094,7 @@ export function SchedulePage() {
                 <span style={{fontWeight:600,fontSize:'.88rem'}}>{b.unitNumber}</span>
                 <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{b.propertyName}</span>
                 <span className="badge badge-green" style={{fontSize:'.65rem'}}>{LEASE_TYPE_LABELS[b.leaseType] || humanize(b.leaseType)}</span>
-                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{humanize(b.status)}</span>
+                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{bookingStatusWords(b.status)}</span>
               </div>
               <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
                 {b.guestName||'Guest'} · {new Date(dayOnly(b.checkIn)+'T12:00:00').toLocaleDateString()} — {new Date(dayOnly(b.checkOut)+'T12:00:00').toLocaleDateString()} ({b.nights} nights)
@@ -1685,14 +2135,14 @@ export function SchedulePage() {
               </div>
             </div>
           ))}
-          {past.length > 0 && divider(`Past / cancelled (${past.length})`)}
+          {past.length > 0 && divider(`Past / canceled (${past.length})`)}
           {past.map(bookingCard)}
         </div>
         )
       })()}
 
       {/* ── UNITS VIEW ── */}
-      {!isLoading && view==='units' && (
+      {schedulePropertyId && !isLoading && view==='units' && (
         <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(280px,1fr))',gap:12}}>
           {filteredUnits.map(unit => (
             <div key={unit.id} className="card">
@@ -1739,7 +2189,7 @@ export function SchedulePage() {
             <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>No reservation changes yet.</div>
           ) : history.map((e:any) => {
             const COLORS:Record<string,string> = { created:'var(--green)', moved:'var(--blue)', dates_changed:'var(--gold)', status_changed:'var(--amber)', cancelled:'var(--red)' }
-            const LABELS:Record<string,string> = { created:'Created', moved:'Moved', dates_changed:'Dates', status_changed:'Status', cancelled:'Cancelled' }
+            const LABELS:Record<string,string> = { created:'Created', moved:'Moved', dates_changed:'Dates', status_changed:'Status', cancelled:'Canceled' }
             return (
               <div key={e.id} style={{display:'flex',gap:12,alignItems:'center',padding:'9px 16px',borderBottom:'1px solid var(--border-1)'}}>
                 <span style={{fontSize:'.6rem',fontWeight:700,color:'#fff',background:COLORS[e.eventType]||'var(--text-3)',borderRadius:4,padding:'2px 7px',minWidth:64,textAlign:'center'}}>{LABELS[e.eventType]||e.eventType}</span>
@@ -1774,11 +2224,7 @@ export function SchedulePage() {
                 <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Status</label>
                 <select value={resvStatus} onChange={e => setResvStatus(e.target.value)} className="input">
                   <option value="">All</option>
-                  <option value="confirmed">Confirmed</option>
-                  <option value="checked_in">Checked-in</option>
-                  <option value="checked_out">Checked-out</option>
-                  <option value="cancelled">Cancelled</option>
-                  <option value="no_show">No-show</option>
+                  {BOOKING_STATUSES.map(st => <option key={st} value={st}>{BOOKING_STATUS_LABEL[st]}</option>)}
                 </select>
               </div>
               <div>
@@ -1852,7 +2298,7 @@ export function SchedulePage() {
                 <tbody>
                   {resvList.map(b => (
                     <tr key={b.id}>
-                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{humanize(b.status)}</span></td>
+                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{bookingStatusWords(b.status)}</span></td>
                       <td>
                         <div style={{ color: 'var(--text-0)', fontWeight: 600 }}>{b.guestName || '—'}</div>
                         <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.guestEmail || ''}</div>
@@ -2074,6 +2520,7 @@ export function SchedulePage() {
                     <label className="form-label">Office email</label>
                     <input className="input" type="email" value={bpCfg.officeEmail ?? ''} placeholder="office@yourpark.com"
                       onChange={e => setBpCfg((c: any) => ({ ...c, officeEmail: e.target.value }))} />
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>Replies from residents and guests to our emails come here too.</div>
                   </div>
                 </div>
                 <label className="form-label">Office hours</label>
@@ -2166,6 +2613,20 @@ export function SchedulePage() {
       )}
 
       {/* ── RESERVATION DETAIL ── click a bar to view */}
+      {oooUnit && <OutOfOrderModal unit={oooUnit} onClose={() => setOooUnit(null)} />}
+      {checkOutFor && (
+        <EarlyCheckOutModal unitId={checkOutFor.unitId} bookingId={checkOutFor.bookingId}
+          onClose={() => {
+            setCheckOutFor(null)
+            try {
+              const url = new URL(window.location.href)
+              if (url.searchParams.has('checkout')) {
+                url.searchParams.delete('checkout'); url.searchParams.delete('unit')
+                window.history.replaceState(null, '', url.toString())
+              }
+            } catch { /* nothing to tidy */ }
+          }} />
+      )}
       {detailBooking && (() => {
         const d = detailBooking
         const isLease = !!d.isLease
@@ -2180,15 +2641,26 @@ export function SchedulePage() {
         // W-18: payment state — paid in full, deposit-only (show balance), or unpaid.
         const total = d.totalAmount != null ? Number(d.totalAmount) : null
         const depositPaid = !isLease && !!d.depositPaidAt && d.depositAmount != null ? Number(d.depositAmount) : null
-        const closeDetail = () => { setDetailBooking(null); setEditForm(null); setEditError('') }
+        const closeDetail = () => {
+          setDetailBooking(null); setEditForm(null); setEditError('')
+          // 10/5: a stay opened from a notice (?booking=&unit=) does not open again on the next visit.
+          try {
+            const url = new URL(window.location.href)
+            if (url.searchParams.has('booking')) {
+              url.searchParams.delete('booking'); url.searchParams.delete('unit')
+              window.history.replaceState(null, '', url.toString())
+            }
+          } catch { /* nothing to tidy */ }
+        }
         const isEditing = !isLease && !!editForm
         // Live re-price preview while editing (unit rate → property default).
         const eu = isEditing ? units.find((u:any)=>u.id===editForm!.unitId) : null
         const eNights = isEditing && editForm!.checkIn && editForm!.checkOut && editForm!.checkOut>editForm!.checkIn
-          ? Math.round((new Date(editForm!.checkOut+'T12:00:00').getTime()-new Date(editForm!.checkIn+'T12:00:00').getTime())/86400000) : 0
-        const ePrice = eu ? computeStayPrice(
+          ? stayNightsBetween(editForm!.checkIn, editForm!.checkOut) : 0
+        // 10/6: the one price every door charges (shared priceStay).
+        const ePrice = eu && eNights > 0 ? priceStay(
           { nightly: eu.nightlyRate ?? eu.propertyNightlyRate, weekly: eu.weeklyRate ?? eu.propertyWeeklyRate, monthly: eu.monthlyRate ?? eu.propertyMonthlyRate },
-          Number(eu.propertyTaxRate || 0), eNights) : null
+          Number(eu.propertyTaxRate || 0), editForm!.checkIn, eNights) : null
         const editValid = isEditing && eNights > 0 && !!editForm!.guestName.trim()
         // W-19: filter-first — options are the server's available+compatible
         // list; the current unit always stays so the selection can't vanish
@@ -2209,7 +2681,7 @@ export function SchedulePage() {
                   <div>
                     <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Unit</div>
                     <select className="form-input" style={{width:'100%'}} value={editForm!.unitId} onChange={e=>setEditForm(s=>s&&({...s,unitId:e.target.value}))}>
-                      {unitOptions.map((u:any)=><option key={u.id} value={u.id}>{u.unitNumber} · {u.propertyName}{u.rvSiteLayout && u.rvSiteLayout!=='none' ? ` (${RV_SITE_LAYOUT_LABEL[u.rvSiteLayout as keyof typeof RV_SITE_LAYOUT_LABEL]})` : ''}</option>)}
+                      {unitOptions.map((u:any)=><option key={u.id} value={u.id}>{u.unitNumber} · {u.propertyName}{u.rvSiteLayout && u.rvSiteLayout!=='none' ? ` (${RV_SITE_LAYOUT_LABEL[u.rvSiteLayout as keyof typeof RV_SITE_LAYOUT_LABEL]})` : ''}{u.id!==d.unitId && ((d.avoidedUnitIds||[]) as string[]).includes(u.id) ? ' — they asked not to be here' : ''}</option>)}
                     </select>
                   </div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
@@ -2227,6 +2699,8 @@ export function SchedulePage() {
                     </div>
                   </div>
                   {editReasons.length>0 && <div style={{fontSize:'.7rem',color:'var(--amber)'}}>⚠ Unit {eu?.unitNumber}: {editReasons.join('; ')}. You can still save.</div>}
+                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid</div>
+                    <input className="form-input" style={{width:'100%'}} placeholder="e.g. RV 12, RV 14" value={editForm!.avoid} onChange={e=>setEditForm(s=>s&&({...s,avoid:e.target.value}))} /></div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={editForm!.checkIn} onChange={e=>setEditForm(s=>s&&({...s,checkIn:e.target.value}))} /></div>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={editForm!.checkOut} onChange={e=>setEditForm(s=>s&&({...s,checkOut:e.target.value}))} /></div>
@@ -2237,11 +2711,35 @@ export function SchedulePage() {
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:e.target.value}))} /></div>
                   </div>
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><textarea className="form-input" style={{width:'100%',minHeight:54}} value={editForm!.notes} onChange={e=>setEditForm(s=>s&&({...s,notes:e.target.value}))} /></div>
-                  {ePrice && <div style={{fontSize:'.78rem',color:'var(--text-3)'}}>{eNights} night{eNights===1?'':'s'} · new total <span style={{color:'var(--gold)',fontWeight:600}}>{fmt(ePrice.total)}</span></div>}
+                  {/* 10/6 (Nic): the stay's work trade — ticked, changed or taken off. */}
+                  {can('work_trade.manage') && (
+                    <div style={{padding:'10px 12px',border:'1px solid var(--border-1)',borderRadius:8,background:'var(--bg-2)'}}>
+                      <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',fontWeight:600,color:'var(--text-0)',cursor:'pointer'}}>
+                        <input type="checkbox" checked={editWorkTrade} onChange={e=>setEditWorkTrade(e.target.checked)} />
+                        Work trade
+                      </label>
+                      {editWorkTrade && (
+                        <div style={{marginTop:10}}>
+                          <WorkTradeTermsFields value={editWt} onChange={setEditWt} propertyHours={wtTarget?.target ?? null} />
+                        </div>
+                      )}
+                      {!editWorkTrade && d.workTrade && (
+                        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>Saving ends their work trade.</div>
+                      )}
+                    </div>
+                  )}
+                  {/* 10/6 (Nic): a returning guest needs no background check. */}
+                  {d.returningGuestAt
+                    ? <div style={{fontSize:'.74rem',color:'var(--text-2)'}}>{RETURNING_GUEST_DETAIL}</div>
+                    : editOffer.data?.screening === 'fee_due' && (
+                      <ReturningGuestChoice offer={editOffer.data.returning} checked={editReturning}
+                        onChange={setEditReturning} fee={editOffer.data.screeningFee} />
+                    )}
+                  {ePrice && <div style={{fontSize:'.78rem',color:'var(--text-3)'}}>{eNights} night{eNights===1?'':'s'} · new total <span style={{color:'var(--gold)',fontWeight:600}}>{editWorkTrade && editWt.coveredCharges.includes('rent') ? fmt(0) + ' — rent covered by work trade' : fmt(ePrice.total)}</span></div>}
                   {editError && <div style={{fontSize:'.76rem',color:'var(--red,#ff6b81)'}}>{editError}</div>}
                   <div style={{display:'flex',gap:8,marginTop:4}}>
                     <button className="btn btn-ghost btn-sm" onClick={()=>{setEditForm(null);setEditError('')}}>Cancel</button>
-                    <button className="btn btn-primary btn-sm" style={{marginLeft:'auto'}} disabled={!editValid || editBookingMut.isLoading}
+                    <button className="btn btn-primary btn-sm" style={{marginLeft:'auto'}} disabled={!editValid || editBookingMut.isLoading || (editWorkTrade && !editWt.coveredCharges.length)}
                       onClick={()=>editBookingMut.mutate({orig:d, form:editForm!})}>
                       {editBookingMut.isLoading?'Saving…':'Save changes'}
                     </button>
@@ -2266,19 +2764,73 @@ export function SchedulePage() {
                     )}
                   </div></>
                 )}
-                <div style={{color:'var(--text-3)'}}>Status</div><div>{humanize(d.status)}</div>
+                <div style={{color:'var(--text-3)'}}>Status</div><div>{isLease ? humanize(d.status) : bookingStatusWords(d.status)}</div>
+                {/* 10/5 (Nic, R2): lease or stay — the desk's answer for a stay of 30+ nights. */}
+                {!isLease && (d.stayLeaseId || d.stayTerms) && (
+                  <><div style={{color:'var(--text-3)'}}>Lease or stay</div>
+                  <div>
+                    {d.stayLeaseId || d.stayTerms === 'lease' ? STAY_TERMS_LABEL.lease : STAY_TERMS_LABEL[d.stayTerms as StayTerms]}
+                    {d.stayLeaseId && (
+                      <button className="btn btn-ghost btn-sm" style={{marginLeft:8,padding:'1px 8px',fontSize:'.7rem'}}
+                        onClick={()=>navigate(`/leases?open=${d.stayLeaseId}`)}>Open the lease</button>
+                    )}
+                    {!d.stayLeaseId && d.stayTerms === 'stay' && d.checkOut && (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>Held through {longCalendarDate(dayOnly(d.checkOut))} — after that the site can be booked by someone else.</div>
+                    )}
+                  </div></>
+                )}
+                {/* 10/6 (Nic): what the desk confirmed, and the stay's work trade. */}
+                {!isLease && d.returningGuestAt && (
+                  <><div style={{color:'var(--text-3)'}}>Background check</div><div>{RETURNING_GUEST_DETAIL}</div></>
+                )}
+                {!isLease && d.workTrade && (
+                  <><div style={{color:'var(--text-3)'}}>Work trade</div><div>{workTradeLine(d.workTrade)}</div></>
+                )}
+                {/* 10/5 (Nic, R9): check-in waits on the background check. */}
+                {!isLease && d.screeningBlock && (
+                  <><div style={{color:'var(--text-3)'}}>Check-in</div>
+                  <div style={{color:'var(--amber)'}}>{d.screeningBlock.message}</div></>
+                )}
+                {!isLease && (d.avoidedUnitIds||[]).length>0 && <><div style={{color:'var(--text-3)'}}>Avoids</div><div>{(d.avoidedUnitIds as string[]).map(id=>unitNumberOf(id)).filter(Boolean).join(', ')}</div></>}
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
                 <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>Leases are managed on the Leases page.</div>
               ) : (
-                <div style={{display:'flex',gap:8,marginTop:18}}>
+                <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
                   {/* S559: front-desk check-in (guard prompts a closing read if the prior guest's meter is unread). */}
                   {can('guests.check_in') && ['tentative','confirmed'].includes(d.status) && (
                     <button className="btn btn-primary btn-sm" disabled={checkInMut.isLoading} onClick={()=>checkInMut.mutate(d)}>
                       {checkInMut.isLoading?'…':'Check in'}
+                    </button>
+                  )}
+                  {/* 10/5 (Nic, R6): extend this same stay by a calendar month, rung up at the register. */}
+                  {can('schedule.edit_reservation') && ['confirmed','checked_in'].includes(d.status)
+                    && !d.stayLeaseId && d.stayTerms !== 'lease' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>setAddMonthFor(d)}>Add a month</button>
+                  )}
+                  {/* 10/5 (Nic, R2/R4): a stay with no lease can be offered one. */}
+                  {can('schedule.edit_reservation') && ['tentative','confirmed','checked_in'].includes(d.status)
+                    && !d.stayLeaseId && d.stayTerms !== 'lease' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>offerLease(d)}>Offer a lease</button>
+                  )}
+                  {/* 10/4 (decisions #38): check out — on the day or early — and settle the money. */}
+                  {can('guests.check_out') && d.status === 'checked_in' && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Check out
+                    </button>
+                  )}
+                  {(can('guests.check_out') || can('pos.refund')) && d.status === 'checked_out' && d.moneyDecisionPending && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Decide the money
+                    </button>
+                  )}
+                  {/* 10/4 (#38): a card or bank refund on this early check-out did not go out — send it again. */}
+                  {can('pos.refund') && d.status === 'checked_out' && !d.moneyDecisionPending && d.refundNeedsRetry && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>{ setCheckOutFor({ unitId: d.unitId, bookingId: d.id }); setDetailBooking(null) }}>
+                      Try the refund again
                     </button>
                   )}
                   {/* S547: snowbird lock — pin the stay to this exact site, exempt from auto re-siting */}
@@ -2293,13 +2845,7 @@ export function SchedulePage() {
                       {lockBookingMut.isLoading ? '…' : d.lockedToUnit ? '🔒 Locked to site' : 'Lock to site'}
                     </button>
                   )}
-                  {can('schedule.edit_reservation') && (
-                    <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
-                      disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
-                      onClick={()=>{ appConfirm('Cancel this reservation?', { danger: true, confirmLabel: 'Cancel reservation' }).then(ok => { if (ok) cancelBookingMut.mutate(d) }) }}>
-                      {cancelBookingMut.isLoading?'Cancelling…':'Cancel reservation'}
-                    </button>
-                  )}
+                  <CancelReservationButton booking={d} onCancel={()=>setCancelFor(d)} />
                 </div>
               )}
               </>)}
@@ -2309,19 +2855,73 @@ export function SchedulePage() {
         )
       })()}
 
+      {cancelFor && (
+        <CancelReservationModal booking={cancelFor}
+          onClose={() => setCancelFor(null)}
+          onDone={() => { setCancelFor(null); setDetailBooking(null) }} />
+      )}
+
       {checkInPrompt && (
         <CheckInReadModal prompt={checkInPrompt} busy={checkInBusy}
           onRead={submitCheckInReads} onOverride={overrideCheckIn}
           onClose={()=>{ if (!checkInBusy) setCheckInPrompt(null) }} />
       )}
 
-      {/* ── NEW RESERVATION MODAL — dates → contact → pick available unit ── */}
+      {screeningWait && (
+        <div className="modal-overlay" onClick={()=>setScreeningWait(null)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title">Check-in is waiting on the background check</div>
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{screeningWait.message}</div>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setScreeningWait(null)}>Close</button>
+              {can('tenants.run_background_check') && (
+                <button className="btn btn-primary btn-sm" onClick={()=>{ setScreeningWait(null); navigate('/background') }}>Open Background Checks</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {addMonthFor && (
+        <AddMonthModal booking={addMonthFor} onClose={()=>setAddMonthFor(null)}
+          onDone={(r: any) => {
+            setAddMonthFor(null); setDetailBooking(null)
+            qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+            if (r?.extended === false) {
+              qc.invalidateQueries('leases')
+              toast('Lease chosen — a draft lease is waiting on the Leases page. No month was added; the lease bills each month.')
+            } else {
+              const to = r?.addedMonth?.newCheckOut
+              toast(`A month added${to ? ` — check-out is now ${longCalendarDate(to)}` : ''}. It is on the stay's register ticket to be rung up.`)
+            }
+          }} />
+      )}
+
+      {/* ── NEW RESERVATION — dates → what's available → the space → who ──
+          S652 (Nic), the flow in his words: "pick arrival AND end date → 'Show
+          available' filters out anything not free for the whole stay → the
+          counter tells the customer what IS available (30 amp, back-in,
+          pull-through) → the customer chooses from what exists → THEN the
+          counter picks the space → THEN name, phone, email → emailed a deposit
+          pay link. Names come last, after the negotiation, not first."
+
+          The old order asked for a name, an email and a phone number BEFORE it
+          would show a single site — so the counter had to take a stranger's
+          details to answer "have you got anything the first week of March".
+          Nobody works that way, and the person on the phone has not agreed to
+          anything yet.
+
+          Nothing is saved until the last button. "When I back out and it's not
+          a completed reservation, it just abandons everything... It's more like
+          a browser than anything else." No draft, no held site, no row. */}
       {newResvOpen && (() => {
         const validEmail = /.+@.+\..+/.test(newBooking.guestEmail.trim())
         const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail && !!newBooking.guestPhone.trim()
+        const offered = freeUnits.length ? freeUnits : heldUnpaidUnits
+        const lastResort = freeUnits.length === 0 && heldUnpaidUnits.length > 0
         return (
         <div className="modal-overlay" onClick={closeNewResv}>
-          <div className="modal" style={{maxWidth:540}} onClick={e=>e.stopPropagation()}>
+          <div className="modal" style={{maxWidth:560}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">New Reservation</span>
               <button className="btn btn-ghost btn-sm" onClick={closeNewResv}>✕</button>
@@ -2331,95 +2931,229 @@ export function SchedulePage() {
               {/* 1 · Dates */}
               <div>
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>1 · Dates</div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
+                {/* 10/6 (Nic): arrival, then Add a day / a week / a month, the
+                    night count and the leaving day — StayDatesFields below. */}
+                <StayDatesFields checkIn={newBooking.checkIn} checkOut={newBooking.checkOut}
+                  onChange={(checkIn, checkOut) => { setShowAvail(false); setPickedUnit(null); setNewBooking(st => ({ ...st, checkIn, checkOut })) }} />
+
+                {/* Optional: what the customer says they need, before the list
+                    is drawn, so the counter is not reading out sites that will
+                    not take their rig. */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}}>
+                  <div>
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Needs (optional)</div>
+                    <select className="form-select" style={{width:'100%'}} value={resvLayout} onChange={e=>setResvLayout(e.target.value)}>
+                      {RV_SITE_LAYOUTS.map(l=><option key={l} value={l}>{l==='none'?'Any layout':RV_SITE_LAYOUT_LABEL[l]}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>&nbsp;</div>
+                    <select className="form-select" style={{width:'100%'}} value={resvAmp} onChange={e=>setResvAmp(e.target.value)}>
+                      {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'Any service':RV_AMP_SERVICE_LABEL[a]}</option>)}
+                    </select>
+                  </div>
                 </div>
-                {datesValid && <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>{resvNights} night{resvNights===1?'':'s'} · billed {resvType==='month_to_month'?'monthly':resvType}</div>}
+
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid (optional)</div>
+                  <input className="form-input" style={{width:'100%'}} placeholder="e.g. RV 12, RV 14 — spots they don't want again"
+                    value={resvAvoid} onChange={e=>{ setResvAvoid(e.target.value); setPickedUnit(null) }} />
+                  {avoidTokens.length>0 && (
+                    <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                      {(() => { const hit = units.filter(isAvoided); return hit.length
+                        ? `Left out: ${Array.from(new Set(hit.map((u:any)=>u.unitNumber))).join(', ')}`
+                        : 'No site by that number here yet — check the spelling' })()}
+                    </div>
+                  )}
+                </div>
+
+                <button className="btn btn-primary" style={{width:'100%',marginTop:12}}
+                        disabled={!datesValid}
+                        onClick={()=>{ setPickedUnit(null); setResvError(''); setShowAvail(true) }}>
+                  Show available
+                </button>
               </div>
 
-              {/* 2 · Contact */}
-              <div style={{opacity:datesValid?1:.5,pointerEvents:datesValid?'auto':'none'}}>
-                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>2 · Guest contact</div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>First name</div><input className="form-input" style={{width:'100%'}} value={resvFirst} onChange={e=>setResvFirst(e.target.value)} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Last name</div><input className="form-input" style={{width:'100%'}} value={resvLast} onChange={e=>setResvLast(e.target.value)} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
-                </div>
-              </div>
-
-              {/* Optional RV requirements: site layout + electrical service. */}
-              <div style={{opacity:datesValid?1:.5,pointerEvents:datesValid?'auto':'none',display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                <div>
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Required site layout (optional)</div>
-                  <select className="form-select" style={{width:'100%'}} value={resvLayout} onChange={e=>setResvLayout(e.target.value)}>
-                    {RV_SITE_LAYOUTS.map(l=><option key={l} value={l}>{l==='none'?'No preference':RV_SITE_LAYOUT_LABEL[l]}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Required amp service (optional)</div>
-                  <select className="form-select" style={{width:'100%'}} value={resvAmp} onChange={e=>setResvAmp(e.target.value)}>
-                    {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'No preference':RV_AMP_SERVICE_LABEL[a]}</option>)}
-                  </select>
-                </div>
-              </div>
-
-              {/* 3 · Pick an available unit → completes the reservation */}
-              <div style={{opacity:(datesValid&&hasContact)?1:.5,pointerEvents:(datesValid&&hasContact)?'auto':'none'}}>
+              {/* 2 · What is available — read out loud to the customer. */}
+              {showAvail && datesValid && (
+              <div>
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
-                  3 · Pick a unit {datesValid&&hasContact && `· ${availableUnits.length} available`}
+                  2 · What is available · {offered.length} for {newBooking.checkIn} → {newBooking.checkOut}
                 </div>
-                {!datesValid ? (
-                  <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'12px',background:'var(--bg-3)',borderRadius:8}}>Choose dates first.</div>
-                ) : !hasContact ? (
-                  <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'12px',background:'var(--bg-3)',borderRadius:8}}>Fill in the guest's first &amp; last name, a valid email, and phone to see available units.</div>
-                ) : availableUnits.length === 0 ? (
+                {lastResort && (
+                  <div style={{fontSize:'.74rem',color:'var(--amber)',marginBottom:8,lineHeight:1.5}}>
+                    Everything else is taken. These are held by reservations that have not paid a deposit —
+                    taking one moves that guest to another site, or cancels them if there is nothing left.
+                  </div>
+                )}
+                {offered.length === 0 ? (
                   <div style={{padding:'12px',background:'var(--bg-3)',borderRadius:8}}>
-                    <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>All units are booked for those dates.</div>
-                    <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Add {resvGuestName||'this guest'} to the waitlist — they'll get a 1-hour claim link the moment a unit frees up.</div>
-                    {!/.+@.+\..+/.test(newBooking.guestEmail.trim())
-                      ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>Enter the guest's email above to add them to the waitlist (it's where the claim link is sent).</div>
+                    <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>Nothing is free for those dates.</div>
+                    <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Take their details and put them on the waitlist — they get a 1-hour claim link the moment something opens.</div>
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                      <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
+                      <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
+                      <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
+                      <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                    </div>
+                    {!validEmail
+                      ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>An email address is where the claim link goes.</div>
                       : <button className="btn btn-primary btn-sm" onClick={()=>{ setResvError(''); waitlistMut.mutate() }} disabled={waitlistMut.isLoading}>
                           {waitlistMut.isLoading?'Adding…':'Add to waitlist'}
                         </button>}
                   </div>
                 ) : (
-                  <div style={{display:'grid',gap:8,maxHeight:260,overflowY:'auto'}}>
-                    {availableUnits.map((u:any)=>{
+                  <div style={{display:'grid',gap:8,maxHeight:280,overflowY:'auto'}}>
+                    {offered.map((u:any)=>{
                       const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
                       const mismatch = reasons.length > 0
-                      const pickUnit = async () => {
-                        if (createResvMut.isLoading) return
-                        if (mismatch && !(await appConfirm(`Unit ${u.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
-                        setResvError(''); createResvMut.mutate(u)
-                      }
-                      const rvTags = u.unitType==='rv_spot'
-                        ? [u.rvSiteLayout, u.rvAmpService].filter((x:string)=>x && x!=='none')
-                            .map((x:string)=>(RV_SITE_LAYOUT_LABEL as any)[x] || (RV_AMP_SERVICE_LABEL as any)[x]).join(' · ')
-                        : ''
+                      const facts = u.unitType==='rv_spot' ? rvSiteFactsLabel(u) : ''
+                      const price = stayPriceForUnit(u)
+                      const isPicked = pickedUnit?.id === u.id
                       return (
                         <div key={u.id}
-                          onClick={pickUnit}
-                          style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,padding:'11px 14px',background:'var(--bg-2)',border:`1px solid ${mismatch?'var(--amber)':'var(--border-1)'}`,borderRadius:10,cursor:'pointer'}}
-                          onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')}
-                          onMouseLeave={e=>(e.currentTarget.style.borderColor=mismatch?'var(--amber)':'var(--border-1)')}>
+                          onClick={()=>{ setResvError(''); setPickedUnit(u) }}
+                          style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,padding:'11px 14px',background:isPicked?'var(--bg-3)':'var(--bg-2)',border:`1px solid ${isPicked?'var(--gold)':mismatch?'var(--amber)':'var(--border-1)'}`,borderRadius:10,cursor:'pointer'}}>
                           <div>
-                            <div style={{fontWeight:700,fontSize:'.9rem'}}>Unit {u.unitNumber}</div>
-                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unitType]||humanize(u.unitType)} · {u.propertyName}{rvTags ? ` · ${rvTags}` : ''}</div>
+                            <div style={{fontWeight:700,fontSize:'.9rem'}}>
+                              {u.unitNumber}{facts ? ` · ${facts}` : ''}
+                            </div>
+                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>
+                              {UNIT_TYPE_LABELS[u.unitType]||humanize(u.unitType)} · {u.propertyName}
+                              {lastResort ? ' · held, unpaid' : ''}
+                            </div>
                             {mismatch && <div style={{fontSize:'.68rem',color:'var(--amber)',marginTop:2}}>⚠ {reasons.join('; ')}</div>}
                           </div>
-                          {/* S526 (Nic): no pricing here — nobody pays on this
-                              screen; the backend prices from the unit's rates. */}
-                          <span className="btn btn-primary btn-sm" style={{pointerEvents:'none'}}>Reserve →</span>
+                          {/* S652 (Nic): the price IS shown here now. The counter
+                              is quoting a stay out loud, and "what does it cost"
+                              is the second thing anyone asks. It is the site's
+                              own rate — the same number the booking site would
+                              quote for these nights.
+                              (memory: gam-register-price-is-its-own-thing) */}
+                          <div style={{textAlign:'right'}}>
+                            <div style={{fontWeight:700,fontSize:'.9rem',color:'var(--gold)'}}>{fmt(price.total)}</div>
+                            <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>{resvNights} night{resvNights===1?'':'s'}</div>
+                            {/* 10/6 (Nic): six nights at the week's price, said so. */}
+                            {stayLowerRateWords(price) && <div style={{fontSize:'.66rem',color:'var(--text-3)'}}>{stayLowerRateWords(price)}</div>}
+                          </div>
                         </div>
                       )
                     })}
                   </div>
                 )}
-                {createResvMut.isLoading && <div style={{fontSize:'.78rem',color:'var(--text-3)',marginTop:8}}>Creating reservation…</div>}
-                {resvError && <div style={{fontSize:'.78rem',color:'var(--red,#ff6b81)',marginTop:8}}>{resvError}</div>}
-              </div>
+              </div>)}
+
+              {/* 3 · Who it is for — LAST, once there is something to agree to. */}
+              {pickedUnit && (
+              <div>
+                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
+                  3 · Who is it for · {pickedUnit.unitNumber}
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                  <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
+                  <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
+                  <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
+                  <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                </div>
+
+                {/* S652 (Nic): movable by default. The nightly compression can
+                    shuffle this stay onto an equivalent site to close gaps —
+                    unless the counter promised them that exact space. */}
+                <label style={{display:'flex',alignItems:'center',gap:8,marginTop:12,fontSize:'.78rem',color:'var(--text-2)',cursor:'pointer'}}>
+                  <input type="checkbox" checked={lockSite} onChange={e=>setLockSite(e.target.checked)} />
+                  Keep them on {pickedUnit.unitNumber} — do not let the schedule move them
+                </label>
+
+                {/* 10/6 (Nic): "Mark them as work trade. Boom." Covers
+                    everything by default (untick any); monitored or trusted;
+                    the hours are the property's setting. */}
+                {can('work_trade.manage') && (
+                  <div style={{marginTop:12,padding:'10px 12px',border:'1px solid var(--border-1)',borderRadius:8,background:'var(--bg-2)'}}>
+                    <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',fontWeight:600,color:'var(--text-0)',cursor:'pointer'}}>
+                      <input type="checkbox" checked={resvWorkTrade} onChange={e=>setResvWorkTrade(e.target.checked)} />
+                      Work trade
+                    </label>
+                    {resvWorkTrade && (
+                      <div style={{marginTop:10}}>
+                        <WorkTradeTermsFields value={resvWt} onChange={setResvWt} propertyHours={wtTarget?.target ?? null} />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 10/6 (Nic): a stay of more than three weeks needs a
+                    background check — unless they've stayed here before. */}
+                {resvOffer.data?.screening === 'fee_due' && (
+                  <div style={{marginTop:12,display:'grid',gap:6}}>
+                    <div style={{fontSize:'.74rem',color:'var(--text-2)',lineHeight:1.5}}>
+                      This stay is {resvOffer.data.nights} nights in a row, so the guest needs a background check before check-in
+                      {resvOffer.data.screeningFee != null ? <> — its {fmt(resvOffer.data.screeningFee)} fee is paid with the stay</> : null}.
+                    </div>
+                    <ReturningGuestChoice offer={resvOffer.data.returning} checked={resvReturning}
+                      onChange={setResvReturning} fee={resvOffer.data.screeningFee} />
+                  </div>
+                )}
+                {resvOffer.data?.screening === 'returning' && (
+                  <div style={{marginTop:12,fontSize:'.74rem',color:'var(--text-2)'}}>{RETURNING_GUEST_DETAIL} — no background check for this stay.</div>
+                )}
+
+                {(() => {
+                  // 10/6: a work trade covering rent — nothing to pay for the site.
+                  const rentTraded = resvWorkTrade && resvWt.coveredCharges.includes('rent')
+                  if (rentTraded) return (
+                    <div style={{fontSize:'.74rem',color:'var(--text-2)',marginTop:12,lineHeight:1.5}}>
+                      Rent is covered by the work trade, so there is nothing to pay for the site — the reservation is confirmed now.
+                      {resvOffer.data?.screening === 'fee_due' && !resvReturning ? ' You will be asked how the background check is paid.' : ''}
+                    </div>
+                  )
+                  return null
+                })()}
+
+                {/* S652 (Nic): "it needs to generate either a pay link from the
+                    scheduling flow or send it to the point of sale for payment
+                    there in person." Either way the site comes off the calendar
+                    now — the sales inventory and the calendar inventory are the
+                    same inventory. */}
+                {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) && (
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginTop:14}}>
+                  {([['link','Email a deposit link'],['register','Paying at the counter']] as const).map(([m,label])=>(
+                    <button key={m} onClick={()=>setPayMode(m)}
+                      style={{padding:'8px 4px',border:'1px solid '+(payMode===m?'var(--gold)':'var(--border-1)'),
+                              background:payMode===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',
+                              cursor:'pointer',fontSize:'.74rem',fontWeight:payMode===m?700:400,
+                              color:payMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
+                  ))}
+                </div>)}
+
+                <button className="btn btn-primary" style={{width:'100%',marginTop:10}}
+                        disabled={(payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')))
+                          || !resvGuestName || createResvMut.isLoading
+                          || (resvWorkTrade && (!resvWt.coveredCharges.length || !validEmail))}
+                        onClick={async ()=>{
+                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
+                          if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
+                          setResvError(''); createResvMut.mutate(pickedUnit)
+                        }}>
+                  {createResvMut.isLoading ? 'Holding the site…'
+                   : resvWorkTrade && resvWt.coveredCharges.includes('rent') ? 'Reserve — work trade'
+                   : payMode==='register' ? 'Hold it and send to the register'
+                   : 'Reserve and email the deposit link'}
+                </button>
+                {resvWorkTrade && !validEmail &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A work trade is made for the guest's own account, so it needs their email.</div>}
+                {payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                {payMode==='register' && !resvGuestName &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name is enough when they are paying here.</div>}
+                {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
+                <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6,lineHeight:1.5}}>
+                  {payMode==='register'
+                    ? 'The site comes off the board now and a ticket appears on the register. Ringing it up confirms this same reservation.'
+                    : 'The site is held for them with no deadline. If it is still unpaid when the park fills up, they get moved to another site — or told, if there is nothing else.'}
+                </div>}
+              </div>)}
+
+              {resvError && <div style={{fontSize:'.78rem',color:'var(--red,#ff6b81)'}}>{resvError}</div>}
             </div>
           </div>
         </div>
@@ -2536,7 +3270,7 @@ export function SchedulePage() {
           dropdown (implied by stay length). */}
       {bookingModal.show && (() => {
         const bkNights = (newBooking.checkIn && newBooking.checkOut && newBooking.checkOut > newBooking.checkIn)
-          ? Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
+          ? stayNightsBetween(newBooking.checkIn, newBooking.checkOut)
           : 0
         const bkEmailValid = /.+@.+\..+/.test(newBooking.guestEmail.trim())
         const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim() && bkEmailValid && !!newBooking.guestPhone.trim()
@@ -2556,11 +3290,20 @@ export function SchedulePage() {
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
               </div>
-              {bkNights > 0 && (
-                <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
-                  {bkNights} night{bkNights===1?'':'s'} · billed {bkNights>=30?'monthly':bkNights>=7?'weekly':'nightly'}
-                </div>
-              )}
+              {bkNights > 0 && (() => {
+                // 10/6 (Nic): the one price every door charges for these nights.
+                const u = bookingModal.unit
+                const p = u ? priceStay(
+                  { nightly: u.nightlyRate ?? u.propertyNightlyRate, weekly: u.weeklyRate ?? u.propertyWeeklyRate, monthly: u.monthlyRate ?? u.propertyMonthlyRate },
+                  Number(u.propertyTaxRate || 0), newBooking.checkIn, bkNights) : null
+                const lower = p ? stayLowerRateWords(p) : null
+                return (
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+                    {bkNights} night{bkNights===1?'':'s'} — leaving {leavingDayLabel(newBooking.checkOut)}
+                    {p && p.total > 0 ? <> · {fmt(p.total)}{lower ? ` (${lower})` : ''}</> : null}
+                  </div>
+                )
+              })()}
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
                 {createBookingMut.isLoading?'Creating...':'Create Reservation'}
               </button>
@@ -2607,6 +3350,270 @@ export function SchedulePage() {
           </div>
         </div>
       )}
+
+      {/* 10/5: the questions a save can come back with — drawn last, so they
+          open above the reservation form that sent the save. */}
+      {termsAsk && (
+        <StayTermsModal question={termsAsk.question} onChoose={termsAsk.resend} onClose={()=>setTermsAsk(null)} />
+      )}
+
+      {feeRoute && (
+        <div className="modal-overlay" onClick={()=>setFeeRoute(null)}>
+          <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title">How will the background check be paid?</div>
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{feeRoute.message}</div>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setFeeRoute(null)}>Cancel</button>
+              {feeRoute.canSendLink && (
+                <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('link')}>Email a pay link</button>
+              )}
+              <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('register')}>Send to the register</button>
+              {/* 10/6 (Nic): the third choice — owner or a manager only (the server says whether it is offered). */}
+              {feeRoute.returning?.available && (
+                <button className="btn btn-primary btn-sm" onClick={()=>feeRoute.resend('returning')}>{RETURNING_GUEST_WORDS}</button>
+              )}
+            </div>
+            {feeRoute.returning && !feeRoute.returning.available && (
+              <div style={{ marginTop: 10, fontSize: '.74rem', color: 'var(--text-3)', opacity: .7, lineHeight: 1.5 }}>
+                <b style={{ color: 'var(--text-1)' }}>{RETURNING_GUEST_WORDS}</b> — {feeRoute.returning.message}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The stays Cancel reservation is never offered on:
+ *   - canceled — nothing left to cancel;
+ *   - checked out — the stay happened; it stays on the schedule as its record
+ *     (final fix, fix pass 1);
+ *   - checked in — the guest is on the site; the next step is Check out
+ *     (fix pass 2, review);
+ *   - no-show — the no-show already freed the site, so there is nothing else
+ *     to do (fix pass 3, review; the cancel-check says the same in words).
+ */
+export const CANCEL_HIDDEN_STATUSES: readonly string[] = ['cancelled', 'checked_out', 'checked_in', 'no_show']
+
+/**
+ * 10/6 (Nic): "If I pick a start date, I want some buttons that say add a day,
+ * add a week, add a month... And then it will give you the total number of
+ * nights. And automatically input the leaving date to match... if I click four
+ * times on the button to add a day, it would change the leaving date to be four
+ * days after the start of the reservation." People get overnight stays wrong —
+ * leaving on the 5th from the 30th is five nights, not six — so the count is
+ * shown in plain words beside the leaving day.
+ *
+ * Each press lengthens the stay from the leaving day already there (from the
+ * arrival when there is none): one night, seven nights, or one calendar month
+ * (Oct 4 → Nov 4). No take-away buttons (Nic): a wrong press is fixed by picking
+ * the leaving day by hand, which still works and keeps the count in step.
+ * Nights are check-out − check-in, the count the server keeps.
+ */
+export function lengthenStay(checkIn: string, checkOut: string, by: 'day' | 'week' | 'month'): string | null {
+  if (!checkIn) return null
+  const from = checkOut && checkOut > checkIn ? checkOut : checkIn
+  if (by === 'month') {
+    // Months count from the arrival, as the price does (priceStay): a stay
+    // already whole months long gets the next whole month from the arrival, so
+    // a 31st arrival goes Feb 28 → Mar 31, never Feb 28 → Mar 28 (three nights
+    // short of the two months it is charged).
+    if (from > checkIn) {
+      for (let k = 1; k <= 240; k++) {
+        const at = addCalendarMonths(checkIn, k)
+        if (at === from) return addCalendarMonths(checkIn, k + 1)
+        if (at > from) break
+      }
+    }
+    return addCalendarMonths(from, 1)
+  }
+  return addStayDays(from, by === 'week' ? 7 : 1)
+}
+/** "Wed, Oct 10" */
+export const leavingDayLabel = (ymd: string) =>
+  new Date(ymd + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+
+export function StayDatesFields({ checkIn, checkOut, onChange }: {
+  checkIn: string; checkOut: string; onChange: (checkIn: string, checkOut: string) => void
+}) {
+  const valid = !!checkIn && !!checkOut && checkOut > checkIn
+  const nights = valid ? stayNightsBetween(checkIn, checkOut) : 0
+  const add = (by: 'day' | 'week' | 'month') => {
+    const to = lengthenStay(checkIn, checkOut, by)
+    if (to) onChange(checkIn, to)
+  }
+  return (
+    <>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Arriving</div>
+          <input className="form-input" type="date" aria-label="Arriving" style={{width:'100%'}} value={checkIn}
+                 onChange={e=>onChange(e.target.value, checkOut)} /></div>
+        <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Leaving</div>
+          <input className="form-input" type="date" aria-label="Leaving" style={{width:'100%'}} min={checkIn || undefined} value={checkOut}
+                 onChange={e=>onChange(checkIn, e.target.value)} /></div>
+      </div>
+      <div style={{display:'flex',gap:8,marginTop:8,flexWrap:'wrap'}}>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('day')}>Add a day</button>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('week')}>Add a week</button>
+        <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('month')}>Add a month</button>
+      </div>
+      {valid && (
+        <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)',marginTop:8}}>
+          {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
+        </div>
+      )}
+    </>
+  )
+}
+
+/**
+ * The detail panel's Cancel reservation button (opens CancelReservationModal),
+ * shown only to someone who may cancel reservations and only on a stay that
+ * can still be canceled.
+ */
+export function CancelReservationButton({ booking, onCancel }: { booking: { status: string }; onCancel: () => void }) {
+  const { can } = usePerms()
+  if (!can('schedule.edit_reservation') || CANCEL_HIDDEN_STATUSES.includes(booking.status)) return null
+  return (
+    <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
+      onClick={onCancel}>
+      Cancel reservation
+    </button>
+  )
+}
+
+/** What GET /units/:id/bookings/:bookingId/cancel-check answers (camelCased). */
+type CancelCheck = {
+  booking: { id: string; unitId: string; guestName: string | null; status: string; checkIn: string; checkOut: string }
+  applies: boolean
+  words: string | null
+  leases: Array<NeverMovedInPreview & { leaseId: string }>
+  total: number
+  keptTotal: number
+  needsTotal: boolean
+}
+
+/** "Oct 4, 2026" from a calendar day — never moved by a time zone. */
+const cancelDay = (ymd: string | null | undefined) => ymd
+  ? new Date(`${String(ymd).slice(0, 10)}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+  : ''
+
+/**
+ * Final fix (fix pass 1, decisions #53): the Cancel reservation confirm. "Never
+ * runs blind: Cancel reservation on the Schedule opens the same confirm,
+ * showing fresh figures and names, before anything is zeroed."
+ *
+ * It reads, fresh when it opens, what canceling the stay changes: each lease
+ * drafted with it, the people on it by name, the move-in bill lines zeroed and
+ * the lines that stay owed (the Leases page's never-moved-in body, one copy) —
+ * or the words the cancel would be refused in, with only Close. The gold
+ * button sends the total it showed; a refusal or a 409 (something changed) is
+ * said once and the window reads again in place. On success a toast says what
+ * happened and the Schedule, the Leases page and the dashboard read again.
+ */
+export function CancelReservationModal({ booking, onClose, onDone }: { booking: any; onClose: () => void; onDone: () => void }) {
+  const qc = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const check = useQuery<CancelCheck>(
+    ['cancel-check', booking.id],
+    () => apiGet<CancelCheck>(`/units/${booking.unitId}/bookings/${booking.id}/cancel-check`),
+    { staleTime: 0, cacheTime: 0, retry: false, refetchOnWindowFocus: false },
+  )
+  const cancel = useMutation(
+    // Fix pass 2 (review): the total the window showed ALWAYS goes with the
+    // press — $0 when its read found no lease. A lease drafted with the stay
+    // after the read is then answered "changed since you opened this" (and
+    // read again here), never "use Cancel reservation on the Schedule" inside
+    // the very window that is Cancel reservation.
+    // The number of drafted leases it showed goes too, so one drafted since
+    // (even with nothing to zero) is never ended unseen.
+    (v: { total: number; leases: number }) => apiPatch<any>(`/units/${booking.unitId}/bookings/${booking.id}`,
+      { status: 'cancelled', expectedNeverMovedInTotal: v.total, expectedNeverMovedInLeases: v.leases }),
+    {
+      onSuccess: (data: any) => {
+        // The Schedule, the Leases page, the dashboard and its to-dos, and the
+        // Payments ledger read again — pages not on screen too.
+        refreshAfterLeaseClose(qc)
+        toast(data?.leaseClosed ? `Reservation canceled. ${data.leaseClosed}` : 'Reservation canceled.')
+        onDone()
+      },
+      onError: (e: any) => {
+        setError(e?.response?.data?.error || 'The reservation could not be canceled. Nothing changed. Try again.')
+        // Read it again in place — what the cancel changes now, or why it can't.
+        qc.invalidateQueries('schedule')
+        check.refetch()
+      },
+    },
+  )
+  const d = check.data
+  const guest = d?.booking.guestName || booking.guestName || 'This guest'
+  const dates = d ? `${cancelDay(d.booking.checkIn)} – ${cancelDay(d.booking.checkOut)}` : `${cancelDay(booking.checkIn)} – ${cancelDay(booking.checkOut)}`
+  // Each error once: a refusal the fresh read now shows is not repeated above it.
+  const shownError = error && error !== d?.words && !check.isError ? error : null
+  const close = () => { if (!cancel.isLoading) onClose() }
+  const names = (l: CancelCheck['leases'][number]) => {
+    const n = (l.household?.tenantNames ?? []).filter(Boolean)
+    const people = n.length === 0 ? 'Nobody is on this lease yet'
+      : n.length === 1 ? n[0] : `${n.slice(0, -1).join(', ')} and ${n[n.length - 1]}`
+    const space = [l.household?.unitNumber, l.household?.propertyName].filter(Boolean).join(', ')
+    return `Lease drafted with this stay: ${people}${space ? ` — ${space}` : ''}`
+  }
+  return (
+    <div className="modal-overlay" onClick={close}>
+      <div className="modal" role="dialog" aria-label="Cancel reservation" style={{ maxWidth: 540 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Cancel reservation</span>
+          <button className="btn btn-ghost btn-sm" aria-label="Close" disabled={cancel.isLoading} onClick={close}><X size={14} /></button>
+        </div>
+        <div data-testid="cancel-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 10 }}>
+          {guest}<span style={{ color: 'var(--text-3)' }}> — {dates}</span>
+        </div>
+        {shownError && (
+          <div role="alert" style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', color: 'var(--red)', fontSize: '.78rem' }}>{shownError}</div>
+        )}
+        {check.isLoading ? (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-3)', padding: '8px 0' }}>Reading what canceling this changes…</div>
+        ) : check.isError || !d ? (
+          // Fix pass 2 (review): the error once, with its next step — Read again.
+          <div role="alert" style={{ fontSize: '.84rem', color: 'var(--red)', padding: '8px 0' }}>
+            {(check.error as any)?.response?.data?.error || 'What canceling this changes could not be read, so nothing was changed. Press Read again.'}
+          </div>
+        ) : !d.applies ? (
+          <div data-testid="cancel-refusal" style={{ fontSize: '.84rem', color: 'var(--text-1)', lineHeight: 1.5, padding: '4px 0 8px' }}>{d.words}</div>
+        ) : d.leases.length === 0 ? (
+          <div data-testid="cancel-plain" style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            The reservation comes off the Schedule and the site is free for those nights.
+          </div>
+        ) : (
+          <div>
+            {d.leases.map(l => (
+              <div key={l.leaseId} data-testid="cancel-lease" style={{ marginBottom: 10 }}>
+                <div data-testid="cancel-lease-who" style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 6 }}>{names(l)}</div>
+                <NeverMovedInBody d={l} ended={false} />
+              </div>
+            ))}
+            <div style={{ fontSize: '.84rem', color: 'var(--text-2)' }}>The reservation comes off the Schedule too.</div>
+          </div>
+        )}
+        <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
+          {/* Fix pass 3 (review): Read again is the next step and the only
+              action while the read has failed, so it is the gold button. */}
+          {check.isError && (
+            <button className="btn btn-primary" disabled={check.isFetching} onClick={() => { setError(null); check.refetch() }}>
+              {check.isFetching ? 'Reading…' : 'Read again'}
+            </button>
+          )}
+          <button className="btn btn-ghost" style={{ marginLeft: 'auto' }} disabled={cancel.isLoading} onClick={close}>{d && !d.applies ? 'Close' : 'Keep the reservation'}</button>
+          {d?.applies && (
+            <button className="btn btn-primary" disabled={cancel.isLoading || check.isFetching}
+              onClick={() => { setError(null); cancel.mutate({ total: d.total, leases: d.leases.length }) }}>
+              {cancel.isLoading ? 'Canceling…' : d.total > 0 ? `Cancel reservation — ${fmt(d.total)} no longer owed` : 'Cancel reservation'}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -2650,6 +3657,119 @@ function CheckInReadModal({ prompt, busy, onRead, onOverride, onClose }: {
           <button className="btn btn-primary" disabled={!allFilled || busy} onClick={() => onRead(values)}>
             {busy ? '…' : 'Record & check in'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 10/5 (Nic, R2): "does this person get a lease or just a stay?" Asked of the
+// front counter when a save makes a guest's stay 30+ nights in a row (back-to-
+// back stays add up). The question's words are the server's (stayTermsQuestion).
+// Either way the landlord is told; a lease is drafted for them to review.
+function StayTermsModal({ question, onChoose, onClose }: {
+  question: string
+  onChoose: (t: StayTerms) => void
+  onClose: () => void
+}) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Lease or stay?</div>
+        <div style={{ fontSize: '.84rem', color: 'var(--text-2)', margin: '10px 0 16px', lineHeight: 1.5 }}>{question}</div>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          {STAY_TERMS.map(t => (
+            <button key={t} className="btn btn-primary btn-sm" onClick={() => onChoose(t)}>{STAY_TERMS_LABEL[t]}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 10/5 (Nic, R6): Add a month — the guest's current stay runs one calendar
+// month longer, priced at the site's monthly rate on its own, and the month is
+// put on the stay's register ticket to be rung up. Every figure shown is the
+// server's quote (GET .../add-month). A stay that reaches 30 nights asks lease
+// or stay first; a lease chosen here drafts the lease instead of adding the
+// month. A stay that reaches three weeks carries the background check's fee
+// on the same ticket when nothing is on file.
+function AddMonthModal({ booking, onClose, onDone }: {
+  booking: any
+  onClose: () => void
+  onDone: (result: any) => void
+}) {
+  const [quote, setQuote] = useState<any>(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  // 10/6 (Nic): "Returning guest — they've stayed with us before" — no check, no fee.
+  const [returning, setReturning] = useState(false)
+  useEffect(() => {
+    let live = true
+    apiGet(`/units/${booking.unitId}/bookings/${booking.id}/add-month`)
+      .then((q) => { if (live) setQuote(q) })
+      .catch((e: any) => { if (live) setErr(e?.response?.data?.error || 'The month could not be priced.') })
+    return () => { live = false }
+  }, [booking.id, booking.unitId])
+  const send = async (stayTerms?: StayTerms) => {
+    setBusy(true); setErr('')
+    try {
+      const r: any = await apiPost(`/units/${booking.unitId}/bookings/${booking.id}/add-month`,
+        { ...(stayTerms ? { stayTerms } : {}), ...(returning ? { returningGuest: true } : {}) })
+      onDone(r?.data)
+    } catch (e: any) {
+      const body = e?.response?.data
+      if (body?.code === 'stay_terms_needed') setQuote((q: any) => q ? { ...q, leaseChoice: 'needed', question: body.error } : q)
+      else setErr(body?.error || 'The month could not be added.')
+    } finally { setBusy(false) }
+  }
+  const asking = quote?.leaseChoice === 'needed'
+  return (
+    <div className="modal-overlay" onClick={() => { if (!busy) onClose() }}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add a month · {booking.guestName || 'Guest'}</div>
+        {!quote && !err && <div style={{ fontSize: '.84rem', color: 'var(--text-3)', margin: '12px 0' }}>Pricing the month…</div>}
+        {quote && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '8px 14px', fontSize: '.84rem', margin: '12px 0' }}>
+            <div style={{ color: 'var(--text-3)' }}>Check-out</div>
+            <div>{longCalendarDate(quote.fromCheckOut)} → <strong>{longCalendarDate(quote.newCheckOut)}</strong> <span style={{ color: 'var(--text-3)' }}>({quote.addedNights} nights added)</span></div>
+            <div style={{ color: 'var(--text-3)' }}>The month</div>
+            <div style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmt(quote.monthPrice)}</div>
+            {quote.screeningFee != null && !returning && (<>
+              <div style={{ color: 'var(--text-3)' }}>Background check</div>
+              <div>{fmt(quote.screeningFee)} <span style={{ color: 'var(--text-3)' }}>— the stay is now more than three weeks and nothing is on file, so the check's fee goes on the same ticket.</span></div>
+            </>)}
+            {quote.screening === 'returning' && (<>
+              <div style={{ color: 'var(--text-3)' }}>Background check</div>
+              <div>{RETURNING_GUEST_DETAIL}</div>
+            </>)}
+            <div style={{ color: 'var(--text-3)' }}>Paid</div>
+            <div>{Number(quote.monthPrice) > 0 ? 'At the register — the month goes on the stay\'s ticket.' : 'Nothing to pay — rent is covered by their work trade.'}</div>
+          </div>
+        )}
+        {quote?.screeningFee != null && quote?.returning && (
+          <div style={{ marginBottom: 10 }}>
+            <ReturningGuestChoice offer={quote.returning} checked={returning} onChange={setReturning} fee={quote.screeningFee} />
+          </div>
+        )}
+        {asking && (
+          <div style={{ fontSize: '.84rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 8 }}>
+            {quote.question}
+            {quote.heldThrough && <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginTop: 6 }}>With a stay, the guest is told: “{quote.heldThrough}”</div>}
+          </div>
+        )}
+        {err && <div style={{ fontSize: '.78rem', color: 'var(--red,#ff6b81)', marginBottom: 8 }}>{err}</div>}
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-ghost btn-sm" disabled={busy} onClick={onClose}>Cancel</button>
+          {quote && asking && STAY_TERMS.map(t => (
+            <button key={t} className="btn btn-primary btn-sm" disabled={busy} onClick={() => send(t)}>
+              {t === 'lease' ? 'Lease (draft it instead)' : `${STAY_TERMS_LABEL[t]} — add the month`}
+            </button>
+          ))}
+          {quote && !asking && (
+            <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => send()}>{busy ? 'Adding…' : 'Add the month'}</button>
+          )}
         </div>
       </div>
     </div>

@@ -47,7 +47,9 @@ import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { isFeatureEnabled } from '../services/systemFeatures'
 import { appendEvent } from '../services/creditLedger'
+import { replyToProperty } from '../services/replyRouting'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export const subleasesRouter = Router()
 subleasesRouter.use(requireAuth)
@@ -94,9 +96,10 @@ subleasesRouter.post('/', async (req, res, next) => {
       subleasing_allowed: 'prohibited' | 'with_consent' | 'allowed'
       property_id: string
       property_subleasing_allowed: boolean
+      timezone: string | null
     }>(
       `SELECT l.id, l.landlord_id, l.status, l.subleasing_allowed,
-              u.property_id, p.subleasing_allowed AS property_subleasing_allowed
+              u.property_id, p.subleasing_allowed AS property_subleasing_allowed, p.timezone
          FROM leases l
          JOIN units u      ON u.id = l.unit_id
          JOIN properties p ON p.id = u.property_id
@@ -184,7 +187,8 @@ subleasesRouter.post('/', async (req, res, next) => {
     } else {
       const autoApprove = lease.subleasing_allowed === 'allowed'
       initialStatus = autoApprove ? 'active' : 'pending'
-      consentDate = autoApprove ? new Date().toISOString().slice(0, 10) : null
+      // S654: consent is dated on the PROPERTY's calendar, not the UTC one.
+      consentDate = autoApprove ? todayIn(lease.timezone) : null
     }
 
     const inserted = await queryOne<any>(
@@ -253,10 +257,12 @@ subleasesRouter.post('/', async (req, res, next) => {
       try {
         const inviteCtx = await queryOne<{
           unit_number: string
+          property_id: string
           property_name: string
           sublessor_name: string
         }>(
           `SELECT u.unit_number,
+                  u.property_id,
                   p.name AS property_name,
                   tu.first_name || ' ' || tu.last_name AS sublessor_name
              FROM leases l
@@ -281,6 +287,8 @@ subleasesRouter.post('/', async (req, res, next) => {
             ctx: {
               masterLeaseId:     body.masterLeaseId,
               sublessorTenantId,
+              // 10/5: replies reach the people who run this property (services/replyRouting).
+              replyTo:           replyToProperty(inviteCtx.property_id),
             },
           })
         }
@@ -362,10 +370,13 @@ subleasesRouter.patch('/:id/decision', requirePerm('subleases.decide'), async (r
       master_lease_id: string
       status: string
       landlord_id: string
+      timezone: string | null
     }>(
-      `SELECT s.id, s.master_lease_id, s.status, l.landlord_id
+      `SELECT s.id, s.master_lease_id, s.status, l.landlord_id, p.timezone
          FROM subleases s
          JOIN leases l ON l.id = s.master_lease_id
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
         WHERE s.id = $1`,
       [req.params.id],
     )
@@ -386,13 +397,14 @@ subleasesRouter.patch('/:id/decision', requirePerm('subleases.decide'), async (r
       ? await queryOne<any>(
           `UPDATE subleases
               SET status = 'awaiting_signatures',
-                  landlord_consent_date = CURRENT_DATE,
+                  landlord_consent_date = $3::date,
                   notes = COALESCE(notes || E'\\n', '') ||
                           'Approved: ' || COALESCE($2, '(no note)'),
                   updated_at = NOW()
             WHERE id = $1
             RETURNING *`,
-          [row.id, body.notes ?? null],
+          // S654: consent is dated on the PROPERTY's calendar, as on create.
+          [row.id, body.notes ?? null, todayIn(row.timezone)],
         )
       : await queryOne<any>(
           `UPDATE subleases

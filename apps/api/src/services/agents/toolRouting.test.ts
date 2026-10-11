@@ -36,6 +36,7 @@ const LANDLORD_TOOLS = [
   'get_service_interruptions', 'get_background_check_status', 'get_work_trade_status',
   'get_profit_and_loss',
   'get_lease_expirations', 'get_pending_maintenance', 'get_property_rent_roll',
+  'get_setup_progress',
 ]
 
 const tenant = (m: string) => routeToTool(m, 'tenant', TENANT_TOOLS)
@@ -206,7 +207,7 @@ describe('reading the lease itself', () => {
 })
 
 describe('landlord phrasings', () => {
-  // The exact wording that flaked in the battery, plus its neighbours.
+  // The exact wording that flaked in the battery, plus its neighbors.
   it('routes ONE named tenant or unit to the single-tenant lookup', () => {
     for (const m of [
       "what's bob chen's balance",
@@ -298,11 +299,37 @@ describe('portfolio analytics', () => {
     for (const m of [
       'what percentage of my tenants pay late',
       "what's my average rent",
-      'how many of my tenants are on fixed income',
       'what percent of people break their lease early',
       'how old are my tenants',
       'how am I doing',
     ]) expect(landlord(m), m).toBe('get_portfolio_stats')
+  })
+
+  // S655 (Nic, 10/2): source of income is GAM's check for the flex products.
+  // The question still goes to the stats tool, whose answer is that it is
+  // private — never a count (services/agents/tools/tools.test.ts).
+  it('sends source-of-income questions to get_portfolio_stats, which says they are private', () => {
+    for (const m of [
+      'how many of my tenants are on fixed income',
+      'which of my tenants get SSI or SSDI',
+      'how many of my renters are on social security',
+    ]) expect(landlord(m), m).toBe('get_portfolio_stats')
+  })
+
+  // S650: a waiver request looks at the unit first (the landlord applies the credit).
+  it('looks up the unit a landlord wants a late fee waived on', () => {
+    expect(landlord('can you waive the late fee on 204?')).toBe('get_unit_lease')
+    expect(landlord('please remove the late fee on RV 12')).toBe('get_unit_lease')
+  })
+
+  // S650: "Get Paid" on the setup screen is a step, not a payout question.
+  it('sends the Get Paid setup step to setup progress, and payout timing to payouts', () => {
+    for (const m of [
+      'It says get paid what do i do?',
+      'I am stuck on the get paid step',
+      'help me get set up',
+    ]) expect(landlord(m), m).toBe('get_setup_progress')
+    expect(landlord('when do i get paid?')).toBe('get_my_payouts')
   })
 
   // The distinction that matters: a rate is one number, a ranking is names.
@@ -313,8 +340,8 @@ describe('portfolio analytics', () => {
 })
 
 describe('the safety properties', () => {
-  it('returns nothing when the table does not recognise the wording', () => {
-    // Falls back to the runner's previous behaviour; must not guess.
+  it('returns nothing when the table does not recognize the wording', () => {
+    // Falls back to the runner's previous behavior; must not guess.
     expect(tenant('what is FlexVault?')).toBeUndefined()
     expect(landlord('what is my property worth?')).toBeUndefined()
     expect(tenant('')).toBeUndefined()

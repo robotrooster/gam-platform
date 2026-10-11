@@ -1,18 +1,14 @@
 /**
- * Tenant CSV — outstanding_balance opening-invoice path (S29X / Phase A).
+ * Tenant CSV — outstanding_balance (S29X / Phase A; S655 draft roster).
  *
  * Covers:
  *   - Validate parses outstanding_balance with currency formatting
- *     (e.g. "$1,234.56") and accepts negative as block.
- *   - Commit writes a `pending` invoice (subtotal_rent=balance,
- *     due_date=today, notes="Imported opening balance from prior
- *     platform.") for any positive balance.
- *   - Zero, missing, or negative balances skip invoice creation.
- *   - Invoice uses the landlord's invoice_sequences counter
- *     (no collision with native GAM-generated invoices).
- *
- * Mocks emailTenantOnboarded since commit fires activation emails
- * post-commit and we don't want real network calls in the test harness.
+ *     (e.g. "$1,234.56") and blocks a value that isn't a number.
+ *   - S655 (decisions 10/2): saving the draft roster KEEPS the household's
+ *     old balance on the roster and bills NOTHING yet — there is no lease to
+ *     bill until the landlord signs. It posts as one charge when the lease
+ *     issues (esign-own-signature.test.ts covers that moment).
+ *   - Zero and missing balances keep nothing; a credit is noted, not carried.
  */
 
 import { vi, describe, it, expect, beforeEach } from 'vitest'
@@ -176,155 +172,58 @@ describe('Tenant CSV — outstanding_balance parsing (validate)', () => {
   })
 })
 
-describe('Tenant CSV — opening-balance invoice (commit)', () => {
-  it('writes a pending invoice for the carry-over balance', async () => {
-    const { landlordId, unitId, token } = await seedLandlordWithProperty()
-    const csv = [
-      'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
-      'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,1234.56',
-    ].join('\n')
+describe('Tenant CSV — the old balance rides on the draft roster, billed nothing yet', () => {
+  const draft = (token: string, balance: string) => request(buildApp())
+    .post('/api/landlords/me/onboard-tenants-csv/draft')
+    .set('Authorization', `Bearer ${token}`)
+    .send({
+      source: 'generic', claimedPlatformName: 'TestPlatform',
+      csv: [
+        'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
+        `Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,${balance}`,
+      ].join('\n'),
+    })
+  const rosterBalance = async (landlordId: string) => (await db.query(
+    `SELECT opening_balance::float AS b FROM tenant_roster_drafts WHERE landlord_id = $1`, [landlordId])).rows[0]?.b ?? null
 
-    const val = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ csv, source: 'generic' })
-    expect(val.body.data.summary.blockers).toBe(0)
-
-    const commit = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(commit.status).toBe(200)
-    expect(commit.body.data.committed).toBe(1)
-
-    // Invoice landed
-    const inv = await db.query<any>(
-      `SELECT invoice_number, status, subtotal_rent, total_amount, notes,
-              due_date::text AS due_date_str, lease_id, unit_id, landlord_id
-         FROM invoices WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(inv.rows).toHaveLength(1)
-    expect(inv.rows[0].status).toBe('pending')
-    expect(parseFloat(inv.rows[0].subtotal_rent)).toBe(1234.56)
-    expect(parseFloat(inv.rows[0].total_amount)).toBe(1234.56)
-    expect(inv.rows[0].unit_id).toBe(unitId)
-    expect(inv.rows[0].notes).toMatch(/Imported opening balance/i)
-    // due_date is CURRENT_DATE — pull "today" from the DB so the
-    // assertion uses the same timezone the column was stamped in
-    // (avoids a UTC-vs-local boundary flake when the local clock
-    // straddles UTC midnight; pre-S454 used `new Date()...slice(0,10)`).
-    const { rows: [{ today }] } = await db.query<{ today: string }>(
-      `SELECT CURRENT_DATE::text AS today`)
-    expect(inv.rows[0].due_date_str).toBe(today)
+  it('keeps a plain balance on the household and writes no invoice', async () => {
+    const { token, landlordId } = await seedLandlordWithProperty()
+    const res = await draft(token, '1234.56')
+    expect(res.status).toBe(200)
+    expect(await rosterBalance(landlordId)).toBe(1234.56)
+    expect((await db.query(`SELECT id FROM invoices WHERE landlord_id = $1`, [landlordId])).rows).toEqual([])
+    expect(sendOnboardMock).not.toHaveBeenCalled()
   })
 
-  it('handles currency-formatted balance ($1,234.56) correctly on commit', async () => {
-    const { landlordId, token } = await seedLandlordWithProperty()
-    const csv = [
-      'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
-      'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,"$1,234.56"',
-    ].join('\n')
-
-    const val = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ csv, source: 'generic' })
-
-    const commit = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(commit.status).toBe(200)
-
-    const inv = await db.query<any>(
-      `SELECT subtotal_rent FROM invoices WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(parseFloat(inv.rows[0].subtotal_rent)).toBe(1234.56)
+  it('reads a currency-formatted balance ($1,234.56)', async () => {
+    const { token, landlordId } = await seedLandlordWithProperty()
+    await draft(token, '"$1,234.56"')
+    expect(await rosterBalance(landlordId)).toBe(1234.56)
   })
 
-  it('skips invoice when balance is missing', async () => {
-    const { landlordId, token } = await seedLandlordWithProperty()
-    const csv = [
-      'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
-      'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,',
-    ].join('\n')
-
-    const val = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ csv, source: 'generic' })
-
-    const commit = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(commit.status).toBe(200)
-
-    const inv = await db.query<any>(
-      `SELECT count(*)::text AS c FROM invoices WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(inv.rows[0].c).toBe('0')
+  it('keeps nothing for a missing or zero balance', async () => {
+    const a = await seedLandlordWithProperty()
+    await draft(a.token, '')
+    expect(await rosterBalance(a.landlordId)).toBeNull()
+    await cleanupAllSchema()
+    const b = await seedLandlordWithProperty()
+    await draft(b.token, '0')
+    expect(await rosterBalance(b.landlordId)).toBeNull()
   })
 
-  it('skips invoice when balance is zero', async () => {
-    const { landlordId, token } = await seedLandlordWithProperty()
-    const csv = [
-      'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
-      'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,0',
-    ].join('\n')
-
-    const val = await request(buildApp())
+  it('a credit on the old system is noted and not carried as a charge', async () => {
+    const { token, landlordId } = await seedLandlordWithProperty()
+    const v = await request(buildApp())
       .post('/api/landlords/me/onboard-tenants-csv/validate')
       .set('Authorization', `Bearer ${token}`)
-      .send({ csv, source: 'generic' })
-
-    const commit = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(commit.status).toBe(200)
-
-    const inv = await db.query<any>(
-      `SELECT count(*)::text AS c FROM invoices WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(inv.rows[0].c).toBe('0')
-  })
-
-  it('allocates a sequential invoice_number via invoice_sequences', async () => {
-    const { landlordId, token } = await seedLandlordWithProperty()
-    const csv = [
-      'first_name,last_name,email,phone,property_name,unit_number,lease_start,monthly_rent,outstanding_balance',
-      'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,2024-06-01,1850,500',
-    ].join('\n')
-
-    const val = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/validate')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ csv, source: 'generic' })
-
-    const commit = await request(buildApp())
-      .post('/api/landlords/me/onboard-tenants-csv/commit')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
-    expect(commit.status).toBe(200)
-
-    const inv = await db.query<any>(
-      `SELECT invoice_number FROM invoices WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(inv.rows).toHaveLength(1)
-    // Format is year-based: e.g. INV-2026-001 (per formatInvoiceNumber).
-    expect(inv.rows[0].invoice_number).toMatch(/\d{4}-\d+/)
-
-    // Sequence row advanced
-    const seq = await db.query<any>(
-      `SELECT next_number FROM invoice_sequences WHERE landlord_id = $1`,
-      [landlordId],
-    )
-    expect(parseInt(seq.rows[0].next_number, 10)).toBeGreaterThan(1)
+      .send({ source: 'generic', csv: [
+        'first_name,last_name,email,phone,property_name,unit_number,outstanding_balance',
+        'Jane,Doe,jane@x.com,555-0100,Sunset Apartments,4B,-40',
+      ].join('\n') })
+    const note = v.body.data.rows[0].issues.find((i: any) => i.field === 'outstanding_balance')
+    expect(note.severity).toBe('warn')
+    expect(note.message).toMatch(/credit of \$40/)
+    await draft(token, '-40')
+    expect(await rosterBalance(landlordId)).toBeNull()
   })
 })

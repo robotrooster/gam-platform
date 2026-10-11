@@ -41,6 +41,7 @@
 import { getClient, query } from '../db'
 import { PORTFOLIO_COMMISSION } from '@gam/shared'
 import type { PoolClient } from 'pg'
+import { dateIn, monthStartOf } from '../lib/timezone'
 
 interface CommissionAccrualResult {
   monthScanned: string
@@ -54,8 +55,10 @@ interface CommissionAccrualResult {
 }
 
 export async function processCommissionAccrual(now: Date = new Date()): Promise<CommissionAccrualResult> {
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
-  const monthIso   = monthStart.toISOString().slice(0, 10)
+  // S654: the commission month is read on GAM's Phoenix calendar (the cron's
+  // zone and the database's), not UTC, so a run after 5 pm Phoenix on the last
+  // day of a month does not accrue next month's commission early.
+  const monthIso   = monthStartOf(dateIn(null, now))
 
   const result: CommissionAccrualResult = {
     monthScanned: monthIso,

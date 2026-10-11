@@ -79,6 +79,11 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
   // Human texting cadence: a 'read' receipt → 'typing' → the reply lands as
   // separate bubbles. Mirrors Lucy's marketing widget so every agent feels alike.
   const [indicator, setIndicator] = useState<'none' | 'sent' | 'read' | 'typing'>('none')
+  // S651: set only while this turn is genuinely sitting in the model queue
+  // behind somebody else. Replaces the "is typing" line, because claiming to
+  // type while waiting for a slot is the one part of the cadence that would be
+  // a lie.
+  const [queuedNote, setQueuedNote] = useState<string | null>(null)
   // When the agent last finished a reply — drives the engaged/idle notice delay.
   const agentLastSpokeAt = useRef<number | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -115,9 +120,14 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
     // away that this isn't a person. The 180s server timeout keeps the turn
     // pending (typing indicator) until the model answers, so the fallback only
     // fires on a genuine failure.
+    // S651: an id for THIS turn so the poll below can ask where we are. The
+    // server mints conversationId on a new thread, which is too late to explain
+    // a wait that is happening now.
+    const turnId = (globalThis.crypto?.randomUUID?.() ?? String(Math.random()).slice(2))
     const replyPromise: Promise<string> = (async () => {
       try {
-        const res = await apiPost<any>('/agent/chat', conversationId ? { message: text, conversationId } : { message: text })
+        const res = await apiPost<any>('/agent/chat',
+          conversationId ? { message: text, conversationId, turnId } : { message: text, turnId })
         const d = res.data
         if (d?.handledBy?.name) setAgent(d.handledBy.name)
         if (d?.conversationId) setConversationId(d.conversationId)
@@ -148,7 +158,30 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
     await sleep(PAUSE_BEFORE_TYPING_MS); setIndicator('typing')
     let since = Date.now()
 
+    // S651 — tell somebody they are in a queue, because until now nobody ever
+    // was. The gate has held conversations back since S628 and the person
+    // waiting saw a typing indicator running for ninety seconds with no
+    // explanation, which reads as a broken page rather than as a busy person.
+    //
+    // Starts after a beat: a turn that gets a slot immediately, which is nearly
+    // all of them, must never flash a "one moment" that was never true. Only
+    // the genuinely queued ever see this.
+    let polling = true
+    void (async () => {
+      await sleep(QUEUE_CHECK_AFTER_MS)
+      while (polling) {
+        try {
+          const st = await apiGet<any>(`/agent/chat/waiting?turnId=${turnId}`)
+          setQueuedNote(polling && st?.waiting ? (st.message ?? null) : null)
+        } catch { /* a failed poll says nothing; the cadence carries on */ }
+        if (!polling) break
+        await sleep(QUEUE_POLL_MS)
+      }
+    })()
+
     const reply = await replyPromise
+    polling = false
+    setQueuedNote(null)
     const parts = String(reply).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
     if (!parts.length) parts.push(String(reply))
 
@@ -194,7 +227,9 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
         {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} agent={agent} />)}
         {indicator === 'sent' && <SentMarker />}
         {indicator === 'read' && <ReadMarker />}
-        {indicator === 'typing' && <Working agent={agent} />}
+        {indicator === 'typing' && (queuedNote
+          ? <Waiting agent={agent} note={queuedNote} />
+          : <Working agent={agent} />)}
       </div>
 
       {/* Input */}
@@ -247,6 +282,32 @@ function SentMarker() {
 /** Right-aligned "Seen" receipt — the moment the agent actually looks at it. */
 function ReadMarker() {
   return <div style={{ fontSize: 11, color: 'var(--t2)', textAlign: 'right', margin: '-4px 4px 0 0' }}>Seen</div>
+}
+
+// How long before the widget even asks whether it is queued, and how often it
+// asks after that. Long enough that an ordinary turn never sees it; short
+// enough that a real wait gets explained while the person is still watching.
+const QUEUE_CHECK_AFTER_MS = 6000
+const QUEUE_POLL_MS = 5000
+
+/**
+ * S651: what someone sees while they are behind somebody else.
+ *
+ * Takes the typing indicator's place rather than sitting beside it — claiming
+ * to be typing while waiting for a slot is the one beat of this cadence that
+ * would not be true. The wording comes from the server (queuePositionMessage)
+ * and is a person's phrasing on purpose: no position numbers, no "capacity",
+ * nothing that gives away there is a machine behind it.
+ */
+function Waiting({ agent, note }: { agent: string; note: string }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <Avatar name={agent} size={26} />
+      <div style={{ padding: '9px 12px', borderRadius: 12, background: 'var(--bg3)', color: 'var(--t2)', fontSize: 13, fontStyle: 'italic' }}>
+        {note}
+      </div>
+    </div>
+  )
 }
 
 function Working({ agent }: { agent: string }) {

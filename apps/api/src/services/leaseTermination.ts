@@ -2,6 +2,8 @@ import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { appendEvent } from './creditLedger'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
+import { AppError } from '../middleware/errorHandler'
 
 // ============================================================
 // Early-termination service.
@@ -148,6 +150,16 @@ export async function requestEarlyTermination(args: {
   if (lease.status !== 'active' && lease.status !== 'pending') {
     throw new Error(`Cannot terminate lease in status ${lease.status}`)
   }
+  // S655: a new lease is waiting for this household (or this IS that new lease,
+  // not started yet). Leaving and staying on a new lease cannot both be true —
+  // the same rule, in the same words, as the front desk's leaving date
+  // (services/renewalSuccessor.newLeaseBlocksEarlyEnd).
+  {
+    const { newLeaseBlocksEarlyEnd } = await import('./renewalSuccessor')
+    const blocked = await newLeaseBlocksEarlyEnd(
+      async (sql, params) => ({ rows: await query<any>(sql, params) }), args.leaseId, 'tenant')
+    if (blocked) throw new AppError(409, blocked)
+  }
 
   // Reject duplicate active requests
   const existing = await queryOne(
@@ -256,7 +268,7 @@ async function chargeAndTerminate(
   if (!req) return { charged: false, reason: 'Request not found' }
 
   const Stripe = (await import('stripe')).default
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' as any })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' as any })
 
   let paymentMethodId: string | null = null
   try {
@@ -396,6 +408,15 @@ export async function waiveFeeAndTerminate(args: {
     if (req.status !== 'requested' && req.status !== 'failed') {
       throw new Error(`Cannot waive request in status ${req.status}`)
     }
+    // S655: the same rule as the tenant's request — a waiting new lease is
+    // canceled first (nobody signed) or the leaving date goes on it once it
+    // starts (someone signed). A request made before the new lease was signed
+    // lands here.
+    {
+      const { newLeaseBlocksEarlyEnd } = await import('./renewalSuccessor')
+      const blocked = await newLeaseBlocksEarlyEnd(client.query.bind(client) as any, req.lease_id, 'landlord')
+      if (blocked) throw new AppError(409, blocked)
+    }
 
     await client.query(
       `UPDATE lease_termination_requests
@@ -465,10 +486,19 @@ async function terminateInTx(
       RETURNING unit_id`,
     [leaseId],
   )
+  // Final sweep (10/3): an add-a-roommate spot nobody signed ('pending_add')
+  // never joined this lease, so it is void (as voiding its addendum leaves it,
+  // lib/leaseDocCascade.ts), not 'removed' / lease_ended like the people who
+  // were on it.
+  await client.query(
+    `UPDATE lease_tenants SET status = 'void', updated_at = NOW()
+      WHERE lease_id = $1 AND status = 'pending_add'`,
+    [leaseId],
+  )
   await client.query(
     `UPDATE lease_tenants
         SET status = 'removed', removed_at = NOW(), removed_reason = 'lease_ended', updated_at = NOW()
-      WHERE lease_id = $1 AND status IN ('active','pending_add','pending_remove')`,
+      WHERE lease_id = $1 AND status IN ('active','pending_remove')`,
     [leaseId],
   )
   if (lease.rows[0]) {

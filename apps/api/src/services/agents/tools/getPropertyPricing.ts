@@ -5,10 +5,11 @@
  * deposit and short-term lodging tax. Hard-scoped to actor.propertyId. Read-only.
  *
  * Rates are read live from the landlord's settings, so a price change shows up on
- * the next question — the agent never memorizes or invents a number. The weekly
- * rate is the built-in weekly discount (charged instead of 7× nightly on 7+ night
- * stays); the agent can point that out. For a real quote on specific dates the
- * agent should use check_availability, which prorates + adds tax.
+ * the next question — the agent never memorizes or invents a number. 10/6
+ * (Nic): a stay is always charged the lowest price for its nights — whole
+ * months, weeks and nights, whichever combination costs less (six nights can be
+ * charged as a week); the agent can point that out. For a real quote on
+ * specific dates the agent should use check_availability, which adds tax.
  */
 
 import { resolvePropertyById, listSiteTypePricing } from '../../propertyBookingQuote'
@@ -54,8 +55,10 @@ export const getPropertyPricing: AgentTool = {
         maxStayNights: t.maxStayNights,
       })),
       note:
-        'Rates are per site. The weekly rate is the discounted 7-night price (charged instead of 7× nightly); ' +
-        'monthly is the long-stay rate. Deposit and lodging tax apply — quote the exact total with ' +
+        'Rates are per site. The weekly rate is the discounted 7-night price; monthly is the long-stay rate. A stay ' +
+        'is always charged the lowest price for its nights, so a stay just short of a week costs no more than the week. ' +
+        'Lodging tax is only on stays under 30 nights, so a stay just short of a month charged the monthly rate can cost ' +
+        'more than a full month — never say it costs no more than the month. Deposit and lodging tax apply — quote the exact total with ' +
         'check_availability once the guest has dates. Amounts are US dollars.\n' +
         // S626 (Nic): "Give the WEEKLY rate as an upsell with the actual
         // number; saying 'better rates for weekly and monthly' without the

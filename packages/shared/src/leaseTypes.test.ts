@@ -88,7 +88,7 @@ import { normaliseLeaseType, normaliseAutoRenewMode, autoRenewFromElection, WRIT
 const LEASE_TYPE_ALLOWED = ['month_to_month', 'fixed_term', 'nnn_commercial']
 const MODE_ALLOWED = ['extend_same_term', 'convert_to_month_to_month']
 
-describe('S622 lease-type normalisation', () => {
+describe('S622 lease-type normalization', () => {
   it('accepts the wording Oak Park’s lease actually prints', () => {
     expect(normaliseLeaseType('FIXED TERM')).toBe('fixed_term')
     expect(normaliseLeaseType('MONTH-TO-MONTH TERM')).toBe('month_to_month')

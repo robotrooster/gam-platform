@@ -13,7 +13,7 @@
  *
  * SCOPED HARD, because a free-text channel is the easiest thing on the platform
  * to abuse by accident. Everything with a real home keeps it: a repair is a
- * maintenance request, a neighbour is a complaint, wanting to renew is
+ * maintenance request, a neighbor is a complaint, wanting to renew is
  * request_lease_renewal. This is for what is genuinely left over — asking about
  * a different unit, flagging that they will be away, a question only the
  * landlord can answer.
@@ -53,7 +53,7 @@ export const messageMyLandlord: AgentTool = {
     'or different unit, telling them they will be away, asking a question only the landlord can ' +
     'answer.\\n' +
     'DO NOT use it for anything that has its own tool. A repair is file_maintenance_request. A ' +
-    'neighbour, noise, parking or trash is log_complaint. Wanting to renew is request_lease_renewal. ' +
+    'neighbor, noise, parking or trash is log_complaint. Wanting to renew is request_lease_renewal. ' +
     'Those are tracked; a message is not, and sending one instead quietly drops the tenant out of a ' +
     'workflow they should be in.\\n' +
     'CONFIRM FIRST — read the wording back and get an explicit yes. It goes out in their name and ' +

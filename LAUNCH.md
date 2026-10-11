@@ -140,9 +140,11 @@ Nic is entering his three Oak Park lease templates and sending portal invites.
 Everything here is meant to land BEFORE real tenants are on the platform. Nic:
 *"I wanted to knock all those changes out before real people got on there."*
 
-1. **E-sign auto-draft workflow** — verify the path Nic is about to use for
-   real: upload template → auto-place fields → draft → send. Not yet checked
-   this session.
+1. **E-sign auto-draft workflow — ✅ PROVEN IN USE (S641).** This item was
+   written 2026-08-22, before Nic had used the flow. He has since put **35
+   completed leases and 12 in progress** through upload template → auto-place
+   fields → draft → send. Nothing to verify; it is the daily path.
+   Superseded by the SIGNING PACKAGE work (§2d).
 2. **AI agents — ✅ DONE (S617).** Knowledge re-ingested, scope enforced, manner
    fixed, and — the part nobody knew about — they had been **inventing account
    data**.
@@ -176,7 +178,14 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
      **Do not run it alongside the vitest suite** — together they starve the
      36B model server, which crashes and respawns mid-run.
 
-3. **Demo server — split the seed data off the live database.** Nic: *"when
+3. **Demo server — DEFERRED by Nic (S641): "skip demo data for now."** Still
+   wanted eventually, and it has to live on a server rather than this Mac,
+   since other salespeople will not be on this machine. The production
+   cleanup half already happened — Thornton Properties and Reyes Rentals and
+   their payment rows are gone from the live database.
+   Original note follows.
+
+   **Demo server — split the seed data off the live database.** Nic: *"when
    we're having sales calls and demos, I can walk through a process without
    showing real customer data."* Wants seeded data at EVERY STAGE of a flow —
    a template being built, one with its boxes already placed, one signed — so a
@@ -186,6 +195,38 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
    sit alongside real money.
 
 ---
+
+## 2e. Government forms library — stock the whole shelf (S652, 2026-09-21)
+
+Nic: *"need to download all the government pamphlets and issued forms for this
+library build. Not just... five. That's not the only ones the government puts
+out."* The shelf, the locking, the refresh and the landlord screen are built;
+the first five are on it (EPA lessor + seller lead disclosures, the January 2026
+lead pamphlet, IDPH's manufactured-home guide, and the Illinois Act). What is
+left is the inventory.
+
+- **Scope: government-published only, unaltered.** Nic: *"the library should
+  only be government published documents that something we're not altering at
+  all."* Nothing GAM or a landlord authored. Attorney-verified state forms are a
+  later, separate source once there are attorneys on retainer.
+- **Federal first, then every state.** Federal: HUD and EPA handouts beyond
+  lead (e.g. HUD's fair housing and "Know Your Rights" material, the Spanish and
+  other-language editions of the lead pamphlet — EPA publishes eight). States:
+  each state's own tenant/landlord handbook, manufactured-home guides, and any
+  agency-issued disclosure forms (bed bug, mold, radon, flood, sex-offender
+  registry notices where the STATE prints the form). Walk each state's housing,
+  health, and attorney-general sites.
+- **Every one gets:** a title-case name that says what it is (never the download
+  filename), the publishing agency, the source URL, the edition date, the right
+  disclosure category (add a category if none fits — `tenant_rights_guide` was
+  added this way), unit-type narrowing where the agency wrote it for one kind of
+  space, and default initial/signature boxes placed on its own blanks or, for a
+  pamphlet with none, initials on the first and last page.
+- **Annual refresh:** re-check every source URL each November with the deposit-
+  interest and state-tax-form refresh. A changed edition is a NEW library row;
+  `resyncAdoptions` moves every landlord holding the old one onto it.
+  NOTE: a refresh resets the landlord's boxes to the new edition's defaults,
+  because positions placed on the old layout can land on text in the new one.
 
 ## 2c. Open items raised S624 (2026-08-26)
 

@@ -259,7 +259,7 @@ export const TENANT_INTENTS: Intent[] = [
     // point of contact where tenants are gonna complain about the neighbor —
     // hey, tell my neighbor to turn their shit down."
     //
-    // The complaint must be RECORDED, not sympathised with. mustNotContain
+    // The complaint must be RECORDED, not sympathized with. mustNotContain
     // guards the two failures that make it worthless: promising the landlord
     // will do something, and promising a person will call.
     audience: 'tenant', id: 'file-complaint', needsTool: true,
@@ -400,7 +400,7 @@ export const LANDLORD_INTENTS: Intent[] = [
     ],
   },
   {
-    audience: 'landlord', id: 'neighbour-utilities', needsTool: false,
+    audience: 'landlord', id: 'neighbor-utilities', needsTool: false,
     phrasings: [
       'I supply trash cans to the building next door, can I bill them?',
       'can I charge someone who is not my tenant for utilities',
@@ -429,8 +429,21 @@ export const LANDLORD_INTENTS: Intent[] = [
     phrasings: [
       'what percentage of my tenants pay late',
       "what's my average rent",
-      'how many of my tenants are on fixed income',
       'how am I doing',
+    ],
+  },
+  {
+    // S655 (Nic, 10/2): SSI/SSDI is "our check for the flex products" — kept
+    // GAM-side. The stats tool says source of income is private (not even a
+    // count), and the agent must say so rather than produce a number.
+    audience: 'landlord', id: 'income-source-private', needsTool: true,
+    expectTool: 'get_portfolio_stats',
+    expect: 'private',
+    mustNotContain: ["I've escalated"],
+    phrasings: [
+      'how many of my tenants are on fixed income',
+      'which of my tenants get SSI or SSDI',
+      'how many of my renters are on social security',
     ],
   },
   {
@@ -438,6 +451,9 @@ export const LANDLORD_INTENTS: Intent[] = [
     // Verified 2026-08-24: 2026 income $11,702, expenses $240 (the GAM fee),
     // net $11,462 — from computeLandlordPL, the SAME definition the reports
     // page and Books use, so the agent and the portal cannot disagree.
+    // S655: computeLandlordPL now reads services/incomeBasis ("Money received"
+    // by default: paid-ahead money counts the day it arrives, a credit the
+    // landlord gives is never income), still the same figures as the page.
     audience: 'landlord', id: 'profit-and-loss', needsTool: true,
     expectTool: 'get_profit_and_loss',
     mustNotContain: ["I've escalated"],
@@ -446,6 +462,22 @@ export const LANDLORD_INTENTS: Intent[] = [
       'what did I make this year',
       'what were my expenses',
       'am I profitable',
+    ],
+  },
+  {
+    // S655 (Nic, 10/2): "a landlord should be able to see how much money came
+    // in this month, ACTUALLY came in, versus how much money actually was
+    // SCHEDULED to come in... people need to be able to see it both ways."
+    // get_profit_and_loss takes basis 'received' (the day money arrived; the
+    // default) or 'billed' (bills by the month they were due), the same switch
+    // as the reports page. Whichever it picks, the answer names it.
+    audience: 'landlord', id: 'profit-and-loss-both-ways', needsTool: true,
+    expectTool: 'get_profit_and_loss',
+    mustNotContain: ["I've escalated"],
+    phrasings: [
+      'how much money actually came in this month',
+      'how much did I bill this month, paid or not',
+      'what was scheduled to come in last month',
     ],
   },
   {
@@ -484,7 +516,7 @@ export const LANDLORD_INTENTS: Intent[] = [
       'will this unit rent quickly',
     ],
   },
-  // ── S618: the three behaviours S617 BUILT but never measured ────────────
+  // ── S618: the three behaviors S617 BUILT but never measured ────────────
   // Two tools were added because the question had nothing to call, and the
   // "spot number one" disambiguation was written to Nic's spec — and none of
   // it had a case here. A tool that is registered but never reached through
@@ -547,7 +579,7 @@ export const LANDLORD_INTENTS: Intent[] = [
  *
  * Found by hand means found by luck. These are the cases that make it not luck.
  *
- * Every group carries a CROSS-AUDIENCE case — the question from a NEIGHBOURING
+ * Every group carries a CROSS-AUDIENCE case — the question from a NEIGHBORING
  * audience — because that is the failure Nic reported: "the tenant agent keeps
  * telling people stuff about the landlord or the booking side that has nothing
  * to do with being a tenant."

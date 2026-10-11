@@ -16,11 +16,13 @@ import { createBookingCheckout } from './createBookingCheckout'
 import { getToolsForProfile } from './index'
 import { getEntryProfile } from '../profiles'
 import type { AgentActor } from './types'
+import { todayIn, addDaysTo } from '../../../lib/timezone'
 
+// S654: N days from the property's today (seeded properties default to
+// America/Phoenix, the test DB's zone too). Local setDate + UTC toISOString
+// jumped a day ahead after 5 pm in Phoenix.
 function plusDays(n: number): string {
-  const d = new Date()
-  d.setDate(d.getDate() + n)
-  return d.toISOString().slice(0, 10)
+  return addDaysTo(todayIn(null), n)
 }
 
 /** A property with a public booking site + two RV site types (back-in / pull-through). */

@@ -73,12 +73,22 @@ async function seed(opts: { allProperties?: boolean } = {}): Promise<Fixture> {
   finally { client.release() }
 }
 
-// A minimal walk-up cash sale (no catalog id → server trusts the line).
-const sale = (propertyId: string | null) => ({
-  items: [{ id: null, name: 'Propane', qty: 1, price: 20, tax: 0, cat: 'misc' }],
+// S650: every register line is a catalog item, so the scope tests ring a real
+// one. `catalogItem` (below) seeds it against the fixture's property A.
+const sale = (itemId: string, propertyId: string | null) => ({
+  items: [{ id: itemId, name: 'Propane', qty: 1, price: 20, tax: 0, cat: 'misc' }],
   paymentMethod: 'cash',
   propertyId,
 })
+async function propaneAt(f: Fixture, propertyId: string): Promise<string> {
+  const cat = await db.query<{ id: string }>(
+    `INSERT INTO pos_categories (landlord_id, name, property_id) VALUES ($1, $2, $3) RETURNING id`,
+    [f.landlordId, `Fuel ${propertyId.slice(0, 8)}`, propertyId])
+  const r = await db.query<{ id: string }>(
+    `INSERT INTO pos_items (landlord_id, name, sell_price, cost_price, tax_rate, stock_qty, property_id, category_id)
+     VALUES ($1, 'Propane', 20, 0, 0, 999, $2, $3) RETURNING id`, [f.landlordId, propertyId, cat.rows[0].id])
+  return r.rows[0].id
+}
 
 describe('POS property-lock (assertPropertyInScope)', () => {
   it('cashier can ring on their assigned property (A)', async () => {
@@ -86,7 +96,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propAId))
+      .send(sale(await propaneAt(f, f.propAId), f.propAId))
     expect(res.status).toBe(201)
     expect(res.body.data.property_id).toBe(f.propAId)   // sale persists its property
   })
@@ -96,7 +106,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(403)
     expect(res.body.error).toMatch(/not assigned to this property/i)
   })
@@ -106,7 +116,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(null))
+      .send(sale(await propaneAt(f, f.propAId), null))
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/property must be selected/i)
   })
@@ -116,7 +126,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(201)
   })
 
@@ -125,8 +135,58 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(201)
     expect(res.body.data.property_id).toBe(f.propBId)
+  })
+})
+
+// S650 (Nic): the front counter rings sales and sends pay links — it does not
+// discount and it does not change prices. Prices arrive from the browser, so
+// the server holds a cashier to the catalog.
+describe('front-counter pricing lockdown', () => {
+  async function catalogItem(f: Fixture, price: number): Promise<string> {
+    const cat = await db.query<{ id: string }>(
+      `INSERT INTO pos_categories (landlord_id, name, property_id) VALUES ($1, 'Stays', $2) RETURNING id`,
+      [f.landlordId, f.propAId])
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO pos_items (landlord_id, name, sell_price, cost_price, tax_rate, stock_qty, property_id, category_id)
+       VALUES ($1, 'RV site — daily', $2, 0, 0, 999, $3, $4) RETURNING id`, [f.landlordId, price, f.propAId, cat.rows[0].id])
+    return r.rows[0].id
+  }
+  const ring = (f: Fixture, token: string, body: any) => request(buildApp())
+    .post('/api/pos/transactions').set('Authorization', `Bearer ${token}`)
+    .send({ paymentMethod: 'cash', propertyId: f.propAId, ...body })
+
+  it('a cashier rings a catalog item at its own price', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, { items: [{ id, name: 'RV site — daily', qty: 1, price: 49, tax: 0 }] })
+    expect(res.status).toBe(201)
+  })
+
+  it('a cashier cannot ring it at a lower price', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, { items: [{ id, name: 'RV site — daily', qty: 1, price: 10, tax: 0 }] })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/differs from the item's price/)
+  })
+
+  it('a cashier cannot apply a discount', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, {
+      items: [{ id, name: 'RV site — daily', qty: 1, price: 49, tax: 0 }], discountAmount: 5 })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/Apply discounts/)
+  })
+
+  it('the owner can still change a price and discount', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.ownerToken, {
+      items: [{ id, name: 'RV site — daily', qty: 1, price: 40, tax: 0 }], discountAmount: 5 })
+    expect(res.status).toBe(201)
   })
 })

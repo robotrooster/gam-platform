@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon'
 // S624: the month-close settlement model. This file OPENS a period; the credit
 // itself is applied by jobs/workTradeSettlement.ts once the month is over.
+import { nextDueDateAfter, renewalSchedule, prorateMoveInRent } from '@gam/shared'
 import { proratedTarget, hourRateFor } from '../services/workTradeSettlement'
 import { formatInvoiceNumber } from '@gam/shared'
 import { getClient, query, queryOne } from '../db'
@@ -10,12 +11,14 @@ import {
   loadWorkTradeCreditContext, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
-import { applyCreditsToOpenCharges } from '../services/creditApplication'
-import { consumePrepaidCreditForInvoice } from '../services/prepaidRelease'
+import { settleWholeBillIfCovered, type WholeBillResult } from '../services/creditUse'
+import { lockHousehold } from '../services/moneyPredicates'
 import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { activeLinkForUnit } from '../services/crossPropertyLink'
+import { reconcileHomeSaleContract } from '../services/homeSale'
+import { existingTenancyFirstDue } from './moveInBundle'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -33,9 +36,38 @@ interface ActiveLease {
   rent_due_day: number
   start_date: string        // YYYY-MM-DD
   end_date: string | null
+  // S639: already living there when the park came onto GAM — their first
+  // invoice is late-fee exempt however long they took to sign.
+  is_existing_tenancy?: boolean
+  first_billing_cycle?: string | null
+  property_added_on?: string | null
+  // S648: the landlord's answer for this property. Only TRUE waives.
+  onboarding_late_fee_waiver?: boolean
   tenant_id: string | null
   property_tz: string
   lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
+  // S648: page 8's first month, when the move-in invoice collected it.
+  move_in_first_month_rent?: string | null
+  // Renewals (Nic: "people get billed on their due date according to how the
+  // landlord sets the property"). A renewal names the lease it continues; the
+  // predecessor's last day and due day decide the renewal's first bill.
+  supersedes_lease_id?: string | null
+  predecessor_end_date?: string | null
+  predecessor_due_day?: number | null
+  // On the OLD lease: the start of a landlord-signed new lease of it (signed
+  // by the tenant or not — Nic, 10/2). Its last day is the day before: it never
+  // bills on or after that day, and a term that ended sooner holds over to it
+  // (decisions 10/2 #7) — whatever order the jobs run in.
+  successor_start_date?: string | null
+}
+
+/**
+ * A lease that continues one before it — an e-signed renewal. Booking and
+ * imported leases keep their own rules (a booking bills its calendar; an
+ * imported supersede replaces a record rather than continuing a tenancy).
+ */
+export function isRenewalSuccessor(lease: Pick<ActiveLease, 'supersedes_lease_id' | 'lease_source'>): boolean {
+  return !!lease.supersedes_lease_id && (lease.lease_source ?? 'esigned') === 'esigned'
 }
 
 interface MonthlyFee {
@@ -46,11 +78,32 @@ interface MonthlyFee {
   description: string | null
 }
 
+/**
+ * Does the tenant on this lease owe the utility this meter measures? The bill
+ * engine's own rule (services/utilityBilling tenantOwesUtility, S629/S634): a
+ * utility row on the lease wins when the lease says something; when it is
+ * silent, the meter's setup decides — anything but "bill the landlord" is the
+ * tenant's. `leaseRef` is a placeholder, `m` the utility_meters alias.
+ *
+ * The three invoice holds below used to INNER JOIN the lease's utility rows,
+ * so a lease that names no utilities (78 of the 79 active leases in
+ * production, 10/3) never waited for an unread meter, a flagged reading or
+ * the landlord's review — its bill went out with last month's utility missing
+ * while the engine billed it anyway. The holds now ask the engine's question.
+ */
+function tenantOwesMeterSql(leaseRef: string, m: string): string {
+  return `COALESCE((SELECT lur.tenant_responsible FROM lease_utility_responsibilities lur
+                     WHERE lur.lease_id = ${leaseRef} AND lur.utility_type = ${m}.utility_type),
+                   ${m}.billing_method <> 'master_bill_to_landlord')`
+}
+
 interface InvoiceGenResult {
   invoicesInserted: number
   rentsInserted: number
   feesInserted: number
   utilitiesInserted: number
+  /** S654: home-sale installments that rode a rent invoice this run. */
+  homePaymentsInserted: number
   leasesProcessed: number
 }
 
@@ -65,7 +118,7 @@ interface RunOpts {
   dryRun?: boolean
 }
 
-const CATCHUP_DAYS = 30
+export const CATCHUP_DAYS = 30
 
 /**
  * Compute every rent_due_day date in [fromDate, toDate] inclusive, given a rent_due_day.
@@ -115,7 +168,7 @@ export async function generateFinalUtilityInvoice(
     SELECT l.id, l.landlord_id, l.unit_id,
            (SELECT lt.tenant_id FROM lease_tenants lt
              WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS tenant_id,
-           u.unit_number, p.name AS property_name
+           u.unit_number, p.name AS property_name, p.timezone AS property_timezone
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -130,13 +183,18 @@ export async function generateFinalUtilityInvoice(
      ORDER BY ub.billing_cycle_month ASC`, [leaseId])
   if (bills.length === 0) return null
   const total = round2(bills.reduce((s: number, b: any) => s + Number(b.amount), 0))
-  const today = new Date().toISOString().slice(0, 10)
+  // S654: the property's today, not UTC's — after 5 pm here UTC is already tomorrow.
+  const today = todayIn(lease.property_timezone)
 
   const client = await getClient()
   let invoiceId: string
   try {
     await client.query('BEGIN')
-    const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, new Date().getFullYear())
+    // S655 money plan §1.5: this writes the household's charges, so it takes
+    // the household lock first, like the monthly run (before the invoice
+    // number, which another writer holding the household may also need).
+    if (lease.tenant_id) await lockHousehold(client, lease.tenant_id, lease.landlord_id)
+    const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, Number(today.slice(0, 4)))
     const inv = await client.query<{ id: string }>(
       `INSERT INTO invoices (
          landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
@@ -210,35 +268,251 @@ export async function generateFinalUtilityInvoice(
 }
 
 /**
- * Generate (or catch up) invoices for all active leases.
- * Called daily by cron.
+ * The renewal facts every generator reads (see isRenewalSuccessor and the
+ * successor / predecessor rules in runGeneration). `pl` is the lease this one
+ * continues.
  */
-export async function generateInvoices(
-  nowUtc: Date = new Date()
-): Promise<InvoiceGenResult> {
-  const leases = await query<ActiveLease>(`
+const RENEWAL_COLUMNS = `
+           l.supersedes_lease_id,
+           -- The lease this one follows ran to the day before this one started:
+           -- a signed term that ended sooner HELD OVER at its old rent until then
+           -- (decisions 10/2 #7 — never a gap; the old lease's bills below), so
+           -- this lease's schedule picks up from there, not from the printed end.
+           to_char(CASE WHEN pl.end_date IS NOT NULL AND pl.end_date < l.start_date - 1
+                         AND l.lease_source = 'esigned'
+                        THEN l.start_date - 1 ELSE pl.end_date END, 'YYYY-MM-DD') AS predecessor_end_date,
+           pl.rent_due_day AS predecessor_due_day,
+           -- A new lease of THIS household that the landlord has signed. Nic
+           -- (10/2): "they always get charged the new rent, whether or not they
+           -- sign it... the old one is expired." From its start date the new
+           -- lease owns the dates, signed by the tenant or not; a landlord who
+           -- cancels it before then takes it out of this list (it is no longer
+           -- pending or active), and the old lease bills on as before.
+           (SELECT to_char(MIN(s.start_date), 'YYYY-MM-DD') FROM leases s
+             WHERE s.supersedes_lease_id = l.id
+               AND s.lease_source = 'esigned'
+               AND s.status IN ('pending', 'active')
+               AND s.signed_by_landlord) AS successor_start_date`
+
+/**
+ * S648: ONE lease query for every generator. There were three copies, and the
+ * one production actually runs (generateInvoicesForTimezone) had drifted: it
+ * never loaded is_existing_tenancy (so the S639 first-bill waiver stamp never
+ * fired from the daily run) and never excluded hibernating leases (so a
+ * snowbird's paused lease would still have been billed).
+ */
+const ACTIVE_LEASE_SELECT = `
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
            l.lease_source,
+           -- S639: somebody who was already living there when the park came onto
+           -- GAM. Their first bill here is late-fee exempt however long they
+           -- took to sign — see lateStartExempt below.
+           l.is_existing_tenancy,
+           COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
+           -- S652 (Nic): the property's first billing cycle is the hard floor on
+           -- the DUE month. Country Acres was set to October; this job billed
+           -- September on the 23rd and the late-fee job followed.
+           to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+           to_char((COALESCE(p.onboarding_started_at, p.created_at)
+                    AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
+           l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
               FROM v_lease_active_tenants vlat
               WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
               LIMIT 1) AS tenant_id,
-           COALESCE(p.timezone, 'America/Phoenix') AS property_tz
+           COALESCE(p.timezone, 'America/Phoenix') AS property_tz,
+${RENEWAL_COLUMNS}
     FROM leases l
     JOIN units u ON u.id = l.unit_id
     JOIN properties p ON p.id = u.property_id
+    LEFT JOIN leases pl ON pl.id = l.supersedes_lease_id
     WHERE l.status = 'active'
       AND (l.needs_review IS NULL OR l.needs_review = false)
       -- S576 Snowbird: a hibernating (seasonally-paused) lease generates NO
       -- rent/utility invoices. No invoice → nothing pulled off the ACH mandate,
       -- so the snowbird is never charged in the off-season. Resume clears the
       -- flag and billing restarts.
-      AND l.is_hibernating = false
-  `)
+      AND l.is_hibernating = false`
+
+/**
+ * Generate (or catch up) invoices for all active leases.
+ * Called daily by cron.
+ */
+export async function generateInvoices(
+  nowUtc: Date = new Date()
+): Promise<InvoiceGenResult> {
+  const leases = await query<ActiveLease>(ACTIVE_LEASE_SELECT)
 
   return runGeneration(leases, nowUtc)
+}
+
+/**
+ * Which due dates the bill run owes a lease today, and the rent on any date
+ * that is not a regular due date (a renewal's bridge). No holds, no existence
+ * check — that is the run's job. One function, so the lease-end job asks
+ * exactly the question the run answers (see unbilledDueDates).
+ */
+export function billDatesForLease(
+  lease: ActiveLease,
+  nowUtc: Date,
+  opts: Pick<RunOpts, 'explicitWindow'> = {},
+): { dueDates: string[]; rentForDate: Record<string, string> } {
+  const none = { dueDates: [] as string[], rentForDate: {} as Record<string, string> }
+  const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
+  // The lease's last day. RENEWAL (Nic's rule): with a landlord-signed new
+  // lease to follow, it is the day before that one starts — whatever the
+  // printed end date says, and whatever order tonight's jobs run in (a
+  // property's 7am run can land before the 2am lease-end job, or that job can
+  // miss a night). Both ways: a lease printed past the new start bills nothing
+  // on or after it, and a signed term that ran out BEFORE the new start holds
+  // over and keeps billing its old rent until the day before (decisions 10/2
+  // #7: there is never a stretch with no lease).
+  const leaseEnd = lease.successor_start_date
+    ? DateTime.fromISO(lease.successor_start_date, { zone: lease.property_tz }).minus({ days: 1 })
+    : lease.end_date
+      ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
+      : null
+
+  let windowStart: DateTime
+  let windowEnd: DateTime
+  if (opts.explicitWindow) {
+    const fromInTz = DateTime.fromISO(opts.explicitWindow.from, { zone: lease.property_tz }).startOf('day')
+    const toInTz = DateTime.fromISO(opts.explicitWindow.to, { zone: lease.property_tz }).startOf('day')
+    windowStart = fromInTz > leaseStart ? fromInTz : leaseStart
+    windowEnd = leaseEnd && leaseEnd < toInTz ? leaseEnd : toInTz
+  } else {
+    const todayInTz = DateTime.fromJSDate(nowUtc, { zone: lease.property_tz }).startOf('day')
+    const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
+    windowStart = catchupStart > leaseStart ? catchupStart : leaseStart
+    windowEnd = leaseEnd && leaseEnd < todayInTz ? leaseEnd : todayInTz
+  }
+
+  if (windowEnd < windowStart) return none
+
+  // S652 (Nic): nothing is due before the property's first billing cycle.
+  // The floor is on the invoice's DUE month, not on what was consumed: the
+  // October 1 invoice still carries September's water and electric, because
+  // utilities bill in arrears and ride whichever invoice comes next.
+  //
+  // S652 (Nic): EXCEPT a resident billed on their own day, whose floor is the
+  // day the property was added: "if I onboard the 15th... and I choose
+  // October 1st as the first billing cycle... somebody's on the 20th... they
+  // would be billed before the 1st of the month." Their floor is applied
+  // below, as their first due date.
+  const ownDay = lease.is_existing_tenancy && (Number(lease.rent_due_day) || 1) !== 1
+  const floor = lease.first_billing_cycle ? lease.first_billing_cycle.slice(0, 7) + '-01' : null
+  const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
+    .filter(d => ownDay || !floor || d >= floor)
+  const renewal = isRenewalSuccessor(lease)
+  // A renewal's bridge (below) can fall between due dates, so it is not in
+  // the candidates; everything else needs one.
+  if (candidateDueDates.length === 0 && !renewal) return none
+
+  // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
+  // for the ENTIRE start calendar month — start_date through month-end (a
+  // lease starting on the 1st bills the full month; a booking lease's arrival
+  // segment likewise runs to the day before its first 1st-of-month segment).
+  // So EVERY regular due date that falls in the start month is already covered
+  // by it. Skipping ONLY the date equal to start_date was a bug: a lease with
+  // a mid-month rent_due_day (e.g. due on the 15th — any rent_due_day > 1)
+  // would land a second full-month invoice inside the already-prorated move-in
+  // window and double-bill the first month. Skip the whole start month.
+  // (Candidates are always on/after start_date — the window floors at the
+  // lease start — so a start-month match is necessarily on/after move-in;
+  // it can never drop a legitimately earlier same-month cycle.)
+  const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
+  const dueDay = Number(lease.rent_due_day) || 1
+  let dueDates: string[]
+  // The rent on a date that is not a regular due date — a renewal's bridge.
+  const rentForDate: Record<string, string> = {}
+  if (renewal) {
+    // ── A RENEWAL CONTINUES THE SCHEDULE ───────────────────────────────────
+    //
+    // Nic: "people get billed on their due date according to how the
+    // landlord sets the property." One tenancy, one billing schedule. None of
+    // the move-in rules below apply — nobody moved in. The old lease's last
+    // bill already covered up to the first of its due dates after its last
+    // day; this lease bills from there (or from its own start, if later).
+    // Only a due day changed on the new form leaves a stretch to bridge, and
+    // that is the one prorated bill.
+    const sched = renewalSchedule({
+      oldEnd: lease.predecessor_end_date ?? null,
+      oldDueDay: Number(lease.predecessor_due_day) || dueDay,
+      newStart: lease.start_date,
+      newDueDay: dueDay,
+      rent: Number(lease.rent_amount),
+    })
+    dueDates = candidateDueDates.filter(d => d >= sched.firstFullDue)
+    const bridgeIn = sched.bridge != null && sched.bridge > 0
+      && sched.firstBill >= windowStart.toISODate()! && sched.firstBill <= windowEnd.toISODate()!
+      && (ownDay || !floor || sched.firstBill >= floor)
+    if (bridgeIn) {
+      dueDates = [sched.firstBill, ...dueDates]
+      rentForDate[sched.firstBill] = sched.bridge!.toFixed(2)
+    }
+  } else if (lease.is_existing_tenancy && dueDay !== 1) {
+    // S652 (Nic): an onboarding resident on their own due day. Their first
+    // bill is the first time that day comes round after signing (or the day
+    // itself, if they signed on it — the move-in invoice makes that one).
+    // This run makes it when the day arrives. Skipping the start month, as
+    // the 1st does, skipped that bill entirely: a month of rent never
+    // invoiced. Anything already invoiced is left alone by the (lease, due
+    // date) check.
+    const firstDue = existingTenancyFirstDue(lease.start_date, lease.first_billing_cycle ?? null, dueDay, lease.property_added_on ?? null)
+    dueDates = candidateDueDates.filter(d => d >= firstDue)
+  } else if (lease.is_existing_tenancy || dueDay === 1) {
+    dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+  } else {
+    // S648 (Nic): rent due on another day (a fixed 15th, or the tenant's
+    // move-in day). The move-in invoice covers the start date up to the next
+    // due date — which may fall inside the start month — so everything
+    // before that date is already billed; the start-month rule above would
+    // skip a real due date (move in the 5th, due the 15th) or double-bill.
+    const firstRegular = nextDueDateAfter(lease.start_date, dueDay)
+    dueDates = candidateDueDates.filter(d => d >= firstRegular)
+  }
+  // S648 (Nic): a new tenant who moved in between due dates and paid page
+  // 8's "first month's rent" on top of the proration has ALREADY paid the
+  // next due date. Billing it again would charge that month twice.
+  const paidNextAtMoveIn = !renewal && !lease.is_existing_tenancy
+    && Number(lease.move_in_first_month_rent ?? 0) > 0
+    && Number(lease.start_date.slice(8, 10)) !== dueDay
+  if (paidNextAtMoveIn) {
+    const firstAfter = dueDay === 1
+      ? dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), dueDay).find(d => d.slice(0, 7) !== startMonth)
+      : nextDueDateAfter(lease.start_date, dueDay)
+    if (firstAfter) dueDates = dueDates.filter(d => d !== firstAfter)
+  }
+  return { dueDates, rentForDate }
+}
+
+/**
+ * The due dates the bill run still owes this lease and has not made — held by
+ * an unread meter or an unapproved reading run, or a run that never happened.
+ *
+ * RENEWAL HAND-OFF (Nic: "people get billed on their due date"): once the old
+ * lease is handed off it is expired, and the run never looks at it again, while
+ * the renewal's schedule counts that month as the old lease's. A bill still
+ * owed then was never billed by anyone — a renewal ending 10/1 whose October
+ * bill waited on the landlord's approval lost October's rent. The lease-end job
+ * asks this first and waits. The answer is empty once a date falls out of the
+ * run's own catch-up window, so the wait ends when the run would give up.
+ */
+export async function unbilledDueDates(leaseId: string, nowUtc: Date = new Date()): Promise<string[]> {
+  const lease = await queryOne<ActiveLease>(`${ACTIVE_LEASE_SELECT} AND l.id = $1`, [leaseId])
+  if (!lease) return []
+  const { dueDates } = billDatesForLease(lease, nowUtc)
+  // A booking lease owes nothing on a due date that starts no stay segment.
+  const owed = isBookingScheduleLease(lease)
+    ? dueDates.filter(d => bookingRentForDueDate(lease.start_date, lease.end_date!, Number(lease.rent_amount), d) != null)
+    : dueDates
+  if (owed.length === 0) return []
+  const made = new Set((await query<{ d: string }>(
+    `SELECT to_char(due_date, 'YYYY-MM-DD') AS d FROM invoices
+      WHERE lease_id = $1 AND due_date = ANY($2::date[])`, [leaseId, owed])).map(r => r.d))
+  return owed.filter(d => !made.has(d))
 }
 
 /**
@@ -255,50 +529,16 @@ async function runGeneration(
   let rentsInserted = 0
   let feesInserted = 0
   let utilitiesInserted = 0
+  let homePaymentsInserted = 0
 
   for (const lease of leases) {
-    const leaseStart = DateTime.fromISO(lease.start_date, { zone: lease.property_tz })
-    const leaseEnd = lease.end_date
-      ? DateTime.fromISO(lease.end_date, { zone: lease.property_tz })
-      : null
-
-    let windowStart: DateTime
-    let windowEnd: DateTime
-    if (opts.explicitWindow) {
-      const fromInTz = DateTime.fromISO(opts.explicitWindow.from, { zone: lease.property_tz }).startOf('day')
-      const toInTz = DateTime.fromISO(opts.explicitWindow.to, { zone: lease.property_tz }).startOf('day')
-      windowStart = fromInTz > leaseStart ? fromInTz : leaseStart
-      windowEnd = leaseEnd && leaseEnd < toInTz ? leaseEnd : toInTz
-    } else {
-      const todayInTz = DateTime.fromJSDate(nowUtc, { zone: lease.property_tz }).startOf('day')
-      const catchupStart = todayInTz.minus({ days: CATCHUP_DAYS })
-      windowStart = catchupStart > leaseStart ? catchupStart : leaseStart
-      windowEnd = leaseEnd && leaseEnd < todayInTz ? leaseEnd : todayInTz
-    }
-
-    if (windowEnd < windowStart) continue
-
-    const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
-    if (candidateDueDates.length === 0) continue
-
-    // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
-    // for the ENTIRE start calendar month — start_date through month-end (a
-    // lease starting on the 1st bills the full month; a booking lease's arrival
-    // segment likewise runs to the day before its first 1st-of-month segment).
-    // So EVERY regular due date that falls in the start month is already covered
-    // by it. Skipping ONLY the date equal to start_date was a bug: a lease with
-    // a mid-month rent_due_day (e.g. due on the 15th — any rent_due_day > 1)
-    // would land a second full-month invoice inside the already-prorated move-in
-    // window and double-bill the first month. Skip the whole start month.
-    // (Candidates are always on/after start_date — the window floors at the
-    // lease start — so a start-month match is necessarily on/after move-in;
-    // it can never drop a legitimately earlier same-month cycle.)
-    const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
-    const dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+    const renewal = isRenewalSuccessor(lease)
+    const dueDay = Number(lease.rent_due_day) || 1
+    const { dueDates, rentForDate } = billDatesForLease(lease, nowUtc, opts)
     if (dueDates.length === 0) continue
 
     // Load monthly fees once per lease
-    const fees = await query<MonthlyFee>(
+    const monthlyFees = await query<MonthlyFee>(
       `SELECT id, lease_id, fee_type, amount, description
        FROM lease_fees
        WHERE lease_id = $1 AND due_timing = 'monthly_ongoing'`,
@@ -306,6 +546,13 @@ async function runGeneration(
     )
 
     for (const dueDate of dueDates) {
+      // RENEWAL BRIDGE: a bill on a date that is not a due date (rentForDate)
+      // covers only the days up to the next due date, so its monthly fees are
+      // prorated by the same days as its rent. In full, the first full due date
+      // charged them again — half a period of pet rent cost a whole month.
+      const fees: MonthlyFee[] = dueDate in rentForDate
+        ? monthlyFees.map(f => ({ ...f, amount: prorateMoveInRent(Number(f.amount), dueDate, dueDay).toFixed(2) }))
+        : monthlyFees
       // S534 (Nic): two things hold a unit's invoice — and they hold the
       // WHOLE invoice (rent included), never a partial send:
       //   1. a missing ORIGINAL read on a tenant-responsible submeter
@@ -323,18 +570,21 @@ async function runGeneration(
       // and on any needs_review flag on the master or a linked submeter.
       // (Supersedes the old "RUBS masters never block" posture.) Same
       // force-complete escape hatch releases it.
+      // S655 (10/3 sweep): "tenant-responsible" is the engine's rule
+      // (tenantOwesMeterSql), not "the lease has a utility row".
       const readHold = await queryOne<{ meter_id: string }>(
         `SELECT m.id AS meter_id
            FROM utility_reading_runs r
            JOIN utility_meters m ON m.property_id = r.property_id
                                 AND m.billing_method IN ('submeter','rubs')
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
-           JOIN lease_utility_responsibilities lur
-             ON lur.lease_id = $1
-            AND lur.utility_type = m.utility_type
-            AND lur.tenant_responsible
           WHERE r.status <> 'completed'
-            AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
+            -- S652: BEFORE the invoice's own month. An invoice due in March
+            -- carries February's round; March's round is read for April. With
+            -- "<=" a round that opened on the 26th held every invoice due the
+            -- 27th and 28th of that month until the following month's read.
+            AND r.billing_cycle_month < date_trunc('month', $3::date)::date
             AND (
               -- this meter (submeter or RUBS master) unread for the cycle
               NOT EXISTS (
@@ -361,20 +611,26 @@ async function runGeneration(
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
+      // A flag holds the bill only on a monthly-cycle read — the same reads the
+      // run counts (utilityReadingRuns.countFlaggedOnRun) and the landlord's
+      // "Readings to double-check" shows. A reference, turnover or
+      // billed-off-platform read is not what this month's bill is computed
+      // from, so a stale flag on one never holds a household's rent. (Country
+      // Acres MH 21/22/24's August water reads were re-marked
+      // 'billed_off_platform' still flagged; under the old join they never
+      // held a bill and they must not start to.)
       const flagHold = readHold ? null : await queryOne<{ meter_id: string }>(
         `SELECT m.id AS meter_id
            FROM utility_meters m
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
-           JOIN lease_utility_responsibilities lur
-             ON lur.lease_id = $1
-            AND lur.utility_type = m.utility_type
-            AND lur.tenant_responsible
           WHERE m.billing_method IN ('submeter','rubs')
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
             AND (
               EXISTS (
                 SELECT 1 FROM utility_meter_readings rd
                  WHERE rd.meter_id = m.id AND rd.needs_review
-                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date)
+                   AND rd.reason = 'monthly_cycle'
+                   AND rd.billing_cycle_month < date_trunc('month', $3::date)::date)
               -- a flagged reading on a submeter on one of the master's units
               OR (m.billing_method = 'rubs' AND EXISTS (
                 SELECT 1 FROM utility_meter_units master_mu
@@ -384,12 +640,31 @@ async function runGeneration(
                                         AND sm.utility_type = m.utility_type
                   JOIN utility_meter_readings rd ON rd.meter_id = sm.id
                  WHERE master_mu.meter_id = m.id AND rd.needs_review
-                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date))
+                   AND rd.reason = 'monthly_cycle'
+                   AND rd.billing_cycle_month < date_trunc('month', $3::date)::date))
             )
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
-      if (readHold || flagHold) continue
+      // S652 (Nic): a company that chose to review its utility bills has this
+      // invoice wait — whole, like the two holds above — until the landlord
+      // approves the reading run its utilities come from. "He'd rather fix it
+      // before the people get billed than wait till they complain." One unread
+      // meter still holds only ITS unit; approval never needs every meter read.
+      const reviewHold = (readHold || flagHold) ? null : await queryOne<{ id: string }>(
+        `SELECT r.id
+           FROM utility_reading_runs r
+           JOIN landlords ll ON ll.id = r.landlord_id AND ll.review_utility_bills
+           JOIN utility_meters m ON m.property_id = r.property_id
+                                AND m.billing_method IN ('submeter','rubs')
+                                AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
+           JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
+          WHERE r.status <> 'completed' AND r.approved_at IS NULL
+            AND ${tenantOwesMeterSql('$1::uuid', 'm')}
+            AND r.billing_cycle_month < date_trunc('month', $3::date)::date
+          LIMIT 1`,
+        [lease.id, lease.unit_id, dueDate])
+      if (readHold || flagHold || reviewHold) continue
 
       // S534: per-unit billing readiness — generate any bills this
       // unit's readings support before pulling them below. Write-path
@@ -420,7 +695,7 @@ async function runGeneration(
       )
       const effectiveTenantId = sublease?.sublessee_tenant_id ?? lease.tenant_id
       // S548: booking-sourced leases bill the calendar-aligned schedule —
-      // flat monthly for full months, prorated (monthly/30) for the final
+      // flat monthly for full months, prorated (by days in the month) for the final
       // partial month; a due date starting no segment owes no rent that
       // cycle. Matches the guest's quote exactly (shared schedule math).
       // Sublease pricing, when active, still wins (explicit contract).
@@ -431,7 +706,7 @@ async function runGeneration(
         bookingRent = seg.toFixed(2)
       }
       const effectiveRentAmount = sublease ? Number(sublease.sub_monthly_amount).toFixed(2)
-        : bookingRent ?? lease.rent_amount
+        : bookingRent ?? rentForDate[dueDate] ?? lease.rent_amount
 
       // S178: pull any utility_bills for this lease that haven't been
       // attached to an invoice yet (payment_id IS NULL) and whose cycle
@@ -470,6 +745,8 @@ async function runGeneration(
         // electric and exclude propane. Already SELECTed below; it just was not
         // in the type.
         utility_type: string
+        bill_unit_id: string | null
+        bill_unit_number: string | null
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
                 ub.allocation_method, ub.allocation_basis, ub.rate_per_unit,
@@ -481,9 +758,18 @@ async function runGeneration(
                 -- invoice it is the landlord next door.
                 ub.landlord_id AS bill_landlord_id,
                 ub.service_agreement_id,
+                -- S641: WHICH SPACE this reading came from, named as it was
+                -- called at the time. Only matters when a resident moved
+                -- mid-cycle, and then it matters a lot: without it a bill with
+                -- two electric lines shows the same words twice and the reader
+                -- cannot tell which spot is which.
+                ub.unit_id AS bill_unit_id,
+                COALESCE(unit_number_on(ub.unit_id, ub.billing_cycle_month::timestamptz),
+                         bu.unit_number) AS bill_unit_number,
                 m.digits
            FROM utility_bills ub
            JOIN utility_meters m ON m.id = ub.meter_id
+           LEFT JOIN units bu ON bu.id = ub.unit_id
           WHERE (ub.lease_id = $1
                  -- S616: the linked serviced space's bills join this invoice.
                  -- They carry NO lease_id and never will; the link is what puts
@@ -522,6 +808,52 @@ async function runGeneration(
         [lease.id, dueDate]
       )
 
+      // ── S654 (Nic): THE HOME PAYMENT RIDES THE RENT INVOICE ──────────────
+      //
+      //   "If the base space rent for the property is $450 everywhere, John
+      //    Sheptock's $200 trailer payment would make it $650."
+      //
+      // A park-financed home sale bills its installment each month. Until now
+      // that was a standalone charge written by a 4:20 AM job: it was real, it
+      // was owed, and nothing else could see it — the rent invoice made at 5:00
+      // left it out, so the bill email headlined $489.60 for a household that
+      // owed $589.60, the landlord's who-owes page omitted it, and the tenant's
+      // Pay page showed a second box with no lease on it. Every rent-to-own
+      // resident at Country Acres read as "the home payment was skipped."
+      //
+      // Same straggler semantics as a utility bill: anything due on or before
+      // this cycle rides it. The buyer must be THIS lease's primary (the
+      // contract names the tenant and the space). Charged at face value and
+      // kept out of the work-trade distribution — a purchase installment is not
+      // a cost of living there, and hours worked do not buy a trailer. The
+      // 4:20 job keeps billing standalone only for a buyer with no lease here
+      // (services/homeSale.ts). The property's first billing cycle is honored
+      // the same way that job honors it: earlier installments were paid outside
+      // GAM and are stamped so by that job, never billed here.
+      const homeInstallments = (sublease || !lease.tenant_id) ? [] : await query<{
+        id: string
+        amount: string
+        installment_number: number
+        installments_total: number
+        contract_id: string
+        landlord_id: string
+      }>(
+        `SELECT i.id, i.amount::text, i.installment_number, c.installments_total,
+                c.id AS contract_id, c.landlord_id
+           FROM home_sale_installments i
+           JOIN home_sale_contracts c ON c.id = i.contract_id
+          WHERE c.status = 'active'
+            AND c.unit_id = $1
+            AND c.tenant_id = $2
+            AND i.payment_id IS NULL
+            AND i.settled_off_platform_at IS NULL
+            AND i.billing_month <= date_trunc('month', $3::date)::date
+            AND ($4::date IS NULL OR i.billing_month >= date_trunc('month', $4::date)::date)
+          ORDER BY i.billing_month ASC, i.installment_number ASC`,
+        [lease.unit_id, lease.tenant_id, dueDate, lease.first_billing_cycle]
+      )
+      const touchedHomeContracts = new Set<string>()
+
       // S533: propane fill installments not yet billed whose cycle has
       // arrived. #1 billed immediately at the fill (payment_id set), so
       // this only picks up the split remainder. Same straggler semantics
@@ -556,12 +888,21 @@ async function runGeneration(
         rentsInserted++
         feesInserted += fees.length + oneOffCharges.length
         utilitiesInserted += utilityBills.length + propaneInstallments.length
+        homePaymentsInserted += homeInstallments.length
         continue
       }
 
       const client = await getClient()
+      // The "paid with your account credit" receipts, sent once COMMIT returns.
+      let creditReceipts: WholeBillResult['afterCommit'] | null = null
       try {
         await client.query('BEGIN')
+        // S655 money plan §1.5: the bill run writes this household's money
+        // (its rows, and a credit settle right after), so it takes the
+        // household lock first, like every other writer. A tenant paying, the
+        // desk, a webhook or a credit being issued for the same household waits
+        // for this bill, or this bill waits for them — never both at once.
+        if (effectiveTenantId) await lockHousehold(client, effectiveTenantId, lease.landlord_id)
 
         const year = DateTime.fromISO(dueDate).year
         const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, year)
@@ -625,10 +966,10 @@ async function runGeneration(
         //
         // The credit is a PERCENTAGE OF A BASIS, so an excluded charge has to
         // leave the basis as well as the distribution. Leave propane in the
-        // basis and the tenant's labour buys dollars off a bill they are meant
+        // basis and the tenant's labor buys dollars off a bill they are meant
         // to pay whole — the excluded charge silently discounts everything else,
-        // which is invisible on the invoice and wrong in the landlord's favour
-        // nowhere and the tenant's favour everywhere.
+        // which is invisible on the invoice and wrong in the landlord's favor
+        // nowhere and the tenant's favor everywhere.
         //
         // No agreement at all → everything is covered, which is what the credit
         // did before this existed.
@@ -639,8 +980,8 @@ async function runGeneration(
         // and THIS landlord — the tenant's hours buy dollars off what this
         // landlord is owed. A converged row is owed to the landlord next door,
         // who is not party to that bargain and never agreed to fund it. Leaving
-        // it in would quietly take money out of one landlord's pocket to honour
-        // another landlord's labour deal.
+        // it in would quietly take money out of one landlord's pocket to honor
+        // another landlord's labor deal.
         //
         // It leaves the BASIS as well as the distribution, for the S613 reason:
         // a charge that cannot be discounted must not inflate the pot that
@@ -687,16 +1028,98 @@ async function runGeneration(
         const rowStatus = (net: number) => (wtActive && net === 0 ? 'settled' : 'pending')
         const rowNote   = (net: number) => (wtActive && net === 0 ? WT_NOTE : null)
 
+        // ── S654 (Nic): A COVERED LINE IS SUSPENDED HERE TOO ─────────────────
+        //
+        //   "Work trade people are on work trade. There's no bills going out to
+        //    those people."
+        //
+        // S634 made the MOVE-IN bill write a covered line suspended — real, at
+        // what the month is worth, and out of the amount due while the hours
+        // are worked. This run never did. So the first bill of every work-trade
+        // tenancy read right and the second one did not: October 1 went out to
+        // nine work-trade residents at three parks as "$460.00 due", their rent
+        // sat on the landlord's who-owes page, and the only thing that would
+        // ever have cleared it was a month close that has nothing to credit
+        // until somebody logs hours.
+        //
+        // Same rule as the move-in bill, read off the same covered_charges: a
+        // charge the agreement covers is written and suspended; one it does not
+        // cover is owed as usual. The settlement period opened below still
+        // prices the covered basis, and the month close (jobs/workTradeSettlement)
+        // is what lifts the suspension — settled in full, or the lapse billed.
+        // A converged row never qualifies (utilityCovered already says so), and
+        // a one-off charge never does.
+        const suspendRent      = !!wt && rentCovered && dist.rentNet > 0
+        const suspendFee       = (i: number) => !!wt && feeCovered[i] && dist.feeNets[i] > 0
+        const suspendUtility   = (i: number) => !!wt && utilityCovered[i] && dist.utilityNets[i] > 0
+        const suspendPropane   = (i: number) => !!wt && propaneCovered && (dist.propaneNets[i] ?? 0) > 0
+        const suspendedTotalNum = round2(
+          (suspendRent ? dist.rentNet : 0)
+          + dist.feeNets.reduce((s, n, i) => s + (suspendFee(i) ? n : 0), 0)
+          + dist.utilityNets.reduce((s, n, i) => s + (suspendUtility(i) ? n : 0), 0)
+          + dist.propaneNets.reduce((s, n, i) => s + (suspendPropane(i) ? n : 0), 0))
+        const WT_SUSPENDED_NOTE = 'Work trade — suspended while the hours are worked; settled at month close'
+        const suspendedAt = new Date().toISOString()
+        // The home payment is owed at face value whatever the trade covers.
+        const homeTotalNum = round2(homeInstallments.reduce((s, h) => s + Number(h.amount), 0))
+        // What the resident is asked for today. Subtotals stay gross; the
+        // suspended lines are still on the document at their full value.
+        const owedTotalNum = round2(netTotalNum - suspendedTotalNum + homeTotalNum)
+
         // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
         // total_amount is NET of the work-trade credit; the credit + driving
         // agreement are stamped for audit + tenant/landlord display.
+        // ── THE FIRST BILL'S LATE FEE IS THE LANDLORD'S CALL (Nic, 10/2) ──────
+        //
+        // S638 exempted every lease that started after the 20th, platform-wide.
+        // Nic, 10/2: "that late fee waiver was just my personal preference. Make
+        // that an onboarding question... That should be a landlord preference,
+        // not a platform setting." So the calendar no longer decides anything
+        // here: only the property's onboarding answer does (below), and only for
+        // an existing tenancy's first bill. A renewal is never exempt.
+        const priorInvoice = await client.query<{ n: string }>(
+          // S654: a voided history invoice is not a prior bill (see lateFees.ts).
+          `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date AND status <> 'void'`,
+          [lease.id, dueDate])
+        // ── S639 (Nic): THE WAIVER FOLLOWS THE PERSON, NOT THE CALENDAR ─────
+        //
+        // "The wipe needs to not be for existing leases. It needs to be for
+        // people onboarded as EXISTING TENANTS, to make it catch everybody
+        // depending on when they finally get around to getting signed."
+        //
+        // I had reached for a landlord-level holiday DATE, which is wrong in
+        // both directions: it expires while people are still signing, and it
+        // hands free lateness to a genuinely new applicant who signs during the
+        // window. is_existing_tenancy is the honest signal — somebody who was
+        // already living there when the park came onto GAM. Their first bill
+        // here was late because onboarding took time, which is our doing and not
+        // theirs, however long they take to get signed.
+        //
+        // FIRST invoice only. After one full cycle on the platform they are an
+        // ordinary resident and each lease's own late-fee terms apply, exactly
+        // as configured — Nic: "the late fee is set up correctly for future
+        // cycles."
+        //
+        // S648 (Nic): and only where the LANDLORD chose to waive. "The tenants
+        // need to be billed late fees if the landlord doesn't agree to waive
+        // them. I did that for myself personally here but not every landlord's
+        // going to do that." properties.onboarding_late_fee_waiver; unanswered
+        // means no waiver.
+        const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
+        const onboardingWaived =
+          lease.is_existing_tenancy === true && lease.onboarding_late_fee_waiver === true
+        // A renewal is not an onboarding: the resident has been set up and
+        // paying here for a whole lease, and a new lease is nobody's first bill
+        // on the platform. (Renewals never carry is_existing_tenancy either.)
+        const lateStartExempt = isFirstInvoice && onboardingWaived && !renewal
+
         const invoiceRes = await client.query(
           `INSERT INTO invoices (
              landlord_id, tenant_id, lease_id, unit_id,
              invoice_number, due_date,
              subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
              work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id,
-             late_fee_exempt
+             late_fee_exempt, subtotal_home_payments
            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
              -- S623 (Nic): a work-trade tenant must not be fined while they are
              -- working off the month. "Why would they pay and then start working
@@ -710,14 +1133,15 @@ async function runGeneration(
              -- from ITS OWN hours at month close, instead of from the previous
              -- month at generation — is a real billing change and is written up
              -- in the handoff rather than rushed in overnight.
-             $13::uuid IS NOT NULL)
+             $13::uuid IS NOT NULL OR $14::boolean, $15)
            ON CONFLICT (lease_id, due_date) DO NOTHING
            RETURNING id`,
           [
             lease.landlord_id, effectiveTenantId, lease.id, lease.unit_id,
             invoiceNumber, dueDate,
-            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, netTotalNum.toFixed(2),
+            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, owedTotalNum.toFixed(2),
             dist.creditApplied.toFixed(2), (wt ? wt.verifiedHours : 0).toFixed(2), wt ? wt.agreementId : null,
+            lateStartExempt, homeTotalNum.toFixed(2),
           ]
         )
 
@@ -741,21 +1165,35 @@ async function runGeneration(
         // of the rent, so it asks 11/31 of the hours — otherwise every work-trade
         // tenancy would open ~69 hours in deficit for a month that charged eleven
         // days. `hourRate` is frozen here and never recomputed: a later rent
-        // change must not reprice labour owed for THIS month.
+        // change must not reprice labor owed for THIS month.
         if (wt && creditBasis > 0) {
           const monthStart = DateTime.fromISO(dueDate).startOf('month').toISODate()!
+          // A bridge prorated its fees as well as its rent; the full month counts
+          // them whole, so the hours asked shrink by the same days.
+          const proratedFeeShortfall = fees.reduce((s, f, i) =>
+            s + (feeCovered[i] ? Number(monthlyFees[i].amount) - Number(f.amount) : 0), 0)
           const fullMonthBasis = round2(
             (rentCovered ? Number(lease.rent_amount ?? effectiveRentAmount) : 0)
-            + (creditBasis - (rentCovered ? rentAmountNum : 0)))
+            + (creditBasis - (rentCovered ? rentAmountNum : 0))
+            + proratedFeeShortfall)
           const target = proratedTarget(wt.target, creditBasis, fullMonthBasis)
+          // S648 (Nic): the hours that count run from THIS due date to the day
+          // before the next — the calendar month when rent is due on the 1st.
+          // A renewal's bridge runs from its own date to the next due date.
+          const calendarMonth = dueDay === 1 && !(dueDate in rentForDate)
+          const periodStart = calendarMonth ? monthStart : dueDate
+          const periodEnd = calendarMonth
+            ? DateTime.fromISO(monthStart).endOf('month').toISODate()!
+            : DateTime.fromISO(nextDueDateAfter(dueDate, dueDay)).minus({ days: 1 }).toISODate()!
           await client.query(
             `INSERT INTO work_trade_settlements
                (agreement_id, invoice_id, period_month, target_hours,
-                hour_rate, basis_amount)
-             VALUES ($1, $2, $3::date, $4, $5, $6)
-             ON CONFLICT (agreement_id, period_month) DO NOTHING`,
+                hour_rate, basis_amount, period_start, period_end)
+             VALUES ($1, $2, $3::date, $4, $5, $6, $7::date, $8::date)
+             ON CONFLICT (agreement_id, period_start) DO NOTHING`,
             [wt.agreementId, invoiceId, monthStart, target.toFixed(2),
-             hourRateFor(creditBasis, target).toFixed(4), creditBasis.toFixed(2)])
+             hourRateFor(creditBasis, target).toFixed(4), creditBasis.toFixed(2),
+             periodStart, periodEnd])
         }
 
         // Rent child row at the work-trade-NET amount. entry_description is the
@@ -764,12 +1202,14 @@ async function runGeneration(
           `INSERT INTO payments (
              invoice_id, unit_id, lease_id, tenant_id, landlord_id,
              type, amount, status, due_date, entry_description, notes,
-             settled_at
+             settled_at, work_trade_suspended_at
            ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, $8, $7, 'RENT', $9,
-             CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)`,
+             CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END, $10)`,
           [
             invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-            dist.rentNet.toFixed(2), dueDate, rowStatus(dist.rentNet), rowNote(dist.rentNet),
+            dist.rentNet.toFixed(2), dueDate, rowStatus(dist.rentNet),
+            suspendRent ? WT_SUSPENDED_NOTE : rowNote(dist.rentNet),
+            suspendRent ? suspendedAt : null,
           ]
         )
         rentsInserted++
@@ -786,12 +1226,14 @@ async function runGeneration(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
                type, amount, status, due_date, entry_description, lease_fee_id, notes,
-               settled_at
+               settled_at, work_trade_suspended_at
              ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, $9, $7, 'SUBSCRIP', $8, $10,
-               CASE WHEN $9 = 'settled' THEN NOW() ELSE NULL END)`,
+               CASE WHEN $9 = 'settled' THEN NOW() ELSE NULL END, $11)`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              net.toFixed(2), dueDate, fee.id, rowStatus(net), rowNote(net),
+              net.toFixed(2), dueDate, fee.id, rowStatus(net),
+              suspendFee(i) ? WT_SUSPENDED_NOTE : rowNote(net),
+              suspendFee(i) ? suspendedAt : null,
             ]
           )
           feesInserted++
@@ -815,7 +1257,7 @@ async function runGeneration(
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
               Number(oc.amount).toFixed(2), dueDate,
               // The tenant reads the reason and the day it happened, so the
-              // line is recognisable instead of a bare amount they have to
+              // line is recognizable instead of a bare amount they have to
               // phone up about.
               `${oc.reason} (${new Date(oc.incident_date + 'T00:00:00Z')
                 .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })})`,
@@ -836,13 +1278,25 @@ async function runGeneration(
         // flipped to 'billed' so subsequent invoice runs don't double-
         // bill — this link is made even when the trade fully covers the
         // bill (the $0 settled row still owns the bill).
+        // S641 (Nic): "I want them to see the electric from where they started
+        // and the electric from where they went to."
+        //
+        // Name the space on a line ONLY when this cycle's bills come from more
+        // than one — i.e. the resident moved mid-month. Naming it always would
+        // put "RV 12" on every line of every bill forever, which is noise on
+        // the month nobody moved, and Nic was explicit that one line item is
+        // fine in the ordinary case.
+        const spotsThisCycle = new Set(
+          utilityBills.map(b => (b as any).bill_unit_id).filter(Boolean))
+        const movedMidCycle = spotsThisCycle.size > 1
+
         for (let i = 0; i < utilityBills.length; i++) {
           const ub = utilityBills[i]
           const net = dist.utilityNets[i]
           // S533: the invoice line carries begin/end reads + usage — the
           // tenant sees exactly what produced the charge (the blind rule
           // only ever applied to the READER's entry flow).
-          // S613: propane is sold and read in GALLONS. A propane line labelled
+          // S613: propane is sold and read in GALLONS. A propane line labeled
           // "therms" on a billable document is a wrong unit in front of a tenant.
           const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms', propane: 'gal' }
           const pad = (v: any) => v == null ? null : String(Math.trunc(Number(v))).padStart(Number((ub as any).digits) || 6, '0')
@@ -866,11 +1320,18 @@ async function runGeneration(
             : (ub as any).allocation_method === 'flat_rate' && Number((ub as any).allocation_basis || 1) > 1
               ? `${Number((ub as any).allocation_basis)} × $${Number((ub as any).rate_per_unit || 0).toFixed(2)}`
               : null
-          const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
+          // The space leads the line when there is more than one, so the two
+          // readings are told apart at a glance rather than by comparing meter
+          // numbers.
+          const spotNote = movedMidCycle && (ub as any).bill_unit_number
+            ? String((ub as any).bill_unit_number)
+            : null
+          const combinedNote = [spotNote, readNote, suspendUtility(i) ? WT_SUSPENDED_NOTE : rowNote(net)]
+            .filter(Boolean).join(' — ') || null
           // S616 — THE DIVERSION. This row's landlord is the bill's own, not the
           // lease's. For every ordinary utility they are the same value and
           // nothing changes; on a converged invoice this is the line that sends
-          // the neighbour's electricity money to the landlord whose meter
+          // the neighbor's electricity money to the landlord whose meter
           // turned, while the rent on the same document goes to the landlord who
           // owns the bricks. The payout sweep scopes by payments.landlord_id and
           // not by invoice, so no other code has to know this happened.
@@ -896,9 +1357,9 @@ async function runGeneration(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
                type, amount, status, due_date, entry_description, notes,
-               settled_at
+               settled_at, work_trade_suspended_at
              ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, $8, $7, 'UTILITY', $9,
-               CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)
+               CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END, $10)
              RETURNING id`,
             [
               invoiceId,
@@ -907,6 +1368,7 @@ async function runGeneration(
               effectiveTenantId,
               rowLandlordId,
               net.toFixed(2), dueDate, rowStatus(net), combinedNote,
+              suspendUtility(i) ? suspendedAt : null,
             ]
           )
           await client.query(
@@ -931,8 +1393,9 @@ async function runGeneration(
           const propanePayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-               type, amount, status, due_date, entry_description, notes
-             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'PROPANE', $8)
+               type, amount, status, due_date, entry_description, notes,
+               work_trade_suspended_at
+             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'PROPANE', $8, $9)
              RETURNING id`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
@@ -940,7 +1403,9 @@ async function runGeneration(
               propaneNet < Number(pi.amount)
                 ? `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count} (${
                     propaneNet === 0 ? 'covered in full by work trade' : `$${round2(Number(pi.amount) - propaneNet).toFixed(2)} covered by work trade`})`
-                : `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`,
+                : `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`
+                  + (suspendPropane(piIdx) ? ` — ${WT_SUSPENDED_NOTE}` : ''),
+              suspendPropane(piIdx) ? suspendedAt : null,
             ]
           )
           await client.query(
@@ -950,58 +1415,100 @@ async function runGeneration(
           utilitiesInserted++
         }
 
-        // S537 (Nic): consume prepaid credit — money the tenant paid ahead —
-        // against this invoice's fresh charge rows, oldest credit first.
-        //
-        // S609: the release now also HANDS THE LANDLORD their share of what the
-        // credit covered. Before, the tenant's bill was marked paid and the
-        // money stayed on GAM's books permanently; see services/prepaidRelease
-        // for the full note. Runs BEFORE landlord-issued credits so real money
-        // the tenant already paid is spent before a landlord's write-off is.
-        await consumePrepaidCreditForInvoice(client, { leaseId: lease.id, invoiceId })
+        // S654: home-sale installments at face value, on this invoice. The
+        // partial-unique index on payments.home_sale_installment_id makes a
+        // race with the standalone job a no-op, so an installment bills once.
+        for (const h of homeInstallments) {
+          const hp = await client.query<{ id: string }>(
+            `INSERT INTO payments (
+               invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+               type, amount, status, due_date, entry_description, notes,
+               home_sale_installment_id
+             ) VALUES ($1, $2, $3, $4, $5, 'home_payment', $6, 'pending', $7, 'HOMEPMT', $8, $9)
+             ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+             RETURNING id`,
+            [
+              invoiceId, lease.unit_id, lease.id, effectiveTenantId, h.landlord_id,
+              Number(h.amount).toFixed(2), dueDate,
+              `Home payment ${h.installment_number} of ${h.installments_total}`,
+              h.id,
+            ]
+          )
+          if (hp.rows.length === 0) continue
+          await client.query(
+            `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
+            [hp.rows[0].id, h.id]
+          )
+          touchedHomeContracts.add(h.contract_id)
+          homePaymentsInserted++
+        }
 
-        // S577/S607: landlord-issued account credits (tenant_credits), applied to
-        // whatever pending rows remain after prepaid credits, oldest-first.
-        // Funded by the landlord (the tenant simply owes less → less rent
-        // received). INDEPENDENT of work-trade.
+        // ── S655 (Nic, 10/2): THE WHOLE-BILL RULE, ONCE PER HOUSEHOLD ────────
         //
-        // S607: the application logic now lives in services/creditApplication so
-        // this path and the issue-a-credit path behave identically. They had to
-        // agree anyway, and two copies of "how a credit lands" is how a tenant
-        // ends up with a different balance depending on which code touched them
-        // last. Scoped to this invoice's rows, as it always was — the landlord
-        // route uses lease scope to reach older open charges.
+        //   "Credit auto-applies only when it covers the WHOLE bill."
         //
-        // S609: savepoint-guarded for the same reason the prepaid release is —
+        // This was two passes (S537 paid-ahead money, then S607 landlord
+        // credits), each settling whatever single charges a credit could cover:
+        // a $200 monthly draw paid a $60 water line by itself, and Kim
+        // Harland's $450 Move In Special was chopped into a water row, a trash
+        // row and five late fees. Now credit of every kind — paid ahead,
+        // landlord-issued, deposit interest — settles a lease's bill only when it
+        // covers every row the tenant owes on it (older open rows included).
+        // 10/6 (Nic): "a credit against the entire balance" — money PAID AHEAD
+        // then goes on the balance even when it covers less, oldest bill
+        // first, part of a line where it runs out, the rest left owed
+        // (creditUse.drawPaidAheadOnBalance). Other credit that covers less
+        // settles nothing and waits for the payer's "Use" or "Save it for
+        // later" (MH 25's landlord-given $10). A bill carrying a GAM fee, a
+        // neighbor landlord's utility or a scheduled bank retry never settles
+        // itself (creditUse.settleWholeBillIfCovered). The check covers the
+        // whole household with this landlord, so a credit that already covers
+        // another of its leases' bills pays that one too.
+        //
         // THE BILL ALWAYS GOES OUT. This runs inside the per-lease invoice
         // transaction, so anything thrown here would roll the invoice back and
-        // the tenant would get no bill at all. A credit that fails to apply
-        // leaves the tenant owing money they were going to be forgiven, which is
-        // fixable next cycle; a tenant who never receives a bill is not.
-        // (The landlord's own issue-a-credit route calls the same service
-        // WITHOUT a savepoint, and should — a person pressing a button needs to
-        // see the error.)
-        await client.query('SAVEPOINT lease_credits')
-        try {
-          await applyCreditsToOpenCharges(client, {
-            leaseId: lease.id, scope: 'invoice', invoiceId,
-          })
-          await client.query('RELEASE SAVEPOINT lease_credits')
-        } catch (e) {
-          await client.query('ROLLBACK TO SAVEPOINT lease_credits')
-          logger.error({ err: e, leaseId: lease.id, invoiceId },
-            '[InvoiceGen] account credits could not be applied — invoice still issued')
-          await createAdminNotification({
-            severity: 'warn',
-            category: 'invoice_credit_apply_failed',
-            title: `Account credit could not be applied to invoice ${invoiceId}`,
-            body: `The tenant's landlord-issued credit was not applied, so their bill is higher than intended. The invoice was issued rather than held. The credit is untouched and applies on the next cycle.`,
-            context: { lease_id: lease.id, invoice_id: invoiceId },
-          }).catch(() => {})
+        // the tenant would get no bill at all. Savepoint-guarded: a credit step
+        // that fails leaves the credit untouched and the bill open, GAM is told,
+        // and the next bill run (or the next credit) applies it.
+        if (effectiveTenantId) {
+          await client.query('SAVEPOINT whole_bill_credit')
+          try {
+            const wb = await settleWholeBillIfCovered(client, {
+              tenantId: effectiveTenantId, landlordId: lease.landlord_id, source: 'whole_bill',
+            })
+            await client.query('RELEASE SAVEPOINT whole_bill_credit')
+            creditReceipts = wb.afterCommit
+            if (wb.settledIds.length > 0) {
+              logger.info({ leaseId: lease.id, invoiceId, settled: wb.settledIds.length,
+                creditUsed: wb.leases.reduce((s, l) => s + l.creditUsed, 0) },
+                '[InvoiceGen] the whole bill was paid from account credit')
+            }
+          } catch (e) {
+            await client.query('ROLLBACK TO SAVEPOINT whole_bill_credit')
+            logger.error({ err: e, leaseId: lease.id, invoiceId },
+              '[InvoiceGen] account credit could not be checked against the bill — invoice still issued')
+            await createAdminNotification({
+              severity: 'warn',
+              category: 'invoice_credit_apply_failed',
+              title: `Account credit could not be checked against invoice ${invoiceId}`,
+              body: `The bill went out in full, and the tenant's account credit was not touched: checking whether it covers the whole bill failed (${e instanceof Error ? e.message : String(e)}). ` +
+                `If the credit covers the bill, the next bill run or the next credit applies it once the cause is fixed; the tenant can also use it when they pay.`,
+              context: { lease_id: lease.id, invoice_id: invoiceId, tenant_id: effectiveTenantId },
+            }).catch(() => {})
+          }
         }
 
         await client.query('COMMIT')
         invoicesInserted++
+        // Never throws: a receipt that fails to send costs nobody their bill.
+        if (creditReceipts) await creditReceipts()
+
+        // S654: the contract's billed/paid counters, after the commit so a
+        // counter that fails to update never costs anyone their bill.
+        for (const cid of touchedHomeContracts) {
+          await reconcileHomeSaleContract(cid).catch(err =>
+            logger.error({ err, contractId: cid, invoiceId }, '[InvoiceGen] home-sale reconcile failed — invoice issued'))
+        }
       } catch (e) {
         // Per-lease isolation: a single malformed lease (e.g. a pre-existing
         // orphan rent payment for this cycle that collides with
@@ -1023,6 +1530,7 @@ async function runGeneration(
     rentsInserted,
     feesInserted,
     utilitiesInserted,
+    homePaymentsInserted,
     leasesProcessed: leases.length,
   }
 }
@@ -1030,6 +1538,7 @@ async function runGeneration(
 // ----- S26b-tz: per-timezone scoped variant + manager registration -----
 
 import { registerEngine } from './timezoneCronManager'
+import { todayIn } from '../lib/timezone'
 
 /**
  * Run invoice generation scoped to leases whose property is in the given
@@ -1045,23 +1554,9 @@ export async function generateInvoicesForTimezone(
   tz: string,
   nowUtc: Date = new Date()
 ): Promise<InvoiceGenResult> {
-  const leases = await query<ActiveLease>(`
-    SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
-           l.lease_source,
-           to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
-           to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
-           (SELECT vlat.tenant_id
-              FROM v_lease_active_tenants vlat
-              WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
-              LIMIT 1) AS tenant_id,
-           p.timezone AS property_tz
-    FROM leases l
-    JOIN units u ON u.id = l.unit_id
-    JOIN properties p ON p.id = u.property_id
-    WHERE l.status = 'active'
-      AND (l.needs_review IS NULL OR l.needs_review = false)
-      AND p.timezone = $1
-  `, [tz])
+  const leases = await query<ActiveLease>(
+    ACTIVE_LEASE_SELECT + `
+      AND p.timezone = $1`, [tz])
 
   return runGeneration(leases, nowUtc)
 }
@@ -1091,34 +1586,21 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
   if (!to.isValid) throw new Error(`Invalid to date: ${opts.to}`)
   if (from > to) throw new Error('from must be on or before to')
 
-  const where: string[] = [
-    `l.status = 'active'`,
-    `(l.needs_review IS NULL OR l.needs_review = false)`,
-  ]
+  // The daily run's own lease query, narrowed — a catch-up must bill exactly
+  // as the daily run does (this was a fourth copy that had already drifted:
+  // it billed a hibernating snowbird's paused lease and knew nothing of
+  // renewals).
   const params: any[] = []
+  let narrow = ''
   if (opts.leaseId) {
     params.push(opts.leaseId)
-    where.push(`l.id = $${params.length}`)
+    narrow = ` AND l.id = $${params.length}`
   } else if (opts.landlordId) {
     params.push(opts.landlordId)
-    where.push(`l.landlord_id = $${params.length}`)
+    narrow = ` AND l.landlord_id = $${params.length}`
   }
 
-  const leases = await query<ActiveLease>(`
-    SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
-           l.lease_source,
-           to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
-           to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
-           (SELECT vlat.tenant_id
-              FROM v_lease_active_tenants vlat
-              WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
-              LIMIT 1) AS tenant_id,
-           COALESCE(p.timezone, 'America/Phoenix') AS property_tz
-    FROM leases l
-    JOIN units u ON u.id = l.unit_id
-    JOIN properties p ON p.id = u.property_id
-    WHERE ${where.join(' AND ')}
-  `, params)
+  const leases = await query<ActiveLease>(ACTIVE_LEASE_SELECT + narrow, params)
 
   return runGeneration(leases, new Date(), {
     explicitWindow: { from: opts.from, to: opts.to },
@@ -1138,10 +1620,29 @@ export function registerInvoiceEngine(): void {
       try {
         const r = await generateInvoicesForTimezone(tz)
         if (r.invoicesInserted > 0 || r.rentsInserted > 0 || r.feesInserted > 0) {
-          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted }, '[InvoiceGen] invoices generated')
+          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted, homePayments: r.homePaymentsInserted }, '[InvoiceGen] invoices generated')
         }
       } catch (e) {
         logger.error({ err: e, tz }, '[InvoiceGen] error')
+      }
+
+      // S641 — tell the tenant. Generation used to send nothing at all, so the
+      // only billing mail anyone ever got was a late notice.
+      //
+      // Outside the try above on purpose: a generation failure for one property
+      // must not silence the bills that DID generate, and a mail failure must
+      // never look like a generation failure. Runs at the same 7am local hour
+      // as generation and not a day earlier — Nic: "when you send the invoices
+      // early, people wanna pay early", which drags a payment into the wrong
+      // month's books.
+      try {
+        const { sendPendingInvoiceNotices } = await import('../services/invoiceNotice')
+        const n = await sendPendingInvoiceNotices({ timezone: tz })
+        if (n.sent > 0 || n.failed > 0 || n.skippedNoEmail > 0) {
+          logger.info({ tz, ...n }, '[InvoiceGen] tenant invoice notices')
+        }
+      } catch (e) {
+        logger.error({ err: e, tz }, '[invoice-notice] pass failed')
       }
     },
     label: 'Invoice generation',

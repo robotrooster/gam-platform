@@ -6,16 +6,16 @@ import { z } from 'zod'
 import { normalizeAddress } from '../lib/address'
 import { formatPropertyInput, formatName, formatStreet, formatStreet2, formatCity, formatState, formatZip } from '../lib/format'
 import { db, query, queryOne, getClient } from '../db'
-import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
+import { requireAuth, requireLandlord, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { suggestBookingSlug } from './propertyBookingAdmin'
-import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from '../services/onboardingWindow'
+import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow, screeningWaivedByAccountSql, approvedCheckForAccountSql, pooledCheckSql } from '../services/onboardingWindow'
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, isEntityMember, resolveLandlordTarget, landlordIdForProperty, ownsLandlord } from '../lib/landlordScope'
-import {
+import { MAINTENANCE_CATEGORIES,
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
   PropertyReviewStatus,
@@ -25,12 +25,19 @@ import {
   LISTING_MIN_PHOTOS_BY_UNIT_TYPE,
   LISTING_MIN_PHOTOS_DEFAULT,
   timezoneForState,
+  FEE_TYPES,
+  type FeeType,
+  RENT_DUE_MODES,
+  CARD_FEE_PAYERS,
+  PROCESSING_FEE_CHOICES,
+  type ProcessingFeeChoice,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
+import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { resolveLeaseSigner } from '../services/leaseSigner'
-import { initiateTransfer, approveTransfer, declineTransfer } from '../services/propertyTransfer'
+import { initiateTransfer, confirmTransfer, declineTransfer, listIncomingTransfers } from '../services/propertyTransfer'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -55,9 +62,14 @@ propertiesRouter.get('/', async (req, res, next) => {
     // instead — the underlying PK that's referenced via the JOIN.
     const props = await query<any>(`
       SELECT p.*, COUNT(u.id)::int AS total_units,
+        -- S652 (Nic): "once that's set and the property's onboarded, that's not
+        -- changeable again." Locked the moment a lease or an invoice exists.
+        (EXISTS (SELECT 1 FROM leases lx JOIN units ux ON ux.id = lx.unit_id WHERE ux.property_id = p.id)
+         OR EXISTS (SELECT 1 FROM invoices ix JOIN units ux2 ON ux2.id = ix.unit_id WHERE ux2.property_id = p.id)) AS first_billing_cycle_locked,
         COUNT(u.id) FILTER (WHERE u.status='active')::int AS occupied_units,
         COUNT(u.id) FILTER (WHERE u.status='vacant')::int AS vacant_units,
-        to_jsonb(r.*) AS allocation_rule,
+        -- S654: manual_fee_payer is retired (cash/check is free); never sent.
+        to_jsonb(r.*) - 'manual_fee_payer' AS allocation_rule,
         COALESCE(ll.business_name, lu.first_name || ' ' || lu.last_name) AS entity_name
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
@@ -81,6 +93,12 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       city: z.string(), state: z.string(), zip: z.string(),
       type: z.enum(['residential','rv_longterm','rv_weekly','rv_nightly','mixed']).default('residential').optional(),
       unitTypes: z.array(z.string()).optional(),
+      // S652 (Nic): "when a landlord onboards a property they need to choose
+      // when the first billing cycle starts through the platform." Required at
+      // creation; it is the hard floor every bill's due month sits on.
+      // The app requires it; the API defaults to next month so nothing that
+      // creates a property without asking (agents, older callers) breaks.
+      firstBillingCycle: z.string().regex(/^\d{4}-\d{2}(-\d{2})?$/, 'Pick the month GAM sends the first bill').optional(),
       // S568: FALSE = homes-only external park (investor operates without owning
       // the land; park owner not on GAM). Default TRUE (operator owns the park).
       operatorOwnsLand: z.boolean().optional(),
@@ -91,6 +109,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       // Optional so every existing caller keeps landing on the caller's own
       // entity; supplied by the entity picker on the Add Property form.
       landlordId: z.string().uuid().optional(),
+      // 10/5: where residents' and guests' replies go (services/replyRouting).
+      // Optional — until set, replies go to whoever runs the property.
+      officeEmail: z.string().trim().toLowerCase().email().max(200).nullable().optional().or(z.literal('')),
       // 16a: allocation rule required on every property creation.
       // S116: three independent fee toggles replace bankingFeePayer.
       // Legacy callers passing bankingFeePayer auto-mirror into ACH+card.
@@ -101,10 +122,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         // volume discounts must never reach a tenant's bill. Accepted for
         // backward compatibility with older clients, then ignored below.
         platformFeePayer:   z.enum(FEE_PAYER_VALUES).default('landlord'),
-        // S607 (Nic): who reimburses the cash/check/money-order fee.
-        // Defaults to the tenant — a landlord who has not opted in has not
-        // agreed to absorb anything.
-        manualFeePayer:     z.enum(FEE_PAYER_VALUES).default('tenant'),
+        // S654 (Nic): no cash/check fee exists, so there is no manualFeePayer.
+        // An older client still sending it is stripped by zod, not refused.
+
         // Deprecated S116 — accepted for backward compat; if set, mirrors
         // into achFeePayer + cardFeePayer when those aren't supplied.
         bankingFeePayer:    z.enum(FEE_PAYER_VALUES).optional(),
@@ -117,10 +137,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         placementFeeValue: z.number().nullable().optional(),
         maintenanceMarkupPercent: z.number().nullable().optional(),
         ownerBankAccountId: z.string().uuid().nullable().optional(),
-      // S513 (#2): fee payers are no longer required on create. card_fee_payer
-      // is hard-locked to 'tenant' and ach_fee_payer inherits the landlord's
-      // onboarding election (landlords.default_ach_fee_payer) when omitted, so
-      // a caller need not supply either. allocationRule itself is optional —
+      // S513 (#2): fee payers are not required on create — a property with no
+      // answer passes the fees on (10/5: the choice is the property's own,
+      // never inherited from its company). allocationRule itself is optional —
       // this also fixes onboarding step-1, which posts a property with no
       // allocationRule and previously 400'd on the old required-payer refine.
       }).default({}),
@@ -209,7 +228,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // that has to be unwound by hand. This replaces `?? req.user!.profileId` —
     // the session's "active" entity, which is precisely the arbitrary default
     // this release removes.
-    const targetLandlordId = resolveLandlordTarget(req.user!, body.landlordId, 'property')
+    const targetLandlordId = resolveLandlordTarget(req.user!, body.landlordId, 'property', true)
     // S629: checked against the DATABASE, not just the token. landlordIds is
     // baked into the JWT at login, so an entity created after that login is
     // invisible to a synchronous check — and the session that created the
@@ -247,18 +266,23 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       INSERT INTO properties
         (landlord_id, name, street1, street2, city, state, zip, type, unit_types,
          requires_booking_acknowledgment, operator_owns_land,
-         owner_user_id, managed_by_user_id, timezone, timezone_source)
+         owner_user_id, managed_by_user_id, timezone, timezone_source, first_billing_cycle)
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
          (SELECT user_id FROM landlords WHERE id=$1),
          (SELECT user_id FROM landlords WHERE id=$1),
-         $12,'derived')
+         $12,'derived',$13::date)
       RETURNING *`,
       [targetLandlordId, body.name, body.street1, body.street2 ?? null,
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
        body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true,
-       timezone])
+       timezone,
+       (body.firstBillingCycle ?? nextMonthIso(timezone)).slice(0, 7) + '-01'])
     const prop = propRes.rows[0]
+    if (body.officeEmail) {
+      await client.query(`UPDATE properties SET office_email = $2 WHERE id = $1`, [prop.id, body.officeEmail])
+      prop.office_email = body.officeEmail
+    }
 
     // S579: open the property's onboarding window. While it's open the landlord
     // can grandfather sitting tenants past the background check (per occupied
@@ -266,6 +290,16 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // recomputed against unit count on read, so units added next extend it
     // (within the 30-day cap). See services/onboardingWindow.ts.
     await openOnboardingWindow(prop.id, client)
+
+    // S652 (Nic): "by default, we should have every property available to
+    // pick from that menu" — the Stripe Terminal location a card reader is
+    // registered to (and pre-registered to, straight from Stripe's shop). Made
+    // the moment the property exists so it is there the day someone orders a
+    // reader. Best-effort: a Stripe hiccup must never stop a property from
+    // being created; the location is made on first use if this misses.
+    void import('../services/posTerminal').then(({ getOrCreatePropertyLocation }) =>
+      getOrCreatePropertyLocation(prop.id).catch((e: any) =>
+        logger.warn({ err: e, propertyId: prop.id }, '[terminal] location not made at property creation')))
 
     // S574 (Nic): every property gets a live public website the moment it's
     // created — auto-assign a booking slug and publish it so the landlord has a
@@ -308,34 +342,31 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     }
 
     // Allocation rule INSERT — 1:1 with property.
-    // S116: three independent fee toggles. S513 (walkthrough #2): card_fee_payer
-    // is hard-locked to 'tenant' — the landlord NEVER covers card (S512). ACH
-    // defaults to the landlord's onboarding election
-    // (landlords.default_ach_fee_payer), overridable per-property by an explicit
-    // achFeePayer in the request. Legacy bankingFeePayer still mirrors into ACH.
-    const dfltRes = await client.query<{ default_ach_fee_payer: string }>(
-      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`,
-      [req.user!.profileId]
-    )
-    const landlordAchDefault = dfltRes.rows[0]?.default_ach_fee_payer ?? 'tenant'
-    const achFeePayer       = ar.achFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
-    const cardFeePayer      = 'tenant'
+    // 10/5 (Nic): ONE card-and-bank fee choice per property for everyone who
+    // pays there (PROCESSING_FEE_CHOICES). It is the PROPERTY's own answer —
+    // never a company default ("There's things at the company level, there's
+    // things at the property level and there's things at the unit level").
+    // No answer = pass them on. The database copies it to card and to the
+    // property's counter and booking-site columns.
+    if (ar.achFeePayer && ar.cardFeePayer && ar.achFeePayer !== ar.cardFeePayer) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
+    }
+    const achFeePayer       = ar.achFeePayer ?? ar.cardFeePayer ?? ar.bankingFeePayer ?? 'tenant'
+    const cardFeePayer      = achFeePayer
     const platformFeePayer  = 'landlord'   // S607 lock — never from the request
     await client.query(`
       INSERT INTO property_allocation_rules
         (property_id, ach_fee_payer, card_fee_payer, platform_fee_payer,
-         manual_fee_payer,
          rent_percent, rent_percent_floor, rent_percent_ceiling,
          flat_monthly_fee, per_unit_fee,
          placement_fee_type, placement_fee_value,
          maintenance_markup_percent, owner_bank_account_id)
-      VALUES ($1,$2,$3,$4,$14,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [prop.id, achFeePayer, cardFeePayer, platformFeePayer,
        ar.rentPercent ?? null, ar.rentPercentFloor ?? null, ar.rentPercentCeiling ?? null,
        ar.flatMonthlyFee ?? null, ar.perUnitFee ?? null,
        ar.placementFeeType ?? null, ar.placementFeeValue ?? null,
-       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null,
-       ar.manualFeePayer ?? 'tenant'])
+       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null])
 
     await client.query('COMMIT')
 
@@ -415,6 +446,15 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
   }
 })
 
+// S655 — property transfers waiting on THIS login to accept (the buyer's
+// side). Declared before GET /:id with the other literal paths. Only the
+// buyer's own login sees these; nothing about the tenants is included.
+propertiesRouter.get('/transfer-requests/incoming', async (req, res, next) => {
+  try {
+    res.json({ success: true, data: await listIncomingTransfers(req.user!.userId) })
+  } catch (e) { next(e) }
+})
+
 // S399 fix: /applications declared BEFORE GET /:id so Express doesn't
 // match `applications` as the :id param. Pre-fix the dedicated
 // /applications handler at the bottom of this file was unreachable —
@@ -424,17 +464,39 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
 
 propertiesRouter.get('/applications', requirePerm('tenants.create'), async (req, res, next) => {
   try {
+    // Every company this account owns. This read profileId, which names no
+    // company for an owner since S633, so the page was always empty.
+    const scope = landlordScopeIds(req.user!)
+    if (!scope.length) return res.json({ success: true, data: [] })
+    // Screening as THIS account knows it — never the person's platform-wide
+    // status, which carried other companies' verdicts (an approval or denial
+    // somewhere else, or another park's grandfather waiver).
+    //   approved  — a check run for this account, or a renter-pool check (run
+    //               through GAM's pool intake, shared by the applicant). A
+    //               check another company ran never counts or shows, even
+    //               with its share box ticked.
+    //   waived    — this account grandfathered them
+    //   otherwise — the latest such check's own status, or not_started
     const { rows } = await db.query(
       `SELECT ua.*, u.unit_number, p.name AS property_name,
-              t.background_check_status,
+              CASE
+                WHEN ${approvedCheckForAccountSql('t.id', 'ua.applicant_user_id', 'ua.landlord_id')} THEN 'approved'
+                WHEN ${screeningWaivedByAccountSql('t.id', 'ua.landlord_id')} THEN 'waived'
+                ELSE COALESCE((
+                  SELECT bc.status FROM background_checks bc
+                   WHERE (bc.tenant_id = t.id OR bc.user_id = ua.applicant_user_id)
+                     AND (${pooledCheckSql('bc')}
+                          OR bc.landlord_id IN (SELECT public.account_companies(ua.landlord_id)))
+                   ORDER BY bc.created_at DESC LIMIT 1), 'not_started')
+              END AS background_check_status,
               EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = ua.id) AS lease_drafted
        FROM unit_applications ua
        LEFT JOIN units u ON u.id = ua.unit_id
        LEFT JOIN properties p ON p.id = u.property_id
        LEFT JOIN tenants t ON t.user_id = ua.applicant_user_id
-       WHERE ua.landlord_id = $1
+       WHERE ua.landlord_id = ANY($1::uuid[])
        ORDER BY ua.created_at DESC`,
-      [req.user!.profileId]
+      [scope]
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -452,9 +514,11 @@ propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create')
     if (!app) throw new AppError(404, 'Application not found')
     if (!canManageLandlordResource(req.user, app.landlord_id)) throw new AppError(403, 'Forbidden')
     if (!app.unit_id) throw new AppError(400, 'This application is not tied to a specific unit — assign a unit first.')
-    const result = await draftLeaseFromApplication(req.params.id)
-    if (!result.leaseId) throw new AppError(400, 'Could not draft a lease from this application.')
-    res.status(201).json({ success: true, data: { leaseId: result.leaseId, alreadyDrafted: !result.drafted } })
+    // S653: drafts the signing packet (services/householdPacketDraft), never a
+    // bare lease row. The client lands on the signing page.
+    const result = await draftLeaseFromApplication(req.params.id, req.user?.userId ?? null)
+    if (result.reason === 'no_account') throw new AppError(400, 'This applicant has no account yet — invite them from the Tenants page.')
+    res.status(201).json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 
@@ -796,10 +860,11 @@ propertiesRouter.delete('/:id/unit-subtypes/:rowId', requirePerm('properties.edi
 // Anti-discrimination model: per-property standard fees that
 // pre-populate new lease documents. Lease remains the legal
 // contract; this is the policy.
-// NOTE (S526): the landlord-facing fee-schedule page is RETIRED — each
-// tenant is charged per their own signed lease (lease_fees, parsed at
-// e-sign finalize). These routes stay for the esign is_override audit
-// comparison and any legacy rows; no UI writes them anymore.
+// NOTE (S526): each tenant is charged per their own signed lease (lease_fees,
+// parsed at e-sign finalize) — that has not changed.
+// S648 (Nic): the list is back, per UNIT TYPE, as the starting values for a
+// new lease's fee boxes ("a pet deposit on an apartment is gonna only apply to
+// apartments"). It never bills anybody by itself.
 // ─────────────────────────────────────────────────────────────
 
 // GET /api/properties/:id/fee-schedule — list rows for a property
@@ -810,10 +875,10 @@ propertiesRouter.get('/:id/fee-schedule', async (req, res, next) => {
     if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
 
     const rows = await query<any>(
-      `SELECT id, fee_type, slot_index, description, amount, is_refundable, due_timing, created_at, updated_at
+      `SELECT id, unit_type, fee_type, slot_index, description, amount, is_refundable, due_timing, created_at, updated_at
          FROM property_fee_schedules
         WHERE property_id = $1
-        ORDER BY fee_type, slot_index`,
+        ORDER BY unit_type, fee_type, slot_index`,
       [req.params.id],
     )
     res.json({ success: true, data: rows })
@@ -823,15 +888,12 @@ propertiesRouter.get('/:id/fee-schedule', async (req, res, next) => {
 // POST /api/properties/:id/fee-schedule — upsert a row
 // (single-instance fee_types: slot_index implicit 0; other_fee:
 // caller passes slot_index)
+// security_deposit stays off this list: it comes from the unit (S636) and the
+// template's deposit months (S558), and two sources for one figure drift.
+const PROPERTY_FEE_TYPES = FEE_TYPES.filter(t => t !== 'security_deposit') as [FeeType, ...FeeType[]]
 const feeRowSchema = z.object({
-  feeType: z.enum([
-    'pet_deposit', 'key_deposit', 'cleaning_deposit',
-    'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
-    'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
-    'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
-    'trash_fee', 'pest_control_fee', 'technology_fee',
-    'last_month_rent', 'early_termination_fee', 'other_fee',
-  ]),
+  unitType: z.enum(UNIT_TYPES),
+  feeType: z.enum(PROPERTY_FEE_TYPES),
   slotIndex: z.number().int().min(0).optional(),
   description: z.string().max(200).optional(),
   amount: z.number().nonnegative(),
@@ -850,16 +912,16 @@ propertiesRouter.post('/:id/fee-schedule', requirePerm('properties.edit'), async
 
     const upserted = await queryOne<any>(
       `INSERT INTO property_fee_schedules
-         (property_id, fee_type, slot_index, description, amount, is_refundable, due_timing)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (property_id, fee_type, slot_index) DO UPDATE
+         (property_id, unit_type, fee_type, slot_index, description, amount, is_refundable, due_timing)
+       VALUES ($1, $8, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (property_id, unit_type, fee_type, slot_index) DO UPDATE
          SET description = EXCLUDED.description,
              amount = EXCLUDED.amount,
              is_refundable = EXCLUDED.is_refundable,
              due_timing = EXCLUDED.due_timing,
              updated_at = NOW()
        RETURNING *`,
-      [req.params.id, body.feeType, slotIndex, body.description ?? null, body.amount, body.isRefundable, body.dueTiming],
+      [req.params.id, body.feeType, slotIndex, body.description ?? null, body.amount, body.isRefundable, body.dueTiming, body.unitType],
     )
     res.json({ success: true, data: upserted })
   } catch (e) { next(e) }
@@ -1050,14 +1112,304 @@ propertiesRouter.post('/:id/onboarding-complete', requirePerm('properties.edit')
     const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // S655 (decisions 10/2): not while this property's tenant-CSV draft roster
+    // still has people nobody has confirmed. Closing the window first would
+    // send every one of those sitting residents to a background check.
+    const { liveRosterCount } = await import('../services/newLeaseInvite')
+    const waiting = await liveRosterCount(req.params.id)
+    if (waiting > 0) {
+      throw new AppError(409,
+        `${waiting} ${waiting === 1 ? 'person' : 'people'} in this property's draft roster ` +
+        `${waiting === 1 ? "isn't" : "aren't"} confirmed yet. Confirm or remove them first ` +
+        `(Tenant Onboarding → Draft roster), then mark onboarding complete.`)
+    }
     await closeOnboardingWindow(req.params.id)
     res.json({ success: true, data: await getOnboardingWindow(req.params.id) })
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/rent-due-rule — S648 (Nic). When rent is due at
+// this property: every lease on one fixed day (1–28), or each lease on its own
+// move-in day. Applies to leases drafted from now on; a signed lease keeps the
+// day it states, and a landlord may still set one tenant's own day on a lease.
+propertiesRouter.patch('/:id/rent-due-rule', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      mode: z.enum(RENT_DUE_MODES),
+      day: z.number().int().min(1).max(28).optional(),
+    }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(
+      `UPDATE properties SET rent_due_mode = $2, rent_due_day = COALESCE($3, rent_due_day), updated_at = NOW()
+        WHERE id = $1`, [req.params.id, body.mode, body.day ?? null])
+    res.json({ success: true, data: { propertyId: req.params.id, rentDueMode: body.mode, rentDueDay: body.day } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/move-in-collection — S648 (Nic). Whether a new
+// tenant moving in mid-month pays the proration only, or the proration AND the
+// next full month. Property-wide on purpose: the same up-front ask for everyone.
+propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { collectsNextPeriod } = z.object({ collectsNextPeriod: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET move_in_collects_next_period = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, collectsNextPeriod])
+    res.json({ success: true, data: { propertyId: req.params.id, moveInCollectsNextPeriod: collectsNextPeriod } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/processing-fee-payers — 10/5 (Nic): "The only
+// thing the landlord chooses is if they absorb the cost or if they pass it
+// through ... they cannot absorb it for some people and pass it through to
+// other people." ONE choice per property: card and bank fees, for rent, the
+// front counter, pay links and the booking site alike. Body { choice:
+// 'pass_on' | 'cover' }. A page cached from before sends { register } or
+// { booking }; either one is taken as the choice for everything.
+propertiesRouter.patch('/:id/processing-fee-payers', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const payer = z.enum(CARD_FEE_PAYERS)
+    const body = z.object({
+      choice: z.enum(PROCESSING_FEE_CHOICES).optional(),
+      register: payer.optional(), booking: payer.optional(),
+    }).refine(b => b.choice || b.register || b.booking, 'Say whether to pass the fees on or cover them').parse(req.body)
+    const legacy = body.register ?? body.booking
+    if (body.register && body.booking && body.register !== body.booking) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
+    }
+    const choice: ProcessingFeeChoice = body.choice ?? (legacy === 'landlord' ? 'cover' : 'pass_on')
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      // Both tables, one transaction. The database keeps them equal either way
+      // (migration 20261005120000); writing both says so plainly.
+      await client.query(
+        `UPDATE properties
+            SET register_card_fee_payer = $2, booking_card_fee_payer = $2, updated_at = NOW()
+          WHERE id = $1`, [req.params.id, choice === 'cover' ? 'landlord' : 'customer'])
+      await client.query(
+        `UPDATE property_allocation_rules SET ach_fee_payer = $2, card_fee_payer = $2 WHERE property_id = $1`,
+        [req.params.id, choice === 'cover' ? 'landlord' : 'tenant'])
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+    const row = await queryOne<{ register_card_fee_payer: string; booking_card_fee_payer: string }>(
+      `SELECT register_card_fee_payer, booking_card_fee_payer FROM properties WHERE id = $1`, [req.params.id])
+    res.json({ success: true, data: { propertyId: req.params.id, choice,
+      registerCardFeePayer: row!.register_card_fee_payer, bookingCardFeePayer: row!.booking_card_fee_payer } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/office-email — 10/5 (Nic): the property's office
+// email is where its residents', guests' and applicants' replies go (services/
+// replyRouting). Blank clears it; until a property has one, replies go to
+// whoever runs the property — never to GAM. It is also the public contact on
+// the booking site.
+propertiesRouter.patch('/:id/office-email', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const raw = req.body?.officeEmail
+    if (raw !== null && typeof raw !== 'string') throw new AppError(400, 'Send officeEmail as text (blank clears it).')
+    const officeEmail = raw === null ? null : (raw.trim().toLowerCase() || null)
+    if (officeEmail && (officeEmail.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(officeEmail))) {
+      throw new AppError(400, 'That office email is not a valid email address.')
+    }
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, req.params.id)
+    const row = await queryOne<{ office_email: string | null }>(
+      `UPDATE properties SET office_email = $2, updated_at = NOW() WHERE id = $1 RETURNING office_email`,
+      [req.params.id, officeEmail])
+    res.json({ success: true, data: { propertyId: req.params.id, officeEmail: row!.office_email } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/broken-meter-estimate — S648 (Nic). Whether a
+// broken or stuck submeter on an occupied space bills the low end of what
+// occupied neighbors used, or nothing until it is repaired. The landlord's
+// call ("up to them whether their area law allows it").
+propertiesRouter.patch('/:id/broken-meter-estimate', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { estimate } = z.object({ estimate: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET estimates_stuck_meters = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, estimate])
+    res.json({ success: true, data: { propertyId: req.params.id, estimatesStuckMeters: estimate } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/onboarding-late-fee-waiver — S648 (Nic). The
+// landlord's answer to "waive late fees on each existing resident's first bill
+// while they migrate?". Only TRUE waives; the engine treats unanswered as no.
+propertiesRouter.patch('/:id/onboarding-late-fee-waiver', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { waive } = z.object({ waive: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET onboarding_late_fee_waiver = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, waive])
+    res.json({ success: true, data: { propertyId: req.params.id, lateFeeWaiver: waive } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/partial-payments — 10/5 (Nic): "Maybe that's
+// something we set at the property level settings and let his property be set
+// to take partial payments because there's really no way to stop somebody from
+// going into the bank and making a partial." Body { accept: boolean }. Default
+// off. Applies to payments RECORDED here (cash, check, money order, bank
+// deposit): they may be less than the bill, pay the oldest bills first, and
+// what is left stays owed with late fees still applying. Online payments still
+// pay in full.
+propertiesRouter.patch('/:id/partial-payments', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { accept } = z.object({ accept: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET accept_partial_payments = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, accept])
+    res.json({ success: true, data: { propertyId: req.params.id, acceptPartialPayments: accept } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/tenants-deposit-at-bank — 10/6 (Nic): "Do you
+// allow tenants to go into the bank and deposit their rent for this unit or
+// for this property? We don't do that here at Mountain View." Body
+// { allowed: boolean }. Default off. On: tenants may report a bank deposit,
+// Record payment / Post a payment offer "Bank deposit", and the bank feed
+// matches a bank line to a tenant's bill here by itself — the bank's date
+// then decides late fees. Off: all three are refused; the office's own
+// deposit slips still match.
+propertiesRouter.patch('/:id/tenants-deposit-at-bank', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { allowed } = z.object({ allowed: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET tenants_deposit_at_bank = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, allowed])
+    res.json({ success: true, data: { propertyId: req.params.id, tenantsDepositAtBank: allowed } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * S655 — record a change to a property's owner-signing routing and re-route
+ * the owner's open signing seats. Runs on the CALLER's transaction — the same
+ * one that saves the new address on the property (PATCH /:id) — so the stored
+ * address, the audit row, the seat move and the new tokens land together or
+ * not at all. Saving the address first and moving the seats in a second
+ * transaction left a window where the new address was stored with no audit
+ * row and the old inbox's link still signed as the owner.
+ */
+async function applyLeaseSigningChange(client: Awaited<ReturnType<typeof getClient>>, a: {
+  propertyId: string; landlordId: string; byUserId: string
+  oldEmail: string | null; newEmail: string | null
+  oldName: string | null; newName: string | null
+  emailChanged: boolean
+}): Promise<{ seatsMoved: number }> {
+  await client.query(
+    `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+     VALUES ($1, 'property_lease_signing_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+    [a.byUserId, a.propertyId,
+     JSON.stringify({ leaseSigningEmail: a.oldEmail, leaseSigningName: a.oldName }),
+     JSON.stringify({ leaseSigningEmail: a.newEmail, leaseSigningName: a.newName })])
+  let seatsMoved = 0
+  if (a.emailChanged) {
+    // The owner seat is the company's founding login (landlordSigningContact).
+    // An address that was never delegated means the account email.
+    const owner = (await client.query<{ user_id: string; email: string }>(
+      `SELECT u.id AS user_id, LOWER(u.email) AS email
+         FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [a.landlordId])).rows[0]
+    if (owner) {
+      const from = (a.oldEmail || owner.email).toLowerCase()
+      const to = (a.newEmail || owner.email).toLowerCase()
+      if (from !== to) {
+        const moved = await client.query(
+          `UPDATE lease_document_signers s
+              SET email = $4, token = encode(gen_random_bytes(32), 'hex')
+             FROM lease_documents d
+             JOIN units u ON u.id = d.unit_id
+            WHERE d.id = s.document_id
+              AND u.property_id = $1
+              AND d.landlord_id = $2
+              AND d.status IN ('pending', 'sent', 'in_progress')
+              AND s.role = 'landlord'
+              AND s.user_id = $3
+              AND s.status NOT IN ('signed', 'declined')
+              AND LOWER(s.email) = $5`,
+          [a.propertyId, a.landlordId, owner.user_id, to, from])
+        seatsMoved = moved.rowCount ?? 0
+      }
+    }
+  }
+  return { seatsMoved }
+}
+
 propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const raw = req.body as any
+    // S655: authorize FIRST. The address-change block below can raise an admin
+    // notification (and used to write an audit row); it ran before this check, so any
+    // landlord could trigger both on another company's property id and only
+    // then get a 403. A property-scoped staff member was also never held to
+    // the properties they are assigned to.
+    const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
+    await assertPropertyInScope(req.user, req.params.id)
+
+    // S630 (Nic): where THIS property's lease-signing requests go, so an on-site
+    // manager can sign for their property without the portfolio login or the
+    // other properties' mail. Sent explicitly (even as '') to allow clearing it
+    // back to the account email, which COALESCE alone cannot express.
+    const signingEmailSent = raw.leaseSigningEmail !== undefined
+    const signingEmail = signingEmailSent
+      ? (String(raw.leaseSigningEmail).trim().toLowerCase() || null) : null
+    if (signingEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(signingEmail)) {
+      throw new AppError(400, 'That lease-signing address is not a valid email.')
+    }
+    const signingNameSent = raw.leaseSigningName !== undefined
+    const signingName = signingNameSent
+      ? (String(raw.leaseSigningName).trim().slice(0, 120) || null) : null
+    // S655: these two decide where the OWNER's signature requests for this
+    // property are mailed, and the emailed link signs as the owner without a
+    // password. Only an owner of this company (or GAM admin) may change them —
+    // never a property manager, whose "Edit properties" permission covers
+    // every other field here. An unchanged value arriving on an ordinary save
+    // is not a change. Decided HERE, before anything below writes (a blocked
+    // address move raises an admin notice), so a refused request leaves no
+    // trace of a change that never happened.
+    const storedSigningEmailOf = (row: any): string | null =>
+      row?.lease_signing_email ? String(row.lease_signing_email).trim().toLowerCase() || null : null
+    const storedSigningNameOf = (row: any): string | null =>
+      row?.lease_signing_name ? String(row.lease_signing_name).trim() || null : null
+    const mayRouteSigning = canManageLandlordResource(req.user, prop.landlord_id, [])
+    if (!mayRouteSigning && (
+        (signingEmailSent && signingEmail !== storedSigningEmailOf(prop)) ||
+        (signingNameSent && signingName !== storedSigningNameOf(prop)))) {
+      throw new AppError(403, "Only the property owner can change where the owner's signing requests go.")
+    }
+    // Only an owner's save ever writes these two. A manager's form carries the
+    // unchanged values back (checked just above); leaving them unwritten means
+    // a manager's save can never put back an address an owner changed a moment
+    // earlier.
+    const writeSigningEmail = signingEmailSent && mayRouteSigning
+    const writeSigningName = signingNameSent && mayRouteSigning
+
     const name    = raw.name    !== undefined ? formatName(raw.name)       : undefined
     const street1 = raw.street1 !== undefined ? formatStreet(raw.street1)  : undefined
     const street2 = raw.street2 !== undefined ? (raw.street2 ? formatStreet2(raw.street2) : raw.street2) : undefined
@@ -1083,22 +1435,33 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // typo, and it leaves an audit row naming who changed it.
     const addressFieldsSent = ['street1', 'street2', 'city', 'state', 'zip']
       .filter(f => raw[f] !== undefined)
-    if (addressFieldsSent.length) {
-      const cur = await queryOne<any>(
-        `SELECT street1, street2, city, state, zip FROM properties WHERE id = $1`,
-        [req.params.id])
-      const proposed: Record<string, any> = { street1, street2, city, state, zip }
-      const norm = (v: any) => String(v ?? '').trim().toLowerCase()
-      const changed = addressFieldsSent.filter(f => norm(proposed[f]) !== norm(cur?.[f]))
-      // Only a real CHANGE is refused — the edit form posts the whole record
-      // back, so an unchanged address arrives on every save of the name.
-      if (changed.length && req.user!.role !== 'super_admin') {
-        throw new AppError(409,
-          'A property\'s address is fixed once it is set — it decides which state\'s laws apply, ' +
-          'which timezone rent is due in, and stops two landlords claiming the same place. ' +
-          'If this one is wrong, contact support and we will correct it.')
-      }
+    const normAddr = (v: any) => String(v ?? '').trim().toLowerCase()
+    // S655: the address this save will actually STORE over a given row. A blank
+    // street, city, state or zip keeps the current one (the UPDATE COALESCEs
+    // them); a suite line that is sent replaces it, blank or null clearing it;
+    // anything not sent stays. The duplicate check, the change test and the
+    // audit row all read this. Reading the request as sent let {street2: null}
+    // pass the duplicate check as "suite unchanged" and then clear the suite —
+    // which put the property on another landlord's address.
+    const storedAddressOf = (row: any): Record<string, string | null> => ({
+      street1: street1 || row?.street1 || null,
+      street2: raw.street2 !== undefined ? (street2 || null) : (row?.street2 ?? null),
+      city:    city    || row?.city    || null,
+      state:   state   || row?.state   || null,
+      zip:     zip     || row?.zip     || null,
+    })
+    const addressChangesFrom = (row: any) => {
+      const stored = storedAddressOf(row)
+      return addressFieldsSent.filter(f => normAddr(stored[f]) !== normAddr(row?.[f]))
     }
+    // S649 (Nic): "edit property window needs to be able to change property
+    // address" — the landlord may now change it, WITH the safeguards the lock
+    // stood in for (S631): it may not land on another landlord's property,
+    // the timezone follows a new state, and the old address is kept in the
+    // audit log. (An unchanged address arrives on every save — ignored.)
+    // S655: all three happen inside the save's transaction below, against the
+    // locked row, so the address checked is exactly the address stored, and a
+    // save that fails leaves no record of a move that never happened.
 
     // S179 / B3: per-property booking acknowledgment toggle. Sent only when
     // the form actually changed; preserves COALESCE semantics on the others.
@@ -1110,20 +1473,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // into new leases at this property (LeaseFormModal default-pull is a
     // separate carry-forward; for now this surface stores the policy).
     // CHECK constraint allows late_fee_initial_type ∈ {flat, percent_of_rent}.
-    // S630 (Nic): where THIS property's lease-signing requests go, so an on-site
-    // manager can sign for their property without the portfolio login or the
-    // other properties' mail. Sent explicitly (even as '') to allow clearing it
-    // back to the account email, which COALESCE alone cannot express.
-    const signingEmailSent = raw.leaseSigningEmail !== undefined
-    const signingEmail = signingEmailSent
-      ? (String(raw.leaseSigningEmail).trim().toLowerCase() || null) : null
-    if (signingEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(signingEmail)) {
-      throw new AppError(400, 'That lease-signing address is not a valid email.')
-    }
-    const signingNameSent = raw.leaseSigningName !== undefined
-    const signingName = signingNameSent
-      ? (String(raw.leaseSigningName).trim().slice(0, 120) || null) : null
-
     const lateFeeEnabled =
       typeof raw.lateFeeEnabled === 'boolean' ? raw.lateFeeEnabled : undefined
     const lateFeeGraceDays =
@@ -1171,12 +1520,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
       throw new AppError(400, 'late_fee_cap_type must be flat, percent_of_rent, or null')
     }
 
-    const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
-      throw new AppError(403, 'Forbidden')
-    }
-
     // S247: per-property subleasing toggle. NULL = no change.
     const subleasingAllowed =
       typeof raw.subleasingAllowed === 'boolean' ? raw.subleasingAllowed : undefined
@@ -1185,10 +1528,9 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // per property when they want to offer FlexCharge at that Location.
     const flexchargeEnabled =
       typeof raw.flexchargeEnabled === 'boolean' ? raw.flexchargeEnabled : undefined
-    // S526: weekly-lease jurisdictions — drops the auto-lease-draft threshold
-    // for long stays from 30 days to 7 (services/bookingLeaseDraft.ts).
-    const weeklyLeaseMode =
-      typeof raw.weeklyLeaseMode === 'boolean' ? raw.weeklyLeaseMode : undefined
+    // 10/5 (Nic, R14): weekly_lease_mode only moved the auto-lease-draft
+    // threshold, and no lease is drafted on its own any more (R3). The setting
+    // is gone: weeklyLeaseMode is no longer read, and the column is left as it is.
     // S537 (Nic): partial payments reset the eviction clock — a landlord
     // preparing to act can refuse anything under the full outstanding
     // balance. Tenant portal's Pay Now enforces it server-side.
@@ -1200,47 +1542,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     const defaultOccupancyMode =
       (OCCUPANCY_MODES as readonly string[]).includes(raw.defaultOccupancyMode) ? raw.defaultOccupancyMode : undefined
 
-    let updated = await queryOne<any>(`
-      UPDATE properties SET
-        name        = COALESCE($1, name),
-        street1     = COALESCE($2, street1),
-        street2     = COALESCE($3, street2),
-        city        = COALESCE($4, city),
-        state       = COALESCE($5, state),
-        zip         = COALESCE($6, zip),
-        type        = COALESCE($7, type),
-        requires_booking_acknowledgment = COALESCE($8, requires_booking_acknowledgment),
-        late_fee_enabled        = COALESCE($9,  late_fee_enabled),
-        late_fee_grace_days     = COALESCE($10, late_fee_grace_days),
-        late_fee_initial_amount = COALESCE($11, late_fee_initial_amount),
-        late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
-        subleasing_allowed      = COALESCE($13, subleasing_allowed),
-        flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
-        weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
-        default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
-        operator_owns_land      = COALESCE($18, operator_owns_land),
-        lease_signing_email = CASE WHEN $19::boolean THEN $20 ELSE lease_signing_email END,
-        lease_signing_name  = CASE WHEN $21::boolean THEN $22 ELSE lease_signing_name  END,
-        updated_at  = NOW()
-      WHERE id=$16 RETURNING *`,
-      [name||null, street1||null, street2||null, city||null, state||null,
-       zip||null, type||null,
-       reqAck === undefined ? null : reqAck,
-       lateFeeEnabled === undefined ? null : lateFeeEnabled,
-       lateFeeGraceDays === undefined ? null : lateFeeGraceDays,
-       lateFeeInitialAmount === undefined ? null : lateFeeInitialAmount,
-       lateFeeInitialType ?? null,
-       subleasingAllowed === undefined ? null : subleasingAllowed,
-       flexchargeEnabled === undefined ? null : flexchargeEnabled,
-       weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
-       req.params.id,
-       defaultOccupancyMode ?? null,
-       typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
-       signingEmailSent, signingEmail, signingNameSent, signingName]
-    )
-
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
-    // pattern above can't distinguish "preserve" from "clear", and
+    // pattern below can't distinguish "preserve" from "clear", and
     // these columns are nullable on properties — so we need direct
     // assignment with undefined-skip semantics.
     const lfFields: Record<string, any> = {
@@ -1257,30 +1560,174 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
       lfSetParts.push(col + '=$' + (lfValues.length + 1))
       lfValues.push(val)
     }
-    if (lfSetParts.length > 0) {
-      // All-or-nothing validation against the post-update final state.
-      const finalAccrualAmount = lateFeeAccrualAmount === undefined ? updated.late_fee_accrual_amount : lateFeeAccrualAmount
-      const finalAccrualType   = lateFeeAccrualType   === undefined ? updated.late_fee_accrual_type   : lateFeeAccrualType
-      const finalAccrualPeriod = lateFeeAccrualPeriod === undefined ? updated.late_fee_accrual_period : lateFeeAccrualPeriod
-      const accrualSetCount = [finalAccrualAmount, finalAccrualType, finalAccrualPeriod].filter(v => v !== null && v !== undefined).length
-      if (accrualSetCount !== 0 && accrualSetCount !== 3) {
-        throw new AppError(400, 'late-fee accrual requires all of amount, type, and period — or none')
+
+    // S655: the whole save is ONE transaction: the property's fields, the
+    // late-fee accrual and cap, the timezone that follows a new state, the
+    // address-change audit row, and a change to the owner's signing routing
+    // (its audit row and the move of the owner's open seats). Before, the
+    // signing address was stored first and the seats moved in a second
+    // transaction (a failure there left the new address saved, no audit row,
+    // and the revoked inbox's link still signing as the owner); the accrual
+    // check ran after the save committed (its 400 came back for a change that
+    // had already taken effect); and the address audit row was written before
+    // the save, so it stayed even when the save failed.
+    //
+    // The row is locked and re-read FIRST, and every "from what" below is
+    // taken from that locked row, never from the read at the top of the
+    // handler. Two owners saving different signing addresses at the same
+    // moment (A to B and A to C) would otherwise both believe the address was
+    // A: the second would look for seats still at A, find none (the first had
+    // moved them to B), and leave the owner's live links in inbox B while the
+    // property pointed at C.
+    const saveClient = await getClient()
+    let updated: any
+    try {
+      await saveClient.query('BEGIN')
+      const locked = (await saveClient.query<any>(
+        `SELECT * FROM properties WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0]
+      if (!locked) throw new AppError(404, 'Property not found')
+
+      // All-or-nothing accrual and cap, against the row as it will be after
+      // this save. The main UPDATE below never touches these columns, so the
+      // locked row holds the values this save does not send.
+      if (lfSetParts.length > 0) {
+        const finalAccrualAmount = lateFeeAccrualAmount === undefined ? locked.late_fee_accrual_amount : lateFeeAccrualAmount
+        const finalAccrualType   = lateFeeAccrualType   === undefined ? locked.late_fee_accrual_type   : lateFeeAccrualType
+        const finalAccrualPeriod = lateFeeAccrualPeriod === undefined ? locked.late_fee_accrual_period : lateFeeAccrualPeriod
+        const accrualSetCount = [finalAccrualAmount, finalAccrualType, finalAccrualPeriod].filter(v => v !== null && v !== undefined).length
+        if (accrualSetCount !== 0 && accrualSetCount !== 3) {
+          throw new AppError(400, 'late-fee accrual requires all of amount, type, and period — or none')
+        }
+        const finalCapAmount = lateFeeCapAmount === undefined ? locked.late_fee_cap_amount : lateFeeCapAmount
+        const finalCapType   = lateFeeCapType   === undefined ? locked.late_fee_cap_type   : lateFeeCapType
+        const capSetCount = [finalCapAmount, finalCapType].filter(v => v !== null && v !== undefined).length
+        if (capSetCount !== 0 && capSetCount !== 2) {
+          throw new AppError(400, 'late-fee cap requires both amount and type — or neither')
+        }
       }
-      const finalCapAmount = lateFeeCapAmount === undefined ? updated.late_fee_cap_amount : lateFeeCapAmount
-      const finalCapType   = lateFeeCapType   === undefined ? updated.late_fee_cap_type   : lateFeeCapType
-      const capSetCount = [finalCapAmount, finalCapType].filter(v => v !== null && v !== undefined).length
-      if (capSetCount !== 0 && capSetCount !== 2) {
-        throw new AppError(400, 'late-fee cap requires both amount and type — or neither')
+
+      const signingEmailChanged = writeSigningEmail && signingEmail !== storedSigningEmailOf(locked)
+      const signingNameChanged = writeSigningName && signingName !== storedSigningNameOf(locked)
+
+      // S631/S649: a changed address may not land on another landlord's
+      // property, and the old address is kept in the audit log (an unchanged
+      // address arrives on every save and is not a change).
+      const addressChanged = addressChangesFrom(locked)
+      const nextAddress = storedAddressOf(locked)
+      if (addressChanged.length) {
+        const clash = (await saveClient.query<{ id: string; landlord_id: string; name: string }>(
+          `SELECT id, landlord_id, name FROM properties
+            WHERE id <> $1 AND landlord_id <> $2
+              AND LOWER(TRIM(street1)) = LOWER(TRIM($3)) AND LOWER(TRIM(city)) = LOWER(TRIM($4))
+              AND LOWER(TRIM(state)) = LOWER(TRIM($5))
+              AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($6)), '')
+            LIMIT 1`,
+          [req.params.id, locked.landlord_id, nextAddress.street1, nextAddress.city,
+           nextAddress.state, nextAddress.street2 ?? ''])).rows[0]
+        if (clash) {
+          // The notice records a refused attempt, so it is written on its own
+          // connection and stays after this save rolls back.
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          await createAdminNotification({
+            severity: 'warn', category: 'duplicate_property_claim',
+            title: `Blocked address change onto another landlord's property`,
+            body: `Property ${req.params.id} tried to move to an address already registered as "${clash.name}" ` +
+                  `under landlord ${clash.landlord_id} (property ${clash.id}).`,
+            context: { propertyId: req.params.id, existingPropertyId: clash.id },
+          }).catch(() => {})
+          throw new AppError(409,
+            'That address is already registered on GAM to another account. If it\'s a different suite or ' +
+            'building, include its suite/unit line — or contact support if you believe this is an error.')
+        }
+        await saveClient.query(
+          `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+           VALUES ($1, 'property_address_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+          [req.user!.userId, req.params.id,
+           JSON.stringify({ street1: locked.street1, street2: locked.street2, city: locked.city,
+                            state: locked.state, zip: locked.zip }),
+           JSON.stringify(Object.fromEntries(addressFieldsSent.map(f => [f, nextAddress[f]])))])
       }
-      lfValues.push(req.params.id)
-      updated = await queryOne<any>(
-        'UPDATE properties SET ' + lfSetParts.join(', ') + ' WHERE id=$' + lfValues.length + ' RETURNING *',
-        lfValues,
-      )
+      const addressChangedState = addressChanged.includes('state') ? nextAddress.state : null
+
+      updated = (await saveClient.query<any>(`
+        UPDATE properties SET
+          name        = COALESCE($1, name),
+          street1     = COALESCE($2, street1),
+          street2     = CASE WHEN $22::boolean THEN $3 ELSE street2 END,
+          city        = COALESCE($4, city),
+          state       = COALESCE($5, state),
+          zip         = COALESCE($6, zip),
+          type        = COALESCE($7, type),
+          requires_booking_acknowledgment = COALESCE($8, requires_booking_acknowledgment),
+          late_fee_enabled        = COALESCE($9,  late_fee_enabled),
+          late_fee_grace_days     = COALESCE($10, late_fee_grace_days),
+          late_fee_initial_amount = COALESCE($11, late_fee_initial_amount),
+          late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
+          subleasing_allowed      = COALESCE($13, subleasing_allowed),
+          flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
+          default_occupancy_mode  = COALESCE($16, default_occupancy_mode),
+          operator_owns_land      = COALESCE($17, operator_owns_land),
+          lease_signing_email = CASE WHEN $18::boolean THEN $19 ELSE lease_signing_email END,
+          lease_signing_name  = CASE WHEN $20::boolean THEN $21 ELSE lease_signing_name  END,
+          updated_at  = NOW()
+        WHERE id=$15 RETURNING *`,
+        [name||null, street1||null, street2||null, city||null, state||null,
+         zip||null, type||null,
+         reqAck === undefined ? null : reqAck,
+         lateFeeEnabled === undefined ? null : lateFeeEnabled,
+         lateFeeGraceDays === undefined ? null : lateFeeGraceDays,
+         lateFeeInitialAmount === undefined ? null : lateFeeInitialAmount,
+         lateFeeInitialType ?? null,
+         subleasingAllowed === undefined ? null : subleasingAllowed,
+         flexchargeEnabled === undefined ? null : flexchargeEnabled,
+         req.params.id,
+         defaultOccupancyMode ?? null,
+         typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
+         writeSigningEmail, signingEmail, writeSigningName, signingName,
+         // The suite line is optional, so a blank (or null) one sent on
+         // purpose clears it; COALESCE could never clear a wrong suite line.
+         // Not sent = left alone. storedAddressOf above reads it the same way,
+         // so the duplicate check and the audit row see what is stored.
+         raw.street2 !== undefined]
+      )).rows[0]
+      // S649: a property that moved states is due in the new state's timezone.
+      if (addressChangedState) {
+        await saveClient.query(`UPDATE properties SET timezone = $2 WHERE id = $1`,
+          [req.params.id, timezoneForState(addressChangedState)])
+      }
+      if (lfSetParts.length > 0) {
+        lfValues.push(req.params.id)
+        updated = (await saveClient.query<any>(
+          'UPDATE properties SET ' + lfSetParts.join(', ') + ' WHERE id=$' + lfValues.length + ' RETURNING *',
+          lfValues,
+        )).rows[0]
+      }
+
+      // S655: a change to the owner's signing routing is recorded (who, from
+      // what, to what) and takes effect on links ALREADY mailed. Every unsigned
+      // owner seat on an open document at this property that still points at
+      // the old address moves to the new one (the owner's account email when it
+      // is cleared) with a fresh signing token, so a link sitting in an inbox
+      // the owner just revoked stops signing as them. Same pattern as a
+      // resident's corrected address (S654). Reminders send the new link.
+      if (signingEmailChanged || signingNameChanged) {
+        await applyLeaseSigningChange(saveClient, {
+          propertyId: req.params.id, landlordId: prop.landlord_id, byUserId: req.user!.userId,
+          oldEmail: locked.lease_signing_email ?? null, newEmail: signingEmailChanged ? signingEmail : (locked.lease_signing_email ?? null),
+          oldName: locked.lease_signing_name ?? null, newName: signingNameChanged ? signingName : (locked.lease_signing_name ?? null),
+          emailChanged: signingEmailChanged,
+        })
+      }
+      await saveClient.query('COMMIT')
+    } catch (e) {
+      await saveClient.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      saveClient.release()
     }
 
     // S481: state-law mismatches against the property state's
-    // catalogued figures. Mirrors the S476 lease PATCH posture —
+    // cataloged figures. Mirrors the S476 lease PATCH posture —
     // only checks fields TOUCHED in this PATCH so the warning fires
     // when the landlord acts, not on unrelated edits. The default
     // late-fee config here flows into NEW leases at this property
@@ -1347,6 +1794,46 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
 // There is deliberately NO fallback to the entity's retired value. An
 // unanswered property bills the month each lease starts in, which is the reading
 // that never double-bills.
+// S652 (Nic): "we need to have a good system for limiting maintenance requests
+// to common areas" at a park of tenant-owned homes. Per property: which kinds
+// a tenant may file (null = all), and a note the form shows them.
+propertiesRouter.patch('/:id/maintenance-config', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({
+      categories: z.array(z.enum(MAINTENANCE_CATEGORIES)).nullable(),
+      note: z.string().trim().max(400).nullable().optional(),
+    }).parse(req.body)
+    const prop = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, [])) throw new AppError(403, 'That property is not yours to change.')
+    const cats = body.categories && body.categories.length ? [...new Set(body.categories)] : null
+    await query(
+      `UPDATE properties SET maintenance_categories = $2::text[], maintenance_note = $3, updated_at = NOW() WHERE id = $1`,
+      [prop.id, cats, body.note || null])
+    res.json({ success: true, data: { maintenanceCategories: cats, maintenanceNote: body.note || null } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * S652 (Nic): "make the photo step optional… make it where the landlord
+ * toggles whether or not it's required per property. Setting it at the
+ * property level prevents discrimination." On: the reading walk will not take
+ * a number without a photo of the meter face. Off (default): the photo is
+ * offered, never demanded.
+ */
+propertiesRouter.patch('/:id/meter-photo-config', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({ required: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, [])) throw new AppError(403, 'That property is not yours to change.')
+    await query(`UPDATE properties SET meter_photo_required = $2, updated_at = NOW() WHERE id = $1`, [prop.id, body.required])
+    res.json({ success: true, data: { meterPhotoRequired: body.required } })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, res, next) => {
   try {
     const body = z.object({
@@ -1356,8 +1843,8 @@ propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, 
     }).parse(req.body)
     const month = body.firstBillingCycle ? body.firstBillingCycle.slice(0, 7) + '-01' : null
 
-    const prop = await queryOne<{ id: string; landlord_id: string; name: string }>(
-      `SELECT id, landlord_id, name FROM properties WHERE id = $1`, [req.params.id])
+    const prop = await queryOne<{ id: string; landlord_id: string; name: string; first_billing_cycle: string | null }>(
+      `SELECT id, landlord_id, name, to_char(first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle FROM properties WHERE id = $1`, [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     // Moves money for every existing tenancy at the property at once — the
     // landlord or an admin, never a team role.
@@ -1375,6 +1862,15 @@ propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, 
          JOIN units u ON u.id = l.unit_id
         WHERE u.property_id = $1 AND l.is_existing_tenancy = true`,
       [prop.id])
+    // S652 (Nic): "make that locked like it's set when you add the property and
+    // it's locked forever." Once a lease or an invoice exists, the floor stands.
+    const inUse = await queryOne<{ n: string }>(
+      `SELECT (COALESCE((SELECT COUNT(*) FROM leases l JOIN units u ON u.id = l.unit_id WHERE u.property_id = $1), 0)
+             + COALESCE((SELECT COUNT(*) FROM invoices i JOIN units u2 ON u2.id = i.unit_id WHERE u2.property_id = $1), 0))::text AS n`,
+      [prop.id])
+    if (Number(inUse?.n || 0) > 0 && prop.first_billing_cycle && (month ?? null) !== prop.first_billing_cycle) {
+      throw new AppError(409, 'The first billing cycle was set when this property was added and is locked now that tenants are on it.')
+    }
 
     await query(
       `UPDATE properties SET first_billing_cycle = $2::date, updated_at = NOW() WHERE id = $1`,
@@ -1394,7 +1890,6 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       achFeePayer:        z.enum(FEE_PAYER_VALUES).optional(),
       cardFeePayer:       z.enum(FEE_PAYER_VALUES).optional(),
       platformFeePayer:   z.enum(FEE_PAYER_VALUES).optional(),
-      manualFeePayer:     z.enum(FEE_PAYER_VALUES).optional(),
     }).parse(req.body)
 
     const prop = await queryOne<any>(
@@ -1429,19 +1924,16 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       params.push(body.ownerBankAccountId)
       sets.push(`owner_bank_account_id = $${params.length}`)
     }
-    if (body.manualFeePayer !== undefined) {
-      params.push(body.manualFeePayer)
-      sets.push(`manual_fee_payer = $${params.length}`)
+    // 10/5 (Nic): card and bank fees are ONE choice per property. Either field
+    // sets both (and the database carries it to the counter and booking site);
+    // the two sent with different answers is refused rather than guessed.
+    if (body.achFeePayer !== undefined && body.cardFeePayer !== undefined && body.achFeePayer !== body.cardFeePayer) {
+      throw new AppError(400, 'Card and bank payment fees are one choice: pass them on, or cover them.')
     }
-    if (body.achFeePayer !== undefined) {
-      params.push(body.achFeePayer)
-      sets.push(`ach_fee_payer = $${params.length}`)
-    }
-    if (body.cardFeePayer !== undefined) {
-      // S513 lock: card is always the tenant's — the landlord can never elect to
-      // cover card. Accept the field for backward compat but force 'tenant'.
-      params.push('tenant')
-      sets.push(`card_fee_payer = $${params.length}`)
+    const feePayer = body.achFeePayer ?? body.cardFeePayer
+    if (feePayer !== undefined) {
+      params.push(feePayer)
+      sets.push(`ach_fee_payer = $${params.length}`, `card_fee_payer = $${params.length}`)
     }
     // S607 lock (Nic): platformFeePayer is deliberately NOT patchable — the
     // platform fee is always the landlord's, so GAM's volume discounts can
@@ -1449,6 +1941,16 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
     // older clients and simply ignored; a DB CHECK backs the rule up so no
     // future route, script or manual UPDATE can quietly reintroduce it.
     if (sets.length === 0) {
+      // S654: a landlord page cached from before the cash/check fee was retired
+      // can still send its old toggle alone. There is nothing to change, so it
+      // answers with the current rule instead of an error toast.
+      if (req.body && typeof req.body === 'object' && 'manualFeePayer' in req.body) {
+        const current = await queryOne<any>(
+          `SELECT * FROM property_allocation_rules WHERE property_id = $1`, [req.params.id])
+        if (!current) throw new AppError(404, 'Allocation rule not found for property')
+        delete current.manual_fee_payer
+        return res.json({ success: true, data: current })
+      }
       throw new AppError(400, 'No allocation-rule fields supplied')
     }
     params.push(req.params.id)
@@ -1459,6 +1961,8 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
        RETURNING *
     `, params)
     if (!updated) throw new AppError(404, 'Allocation rule not found for property')
+    // S654: manual_fee_payer is retired (cash/check is free) — never sent.
+    delete updated.manual_fee_payer
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -1900,14 +2404,6 @@ publicPropertiesRouter.post('/listings/:unitId/apply', requireAuth, async (req: 
     if (!z.string().uuid().safeParse(req.params.unitId).success) throw new AppError(404, 'Listing not found')
     const body = z.object({ message: z.string().max(5000).nullish() }).parse(req.body ?? {})
 
-    // The one hard gate. 403 here is what the frontend turns into "start your
-    // background check" — the server never trusts the client to have gated it.
-    const t = await queryOne<{ background_check_status: string }>(
-      'SELECT background_check_status FROM tenants WHERE user_id=$1', [u.userId])
-    if (!t || !['approved', 'waived'].includes(t.background_check_status)) {
-      throw new AppError(403, 'A completed background check is required to contact a landlord')
-    }
-
     const unit = await queryOne<any>(`
       SELECT u.id, u.unit_number, u.landlord_id, p.name AS property_name,
              lu.id AS landlord_user_id, lu.first_name AS landlord_first,
@@ -1918,6 +2414,26 @@ publicPropertiesRouter.post('/listings/:unitId/apply', requireAuth, async (req: 
         JOIN users lu ON lu.id = l.user_id
        WHERE u.id=$1 AND u.status='vacant' AND u.listed_vacant=TRUE`, [req.params.unitId])
     if (!unit) throw new AppError(404, 'Listing not found')
+
+    // The one hard gate. 403 here is what the frontend turns into "start your
+    // background check" — the server never trusts the client to have gated it.
+    //
+    // Passes on a completed (approved) background check, or on a screening
+    // waiver granted by THIS listing's own account. A waiver is one company's
+    // decision about somebody already living with it; it used to be stamped
+    // on the person's platform-wide status, so one park's waiver opened every
+    // landlord's listing on GAM. A leftover platform-wide 'waived' no longer
+    // counts on its own.
+    const t = await queryOne<{ id: string; background_check_status: string }>(
+      'SELECT id, background_check_status FROM tenants WHERE user_id=$1', [u.userId])
+    const screened = !!t && (
+      t.background_check_status === 'approved' ||
+      !!(await queryOne<{ one: number }>(
+        `SELECT 1 AS one WHERE ${screeningWaivedByAccountSql('$1::uuid', '$2::uuid')}`,
+        [t.id, unit.landlord_id])))
+    if (!screened) {
+      throw new AppError(403, 'A completed background check is required to contact a landlord')
+    }
 
     const me = await queryOne<any>(
       'SELECT first_name, last_name, email, phone FROM users WHERE id=$1', [u.userId])
@@ -2241,9 +2757,16 @@ propertiesRouter.post('/:id/transfer', requirePerm('properties.edit'), async (re
     const body = z.object({
       // Identify the buyer by the email they log in with — a landlord selling a
       // park knows the buyer's email, not their internal id.
-      toEmail: z.string().trim().email(),
+      toEmail: z.string().trim().email().optional(),
+      // S655: or one of YOUR OWN companies — a move inside the account (Oak
+      // Park → Mountain View). The initiating owner owns the receiver, so there
+      // is no buyer step.
+      toLandlordId: z.string().uuid().optional(),
       note: z.string().max(500).optional(),
     }).parse(req.body)
+    if (!!body.toEmail === !!body.toLandlordId) {
+      throw new AppError(400, 'Enter the email of the person receiving it, or choose one of your own companies.')
+    }
 
     const prop = await queryOne<any>(
       `SELECT p.id, p.landlord_id, l.user_id AS owner_user_id
@@ -2257,22 +2780,34 @@ propertiesRouter.post('/:id/transfer', requirePerm('properties.edit'), async (re
       throw new AppError(403, 'Only the account owner can transfer a property')
     }
 
-    const buyer = await queryOne<any>(
-      `SELECT l.id FROM users u JOIN landlords l ON l.user_id = u.id
-        WHERE lower(u.email) = lower($1)`, [body.toEmail])
-    if (!buyer) {
-      throw new AppError(404,
-        'No landlord account with that email. The buyer needs to register on GAM before the property can be transferred to them.')
+    // S655: the buyer is a LOGIN, not a company. This used to join to the
+    // company a login founded (landlords.user_id), so a co-owner could never
+    // receive, and an account that founded two companies got whichever row
+    // came back first. The buyer now chooses which of their companies takes
+    // it when they accept.
+    let toUserId: string | null = null
+    if (body.toEmail) {
+      const buyer = await queryOne<{ id: string }>(
+        `SELECT id FROM users WHERE lower(email) = lower($1) AND role = 'landlord' LIMIT 1`, [body.toEmail])
+      if (!buyer) {
+        throw new AppError(404,
+          'No landlord account with that email. The buyer needs to register on GAM before the property can be transferred to them.')
+      }
+      toUserId = buyer.id
+    } else if (!landlordScopeIds(req.user!).includes(body.toLandlordId!)) {
+      throw new AppError(403, 'That company is not yours. To transfer it to someone else, enter their email.')
     }
 
     // S605 (Nic): this RAISES a request — it no longer transfers anything.
     // "Anybody that has a GAM platform account as an owner needs to all have a
     // signing or confirmation... so that one person can't just accidentally sell
     // or transfer account ownership out from underneath other people."
+    // S655: and a sale to another account also waits for that account to accept.
     const result = await initiateTransfer({
       propertyId: req.params.id,
       fromLandlordId: prop.landlord_id,
-      toLandlordId: buyer.id,
+      toLandlordId: body.toLandlordId ?? null,
+      toUserId,
       byUserId: req.user!.userId,
       note: body.note ?? null,
     })
@@ -2307,11 +2842,19 @@ propertiesRouter.get('/:id/transfer-request', async (req, res, next) => {
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
 
+    // S655: the receiving company is unknown until the buyer accepts (they
+    // choose it), so it is a LEFT JOIN; until then the seller sees the email
+    // they typed and "waiting on the buyer".
     const reqRow = await queryOne<any>(
       `SELECT r.id, r.status, r.expires_at, r.note, r.initiated_by,
-              tl.business_name AS buyer_name
+              tl.business_name AS buyer_name,
+              bu.email AS buyer_email,
+              r.buyer_accepted_at,
+              (r.buyer_accepted_at IS NULL) AS awaiting_buyer,
+              (r.to_user_id IS NULL) AS own_company_move
          FROM property_transfer_requests r
-         JOIN landlords tl ON tl.id = r.to_landlord_id
+         LEFT JOIN landlords tl ON tl.id = r.to_landlord_id
+         LEFT JOIN users bu ON bu.id = r.to_user_id
         WHERE r.property_id = $1 AND r.status = 'pending'
         LIMIT 1`, [req.params.id])
     if (!reqRow) return res.json({ success: true, data: null })
@@ -2333,18 +2876,25 @@ propertiesRouter.get('/:id/transfer-request', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// Confirm with the code from your email. The LAST approval executes the sale.
+// Confirm with the code from your email — a selling owner, or (S655) the buyer,
+// who also names which of their companies takes it. Whichever step completes
+// both sides executes the sale.
 propertiesRouter.post('/transfer-request/:requestId/approve', async (req, res, next) => {
   try {
-    const { code } = z.object({ code: z.string().min(4).max(12) }).parse(req.body)
-    const result = await approveTransfer({
+    const { code, receivingLandlordId } = z.object({
+      code: z.string().min(4).max(12),
+      receivingLandlordId: z.string().uuid().optional(),
+    }).parse(req.body)
+    const result = await confirmTransfer({
       requestId: req.params.requestId, userId: req.user!.userId, code: code.trim(),
+      receivingLandlordId: receivingLandlordId ?? null,
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 
 // Any one owner can stop it — consent is unanimous, so a single refusal decides.
+// S655: so can the named buyer.
 propertiesRouter.post('/transfer-request/:requestId/decline', async (req, res, next) => {
   try {
     await declineTransfer(req.params.requestId, req.user!.userId)
@@ -2447,3 +2997,12 @@ propertiesRouter.delete('/:id', async (req, res, next) => {
     res.json({ success: true, data: { deleted: true, name: prop.name } })
   } catch (e) { next(e) }
 })
+
+/**
+ * The first of next month, ISO — a property's default first billing cycle.
+ * S654: counted from the property's today. From UTC, a park added on the last
+ * evening of a month in Phoenix had its first cycle pushed a month out.
+ */
+function nextMonthIso(tz: string): string {
+  return monthStartOf(addDaysTo(monthStartOf(todayIn(tz)), 32))
+}

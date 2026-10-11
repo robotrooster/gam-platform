@@ -27,6 +27,7 @@ import {
 } from '../test/dbHelpers'
 import {
   generateBillsForMeter, generateBillsForProperty, generateBillsForLandlord,
+  expireHeldChargesAfterOnboarding,
   billMoveOutRead, ensureBillsForUnit, releaseSuspendedChargesForLease,
 } from './utilityBilling'
 
@@ -54,6 +55,14 @@ async function seedBaseProperty(): Promise<BaseCtx> {
     return { landlordUserId, landlordId, propertyId }
   } catch (e) { await c.query('ROLLBACK'); throw e }
   finally { c.release() }
+}
+
+// S648: a stuck or broken meter is only ESTIMATED where the landlord chose it
+// for the property. Tests of that behavior use this.
+async function seedEstimatingProperty(): Promise<BaseCtx> {
+  const base = await seedBaseProperty()
+  await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])
+  return base
 }
 
 async function seedUnitWithActiveTenant(
@@ -549,6 +558,85 @@ describe('generateBillsForMeter — rubs', () => {
     expect(Number(b2.charge_amount)).toBe(60)
   })
 
+  // 10/5 (Nic): "stay guests would share any RUBS billing — just count them all
+  // as one person … then the other tenants are paying for their cost."
+  async function seedStaySite(base: BaseCtx, checkIn: string, checkOut: string, status = 'confirmed'): Promise<string> {
+    const c = await db.connect()
+    try {
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      await c.query(
+        `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, lease_type, status, guest_name)
+         VALUES ($1, $2, $3, $4, 'nightly', $5, 'Stay Guest')`,
+        [unitId, base.landlordId, checkIn, checkOut, status])
+      return unitId
+    } finally { c.release() }
+  }
+
+  it('occupant_count: a site with a stay and no lease counts as one person — the tenant pays only their share', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)                    // 1 tenant
+    const stay = await seedStaySite(base, '2026-05-10', '2026-05-14')     // a guest, 4 nights
+    const empty = await seedStaySite(base, '2026-05-10', '2026-05-14', 'cancelled')
+    await attachMeterToUnit(meterId, leased.unitId)
+    await attachMeterToUnit(meterId, stay)
+    await attachMeterToUnit(meterId, empty)
+    await seedReading(meterId, '2026-05-01', 90, base.landlordUserId)
+    // 2 people (tenant + guest): the tenant's half is 45, not the whole 90.
+    // The short stay's utilities are in its rate — its half is billed to nobody.
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(`SELECT unit_id, charge_amount FROM utility_bills`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(leased.unitId)
+    expect(Number(rows[0].charge_amount)).toBe(45)
+  })
+
+  it('rented_spaces: a site with a stay in the cycle is a rented space; a stay outside it is not', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)
+    const stay = await seedStaySite(base, '2026-05-30', '2026-06-02')     // touches May
+    const later = await seedStaySite(base, '2026-06-01', '2026-06-05')    // June only
+    for (const u of [leased.unitId, stay, later]) await attachMeterToUnit(meterId, u)
+    await seedReading(meterId, '2026-05-01', 90, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(`SELECT charge_amount FROM utility_bills WHERE unit_id = $1`, [leased.unitId])
+    expect(Number(rows[0].charge_amount)).toBe(45)
+  })
+
+  // 10/5 (Nic): "if their share was $10, and they were only there a third of
+  // the month, then it would be $3.33."
+  it('a stay billed through its utility agreement pays its share only for the days it was there', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)
+    const staySite = await seedStaySite(base, '2026-05-21', '2026-06-20')   // 11 of May's 31 nights (21st–31st)
+    const c = await db.connect()
+    let guestTenantId = ''
+    try { guestTenantId = await seedTenant(c) } finally { c.release() }
+    const { rows: [bk] } = await db.query<any>(`SELECT id FROM unit_bookings WHERE unit_id = $1`, [staySite])
+    await db.query(
+      `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date, booking_id)
+       VALUES ($1, $2, $3, '2026-05-21', $4)`, [base.landlordId, staySite, guestTenantId, bk.id])
+    await attachMeterToUnit(meterId, leased.unitId)
+    await attachMeterToUnit(meterId, staySite)
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
+       VALUES ($1, '2026-05-31', 90, '2026-05-01', $2)`, [meterId, base.landlordUserId])
+    const res = await generateBillsForMeter(meterId, new Date(Date.UTC(2026, 4, 1)))
+    expect(res.billsCreated).toBe(2)
+    const amount = async (u: string) => Number((await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id = $1`, [u])).rows[0].charge_amount)
+    // Two people → 45 each. The tenant pays their whole 45 (never the guest's);
+    // the guest pays 45 × 11/31 = 15.97; the other 29.03 stays with the landlord.
+    expect(await amount(leased.unitId)).toBe(45)
+    expect(await amount(staySite)).toBe(15.97)
+  })
+
   it('total basis = 0 → noop with reason (e.g., sqft method but all units sqft null)', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedRubsMeter(base, 'sqft')
@@ -594,7 +682,7 @@ describe('generateBillsForMeter — rubs', () => {
 // This REPLACES the S558/S605/S607 exclusion tests wholesale. Those asserted
 // that a submetered unit's usage (S558) or dollars (S607) came off the pool
 // before the split, and that the pool clamped at zero when the carve-out
-// overshot (S605). All three behaviours are gone: nothing is subtracted from the
+// overshot (S605). All three behaviors are gone: nothing is subtracted from the
 // pool, so there is nothing to clamp and nothing to estimate for.
 //
 // The tests below are written against the failure that ended the model. See
@@ -706,7 +794,7 @@ describe('generateBillsForMeter — the RUBS pool is the whole bill (S634)', () 
     const { rows } = await db.query<any>(
       `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
     expect(res.billsCreated).toBe(2)
-    // Whole bill, split two ways — the neighbour's meter is irrelevant to it.
+    // Whole bill, split two ways — the neighbor's meter is irrelevant to it.
     expect(rows.map((r: any) => Number(r.charge_amount)).sort()).toEqual([47.00, 47.01])
   })
 
@@ -984,7 +1072,7 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
   })
 
   it('a meter-level amount can no longer change what a unit is billed', async () => {
-    // The old behaviour read base_fee off the meter. Setting it now must have no
+    // The old behavior read base_fee off the meter. Setting it now must have no
     // effect — that field is exactly the discrimination lever being removed.
     const base = await seedBaseProperty()
     const meterId = await seedFlatMeter(base, 25)
@@ -1121,7 +1209,7 @@ describe('S559 point-in-time baseline reset', () => {
 
 describe('S559 broken-meter comparable-low billing', () => {
   it('a broken submeter bills the LOWEST comparable usage (same property + unit type), as a normal charge', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     // Two comparable units (default unit_type/amp match). One good meter with
     // real usage of 120; one broken meter with no read.
     const good = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
@@ -1155,7 +1243,7 @@ describe('S559 broken-meter comparable-low billing', () => {
   })
 
   it('a broken submeter with no comparable usage produces no bill (never invents a number)', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     const broken = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
     const c = await db.connect()
     let brokenMeter = ''
@@ -1231,6 +1319,106 @@ describe('S560 billMoveOutRead odometer rollover', () => {
     expect(r.reason).toMatch(/re-check|mis-entered|not near/i)
     const bill = await db.query<any>(`SELECT id FROM utility_bills WHERE meter_id = $1`, [meterId])
     expect(bill.rows.length).toBe(0)   // no phantom 995k-unit bill
+  })
+
+  // ── S639 (Nic, DIRECTIVE) ────────────────────────────────────────────────
+  // "Read is taken the last fucking business day of the month. Or if they
+  // happen to move out on the thirty first, it's when they unplug and drive
+  // away. It's immediately so they can be billed. It's not the next day or the
+  // day after that."
+  //
+  // The old gate only cut a final invoice when the lease was ALREADY
+  // expired/terminated or its end_date had passed. The ordinary case — tenant
+  // pulls out a few days early while the lease runs on paper to the 31st —
+  // created the bill and then left it `unbilled` until the next month's invoice
+  // run. That is the wait Nic says must not happen.
+  it('a move-out read invoices the departing tenant TODAY, even while the lease still runs on paper', async () => {
+    const base = await seedBaseProperty()
+    const { unitId, leaseId } = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
+    // Lease is ACTIVE and runs to the end of next month — they left early.
+    await db.query(
+      `UPDATE leases SET status = 'active',
+              start_date = (CURRENT_DATE - interval '6 months')::date,
+              end_date   = (CURRENT_DATE + interval '30 days')::date
+        WHERE id = $1`, [leaseId])
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, utilityType: 'water' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await attachMeterToUnit(meterId, unitId)
+    await setMeterRateBase(meterId, 1, 0) // $1/unit
+
+    // Prior read, then the move-out read stamped to the CURRENT cycle — exactly
+    // what the special-read route writes when someone unplugs and drives away.
+    // S654: dates come from the database's clock (the suite crosses midnight UTC at 5 pm Phoenix).
+    const dd = (await db.query<{ today: string; yesterday: string; cycle: string }>(
+      `SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, date_trunc('month', CURRENT_DATE)::date::text AS cycle`)).rows[0]
+    const cycle = dd.cycle
+    // S654: the prior read must be BEFORE the move-out read. Dated on the
+    // cycle's 1st, it equalled today's move-out read every 1st of the month
+    // and the suite went red for 'no prior read'.
+    const priorDay = dd.yesterday
+    await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
+    const { rows: [mo] } = await db.query<any>(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, CURRENT_DATE, 1150, $2, $3, 'move_out_final') RETURNING id`,
+      [meterId, cycle, base.landlordUserId])
+
+    const r = await billMoveOutRead(meterId, mo.id)
+    expect(r.billed).toBe(true)
+
+    // The charge is on an invoice dated and DUE TODAY — not waiting for the
+    // next monthly run, and not stranded past the deposit return.
+    const billed = await db.query<any>(
+      `SELECT ub.status, ub.payment_id, i.due_date::text AS due_date
+         FROM utility_bills ub
+         JOIN payments p ON p.id = ub.payment_id
+         JOIN invoices i ON i.id = p.invoice_id
+        WHERE ub.meter_id = $1`, [meterId])
+    expect(billed.rows.length).toBe(1)
+    expect(billed.rows[0].status).toBe('billed')
+    expect(billed.rows[0].due_date).toBe(dd.today)
+  })
+
+  it('says WHY it did not bill when the cycle was already billed off the monthly run', async () => {
+    const base = await seedBaseProperty()
+    const { unitId } = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, utilityType: 'water' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await attachMeterToUnit(meterId, unitId)
+    await setMeterRateBase(meterId, 1, 0)
+
+    // S654: dates come from the database's clock (the suite crosses midnight UTC at 5 pm Phoenix).
+    const dd = (await db.query<{ today: string; yesterday: string; cycle: string }>(
+      `SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday, date_trunc('month', CURRENT_DATE)::date::text AS cycle`)).rows[0]
+    const cycle = dd.cycle
+    // S654: the prior read must be BEFORE the move-out read. Dated on the
+    // cycle's 1st, it equalled today's move-out read every 1st of the month
+    // and the suite went red for 'no prior read'.
+    const priorDay = dd.yesterday
+    await seedReadingAt(meterId, priorDay, cycle, 1000, 'monthly_cycle', base.landlordUserId)
+    const mk = async (v: number) => (await db.query<any>(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, CURRENT_DATE, $2, $3, $4, 'move_out_final') RETURNING id`,
+      [meterId, v, cycle, base.landlordUserId])).rows[0].id
+
+    expect((await billMoveOutRead(meterId, await mk(1100))).billed).toBe(true)
+    // Second read, same meter + unit + cycle: the uniqueness rule refuses it.
+    // It used to come back as a bare `false` with nothing for the person at the
+    // meter to act on.
+    const again = await billMoveOutRead(meterId, await mk(1200))
+    expect(again.billed).toBe(false)
+    expect(again.reason).toMatch(/already billed|does not owe/i)
   })
 })
 
@@ -1962,6 +2150,33 @@ describe('S616 a serviced space bills by every method', () => {
  * dropped from the pool. With 6 of 30 signed, those 6 split the water for all
  * 30 — a 5x overcharge on the people who signed on time.
  */
+describe('S650 hibernating leases are asleep — nothing bills', () => {
+  it('takes no RUBS share and gets no bill; the awake neighbor carries the whole master', async () => {
+    const base = await seedBaseProperty()
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(meterId, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const awake = await seedUnitWithActiveTenant(base)
+    const asleep = await seedUnitWithActiveTenant(base)
+    await db.query(`UPDATE leases SET is_hibernating = TRUE, hibernated_at = '2026-04-15' WHERE id = $1`, [asleep.leaseId])
+    await attachMeterToUnit(meterId, awake.unitId)
+    await attachMeterToUnit(meterId, asleep.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const bills = await db.query<any>(`SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(bills.rows).toHaveLength(1)
+    expect(bills.rows[0].unit_id).toBe(awake.unitId)
+    expect(Number(bills.rows[0].charge_amount)).toBe(100)
+  })
+})
+
 describe('suspended utility charges for units mid-onboarding', () => {
   async function rubsMeter(base: BaseCtx): Promise<string> {
     const c = await db.connect()
@@ -1985,6 +2200,10 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query(
         `INSERT INTO pending_tenant_intents (unit_id, tenant_id, landlord_id, property_id)
          VALUES ($1,$2,$3,$4)`, [unitId, tenantId, base.landlordId, base.propertyId])
+      // S650: shares are only held while the property is being onboarded.
+      await c.query(
+        `UPDATE properties SET onboarding_started_at = COALESCE(onboarding_started_at, now())
+          WHERE id = $1`, [base.propertyId])
       await c.query('COMMIT')
       return { unitId, tenantId }
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
@@ -2003,7 +2222,7 @@ describe('suspended utility charges for units mid-onboarding', () => {
     const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
 
     // One occupant each → 50/50. The signed unit must NOT absorb all 100 just
-    // because its neighbour has not signed yet.
+    // because its neighbor has not signed yet.
     const bills = await db.query<any>(
       `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
     expect(res.billsCreated).toBe(1)
@@ -2018,6 +2237,86 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(held.rows).toHaveLength(1)
     expect(Number(held.rows[0].charge_amount)).toBe(50)
     expect(held.rows[0].released_at).toBeNull()
+  })
+
+  // S650 (Nic): held only DURING the onboarding window, and anything nobody
+  // claimed by the time it closes is presumed settled off-platform.
+  it('holds nothing once the onboarding window has closed', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await db.query(`UPDATE properties SET onboarding_completed_at = now() WHERE id = $1`, [base.propertyId])
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const held = await db.query(`SELECT 1 FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
+    expect(held.rows).toHaveLength(0)
+  })
+
+  it('expires unclaimed holds when the window closes, and leaves open windows alone', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // Window still open: nothing expires.
+    await expireHeldChargesAfterOnboarding()
+    let held = await db.query<any>(
+      `SELECT charge_amount, cancelled_at, cancelled_reason FROM suspended_utility_charges WHERE unit_id=$1`,
+      [invited.unitId])
+    expect(held.rows).toHaveLength(1)
+    expect(held.rows[0].cancelled_at).toBeNull()
+
+    // 60 days on, the window (at most 30) has long closed.
+    await db.query(`UPDATE properties SET onboarding_started_at = now() - interval '60 days' WHERE id = $1`,
+      [base.propertyId])
+    await expireHeldChargesAfterOnboarding()
+    held = await db.query<any>(
+      `SELECT charge_amount, cancelled_at, cancelled_reason, released_at FROM suspended_utility_charges WHERE unit_id=$1`,
+      [invited.unitId])
+    expect(held.rows).toHaveLength(1)                       // kept, never deleted
+    expect(held.rows[0].cancelled_at).not.toBeNull()
+    expect(held.rows[0].released_at).toBeNull()
+    expect(held.rows[0].cancelled_reason).toMatch(/settled off-platform/)
+    expect(Number(held.rows[0].charge_amount)).toBe(50)
+    // ...and it is on nobody's bill.
+    const bills = await db.query(`SELECT 1 FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bills.rows).toHaveLength(0)
+  })
+
+  // 10/3 (final sweep, fifth pass): the expiry reads the same "is the window
+  // open" rule a share is held by — marking onboarding complete closes it too.
+  it('expires unclaimed holds when onboarding is marked complete, whatever the days left', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 0, amount: 0 })
+
+    // Started minutes ago — days left in the window — but marked complete.
+    await db.query(`UPDATE properties SET onboarding_completed_at = now() WHERE id = $1`, [base.propertyId])
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 1, amount: 50 })
+    const held = await db.query<any>(
+      `SELECT cancelled_at, cancelled_reason FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
+    expect(held.rows).toHaveLength(1)
+    expect(held.rows[0].cancelled_at).not.toBeNull()
+    expect(held.rows[0].cancelled_reason).toMatch(/settled off-platform/)
+    // Idempotent: a second night closes nothing more.
+    expect(await expireHeldChargesAfterOnboarding()).toEqual({ closed: 0, amount: 0 })
   })
 
   it('releases the held share onto the lease when it is signed', async () => {
@@ -2038,6 +2337,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // The signed lease passes water through — release consults the terms.
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
@@ -2092,6 +2393,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // The lease EXPLICITLY refuses water, so releasing on signature cancels
       // the hold rather than billing it — lease is law.
       await c.query(
@@ -2155,6 +2458,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
         startDate: '2026-06-01',
       })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
          VALUES ($1,'water',true)`, [leaseId])
@@ -2168,10 +2473,10 @@ describe('suspended utility charges for units mid-onboarding', () => {
     // ...and only THEN does May get billed.
     await generateBillsForMeter(meterId, new Date(2026, 4, 1))
 
-    // Their neighbour must still be split 50/50, not handed the whole 100.
-    const neighbour = await db.query<any>(
+    // Their neighbor must still be split 50/50, not handed the whole 100.
+    const neighbor = await db.query<any>(
       `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
-    expect(Number(neighbour.rows[0].charge_amount)).toBe(50)
+    expect(Number(neighbor.rows[0].charge_amount)).toBe(50)
 
     // And the 50 they used must land on them — as a bill or as a held share,
     // but never silently absorbed by the landlord.
@@ -2239,6 +2544,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // Their signed lease says the LANDLORD covers water.
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
@@ -2390,5 +2697,209 @@ describe('S637 — flat-rate meters bill ahead only, never on a catch-up sweep',
 
     const results = await generateBillsForLandlord(landlordId, new Date('2026-08-01T00:00:00Z'))
     expect(results.every(r => r.meterId !== flatMeter)).toBe(true)
+  })
+})
+
+// ─── S637: a stuck meter on an OCCUPIED spot estimates itself ────────────────
+//
+// Nic: "A meter with identical values and flagged as occupied needs to... those
+// two need to correlate that it's out of service." And: "match the lowest of
+// any other occupied spot."
+//
+// The estimation existed, but fired only for a meter someone had flagged
+// out_of_service BY HAND — and not one meter in the system had ever been
+// flagged. So a submeter reading the identical number two cycles running billed
+// NOTHING, and Chris Ast paid a month at Mountain View RV 07 with no
+// electricity on it at all.
+describe('S637 stuck meter on an occupied spot', () => {
+  const CYCLE = '2026-09-01'
+  const PREV  = '2026-08-01'
+
+  async function electricSubmeter(base: BaseCtx, label: string) {
+    const { rows } = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, label, utility_type, billing_method, base_fee, rate_per_unit)
+       VALUES ($1, $2, 'electric', 'submeter', 0, 0.15) RETURNING id`,
+      [base.propertyId, label])
+    return rows[0].id
+  }
+
+  async function spot(base: BaseCtx, label: string, prev: number, cycle: number, occupied: boolean) {
+    const meterId = await electricSubmeter(base, label)
+    const unitId = occupied
+      ? (await seedUnitWithActiveTenant(base)).unitId
+      : await (async () => {
+          const c = await db.connect()
+          try { return await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId }) }
+          finally { c.release() }
+        })()
+    if (!occupied) await db.query(`UPDATE units SET status='vacant' WHERE id=$1`, [unitId])
+    await attachMeterToUnit(meterId, unitId)
+    await seedReadingAt(meterId, PREV,  CYCLE, prev,  'baseline',      base.landlordUserId)
+    await seedReadingAt(meterId, CYCLE, CYCLE, cycle, 'monthly_cycle', base.landlordUserId)
+    return { meterId, unitId }
+  }
+
+  async function seedEmptyBill(base: BaseCtx, meterId: string, unitId: string, status: string) {
+    const { rows } = await db.query<{ tenant_id: string; lease_id: string }>(
+      `SELECT lt.tenant_id, l.id AS lease_id FROM leases l
+         JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role='primary'
+        WHERE l.unit_id = $1 ORDER BY l.start_date DESC LIMIT 1`, [unitId])
+    await db.query(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month, usage_amount,
+          allocation_method, rate_per_unit, base_fee_share, charge_amount,
+          tax_rate_pct, tax_amount, utility_type, status)
+       VALUES ($1,$2,$3,$4,$5,$6::date,0,'submeter',0.15,0,0,0,0,'electric',$7)`,
+      [meterId, unitId, rows[0].tenant_id, rows[0].lease_id, base.landlordId, CYCLE, status])
+  }
+
+  it('estimates from the lowest OCCUPIED comparable rather than billing zero', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV A electric', 1000, 1120, true)   // lived-in, used 120
+    await spot(base, 'RV B electric', 5000, 5400, true)   // lived-in, used 400
+    await spot(base, 'RV C electric',  700,  700, false)  // VACANT, zero — must be ignored
+    const stuck = await spot(base, 'RV D electric', 40999, 40999, true)
+
+    const res = await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    expect(res.billsCreated).toBe(1)
+
+    const { rows } = await db.query<{ usage_amount: string; allocation_method: string }>(
+      `SELECT usage_amount, allocation_method FROM utility_bills
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(Number(rows[0].usage_amount)).toBe(120)   // the lowest OCCUPIED, not the vacant zero
+    expect(rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  // ── S640 (Nic): "Jared Coil in RV twenty three was not billed for
+  // electricity... if it is [a broken meter], it should be matching the lowest
+  // real use case." ────────────────────────────────────────────────────────
+  //
+  // His meter read 44999 twice running, so the rule above should have caught
+  // it. It did not: the occupancy test asked for status 'active' and Jared is
+  // DELINQUENT. A resident behind on rent is exactly who must not quietly get a
+  // free month of power and then a double bill when somebody notices.
+  it('estimates for a DELINQUENT spot — behind on rent is still lived in', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV G electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV H electric', 44999, 44999, true)
+    await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
+
+    const res = await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<{ usage_amount: string; allocation_method: string }>(
+      `SELECT usage_amount, allocation_method FROM utility_bills
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(Number(rows[0].usage_amount)).toBe(120)
+    expect(rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  it('estimates for a SUSPENDED spot too', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV I electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV J electric', 500, 500, true)
+    await db.query(`UPDATE units SET status='suspended' WHERE id=$1`, [stuck.unitId])
+    const res = await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    expect(res.billsCreated).toBe(1)
+  })
+
+  // The $0.00 row an earlier run already wrote would otherwise BLOCK the fix:
+  // bills are idempotent per (meter, unit, cycle), so re-running found RV 23's
+  // empty row and skipped. An empty, un-invoiced bill is the absence of a
+  // reading filed as a fact — it gets replaced, not kept.
+  it('replaces an empty $0 bill a prior run left behind', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV K electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV L electric', 44999, 44999, true)
+    await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
+
+    // What the pre-fix run produced.
+    await seedEmptyBill(base, stuck.meterId, stuck.unitId, 'unbilled')
+
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    const { rows } = await db.query<{ usage_amount: string; charge_amount: string }>(
+      `SELECT usage_amount, charge_amount FROM utility_bills
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(rows.length).toBe(1)
+    expect(Number(rows[0].usage_amount)).toBe(120)
+    expect(Number(rows[0].charge_amount)).toBeGreaterThan(0)
+  })
+
+  // An invoiced bill is money the resident has already been told about. Even at
+  // zero it stays — reversing a sent charge is the landlord's call, not a job's.
+  it('leaves an already-billed row alone', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV M electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV N electric', 44999, 44999, true)
+    await seedEmptyBill(base, stuck.meterId, stuck.unitId, 'billed')
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM utility_bills WHERE meter_id=$1 AND billing_cycle_month=$2::date`,
+      [stuck.meterId, CYCLE])
+    expect(rows.some(r => r.status === 'billed')).toBe(true)
+  })
+
+  // ── S640 (Nic, second pass): "Any occupied spot of any status gets that
+  // treatment — delinquent or active or whatever. Anything that's not vacant is
+  // fine. If an owner-occupied spot has a submeter that's broken, we still want
+  // to flag that usage so the owner's keeping track of the real money... when
+  // they're paying the utilities on behalf of somebody, that's actual real
+  // money going out." ──────────────────────────────────────────────────────
+  //
+  // Free rent costs the landlord nothing they had. The power bill is a check
+  // they write, and a broken meter meant that number was never even estimated.
+  it('records the absorption on an OWNER-OCCUPIED spot instead of billing nobody', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV O electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV P electric', 700, 700, true)
+    await db.query(`UPDATE units SET status='owner_use', owner_household_size=2 WHERE id=$1`, [stuck.unitId])
+
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+
+    // Nobody is billed…
+    const bills = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1 AND billing_cycle_month=$2::date`,
+      [stuck.meterId, CYCLE])
+    expect(bills.rows).toHaveLength(0)
+    // …and the landlord's own cost is on the ledger, estimated off the lowest
+    // real occupied usage exactly as a tenant's would have been.
+    const abs = await db.query<any>(
+      `SELECT allocation_basis, charge_amount, allocation_method FROM utility_owner_use_absorptions
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(abs.rows).toHaveLength(1)
+    expect(Number(abs.rows[0].allocation_basis)).toBe(120)
+    expect(Number(abs.rows[0].charge_amount)).toBeCloseTo(18, 2)  // 120 × $0.15
+    expect(abs.rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  // The same money, in the branch that runs when the meter WORKS. An
+  // owner-occupied unit has no tenant and no lease, so the charge used to be
+  // dropped on the floor — the property audit could not reconcile.
+  it('records the absorption on an owner-occupied spot whose meter reads fine', async () => {
+    const base = await seedEstimatingProperty()
+    const owner = await spot(base, 'RV Q electric', 1000, 1300, true)
+    await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
+
+    await generateBillsForMeter(owner.meterId, new Date(CYCLE + 'T00:00:00Z'))
+
+    const abs = await db.query<any>(
+      `SELECT allocation_basis, charge_amount, allocation_method FROM utility_owner_use_absorptions
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [owner.meterId, CYCLE])
+    expect(abs.rows).toHaveLength(1)
+    expect(Number(abs.rows[0].allocation_basis)).toBe(300)
+    expect(Number(abs.rows[0].charge_amount)).toBeCloseTo(45, 2)  // 300 × $0.15
+    expect(abs.rows[0].allocation_method).toBe('submeter')
+  })
+
+  // A vacant spot reading zero is simply a vacant spot. 33 read zero at Mountain
+  // View this cycle and every one of those bills is correct.
+  it('leaves a stuck meter on a VACANT spot alone', async () => {
+    const base = await seedEstimatingProperty()
+    await spot(base, 'RV E electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV F electric', 700, 700, false)
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    const { rows } = await db.query<{ usage_amount: string }>(
+      `SELECT usage_amount FROM utility_bills WHERE meter_id=$1 AND billing_cycle_month=$2::date`,
+      [stuck.meterId, CYCLE])
+    expect(rows.every(r => Number(r.usage_amount) === 0)).toBe(true)
   })
 })

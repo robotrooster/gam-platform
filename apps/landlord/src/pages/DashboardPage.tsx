@@ -1,11 +1,20 @@
 import React, { useState, useRef } from 'react'
 import { useQuery } from 'react-query'
-import { humanize } from '@gam/shared'
+import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
+import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus, LogOut } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
 import { PropertySelect } from '../components/ListControls'
+// S655 (money plan, Step 15): the "Money received" / "Money billed" switch
+// drives the income card, the trend and the property-health card.
+import { IncomeBasisToggle } from '../components/IncomeBasisToggle'
+import {
+  useIncomeBasis, withBasis, incomeCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
+  activeCategories, categoryLabel, figuresBasis, reportErrorText, monthToDate,
+  type IncomeBasis, type IncomeCardData, type CategoryRow,
+} from '../lib/incomeBasis'
+import '../styles/reports-basis.css'
 // KPI cards show full dollars without cents (fmtWhole). Tables below keep this
 // exact, with-cents `fmt` — precise figures belong in the tables.
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -18,17 +27,64 @@ interface DashStats {
   evictionModeUnits: number
   monthlyRentVolume: number
   collectedMtd: number
+  /** S642: of collectedMtd, how much is ACH still clearing. */
+  collectedInFlight?: number
   outstanding: number
+  // S640: rent that trades for labor — contracted, real, and never arriving as
+  // money. Reported apart from monthlyRentVolume/outstanding, not inside them.
+  workTradeRent?: number
+  workTradeUnits?: number
+  workTradeSuspended?: number
+  /** S640: YYYY-MM-DD, from the payout engine. The card never derives it. */
+  nextPayoutDate?: string
+  // S640: of the delinquent units, how many a late fee will actually reach
+  // tonight. Onboarding residents are waived, so the two numbers differ.
+  delinquentUnitsAccruingLateFees?: number
+  /** S641: units owing ANYTHING, propane installments aside. What the card means. */
+  unitsOwing?: number
+  /** S654: of those, open charges past their lease's grace period — delinquent. */
+  unitsPastGrace?: number
   totalUnits: number
   occupancyRate: number
   leasesExpiring30d: number
   leasesExpiring60d: number
   propertyCount: number
   upcomingDisbursement: { count: number; amount: number }
+  // S640: rent we are holding that goes out on the next weekly run, and the
+  // part still clearing at the tenant's bank behind it.
+  nextPayoutReady?: number
+  nextPayoutClearing?: number
   otpUnits?: number
   projectedOtpDisbursement?: number
   platformFee?: number
   platformFeeByProperty?: { propertyId: string; name: string; fee: number }[]
+  /** S655: the income card, both ways; the switch picks which one leads. */
+  incomeCard?: IncomeCardData
+  /** S655: the rent card, both ways (rent only). */
+  rentCard?: {
+    received: { amount: number; clearing: number }
+    billed: { amount: number; collected: number; clearing: number; stillOwed: number }
+  }
+  /** S655 (decision #4): this month's income by category — the property report's own totals. */
+  propertyHealth?: {
+    period: string
+    categories: CategoryRow[]
+    lines: Array<{ line: string; label: string; amount: number }>
+    total: number
+  }
+  trend?: TrendMonth[]
+  /** S655: the basis these figures were counted under (the API echoes the switch). */
+  basis?: { basis: IncomeBasis; label: string; note: string }
+}
+
+/** One month of the trend: its total under the switch, split rent / everything else, by category. */
+interface TrendMonth {
+  month: string
+  period: string
+  revenue: number
+  rentRevenue: number
+  otherRevenue: number
+  categories?: Array<{ category: string; label: string; amount: number; billed: number; collected: number }>
 }
 
 export function DashboardPage() {
@@ -48,13 +104,15 @@ export function DashboardPage() {
   // they see without impersonating anybody. Empty string is the blended view,
   // which stays the default.
   const [propertyId, setPropertyId] = useState('')
+  // S655: "Money received" (default) or "Money billed", remembered per browser.
+  const [basis, setBasis] = useIncomeBasis()
 
   const { data: properties = [] } = useQuery<any[]>(
     'properties', () => apiGet<any[]>('/properties'), { staleTime: 60_000 })
 
-  const { data: stats, isLoading } = useQuery<DashStats>(
-    ['dashboard', propertyId],
-    () => apiGet(`/landlords/me/dashboard${propertyId ? `?propertyId=${propertyId}` : ''}`),
+  const { data: stats, isLoading, isPreviousData, isError, error } = useQuery<DashStats>(
+    ['dashboard', propertyId, basis],
+    () => apiGet(withBasis(`/landlords/me/dashboard${propertyId ? `?propertyId=${propertyId}` : ''}`, basis)),
     { staleTime: Infinity, keepPreviousData: true }
   )
 
@@ -64,21 +122,40 @@ export function DashboardPage() {
     { select: (d: any) => d?.slice(0, 5) }
   )
 
-  // S574 (Nic): referral earnings for the platform-fee / referral / net trio.
-  // The platform-fee card is a gross COST; this is the income that offsets it.
-  const { data: referral } = useQuery<any>('referral-earnings', () => apiGet('/landlords/referral-earnings'))
 
-  // Pad trend to always show 6 months
+  // Pad trend to always show 6 months. S655: each month is that month's total
+  // under the switch — the same figure as its row on Reports and, for this
+  // month, the income card — matched by its 'YYYY-MM' period.
   const trendData = (() => {
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     const now = new Date()
     const slots = Array.from({length:6}, (_,i) => {
       const d = new Date(now.getFullYear(), now.getMonth() - 5 + i, 1)
-      return months[d.getMonth()]
+      return { month: months[d.getMonth()], period: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` }
     })
-    const apiTrend: any[] = (stats as any)?.trend || []
-    return slots.map(m => ({ month: m, revenue: apiTrend.find((r:any) => r.month === m)?.revenue || 0 }))
+    const apiTrend: TrendMonth[] = stats?.trend || []
+    return slots.map(s => {
+      const r = apiTrend.find(x => x.period === s.period) ?? apiTrend.find(x => !x.period && x.month === s.month)
+      // S639: rent and everything else, so the tooltip can explain how a beat
+      // splits between lot/space rent and the rest.
+      return {
+        month: s.month,
+        revenue: r?.revenue || 0,
+        rentRevenue: r?.rentRevenue || 0,
+        otherRevenue: r?.otherRevenue || 0,
+      }
+    })
   })()
+  // S655: while a flip loads, the last answer stays up (dimmed) — labeled by
+  // the basis it was COUNTED under (the API echoes it), never the switch's new
+  // one, so an old figure never sits under the other basis's name.
+  const shownBasis = figuresBasis(stats?.basis?.basis, basis)
+  // Nothing to show and the load failed: say so rather than a page of $0.
+  const loadFailed = isError && !stats
+  // S655 (§0.0, Nic): "Money received this month $A", incl. $X paid ahead for
+  // later bills, + $Y still clearing beside it — or "Money billed this month
+  // $B" with collected so far · clearing · still owed (adding up to $B).
+  const incomeCard = incomeCardView(stats?.incomeCard, shownBasis)
 
   // Platform fee: authoritative per-property number from the API — $2/billable
   // unit floored at the $10 property minimum (full stop), summed across every
@@ -87,22 +164,36 @@ export function DashboardPage() {
   // Backs the "Expected Monthly Rent" subtext so the count matches the units
   // actually summed into that figure. (direct_pay retired W-15/S531.)
   const rentRollUnits = (stats?.activeUnits || 0) + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
+  // S654 (Nic): "I did mark one unit as owner use… it should say 68 occupied
+  // units." The owner lives there: occupied (and billed), just not rented.
+  const occupiedUnits = rentRollUnits + Number((stats as any)?.ownerUseUnits ?? 0)
+  // The fee card counts what the bill counted, once the month is billed.
+  const platformFeeUnits = Number((stats as any)?.platformFeeUnits ?? occupiedUnits)
+  // S640 (Nic, DIRECTIVE): work trade is revenue that is never coming in as
+  // money. It is out of Expected and out of Outstanding, and stands on its own
+  // so the landlord can still see what the trades are worth.
+  const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
+  // S650: hibernating leases are asleep — occupied, never payable.
+  const payableUnits   = Math.max(rentRollUnits - workTradeUnits - Number((stats as any)?.hibernatingUnits ?? 0), 0)
   const platformFee = stats?.platformFee ?? 0
-  // S574: referral earnings offset the platform fee. Net > 0 = you still owe GAM
-  // that much this month; Net <= 0 = your referrals earn back more than you pay.
-  const referralThisMonth = Number(referral?.thisMonth ?? 0)
-  const netToGam = platformFee - referralThisMonth
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
 
-  // Auto-payout cadence is weekly (Fridays). Show the next Friday as the
-  // concrete next-payout date rather than a fixed "1st of month" SLA label.
-  const nextPayoutDate = (() => {
-    const d = new Date()
-    const add = ((5 - d.getDay()) + 7) % 7 || 7
-    d.setDate(d.getDate() + add)
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-  })()
+  // ── S640: THE DATE COMES FROM THE ENGINE NOW ───────────────────────────
+  //
+  // This card computed its own payout date and was wrong three times running:
+  // it said Friday while the engine fired Tuesday, then Tuesday while Nic moved
+  // the run to Thursday — telling him "Sep 15" when the job would not fire until
+  // Sep 17. Two copies of a schedule is one copy too many.
+  //
+  // The API returns the date the payout job will actually fire, derived from
+  // the engine's own gate, holiday shifts and all. No fallback guess: if it is
+  // absent the card simply does not name a day, which is better than naming the
+  // wrong one.
+  const nextPayoutDate = stats?.nextPayoutDate
+    ? new Date(stats.nextPayoutDate + 'T12:00:00Z')
+        .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+    : null
 
   if (isLoading) return (
     <div>
@@ -148,10 +239,40 @@ export function DashboardPage() {
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
-      {(stats?.delinquentUnits || 0) > 0 && (
-        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=delinquent')}>
+      {/* ── S641 (Nic): "it needs to read any outstanding charges" ──────────
+          The units table counts unpaid RENT only — correct for the eviction
+          clock, wrong for a card a landlord reads as "who owes me". Jeremy
+          Parker paid his rent and not his electricity, so his spot read clean
+          while the money was still owed. */}
+      {(stats?.unitsOwing ?? stats?.delinquentUnits ?? 0) > 0 && (
+        // S641: opens the BALANCES page, not the delinquent-unit filter. The
+        // banner now counts anyone owing anything, and /units?status=delinquent
+        // would show two of the three — a card that disagrees with the page it
+        // opens is the bug this whole pass has been about.
+        // S654 (Nic): "until a unit is actually delinquent past its grace
+        // period, I would really love for that to say outstanding units… flag a
+        // difference between outstanding and delinquent based on when the grace
+        // period ends." Outstanding = owes anything; delinquent = a charge still
+        // open after its grace period. The late-fee line is only said when a fee
+        // will actually be charged — the API reads each lease's own terms.
+        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <Clock size={16} />
-          <strong>{stats!.delinquentUnits} delinquent unit(s)</strong> — In cure window. Late fees accruing.
+          {(() => {
+            const owing = stats!.unitsOwing ?? stats!.delinquentUnits ?? 0
+            const past = stats?.unitsPastGrace ?? 0
+            const accruing = stats?.delinquentUnitsAccruingLateFees ?? 0
+            return (
+              <>
+                <strong>{owing} unit{owing === 1 ? '' : 's'} with an outstanding balance</strong>
+                {past > 0
+                  ? <> — <strong>{past} delinquent</strong> (past the grace period).{' '}</>
+                  : <> — none past the grace period yet.{' '}</>}
+                {accruing > 0
+                  ? `Late fees accruing on ${accruing}.`
+                  : past > 0 ? 'No late fees accruing.' : ''}
+              </>
+            )
+          })()}
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
@@ -165,42 +286,78 @@ export function DashboardPage() {
 
 
       {/* S637: one property at a time. PropertySelect hides itself for a
-          single-property landlord, so this costs nothing for most accounts. */}
-      {properties.length > 1 && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-          <PropertySelect
-            value={propertyId}
-            onChange={setPropertyId}
-            properties={(properties as any[]).map(p => ({ id: p.id, name: p.name }))}
-            allLabel="All properties"
-          />
-          {propertyId && (
-            <span style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>
-              Showing one property — this is the view a co-owner of it sees.
-            </span>
-          )}
+          single-property landlord, so this costs nothing for most accounts.
+          S655: the Money received / Money billed switch sits beside it. */}
+      <div className="dash-basis-bar">
+        <IncomeBasisToggle basis={basis} onChange={setBasis} />
+        {properties.length > 1 && (
+          <div className="dash-prop-filter">
+            <PropertySelect
+              value={propertyId}
+              onChange={setPropertyId}
+              properties={(properties as any[]).map(p => ({ id: p.id, name: p.name }))}
+              allLabel="All properties"
+            />
+            {propertyId && (
+              <span className="dash-prop-note">
+                Showing one property — this is the view a co-owner of it sees.
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* S655: a dashboard that could not load says so once, in plain words —
+          it used to fall through to a grid of $0 cards that read as real. */}
+      {loadFailed && (
+        <div className="alert alert-warn" role="alert">
+          <AlertTriangle size={16} />
+          <span>{reportErrorText(error, 'your dashboard figures')}</span>
         </div>
       )}
 
       {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
-      <div className="kpi-grid" style={{gridTemplateColumns:"repeat(12, 1fr)"}}>
+      {/* While a new switch or property loads, the last figures stay up dimmed
+          rather than reading as the new choice's numbers. */}
+      {!loadFailed && (
+      <div className="kpi-grid dash-kpis" style={{gridTemplateColumns:"repeat(12, 1fr)", opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}}
+           aria-busy={isPreviousData || undefined}>
         {/* Row 1 (span 4): rent money trio */}
         {/* W-2 (S531): clicks through to the rent-roll page, whose total is
             the same formula as monthlyRentVolume. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
-          <div className="kpi-sub">contracted across {rentRollUnits} occupied units</div>
+          {/* S641 (Nic): the "$2,869 traded for work on 6" clause is gone — he
+              knows what his trades are and does not need the figure quoted back
+              on the rent card every time he opens the dashboard. The count
+              stays, and now says what it is counting against, so the number
+              reconciles with the Occupied Units card instead of looking like a
+              third unexplained figure. */}
+          <div className="kpi-sub">
+            payable across {payableUnits} of {occupiedUnits} occupied unit{occupiedUnits === 1 ? '' : 's'}
+          </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
-          <div className="kpi-label">Collected This Month</div>
-          <div className="kpi-value green">{fmtWhole(stats?.collectedMtd || 0)}</div>
-          <div className="kpi-sub">settled rent payments MTD</div>
+          <div className="kpi-label">{incomeCard.label}</div>
+          <div className="kpi-value green">{fmtWhole(incomeCard.amount)}</div>
+          {/* S642 (Nic): "Collected this month needs to show any in-flight
+              stuff… those two cards need to match up." S655 (§0.0): the card
+              is the income card, from the same facts as Reports. Money received
+              counts the day money ARRIVED — money paid ahead inside it, money
+              still clearing beside it, never in it. Money billed shows this
+              month's bills with collected so far · clearing · still owed. */}
+          <div className="kpi-sub" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {incomeCard.notes.length
+              ? incomeCard.notes.map(n => <span key={n}>{n}</span>)
+              : <span>{shownBasis === 'billed' ? 'bills due this month' : 'money that arrived this month'}</span>}
+          </div>
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
+          {/* S650 (Nic): no small print about work-trade balances here. */}
           <div className="kpi-sub">unpaid invoice balances</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
@@ -210,9 +367,18 @@ export function DashboardPage() {
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
         </div>
         {/* S527 W-4: land pre-filtered to active units. */}
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=active')}>
-          <div className="kpi-label">Active Units</div>
-          <div className="kpi-value green">{stats?.activeUnits || 0}</div>
+        {/* S641 (Nic): "my active units KPI card says thirty three, and the
+            expected monthly rent card only says thirty. So you have a three
+            unit distinction."
+            He is right and the gap was a definition, not a bug: this card
+            counted status='active' ONLY, while the rent card counted every
+            OCCUPIED space — active, delinquent, suspended. A delinquent space
+            has somebody living in it and owing rent; excluding it here and
+            including it there put two different denominators on one screen.
+            Occupied is occupied — the same rule the utility billing follows. */}
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=occupied')}>
+          <div className="kpi-label">Occupied Units</div>
+          <div className="kpi-value green">{occupiedUnits}</div>
           <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
         {/* S527 W-5: land pre-filtered to the expiring window. */}
@@ -237,34 +403,46 @@ export function DashboardPage() {
             one didn't, so the payout history was only reachable by knowing to
             look under Financials. */}
         <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/disbursements')}>
+          {/* S640 (Nic): "It's still showing a next disbursement of zero
+              dollars. The landlord's expecting money to be handled and moved.
+              They wanna know what's about to hit their bank."
+
+              It read the table of payouts ALREADY FIRED, so before the first
+              one it said $0 — while $2,049 of collected rent sat waiting to be
+              sent. Now it says what is going out, and names the part still
+              clearing separately rather than folding it in: quoting money that
+              has not cleared as "arriving Tuesday" is a promise we cannot
+              keep. */}
           <div className="kpi-label">Next Disbursement</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmtWhole(stats?.upcomingDisbursement?.amount || 0)}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>
+            {fmtWhole(Number(stats?.nextPayoutReady ?? 0) || (stats?.upcomingDisbursement?.amount || 0))}
+          </div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
-            Next payout {nextPayoutDate}
+            {Number(stats?.nextPayoutReady ?? 0) > 0
+              ? (nextPayoutDate ? `On its way to your bank — sent ${nextPayoutDate}` : 'On its way to your bank')
+              : (nextPayoutDate ? `Next payout ${nextPayoutDate}` : 'Next payout scheduled')}
           </div>
+          {Number(stats?.nextPayoutClearing ?? 0) > 0 && (
+            <div className="kpi-sub" style={{color:'var(--text-3)'}}>
+              {fmtWhole(Number(stats?.nextPayoutClearing))} still clearing at the tenant's bank
+            </div>
+          )}
         </div>
-        {/* Row 4 (span 4): your money with GAM — fee you pay, referral you earn, net.
-            S574 (Nic): kept as three separate cards (a cost, an income, the net)
-            rather than netting into one, so each reads clearly at a glance. */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
+        {/* Row 4: what you pay GAM.
+            S642 (Nic): the landlord referral program is withdrawn — "not
+            having something there is better than offering it to landlords and
+            then taking it away", and it cannot survive landlords onboarding
+            free. The Referral Earnings and Net Platform Cost cards went with
+            it; this one widens to fill the row rather than leaving a gap where
+            an offer used to be. */}
+        <div className="kpi-card" style={{gridColumn:'span 12',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmtWhole(platformFee)}</div>
-          <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
-        </div>
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/refer')}>
-          <div className="kpi-label">Referral Earnings</div>
-          <div className="kpi-value green">{fmtWhole(referralThisMonth)}</div>
-          <div className="kpi-sub">this month{referral?.referredCount ? ` · ${referral.referredCount} referred landlord${referral.referredCount === 1 ? '' : 's'}` : ''}</div>
-        </div>
-        <div className="kpi-card" style={{gridColumn:'span 4'}}>
-          <div className="kpi-label">Net Platform Cost</div>
-          <div className="kpi-value" style={{color: netToGam <= 0 ? 'var(--green)' : 'var(--text-0)'}}>
-            {netToGam < 0 ? `+${fmtWhole(-netToGam)}` : fmtWhole(netToGam)}
-          </div>
-          <div className="kpi-sub">{netToGam <= 0 ? 'referrals cover your fee' : 'fee − referral earnings'}</div>
+          <div className="kpi-sub">{platformFeeUnits} occupied × $2/unit · $10/property min</div>
         </div>
       </div>
+      )}
 
       {/* S159: PM cut MTD vs net to owner — only renders when there's
             an active PM linkage with measurable cut this month. */}
@@ -273,7 +451,13 @@ export function DashboardPage() {
       <div className="grid-2" style={{gap:20}}>
         {/* Property health — an animated ECG whose 6 beats are the last 6
             months of rent collected (taller beat = stronger month). */}
-        <PropertyHealthMonitor months={trendData} expected={stats?.monthlyRentVolume} collected={stats?.collectedMtd} />
+        {!loadFailed && <PropertyHealthMonitor
+          months={trendData}
+          basis={shownBasis}
+          rentBilled={stats?.rentCard?.billed}
+          thisMonth={stats?.propertyHealth}
+          stale={isPreviousData}
+        />}
 
         {/* Recent disbursements */}
         <div className="card">
@@ -302,7 +486,7 @@ export function DashboardPage() {
                       <td className="mono">{dateStr ? new Date(dateStr).toLocaleDateString() : '—'}</td>
                       <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
                       <td style={{fontSize:'.78rem'}}>
-                        {d.triggerType === 'auto_friday' ? 'Auto-Friday' : d.triggerType === 'manual_on_demand' ? 'Manual' : (d.triggerType ?? '—')}
+                        {DISBURSEMENT_TRIGGER_LABEL[d.triggerType] ?? (d.triggerType ? humanize(d.triggerType) : '—')}
                       </td>
                       <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' || d.status === 'processing' ? 'badge-amber' : 'badge-red'}`}>{humanize(d.status)}</span></td>
                     </tr>
@@ -361,7 +545,7 @@ export function DashboardPage() {
 
 function TodoCard() {
   const navigate = useNavigate()
-  const [expanded, setExpanded] = React.useState<{ onboarding: boolean; leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ onboarding: false, leases: false, ach: false, maintenance: false, workTrade: false })
+  const [expanded, setExpanded] = React.useState<{ stayMoney: boolean; paidAhead: boolean; depositRefunds: boolean; onboarding: boolean; leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ stayMoney: false, paidAhead: false, depositRefunds: false, onboarding: false, leases: false, ach: false, maintenance: false, workTrade: false })
 
   const { data: todos, isLoading } = useQuery<any>(
     'landlord-todos',
@@ -396,6 +580,12 @@ function TodoCard() {
   }
 
   const sections = [
+    // 10/4 (decisions #38 Q5): an early check-out's money still waiting on a stay.
+    { key: 'stayMoney', label: 'Early check-outs', icon: LogOut, color: 'var(--gold)', items: todos?.stayMoney || [] },
+    // 10/4 (decisions #46.1): money paid ahead left on an ended lease, waiting on the landlord's choice.
+    { key: 'paidAhead', label: 'Money paid ahead', icon: CreditCard, color: 'var(--gold)', items: todos?.paidAhead || [] },
+    // 10/4 (decisions #47a): part of a move-out's deposit refund still to go back.
+    { key: 'depositRefunds', label: 'Deposit refunds', icon: CreditCard, color: 'var(--gold)', items: todos?.depositRefunds || [] },
     { key: 'onboarding', label: 'Onboarding', icon: UserPlus, color: 'var(--green)', items: todos?.onboarding || [] },
     { key: 'leases', label: 'Lease Issues', icon: FileText, color: 'var(--gold)', items: todos?.leases || [] },
     { key: 'ach', label: 'ACH Issues', icon: CreditCard, color: 'var(--amber)', items: todos?.ach || [] },
@@ -490,8 +680,10 @@ function TodoCard() {
 
 function PmCutThisMonthCard() {
   const navigate = useNavigate()
-  const monthStart = (() => { const d = new Date(); d.setDate(1); return d.toISOString().slice(0,10) })()
-  const today = new Date().toISOString().slice(0,10)
+  // The viewer's calendar, never toISOString (UTC): at 8 pm on Oct 3 in
+  // Arizona, "the 1st" built that way is Oct 2 and today is Oct 4, so the
+  // card would leave out the 1st, the day most rent settles.
+  const { monthStart, today } = monthToDate()
 
   const { data } = useQuery<{ rows: Array<{
     propertyId: string; propertyName: string; pmCompanyId: string | null;
@@ -538,11 +730,22 @@ function PmCutThisMonthCard() {
   )
 }
 // Property Health — an animated ECG/"heartbeat monitor". Each of the last 6
-// months of rent collected is one PQRST beat; the R-spike height scales with
-// that month's collection relative to the strongest month (0 → flatline). A
-// sweeping scan bar + glow give the live-monitor feel. Falls back to a static
-// trace when the viewer prefers reduced motion.
-function PropertyHealthMonitor({ months, expected, collected }: { months: { month: string; revenue: number }[]; expected?: number; collected?: number }) {
+// months is one PQRST beat; the R-spike height scales with that month's total
+// under the switch relative to the strongest month (0 → flatline). A sweeping
+// scan bar + glow give the live-monitor feel. Falls back to a static trace
+// when the viewer prefers reduced motion.
+//
+// S655 (decision #4): under the trace, this month's income by category — the
+// SAME totals the property report shows for the same month and switch.
+function PropertyHealthMonitor({ months, basis, rentBilled, thisMonth, stale }: {
+  months: { month: string; revenue: number; rentRevenue?: number; otherRevenue?: number }[]
+  /** The basis the figures were counted under (the API's echo), not the switch mid-flip. */
+  basis: IncomeBasis
+  rentBilled?: { amount: number; collected: number; clearing: number; stillOwed: number }
+  thisMonth?: DashStats['propertyHealth']
+  /** The last answer, still up while a new switch or property loads: dimmed, like the KPI grid. */
+  stale?: boolean
+}) {
   const W = 640, H = 190
   const data = months.length ? months : Array.from({ length: 6 }, () => ({ month: '', revenue: 0 }))
   const vals = data.map(m => Math.max(0, Number(m.revenue) || 0))
@@ -572,20 +775,24 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
   })
   const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
 
-  // Health = how much of this month's EXPECTED lease rent has come in. A high
-  // outstanding balance (far from expected) reads red; as collections approach
-  // the expected monthly rent it goes green; at 100% it's gold. Lease rent only
-  // — short-term / walk-in reservation income isn't counted here.
-  const expectedN = Math.max(0, Number(expected) || 0)
-  const collectedN = Math.max(0, Number(collected) || 0)
-  const rate = expectedN > 0 ? collectedN / expectedN : null   // fraction of expected rent collected
+  // Health = how much of THIS MONTH'S RENT BILLS is paid (money still
+  // clearing counts — the tenant has paid). S655: read off the bills, not the
+  // contracted rent roll, and the same under either switch: "is rent getting
+  // paid" is a question about the bills. Under Money received, a bill paid by
+  // money that arrived last month (Todd) is paid, not missing. Red → green →
+  // gold (no amber — it'd read as the gold at a glance).
+  const rate = rentBillsPaidRate(rentBilled)
   const pct = rate == null ? null : Math.round(rate * 100)
-  // Clean red → green → gold (no amber — it'd read as the gold at a glance).
-  const status = rate == null
-    ? { label: 'Awaiting data',     color: 'var(--text-3)' }
-    : rate >= 1    ? { label: 'Fully collected', color: 'var(--gold)' }
-    : rate >= 0.85 ? { label: 'Healthy',         color: 'var(--green)' }
-    :                { label: 'Needs attention', color: 'var(--red)' }
+  const hs = healthStatus(rate)
+  const status = {
+    label: HEALTH_STATUS_LABEL[hs],
+    color: hs === 'full' ? 'var(--gold)' : hs === 'healthy' ? 'var(--green)' : hs === 'attention' ? 'var(--red)' : 'var(--text-3)',
+  }
+  const cats = activeCategories(thisMonth?.categories)
+  const otherLines = thisMonth?.lines ?? []
+  // The figure that adds up to the total under the switch.
+  const pick = (c: CategoryRow) => basis === 'billed' ? c.billed : c.collected
+  const second = (c: CategoryRow) => basis === 'billed' ? c.collected : c.billed
 
   // Hover: map the cursor to a month and surface that beat's details.
   const peaks = data.map((_, i) => ({ x: (i + 0.53) * bw, y: baseY - spk * (vals[i] / max) }))
@@ -600,7 +807,7 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
   }
 
   return (
-    <div className="card">
+    <div className="card" style={{ opacity: stale ? 0.55 : 1, transition: 'opacity .15s' }} aria-busy={stale || undefined}>
       <div className="card-header">
         <span className="card-title">Property Health — last 6 months</span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.72rem', fontWeight: 700, color: status.color }}>
@@ -610,14 +817,27 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
       <div className="phm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
         {hoverIdx == null ? (
           <div className="phm-readout">
-            <span className="phm-readout-label">rent collected · this month</span>
+            <span className="phm-readout-label">rent bills paid · this month</span>
             <span className="phm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
           </div>
         ) : (
           <div className="phm-tip" style={{ left: `clamp(62px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 62px))` }}>
+            {/* S639 (Nic): "when I hover over September's spike it says
+                $8,915.95, but the KPI card only shows $8,020. That's a nine
+                hundred dollar difference, and I'm trying to figure out why."
+                Both were right — this line is ALL money collected, the card is
+                rent only, and the $895.95 was utilities. Neither said which, so
+                the two numbers just looked broken. This one says. */}
             <div className="phm-tip-month">{data[hoverIdx].month || '—'}</div>
             <div className="phm-tip-val" style={{ color: status.color }}>{fmt(vals[hoverIdx])}</div>
-            <div className="phm-tip-sub">collected · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+            {(data[hoverIdx] as any).otherRevenue ? (
+              <div className="phm-tip-sub">
+                {fmt((data[hoverIdx] as any).rentRevenue)} lot/space rent
+                {' + '}{fmt((data[hoverIdx] as any).otherRevenue)} everything else
+              </div>
+            ) : (
+              <div className="phm-tip-sub">{basis === 'billed' ? 'money billed' : 'money received'} · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+            )}
           </div>
         )}
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={190} preserveAspectRatio="none"
@@ -649,6 +869,40 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
           {data.map((m, i) => <span key={i}>{m.month}</span>)}
         </div>
       </div>
+      {rentBilled && rentBilled.amount > 0 && (
+        <div className="phm-health-note">
+          {fmt(rentBilled.collected)} of {fmt(rentBilled.amount)} in rent bills paid this month
+          {rentBilled.clearing ? `, ${fmt(rentBilled.clearing)} still clearing` : ''}
+          {rentBilled.stillOwed ? `, ${fmt(rentBilled.stillOwed)} still owed` : ''}.
+        </div>
+      )}
+      {(cats.length > 0 || otherLines.length > 0) && (
+        <div className="phm-cats">
+          <div className="phm-cats-head">
+            <span>This month by category</span>
+            <span>{basis === 'billed' ? 'Billed · collected so far' : 'Received · billed'}</span>
+          </div>
+          {cats.map(c => (
+            <div key={c.category} className="phm-cat-row">
+              <span>{categoryLabel(c)}</span>
+              <span>{fmt(pick(c))}</span>
+              <span style={{ color: 'var(--text-3)' }}>{fmt(second(c))}</span>
+            </div>
+          ))}
+          {otherLines.map(l => (
+            <div key={l.line} className="phm-cat-row">
+              <span>{l.label}</span>
+              <span>{fmt(l.amount)}</span>
+              <span style={{ color: 'var(--text-3)' }}>—</span>
+            </div>
+          ))}
+          <div className="phm-cat-row total">
+            <span>{basis === 'billed' ? 'Money billed' : 'Money received'}</span>
+            <span>{fmt(thisMonth?.total ?? 0)}</span>
+            <span></span>
+          </div>
+        </div>
+      )}
       <style>{`
         .phm-screen { position: relative; background: radial-gradient(120% 90% at 50% 30%, rgba(20,26,22,.55), var(--bg-2)); border: 1px solid var(--border-0); border-radius: 10px; padding: 8px; overflow: hidden; cursor: crosshair; }
         .phm-hoverline { stroke: currentColor; stroke-width: 1; opacity: .55; stroke-dasharray: 3 3; }

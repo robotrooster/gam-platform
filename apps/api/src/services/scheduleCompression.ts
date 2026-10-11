@@ -75,12 +75,32 @@ export function slackScore(timeline: Interval[], win: Interval): number {
   return before + after
 }
 
+/** S649: out-of-order windows as timeline obstacles (open-ended = forever). */
+async function outOfOrderWindows(unitIds: string[]): Promise<Array<{ unit_id: string; check_in: string; check_out: string }>> {
+  if (!unitIds.length) return []
+  return query<any>(`
+    SELECT unit_id, starts_on::text AS check_in, COALESCE(ends_on::text, '9999-12-31') AS check_out
+      FROM unit_out_of_order
+     WHERE unit_id = ANY($1::uuid[]) AND cleared_at IS NULL`, [unitIds])
+}
+
 export interface CompressionMove {
   bookingId: string
   guestName: string | null
   fromUnit: string
   toUnit: string
   checkIn: string
+}
+
+/**
+ * 10/6 (review): a stay moved to another site takes its work trade and its
+ * utility agreement with it (services/stayTerms syncStayUtilityAgreement, which
+ * syncs the stay's work trade too). Best-effort — the move stands either way.
+ */
+async function followMovedStay(bookingId: string): Promise<void> {
+  const { syncStayUtilityAgreement } = await import('./stayTerms')
+  await syncStayUtilityAgreement(bookingId).catch(err =>
+    logger.error({ err, bookingId }, '[compress] the moved stay\'s work trade or utilities could not follow it'))
 }
 
 export async function compressPropertySchedule(propertyId: string): Promise<CompressionMove[]> {
@@ -107,11 +127,16 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
   for (const l of leaseRows) {
     siteById.get(l.unit_id)?.timeline.push({ checkIn: l.check_in, checkOut: l.check_out })
   }
+  // S649 (Nic): an out-of-order site is an obstacle like a lease — nothing is
+  // packed onto it, and a stay already on it moves off when there's room.
+  for (const o of await outOfOrderWindows(sites.map(s => s.id))) {
+    siteById.get(o.unit_id)?.timeline.push({ checkIn: o.check_in, checkOut: o.check_out })
+  }
 
   const bookingRows = await query<any>(`
     SELECT b.id, b.unit_id, b.guest_name, b.status, b.hold_expires_at,
            b.site_reveal_sent_at, b.required_site_layout, b.required_amp_service,
-           b.locked_to_unit,
+           b.locked_to_unit, b.avoided_unit_ids,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
       FROM unit_bookings b
@@ -148,6 +173,8 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
     for (const s of sites) {
       if (isSiteLayoutMismatch(b.required_site_layout, s.rv_site_layout)) continue
       if (isAmpServiceMismatch(b.required_amp_service, s.rv_amp_service)) continue
+      // S653 (Nic): "they didn't like the spot they were in last year."
+      if ((b.avoided_unit_ids ?? []).includes(s.id)) continue
       if (s.timeline.some(t => overlaps(t, win))) continue
       const score = slackScore(s.timeline, win)
       if (score < bestScore) { bestScore = score; placed = s }
@@ -166,6 +193,7 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
       await query(
         `UPDATE unit_bookings SET unit_id = $1, updated_at = NOW() WHERE id = $2`,
         [placed.id, b.id])
+      await followMovedStay(b.id)
     }
   }
   if (moves.length) {
@@ -224,7 +252,8 @@ export async function rankUnitsBestFit(
      WHERE unit_id = ANY($1::uuid[]) AND status IN ('active','pending')`,
     [unitIds])
   const timelines = new Map<string, Interval[]>(unitIds.map(id => [id, []]))
-  for (const r of [...bookingRows, ...leaseRows]) {
+  const oooRows = await outOfOrderWindows(unitIds)
+  for (const r of [...bookingRows, ...leaseRows, ...oooRows]) {
     timelines.get(r.unit_id)?.push({ checkIn: r.check_in, checkOut: r.check_out })
   }
   const w: Interval = { checkIn: winN.checkIn, checkOut: winN.checkOut }
@@ -263,7 +292,7 @@ export async function relocateBlockingBookings(
   const winN = { checkIn: dayStr(win.checkIn), checkOut: dayStr(win.checkOut) }
   const blockers = await query<any>(`
     SELECT b.id, b.guest_name, b.status, b.hold_expires_at, b.site_reveal_sent_at,
-           b.required_site_layout, b.required_amp_service, b.locked_to_unit,
+           b.required_site_layout, b.required_amp_service, b.locked_to_unit, b.avoided_unit_ids,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            u.property_id, u.unit_number,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
@@ -302,7 +331,8 @@ export async function relocateBlockingBookings(
        ORDER BY unit_number`, [blk.property_id, unitId])
     const compatible = candidates.filter((c: any) =>
       !isSiteLayoutMismatch(blk.required_site_layout, c.rv_site_layout) &&
-      !isAmpServiceMismatch(blk.required_amp_service, c.rv_amp_service))
+      !isAmpServiceMismatch(blk.required_amp_service, c.rv_amp_service) &&
+      !(blk.avoided_unit_ids ?? []).includes(c.id))   // S653: never onto a site they asked not to have
     const ranked = await rankUnitsBestFit(
       compatible.map((c: any) => c.id),
       { checkIn: blk.check_in, checkOut: blk.check_out })
@@ -311,6 +341,7 @@ export async function relocateBlockingBookings(
     }
     const target = candidates.find((c: any) => c.id === ranked[0])
     await query(`UPDATE unit_bookings SET unit_id = $1, updated_at = NOW() WHERE id = $2`, [ranked[0], blk.id])
+    await followMovedStay(blk.id)
     moves.push({
       bookingId: blk.id, guestName: blk.guest_name,
       fromUnit: blk.unit_number, toUnit: target?.unit_number ?? ranked[0],

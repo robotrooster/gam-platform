@@ -16,6 +16,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { EntityPicker } from '../components/EntityPicker'
 
 interface PoolEntry {
   id:                 string
@@ -290,6 +291,10 @@ function ReachOutModal({ entry, onClose }: { entry: PoolEntry; onClose: () => vo
   const [unitId,  setUnitId]  = useState<string>('')
   const [message, setMessage] = useState<string>('')
   const [error,   setError]   = useState<string | null>(null)
+  // S654 (Nic): no default company. With no unit offered, the outreach has
+  // nothing to derive its company from, so an account that owns several
+  // picks one here; one company needs no picking.
+  const [landlordId, setLandlordId] = useState<string>('')
 
   // W-48 (S529): only units actually AVAILABLE — free of any active lease or
   // upcoming reservation from today onward, via the shared /units/available
@@ -307,6 +312,7 @@ function ReachOutModal({ entry, onClose }: { entry: PoolEntry; onClose: () => vo
   const mut = useMutation(
     () => apiPost(`/background/pool/${entry.id}/reach-out`, {
       unitId:  unitId || null,
+      landlordId: unitId ? undefined : (landlordId || undefined),
       message: message.trim() || null,
     }),
     {
@@ -341,6 +347,10 @@ function ReachOutModal({ entry, onClose }: { entry: PoolEntry; onClose: () => vo
           </div>
         </div>
 
+        {!unitId && (
+          <EntityPicker value={landlordId} onChange={setLandlordId} label="Reaching out as"
+            note="With no unit offered, the invitation goes out under this company." />
+        )}
         <div style={{ marginBottom: 12 }}>
           <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 4 }}>
             Unit offered <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional — leave blank to invite for any vacancy)</span>

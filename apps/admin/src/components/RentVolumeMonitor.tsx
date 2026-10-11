@@ -40,10 +40,17 @@ export interface TrendPoint {
   revenue: number
 }
 
-const fmt = (n: number) =>
-  n >= 1000
-    ? `$${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`
-    : `$${n.toFixed(0)}`
+/**
+ * S642 (Nic): "the admin portal shows twenty thousand dollars" against the
+ * landlord's $19,700.14. Same number — the old formatter rounded anything over
+ * $10k to whole thousands, so $19,700.14 printed as "$20k" and read as a THIRD
+ * figure agreeing with neither screen. There are only two places money is
+ * shown here, the headline and the hover, and both have room for it, so the
+ * abbreviating formatter is gone rather than kept for a caller that no longer
+ * exists.
+ */
+const exact = (n: number) =>
+  new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 
 const fullMonth = (iso: string) => {
   const m = /^(\d{4})-(\d{2})/.exec(iso)
@@ -90,11 +97,13 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
   })
   const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
 
-  // The colour reads MOMENTUM, not health: this month against the average of
+  // The color reads MOMENTUM, not health: this month against the average of
   // the ones before it. A platform-wide total has no "expected" to measure
   // against the way one property's rent roll does, so inventing a target would
   // be a made-up number on a dashboard that just had one removed.
   const current = vals[vals.length - 1] ?? 0
+  // S639: how much of the current month's figure has not cleared yet.
+  const inFlightNow = Number((data[data.length - 1] as any)?.inFlight ?? 0) || 0
   const prior = vals.slice(0, -1)
   const priorAvg = prior.length ? prior.reduce((s, v) => s + v, 0) / prior.length : 0
   const trend = priorAvg > 0 ? current / priorAvg : null
@@ -126,19 +135,41 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.72rem', fontWeight: 700, color: status.color }}>
           <Activity size={15} /> {status.label}
         </span>
-        {/* S616 (Nic): "are we just tracking the rent volume and not the stripe
-            charge volume?" We were. Gross is what Stripe charged, obligations
-            is what it settled, fees is the difference the tenant bore — shown
-            side by side so this card ties out to the Stripe dashboard instead
-            of approximating it. */}
+        {/* S642 (Nic): "Why is the gross $6,399.05? Why are the obligations
+            $20,160.14? I need a better breakdown because that doesn't map
+            correctly to anything I'm aware of."
+            
+            Because two of the three came from a Stripe-only table and the third
+            from every rail. "Gross" and "fees" are summed from
+            tenant_remittances, which only has rows when Stripe was involved;
+            "obligations" is summed from payments, which includes cash, checks
+            and money orders. In the month he was reading, 69% of the money had
+            never touched Stripe — $8,391 cash, $3,745 checks, $1,823 money
+            orders — so the two figures could not reconcile and the labels gave
+            no hint of it. The S616 note under here claimed the card "ties out
+            to the Stripe dashboard"; it cannot, because obligations is not a
+            Stripe number.
+            
+            Named by RAIL now, which is the distinction that actually exists. */}
         {(() => {
           const last: any = data[data.length - 1] || {}
           if (!last.gross) return null
+          const online = Number(last.gross) - Number(last.fees ?? 0)
+          const offline = Number(last.revenue ?? 0) - online
           return (
             <span style={{ display: 'inline-flex', gap: 10, fontSize: '.7rem', color: 'var(--t3)' }}>
-              <span>gross <strong style={{ color: 'var(--t0)' }}>${Number(last.gross).toFixed(2)}</strong></span>
-              <span>obligations <strong style={{ color: 'var(--t0)' }}>${Number(last.revenue ?? 0).toFixed(2)}</strong></span>
-              <span>fees <strong style={{ color: 'var(--t0)' }}>${Number(last.fees ?? 0).toFixed(2)}</strong></span>
+              <span title="Every rail — card, bank, cash, check and money order">
+                collected <strong style={{ color: 'var(--t0)' }}>${Number(last.revenue ?? 0).toFixed(2)}</strong>
+              </span>
+              <span title={`Card and bank only. Stripe charged $${Number(last.gross).toFixed(2)}, of which $${Number(last.fees ?? 0).toFixed(2)} was the processing fee the tenant paid on top.`}>
+                via Stripe <strong style={{ color: 'var(--t0)' }}>${online.toFixed(2)}</strong>
+                <span style={{ color: 'var(--t3)' }}> (+${Number(last.fees ?? 0).toFixed(2)} fee)</span>
+              </span>
+              {offline > 0.005 && (
+                <span title="Cash, checks and money orders — recorded at the desk, never through Stripe">
+                  at the desk <strong style={{ color: 'var(--t0)' }}>${offline.toFixed(2)}</strong>
+                </span>
+              )}
               {Number(last.inFlight ?? 0) > 0 && (
                 /* S616: money the tenant has sent that Stripe has not released
                    yet — an ACH debit sits here ~4 business days AFTER the
@@ -175,17 +206,28 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
       <div className="rvm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
         {hoverIdx == null ? (
           <div className="rvm-readout">
-            <span className="rvm-readout-label">collected · this month</span>
-            <span className="rvm-readout-value" style={{ color: status.color }}>{fmt(current)}</span>
+            {/* S639 (Nic): "the heartbeat monitor is saying nine point nine k
+                collected versus the other heartbeat monitor saying eight point
+                nine k." Both right, neither labeled. This one counts money the
+                TENANT HAS SENT — including ACH still clearing — which was a
+                deliberate S616 decision so the chart does not flatline during
+                the first week of every month, exactly when rent arrives. The
+                landlord's card counts SETTLED only. The $980.20 between them
+                was three ACH payments in flight. */}
+            <span className="rvm-readout-label">received · this month{inFlightNow > 0 ? ' (incl. in flight)' : ''}</span>
+            <span className="rvm-readout-value" style={{ color: status.color }}>{exact(current)}</span>
           </div>
         ) : (
           <div className="rvm-tip" style={{ left: `clamp(70px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 70px))` }}>
             <div className="rvm-tip-month">
               {data[hoverIdx].monthStart ? fullMonth(data[hoverIdx].monthStart) : '—'}
             </div>
-            <div className="rvm-tip-val" style={{ color: status.color }}>{fmt(vals[hoverIdx])}</div>
+            <div className="rvm-tip-val" style={{ color: status.color }}>{exact(vals[hoverIdx])}</div>
             <div className="rvm-tip-sub">
-              {vals[hoverIdx] === 0 ? 'nothing collected' : `${Math.round((vals[hoverIdx] / max) * 100)}% of peak`}
+              {vals[hoverIdx] === 0 ? 'nothing received'
+                : Number((data[hoverIdx] as any)?.inFlight ?? 0) > 0
+                  ? `incl. $${Number((data[hoverIdx] as any).inFlight).toFixed(2)} still clearing`
+                  : `${Math.round((vals[hoverIdx] / max) * 100)}% of peak`}
             </div>
           </div>
         )}
@@ -222,7 +264,9 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
       </div>
 
       <div style={{ fontSize: '.66rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
-        Rent, utilities and fees that actually settled, by the month the money moved. Each beat is
+        Rent, utilities and fees the tenant has SENT — settled, plus ACH still clearing —
+        by the month the money moved. A landlord's own dashboard counts settled only, so
+        this figure runs ahead of theirs while payments are in flight. Each beat is
         one month; spike height is that month against the strongest in view, so a big month towers
         and a dead month flatlines. Contracted rent is the KPI above — this is what came in.
       </div>

@@ -1,8 +1,12 @@
 import { Resend } from 'resend'
-import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/shared'
+import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
+import { portalLink } from '../lib/portalUrls'
+import { replyAddressesFor, type ReplyTo } from './replyRouting'
 import { buildDemoBookingIcs } from './demoCalendar'
+// S651: read before every send — see the comment at the send decision below.
+import { suppressionFor } from './emailSuppressions'
 
 // S630: no key, no sender. The Resend constructor throws on a missing key, at
 // IMPORT time, which took the whole API down rather than degrading — and the
@@ -88,6 +92,13 @@ export interface EmailSendContext {
   relatedEntityType?: string | null
   relatedEntityId?: string | null
   metadata?: Record<string, unknown>
+  /**
+   * 10/5: who gets a reply (services/replyRouting). Omitted = GAM support.
+   * Mail about a property a landlord runs — to its residents, guests,
+   * applicants — passes { kind: 'property', propertyId } so replies reach the
+   * people who run that property, never GAM.
+   */
+  replyTo?: ReplyTo
 }
 
 /**
@@ -142,10 +153,34 @@ async function send(
   const isTestAddress = TEST_DOMAINS.some((d) => toLower.endsWith(d))
     || RESERVED_TLDS.some((t) => toLower.endsWith(t))
   const willSend = (nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1') && !isTestAddress
-  let status: 'sent' | 'failed' = 'sent'
+  let status: 'sent' | 'failed' | 'suppressed' | 'undeliverable' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
-  if (willSend) {
+
+  // S651 — DO NOT PRETEND TO SEND TO AN ADDRESS THE PROVIDER HAS GIVEN UP ON.
+  //
+  // Once Resend suppresses an address, every send to it is accepted, assigned a
+  // message id, and thrown away. No delivered event, no bounced event, nothing.
+  // Thirteen emails to Rashawn Bump disappeared that way over three weeks —
+  // invitations, reminders and two lease signing requests — every one of them
+  // written here as 'sent'. From the landlord's side a tenant was ignoring him.
+  //
+  // The point is not saving an API call. It is that this row is the answer to
+  // "did they get it?", and a row that says 'sent' about a message the provider
+  // will discard is worse than no row, because somebody believes it.
+  // 10/5: where a reply lands. Resolved even when nothing is sent, so the log
+  // row says who would have heard back.
+  const routedReplyTo = ctx.replyTo ? await replyAddressesFor(ctx.replyTo) : null
+  if (routedReplyTo) ctx = { ...ctx, metadata: { ...(ctx.metadata ?? {}), reply_to: routedReplyTo } }
+  const suppressed = willSend ? await suppressionFor(to) : null
+  if (suppressed) {
+    status = 'undeliverable'
+    errorMessage = `Address is on the mail provider suppression list (${suppressed.origin}`
+      + `${suppressed.suppressedAt ? ` since ${suppressed.suppressedAt.slice(0, 10)}` : ''})`
+      + ' — nothing sent. Correct the address; resending to this one cannot work.'
+    logger.warn({ to, subject, origin: suppressed.origin },
+      '[EMAIL UNDELIVERABLE] provider suppresses this address — not sent')
+  } else if (willSend) {
     try {
       // S322: optional attachments via Resend's documented attachments[]
       // field. Unset for the existing callers — only the new
@@ -158,7 +193,7 @@ async function send(
       const sendArgs: any = {
         from: senderFor(from), to, subject, html,
         text: htmlToPlainText(html),
-        reply_to: FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined,
+        reply_to: routedReplyTo ?? (FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined),
       }
       if (attachments && attachments.length > 0) sendArgs.attachments = attachments
       if (!resend) {
@@ -182,7 +217,19 @@ async function send(
       logger.error({ err: e }, '[EMAIL FAILED]')
     }
   } else {
+    // S641: the log must not claim we sent something we did not. This row is
+    // the answer to "did the tenant get their notice?", and a record that
+    // cannot tell "delivered" from "never left the machine" is worse than no
+    // record, because it is believed.
+    status = 'suppressed'
     logger.info(`[EMAIL SUPPRESSED — ${nodeEnv}] ${subject} -> ${to}`)
+    // S637: test logins used to recover the code from the SUBJECT in this log
+    // line (S571). The code is no longer there — it is in the body now — so
+    // print the body for this one category. Process log only; the database
+    // still never sees it.
+    if (ctx.category === 'login_2fa_code') {
+      logger.info(`[EMAIL SUPPRESSED BODY] ${htmlToPlainText(html)}`)
+    }
   }
   // Best-effort log — never let logging failure break a user-facing flow.
   try {
@@ -284,7 +331,7 @@ export async function emailNewBackgroundCheck(landlordEmail: string, landlordNam
 // S547: the guest's stay link — their key to the tokened stay page on the
 // property's site (amenity booking, stay details). Sent at booking and via
 // the "resend my stay link" box.
-export async function emailGuestStayLink(guestEmail: string, guestName: string | null, propertyName: string, stayUrl: string, ctx?: { landlordId?: string }) {
+export async function emailGuestStayLink(guestEmail: string, guestName: string | null, propertyName: string, stayUrl: string, ctx?: { landlordId?: string; replyTo?: ReplyTo }) {
   await send(guestEmail, `Your stay at ${propertyName}`,
     base(h('Your stay link') +
       p(`Hi ${guestName || 'there'},`) +
@@ -293,26 +340,54 @@ export async function emailGuestStayLink(guestEmail: string, guestName: string |
       btn('Open my stay', stayUrl) +
       `<p style="color:#888;font-size:12px">${stayUrl}</p>`
     ),
-    { category: 'guest_stay_link', landlordId: ctx?.landlordId ?? null }
+    { category: 'guest_stay_link', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
   )
 }
 
-// S547 (Nic): landlord-INITIATED screening request for a long-stay guest.
-// Sent only when the landlord explicitly chooses to screen — the system
-// never auto-sends a background check to a prospect.
-export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string }) {
-  await send(guestEmail, `${propertyName} — screening needed for your extended stay`,
-    base(h('One more step for your extended stay') +
+/**
+ * S652 — the site on a reservation changed, and the guest hears it from us
+ * before they arrive and find somebody else parked there.
+ *
+ * Only ever sent for a MOVE. A guest whose reservation was displaced entirely
+ * gets a phone call, not an email — see services/holdDisplacement.
+ */
+export async function emailBookingSiteChanged(
+  guestEmail: string, guestName: string | null, propertyName: string,
+  fromSite: string, toSite: string, ctx?: { landlordId?: string; replyTo?: ReplyTo },
+) {
+  await send(guestEmail, `Your site at ${propertyName} is now ${toSite}`,
+    base(h('Your site has changed') +
       p(`Hi ${guestName || 'there'},`) +
-      p(`<strong style="color:#eef1f8">${propertyName}</strong> asks guests staying 30 nights or longer to complete a routine background screening before the lease is finalized.`) +
-      p('Sign in to your GAM account (or create one with this email address) and complete the screening from your portal — it takes a few minutes.') +
-      btn('Complete screening', portalUrl)
+      p(`We have moved your reservation at <strong style="color:#eef1f8">${propertyName}</strong> `
+        + `from site <strong style="color:#eef1f8">${fromSite}</strong> to site `
+        + `<strong style="color:#eef1f8">${toSite}</strong>.`) +
+      p('Your dates have not changed and nothing else about your reservation is different.') +
+      p('If that site does not suit you, just reply to this email or give us a ring and we will sort it out.')
     ),
-    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null }
+    { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
   )
 }
 
-export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string }) {
+// S547 (Nic): screening request for a long-stay guest.
+// 10/5 (Nic): a stay of more than three weeks needs a background check before
+// check-in, and its fee is taken with the stay's payment — `prepaid` says so,
+// so the guest is never asked to pay for it again.
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
+  await send(guestEmail, `${propertyName} — background check for your stay`,
+    base(h('One more step before check-in') +
+      p(`Hi ${guestName || 'there'},`) +
+      p(`<strong style="color:#eef1f8">${propertyName}</strong> asks guests staying more than three weeks to complete a background check before check-in.`) +
+      (ctx?.prepaid
+        ? p('The check is already paid for — it was part of your stay\'s payment, so there is nothing more to pay.')
+        : '') +
+      p('Sign in to your GAM account (or create one with this email address) and complete the check from your portal — it takes a few minutes.') +
+      btn('Complete background check', portalUrl)
+    ),
+    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo, metadata: { prepaid: !!ctx?.prepaid } }
+  )
+}
+
+export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
   const approved = decision === 'approved'
   await send(tenantEmail,
     approved ? 'Your application has been approved! 🎉' : 'Update on your rental application',
@@ -332,13 +407,14 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
       relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
       relatedEntityId: ctx?.backgroundCheckId ?? null,
       metadata: { decision },
+      replyTo: ctx?.replyTo,
     }
   )
 }
 
 // ── POOL EMAILS ───────────────────────────────────────────────
 
-export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string }) {
+export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
   await send(tenantEmail, `A landlord is interested in you — ${propertyName}`,
     base(
       h('You Have a Match!') +
@@ -353,6 +429,7 @@ export async function emailPoolMatchInterest(tenantEmail: string, tenantName: st
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.matchRequestId ? 'pool_match_request' : null,
       relatedEntityId: ctx?.matchRequestId ?? null,
+      replyTo: ctx?.replyTo,
     }
   )
 }
@@ -377,25 +454,35 @@ export async function emailPoolTenantInterested(landlordEmail: string, landlordN
 
 // ── E-SIGN EMAILS ─────────────────────────────────────────────
 
-export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string }) {
-  await send(to, `Please sign: ${documentTitle}`,
+export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; replyTo?: ReplyTo }) {
+  // S647: a resident who has never set up their account gets ONE email that
+  // does both — set a password, then land on the lease (services/
+  // tenantLeaseLink). Saying so plainly is the point: "accept" and "sign" used
+  // to arrive as two emails, and people believed the first was the second.
+  const setup = !!ctx?.needsSetup
+  await send(to, setup ? `Your lease is ready to sign — ${unitLabel}` : `Please sign: ${documentTitle}`,
     base(
-      h('Document Ready for Your Signature') +
+      h(setup ? 'Your Lease Is Ready to Sign' : 'Document Ready for Your Signature') +
       p(`Hi ${signerName},`) +
-      p(`<strong style="color:#eef1f8">${landlordName}</strong> has sent you a document to review and sign:`) +
+      (setup
+        ? p(`<strong style="color:#eef1f8">${landlordName}</strong> has signed your lease and it is ready for you. The button below sets up your GAM account and takes you straight to your signature — it is one step, and your lease is not signed until you finish it:`)
+        : p(`<strong style="color:#eef1f8">${landlordName}</strong> has sent you a document to review and sign:`)) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
       </div>` +
       p('Please review the document carefully before signing. This is a legally binding agreement under UETA and the federal E-SIGN Act.') +
-      btn('Review & Sign Document', signingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+      btn(setup ? 'Set Up Account & Sign Lease' : 'Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${setup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to access this document.'}</div>`
     ),
     {
       category: 'esign_signing_request',
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     // ── S637: SIGNING MAIL COMES FROM A REPLYABLE ADDRESS ──────────────────
     //
@@ -418,7 +505,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
   )
 }
 
-export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string }, pdfBytes?: Buffer) {
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
   // S637: no leading emoji in a transactional subject — it is a spam signal
   // and this one goes out at the moment a lease becomes legally binding.
   await send(to, `Document fully signed: ${documentTitle}`,
@@ -451,6 +538,7 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     'noreply',
     pdfBytes ? [{ filename: 'signed-lease.pdf', content: pdfBytes }] : undefined,
@@ -459,68 +547,47 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
 
 // ── ESIGN REMINDER + AUTO-VOID EMAILS (S29) ───────────────
 
-export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string }) {
+export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; documentCount?: number; replyTo?: ReplyTo }) {
+  // S652: one reminder per packet. documentCount > 1 means this covers the
+  // whole packet; the link opens the first document and walks through the rest.
+  const n = ctx?.documentCount ?? 1
   await send(to, `Reminder: please sign ${documentTitle}`,
     base(
-      h('Reminder: Document Awaiting Your Signature') +
+      h(n > 1 ? 'Reminder: Documents Awaiting Your Signature' : 'Reminder: Document Awaiting Your Signature') +
       p(`Hi ${signerName},`) +
-      p(`This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a document to review and sign, and it has not yet been signed:`) +
+      p(n > 1
+        ? `This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a packet of documents to review and sign, and <strong style="color:#eef1f8">${n}</strong> of them still need your signature. The link below opens the first and walks you through the rest — this is the only reminder for the whole packet.`
+        : `This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a document to review and sign, and it has not yet been signed:`) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
       </div>` +
-      p('If the document is not signed within 24 hours of being sent, it will be automatically voided.') +
-      btn('Review & Sign Document', signingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+      // S637 (Nic): the window became 48 hours in S636 and this copy did not
+      // follow. He read his own auto-void email and thought the rule had been
+      // reverted: "I thought we changed it to be forty eight hours."
+      p('If the document is not signed within 48 hours of being sent, it will be automatically voided.') +
+      btn(ctx?.needsSetup ? 'Set Up Account & Sign Lease' : 'Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${ctx?.needsSetup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to access this document.'}</div>`
     ),
     {
       category: 'esign_signing_reminder',
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     },
     'support',   // S637: same reasoning as the request above.
   )
 }
 
-// S234: tenant decline-with-reason. Fires to the landlord (and any
-// other landlord-side recipients passed in `to`) when a signer hits
-// the Decline button on the sign page. The doc is voided as a side
-// effect of decline; the landlord can optionally re-send a new doc.
-export async function emailDocumentDeclined(to: string, recipientName: string, signerName: string, signerRole: string, documentTitle: string, unitLabel: string, reason: string | null, ctx?: { landlordId?: string; documentId?: string }) {
-  const reasonBlock = reason && reason.trim()
-    ? `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #dc4c4c">
-         <div style="font-size:.72rem;font-weight:700;color:#dc4c4c;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Reason given</div>
-         <div style="color:#eef1f8;line-height:1.45">${escapeHtml(reason.trim())}</div>
-       </div>`
-    : p('<em style="color:#b8c4d8">No reason provided.</em>')
-  await send(to, `Document declined: ${documentTitle}`,
-    base(
-      h('A Signer Declined Your Document') +
-      p(`Hi ${recipientName},`) +
-      p(`<strong>${escapeHtml(signerName)}</strong> (${escapeHtml(signerRole)}) declined to sign the following document:`) +
-      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(documentTitle)}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)}</div>
-      </div>` +
-      reasonBlock +
-      p('The document has been voided. If the issue is resolvable, prepare a new document and re-send it for signing.')
-    ),
-    {
-      category: 'esign_document_declined',
-      landlordId: ctx?.landlordId ?? null,
-      relatedEntityType: ctx?.documentId ? 'document' : null,
-      relatedEntityId: ctx?.documentId ?? null,
-    }
-  )
-}
-
-export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string }) {
+export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }) {
   await send(to, `Document auto-voided: ${documentTitle}`,
     base(
       h('Document Has Been Auto-Voided') +
       p(`Hi ${recipientName},`) +
-      p('The following document was automatically voided because it was not signed by all parties within 24 hours of being sent:') +
+      p('The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
@@ -532,20 +599,295 @@ export async function emailDocumentAutoVoided(to: string, recipientName: string,
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
+      replyTo: ctx?.replyTo,
     }
+  )
+}
+
+// ── NEW LEASE FOR A HOUSEHOLD ALREADY LIVING THERE (S655) ─────
+//
+// Nic (10/2): tenant copy about a new lease reads as a new lease / a rent
+// update — never "we're ending your lease". The current lease stays as it is
+// until the new one starts; from that day the new lease's rent is what is
+// billed, signed or not (it says so plainly, without threatening anyone).
+
+/** "January 1, 2027" from 'YYYY-MM-DD'. */
+function newLeaseDate(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return String(iso)
+  return new Date(Date.UTC(y, m - 1, d))
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+function newLeaseMoney(n: number | string | null | undefined): string {
+  return '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+/** The day before 'YYYY-MM-DD', as words. */
+function newLeaseDayBefore(iso: string): string {
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d - 1))
+  return t.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+function newLeaseBox(unitLabel: string, startDate: string, rent: number | string, started = false) {
+  return `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">New lease — ${started ? 'started' : 'starts'} ${escapeHtml(newLeaseDate(startDate))}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)} · ${newLeaseMoney(rent)} a month</div>
+      </div>`
+}
+
+/**
+ * The tenant's signing request for a new lease (sent when the landlord signs).
+ * Same link rules as emailSigningRequest (S647: one email that sets up the
+ * account and opens the lease when they have none yet).
+ *
+ * `started`: the start date is today or already past by the property's calendar
+ * (a landlord may sign on or after it while that date is not billed yet — the
+ * lease is then in force at once). "Your current lease stays as it is through
+ * <a day already gone>" would be false, so it says the new lease is their lease
+ * now — the signing page and the banner say the same.
+ */
+export async function emailNewLeaseSigningRequest(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
+  startDate: string; rent: number | string; landlordId?: string; documentId?: string; needsSetup?: boolean
+  started?: boolean; replyTo?: ReplyTo
+}) {
+  const setup = !!ctx.needsSetup
+  await send(to, `Your new lease is ready to sign — ${unitLabel}`,
+    base(
+      h('Your New Lease Is Ready to Sign') +
+      p(`Hi ${escapeHtml(signerName)},`) +
+      p(`<strong style="color:#eef1f8">${escapeHtml(landlordName)}</strong> has signed a new lease for your home and it is ready for your signature.`) +
+      newLeaseBox(unitLabel, ctx.startDate, ctx.rent, ctx.started) +
+      p(ctx.started
+        ? `Your new lease started ${escapeHtml(newLeaseDate(ctx.startDate))} and is your lease now — ` +
+          `${newLeaseMoney(ctx.rent)} a month. Please read it and sign it.`
+        : `Nothing changes today. Your current lease stays exactly as it is through ${escapeHtml(newLeaseDayBefore(ctx.startDate))}. ` +
+          `Starting ${escapeHtml(newLeaseDate(ctx.startDate))}, the new lease takes over and your rent is ${newLeaseMoney(ctx.rent)} a month. ` +
+          `Please read it and sign it.`) +
+      p('This is a legally binding agreement under UETA and the federal E-SIGN Act.') +
+      btn(setup ? 'Set Up Account & Sign Lease' : 'Review & Sign New Lease', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${setup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to open it. It is also waiting on your Home page.'}</div>`
+    ),
+    {
+      category: 'esign_signing_request',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+      replyTo: ctx.replyTo,
+    },
+    'support',
+  )
+}
+
+/**
+ * A reminder to the TENANT to sign their new lease (14 and 3 days before it
+ * starts). One household, one document — one email.
+ */
+export async function emailNewLeaseSigningReminder(to: string, signerName: string, unitLabel: string, landlordName: string, signingUrl: string, ctx: {
+  startDate: string; rent: number | string
+  landlordId?: string; documentId?: string; needsSetup?: boolean; replyTo?: ReplyTo
+}) {
+  const when = newLeaseDate(ctx.startDate)
+  await send(to, `Reminder: your new lease starts ${when}`,
+    base(
+      h('Your New Lease Is Waiting for Your Signature') +
+      p(`Hi ${escapeHtml(signerName)},`) +
+      p(`A reminder that your new lease from <strong style="color:#eef1f8">${escapeHtml(landlordName)}</strong> is waiting for your signature.`) +
+      newLeaseBox(unitLabel, ctx.startDate, ctx.rent) +
+      p(`Your current lease stays as it is through ${escapeHtml(newLeaseDayBefore(ctx.startDate))}. ` +
+        `Starting ${escapeHtml(when)}, the new lease takes over and your rent is ${newLeaseMoney(ctx.rent)} a month. Please read it and sign it.`) +
+      btn(ctx.needsSetup ? 'Set Up Account & Sign Lease' : 'Review & Sign New Lease', signingUrl)
+    ),
+    {
+      category: 'esign_signing_reminder',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+      replyTo: ctx.replyTo,
+    },
+    'support',
+  )
+}
+
+// ── To the LANDLORD: one email per person per run, never one per lease ─────
+//
+// S652 "one email per thing" (reminders per packet, alerts as one digest). The
+// park-wide sender drafts a new lease for every household at once, so anything
+// the landlord hears about new leases is a LIST: forty drafts waiting on them is
+// one morning email, not forty.
+
+export interface NewLeaseDigestItem {
+  unitLabel: string
+  startDate: string | null
+  rent?: number | string | null
+  /** Who in the household has not signed (the "not signed yet" alerts). */
+  tenantNames?: string | null
+}
+
+function newLeaseList(items: NewLeaseDigestItem[]): string {
+  const rows = items.map(it => {
+    const bits = [
+      it.tenantNames ? escapeHtml(it.tenantNames) : null,
+      it.startDate ? `starts ${escapeHtml(newLeaseDate(it.startDate))}` : null,
+      it.rent != null && String(it.rent).trim() !== '' && Number(it.rent) > 0 ? `${newLeaseMoney(it.rent)} a month` : null,
+    ].filter(Boolean).join(' · ')
+    return `<div style="padding:8px 0;border-bottom:1px solid #1d2733">
+        <div style="font-weight:700;color:#eef1f8">${escapeHtml(it.unitLabel)}</div>
+        ${bits ? `<div style="font-size:.82rem;color:#b8c4d8">${bits}</div>` : ''}
+      </div>`
+  }).join('')
+  return `<div style="margin:12px 0;padding:4px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">${rows}</div>`
+}
+const newLeaseCount = (n: number) => `${n} new lease${n === 1 ? '' : 's'}`
+
+/**
+ * To the landlord, each morning while new leases they drafted wait on their
+ * signature: every one of them in one email, with one link that opens the first
+ * and walks on to the next.
+ */
+export async function emailNewLeasesAwaitingLandlord(to: string, recipientName: string, items: NewLeaseDigestItem[], signingUrl: string, ctx: {
+  landlordId?: string; documentId?: string
+} = {}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  await send(to, one ? `Reminder: sign the new lease for ${items[0].unitLabel}` : `Reminder: ${newLeaseCount(items.length)} waiting for your signature`,
+    base(
+      h(one ? 'A New Lease Is Waiting for Your Signature' : `${items.length} New Leases Are Waiting for Your Signature`) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      p(one
+        ? 'The new lease below is drafted and waiting for your signature. Open it, check the rent and start date, and sign — the household gets it right after.'
+        : 'The new leases below are drafted and waiting for your signature. The button opens the first; each signature moves you on to the next. Each household gets theirs right after you sign it.') +
+      newLeaseList(items) +
+      p(`A new lease you have not signed by its start date is canceled, and nothing changes for that household.`) +
+      btn(one ? 'Open & Sign' : 'Open & Sign Them', signingUrl)
+    ),
+    {
+      category: 'esign_signing_reminder',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+    'support',
+  )
+}
+
+/**
+ * To the landlord: new leases they drafted but never signed reached their start
+ * date, so they were canceled. Nothing went to those households, so only the
+ * landlord hears — once, for all of them.
+ */
+export async function emailNewLeaseDraftLapsed(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
+  landlordId?: string; documentId?: string
+} = {}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  const only = items[0]
+  await send(to, one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`,
+    base(
+      h(one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      (one
+        ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+            `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
+        : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items)) +
+      p(one
+        ? 'Nothing changed for the household: their current lease carries on exactly as it is, and they were never sent this draft.'
+        : 'Nothing changed for those households: each current lease carries on exactly as it is, and none of them was sent a draft.') +
+      p('To send a new one, open <strong style="color:#eef1f8">Leases</strong>, find the space, and choose <strong style="color:#eef1f8">Change → New lease from a date…</strong>')
+    ),
+    {
+      category: 'esign_document_auto_voided',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
+  )
+}
+
+/**
+ * To the landlord: households that have not signed their new lease yet — 14
+ * days before it starts, and again on the day it starts. One email per stage
+ * for all of them. The new lease bills its rent from its start date either way
+ * (Nic, 10/2); this is so the landlord can follow up in person.
+ */
+export async function emailNewLeaseTenantUnsigned(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
+  stage: 'soon' | 'started'; landlordId?: string; documentId?: string; leasesUrl?: string
+}) {
+  if (items.length === 0) return
+  const one = items.length === 1
+  const only = items[0]
+  const when = only.startDate ? newLeaseDate(only.startDate) : ''
+  const subject = one
+    ? (ctx.stage === 'started'
+        ? `New lease started, still not signed: ${only.unitLabel}`
+        : `Not signed yet — new lease starts ${when}: ${only.unitLabel}`)
+    : (ctx.stage === 'started'
+        ? `${newLeaseCount(items.length)} started, still not signed`
+        : `Not signed yet — ${newLeaseCount(items.length)} start soon`)
+  const rule = ctx.stage === 'started'
+    ? (one
+        ? `It took over on ${escapeHtml(when)}: the old lease ended the day before, and the household is billed the new rent of ${newLeaseMoney(only.rent)} from that day. The lease stays open for their signature.`
+        : 'Each one took over on its start date: the old lease ended the day before, and the household is billed the new rent from that day. Each lease stays open for their signature.')
+    : (one
+        ? `It takes over on ${escapeHtml(when)} whether or not they sign — the household is billed the new rent of ${newLeaseMoney(only.rent)} from that day. A word with them now usually gets it signed.`
+        : 'Each one takes over on its start date whether or not they sign — the household is billed the new rent from that day. A word with them now usually gets it signed.')
+  await send(to, subject,
+    base(
+      h(ctx.stage === 'started'
+        ? (one ? 'The New Lease Started — Not Signed Yet' : 'New Leases Started — Not Signed Yet')
+        : (one ? 'The New Lease Is Not Signed Yet' : 'New Leases Not Signed Yet')) +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      (one
+        ? p(`${escapeHtml(only.tenantNames || 'The household')} ${ctx.stage === 'started' ? 'still has' : 'has'} not signed the new lease for ` +
+            `<strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong>.`) +
+          newLeaseBox(only.unitLabel, only.startDate ?? '', only.rent ?? 0, ctx.stage === 'started')
+        : p(`These households ${ctx.stage === 'started' ? 'still have' : 'have'} not signed their new leases:`) + newLeaseList(items)) +
+      p(rule) +
+      (ctx.leasesUrl ? btn('Open Leases', ctx.leasesUrl) : '')
+    ),
+    {
+      category: 'esign_new_lease_unsigned',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.documentId ? 'document' : null,
+      relatedEntityId: ctx.documentId ?? null,
+    },
   )
 }
 
 // ── INVITATION EMAILS ─────────────────────────────────────────
 
-export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string }) {
+/**
+ * S641: `resend` is not cosmetic. A resent invitation used to carry the
+ * byte-identical subject, sender and body as the first one — only the token in
+ * the href differed. Outlook and Hotmail treat that as a duplicate: the message
+ * is accepted at the boundary (so Resend reports `delivered`) and then silently
+ * dropped or collapsed into the original conversation, where nobody looks.
+ *
+ * Lisa Scheeler's resent invitation did exactly this. Resend said delivered, the
+ * link was correct, and it never appeared in her mailbox — not even in spam.
+ *
+ * So a resend announces itself: different subject, different opening, and a line
+ * saying the earlier link is dead. That also happens to be the honest message,
+ * since resending always invalidates the previous token.
+ */
+export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string; resend?: boolean; replyTo?: ReplyTo }) {
   const roleLabel = LANDLORD_ASSIGNABLE_ROLE_LABEL[role]
-  await send(to, `${inviterName} invited you to join GAM as ${roleLabel}`,
+  const isResend = ctx?.resend === true
+
+  const subject = isResend
+    ? `Your new ${roleLabel} sign-in link for ${inviterName}`
+    : `${inviterName} invited you to join GAM as ${roleLabel}`
+
+  const intro = isResend
+    ? p(`Here is a new link to set up your <strong style="color:#eef1f8">${roleLabel}</strong> account with <strong style="color:#eef1f8">${inviterName}</strong> on Gold Asset Management. If you had an earlier invitation email, that link no longer works — use this one.`)
+    : p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`)
+
+  await send(to, subject,
     base(
-      h("You've been invited") +
-      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
-      btnWithLink('Accept Invitation', acceptUrl) +
+      h(isResend ? 'Your new invitation link' : "You've been invited") +
+      intro +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      btnWithLink(isResend ? 'Set Up My Account' : 'Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
     {
@@ -553,7 +895,8 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.invitationId ? 'invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
-      metadata: { role },
+      metadata: { role, resend: isResend },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -564,7 +907,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
 // self-service portal by email; we mail them their portal link. The
 // token in the URL is the bearer credential — this is the magic-link
 // "login": no password to manage.
-export async function emailCustomerPortalLink(to: string, businessName: string, portalUrl: string) {
+export async function emailCustomerPortalLink(to: string, businessName: string, portalUrl: string, ctx?: { replyTo?: ReplyTo }) {
   await send(to, `Your ${businessName} customer portal link`,
     base(
       h('Your portal link') +
@@ -572,7 +915,7 @@ export async function emailCustomerPortalLink(to: string, businessName: string, 
       btn('Open my portal', portalUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you didn't request this, you can safely ignore this email.</div>`
     ),
-    { category: 'customer_portal' },
+    { category: 'customer_portal', replyTo: ctx?.replyTo },
     'support',
   )
 }
@@ -593,7 +936,7 @@ export async function emailLandlordCoOwnerInvitation(
   inviterName: string,
   entityName: string,
   acceptUrl: string,
-  ctx?: { landlordId?: string; invitationId?: string },
+  ctx?: { landlordId?: string; invitationId?: string; replyTo?: ReplyTo },
 ) {
   await send(to, `${inviterName} added you as an owner of ${entityName} on GAM`,
     base(
@@ -612,6 +955,7 @@ export async function emailLandlordCoOwnerInvitation(
       relatedEntityType: ctx?.invitationId ? 'landlord_member_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { entity_name: entityName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -655,13 +999,49 @@ export async function emailPropertyTransferApproval(
   )
 }
 
+/**
+ * S655 — the BUYER's side of a property sale. A property used to land on the
+ * receiving account the moment the seller's owners confirmed: the buyer was
+ * never told, never asked, and a mistyped email handed every tenant's record
+ * to an unrelated landlord. Now the buyer accepts with this code before
+ * anything moves.
+ */
+export async function emailPropertyTransferOffer(
+  to: string,
+  args: {
+    propertyName: string
+    sellerName: string
+    code: string
+  },
+) {
+  const property = escapeHtml(args.propertyName)
+  const seller = escapeHtml(args.sellerName)
+  await send(to, `${args.sellerName} wants to transfer ${args.propertyName} to you`,
+    base(
+      h(`A property is being transferred to you`) +
+      p(`<strong style="color:#eef1f8">${seller}</strong> has asked to transfer <strong style="color:#eef1f8">${property}</strong> to your GAM account.`) +
+      p('If you accept, the property, its units, its leases and tenants, its security deposits and its equipment move to the company you choose, rent from then on goes to that company, and GAM\'s monthly platform fee for those units is billed to it. Nothing moves unless you accept.') +
+      p('Your acceptance code:') +
+      `<div style="margin:18px 0;padding:14px 18px;border-radius:10px;background:#12151c;border:1px solid #2a2f3a;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.6rem;letter-spacing:.35em;color:#e8c766">${args.code}</div>` +
+      p('Sign in to GAM and open Properties to review the transfer, choose which of your companies takes it, and enter the code. The request expires in 7 days.') +
+      `<div style="margin-top:16px;font-size:.78rem;color:#c0392b"><strong>If you were not expecting this, do not enter the code.</strong> Decline it on your Properties page and nothing will move.</div>`
+    ),
+    {
+      category: 'property_transfer_offer',
+      landlordId: null,
+      metadata: { property_name: args.propertyName },
+    },
+    'support',
+  )
+}
+
 export async function emailPmInvitation(
   to: string,
   inviterName: string,
   companyName: string,
   role: 'owner' | 'manager' | 'staff',
   acceptUrl: string,
-  ctx?: { pmCompanyId?: string; invitationId?: string }
+  ctx?: { pmCompanyId?: string; invitationId?: string; replyTo?: ReplyTo }
 ) {
   const roleLabel = role === 'owner' ? 'Owner' : role === 'manager' ? 'Manager' : 'Staff'
   await send(to, `${inviterName} invited you to join ${companyName} on GAM`,
@@ -669,7 +1049,7 @@ export async function emailPmInvitation(
       h(`You've been invited to ${companyName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${companyName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${companyName} uses GAM (Gold Asset Management) to manage rental properties on behalf of property owners. As ${roleLabel.toLowerCase()}, you'll have access to the company's portfolio inside the GAM platform.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -682,6 +1062,7 @@ export async function emailPmInvitation(
       relatedEntityType: ctx?.invitationId ? 'pm_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { role, pm_company_id: ctx?.pmCompanyId, company_name: companyName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -706,7 +1087,7 @@ export async function emailBusinessInvitation(
   businessName: string,
   staffRole: 'manager' | 'dispatcher' | 'driver' | 'office',
   acceptUrl: string,
-  ctx?: { businessId?: string; invitationId?: string }
+  ctx?: { businessId?: string; invitationId?: string; replyTo?: ReplyTo }
 ) {
   const roleLabel = BUSINESS_STAFF_ROLE_LABEL_MAP[staffRole] ?? staffRole
   await send(to, `${inviterName} invited you to join ${businessName} on GAM`,
@@ -714,7 +1095,7 @@ export async function emailBusinessInvitation(
       h(`You've been invited to ${businessName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -727,6 +1108,7 @@ export async function emailBusinessInvitation(
       relatedEntityType: ctx?.invitationId ? 'business_user_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { staff_role: staffRole, business_id: ctx?.businessId, business_name: businessName },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -748,7 +1130,7 @@ export async function emailPmPropertyInvitation(args: {
   propertyName: string
   proposedScope: 'manage' | 'view'
   acceptUrl: string
-  ctx?: { pmCompanyId?: string; invitationId?: string; landlordId?: string | null }
+  ctx?: { pmCompanyId?: string; invitationId?: string; landlordId?: string | null; replyTo?: ReplyTo }
 }) {
   const scopeLabel = args.proposedScope === 'manage' ? 'manage' : 'connect to'
   const subject = args.direction === 'owner_to_pm'
@@ -784,42 +1166,9 @@ export async function emailPmPropertyInvitation(args: {
         pm_company_name: args.pmCompanyName,
         property_name: args.propertyName,
       },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
-  )
-}
-
-// ── S163: tenant nudges landlord to finish Connect onboarding ─────────────
-//
-// The tenant clicked the "Notify my landlord" CTA on the LandlordBankingBanner
-// after seeing online rent payment was unavailable. Soft, polite copy — the
-// tenant is the customer here too and we don't want them to feel awkward.
-export async function emailLandlordBankingNudge(args: {
-  to: string
-  landlordName: string
-  tenantName: string
-  propertyName: string
-  unitNumber: string
-  bankingUrl: string
-  ctx?: { landlordId?: string | null; tenantId?: string | null }
-}) {
-  await send(args.to,
-    `${args.tenantName} is waiting on your GAM banking setup`,
-    base(
-      h(`${args.tenantName} wants to pay rent through GAM`) +
-      p(`Hi ${args.landlordName},`) +
-      p(`<strong style="color:#eef1f8">${args.tenantName}</strong> at <strong style="color:#eef1f8">${args.propertyName}, Unit ${args.unitNumber}</strong> tried to pay rent online but couldn't — your Stripe Connect onboarding isn't finished yet, so GAM can't route their payment to your bank.`) +
-      p('Finish onboarding (a few minutes via the embedded Stripe form) and your tenant can start paying rent online immediately.') +
-      btn('Complete Banking Setup', args.bankingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This is an automated nudge from your tenant. They'll only see the option to send it once every 24 hours.</div>`
-    ),
-    {
-      category: 'landlord_banking_nudge',
-      landlordId: args.ctx?.landlordId ?? null,
-      relatedEntityType: 'tenant_landlord_nudge',
-      relatedEntityId: args.ctx?.tenantId ?? null,
-      metadata: { property_name: args.propertyName, unit_number: args.unitNumber },
-    }
   )
 }
 
@@ -877,7 +1226,7 @@ export async function emailTenantAchSetup(args: {
 // adverse_action_notices row for delivery audit.
 export async function emailAdverseActionNotice({
   to, applicantFirstName, noticeText, ctx,
-}: { to: string; applicantFirstName: string; noticeText: string; ctx?: { landlordId?: string; backgroundCheckId?: string } }): Promise<string | null> {
+}: { to: string; applicantFirstName: string; noticeText: string; ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo } }): Promise<string | null> {
   const html = base(
     h('Notice of Adverse Action') +
     p(`Hi ${applicantFirstName},`) +
@@ -893,6 +1242,7 @@ export async function emailAdverseActionNotice({
     landlordId: ctx?.landlordId ?? null,
     relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
     relatedEntityId: ctx?.backgroundCheckId ?? null,
+    replyTo: ctx?.replyTo,
   }, 'support')
 }
 
@@ -926,7 +1276,7 @@ export async function sendSubleaseInvite({
   propertyName: string; unitNumber: string
   subMonthlyAmount: number
   startDate: string; endDate: string | null
-  ctx?: { masterLeaseId?: string; sublessorTenantId?: string }
+  ctx?: { masterLeaseId?: string; sublessorTenantId?: string; replyTo?: ReplyTo }
 }) {
   const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
   const acceptUrl = `${appUrl}/sublease-invite/${token}`
@@ -959,6 +1309,7 @@ export async function sendSubleaseInvite({
         sublessor_tenant_id: ctx?.sublessorTenantId ?? null,
         sub_monthly_amount: subMonthlyAmount,
       },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -979,7 +1330,7 @@ export async function sendPosCustomerOnboarding({
   customerName:  string
   merchantName:  string
   token:         string
-  ctx?: { landlordId?: string; posCustomerId?: string }
+  ctx?: { landlordId?: string; posCustomerId?: string; replyTo?: ReplyTo }
 }) {
   const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
   const acceptUrl = `${appUrl}/pos-customer-onboard/${token}`
@@ -1007,8 +1358,52 @@ export async function sendPosCustomerOnboarding({
       relatedEntityType: ctx?.posCustomerId ? 'pos_customer' : null,
       relatedEntityId: ctx?.posCustomerId ?? null,
       metadata: {},
+      replyTo: ctx?.replyTo,
     },
     'support',
+  )
+}
+
+// S652 (Nic): the morning late-rent email is ONE per landlord — every overdue
+// balance in a table — never one per tenant. "I don't need 15 emails."
+// S654: one line per PERSON with their whole open balance (rent, utilities,
+// fees), so it is "overdue balances", not "overdue rent".
+export async function sendLatePaymentDigest({ landlordEmail, landlordName, items, ctx }: {
+  landlordEmail: string; landlordName: string
+  items: Array<{ tenantName: string; unitNumber: string; propertyName: string; daysLate: number; amount: number; paymentId?: string; tenantId?: string }>
+  ctx?: { landlordId?: string }
+}) {
+  if (!items.length) return
+  // 10/5 (Nic): "ONLY how many tenants have outstanding balances: no names, no
+  // amounts. We want to drive traffic into the portal." The email carries the
+  // count and a link to Outstanding Balances; who owes what is read there. The
+  // send log still records the ids and the total, for us, not for the email.
+  const n = items.length
+  const sorted = [...items].sort((a, b) => b.daysLate - a.daysLate)
+  // S654: summed in cents — a raw float sum is not a dollar figure.
+  const total = Math.round(sorted.reduce((s, i) => s + Math.round(i.amount * 100), 0)) / 100
+  const paymentIds = sorted.map(i => i.paymentId).filter(Boolean)
+  const tenantIds = sorted.map(i => i.tenantId).filter(Boolean)
+  const who = n === 1 ? '1 tenant has' : `${n} tenants have`
+  await send(landlordEmail,
+    `${who} an overdue balance`,
+    base(
+      h('Overdue balances this morning') +
+      p(`Hi ${escapeHtml(landlordName)},`) +
+      p(`${who} a balance five or more days past due. See who in your portal.`) +
+      btnWithLink('Open Outstanding Balances', portalLink('landlord', 'balances'))
+    ),
+    {
+      category: 'late_payment_notice',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: null,
+      relatedEntityId: null,
+      metadata: {
+        count: n, total,
+        ...(tenantIds.length ? { tenant_ids: tenantIds } : {}),
+        ...(paymentIds.length ? { payment_ids: paymentIds } : {}),
+      },
+    }
   )
 }
 
@@ -1048,6 +1443,8 @@ export async function sendNotificationEmail(opts: {
   userId?: string | null
   landlordId?: string | null
   notificationId?: string | null
+  /** 10/5: who gets a reply — see services/replyRouting. Omitted = GAM support. */
+  replyTo?: ReplyTo
 }): Promise<string | null> {
   return send(opts.to, opts.subject, opts.html, {
     category: `notif_${opts.notificationType}`,
@@ -1055,6 +1452,7 @@ export async function sendNotificationEmail(opts: {
     relatedEntityType: opts.notificationId ? 'notification' : null,
     relatedEntityId: opts.notificationId ?? null,
     metadata: opts.userId ? { user_id: opts.userId } : undefined,
+    replyTo: opts.replyTo,
   })
 }
 
@@ -1066,16 +1464,20 @@ export async function emailTenantOnboarded(
   propertyAddress: string,
   unitLabel: string,
   activationUrl: string,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
-  await send(to, `${landlordName} added you to GAM for ${unitLabel}`,
+  // S654: names, address and unit come from a landlord's CSV, so every one is
+  // escaped before it goes into the HTML (and kept to one line in the subject).
+  const esc = (v: unknown) => escapeHtml(String(v ?? ''))
+  const subject = `${landlordName} added you to GAM for ${unitLabel}`.replace(/[\r\n]+/g, ' ')
+  await send(to, subject,
     base(
       h('Welcome to GAM') +
-      p(`Hi ${tenantName},`) +
-      p(`Your landlord <strong style="color:#eef1f8">${landlordName}</strong> has added you to GAM, the platform they use to manage your tenancy.`) +
+      p(`Hi ${esc(tenantName)},`) +
+      p(`Your landlord <strong style="color:#eef1f8">${esc(landlordName)}</strong> has added you to GAM, the platform they use to manage your tenancy.`) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${propertyAddress}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${esc(propertyAddress)}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${esc(unitLabel)}</div>
       </div>` +
       p('Click below to activate your account and set a password. There is no application or background check required — your landlord has already onboarded you.') +
       btnWithLink('Activate Your Account', activationUrl) +
@@ -1088,6 +1490,7 @@ export async function emailTenantOnboarded(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1118,7 +1521,7 @@ export async function emailTenantInvite(
   unitLabel: string | null,
   activationUrl: string,
   screeningRequired: boolean,
-  ctx?: { landlordId?: string; tenantId?: string },
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo },
 ) {
   const place = unitLabel ? `${propertyName} — ${unitLabel}` : propertyName
   const next = screeningRequired
@@ -1143,6 +1546,7 @@ export async function emailTenantInvite(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel, screening_required: screeningRequired },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1166,7 +1570,7 @@ export async function emailUtilityServiceInvite(
   providerName: string,
   serviceAddress: string,
   activationUrl: string,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
   await send(to, `Set up online billing for ${serviceAddress}`,
     base(
@@ -1188,6 +1592,45 @@ export async function emailUtilityServiceInvite(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { service_address: serviceAddress },
+      replyTo: ctx?.replyTo,
+    },
+    'support',
+  )
+}
+
+/**
+ * 10/6 (review): a work trade made on a reservation for a guest with no GAM
+ * login made them an account — this is its set-up link. It says what is true
+ * for a stay: no lease, no application; their account is where they see the
+ * trade (and, when hours are tracked, log them).
+ */
+export async function emailStayWorkTradeInvite(a: {
+  to: string; firstName: string; propertyName: string; siteLabel: string
+  logsHours: boolean; activationUrl: string
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
+}) {
+  await send(a.to, `Set up your account for your work trade at ${a.propertyName}`,
+    base(
+      h('Your work trade') +
+      p(`Hi ${a.firstName},`) +
+      p(`<strong style="color:#eef1f8">${a.propertyName}</strong> set up a work trade for your stay and made you an account on GAM, the system they use to run the park.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${a.propertyName}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${a.siteLabel}</div>
+      </div>` +
+      p(a.logsHours
+        ? 'Click below to set a password. Your account is where you see your work trade and log the hours you work.'
+        : 'Click below to set a password. Your account is where you see your stay and your work trade.') +
+      btnWithLink('Activate Your Account', a.activationUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This link expires in 7 days. If it has, ask the office for a new one.</div>`
+    ),
+    {
+      category: 'tenant_invite',
+      landlordId: a.ctx?.landlordId ?? null,
+      relatedEntityType: a.ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: a.ctx?.tenantId ?? null,
+      metadata: { site_label: a.siteLabel, work_trade: true },
+      replyTo: a.ctx?.replyTo,
     },
     'support',
   )
@@ -1202,7 +1645,7 @@ export async function emailTenantInviteReminder(
   unitLabel: string,
   activationUrl: string,
   daysLeft: number,
-  ctx?: { landlordId?: string; tenantId?: string }
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo }
 ) {
   const window = daysLeft <= 1 ? 'tomorrow' : `in ${daysLeft} days`
   await send(to, `Reminder: activate your GAM tenant account for ${unitLabel}`,
@@ -1220,6 +1663,7 @@ export async function emailTenantInviteReminder(
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,
       metadata: { unit_label: unitLabel, days_left: daysLeft },
+      replyTo: ctx?.replyTo,
     },
     'support',
   )
@@ -1235,9 +1679,19 @@ export async function emailLoginCode(
   ttlMinutes: number,
   ctx?: { userId?: string },
 ): Promise<string | null> {
+  // ── S637: THE CODE DOES NOT GO IN THE SUBJECT ───────────────────────────
+  //
+  // Every subject line is written to email_send_log, which is PERMANENT by
+  // design — triggers refuse UPDATE and DELETE so an outreach record cannot be
+  // rewritten. That made 183 live sign-in codes readable in plaintext by any
+  // admin, and put them in every nightly backup. A second factor anybody with
+  // database access can read is not a second factor.
+  //
+  // The code lives in the body only. The body is not logged (body_text is null
+  // for this category), so it never lands anywhere durable.
   return send(
     to,
-    `Your GAM sign-in code: ${code}`,
+    'Your GAM sign-in code',
     base(
       h('Your sign-in code') +
       p('Use this code to finish signing in to GAM:') +
@@ -1365,6 +1819,18 @@ export async function sendPasswordResetEmail(
 }
 
 
+/** The FlexPay terms, section by section, exactly as packages/shared states them. */
+export function flexPayTermsBlock(): string {
+  return `<div style="margin:16px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+    <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">How FlexPay works</div>
+    ${FLEXPAY_TERMS.map(t =>
+      `<div style="margin-bottom:10px">
+         <div style="font-size:.84rem;font-weight:700;color:#eef1f8">${escapeHtml(t.title)}</div>
+         <div style="font-size:.82rem;color:#b8c4d8;line-height:1.55">${escapeHtml(t.body)}</div>
+       </div>`).join('')}
+  </div>`
+}
+
 // S322: FlexSuite enrollment confirmation with attached populated
 // terms PDF. The PDF is the load-bearing tenant-inbox-durability copy
 // of the click-accepted SLA / Subscription Terms; the canonical legal
@@ -1393,6 +1859,10 @@ export async function emailFlexsuiteEnrollment(args: {
     p(greeting) +
     p(`Thank you for enrolling. Your accepted copy of the ${productLabel} is attached as a PDF for your records.`) +
     p(`<strong style="color:#eef1f8">What's attached:</strong> the exact populated agreement you click-accepted on the platform on <strong style="color:#eef1f8">${args.acceptedAt.toLocaleString()}</strong>. Keep it with your other GAM records.`) +
+    // S655: how FlexPay works, in the same words as the app, the PDF and the
+    // admin screen (packages/shared FLEXPAY_TERMS) — one set of terms, so the
+    // email can never promise something the code does not do.
+    (args.product === 'flexpay' ? flexPayTermsBlock() : '') +
     `<div style="margin-top:20px;padding:12px 14px;background:#1a1f24;border-radius:7px;font-size:.74rem;color:#a0aec0;line-height:1.5">
       <div><strong style="color:#c9a227">Acceptance ID</strong> ${args.acceptanceId}</div>
       <div style="margin-top:4px"><strong style="color:#c9a227">Template version</strong> v${args.templateVersion}</div>
@@ -1428,6 +1898,53 @@ export async function emailFlexsuiteEnrollment(args: {
  * email still goes out — invoice + amount + due date — but without a
  * pay-now button (operator collects via cash/check/external rails).
  */
+/**
+ * S648 — a register pay link: a charge from the property for someone not on a
+ * lease (a stay, propane, a repair). The card fee is shown up front, not
+ * discovered on the card page.
+ */
+export async function emailPayLink(args: {
+  to: string
+  name: string | null
+  propertyName: string
+  label: string
+  amount: number
+  cardFee: number
+  url: string
+  /**
+   * 10/5 (Nic): a sentence the payer reads before paying — R13's "Your site is
+   * held through …" for a 30+ night stay with no lease, or what the background
+   * check on the link is for. Plain text; escaped here.
+   */
+  note?: string | null
+  /** A link with no expiry (a deposit or a background check) — the email does not say 14 days. */
+  neverExpires?: boolean
+  ctx?: { landlordId?: string; payLinkId?: string; replyTo?: ReplyTo }
+}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  await send(args.to,
+    `${args.propertyName} — ${args.label}: ${money(args.amount)}`,
+    base(
+      h(`Payment for ${args.propertyName}`) +
+      p(`${args.name ? `Hi ${args.name}, ` : ''}${args.propertyName} sent you a charge to pay by card.`) +
+      p(`<strong style="color:#eef1f8">${args.label}:</strong> ${money(args.amount)}<br>` +
+        (args.cardFee > 0 ? `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` : '') +
+        `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
+      (args.note ? p(escapeHtml(args.note)) : '') +
+      btn('Pay by card', args.url) +
+      p(args.neverExpires ? 'To pay another way, contact the office.' : 'The link works for 14 days. To pay another way, contact the office.')
+    ),
+    {
+      category: 'pos_pay_link',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'pos_pay_link',
+      relatedEntityId: args.ctx?.payLinkId ?? null,
+      replyTo: args.ctx?.replyTo,
+    },
+    'support',
+  )
+}
+
 export async function emailBusinessInvoiceSent(args: {
   to: string
   businessName: string
@@ -1435,7 +1952,7 @@ export async function emailBusinessInvoiceSent(args: {
   totalAmount: number
   dueDate: string                // YYYY-MM-DD
   payUrl: string | null
-  ctx?: { businessId?: string; invoiceId?: string }
+  ctx?: { businessId?: string; invoiceId?: string; replyTo?: ReplyTo }
 }) {
   const formattedAmount = `$${args.totalAmount.toLocaleString('en-US', {
     minimumFractionDigits: 2, maximumFractionDigits: 2,
@@ -1462,6 +1979,7 @@ export async function emailBusinessInvoiceSent(args: {
       relatedEntityType: 'business_invoice',
       relatedEntityId: args.ctx?.invoiceId ?? null,
       metadata: { business_id: args.ctx?.businessId, invoice_number: args.invoiceNumber },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1480,7 +1998,7 @@ export async function emailBusinessAppointmentConfirmed(args: {
   scheduledFor: Date              // converted to local-string in body
   durationMinutes: number
   notes: string | null
-  ctx?: { businessId?: string; appointmentId?: string }
+  ctx?: { businessId?: string; appointmentId?: string; replyTo?: ReplyTo }
 }) {
   const when = args.scheduledFor.toLocaleString([], {
     weekday: 'long', month: 'long', day: 'numeric',
@@ -1509,6 +2027,7 @@ export async function emailBusinessAppointmentConfirmed(args: {
       relatedEntityType: 'appointment',
       relatedEntityId: args.ctx?.appointmentId ?? null,
       metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1526,7 +2045,7 @@ export async function emailBusinessAppointmentReminder(args: {
   serviceType: string
   scheduledFor: Date
   durationMinutes: number
-  ctx?: { businessId?: string; appointmentId?: string }
+  ctx?: { businessId?: string; appointmentId?: string; replyTo?: ReplyTo }
 }) {
   const when = args.scheduledFor.toLocaleString([], {
     weekday: 'long', month: 'long', day: 'numeric',
@@ -1550,6 +2069,7 @@ export async function emailBusinessAppointmentReminder(args: {
       relatedEntityType: 'appointment',
       relatedEntityId: args.ctx?.appointmentId ?? null,
       metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1574,7 +2094,7 @@ export async function emailBusinessQuoteSent(args: {
   totalAmount: number
   expiresAt: Date | null
   notes: string | null
-  ctx?: { businessId?: string; quoteId?: string }
+  ctx?: { businessId?: string; quoteId?: string; replyTo?: ReplyTo }
 }) {
   const fmt = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   const greet = args.customerName
@@ -1648,6 +2168,7 @@ export async function emailBusinessQuoteSent(args: {
       relatedEntityType: 'business_quote',
       relatedEntityId: args.ctx?.quoteId ?? null,
       metadata: { business_id: args.ctx?.businessId, quote_number: args.quoteNumber },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1665,7 +2186,7 @@ export async function emailBusinessCardUpdateRequest(args: {
   updateUrl: string
   expiresAt: Date
   reasonHint: 'auto_charge_failed' | 'expired' | 'manual'
-  ctx?: { businessId?: string; customerId?: string; invoiceId?: string | null }
+  ctx?: { businessId?: string; customerId?: string; invoiceId?: string | null; replyTo?: ReplyTo }
 }) {
   const greet = args.customerName
     ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`)
@@ -1699,6 +2220,7 @@ export async function emailBusinessCardUpdateRequest(args: {
         invoice_id: args.ctx?.invoiceId,
         reason: args.reasonHint,
       },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1711,7 +2233,7 @@ export async function emailBusinessCustomerPortalLink(args: {
   to: string
   businessName: string
   portalUrl: string
-  ctx?: { businessId?: string; customerId?: string }
+  ctx?: { businessId?: string; customerId?: string; replyTo?: ReplyTo }
 }) {
   await send(args.to,
     `Your account with ${args.businessName}`,
@@ -1727,6 +2249,7 @@ export async function emailBusinessCustomerPortalLink(args: {
       relatedEntityType: 'business_customer',
       relatedEntityId: args.ctx?.customerId ?? null,
       metadata: { business_id: args.ctx?.businessId },
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1745,7 +2268,7 @@ export async function emailBookingSiteAssignment(args: {
   unitNumber: string
   checkIn: string
   checkInTime?: string | null
-  ctx?: { landlordId?: string; bookingId?: string }
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
 }) {
   const greet = args.guestName
     ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
@@ -1767,6 +2290,7 @@ export async function emailBookingSiteAssignment(args: {
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
       relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1781,7 +2305,7 @@ export async function emailBookingGuestAccess(args: {
   checkOut: string
   stayUrl: string
   expiresAt: Date
-  ctx?: { landlordId?: string; bookingId?: string }
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
 }) {
   const greet = args.guestName
     ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
@@ -1812,6 +2336,7 @@ export async function emailBookingGuestAccess(args: {
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
       relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
     },
     'support',
   )
@@ -1828,11 +2353,14 @@ export async function emailPosReceipt(
   total: number,
   pdf: Buffer,
   ctx: EmailSendContext = {},
+  /** 10/5 (Nic, R13): a sentence under the total — how long a stay with no lease holds their site (stayHeldWords). */
+  opts: { note?: string | null } = {},
 ): Promise<string | null> {
   const subject = `Receipt ${receiptNumber} — ${operatorName}`
   const html = base(`
     <h2 style="margin:0 0 12px;color:#e8e6e3;font-size:1.05rem">Receipt from ${operatorName}</h2>
     <p style="color:#9b9894;font-size:.9rem;margin:0 0 8px">Total: <strong style="color:#c9a227">$${total.toFixed(2)}</strong></p>
+    ${opts.note ? `<p style="color:#9b9894;font-size:.9rem;margin:0 0 8px">${escapeHtml(opts.note)}</p>` : ''}
     <p style="color:#9b9894;font-size:.9rem;margin:0">Your itemized receipt is attached as a PDF.</p>
   `)
   return send(to, subject, html, { ...ctx, category: ctx.category ?? 'pos_receipt' }, 'noreply',
@@ -1840,25 +2368,6 @@ export async function emailPosReceipt(
 }
 
 // ── S553: sales-call scheduling (Portfolio Strategist funnel) ─────────
-export async function sendSalesCallConfirmation({ to, name, when, mode }: {
-  to: string; name: string; when: string; mode: 'video' | 'phone'
-}) {
-  const first = escapeHtml(name.trim().split(/\s+/)[0] || 'there')
-  await send(to, `Your GAM call is booked — ${when}`,
-    base(
-      h(`You're on the calendar`) +
-      p(`Hi ${first} — your call with a GAM Portfolio Strategist is confirmed:`) +
-      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
-        <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
-        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — your Strategist will email you the meeting link before the call.' : 'Phone call — your Strategist will call the number you provided.'}</div>
-      </div>` +
-      p(`We'll walk through your portfolio, show you the platform live, and lay out exact pricing for your setup. If you need to reschedule, just reply to this email.`)
-    ),
-    { category: 'sales_call_confirmation', landlordId: null },
-    'support',
-  )
-}
-
 export async function sendSalesCallReminder({ to, name, when, mode }: {
   to: string; name: string; when: string; mode: 'video' | 'phone'
 }) {
@@ -2124,6 +2633,441 @@ export async function emailAdminInvitation(
       relatedEntityType: ctx?.invitationId ? 'admin_invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { role: roleLabel },
+    },
+    'support',
+  )
+}
+
+/**
+ * S637 (Nic): a receipt for money received. There wasn't one.
+ *
+ * "When people make their payment, does it email them confirmation of that
+ * payment?" It did not — on any method. A resident paid cash at the desk, or
+ * put a card through the portal, and heard nothing back. The only receipt in
+ * the system was the POS one for counter sales.
+ *
+ * Deliberately method-agnostic: cash, check, money order, card and ACH all
+ * produce the same document, because to the person who paid it is the same
+ * event. The METHOD is stated on it (with the check number where there is one)
+ * since that is what they will look for if they ever have to prove it.
+ *
+ * `pending` is a real and important state to send: an ACH debit takes about
+ * four business days, and a resident who sees nothing for four days assumes it
+ * failed and pays twice. Saying "we have it, it clears in a few days" is the
+ * whole point of the mail.
+ */
+export async function emailPaymentReceipt(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    /** S655: the MONEY received: the lines, less account credit used, plus anything kept on account. */
+    amount: number
+    method: string          // 'cash' | 'check' | 'money order' | 'card' | 'bank transfer'
+    reference?: string | null
+    paidAt: Date
+    /** Each charge paid, by name ("Rent", "Water"), at its full amount. */
+    lines: Array<{ label: string; detail?: string | null; amount: number }>
+    /** Set when the money has not settled yet — ACH in flight. */
+    pending?: boolean
+    /** S655: account credit that paid part of these lines — its own line, never hidden in the total. */
+    creditApplied?: number
+    /** S637: surplus kept on account rather than handed back. */
+    creditBanked?: number
+    /** S655: "your October bill", for a bill paid entirely with account credit. */
+    billLabel?: string | null
+    /** 10/5 (Nic): a part payment — what is still owed after it, by charge. */
+    stillOwed?: Array<{ label: string; detail?: string | null; amount: number }>
+    portalUrl?: string
+  },
+  ctx?: { landlordId?: string; tenantId?: string; paymentId?: string; replyTo?: ReplyTo },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+  const when = args.paidAt.toLocaleDateString('en-US',
+    { month: 'long', day: 'numeric', year: 'numeric' })
+  const credit = Math.max(0, Math.round((args.creditApplied ?? 0) * 100) / 100)
+  const banked = Math.max(0, Math.round((args.creditBanked ?? 0) * 100) / 100)
+  // S655: nothing was charged — the account credit paid the whole thing.
+  const creditOnly = args.amount <= 0 && credit > 0
+  const bill = args.billLabel || 'bill'
+  const owedTotal = Math.round((args.stillOwed ?? []).reduce((t, l) => t + Math.round(l.amount * 100), 0)) / 100
+
+  const line = (label: string, amount: string, color = '#b8c4d8', detail?: string | null) =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${color};margin-bottom:5px">
+       <span>${escapeHtml(label)}${detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(detail)}</span>` : ''}</span><span>${amount}</span>
+     </div>`
+  const rows = args.lines.map(l => line(l.label, money(l.amount), '#b8c4d8', l.detail)).join('') +
+    (credit > 0 ? line('Account credit applied', `-${money(credit)}`, '#5fbf7f') : '') +
+    (banked > 0 ? line('Kept on your account as credit', `+${money(banked)}`, '#5fbf7f') : '')
+
+  const subject = creditOnly
+    ? `Your ${bill} was paid with your account credit — ${args.unitLabel}`
+    : args.pending
+      ? `Payment received — ${money(args.amount)} for ${args.unitLabel}`
+      : `Receipt — ${money(args.amount)} for ${args.unitLabel}`
+
+  return await send(to, subject,
+    base(
+      h(creditOnly ? 'Paid With Your Account Credit' : args.pending ? 'Payment Received' : 'Payment Receipt') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      p(creditOnly
+        ? `Your ${escapeHtml(bill)} was paid with your account credit on ${when}. Nothing was charged to you.`
+        : args.pending
+          ? `We've received your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong>. Bank transfers take about four business days to clear — nothing more is needed from you, and we'll only be in touch if there's a problem.`
+          : `Thank you — your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong> was received on ${when}.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${escapeHtml(args.unitLabel)}</div>
+         ${rows}
+         <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>${creditOnly ? 'Charged to you' : args.pending ? 'Total submitted' : 'Total paid'}</span><span>${money(Math.max(0, args.amount))}</span>
+         </div>
+         <div style="font-size:.78rem;color:#7a8aaa;margin-top:9px">
+           ${creditOnly
+             ? `Paid with your account credit &middot; ${when}`
+             : `Paid by ${escapeHtml(args.method)}${args.reference ? ` &middot; #${escapeHtml(args.reference)}` : ''} &middot; ${when}`}
+         </div>
+       </div>` +
+      (banked > 0
+        ? p(`You paid <strong style="color:#eef1f8">${money(banked)}</strong> more than was owed. It is kept on your account as credit. It pays a bill by itself only when it covers the whole bill; otherwise you can choose to use it when you pay.`)
+        : '') +
+      (owedTotal > 0
+        ? `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #d9534f">
+             <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">Still owed</div>
+             ${(args.stillOwed ?? []).map(l => line(l.label, money(l.amount), '#b8c4d8', l.detail)).join('')}
+             <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                         border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+               <span>Still owed</span><span>${money(owedTotal)}</span>
+             </div>
+           </div>` +
+          p(`This payment did not cover the whole bill. <strong style="color:#eef1f8">${money(owedTotal)}</strong> is still owed, and late fees under your lease still apply to it until it is paid.`)
+        : '') +
+      (args.portalUrl ? btn('View your account', args.portalUrl) : '') +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Keep this receipt for your records.</div>`
+    ),
+    {
+      category: 'payment_receipt',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.paymentId ? 'payment' : null,
+      relatedEntityId: ctx?.paymentId ?? null,
+      metadata: { amount: Math.max(0, args.amount), credit_applied: credit, credit_banked: banked, credit_only: creditOnly,
+                  ...(owedTotal > 0 ? { still_owed: owedTotal } : {}) },
+      replyTo: ctx?.replyTo,
+    },
+    // A receipt is something people reply to when a figure looks wrong.
+    'support',
+  )
+}
+
+// ── S639: A TENANT-FACING BALANCE REMINDER ───────────────────────────────────
+//
+// Nic: "send Jeremy Parker's email a reminder that there's a new charge for
+// electricity, or just send the reminder that there's an outstanding balance
+// due."
+//
+// There was no such email. The only thing the system sent about an overdue
+// balance was sendLatePaymentNotice, which goes to the LANDLORD — the resident
+// who owes the money heard nothing at all unless they opened the portal. A
+// utility charge landing mid-month is exactly the kind of thing nobody expects
+// and nobody sees.
+//
+// Deliberately not a late notice: it never says "late", never names a fee, and
+// never threatens. It says what is owed, what it is for, and where to pay. The
+// same email works the day a charge lands and three weeks later, and a
+// work-trade resident who owes nothing never receives it (the caller filters
+// suspended rows out, the same rule the balances page uses).
+export async function emailBalanceDue(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    /** S655: the FULL balance. Credit is never taken off it. */
+    total: number
+    lines: Array<{ label: string; detail?: string | null; amount: number; dueDate?: string | null }>
+    /** S655: what their credit would pay now — said beside the balance, never netted. */
+    creditAvailable?: number
+    portalUrl?: string
+    landlordName?: string
+  },
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+
+  const rows = args.lines.map(l =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+       <span>${escapeHtml(l.label)}${l.dueDate ? `<span style="color:#7a8aaa"> &middot; due ${escapeHtml(l.dueDate)}</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span>
+       <span>${money(l.amount)}</span>
+     </div>`).join('')
+  const credit = Math.max(0, Math.round((args.creditAvailable ?? 0) * 100) / 100)
+
+  return await send(to, `Balance due — ${money(args.total)} for ${args.unitLabel}`,
+    base(
+      h('You Have a Balance Due') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      p(`This is a reminder that <strong style="color:#eef1f8">${money(args.total)}</strong> is currently owed on your account.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${escapeHtml(args.unitLabel)}</div>
+         ${rows}
+         <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>Total due</span><span>${money(args.total)}</span>
+         </div>
+       </div>` +
+      (credit > 0
+        ? p(`You have <strong style="color:#eef1f8">${money(credit)}</strong> credit available — you can use it when you pay.`)
+        : '') +
+      (args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
+      p(`If any of this looks wrong, reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will take a look.`)
+    ),
+    {
+      category: 'balance_due_reminder',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { total: args.total, credit_available: credit },
+      replyTo: ctx?.replyTo,
+    },
+    'support',
+  )
+}
+
+// ── S641: FINISH VERIFYING YOUR BANK ────────────────────────────────────────
+//
+// Found while chasing a Stripe error in the log. Dominic Gonzalez started a bank
+// setup on September 2, Stripe's deposit landed on the 3rd, and he had been
+// parked in `requires_action` ever since. Nothing chased him: the portal showed
+// a bank on file and the engine saw somebody not paying.
+//
+// The copy matters more than usual here. Stripe verifies one of two ways and
+// the live account uses `descriptor_code` — a SINGLE deposit of about a dollar
+// whose BANK STATEMENT DESCRIPTION carries a six-character code. An email
+// telling somebody to "enter the two amounts" would send them hunting for
+// something that is not on their statement, which is worse than not writing at
+// all. Both shapes are handled, driven by what Stripe actually reports.
+//
+// The link is Stripe's own hosted verification page, taken from the live
+// SetupIntent. It is the shortest path from this email to a finished setup.
+export async function emailVerifyBankReminder(
+  to: string,
+  args: {
+    tenantName: string
+    bankLast4: string | null
+    /** When the deposit lands (or landed) — Stripe tells us, so we do not guess. */
+    arrivedOn: string
+    /** 'descriptor_code' (a code in the statement description) or 'amounts'. */
+    verificationKind: 'descriptor_code' | 'amounts'
+    /** Stripe's hosted page. Falls back to the portal when absent. */
+    verifyUrl: string
+    /**
+     * S641 (Nic): "do we have it set up where as soon as Stripe sends the
+     * microdeposits it will email the tenant as well?"
+     *
+     * 'sent'     — fired the moment the deposit is on its way, so nobody is
+     *              waiting on a message that never comes. This is the one that
+     *              would have saved Dominic Gonzalez nine days.
+     * 'reminder' — the chase, days later, if they still have not confirmed.
+     *
+     * Same facts, different tense. A first notice that scolds is wrong, and a
+     * reminder that reads like news is useless.
+     *
+     * REQUIRED, not defaulted: a default sends whichever tense the author of
+     * the next call site happens not to think about, and the chase went out
+     * worded as a first notice the moment this had one.
+     */
+    kind: 'sent' | 'reminder'
+    landlordName?: string
+    hasBalanceDue?: boolean
+  },
+  ctx?: { landlordId?: string; tenantId?: string },
+): Promise<string | null> {
+  const first = args.kind === 'sent'
+  const howTo = args.verificationKind === 'descriptor_code'
+    ? p(`${first ? 'When it lands, look' : 'Look'} at your bank statement for a deposit of about a dollar from us. Next to it, in the description, is a <strong style="color:#eef1f8">six-character code</strong> that starts with <strong style="color:#eef1f8">SM</strong>. Enter that code and your account is ready.`)
+    : p(`Your bank ${first ? 'will receive' : 'received'} <strong style="color:#eef1f8">two small deposits</strong> from us, each under a dollar. Enter both amounts and your account is ready.`)
+
+  const bank = args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''
+
+  return await send(to,
+    first ? 'Your bank verification deposit is on its way' : 'Finish setting up your bank account',
+    base(
+      h(first ? 'We just sent your verification deposit' : 'One step left on your bank account') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      (first
+        ? p(`Thanks for adding your bank account${bank}. We have sent a small verification deposit — it should reach your bank by <strong style="color:#eef1f8">${escapeHtml(args.arrivedOn)}</strong>. One more step and you can pay by bank.`)
+        : p(`You started adding your bank account${bank}, and the verification deposit reached your bank on ${escapeHtml(args.arrivedOn)}. It has not been confirmed yet.`)) +
+      howTo +
+      (args.hasBalanceDue
+        // Say the quiet part: they may believe they already set up the payment
+        // that would have covered what they owe.
+        ? p('<strong style="color:#eef1f8">Until this is confirmed we cannot take a payment from that account</strong>, so anything showing as owed is still owed.')
+        : '') +
+      btn('Confirm my bank', args.verifyUrl) +
+      p(`If you would rather use a different account, you can add one in your portal. Questions? Reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will help.`)
+    ),
+    {
+      category: first ? 'bank_verification_sent' : 'bank_verification_reminder',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+    },
+    'support',
+  )
+}
+
+// ── S641: THE BILL ITSELF ────────────────────────────────────────────────────
+//
+// Nic: "a lot of people are saying, oh, I never got my bill. I don't know what
+// I owe."
+//
+// They were right. Invoice generation sent no email at all — not one line in
+// the whole job. In the thirty days before this was written the only
+// billing-related mail any tenant received was 197 LATE notices. We never told
+// anyone a bill existed, and then told them they were late for it.
+//
+// This goes out when the invoice is generated, at 7am in the property's own
+// timezone — deliberately NOT early. Nic: "when you send the invoices early,
+// people wanna pay early. And if people have paid ahead with credit, I want it
+// applied to their balance in the correct month. I don't want weird bookkeeping
+// where this person paid two thousand dollars one month, and then nothing the
+// next month, and then two thousand the next." The bill and the month it
+// belongs to stay aligned.
+export async function emailInvoiceReady(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    invoiceNumber: string
+    dueDateLabel: string
+    /** S655: the FULL bill still owed. Credit is never taken off it. */
+    total: number
+    /** Each charge by name ("Rent", "Water"); a covered line was settled before this email — listed, not owed. */
+    lines: Array<{ label: string; detail?: string | null; amount: number; covered?: boolean; coveredHow?: string }>
+    /** Work traded off this cycle — owed by nobody, but it belongs on the bill. */
+    workTradeCredit?: number
+    /**
+     * 10/6 (Nic): credit already applied against this bill (money paid ahead
+     * goes on by itself) — one "Credit applied" line under the charges, then
+     * "Still owed". Never a tag on a line.
+     */
+    creditApplied?: number
+    /** S655: the credit Pay Now will offer for this bill — said beside it, never netted. */
+    creditAvailable?: number
+    portalUrl?: string
+    landlordName?: string
+    /** S654: the bill changed after it was announced — say so, so the earlier email is not the one they pay. */
+    updated?: boolean
+  },
+  ctx?: { landlordId?: string; tenantId?: string; invoiceId?: string; replyTo?: ReplyTo },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+
+  // The covered tag sits BESIDE the line's name, never in place of it.
+  const rows = args.lines.map(l =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${l.covered ? '#7a8aaa' : '#b8c4d8'};margin-bottom:5px">
+       <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
+     </div>`).join('')
+
+  const deduction = (label: string, amount: number) =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+       <span>${label}</span><span>-${money(amount)}</span>
+     </div>`
+
+  // A zero balance is still worth sending: it is the tenant's proof that the
+  // month was covered, and the commonest cause is work trade.
+  const settled = args.total <= 0
+  const credit = Math.max(0, Math.round((args.creditAvailable ?? 0) * 100) / 100)
+
+  const updated = !!args.updated && !settled
+  return await send(to,
+    settled
+      ? `Your ${args.dueDateLabel} statement — nothing due for ${args.unitLabel}`
+      : `${updated ? 'Updated bill: ' : ''}${money(args.total)} due ${args.dueDateLabel} — ${args.unitLabel}`,
+    base(
+      h(settled ? 'Your statement' : updated ? 'Your bill was updated' : 'Your bill is ready') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      (updated
+        ? p(`Your bill for ${escapeHtml(args.unitLabel)} was corrected after this morning's email. This replaces it — please use these numbers.`)
+        : '') +
+      p(settled
+        ? `Here is your statement for ${escapeHtml(args.unitLabel)}. Nothing is owed this cycle.`
+        : `<strong style="color:#eef1f8">${money(args.total)}</strong> is due on <strong style="color:#eef1f8">${escapeHtml(args.dueDateLabel)}</strong> for ${escapeHtml(args.unitLabel)}.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(args.unitLabel)}</div>
+         <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
+         ${rows}` +
+      (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
+      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit applied', args.creditApplied) : '') +
+      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>${settled ? 'Balance' : (args.creditApplied && args.creditApplied > 0 ? 'Still owed' : 'Total due')}</span><span>${money(Math.max(0, args.total))}</span>
+         </div>
+       </div>` +
+      // S655 (Nic, 10/2): credit is used when they pay — they choose "Use all"
+      // or "Save it for later" — so it is said here, not taken off the bill.
+      (!settled && credit > 0
+        ? p(`You have <strong style="color:#eef1f8">${money(credit)}</strong> credit available — you can use it when you pay.`)
+        : '') +
+      (!settled && args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
+      p(`If any of this looks wrong, reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will take a look.`)
+    ),
+    {
+      category: 'invoice_ready',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.invoiceId ? 'invoice' : (ctx?.tenantId ? 'tenant' : null),
+      relatedEntityId: ctx?.invoiceId ?? ctx?.tenantId ?? null,
+      metadata: { total: Math.max(0, args.total), credit_available: credit },
+      replyTo: ctx?.replyTo,
+    },
+    'support',
+  )
+}
+
+// ── S639: THE APPLICANT NEEDS THEIR OWN SCREENING LINK ───────────────────────
+//
+// Checkr Tenant collects the SSN and the FCRA consent on its OWN hosted form,
+// so an order is not a screening until the applicant opens that link. We
+// returned the link to the browser for display and emailed nobody but the
+// landlord — so an applicant who paid, closed the tab, and walked away had no
+// route back to the thing they had just paid for.
+//
+// Anastacio Erreguin paid $44.99 on 2026-09-04. His order failed because Checkr
+// had no card on file, and when it was re-placed five days later the only email
+// he had ever received from GAM was a sign-in code. He could not have finished
+// if he wanted to.
+export async function emailScreeningApplyLink(
+  to: string,
+  args: {
+    firstName: string
+    propertyName?: string | null
+    applyUrl: string
+    /** Set when the order was placed some time after they paid. */
+    delayed?: boolean
+  },
+  ctx?: { landlordId?: string; backgroundCheckId?: string },
+): Promise<string | null> {
+  return await send(to, 'Finish your background check — one step left',
+    base(
+      h('One Step Left on Your Application') +
+      p(`Hi ${args.firstName || 'there'},`) +
+      p(args.delayed
+        ? `Your payment went through and your background check is now open${args.propertyName ? ` for <strong style="color:#eef1f8">${args.propertyName}</strong>` : ''}. Sorry for the wait — that was on our end, not yours, and there is nothing more to pay.`
+        : `Thanks — your payment went through and your background check is open${args.propertyName ? ` for <strong style="color:#eef1f8">${args.propertyName}</strong>` : ''}.`) +
+      p('Our screening partner Checkr handles the last step on their own secure form. They will ask for your Social Security number and your consent — we never see or store it.') +
+      btn('Finish my background check', args.applyUrl) +
+      `<div style="margin-top:14px;font-size:.78rem;color:#7a8aaa">
+         If the button does not work, paste this into your browser:<br/>
+         <span style="color:#b8c4d8;word-break:break-all">${args.applyUrl}</span>
+       </div>` +
+      p('Nothing happens until you complete it, so please do it when you have a couple of minutes.')
+    ),
+    {
+      category: 'screening_apply_link',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
+      relatedEntityId: ctx?.backgroundCheckId ?? null,
     },
     'support',
   )

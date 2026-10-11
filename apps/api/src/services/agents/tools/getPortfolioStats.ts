@@ -9,6 +9,12 @@
  * through and manually figure that out. We're already tracking all that
  * information."
  *
+ * S655 (Nic, 10/2): EXCEPT source of income. The SSI/SSDI flag is "our check
+ * for the flex products" — GAM's eligibility check, kept GAM-side. Not even a
+ * count leaves here: at a ten-site park "1 tenant on fixed income" names
+ * someone. The tool says plainly that it is private instead, so the agent
+ * neither guesses a number nor goes looking for one.
+ *
  * That is the point of this tool: the platform already records every payment,
  * lease, repair and tenant. Nobody was turning that into the two-second answer
  * — "17% of my rent comes in late", "my average repair takes eleven days" —
@@ -36,6 +42,9 @@
 
 import { query } from '../../../db'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { incomeTotals } from '../../incomeBasis'
+import { incomeCardMtd } from '../../../lib/rentCollected'
+import { todayIn, addDaysTo } from '../../../lib/timezone'
 
 /** Occupied = a unit someone lives in. Same set the portfolio and KPI use. */
 const OCCUPIED = `('active','delinquent','suspended')`
@@ -47,6 +56,15 @@ const OCCUPIED = `('active','delinquent','suspended')`
  * idea of "occupied".
  */
 const LATE = `COALESCE(p.settled_at, NOW()) > p.due_date + (COALESCE(l.late_fee_grace_days, 0) || ' days')::interval`
+
+/**
+ * S655 (Nic, 10/2): SSI/SSDI is GAM's check for the flex products, kept
+ * GAM-side. Said in words so the agent can answer "how many of my tenants are
+ * on fixed income" truthfully instead of inventing a figure.
+ */
+const INCOME_IS_PRIVATE =
+  'Private. GAM does not share whether any resident receives SSI, SSDI, disability or other ' +
+  'benefits, not even as a count. It is between the resident and GAM.'
 
 const pct = (n: number, d: number): number | null =>
   d > 0 ? Math.round((n / d) * 1000) / 10 : null
@@ -74,7 +92,7 @@ export const getPortfolioStats: AgentTool = {
   name: 'get_portfolio_stats',
   description:
     'Statistics about the landlord’s OWN portfolio, computed from their real records — occupancy ' +
-    'rate; how many tenants and their average age and how many are on fixed income; monthly rent ' +
+    'rate; how many tenants and their average age; monthly rent ' +
     'roll and average rent; what share of rent arrives late and how many days late on average; how ' +
     'many leases end early and average lease length; open repairs and average days to complete one; ' +
     'rent collected against recorded expenses and other income; what deposits cost at move-out; how ' +
@@ -131,8 +149,7 @@ export const getPortfolioStats: AgentTool = {
       const [r] = await query<any>(
         `SELECT COUNT(DISTINCT lt.tenant_id)::int AS tenants,
                 ROUND(AVG(EXTRACT(YEAR FROM age(t.date_of_birth)))::numeric, 1) AS avg_age,
-                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.date_of_birth IS NOT NULL)::int AS with_dob,
-                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.ssi_ssdi)::int AS fixed_income
+                COUNT(DISTINCT lt.tenant_id) FILTER (WHERE t.date_of_birth IS NOT NULL)::int AS with_dob
            FROM leases l
            JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
            JOIN tenants t        ON t.id = lt.tenant_id
@@ -143,8 +160,7 @@ export const getPortfolioStats: AgentTool = {
         currentTenants: r.tenants,
         averageAgeYears: avgAge,
         tenantsWithAgeOnFile: r.with_dob,
-        onFixedIncome: r.fixed_income,
-        onFixedIncomePct: pct(r.fixed_income, r.tenants),
+        sourceOfIncome: INCOME_IS_PRIVATE,
       }
     }
 
@@ -233,26 +249,38 @@ export const getPortfolioStats: AgentTool = {
     // landlord's own book — money in and out, what deposits cost at move-out,
     // how applications convert, what short stays bring in, and inspections.
     if (want.includes('money')) {
-      const [r] = await query<any>(
-        `SELECT
-           (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
-             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
-               AND expense_date >= CURRENT_DATE - INTERVAL '12 months') AS expenses,
-           (SELECT COALESCE(SUM(amount),0) FROM landlord_other_income
-             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
-               AND income_date >= CURRENT_DATE - INTERVAL '12 months') AS other_income,
-           (SELECT COALESCE(SUM(amount),0) FROM payments
-             WHERE landlord_id= ANY($1::uuid[]) AND type='rent' AND status='settled'
-               AND settled_at >= CURRENT_DATE - INTERVAL '12 months') AS rent_collected`,
-        [id])
-      const rent = Number(r.rent_collected), exp = Number(r.expenses), other = Number(r.other_income)
+      // S655: income from the same facts as the reports page and the dashboard
+      // card ("Money received": money on the day it arrived; paid-ahead money
+      // the day it arrives; a credit the landlord gave is never income), over
+      // the last 12 months to today. thisMonth IS the dashboard's income card.
+      const today = todayIn(null)
+      const from = addDaysTo(`${Number(today.slice(0, 4)) - 1}${today.slice(4, 10)}`, 1)
+      const [inc, card, [r]] = await Promise.all([
+        incomeTotals({ landlordIds: id, start: from, end: today, basis: 'received' }),
+        incomeCardMtd(id, null, 'received'),
+        query<any>(
+          `SELECT
+             (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
+               WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
+                 AND expense_date >= $2::date AND expense_date <= $3::date) AS expenses`,
+          [id, from, today]),
+      ])
+      const exp = Number(r.expenses)
       if (exp === 0) missing.push('no expenses have been recorded, so there is no cost side to this')
       out.money = {
         windowMonths: 12,
-        rentCollected: rent,
-        otherIncome: other,
+        basis: inc.meta.label,
+        incomeReceived: inc.total,
+        rentCollected: inc.lines.rent,
+        paidAheadForLaterBills: inc.lines.paidAhead,
+        otherIncome: inc.lines.otherIncome,
         expensesRecorded: exp,
-        net: Math.round((rent + other - exp) * 100) / 100,
+        net: Math.round((inc.total - exp) * 100) / 100,
+        thisMonth: {
+          moneyReceived: card.received.amount,
+          includesPaidAhead: card.received.paidAhead,
+          stillClearing: card.received.clearing,
+        },
         netNote: exp === 0
           ? 'Net equals income because no expenses are on file — it is NOT a profit figure.'
           : 'Income minus the expenses recorded on the platform. Off-platform costs are not included.',
@@ -324,7 +352,8 @@ export const getPortfolioStats: AgentTool = {
     // on any of it. Saying plainly what is NOT here is cheaper than catching
     // every shape of embellishment afterwards.
     out.whatThisDoesNotContain =
-      'No per-tenant or per-property breakdown, no day-range buckets, no month-by-month trend, no ' +
+      'No per-tenant or per-property breakdown, no source of income (private), no day-range ' +
+      'buckets, no month-by-month trend, no ' +
       'forecast, and no comparison to other landlords. Report only the figures above. For the ' +
       'month-by-month late history use get_late_payment_history; for named tenants use ' +
       'get_delinquent_tenants or lookup_tenant_payment_status.'

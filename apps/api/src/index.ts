@@ -63,13 +63,16 @@ import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
+import { stayCheckOutRouter }  from './routes/stayCheckOut'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
 import { telemetryRouter } from './routes/telemetry'
 import { leasesRouter }       from './routes/leases'
+import { paidAheadChoiceRouter } from './routes/paidAheadChoice'
 import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
 import { lotRentRouter }      from './routes/lotRent'
 import { expensesRouter }     from './routes/expenses'
+import { financialsRouter }   from './routes/financials'
 import { bankReconciliationRouter } from './routes/bankReconciliation'
 import { bankFeedRouter }     from './routes/bankFeed'
 import { featureRequestsRouter } from './routes/featureRequests'
@@ -95,10 +98,15 @@ import { workTradeRouter }    from './routes/workTrade'
 // S624: "I paid at the bank" — tenant-declared deposits, matched against the feed.
 import { declaredDepositsRouter } from './routes/declaredDeposits'
 import { posRouter }          from './routes/pos'
+import { posPayLinksRouter, publicPayRouter } from './routes/posPayLinks'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
+import { signingPackagesRouter } from './routes/signingPackages'
 import { backgroundRouter }   from './routes/background'
+// S651: the renter's own view of the pool — places near THEM, no company involved.
+import { renterPoolRouter }   from './routes/renterPool'
+import { emergencyContactsRouter } from './routes/emergencyContacts'
 import { announcementsRouter }  from './routes/announcements'
 import { surveysRouter }        from './routes/surveys'
 import { tenantCreditsRouter }  from './routes/tenantCredits'
@@ -169,6 +177,7 @@ const STATIC_ALLOWED_ORIGINS = [
   'http://localhost:3102', // tenant preview
   'http://localhost:3103', // admin preview
   'http://localhost:3105', // pos preview
+  'http://localhost:3106', // books preview
   // S558: the real local dev servers (30xx). In prod-mode the *_APP_URL vars
   // above resolve to the prod domains, so the localhost fallbacks drop out and
   // a local dev portal hitting this API gets a CORS block ("login failed").
@@ -270,6 +279,26 @@ app.use(httpLogger)
 // too high lets clients spoof X-Forwarded-For.
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
 
+// ── S639 SECURITY: NEVER LET A BROWSER CACHE ONE PERSON'S DATA FOR ANOTHER ───
+//
+// Nick Platt accepted his invite on a browser where another household member was
+// already signed in and saw THEIR profile. The main culprit was the client-side
+// query cache (fixed in every portal), but the API log showed the other half of
+// the same hazard: `GET /api/tenants/me` and `/api/auth/me` answering 304, which
+// means a browser was revalidating a cached body rather than fetching a fresh
+// one. On a shared device, with a shared URL and a changed identity, that is a
+// second route to the same leak.
+//
+// Express's ETag is content-derived, so a correct revalidation returns 200 when
+// the body differs — but nothing about that guarantee is worth relying on for
+// per-user data. Authenticated API responses are simply never cacheable. It also
+// removes the conditional-request round trip that produced those 304s.
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+  res.set('Pragma', 'no-cache')
+  next()
+})
+
 // Rate limiting. General limit sized for AUTHENTICATED PORTAL USE:
 // the portals poll in the background (notification bell + pending-
 // sign every 30s per tab, move-in gate 5min, react-query refocus
@@ -351,6 +380,7 @@ app.use('/api/business-recurring-invoices', businessRecurringInvoicesRouter)
 app.use('/api/business-bookable-services', businessBookableServicesRouter)
 app.use('/api/public', publicBookingRouter)
 app.use('/api/public', publicPropertyBookingRouter)
+app.use('/api/public', publicPayRouter)
 app.use('/api/business-attachments', businessAttachmentsRouter)
 app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
@@ -366,14 +396,20 @@ app.use('/api/dump-locations', dumpLocationsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
+// 10/4 (decisions #38): checking a guest out and settling the money.
+app.use('/api/units',         stayCheckOutRouter)
 app.use('/api/units',         unitsRouter)
 app.use('/api',               propertyBookingAdminRouter)
 app.use('/api',               telemetryRouter)
+// 10/4 (decisions #46.1): the landlord's choice for paid-ahead money left on an ended lease.
+app.use('/api/leases',        paidAheadChoiceRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)
 app.use('/api/lot-rent',      lotRentRouter)
 app.use('/api/expenses',      expensesRouter)
+// 10/11: the shared financial pages (landlord portal + GAM Books), owner and bookkeeper.
+app.use('/api/financials',    financialsRouter)
 app.use('/api/bank-reconciliations', bankReconciliationRouter)
 app.use('/api/bank-feed',         bankFeedRouter)
 app.use('/api/feature-requests',  featureRequestsRouter)
@@ -400,6 +436,7 @@ app.use('/api/portfolio',     portfolioRouter)  // S592: PM-scoped surface (allo
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/declared-deposits', declaredDepositsRouter)
 app.use('/api/stripe',        stripeRouter)
+app.use('/api/pos/pay-links', posPayLinksRouter)
 app.use('/api/pos',           posRouter)
 app.use('/api/reports',       reportsRouter)
 // Allow PDF embedding for file routes
@@ -416,18 +453,22 @@ app.use('/api/background/id-files', (req, res, next) => {
 })
 app.use('/api/maint-portal', maintenancePortalRouter)
 app.use('/api/esign',         esignRouter)
+app.use('/api/signing-packages', signingPackagesRouter)
 app.use('/api/announcements',  announcementsRouter)
 app.use('/api/surveys',        surveysRouter)
 app.use('/api/tenant-credits', tenantCreditsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
   app.use('/api/background',    backgroundRouter)
+  // S640: the front desk's emergency contact list.
+  app.use('/api/emergency-contacts', emergencyContactsRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/bank-accounts',  bankAccountsRouter)
 app.use('/api/admin',          adminBankAccountsRouter)
 app.use('/api/users',          financesRouter)
 app.use('/api/books',          booksRouter)
+app.use('/api/renter-pool',    renterPoolRouter)
 app.use('/api/scopes',         scopesRouter)
 app.use('/api/invitations',    invitationsRouter)
 app.use('/api/pm',             pmRouter)
@@ -460,7 +501,8 @@ app.use(errorHandler)
 // flag is opt-OUT ('0' disables), and only the multi-replica deployment
 // (GCP: gam-api sets 0, gam-scheduler runs the crons) turns it off.
 // Hard rule either way: exactly one process anywhere runs with crons on.
-const runScheduler = process.env.RUN_SCHEDULER !== '0'
+// S650's GAM_DISABLE_SCHEDULER=1 (the gam_demo preview instance) still works.
+const runScheduler = process.env.RUN_SCHEDULER !== '0' && process.env.GAM_DISABLE_SCHEDULER !== '1'
 
 // A5: rate limiters / agent caches / turn gates are in-process. One replica
 // is correct by design (Cloud Run max-instances=1); a scaled-out deployment
@@ -479,7 +521,7 @@ const server = app.listen(PORT, () => {
     marketing:    process.env.MARKETING_URL    || 'http://localhost:3004',
   }, 'GAM API listening')
   if (runScheduler) schedulerInit()
-  else logger.info('RUN_SCHEDULER=0 — cron scheduler disabled on this instance')
+  else logger.info('cron scheduler disabled on this instance (RUN_SCHEDULER=0 or GAM_DISABLE_SCHEDULER=1)')
 })
 
 // Graceful shutdown (Cloud Run sends SIGTERM with ~10s grace; launchd sends

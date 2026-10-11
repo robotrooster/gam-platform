@@ -29,6 +29,7 @@ import { RegisterPage } from './pages/RegisterPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { InvitationsPage } from './pages/InvitationsPage'
 import { PropertiesPage } from './pages/PropertiesPage'
+import { OwnersPage } from './pages/OwnersPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
 import { FeePlansPage } from './pages/FeePlansPage'
 import { StaffPage } from './pages/StaffPage'
@@ -42,11 +43,24 @@ const qc = new QueryClient({
 })
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
-  const { user, loading, pmCompanies } = useAuth()
+  const { user, loading, pmCompanies, activePmCompany, setActivePmCompany } = useAuth()
   if (loading) return <div style={{ padding: 32, color: 'var(--text-3)' }}>Loading…</div>
   if (!user) return <Navigate to="/login" replace />
   // User is signed in but isn't a member of any pm_company → send them to register
   if (pmCompanies.length === 0) return <Navigate to="/register" replace />
+  // S654 (Nic, DIRECTIVE): no default company — someone on staff at several
+  // chooses which one they are working in before any company page loads.
+  if (!activePmCompany) return (
+    <div style={{ maxWidth: 420, margin: '80px auto', padding: 24 }}>
+      <h2 style={{ marginTop: 0, color: 'var(--text-0)' }}>Choose a company</h2>
+      <p style={{ color: 'var(--text-2)', fontSize: '.88rem' }}>You work with more than one company. Pick the one you are working in now; you can switch any time from the menu.</p>
+      <div style={{ display: 'grid', gap: 8 }}>
+        {pmCompanies.map(c => (
+          <button key={c.id} className="btn btn-primary" onClick={() => setActivePmCompany(c)}>{c.name}</button>
+        ))}
+      </div>
+    </div>
+  )
   return <>{children}</>
 }
 
@@ -79,6 +93,7 @@ appRoot.render(
               <Route path="dashboard"      element={<DashboardPage />} />
               <Route path="properties"      element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
+              <Route path="owners"          element={<OwnersPage />} />
               <Route path="invitations" element={<InvitationsPage />} />
               <Route path="fee-plans"  element={<FeePlansPage />} />
               <Route path="staff"      element={<StaffPage />} />

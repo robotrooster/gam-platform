@@ -292,3 +292,27 @@ describe('S636 per-tenant name slots each bind their own column', () => {
     expect(tenantColumnForSlot('tenant_initial', 1)).toBeNull()
   })
 })
+
+
+// S648 (Nic): "Can a new landlord that's onboarding and creating their
+// templates auto draft the boxes... have that link to certain fee types."
+describe('S648 move-in table and fee boxes link on upload', () => {
+  it.each([
+    ["First month's rent", 'move_in_first_month_rent'],
+    ['Proration', 'move_in_proration'],
+    ['Prorated rent', 'move_in_proration'],
+    ['Total due', 'move_in_total_due'],
+    ['Total move-in cost', 'move_in_total_due'],
+    ['Monthly rent', 'rent_amount'],
+    ['Rent pre-payment', 'last_month_rent'],
+    ['Utility deposit', 'utility_deposit'],
+    ['Key deposit', 'key_deposit'],
+    ['Pet rent', 'pet_rent'],
+    ['Pet fee', 'pet_fee'],
+    ['Move-in fee', 'move_in_fee'],
+    ['Cleaning fee', 'cleaning_fee'],
+    ['Parking fee', 'parking_rent'],
+  ])('%s → %s', (label, col) => {
+    expect(columnForContext(label, '')).toBe(col)
+  })
+})

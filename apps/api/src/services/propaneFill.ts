@@ -24,6 +24,7 @@
 import type { PoolClient } from 'pg'
 import { propaneSplitOptions } from '@gam/shared'
 import { AppError } from '../middleware/errorHandler'
+import { todayIn, monthStartOf } from '../lib/timezone'
 
 const monthStart = (d: Date) =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
@@ -43,6 +44,8 @@ export interface UnitFillContext {
   propane_allow_installments: boolean
   propane_split_min_gallons: string
   propane_split_four_min_gallons: string
+  /** S654: the property's zone — "next month" is counted on its calendar. */
+  timezone: string | null
 }
 
 /**
@@ -194,7 +197,9 @@ export async function recordFill(
   const nextFree = lastScheduled.rows[0]?.last
     ? addMonths(lastScheduled.rows[0].last, 1)
     : null
-  const nextMonth = addMonths(monthStart(new Date()), 1)
+  // S654: next month on the PROPERTY's calendar. A UTC month start skipped a
+  // month for fills recorded after 5 pm Phoenix on the last day of a month.
+  const nextMonth = addMonths(monthStartOf(todayIn(unit.timezone)), 1)
   // Whichever is later: next month, or the month after everything already queued.
   const firstCycle = nextFree && nextFree > nextMonth ? nextFree : nextMonth
 

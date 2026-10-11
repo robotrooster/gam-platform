@@ -402,8 +402,8 @@ describe('S561 landlord-owned adverse action', () => {
       .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), ssn: undefined })
     expect(sub.status).toBe(201)
     const checkId = sub.body.data.id
-    // Make the check decidable.
-    await db.query(`UPDATE background_checks SET status='processing' WHERE id=$1`, [checkId])
+    // Make the check decidable: 10/5 (Nic, A6) — only once the results are back.
+    await db.query(`UPDATE background_checks SET status='complete' WHERE id=$1`, [checkId])
     return { f, checkId }
   }
 
@@ -447,7 +447,7 @@ describe('S561 landlord-owned adverse action', () => {
   })
 
   it('adverse-action send is rejected for a non-denied applicant', async () => {
-    const { f, checkId } = await denyFixture()  // status = 'processing', not denied
+    const { f, checkId } = await denyFixture()  // status = 'complete', not denied
     const res = await request(buildApp())
       .post(`/api/background/${checkId}/adverse-action`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -503,5 +503,130 @@ describe('S636 — property binding from a scanned QR', () => {
     const { rows: [row] } = await db.query<any>(
       `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
     expect(row.property_id).toBe(f.propertyId)
+  })
+})
+
+// S655: the last fallback took the property from the person's latest
+// application ANYWHERE, so a check run for company X could be tied to company
+// Y's park — and X's screening views then showed where else the person had
+// applied. Only an application to the company being screened for counts.
+describe('S655 — property binding from an older application is per company', () => {
+  const applyTo = (applicantUserId: string, landlordId: string, unitId: string, propertyId: string) =>
+    db.query(
+      `INSERT INTO unit_applications (unit_id, landlord_id, property_id, applicant_user_id, first_name, last_name, email)
+       VALUES ($1, $2, $3, $4, 'App', 'Licant', $5)`,
+      [unitId, landlordId, propertyId, applicantUserId, `app-${randomUUID()}@test.dev`])
+
+  it('an application to another company never binds this company’s check to that park', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    await applyTo(f.applicantUserId, other.landlordId, other.unitId, other.propertyId)
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBeNull()
+  })
+
+  it('an older application to this company still binds its property', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    await applyTo(f.applicantUserId, f.landlordId, f.unitId, f.propertyId)
+    // A newer application elsewhere does not win over it.
+    await applyTo(f.applicantUserId, other.landlordId, other.unitId, other.propertyId)
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBe(f.propertyId)
+  })
+})
+
+// ── S642: THE MONEY HAS TO REFLECT WHAT ACTUALLY HAPPENED ────────────────────
+//
+// Nic: "I don't know what the $40 is, but let's get it fixed because that's not
+// the real price. As long as she's getting charged right, that's priority number
+// one. But just as important is all the money needs to reflect what actually
+// happened."
+//
+// Two defects, both found on the ONE real screening on file. Her row said
+// $40.00 (a column DEFAULT nothing ever overwrote) against a $44.99 Stripe
+// charge, and the applicant's payment id was recorded only on the pool route —
+// so a landlord-route or QR-scanned applicant left a charge in Stripe and a
+// screening in the database with nothing joining them.
+describe('S642 the screening record matches the charge', () => {
+  it('records the applicant payment id on the LANDLORD route, not just the pool route', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const payload = happyPayload({ landlordId: f.landlordId, unitId: f.unitId })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(payload)
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT applicant_payment_intent_id FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    // The old line was `isSpeculative ? applicantPaymentIntentId : null`, which
+    // stored NULL here — no refund path and no dispute evidence.
+    expect(row.applicant_payment_intent_id).toBe(payload.applicantPaymentIntentId)
+  })
+
+  it('records it on the pool route too', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    // The pool route anchors at a system shell landlord; without it the route
+    // 503s ("Renter pool intake is not set up") long before it reaches the line
+    // under test.
+    const shellUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ('pool-intake@gam.internal','x','landlord','Pool','Intake',TRUE)
+       ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name
+       RETURNING id`)
+    const shellLl = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, is_system, background_provider)
+       VALUES ($1, TRUE, 'mock') RETURNING id`, [shellUser.rows[0].id])
+    // getPoolIntakeShell returns null unless the shell landlord also has a
+    // PROPERTY — Checkr Tenant orders need an address to run against.
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await seedProperty(c, {
+        landlordId: shellLl.rows[0].id,
+        ownerUserId: shellUser.rows[0].id,
+        managedByUserId: shellUser.rows[0].id,
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const payload = happyPayload()
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(payload)
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT applicant_payment_intent_id FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    expect(row.applicant_payment_intent_id).toBe(payload.applicantPaymentIntentId)
+  })
+
+  it('never invents an amount — an unrecorded charge reads as NULL, not $40', async () => {
+    // Mock intents carry no Stripe amount to read, so nothing is recorded. The
+    // point is that nothing is FABRICATED either: the 40.00 default is gone, so
+    // "unknown" stays visibly unknown instead of masquerading as a price.
+    const f = await seedFixture({ provider: 'mock' })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId, unitId: f.unitId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT amount_charged FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    expect(row.amount_charged).toBeNull()
   })
 })

@@ -180,6 +180,36 @@ describe('POS customers — GET/POST/DELETE pass-through', () => {
     })
   })
 
+  // S654 (Nic, DIRECTIVE): no default company. The FlexCharge page now asks
+  // "Customer of" on a two-company account and sends landlordId; the customer
+  // lands in that company, naming nothing is asked, a foreign company refused.
+  it('S654: POST /pos-customers on a two-company account files under the named company', async () => {
+    const f = await seedPFFixture()
+    const b = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [f.landlordUserId])
+    const llB = b.rows[0].id
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'two@test.dev',
+        profileId: null, landlordIds: [f.landlordId, llB], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const body = { firstName: 'Alice', lastName: 'Smith', email: 'a2@x.dev' }
+
+    const ask = await request(buildApp()).post('/api/landlords/pos-customers')
+      .set('Authorization', `Bearer ${token}`).send(body)
+    expect(ask.status).toBe(400)
+    expect(String(ask.body.error)).toMatch(/more than one company/i)
+
+    const foreign = await request(buildApp()).post('/api/landlords/pos-customers')
+      .set('Authorization', `Bearer ${token}`).send({ ...body, landlordId: randomUUID() })
+    expect(foreign.status).toBe(403)
+    expect(createPosCustomerMock).not.toHaveBeenCalled()
+
+    const named = await request(buildApp()).post('/api/landlords/pos-customers')
+      .set('Authorization', `Bearer ${token}`).send({ ...body, landlordId: llB })
+    expect(named.status).toBe(201)
+    expect(createPosCustomerMock.mock.calls[0]![0]).toMatchObject({ landlordId: llB })
+  })
+
   it('DELETE /pos-customers/:id scopes the archive to the account\'s companies', async () => {
     const f = await seedPFFixture()
     const customerId = randomUUID()

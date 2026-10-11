@@ -20,7 +20,7 @@ That timing is why approving logs promptly matters — hours still sitting unapp
 
 **You decide how long a shortfall may carry.** The **Grace** column on each agreement sets it, from 0 (settle at the end of the month the hours were owed) upward. When the window closes with hours still owed, the uncovered part of that month's bill is charged as an ordinary balance and the agreement ends. That charge never takes a late fee, and the tenant may pay it down in any amount rather than all at once. Each carried hour is valued at the rate of the month it was owed for, so a rent increase since then doesn't change what old hours are worth.
 
-Setting the grace is a judgement call worth making deliberately: at some point a tenant is far enough behind that no realistic month of work catches them up, and their portal states plainly how many hours that would take. Ending the agreement yourself does the same settlement immediately.
+Setting the grace is a judgment call worth making deliberately: at some point a tenant is far enough behind that no realistic month of work catches them up, and their portal states plainly how many hours that would take. Ending the agreement yourself does the same settlement immediately.
 
 ## Targets are per person
 

@@ -11,7 +11,7 @@
  * multi-company landlord, and the UI rendered that failure as "Loading…"
  * forever because it tested `!data`.
  *
- * These pin the contract the modal now honours.
+ * These pin the contract the modal now honors.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -59,10 +59,12 @@ const pl = (qs: string, token: string) => request(buildApp())
   .get(`/api/reports/monthly-pl?${qs}`).set('Authorization', `Bearer ${token}`)
 
 describe('GET /reports/monthly-pl', () => {
-  it('refuses to blend two companies, and says so', async () => {
+  // S654 (Nic, DIRECTIVE): no default company. With none named and two
+  // owned, the report asks — it never answers for "the founding company".
+  it('asks which company when none is named and the account owns two', async () => {
     const res = await pl('year=2026&month=9', twoCoToken)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/more than one company/i)
+    expect(res.status, JSON.stringify(res.body)).toBe(400)
+    expect(String(res.body?.error)).toMatch(/more than one company/i)
   })
 
   it('answers once a company is named — what the modal now sends', async () => {
@@ -88,5 +90,16 @@ describe('GET /reports/monthly-pl', () => {
     })()
     const res = await pl(`year=2026&month=9&landlordId=${stranger}`, twoCoToken)
     expect([400, 403, 404]).toContain(res.status)
+  })
+})
+
+// S655: the switch does not change who the statement belongs to — a P&L is
+// still ONE company's, asked for by name when the account owns two.
+describe('GET /reports/monthly-pl under Money billed', () => {
+  it('still asks which company, and answers once one is named', async () => {
+    expect((await pl('year=2026&month=9&basis=billed', twoCoToken)).status).toBe(400)
+    const res = await pl(`year=2026&month=9&basis=billed&landlordId=${coA}`, twoCoToken)
+    expect(res.status).toBe(200)
+    expect(res.body.data.meta.basis.basis).toBe('billed')
   })
 })

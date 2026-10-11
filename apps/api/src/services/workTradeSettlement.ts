@@ -3,7 +3,7 @@
 // This file is the arithmetic only: no database, no dates beyond a month key,
 // no side effects. The job (jobs/workTradeSettlement.ts) reads rows, calls
 // `settleMonth`, and writes what comes back. Keeping it pure is what lets the
-// interesting cases — a deficit ageing out, a bank covering a bad month, a
+// interesting cases — a deficit aging out, a bank covering a bad month, a
 // catch-up crediting an invoice from two months ago — be tested without
 // standing up a tenancy.
 //
@@ -29,12 +29,12 @@
 // going to be caught up would run forever.
 //
 // A carried hour keeps ITS OWN MONTH'S VALUE (`hourRate`, frozen at settlement).
-// A rent increase must not retroactively reprice labour somebody already failed
+// A rent increase must not retroactively reprice labor somebody already failed
 // to do.
 //
 // SURPLUS BANKS WITHOUT LIMIT. Deficits follow the tenant, so credits follow
 // them too. Banked hours buy months; they never become cash. That is what keeps
-// this a trade rather than paid labour — the cap that used to enforce that
+// this a trade rather than paid labor — the cap that used to enforce that
 // (clamping a single month to 100%) still holds per month, it just no longer
 // throws the excess away.
 
@@ -86,7 +86,7 @@ export interface PeriodOutcome {
   uncoveredAmount: number
   /**
    * How many month-closes this period has now survived while open. The job
-   * persists it; a period that settles or bills stops ageing.
+   * persists it; a period that settles or bills stops aging.
    */
   agedCloses: number
   status: 'open' | 'settled' | 'billed'
@@ -151,6 +151,24 @@ export function hourRateFor(basisAmount: number, targetHours: number): number {
  * Rounded UP to the quarter hour, and never to zero: a month that bills
  * anything at all asks for some work.
  */
+/**
+ * Dollars a period's applied hours have bought, capped at the bill.
+ *
+ * S637 (Nic): a ZERO-hour agreement covers the month outright. The landlord
+ * approves it for someone they trust to get the work done without counting —
+ * "I wanna only track hours on people that I can't trust to get enough done."
+ * No hours are expected, so there is nothing to fall short of and the whole
+ * basis is credited. Pricing it the normal way (applied x rate) would credit
+ * zero and leave the tenant the full gross bill, which is the exact opposite of
+ * what the agreement says.
+ */
+export function periodCredit(
+  basisAmount: number, targetHours: number, appliedHours: number, hourRate: number,
+): number {
+  if (!(targetHours > 0)) return round2(basisAmount)
+  return Math.min(round2(basisAmount), round2(appliedHours * hourRate))
+}
+
 export function proratedTarget(
   monthlyTarget: number, billedAmount: number, fullMonthAmount: number,
 ): number {
@@ -248,9 +266,8 @@ export function settleMonth(input: SettlementInput): SettlementResult {
     // frozen rate. Computed from the rate rather than from basis × fraction so
     // that a period always prices its hours the way it promised to — and capped
     // at basis so rounding can never credit more than the bill.
-    const creditTotal = Math.min(
-      round2(s.src.basisAmount),
-      round2(s.applied * s.src.hourRate),
+    const creditTotal = periodCredit(
+      s.src.basisAmount, s.src.targetHours, s.applied, s.src.hourRate,
     )
     const uncovered = round2(Math.max(0, s.src.basisAmount - creditTotal))
 
@@ -298,28 +315,44 @@ export function settleMonth(input: SettlementInput): SettlementResult {
  * and there is no more time. Banked hours ARE spent first — they were earned,
  * and refusing to let them cover a debt at the one moment it matters would take
  * work someone already did and throw it away.
+ *
+ * S654: so are approved hours no close has counted yet — the month the
+ * agreement ends in, mostly. `uncountedHours` (by periodMonth) lands on its own
+ * period first, as at a close; any surplus joins the bank. Without it, ending
+ * mid-month billed the whole month however much of it had been worked.
  */
 export function settleOnEnd(
   periods: SettlementPeriod[], bankedHours: number,
+  uncountedHours: Record<string, number> = {},
 ): SettlementResult {
   let bank = round2h(Math.max(0, bankedHours))
   let billedAmount = 0
   const billedPeriods: string[] = []
 
+  const state = periods.map(p => ({ p, applied: round2h(p.hoursApplied), now: 0 }))
+  const give = (s: typeof state[number], hours: number): number => {
+    const used = Math.min(round2h(hours), Math.max(0, round2h(s.p.targetHours - s.applied)))
+    if (used <= 0) return 0
+    s.applied = round2h(s.applied + used)
+    s.now = round2h(s.now + used)
+    return used
+  }
+  // Each period's own uncounted hours first; the surplus is banked.
+  for (const s of state) {
+    const own = round2h(Math.max(0, uncountedHours[s.p.periodMonth] ?? 0))
+    bank = round2h(bank + own - give(s, own))
+  }
+
   // Oldest first. Which month a banked hour lands on is not cosmetic — periods
   // carry different frozen rates, so the order changes what the tenant is
   // billed. Oldest-first is the same order catch-up uses during a normal close,
   // and it clears the debt that has been outstanding longest.
-  const outcomes: PeriodOutcome[] = periods.map(p => {
-    let applied = round2h(p.hoursApplied)
-    const wanted = Math.max(0, round2h(p.targetHours - applied))
-    const drawn = Math.min(bank, wanted)
-    if (drawn > 0) {
-      applied = round2h(applied + drawn)
-      bank = round2h(bank - drawn)
-    }
+  const outcomes: PeriodOutcome[] = state.map(s => {
+    const p = s.p
+    if (bank > 0) bank = round2h(bank - give(s, bank))
+    const applied = s.applied
     const outstanding = Math.max(0, round2h(p.targetHours - applied))
-    const creditTotal = Math.min(round2(p.basisAmount), round2(applied * p.hourRate))
+    const creditTotal = periodCredit(p.basisAmount, p.targetHours, applied, p.hourRate)
     const uncovered = round2(Math.max(0, p.basisAmount - creditTotal))
     const status: PeriodOutcome['status'] = outstanding <= 0 ? 'settled' : 'billed'
     if (status === 'billed') {
@@ -328,7 +361,7 @@ export function settleOnEnd(
     }
     return {
       periodMonth: p.periodMonth,
-      hoursAppliedNow: drawn,
+      hoursAppliedNow: s.now,
       hoursAppliedTotal: applied,
       hoursOutstanding: outstanding,
       creditTotal,

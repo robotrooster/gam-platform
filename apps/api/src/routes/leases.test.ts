@@ -364,7 +364,23 @@ describe('GET /leases — list scoping', () => {
     expect(names).toEqual(new Set(['Oak Park Motel and RV', 'Mountain View RV Ranch']))
   })
 
-  it('unknown role (bookkeeper) gets empty list, not 500', async () => {
+  // A role with no branch of its own falls through to the "empty rather than
+  // leak" guard. (10/11: this used a bookkeeper, which the bookkeeper gate in
+  // requireAuth now refuses outright — the next test.)
+  it('unknown role (business staff) gets empty list, not 500', async () => {
+    await seedFixture()
+    const token = jwt.sign(
+      { userId: randomUUID(), role: 'business_staff', email: 'bs@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/leases')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('a bookkeeper is refused outright (10/11, lib/bookkeeperAccess)', async () => {
     await seedFixture()
     const bkToken = jwt.sign(
       { userId: randomUUID(), role: 'bookkeeper', email: 'bk@test.dev', profileId: randomUUID(), permissions: {} },
@@ -373,8 +389,7 @@ describe('GET /leases — list scoping', () => {
     const res = await request(buildApp())
       .get('/api/leases')
       .set('Authorization', `Bearer ${bkToken}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data).toEqual([])
+    expect(res.status).toBe(403)
   })
 })
 
@@ -450,6 +465,20 @@ describe('PATCH /leases/:id — S201 material-change gate', () => {
       .send({ endDate: '2027-12-31' })
     expect(res.status).toBe(409)
     expect(res.body.error).toBe('material_change_requires_new_lease')
+    // S654: the stored date reads back as the date, not "Thu Dec 31".
+    expect(res.body.changes).toEqual([{ field: 'end_date', from: '2026-12-31', to: '2027-12-31' }])
+  })
+
+  // S654: a client that echoes the lease's own end date has changed nothing.
+  // pg's Date stringified as "Thu Dec 31" never matched, so this read as a term
+  // change and was refused.
+  it('an unchanged endDate on an active lease is not a material change', async () => {
+    const f = await seedFixture({ leaseStatus: 'active', endDate: '2026-12-31' })
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ endDate: '2026-12-31' })
+    expect(res.status).toBe(200)
   })
 
   it('non-material change (lateFeeGraceDays) on active without confirmAddendum → 409 addendum_confirmation_required', async () => {
@@ -705,20 +734,20 @@ describe('PATCH /leases/:id — auth + validation', () => {
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
-  it('S476: uncatalogued state → state_law_warnings empty', async () => {
+  it('S476: uncataloged state → state_law_warnings empty', async () => {
     const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
     await db.query(`UPDATE properties SET state = 'XX' WHERE id = $1`, [f.propertyId])
     const res = await request(buildApp())
       .patch(`/api/leases/${f.leaseId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ securityDeposit: 5000 })  // would flag in catalogued state
+      .send({ securityDeposit: 5000 })  // would flag in cataloged state
     expect(res.status).toBe(200)
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
   it('S476: lateFeeInitial percent of 10% > AZ catalog (no late_fee_max_pct on AZ residential) → empty', async () => {
     // AZ does NOT have a late_fee_max_pct provision; checkAgainstStatute
-    // returns null when the topic is uncatalogued. Confirms no false
+    // returns null when the topic is uncataloged. Confirms no false
     // alarm on a topic that doesn't have a state figure.
     const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
     const res = await request(buildApp())
@@ -817,13 +846,36 @@ describe('POST /leases/:id/bill-fee', () => {
   it('defaults dueDate to today when not provided', async () => {
     const f = await seedFixture()
     const feeId = await addBillableFee(f.leaseId, 'other_fee', 100)
-    const today = new Date().toISOString().slice(0, 10)
+    // S654: today from the database (Phoenix, the seeded park's zone), so the
+    // test agrees with the route in any hour — a UTC date runs a day ahead
+    // every evening.
+    const { rows: [{ today }] } = await db.query<{ today: string }>(`SELECT CURRENT_DATE::text AS today`)
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ leaseFeeId: feeId })
     expect(res.status).toBe(201)
     expect(res.body.data.due_date).toBe(today)
+  })
+
+  // S654 (Nic): "Everything must be local to the property." A park far from
+  // Phoenix dates the charge on its own calendar — Kiritimati (UTC+14) is a
+  // calendar day ahead of Phoenix for 21 hours of every day.
+  it('defaults dueDate to the PROPERTY\'s today, not the server\'s or UTC\'s', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE properties SET timezone = 'Pacific/Kiritimati' WHERE id = $1`, [f.propertyId])
+    const feeId = await addBillableFee(f.leaseId, 'other_fee', 100)
+    const { rows: [{ today }] } = await db.query<{ today: string }>(
+      `SELECT (NOW() AT TIME ZONE 'Pacific/Kiritimati')::date::text AS today`)
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/bill-fee`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseFeeId: feeId })
+    expect(res.status).toBe(201)
+    expect(res.body.data.due_date).toBe(today)
+    const row = await db.query<{ d: string }>(
+      `SELECT to_char(due_date, 'YYYY-MM-DD') AS d FROM payments WHERE id = $1`, [res.body.data.payment_id])
+    expect(row.rows[0].d).toBe(today)
   })
 
   it('409 when lease has no active primary tenant', async () => {
@@ -1254,5 +1306,79 @@ describe('POST /leases/:id/charge — one-off charge with a description', () => 
     const row = (await db.query<{ type: string }>(
       `SELECT type FROM payments WHERE id=$1`, [res.body.data.paymentId])).rows[0]
     expect(row.type).not.toBe('late_fee')
+  })
+})
+
+// S652 (Nic): a lease row opens the PACKET — every document drafted with it.
+describe('GET /api/leases/:id/documents', () => {
+  it('lists the lease document and its packet siblings with signers, oldest first, never voided ones', async () => {
+    const f = await seedFixture({})
+    const group = randomUUID()
+    const mk = async (title: string, sort: number, status: string, withLease: boolean, exec: string | null = null) => {
+      const { rows: [{ id }] } = await db.query<{ id: string }>(
+        `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status, package_group_id, package_sort_order, base_pdf_url, executed_pdf_url)
+         VALUES ($1,$2,$3,$4,'original_lease',$5,$6,$7,'/api/esign/files/base.pdf',$8) RETURNING id`,
+        [f.landlordId, f.unitId, withLease ? f.leaseId : null, title, status, group, sort, exec])
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+         VALUES ($1,$2,'landlord','LL','ll@test.dev',1,$3,$4)`, [id, f.landlordUserId, randomUUID(), status === 'completed' ? 'signed' : 'sent'])
+      return id
+    }
+    const leaseDoc = await mk('Lease', 0, 'completed', true, '/api/esign/files/executed-1.pdf')
+    const radon = await mk('Radon', 1, 'sent', false)
+    await mk('Old copy', 1, 'voided', false)
+    const res = await request(buildApp()).get(`/api/leases/${f.leaseId}/documents`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((d: any) => d.id)).toEqual([leaseDoc, radon])
+    expect(res.body.data[0].executed).toBe(true)
+    expect(res.body.data[0].fileUrl).toBe('/api/esign/files/executed-1.pdf')
+    expect(res.body.data[1].executed).toBe(false)
+    expect(res.body.data[1].fileUrl).toBe('/api/esign/files/base.pdf')
+    expect(res.body.data[1].signers[0]).toMatchObject({ role: 'landlord', status: 'sent' })
+  })
+
+  it('a stranger gets 403', async () => {
+    const f = await seedFixture({})
+    const other = jwt.sign({ userId: randomUUID(), role: 'landlord', email: 'x@test.dev', profileId: randomUUID(), permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp()).get(`/api/leases/${f.leaseId}/documents`).set('Authorization', `Bearer ${other}`)
+    expect(res.status).toBe(403)
+  })
+})
+
+// Final sweep (10/3): ending a lease here marked an add-a-roommate spot nobody
+// signed ('pending_add') 'removed' / lease_ended, as if that person had been on
+// the lease, and never stamped updated_at. The spot is void now (as voiding
+// its addendum leaves it); the people who were on the lease are removed.
+describe('PATCH /leases/:id ending a lease: an unsigned roommate spot becomes void', () => {
+  it.each(['terminated', 'expired'] as const)('status %s', async (status) => {
+    const f = await seedFixture({ leaseStatus: 'active' })
+    const roommate = await (async () => {
+      const c = await db.connect()
+      try { return await seedTenant(c, { email: `rm-${randomUUID()}@test.dev` }) } finally { c.release() }
+    })()
+    const addendum = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
+       VALUES ($1,$2,$3,'Add a roommate','addendum_add','in_progress') RETURNING id`,
+      [f.landlordId, f.unitId, f.leaseId])).rows[0].id
+    await db.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_reason, financial_responsibility, add_document_id)
+       VALUES ($1,$2,'co_tenant','pending_add','roommate_added','joint_several',$3)`,
+      [f.leaseId, roommate, addendum])
+    await db.query(`UPDATE lease_tenants SET updated_at = NOW() - INTERVAL '1 day' WHERE lease_id = $1`, [f.leaseId])
+
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ status, terminationReason: 'mutual agreement' })
+    expect(res.status).toBe(200)
+
+    const spots = await db.query<{ tenant_id: string; status: string; removed_reason: string | null; removed_at: string | null; fresh: boolean }>(
+      `SELECT tenant_id, status, removed_reason, removed_at, (updated_at > NOW() - INTERVAL '1 minute') AS fresh
+         FROM lease_tenants WHERE lease_id = $1`, [f.leaseId])
+    expect(spots.rows.find(r => r.tenant_id === f.tenantId))
+      .toMatchObject({ status: 'removed', removed_reason: 'lease_ended', fresh: true })
+    expect(spots.rows.find(r => r.tenant_id === roommate))
+      .toMatchObject({ status: 'void', removed_reason: null, removed_at: null, fresh: true })
   })
 })

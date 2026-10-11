@@ -1,0 +1,13 @@
+-- S652 — WHERE TO LOOK FOR THE NEXT EDITION.
+--
+-- Nic: "You need to be able to source them. That way we know where to search
+-- for them next time it comes up."
+--
+-- source_url is the FILE we downloaded — it goes dead the day an agency posts a
+-- new edition under a new name. source_page_url is the agency's PAGE that lists
+-- the document, which is where the yearly check starts: open the page, compare
+-- the edition, shelve the new one (resync carries it to every landlord copy).
+--
+-- No backfill here: stockLibrary.ts is the one source for every library row's
+-- metadata and writes this column on its next run.
+ALTER TABLE disclosure_library_documents ADD COLUMN IF NOT EXISTS source_page_url text;

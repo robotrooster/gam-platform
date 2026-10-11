@@ -65,7 +65,7 @@ const link = (body: any) => request(buildApp())
   .post('/api/bank-feed/link-session').set('Authorization', `Bearer ${token}`).send(body)
 
 describe('POST /bank-feed/link-session', () => {
-  it('uses the company sent in the BODY — the picker is honoured', async () => {
+  it('uses the company sent in the BODY — the picker is honored', async () => {
     const res = await link({ entityId: coB })
     expect(res.status).toBe(200)
     const { createLinkSession } = await import('../services/bankFeed')
@@ -90,5 +90,58 @@ describe('POST /bank-feed/link-session', () => {
     expect(res.status).toBe(200)
     const { createLinkSession } = await import('../services/bankFeed')
     expect(createLinkSession).toHaveBeenCalledWith(coA)
+  })
+})
+
+// S652 (Nic): "I select Mountain View, it shows the linked bank, and when I
+// click sync it tells me I need to choose which business." A connection
+// belongs to one company already; acting on it never asks.
+describe('POST /bank-feed/connections/:id/sync — the row knows its company', () => {
+  async function seedConnection(landlordId: string) {
+    const { rows: [row] } = await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1, 'stripe_fc', 'active') RETURNING id`, [landlordId])
+    return row.id
+  }
+  it('syncs a two-company account\'s connection without being told which company', async () => {
+    const id = await seedConnection(coB)
+    const res = await request(buildApp())
+      .post(`/api/bank-feed/connections/${id}/sync`).set('Authorization', `Bearer ${token}`).send({})
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+  })
+  it("refuses a connection that belongs to somebody else's company", async () => {
+    const id = await seedConnection(strangerCo)
+    const res = await request(buildApp())
+      .post(`/api/bank-feed/connections/${id}/sync`).set('Authorization', `Bearer ${token}`).send({})
+    expect(res.status).toBe(404)
+  })
+})
+
+// S655 (Step 12): a deposit slip, an Undo, a filing undo — each lands on the
+// company chosen on the page, or on the row's own company; never a guess.
+describe('Step 12: deposit slips and undo respect the company', () => {
+  it('a slip is made for the company chosen on the page; a company not yours is refused; none named with two is asked', async () => {
+    const send = (body: any) => request(buildApp()).post('/api/bank-feed/deposit-slips')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ depositDate: '2026-09-29', otherAmount: 12, otherNote: 'Vending', otherIsNotRent: true, ...body })
+    const ok = await send({ entityId: coB })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    const slip = (await db.query(`SELECT landlord_id FROM bank_deposit_slips WHERE id = $1`, [ok.body.data.id])).rows[0]
+    expect(slip.landlord_id).toBe(coB)
+    expect((await send({ entityId: strangerCo })).status).toBe(403)
+    const unnamed = await send({})
+    expect(unnamed.status).toBe(400)
+    expect(unnamed.body.error).toMatch(/more than one company/i)
+  })
+
+  it('an Undo on another company’s deposit is not found', async () => {
+    const conn = (await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1, 'stripe_fc', 'active') RETURNING id`, [strangerCo])).rows[0].id
+    const txn = (await db.query<{ id: string }>(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, status)
+       VALUES ($1,$2,'x1','2026-09-29',50,'matched') RETURNING id`, [conn, strangerCo])).rows[0].id
+    for (const path of [`/api/bank-feed/deposits/${txn}/undo`, `/api/bank-feed/transactions/${txn}/undo-auto-file`]) {
+      const res = await request(buildApp()).post(path).set('Authorization', `Bearer ${token}`).send({})
+      expect(res.status, path).toBe(404)
+    }
   })
 })

@@ -463,7 +463,7 @@ describe('nobody is invoiced without having agreed (S616)', () => {
     expect(Number(rows[0].total)).toBeGreaterThanOrEqual(25)
   })
 
-  // Nic's own case: the arrangement predates GAM and the neighbour is never
+  // Nic's own case: the arrangement predates GAM and the neighbor is never
   // going to click an email.
   it('a landlord can attest to an arrangement that predates GAM', async () => {
     const ctx = await unconsented()

@@ -272,7 +272,7 @@ async function main() {
     results.push(r)
     const mark = r.flags.length ? `${R}✗${O}` : `${G}✓${O}`
     console.log(`\n${mark} [${conv.audience}] ${conv.id}`)
-    console.log(`${D}   ${conv.behaviour}${O}`)
+    console.log(`${D}   ${conv.behavior}${O}`)
     console.log(`${Y}   ▸ ${conv.opener}${O}`)
     console.log(wrap(r.turn1, '     '))
     console.log(`${Y}   ▸ ${conv.followUp}${O}`)
@@ -288,7 +288,7 @@ async function main() {
   }
 
   // S630: the transcript is DATA, not console output. It was being recovered by
-  // scraping this log, and the scrape twice pulled neighbouring debug lines into
+  // scraping this log, and the scrape twice pulled neighboring debug lines into
   // a reply — once making it look as though the agent had named a tool out loud.
   // Anything that needs the transcripts reads this file instead.
   const jsonPath = process.env.AGENT_CONV_JSON
@@ -301,7 +301,7 @@ async function main() {
       total: results.length,
       passed: results.filter((r) => !r.flags.length).length,
       conversations: results.map((r) => ({
-        id: r.conv.id, audience: r.conv.audience, behaviour: r.conv.behaviour,
+        id: r.conv.id, audience: r.conv.audience, behavior: r.conv.behavior,
         pass: r.flags.length === 0, flags: r.flags,
         turns: [
           { user: r.conv.opener,   agent: r.turn1, tools: r.tools1, leaks: r.leaks1 },

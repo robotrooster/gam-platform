@@ -20,7 +20,7 @@
  * So past a point every rule added makes the earlier rules weaker, and the first
  * casualty is the one that matters most: look it up before you say it. That is
  * the real reason the phrase table exists and rescues nearly every lookup, and
- * why the S618 note above tool_choice reads "honoured most of the time, not
+ * why the S618 note above tool_choice reads "honored most of the time, not
  * every time" — it was measuring this without knowing it.
  *
  * De-collided example data was NOT the cause. With $1,145 in place of $1,200 the

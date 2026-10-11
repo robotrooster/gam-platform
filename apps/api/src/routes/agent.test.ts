@@ -20,8 +20,13 @@ vi.mock('../services/agents/conversationHistory', () => ({
   loadGuestConversationHistory: loadGuestHistoryMock,
 }))
 vi.mock('../services/bookingGuestTokens', () => ({ resolveBookingGuestToken: resolveGuestTokenMock }))
+// 10/4: every assistant sits behind one switch (ai_assistants_enabled). These
+// tests exercise the assistants themselves, so it reads ON unless a test says
+// otherwise.
+const { featureOnMock } = vi.hoisted(() => ({ featureOnMock: vi.fn(async (_key: string) => true) }))
+vi.mock('../services/systemFeatures', () => ({ isFeatureEnabled: featureOnMock }))
 
-import { agentRouter, guestAgentRouter } from './agent'
+import { agentRouter, guestAgentRouter, salesAgentRouter, propertyAgentRouter, ASSISTANT_OFF_MESSAGE } from './agent'
 import { errorHandler } from '../middleware/errorHandler'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_agent'
@@ -200,5 +205,54 @@ describe('POST /api/guest/chat (token-authenticated, no login)', () => {
     expect(loadGuestHistoryMock).toHaveBeenCalledWith(convo, 'bk-1')
     const passed = runAgentSessionMock.mock.calls[0][0]
     expect(passed.history).toEqual([{ role: 'user', content: 'from server' }])
+  })
+})
+
+// 10/4 (Nic): every AI assistant is off until it is retrained.
+describe('the assistants are switched off', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    featureOnMock.mockImplementation(async () => false)
+  })
+  const offApp = () => {
+    const a = express()
+    a.use(express.json())
+    a.use('/api/agent', agentRouter)
+    a.use('/api/sales', salesAgentRouter)
+    a.use('/api/guest', guestAgentRouter)
+    a.use('/api/property', propertyAgentRouter)
+    a.use(errorHandler)
+    return a
+  }
+
+  it('the tenant and landlord chat is hidden and refuses a message, without running the model', async () => {
+    const a = offApp()
+    const vis = await request(a).get('/api/agent/visibility').set('Authorization', `Bearer ${token('tenant')}`)
+    expect(vis.body.data).toEqual({ visible: false })
+    for (const role of ['tenant', 'landlord']) {
+      const r = await request(a).post('/api/agent/chat').set('Authorization', `Bearer ${token(role)}`).send({ message: 'hi' })
+      expect(r.status).toBe(503)
+      expect(r.body).toMatchObject({ code: 'assistant_off', error: ASSISTANT_OFF_MESSAGE })
+    }
+    expect(runAgentSessionMock).not.toHaveBeenCalled()
+  })
+
+  it('the sales, guest stay and booking-site chats refuse too, and the public check says hidden', async () => {
+    const a = offApp()
+    expect((await request(a).get('/api/sales/assistant')).body.data).toEqual({ visible: false })
+    const sales = await request(a).post('/api/sales/chat').send({ message: 'hi' })
+    const guest = await request(a).post('/api/guest/chat').send({ token: 'x'.repeat(32), message: 'hi' })
+    const site = await request(a).post('/api/property/some-park/agent/chat').send({ message: 'hi' })
+    for (const r of [sales, guest, site]) {
+      expect(r.status).toBe(503)
+      expect(r.body.code).toBe('assistant_off')
+    }
+    expect(runAgentSessionMock).not.toHaveBeenCalled()
+    expect(resolveGuestTokenMock).not.toHaveBeenCalled()
+  })
+
+  it('switched back on, the public check says visible', async () => {
+    featureOnMock.mockImplementation(async () => true)
+    expect((await request(offApp()).get('/api/sales/assistant')).body.data).toEqual({ visible: true })
   })
 })

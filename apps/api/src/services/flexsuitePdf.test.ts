@@ -41,11 +41,22 @@ function extractDecodedText(buf: Buffer): string {
     const dict = match[1] ?? ''
     const body = match[2] ?? ''
     if (!/\/Filter\s*\/FlateDecode/.test(dict)) continue
-    try {
-      streams.push(zlib.inflateSync(Buffer.from(body, 'latin1')).toString('latin1'))
-    } catch {
-      // Some streams may use other filters; skip them.
+    // 10/6: the pattern above eats a "\r" before "endstream". The PDF carries
+    // the time it was made, so its compressed bytes change every run, and about
+    // one run in 256 a stream's last byte IS "\r" — it was cut off, inflate
+    // failed, the stream was skipped and the page count read 0 (a flaky failure
+    // in the full suite). Put the byte back, and as a last resort decode what
+    // is there without the checksum.
+    const raw = Buffer.from(body, 'latin1')
+    const attempts = [
+      () => zlib.inflateSync(raw),
+      () => zlib.inflateSync(Buffer.concat([raw, Buffer.from('\r', 'latin1')])),
+      () => zlib.inflateSync(raw, { finishFlush: zlib.constants.Z_SYNC_FLUSH }),
+    ]
+    for (const attempt of attempts) {
+      try { streams.push(attempt().toString('latin1')); break } catch { /* next */ }
     }
+    // Streams using other filters are skipped.
   }
   const joined = streams.join('\n')
   // Replace each <hex> Tj operator with the decoded text.

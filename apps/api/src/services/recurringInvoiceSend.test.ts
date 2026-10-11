@@ -46,6 +46,7 @@ import { sendGeneratedInvoice } from './recurringInvoiceSend'
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  process.env.STRIPE_SECRET_KEY = 'sk_test_mock_recurring'
   piCreateMock.mockReset()
   checkoutCreateMock.mockReset()
   emailBusinessInvoiceSentMock.mockClear()
@@ -129,7 +130,10 @@ describe('sendGeneratedInvoice — auto-charge path (S508)', () => {
     expect(piArgs.off_session).toBe(true)
     expect(piArgs.confirm).toBe(true)
     expect(piArgs.amount).toBe(10000)  // $100 → 10000 cents
-    expect(piArgs.transfer_data.destination).toBe('acct_test')
+    // S648: GAM's charge — nothing goes straight to the business.
+    expect(piArgs.transfer_data).toBeUndefined()
+    const { rows: held } = await db.query<any>(`SELECT amount FROM held_payout_items WHERE business_id = $1`, [f.businessId])
+    expect(Number(held[0].amount)).toBe(95.95)  // $100 less 3.5% + 55¢
 
     const { rows: [inv] } = await db.query<{
       status: string; amount_paid: string; stripe_payment_intent_id: string;

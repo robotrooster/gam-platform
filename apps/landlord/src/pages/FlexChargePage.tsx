@@ -17,6 +17,7 @@ import { CreditCard, Plus } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
 import { humanize, FLEX_CHARGE_MAX_FINANCE_PCT } from '@gam/shared'
 import { appPrompt } from '../components/dialogs'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 
 // S583: per-property merchant finance rate. The merchant is the lender — they
 // set the flat % their customers pay on each monthly statement balance (capped
@@ -80,6 +81,9 @@ interface AccountRow {
 
 interface PosCustomerRow {
   id:           string
+  // S654: the company the customer is filed under — accounts open only at
+  // that company's properties.
+  landlordId:   string
   firstName:    string
   lastName:     string
   email:        string
@@ -92,6 +96,7 @@ interface PosCustomerRow {
 interface Property {
   id:                string
   name:              string
+  landlordId:        string
   // S309 / S312: per-Location FlexCharge enablement gate. The schema
   // column is `flexcharge_enabled`; after the S312 response-interceptor
   // transform (packages/shared/src/camelize.ts) the frontend reads it
@@ -303,7 +308,7 @@ function PosCustomerActionsRow({ customer, qc }: { customer: PosCustomerRow; qc:
         setErr(null)
         qc.invalidateQueries('pos-customers')
       },
-      onError: (e: any) => setErr(e?.response?.data?.error?.message || 'Send failed'),
+      onError: (e: any) => setErr(e?.message || 'Send failed'),
     },
   )
   return (
@@ -512,8 +517,22 @@ function CreateAccountModal({ properties, tenants, posCustomers, onClose, onSucc
   const [customerType, setCustomerType] = useState<'tenant'|'pos_customer'>('tenant')
   const [tenantId, setTenantId] = useState('')
   const [posCustomerId, setPosCustomerId] = useState('')
-  const [propertyId, setPropertyId] = useState(properties[0]?.id || '')
+  // S654 (Nic, DIRECTIVE): no default — the first property in the list is not
+  // a choice the landlord made, and it decides which company's customers show.
+  const [propertyId, setPropertyId] = useState('')
   const [creditLimit, setCreditLimit] = useState('')
+  const pickedProperty = properties.find(p => p.id === propertyId)
+  // A POS customer belongs to one company; only that company's customers can
+  // open an account at its properties.
+  const companyPosCustomers = pickedProperty
+    ? posCustomers.filter(c => c.landlordId === pickedProperty.landlordId)
+    : []
+  const pickProperty = (id: string) => {
+    setPropertyId(id)
+    // The customer picked for the old property may belong to another company.
+    setPosCustomerId('')
+    setTenantId('')
+  }
   const [err, setErr] = useState<string | null>(null)
   const create = useMutation(
     () => apiPost('/landlords/flex-charge/accounts', {
@@ -524,7 +543,7 @@ function CreateAccountModal({ properties, tenants, posCustomers, onClose, onSucc
     }),
     {
       onSuccess,
-      onError: (e: any) => setErr(e?.response?.data?.error?.message || 'Create failed'),
+      onError: (e: any) => setErr(e?.message || 'Create failed'),
     },
   )
   const canSubmit = propertyId && (customerType === 'tenant' ? tenantId : posCustomerId)
@@ -533,6 +552,14 @@ function CreateAccountModal({ properties, tenants, posCustomers, onClose, onSucc
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">New FlexCharge Account</span><button className="btn btn-ghost btn-sm" onClick={onClose}>x</button></div>
         <div style={{ padding: '0 24px 24px', display: 'grid', gap: 12 }}>
+          {/* S654: property first — it decides whose customers can be picked. */}
+          <div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>Property</div>
+            <select className="form-select" value={propertyId} onChange={e => pickProperty(e.target.value)} style={{ width: '100%' }}>
+              <option value="">Select a property…</option>
+              {properties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
           <div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>Customer type</div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
@@ -559,18 +586,18 @@ function CreateAccountModal({ properties, tenants, posCustomers, onClose, onSucc
           ) : (
             <div>
               <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>POS customer</div>
-              <select className="form-select" value={posCustomerId} onChange={e => setPosCustomerId(e.target.value)} style={{ width: '100%' }}>
-                <option value="">Select customer...</option>
-                {posCustomers.map(c => <option key={c.id} value={c.id}>{c.firstName} {c.lastName} — {c.email}</option>)}
+              <select className="form-select" value={posCustomerId} onChange={e => setPosCustomerId(e.target.value)} style={{ width: '100%' }}
+                      disabled={!pickedProperty}>
+                <option value="">{pickedProperty ? 'Select customer...' : 'Select a property first'}</option>
+                {companyPosCustomers.map(c => <option key={c.id} value={c.id}>{c.firstName} {c.lastName} — {c.email}</option>)}
               </select>
+              {pickedProperty && companyPosCustomers.length === 0 && (
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                  No POS customers are filed under this property's company yet.
+                </div>
+              )}
             </div>
           )}
-          <div>
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>Property</div>
-            <select className="form-select" value={propertyId} onChange={e => setPropertyId(e.target.value)} style={{ width: '100%' }}>
-              {properties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
-          </div>
           <div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>Credit limit (blank = property default)</div>
             <input className="form-input" type="number" min={0} step={10} value={creditLimit} onChange={e => setCreditLimit(e.target.value)} style={{ width: '100%' }} placeholder="500.00" />
@@ -590,12 +617,19 @@ function NewPosCustomerModal({ onClose, onSuccess }: { onClose: () => void; onSu
   const [lastName, setLastName]   = useState('')
   const [email, setEmail]         = useState('')
   const [phone, setPhone]         = useState('')
+  // S654 (Nic, DIRECTIVE): no default company. A customer is filed under the
+  // company the landlord names; one company needs no naming.
+  const [entityId, setEntityId]   = useState('')
+  const { data: entities = [] } = useEntities()
+  const needsCompany = entities.length >= 2 && !entityId
   const [err, setErr] = useState<string | null>(null)
   const create = useMutation(
-    () => apiPost('/landlords/pos-customers', { firstName, lastName, email, phone: phone || null }),
+    () => apiPost('/landlords/pos-customers', {
+      firstName, lastName, email, phone: phone || null, landlordId: entityId || undefined,
+    }),
     {
       onSuccess,
-      onError: (e: any) => setErr(e?.response?.data?.error?.message || 'Create failed'),
+      onError: (e: any) => setErr(e?.message || 'Create failed'),
     },
   )
   void apiDel
@@ -604,6 +638,8 @@ function NewPosCustomerModal({ onClose, onSuccess }: { onClose: () => void; onSu
       <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">New POS Customer</span><button className="btn btn-ghost btn-sm" onClick={onClose}>x</button></div>
         <div style={{ padding: '0 24px 24px', display: 'grid', gap: 12 }}>
+          <EntityPicker value={entityId} onChange={setEntityId} label="Customer of"
+            note="Their account can be opened at this company's properties." />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <input className="form-input" placeholder="First name" value={firstName} onChange={e => setFirstName(e.target.value)} />
             <input className="form-input" placeholder="Last name" value={lastName} onChange={e => setLastName(e.target.value)} />
@@ -611,11 +647,11 @@ function NewPosCustomerModal({ onClose, onSuccess }: { onClose: () => void; onSu
           <input className="form-input" placeholder="Email" type="email" value={email} onChange={e => setEmail(e.target.value)} />
           <input className="form-input" placeholder="Phone (optional)" value={phone} onChange={e => setPhone(e.target.value)} />
           {err && <div style={{ color: 'var(--red)', fontSize: '.78rem' }}>{err}</div>}
-          <button className="btn btn-primary" disabled={!firstName || !lastName || !email || create.isLoading} onClick={() => create.mutate()}>
+          <button className="btn btn-primary" disabled={!firstName || !lastName || !email || needsCompany || create.isLoading} onClick={() => create.mutate()}>
             {create.isLoading ? 'Creating…' : 'Create customer'}
           </button>
           <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-            The customer can be enrolled in a FlexCharge account at any of your properties from the main page.
+            The customer can be enrolled in a FlexCharge account at any property of the company it is filed under, from the main page.
           </div>
         </div>
       </div>

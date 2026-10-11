@@ -14,6 +14,7 @@ import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { AccountLockScreen } from './components/AccountLockScreen'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
@@ -68,7 +69,6 @@ import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { AcceptOwnerInvitePage } from './pages/AcceptOwnerInvitePage'
 import { VerifyEmailPage } from './pages/VerifyEmailPage'
 import { DashboardPage }   from './pages/DashboardPage'
-import { ReferLandlordPage } from './pages/ReferLandlordPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
 import { PmInvitationsPage } from './pages/PmInvitationsPage'
@@ -83,16 +83,24 @@ import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { LotRentPage } from './pages/LotRentPage'
-import { ExpensesPage } from './pages/ExpensesPage'
+// 10/11 (Nic): the shared financial pages — the same files in GAM Books
+// (src/financials, financials-parity.test.ts).
+import { ExpensesPage } from './financials/ExpensesPage'
+import { IncomePage } from './financials/IncomePage'
+import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+import { BankActivityPage } from './financials/BankActivityPage'
+import { PayoutsPage } from './financials/PayoutsPage'
+import { MyManagersPage } from './pages/MyManagersPage'
 import { BankPage } from './pages/BankPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
+import { TenantPhotosPage } from './pages/TenantPhotosPage'
 import { OnboardingPage }  from './pages/OnboardingPage'
 import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
 import { PaymentHistoryOnboardingPage } from './pages/PaymentHistoryOnboardingPage'
-import { ReportsPage } from './pages/ReportsPage'
+import { ReportsPage } from './financials/ReportsPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
 import { SignPage } from './pages/SignPage'
@@ -124,8 +132,10 @@ import { ApplicationsPage } from './pages/ApplicationsPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
+import { PaidAheadChoicePage } from './pages/PaidAheadChoicePage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
+import { FrontDeskPage } from './pages/FrontDeskPage'
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: Error | null}> {
   constructor(props: any) { super(props); this.state = { error: null } }
@@ -156,7 +166,8 @@ function RoleRedirect() {
   // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
   // front-desk user with no POS access on an empty register). Zero grants →
   // /welcome explains what's missing.
-  if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager') {
+  // 10/11: a bookkeeper lands on the financial pages (Money in first).
+  if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager' || user.role === 'bookkeeper') {
     const first = visibleNavItemsFor(user)[0]
     return <Navigate to={first ? first.to : '/welcome'} replace />
   }
@@ -228,6 +239,8 @@ function App() {
           <TelemetryPing />
           <VersionWatch />
           <ScrollUnlock />
+          {/* S652: draws itself only when the API says the account is on hold. */}
+          <AccountLockScreen />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
@@ -260,7 +273,6 @@ function App() {
               <Route index element={<RoleRedirect />} />
               <Route path="welcome"        element={<NoAccessPage />} />
               <Route path="dashboard"      element={<DashboardPage />} />
-              <Route path="refer"          element={<ReferLandlordPage />} />
               <Route path="onboarding"     element={<OnboardingPage />} />
               <Route path="properties"     element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
@@ -272,8 +284,12 @@ function App() {
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
               <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
+              {/* S639: the front counter's call list — same people as the
+                  pending pool, shaped as "who do I ring and what do I say". */}
+              <Route path="front-desk" element={<FrontDeskPage />} />
               <Route path="tenant-onboarding/pending" element={<PendingTenantsPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
+              <Route path="tenant-photos"  element={<TenantPhotosPage />} />
               <Route path="leases"         element={<LeasesPage />} />
               <Route path="view"           element={<PdfViewerPage />} />
               <Route path="subleases"       element={LAUNCH_HIDDEN.has('/subleases') ? <Navigate to="/dashboard" replace /> : <SubleasesPage />} />
@@ -291,8 +307,13 @@ function App() {
                 <Route path="balances"       element={<BalancesPage />} />
                 <Route path="rent-roll"      element={<RentRollPage />} />
                 <Route path="disbursements"  element={<DisbursementsPage />} />
+                <Route path="income"         element={<IncomePage />} />
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
+                <Route path="maintenance-costs" element={<MaintenanceCostsPage />} />
+                <Route path="bank-activity"  element={<BankActivityPage />} />
+                <Route path="payouts"        element={<PayoutsPage />} />
+                <Route path="my-managers"    element={<MyManagersPage />} />
                 {/* S605: one Bank tab. The old paths redirect so existing
                     links and bookmarks don't 404. */}
                 <Route path="bank"           element={<BankPage />} />
@@ -330,6 +351,8 @@ function App() {
               <Route path="notifications"     element={<NotificationsPage />} />
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />
+              {/* 10/4 (decisions #46.1): the landlord's choice for money paid ahead left on an ended lease. */}
+              <Route path="leases/:leaseId/paid-ahead-choice" element={<PaidAheadChoicePage />} />
               <Route path="flex-charge"               element={LAUNCH_HIDDEN.has('/flex-charge') ? <Navigate to="/dashboard" replace /> : <FlexChargePage />} />
               {/* S632 (Nic): "Clicking back to lease at the end of the signing
                   flow just takes us to a black screen." The button pointed at

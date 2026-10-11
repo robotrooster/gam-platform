@@ -7,10 +7,10 @@
  * the window math is deterministic regardless of the real clock.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease } from '../test/dbHelpers'
-import { anticipatedLeaseInflux, decideReversalRecovery, escalateStaleNetting } from './reversalRecovery'
+import { anticipatedLeaseInflux, decideReversalRecovery, decideEventRecovery, processPendingReversalRecoveries, escalateStaleNetting } from './reversalRecovery'
 
 async function seedLandlordWithLease(rentAmount = 1000): Promise<{ landlordId: string; paymentId: string }> {
   const c = await db.connect()
@@ -42,6 +42,21 @@ async function insertReversal(paymentId: string, landlordId: string, reversedAmo
 }
 
 beforeEach(async () => { await cleanupAllSchema() })
+
+// S655: several records per event (C0 drops the old one-per-event constraint;
+// dropped here for this file only, and put back after only if it was there, so
+// a run with C0 applied stays post-C0 for every later suite).
+let hadOldConstraint = false
+beforeAll(async () => {
+  hadOldConstraint = (await db.query(
+    `SELECT 1 FROM pg_constraint WHERE conname = 'payment_reversals_stripe_event_id_key'`)).rowCount === 1
+  await db.query(`ALTER TABLE payment_reversals DROP CONSTRAINT IF EXISTS payment_reversals_stripe_event_id_key`)
+})
+afterAll(async () => {
+  if (!hadOldConstraint) return
+  await cleanupAllSchema()
+  await db.query(`ALTER TABLE payment_reversals ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id)`)
+})
 
 describe('anticipatedLeaseInflux', () => {
   it('counts active-lease rent whose due day (the 1st) falls inside the window', async () => {
@@ -114,5 +129,60 @@ describe('escalateStaleNetting', () => {
     expect(s.rows[0]).toMatchObject({ recovery_method: 'ach_pull', recovery_status: 'pending' })
     const f = await db.query(`SELECT recovery_status FROM payment_reversals WHERE id=$1`, [fresh.id])
     expect(f.rows[0].recovery_status).toBe('scheduled_netting')
+  })
+})
+
+describe('S655: one recovery per event', () => {
+  async function secondRow(landlordId: string, amount: number): Promise<string> {
+    const unit = (await db.query<{ unit_id: string; tenant_id: string }>(
+      `SELECT unit_id, tenant_id FROM payments WHERE landlord_id = $1 LIMIT 1`, [landlordId])).rows[0]
+    return (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,'utility',$4,'returned','UTILITY',CURRENT_DATE) RETURNING id`,
+      [unit.unit_id, unit.tenant_id, landlordId, amount])).rows[0].id
+  }
+
+  it('recovery runs once per event across its rows', async () => {
+    // $900 rent + $100 water reversed by one dispute; a $1,000 influx is in the
+    // window. Decided per row, each would look covered alone; decided per
+    // event, it is the $1,000 that must be covered — and it is, once.
+    const { landlordId, paymentId } = await seedLandlordWithLease(1000)
+    const water = await secondRow(landlordId, 100)
+    const a = await insertReversal(paymentId, landlordId, 900, 'evt_one_dispute')
+    const b = await insertReversal(water, landlordId, 100, 'evt_one_dispute')
+
+    const decided = await decideEventRecovery('evt_one_dispute', '2026-03-28')
+    expect(decided).toHaveLength(1)
+    expect(decided[0]).toMatchObject({ method: 'netting', needed: 1000 })
+    expect(decided[0].reversalIds.sort()).toEqual([a, b].sort())
+    const rows = await db.query<any>(`SELECT recovery_method, recovery_status FROM payment_reversals WHERE stripe_event_id = 'evt_one_dispute'`)
+    expect(rows.rows).toEqual([
+      { recovery_method: 'netting', recovery_status: 'scheduled_netting' },
+      { recovery_method: 'netting', recovery_status: 'scheduled_netting' },
+    ])
+    // Nothing left to decide: a second run changes nothing.
+    expect(await decideEventRecovery('evt_one_dispute', '2026-03-28')).toEqual([])
+    expect(await processPendingReversalRecoveries()).toEqual({ decided: 0, netting: 0, achPull: 0 })
+  })
+
+  it('an event too large for the influx is pulled once, for the whole event', async () => {
+    const { landlordId, paymentId } = await seedLandlordWithLease(1000)
+    const water = await secondRow(landlordId, 600)
+    await insertReversal(paymentId, landlordId, 900, 'evt_big')
+    const b = await insertReversal(water, landlordId, 600, 'evt_big')
+    // decideReversalRecovery on one record decides its whole event.
+    const d = await decideReversalRecovery(b, '2026-03-28')
+    expect(d).toMatchObject({ method: 'ach_pull', needed: 1500 })
+    const rows = await db.query<any>(`SELECT DISTINCT recovery_method FROM payment_reversals WHERE stripe_event_id = 'evt_big'`)
+    expect(rows.rows).toEqual([{ recovery_method: 'ach_pull' }])
+  })
+
+  it('records GAM recovers from nobody are never part of a decision', async () => {
+    const { landlordId, paymentId } = await seedLandlordWithLease(1000)
+    await db.query(
+      `INSERT INTO payment_reversals (payment_id, landlord_id, reversal_type, reversed_amount, reversal_fee, stripe_event_id,
+                                      raw_event, recovery_status, status, resolved_at)
+       VALUES ($1,$2,'card_dispute',0,0,'evt_zero','{}','not_needed','resolved',NOW())`, [paymentId, landlordId])
+    expect(await decideEventRecovery('evt_zero', '2026-03-28')).toEqual([])
   })
 })

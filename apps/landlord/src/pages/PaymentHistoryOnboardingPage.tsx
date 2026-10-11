@@ -1,7 +1,7 @@
-import { useState, useRef, useMemo } from 'react'
+import { useState, useRef, useMemo, useCallback } from 'react'
 import { useMutation } from 'react-query'
 // S633: an import lands in ONE company. The account names it.
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
 import { useNavigate } from 'react-router-dom'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { api, apiPost } from '../lib/api'
@@ -36,6 +36,13 @@ type CommitResponse = {
   escalateToSuperAdmin?: boolean
   mappingStatus?: 'unverified' | 'verified'
 }
+
+// S654: the API's reason lives in `error` (errorHandler). Reading only
+// `message` hid every 400 behind "check the CSV format".
+const serverReason = (e: any, fallback: string): string =>
+  e?.response?.data?.error || e?.response?.data?.message || fallback
+
+const CHOOSE_COMPANY_FIRST = 'Choose the company this file belongs to first.'
 
 const FIELD_TO_ISSUE_KEY: Record<string, string> = {
   tenantEmail:   'tenant_email',
@@ -79,6 +86,21 @@ export function PaymentHistoryOnboardingPage() {
   // S297: free-text claim required on generic uploads.
   const [claimedPlatformName, setClaimedPlatformName] = useState<string>('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // S654: NO DEFAULT COMPANY — a several-company account validates and imports
+  // nothing until it names one.
+  const companyMissing = useCompanyMissing(landlordId)
+  // S654: rows were matched to one company's tenants and leases; switching
+  // company makes the review stale, so it goes. The first pick keeps it.
+  const chooseCompany = useCallback((id: string) => {
+    if (landlordId && id !== landlordId) {
+      setPunchListRows(null)
+      setSummary(null)
+      setErrorMsg('')
+      setSuccessBanner('')
+      setReviewBanner(null)
+    }
+    setLandlordId(id)
+  }, [landlordId])
 
   // S297: lightweight client-side mirror of services/csvImportAttempts.ts
   // normalizeClaimName(). Used for the "we have a dedicated importer"
@@ -106,7 +128,7 @@ export function PaymentHistoryOnboardingPage() {
         setPunchListRows(data.rows)
       },
       onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.message || 'Validation failed. Check the CSV format and try again.')
+        setErrorMsg(serverReason(err, 'Validation failed. Check the CSV format and try again.'))
         setPunchListRows(null)
         setSummary(null)
       },
@@ -137,7 +159,7 @@ export function PaymentHistoryOnboardingPage() {
         if (fileInputRef.current) fileInputRef.current.value = ''
       },
       onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.message || 'Commit failed. Review the issues below.')
+        setErrorMsg(serverReason(err, 'Commit failed. Review the issues below.'))
       },
     }
   )
@@ -155,6 +177,7 @@ export function PaymentHistoryOnboardingPage() {
 
   const handleValidate = () => {
     if (!csvText) { setErrorMsg('Pick a CSV file first.'); return }
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     validateMut.mutate({
       csv: csvText, source,
       ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
@@ -171,7 +194,7 @@ export function PaymentHistoryOnboardingPage() {
       a.click()
       URL.revokeObjectURL(url)
     } catch (e: any) {
-      setErrorMsg(e?.response?.data?.message || 'Could not download template.')
+      setErrorMsg(serverReason(e, 'Could not download the template.'))
     }
   }
 
@@ -200,6 +223,7 @@ export function PaymentHistoryOnboardingPage() {
 
   const handleCommit = () => {
     if (!punchListRows) return
+    if (companyMissing) { setErrorMsg(CHOOSE_COMPANY_FIRST); return }
     if (source === 'generic' && !claimedPlatformName.trim()) {
       setErrorMsg('Enter the platform name your CSV came from before importing.')
       return
@@ -219,7 +243,8 @@ export function PaymentHistoryOnboardingPage() {
         <h1 style={{ fontSize: '1.6rem', fontWeight: 700, color: 'var(--text-0)', margin: 0 }}>
           Payment History Import
         </h1>
-        <EntityPicker value={landlordId} onChange={setLandlordId}
+        <EntityPicker value={landlordId} onChange={chooseCompany}
+          disabled={validateMut.isLoading || commitMut.isLoading}
           note="Imported payments are filed under this company's books." />
         <p style={{ fontSize: '.88rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
           Bring your historical payment records onto GAM so your tenants' account
@@ -347,9 +372,12 @@ export function PaymentHistoryOnboardingPage() {
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
             <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
-            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading || companyMissing} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
             </button>
+            {companyMissing && (
+              <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
+            )}
           </div>
         )}
       </div>
@@ -434,12 +462,15 @@ export function PaymentHistoryOnboardingPage() {
           <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button
               onClick={handleCommit}
-              disabled={commitMut.isLoading || summary.ready === 0}
+              disabled={commitMut.isLoading || companyMissing || summary.ready === 0}
               className="btn btn-primary"
               style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
             >
               {commitMut.isLoading ? 'Importing…' : `Import ${summary.ready} ready payment(s)`}
             </button>
+            {companyMissing && (
+              <span style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{CHOOSE_COMPANY_FIRST}</span>
+            )}
             {summary.blockers > 0 && (
               <span style={{ fontSize: '.82rem', color: 'var(--text-2)' }}>
                 Blocker rows are skipped on commit — fix them above to include.

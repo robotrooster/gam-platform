@@ -30,7 +30,9 @@
  *   - POST /witnesses/provision enables email enumeration via
  *     `reused: true` flag in the response — any authenticated landlord
  *     with leases.create permission can probe whether a given email
- *     exists on the platform.
+ *     exists on the platform. S654 narrowed it: a landlord or staff login,
+ *     or another company's resident, now gets 409 with no id; only a
+ *     witness-only login or a contact is reused.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -143,18 +145,38 @@ describe('POST /witnesses/provision', () => {
     expect(u.rows[0].password_hash).toMatch(/placeholder/)
   })
 
-  it('FINDING (S393): existing email returns reused=true → enables email enumeration', async () => {
+  // S654: provision used to hand back the id of ANY account on the address —
+  // the first step of landlord B putting landlord A's invitee on B's lease. A
+  // landlord or staff login is now never a witness: 409, and no id.
+  it('S654: an existing landlord login → 409, no id', async () => {
     const f = await seed()
     const existingEmail = `existing-${randomUUID()}@test.dev`
-    await db.query(
-      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1, 'x', 'landlord', 'Pre', 'Existing')`,
+    const pre = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name) VALUES ($1, 'x', 'landlord', 'Pre', 'Existing') RETURNING id`,
       [existingEmail])
     const res = await request(buildApp())
       .post('/api/esign/witnesses/provision')
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ email: existingEmail, firstName: 'X' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.reused).toBe(true)  // the enumeration signal — flagged
+      .send({ email: existingEmail.toUpperCase(), firstName: 'X' })
+    expect(res.status).toBe(409)
+    expect(res.body.data).toBeUndefined()
+    expect(JSON.stringify(res.body)).not.toContain(pre.rows[0].id)
+  })
+
+  it('S654: an existing witness-only login (no tenant profile) is reused — the id and nothing else', async () => {
+    const f = await seed()
+    const email = `witness-${randomUUID()}@test.dev`
+    const first = await request(buildApp())
+      .post('/api/esign/witnesses/provision')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ email, firstName: 'Wit' })
+    expect(first.status).toBe(201)
+    const again = await request(buildApp())
+      .post('/api/esign/witnesses/provision')
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ email: email.toUpperCase(), firstName: 'Wit' })
+    expect(again.status).toBe(200)
+    expect(again.body.data).toEqual({ userId: first.body.data.userId, reused: true })
   })
 })
 
@@ -362,5 +384,123 @@ describe('DELETE /templates/:id/fields/:fieldId — S393 scope fix', () => {
     expect(res.status).toBe(200)
     const row = await db.query(`SELECT id FROM lease_template_fields WHERE id=$1`, [fid])
     expect(row.rows).toHaveLength(0)
+  })
+})
+
+/**
+ * S652 — slots for the disclosures that exist, filled at the landlord's
+ * discretion, policed by nobody.
+ *
+ * Nic: "These are categories to be filled... some of these are required in some
+ * areas. We don't police what's required where... maybe there's something
+ * that's not required in one state that a landlord decides, hey, it might be a
+ * good idea if I had this. Say there's 15 different disclosures, maybe only two
+ * of them are required in their area. We're not enforcing it, but they could
+ * upload the other 13 to kind of fill out the robustness of their operation."
+ */
+describe('S652: disclosure categories', () => {
+  it('offers every category and says nothing about which are required', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    // S652: 45 and growing. A landlord may fill as many as they like; the count
+    // only has to be big enough that the list is the vocabulary, not a sample.
+    expect(res.body.data.length).toBeGreaterThanOrEqual(40)
+
+    const blob = JSON.stringify(res.body.data).toLowerCase()
+    // The words that would turn a checklist into a compliance claim.
+    expect(blob).not.toMatch(/required|must|mandatory|violation|complian/)
+    // `states` IS present, and means one thing only: the states this landlord
+    // has filed a specific form for. It is never a list of states that require
+    // the disclosure — GAM holds the acts, it does not rule on them. Empty here
+    // because this fixture has filed nothing.
+    expect(res.body.data[0].states).toEqual([])
+  })
+
+  it('shows a landlord what they hold, per category and per transaction', async () => {
+    const f = await seed()
+    const mk = (name: string, appliesTo: string) =>
+      request(buildApp()).post('/api/esign/templates')
+        .set('Authorization', `Bearer ${f.tokenA}`)
+        .send({ name, disclosureType: 'lead_based_paint', appliesTo, unitType: null })
+
+    expect((await mk('LBP — sale', 'sale')).status).toBe(201)
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const lbp = res.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp.documents).toHaveLength(1)
+    expect(lbp.hasSale).toBe(true)
+    // Held for a sale, not for a rental. A FACT about what they have — the
+    // landlord decides whether that matters to them.
+    expect(lbp.hasRental).toBe(false)
+
+    expect((await mk('LBP — lease', 'rental')).status).toBe(201)
+    const after = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const lbp2 = after.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp2.hasRental).toBe(true)
+    expect(lbp2.documents).toHaveLength(2)
+  })
+
+  it('refuses a category nobody has heard of', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Made up', disclosureType: 'dragons', unitType: null })
+    expect(res.status).toBe(400)
+  })
+
+  it('a template with no category is simply not a disclosure', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Plain lease', unitType: null })
+    expect(res.status).toBe(201)
+    expect(res.body.data.disclosure_type ?? res.body.data.disclosureType).toBeFalsy()
+    expect(res.body.data.applies_to ?? res.body.data.appliesTo).toBe('any')
+  })
+})
+
+/**
+ * S652 — many forms per category, because many of these are a state's own words.
+ *
+ * Nic: "are any of these forms state specific or could I use one asbestos
+ * disclosure for all seventeen states... when the form is specific we need to be
+ * able to assign multiple per category."
+ *
+ * Both cases are real. Lead-based paint is federal — one form, fifty states.
+ * Washington legislates the FORMAT of its disclosure statement and Minnesota,
+ * Michigan, Ohio and Nebraska each prescribe their own, so one form does not
+ * travel. NULL state means it travels; a state code means it does not.
+ */
+describe('S652: a disclosure can be written for one state', () => {
+  const mk = (f: any, body: any) =>
+    request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: null, ...body })
+
+  it('holds several forms in one category and says which state each is for', async () => {
+    const f = await seed()
+    expect((await mk(f, { name: 'Asbestos — WA', disclosureType: 'asbestos', stateCode: 'WA' })).status).toBe(201)
+    expect((await mk(f, { name: 'Asbestos — IL', disclosureType: 'asbestos', stateCode: 'il' })).status).toBe(201)
+    expect((await mk(f, { name: 'Lead paint (federal)', disclosureType: 'lead_based_paint' })).status).toBe(201)
+
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const asb = res.body.data.find((d: any) => d.type === 'asbestos')
+    expect(asb.documents).toHaveLength(2)
+    expect(asb.states.sort()).toEqual(['IL', 'WA'])   // lowercase input normalized
+
+    const lbp = res.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp.documents[0].stateCode).toBeNull()     // federal: it travels
+    expect(lbp.states).toEqual([])
+  })
+
+  it('refuses something that is not a state', async () => {
+    const f = await seed()
+    const res = await mk(f, { name: 'Nope', disclosureType: 'mold', stateCode: 'Illinois' })
+    expect(res.status).toBe(400)
   })
 })

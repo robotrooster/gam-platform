@@ -35,7 +35,7 @@
  * bills next cycle.
  */
 
-import { METER_DOUBLE_CHECK_MIN, METER_DOUBLE_CHECK_TOLERANCE, METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus } from '@gam/shared'
+import { METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { generateBillsForProperty } from './utilityBilling'
 import { createNotification } from './notifications'
@@ -64,6 +64,34 @@ export function lastBusinessDayOfMonth(year: number, month: number): string {
     if (dow !== 0 && dow !== 6 && !US_FEDERAL_HOLIDAYS.has(isoDate(d))) return isoDate(d)
     d.setUTCDate(d.getUTCDate() - 1)
   }
+}
+
+/**
+ * S648 (Nic): the last business day BEFORE a date — weekends and US federal
+ * holidays skipped, the same walk as the month-end rule. "If their due date is
+ * going to be Monday, read it on Friday. If their due date is going to be on
+ * Friday, read it on Thursday... read it the last business day before the due
+ * date, but also not a holiday. Same way we do everything else."
+ */
+export function lastBusinessDayBefore(iso: string): string {
+  const d = new Date(iso.slice(0, 10) + 'T00:00:00Z')
+  for (;;) {
+    d.setUTCDate(d.getUTCDate() - 1)
+    const dow = d.getUTCDay()
+    if (dow !== 0 && dow !== 6 && !US_FEDERAL_HOLIDAYS.has(isoDate(d))) return isoDate(d)
+  }
+}
+
+/**
+ * When a meter in cycle `cycleMonth` is read: the last business day before its
+ * tenant's due date in the following month. Due on the 1st, that is the last
+ * business day of the cycle month — the day the run opens, as it always was.
+ */
+export function meterReadBy(cycleMonth: string, dueDay: number): string {
+  const y = Number(cycleMonth.slice(0, 4)), m = Number(cycleMonth.slice(5, 7))
+  const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1
+  const due = `${ny}-${String(nm).padStart(2, '0')}-${String(Math.min(Math.max(dueDay, 1), 28)).padStart(2, '0')}`
+  return lastBusinessDayBefore(due)
 }
 
 export function todayInPhoenix(): string {
@@ -233,7 +261,7 @@ async function notifyReadingRunOpened(
  * (active lease, primary tenant, lease carries the utility).
  */
 export async function getRunMeters(runId: string) {
-  return query<any>(
+  const rows = await query<any>(
     `SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits,
             m.rubs_basis,
             -- S631: enough to render the list as a task list — what is done and
@@ -251,8 +279,18 @@ export async function getRunMeters(runId: string) {
                      WHERE mmu.meter_id = m.id) AS has_submetered_units,
             u.id AS unit_id, u.unit_number,
             (cur.id IS NOT NULL) AS is_read,
-            (t.tenant_id IS NOT NULL) AS will_bill
+            -- S652 (Nic): a photo of the meter face rides with the reading;
+            -- the property decides whether its walk insists on one.
+            (cur.photo_url IS NOT NULL) AS has_photo,
+            p.meter_photo_required AS photo_required,
+            (t.tenant_id IS NOT NULL) AS will_bill,
+            to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle_month,
+            -- S648: the tenant's due day decides when their meter is read.
+            (SELECT l2.rent_due_day FROM leases l2
+              WHERE l2.unit_id = u.id AND l2.status = 'active'
+              ORDER BY l2.start_date DESC LIMIT 1) AS due_day
        FROM utility_reading_runs r
+       JOIN properties p ON p.id = r.property_id
        JOIN utility_meters m ON m.property_id = r.property_id
                             AND m.billing_method IN ('submeter','rubs')
                             -- S631: the walk shows only what this run covers,
@@ -278,172 +316,129 @@ export async function getRunMeters(runId: string) {
       WHERE r.id = $1
       ORDER BY u.unit_number NULLS LAST, m.utility_type, m.label`,
     [runId])
+  // S648 (Nic): a tenant billed on their own day has their meter read the last
+  // business day before THAT day, so their usage lines up with their bill.
+  // Submeters only — a RUBS master is read off the provider's bill.
+  const today = todayInPhoenix()
+  return rows.map(r => {
+    const readBy = r.billing_method === 'submeter' && r.due_day && Number(r.due_day) !== 1
+      ? meterReadBy(r.cycle_month, Number(r.due_day)) : null
+    return { ...r, read_by: readBy, not_yet: !!readBy && !r.is_read && today < readBy }
+  })
 }
 
-// ── Double-check verification phase (S533) ───────────────────────────
-// The reader finishes the whole walk uninterrupted; back at the office
-// the system generates a blind re-read list: every suspicious submeter
-// plus RANDOM clean ones so the list always has METER_DOUBLE_CHECK_MIN
-// entries and the reader can't tell which are the suspects. Billing
-// does NOT wait for this phase (S534) — clean original reads bill on
-// each lease's invoice date regardless; the re-read corrects the stored
-// value only while its bill hasn't reached an invoice.
+// ── Flagged reads (S652) ─────────────────────────────────────────────
+//
+// S533 built a blind VERIFICATION WALK here: every suspect plus random clean
+// meters, re-read by staff so they couldn't tell which the system doubted.
+// Nic, S652: "I don't know why there's two windows in the first place... get
+// rid of the clean meters random blind reread. Just flag the ones that need
+// flagging, with limited to one window."
+//
+// So: when the last meter is read, a run with nothing flagged completes on the
+// spot. One with flagged reads waits — status 'double_check', kept for the
+// history it already carries — for the landlord to settle them in the ONE
+// window, "Readings to double-check". The last one settled completes the run.
 
-/** Flip a fully-read run into its verification phase and build the list. */
-export async function startDoubleCheckPhase(runId: string) {
-  const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
-  if (!run || run.status !== 'open') return run
-
-  const suspects = await query<{ meter_id: string; reading_value: string }>(
-    `SELECT rd.meter_id, rd.reading_value
-       FROM utility_meter_readings rd
-       JOIN utility_meters m ON m.id = rd.meter_id
-      WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND rd.needs_review
-        AND ($3::text IS NULL OR m.utility_type = $3)`,
-    [run.property_id, run.billing_cycle_month, run.utility_type])
-  const pads = await query<{ meter_id: string; reading_value: string }>(
-    `SELECT rd.meter_id, rd.reading_value
-       FROM utility_meter_readings rd
-       JOIN utility_meters m ON m.id = rd.meter_id
-      WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND NOT rd.needs_review
-        AND ($4::text IS NULL OR m.utility_type = $4)
-      ORDER BY random()
-      LIMIT $3`,
-    [run.property_id, run.billing_cycle_month,
-     Math.max(0, METER_DOUBLE_CHECK_MIN - suspects.length), run.utility_type])
-
-  for (const row of [...suspects.map(s => ({ ...s, sus: true })), ...pads.map(p => ({ ...p, sus: false }))]) {
-    await query(
-      `INSERT INTO utility_reading_double_checks (run_id, meter_id, first_value, is_suspicious)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (run_id, meter_id) DO NOTHING`,
-      [runId, row.meter_id, row.reading_value, row.sus])
-  }
-  return queryOne<any>(
-    `UPDATE utility_reading_runs SET status = 'double_check' WHERE id = $1 RETURNING *`,
-    [runId])
-}
-
-/**
- * Blind verification payload — the same shape the main walk consumes.
- * Deliberately NO first values and NO suspicion markers: the re-reader
- * must not know which entries the system doubts.
- */
-export async function getDoubleChecks(runId: string) {
-  return query<any>(
-    `SELECT dc.meter_id, m.label, m.utility_type, m.billing_method, m.digits,
-            u.id AS unit_id, u.unit_number,
-            (dc.second_value IS NOT NULL) AS is_read
-       FROM utility_reading_double_checks dc
-       JOIN utility_meters m ON m.id = dc.meter_id
-       LEFT JOIN utility_meter_units mu ON mu.meter_id = m.id
-       LEFT JOIN units u ON u.id = mu.unit_id
-      WHERE dc.run_id = $1
-      ORDER BY u.unit_number NULLS LAST, m.utility_type, m.label`,
-    [runId])
-}
-
-/**
- * Record a re-read and reconcile automatically:
- *   - within METER_DOUBLE_CHECK_TOLERANCE of the first read → the meter
- *     just moved between reads; the FIRST read stands for billing and
- *     the drift bills next cycle ('verified').
- *   - bigger difference → the deliberate re-read replaces the original
- *     ('replaced'), and a high usage it confirms simply bills — the
- *     re-read IS the verification.
- *   - the one unresolvable case: the effective value sits below the
- *     previous reading with an implausible wrap — rollover vs meter
- *     swap is a money decision, so it stays flagged for the landlord
- *     ('escalated') and that meter doesn't bill until resolved.
- * Completes the run (bills generate + finalize) after the last entry.
- */
-export async function enterDoubleCheck(runId: string, meterId: string, secondValue: number, userId: string) {
-  const dc = await queryOne<any>(
-    `SELECT dc.*, m.digits, m.utility_type
-       FROM utility_reading_double_checks dc
-       JOIN utility_meters m ON m.id = dc.meter_id
-      WHERE dc.run_id = $1 AND dc.meter_id = $2`, [runId, meterId])
-  if (!dc) return null
-  const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
-
-  // S534: bills can now exist BEFORE verification finishes — the invoice
-  // cron bills per-unit straight from original reads (Nic: an unfinished
-  // verification walk never holds billing). Once this cycle's bill is on
-  // an invoice (payment_id set) the reading is immutable: the FIRST read
-  // stands no matter the re-read, and any drift self-corrects next cycle
-  // because usage is always computed against the stored value. A bill
-  // not yet on an invoice is deleted when the re-read replaces the
-  // value, then regenerates from the corrected reading (run completion /
-  // invoice-time ensure both re-run the idempotent engine).
-  const bill = await queryOne<{ id: string; payment_id: string | null }>(
-    `SELECT id, payment_id FROM utility_bills
-      WHERE meter_id = $1 AND billing_cycle_month = $2
-      LIMIT 1`, [meterId, run.billing_cycle_month])
-  const billLocked = !!bill?.payment_id
-
-  const first = Number(dc.first_value)
-  const withinTol = billLocked || Math.abs(secondValue - first) <= METER_DOUBLE_CHECK_TOLERANCE
-  const effective = withinTol ? first : secondValue
-
-  // Point-in-time prior (S559): the read immediately before THIS cycle's
-  // read by time (excluding the cycle read itself), which may be a mid-month
-  // turnover/reference read that reset the baseline.
-  const prior = await queryOne<{ reading_value: string }>(
-    `SELECT reading_value FROM utility_meter_readings
-      WHERE meter_id = $1
-        AND NOT (billing_cycle_month = $2 AND reason = 'monthly_cycle')
-      ORDER BY reading_date DESC, created_at DESC LIMIT 1`,
-    [meterId, run.billing_cycle_month])
-
-  let isRollover = false
-  let needsReview = false
-  if (prior && effective < Number(prior.reading_value)) {
-    const modulus = meterReadingModulus(dc.digits)
-    const wrap = (modulus - Number(prior.reading_value)) + effective
-    if (wrap < modulus / 2) isRollover = true
-    else needsReview = true
-  }
-  const outcome = needsReview ? 'escalated' : (withinTol ? 'verified' : 'replaced')
-
-  if (!billLocked) {
-    await query(
-      `UPDATE utility_meter_readings
-          SET reading_value = $3, needs_review = $4, is_rollover = $5, review_note = $6
-        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'`,
-      [meterId, run.billing_cycle_month, effective, needsReview, isRollover,
-       needsReview ? 'Re-read confirmed a value below the previous reading — rollover or meter swap?' : null])
-    // An un-invoiced bill built on the superseded value is stale — drop
-    // it so the engine regenerates from the corrected reading.
-    if (bill && effective !== first) {
-      await query(
-        `DELETE FROM utility_bills WHERE id = $1 AND payment_id IS NULL`, [bill.id])
-    }
-  }
-  const updated = await queryOne<any>(
-    `UPDATE utility_reading_double_checks
-        SET second_value = $2, outcome = $3, entered_by_user_id = $4, entered_at = NOW()
-      WHERE id = $1 RETURNING *`,
-    [dc.id, secondValue, outcome, userId])
-
-  const remaining = await queryOne<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks
-      WHERE run_id = $1 AND second_value IS NULL`, [runId])
-  let finishedRun = null
-  if (remaining && remaining.n === 0) {
-    finishedRun = await completeReadingRun(runId, userId)
-  }
-  return { doubleCheck: updated, run: finishedRun ?? run }
-}
-
-/** Escalations left on a run's cycle — surfaced in the completion summary. */
-export async function countEscalations(runId: string): Promise<number> {
+/** Flagged reads still open on this run's cycle (submeters and masters alike). */
+export async function countFlaggedOnRun(runId: string): Promise<number> {
   const row = await queryOne<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM utility_reading_double_checks
-      WHERE run_id = $1 AND outcome = 'escalated'`, [runId])
+    `SELECT COUNT(*)::int AS n
+       FROM utility_reading_runs r
+       JOIN utility_meters m ON m.property_id = r.property_id
+                            AND m.billing_method IN ('submeter','rubs')
+                            AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
+       JOIN utility_meter_readings rd ON rd.meter_id = m.id
+                                     AND rd.billing_cycle_month = r.billing_cycle_month
+                                     AND rd.reason = 'monthly_cycle' AND rd.needs_review
+      WHERE r.id = $1`, [runId])
   return row?.n ?? 0
+}
+
+/**
+ * The last meter is read. Nothing flagged → the run completes now (or, for a
+ * company that reviews its bills, the landlord is told they are ready).
+ * Something flagged → the run waits on the review queue, and the landlord is
+ * told what is waiting, once.
+ */
+export async function finishReadingPhase(runId: string, userId: string) {
+  const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+  if (!run || run.status !== 'open') return run
+  const flagged = await countFlaggedOnRun(runId)
+  if (flagged === 0) {
+    const done = await completeReadingRun(runId, userId)
+    if (!done || done.status !== 'completed') await tellLandlordBillsAreReady(runId)
+    return done
+  }
+  const waiting = await queryOne<any>(
+    `UPDATE utility_reading_runs SET status = 'double_check' WHERE id = $1 RETURNING *`, [runId])
+  await tellLandlordReadsNeedReview(runId, flagged)
+  return waiting
+}
+
+/**
+ * A flagged read was settled from the review queue. If that was the last one
+ * on a run that is waiting, the run completes — the same moment the walk's
+ * last re-read used to bring.
+ */
+export async function settleFlaggedOnRun(propertyId: string, cycleMonth: string, userId: string) {
+  const run = await queryOne<any>(
+    `SELECT * FROM utility_reading_runs
+      WHERE property_id = $1 AND billing_cycle_month = $2 AND status = 'double_check'`,
+    [propertyId, cycleMonth])
+  if (!run) return null
+  if (await countFlaggedOnRun(run.id) > 0) return run
+  const done = await completeReadingRun(run.id, userId)
+  if (!done || done.status !== 'completed') await tellLandlordBillsAreReady(run.id)
+  return done
+}
+
+async function tellLandlordReadsNeedReview(runId: string, flagged: number) {
+  const r = await queryOne<any>(
+    `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+       JOIN landlords l ON l.id = p.landlord_id JOIN users u ON u.id = l.user_id
+      WHERE r.id = $1`, [runId])
+  if (!r) return
+  const month = new Date(String(r.billing_cycle_month).slice(0, 10) + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+  const body = `Every meter at ${r.name} is read for ${month}, and ${flagged} reading${flagged === 1 ? ' looks' : 's look'} off — ` +
+    `below the last read, or unusually high. Check ${flagged === 1 ? 'it' : 'them'} under "Readings to double-check" and correct or confirm. ` +
+    `The month's bills go out when the last one is settled; until then only those units' invoices wait.`
+  await createNotification({
+    userId: r.user_id, landlordId: r.landlord_id,
+    type: 'utility_reads_need_review',
+    title: `${flagged} meter reading${flagged === 1 ? '' : 's'} to double-check — ${r.name}`,
+    body,
+    data: { runId: r.id, propertyId: r.property_id, flagged },
+    actionUrl: `/utilities?propertyId=${r.property_id}`,
+    sendEmail: true, emailTo: r.email,
+    emailSubject: `${flagged} meter reading${flagged === 1 ? '' : 's'} to double-check — ${r.name} (${month})`,
+    emailHtml: body,
+  }).catch(() => {})
+}
+
+/** S652: every read is in — the landlord approves before anything goes out. */
+export async function tellLandlordBillsAreReady(runId: string) {
+  const r = await queryOne<any>(
+    `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+       JOIN landlords l ON l.id = p.landlord_id JOIN users u ON u.id = l.user_id
+      WHERE r.id = $1 AND l.review_utility_bills`, [runId])
+  if (!r) return
+  const month = new Date(String(r.billing_cycle_month).slice(0, 10) + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+  await createNotification({
+    userId: r.user_id, landlordId: r.landlord_id,
+    type: 'utility_bills_ready_to_review',
+    title: `Utility bills ready to review — ${r.name}`,
+    body: `${month}'s meter readings are all in. Look them over and approve, and the bills go out on each tenant's next invoice. Until then those invoices wait.`,
+    data: { runId: r.id, propertyId: r.property_id },
+    actionUrl: `/utilities?propertyId=${r.property_id}`,
+    sendEmail: true, emailTo: r.email,
+    emailSubject: `Utility bills ready to review — ${r.name} (${month})`,
+    emailHtml: `${month}'s meter readings for <b>${r.name}</b> are all in. Open the Utilities page, review the bills, and approve them to send.`,
+  }).catch(() => {})
 }
 
 /**
@@ -455,10 +450,19 @@ export async function countEscalations(runId: string): Promise<number> {
  * (escape hatch — e.g. a physically unreadable meter) or from
  * 'double_check' (the normal path once verification finishes).
  */
-export async function completeReadingRun(runId: string, userId: string) {
+export async function completeReadingRun(runId: string, userId: string, opts: { approve?: boolean } = {}) {
   const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+    `SELECT r.*, l.review_utility_bills FROM utility_reading_runs r
+       JOIN landlords l ON l.id = r.landlord_id WHERE r.id = $1`, [runId])
   if (!run || run.status === 'completed') return run
+  // S652 (Nic): a company that chose to review its utility bills issues them
+  // only on the landlord's approval. The walk finishing is not that — it
+  // leaves the run waiting, and the landlord is told the bills are ready.
+  // Everyone else's bills go through on their own, as they always did.
+  if (run.review_utility_bills && !run.approved_at && !opts.approve) return run
+  if (opts.approve && !run.approved_at) {
+    await query(`UPDATE utility_reading_runs SET approved_at = NOW(), approved_by_user_id = $2 WHERE id = $1`, [runId, userId])
+  }
 
   // pg returns date columns as local-midnight Date objects — normalize to
   // the day string before rebuilding a UTC date (string-concat on a Date
@@ -619,6 +623,122 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
   return { prompted }
 }
 
+// ── S652: reads that fall on a tenant's own date (Nic) ───────────────
+//
+// "No reminder on the read day... let's fix that gap too."
+//
+// A round opens at month end and says so once. A tenant due on the 15th is read
+// on the 14th, a tenant due on the 23rd on the 22nd — and nothing said so on
+// those days. Miss one and that tenant's whole invoice, rent included, sits
+// held until somebody notices.
+//
+// Every morning: the meters whose read day is TODAY, and the ones whose day has
+// passed and are still unread. One notice per property per day, to whoever can
+// take the read — the landlord, staff with the permission, and work traders
+// whose agreement includes meter reading. Tenants due on the 1st are not
+// listed: they are the month-end round, which has its own notice.
+export async function promptTenantDateMeterReads(
+  today: string = todayInPhoenix(),
+): Promise<{ prompted: number; meters: number }> {
+  const runs = await query<{ id: string; property_id: string; landlord_id: string; property_name: string }>(
+    `SELECT r.id, r.property_id, r.landlord_id, p.name AS property_name
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+      WHERE r.status = 'open'
+      ORDER BY r.billing_cycle_month`)
+  type Due = { unit: string; readBy: string }
+  const byProperty = new Map<string, { landlordId: string; name: string; due: Due[] }>()
+  for (const run of runs) {
+    const rows = await getRunMeters(run.id)
+    for (const m of rows as any[]) {
+      if (!m.read_by || m.is_read || !m.will_bill || m.read_by > today) continue
+      const entry = byProperty.get(run.property_id)
+        ?? { landlordId: run.landlord_id, name: run.property_name, due: [] as Due[] }
+      entry.due.push({ unit: m.unit_number || m.label, readBy: m.read_by })
+      byProperty.set(run.property_id, entry)
+    }
+  }
+
+  let prompted = 0, meters = 0
+  const short = (iso: string) => new Date(iso + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+  for (const [propertyId, p] of byProperty) {
+    const already = await queryOne<{ id: string }>(
+      `SELECT id FROM notifications
+        WHERE type = 'tenant_date_meter_reads_due'
+          AND data ->> 'propertyId' = $1 AND data ->> 'day' = $2
+        LIMIT 1`, [propertyId, today])
+    if (already) continue
+
+    const dueToday = p.due.filter(d => d.readBy === today)
+    const overdue = p.due.filter(d => d.readBy < today)
+    const parts: string[] = []
+    if (dueToday.length) {
+      parts.push(`${dueToday.length} meter${dueToday.length === 1 ? '' : 's'} to read today: ` +
+        `${dueToday.map(d => d.unit).join(', ')}. Their rent is due next, and the reading goes on that bill.`)
+    }
+    if (overdue.length) {
+      parts.push(`${overdue.length} overdue: ` +
+        `${overdue.map(d => `${d.unit} (was due ${short(d.readBy)})`).join(', ')}. ` +
+        `${overdue.length === 1 ? "That tenant's bill is" : "Those tenants' bills are"} on hold, rent included, until the meter is read.`)
+    }
+    const body = parts.join(' ')
+    const title = overdue.length && !dueToday.length
+      ? `Overdue meter reads — ${p.name}`
+      : `Meter reads due today — ${p.name}`
+
+    const landlord = await queryOne<{ user_id: string; email: string }>(
+      `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
+      [p.landlordId])
+    const staff = await query<{ user_id: string; email: string }>(
+      `SELECT DISTINCT u.id AS user_id, u.email FROM (
+          SELECT user_id FROM property_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+          UNION
+          SELECT user_id FROM onsite_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+        ) s JOIN users u ON u.id = s.user_id`,
+      [p.landlordId, propertyId])
+    // Work traders whose agreement includes reading meters read them from the
+    // tenant portal, so their notice opens there.
+    const traders = await query<{ user_id: string; email: string }>(
+      `SELECT DISTINCT u.id AS user_id, u.email
+         FROM work_trade_agreements a
+         JOIN tenants t ON t.id = a.tenant_id
+         JOIN users u ON u.id = t.user_id
+         JOIN units un ON un.id = a.unit_id
+        WHERE un.property_id = $1 AND a.status = 'active'
+          AND 'read_meters' = ANY(a.field_permissions)`, [propertyId])
+
+    const seen = new Set<string>()
+    const recipients = [
+      ...(landlord ? [{ ...landlord, url: `/utilities?propertyId=${propertyId}` }] : []),
+      ...staff.map(x => ({ ...x, url: `/utilities?propertyId=${propertyId}` })),
+      ...traders.map(x => ({ ...x, url: '/meter-readings' })),
+    ].filter(r => (seen.has(r.user_id) ? false : (seen.add(r.user_id), true)))
+    for (const r of recipients) {
+      await createNotification({
+        userId: r.user_id, landlordId: p.landlordId,
+        type: 'tenant_date_meter_reads_due',
+        title, body,
+        data: { propertyId, day: today, dueToday: dueToday.map(d => d.unit), overdue: overdue.map(d => d.unit) },
+        actionUrl: r.url,
+        sendEmail: true, emailTo: r.email,
+        emailSubject: title,
+        emailHtml: body,
+      })
+    }
+    prompted++
+    meters += p.due.length
+  }
+  return { prompted, meters }
+}
+
 // S559: LIVE front-desk "reads due" list — derived from the CURRENT calendar
 // every call, never a stored snapshot, so guest extensions / early checkouts
 // / cancellations self-correct with zero special handling. A spot is "due"
@@ -628,11 +748,11 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
 // stamped without the reader choosing it: a departing lease whose tenant is
 // responsible for that utility → move_out_final (bills); everything else
 // (short-term / utilities-included) → stay_turnover (reference). Taking the
-// read, extending the stay, or cancelling all drop the row on the next fetch.
+// read, extending the stay, or canceling all drop the row on the next fetch.
 export async function getReadsDue(propertyId: string) {
   return query<any>(`
     WITH departures AS (
-      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id,
+      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills,
              (SELECT us.first_name || ' ' || us.last_name
                 FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
                 JOIN users us ON us.id = t.user_id
@@ -642,7 +762,13 @@ export async function getReadsDue(propertyId: string) {
          AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
          AND l.status IN ('active','ended','expired')
       UNION ALL
-      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id, b.guest_name AS who
+      -- 10/5 (Nic, prepaid stays — M7): a stay of 30+ nights with no lease
+      -- pays its site's utilities (a utility service agreement tied to the
+      -- stay). Its check-out read is a move-out read that bills its last
+      -- stretch, the same as a departing lease's.
+      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id,
+             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills,
+             b.guest_name AS who
         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
        WHERE u.property_id = $1
          AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
@@ -651,7 +777,7 @@ export async function getReadsDue(propertyId: string) {
     )
     SELECT d.unit_id, u.unit_number, d.departed_on, d.lease_id, d.who,
            m.id AS meter_id, m.label AS meter_label, m.utility_type,
-           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+           CASE WHEN (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills
                 THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
       FROM departures d
       JOIN units u ON u.id = d.unit_id
@@ -674,22 +800,30 @@ export async function getReadsDue(propertyId: string) {
 export async function unitPendingReads(unitId: string) {
   return query<any>(`
     WITH departures AS (
-      SELECT l.end_date AS departed_on, l.id AS lease_id
+      SELECT l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills
         FROM leases l
        WHERE l.unit_id = $1 AND l.end_date IS NOT NULL
          AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
          AND l.status IN ('active','ended','expired')
       UNION ALL
-      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id
+      -- 10/5 (M7): a stay that pays its site's utilities is read out with a
+      -- move-out read that bills it (see getReadsDue).
+      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id,
+             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills
         FROM unit_bookings b
        WHERE b.unit_id = $1
          AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
          AND (b.status = 'checked_out'
               OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
     )
-    SELECT DISTINCT m.id AS meter_id, m.label AS meter_label, m.utility_type,
+    -- 10/3: one row per meter (two departures used to ask for the same meter
+    -- twice). A billing move-out wins over a turnover; its lease rides along
+    -- so the read bills that household.
+    SELECT DISTINCT ON (m.id) m.id AS meter_id, m.label AS meter_label, m.utility_type,
+           CASE WHEN (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills
+                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason,
            CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
-                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
+                THEN d.lease_id END AS lease_id
       FROM departures d
       JOIN utility_meter_units mu ON mu.unit_id = $1
       JOIN utility_meters m ON m.id = mu.meter_id
@@ -698,6 +832,9 @@ export async function unitPendingReads(unitId: string) {
              ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
      WHERE NOT EXISTS (
         SELECT 1 FROM utility_meter_readings r
-         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)`,
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+     ORDER BY m.id,
+              ((d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills) DESC,
+              d.departed_on DESC`,
     [unitId])
 }

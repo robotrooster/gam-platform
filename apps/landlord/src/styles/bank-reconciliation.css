@@ -1,0 +1,78 @@
+/* S655 money plan, Step 12: bank reconciliation — "Make a bank deposit"
+   (MakeDepositPanel), the cash-control card (DepositMatchPanel's
+   CashPositionPanel) and the Undo lines on the bank feed (BankFeedPage). Every
+   class the new markup uses has its rule here; globals.css is not touched.
+   Colors come from the theme tokens, so light and dark both work. */
+
+/* ── Make a bank deposit ─────────────────────────────────── */
+.bankrec-card { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.bankrec-title { font-weight: 700; font-size: .9rem; color: var(--text-0); }
+.bankrec-sub { font-size: .76rem; color: var(--text-2); line-height: 1.5; }
+.bankrec-section {
+  font-size: .66rem; font-weight: 700; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: .07em; margin-top: 8px;
+}
+.bankrec-muted { font-size: .78rem; color: var(--text-3); padding: 2px 0; }
+.bankrec-strong { font-size: .82rem; font-weight: 600; color: var(--text-0); }
+.bankrec-note { font-size: .74rem; color: var(--text-2); line-height: 1.5; }
+.bankrec-meta { font-size: .72rem; color: var(--text-3); }
+.bankrec-error {
+  font-size: .8rem; color: var(--red); background: var(--red-bg);
+  border: 1px solid var(--red-dim); border-radius: var(--r-sm); padding: 8px 10px; line-height: 1.5;
+}
+
+.bankrec-list { display: flex; flex-direction: column; gap: 4px; }
+.bankrec-row {
+  display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 10px;
+  padding: 6px 8px; border: 1px solid var(--border-0); border-radius: var(--r-sm);
+  cursor: pointer; font-size: .8rem; color: var(--text-1);
+}
+.bankrec-row-on { border-color: var(--gold); background: var(--gold-bg); }
+.bankrec-who { color: var(--text-1); font-size: .8rem; }
+.bankrec-amt { font-family: var(--font-mono); font-size: .8rem; color: var(--text-0); white-space: nowrap; }
+
+.bankrec-other { display: flex; flex-direction: column; gap: 8px; }
+.bankrec-money { max-width: 160px; }
+.bankrec-question {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--border-1); border-radius: var(--r-sm); padding: 8px 10px; background: var(--bg-3);
+}
+.bankrec-choices { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.bankrec-bag-row {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px;
+  padding: 4px 8px; border-bottom: 1px solid var(--border-0); font-size: .8rem;
+}
+.bankrec-x {
+  background: none; border: 1px solid var(--border-1); border-radius: var(--r-sm);
+  color: var(--text-2); width: 24px; height: 24px; line-height: 20px; cursor: pointer; font-size: .9rem;
+}
+.bankrec-x:hover { color: var(--red); border-color: var(--red-dim); }
+
+.bankrec-actions { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.bankrec-date { display: flex; flex-direction: column; gap: 4px; font-size: .72rem; color: var(--text-3); }
+.bankrec-total { font-family: var(--font-mono); font-weight: 700; font-size: 1rem; color: var(--text-0); margin-left: auto; }
+
+.bankrec-slip {
+  border: 1px solid var(--border-0); border-radius: var(--r-md); padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.bankrec-slip-late { border-color: var(--amber); background: var(--amber-bg); }
+.bankrec-slip-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bankrec-slip-head .btn { margin-left: auto; }
+.bankrec-slip-items { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: .74rem; color: var(--text-2); }
+.bankrec-flag { font-size: .76rem; color: var(--amber); line-height: 1.5; }
+.bankrec-done { font-size: .74rem; color: var(--text-3); }
+
+/* ── The cash-control card ──────────────────────────────── */
+.bankrec-cash-group { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.bankrec-cash-line {
+  display: flex; justify-content: space-between; gap: 12px; font-size: .78rem; padding: 3px 0;
+}
+.bankrec-cash-who { color: var(--text-2); }
+.bankrec-cash-amt { white-space: nowrap; }
+.bankrec-cash-amt .bankrec-amt { margin-right: 4px; }
+
+/* ── Bank feed: what a row was matched to, and Undo ─────── */
+.bankrec-matched { font-size: .72rem; color: var(--gold); margin-top: 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bankrec-undo-box { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }

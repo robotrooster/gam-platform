@@ -32,6 +32,12 @@ async function seed() {
     const { userId: sellerUser, landlordId } = await seedLandlord(c)
     const buyerTenant = await seedTenant(c)
     const buyerUser = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [buyerTenant])).rows[0].user_id
+    // S654: a resident goes on a company's document only once they are that
+    // company's — a lease, an invite or a draft lease with it. The buyer here
+    // is the seller's invitee.
+    await c.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1, $2, 'not_uploaded')`,
+      [landlordId, buyerTenant])
     await c.query('COMMIT')
     const token = jwt.sign({ userId: sellerUser, role: 'landlord', email: 'seller@t.dev', profileId: landlordId, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })

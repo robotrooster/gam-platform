@@ -1,0 +1,191 @@
+/**
+ * S652 — POST A PAYMENT: money that arrived before there was a bill.
+ *
+ * Nic: "I've got somebody that already wrote a check and paid ahead of time
+ * for October ... I don't want to issue it as a credit because it's not going
+ * to come out right in the bookkeeping. I want to apply a payment ahead of
+ * time, and there's no way to do that."
+ *
+ * The receipt is written as a receipt (tenant_remittances: method, check
+ * number, date, who took it, gross_amount NULL — no Stripe involved). It
+ * settles what the household owes this company, oldest first and whole, by
+ * the same desk rules (services/manualPaymentSettle): the current bill in
+ * full, then the old (carried-forward) balance. Whatever is left is banked on
+ * the newest active lease as money PAID AHEAD the landlord holds
+ * (funded_by 'landlord', received_at = the day it was received), which pays a
+ * later bill when that bill comes.
+ *
+ * S655: it never spends credit — this is new money, not a use of old money —
+ * and the credit on file is never asked about here. Pay in full holds: an
+ * amount below what is owed now is refused — unless the property takes part
+ * payments (10/5, Nic), when it pays the oldest bills first and the rest stays
+ * owed (services/manualPaymentSettle).
+ *
+ * 10/5 (Nic): a BANK DEPOSIT (the resident's cash put straight into the
+ * landlord's bank) is posted the same way, with the reference number on the
+ * bank's receipt required.
+ */
+import type { PoolClient } from 'pg'
+import type { ManualPaymentMethod } from '@gam/shared'
+import { MANUAL_PAYMENT_METHOD_WORD } from '@gam/shared'
+import { AppError } from '../middleware/errorHandler'
+import { lockHousehold } from './moneyPredicates'
+import { createPaidAhead, runWholeBillCheckAfterCommit } from './creditUse'
+import { settleManualRentPayment, deskQuote, BANK_DEPOSIT_REFERENCE_REQUIRED, assertBankDepositTaken, type StillOwedRow } from './manualPaymentSettle'
+import { activateBillingForMoneyMoved } from './billingActivation'
+
+export interface PostPaymentInput {
+  tenantId: string
+  landlordIds: string[]
+  method: ManualPaymentMethod
+  amount: number
+  reference?: string | null
+  notes?: string | null
+  receivedAt?: Date | null
+  /**
+   * 10/5 (Nic): a bank deposit's date (YYYY-MM-DD). Paying the bill in full,
+   * late fees charged after it come off (services/manualPaymentSettle).
+   */
+  depositedOn?: string | null
+  /** 10/6 (Nic): the onboarding box — delete, not credit, a late fee this takes off an onboarding bill. Caller checked who may. */
+  deleteOnboardingLateFees?: boolean
+  postedBy: string
+}
+
+export interface PostPaymentResult {
+  remittanceId: string
+  /** Money that paid open charges (the current bill and the old balance). */
+  applied: number
+  /** Money banked as paid ahead. */
+  paidAhead: number
+  settledPaymentIds: string[]
+  leaseId: string
+  creditId: string | null
+  /** 10/5: late fees charged after a bank deposit's date that came off — 10/6: credited (unbilled), and refunded as credit. */
+  lateFeesUnbilled: number
+  lateFeesRefunded: number
+  /** 10/6 (Nic): late fees deleted from an onboarding bill (the box). */
+  lateFeesDeleted: number
+  /** 10/6 (Nic): the box was ticked but a late fee could not be deleted — why, in plain words (credited instead, or still owed). */
+  lateFeeDeleteRefusals: string[]
+  /** 10/6 (Nic): a bill a late fee came off of still has a late fee on it — the payment still counts late on their history. */
+  lateFeeCountsLate: boolean
+  /** 10/6: the box deleted a late fee from a bill that still has another one on it (still late). */
+  lateFeeDeletedStillLate: boolean
+  /** 10/5: a part payment (the property takes them) — what is still owed after it; 0 when paid in full. */
+  stillOwed: number
+  stillOwedRows: StillOwedRow[]
+  /** Call once after COMMIT: the receipt email, and the whole-bill check for the money paid ahead. Never throws. */
+  afterCommit: () => Promise<void>
+}
+
+const toCents = (v: number | string | null | undefined): number => Math.round(Number(v ?? 0) * 100)
+const toDollars = (c: number): number => Math.round(c) / 100
+
+export async function postTenantPayment(client: PoolClient, input: PostPaymentInput): Promise<PostPaymentResult> {
+  const amount = toCents(input.amount)
+  if (!(amount > 0)) throw new AppError(400, 'The amount has to be more than zero.')
+  if (input.method === 'bank_deposit' && !(input.reference ?? '').trim()) {
+    throw new AppError(422, BANK_DEPOSIT_REFERENCE_REQUIRED)
+  }
+
+  // Where the money sits: the tenant's newest active lease with one of this account's companies.
+  const lease = (await client.query<{ id: string; landlord_id: string; payment_block: boolean }>(
+    `SELECT l.id, l.landlord_id, COALESCE(u.payment_block, FALSE) AS payment_block
+       FROM leases l JOIN lease_tenants lt ON lt.lease_id = l.id
+       LEFT JOIN units u ON u.id = l.unit_id
+      WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active', 'pending')
+        AND l.landlord_id = ANY($2::uuid[])
+      ORDER BY l.status = 'active' DESC, l.start_date DESC, l.id LIMIT 1`,
+    [input.tenantId, input.landlordIds])).rows[0]
+  if (!lease) throw new AppError(409, 'This tenant has no active lease with you to hold a payment on.')
+  // 10/6 (Nic): a bank deposit only where tenants deposit rent at the bank.
+  if (input.method === 'bank_deposit') await assertBankDepositTaken(client, { leaseId: lease.id })
+  // Accepting landlord-bound money during an eviction can reset its timeline.
+  if (lease.payment_block) {
+    throw new AppError(409, 'This space is in eviction mode — recording a payment is paused. Contact the landlord.')
+  }
+
+  await lockHousehold(client, input.tenantId, lease.landlord_id)
+  const q = await deskQuote(client, { tenantId: input.tenantId, landlordId: lease.landlord_id, lock: true })
+  const anchor = q.rows[0] ?? q.carried[0] ?? null
+
+  if (anchor) {
+    const owed = q.rows.reduce((s, r) => s + toCents(r.amount) - toCents(r.appliedCredit), 0)
+    const carried = q.carried.reduce((s, r) => s + toCents(r.amount) - toCents(r.appliedCredit), 0)
+    const backdated = input.method === 'bank_deposit' && input.depositedOn ? input.depositedOn : null
+    const r = await settleManualRentPayment(client, {
+      payment: {
+        id: anchor.id, landlord_id: lease.landlord_id, tenant_id: input.tenantId,
+        unit_id: anchor.unitId, lease_id: anchor.leaseId, due_date: anchor.dueDate,
+      },
+      method: input.method,
+      settledAt: input.receivedAt ?? null,
+      reference: input.reference ?? null,
+      provenance: 'posted from the tenant\'s page',
+      settleHousehold: true,
+      amountTendered: toDollars(amount),
+      neverUseCredit: true,
+      // The portal's order: the current bill, then the old balance, then
+      // paid ahead. The post is deliberate, so nothing more is asked. 10/5: a
+      // bank deposit dated back may take late fees off the bill first, so the
+      // settle works the old balance out itself (money kept pays it first).
+      towardOldBalance: backdated ? null : toDollars(Math.max(0, Math.min(amount - owed, carried))),
+      surplusHandling: 'credit',
+      confirmWrittenAmount: true,
+      takenBy: input.postedBy,
+      notes: input.notes ?? null,
+      creditLeaseId: lease.id,
+      depositedOn: backdated,
+      deleteOnboardingLateFees: input.deleteOnboardingLateFees === true,
+      lateFeeDeleteVia: 'post_payment',
+    })
+    return {
+      remittanceId: r.receiptId!,
+      applied: r.amountSettled,
+      paidAhead: r.creditId ? r.surplus : 0,
+      settledPaymentIds: r.settledPaymentIds,
+      leaseId: lease.id,
+      creditId: r.creditId,
+      stillOwed: r.stillOwed,
+      stillOwedRows: r.stillOwedRows,
+      lateFeesUnbilled: r.lateFeesReversed.unbilled,
+      lateFeesRefunded: r.lateFeesReversed.refunded,
+      lateFeesDeleted: r.lateFeesDeleted.count,
+      lateFeeDeleteRefusals: r.lateFeeDeleteRefusals,
+      lateFeeCountsLate: r.lateFeeCountsLate,
+      lateFeeDeletedStillLate: r.lateFeeDeletedStillLate,
+      afterCommit: async () => {
+        await r.afterCommit()
+        if (r.creditId) await runWholeBillCheckAfterCommit({ tenantId: input.tenantId, landlordId: lease.landlord_id })
+      },
+    }
+  }
+
+  // Nothing is owed: the whole receipt is paid ahead.
+  const rem = await client.query<{ id: string }>(
+    `INSERT INTO tenant_remittances
+       (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status,
+        payment_method, gross_amount, processing_fee_amount, settled_at, reference, notes, received_by)
+     VALUES ($1, $2, $3, $4, 0, $4, 'settled', $5, NULL, 0, COALESCE($6::timestamptz, NOW()), $7, $8, $9)
+     RETURNING id`,
+    [input.tenantId, lease.id, lease.landlord_id, toDollars(amount).toFixed(2),
+     input.method, input.receivedAt ?? null, input.reference || null, input.notes || null, input.postedBy])
+  const remittanceId = rem.rows[0].id
+  // 10/5 (Nic): "money movement is the end of onboarding" — money posted
+  // ahead with nothing owed yet still moved through GAM.
+  await activateBillingForMoneyMoved(client, [lease.landlord_id])
+  const creditId = await createPaidAhead(client, {
+    leaseId: lease.id, tenantId: input.tenantId, amount: toDollars(amount), fundedBy: 'landlord',
+    receivedAt: input.receivedAt ?? new Date(), sourceRemittanceId: remittanceId,
+    note: `Paid ahead — posted ${MANUAL_PAYMENT_METHOD_WORD[input.method]}${input.reference ? ` (ref ${input.reference})` : ''}`,
+  })
+  return {
+    remittanceId, applied: 0, paidAhead: toDollars(amount), settledPaymentIds: [], leaseId: lease.id, creditId,
+    stillOwed: 0, stillOwedRows: [], lateFeesUnbilled: 0, lateFeesRefunded: 0,
+    lateFeesDeleted: 0, lateFeeDeleteRefusals: [], lateFeeCountsLate: false, lateFeeDeletedStillLate: false,
+    afterCommit: async () => {
+      await runWholeBillCheckAfterCommit({ tenantId: input.tenantId, landlordId: lease.landlord_id })
+    },
+  }
+}

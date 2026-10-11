@@ -62,7 +62,7 @@ describe('autopayLateness', () => {
   // `today >= due_date + grace`, so a grace of ZERO makes the DUE DATE ITSELF
   // late. Whether a landlord should be able to set that is a product question;
   // what must not happen is this screen calling a day safe that the charge then
-  // penalises, so it agrees with the engine and says so.
+  // penalizes, so it agrees with the engine and says so.
   it('a zero-day grace makes the due date itself late', () => {
     expect(autopayLateness('2026-09-01', 1, 0).isLate).toBe(true);
     expect(autopayLateness('2026-09-01', 5, 5).isLate).toBe(false);

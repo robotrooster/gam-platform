@@ -113,7 +113,8 @@ appointmentsRouter.post('/', requireAuth, async (req, res, next) => {
             scheduledFor:    new Date(body.scheduledFor),
             durationMinutes: body.durationMinutes ?? 30,
             notes:           body.notes ?? null,
-            ctx: { businessId, appointmentId: row.id },
+            // 10/5: replies reach the business, not GAM (services/replyRouting).
+            ctx: { businessId, appointmentId: row.id, replyTo: { kind: 'business', businessId } },
           })
         }
       } catch {/* logged at email-service layer */}

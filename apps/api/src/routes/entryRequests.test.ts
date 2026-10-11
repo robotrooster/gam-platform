@@ -352,7 +352,7 @@ describe('POST /api/entry-requests — create', () => {
     expect(res.body.data.state_law_warnings).toEqual([])
   })
 
-  it('S476: uncatalogued state → state_law_warnings empty (no false alarm)', async () => {
+  it('S476: uncataloged state → state_law_warnings empty (no false alarm)', async () => {
     const f = await seedERFixture()
     // Move the property to a fake state with no provisions seeded.
     await db.query(`UPDATE properties SET state = 'XX' WHERE id = $1`, [f.propertyId])
@@ -578,7 +578,7 @@ describe('loadRequest scope guard (via GET /:id)', () => {
   // ─────────────────────────────────────────────────────────────
 
   // Reuse the seed pattern from POST tests so the GET path has
-  // catalogued AZ statute data to compare against.
+  // cataloged AZ statute data to compare against.
   async function seedAzEntryNoticeStatute(): Promise<void> {
     const { rows: [a] } = await db.query<{ id: string }>(
       `INSERT INTO state_landlord_tenant_acts

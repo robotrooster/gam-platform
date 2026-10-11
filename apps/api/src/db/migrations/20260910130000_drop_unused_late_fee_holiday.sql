@@ -1,0 +1,16 @@
+-- S639: reverting my own column, minutes old and never used.
+--
+-- I reached for a landlord-level holiday DATE for the onboarding late-fee
+-- waiver. Nic corrected the shape before it shipped: "The wipe needs to not be
+-- for existing leases. It needs to be for people onboarded as EXISTING TENANTS,
+-- to make it catch everybody depending on when they finally get around to
+-- getting signed."
+--
+-- He is right, and a date is wrong in both directions: it expires while people
+-- are still signing, and it hands free lateness to a genuinely new applicant who
+-- happens to sign inside the window. leases.is_existing_tenancy already says
+-- exactly who is owed the grace, and it keys off THEIR first invoice rather than
+-- a calendar, so it cannot expire out from under somebody.
+--
+-- Two mechanisms for one rule is how they drift apart, so the unused one goes.
+ALTER TABLE landlords DROP COLUMN IF EXISTS late_fee_holiday_until;

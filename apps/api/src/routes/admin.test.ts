@@ -195,8 +195,31 @@ describe('GET /api/admin/overview', () => {
     expect(typeof d.open_maintenance).toBe('number')
     expect(typeof d.zero_tolerance_events).toBe('number')
     expect(typeof d.csv_imports_pending_review).toBe('number')
-    // Fixture has 1 landlord
-    expect(d.total_landlords).toBe(1)
+    // S650: the fixture's landlord has signed up but brought no property yet.
+    expect(d.total_landlords).toBe(0)
+    expect(d.landlords_without_property).toBe(1)
+  })
+
+  it('S650: counts PEOPLE who brought a property — not companies, not co-owners', async () => {
+    const f = await seedAFixture()
+    const c = await db.connect()
+    try {
+      // The fixture landlord brings a property under a SECOND company too.
+      const second = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [f.landlordUserId])
+      await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      await seedProperty(c, { landlordId: second.rows[0].id, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      // A co-owner who owns nothing of their own.
+      const co = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'landlord', 'Co', 'Owner', TRUE) RETURNING id`, [`co-${randomUUID()}@test.dev`])
+      await c.query(`INSERT INTO landlords (user_id) VALUES ($1)`, [co.rows[0].id])
+      await c.query(`INSERT INTO landlord_members (landlord_id, user_id) VALUES ($1, $2)`, [f.landlordId, co.rows[0].id])
+    } finally { c.release() }
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.body.data.total_landlords).toBe(1)            // one person, two companies
+    expect(res.body.data.landlords_without_property).toBe(0) // the co-owner is not a "no property" signup
   })
 
   it('plain admin (portfolio manager) → 403 (financials are super_admin only)', async () => {
@@ -479,5 +502,111 @@ describe('POST /api/admin/users/:userId/referral-upline — manual re-attach (su
       .set('Authorization', `Bearer ${f.adminToken}`)
       .send({ uplineUserId: f.superAdminUserId })
     expect(res.status).toBe(403)
+  })
+})
+
+// ─── S639: THE ADMIN CARDS AND THE LANDLORD CARDS MEAN THE SAME WORDS ───────
+//
+// Nic, reading the platform overview against his own dashboard: "the monthly
+// rent volume across twenty two units should be eleven thousand five hundred and
+// thirteen dollars, but the landlord portal shows expected monthly rent at
+// thirteen thousand four hundred and seventy seven dollars... I'm showing also
+// twenty pending payments awaiting ACH settlement. Where is that card reading
+// from? We have a lot of issues with the cards on this page."
+//
+// Both were counting units.rent_amount and disagreeing about which units count.
+// The platform figure came out SMALLER than one landlord's own, which is the
+// tell: a whole-platform number can never be less than a subset of it.
+describe('S639 admin platform stats — occupied means occupied', () => {
+  it('rent volume is money that MOVED, not rent that is owed', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      // A second unit and lease: two live rent charges on ONE lease and due date
+      // collide with the rent-idempotency rule, which is correct and is not what
+      // this test is about.
+      const unit2Id = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      await client.query(`UPDATE units SET status='active', rent_amount=1000 WHERE id IN ($1,$2)`, [unitId, unit2Id])
+      const tenantId = await seedTenant(client)
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      const lease2Id = await seedLease(client, { unitId: unit2Id, landlordId: f.landlordId })
+      // Paid, in flight, and unpaid — only the first two moved money.
+      await client.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, settled_at)
+         VALUES ($1,$2,$3,$4,'rent',600,'settled','RENT',CURRENT_DATE,NOW()),
+                ($1,$2,$3,$4,'utility',75,'settled','UTILITY',CURRENT_DATE,NOW()),
+                ($5,$6,$3,$4,'rent',400,'processing','RENT',CURRENT_DATE,NOW())`,
+        [unitId, leaseId, tenantId, f.landlordId, unit2Id, lease2Id])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // Nic: "monthly rent volume should only be money that actually moved."
+    // $600 settled + $400 still clearing. NOT the $1,000 contracted, and not
+    // the $75 of utilities — those belong to the heartbeat beside it.
+    expect(Number(res.body.data.monthly_rent_volume)).toBe(1000)
+    // Two leases sent rent this month.
+    expect(Number(res.body.data.paying_leases)).toBe(2)
+  })
+
+  it('separates unpaid charges from money actually in ACH flight', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // 'pending' is a charge nobody has paid — no ACH exists for it. 'processing'
+    // is money the tenant has sent that has not cleared. The card said the first
+    // count was "awaiting ACH settlement", which was never true of it.
+    // The test harness mounts the router directly, so responses are still
+    // snake_case here; the real API camelizes on the way out.
+    expect(res.body.data).toHaveProperty('unpaid_charges')
+    expect(res.body.data).toHaveProperty('payments_in_flight')
+    expect(res.body.data).toHaveProperty('payments_in_flight_amount')
+  })
+
+  it('counts unpaid INVOICES, not the line items on them', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      const tenantId = await seedTenant(client)
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      const { rows: [inv] } = await client.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                               due_date, subtotal_rent, subtotal_fees, subtotal_utilities, total_amount)
+         VALUES ($1,$2,$3,$4,'S639-INV',CURRENT_DATE,900,0,120,1020) RETURNING id`,
+        [f.landlordId, tenantId, leaseId, unitId])
+      // Nic: "once line items go on an invoice, they are bundled together as one
+      // item." Rent and utilities are two rows and ONE bill, paid in one act.
+      await client.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type,
+                               amount, status, entry_description, due_date)
+         VALUES ($1,$2,$3,$4,$5,'rent',900,'pending','RENT',CURRENT_DATE),
+                ($1,$2,$3,$4,$5,'utility',120,'pending','UTILITY',CURRENT_DATE)`,
+        [inv.id, unitId, leaseId, tenantId, f.landlordId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // One bill, not two. Counting rows counted the same debt twice — 21 rows
+    // were 10 invoices on Nic's platform.
+    expect(Number(res.body.data.unpaid_charges)).toBe(1)
+    expect(Number(res.body.data.unpaid_line_items)).toBe(2)
   })
 })

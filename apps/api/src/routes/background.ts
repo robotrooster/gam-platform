@@ -10,26 +10,40 @@ import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
-import { PROCESSING_FEES } from '@gam/shared'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
+import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
-import { query, queryOne } from '../db'
+import { db, query, queryOne, getClient } from '../db'
+import type { PoolClient } from 'pg'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
+import { recordScreeningEarnings } from '../services/platformRevenue'
 import crypto from 'crypto'
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import Stripe from 'stripe'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
+import { emailScreeningApplyLink } from '../services/email'
+import { propertyIdForUnit } from '../services/replyRouting'
+import { archiveProviderPayload } from '../services/backgroundReportArchive'
+// S640: shared with the status poller — see services/applicationPool.ts.
+import { isPoolEligible, upsertPoolEntry } from '../services/applicationPool'
+import { applyProviderUpdate } from '../services/backgroundApplyUpdate'
+import { todayIn } from '../lib/timezone'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
 // credentials) the helpers fall back to mock IDs so the dev server still
 // boots — verifyPaymentIntent then accepts the mock prefix in non-production.
-const stripeForBgc: Stripe | null = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+// S639: stripeSecretKeyOrNull refuses a LIVE key under vitest. This module is
+// why the guard exists — six test files exercise the intake path without
+// mocking Stripe, and each one minted real PaymentIntents on the live account.
+const _bgcKey = stripeSecretKeyOrNull()
+const stripeForBgc: Stripe | null = _bgcKey
+  ? new Stripe(_bgcKey, { apiVersion: '2023-10-16' })
   : null
 const STRIPE_LIVE = !!stripeForBgc
 
@@ -101,7 +115,9 @@ const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD
 async function screeningIntakeTax(applicantState: string | null | undefined, parts: { screening: number; gamFee: number }): Promise<number> {
   if (!applicantState || applicantState.length !== 2) return 0
   const st = applicantState.toUpperCase()
-  const year = new Date().getFullYear()
+  // S654: GAM collects this tax, so the year is GAM's home calendar (Phoenix),
+  // not whatever zone the API host runs in.
+  const year = Number(todayIn(null).slice(0, 4))
   // Latest catalog row for the state at-or-before the current year (survives the
   // annual-refresh gap before next year's rows land), gated on an active
   // registration. Non-registered / non-taxable / no-row → no collection.
@@ -133,6 +149,60 @@ export async function screeningIntakeFee(applicantState?: string | null) {
   return { screening, gamFee, tax, processing, total }
 }
 const POOL_REPORT_UNLOCK_USD = parseFloat(process.env.POOL_REPORT_UNLOCK_USD || '1')
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// ── 10/5 (Nic, R8): A CHECK ALREADY PAID WITH A STAY ─────────────────────────
+//
+// "Charged whether or not they complete the check; the paid check waits for
+//  them (no second charge at intake)."
+//
+// A stay of more than three weeks carries the background-check fee on the
+// payment that sold or extended it (services/stayTerms recordScreeningPrepayment)
+// and the guest is emailed the link. That payment is a register sale, a pay
+// link or a booking deposit — none of them a screening PaymentIntent this
+// applicant made, so the Stripe search below can never find it. The record
+// that it was paid is screening_prepayments, looked up by the PERSON: the
+// guest's tenant record, or the email the stay was sold to.
+//
+// An email match never takes a prepayment that names a DIFFERENT tenant (the
+// rule continuousStayNights uses). Only the company the link names, or one
+// under the same account, can be paid for this way.
+interface PrepaidScreening {
+  id: string
+  amount: string
+  booking_id: string | null
+  property_id: string | null
+  unit_id: string | null
+}
+async function unusedScreeningPrepayment(
+  client: PoolClient | null,
+  args: { userId: string; landlordId: string; prepaymentId?: string | null },
+): Promise<PrepaidScreening | null> {
+  if (!UUID_RE.test(args.landlordId)) return null
+  if (args.prepaymentId && !UUID_RE.test(args.prepaymentId)) return null
+  const sql = `
+    SELECT sp.id, sp.amount::text AS amount, sp.booking_id,
+           COALESCE(sp.property_id, bu.property_id) AS property_id, b.unit_id
+      FROM screening_prepayments sp
+      JOIN users u ON u.id = $1
+      LEFT JOIN tenants t ON t.user_id = u.id
+      LEFT JOIN unit_bookings b ON b.id = sp.booking_id
+      LEFT JOIN units bu ON bu.id = b.unit_id
+     WHERE sp.status = 'unused'
+       AND sp.landlord_id IN (SELECT public.account_companies($2::uuid))
+       AND ((sp.tenant_id IS NOT NULL AND sp.tenant_id = t.id)
+            OR (sp.email IS NOT NULL AND LOWER(sp.email) = LOWER(u.email)
+                AND (sp.tenant_id IS NULL OR t.id IS NULL OR sp.tenant_id = t.id)))
+       AND ($3::uuid IS NULL OR sp.id = $3::uuid)
+     ORDER BY sp.created_at ASC
+     LIMIT 1
+     ${client ? 'FOR UPDATE OF sp' : ''}`
+  const params = [args.userId, args.landlordId, args.prepaymentId ?? null]
+  return client
+    ? (await client.query<PrepaidScreening>(sql, params)).rows[0] ?? null
+    : queryOne<PrepaidScreening>(sql, params)
+}
 
 function encrypt(text: string): string {
   const key = Buffer.from(ENCRYPTION_KEY.slice(0, 64), 'hex')
@@ -166,41 +236,6 @@ async function geocodeAddress(street1: string, city: string, state: string, zip:
     if (data?.[0]) return { lat: data[0].lat, lon: data[0].lon }
   } catch (_) { /* timeout or network — fall through */ }
   return { lat: null, lon: null }
-}
-
-// Pool eligibility: tenant consented + risk gate. Approved tenants are
-// housed and don't need leads; only denials and speculative completes
-// route here.
-function isPoolEligible(check: any): boolean {
-  if (!check.consent_pool) return false
-  if (check.risk_level === 'very_high') return false
-  return true
-}
-
-// Idempotent pool-entry create. Backfills pool_entry_id pointer on bgc.
-async function upsertPoolEntry(check: any) {
-  const existing = await queryOne<any>(
-    'SELECT id FROM application_pool WHERE background_check_id=$1',
-    [check.id]
-  )
-  if (existing) return existing
-  const geo = check.street1 && check.city
-    ? await geocodeAddress(check.street1, check.city, check.state, check.zip)
-    : { lat: null, lon: null }
-  const entry = await queryOne<any>(`
-    INSERT INTO application_pool
-      (background_check_id, user_id, status, consent_pool, employment_status, monthly_income, city, state, zip, lat, lon, risk_level, risk_score)
-    VALUES ($1, $2, 'available', TRUE, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    RETURNING id
-  `, [
-    check.id, check.user_id,
-    check.employment_status, check.monthly_income,
-    check.city, check.state, check.zip,
-    geo.lat, geo.lon,
-    check.risk_level, check.risk_score,
-  ])
-  await query('UPDATE background_checks SET pool_entry_id=$1 WHERE id=$2', [entry!.id, check.id])
-  return entry
 }
 
 // ── PRICING + PAYMENT INTENT (mock Stripe) ───────────────────
@@ -273,8 +308,9 @@ backgroundRouter.get('/price', async (req, res) => {
 })
 
 // POST /api/background/payment-intent
-// S561: retained for client compatibility only — the applicant is not charged
-// for screening (GAM bills the landlord), so this always reports fee waived.
+// The applicant's screening payment (S577: the applicant pays, on both routes).
+// Hands back an already-paid screening instead when there is one: a check paid
+// with a stay (10/5, R8), or a fee paid on an earlier visit and never used.
 backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
   try {
     // ── S636 (Nic, DIRECTIVE): THE LANDLORD IS NOT IN THIS TRANSACTION ──
@@ -296,6 +332,23 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
     const landlordId = req.body?.landlordId || null
     const fee = await screeningIntakeFee(req.body?.state || null)
 
+    // 10/5 (Nic, R8): a check paid with this guest's stay waits for them —
+    // looked up before anything else (mock or Stripe), so nothing is charged
+    // twice. The page goes straight to Submit, which claims it.
+    if (landlordId) {
+      const prepaid = await unusedScreeningPrepayment(null, { userId: req.user!.userId, landlordId })
+      if (prepaid) {
+        return res.json({
+          success: true,
+          data: {
+            clientSecret: null, intentId: null, screeningPrepaymentId: prepaid.id,
+            amount: Number(prepaid.amount), breakdown: null, feeWaived: false,
+            alreadyPaid: true, paidWithStay: true, testMode: !STRIPE_LIVE,
+          },
+        })
+      }
+    }
+
     if (!STRIPE_LIVE) {
       const mockId = 'pi_intake_mock_' + crypto.randomBytes(8).toString('hex')
       return res.json({
@@ -303,10 +356,83 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
         data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.total, breakdown: fee, feeWaived: false, testMode: true },
       })
     }
+    // ── S642 (Nic): KEEP THE CARD, ON THE AUTHORIZATION WE ARE ALREADY MAKING ──
+    //
+    // "Let's store the card on the screening charge."
+    //
+    // Stripe bills per AUTHORIZATION, not per successful payment, which is the
+    // whole reason a tenant cannot store a card out of the blue — that would be
+    // a ~$0.28 bank ask collecting nothing ([[gam-card-auth-cost-model]], and the
+    // gate on /stripe/tenant/setup that Nic re-affirmed this same session).
+    // THIS authorization is already happening: the applicant is paying the
+    // screening fee. Adding setup_future_usage stores the card on it for free.
+    //
+    // Same platform Stripe account the rent rails use, so if this applicant
+    // becomes a tenant anywhere on GAM the card is already on file and their
+    // first rent payment is one action instead of two.
+    //
+    // Best-effort: a customer that cannot be created must never stop somebody
+    // paying for a screening. The charge proceeds without storage.
+    let bgcCustomerId: string | null = null
+    try {
+      const t = await queryOne<{ id: string; stripe_customer_id: string | null; email: string }>(
+        `SELECT t.id, t.stripe_customer_id, u.email
+           FROM tenants t JOIN users u ON u.id = t.user_id
+          WHERE t.id = $1`,
+        [req.user!.profileId])
+      if (t) {
+        bgcCustomerId = t.stripe_customer_id
+        if (!bgcCustomerId) {
+          const customer = await stripeForBgc!.customers.create({
+            email:    t.email,
+            metadata: { tenantId: t.id, createdBy: 'background_check_intake' },
+          })
+          bgcCustomerId = customer.id
+          await query(`UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2`,
+            [bgcCustomerId, t.id])
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, user_id: req.user!.userId },
+        '[bgc] could not prepare a customer to keep the card on — charging without storing')
+      bgcCustomerId = null
+    }
+
+    // 10/5: an applicant who paid on an earlier visit and left before pressing
+    // Submit comes back to this step. Charging again would take the fee twice
+    // and leave the first payment unused. A paid screening fee of the same
+    // amount that no check has used yet is handed back instead, and the page
+    // goes straight to Submit; /submit verifies it like any intent, and the
+    // unique index on applicant_payment_intent_id keeps it to one check.
+    // Best-effort: Stripe's search can trail a payment by about a minute, and
+    // a failure here only means a fresh intent, as before.
+    try {
+      const found = await stripeForBgc!.paymentIntents.search({
+        query: `metadata['userId']:'${String(req.user!.userId).replace(/'/g, '')}' AND metadata['kind']:'background_check_intake' AND status:'succeeded'`,
+        limit: 10,
+        expand: ['data.latest_charge'],
+      })
+      for (const pi of found.data) {
+        if (pi.amount !== Math.round(fee.total * 100)) continue
+        if (chargeTakenBack(pi.latest_charge)) continue
+        const used = await queryOne(`SELECT 1 FROM background_checks WHERE applicant_payment_intent_id = $1`, [pi.id])
+        if (used) continue
+        return res.json({
+          success: true,
+          data: { clientSecret: null, intentId: pi.id, amount: fee.total, breakdown: fee, feeWaived: false, alreadyPaid: true, testMode: false },
+        })
+      }
+    } catch (e) {
+      logger.warn({ err: e, user_id: req.user!.userId }, '[bgc] could not look for an earlier paid screening fee — starting a new one')
+    }
+
     const intent = await stripeForBgc!.paymentIntents.create({
       amount: Math.round(fee.total * 100),
       currency: 'usd',
       payment_method_types: ['card'],
+      ...(bgcCustomerId
+        ? { customer: bgcCustomerId, setup_future_usage: 'off_session' as const }
+        : {}),
       description: landlordId ? 'GAM tenant background screening' : 'GAM renter-pool background screening',
       // The landlord id still rides in metadata so the check can be attributed,
       // but it steers nothing about the charge.
@@ -323,27 +449,46 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
 // Used by /submit (intake fee) and /pool/match/:matchId/purchase-report
 // (pool unlock fee). Mock IDs from the dev fallback are accepted in
 // non-production only.
+/**
+ * S642 (Nic): "All the money needs to reflect what actually happened."
+ *
+ * Returns the cents Stripe ACTUALLY captured, so the caller records the real
+ * figure instead of re-deriving a fee and hoping the two agree. Null for a mock
+ * intent, which only exists outside production.
+ */
+/** A charge that was refunded (any part) or disputed no longer pays for anything. */
+function chargeTakenBack(ch: string | Stripe.Charge | null | undefined): boolean {
+  if (!ch || typeof ch === 'string') return false
+  return !!(ch.refunded || (ch.amount_refunded ?? 0) > 0 || ch.disputed)
+}
+
 async function verifyPaymentIntent(
   intentId: string,
   expected: { kind: 'background_check_intake' | 'pool_report_unlock'; amountUsd: number; userId?: string; matchId?: string },
-): Promise<void> {
+): Promise<number | null> {
   if (isMockIntentId(intentId)) {
     if (process.env.NODE_ENV === 'production') {
       throw new AppError(400, 'Mock payment intents are not accepted in production')
     }
-    return
+    return null
   }
   if (!STRIPE_LIVE) {
     throw new AppError(500, 'Stripe not configured but a non-mock intent id was supplied')
   }
   let pi: Stripe.PaymentIntent
   try {
-    pi = await stripeForBgc!.paymentIntents.retrieve(intentId)
+    pi = await stripeForBgc!.paymentIntents.retrieve(intentId, { expand: ['latest_charge'] })
   } catch {
     throw new AppError(400, 'Payment intent not found')
   }
   if (pi.status !== 'succeeded') {
     throw new AppError(400, `Payment not yet succeeded (status: ${pi.status})`)
+  }
+  // 10/5 review: Stripe keeps a payment 'succeeded' after it is refunded or
+  // charged back. Such a payment never pays for a screening — the browser
+  // names the intent, so this is the gate that has to say no.
+  if (chargeTakenBack(pi.latest_charge)) {
+    throw new AppError(400, 'That payment was refunded or disputed, so it can\u2019t pay for this screening. Please pay again.')
   }
   if (pi.metadata?.kind !== expected.kind) {
     throw new AppError(400, 'Payment intent kind mismatch')
@@ -359,6 +504,8 @@ async function verifyPaymentIntent(
   if (Math.abs(pi.amount - expectedCents) > 1) {
     throw new AppError(400, `Payment amount mismatch (got ${pi.amount}¢, expected ${expectedCents}¢)`)
   }
+  // What was really taken — not what we expected to take.
+  return pi.amount
 }
 
 // ── INTAKE: APPLICANT PAYS + SUBMITS ATOMICALLY ──────────────
@@ -373,16 +520,34 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       employmentStatus, employerName, employerPhone, monthlyIncome,
       prevLandlordName, prevLandlordPhone, prevLandlordEmail,
       idDocumentUrl, incomeDocUrls, consentCredit, consentCriminal, consentPool,
-      timeToComplete, applicantPaymentIntentId,
+      timeToComplete, applicantPaymentIntentId, screeningPrepaymentId,
+      // S639 (Nic): the tenancy being applied FOR. Without these an approval
+      // lands on "now what" and the terms live in a conversation he had days ago.
+      desiredMoveIn, desiredTermMonths, desiredMonthToMonth,
     } = req.body
     // S636: propertyId rides in from the property's QR code — see the
     // resolution below, which verifies it belongs to this landlord before
     // trusting it.
-    const { landlordId, unitId, propertyId: propertyIdFromScan } = req.body
+    const { landlordId, unitId: bodyUnitId, propertyId: propertyIdFromScan } = req.body
     const isSpeculative = !landlordId
 
     if (!firstName || !lastName) throw new AppError(400, 'Required fields missing')
     if (isSpeculative && !consentPool) throw new AppError(400, 'Pool consent required for speculative applications')
+
+    // S642 (Nic): an account made in the inline applicant flow was created from
+    // email + password alone and carries no name yet. The name typed here is the
+    // seed Checkr needs to open the order, so it is also the first name the
+    // account has ever had — write it through. It is provisional: applyMatchedLegalName()
+    // replaces it with the matched legal name when the report lands.
+    //
+    // Only fills a BLANK name. An established account is never renamed by a form.
+    await query(
+      `UPDATE users
+          SET first_name = CASE WHEN COALESCE(TRIM(first_name),'') = '' THEN $2 ELSE first_name END,
+              last_name  = CASE WHEN COALESCE(TRIM(last_name), '') = '' THEN $3 ELSE last_name  END,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [req.user!.userId, String(firstName).trim(), String(lastName).trim()])
 
     // S423: resolve the provider per-landlord (moved above SSN handling in
     // S551 — whether GAM collects an SSN at all depends on the provider).
@@ -422,18 +587,65 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     }
 
     // S577 (Nic): the applicant pays for the screen up front on BOTH routes,
-    // verified BEFORE the check is created — no free checks, and the landlord is
-    // never billed (they're the property lock / merchant-of-record via
-    // on_behalf_of at payment time). Landlord handles any state fee-cap by
-    // issuing the tenant a credit (POST /:id/screening-credit); GAM never
-    // computes caps.
-    if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required before screening can start')
-    await verifyPaymentIntent(applicantPaymentIntentId, {
-      kind: 'background_check_intake',
-      amountUsd: (await screeningIntakeFee(state)).total,
-      userId: req.user!.userId,
-    })
+    // verified BEFORE the check is created — no free checks.
+    //
+    // S642: the rest of this comment used to say the landlord was "the property
+    // lock / merchant-of-record via on_behalf_of at payment time". S636 removed
+    // on_behalf_of entirely — "the landlord is not part of the screening process
+    // at all" — and the one real screening on file proves it: that charge has
+    // on_behalf_of null, transfer_data null and no application fee, settling
+    // 100% to the platform. The stale sentence cost real time today, read as
+    // current behavior. Landlord handles any state fee-cap by issuing the
+    // tenant a credit (POST /:id/screening-credit); GAM never computes caps.
+    //
+    // 10/5 (Nic, R8): or the check was paid with the applicant's stay — the
+    // prepayment /payment-intent handed back. It is checked here and claimed
+    // below in the same transaction that creates the check, so it pays for
+    // exactly one.
+    let prepaid: PrepaidScreening | null = null
+    let chargedCents: number | null = null
+    if (screeningPrepaymentId) {
+      if (isSpeculative) {
+        throw new AppError(400, 'A background check paid with a stay is for that property. Open the link in the email you were sent.')
+      }
+      prepaid = await unusedScreeningPrepayment(null, {
+        userId: req.user!.userId, landlordId, prepaymentId: String(screeningPrepaymentId),
+      })
+      if (!prepaid) {
+        throw new AppError(409, 'That paid background check has already been used, or it was paid for someone else.')
+      }
+    } else {
+      if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required before screening can start')
+      chargedCents = await verifyPaymentIntent(applicantPaymentIntentId, {
+        kind: 'background_check_intake',
+        amountUsd: (await screeningIntakeFee(state)).total,
+        userId: req.user!.userId,
+      })
+    }
+    // What was really collected for this check. A prepaid one carries the
+    // screening's own price, without card processing — the stay's payment
+    // charged its card fee once, on the whole sale.
+    const amountChargedUsd = prepaid ? Number(prepaid.amount)
+      : chargedCents === null ? null : chargedCents / 100
 
+    // 10/5 review: the unit rides in the request body, so it is a foreign
+    // reference — it has to belong to the company being screened for before it
+    // is written onto the check (unit numbers repeat across parks). A check
+    // paid with a stay is for that stay's site when the page names none.
+    let unitId: string | null = null
+    if (bodyUnitId && UUID_RE.test(String(bodyUnitId))) {
+      if (isSpeculative) {
+        unitId = String(bodyUnitId)
+      } else {
+        const owned = await queryOne<{ id: string }>(
+          `SELECT u.id FROM units u JOIN properties p ON p.id = u.property_id
+            WHERE u.id = $1 AND p.landlord_id IN (SELECT public.account_companies($2::uuid))`,
+          [bodyUnitId, landlordId])
+        if (owned) unitId = owned.id
+        else logger.warn({ unitId: bodyUnitId, landlordId }, '[background] a unit outside this company was named at intake — ignored')
+      }
+    }
+    if (!unitId && prepaid?.unit_id) unitId = prepaid.unit_id
     let ssnClean: string | null = null
     let ssnLast4: string | null = null
     let ssnEncrypted: string | null = null
@@ -456,10 +668,14 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // landlord see "this check was for Oak Park" even before a unit is assigned.
     const effectivePropertyId =
       (unitId ? (await queryOne<{ property_id: string }>(`SELECT property_id FROM units WHERE id=$1`, [unitId]))?.property_id : null)
-      || (tenant ? (await queryOne<{ property_id: string }>(
+      // Only an intent from the company this check is FOR. A person can now
+      // hold a live intent at more than one company; "latest of any company"
+      // would bind this check to somebody else's park.
+      || (tenant && effectiveLandlordId ? (await queryOne<{ property_id: string }>(
             `SELECT property_id FROM pending_tenant_intents
               WHERE tenant_id=$1 AND cancelled_at IS NULL AND property_id IS NOT NULL
-              ORDER BY created_at DESC LIMIT 1`, [tenant.id]))?.property_id : null)
+                AND landlord_id = $2
+              ORDER BY created_at DESC LIMIT 1`, [tenant.id, effectiveLandlordId]))?.property_id : null)
       // S636: a walk-up who scanned the property's QR code has neither a
       // unit nor an invite — the code carried the property in the query
       // string and the page passes it through here. Verified against the
@@ -468,19 +684,47 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       || (propertyIdFromScan ? (await queryOne<{ id: string }>(
             `SELECT id FROM properties WHERE id = $1 AND landlord_id = $2`,
             [propertyIdFromScan, effectiveLandlordId]))?.id ?? null : null)
+      // 10/5: a check paid with a stay is for that stay's park.
+      || prepaid?.property_id
       // Older rows: an application filed before the code pointed straight at
-      // screening. Matched on the account's own email, never a stranger's.
-      || (await queryOne<{ property_id: string }>(
+      // screening. Matched on the account's own email, never a stranger's —
+      // and, like the intent lookup above, only an application to the company
+      // this check is FOR. "Latest application anywhere" tied company X's
+      // check to company Y's park and showed X where else the person applied.
+      || (effectiveLandlordId ? (await queryOne<{ property_id: string }>(
             `SELECT a.property_id FROM unit_applications a
               WHERE a.property_id IS NOT NULL
+                AND a.landlord_id = $3
                 AND (a.applicant_user_id = $1 OR LOWER(a.email) = LOWER($2))
               ORDER BY a.created_at DESC LIMIT 1`,
-            [req.user!.userId, req.user!.email]))?.property_id
+            [req.user!.userId, req.user!.email, effectiveLandlordId]))?.property_id : null)
       || null
 
+    // S639: what tenancy is being applied for. Month-to-month and a term are
+    // exclusive answers to one question — a term wins if somehow both arrive.
+    const termMonths = Number.isFinite(Number(desiredTermMonths)) && Number(desiredTermMonths) > 0
+      ? Math.min(120, Math.trunc(Number(desiredTermMonths)))
+      : null
+    const stay = {
+      moveIn: typeof desiredMoveIn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(desiredMoveIn) ? desiredMoveIn : null,
+      termMonths,
+      monthToMonth: termMonths === null && !!desiredMonthToMonth,
+    }
+
     let check: any
+    // 10/5 (R8): the check and the claim on a prepaid screening commit together
+    // — a check never exists without its payment, and a prepayment never pays
+    // for two.
+    const tx = await getClient()
     try {
-      check = await queryOne<any>(`
+      await tx.query('BEGIN')
+      if (prepaid) {
+        const held = await unusedScreeningPrepayment(tx, {
+          userId: req.user!.userId, landlordId, prepaymentId: prepaid.id,
+        })
+        if (!held) throw new AppError(409, 'That paid background check has already been used, or it was paid for someone else.')
+      }
+      check = (await tx.query<any>(`
         INSERT INTO background_checks (
           tenant_id, user_id, landlord_id, unit_id, status,
           first_name, last_name, date_of_birth, ssn_encrypted, ssn_last4,
@@ -490,7 +734,9 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           id_document_url, income_document_urls,
           consent_credit, consent_criminal, consent_pool, consent_signed_at, consent_ip,
           ip_address, user_agent, provider_name,
-          applicant_payment_intent_id, property_id
+          applicant_payment_intent_id, property_id,
+          desired_move_in, desired_term_months, desired_month_to_month,
+          amount_charged
         ) VALUES (
           $1, $2, $3, $4, 'pending',
           $5, $6, $7, $8, $9,
@@ -500,7 +746,9 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           $23, $24,
           $25, $26, $27, NOW(), $28,
           $29, $30, $31,
-          $32, $33
+          $32, $33,
+          $34, $35, $36,
+          $37
         ) RETURNING id`,
         [
           tenant?.id || null, req.user!.userId, effectiveLandlordId, unitId || null,
@@ -511,17 +759,85 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           idDocumentUrl || null, JSON.stringify(incomeDocUrls || []),
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
-          isSpeculative ? applicantPaymentIntentId : null, // S564: pool applicants pay; landlord route billed to landlord
+          // S642 (Nic): "All the money needs to reflect what actually happened."
+          //
+          // This was `isSpeculative ? applicantPaymentIntentId : null`, on the
+          // S564 reasoning that only pool applicants paid and the landlord route
+          // was billed to the landlord. S636 ended that — the applicant pays on
+          // BOTH routes now, screening revenue is 100% platform — but this line
+          // was never updated. So every landlord-route or QR-scanned applicant
+          // left a charge in Stripe and a screening in the database with nothing
+          // joining them: no refund path, no dispute evidence, no way to
+          // reconcile screening income against what was collected.
+          // A check paid with a stay has no payment of its own (the stay's
+          // sale or link carried it); its prepayment points here instead.
+          prepaid ? null : applicantPaymentIntentId,
           effectivePropertyId,
-        ])
+          stay.moveIn, stay.termMonths, stay.monthToMonth,
+          // The figure Stripe actually captured. The column's old 40.00 DEFAULT
+          // showed through on every row ever written, because nothing set it —
+          // a number that looked like a price and was not one.
+          amountChargedUsd,
+        ])).rows[0]
+      if (prepaid) {
+        await tx.query(
+          `UPDATE screening_prepayments
+              SET status = 'used', used_by_check_id = $2, used_at = NOW(),
+                  tenant_id = COALESCE(tenant_id, $3)
+            WHERE id = $1 AND status = 'unused'`,
+          [prepaid.id, check.id, tenant?.id ?? null])
+      }
+      await tx.query('COMMIT')
     } catch (e: any) {
+      await tx.query('ROLLBACK').catch(() => {})
       // Postgres unique violation on background_checks_applicant_pi_uniq —
       // the same PI was already used to fund another submission.
       if (e?.code === '23505' && e?.constraint === 'background_checks_applicant_pi_uniq') {
         throw new AppError(409, 'This payment has already been used to submit a background check')
       }
       throw e
+    } finally { tx.release() }
+
+    // 10/5 (Nic): an applicant is a customer at this company's register from
+    // the moment they apply — approved or not — so a pay link is two clicks.
+    // Not for the renter pool (no company yet). Never blocks the screening.
+    if (!isSpeculative && effectiveLandlordId && tenant?.id) {
+      const { applicantRegisterRecord } = await import('../services/posPeople')
+      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName })
+        .catch((err: unknown) => logger.warn({ err, checkId: check?.id }, '[background] could not add the applicant to the register'))
     }
+
+    // S650 (Nic): "Where is that $5 from that first background check?" The
+    // applicant's payment settles 100% to GAM (no landlord split since S636),
+    // so GAM's margin inside it is earnings — recorded the moment the check
+    // exists, instead of being estimated later by counting checks.
+    //
+    // 10/5 (Nic, R8): a check paid with a stay books the same $5 here, once, on
+    // the check — nothing was booked when the stay was paid, and the landlord's
+    // 'screening_fee' charge only moves the money to GAM. It carries no card
+    // spread of its own: the stay's payment charged one card fee on the whole
+    // sale and the register booked that spread already.
+    //
+    // Awaited (a failure is still only logged): a cancel arriving before the
+    // margin was booked would find nothing to take back (restorePrepaidScreening),
+    // and the paid screening would then book its $5 twice when the guest starts
+    // again. The response waits for the booking, so no cancel can come first.
+    await (async () => {
+      const priced = await screeningIntakeFee(state)
+      await recordScreeningEarnings(prepaid
+        ? {
+            backgroundCheckId: check!.id,
+            gamMarginUsd: priced.gamFee,
+            processingChargedUsd: 0,
+            totalChargedUsd: Number(prepaid.amount),
+          }
+        : {
+            backgroundCheckId: check!.id,
+            gamMarginUsd: priced.gamFee,
+            processingChargedUsd: priced.processing,
+            totalChargedUsd: amountChargedUsd ?? priced.total,
+          })
+    })().catch(err => logger.error({ err, checkId: check?.id }, '[background] could not book the screening earnings'))
 
     // Risk score (intake-fraud only — disposable email, SSN patterns, IP velocity, prior denials)
     let riskLevel: string | null = null
@@ -597,6 +913,21 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         SET provider_ref=$1, applicant_redirect_url=$2, status=$3, failure_reason=$4, ssn_encrypted=NULL
         WHERE id=$5`,
         [initRes.providerRef || null, initRes.applicantRedirectUrl || null, initRes.status, initRes.failureReason || null, check!.id])
+      // S639: mail the applicant their own link. Checkr Tenant collects the SSN
+      // and the FCRA consent on its own hosted form, so an order is not a
+      // screening until the applicant opens it — and until now that link existed
+      // only in the browser response. Anyone who paid and then closed the tab had
+      // no way back to what they had just bought. Best-effort: a mail failure
+      // must not undo an order that exists.
+      if (initRes.applicantRedirectUrl) {
+        try {
+          await emailScreeningApplyLink((req as any).user.email, {
+            firstName,
+            propertyName: screeningProperty?.name || null,
+            applyUrl: initRes.applicantRedirectUrl,
+          }, { landlordId: landlordId || undefined, backgroundCheckId: check!.id })
+        } catch (e) { logger.error({ err: e }, '[EMAIL screening_apply_link]') }
+      }
     } catch (e) {
       logger.error({ err: e }, '[PROVIDER INITIATE]')
       await query("UPDATE background_checks SET status='failed', failure_reason=$1 WHERE id=$2",
@@ -673,9 +1004,24 @@ backgroundRouter.get('/status', requireAuth, async (req, res, next) => {
            FROM background_checks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
           [req.user!.userId]
         )
+    // screenedStatus is the person's real screening result. A grandfather
+    // waiver is no longer written onto it — the waiver belongs to the company
+    // that granted it (pending_tenant_intents) — so `status`, which routes the
+    // tenant portal, still reads 'waived' for somebody holding a live waiver
+    // and with no real result of their own. Anything deciding "screened"
+    // across companies (the marketplace) must read screenedStatus.
+    const screenedStatus = tenant?.background_check_status || (check?.status || 'not_started')
+    let status = screenedStatus
+    if (tenant && !['approved', 'submitted', 'denied'].includes(screenedStatus)) {
+      const waiver = await queryOne<{ one: number }>(
+        `SELECT 1 AS one FROM pending_tenant_intents
+          WHERE tenant_id = $1 AND screening_waived = true AND cancelled_at IS NULL
+          LIMIT 1`, [tenant.id])
+      if (waiver) status = 'waived'
+    }
     res.json({
       success: true,
-      data: { status: tenant?.background_check_status || (check?.status || 'not_started'), check },
+      data: { status, screenedStatus, check },
     })
   } catch (e) { next(e) }
 })
@@ -718,8 +1064,11 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         bc.decision_notes, bc.decided_at, bc.created_at, bc.expires_at,
         bc.risk_score, bc.risk_level, bc.risk_flags,
         bc.provider_name, bc.provider_ref, bc.report_summary,
+        bc.desired_move_in, bc.desired_term_months, bc.desired_month_to_month,
+        bc.parked_at, bc.parked_note,
+        COALESCE(un.property_id, bc.property_id) AS property_id,
         u.email, u.phone,
-        un.unit_number,
+        un.unit_number, un.id AS unit_id, un.rent_amount AS unit_rent,
         -- S636: a walk-up who scanned a property's QR code has NO unit — that
         -- is the point of the code, they have not picked a space yet. This
         -- resolved the property only through the unit, so every scanned
@@ -727,31 +1076,90 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         -- page and the binding the code exists to create was invisible.
         -- The unit still wins when there is one; bc.property_id is what a
         -- scan (and a pool intake) actually carries.
-        COALESCE(p.name, bcp.name) AS property_name
+        COALESCE(p.name, bcp.name) AS property_name,
+        -- S653 (Nic): "the main background checks page is only showing people
+        -- that need attention." Housed = a lease (or a live lease packet) now
+        -- exists for this applicant under this landlord — the screening did its
+        -- job. Computed here, once, so every screen sorts the same way.
+        EXISTS (
+          SELECT 1 FROM lease_tenants lt
+            JOIN leases l ON l.id = lt.lease_id
+            JOIN tenants t ON t.id = lt.tenant_id
+           WHERE t.user_id = bc.user_id AND l.landlord_id = bc.landlord_id
+             AND l.status IN ('pending', 'active')
+          UNION ALL
+          SELECT 1 FROM pending_tenant_intents pti
+            JOIN tenants t ON t.id = pti.tenant_id
+            JOIN lease_documents d ON d.id = pti.draft_document_id
+           WHERE t.user_id = bc.user_id AND pti.landlord_id = bc.landlord_id
+             AND pti.cancelled_at IS NULL AND d.status <> 'voided'
+        ) AS housed,
+        -- 10/5 (Nic, R10): the stay this check was run for, if any. A stay
+        -- guest's approval clears check-in; it is not waiting on a lease.
+        st.booking_id AS stay_booking_id, st.stay_terms,
+        st.check_in AS stay_check_in, st.check_out AS stay_check_out,
+        st.lease_id AS stay_lease_id
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
+      LEFT JOIN LATERAL (${stayForCheckSql('bc', 'u.email')}) st ON TRUE
       LEFT JOIN units un ON un.id = bc.unit_id
       LEFT JOIN properties p ON p.id = un.property_id
       LEFT JOIN properties bcp ON bcp.id = bc.property_id
-      WHERE bc.landlord_id = $1
-      ORDER BY bc.created_at DESC`, [req.user!.profileId])
-    // S561: surface the landlord's per-check screening charge (Checkr cost +
-    // $5 margin) so the review UI can show what they're billed. Only real
-    // checkr orders incur it; mock/speculative rows show 0.
-    const landlordCharge = Math.round((SCREENING_CHECKR_COST_USD + SCREENING_GAM_MARGIN_USD) * 100) / 100
-    const withCharge = checks.map((c) => ({
-      ...c,
-      landlord_charge: c.provider_name === 'checkr' ? landlordCharge : 0,
-    }))
-    res.json({ success: true, data: withCharge })
+      -- ── S639 (Nic): "I'm in the background checks flow, and there is nothing
+      -- showing here. Nothing rendered." ───────────────────────────────────
+      --
+      -- This filtered on req.user.profileId, and since S633 a landlord's
+      -- profileId is NULL — an account is not an entity, and the companies it
+      -- owns come from landlordIds. So the comparison matched nothing and the
+      -- page rendered empty for every landlord, however many screenings they
+      -- had. Anastacio Erreguin's check has been sitting under Mountain View
+      -- since 09-04, paid for and running, and Nic could not see it anywhere.
+      --
+      -- Same fix the dashboard, units and payments lists already carry: ask the
+      -- ACCOUNT for every company it can read.
+      WHERE bc.landlord_id = ANY($1::uuid[])
+      ORDER BY bc.created_at DESC`, [landlordScopeIds(req.user!)])
+    // ── S639 (Nic): THE LANDLORD IS NOT BILLED FOR SCREENING ───────────────
+    //
+    // "It says screening cost billed to you, forty two ninety four. That was
+    // not my charge to Checkr, and that wouldn't be billed to the landlord. So
+    // why is the landlord seeing any price on there at all?"
+    //
+    // They shouldn't, on two counts. S577 settled the billing: the APPLICANT
+    // pays up front and the landlord nets $0 — screening revenue is entirely
+    // the platform's. This line was left over from the S561 model where the
+    // landlord was charged, and it survived the change, quoting a bill that
+    // does not exist.
+    //
+    // It was also assembled as Checkr's cost PLUS GAM's $5 margin, which puts
+    // the platform's markup on a customer's screen. Nothing landlord-facing
+    // breaks GAM's costs out that way.
+    // S653: which list a row belongs on. 'past' is settled — denied, expired,
+    // cancelled, failed, or approved AND housed. Everything else still needs
+    // somebody to do something: the applicant to finish, the landlord to
+    // decide, or a space to be picked and a lease drafted.
+    for (const c of checks) {
+      // S653: an approved applicant the landlord set aside ("not moving in for
+      // now") is past too — still approved, just not a to-do.
+      // 10/5 (R10): so is an approved guest screened for a stay — the stay is
+      // cleared for check-in and nothing here waits on a lease. A8: a stay
+      // that chose a lease has its own draft on the Leases page; nothing here
+      // drafts another.
+      c.cleared_for_stay = c.status === 'approved' && !!c.stay_booking_id
+      c.bucket = (['denied', 'expired', 'cancelled', 'failed'].includes(c.status)
+          || (c.status === 'approved' && (c.housed || c.parked_at || c.cleared_for_stay)))
+        ? 'past' : 'attention'
+    }
+    res.json({ success: true, data: checks })
   } catch (e) { next(e) }
 })
 
 backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+      // S639: same account-scope fix as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
     delete check.ssn_encrypted
@@ -759,24 +1167,215 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
   } catch (e) { next(e) }
 })
 
+// ── LANDLORD: DRAFT A LEASE FROM AN APPROVED SCREENING ───────────────────
+//
+// S639 (Nic): "I've marked him as approved, but what is the next course of
+// action? I need to generate him a lease. I don't know how much he's wanting
+// to have the spot for... I wanted to just, like, draft up a lease, essentially,
+// from the information on the background check."
+//
+// The screening now asks for the move-in date and the term (see /submit), so
+// everything a draft needs is already on the check. This does NOT grow a second
+// lease drafter — it files the screening as an application and hands it to the
+// one that has existed since S593, so both public doors converge on the same
+// Master Schedule and the same review flow.
+// S653 (Nic): "When we approve somebody for a background check, it doesn't
+// automatically draft up a lease for me to sign... that should start another
+// workflow." And, on what the old version produced: "creating the bare lease
+// row with no tenant or document and opens an empty edit window. That edit
+// window should not even fucking exist."
+//
+// So an approval now does what the Tenants-page invite does (routes/tenants.ts
+// POST /invite): it records the household on the space as a unit-bound intent
+// and drafts the SIGNING PACKET off the unit's default template — the real
+// lease, with the applicant on it as primary, carrying the move-in date and
+// term they gave at screening — then puts it in front of the landlord to sign.
+// No unit_applications shell, no bare `leases` row, no edit form.
+// ── 10/5 (Nic, R10): A STAY GUEST'S CHECK ONLY CLEARS CHECK-IN ─────────────
+//
+// "The only difference is whether or not they are guaranteed the spot
+//  indefinitely or not."
+//
+// A guest staying more than three weeks is screened before check-in (R9). Their
+// approval is NOT the start of a lease: it records nothing on the site and
+// drafts no signing packet — the stay simply clears for check-in. Only a stay
+// whose guest (or the counter) chose a LEASE goes on to the lease the approval
+// drafts for anyone else.
+//
+// The stay a check was run for, as a LATERAL subquery on `bc` (the check) and
+// `userEmail` (the applicant's email):
+//   · the stay whose prepaid screening this check used, whatever its status; or
+//   · a live stay of this person at this account that needs screening, on the
+//     site the check names — or, for a check naming no site, one made before
+//     the check was.
+// A check run for a different site (the guest applying for a lease elsewhere)
+// is not the stay's.
+const stayForCheckSql = (bc: string, userEmail: string) => `
+  SELECT sb.id AS booking_id, sb.unit_id, sb.stay_terms,
+         sb.check_in::text AS check_in, sb.check_out::text AS check_out,
+         -- A8: the stay's own draft lease, when the stay chose one.
+         (SELECT sl.id FROM leases sl
+           WHERE sl.source_booking_id = sb.id AND sl.status IN ('pending', 'active')
+           ORDER BY sl.created_at DESC LIMIT 1) AS lease_id
+    FROM unit_bookings sb
+   WHERE sb.landlord_id IN (SELECT public.account_companies(${bc}.landlord_id))
+     AND (EXISTS (SELECT 1 FROM screening_prepayments sp
+                   WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id)
+          OR (sb.screening_required
+              AND sb.status IN ('tentative', 'confirmed', 'checked_in')
+              AND (sb.tenant_id IN (SELECT t.id FROM tenants t WHERE t.user_id = ${bc}.user_id)
+                   OR (sb.guest_email IS NOT NULL AND LOWER(sb.guest_email) = LOWER(${userEmail})))
+              AND (sb.unit_id = ${bc}.unit_id
+                   OR (${bc}.unit_id IS NULL AND sb.created_at <= ${bc}.created_at))))
+   ORDER BY EXISTS (SELECT 1 FROM screening_prepayments sp
+                     WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id) DESC,
+            sb.check_in DESC
+   LIMIT 1`
+
+interface CheckStay { booking_id: string; unit_id: string; stay_terms: string | null; check_in: string; check_out: string; lease_id: string | null }
+
+/** What a decision on a stay guest's check answers with: the stay, cleared, and its own lease when it chose one. */
+const stayAnswer = (st: CheckStay) => ({
+  bookingId: st.booking_id, unitId: st.unit_id, checkIn: st.check_in, checkOut: st.check_out,
+  terms: st.stay_terms, leaseId: st.lease_id, clearedForCheckIn: true,
+})
+async function stayForCheck(checkId: string): Promise<CheckStay | null> {
+  return queryOne<CheckStay>(
+    `SELECT st.* FROM background_checks bc
+       JOIN users u ON u.id = bc.user_id
+       CROSS JOIN LATERAL (${stayForCheckSql('bc', 'u.email')}) st
+      WHERE bc.id = $1`, [checkId])
+}
+
+const ymd = (v: any): string | null => {
+  if (!v) return null
+  if (v instanceof Date) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  return String(v).slice(0, 10)
+}
+
+async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitId: string | null, actorUserId: string) {
+  // The unit may come from the check (a QR scan or a landlord-sent link that
+  // named a space) or from the landlord picking one now for a walk-up. Either
+  // way it has to belong to a company this account can read — a body-supplied
+  // id is never trusted on its own (draftPacketForHousehold checks the scope).
+  const unitId = check.unit_id || bodyUnitId || null
+  if (!unitId) throw new AppError(400, 'Pick a unit for this applicant first')
+  const { draftPacketForHousehold } = await import('../services/householdPacketDraft')
+  const out = await draftPacketForHousehold({
+    unitId, applicantUserId: check.user_id, landlordScope: scope,
+    // node-postgres hands DATE back as a Date object; format it as a day, not
+    // via String() ("Thu Oct 01 …" is not a date the drafter can read).
+    startDate: ymd(check.desired_move_in),
+    termMonths: check.desired_term_months ? Number(check.desired_term_months) : null,
+    monthToMonth: !!check.desired_month_to_month,
+    actorUserId,
+  })
+  // A walk-up's pick is remembered on the check so a second click needs no pick.
+  if (!check.unit_id) {
+    await query('UPDATE background_checks SET unit_id = $2 WHERE id = $1', [check.id, out.unitId])
+  }
+  return out
+}
+
+backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const scope = landlordScopeIds(req.user!)
+    const check = await queryOne<any>(
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, scope],
+    )
+    if (!check) throw new AppError(404, 'Not found')
+    if (check.status !== 'approved') {
+      throw new AppError(400, 'Approve the screening before drafting a lease')
+    }
+    // 10/5 (Nic, R3/A8): a guest screened for a stay gets a lease only from
+    // the stay itself — the lease they chose is already drafted, and a stay
+    // with no lease is offered one from the schedule. Never a second lease here.
+    const st = await stayForCheck(check.id)
+    if (st) {
+      throw new AppError(409, st.lease_id
+        ? 'This guest chose a lease for their stay, and it is already drafted. Open it on the Leases page.'
+        : 'This guest was screened for their stay. To give them a lease, open the stay on the schedule and choose Offer a lease.')
+    }
+    res.json({ success: true, data: await draftLeaseForApprovedCheck(check, scope, req.body?.unitId || null, req.user!.userId) })
+  } catch (e) { next(e) }
+})
+
+// ── S653 (Nic): NOT MOVING IN FOR NOW ────────────────────────
+//
+//   "for background checks that were approved that opted not to sign a lease
+//    ... keep them approved but mark them as dormant for now... so this last
+//    one for Anastacio does not just forever say that it needs attention."
+//
+// Park = the approval stands (expires_at untouched), the row leaves the
+// needs-attention list. Un-park brings it back. Drafting a lease from a parked
+// check still works — a space picked is a space picked.
+backgroundRouter.post('/:id/park', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : null
+    const check = await queryOne<any>(
+      'SELECT id, status FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!check) throw new AppError(404, 'Not found')
+    if (check.status !== 'approved') throw new AppError(409, 'Only an approved applicant can be set aside — decide first')
+    await query(`UPDATE background_checks SET parked_at = NOW(), parked_note = $2, updated_at = NOW() WHERE id = $1`, [check.id, note || null])
+    res.json({ success: true, data: { id: check.id, parked: true } })
+  } catch (e) { next(e) }
+})
+
+backgroundRouter.post('/:id/unpark', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const check = await queryOne<any>(
+      'SELECT id FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!check) throw new AppError(404, 'Not found')
+    await query(`UPDATE background_checks SET parked_at = NULL, parked_note = NULL, updated_at = NOW() WHERE id = $1`, [check.id])
+    res.json({ success: true, data: { id: check.id, parked: false } })
+  } catch (e) { next(e) }
+})
+
 // ── LANDLORD: DECIDE ─────────────────────────────────────────
-// Approval sets expires_at (6mo from now). Denial may create pool entry.
+// Approval sets expires_at (SCREENING_VALID_MONTHS from now). Denial may create pool entry.
 // Approval flips any existing pool entry to inactive — tenant is housed.
 backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const { decision, notes } = req.body
     if (!['approved', 'denied'].includes(decision)) throw new AppError(400, 'Invalid decision')
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+    // S639: account-scoped, not profileId — a landlord's profileId is NULL
+    // since S633 and this matched nothing. Same bug as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
-    if (!['complete', 'submitted', 'processing'].includes(check.status)) {
-      throw new AppError(400, `Cannot decide a check with status '${check.status}'`)
+    // 10/4 (Nic): an approval whose next step was left open — the window closed
+    // on "Which space?" — dead-ended: the stale screen offered Approve again and
+    // this refused it. Approving an approved check is now a no-op that answers
+    // with the next step; anything else on a decided check is refused in plain
+    // words.
+    if (check.status === 'approved' && decision === 'approved') {
+      // 10/5 (R10): a stay guest's approval has no next step here — the stay
+      // is cleared for check-in, and no space is picked.
+      const st = await stayForCheck(check.id)
+      return res.json({ success: true, data: {
+        decision, alreadyApproved: true, lease: null, draftError: null,
+        needsUnit: !st && !check.unit_id,
+        stay: st ? stayAnswer(st) : null,
+      } })
+    }
+    // 10/5 (Nic, A6): a decision counts only once the results are back, so
+    // one is refused before then — approving or denying on no report would
+    // clear a stay's check-in on nothing (services/stayTerms checkInBlock).
+    if (check.status !== 'complete') {
+      throw new AppError(409, check.status === 'approved'
+        ? 'This applicant is already approved. Pick their space and draft the lease, or mark them not moving in for now.'
+        : check.status === 'denied'
+          ? 'This applicant was already denied.'
+          : 'The background check results aren\'t back yet. You can approve or deny once they are.')
     }
 
     const expiresClause = decision === 'approved'
-      ? ", expires_at = NOW() + INTERVAL '6 months'"
+      ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}`
       : ''
     await query(
       `UPDATE background_checks SET status=$1, decision_notes=$2, decided_at=NOW(), decided_by=$3${expiresClause} WHERE id=$4`,
@@ -796,8 +1395,10 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
     const tu = await queryOne<any>('SELECT email, first_name, last_name FROM users WHERE id=$1', [check.user_id])
     if (tu?.email) {
       const u = check.unit_id
-        ? await queryOne<any>('SELECT u.unit_number, p.name FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1', [check.unit_id])
+        ? await queryOne<any>('SELECT u.unit_number, p.name, p.id AS property_id FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1', [check.unit_id])
         : null
+      // 10/5: replies reach the people who run this property (services/replyRouting).
+      const replyPropertyId: string | null = u?.property_id ?? check.property_id ?? null
       try {
         await emailBackgroundDecision(
           tu.email, tu.first_name || 'there',
@@ -808,7 +1409,10 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
           // (POST /:id/adverse-action), never in a GAM-authored message.
           decision === 'denied' ? undefined : (notes || undefined),
           undefined,
-          { landlordId: check.landlord_id, backgroundCheckId: check.id }
+          {
+            landlordId: check.landlord_id, backgroundCheckId: check.id,
+            replyTo: replyPropertyId ? { kind: 'property', propertyId: replyPropertyId } : undefined,
+          }
         )
       } catch (e) { logger.error({ err: e }, '[EMAIL]') }
     }
@@ -836,7 +1440,36 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
       } catch (e) { logger.error({ err: e }, '[ADVERSE ACTION PREP]') }
     }
 
-    res.json({ success: true, data: { decision, adverseAction } })
+    // S653 (Nic): approval IS the start of the lease. A screening that named a
+    // space drafts its lease here, in the same click, and the landlord lands on
+    // it to review and sign. A walk-up that named no space is told so — the
+    // client asks which space and calls /draft-lease. Drafting is best-effort:
+    // the approval itself is recorded above whatever happens here.
+    //
+    // 10/5 (Nic, R10): except for a guest screened for a STAY. Their approval
+    // (or denial — "after a denial the landlord may still check them in")
+    // clears the stay for check-in and does nothing else: no resident record
+    // on the site, no signing packet. A8 (Nic, 10/5): that holds for a stay
+    // that chose a LEASE too — the stay's own draft lease (booking_draft,
+    // services/stayTerms draftLeaseFromStay) IS the lease, so no second lease
+    // or packet is drafted; the answer points at that one.
+    const st = await stayForCheck(check.id)
+    let lease: Awaited<ReturnType<typeof draftLeaseForApprovedCheck>> | null = null
+    let draftError: string | null = null
+    if (decision === 'approved' && check.unit_id && !st) {
+      try {
+        lease = await draftLeaseForApprovedCheck({ ...check, status: 'approved' }, landlordScopeIds(req.user!), null, req.user!.userId)
+      } catch (e: any) {
+        draftError = e?.message || 'Could not draft a lease'
+        logger.error({ err: e, checkId: check.id }, '[background] approval could not draft the lease')
+      }
+    }
+    const needsUnit = decision === 'approved' && !check.unit_id && !st
+
+    res.json({ success: true, data: {
+      decision, adverseAction, lease, draftError, needsUnit,
+      stay: st ? stayAnswer(st) : null,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -850,8 +1483,10 @@ backgroundRouter.post('/:id/adverse-action', requireAuth, requirePerm('tenants.r
     const { text, saveAsTemplate } = (req.body ?? {}) as { text?: string; saveAsTemplate?: boolean }
     if (!text || !text.trim()) throw new AppError(400, 'Notice text is required')
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+    // S639: account-scoped, not profileId — a landlord's profileId is NULL
+    // since S633 and this matched nothing. Same bug as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
     if (check.status !== 'denied') throw new AppError(400, 'Adverse-action notices apply only to denied applicants')
@@ -861,12 +1496,17 @@ backgroundRouter.post('/:id/adverse-action', requireAuth, requirePerm('tenants.r
 
     const cra = check.provider_name ? getProvider(check.provider_name).craDisclosure() : null
     const body = text.trim()
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    const replyPropertyId: string | null = check.property_id ?? await propertyIdForUnit(check.unit_id).catch(() => null)
 
     const messageId = await emailAdverseActionNotice({
       to: tu.email,
       applicantFirstName: tu.first_name || check.first_name || 'Applicant',
       noticeText: body,
-      ctx: { landlordId: check.landlord_id, backgroundCheckId: check.id },
+      ctx: {
+        landlordId: check.landlord_id, backgroundCheckId: check.id,
+        replyTo: replyPropertyId ? { kind: 'property', propertyId: replyPropertyId } : undefined,
+      },
     })
 
     try {
@@ -915,7 +1555,8 @@ backgroundRouter.get('/:id/adverse-action', requireAuth, async (req, res, next) 
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isApplicant = check.user_id === req.user!.userId
-    const isLandlord = role === 'landlord' && check.landlord_id === req.user!.profileId
+    // S639: compare against every company the account owns, not the null profileId.
+    const isLandlord = role === 'landlord' && landlordScopeIds(req.user!).includes(check.landlord_id)
     const isWorker = ['property_manager','onsite_manager','maintenance'].includes(role)
       && req.user!.landlordId === check.landlord_id
       && req.user!.permissions?.['tenants.run_background_check'] === true
@@ -946,6 +1587,16 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
     await query("UPDATE background_checks SET status='cancelled' WHERE id=$1", [check.id])
     if (check.tenant_id) {
       await query("UPDATE tenants SET background_check_status='cancelled' WHERE id=$1", [check.tenant_id])
+    }
+    // 10/5 (Nic, R8): a check paid with a stay has no payment of its own to
+    // refund. "The paid check waits for them" — so the screening they paid for
+    // goes back to waiting, and starting again charges nothing. The margin
+    // booked for this check comes back off GAM's book with it (M9), so the
+    // one payment never books it twice.
+    const { restorePrepaidScreening } = await import('../services/stayTerms')
+    const restored = await restorePrepaidScreening(check.id)
+    if (restored.restored) {
+      return res.json({ success: true, data: { refunded: false, paidWithStay: true } })
     }
     // S552: no screening delivered → refund the applicant in full and void
     // the landlord's unbilled accrual. Refund failure doesn't fail the
@@ -983,7 +1634,8 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     )
     if (!owner) throw new AppError(404, 'Not found')
     const isApplicant = owner.user_id === req.user!.userId
-    const isLandlord = owner.landlord_id && owner.landlord_id === req.user!.profileId
+    // S639: same — an account can own several companies.
+    const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
     await sendStoredFile(res, key, { stripEmbedBlockers: true })
   } catch (e) { next(e) }
@@ -1057,19 +1709,83 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     if (!provider.verifyWebhook(req.headers as any, rawBody)) {
       throw new AppError(401, 'Invalid webhook signature')
     }
-    const update = provider.parseWebhook(rawBody)
+    // ── S640: THE ARCHIVE WAS STORING BUFFERS ──────────────────────────────
+    //
+    // This route takes the RAW bytes (express.raw, so the HMAC verifies against
+    // exactly what Checkr sent), which means req.body is a Buffer — not an
+    // object. Everything downstream read it as one anyway: the archived payload
+    // came out as {"type":"Buffer","data":[...]} and the event type as null, so
+    // the record of "what did the provider actually send us" was unreadable.
+    // Parse once, after verification, and use that everywhere.
+    const event: any = (() => {
+      try { return JSON.parse(rawBody) } catch { return null }
+    })()
+    const eventType: string | null = event?.type ?? event?.event ?? null
 
-    // S551: providers whose webhooks carry only a report pointer (Checkr
-    // Tenant report.completed → { id, order_id }) get the real per-product
-    // results pulled here, before the row update, so status + summary land
-    // together. A failed fetch still applies the status — the summary can
-    // be backfilled by the next redelivery (their webhooks retry).
-    if (update.reportRef && provider.fetchReport) {
+    const update = provider.parseWebhook(rawBody)
+    // ── S640: ACKNOWLEDGE WHAT WE DO NOT ACT ON ────────────────────────────
+    //
+    // A null is a deliberate "nothing to do here" — a per-product progress
+    // ping, or an event type Checkr added without telling anyone. Answering 200
+    // ends the delivery. Answering 500, which is what throwing used to do, told
+    // Checkr to try again: 75 of 79 webhooks in a 25-hour window were the same
+    // event failing over and over, and the `report.completed` that would have
+    // finished Anastacio Erreguin's screening never got through.
+    if (!update) {
+      logger.info({ provider: provider.name, type: eventType },
+        '[BGC WEBHOOK] acknowledged, nothing to apply')
+      // S640: ARCHIVE IT ANYWAY. Nobody can say for certain which events the
+      // Checkr TENANT API sends — it is a different product from the staffing
+      // API their public docs describe, its event names differ, and the
+      // dashboard offers no subscription list to read. We expect
+      // `report.completed` to finish a screening and have never seen one
+      // arrive. Recording the ones we ignore turns the next real applicant into
+      // the answer, instead of another round of guessing. Keyed by order id
+      // where the event carries one; unattached otherwise.
+      const ref = event?.data?.order_id || event?.data?.id || null
+      const owner = ref
+        ? await queryOne<any>('SELECT id, landlord_id FROM background_checks WHERE provider_ref=$1', [ref])
+        : null
+      await archiveProviderPayload({
+        backgroundCheckId: owner?.id ?? null, landlordId: owner?.landlord_id ?? null,
+        provider: provider.name, reportRef: null,
+        source: 'webhook', eventType, payload: event ?? { unparseable: rawBody.slice(0, 4000) },
+      })
+      return res.json({ success: true, applied: false })
+    }
+
+    // ── S640: RESOLVE THE ORDER FROM THE REPORT WHEN THAT IS ALL WE GET ────
+    //
+    // Checkr's `report.completed` carries a report_id and does not promise an
+    // order_id — which is what GAM keys a screening by. The report body does
+    // carry order_id, so fetch it here and use it. The summary comes back on
+    // the same call, so it is handed straight to applyProviderUpdate rather
+    // than fetched twice.
+    if (!update.providerRef && update.reportRef && provider.fetchReport) {
       try {
-        update.reportSummary = (await provider.fetchReport(update.reportRef)) ?? update.reportSummary ?? null
+        const summary = await provider.fetchReport(update.reportRef)
+        const orderId = (summary as any)?.order_id || (provider as any).rawReport?.order_id
+        if (orderId) {
+          update.providerRef = String(orderId)
+          update.reportSummary = summary ?? null
+        }
       } catch (e) {
-        logger.error({ err: e, report_ref: update.reportRef }, '[BGC WEBHOOK] report fetch failed')
+        logger.error({ err: e, report_ref: update.reportRef },
+          '[BGC WEBHOOK] could not resolve the order from the report')
       }
+    }
+    if (!update.providerRef) {
+      // Nothing to attach it to. Keep the event — it is evidence about what
+      // Checkr sends — and acknowledge, so this does not become another retry
+      // storm. The ten-minute poller finishes the screening regardless.
+      await archiveProviderPayload({
+        backgroundCheckId: null, landlordId: null, provider: provider.name,
+        reportRef: update.reportRef ?? null, source: 'webhook', eventType,
+        payload: event ?? { unparseable: rawBody.slice(0, 4000) },
+      })
+      logger.warn({ type: eventType, reportRef: update.reportRef },
+        '[BGC WEBHOOK] event names no order we can resolve — archived, poller will finish it')
+      return res.json({ success: true, applied: false })
     }
 
     const check = await queryOne<any>(
@@ -1078,26 +1794,16 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     )
     if (!check) throw new AppError(404, 'Unknown provider_ref')
 
-    const expiresClause = update.status === 'complete'
-      ? ", expires_at = NOW() + INTERVAL '6 months'"
-      : ''
-    // COALESCE keeps an existing summary when this event carries none —
-    // Checkr Tenant sends summary-less progress events (applicant.visited,
-    // product.completed) that must not null a previously stored report.
-    await query(`
-      UPDATE background_checks
-      SET status=$1, report_summary=COALESCE($2::jsonb, report_summary),
-          failure_reason=$3, webhook_received_at=NOW()${expiresClause}
-      WHERE id=$4`,
-      [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
-
-    // Speculative path: complete → pool (if eligible). No landlord decision step.
-    if (update.status === 'complete' && (!check.landlord_id || await isPoolIntakeLandlord(check.landlord_id))) {
-      const fresh = await queryOne<any>('SELECT * FROM background_checks WHERE id=$1', [check.id])
-      if (fresh && isPoolEligible(fresh)) {
-        try { await upsertPoolEntry(fresh) } catch (e) { logger.error({ err: e }, '[POOL CREATE]') }
-      }
-    }
+    // S640: the body of this handler now lives in services/backgroundApplyUpdate
+    // so the status POLLER applies a verdict exactly the way a webhook does.
+    // Checkr completed Anastacio Erreguin's report and no webhook ever arrived;
+    // the poller is what makes the answer land at all, and two near-identical
+    // code paths advancing the same row is how they stop matching.
+    await applyProviderUpdate({
+      provider, check, update, source: 'webhook',
+      rawWebhookBody: event,
+      eventType,
+    })
 
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -1113,12 +1819,15 @@ backgroundRouter.post('/dev-mock-webhook', requireAuth, requireAdmin, async (req
     const payload = JSON.stringify({ providerRef, status, reportSummary: reportSummary || null, failureReason: failureReason || null })
     const provider = getProvider('mock')
     const update = provider.parseWebhook(payload)
+    // The mock always produces an update; the null branch belongs to real
+    // providers that send progress events (see the live webhook above).
+    if (!update) throw new AppError(400, 'Mock webhook produced no update')
     const check = await queryOne<any>(
       "SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name='mock'",
       [update.providerRef]
     )
     if (!check) throw new AppError(404, 'Unknown provider_ref')
-    const expiresClause = update.status === 'complete' ? ", expires_at = NOW() + INTERVAL '6 months'" : ''
+    const expiresClause = update.status === 'complete' ? `, expires_at = NOW() + ${SCREENING_VALID_INTERVAL_SQL}` : ''
     await query(`
       UPDATE background_checks
       SET status=$1, report_summary=$2, failure_reason=$3, webhook_received_at=NOW()${expiresClause}
@@ -1214,11 +1923,19 @@ backgroundRouter.post('/pool/withdraw', requireAuth, async (req, res, next) => {
 // the proximity_rank CASE can be swapped for a haversine ORDER BY.
 backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S639: a read spans the account's companies — and S651, it now actually
+    // does. The line here took landlordIds[0] and passed one id, so an account
+    // holding two LLCs had every applicant ranked against whichever company
+    // happened to come back first, and `already_contacted` came back FALSE for
+    // anyone the OTHER company had already paid to unlock. A landlord with a
+    // park in Yarnell and one in Amado saw the Amado renters sorted as though
+    // they were miles from anything, and could pay the dollar twice for the
+    // same person. (memory: gam-account-is-not-an-entity)
+    const landlordIds = landlordScopeIds(req.user!)
     const pool = await query<any>(`
       WITH props AS (
         SELECT DISTINCT zip, lower(city) AS city, state
-          FROM properties WHERE landlord_id = $1
+          FROM properties WHERE landlord_id = ANY($1::uuid[])
       )
       SELECT ap.id, ap.employment_status, ap.monthly_income, ap.city, ap.state, ap.zip,
              ap.risk_level, ap.risk_score, ap.created_at,
@@ -1231,10 +1948,11 @@ backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_backg
              END AS proximity_rank,
              CASE WHEN mr.id IS NOT NULL THEN TRUE ELSE FALSE END as already_contacted
         FROM application_pool ap
-        LEFT JOIN pool_match_requests mr ON mr.pool_entry_id = ap.id AND mr.landlord_id = $1
+        LEFT JOIN pool_match_requests mr ON mr.pool_entry_id = ap.id
+                                        AND mr.landlord_id = ANY($1::uuid[])
        WHERE ap.status = 'available'
        ORDER BY proximity_rank ASC, ap.risk_score ASC NULLS LAST, ap.created_at DESC
-       LIMIT 50`, [landlordId])
+       LIMIT 50`, [landlordIds])
     res.json({ success: true, data: pool })
   } catch (e) { next(e) }
 })
@@ -1289,7 +2007,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // message goes to a real person and cannot be unsent.
     const landlordId = unitId
       ? await landlordIdForUnit(req.user!, String(unitId), query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'outreach')
+      : await landlordForRequest(req, 'outreach')
 
     const existing = await queryOne<any>(
       'SELECT id FROM pool_match_requests WHERE pool_entry_id=$1 AND landlord_id=$2',
@@ -1303,7 +2021,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // for the preset-rent fallback below.
     const unit = unitId
       ? await queryOne<any>(
-          `SELECT u.*, p.name as property_name
+          `SELECT u.*, p.name as property_name, p.timezone AS property_timezone
            FROM units u JOIN properties p ON p.id=u.property_id
            WHERE u.id=$1 AND u.landlord_id=$2`,
           [unitId, landlordId]
@@ -1311,22 +2029,32 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       : null
     if (unitId && !unit) throw new AppError(404, 'Unit not found')
     if (unit) {
-      const conflict = await findStayConflict(unit.id, { checkIn: new Date().toISOString().slice(0, 10) })
+      // S654: "from today onward" is the PROPERTY's today, not the UTC date.
+      const conflict = await findStayConflict(unit.id, { checkIn: todayIn(unit.property_timezone) })
       if (conflict) throw new AppError(409, 'That unit isn\u2019t available — it has an active lease or an upcoming reservation')
     }
     // W-48: monthly rent comes from the landlord's preset unit info — nobody
     // types it. S613: the unit carries its subtype's price (the subtype owns
     // it), so there is no longer a second number to fall back to.
     const monthlyRent = unit ? (unit.rent_amount ?? null) : null
+    // S639 (S633 rule): a write names ONE company. Prefer the company that owns
+    // the unit being offered — that is the entity making the offer — and fall
+    // back to the account's first company when no unit was named.
+    const poolMatchLandlordId = unit
+      ? await landlordIdForUnit(req.user!, unit.id, query)
+      : (landlordScopeIds(req.user!)[0] ?? null)
+    if (!poolMatchLandlordId) throw new AppError(403, 'No company on this account to send the match from')
 
     const match = await queryOne<any>(`
       INSERT INTO pool_match_requests (pool_entry_id, landlord_id, unit_id, status, landlord_message)
       VALUES ($1, $2, $3, 'pending', $4) RETURNING id`,
-      [entry.id, req.user!.profileId, unitId || null, message || null]
+      // S639: a WRITE names one company (S633: reads span, writes name). A null
+      // profileId would have written a null landlord_id onto the match.
+      [entry.id, poolMatchLandlordId, unitId || null, message || null]
     )
     const landlordUser = await queryOne<any>(
       'SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1',
-      [req.user!.profileId]
+      [poolMatchLandlordId]
     )
 
     await query(`
@@ -1350,7 +2078,11 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
           message || null,
           monthlyRent != null ? Number(monthlyRent) : null,
           undefined,
-          { landlordId, matchRequestId: match!.id }
+          // 10/5: replies reach the people who run this property (services/replyRouting).
+          {
+            landlordId, matchRequestId: match!.id,
+            replyTo: unit?.property_id ? { kind: 'property', propertyId: unit.property_id } : undefined,
+          }
         )
       }
     } catch (e) { logger.error({ err: e }, '[EMAIL]') }
@@ -1403,8 +2135,9 @@ backgroundRouter.post('/pool/match/:matchId/payment-intent', requireAuth, requir
   try {
     const match = await queryOne<any>(
       `SELECT id, status, report_fee_paid, landlord_id FROM pool_match_requests
-       WHERE id=$1 AND landlord_id=$2`,
-      [req.params.matchId, req.user!.profileId])
+       -- S639: account-scoped; a landlord's profileId is NULL since S633.
+       WHERE id=$1 AND landlord_id = ANY($2::uuid[])`,
+      [req.params.matchId, landlordScopeIds(req.user!)])
     if (!match) throw new AppError(404, 'Match not found')
     if (match.status !== 'interested') throw new AppError(400, 'Tenant has not confirmed interest yet')
     if (match.report_fee_paid) throw new AppError(400, 'Report already purchased')
@@ -1452,8 +2185,9 @@ backgroundRouter.post('/pool/match/:matchId/purchase-report', requireAuth, requi
     const match = await queryOne<any>(`
       SELECT mr.*, ap.background_check_id, ap.user_id FROM pool_match_requests mr
       JOIN application_pool ap ON ap.id=mr.pool_entry_id
-      WHERE mr.id=$1 AND mr.landlord_id=$2`,
-      [req.params.matchId, req.user!.profileId])
+      -- S639: account-scoped; see above.
+      WHERE mr.id=$1 AND mr.landlord_id = ANY($2::uuid[])`,
+      [req.params.matchId, landlordScopeIds(req.user!)])
     if (!match) throw new AppError(404, 'Match not found')
     if (match.status !== 'interested') throw new AppError(400, 'Tenant has not confirmed interest yet')
     if (match.report_fee_paid) throw new AppError(400, 'Report already purchased')

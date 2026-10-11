@@ -16,7 +16,7 @@
  *
  * The point of naming them rather than silently dropping them: a fee that
  * vanishes without explanation is indistinguishable from one we failed to find.
- * These are surfaced as their own category, labelled as intentionally excluded.
+ * These are surfaced as their own category, labeled as intentionally excluded.
  *
  * Deliberately NOT matched: "pet screening", and "processing"/"admin" fees,
  * which are ordinary move-in charges that happen to sit near application

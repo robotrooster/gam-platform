@@ -181,7 +181,7 @@ const TENANT_ROUTES: PhraseRoute[] = [
     // that a complaint was made, never what it says.
     tools: ['log_complaint'],
     audience: 'tenant',
-    means: 'a complaint about a neighbour or living condition — record it, do not just sympathise',
+    means: 'a complaint about a neighbor or living condition — record it, do not just sympathize',
     patterns: [
       /\b(neighbou?r|next door|upstairs|downstairs|people (above|below|next))\b[^?]{0,60}\b(loud|noise|noisy|music|yelling|screaming|party|parties|smell|smoke|smoking|park\w*|dog|bark\\w*|trash|rude)\b/i,
       /\b(loud|noise|noisy|music|yelling|screaming|party|parties|bark\\w*)\b[^?]{0,60}\b(neighbou?r|next door|upstairs|downstairs|apartment|unit|lot|spot|site)\b/i,
@@ -189,7 +189,7 @@ const TENANT_ROUTES: PhraseRoute[] = [
       /\b(someone|somebody|people)\b[^?]{0,40}\b(smoking|smokes|parking|parked)\b[^?]{0,30}\b(in my|my spot|comes into|into my)\b/i,
       // S626: found while adding the tenant amenity route. "someone is smoking
       // by the pool" matched NOTHING — the pattern above needs "in my spot", so
-      // a complaint about behaviour in a COMMON area routed nowhere at all.
+      // a complaint about behavior in a COMMON area routed nowhere at all.
       // This is about what a person is doing, never about a facility, so it
       // cannot swallow "is there a pool".
       /\b(someone|somebody|people|kids|guests?)\b[^?]{0,30}\b(smoking|smokes|vaping|drinking|yelling|screaming|littering|speeding|trespassing)\b/i,
@@ -264,7 +264,7 @@ const TENANT_ROUTES: PhraseRoute[] = [
     // Hey, your lease expires here, your landlord typically renews."
     //
     // Neither lookup alone answers it. The lease has the date; the tendency has
-    // the behaviour. So both run and the agent answers with the two together.
+    // the behavior. So both run and the agent answers with the two together.
     tools: ['get_my_lease', 'get_my_landlord_renewal_tendency'],
     audience: 'tenant',
     means: 'will they be renewed — the lease end date AND how this landlord usually behaves',
@@ -317,7 +317,7 @@ const TENANT_ROUTES: PhraseRoute[] = [
     audience: 'tenant',
     means: 'what is on the property and what the tenant can reserve',
     patterns: [
-      /\b(amenit\w+|clubhouse|gym|fitness (room|center|centre)|hot tub|fire ?pit|bbq|barbecue|picnic area|common area|community room)\b/i,
+      /\b(amenit\w+|clubhouse|gym|fitness (room|center|center)|hot tub|fire ?pit|bbq|barbecue|picnic area|common area|community room)\b/i,
       // "pool" and "laundry" are the ambiguous ones: they name a facility AND a
       // thing that breaks. A bare noun would swallow "my washer is broken",
       // which is maintenance, so these require the sentence to be ASKING about
@@ -710,6 +710,9 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bhow (?:many|much)\b[^?]{0,30}\b(on average|typically|usually)\b/i,
       /\b(am i|are we) averaging\b/i,
       /\bhow am i doing\b/i,
+      // S655 (Nic, 10/2): source of income is GAM's check for the flex
+      // products and is never shared with a landlord. Still routed here so the
+      // agent reads the tool's plain "that is private" instead of guessing.
       /\b(fixed income|ssi|ssdi|disability|social security)\b/i,
       /\bhow old are (my|the) (tenants|renters)\b/i,
       /\b(break|breaking|broke|end|ending|ended)\b[^?]{0,20}\blease(s)? early\b/i,
@@ -730,7 +733,7 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
     extractArgs: (m) => { const who = whoOrWhere(m); return who ? { tenant: who } : undefined },
     patterns: [
       // "is bob behind", "how much does bob owe", "what's bob chen's balance"
-      // — the exact phrasing that flaked, plus its neighbours.
+      // — the exact phrasing that flaked, plus its neighbors.
       // The negative lookahead is what keeps "is ANYONE behind" out of here —
        // that is the delinquency list, and the two share every other word.
       /\bis\s+(?!anyone|anybody|any|someone|somebody|everyone|everybody|all|my|the|there|it|that|this|he|she|they)[a-z][a-z'-]+(\s+[a-z][a-z'-]+)?\s+(behind|current|late|paid up|caught up)\b/i,
@@ -760,6 +763,25 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bpast due (tenants|accounts|rent)\b/i,
       /\bcollections?\b/i,
       /\bhow many (tenants )?are behind\b/i,
+    ],
+  },
+  {
+    // S650: "can you waive the late fee on 204?" — the agent never waives (the
+    // landlord applies a credit), but it has to look at 204 first so it can say
+    // which fee, how much and where to credit it. Without a route the model
+    // answered from nothing and the claim guard replaced it with "which unit?".
+    tools: ['get_unit_lease'],
+    audience: 'landlord',
+    means: 'the unit a landlord wants a fee waived or credited on',
+    extractArgs: (m) => {
+      const u = UNIT_RE.exec(m)
+      if (u) return { unit: `${u[1]} ${u[2]}` }
+      const bare = /\b(?:on|for|in|at)\s+#?(\d{1,5}[a-z]?)\b/i.exec(m)
+      return bare ? { unit: bare[1] } : undefined
+    },
+    patterns: [
+      /\b(waive|forgive|remove|drop|take off|credit( back)?|reverse)\b[^?]{0,40}\b(late )?fees?\b/i,
+      /\blate fees?\b[^?]{0,30}\b(waive|waived|forgive|removed?|credit)\b/i,
     ],
   },
   {
@@ -861,6 +883,23 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bunit by unit\b/i,
       /\brents? (by|per) unit\b/i,
       /\bhow much (rent )?(am i|do i) collect\b/i,
+    ],
+  },
+  {
+    // S650: "It says get paid what do i do?" — Nic, on the onboarding screen.
+    // "Get Paid" is the SETUP step (connect a bank so payouts can land), not a
+    // question about payouts. Unrouted, the account-data net forced a lookup,
+    // the model found none to call, and the reply was a canned "which property
+    // or tenant do you mean?". Above the payouts route, which owns "get paid"
+    // in the WHEN-do-I-get-paid sense.
+    tools: ['get_setup_progress'],
+    audience: 'landlord',
+    means: 'where they are in setting up the account, and the next step',
+    patterns: [
+      /\b(says?|saying|shows?|showing|on the|stuck on|at the)\b[^?]{0,15}\bget paid\b/i,
+      /\bget paid\b[^?]{0,15}\b(step|page|screen|section|tab|part|button)\b/i,
+      /\b(set ?up|setup|onboarding)\b[^?]{0,40}\b(what (do|should) i|next|stuck|how do i|help)\b/i,
+      /\b(help me )?get (me )?set ?up\b/i,
     ],
   },
   {
@@ -1122,7 +1161,7 @@ const ALL_ROUTES: PhraseRoute[] = [
  *
  * Returns undefined when nothing matches — the common case for anything this
  * table does not cover, and the runner then falls back to its previous
- * behaviour (force SOME tool and let the model pick). This is additive: it can
+ * behavior (force SOME tool and let the model pick). This is additive: it can
  * make the choice more certain, never less.
  *
  * `available` is the calling profile's own tool list. A route whose tool the
@@ -1134,7 +1173,7 @@ const ALL_ROUTES: PhraseRoute[] = [
  * The lookups a wording calls for.
  *
  * Delegates to routePlan — S618: these were two separate loops over ALL_ROUTES
- * and they drifted the moment one was improved. The pronoun normalisation went
+ * and they drifted the moment one was improved. The pronoun normalization went
  * into routePlan (which the runner uses) and not into this one (which the tests
  * use), so "who owes me the most" routed correctly in production and wrongly in
  * the test, and the test was the thing telling us it worked. One loop.

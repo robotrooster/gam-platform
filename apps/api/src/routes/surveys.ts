@@ -207,7 +207,7 @@ surveysRouter.post('/', requireSurveyPerm, async (req, res, next) => {
     const body = surveyBodySchema.parse(req.body)
     validateQuestions(body.questions)
     // S633: the survey belongs to the company that owns the property it is
-    // being sent to. Derived and authorised in one step — the ownership check
+    // being sent to. Derived and authorized in one step — the ownership check
     // the two lines below used to do is now inside landlordIdForProperty.
     const landlordId = await landlordIdForProperty(req.user!, body.propertyId, query)
 
@@ -291,6 +291,8 @@ surveysRouter.post('/:id/send', requireSurveyPerm, async (req, res, next) => {
         sendEmail: true,
         emailTo: r.email,
         emailSubject: `Survey: ${survey.title}`,
+        // 10/5: replies reach the people who run this property (services/replyRouting).
+        replyTo: { kind: 'property', propertyId: survey.property_id },
       })
     }
     res.json({ success: true, data: { recipients: recipients.length } })

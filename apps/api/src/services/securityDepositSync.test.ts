@@ -133,6 +133,22 @@ describe('syncSecurityDepositRow — creation', () => {
     }, { custodyState: 'XY', custodyStatus: 'blocked' })
   })
 
+  // Fix pass 1 (final fix): one custody gate — the plan uses the same
+  // predicate as gamMayHoldDeposits / depositCustody.canCustodyDeposits.
+  it('S604: a state marked supported that does not allow the vehicle GAM uses (Treasury bills) plans the landlord, as the gate says', async () => {
+    await withTx(async (client, s) => {
+      await client.query(
+        `INSERT INTO state_deposit_custody_rules (state_code, custody_status, allows_treasury_bills, statute_citation)
+         VALUES ('XT', 'supported', false, 'test')
+         ON CONFLICT (state_code) DO UPDATE SET custody_status = 'supported', allows_treasury_bills = false`)
+      await client.query(`UPDATE properties SET state = 'XT' WHERE id = $1`, [s.propertyId])
+      await syncSecurityDepositRow(s.leaseId, 1200, client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('landlord')
+      const { gamMayHoldDeposits } = await import('./leaseFeesSync')
+      expect(await gamMayHoldDeposits(client, s.leaseId)).toBe(false)
+    })
+  })
+
   it('S604: FAILS CLOSED — an unresearched state also resolves to landlord', async () => {
     // No row in the catalog must never read as permission.
     await withTx(async (client, s) => {
@@ -267,6 +283,112 @@ describe('reconcileSettledDepositPayment', () => {
       await reconcileSettledDepositPayment(pay.rows[0].id, client)
       const dep = await getDeposit(client, s.leaseId)
       expect(Number(dep.collected_amount)).toBe(0)  // untouched by this reconciler
+    })
+  })
+})
+
+// ─── 10/4 (decisions #46.3, Nic, FINAL) ──────────────────────────────────────
+// "There is NO property setting for who holds deposits … the holder is decided
+// by HOW THE DEPOSIT WAS COLLECTED": through GAM → GAM holds it (where the S604
+// custody gate allows); in person or into the landlord's bank → the landlord.
+// held_by planned at billing is only a plan — every settle sets it.
+describe('decisions #46.3: who holds a deposit is set by how it was collected', () => {
+  async function depositCharge(client: PoolClient, s: Omit<Stack, 'client'>, o: {
+    amount: number; status?: 'pending' | 'settled'; intent?: string | null; manualMethod?: string | null
+  }): Promise<string> {
+    return (await client.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description, due_date,
+                             stripe_payment_intent_id, manual_method, platform_held, settled_at)
+       VALUES ($1, $2, $3, $4, 'deposit', $5, $6, 'DEPOSIT', CURRENT_DATE, $7, $8, $9,
+               CASE WHEN $6 = 'settled' THEN NOW() END)
+       RETURNING id`,
+      [s.landlordId, s.tenantId, s.leaseId, s.unitId, o.amount, o.status ?? 'settled', o.intent ?? null,
+       o.manualMethod ?? null, !!o.intent && !o.manualMethod])).rows[0].id
+  }
+
+  it('paid through GAM where GAM may hold deposits: GAM holds it', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1000, client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('gam_escrow')   // the plan
+      const pay = await depositCharge(client, s, { amount: 1000, intent: 'pi_portal_deposit' })
+      const r = await reconcileSettledDepositPayment(pay, client)
+      expect(r).toMatchObject({ amount: 1000, priorHeldBy: 'gam_escrow', heldBy: 'gam_escrow', priorStatus: 'pending' })
+      expect(await getDeposit(client, s.leaseId)).toMatchObject({ status: 'funded', held_by: 'gam_escrow' })
+      expect(Number((await getDeposit(client, s.leaseId)).collected_amount)).toBe(1000)
+    })
+  })
+
+  it('an imported lease planned for the landlord but paid through GAM where the custody gate allows: GAM holds it', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 800, client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('landlord')     // the plan
+      const pay = await depositCharge(client, s, { amount: 800, intent: 'pi_imported_paid_online' })
+      await reconcileSettledDepositPayment(pay, client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('gam_escrow')
+    }, { leaseSource: 'imported' })
+  })
+
+  it('paid through GAM where the custody gate does not let GAM hold deposits: the landlord holds it, as before', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1000, client)
+      const pay = await depositCharge(client, s, { amount: 1000, intent: 'pi_blocked_state' })
+      await reconcileSettledDepositPayment(pay, client)
+      expect(await getDeposit(client, s.leaseId)).toMatchObject({ held_by: 'landlord', status: 'funded' })
+    }, { custodyState: 'XB', custodyStatus: 'blocked' })
+  })
+
+  it('paid in cash at the desk on a lease planned for GAM: the landlord holds it, and the deposit record counts it (the desk settle records it)', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 500, client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('gam_escrow')   // the plan
+      const charge = await depositCharge(client, s, { amount: 500, status: 'pending' })
+      const { settleManualRentPayment } = await import('./manualPaymentSettle')
+      const r = await settleManualRentPayment(client, {
+        payment: { id: charge, landlord_id: s.landlordId, tenant_id: s.tenantId, unit_id: s.unitId, lease_id: s.leaseId,
+                   due_date: new Date().toISOString().slice(0, 10) } as any,
+        method: 'cash', settledAt: null, settleHousehold: true, amountTendered: 500, takenBy: null, source: 'desk',
+        sendReceipt: false,
+      })
+      expect(r.settledPaymentIds).toEqual([charge])
+      expect(r.depositRecords).toEqual([expect.objectContaining({ amount: 500, priorHeldBy: 'gam_escrow', heldBy: 'landlord' })])
+      const dep = await getDeposit(client, s.leaseId)
+      expect(dep).toMatchObject({ held_by: 'landlord', status: 'funded' })
+      expect(Number(dep.collected_amount)).toBe(500)
+    })
+  })
+
+  it('a check matched as one named charge (the bank-deposit match’s settle) is the landlord’s too', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 500, client)
+      const charge = await depositCharge(client, s, { amount: 500, status: 'pending' })
+      const { settleManualRentPayment } = await import('./manualPaymentSettle')
+      const r = await settleManualRentPayment(client, {
+        payment: { id: charge, landlord_id: s.landlordId, tenant_id: s.tenantId, unit_id: s.unitId, lease_id: s.leaseId,
+                   due_date: new Date().toISOString().slice(0, 10) } as any,
+        method: 'check', settledAt: null,
+      })
+      expect(r.depositRecords).toEqual([expect.objectContaining({ amount: 500, heldBy: 'landlord' })])
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('landlord')
+    })
+  })
+
+  it('a desk payment toward a deposit GAM already holds part of: the record stays GAM’s; the desk part is told apart at move-out by its own payment', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1000, client)
+      await reconcileSettledDepositPayment(await depositCharge(client, s, { amount: 600, intent: 'pi_first_part' }), client)
+      const r = await reconcileSettledDepositPayment(await depositCharge(client, s, { amount: 400, manualMethod: 'cash' }), client)
+      expect(r).toMatchObject({ amount: 400, priorHeldBy: 'gam_escrow', heldBy: 'gam_escrow' })
+      const dep = await getDeposit(client, s.leaseId)
+      expect(dep).toMatchObject({ held_by: 'gam_escrow', status: 'funded' })
+      expect(Number(dep.collected_amount)).toBe(1000)
+    })
+  })
+
+  it('a hand-made settled row with no payment facts on it keeps the planned holder', async () => {
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1000, client)
+      await reconcileSettledDepositPayment(await depositCharge(client, s, { amount: 1000 }), client)
+      expect((await getDeposit(client, s.leaseId)).held_by).toBe('gam_escrow')
     })
   })
 })

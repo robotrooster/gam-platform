@@ -7,7 +7,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource, canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { createHomeSaleContract } from '../services/homeSale'
+import { createHomeSaleContract, assertUnitIsSaleable, assertBuyerIsKnown } from '../services/homeSale'
 
 export const homeSaleRouter = Router()
 homeSaleRouter.use(requireAuth)
@@ -38,7 +38,10 @@ async function purchaseSigners(client: any, landlordId: string, tenantId: string
 
 const createSchema = z.object({
   unitId:             z.string().uuid(),
-  leaseId:            z.string().uuid(),
+  // S651: optional. A home sale is not a tenancy — see the note on
+  // CreateHomeSaleInput.leaseId. Supplied when the buyer does rent the space,
+  // because it is useful context; never required for the sale to exist.
+  leaseId:            z.string().uuid().optional(),
   tenantId:           z.string().uuid(),
   startMonth:         z.string().regex(/^\d{4}-\d{2}-01$/),  // first billing cycle
   planType:           z.enum(['amortized', 'flat']).default('amortized'),
@@ -65,34 +68,37 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     // The unit + lease must belong to this landlord, and the dwelling must be
     // landlord-owned (you can only finance-sell a home the park owns; it flips
     // to tenant-owned on payoff).
-    const unit = await queryOne<any>(
-      `SELECT u.id, u.landlord_id, u.dwelling_ownership, u.unit_type, u.unit_number
-         FROM units u WHERE u.id = $1`, [body.unitId])
-    if (!unit) throw new AppError(404, 'Unit not found')
+    // S652: these two checks moved into services/homeSale so the lease-packet
+    // path runs the identical ones. They read the same and they ARE the same —
+    // the next change to either applies to both doors at once.
+    const unit = await assertUnitIsSaleable({ query }, body.unitId)
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
-    if (unit.dwelling_ownership !== 'landlord') {
-      throw new AppError(409, 'This unit is already tenant-owned — there is no park-owned home to finance.')
+    // A lease, when there is one, still has to be this unit's.
+    if (body.leaseId) {
+      const lease = await queryOne<any>(`SELECT id, landlord_id, unit_id FROM leases WHERE id=$1`, [body.leaseId])
+      if (!lease || lease.unit_id !== body.unitId) throw new AppError(400, 'Lease does not belong to this unit')
     }
-    // S613 (Nic, DIRECTIVE): "Financed sales scope needs to be limited to
-    // converting park owned homes to tenant owned homes. We don't want it to be
-    // anything to do with RVs."
+
+    // THE GUARD THAT MATTERS, and why it is not the lease check any more.
     //
-    // The shape only makes sense for a HOME: the park owns a house sitting on
-    // its own lot, the household living in it buys it over time, and on payoff
-    // the dwelling flips to tenant-owned and the lot becomes space rent. An RV
-    // is towed away — there is nothing to convert, and financing one would make
-    // GAM the lender on a vehicle that can leave the property.
-    if (unit.unit_type !== 'mobile_home') {
-      throw new AppError(400,
-        'A financed sale converts a park-owned HOME to tenant-owned. It is only offered on mobile homes.')
+    // tenantId becomes the billed obligor on every installment, so it can never
+    // be an arbitrary id from the body (memory: gam-foreign-ref-write-scope).
+    // That used to be enforced by requiring the buyer to be active on a lease —
+    // which also, wrongly, made a tenancy a precondition of buying a home.
+    //
+    // What is actually required is that this landlord has some standing with
+    // this person: a lease of any status, an open onboarding invite, or a
+    // utility agreement. A buyer who rents nowhere still reaches GAM through an
+    // invite from the seller, so they have one. A stranger's tenant id does not.
+    await assertBuyerIsKnown({ query }, body.tenantId, unit.landlord_id)
+    if (body.leaseId) {
+      // When a lease IS given, the buyer should genuinely be on it; a mismatch
+      // is a mistake worth stopping rather than quietly recording.
+      const onLease = await queryOne<any>(
+        `SELECT 1 FROM v_lease_active_tenants WHERE lease_id=$1 AND tenant_id=$2 LIMIT 1`,
+        [body.leaseId, body.tenantId])
+      if (!onLease) throw new AppError(400, 'That buyer is not an active tenant on the lease you gave.')
     }
-    const lease = await queryOne<any>(`SELECT id, landlord_id, unit_id FROM leases WHERE id=$1`, [body.leaseId])
-    if (!lease || lease.unit_id !== body.unitId) throw new AppError(400, 'Lease does not belong to this unit')
-    // The buyer must be an active tenant on this lease — never trust an arbitrary
-    // body-supplied tenantId (it becomes the billed obligor on every installment).
-    const onLease = await queryOne<any>(
-      `SELECT 1 FROM v_lease_active_tenants WHERE lease_id=$1 AND tenant_id=$2 LIMIT 1`, [body.leaseId, body.tenantId])
-    if (!onLease) throw new AppError(400, 'Buyer must be an active tenant on this lease.')
 
     // Resolve the plan into the amortization inputs. A flat plan is 0% interest
     // with each installment equal to the flat monthly amount; the total sale
@@ -116,7 +122,7 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
 
     await client.query('BEGIN')
     const contract = await createHomeSaleContract(client, {
-      unitId: body.unitId, leaseId: body.leaseId, tenantId: body.tenantId, landlordId: unit.landlord_id,
+      unitId: body.unitId, leaseId: body.leaseId ?? null, tenantId: body.tenantId, landlordId: unit.landlord_id,
       salePrice, downPayment, annualInterestRate, termMonths, startMonth: body.startMonth,
       planType: body.planType,
       pendingSignature: !!body.templateId,
@@ -132,7 +138,7 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
       const { createDocumentRecord } = await import('./esign')
       const doc = await createDocumentRecord(client, {
         landlordId: unit.landlord_id, templateId: body.templateId,
-        unitId: body.unitId, leaseId: body.leaseId,
+        unitId: body.unitId, leaseId: body.leaseId ?? null,
         title: `Purchase agreement — Unit ${unit.unit_number}`,
         basePdfUrl: null, documentType: 'purchase_agreement',
         targetLeaseTenantId: null, promoteLeaseTenantId: null,

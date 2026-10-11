@@ -56,7 +56,7 @@ describe('a service point is neither occupied nor vacant (S616)', () => {
 
   // Before this, the view derived occupancy from an active lease — a service
   // point has none, so it appeared as NOT occupied, i.e. as a VACANCY. A
-  // neighbour's building counted against this landlord's vacancy rate.
+  // neighbor's building counted against this landlord's vacancy rate.
   it('does not count as a vacancy', async () => {
     const f = await propertyWithServicePoint()
     const { rows } = await db.query<any>(

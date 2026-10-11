@@ -1,5 +1,9 @@
 // @ts-nocheck
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
+import { useUrlTab } from '../lib/useUrlTab'
+import SigningPackagesPanel from './SigningPackagesPanel'
+import TemplateLibrarySection from './TemplateLibrarySection'
+import TemplateSleeves, { type Sleeve } from './TemplateSleeves'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -7,11 +11,11 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
   SCREENING_FEE_EXCLUSION_REASON,
-  isAutoFilledLeaseColumn,
-} from '@gam/shared'
+  isAutoFilledLeaseColumn, matchesUnitQuery,
+  LEASE_TEMPLATE_PURPOSE_LABEL, MONEY_KINDS, MONEY_KIND_LABEL, defaultMoneyKind, isMoneyBoxColumn } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
-import { SearchBox, PropertySelect } from '../components/ListControls'
+import { SearchBox } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
@@ -26,6 +30,16 @@ const FIELD_TYPES = [
   { type:'text',      label:'Text Field', icon:'📝', color:'#a78bfa', w:200, h:40 },
   { type:'checkbox',  label:'Checkbox',   icon:'☑️', color:'#f59e0b', w:30,  h:30 },
   { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:16, h:16 },
+  // S652 (Nic): several boxes on the page, pick ONE — marked X, a check, or the
+  // signer's initials. The lead-paint form's (a)(i)/(a)(ii) is one of these.
+  { type:'choice',    label:'Choice (pick one)', icon:'◯', color:'#f97316', w:30, h:16 },
+  // S652 (Nic): "text I put in the template that is just there, as part of the
+  // document on every lease" — printed, not a box; the landlord can change it
+  // on one lease with a deliberate click.
+  { type:'fixed_text',label:'Template text', icon:'🔤', color:'#64748b', w:200, h:20 },
+  // S652 (Blu): the year of manufacture picked from a list, not typed — a
+  // year only, no month or day.
+  { type:'year',      label:'Year (pick from a list)', icon:'📆', color:'#0ea5e9', w:70, h:18 },
 ]
 
 // Lease roles + S568 generic roles (standalone contracts: purchase agreements,
@@ -46,9 +60,17 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     .filter(c => LEASE_COLUMN_INPUT[c] === 'text' && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
   date: LEASE_COLUMNS
-    .filter(c => LEASE_COLUMN_INPUT[c] === 'date' && !PALETTE_EXCLUDED.has(c))
+    .filter(c => (LEASE_COLUMN_INPUT[c] === 'date' || c === 'date_signed') && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
+// S652 (Nic): "Everything should be uniform and selectable for data label."
+// Every kind of box offers the labels that fit it.
+DATA_LABELS.year = DATA_LABELS.text
+DATA_LABELS.checkbox = DATA_LABELS.text
+DATA_LABELS.choice = DATA_LABELS.text
+DATA_LABELS['radio_group'] = DATA_LABELS.text
+DATA_LABELS.signature = LEASE_COLUMNS.filter(c => /_signature$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
+DATA_LABELS.initials = LEASE_COLUMNS.filter(c => /_initial$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
 // S622 (Nic): the Data label dropdown is how a landlord RE-TAGS a box the
 // auto-placer got wrong — "can a landlord mark a box as a lease fee item".
 // They always could. What the form never said is that this tag is what makes
@@ -60,8 +82,7 @@ function billingEffect(col: string | null | undefined): { text: string; billing:
   const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
   if (cat === 'fee_row') {
     const meta = (FEE_TYPE_META as Record<string, any>)[col]
-    const refund = meta?.isRefundable ? ' Refundable — returned at move-out.' : ''
-    if (meta?.dueTiming === 'move_in') return { text: `Billed on the tenant's FIRST invoice, at move-in.${refund}`, billing: true }
+    if (meta?.dueTiming === 'move_in') return { text: `Billed on the tenant's FIRST invoice, at move-in.`, billing: true }
     if (meta?.dueTiming === 'monthly_ongoing') return { text: 'Billed EVERY MONTH alongside rent.', billing: true }
     if (meta?.dueTiming === 'move_out') return { text: 'Charged at move-out, from the deposit.', billing: true }
     return { text: 'Recorded on the lease; billed when you choose to bill it.', billing: true }
@@ -91,16 +112,21 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   //
   // An identity box is the SYSTEM'S — it is filled from the invite and nobody
   // types it. Clearing the signer role alone left it falling through to the
-  // unassigned grey, which reads as a field somebody forgot to assign rather
-  // than one that is deliberately nobody's. It gets its own colour and says so
+  // unassigned gray, which reads as a field somebody forgot to assign rather
+  // than one that is deliberately nobody's. It gets its own color and says so
   // on the canvas, so the difference is visible without selecting it.
   const systemFilled = isAutoFilledLeaseColumn(field.leaseColumn)
   const color = systemFilled ? '#64748b' : (ROLE_COLORS[field.signerRole] || '#888')
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
-  // S558 (Nic): late-fee boxes are policy-controlled — locked from move / resize
-  // / delete / edit so the landlord can't tamper with the stamped fee (anti-
-  // discrimination; the signed lease is the legal charge). S582: same lock covers
-  // rent_due_day (platform-locked to the 1st).
+  // S558 (Nic): late-fee boxes are policy-controlled — their VALUE is locked and
+  // they cannot be deleted, so the landlord can't tamper with the stamped fee
+  // (anti-discrimination; the signed lease is the legal charge).
+  //
+  // S652 (Nic): the box itself is NOT frozen. "When the box placement generator
+  // places it in the wrong spot, that needs to be selectable to be able to be
+  // moved on the page and resized... not to input the data that's in the actual
+  // box." Where auto-placement put a box is a guess about the PDF, not policy;
+  // what gets stamped in it still comes only from the property's Late Fees.
   const locked = isLockedLeaseColumn(field.leaseColumn)
 
   const onResizeMouseDown = (e: React.MouseEvent, handle: string) => {
@@ -126,7 +152,6 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
     e.stopPropagation()
     e.preventDefault()
     onSelect(field.id)
-    if (locked) return // locked late-fee box: select only, no drag
     const startX = e.clientX
     const startY = e.clientY
     let moved = false
@@ -190,7 +215,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         }}>↳</div>
       ))}
       {/* S636: a system-filled box announces itself on the canvas. Without this
-          the only signal was a colour nobody has a key for. */}
+          the only signal was a color nobody has a key for. */}
       {systemFilled && (
         <div style={{
           position:'absolute', bottom:'100%', right:0, marginBottom:1,
@@ -199,26 +224,34 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
           background:'var(--bg-0)', padding:'0 3px', borderRadius:3, zIndex:30,
         }}>auto</div>
       )}
-      <div onMouseDown={onMouseDown} title={systemFilled ? 'Filled from the invite — nobody types this. If it is wrong, fix the invite.' : locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
+      <div onMouseDown={onMouseDown} title={systemFilled ? 'Filled from the invite — nobody types this. If it is wrong, fix the invite.' : locked ? 'Late-fee field — its amount comes from the property Late Fees policy. Move or resize it to fit the form.' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
         // Depth ring — drawn outside the box so it never eats the field's own
-        // colour, which still says WHO fills it.
+        // color, which still says WHO fills it.
         boxShadow: depth > 0 ? `0 0 0 ${Math.max(1, Math.round(2 * scale))}px ${DEPTH_RING[Math.min(depth, 3)]}` : undefined,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
-        cursor: locked ? 'not-allowed' : 'move', userSelect:'none', boxSizing:'border-box' as const,
+        cursor: 'move', userSelect:'none', boxSizing:'border-box' as const,
         display:'flex', alignItems:'center', justifyContent:'center', gap:4,
         overflow:'visible',
       }}>
         {locked && <span style={{ position:'absolute', top:-8, left:-8, fontSize: Math.max(9, 11*scale), zIndex:998, pointerEvents:'none' }}>🔒</span>}
-        <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>{ft.icon}</span>
+        {field.fieldType === 'fixed_text' ? (
+          <span style={{ color:'#1a1a1a', whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, Math.min(field.height * scale * 0.6, 12 * scale)), pointerEvents:'none', padding:'0 2px' }}>
+            {field.defaultValue || 'Template text — type it in the panel'}
+          </span>
+        ) : (<>
+        <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>
+          {field.fieldType === 'choice' ? (field.checkboxMark === 'check' ? '✓' : field.checkboxMark === 'initials' ? 'AB' : 'X') : ft.icon}
+        </span>
         {field.width * scale > 50 && (
           <span style={{ color, fontWeight:700, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, 9 * scale), pointerEvents:'none' }}>
             {field.label || ft.label}
           </span>
         )}
-        {selected && !locked && [
+        </>)}
+        {selected && [
           { id:'e',  style:{ position:'absolute' as const, right:-5, top:'50%', transform:'translateY(-50%)', cursor:'ew-resize',   width:8, height:20, background:color, borderRadius:2, zIndex:20 } },
           { id:'s',  style:{ position:'absolute' as const, bottom:-5, left:'50%', transform:'translateX(-50%)', cursor:'ns-resize',  width:20, height:8, background:color, borderRadius:2, zIndex:20 } },
           { id:'se', style:{ position:'absolute' as const, right:-5, bottom:-5, cursor:'nwse-resize', width:10, height:10, background:color, borderRadius:2, zIndex:20 } },
@@ -227,6 +260,22 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
       </div>
     </div>
   )
+}
+
+// S637: canvas scale for a crisp page on a high-density screen — device pixel
+// ratio plus zoom headroom, clamped so mobile Safari never hits its canvas-area
+// limit (past which it returns a blank canvas).
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
 }
 
 // ── PDF CANVAS RENDERER ──────────────────────────────────────
@@ -251,7 +300,15 @@ function PDFCanvas({ url, page, width, height }: { url:string; page:number; widt
         const canvas = canvasRef.current
         if (!canvas) return
         const ctx = canvas.getContext('2d')!
-        const viewport = pdfPage.getViewport({ scale: width / pdfPage.getViewport({ scale:1 }).width })
+        // S637: size the backing store by real screen density, not CSS pixels.
+        // The canvas is stretched to width/height by CSS, so at devicePixelRatio
+        // 2–3 this was drawing a half- or third-resolution page and letting the
+        // browser upscale it. Field boxes are positioned off `width`/`height`
+        // props, which are untouched.
+        const base = pdfPage.getViewport({ scale:1 })
+        const viewport = pdfPage.getViewport({
+          scale: renderScaleFor(width / base.width, base.width, base.height),
+        })
         canvas.width  = viewport.width
         canvas.height = viewport.height
         await pdfPage.render({ canvasContext: ctx, viewport }).promise
@@ -363,7 +420,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const [screeningFees, setScreeningFees] = useState<any[]>([])
   // S622: the late-fee terms the lease states in words, read from the prose.
   const [lateFeeTerms, setLateFeeTerms] = useState<any>(template.lateFeeTerms ?? null)
-  // S622: what the placer recognised, and what read like a choice it could not
+  // S622: what the placer recognized, and what read like a choice it could not
   // lay out. Advisory — not saved.
   const [detection, setDetection] = useState<any>(null)
   const [scale, setScale] = useState(0.9)
@@ -382,11 +439,15 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     const y = (e.clientY - rect.top) / scale
     const ft = FIELD_TYPES.find(f => f.type === activeTool)!
     const remembered = lastSizes.current[activeTool]
-    const newField = {
-      id: `f_${Date.now()}`, fieldType: activeTool, signerRole: activeRole,
-      label: ft.label, page: currentPage, x, y,
+    const newField: any = {
+      id: `f_${Date.now()}`, fieldType: activeTool,
+      signerRole: activeTool === 'fixed_text' ? 'landlord' : activeRole,
+      label: activeTool === 'choice' ? '' : ft.label, page: currentPage, x, y,
       width: remembered ? remembered.w : ft.w,
-      height: remembered ? remembered.h : ft.h, required: true
+      height: remembered ? remembered.h : ft.h,
+      required: activeTool !== 'fixed_text',
+      checkboxMark: activeTool === 'choice' ? 'x' : undefined,
+      defaultValue: activeTool === 'fixed_text' ? '' : undefined,
     }
     setFields(prev => [...prev, newField])
     setSelectedField(newField.id)
@@ -435,7 +496,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       // S556: conditional nesting — clientId is this field's stable key, and
       // parentClientId points at the parent field's clientId (the server maps
       // both to new DB ids after the full-replace insert).
-      clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null
+      clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null,
+      defaultValue: f.defaultValue ?? null, checkboxMark: f.checkboxMark ?? null,
+      // S653: the landlord's tag on a money box (fee / deposit / prepaid).
+      moneyKind: f.moneyKind ?? null,
     })), lateFeeTerms, conditionalFees: conditionalFees.map((c: any) => ({
       label: c.label, amount: c.amount, conditionText: c.conditionText,
     })) }),
@@ -824,9 +888,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   moved, or deleted; the landlord doesn&apos;t choose the due day.</>
                 ) : (
                   <> Late fees come from the property&apos;s <b>Late Fees</b> policy for this unit type. The amount is
-                  stamped into the lease at signing and can&apos;t be edited, moved, or deleted here — that keeps the
-                  charge identical for every tenant of the class and matching the signed document. To change late
-                  fees, update the property settings; changes apply to new leases at signing/renewal.</>
+                  stamped into the lease at signing and nobody types it or deletes the box — that keeps the charge
+                  identical for every tenant of the class and matching the signed document. <b>You can move and resize
+                  the box</b> so it lines up with the form. To change late fees, update the property settings; changes
+                  apply to new leases at signing/renewal.</>
                 )}
               </div>
             </div>
@@ -888,7 +953,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 <input className="input" value={sel.label||''} onChange={e => updateSelected('label', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }} />
               </div>
               <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginBottom:8 }}>Drag edges to resize field</div>
-              {(sel.fieldType === 'text' || sel.fieldType === 'date') && (
+              {sel.fieldType !== 'fixed_text' && (
                 <div style={{ marginBottom:8 }}>
                   <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Data label</label>
                   <select className="input" value={sel.leaseColumn||''} onChange={e => updateSelected('leaseColumn', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem' }}>
@@ -915,6 +980,46 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   })()}
                 </div>
               )}
+              {/* S653 (Nic): "tag the money boxes as either credits or debits...
+                  that's the difference between a refundable pet deposit versus a
+                  non-refundable pet fee." The tag decides what the engine DOES
+                  with the money; the box's name only suggests a default. */}
+              {isMoneyBoxColumn(sel.leaseColumn) && (FEE_TYPE_META as Record<string, any>)[sel.leaseColumn]?.dueTiming === 'move_in' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>This money is</label>
+                  <select className="input" value={sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)}
+                    onChange={e => updateSelected('moneyKind', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }}>
+                    {MONEY_KINDS.map(k => <option key={k} value={k}>{MONEY_KIND_LABEL[k]}</option>)}
+                  </select>
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2, lineHeight:1.4 }}>
+                    {(sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)) === 'deposit'
+                      ? 'Held for the renter and returned at move-out, less any deductions.'
+                      : (sel.moneyKind || defaultMoneyKind(sel.leaseColumn as any)) === 'prepaid'
+                        ? 'Becomes credit on their account the day it is paid; each upcoming rent invoice draws it down. Anything left comes back at move-out.'
+                        : 'Yours to keep once paid.'}
+                  </div>
+                </div>
+              )}
+              {sel.fieldType === 'choice' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Group (boxes with the same group name — pick one of them)</label>
+                  <input className="input" value={sel.options||''} onChange={e => updateSelected('options', e.target.value)} placeholder="e.g. lead paint (a)" style={{ width:'100%', fontSize:'.75rem' }} />
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', margin:'6px 0 3px' }}>Marked with</label>
+                  <select className="input" value={sel.checkboxMark || 'x'} onChange={e => updateSelected('checkboxMark', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }}>
+                    <option value="x">X</option>
+                    <option value="check">Check mark</option>
+                    <option value="initials">Signer's initials</option>
+                  </select>
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Required means one box in the group must be marked, not each of them. The label above is this box's option.</div>
+                </div>
+              )}
+              {sel.fieldType === 'fixed_text' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Text printed here on every document</label>
+                  <textarea className="input" value={sel.defaultValue||''} onChange={e => updateSelected('defaultValue', e.target.value)} placeholder="e.g. $150.00" rows={2} style={{ width:'100%', fontSize:'.75rem', resize:'vertical' }} />
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Not a box — it prints as text. You can change it on one lease by clicking it while signing; the tenant never can.</div>
+                </div>
+              )}
               {sel.fieldType === 'radio_group' && (
                 <div style={{ marginBottom:8 }}>
                   <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Options (comma separated)</label>
@@ -934,18 +1039,21 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   = "Month-to-month"). Inapplicable fields auto-hide + drop their
                   required flag, so the landlord never marks N/A. */}
               {(() => {
-                const candidates = fields.filter(x => x.fieldType === 'radio_group' && x.id !== sel.id)
+                const candidates = fields.filter(x => (x.fieldType === 'radio_group' || x.fieldType === 'choice') && x.id !== sel.id)
                 if (candidates.length === 0) return null
                 const parent = candidates.find(x => x.id === sel.parentFieldId)
-                const parentOpts = (parent?.options || '').split(',').map((o:string) => o.trim()).filter(Boolean)
+                // S652: a CHOICE box has no options of its own — the condition is
+                // simply that it is the one chosen.
+                const parentIsChoice = parent?.fieldType === 'choice'
+                const parentOpts = parentIsChoice ? [] : (parent?.options || '').split(',').map((o:string) => o.trim()).filter(Boolean)
                 return (
                   <div style={{ marginBottom:8 }}>
                     <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Only show if…</label>
-                    <select className="input" value={sel.parentFieldId || ''} onChange={e => { updateSelected('parentFieldId', e.target.value || null); updateSelected('parentOption', null) }} style={{ width:'100%', fontSize:'.75rem' }}>
+                    <select className="input" value={sel.parentFieldId || ''} onChange={e => { const c = candidates.find(x => x.id === e.target.value); updateSelected('parentFieldId', e.target.value || null); updateSelected('parentOption', c?.fieldType === 'choice' ? 'chosen' : null) }} style={{ width:'100%', fontSize:'.75rem' }}>
                       <option value="">Always shown</option>
-                      {candidates.map(c => <option key={c.id} value={c.id}>{c.label || c.groupName || 'Radio group'}</option>)}
+                      {candidates.map(c => <option key={c.id} value={c.id}>{c.fieldType === 'choice' ? `${c.options ? c.options + ': ' : ''}${c.label || 'choice'} is chosen` : (c.label || c.groupName || 'Radio group')}</option>)}
                     </select>
-                    {sel.parentFieldId && (
+                    {sel.parentFieldId && !parentIsChoice && (
                       <select className="input" value={sel.parentOption || ''} onChange={e => updateSelected('parentOption', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem', marginTop:4 }}>
                         <option value="">Pick trigger option…</option>
                         {parentOpts.map((o:string) => <option key={o} value={o}>{o}</option>)}
@@ -973,7 +1081,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 </button>
               )}
               <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontSize:'.72rem', color:'var(--text-2)' }}>
-                <input type="checkbox" checked={sel.required} onChange={e => updateSelected('required', e.target.checked)} /> Required
+                {sel.fieldType !== 'fixed_text' && <><input type="checkbox" checked={sel.required} onChange={e => updateSelected('required', e.target.checked)} /> Required</>}
               </label>
             </div>
           )}
@@ -1044,6 +1152,10 @@ function SendDocumentModal({ onClose }) {
   // 'manual' — the escape hatch for non-tenant signers (old flow).
   const [mode, setMode] = useState<'unit'|'property'|'manual'>('unit')
   const [selectedUnitId, setSelectedUnitId] = useState('')
+  // S641: the package checklist. Resolved at DRAFT time, not at invite — by now
+  // we know whether this tenant is work-trade or buying on installment, which
+  // is exactly what we did not know when the invite went out.
+  const [packageTicked, setPackageTicked] = useState<Record<string, boolean>>({})
   const [selectedPropertyId, setSelectedPropertyId] = useState('')
   const [tenantEmails, setTenantEmails] = useState([''])
   const [tenantNames, setTenantNames] = useState([{ firstName: '', lastName: '' }])
@@ -1083,6 +1195,17 @@ function SendDocumentModal({ onClose }) {
   const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
   const properties = Array.from(new Map((units as any[]).map(u => [u.propertyId, { id: u.propertyId, name: u.propertyName }])).values())
   const selectedTemplate = templates.find(t => t.id === templateId)
+  // S654: typed emails that match no tenant name no unit, so nothing says where
+  // the person is being invited. An invite always belongs to a PROPERTY (its
+  // screening and onboarding rules come from there, and the property says which
+  // company is sending) — so the landlord picks the property BEFORE any invite
+  // goes out. Never a default; this also fixed the send for one-company accounts,
+  // which the invite route refused without a unit or property.
+  const [manualPropertyId, setManualPropertyId] = useState('')
+  const { data: allProperties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  const manualFirstEmail = (tenantEmails.find(e => e.trim()) || '').trim()
+  const manualNoUnit = mode === 'manual' && !!manualFirstEmail && !existingTenants.find(t => t.email === manualFirstEmail)
+  const manualPropertyMissing = manualNoUnit && !manualPropertyId
 
   // S535 auto-pull: picking a unit selects the template written for its
   // type (newest exact-type match, else universal) unless the current
@@ -1127,6 +1250,20 @@ function SendDocumentModal({ onClose }) {
   }, [selectedUnitId, mode, templateId])
 
   // Resolved lease signers for the picked unit / property.
+  // S641: what would be drafted alongside the lease for this unit.
+  const { data: pkg } = useQuery(
+    ['signing-package-for-unit', selectedUnitId],
+    () => apiGet(`/signing-packages/for-unit/${selectedUnitId}`),
+    { enabled: mode === 'unit' && !!selectedUnitId },
+  )
+  useEffect(() => {
+    if (!pkg?.items) { setPackageTicked({}); return }
+    // Pre-ticked from the package's own judgment; the landlord adjusts.
+    const next: Record<string, boolean> = {}
+    for (const i of pkg.items) next[i.templateId] = !!i.suggested
+    setPackageTicked(next)
+  }, [pkg])
+
   const recipientsQ = mode === 'unit' && selectedUnitId
     ? `/esign/recipients?unitId=${selectedUnitId}`
     : mode === 'property' && selectedPropertyId
@@ -1180,7 +1317,15 @@ function SendDocumentModal({ onClose }) {
     const w = await witnessSigner(order)
     if (w) signers.push(w)
     const title = (selectedTemplate ? selectedTemplate.name : 'Document') + ' — Unit ' + group.unitNumber
-    const res = await apiPost('/esign/documents', { templateId, unitId: group.unitId, title, signers, prefillValues, depositAlreadyHeld })
+    // S641: everything still ticked rides along in the same bundle. The lease
+    // template itself is excluded server-side so it is never drafted twice.
+    const packageTemplateIds = Object.entries(packageTicked)
+      .filter(([id, on]) => on && id !== templateId).map(([id]) => id)
+    const res = await apiPost('/esign/documents', {
+      templateId, unitId: group.unitId, title, signers, prefillValues, depositAlreadyHeld,
+      packageId: pkg?.packageId ?? null,
+      packageTemplateIds,
+    })
     await apiPost('/esign/documents/' + res.data.id + '/send', {})
   }
 
@@ -1209,6 +1354,10 @@ function SendDocumentModal({ onClose }) {
     const validEmails = tenantEmails.filter(e => e.trim())
     if (!validEmails.length) { setError('Please enter at least one email'); return }
     const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
+    if (!firstTenant && !manualPropertyId) {
+      setError('Choose which property this document is for.'); return
+    }
+    const company = !firstTenant ? { propertyId: manualPropertyId } : {}
     setSending(true)
     try {
       const signers = []
@@ -1221,7 +1370,7 @@ function SendDocumentModal({ onClose }) {
           : { firstName: (tenantNames[i]?.firstName || email.split('@')[0]), lastName: (tenantNames[i]?.lastName || '') }
         const inviteRes: any = await apiPost('/tenants/invite', {
           email, firstName: nameParts.firstName, lastName: nameParts.lastName,
-          phone: null, unitId: firstTenant?.unitId || null,
+          phone: null, unitId: firstTenant?.unitId || null, ...company,
         })
         signers.push({
           role: order === 2 ? 'primary' : 'co_tenant_' + (order - 2),
@@ -1240,7 +1389,7 @@ function SendDocumentModal({ onClose }) {
       if (w) signers.push(w)
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
-      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues })
+      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues, ...company })
       await apiPost('/esign/documents/' + res.data.id + '/send', {})
       qc.invalidateQueries('esign-documents')
       onClose()
@@ -1252,7 +1401,7 @@ function SendDocumentModal({ onClose }) {
   const canSend = !!templateId && (
     mode === 'unit' ? !!selectedUnitId && recipientGroups.length > 0 :
     mode === 'property' ? !!selectedPropertyId && recipientGroups.length > 0 :
-    tenantEmails.some(e => e.trim())
+    tenantEmails.some(e => e.trim()) && !manualPropertyMissing
   )
 
   return (
@@ -1351,6 +1500,16 @@ function SendDocumentModal({ onClose }) {
               )
             })}
             <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add Another Signer</button>
+            {manualNoUnit && (
+              <div style={{ marginTop:10 }}>
+                <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', display:'block', marginBottom:6 }}>Which property is this for?</label>
+                <select className='form-select' value={manualPropertyId} onChange={e => setManualPropertyId(e.target.value)} style={{ width:'100%' }}>
+                  <option value=''>Choose a property…</option>
+                  {(allProperties as any[]).map((p: any) => <option key={p.id} value={p.id}>{p.name || p.street1 || p.address1 || 'Property'}</option>)}
+                </select>
+                <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4 }}>No unit matches these emails, so the invite goes to the property you choose.</div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1384,6 +1543,39 @@ function SendDocumentModal({ onClose }) {
               })}
               <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Blank values can be left for the signer to fill in.</div>
             </div>
+          </div>
+        )}
+        {/* S641 (Nic): the package checklist. "Some things are pertinent to some
+            tenants and some things are not, all at the same property." Ticked
+            items ride along in one signing session, so nobody receives a second
+            document days later wondering what it is for. Everything here is a
+            suggestion — untick what does not apply, tick what does. */}
+        {mode === 'unit' && pkg?.items?.length > 0 && (
+          <div style={{ marginBottom:12, padding:'10px 12px', background:'var(--bg-2)',
+                        borderRadius:8, border:'1px solid var(--border-0)' }}>
+            <div style={{ fontSize:'.8rem', fontWeight:600, color:'var(--text-0)', marginBottom:2 }}>
+              {pkg.name}
+            </div>
+            <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginBottom:8 }}>
+              Signed together in one sitting, in this order.
+            </div>
+            {pkg.items.map((i:any) => (
+              <label key={i.templateId}
+                style={{ display:'flex', alignItems:'flex-start', gap:9, padding:'4px 0',
+                         cursor: i.required ? 'default' : 'pointer', opacity: i.required ? .85 : 1 }}>
+                <input type="checkbox"
+                  checked={i.templateId === templateId ? true : !!packageTicked[i.templateId]}
+                  disabled={i.required || i.templateId === templateId}
+                  onChange={e => setPackageTicked(prev => ({ ...prev, [i.templateId]: e.target.checked }))}
+                  style={{ marginTop:3 }} />
+                <span>
+                  <span style={{ fontSize:'.78rem', color:'var(--text-1)' }}>{i.templateName}</span>
+                  <span style={{ display:'block', fontSize:'.68rem', color:'var(--text-3)', marginTop:1 }}>
+                    {i.templateId === templateId ? 'The lease you selected above' : i.reason}
+                  </span>
+                </span>
+              </label>
+            ))}
           </div>
         )}
         {/* S604 (Nic): migration onboarding. Existing tenants signing a NEW GAM
@@ -1521,11 +1713,37 @@ export function ESignPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { can } = usePerms()
-  const [tab, setTab]           = useState<'documents'|'templates'>('documents')
+  const [tab, setTab]           = useUrlTab('tab', 'documents', ['documents','templates','packages','government'] as const)
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
   const [showStandalone, setShowStandalone] = useState(false)
   const [showNewTemplate, setShowNewTemplate] = useState(false)
+  // S652: set when the landlord clicked Upload on a sleeve. The sleeve says what
+  // the document is, so the dialog stops asking.
+  const [newTmplSleeve, setNewTmplSleeve] = useState<Sleeve | null>(null)
+  // S652 — Replace PDF, keep the boxes. Nic: "if I change my draft next year..."
+  // and the Mountain View lease that still said Oak Park. The new file goes
+  // under the existing boxes, and the lease is re-read for what it contains.
+  const replaceInput = useRef<HTMLInputElement>(null)
+  const [replacing, setReplacing] = useState<{ templateId: string; name: string } | null>(null)
+  const replacePdf = async (file: File) => {
+    if (!replacing) return
+    try {
+      const form = new FormData(); form.append('file', file)
+      const up = await fetch(`${API_URL}/api/esign/upload`, {
+        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('gam_token')}` }, body: form,
+      }).then(r => r.json())
+      if (!up.success) throw new Error(up.error || 'Upload failed')
+      await apiPatch(`/esign/templates/${replacing.templateId}`, { basePdfUrl: up.data.url, pageCount: up.data.pageCount || 1 })
+      qc.invalidateQueries('esign-sleeves'); qc.invalidateQueries('esign-templates')
+      toast(`${replacing.name}: new PDF in place, every box kept. Re-read for what it contains.`)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || e?.message || 'Could not replace the PDF')
+    } finally {
+      setReplacing(null)
+      if (replaceInput.current) replaceInput.current.value = ''
+    }
+  }
   const [newTmplName, setNewTmplName] = useState('')
   // S576 (B-8): template purpose — 'lease' (default) or 'work_trade_addendum'
   // (the landlord's own work-trade addendum form).
@@ -1568,6 +1786,8 @@ export function ESignPage() {
   // reloaded on navigation or on returning to the tab. That is defensible for
   // reference data and wrong for a WORK QUEUE: the whole point of coming back
   // here is to see what is left, and signing a lease changes it every time.
+  // S638: which document's signing order is expanded on the list.
+  const [openDoc, setOpenDoc] = useState<string | null>(null)
   const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',
     () => apiGet('/esign/documents'),
     { staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true, refetchInterval: 60000 })
@@ -1576,8 +1796,24 @@ export function ESignPage() {
   // propertyName (the docs payload has no propertyId); standalone contracts
   // have no property and fall out of a property-filtered view by design.
   const [docSearch, setDocSearch] = useState('')
-  const [docPropertyName, setDocPropertyName] = useState('')
-  const docPropertyOptions = (documents as any[]).map(d => ({ id: d.propertyName, name: d.propertyName }))
+  // ── S639 (Nic): ONE PARK AT A TIME ─────────────────────────────────────────
+  //
+  //   "each lease should be in a sub window. Like, if I click Mountain View,
+  //    it'll expand the window to show the status of all the leases. And if I
+  //    close that and click Oak Park, it'll expand that view as well... between
+  //    adding a whole portfolio in here, you don't wanna have five hundred, you
+  //    know, leases or thousands of leases, and have to scroll down forever just
+  //    to figure out what's going on."
+  //
+  // The dropdown made you choose between one park and ALL of them, and "all" is
+  // the option that stops working the moment there is more than one park. A park
+  // is a section you open, and the header carries the counts so the page answers
+  // "what is going on" before anything is expanded at all.
+  //
+  // Which sections are open, not which one: two parks side by side is a
+  // legitimate thing to want, and forcing a single choice is the dropdown's
+  // mistake in a different shape.
+  const [openProps, setOpenProps] = useState<Record<string, boolean>>({})
   const dq = docSearch.trim().toLowerCase()
 
   // S637 (Nic, DIRECTIVE): "all the ones that are completed need to be bumped
@@ -1598,39 +1834,82 @@ export function ESignPage() {
     // sent / in_progress — the landlord's own signature outranks everything.
     return d.landlordMustSign ? 0 : 1
   }
+  // ── S639 (Nic): SEARCH THE UNIT, NOT THE PARK ──────────────────────────────
+  //
+  //   "The search bar doesn't search very good, especially for RV spots, because
+  //    the word RV is usually in the park name, and so it pulls up all the mobile
+  //    home spaces too... If there's a way to just filter that search bar so it
+  //    only searches the unit number."
+  //
+  // It matched the document TITLE ("Lease — Unit RV 41 — Mountain View RV Ranch")
+  // and the property name, so at an RV park the letters "RV" were in every row
+  // and the search did nothing. The park name is never the thing being searched
+  // for — the accordion below already says which park you are in.
+  //
+  // matchesUnitQuery normalizes both sides, so "mobile home 5", "mh5" and "MH 05"
+  // are one query. Signer and tenant names still match: a name cannot collide
+  // with a park the way a unit type can, and looking somebody up by name is the
+  // other reason to use this box.
   const filteredDocs = (documents as any[]).filter(d => {
-    const matchProperty = docPropertyName === '' || d.propertyName === docPropertyName
-    if (!matchProperty) return false
     if (dq === '') return true
-    return (d.title || '').toLowerCase().includes(dq)
-      || (d.unitNumber || '').toLowerCase().includes(dq)
-      || (d.propertyName || '').toLowerCase().includes(dq)
-      || (d.documentType ? humanize(d.documentType).toLowerCase().includes(dq) : false)
+    if (matchesUnitQuery(dq, d.unitNumber)) return true
+    const people = [
+      ...(Array.isArray(d.signers) ? d.signers.map((x: any) => x?.name) : []),
+      d.tenantName,
+    ].filter(Boolean).join(' ').toLowerCase()
+    return people.includes(dq)
   }).sort((a, b) => {
     const r = queueRank(a) - queueRank(b)
     if (r !== 0) return r
     return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
   })
 
+  // S639: filtered rows, grouped into one section per park and ordered by the
+  // work owed — a park with a signature waiting on Nic sorts above a park where
+  // everything is done, for the same reason the rows inside it do.
+  const docGroups = (() => {
+    const m = new Map<string, any[]>()
+    for (const d of filteredDocs) {
+      const k = d.propertyName || 'No property'
+      if (!m.has(k)) m.set(k, [])
+      m.get(k)!.push(d)
+    }
+    return [...m.entries()]
+      .map(([name, docs]) => ({
+        name,
+        docs,
+        needsYou:   docs.filter(d => d.landlordMustSign && d.status !== 'completed' && d.status !== 'voided').length,
+        awaiting:   docs.filter(d => !d.landlordMustSign && (d.status === 'sent' || d.status === 'in_progress')).length,
+        completed:  docs.filter(d => d.status === 'completed').length,
+      }))
+      .sort((a, b) => (b.needsYou - a.needsYou) || a.name.localeCompare(b.name))
+  })()
+  // A search is a hunt for one row — opening every match beats making the user
+  // expand each park to find out whether their match is in it.
+  const sectionOpen = (name: string) => (dq !== '' ? true : !!openProps[name])
+
   const deleteTemplateMut = useMutation(
     (id: string) => apiDelete('/esign/templates/' + id),
-    { onSuccess: () => qc.invalidateQueries('esign-templates') }
+    { onSuccess: () => { qc.invalidateQueries('esign-templates'); qc.invalidateQueries('esign-sleeves') },
+      onError: (e: any) => toast.error(e?.message || 'Could not delete that template') }
   )
 
   // S558: designate a template as its unit type's default (the "primary
   // <unit type> lease"). Server clears any prior default for the same
-  // (unit type, property) — radio behaviour.
+  // (unit type, property) — radio behavior.
   const setDefaultTemplateMut = useMutation(
     (id: string) => apiPost(`/esign/templates/${id}/set-default`, { isDefault: true }),
-    { onSuccess: () => qc.invalidateQueries('esign-templates'),
+    { onSuccess: () => { qc.invalidateQueries('esign-templates'); qc.invalidateQueries('esign-sleeves') },
       onError: (e: any) => toast.error(e?.message || 'Could not set default') }
   )
 
   const createTemplateMut = useMutation(
-    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, purpose: newTmplPurpose, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null, depositMonths: newTmplDepositMonths === '' ? null : Number(newTmplDepositMonths), defaultTermMonths: newTmplTermMonths === '' ? null : Number(newTmplTermMonths) }),
+    () => apiPost('/esign/templates', { sleeveId: newTmplSleeve?.id ?? null, name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, purpose: newTmplPurpose, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null, depositMonths: newTmplDepositMonths === '' ? null : Number(newTmplDepositMonths), defaultTermMonths: newTmplTermMonths === '' ? null : Number(newTmplTermMonths) }),
     { onSuccess: async (res: any) => {
       qc.invalidateQueries('esign-templates')
+      qc.invalidateQueries('esign-sleeves')
       setShowNewTemplate(false)
+      setNewTmplSleeve(null)
       // Open editor immediately
       const full = await apiGet<any>(`/esign/templates/${(res as any).data.id}`)
       setEditTemplate(full)
@@ -1640,6 +1919,22 @@ export function ESignPage() {
   const voidMut = useMutation(
     (id: string) => apiPost(`/esign/documents/${id}/void`, { reason: 'Voided by landlord' }),
     { onSuccess: () => qc.invalidateQueries('esign-documents') }
+  )
+
+  // S642: push a reminder by hand. Says WHO it reached — a landlord clicking
+  // this wants to know the lease went to the right person, not that a request
+  // succeeded.
+  const remindMut = useMutation(
+    (id: string) => apiPost(`/esign/documents/${id}/remind`, {}),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toast(d?.name ? `Reminder sent to ${d.name}` : 'Reminder sent')
+        qc.invalidateQueries('esign-documents')
+      },
+      onError: (e: any) =>
+        toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not send that reminder.'),
+    }
   )
 
   const STATUS_COLORS: Record<string,string> = {
@@ -1653,6 +1948,11 @@ export function ESignPage() {
   const TABS = [
     { id:'documents', label:'Documents', perm:'esign.tab.documents' },
     { id:'templates', label:'Templates', perm:'esign.tab.templates' },
+    // S641: a package is a list of templates, so it is gated with them.
+    { id:'packages',  label:'Packages',  perm:'esign.tab.templates' },
+    // S652: read-only reference. The same forms are already in Templates,
+    // which is where their boxes are placed.
+    { id:'government', label:'Government Forms', perm:'esign.tab.templates' },
   ].filter(t => can(t.perm))
   const visibleTabIds = TABS.map(t => t.id).join(',')
   useEffect(() => {
@@ -1672,7 +1972,7 @@ export function ESignPage() {
         <div style={{ display:'flex', gap:8 }}>
           {tab === 'documents' && can('esign.template_manage') && <button className="btn btn-ghost" onClick={() => setShowStandalone(true)} title="Purchase agreement, bill of sale, or other contract with any signers"><FileText size={15} /> New Contract</button>}
           {tab === 'documents' && can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={15} /> Send Document</button>}
-          {tab === 'templates' && can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={15} /> New Template</button>}
+          {tab === 'templates' && can('esign.template_manage') && <button className="btn btn-primary" onClick={() => { setNewTmplSleeve(null); setShowNewTemplate(true) }}><Plus size={15} /> New Template</button>}
         </div>
       </div>
 
@@ -1682,11 +1982,31 @@ export function ESignPage() {
         ))}
       </div>
 
+      {tab === 'packages' && <SigningPackagesPanel />}
+      {tab === 'government' && <TemplateLibrarySection mode="reference" />}
+
+
       {/* Documents */}
       {tab === 'documents' && (documents as any[]).length > 0 && (
         <div className="filter-bar">
-          <SearchBox value={docSearch} onChange={setDocSearch} placeholder="Search document, unit, property…" />
-          <PropertySelect value={docPropertyName} onChange={setDocPropertyName} properties={docPropertyOptions} />
+          <SearchBox value={docSearch} onChange={setDocSearch}
+            placeholder="Unit or person — try “MH 5” or “mobile home 5”" />
+          {dq !== '' && (
+            <span style={{ fontSize:'.76rem', color:'var(--text-3)' }}>
+              {/* S639: say LEASES, not "matches". This page lists lease
+                  documents, and there are far more spaces than leases — 74 RV
+                  spaces against 25 RV leases, 45 mobile homes against 18. A
+                  bare count invites the reading that a search for "rv" found
+                  every RV space, which is not what this page holds. */}
+              {filteredDocs.length} lease{filteredDocs.length === 1 ? '' : 's'} at {docGroups.length} propert{docGroups.length === 1 ? 'y' : 'ies'}
+              <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft:6 }}
+                onClick={() => setDocSearch('')}>Clear</button>
+            </span>
+          )}
+          <button type="button" className="btn btn-ghost btn-sm"
+            onClick={() => setOpenProps(Object.fromEntries(docGroups.map(g => [g.name, true])))}>Expand all</button>
+          <button type="button" className="btn btn-ghost btn-sm"
+            onClick={() => setOpenProps({})}>Collapse all</button>
         </div>
       )}
 
@@ -1702,17 +2022,80 @@ export function ESignPage() {
               {can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={14} /> Send Document</button>}
             </div>
           ) : (
-            <table className="data-table">
-              <thead><tr><th>Document</th><th>Unit</th><th>Status</th><th>Signers</th><th>Sent</th><th>Completed</th><th></th></tr></thead>
-              <tbody>
-                {filteredDocs.length === 0 ? (
-                  <tr><td colSpan={7} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No documents match your filters.</td></tr>
-                ) : filteredDocs.map(d => (
-                  <tr key={d.id}>
-                    <td style={{ fontWeight:600, color:'var(--text-0)' }}>{d.title}</td>
+            docGroups.length === 0 ? (
+              // S639: an empty result here is nearly always "that space has no
+              // lease yet", not "your search is broken" — there are three MH 05s
+              // across the portfolio and only one of them has ever been leased.
+              // Saying so turns a dead end into an answer.
+              <div style={{ textAlign:'center', color:'var(--text-3)', padding:32, lineHeight:1.6 }}>
+                <div style={{ fontWeight:600, color:'var(--text-2)' }}>
+                  No lease matches “{docSearch.trim()}”.
+                </div>
+                <div style={{ fontSize:'.82rem', marginTop:6 }}>
+                  This page lists units that have a lease. A space with no lease drafted yet
+                  will not appear here — check it on the Units page for that property.
+                </div>
+              </div>
+            ) : <>{docGroups.map(g => (
+              <div key={g.name} style={{ borderTop:'1px solid var(--border-0)' }}>
+                {/* S639: the park header answers "what is going on" before
+                    anything is opened, so a portfolio of thousands of leases
+                    does not have to be scrolled to be understood. */}
+                <button type="button"
+                  onClick={() => setOpenProps(o => ({ ...o, [g.name]: !o[g.name] }))}
+                  style={{ width:'100%', display:'flex', alignItems:'center', gap:10,
+                           background:'transparent', border:'none', cursor:'pointer',
+                           padding:'12px 16px', textAlign:'left', color:'var(--text-0)' }}>
+                  <span style={{ color:'var(--text-3)', fontSize:'.8rem', width:12 }}>
+                    {sectionOpen(g.name) ? '▾' : '▸'}
+                  </span>
+                  <span style={{ fontWeight:700, fontSize:'.95rem' }}>{g.name}</span>
+                  <span style={{ fontSize:'.78rem', color:'var(--text-3)' }}>
+                    {g.docs.length} lease{g.docs.length === 1 ? '' : 's'}
+                  </span>
+                  {g.needsYou > 0 && (
+                    <span style={{ fontSize:'.76rem', fontWeight:700, color:'var(--gold)' }}>
+                      {g.needsYou} waiting on you
+                    </span>
+                  )}
+                  {g.awaiting > 0 && (
+                    <span style={{ fontSize:'.76rem', color:'var(--text-2)' }}>
+                      {g.awaiting} out for signature
+                    </span>
+                  )}
+                  {g.completed > 0 && (
+                    <span style={{ fontSize:'.76rem', color:'var(--green)' }}>
+                      {g.completed} signed
+                    </span>
+                  )}
+                </button>
+                {sectionOpen(g.name) && (
+                <table className="data-table">
+                  <thead><tr><th>Document</th><th>Unit</th><th>Status</th><th>Signers</th><th>Sent</th><th>Completed</th><th></th></tr></thead>
+                  <tbody>
+                    {g.docs.map((d: any) => (
+                  <Fragment key={d.id}>
+                  <tr onClick={() => setOpenDoc(openDoc === d.id ? null : d.id)}
+                      style={{ cursor:'pointer' }}
+                      title="Show who has signed and who it is waiting on">
+                    <td style={{ fontWeight:600, color:'var(--text-0)' }}>
+                      <span style={{ color:'var(--text-3)', marginRight:6, fontSize:'.7rem' }}>
+                        {openDoc === d.id ? '▾' : '▸'}
+                      </span>
+                      {d.title}
+                    </td>
                     <td style={{ fontSize:'.75rem' }}>{d.unitNumber ? `${d.propertyName} · Unit ${d.unitNumber}` : (d.documentType ? humanize(d.documentType) : '—')}</td>
                     <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{humanize(d.status)}</span></td>
-                    <td style={{ fontSize:'.75rem' }}>{d.signedCount}/{d.signerCount} signed</td>
+                    <td style={{ fontSize:'.75rem' }}>
+                      {d.signedCount}/{d.signerCount} signed
+                      {/* S638: the name is the useful half — a count does not
+                          tell you who to phone. */}
+                      {d.waitingOn && d.status !== 'completed' && d.status !== 'voided' && (
+                        <div style={{ fontSize:'.7rem', color:'var(--gold)', marginTop:2 }}>
+                          waiting on {d.waitingOn}
+                        </div>
+                      )}
+                    </td>
                     <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sentAt ? new Date(d.sentAt).toLocaleDateString() : '—'}</td>
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
@@ -1754,15 +2137,73 @@ export function ESignPage() {
                               catch (err: any) { toast.error(`Could not print that lease (${err?.message || 'unknown error'}).`) }
                             }}><Printer size={12} /></button>
                         )}
+                        {/* S642 (Nic): "we need to send the lease out to people
+                            in progress. They all timed out over the weekend."
+                            The automatic reminder stops after five — correctly,
+                            since a reminder that never stops is harassment — but
+                            with no way to push, the platform's answer to "they
+                            still haven't signed" was permanent silence. Nine
+                            residents sat unreachable for five days. */}
+                        {can('esign.send') && d.status !== 'completed' && d.status !== 'voided' && (
+                          <button className="btn btn-ghost btn-sm" title="Email a reminder to whoever is holding this up"
+                            disabled={remindMut.isLoading}
+                            onClick={e => { e.stopPropagation(); remindMut.mutate(d.id) }}>
+                            <Send size={12} />
+                          </button>
+                        )}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>
                         )}
                       </div>
                     </td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                  {openDoc === d.id && (
+                    <tr>
+                      <td colSpan={7} style={{ background:'var(--bg-2)', padding:'10px 14px' }}>
+                        <div style={{ fontSize:'.7rem', color:'var(--text-3)', textTransform:'uppercase',
+                          letterSpacing:'.06em', marginBottom:6 }}>Signing order</div>
+                        {(d.signers ?? []).map((sg: any, i: number) => {
+                          const done = sg.status === 'signed'
+                          const isNext = !done && (d.signers ?? [])
+                            .slice(0, i).every((e: any) => e.status === 'signed')
+                          return (
+                            <div key={i} style={{ display:'flex', alignItems:'center', gap:10,
+                              padding:'5px 0', fontSize:'.8rem',
+                              borderBottom: i < (d.signers.length - 1) ? '1px solid var(--border-0)' : 'none' }}>
+                              <span style={{ width:18, textAlign:'center',
+                                color: done ? 'var(--green)' : isNext ? 'var(--gold)' : 'var(--text-3)' }}>
+                                {done ? '✓' : isNext ? '→' : '·'}
+                              </span>
+                              <span style={{ minWidth:170, color:'var(--text-0)', fontWeight: isNext ? 700 : 400 }}>
+                                {sg.name}
+                              </span>
+                              <span style={{ minWidth:96, color:'var(--text-3)', fontSize:'.72rem' }}>
+                                {humanize(sg.role)}
+                              </span>
+                              <span style={{ color: done ? 'var(--green)' : isNext ? 'var(--gold)' : 'var(--text-3)',
+                                fontSize:'.72rem' }}>
+                                {done ? `signed ${new Date(sg.signedAt).toLocaleDateString()}`
+                                      : isNext ? (sg.invitedAt ? 'waiting on them now' : 'about to be asked')
+                                      : 'waits their turn'}
+                              </span>
+                              {isNext && sg.email && (
+                                <span style={{ marginLeft:'auto', color:'var(--text-3)', fontSize:'.72rem' }}>
+                                  {sg.email}
+                                </span>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
+                    ))}
+                  </tbody>
+                </table>
+                )}
+              </div>
+            ))}</>
           )}
         </div>
       )}
@@ -1770,91 +2211,48 @@ export function ESignPage() {
       {/* Templates */}
       {tab === 'templates' && (
         <div>
-          {(tmplProperties as any[]).length > 1 && (
-            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14, flexWrap:'wrap' }}>
-              <label className="form-label" style={{ margin:0, fontSize:'.72rem' }}>Property</label>
-              <select className="input" style={{ width:'auto', minWidth:240 }}
-                      value={tmplPropertyId} onChange={e => setTmplPropertyId(e.target.value)}>
-                <option value="">All properties</option>
-                {(tmplProperties as any[]).map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-              <span style={{ fontSize:'.7rem', color:'var(--text-3)' }}>
-                Templates set to one property, plus any that apply everywhere.
-              </span>
-            </div>
-          )}
-          {tmplLoading ? <div style={{ padding:32, textAlign:'center', color:'var(--text-3)' }}>Loading…</div> :
-          (templates as any[]).length === 0 ? (
-            <div className="empty-state" style={{ padding:48 }}>
-              <FileText size={40} />
-              <h3>No templates yet</h3>
-              <p>Create a template to define reusable signature fields.</p>
-              {can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={14} /> New Template</button>}
-            </div>
-          ) : (
-            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))', gap:12 }}>
-              {(templates as any[]).map(t => (
-                <div key={t.id} className="card" style={{ padding:'16px' }}>
-                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
-                    <div>
-                      <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:2 }}>
-                        <span style={{ fontWeight:700, color:'var(--text-0)' }}>{t.name}</span>
-                        {t.purpose === 'work_trade_addendum' && (
-                          <span title="Attaches to a renewal when a work-trade tenant needs a fresh tenancy" style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--text-1)', border:'1px solid var(--border-1)', borderRadius:4, padding:'1px 5px' }}>Work-Trade Addendum</span>
-                        )}
-                        {t.isUnitTypeDefault && (
-                          <span title={`Default lease for ${t.unitType ? humanize(t.unitType) : 'this unit type'}`} style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--gold)', border:'1px solid var(--gold)', borderRadius:4, padding:'1px 5px' }}>Default</span>
-                        )}
-                      </div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? humanize(t.unitType) : 'any unit type'} · {t.propertyName || 'any property'}</div>
-                      {t.purpose !== 'work_trade_addendum' && (
-                        <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:2 }}>
-                          {t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'Month-to-month'}
-                          {t.depositMonths != null ? ` · deposit ${Number(t.depositMonths)}× rent` : ' · deposit set on lease'}
-                        </div>
-                      )}
-                    </div>
-                    <FileText size={18} style={{ color:'var(--text-3)' }} />
-                  </div>
-                  {t.description && <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:12 }}>{t.description}</div>}
-                  {can('esign.template_manage') && (
-                    <div style={{ display:'flex', gap:6, flexWrap:'wrap' as const }}>
-                      <button className="btn btn-ghost btn-sm" onClick={async () => {
-                        const full = await apiGet<any>(`/esign/templates/${t.id}`)
-                        setEditTemplate(full)
-                      }}>
-                        <Settings size={12} /> Edit Fields
-                      </button>
-                      {t.purpose !== 'work_trade_addendum' && t.unitType && !t.isUnitTypeDefault && (
-                        <button className="btn btn-ghost btn-sm" disabled={setDefaultTemplateMut.isLoading} onClick={() => setDefaultTemplateMut.mutate(t.id)}>
-                          Make default
-                        </button>
-                      )}
-                      <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
-                        appConfirm('Delete template "' + t.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteTemplateMut.mutate(t.id) })
-                      }}>
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+          {/* S652 — the Templates page is the landlord's card collection: one
+              section per state they hold property in, a numbered sleeve for
+              every document that state's law has a landlord hand over for the
+              spaces they run, government forms already in theirs. See
+              TemplateSleeves. */}
+          <input ref={replaceInput} type="file" accept="application/pdf" style={{ display:'none' }}
+                 onChange={e => { const f = e.target.files?.[0]; if (f) replacePdf(f) }} />
+          <TemplateSleeves
+            canEdit={can('esign.template_manage')}
+            onReplacePdf={(c) => { setReplacing({ templateId: c.templateId, name: c.name }); replaceInput.current?.click() }}
+            onEdit={async (id) => setEditTemplate(await apiGet<any>(`/esign/templates/${id}`))}
+            onMakeDefault={(id) => setDefaultTemplateMut.mutate(id)}
+            onDelete={(c) => {
+              appConfirm('Delete template "' + c.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' })
+                .then(ok => { if (ok) deleteTemplateMut.mutate(c.templateId) })
+            }}
+            onUpload={(sleeve) => {
+              setNewTmplSleeve(sleeve)
+              setNewTmplName(sleeve.title.replace(/^[A-Z][A-Za-z .]+:\s+/, ''))
+              setNewTmplPurpose(sleeve.kind === 'lease' ? 'lease' : sleeve.kind === 'sale_contract' ? 'installment_sale' : 'state_disclosure')
+              setNewTmplUnitType(sleeve.unitTypes && sleeve.unitTypes.length === 1 ? sleeve.unitTypes[0] : 'all')
+              setShowNewTemplate(true)
+            }}
+          />
         </div>
       )}
 
       {/* New template modal */}
       {showNewTemplate && (
-        <div className="modal-overlay" onClick={() => setShowNewTemplate(false)}>
+        <div className="modal-overlay" onClick={() => { setShowNewTemplate(false); setNewTmplSleeve(null) }}>
           <div className="modal" style={{ maxWidth:400 }} onClick={e => e.stopPropagation()}>
-            <div className="modal-title">New Template</div>
+            <div className="modal-title">{newTmplSleeve ? 'Upload a document' : 'New Template'}</div>
+            {newTmplSleeve && (
+              <div style={{ fontSize:'.78rem', color:'var(--text-2)', marginBottom:12, padding:'8px 10px', border:'1px solid var(--border-0)', borderRadius:8 }}>
+                Into <strong style={{ color:'var(--text-0)' }}>{newTmplSleeve.title}</strong>
+              </div>
+            )}
             <div style={{ marginBottom:12 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Template Name *</label>
               <input className="input" placeholder="Standard 12-Month Lease" value={newTmplName} onChange={e => setNewTmplName(e.target.value)} style={{ width:'100%' }} autoFocus />
             </div>
+            {!newTmplSleeve && <>
             <div style={{ marginBottom:12 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Form Type</label>
               <select className="form-select" value={newTmplPurpose} onChange={e => setNewTmplPurpose(e.target.value)} style={{ width:'100%' }}>
@@ -1881,6 +2279,7 @@ export function ESignPage() {
               </select>
               <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Drafting only offers this template for matching units — an RV lease is not an apartment lease.</div>
             </div>
+            </>}
             <div style={{ marginBottom:12 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Property Lock</label>
               <select className="form-select" value={newTmplPropertyId} onChange={e => setNewTmplPropertyId(e.target.value)} style={{ width:'100%' }}>

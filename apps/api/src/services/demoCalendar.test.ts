@@ -56,7 +56,7 @@ describe('buildSalesFeedIcs (owner subscribe feed)', () => {
     expect(unfolded).toContain('Join: https://meet.jit.si/gam-demo-1')
   })
 
-  it('greys out cancelled/no-show as STATUS:CANCELLED', () => {
+  it('grays out cancelled/no-show as STATUS:CANCELLED', () => {
     const ics = buildSalesFeedIcs([{ ...base, status: 'cancelled' }], NOW)
     expect(ics).toContain('STATUS:CANCELLED')
   })

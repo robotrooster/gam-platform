@@ -1,11 +1,12 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN } from '@gam/shared'
-import { requireAuth } from '../middleware/auth'
+import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal, FALLBACK_TIMEZONE } from '@gam/shared'
+import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
+import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
+import { requireAuth, forgetSessionCutoff } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
          sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
@@ -13,7 +14,7 @@ import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
-import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
+import { signEmailOtpSessionToken, issueEmailOtp, verifyEmailFactorToken } from './emailOtp'
 
 // S80: scope-table dispatch for login / refresh JWT claims. Replaced the
 // pre-S80 team_members LEFT JOIN. Role-keyed lookup against the right
@@ -80,9 +81,18 @@ async function getScopeForUser(userId: string, role: string):
   }
   if (role === 'bookkeeper') {
     const r = await queryOne<any>(
-      `SELECT landlord_id, access_level FROM bookkeeper_scopes WHERE user_id = $1 LIMIT 1`,
+      // 10/11: oldest assignment first, so the company on the pass is the same
+      // one requireAuth falls back to (middleware/auth bookkeeperScopeFor).
+      `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
+        WHERE user_id = $1 ORDER BY created_at, id LIMIT 1`,
       [userId])
-    return r ? { landlordId: r.landlord_id, permissions: { access_level: r.access_level } } : null
+    // property_ids NULL = the whole company (allProperties); else only these.
+    return r ? {
+      landlordId: r.landlord_id,
+      permissions: { access_level: r.access_level },
+      propertyIds: r.property_ids ?? [],
+      allProperties: r.property_ids == null,
+    } : null
   }
   return null
 }
@@ -126,7 +136,7 @@ const registerSchema = z.object({
   // the entity name; it just is not asked for on the self-serve form.
   businessName: z.string().trim().min(1).optional(),
   // Legal acceptance — frontend gate sets this true when the user
-  // checks the Terms + Privacy acknowledgement at registration.
+  // checks the Terms + Privacy acknowledgment at registration.
   // We refuse the request if it's false or missing so the timestamps
   // on users.accepted_tos_at / accepted_privacy_at are never a lie.
   acceptedTerms: z.literal(true, {
@@ -134,13 +144,48 @@ const registerSchema = z.object({
   }),
 })
 
+// ── S639 OUTAGE: "we are all getting invalid credentials during login now" ──
+//
+// Every stored email is lowercase, and login compared the typed string RAW
+// against users.email — an exact, case-sensitive match. Type "Ben@golddoor.io"
+// and there is no such row, so the lookup misses and returns the deliberately
+// vague "Invalid credentials" with no hint that the address was the problem.
+//
+// Phone keyboards auto-capitalize the first letter of a text field, and both
+// Nicks and Ben were locked out simultaneously the first evening they all tried
+// to sign in to the admin portal. The API log shows it plainly: those 401s came
+// back in 5-12ms, far too fast for bcrypt to have run — the password was never
+// even checked, because no user was found. A genuine wrong password takes ~270ms
+// and there was exactly one of those all night.
+//
+// Normalized here, at the edge, so every path below sees the same string.
 const loginSchema = z.object({
-  email:    z.string().email(),
+  email:    z.string().trim().toLowerCase().pipe(z.string().email()),
   password: z.string(),
+  // S650: the portal the sign-in came from. Only the staff consoles change
+  // anything — see the per-portal gate in /login. S655: GAM Books names itself
+  // too, and every named portal signs in for a fixed length by default.
+  portal:   z.enum(SIGN_IN_PORTAL_VALUES).optional(),
+  // S655: "Keep me signed in on this device" on the admin console, Support and
+  // GAM Books. Ticked, the session renews while in use like every other portal;
+  // unticked, it ends SESSION_TTL_SECONDS after this sign-in. lib/sessionToken.ts.
+  keepSignedIn: z.boolean().optional(),
+  // S654: the bill email's Pay now link vouches for the inbox — see
+  // signEmailFactorToken. Optional; a stale or foreign one means the usual code.
+  emailFactor: z.string().max(4000).optional(),
 })
 
-function signToken(payload: object) {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' })
+// S650/S655: who each named sign-in page admits, checked before any code is
+// emailed. Books matches its own ALLOWED_ROLES (apps/books) — S568: no admins.
+const PORTAL_ROLES: Record<SignInPortal, string[]> = {
+  admin:     ['admin', 'super_admin'],
+  admin_ops: ['admin', 'super_admin', 'portfolio_manager'],
+  books:     ['landlord', 'bookkeeper', 'business_owner', 'business_staff'],
+}
+const PORTAL_REFUSAL: Record<SignInPortal, string> = {
+  admin:     'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.',
+  admin_ops: 'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.',
+  books:     'GAM Books is for landlords, their bookkeepers, and business owners and staff. Check the email address you signed in with.',
 }
 
 // POST /api/auth/register
@@ -151,7 +196,7 @@ authRouter.post('/register', async (req, res, next) => {
     if (isDisposableEmail(body.email)) {
       throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
     }
-    const exists = await queryOne('SELECT id FROM users WHERE email = $1', [body.email])
+    const exists = await queryOne('SELECT id FROM users WHERE lower(email) = lower($1)', [body.email])
     if (exists) throw new AppError(409, 'Email already registered')
 
     const hash = await bcrypt.hash(body.password, 12)
@@ -174,9 +219,9 @@ authRouter.post('/register', async (req, res, next) => {
         [body.email, hash, body.role, body.firstName, body.lastName, body.phone ?? null, devAutoVerify]
       ).then(r => r.rows)
 
-      let profileId: string
-      // S637: companies this account was INVITED into, claimed during signup.
-      let invitedLandlordIds: string[] = []
+      // Null for a landlord who was invited: they get no company here (S637)
+      // and claim the invited one once the address is proven (S655).
+      let profileId: string | null
       // Hoisted so the post-commit signup alert can read closer attribution.
       let closerId: string | null = null
       let referredByUserId: string | null = null
@@ -204,14 +249,6 @@ authRouter.post('/register', async (req, res, next) => {
               [uplineId, user.id])
           }
         }
-        // S568: open the onboarding reconciliation window (21 days). While it's
-        // open the landlord can mark a tenant's FIRST GAM invoice paid off-platform
-        // (old-system autopay overlap during a migration) — see landlords.reconciliation_until.
-        // S600: open the no-double-bill onboarding grace. billing_starts_at stays
-        // NULL (not billed) until the landlord goes live — first settled rent flips
-        // it (webhooks.ts), else the grace-cap cron flips it at billing_grace_until:
-        // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
-        // extendable for long large-portfolio setups.
         // ── S637: AN INVITED CO-OWNER GETS ONE COMPANY, NOT TWO ───────────
         //
         // Nic: "Dusty only owns one company, but it's telling him he owns two.
@@ -226,54 +263,33 @@ authRouter.post('/register', async (req, res, next) => {
         // page it turned a one-click task into a choice between a real company
         // and a phantom.
         //
-        // An invitation addressed to this email is proof of why the account
-        // exists. Claim it BEFORE deciding whether a personal entity is
-        // warranted: if they were invited, the invited company IS their
-        // company and no second one is created.
-        const claimed = await client.query<{ landlord_id: string; invited_by_user_id: string | null }>(
-          `UPDATE landlord_member_invitations
-              SET status = 'accepted', accepted_at = now(),
-                  accepted_user_id = $2, updated_at = now()
+        // An invitation addressed to this email is why the account exists, so
+        // no personal company is created beside the invited one.
+        //
+        // S655 SECURITY: but registering only LOOKS at the invitation now. It
+        // used to accept it right here, before anything proved this person owns
+        // the address — so whoever registered an invited address first became
+        // an owner of that company with a password they chose, and the real
+        // partner's link said "already used". The invitation is accepted when
+        // the address is proven, at the emailed code a few seconds from now
+        // (services/coOwnerInvites.ts claimInvitationsOnProvenAddress). If the
+        // invitation is gone by then, that step makes this company instead.
+        const invited = (await client.query(
+          `SELECT 1 FROM landlord_member_invitations
             WHERE LOWER(email) = LOWER($1)
               AND status = 'pending'
               AND expires_at > now()
-            RETURNING landlord_id, invited_by_user_id`,
-          [user.email, user.id])
-        for (const inv of claimed.rows) {
-          await client.query(
-            `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
-             VALUES ($1, $2, 'owner', $3) ON CONFLICT (landlord_id, user_id) DO NOTHING`,
-            [inv.landlord_id, user.id, inv.invited_by_user_id ?? null])
-        }
-        invitedLandlordIds = claimed.rows.map(r => r.landlord_id)
+            LIMIT 1`,
+          [user.email])).rows.length > 0
 
         // Somebody joining an existing company needs no company of their own.
         // If they later buy property under their own name they can create one
         // deliberately, which is a better moment to name it than a signup form.
-        if (invitedLandlordIds.length > 0) {
-          profileId = invitedLandlordIds[0]
-        } else {
-        const [l] = await client.query(
-          // S624: migration_window_ends_at MUST be set here. It was not, and a
-          // NULL read as "window open forever" in the screening gate — so every
-          // landlord who signed up after the S623 backfill had the background-check
-          // requirement silently disabled for life, in contradiction of the
-          // published Terms (§9.2). Found on a real organic signup 15 minutes old.
-          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until,
-                                  business_name, ein, migration_window_ends_at)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '21 days',
-                   (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date,
-                   $5, $6, NOW() + ($7::int * INTERVAL '1 day')) RETURNING id`,
-          [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES,
-           body.businessName ?? null, null, MIGRATION_WINDOW_DAYS]
-        ).then(r => r.rows)
-        profileId = l.id
-        // S553: founding owner-membership (multi-owner entities).
-        await client.query(
-          `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')
-           ON CONFLICT (landlord_id, user_id) DO NOTHING`,
-          [l.id, user.id])
-        }
+        profileId = invited
+          ? null
+          : await createFoundingLandlordEntity(client, {
+              userId: user.id, closerId, referredByUserId, businessName: body.businessName ?? null,
+            })
 
       } else {
         const [t] = await client.query(
@@ -301,12 +317,11 @@ authRouter.post('/register', async (req, res, next) => {
         userId: user.id, role: user.role, email: user.email,
         profileId: body.role === 'landlord' ? null : profileId,
         landlordId: null,
-        // S637: every company they were invited into, not just the first —
-        // an account can be a co-owner of more than one from the start.
-        landlordIds: body.role === 'landlord'
-          ? (invitedLandlordIds.length > 0 ? invitedLandlordIds : [profileId])
-          : null,
+        // S655: an invited signup owns nothing yet — the invited companies
+        // arrive when the code proves the address (see above).
+        landlordIds: body.role === 'landlord' ? (profileId ? [profileId] : []) : null,
         businessId: null, staffRole: null, permissions: null,
+        sp: sessionPolicyFor(user.role, null, false),
       })
       await issueEmailOtp(user.id, user.email)
 
@@ -351,11 +366,115 @@ authRouter.post('/register', async (req, res, next) => {
 const LOGIN_FAIL_LIMIT = 5
 const LOGIN_LOCK_MINUTES = 15
 
-// POST /api/auth/login
-authRouter.post('/login', async (req, res, next) => {
+// Final sweep (10/3): a locked sign-in is told WHEN, in plain words, on the
+// person's own clock. It used to read "Try again after
+// 2026-10-03T20:11:27.596Z": a machine timestamp in UTC, seven hours off for
+// anyone in Arizona, on the screen most people see a lock on.
+//
+// The server cannot see where the person is sitting, so the clock is their
+// place's: a tenant's lease's property, a worker's own property (when they are
+// kept to certain ones), a landlord's or worker's company's first property,
+// else GAM's default zone. The minutes beside it are right
+// wherever they are, so a wrong guess about the zone never leaves them waiting
+// on the wrong hour. The time shown is rounded UP to the minute, so "after
+// 1:12 PM" is never a moment when the lock is still on.
+export function lockedSignInMessage(lockedUntil: Date, timeZone: string, now: Date = new Date()): string {
+  const shownAt = new Date(Math.ceil(lockedUntil.getTime() / 60_000) * 60_000)
+  let clock: string
   try {
-    const { email, password } = loginSchema.parse(req.body)
-    const user = await queryOne<any>(
+    clock = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit' }).format(shownAt)
+  } catch {
+    clock = new Intl.DateTimeFormat('en-US', { timeZone: FALLBACK_TIMEZONE, hour: 'numeric', minute: '2-digit' }).format(shownAt)
+  }
+  // Newer ICU puts a narrow no-break space before AM/PM; say it with a plain one.
+  clock = clock.replace(/[\u202f\u00a0]/g, ' ')
+  const minutes = Math.max(1, Math.ceil((lockedUntil.getTime() - now.getTime()) / 60_000))
+  return `Your account is temporarily locked after too many sign-in attempts. `
+    + `Try again after ${clock} (in ${minutes} minute${minutes === 1 ? '' : 's'}), or reset your password.`
+}
+
+// The zone a lock message is told in (see lockedSignInMessage). Never throws:
+// a message with GAM's default clock beats no message.
+//
+// A worker kept to certain properties hears the first of THOSE properties'
+// clock, not the company's first property: a company can run parks in more
+// than one zone, and a manager who works only the Chicago park should not be
+// told an Arizona time. A worker on every property hears the company's.
+async function lockClockZone(user: { id: string; role: string }): Promise<string> {
+  try {
+    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper'].includes(user.role)
+    const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
+    const workerLandlordId = scope?.landlordId ?? null
+    const workerPropertyIds = scope && !scope.allProperties ? (scope.propertyIds ?? []) : []
+    const row = await queryOne<{ timezone: string | null }>(
+      `SELECT COALESCE(
+         -- A tenant: the property of their lease (the live one first, else the latest).
+         (SELECT p.timezone
+            FROM tenants t
+            JOIN lease_tenants lt ON lt.tenant_id = t.id
+            JOIN leases l         ON l.id = lt.lease_id
+            JOIN units un         ON un.id = l.unit_id
+            JOIN properties p     ON p.id = un.property_id
+           WHERE t.user_id = $1
+           ORDER BY (l.status = 'active') DESC, l.start_date DESC
+           LIMIT 1),
+         -- A worker kept to certain properties: the first of those (in their company).
+         (SELECT p.timezone
+            FROM properties p
+           WHERE p.id = ANY($3::uuid[])
+             AND p.landlord_id = $2::uuid
+           ORDER BY p.created_at ASC
+           LIMIT 1),
+         -- A landlord (owner or member) or a worker: their company's first property.
+         (SELECT p.timezone
+            FROM properties p
+           WHERE p.landlord_id = $2::uuid
+              OR p.landlord_id IN (SELECT lm.landlord_id FROM landlord_members lm WHERE lm.user_id = $1
+                                   UNION
+                                   SELECT x.id FROM landlords x WHERE x.user_id = $1)
+           ORDER BY p.created_at ASC
+           LIMIT 1)
+       ) AS timezone`, [user.id, workerLandlordId, workerPropertyIds])
+    return row?.timezone || FALLBACK_TIMEZONE
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, '[auth] could not read the zone for a lock message; using the default')
+    return FALLBACK_TIMEZONE
+  }
+}
+
+// POST /api/auth/login
+// S654: a password change ends every other session. Sessions renew while in
+// use now, so a stolen signed-in device would otherwise keep renewing forever;
+// a pass minted before the change is refused here and at /auth/me (which every
+// portal calls on load), so the device is out at its next load.
+// S655: exported — the authenticator enrollment endpoints (routes/totp.ts)
+// mint a pass too and apply the same rule.
+//
+// S655: { wholeSecond: true } compares at the pass's own precision (iat is
+// whole seconds). For the emailed-code step's /verify and /resend (both through
+// liveAccountForPendingPass in routes/emailOtp.ts): the tenant invite activation
+// stamps sessions_valid_from and mints the email-code pass in the SAME request,
+// so that pass's iat usually reads as a fraction of a second "before" the stamp.
+// Everywhere else keeps the exact comparison.
+export function assertPassPostdatesPasswordChange(
+  pass: any,
+  sessionsValidFrom: string | Date | null | undefined,
+  opts?: { wholeSecond?: boolean },
+) {
+  if (!sessionsValidFrom || typeof pass?.iat !== 'number') return
+  const validFromMs = new Date(sessionsValidFrom).getTime()
+  const mintedBefore = opts?.wholeSecond
+    ? pass.iat < Math.floor(validFromMs / 1000)
+    : pass.iat * 1000 < validFromMs
+  if (mintedBefore) {
+    throw new AppError(401, 'Your password was changed. Please sign in again.')
+  }
+}
+
+// S654: one loader for a session's user row. The password sign-in and the
+// session renewal (/refresh) must see the same account the same way.
+async function loadUserForSession(by: 'email' | 'id', value: string): Promise<any> {
+  return queryOne<any>(
       `SELECT u.*,
               COALESCE(t.id, b.id) AS profile_id,
               b.id                 AS business_id
@@ -370,19 +489,100 @@ authRouter.post('/login', async (req, res, next) => {
        -- business_staff users go through getScopeForUser instead because
        -- their business_id lives in the scope row.
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
-       WHERE u.email = $1`, [email]
-    )
+       -- S639: case-insensitive. An address is the same address whatever a
+       -- phone keyboard capitalized on the way in.
+       WHERE ${by === 'email' ? 'lower(u.email) = lower($1)' : 'u.id = $1'}`, [value]
+  )
+}
+
+// S654: the claims a session carries, built from the database for THIS user.
+// Shared by the password sign-in and by /refresh, so a renewed session is
+// rebuilt from what is true now — a company added since, a scope pulled since —
+// never copied forward from the old pass.
+async function sessionClaimsFor(user: any) {
+  const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
+  const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
+  if (isWorkerRole && !scope) {
+    const msg = user.role === 'business_staff'
+      ? 'Your account has been deactivated. Contact your business owner.'
+      : 'Your account has been deactivated. Contact your landlord.'
+    throw new AppError(403, msg)
+  }
+  // ── S633: A LANDLORD SESSION CARRIES NO ENTITY ──────────────────────────
+  //
+  // Nic (DIRECTIVE, verbatim): "Account ownership is no correlation to a
+  // specific entity. Entities own properties. The account owns the entities.
+  // When I'm logged into my account, I can invite any fucking person to any
+  // fucking property I own without switching a goddamn thing." And: "I don't
+  // want it to say fucking Oak Park ID when I sign into my login."
+  //
+  // `profileId` used to be resolved to ONE `landlords` row here — whichever
+  // entity `active_landlord_id` named, or an arbitrary one when it was null.
+  // Around 269 landlord call sites then read that id as "the landlord", so a
+  // person who owns two companies was only ever half signed in. It did not
+  // fail loudly: it returned an empty list. That is how a meter list at his
+  // own park came back with zero rows, how a billing-cycle card could not
+  // reach his second company, and how an invite refused a unit he owns.
+  //
+  // For a landlord it is now NULL, deliberately and permanently. Nulling it is
+  // the point of the change, not a side effect: any scoping site still reading
+  // it now fails where it can be seen and fixed, instead of silently answering
+  // for one company. An account is not an entity, so its session does not name
+  // one.
+  //
+  // Every other role is untouched — a tenant's profileId is their tenant row,
+  // a business owner's is their business, a team worker's scope arrives as
+  // landlordId. Those are genuinely one-to-one and stay exactly as they were.
+  const profileId = user.role === 'landlord'
+    ? null
+    : (user.profile_id || scope?.landlordId || scope?.businessId || null)
+
+  // S553/S633: EVERY entity this account owns — the whole of a landlord's
+  // identity now. Unions membership rows with founding ownership, because an
+  // account that predates `landlord_members` has a company it owns with no
+  // member row, and dropping profileId must not drop that company with it.
+  const landlordIds = user.role === 'landlord'
+    ? await query<{ landlord_id: string }>(
+        `SELECT landlord_id FROM landlord_members WHERE user_id = $1
+         UNION
+         SELECT id           FROM landlords        WHERE user_id = $1`, [user.id]
+      ).then((rows) => rows.map((r) => r.landlord_id))
+    : null
+  // S453: businessId carries either the owner's business (from JOIN) or
+  // the staff member's scoped business (from getScopeForUser). null for
+  // any non-business role.
+  const businessId = user.role === 'business_owner'
+    ? (user.business_id || null)
+    : (scope?.businessId || null)
+  const staffRole = user.role === 'business_staff'
+    ? (scope?.staffRole || null)
+    : null
+  const claims = {
+    userId: user.id, role: user.role, email: user.email,
+    profileId,
+    landlordId: scope?.landlordId || null,
+    landlordIds,
+    businessId,
+    staffRole,
+    permissions: scope?.permissions || null,
+  }
+  return { scope, profileId, landlordIds, businessId, staffRole, claims }
+}
+
+authRouter.post('/login', async (req, res, next) => {
+  try {
+    const { email, password, portal, keepSignedIn, emailFactor } = loginSchema.parse(req.body)
+    const user = await loadUserForSession('email', email)
     if (!user) throw new AppError(401, 'Invalid credentials')
 
     // S280: lockout gate — BEFORE bcrypt.compare. Even with the
     // right password, a locked account stays locked until the
     // window expires. (Successful unlock requires either waiting
     // out the timer or using password reset.)
+    // Final sweep (10/3): said in plain words on the person's clock — see
+    // lockedSignInMessage.
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      throw new AppError(
-        401,
-        `Account temporarily locked. Try again after ${new Date(user.locked_until).toISOString()} or reset your password.`
-      )
+      throw new AppError(401, lockedSignInMessage(new Date(user.locked_until), await lockClockZone(user)))
     }
 
     const valid = await bcrypt.compare(password, user.password_hash)
@@ -437,6 +637,19 @@ authRouter.post('/login', async (req, res, next) => {
       )
     }
 
+    // S650: the admin console signs in STAFF only, and says so before any
+    // second factor goes out. It used to share this route blind: a browser
+    // autofilled Nic's landlord address into the admin login, the password
+    // matched that landlord account, and the 2FA code was emailed to the
+    // landlord inbox — only to be refused after it was typed in.
+    // S655: GAM Books gets the same gate for its own people (S568: no admins).
+    if (portal && !PORTAL_ROLES[portal].includes(user.role)) {
+      throw new AppError(403, PORTAL_REFUSAL[portal])
+    }
+    // S655: fixed-length or renewing — decided once, here, and carried on every
+    // pass this sign-in mints (pending, enrolment and full).
+    const sp = sessionPolicyFor(user.role, portal, keepSignedIn)
+
     // For landlord-assignable roles + business_staff, look up the scope
     // row to pull (landlordId | businessId) + permissions for the JWT
     // claim. Absence of a scope row for a worker role means the user was
@@ -444,63 +657,7 @@ authRouter.post('/login', async (req, res, next) => {
     // S453: business_staff joins the worker list and goes through the
     // same gate. business_owner is NOT a worker — its business_id comes
     // off the JOIN's `business_id` column directly.
-    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
-    const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
-    if (isWorkerRole && !scope) {
-      const msg = user.role === 'business_staff'
-        ? 'Your account has been deactivated. Contact your business owner.'
-        : 'Your account has been deactivated. Contact your landlord.'
-      throw new AppError(403, msg)
-    }
-    // ── S633: A LANDLORD SESSION CARRIES NO ENTITY ──────────────────────────
-    //
-    // Nic (DIRECTIVE, verbatim): "Account ownership is no correlation to a
-    // specific entity. Entities own properties. The account owns the entities.
-    // When I'm logged into my account, I can invite any fucking person to any
-    // fucking property I own without switching a goddamn thing." And: "I don't
-    // want it to say fucking Oak Park ID when I sign into my login."
-    //
-    // `profileId` used to be resolved to ONE `landlords` row here — whichever
-    // entity `active_landlord_id` named, or an arbitrary one when it was null.
-    // Around 269 landlord call sites then read that id as "the landlord", so a
-    // person who owns two companies was only ever half signed in. It did not
-    // fail loudly: it returned an empty list. That is how a meter list at his
-    // own park came back with zero rows, how a billing-cycle card could not
-    // reach his second company, and how an invite refused a unit he owns.
-    //
-    // For a landlord it is now NULL, deliberately and permanently. Nulling it is
-    // the point of the change, not a side effect: any scoping site still reading
-    // it now fails where it can be seen and fixed, instead of silently answering
-    // for one company. An account is not an entity, so its session does not name
-    // one.
-    //
-    // Every other role is untouched — a tenant's profileId is their tenant row,
-    // a business owner's is their business, a team worker's scope arrives as
-    // landlordId. Those are genuinely one-to-one and stay exactly as they were.
-    const profileId = user.role === 'landlord'
-      ? null
-      : (user.profile_id || scope?.landlordId || scope?.businessId || null)
-
-    // S553/S633: EVERY entity this account owns — the whole of a landlord's
-    // identity now. Unions membership rows with founding ownership, because an
-    // account that predates `landlord_members` has a company it owns with no
-    // member row, and dropping profileId must not drop that company with it.
-    const landlordIds = user.role === 'landlord'
-      ? await query<{ landlord_id: string }>(
-          `SELECT landlord_id FROM landlord_members WHERE user_id = $1
-           UNION
-           SELECT id           FROM landlords        WHERE user_id = $1`, [user.id]
-        ).then((rows) => rows.map((r) => r.landlord_id))
-      : null
-    // S453: businessId carries either the owner's business (from JOIN) or
-    // the staff member's scoped business (from getScopeForUser). null for
-    // any non-business role.
-    const businessId = user.role === 'business_owner'
-      ? (user.business_id || null)
-      : (scope?.businessId || null)
-    const staffRole = user.role === 'business_staff'
-      ? (scope?.staffRole || null)
-      : null
+    const { scope, profileId, landlordIds, businessId, staffRole, claims } = await sessionClaimsFor(user)
 
     // S288: TOTP gate. If the user has 2FA enabled, don't issue the
     // full session JWT yet — mint a short-lived totp_session that
@@ -517,6 +674,7 @@ authRouter.post('/login', async (req, res, next) => {
         businessId,
         staffRole,
         permissions: scope?.permissions || null,
+        sp,
       })
       return res.json({
         success: true,
@@ -539,7 +697,20 @@ authRouter.post('/login', async (req, res, next) => {
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
       user.email_2fa_enabled = true
     }
-    if (user.email_2fa_enabled) {
+    // S654 (Nic): a sign-in that came through the bill's own emailed link has
+    // already shown the inbox — the thing the emailed code exists to prove. The
+    // link must vouch for THIS account (someone else's bill proves nothing about
+    // you); anything stale or foreign simply means the usual code. The password
+    // was still required above, so both factors are present either way.
+    const vouched = emailFactor ? verifyEmailFactorToken(emailFactor) : null
+    const inboxShown = !!vouched && vouched.userId === user.id
+      && vouched.email.toLowerCase() === String(user.email).toLowerCase()
+    if (inboxShown && user.email_verified !== true) {
+      await query(
+        `UPDATE users SET email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, NOW()), updated_at = NOW() WHERE id = $1`,
+        [user.id])
+    }
+    if (user.email_2fa_enabled && !inboxShown) {
       const emailOtpSession = signEmailOtpSessionToken({
         userId:      user.id,
         role:        user.role,
@@ -550,6 +721,7 @@ authRouter.post('/login', async (req, res, next) => {
         businessId,
         staffRole,
         permissions: scope?.permissions || null,
+        sp,
       })
       await issueEmailOtp(user.id, user.email)
       return res.json({
@@ -564,16 +736,7 @@ authRouter.post('/login', async (req, res, next) => {
     // server-side — not just by the client honoring mustEnrollTotp. S565: email
     // 2FA also satisfies the mandatory requirement, so it exempts from enroll.
     const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled
-    const claims = {
-      userId: user.id, role: user.role, email: user.email,
-      profileId,
-      landlordId: scope?.landlordId || null,
-      landlordIds,
-      businessId,
-      staffRole,
-      permissions: scope?.permissions || null,
-    }
-    const token = mustEnroll ? signTotpEnrollToken(claims) : signToken(claims)
+    const token = mustEnroll ? signTotpEnrollToken({ ...claims, sp }) : signSessionToken(claims, sp)
     res.json({
       success: true,
       data: { token, user: {
@@ -609,7 +772,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await queryOne<any>(
       `SELECT u.id, u.email, u.role, u.first_name, u.last_name, u.phone,
-         u.totp_enabled, u.email_2fa_enabled,
+         u.totp_enabled, u.email_2fa_enabled, u.sessions_valid_from,
          -- S630: so the account screen can show a change awaiting confirmation
          -- rather than looking like the request was lost.
          u.pending_email,
@@ -696,6 +859,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
        WHERE u.id = $1`, [req.user!.userId]
     )
     if (!user) throw new AppError(404, 'User not found')
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
 
     const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
     const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
@@ -746,14 +910,46 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
 })
 
 // POST /api/auth/refresh
-authRouter.post('/refresh', requireAuth, (req, res) => {
-  // req.user comes back from jwt.verify with iat+exp set; jwt.sign refuses
-  // to re-mint a token when expiresIn is supplied AND the payload already
-  // carries an exp. Strip both before re-signing so signToken's '7d' TTL
-  // is the only one in play.
-  const { iat, exp, ...claims } = req.user as any
-  const token = signToken(claims)
-  res.json({ success: true, data: { token } })
+//
+// S654 (Nic, live): "your most recent deploy signed me out of the landlord
+// portal." It was not the deploy. A session was a 7-day pass minted at the
+// password step and nothing ever renewed it, so every account was thrown out
+// on the seventh day whatever it was doing — his sign-in history is a login
+// every few days, and the deploy's reload merely surfaced the dead pass. The
+// portals now renew a pass that is more than a day old while it is in use
+// (sessionRenewalDue in @gam/shared), so a session ends only after seven IDLE
+// days. The renewed pass is rebuilt from the database, not copied from the old
+// one: a worker whose scope was pulled is out at the next renewal, a company
+// the account was added to shows up at the next renewal.
+//
+// Final sweep (10/3): A LOCK IS NOT A SIGN-OUT. A lock (five wrong passwords,
+// perhaps typed by someone else) answered 401 here, and every portal treats a
+// 401/403 from renewal as "this pass is dead" (isAuthRejection) — so a tenant
+// signed in on their phone was thrown out without a word the next time the app
+// came into view, and then could not sign back in until the lock ran out. The
+// pass they hold is still good: nothing else refuses it during a lock. So a
+// lock answers 423 ("Locked"), which no portal reads as a rejection: the
+// renewal is skipped, the current pass keeps its own expiry (seven days; a lock
+// lasts fifteen minutes), and the next renewal after the lock goes through.
+// The checks that DO end a session run first, so a lock never shields a pass a
+// password change revoked or a worker whose access was pulled.
+export const RENEWAL_LOCKED_STATUS = 423
+authRouter.post('/refresh', requireAuth, async (req, res, next) => {
+  try {
+    const user = await loadUserForSession('id', req.user!.userId)
+    if (!user) throw new AppError(401, 'Invalid or expired token')
+    assertPassPostdatesPasswordChange(req.user, user.sessions_valid_from)
+    const { claims } = await sessionClaimsFor(user)
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      throw new AppError(RENEWAL_LOCKED_STATUS,
+        'Your account is temporarily locked after too many sign-in attempts. You are still signed in; '
+        + 'your sign-in renews on its own once the lock ends.')
+    }
+    // S655: a fixed-length pass (admin console, Support, GAM Books without
+    // "Keep me signed in") is rebuilt here but keeps its original expiry, so no
+    // portal — not even one that renews automatically — can stretch it.
+    res.json({ success: true, data: { token: renewSessionToken(claims, req.user!) } })
+  } catch (e) { next(e) }
 })
 
 // PATCH /api/auth/me — update user profile
@@ -772,11 +968,57 @@ authRouter.patch('/me', requireAuth, async (req, res, next) => {
   } catch(e) { next(e) }
 })
 
+/**
+ * 10/5: an address that already has an account, coming back through the
+ * screening's account step. A security review (same day) ruled out continuing
+ * on the password alone: the inline step creates accounts for any address with
+ * no proof of the inbox, so a password is not proof of the person. What may be
+ * continued here, with an EMAILED CODE typed on the screening page itself, is
+ * the account this step leaves behind when an applicant stops part-way:
+ *   - a tenant account (never staff, a landlord or a business),
+ *   - its address never proven (a proven address signs in the normal way —
+ *     /login with its own emailed code, returning to the screening),
+ *   - no authenticator 2FA, not locked out.
+ * The code proves the inbox (and marks it verified, at /email-otp/verify), so
+ * whoever typed the password cannot get in without it.
+ */
+async function unprovenTenantAccount(userId: string): Promise<{
+  id: string; email: string; password_hash: string | null; tenant_id: string; locked_until: string | null
+} | null> {
+  const u = await queryOne<{
+    id: string; email: string; role: string; password_hash: string | null
+    email_verified: boolean | null; totp_enabled: boolean | null
+    locked_until: string | null; tenant_id: string | null
+  }>(
+    `SELECT u.id, u.email, u.role, u.password_hash, u.email_verified, u.totp_enabled,
+            u.locked_until::text AS locked_until,
+            (SELECT t.id FROM tenants t WHERE t.user_id = u.id LIMIT 1) AS tenant_id
+       FROM users u WHERE u.id = $1`, [userId])
+  if (!u || u.role !== 'tenant' || !u.tenant_id) return null
+  if (u.email_verified === true || u.totp_enabled === true) return null
+  return { id: u.id, email: u.email, password_hash: u.password_hash, tenant_id: u.tenant_id, locked_until: u.locked_until }
+}
+
+// Same cost as a real compare, so a refusal takes as long as a check would.
+const DUMMY_HASH = '$2a$12$C6UzMDM.H6dfI/f/IKcEeO5S2wEIqdgP5nnUKdlCuFXzUJ.Cd94Jm'
+
 // POST /api/auth/register-prospect — public, creates tenant account from listings page
 authRouter.post('/register-prospect', async (req, res, next) => {
   try {
-    const { firstName, lastName, email, password, phone, unitId, landlordId, acceptedTerms } = req.body
-    if (!firstName || !lastName || !email || !password)
+    const { firstName, lastName, email, password, phone, unitId, landlordId, acceptedTerms, inline } = req.body
+    // S642 (Nic, DIRECTIVE): "Can people pay for the background check, start the
+    // workflow, and have their tenant portal be created off of the information
+    // in the background check?… They never have a spot to type in their name.
+    // We're gonna generate accounts off a legal name."
+    //
+    // In the inline applicant flow the account is created from EMAIL + PASSWORD
+    // alone, partway through the screening form. No name is asked for here: a
+    // name is seeded later only because Checkr's Tenant order requires one to
+    // open the order, and the account's stored legal name is then overwritten
+    // by the matched name on the completed report.
+    if (!email || !password)
+      throw new AppError(400, 'email, password required')
+    if (!inline && (!firstName || !lastName))
       throw new AppError(400, 'firstName, lastName, email, password required')
     if (password.length < PASSWORD_MIN_LEN)
       throw new AppError(400, `Password must be at least ${PASSWORD_MIN_LEN} characters`)
@@ -791,8 +1033,51 @@ authRouter.post('/register-prospect', async (req, res, next) => {
     }
 
     // Check email not already taken
-    const existing = await queryOne('SELECT id FROM users WHERE email=$1', [email])
-    if (existing) throw new AppError(409, 'An account with this email already exists. Please sign in.')
+    const existing = await queryOne<{ id: string }>('SELECT id FROM users WHERE lower(email)=lower($1)', [email])
+    if (existing) {
+      // 10/5 (Nic): an applicant who stopped after this account step and came
+      // back to finish was stuck — "already exists, please sign in" on a page
+      // with no way to sign in. An unproven tenant account with the password
+      // set at this step continues ON THIS PAGE behind an emailed code
+      // (unprovenTenantAccount). Every other account signs in normally; the
+      // page offers that, returning here.
+      const acct = inline ? await unprovenTenantAccount(existing.id) : null
+      if (acct) {
+        if (acct.locked_until && new Date(acct.locked_until) > new Date()) {
+          throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+        }
+        const valid = !!acct.password_hash && await bcrypt.compare(password, acct.password_hash)
+        if (!valid) {
+          // Counted exactly as /login counts it, so this door is no easier to
+          // guess through than the sign-in page.
+          await db.query(
+            `UPDATE users
+                SET failed_login_count = failed_login_count + 1,
+                    locked_until = CASE
+                      WHEN failed_login_count + 1 >= $2
+                        THEN NOW() + ($3 || ' minutes')::interval
+                      ELSE locked_until
+                    END
+              WHERE id = $1`,
+            [acct.id, LOGIN_FAIL_LIMIT, LOGIN_LOCK_MINUTES])
+          throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+        }
+        await db.query(`UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = $1`, [acct.id])
+        const emailOtpSession = signEmailOtpSessionToken({
+          userId: acct.id, role: 'tenant', email: acct.email, profileId: acct.tenant_id,
+          landlordId: landlordId || null,
+          landlordIds: null, businessId: null, staffRole: null, permissions: null,
+        })
+        await issueEmailOtp(acct.id, acct.email)
+        return res.status(200).json({
+          success: true,
+          data: { requiresEmailOtp: true, emailOtpSession, resumed: true,
+            user: { id: acct.id, email: acct.email, firstName: '', lastName: '', role: 'tenant', profileId: acct.tenant_id } }
+        })
+      }
+      await bcrypt.compare(password, DUMMY_HASH)
+      throw new AppError(409, 'An account with this email already exists. Sign in to continue.')
+    }
 
     const hash = await bcrypt.hash(password, 12)
 
@@ -801,11 +1086,14 @@ authRouter.post('/register-prospect', async (req, res, next) => {
       await client.query('BEGIN')
 
       // Create user
+      // first_name/last_name are NOT NULL. In the inline flow they are not known
+      // yet, so they start empty and are filled from the Checkr match. Empty is
+      // the marker for "not established yet" — never a name we invented.
       const { rows: [user] } = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
                             accepted_tos_at, accepted_privacy_at)
          VALUES ($1,$2,'tenant',$3,$4,$5, NOW(), NOW()) RETURNING *`,
-        [email, hash, firstName, lastName, phone || null]
+        [email, hash, firstName || '', lastName || '', phone || null]
       )
 
       // Create tenant profile
@@ -831,11 +1119,36 @@ authRouter.post('/register-prospect', async (req, res, next) => {
       // inline in the background-check flow — the prospect signs up + verifies,
       // lands in the gated portal, THEN completes the check.
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
-      const emailOtpSession = signEmailOtpSessionToken({
+      const claims = {
         userId: user.id, role: 'tenant', email: user.email, profileId: tenant.id,
         landlordId: landlordId || null,
         landlordIds: null, businessId: null, staffRole: null, permissions: null,
-      })
+      }
+
+      // S642: the inline applicant flow issues a REAL session immediately.
+      //
+      // S578 withheld it behind an emailed 6-digit code. That code never gated
+      // account CREATION — the rows above are written either way — it gated only
+      // the session, and in a single-page flow it stops the applicant halfway
+      // through to go hunting in their inbox, which is the confusion this whole
+      // change exists to remove. The account at this instant is empty: a session
+      // on it grants access to nothing but itself.
+      //
+      // What the code was really protecting — somebody's screening report
+      // landing in an inbox they do not control — is still protected, at the
+      // point where it matters: email_2fa_enabled stays TRUE, so every LATER
+      // sign-in needs the code, and the report is not viewable until the address
+      // is verified.
+      if (inline) {
+        const token = signSessionToken(claims, sessionPolicyFor('tenant', null, false))
+        return res.status(201).json({
+          success: true,
+          data: { requiresEmailOtp: false, token,
+            user: { id: user.id, email: user.email, firstName: '', lastName: '', role: 'tenant', profileId: tenant.id } }
+        })
+      }
+
+      const emailOtpSession = signEmailOtpSessionToken(claims)
       await issueEmailOtp(user.id, user.email)
 
       res.status(201).json({
@@ -860,7 +1173,7 @@ authRouter.post('/register-prospect', async (req, res, next) => {
 // `users.reset_token` (S277 surfaced this column existed but no route
 // touched it). Cleared on successful use.
 
-const forgotPasswordSchema = z.object({ email: z.string().email() })
+const forgotPasswordSchema = z.object({ email: z.string().trim().toLowerCase().pipe(z.string().email()) })
 const resetPasswordSchema  = z.object({
   token:       z.string().min(1),
   newPassword: z.string().min(PASSWORD_MIN_LEN),
@@ -872,8 +1185,10 @@ const RESET_TOKEN_TTL_MINUTES = 60
 authRouter.post('/forgot-password', async (req, res, next) => {
   try {
     const { email } = forgotPasswordSchema.parse(req.body)
-    const user = await queryOne<{ id: string; first_name: string | null }>(
-      `SELECT id, first_name FROM users WHERE email = $1`,
+    // S639: role comes back too — the reset link's fallback destination depends
+    // on which portal this person actually signs in to.
+    const user = await queryOne<{ id: string; first_name: string | null; role: string }>(
+      `SELECT id, first_name, role FROM users WHERE lower(email) = lower($1)`,
       [email],
     )
     if (user) {
@@ -913,13 +1228,52 @@ authRouter.post('/forgot-password', async (req, res, next) => {
         ...PORTAL_LABELS.map((l) => `https://${l}.${APEX}`),
       ].filter(Boolean).map((u) => String(u).replace(/\/$/, ''))
       const origin = String(req.get('origin') || '').replace(/\/$/, '')
-      // Only ever echo back an origin we recognise — an attacker who could set
+      // Only ever echo back an origin we recognize — an attacker who could set
       // Origin freely would otherwise redirect a real reset token to their host.
+      // S639 (Nic): "the link you sent me is a password reset request for the
+      // landlord page, not for my admin login. Why is that the case?"
+      //
+      // Because with no recognized Origin this fell to a fixed default — the
+      // tenant app, or whatever RESET_PASSWORD_URL happened to say — with no
+      // regard for WHO is resetting. A reset fired from a script, a CLI or any
+      // client that does not send Origin therefore handed an admin a link into
+      // a product they do not log in to.
+      //
+      // The user is known here, so the fallback follows their ROLE, the same
+      // map the verification link uses. Origin still wins when it is one we
+      // recognize: the portal that served the form is the best answer, and
+      // echoing only allow-listed origins is what stops a forged Origin
+      // redirecting a live reset token somewhere else.
+      //
+      // S641 (Nic): "Lisa just tried to sign in on the landlord account… you
+      // might need to send her a reset password link."
+      //
+      // The map listed four roles and every OTHER staff role fell through to
+      // RESET_PASSWORD_URL — a variable that has never existed in any
+      // environment — and from there to the TENANT portal. So an on-site
+      // manager, a bookkeeper or a maintenance user asking to reset the password
+      // for a LANDLORD-portal login was mailed a link into the residents' app.
+      // Lisa is an on-site manager, which is exactly the hole.
+      //
+      // Every landlord-side staff role now resolves to the landlord portal.
+      // Listing them explicitly rather than defaulting: a role that belongs
+      // somewhere else must be a deliberate entry, not an accident of omission.
+      const LANDLORD_PORTAL_ROLES = [
+        'landlord', 'property_manager', 'onsite_manager', 'bookkeeper',
+        'maintenance', 'portfolio_manager',
+      ]
+      const landlordPortal = process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`
+      const roleFallback: Record<string, string | undefined> = {
+        admin:            process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
+        super_admin:      process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
+        ...Object.fromEntries(LANDLORD_PORTAL_ROLES.map(r => [r, landlordPortal])),
+      }
       const portalBase = ALLOWED_RESET_ORIGINS.includes(origin)
         ? origin
-        : (process.env.RESET_PASSWORD_URL
-            ? String(process.env.RESET_PASSWORD_URL).replace(/\/reset-password\/?$/, '')
-            : (process.env.TENANT_APP_URL || 'http://localhost:3002'))
+        : (roleFallback[user.role]
+            || (process.env.RESET_PASSWORD_URL
+                  ? String(process.env.RESET_PASSWORD_URL).replace(/\/reset-password\/?$/, '')
+                  : (process.env.TENANT_APP_URL || 'http://localhost:3002')))
       const base = `${String(portalBase).replace(/\/$/, '')}/reset-password`
       const resetUrl = `${base}?token=${encodeURIComponent(token)}`
       // Fire-and-forget — don't let email-send latency bound the
@@ -933,12 +1287,24 @@ authRouter.post('/forgot-password', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S655: an address just proven by a link from its own inbox (reset or
+// verification) — the same moment the emailed code is. A landlord account with
+// no company accepts the invitations waiting for that address here
+// (services/coOwnerInvites.ts). Best-effort: it never fails the request. Only
+// the address's FIRST proof claims, so if this claim fails nothing retries it
+// at a later sign-in; the person accepts from the invitation link while
+// signed in.
+async function claimOnProvenAddress(userId: string, firstVerification: boolean): Promise<void> {
+  try { await claimInvitationsOnProvenAddress(userId, { firstVerification }) }
+  catch (err) { logger.error({ err, userId }, '[auth] co-owner invitation claim failed') }
+}
+
 // POST /api/auth/reset-password
 authRouter.post('/reset-password', async (req, res, next) => {
   try {
     const { token, newPassword } = resetPasswordSchema.parse(req.body)
-    const user = await queryOne<{ id: string }>(
-      `SELECT id FROM users
+    const user = await queryOne<{ id: string; email_verified: boolean | null }>(
+      `SELECT id, email_verified FROM users
         WHERE reset_token = $1
           AND reset_token_expires IS NOT NULL
           AND reset_token_expires > NOW()`,
@@ -956,14 +1322,25 @@ authRouter.post('/reset-password', async (req, res, next) => {
     await query(
       `UPDATE users
           SET password_hash = $1,
+              sessions_valid_from = NOW(),   -- S654: every pass minted before this is dead
               reset_token = NULL,
               reset_token_expires = NULL,
               failed_login_count = 0,
               locked_until = NULL,
+              -- S650 (Ellen Gregory, Oak Park MH 02): the reset link went to
+              -- her inbox and she used it, which proves the address as surely
+              -- as a verification link does. Leaving email_verified FALSE sent
+              -- her straight into "verify your email first" on a password she
+              -- had just set, with no way out but another email.
+              email_verified = TRUE,
+              email_verified_at = COALESCE(email_verified_at, NOW()),
               updated_at = NOW()
         WHERE id = $2`,
       [hash, user.id],
     )
+    forgetSessionCutoff(user.id)
+    // S655: the same proof of the address accepts a waiting co-owner invitation.
+    await claimOnProvenAddress(user.id, user.email_verified !== true)
     res.json({ success: true, data: { message: 'Password updated. Please sign in with your new password.' } })
   } catch (e) { next(e) }
 })
@@ -1006,11 +1383,40 @@ export async function mintAndSendVerifyEmail(userId: string, email: string, firs
   // somewhere they do not have an account.
   const role = (await queryOne<{ role: string }>(
     `SELECT role FROM users WHERE id = $1`, [userId]))?.role ?? 'tenant'
-  const portal = role === 'landlord' || role === 'property_manager'
-    ? (process.env.LANDLORD_APP_URL || (process.env.NODE_ENV === 'production'
-        ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001'))
-    : (process.env.TENANT_APP_URL || (process.env.NODE_ENV === 'production'
-        ? 'https://tenant.goldassetmanagement.com' : 'http://localhost:3002'))
+  // S639 (Nic): "add the other admins on the admin portal. Point their login to
+  // not the localhost. Point it to the right thing. Every time they log in, it
+  // just shows them nothing."
+  //
+  // The role branch handled landlord and PM and let EVERYTHING ELSE fall to the
+  // tenant app — admins included. So Ben Ferrell and Nicholas Fausett, both
+  // super_admins, were mailed a verification link to tenant.goldassetmanagement
+  // .com, a product they have no account in. Login refuses an unverified account
+  // and helpfully re-sends the same wrong link, which is why Ben has three of
+  // them from 2026-09-05 and neither has ever reached a login code. Not "nothing
+  // shows" — they were never let in.
+  //
+  // Exactly the shape of the landlord bug fixed in S637, one role short. Written
+  // as a map now so the next role added cannot silently inherit the tenant app.
+  const portalFor: Record<string, string | undefined> = {
+    landlord:         process.env.LANDLORD_APP_URL,
+    property_manager: process.env.LANDLORD_APP_URL,
+    admin:            process.env.ADMIN_APP_URL,
+    super_admin:      process.env.ADMIN_APP_URL,
+  }
+  const devFallback: Record<string, string> = {
+    landlord: 'http://localhost:3001', property_manager: 'http://localhost:3001',
+    admin: 'http://localhost:3003', super_admin: 'http://localhost:3003',
+  }
+  const prodFallback: Record<string, string> = {
+    landlord: 'https://landlord.goldassetmanagement.com',
+    property_manager: 'https://landlord.goldassetmanagement.com',
+    admin: 'https://admin.goldassetmanagement.com',
+    super_admin: 'https://admin.goldassetmanagement.com',
+  }
+  const portal = portalFor[role]
+    || (process.env.NODE_ENV === 'production'
+          ? (prodFallback[role] || process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com')
+          : (devFallback[role] || process.env.TENANT_APP_URL || 'http://localhost:3002'))
   const base = process.env.VERIFY_EMAIL_URL || `${portal}/verify-email`
   const verifyUrl = `${base}?token=${encodeURIComponent(token)}`
   // Fire-and-forget; failures land in email_send_log.
@@ -1022,18 +1428,25 @@ authRouter.post('/verify-email', async (req, res, next) => {
   try {
     const { token } = verifyEmailSchema.parse(req.body)
     // Single-use: the same UPDATE clears the token. A replay sees
-    // email_verify_token=NULL and matches no row.
-    const r = await query<{ id: string }>(
-      `UPDATE users
+    // email_verify_token=NULL and matches no row. S655: `was_verified` says
+    // whether this link was the address's first proof.
+    const r = await query<{ id: string; was_verified: boolean | null }>(
+      `WITH prev AS (
+         SELECT id, email_verified FROM users WHERE email_verify_token = $1 FOR UPDATE
+       )
+       UPDATE users u
           SET email_verified = TRUE,
               email_verified_at = NOW(),
               email_verify_token = NULL,
               updated_at = NOW()
-        WHERE email_verify_token = $1
-        RETURNING id`,
+         FROM prev
+        WHERE u.id = prev.id
+        RETURNING u.id, prev.email_verified AS was_verified`,
       [token],
     )
     if (r.length === 0) throw new AppError(400, 'Verification link is invalid or already used')
+    // S655: the same proof of the address accepts a waiting co-owner invitation.
+    await claimOnProvenAddress(r[0].id, r[0].was_verified !== true)
     res.json({ success: true, data: { message: 'Email verified. You can now sign in.' } })
   } catch (e) { next(e) }
 })
@@ -1050,7 +1463,7 @@ authRouter.post('/resend-verification', async (req, res, next) => {
     const user = await queryOne<{
       id: string; first_name: string | null; email_verified: boolean
     }>(
-      `SELECT id, first_name, email_verified FROM users WHERE email = $1`,
+      `SELECT id, first_name, email_verified FROM users WHERE lower(email) = lower($1)`,
       [email],
     )
     if (user && !user.email_verified) {
@@ -1081,7 +1494,7 @@ authRouter.post('/resend-verification', async (req, res, next) => {
 
 const EMAIL_CHANGE_TTL_HOURS = 24
 
-/** Only ever echo back an origin we recognise — see forgot-password. */
+/** Only ever echo back an origin we recognize — see forgot-password. */
 function portalBaseForRequest(req: any): string {
   const APEX = 'goldassetmanagement.com'
   const LABELS = ['landlord', 'tenant', 'admin', 'pm', 'business', 'pos']

@@ -29,15 +29,23 @@ export type CsvImportPlatform =
 // landlords.ts; duplicated here so the mapping module is self-contained).
 //
 // S29X: outstanding_balance added — when a landlord migrates from a prior
-// platform we want day-1 AR to carry. Commit translates a non-zero value
-// into an opening-balance invoice attached to the imported lease.
+// platform we want day-1 AR to carry.
+//
+// S655: the tenant CSV fills a DRAFT ROSTER (who lives where), so the roster
+// columns come first: name, email, phone (optional), property, unit, and the
+// old system's balance (the one figure that becomes a real charge — once,
+// when the household's lease issues). The lease columns after it are
+// OPTIONAL and for reference only: the lease drafts from the landlord's own
+// setup (the unit's rent and its unit type's packet), and the review screen
+// flags where the file's rent differs. They stay because every platform
+// export carries them.
 export const GAM_CANONICAL_HEADERS = [
   'first_name', 'last_name', 'email', 'phone',
   'property_name', 'unit_number',
+  'outstanding_balance',
   'lease_start', 'lease_end', 'monthly_rent',
   'security_deposit', 'late_fee_amount', 'late_fee_grace_days',
   'auto_renew', 'auto_renew_mode', 'notice_days_required',
-  'outstanding_balance',
 ] as const
 
 export type GamCanonicalHeader = typeof GAM_CANONICAL_HEADERS[number]
@@ -588,13 +596,14 @@ export function buildTemplateCsv(platform: CsvImportPlatform): string {
 
   if (platform === 'generic') {
     const header = GAM_CANONICAL_HEADERS.join(',')
+    // Roster columns first; the lease columns are optional reference.
     const exampleRow = [
       'Jane', 'Doe', 'jane@example.com', '555-123-4567',
       'Sunset Apartments', '4B',
+      '0',
       '2024-06-01', '2025-05-31', '1850',
       '1850', '50', '5',
       'no', '', '30',
-      '0',
     ].join(',')
     return `${header}\n${exampleRow}\n`
   }

@@ -30,6 +30,8 @@ import { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
+import { replyToProperty } from './replyRouting'
 
 
 export interface GenerateSubleaseDocumentResult {
@@ -46,6 +48,7 @@ interface SubleaseContext {
   unit_id:           string
   unit_number:       string
   property_name:     string
+  property_id:       string
   property_template_url: string | null
   landlord_name:     string
   sublessor_tenant_id:   string
@@ -58,6 +61,7 @@ interface SubleaseContext {
   sublessee_email:       string
   start_date:        string
   end_date:          string | null
+  property_timezone: string | null
   sub_monthly_amount: string
   master_share_amount: string
   notes:             string | null
@@ -67,7 +71,7 @@ async function loadSubleaseContext(subleaseId: string): Promise<SubleaseContext>
   const row = await queryOne<SubleaseContext>(`
     SELECT s.id, s.master_lease_id, l.landlord_id, l.unit_id,
            u.unit_number,
-           p.name AS property_name,
+           p.name AS property_name, p.id AS property_id,
            p.sublease_agreement_template_url AS property_template_url,
            lu.first_name || ' ' || lu.last_name AS landlord_name,
            s.sublessor_tenant_id, t_or.user_id AS sublessor_user_id,
@@ -78,6 +82,7 @@ async function loadSubleaseContext(subleaseId: string): Promise<SubleaseContext>
            ur_ee.email AS sublessee_email,
            s.start_date::text  AS start_date,
            s.end_date::text    AS end_date,
+           p.timezone          AS property_timezone,
            s.sub_monthly_amount::text   AS sub_monthly_amount,
            s.master_share_amount::text  AS master_share_amount,
            s.notes
@@ -108,7 +113,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   const { width, height } = page.getSize()
   const margin = 54
   const black = rgb(0, 0, 0)
-  const grey  = rgb(0.4, 0.4, 0.4)
+  const gray  = rgb(0.4, 0.4, 0.4)
   const gold  = rgb(0.788, 0.635, 0.153)
 
   let y = height - margin
@@ -127,24 +132,33 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
 
   // Property + dates block
   const moneyFmt = (n: string) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  const dateFmt  = (d: string | null) => d ? new Date(d).toLocaleDateString(undefined, { year:'numeric', month:'long', day:'numeric' }) : '(open-ended)'
+  // S654: a 'YYYY-MM-DD' calendar day printed as itself — never read at UTC
+  // midnight, which printed the day before on a Phoenix clock.
+  const dateFmt  = (d: string | null) => {
+    const m = d ? /^(\d{4})-(\d{2})-(\d{2})/.exec(d) : null
+    return m
+      ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+          .toLocaleDateString('en-US', { timeZone: 'UTC', year: 'numeric', month: 'long', day: 'numeric' })
+      : '(open-ended)'
+  }
 
   const infoLines: Array<[string, string]> = [
     ['Property:',  ctx.property_name],
     ['Unit:',      ctx.unit_number],
     ['Term:',      `${dateFmt(ctx.start_date)} – ${dateFmt(ctx.end_date)}`],
     ['Sub rent:',  `${moneyFmt(ctx.sub_monthly_amount)} / month, paid by the Sublessee to GAM`],
-    ['Effective:', new Date().toLocaleDateString(undefined, { year:'numeric', month:'long', day:'numeric' })],
+    // S654: the property's today, the calendar the consent date is stored on.
+    ['Effective:', dateFmt(todayIn(ctx.property_timezone))],
   ]
   for (const [label, value] of infoLines) {
-    page.drawText(label, { x: margin,       y, size: 10, font: helveticaBold, color: grey })
+    page.drawText(label, { x: margin,       y, size: 10, font: helveticaBold, color: gray })
     page.drawText(value, { x: margin + 110, y, size: 10, font: helvetica,     color: black })
     y -= 16
   }
   y -= 8
 
   // Parties
-  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('PARTIES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
   page.drawText('Sublessor (original tenant):', { x: margin, y, size: 10, font: helveticaBold, color: black })
   y -= 14
@@ -160,7 +174,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   y -= 18
 
   // Terms / boilerplate
-  page.drawText('TERMS', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('TERMS', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 16
   const terms = [
     '1. The Sublessor remains responsible to the property owner under the master lease.',
@@ -182,7 +196,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   }
   y -= 10
   if (ctx.notes) {
-    page.drawText('ADDITIONAL NOTES', { x: margin, y, size: 10, font: helveticaBold, color: grey })
+    page.drawText('ADDITIONAL NOTES', { x: margin, y, size: 10, font: helveticaBold, color: gray })
     y -= 14
     const wrapped = wrapText(ctx.notes, 92)
     for (const line of wrapped) {
@@ -193,7 +207,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
   }
 
   // Signatures
-  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: grey })
+  page.drawText('SIGNATURES', { x: margin, y, size: 11, font: helveticaBold, color: gray })
   y -= 22
   for (const [label, name] of [
     ['Sublessor', ctx.sublessor_name],
@@ -205,11 +219,11 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
     }
     page.drawText(`${label}: ${name}`, { x: margin, y, size: 10, font: helveticaBold, color: black })
     y -= 14
-    page.drawLine({ start: { x: margin,       y }, end: { x: margin + 240, y }, thickness: 0.7, color: grey })
-    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: grey })
+    page.drawLine({ start: { x: margin,       y }, end: { x: margin + 240, y }, thickness: 0.7, color: gray })
+    page.drawLine({ start: { x: margin + 280, y }, end: { x: margin + 420, y }, thickness: 0.7, color: gray })
     y -= 11
-    page.drawText('Signature', { x: margin,       y, size: 8, font: helvetica, color: grey })
-    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: grey })
+    page.drawText('Signature', { x: margin,       y, size: 8, font: helvetica, color: gray })
+    page.drawText('Date',      { x: margin + 280, y, size: 8, font: helvetica, color: gray })
     y -= 26
   }
 
@@ -312,7 +326,8 @@ export async function generateSubleaseDocument(args: {
       `Unit ${ctx.unit_number} — ${ctx.property_name}`,
       ctx.landlord_name,
       signingUrl,
-      { landlordId: ctx.landlord_id, documentId: doc.id },
+      // 10/5: the sublessor's reply reaches the people who run this property (services/replyRouting).
+      { landlordId: ctx.landlord_id, documentId: doc.id, replyTo: replyToProperty(ctx.property_id) },
     )
   } catch (e) {
     logger.error({ err: e }, '[SUBLEASE-DOC] signer email failed:')
@@ -363,21 +378,27 @@ export async function executeSubleaseAgreementCompletion(
     const doc = docRes.rows[0]
     if (!doc) throw new Error(`Sublease document ${args.documentId} not found`)
 
-    const subRes = await client.query<{ id: string }>(
-      `SELECT id FROM subleases WHERE sublease_document_id = $1`,
+    const subRes = await client.query<{ id: string; timezone: string | null }>(
+      `SELECT s.id, p.timezone
+         FROM subleases s
+         LEFT JOIN leases l ON l.id = s.master_lease_id
+         LEFT JOIN units u ON u.id = l.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+        WHERE s.sublease_document_id = $1`,
       [args.documentId],
     )
     const sublease = subRes.rows[0]
     if (!sublease) throw new Error(`Sublease for document ${args.documentId} not found`)
 
+    // S654: an undated consent takes the PROPERTY's today, not the database's.
     await client.query(
       `UPDATE subleases
           SET status                = 'active',
               sublease_document_url = $1,
-              landlord_consent_date = COALESCE(landlord_consent_date, CURRENT_DATE),
+              landlord_consent_date = COALESCE(landlord_consent_date, $3::date),
               updated_at            = NOW()
         WHERE id = $2`,
-      [doc.executed_pdf_url || doc.base_pdf_url, sublease.id],
+      [doc.executed_pdf_url || doc.base_pdf_url, sublease.id, todayIn(sublease.timezone)],
     )
 
     return { subleaseId: sublease.id, status: 'active' }

@@ -64,7 +64,7 @@ interface Scenario {
 //   "Honestly, I'm GAM's AI assistant — but I can get you on a quick call with
 //    a real person on the team whenever you want."
 //
-// That is exactly the behaviour the S598 directive asks for — disclose the AI
+// That is exactly the behavior the S598 directive asks for — disclose the AI
 // honestly when asked, then offer a handoff — and the test called it a
 // violation. Grading a surface string instead of the meaning marks correct
 // answers wrong, which erodes trust in the suite faster than a missed bug does.

@@ -43,6 +43,21 @@ describe('stampPdf', () => {
     expect(parsed.getPageCount()).toBe(3)
   })
 
+  // S652 (Nic): a choice group's box prints an X or a check, or the signer's
+  // initials when the group is marked that way; fixed text prints as text.
+  it('stamps choice boxes (X / check / initials) and fixed text', async () => {
+    const src = await makeSourcePdf(1)
+    const fields = [
+      { page: 1, x: 50, y: 100, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'x', value: '(a)(i)' },
+      { page: 1, x: 50, y: 130, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'check', value: '(a)(ii)' },
+      { page: 1, x: 50, y: 160, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'initials', value: 'JD', font_css: 'cursive' },
+      { page: 1, x: 50, y: 190, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'x', value: null },
+      { page: 1, x: 50, y: 220, width: 200, height: 16, field_type: 'fixed_text', value: '$150.00' },
+    ] as any[]
+    const parsed = await PDFDocument.load(await stampPdf(src, fields, [signerOne]))
+    expect(parsed.getPageCount()).toBe(2)
+  })
+
   it('handles text + date + checkbox + signature field types without throwing', async () => {
     const src = await makeSourcePdf(1)
     const fields = [
@@ -124,19 +139,80 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
     field_type: 'signature', signer_role: 'primary',
   }
 
+  async function fontsDrawn(bytes: Buffer): Promise<string[]> {
+    const { PDFDocument: Doc, PDFName, PDFArray, PDFDict, decodePDFRawStream } = await import('pdf-lib')
+    const doc = await Doc.load(bytes)
+    const page = doc.getPages()[0]
+    const contents: any = page.node.Contents()
+    const streams = contents instanceof PDFArray
+      ? contents.asArray().map((r: any) => doc.context.lookup(r)) : [contents]
+    let ops = ''
+    for (const st of streams) ops += Buffer.from(decodePDFRawStream(st as any).decode()).toString('latin1')
+    const fonts = page.node.Resources()!.lookup(PDFName.of('Font'), PDFDict)
+    return [...ops.matchAll(/\/(\S+)\s+[\d.]+\s+Tf/g)].map(m =>
+      String(fonts.lookup(PDFName.of(m[1]), PDFDict).lookup(PDFName.of('BaseFont'))))
+  }
+
   it('an italic/script choice does not render in the body font', async () => {
     const src = await makeSourcePdf(1)
     const styled = await stampPdf(src, [{ ...base, value: 'Mireya Fierro',
       font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [])
     const plain = await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [])
 
-    // Different embedded faces produce different bytes for the same name.
-    expect(styled.length).not.toBe(plain.length)
+    // S652: ask which face actually DREW the name. Comparing file lengths
+    // failed the day two different faces happened to produce equal lengths.
+    expect(await fontsDrawn(styled)).toContain('/Times-Italic')
+    expect(await fontsDrawn(plain)).not.toContain('/Times-Italic')
   })
 
   it('a missing choice still stamps, and never throws', async () => {
     const src = await makeSourcePdf(1)
     const bytes = await stampPdf(src, [{ ...base, value: 'Mireya Fierro' } as any], [])
     expect(bytes.length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * S652 — a name on a lease is never shortened.
+ *
+ * Blu, reading Lot 1: "the tenant name, Nancy Sheptock, was cut off. The last
+ * name just has S-H-E dot dot dot."
+ *
+ * He was reading the signing SCREEN, which shrank to a 6px floor and then let
+ * CSS hide the rest. The stamper did something different and arguably worse: it
+ * sized on the box's HEIGHT alone, so the full name was drawn at up to 10pt and
+ * ran out past the box across whatever was printed beside it. The screen and
+ * the document disagreed about what the lease said, which for an e-sign product
+ * is the actual defect.
+ */
+describe('S652: text is shrunk to fit its box, never cut', () => {
+  const LONG = 'Bartholomew Featherstonehaugh-Cholmondeley'
+
+  it('stamps a long value into a narrow box without throwing or truncating', async () => {
+    const src = await makeSourcePdf(1)
+    const out = await stampPdf(src, [
+      // 41 characters into 60 points — impossible at 10pt, fine once shrunk.
+      { page: 1, x: 50, y: 100, width: 60, height: 12, field_type: 'text', value: LONG },
+    ], [signerOne])
+    const parsed = await PDFDocument.load(out)
+    expect(parsed.getPageCount()).toBe(2)
+    // The bytes carry the whole name — nothing was shortened on its way in.
+    expect(out.length).toBeGreaterThan(0)
+  })
+
+  it('does not shrink a value that already fits', async () => {
+    const src = await makeSourcePdf(1)
+    const out = await stampPdf(src, [
+      { page: 1, x: 50, y: 100, width: 300, height: 14, field_type: 'text', value: 'Nancy Sheptock' },
+    ], [signerOne])
+    expect(out.length).toBeGreaterThan(0)
+  })
+
+  it('handles a signature that overruns its box', async () => {
+    const src = await makeSourcePdf(1)
+    const out = await stampPdf(src, [
+      { page: 1, x: 50, y: 200, width: 80, height: 40, field_type: 'signature', value: LONG },
+    ], [signerOne])
+    expect(out.length).toBeGreaterThan(0)
   })
 })

@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -10,23 +10,51 @@ import '@fontsource/dm-sans/600.css'
 import '@fontsource/dm-mono/400.css'
 import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+// 10/11 (Nic): "a bookkeeper in the bookkeeper portal scoped to certain
+// properties should see those properties in the bookkeeper portal as well...
+// It's kind of like the point of sale where it's byte identical." The landlord
+// portal's financial pages, the same files (src/financials,
+// financials-parity.test.ts), shown here for the company that is open.
+import { IncomePage } from './financials/IncomePage'
+import { ExpensesPage } from './financials/ExpensesPage'
+import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+import { ReportsPage } from './financials/ReportsPage'
+import { BankActivityPage } from './financials/BankActivityPage'
+import { PayoutsPage } from './financials/PayoutsPage'
+import { FinancialsViewerContext } from './financials/adapter'
+import './financialsHost.css'
 import React, { createContext, useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'react-query'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, humanize } from '@gam/shared'
+import {
+  formatCurrency, applyCamelizeInterceptor, humanize,
+  INCOME_BASES, DEFAULT_INCOME_BASIS, INCOME_BASIS_LABEL, INCOME_BASIS_NOTE, UNIT_STATUS_LABEL,
+  type IncomeBasis,
+} from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
+import {
+  rentRollVariance, rentPayers, splitBeside, loadErrorText, localToday, PAID_AHEAD_COUNTED_NOTE,
+  companyChoiceState, companyName, type CompanyChoice,
+} from './lib/booksMoney'
 
-const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
-const ADMIN_URL = (import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'
+const ENV = (import.meta as any).env || {}
+const API = ENV.VITE_API_URL || 'http://localhost:4000'
+const ADMIN_URL = ENV.VITE_ADMIN_APP_URL || 'http://localhost:3003'
+// S655: Books people are on the landlord side, so password recovery is there.
+const LANDLORD_URL = ENV.VITE_LANDLORD_APP_URL || (ENV.PROD ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001')
 const api = axios.create({ baseURL: `${API}/api` })
-const TOKEN_KEYS = ['gam_admin_token', 'gam_books_token']
-const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean) || null
+// S655: Books keeps ONE pass, its own. It used to also read 'gam_admin_token'
+// and take a pass from the web address (?token=), which is how the admin
+// console's "GAM Books" button handed over a super_admin pass in a URL — only
+// for Books to refuse it, since admins are kept out (S568).
+const TOKEN = 'gam_books_token'
+const getToken = () => localStorage.getItem(TOKEN)
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
+api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ localStorage.removeItem(TOKEN); window.location.href='/login' } noteClientGone(e); return Promise.reject(e) })
 // Inject active client header for bookkeepers
-api.interceptors.request.use(c=>{ const cid=localStorage.getItem('gam_books_client'); if(cid) c.headers['X-Client-Id']=cid; return c })
+api.interceptors.request.use(c=>{ let cid:string|null=null; try{ cid=localStorage.getItem('gam_books_client') }catch{ /* blocked storage */ } if(cid) c.headers['X-Client-Id']=cid; return c })
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
@@ -39,44 +67,144 @@ const del=(url:string)=>api.delete(url).then(r=>r.data)
 // bookkeepers + business/POS operators.
 const ALLOWED_ROLES=['landlord','bookkeeper','business_owner','business_staff']
 interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;landlordId?:string;activeClientId?:string;activeClientName?:string}
-interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void;login:(e:string,p:string)=>Promise<void>;logout:()=>void}
+const BOOKS_ONLY='GAM Books is for landlords, their bookkeepers, and business owners and staff.'
+// S655: every sign-in has a second step since S578 — the emailed code, or an
+// authenticator app. Books never had one, so nobody could sign in at all.
+type LoginResult={kind:'success'}|{kind:'totp_required';totpSession:string}|{kind:'email_otp_required';emailOtpSession:string}
+interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void;clearActiveClient:()=>void
+  login:(e:string,p:string,keepSignedIn:boolean)=>Promise<LoginResult>
+  loginWithTotp:(totpSession:string,code:string)=>Promise<void>
+  loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
+  resendEmailOtp:(emailOtpSession:string)=>Promise<void>
+  logout:()=>void}
+const toAuthUser=(u:any):AuthUser=>({id:u.id,email:u.email,role:u.role,firstName:u.firstName||'',lastName:u.lastName||'',landlordId:u.landlordId||undefined})
 const Ctx=createContext<AuthCtx>(null!)
 const useAuth=()=>useContext(Ctx)
+
+// S655: the company (a bookkeeper's client, or one of a landlord account's
+// companies) whose books are open is remembered per person: a choice made by
+// someone else on this computer is forgotten before any request carries it.
+const CLIENT_KEY='gam_books_client', CLIENT_NAME_KEY='gam_books_client_name', CLIENT_OWNER_KEY='gam_books_client_user'
+const readStore=(k:string)=>{ try{ return localStorage.getItem(k) }catch{ return null } }
+const forgetClient=()=>{ try{ localStorage.removeItem(CLIENT_KEY); localStorage.removeItem(CLIENT_NAME_KEY); localStorage.removeItem(CLIENT_OWNER_KEY) }catch{ /* blocked storage */ } }
+// 10/11: a bookkeeper whose access to the open client was removed is answered
+// "You are not assigned to …". The remembered client is forgotten and the app
+// told, so the client picker comes back instead of every page erroring.
+// (The shared financial pages' adapter sends the same event.)
+const CLIENT_GONE='gam-books-client-gone'
+function noteClientGone(e:any){
+  const said=String(e?.response?.data?.error||'')
+  if(e?.response?.status===403&&/^You are not assigned to (that company's books|this client)/.test(said)){ forgetClient(); window.dispatchEvent(new Event(CLIENT_GONE)) }
+}
+// A choice saved before choices were remembered per person has no owner: it is
+// taken as this person's (the server still checks it, and a landlord's company
+// picker forgets one that is not theirs), so nobody has to pick again.
+const keepClientOnlyFor=(userId:string)=>{
+  const owner=readStore(CLIENT_OWNER_KEY)
+  if(owner===null){ if(readStore(CLIENT_KEY)){ try{ localStorage.setItem(CLIENT_OWNER_KEY,userId) }catch{ /* blocked storage */ } } return }
+  if(owner!==userId) forgetClient()
+}
 
 function AuthProvider({children}:{children:React.ReactNode}){
   const[user,setUser]=useState<AuthUser|null>(null)
   const[loading,setLoading]=useState(true)
-  const[activeClientId,setActiveClientId]=useState<string|null>(()=>localStorage.getItem('gam_books_client'))
-  const logout=React.useCallback(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization']; setUser(null) },[])
+  const[activeClientId,setActiveClientId]=useState<string|null>(()=>readStore(CLIENT_KEY))
+  // S639 SECURITY: a change of identity empties the client cache, so one
+  // person's cached books never show under the next person's sign-in.
+  const _qc=useQueryClient()
+  const wipeCache=()=>{ try{ _qc.clear() }catch{ /* no cache yet */ } }
+  const logout=React.useCallback(()=>{ wipeCache(); localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) },[])
+
+  // S655: a Books sign-in ends 7 days after it started, even mid-task, unless
+  // "Keep me signed in on this device" was ticked. sessionRenewalDue() says no
+  // for a fixed pass, so this only ever renews a kept sign-in (the server
+  // refuses to extend a fixed one regardless) — on load and whenever Books
+  // comes back into view, once the pass is more than a day old.
+  const renewSession=React.useCallback(async()=>{
+    const current=getToken()
+    if(!sessionRenewalDue(current))return
+    try{
+      const r=await api.post('/auth/refresh',{})
+      // A sign-out (or another sign-in) while this was in flight wins.
+      if(getToken()!==current)return
+      const tk=r.data?.data?.token
+      if(!tk)return
+      localStorage.setItem(TOKEN,tk)
+      api.defaults.headers.common['Authorization']='Bearer '+tk
+    }catch(e){ if(isAuthRejection(e)) logout() }
+  },[logout])
+
   React.useEffect(()=>{
-    const params=new URLSearchParams(window.location.search)
-    const urlToken=params.get('token')
-    if(urlToken){ localStorage.setItem('gam_books_token',urlToken); window.history.replaceState({},'',window.location.pathname) }
     const t=getToken()
     if(!t){setLoading(false);return}
     api.defaults.headers.common['Authorization']='Bearer '+t
-    fetchAuthMeWithRetry(() => api.get('/auth/me')).then(res=>{
+    fetchAuthMeWithRetry(() => api.get('/auth/me')).then(async res=>{
       const u=res.data.data
       if(!u||!ALLOWED_ROLES.includes(u.role)){logout();return}
-      setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
+      keepClientOnlyFor(u.id); setActiveClientId(readStore(CLIENT_KEY))
+      setUser(toAuthUser(u))
+      await renewSession()
     }).catch((e:any)=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
-  },[logout])
-  const login=async(email:string,password:string)=>{
-    const res=await axios.post(`${API}/api/auth/login`,{email,password})
-    const{token:tk,user:u}=res.data.data
-    if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error('GAM Books is for landlords, their bookkeepers, and business operators')
-    localStorage.setItem('gam_books_token',tk)
+  },[logout,renewSession])
+  React.useEffect(()=>{
+    const onVisible=()=>{ if(document.visibilityState==='visible') renewSession() }
+    document.addEventListener('visibilitychange',onVisible)
+    return()=>document.removeEventListener('visibilitychange',onVisible)
+  },[renewSession])
+
+  // The full pass from whichever step finished the sign-in.
+  const acceptPass=async(tk:string)=>{
+    wipeCache(); localStorage.setItem(TOKEN,tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
-    setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
+    try{
+      const res=await fetchAuthMeWithRetry(() => api.get('/auth/me'))
+      const u=res.data.data
+      if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error(BOOKS_ONLY)
+      keepClientOnlyFor(u.id); setActiveClientId(readStore(CLIENT_KEY))
+      setUser(toAuthUser(u))
+    }catch(e){ logout(); throw e }
+  }
+  // S655: portal 'books' — the server refuses anyone Books does not serve
+  // before any code is emailed, and signs in for a fixed length unless kept.
+  const login=async(email:string,password:string,keepSignedIn:boolean):Promise<LoginResult>=>{
+    const res=await axios.post(`${API}/api/auth/login`,{email,password,portal:'books',keepSignedIn})
+    const data=res.data.data
+    if(data.requiresTotp)return{kind:'totp_required',totpSession:data.totpSession as string}
+    if(data.requiresEmailOtp)return{kind:'email_otp_required',emailOtpSession:data.emailOtpSession as string}
+    await acceptPass(data.token)
+    return{kind:'success'}
+  }
+  const loginWithTotp=async(totpSession:string,code:string)=>{
+    const res=await axios.post(`${API}/api/auth/totp/verify`,{totpSession,code})
+    await acceptPass(res.data.data.token)
+  }
+  const loginWithEmailOtp=async(emailOtpSession:string,code:string)=>{
+    const res=await axios.post(`${API}/api/auth/email-otp/verify`,{emailOtpSession,code})
+    await acceptPass(res.data.data.token)
+  }
+  const resendEmailOtp=async(emailOtpSession:string)=>{
+    await axios.post(`${API}/api/auth/email-otp/resend`,{emailOtpSession})
   }
   const setActiveClient=(id:string,name:string)=>{
-    localStorage.setItem('gam_books_client',id)
-    localStorage.setItem('gam_books_client_name',name)
+    try{
+      localStorage.setItem(CLIENT_KEY,id)
+      localStorage.setItem(CLIENT_NAME_KEY,name)
+      if(user?.id) localStorage.setItem(CLIENT_OWNER_KEY,user.id)
+    }catch{ /* blocked storage: the choice holds for this visit only */ }
+    // S655: one company's figures never show under another's name — the
+    // cached screens are dropped and re-read for the company just opened.
+    if(id!==activeClientId) wipeCache()
     setActiveClientId(id)
     setUser(u=>u?{...u,activeClientId:id,activeClientName:name}:u)
   }
-  const activeClientName=localStorage.getItem('gam_books_client_name')
-  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,login,logout}}>{children}</Ctx.Provider>
+  const clearActiveClient=React.useCallback(()=>{ forgetClient(); setActiveClientId(null); wipeCache() },[])
+  React.useEffect(()=>{
+    const gone=()=>{ setActiveClientId(null); wipeCache() }
+    window.addEventListener(CLIENT_GONE,gone)
+    return()=>window.removeEventListener(CLIENT_GONE,gone)
+  },[])
+  const activeClientName=readStore(CLIENT_NAME_KEY)
+  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,clearActiveClient,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,logout}}>{children}</Ctx.Provider>
 }
 
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
@@ -171,6 +299,19 @@ input[type=text],input[type=email],input[type=number],input[type=date],input[typ
 input:focus,select:focus,textarea:focus{border-color:var(--gold)}
 .factions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;padding-top:14px;border-top:1px solid var(--b0)}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* S655: the "Money received" / "Money billed" switch */
+.basis-sw{display:inline-flex;gap:3px;padding:3px;background:var(--bg3);border:1px solid var(--b1);border-radius:999px}
+.basis-sw button{border:none;background:transparent;color:var(--t2);font-family:var(--font-b);font-size:.74rem;font-weight:600;padding:5px 12px;border-radius:999px;cursor:pointer;white-space:nowrap}
+.basis-sw button:hover{color:var(--t0)}
+.basis-sw button.on{background:var(--gold);color:#080a0c}
+.basis-note{font-size:.72rem;color:var(--t3);line-height:1.5;margin:-8px 0 16px;max-width:760px}
+.dr-sub .dk{padding-left:14px}
+.bnote{margin-top:10px;font-size:.72rem;color:var(--t3);line-height:1.5}
+/* S655: which company's books (a landlord account with several) */
+.company-pick{max-width:560px}
+.company-pick-list{display:grid;gap:8px;margin-top:16px}
+.company-pick-list .btn{justify-content:space-between;padding:11px 14px;font-size:.84rem;text-align:left;flex-wrap:wrap}
+.company-pick-sub{font-weight:500;font-size:.72rem;opacity:.75}
 `
 
 // ── MODAL ─────────────────────────────────────────────────────────────
@@ -193,6 +334,14 @@ function Layout(){
   const{user,logout}=useAuth()
   const navigate=useNavigate()
   const isAdmin=user?.role==='admin'||user?.role==='super_admin'
+  // 10/11: the shared financial pages are about a landlord company's money —
+  // its owner and its bookkeeper; business accounts keep their own Books.
+  const isBookkeeper=user?.role==='bookkeeper'
+  const showFinancials=user?.role==='landlord'||isBookkeeper
+  // 10/11: the bank account and payouts are company-wide; a bookkeeper kept to
+  // some of a company's properties is refused both, so the tabs are not shown.
+  const{data:finScope}=useQuery<{wholeCompany:boolean}>('financials-scope',()=>get<{wholeCompany:boolean}>('/financials/scope'),{enabled:isBookkeeper,staleTime:60_000})
+  const showCompanyWide=!isBookkeeper||finScope?.wholeCompany!==false
   return(
     <div className="shell">
       <aside className="sidebar">
@@ -204,6 +353,15 @@ function Layout(){
           <div className="nl">Overview</div>
           <NavLink to="/dashboard" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Dashboard</NavLink>
           {(user?.role==='bookkeeper'||isAdmin)&&<NavLink to="/clients" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 My Clients</NavLink>}
+          {showFinancials&&<>
+            <div className="nl" style={{marginTop:8}}>Financials</div>
+            <NavLink to="/financials/income"            className={({isActive})=>`ni${isActive?' active':''}`}>💵 Money In</NavLink>
+            <NavLink to="/financials/expenses"          className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Expenses</NavLink>
+            <NavLink to="/financials/maintenance-costs" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Maintenance Costs</NavLink>
+            <NavLink to="/financials/reports"           className={({isActive})=>`ni${isActive?' active':''}`}>📊 Reports</NavLink>
+            {showCompanyWide&&<NavLink to="/financials/bank-activity" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Activity</NavLink>}
+            {showCompanyWide&&<NavLink to="/financials/payouts"       className={({isActive})=>`ni${isActive?' active':''}`}>💸 Payouts</NavLink>}
+          </>}
           <div className="nl" style={{marginTop:8}}>Payroll</div>
           <NavLink to="/payroll/employees"   className={({isActive})=>`ni${isActive?' active':''}`}>👥 Employees (W-2)</NavLink>
           <NavLink to="/payroll/contractors" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Contractors (1099)</NavLink>
@@ -217,8 +375,8 @@ function Layout(){
           <NavLink to="/books/transactions" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Transactions</NavLink>
           <NavLink to="/books/reconcile"    className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Reconciliation</NavLink>
           <div className="nl" style={{marginTop:8}}>Property Finance</div>
-          <NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>
-          <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}>💸 Owner Disbursements</NavLink>
+          {/* 10/11 (Nic): the rent roll names every tenant — never a bookkeeper's. */}
+          {!isBookkeeper&&<NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>}
           <NavLink to="/bills"         className={({isActive})=>`ni${isActive?' active':''}`}>📄 Bills & AP</NavLink>
           <div className="nl" style={{marginTop:8}}>Reports</div>
           <NavLink to="/reports/pl"               className={({isActive})=>`ni${isActive?' active':''}`}>📈 P&amp;L</NavLink>
@@ -234,7 +392,7 @@ function Layout(){
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
-            <div style={{marginTop:3}}><span className={`badge ${isAdmin?'br':'bgold'}`} style={{fontSize:'.6rem'}}>{isAdmin?'Admin':'Landlord'}</span></div>
+            <div style={{marginTop:3}}><span className={`badge ${isAdmin?'br':'bgold'}`} style={{fontSize:'.6rem'}}>{isAdmin?'Admin':isBookkeeper?'Bookkeeper':'Landlord'}</span></div>
           </div>
           {isAdmin&&<a href={ADMIN_URL} className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
@@ -248,7 +406,7 @@ function Layout(){
             <span className="badge bgold">Beta</span>
           </div>
         </header>
-        <div className="page"><Outlet/></div>
+        <div className="page"><CompanyGate><Outlet/></CompanyGate></div>
       </div>
     </div>
   )
@@ -1100,7 +1258,7 @@ function JournalEntries(){
   const{data:entryDetail}=useQuery(['je',selectedEntry?.id],()=>get<any>('/books/journal/'+selectedEntry.id),{enabled:!!selectedEntry?.id})
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
-  const initForm={date:new Date().toISOString().split('T')[0],description:'',reference:'',lines:[{accountId:'',description:'',debit:'',credit:''},{accountId:'',description:'',debit:'',credit:''}]}
+  const initForm={date:localToday(),description:'',reference:'',lines:[{accountId:'',description:'',debit:'',credit:''},{accountId:'',description:'',debit:'',credit:''}]}
   const[form,setForm]=useState(initForm)
 
   const totalDebits=form.lines.reduce((s,l)=>s+(+l.debit||0),0)
@@ -1275,7 +1433,7 @@ function Transactions(){
   const[showAdd,setShowAdd]=useState(false)
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
-  const init={date:new Date().toISOString().split('T')[0],description:'',amount:'',type:'expense',category:'',accountId:'',reference:''}
+  const init={date:localToday(),description:'',amount:'',type:'expense',category:'',accountId:'',reference:''}
   const[form,setForm]=useState(init)
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
@@ -1456,7 +1614,7 @@ function BillsAP(){
   const[showAdd,setShowAdd]=useState(false)
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
-  const init={vendorId:'',billNumber:'',date:new Date().toISOString().split('T')[0],dueDate:'',description:'',amount:'',category:'',accountId:'',notes:''}
+  const init={vendorId:'',billNumber:'',date:localToday(),dueDate:'',description:'',amount:'',category:'',accountId:'',notes:''}
   const[form,setForm]=useState(init)
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
@@ -1567,12 +1725,37 @@ function BillsAP(){
   )
 }
 
+// ── S655: "Money received" / "Money billed" ─────────────────────────────
+// Nic (10/2): "people need to be able to see it both ways." One switch,
+// default Money received, remembered per browser — every storage touch is
+// wrapped, so a blocked or private browser simply starts on the default.
+const BASIS_KEY='gam_books_income_basis'
+function readBasis():IncomeBasis{
+  try{ const v=localStorage.getItem(BASIS_KEY)||''; return (INCOME_BASES as readonly string[]).includes(v)?v as IncomeBasis:DEFAULT_INCOME_BASIS }
+  catch{ return DEFAULT_INCOME_BASIS }
+}
+function useBasis():[IncomeBasis,(b:IncomeBasis)=>void]{
+  const[b,setB]=useState<IncomeBasis>(readBasis)
+  const set=(n:IncomeBasis)=>{ setB(n); try{ localStorage.setItem(BASIS_KEY,n) }catch{ /* private mode: the switch still works for this visit */ } }
+  return[b,set]
+}
+function BasisSwitch({basis,onChange}:{basis:IncomeBasis;onChange:(b:IncomeBasis)=>void}){
+  return(
+    <div className="basis-sw" role="radiogroup" aria-label="Count money by">
+      {INCOME_BASES.map(b=>(
+        <button key={b} type="button" role="radio" aria-checked={basis===b} className={basis===b?'on':''} onClick={()=>{ if(b!==basis) onChange(b) }}>{INCOME_BASIS_LABEL[b]}</button>
+      ))}
+    </div>
+  )
+}
+const BasisNote=({basis}:{basis:IncomeBasis})=><p className="basis-note">{INCOME_BASIS_NOTE[basis]}</p>
+
 // ── CASH FLOW ────────────────────────────────────────────────────────
 function CashFlow(){
   const now=new Date()
   const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
-  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
-  const{data,isLoading}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
+  const[endDate,setEndDate]=useState(localToday(now))
+  const{data,isLoading,error}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
 
   const op=(data as any)?.operating
   const fin=(data as any)?.financing
@@ -1581,7 +1764,7 @@ function CashFlow(){
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">💧 Cash Flow Statement</h1><p className="ps">{new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
+        <div><h1 className="pt">💧 Cash Flow Statement</h1><p className="ps">Money in, by the day it arrived · {new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
           <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
           <span style={{color:'var(--t3)'}}>to</span>
@@ -1589,8 +1772,11 @@ function CashFlow(){
         </div>
       </div>
 
+      {/* 10/11: a refused report (a bookkeeper kept to some of the company's
+          properties) says why — never a page of $0 that reads as real. */}
+      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the cash flow.')}</div>:<>
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Operating Inflows</div><div className="kv g">{formatCurrency(op?.inflows?.total||0)}</div><div className="ks">Rent + other income</div></div>
+        <div className="kpi"><div className="kl">Money In</div><div className="kv g">{formatCurrency(op?.inflows?.total||0)}</div><div className="ks">By the day it arrived</div></div>
         <div className="kpi"><div className="kl">Operating Outflows</div><div className="kv r">{formatCurrency(op?.outflows?.total||0)}</div><div className="ks">Expenses + payroll + bills</div></div>
         <div className="kpi"><div className="kl">Financing Outflows</div><div className="kv a">{formatCurrency(fin?.total||0)}</div><div className="ks">Owner disbursements</div></div>
         <div className="kpi"><div className="kl">Net Cash Flow</div><div className={`kv ${net>=0?'g':'r'}`}>{formatCurrency(net)}</div><div className="ks">{net>=0?'Positive cash flow':'Negative cash flow'}</div></div>
@@ -1602,8 +1788,14 @@ function CashFlow(){
             <div className="card" style={{marginBottom:12}}>
               <div className="ct">Operating Activities</div>
               <div style={{marginBottom:10}}>
-                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Inflows</div>
-                <div className="dr"><span className="dk">🏘 GAM Rent Collected</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.rentCollected||0)}</span></div>
+                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Money in, by the day it arrived</div>
+                {/* S655: every inflow line, so they add up to the total. Money
+                    paid ahead is its own line on the day it arrived; a credit
+                    you give never appears (no money moved). */}
+                <div className="dr"><span className="dk">🏘 GAM bills paid (rent, fees, utilities)</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.rentCollected||0)}</span></div>
+                {!!Number(op?.inflows?.paidAhead) && <div className="dr"><span className="dk">Paid ahead for later bills</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op.inflows.paidAhead)}</span></div>}
+                {!!Number(op?.inflows?.registerAndStays) && <div className="dr"><span className="dk">Register sales, stays and pay links</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op.inflows.registerAndStays)}</span></div>}
+                {!!Number(op?.inflows?.moveOut) && <div className="dr"><span className="dk">Move-out settlements</span><span className="dv mono" style={{color:Number(op.inflows.moveOut)<0?'var(--red)':'var(--green)'}}>{formatCurrency(op.inflows.moveOut)}</span></div>}
                 <div className="dr"><span className="dk">Other Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.otherIncome||0)}</span></div>
                 <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Inflows</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(op?.inflows?.total||0)}</span></div>
               </div>
@@ -1612,6 +1804,8 @@ function CashFlow(){
                 <div className="dr"><span className="dk">Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.expenses||0)})</span></div>
                 <div className="dr"><span className="dk">Payroll (net)</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.payroll||0)})</span></div>
                 <div className="dr"><span className="dk">Bills Paid</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.bills||0)})</span></div>
+                {!!Number(op?.outflows?.chargebackFees) && <div className="dr"><span className="dk">Chargeback fees</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op.outflows.chargebackFees)})</span></div>}
+                {!!Number(op?.outflows?.refundCardFees) && <div className="dr"><span className="dk">Card fees given back with refunds</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op.outflows.refundCardFees)})</span></div>}
                 <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Outflows</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>({formatCurrency(op?.outflows?.total||0)})</span></div>
               </div>
               <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
@@ -1638,9 +1832,19 @@ function CashFlow(){
               <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET CASH FLOW</span>
               <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:net>=0?'var(--green)':'var(--red)'}}>{formatCurrency(net)}</span>
             </div>
+            {/* Beside the totals, never in them. */}
+            {(!!Number((data as any)?.stillClearing)||!!Number((data as any)?.depositsHeld)||!!Number((data as any)?.nonCash?.keptAtMoveOut))&&(
+              <div style={{marginTop:14,paddingTop:10,borderTop:'1px dashed var(--b1)'}}>
+                {!!Number((data as any)?.stillClearing)&&<div className="dr"><span className="dk">Still clearing (not arrived yet)</span><span className="dv mono">{formatCurrency((data as any).stillClearing)}</span></div>}
+                {!!Number((data as any)?.depositsHeld)&&<div className="dr"><span className="dk">Deposits received (held for tenants)</span><span className="dv mono">{formatCurrency((data as any).depositsHeld)}</span></div>}
+                {!!Number((data as any)?.nonCash?.keptAtMoveOut)&&<div className="dr"><span className="dk">Kept from deposits you already held</span><span className="dv mono">{formatCurrency((data as any).nonCash.keptAtMoveOut)}</span></div>}
+              </div>
+            )}
+            <div className="bnote">{(data as any)?.meta?.note||'Money in, by the day it arrived.'}</div>
           </div>
         </div>
       )}
+      </>}
     </div>
   )
 }
@@ -1649,36 +1853,45 @@ function CashFlow(){
 function OwnerStatements(){
   const now=new Date()
   const[startDate,setStartDate]=useState(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`)
-  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
-  const[selected,setSelected]=useState<any>(null)
-  const{data:statements=[],isLoading}=useQuery(['owner-statements',startDate,endDate],()=>get<any[]>(`/books/reports/owner-statements?startDate=${startDate}&endDate=${endDate}`))
+  const[endDate,setEndDate]=useState(localToday(now))
+  const[selectedId,setSelectedId]=useState<string|null>(null)
+  const[basis,setBasis]=useBasis()
+  const{data:statements=[],isLoading,error}=useQuery(['owner-statements',startDate,endDate,basis],()=>get<any[]>(`/books/reports/owner-statements?startDate=${startDate}&endDate=${endDate}&basis=${basis}`))
+  // S655: the selected owner is read from the CURRENT data, so flipping the
+  // switch or the dates updates the statement in place instead of showing a
+  // stale copy counted the other way.
+  const selected=(statements as any[]).find((s:any)=>s.landlord.id===selectedId)??null
+  const word=INCOME_BASIS_LABEL[basis]
 
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">🏠 Owner Statements</h1><p className="ps">Per-property income statements</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+        <div><h1 className="pt">🏠 Owner Statements</h1><p className="ps">Per-property income statements · {word}</p></div>
+        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+          <BasisSwitch basis={basis} onChange={setBasis}/>
           <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
           <span style={{color:'var(--t3)'}}>to</span>
           <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
         </div>
       </div>
+      <BasisNote basis={basis}/>
+      {!!error&&<div className="alert aw">{loadErrorText(error,'Could not load owner statements.')}</div>}
 
       {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
         <div className="grid2" style={{gap:16}}>
           <div style={{display:'flex',flexDirection:'column',gap:12}}>
             {(statements as any[]).length?(statements as any[]).map((s:any)=>(
-              <div key={s.landlord.id} className="card" style={{cursor:'pointer',borderColor:selected?.landlord?.id===s.landlord.id?'rgba(201,162,39,.4)':'var(--b1)'}} onClick={()=>setSelected(s)}>
+              <div key={s.landlord.id} className="card" style={{cursor:'pointer',borderColor:selected?.landlord?.id===s.landlord.id?'rgba(201,162,39,.4)':'var(--b1)'}} onClick={()=>setSelectedId(s.landlord.id)}>
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
                   <div>
                     <div style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>{s.landlord.businessName||s.landlord.firstName+' '+s.landlord.lastName}</div>
                     <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{s.landlord.email}</div>
                   </div>
-                  <span className={s.variance>=0?'badge bg2':'badge br'}>{s.variance>=0?'✓ Collected':'⚠ Short'}</span>
+                  <span className={s.variance>=0?'badge bg2':'badge br'}>{s.variance>=0?'✓ At or over expected':'⚠ Under expected'}</span>
                 </div>
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginTop:12}}>
                   <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Expected</div><div style={{fontFamily:'var(--font-m)',color:'var(--t0)',fontWeight:600}}>{formatCurrency(s.totalExpected)}</div></div>
-                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Collected</div><div style={{fontFamily:'var(--font-m)',color:'var(--green)',fontWeight:600}}>{formatCurrency(s.totalCollected)}</div></div>
+                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>{word}</div><div style={{fontFamily:'var(--font-m)',color:'var(--green)',fontWeight:600}}>{formatCurrency(s.totalCollected)}</div></div>
                   <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Disbursed</div><div style={{fontFamily:'var(--font-m)',color:'var(--gold)',fontWeight:600}}>{formatCurrency(s.totalDisbursed)}</div></div>
                 </div>
               </div>
@@ -1699,13 +1912,19 @@ function OwnerStatements(){
                     <div style={{fontWeight:600,color:'var(--t0)',marginBottom:8}}>{p.name}</div>
                     <div className="dr"><span className="dk">Units</span><span className="dv mono">{p.occupied}/{p.unitCount} occupied</span></div>
                     <div className="dr"><span className="dk">Expected Rent</span><span className="dv mono">{formatCurrency(p.expectedRent)}</span></div>
-                    <div className="dr"><span className="dk">Collected</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(p.collected)}</span></div>
+                    {/* S655: the lines that make up this property's figure. */}
+                    {(p.lines??[]).map((l:any)=>(
+                      <div key={l.line} className="dr dr-sub"><span className="dk">{l.label}</span><span className="dv mono" style={{color:Number(l.amount)<0?'var(--red)':'var(--t1)'}}>{formatCurrency(l.amount)}</span></div>
+                    ))}
+                    <div className="dr"><span className="dk">{word}</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(p.collected)}</span></div>
                     <div className="dr"><span className="dk">Variance</span><span className="dv mono" style={{color:(+p.collected-+p.expectedRent)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(+p.collected-+p.expectedRent)}</span></div>
+                    {!!Number(p.depositsHeld)&&<div className="dr"><span className="dk">Deposits received (held, not income)</span><span className="dv mono">{formatCurrency(p.depositsHeld)}</span></div>}
                   </div>
                 ))}
 
                 <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Expected</span><span className="dv mono">{formatCurrency(selected.totalExpected)}</span></div>
-                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Collected</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(selected.totalCollected)}</span></div>
+                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total {word}</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(selected.totalCollected)}</span></div>
+                {!!Number(selected.totalDepositsHeld)&&<div className="dr"><span className="dk">Deposits received (held, not income)</span><span className="dv mono">{formatCurrency(selected.totalDepositsHeld)}</span></div>}
                 <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency(selected.totalDisbursed)}</span></div>
               </div>
             )}
@@ -1883,31 +2102,47 @@ function TaxCenter(){
 
 // ── RENT ROLL ─────────────────────────────────────────────────────────
 function RentRoll(){
-  const{data,isLoading}=useQuery('rent-roll',()=>get<any>('/books/rent-roll'))
+  const[basis,setBasis]=useBasis()
+  const{data,isLoading,error}=useQuery(['rent-roll',basis],()=>get<any>(`/books/rent-roll?basis=${basis}`))
   const units=(data as any)?.units||[]
   const occupied=units.filter((u:any)=>u.status!=='vacant')
+  // S604/S616: an owner-use space is occupied but pays no rent, and a utility
+  // service point is a neighbor's building — neither is expected rent. The
+  // API's expected-rent total leaves both out; each row's variance does too,
+  // so the rows add up to the total instead of showing a gap nobody owes
+  // (lib/booksMoney: earnsRent, rentRollVariance).
+  const payers=rentPayers(units)
+  // S655: THIS month's bills only. Money received: what arrived this month
+  // toward bills due this month or earlier. Money billed: what has been
+  // collected so far of this month's bills.
+  const colLabel=basis==='billed'?'Collected so far':'Received this month'
 
   return(
     <div>
       <div className="ph">
         <div><h1 className="pt">🏘 Rent Roll</h1><p className="ps">Live sync from GAM · {units.length} units</p></div>
-        <span className="badge bteal">Live Data</span>
+        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+          <BasisSwitch basis={basis} onChange={setBasis}/>
+          <span className="badge bteal">Live Data</span>
+        </div>
       </div>
+      <BasisNote basis={basis}/>
+      {!!error&&<div className="alert aw">{loadErrorText(error,'Could not load the rent roll.')}</div>}
 
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Expected Rent (MTD)</div><div className="kv gold">{formatCurrency((data as any)?.totalExpected||0)}</div><div className="ks">{occupied.length} occupied units</div></div>
-        <div className="kpi"><div className="kl">Collected (MTD)</div><div className="kv g">{formatCurrency((data as any)?.totalCollected||0)}</div><div className="ks">Settled payments</div></div>
-        <div className="kpi"><div className="kl">Variance</div><div className={`kv ${((data as any)?.variance||0)>=0?'g':'r'}`}>{formatCurrency((data as any)?.variance||0)}</div><div className="ks">Collected minus expected</div></div>
+        <div className="kpi"><div className="kl">Expected Rent (MTD)</div><div className="kv gold">{formatCurrency((data as any)?.totalExpected||0)}</div><div className="ks">payable across {payers.length} of {occupied.length} occupied units</div></div>
+        <div className="kpi"><div className="kl">{colLabel}</div><div className="kv g">{formatCurrency((data as any)?.totalCollected||0)}</div><div className="ks">{basis==='billed'?"Of this month's bills":"Toward this month's bills and older"}</div></div>
+        <div className="kpi"><div className="kl">Variance</div><div className={`kv ${((data as any)?.variance||0)>=0?'g':'r'}`}>{formatCurrency((data as any)?.variance||0)}</div><div className="ks">{colLabel} minus expected rent</div></div>
         <div className="kpi"><div className="kl">Occupancy Rate</div><div className="kv b">{(((data as any)?.occupancyRate||0)*100).toFixed(0)}%</div><div className="ks">{occupied.length}/{units.length} units</div></div>
       </div>
 
       <div className="card" style={{padding:0}}>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
           <table className="tbl">
-            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Collected MTD</th><th>Variance</th><th>Status</th><th>ACH</th></tr></thead>
+            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>{colLabel}</th><th>Variance</th><th>Status</th><th>ACH</th></tr></thead>
             <tbody>
               {units.length?units.map((u:any)=>{
-                const variance=(+u.collectedMtd||0)-(u.status!=='vacant'?+u.rentAmount:0)
+                const variance=rentRollVariance(u)
                 return(
                   <tr key={u.unitNumber+u.propertyName}>
                     <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{u.unitNumber}</td>
@@ -1915,8 +2150,8 @@ function RentRoll(){
                     <td style={{fontSize:'.75rem'}}>{u.tenantFirst?u.tenantFirst+' '+u.tenantLast:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
                     <td className="mono">{formatCurrency(u.rentAmount)}</td>
                     <td className="mono" style={{color:'var(--green)'}}>{+u.collectedMtd>0?formatCurrency(u.collectedMtd):'—'}</td>
-                    <td className="mono" style={{color:variance>=0?'var(--green)':'var(--red)'}}>{u.status!=='vacant'?formatCurrency(variance):'—'}</td>
-                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{u.status}</span></td>
+                    <td className="mono" style={{color:variance==null?'var(--t3)':variance>=0?'var(--green)':'var(--red)'}}>{variance==null?'—':formatCurrency(variance)}</td>
+                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{(UNIT_STATUS_LABEL as Record<string,string>)[u.status]??humanize(u.status)}</span></td>
                     <td>{u.achVerified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   </tr>
                 )
@@ -1933,8 +2168,9 @@ function RentRoll(){
 function ProfitLoss(){
   const now=new Date()
   const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
-  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
-  const{data,isLoading}=useQuery(['pl',startDate,endDate],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}`))
+  const[endDate,setEndDate]=useState(localToday(now))
+  const[basis,setBasis]=useBasis()
+  const{data,isLoading,error}=useQuery(['pl',startDate,endDate,basis],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}&basis=${basis}`))
 
   const income=(data as any)?.income||[]
   const expenses=(data as any)?.expenses||[]
@@ -1942,40 +2178,94 @@ function ProfitLoss(){
   const totalExpenses=(data as any)?.totalExpenses||0
   const netIncome=(data as any)?.netIncome||0
   const gamRent=(data as any)?.gamRentIncome||0
+  // S655: the GAM P&L — the landlord reports' own, under the switch. Its lines
+  // (rent, fees, utilities, paid ahead, register sales, credits given, ...)
+  // add up to its total; its expenses are GAM's platform fee, maintenance, lot
+  // rent and expenses entered in GAM.
+  const gamPL=(data as any)?.gamPL
+  const gamLines:any[]=gamPL?.lineItems??[]
+  const gamBeside:any[]=gamPL?.besideItems??[]
+  // Money billed: collected so far, still clearing and still owed are what
+  // became of the bills — they add up to the total, and still owed is INSIDE
+  // it — so they are shown as that, never as "beside the total". Money
+  // received: the paid-ahead money on hand already counted on the day it
+  // arrived, so it is shown on its own line, never as "beside the total"
+  // (lib/booksMoney: splitBeside).
+  const{outcome:gamOutcome,aside:gamAside,onHand:gamPaidAhead}=splitBeside(gamBeside,basis)
+  const word=INCOME_BASIS_LABEL[basis]
+  // The switch only changes GAM's landlord income; a business's books have none.
+  const{user}=useAuth()
+  const isBusiness=user?.role==='business_owner'||user?.role==='business_staff'
 
   return(
     <div>
       <div className="ph">
         <div><h1 className="pt">📈 Profit & Loss</h1><p className="ps">Income statement · {new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+          {!isBusiness&&<BasisSwitch basis={basis} onChange={setBasis}/>}
           <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
           <span style={{color:'var(--t3)'}}>to</span>
           <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
         </div>
       </div>
-
+      {!isBusiness&&<BasisNote basis={basis}/>}
+      {/* 10/11: a refused report says why — never "$0.00 Profitable" under it. */}
+      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the profit and loss.')}</div>:<>
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Total Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{income.length} income accounts</div></div>
-        <div className="kpi"><div className="kl">GAM Rent (synced)</div><div className="kv gold">{formatCurrency(gamRent)}</div><div className="ks">Settled payments from GAM</div></div>
-        <div className="kpi"><div className="kl">Total Expenses</div><div className="kv r">{formatCurrency(totalExpenses)}</div><div className="ks">{expenses.length} expense accounts</div></div>
-        <div className="kpi"><div className="kl">Net Income</div><div className={`kv ${netIncome>=0?'g':'r'}`}>{formatCurrency(netIncome)}</div><div className="ks">{netIncome>=0?'Profitable':'Loss'}</div></div>
+        <div className="kpi"><div className="kl">Ledger Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{income.length} income accounts</div></div>
+        {!isBusiness&&<div className="kpi"><div className="kl">GAM Income · {word}</div><div className="kv gold">{formatCurrency(gamRent)}</div><div className="ks">From your GAM properties</div></div>}
+        <div className="kpi"><div className="kl">Ledger Expenses</div><div className="kv r">{formatCurrency(totalExpenses)}</div><div className="ks">{expenses.length} expense accounts</div></div>
+        <div className="kpi"><div className="kl">Ledger Net Income</div><div className={`kv ${netIncome>=0?'g':'r'}`}>{formatCurrency(netIncome)}</div><div className="ks">{netIncome>=0?'Profitable':'Loss'}</div></div>
       </div>
 
       {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
         <div className="grid2">
           <div>
+            {(gamPL||gamRent!==0)&&(
+              <div className="card" style={{marginBottom:12}}>
+                <div className="ct">🏘 GAM income · {word}</div>
+                {gamLines.length?gamLines.map((l:any)=>(
+                  <div key={l.line} className="dr"><span className="dk">{l.label}</span><span className="dv mono" style={{color:Number(l.amount)<0?'var(--red)':'var(--teal)'}}>{formatCurrency(l.amount)}</span></div>
+                )):<div className="dr"><span className="dk">GAM income</span><span className="dv mono" style={{color:'var(--teal)'}}>{formatCurrency(gamRent)}</span></div>}
+                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total GAM income</span><span className="dv mono" style={{color:'var(--teal)',fontWeight:700}}>{formatCurrency(gamRent)}</span></div>
+                {gamPaidAhead&&(
+                  <div className="dr dr-sub"><span className="dk">{gamPaidAhead.label} — {PAID_AHEAD_COUNTED_NOTE}</span><span className="dv mono">{formatCurrency(gamPaidAhead.amount)}</span></div>
+                )}
+                {gamOutcome.length>0&&(
+                  <div style={{marginTop:6,marginBottom:4}}>
+                    <div className="dk" style={{fontSize:'.68rem',textTransform:'uppercase',letterSpacing:'.06em',color:'var(--t3)'}}>What became of the bills</div>
+                    {gamOutcome.map((b:any)=>(
+                      <div key={b.key} className="dr dr-sub"><span className="dk">{b.label}</span><span className="dv mono">{formatCurrency(b.amount)}</span></div>
+                    ))}
+                  </div>
+                )}
+                {gamPL?.expenses&&(<>
+                  <div className="dr"><span className="dk">GAM platform fee</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.platformFee||0)})</span></div>
+                  {!!Number(gamPL.expenses.maintenance)&&<div className="dr"><span className="dk">Maintenance</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.maintenance)})</span></div>}
+                  {!!Number(gamPL.expenses.lotRent)&&<div className="dr"><span className="dk">Lot rent</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.lotRent)})</span></div>}
+                  {!!Number(gamPL.expenses.enteredExpenses)&&<div className="dr"><span className="dk">Expenses entered in GAM</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.enteredExpenses)})</span></div>}
+                  <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>GAM net</span><span className="dv mono" style={{color:Number(gamPL.net)>=0?'var(--green)':'var(--red)',fontWeight:700}}>{formatCurrency(gamPL.net||0)}</span></div>
+                </>)}
+                {gamAside.length>0&&(
+                  <div style={{marginTop:8,paddingTop:6,borderTop:'1px dashed var(--b1)'}}>
+                    {gamAside.map((b:any)=>(
+                      <div key={b.key} className="dr"><span className="dk">{b.label} (beside the total)</span><span className="dv mono">{formatCurrency(b.amount)}</span></div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="card" style={{marginBottom:12}}>
-              <div className="ct">Income</div>
-              {gamRent>0&&<div className="dr"><span className="dk" style={{color:'var(--teal)'}}>🏘 GAM Rent Income (synced)</span><span className="dv mono" style={{color:'var(--teal)'}}>{formatCurrency(gamRent)}</span></div>}
+              <div className="ct">Ledger income accounts</div>
               {income.map((a:any)=>(
                 <div key={a.code} className="dr">
                   <span className="dk">{a.code} · {a.name}</span>
                   <span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(a.periodAmount)}</span>
                 </div>
               ))}
-              {income.length===0&&!gamRent&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No income recorded. Post journal entries or transactions.</div>}
+              {income.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No ledger income recorded. Post journal entries or transactions.</div>}
               <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Income</span>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Ledger Income</span>
                 <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--green)',fontSize:'1rem'}}>{formatCurrency(totalIncome)}</span>
               </div>
             </div>
@@ -1997,19 +2287,20 @@ function ProfitLoss(){
           </div>
 
           <div className="card" style={{alignSelf:'start'}}>
-            <div className="ct">Net Income Summary</div>
-            <div className="dr"><span className="dk">Total Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(totalIncome)}</span></div>
-            <div className="dr"><span className="dk">Total Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(totalExpenses)})</span></div>
+            <div className="ct">Ledger Net Income Summary</div>
+            <div className="dr"><span className="dk">Total Ledger Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(totalIncome)}</span></div>
+            <div className="dr"><span className="dk">Total Ledger Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(totalExpenses)})</span></div>
             <div style={{borderTop:'2px solid var(--b1)',marginTop:12,paddingTop:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET INCOME</span>
               <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:netIncome>=0?'var(--green)':'var(--red)'}}>{formatCurrency(netIncome)}</span>
             </div>
             <div style={{marginTop:16,padding:'12px',background:'var(--bg3)',borderRadius:8,fontSize:'.72rem',color:'var(--t3)',lineHeight:1.6}}>
-              <strong style={{color:'var(--t2)'}}>Note:</strong> This P&L reflects journal entries posted to income/expense accounts plus GAM rent payments. Add transactions and journal entries to build a complete picture.
+              <strong style={{color:'var(--t2)'}}>Note:</strong> Net income here is your ledger: the journal entries and transactions posted to your income and expense accounts. GAM income is shown on its own, from your GAM properties, and is not added into the ledger totals.
             </div>
           </div>
         </div>
       )}
+      </>}
     </div>
   )
 }
@@ -2076,40 +2367,126 @@ function BalanceSheet(){
 }
 
 // ── CLIENT SWITCHER ───────────────────────────────────────────────────
+// A bookkeeper switches between client companies; S655: a landlord account
+// with more than one company switches between its own (Books opens one
+// company's books at a time — the companies are never merged).
 function ClientSwitcher(){
   const{user,activeClientId,activeClientName,setActiveClient}=useAuth()
   const[open,setOpen]=useState(false)
+  const isLandlord=user?.role==='landlord'
   const{data:clients=[]}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'),{enabled:user?.role==='bookkeeper'||user?.role==='admin'||user?.role==='super_admin'})
-  if(user?.role==='landlord')return null
-  if((clients as any[]).length===0)return null
+  const{data:companies=[]}=useLandlordCompanies()
+  const options:Array<{id:string;name:string;sub:string|null}>=isLandlord
+    ?(companies as CompanyChoice[]).map((c,i)=>({id:c.landlordId,name:companyName(c,i),sub:c.businessName&&c.propertyNames?c.propertyNames:null}))
+    :(clients as any[]).map((cl:any)=>({id:cl.landlordId,name:cl.businessName||cl.firstName+' '+cl.lastName,sub:`${cl.employeeCount} emp · ${cl.contractorCount} contractors`}))
+  if(isLandlord&&!companyChoiceState(companies as CompanyChoice[],activeClientId).showSwitcher)return null
+  if(options.length===0)return null
+  const current=options.find(o=>o.id===activeClientId)?.name||activeClientName
   return(
     <div style={{position:'relative'}}>
-      <button className="btn bg-btn bsm" onClick={()=>setOpen(o=>!o)} style={{display:'flex',alignItems:'center',gap:6,maxWidth:200}}>
+      <button className="btn bg-btn bsm" onClick={()=>setOpen(o=>!o)} style={{display:'flex',alignItems:'center',gap:6,maxWidth:220}} aria-haspopup="listbox" aria-expanded={open}>
         <span style={{fontSize:'.7rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-          {activeClientName||'Select Client'}
+          {current||(isLandlord?'Choose a company':'Select Client')}
         </span>
         <span style={{color:'var(--t3)'}}>▾</span>
       </button>
       {open&&(
         <div style={{position:'absolute',right:0,top:'calc(100% + 6px)',background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:10,minWidth:220,zIndex:100,boxShadow:'0 8px 32px rgba(0,0,0,.4)',overflow:'hidden'}}>
-          <div style={{padding:'8px 12px',borderBottom:'1px solid var(--b0)',fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em'}}>Switch Client</div>
-          {(clients as any[]).map((cl:any)=>(
-            <button key={cl.landlordId} onClick={()=>{setActiveClient(cl.landlordId,cl.businessName||cl.firstName+' '+cl.lastName);setOpen(false)}}
-              style={{width:'100%',padding:'10px 14px',background:activeClientId===cl.landlordId?'rgba(201,162,39,.08)':'none',border:'none',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <div style={{padding:'8px 12px',borderBottom:'1px solid var(--b0)',fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em'}}>{isLandlord?'Switch company':'Switch Client'}</div>
+          {options.map(o=>(
+            <button key={o.id} onClick={()=>{setActiveClient(o.id,o.name);setOpen(false)}}
+              style={{width:'100%',padding:'10px 14px',background:activeClientId===o.id?'rgba(201,162,39,.08)':'none',border:'none',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               <div>
-                <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{cl.businessName||cl.firstName+' '+cl.lastName}</div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{cl.employeeCount} emp · {cl.contractorCount} contractors</div>
+                <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{o.name}</div>
+                {o.sub&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{o.sub}</div>}
               </div>
-              {activeClientId===cl.landlordId&&<span style={{color:'var(--gold)'}}>✓</span>}
+              {activeClientId===o.id&&<span style={{color:'var(--gold)'}}>✓</span>}
             </button>
           ))}
-          <div style={{padding:'8px 12px',borderTop:'1px solid var(--b0)'}}>
-            <a href="/clients" style={{fontSize:'.72rem',color:'var(--t3)'}} onClick={()=>setOpen(false)}>Manage clients →</a>
-          </div>
+          {!isLandlord&&(
+            <div style={{padding:'8px 12px',borderTop:'1px solid var(--b0)'}}>
+              <a href="/clients" style={{fontSize:'.72rem',color:'var(--t3)'}} onClick={()=>setOpen(false)}>Manage clients →</a>
+            </div>
+          )}
         </div>
       )}
     </div>
   )
+}
+
+// ── S655: WHICH COMPANY'S BOOKS (landlord accounts) ──────────────────
+// The server never picks a company for an account that owns several (S654:
+// "None is the default"); it answers 400 until one is named. So Books asks
+// first, in place of the page, and every request then names the chosen one.
+function useLandlordCompanies(){
+  const{user}=useAuth()
+  return useQuery<CompanyChoice[]>(['books-companies',user?.id],()=>get<CompanyChoice[]>('/books/companies'),{enabled:user?.role==='landlord',staleTime:60_000})
+}
+
+function CompanyGate({children}:{children:React.ReactNode}){
+  const{user,activeClientId,setActiveClient,clearActiveClient}=useAuth()
+  const{data:companies,isLoading,error,refetch,isFetching}=useLandlordCompanies()
+  const isLandlord=user?.role==='landlord'
+  const state=companyChoiceState(companies,activeClientId)
+  // A remembered company that is no longer this account's is forgotten.
+  React.useEffect(()=>{ if(isLandlord&&companies&&state.staleChoice) clearActiveClient() },[isLandlord,companies,state.staleChoice,clearActiveClient])
+  // 10/11: a bookkeeper, the same way. With no client named, the server falls
+  // back to their oldest assignment, so with several clients the pages would
+  // show one client's money under "Select Client". One client opens by itself;
+  // several are asked which; a remembered client they no longer keep is forgotten.
+  const isBookkeeper=user?.role==='bookkeeper'
+  const{data:bkClients,isLoading:bkLoading,error:bkError,refetch:bkRefetch,isFetching:bkFetching}=useQuery<any[]>('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'),{enabled:isBookkeeper})
+  const bkChoices:CompanyChoice[]|undefined=bkClients?.map((c:any)=>({landlordId:c.landlordId,businessName:c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')||null,propertyNames:null}))
+  const bkState=companyChoiceState(bkChoices,activeClientId)
+  const bkOnly=bkChoices&&bkChoices.length===1?bkChoices[0]:null
+  React.useEffect(()=>{ if(isBookkeeper&&bkChoices&&bkState.staleChoice) clearActiveClient() },[isBookkeeper,bkChoices,bkState.staleChoice,clearActiveClient])
+  React.useEffect(()=>{ if(isBookkeeper&&bkOnly&&!activeClientId) setActiveClient(bkOnly.landlordId,companyName(bkOnly,0)) },[isBookkeeper,bkOnly,activeClientId,setActiveClient])
+  if(isBookkeeper){
+    if(bkLoading||(bkChoices&&(bkState.staleChoice||(bkOnly&&!activeClientId))))return<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+    if(bkError)return(
+      <div className="alert ae" style={{alignItems:'center'}}>
+        <span style={{flex:1}}>{loadErrorText(bkError,'Could not load your clients.')}</span>
+        <button className="btn bp bsm" disabled={bkFetching} onClick={()=>bkRefetch()}>{bkFetching?'Loading…':'Load again'}</button>
+      </div>
+    )
+    if(bkState.mustChoose&&bkChoices)return(
+      <div className="card company-pick">
+        <h2 className="pt" style={{fontSize:'1.15rem'}}>Which client's books?</h2>
+        <p className="ps" style={{marginTop:6,lineHeight:1.5}}>You keep the books for more than one client. Choose one to open — you can switch at the top of the page any time.</p>
+        <div className="company-pick-list">
+          {bkChoices.map((c,i)=>(
+            <button key={c.landlordId} type="button" className="btn bp" onClick={()=>setActiveClient(c.landlordId,companyName(c,i))}>
+              <span>{companyName(c,i)}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    )
+    return<>{children}</>
+  }
+  if(!isLandlord)return<>{children}</>
+  if(isLoading||(companies&&state.staleChoice))return<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+  if(error)return(
+    <div className="alert ae" style={{alignItems:'center'}}>
+      <span style={{flex:1}}>{loadErrorText(error,'Could not load your companies.')}</span>
+      <button className="btn bp bsm" disabled={isFetching} onClick={()=>refetch()}>{isFetching?'Loading…':'Load again'}</button>
+    </div>
+  )
+  if(state.mustChoose&&companies)return(
+    <div className="card company-pick">
+      <h2 className="pt" style={{fontSize:'1.15rem'}}>Which company's books?</h2>
+      <p className="ps" style={{marginTop:6,lineHeight:1.5}}>You own more than one company, and each keeps its own books. Choose one to open — you can switch at the top of the page any time.</p>
+      <div className="company-pick-list">
+        {companies.map((c,i)=>(
+          <button key={c.landlordId} type="button" className="btn bp" onClick={()=>setActiveClient(c.landlordId,companyName(c,i))}>
+            <span>{companyName(c,i)}</span>
+            {c.businessName&&c.propertyNames&&<span className="company-pick-sub">{c.propertyNames}</span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+  return<>{children}</>
 }
 
 // ── MY CLIENTS ────────────────────────────────────────────────────────
@@ -2218,37 +2595,152 @@ function ComingSoon({title,icon,description}:{title:string;icon:string;descripti
 }
 
 // ── LOGIN ────────────────────────────────────────────────────────────
+// S655: remembered per browser so the box starts the way it was last left.
+const KEEP_SIGNED_IN_KEY='gam_books_keep_signed_in'
+
+// S639: the code step must survive leaving the page — a phone browser can
+// discard and reload the tab while someone reads the code in their mail app.
+// sessionStorage holds only the short-lived pre-sign-in pass, which is
+// worthless without the code.
+function usePendingOtpSession(key:string):[string|null,(v:string|null)=>void]{
+  const[v,setV]=useState<string|null>(()=>{ try{ return sessionStorage.getItem(key) }catch{ return null } })
+  const set=(next:string|null)=>{
+    setV(next)
+    try{ if(next) sessionStorage.setItem(key,next); else sessionStorage.removeItem(key) }catch{ /* private mode */ }
+  }
+  return[v,set]
+}
+
 function LoginPage(){
-  React.useEffect(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization'] },[])
-  const{login}=useAuth();const navigate=useNavigate()
+  React.useEffect(()=>{ localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization'] },[])
+  const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth();const navigate=useNavigate()
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
+  const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
+  const[totpSession,setTotpSession]=useState<string|null>(null)
+  const[emailOtpSession,setEmailOtpSession]=usePendingOtpSession('gam.otp.books.login')
+  const[code,setCode]=useState('');const[resent,setResent]=useState(false)
+
   const onSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
-    try{await login(email,pw);navigate('/dashboard')}
-    catch(ex:any){setErr(ex.response?.data?.error||ex.message||'Login failed')}
+    try{
+      rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY,keepSignedIn)
+      const r=await login(email,pw,keepSignedIn)
+      if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
+      else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResent(false)}
+      else navigate('/dashboard')
+    }
+    catch(ex:any){setErr(ex.response?.data?.error||ex.message||'Sign-in failed')}
     finally{setLoading(false)}
   }
+
+  const backToCredentials=()=>{setTotpSession(null);setEmailOtpSession(null);setCode('');setPw('');setResent(false)}
+
+  const onCodeSubmit=async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{
+      if(emailOtpSession){await loginWithEmailOtp(emailOtpSession,code.trim());setEmailOtpSession(null)}
+      else await loginWithTotp(totpSession!,code.trim())
+      navigate('/dashboard')
+    }
+    catch(ex:any){
+      const msg=ex.response?.data?.error||ex.message||'Invalid code.'
+      setErr(msg)
+      // An expired sign-in, or a failure after the code was accepted, starts over.
+      if(/session/i.test(msg)||!ex.response)backToCredentials()
+    }
+    finally{setLoading(false)}
+  }
+
+  const onResend=async()=>{
+    setErr('');setResent(false)
+    try{await resendEmailOtp(emailOtpSession!);setResent(true)}
+    catch(ex:any){setErr(ex.response?.data?.error||'Could not resend the code.')}
+  }
+
+  const header=(
+    <div style={{textAlign:'center',marginBottom:40}}>
+      <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>📒 GAM Books</div>
+      <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Payroll & Bookkeeping · Gold Asset Management</div>
+    </div>
+  )
+
+  // ── Step 2: the emailed code, or the authenticator app ──────────────
+  if(totpSession||emailOtpSession){
+    return(
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:400}}>
+          {header}
+          <div className="card" style={{padding:24}}>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
+              {emailOtpSession
+                ?'Enter the 6-digit code we emailed you.'
+                :'Enter the 6-digit code from your authenticator app, or one of your recovery codes.'}
+            </div>
+            {resent&&!err&&<div style={{marginBottom:14,fontSize:'.8rem',color:'var(--green)'}}>A new code is on its way.</div>}
+            {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
+            <form onSubmit={onCodeSubmit}>
+              <div className="frow"><label>Code</label>
+                <input type="text" value={code} onChange={e=>setCode(e.target.value)} autoFocus required
+                  autoComplete="one-time-code" inputMode="text" placeholder="123456"
+                  style={{textAlign:'center',letterSpacing:'.2em',fontFamily:'var(--font-m)'}}/>
+              </div>
+              <button className="bp btn" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:4}}>
+                {loading?<span className="spinner"/>:'Verify and sign in'}
+              </button>
+            </form>
+            <div style={{marginTop:14,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <button onClick={()=>{backToCredentials();setErr('')}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>← Back to sign in</button>
+              {emailOtpSession&&<button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 1: email and password ──────────────────────────────────────
   return(
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:400}}>
-        <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>📒 GAM Books</div>
-          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Payroll & Bookkeeping · Gold Asset Management</div>
-        </div>
+        {header}
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <div className="alert agold" style={{marginBottom:20,fontSize:'.75rem'}}>Sign in with your GAM Landlord or Business credentials.</div>
           <form onSubmit={onSubmit}>
             <div className="frow"><label>Email</label><input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
             <div className="frow"><label>Password</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            {/* S655: off by default. Off, this sign-in ends 7 days after it
+                starts, even mid-task; on, it stays signed in while in use. */}
+            <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45,textTransform:'none',letterSpacing:'normal',fontWeight:400}}>
+              <input type="checkbox" checked={keepSignedIn} onChange={e=>setKeepSignedIn(e.target.checked)} style={{width:'auto',marginTop:3,accentColor:'var(--gold)'}}/>
+              <span>Keep me signed in on this device
+                <span style={{display:'block',color:'var(--t3)',fontSize:'.74rem'}}>Leave this off on a shared computer. Off, you are signed out 7 days after you sign in.</span>
+              </span>
+            </label>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:4}}>
               {loading?<span className="spinner"/>:'Sign in to GAM Books'}
             </button>
           </form>
         </div>
-        <div style={{textAlign:'center',marginTop:20}}><a href={ADMIN_URL} style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a></div>
+        {/* S655: was "Back to Admin Console" — admins cannot use Books (S568),
+            and the people who can had no way back from a forgotten password. */}
+        <div style={{textAlign:'center',marginTop:20}}><a href={`${LANDLORD_URL}/forgot-password`} style={{color:'var(--t3)',fontSize:'.8rem'}}>Forgot your password?</a></div>
       </div>
     </div>
+  )
+}
+
+// ── SHARED FINANCIAL PAGES ────────────────────────────────────────────
+// 10/11: the landlord portal's financial pages, inside Books' shell. They read
+// who is looking from here, and draw in the landlord portal's look
+// (financialsHost.css, scoped to .fin-host).
+function FinancialsHost(){
+  const{user}=useAuth()
+  if(user?.role!=='landlord'&&user?.role!=='bookkeeper')return<Navigate to="/dashboard" replace/>
+  return(
+    <FinancialsViewerContext.Provider value={{role:user.role}}>
+      <div className="fin-host"><Outlet/></div>
+    </FinancialsViewerContext.Provider>
   )
 }
 
@@ -2257,11 +2749,13 @@ function App(){
   const{user,loading}=useAuth()
   if(loading)return<div className="loading-pg"><span className="spinner" style={{marginRight:10}}/>Loading GAM Books…</div>
   const authed=!!user&&ALLOWED_ROLES.includes(user.role)
+  // 10/11: a bookkeeper opens on money in; everyone else on the dashboard.
+  const home=user?.role==='bookkeeper'?'/financials/income':'/dashboard'
   return(
     <Routes>
-      <Route path="/login" element={authed?<Navigate to="/dashboard" replace/>:<LoginPage/>}/>
+      <Route path="/login" element={authed?<Navigate to={home} replace/>:<LoginPage/>}/>
       <Route path="/" element={authed?<Layout/>:<Navigate to="/login" replace/>}>
-        <Route index element={<Navigate to="/dashboard" replace/>}/>
+        <Route index element={<Navigate to={home} replace/>}/>
         <Route path="dashboard"          element={<Dashboard/>}/>
         <Route path="clients"            element={<MyClients/>}/>
         <Route path="payroll/employees"  element={<Employees/>}/>
@@ -2274,8 +2768,18 @@ function App(){
         <Route path="books/journal"      element={<JournalEntries/>}/>
         <Route path="books/transactions" element={<Transactions/>}/>
         <Route path="books/reconcile"    element={<BankReconcile/>}/>
-        <Route path="rent-roll"          element={<RentRoll/>}/>
-        <Route path="disbursements"      element={<ComingSoon title="Owner Disbursements" icon="💸" description="Disbursement history synced from GAM"/>}/>
+        <Route path="rent-roll"          element={user?.role==='bookkeeper'?<Navigate to="/financials/income" replace/>:<RentRoll/>}/>
+        {/* 10/11: was a "coming soon" placeholder; the payouts are real now. */}
+        <Route path="disbursements"      element={<Navigate to="/financials/payouts" replace/>}/>
+        <Route path="financials" element={<FinancialsHost/>}>
+          <Route index element={<Navigate to="/financials/income" replace/>}/>
+          <Route path="income"            element={<IncomePage/>}/>
+          <Route path="expenses"          element={<ExpensesPage/>}/>
+          <Route path="maintenance-costs" element={<MaintenanceCostsPage/>}/>
+          <Route path="reports"           element={<ReportsPage/>}/>
+          <Route path="bank-activity"     element={<BankActivityPage/>}/>
+          <Route path="payouts"           element={<PayoutsPage/>}/>
+        </Route>
         <Route path="bills"              element={<BillsAP/>}/>
         <Route path="reports/pl"              element={<ProfitLoss/>}/>
         <Route path="reports/balance-sheet"   element={<BalanceSheet/>}/>

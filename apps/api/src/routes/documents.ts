@@ -4,10 +4,10 @@ import fs from 'fs'
 import crypto from 'crypto'
 import multer from 'multer'
 import { z } from 'zod'
-import { DOCUMENT_CATEGORIES } from '@gam/shared'
+import { DOCUMENT_CATEGORIES, REFERENCE_DOCUMENT_CATEGORIES } from '@gam/shared'
 import { query, queryOne } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
+import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
+import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 
@@ -50,20 +50,82 @@ documentsRouter.get('/', async (req, res, next) => {
     // W-45: join unit + tenant display fields — the page renders unitNumber /
     // tenantName / docType and previously fell back to "—" for all of them
     // (d.* alone never carried joins; same class as W-37/W-43).
+    // S641: ?propertyId=<id> narrows to the filing cabinet for ONE park — the
+    // documents pinned to it, plus anything unpinned, which is the "available
+    // everywhere" default (a state disclosure, a lead-paint pamphlet).
+    // Deliberately NOT a plain equality on property_id: the whole point of
+    // pinning is that one parking-rules sheet serves two parks without being
+    // uploaded twice.
+    const propertyFilter = typeof req.query.propertyId === 'string' && req.query.propertyId
+      ? req.query.propertyId : null
+    // S652: the resident's own record — the photos and notices on their file.
+    const tenantFilter = typeof req.query.tenantId === 'string' && req.query.tenantId ? req.query.tenantId : null
+    const pi = scope.params.length + 1
+    const propClause = propertyFilter
+      ? `AND (
+           d.property_id = $${pi}
+           OR EXISTS (SELECT 1 FROM document_properties dp
+                       WHERE dp.document_id = d.id AND dp.property_id = $${pi})
+           OR (d.property_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM document_properties dp2 WHERE dp2.document_id = d.id))
+         )`
+      : ''
     const docs = await query<any>(
       `SELECT d.*, d.type AS doc_type,
-              u.unit_number, p.name AS property_name,
-              tu.first_name || ' ' || tu.last_name AS tenant_name
+              u.unit_number,
+              COALESCE(dprop.name, p.name) AS property_name,
+              tu.first_name || ' ' || tu.last_name AS tenant_name,
+              COALESCE((SELECT array_agg(dp.property_id) FROM document_properties dp
+                         WHERE dp.document_id = d.id), '{}') AS property_ids
          FROM documents d
          LEFT JOIN units u ON u.id = d.unit_id
          LEFT JOIN properties p ON p.id = u.property_id
+         LEFT JOIN properties dprop ON dprop.id = d.property_id
          LEFT JOIN tenants t ON t.id = d.tenant_id
          LEFT JOIN users tu ON tu.id = t.user_id
-        WHERE 1=1 ${scope.filter}
-        ORDER BY d.created_at DESC`,
-      scope.params,
+        WHERE 1=1 ${scope.filter} ${propClause}
+          ${tenantFilter ? `AND d.tenant_id = $${scope.params.length + (propertyFilter ? 2 : 1)}` : ''}
+        ORDER BY d.is_reference DESC, d.created_at DESC`,
+      [...scope.params, ...(propertyFilter ? [propertyFilter] : []), ...(tenantFilter ? [tenantFilter] : [])],
     )
     res.json({ success: true, data: docs })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/documents/photo-targets[?propertyId=] — where a photo can go.
+ *
+ * S652: a maintenance worker with "Add photos & posted notices" may hold no
+ * other permission, so the page cannot lean on /properties or /tenants. Without
+ * a property: the properties in their scope. With one: its occupied spaces and
+ * who lives there. Owners see everything they own.
+ */
+documentsRouter.get('/photo-targets', requirePerm('documents.upload', 'documents.post_photo'), async (req, res, next) => {
+  try {
+    const owned = landlordScopeIds(req.user!)
+    const scopedIds = await getScopedPropertyIds(req.user!)   // null = owner
+    const propertyId = typeof req.query.propertyId === 'string' && req.query.propertyId ? req.query.propertyId : null
+    if (!propertyId) {
+      const props = await query<any>(
+        `SELECT id, name FROM properties
+          WHERE landlord_id = ANY($1::uuid[]) ${scopedIds ? 'AND id = ANY($2::uuid[])' : ''}
+          ORDER BY name`, scopedIds ? [owned, scopedIds] : [owned])
+      return res.json({ success: true, data: { properties: props, residents: [] } })
+    }
+    await assertPropertyInScope(req.user!, propertyId)
+    const prop = await queryOne<{ id: string }>(`SELECT id FROM properties WHERE id = $1 AND landlord_id = ANY($2::uuid[])`, [propertyId, owned])
+    if (!prop) throw new AppError(404, 'Property not found')
+    const residents = await query<any>(
+      `SELECT t.id AS tenant_id, u.id AS unit_id, u.unit_number,
+              us.first_name || ' ' || us.last_name AS name, lt.role
+         FROM leases l
+         JOIN units u ON u.id = l.unit_id
+         JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
+         JOIN tenants t ON t.id = lt.tenant_id
+         JOIN users us ON us.id = t.user_id
+        WHERE u.property_id = $1 AND l.status IN ('active','pending')
+        ORDER BY NULLIF(regexp_replace(u.unit_number, '\\D', '', 'g'), '')::int NULLS LAST, u.unit_number, lt.role`, [propertyId])
+    res.json({ success: true, data: { properties: [], residents } })
   } catch (e) { next(e) }
 })
 
@@ -90,33 +152,163 @@ documentsRouter.get('/:id/file', async (req, res, next) => {
 // with type/unit/tenant so filed docs still land in the right buckets.
 const uploadMetaSchema = z.object({
   name:     z.string().min(1).max(200).optional(),
+  // S652: a photo on a resident's record — a line about it and the day it was
+  // posted (a notice taped to the door is dated the day it went up).
+  note:     z.string().max(1000).optional(),
+  postedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   type:     z.enum(DOCUMENT_CATEGORIES as unknown as [string, ...string[]]).default('other'),
   unitId:   z.string().uuid().optional(),
   tenantId: z.string().uuid().optional(),
   leaseId:  z.string().uuid().optional(),
+  // S641: the filing cabinet. A reference document is about a PROPERTY, or
+  // about several — "if I have parking rules at two of my properties and not a
+  // third, I don't wanna have to upload it two times."
+  propertyId:  z.string().uuid().optional(),
+  propertyIds: z.union([
+    z.array(z.string().uuid()).max(200),
+    // multipart sends a repeated field or a JSON string
+    z.string(),
+  ]).optional(),
+  isReference: z.union([z.boolean(), z.string()]).optional(),
 })
 
-documentsRouter.post('/', requirePerm('documents.upload'), docUpload.single('file'), async (req, res, next) => {
+/** multipart gives us a string, a repeated field, or nothing. */
+function parsePropertyIds(raw: unknown): string[] {
+  if (!raw) return []
+  if (Array.isArray(raw)) return raw.map(String)
+  const s = String(raw).trim()
+  if (!s) return []
+  if (s.startsWith('[')) { try { return JSON.parse(s).map(String) } catch { return [] } }
+  return s.split(',').map(x => x.trim()).filter(Boolean)
+}
+
+/**
+ * S641 — which properties a document applies to.
+ *
+ * No rows means everywhere. Nic: "you never know what the next property you're
+ * gonna buy is gonna have, and being able to reuse as many things as possible
+ * for efficiency is the way to go." So a sheet is repinned as the portfolio
+ * changes rather than re-uploaded.
+ */
+documentsRouter.get('/:id/properties', async (req, res, next) => {
+  try {
+    const scope = scopeFor(req.user)
+    if (!scope) throw new AppError(403, 'Forbidden')
+    const doc = await queryOne<{ id: string }>(
+      `SELECT d.id FROM documents d WHERE d.id = $${scope.params.length + 1} ${scope.filter}`,
+      [...scope.params, req.params.id])
+    if (!doc) throw new AppError(404, 'Document not found')
+    const rows = await query<{ property_id: string }>(
+      `SELECT property_id FROM document_properties WHERE document_id = $1`, [req.params.id])
+    res.json({ success: true, data: rows.map(r => r.property_id) })
+  } catch (e) { next(e) }
+})
+
+documentsRouter.put('/:id/properties', requirePerm('documents.upload'), async (req, res, next) => {
+  try {
+    const body = z.object({ propertyIds: z.array(z.string().uuid()).max(200) }).parse(req.body)
+    const doc = await queryOne<{ id: string }>(
+      `SELECT id FROM documents WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!doc) throw new AppError(404, 'Document not found')
+
+    // Ownership-checked before use — a pin must never reach a property this
+    // account does not hold.
+    const ids = [...new Set(body.propertyIds)]
+    if (ids.length) {
+      const owned = await query<{ id: string }>(
+        `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])`,
+        [ids, landlordScopeIds(req.user!)])
+      if (owned.length !== ids.length) throw new AppError(403, 'One of those properties is not yours')
+    }
+
+    await query(`DELETE FROM document_properties WHERE document_id = $1`, [req.params.id])
+    for (const pid of ids) {
+      await query(`INSERT INTO document_properties (document_id, property_id)
+                   VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, pid])
+    }
+    // Keep the single-property column agreeing with the pins, so a one-park
+    // document still reads correctly anywhere that column is used.
+    await query(`UPDATE documents SET property_id = $2 WHERE id = $1`,
+      [req.params.id, ids.length === 1 ? ids[0] : null])
+    res.json({ success: true, data: { propertyIds: ids } })
+  } catch (e) { next(e) }
+})
+
+documentsRouter.post('/', requirePerm('documents.upload', 'documents.post_photo'), docUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
     const storedName = newStoredFilename(req.file.originalname)
     await storage.save(`docs/${storedName}`, req.file.buffer)
     const meta = uploadMetaSchema.parse(req.body)
+    // S652 (Nic): a maintenance worker with only "Add photos & posted notices"
+    // can put a PHOTO on a RESIDENT's record at a property they are assigned
+    // to — and nothing else through this door.
+    let photoLandlordId: string | null = null
+    const owner = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
+    const perms = (req.user!.permissions || {}) as Record<string, any>
+    const photoOnly = !owner && perms['documents.upload'] !== true
+    if (photoOnly) {
+      if (!meta.tenantId) throw new AppError(400, 'Choose the resident this photo belongs to')
+      if (!['notice', 'other'].includes(meta.type)) throw new AppError(403, 'Only a posted notice or a record photo can be added this way')
+      if (!req.file.mimetype.startsWith('image/')) throw new AppError(400, 'A photo (JPEG, PNG or WebP) is required')
+      const home = await queryOne<{ property_id: string; unit_id: string; landlord_id: string }>(
+        `SELECT u.property_id, u.id AS unit_id, u.landlord_id FROM lease_tenants lt
+           JOIN leases l ON l.id = lt.lease_id JOIN units u ON u.id = l.unit_id
+          WHERE lt.tenant_id = $1 AND lt.status = 'active' AND l.status IN ('active','pending')
+          ORDER BY l.start_date DESC LIMIT 1`, [meta.tenantId])
+      if (!home) throw new AppError(404, 'That resident has no current tenancy')
+      await assertPropertyInScope(req.user!, home.property_id)
+      if (home.landlord_id !== req.user!.landlordId) throw new AppError(403, 'That resident is not with your company')
+      meta.unitId = meta.unitId ?? home.unit_id
+      photoLandlordId = home.landlord_id
+    }
+    // Body-supplied property ids are ownership-checked before use: a pin must
+    // never reach a property this account does not hold.
+    const pinIds = [...new Set([
+      ...(meta.propertyId ? [meta.propertyId] : []),
+      ...parsePropertyIds(meta.propertyIds),
+    ])]
+    let pinCompany: string | null = null
+    if (pinIds.length) {
+      const owned = await query<{ id: string; landlord_id: string }>(
+        `SELECT id, landlord_id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])`,
+        [pinIds, landlordScopeIds(req.user!)])
+      if (owned.length !== pinIds.length) throw new AppError(403, 'One of those properties is not yours')
+      // S654: pins that all sit under ONE company say which company it is, so
+      // nobody is asked. Pins across companies (or none) leave it to the request.
+      const companies = new Set(owned.map(r => r.landlord_id))
+      if (companies.size === 1) pinCompany = owned[0].landlord_id
+    }
     // S633: a document tagged to a unit belongs to the company that owns THAT
-    // unit — derived, and authorised by the same lookup that used to be a
-    // separate ownership check below. Untagged, the account names the company.
-    // Previously this read the session's entity and then required the unit to
-    // match it, so a document about the other company's unit was refused.
-    const landlordId = meta.unitId
-      ? await landlordIdForUnit(req.user!, meta.unitId, query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'document')
+    // unit — derived, and authorized by the same lookup that used to be a
+    // separate ownership check below. Untagged, the pins decide (S654), else the
+    // account names the company. Previously this read the session's entity and
+    // then required the unit to match it, so a document about the other
+    // company's unit was refused.
+    const landlordId = photoLandlordId
+      ?? (meta.unitId
+        ? await landlordIdForUnit(req.user!, meta.unitId, query)
+        : pinCompany ?? await landlordForRequest(req, 'document'))
+
+    const isReference = meta.isReference === true || String(meta.isReference) === 'true'
+      || REFERENCE_DOCUMENT_CATEGORIES.includes(meta.type as any)
+
     const doc = await queryOne<any>(
-      `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, type, name, url, file_size, mime_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [landlordId, meta.unitId ?? null, meta.tenantId ?? null, meta.leaseId ?? null, meta.type,
-       meta.name || req.file.originalname, `/uploads/docs/${storedName}`,
-       req.file.size, req.file.mimetype],
+      `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, property_id,
+                              type, name, url, file_size, mime_type, is_reference,
+                              note, posted_at, uploaded_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [landlordId, meta.unitId ?? null, meta.tenantId ?? null, meta.leaseId ?? null,
+       pinIds.length === 1 ? pinIds[0] : (meta.propertyId ?? null),
+       meta.type, meta.name || req.file.originalname, `/uploads/docs/${storedName}`,
+       req.file.size, req.file.mimetype, isReference,
+       meta.note ?? null, meta.postedAt ?? null, req.user!.userId],
     )
-    res.status(201).json({ success: true, data: doc })
+    for (const pid of pinIds) {
+      await query(`INSERT INTO document_properties (document_id, property_id)
+                   VALUES ($1,$2) ON CONFLICT DO NOTHING`, [doc.id, pid])
+    }
+    res.status(201).json({ success: true, data: { ...doc, propertyIds: pinIds } })
   } catch (e) { next(e) }
 })

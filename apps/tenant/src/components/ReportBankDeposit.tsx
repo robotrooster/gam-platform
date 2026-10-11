@@ -19,13 +19,30 @@
 //    saying: a corroborated report earns them the date THEY paid rather than the
 //    date the bank got round to posting, which over a weekend is several days of
 //    late fees.
+//
+// S655 review — AND IT MUST ONLY PROMISE WHAT GAM CAN DO. All of the above is
+// true only while GAM is reading the landlord's bank. Without that (no bank
+// linked, or a link in error) nothing matches the report and nothing expires
+// it: the landlord checks their own bank and marks the bill paid by hand. The
+// window asks before the tenant reports, and every line here — the form, the
+// confirmation and the list of reports — says which of the two it is
+// (./reportBankDepositCopy.ts).
 
 import { useState } from 'react'
+import { useQuery } from 'react-query'
 import {
-  MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
-  type ManualPaymentMethod,
+  DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
+  DEPOSIT_REFERENCE_LABEL, bankReceiptPhotoProblem, bankDateUsedText, BANK_DEPOSIT_REPORT_NOT_TAKEN,
+  DEPOSIT_HOURS, DEPOSIT_AFTER_HOURS, DEPOSIT_AFTER_HOURS_LABEL, DEPOSIT_HOUR_QUESTION, DEPOSIT_HOUR_HINT,
+  depositHourLabel, reportedTimeText,
+  type ManualPaymentMethod, type DepositablePaymentMethod,
 } from '@gam/shared'
-import { apiPost, apiDelete } from '../lib/api'
+import { apiGet, apiPost, apiDelete, apiUpload } from '../lib/api'
+import { AuthedImg } from './AuthedMedia'
+import {
+  ONLY_AFTER_YOU_PAID, alreadyReportedMessage, bankWatch, pendingReportStatus, reportDepositCopy,
+  reportStandsNow, PHOTO_NOT_SENT,
+} from './reportBankDepositCopy'
 
 interface Props {
   leaseId: string
@@ -43,24 +60,58 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   Props & { onClose: () => void }) {
   const [amountText, setAmountText] = useState(outstanding > 0 ? outstanding.toFixed(2) : '')
   const [declaredDate, setDeclaredDate] = useState(todayISO())
-  const [method, setMethod] = useState<ManualPaymentMethod>('cash')
+  const [method, setMethod] = useState<DepositablePaymentMethod>('cash')
   const [reference, setReference] = useState('')
+  // 10/6 (Nic): about what time they were at the bank — required. '' until picked.
+  const [hour, setHour] = useState('')
+  // 10/5 (Nic): an optional photo of the bank's receipt, sent once the report is made.
+  const [photo, setPhoto] = useState<File | null>(null)
   const [confirmed, setConfirmed] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
+  // Asked fresh every time the window opens: whether GAM is reading this
+  // landlord's bank decides what the window may promise.
+  const feed = useQuery(
+    ['declared-deposit-feed', leaseId],
+    () => apiGet<{ leaseId: string; bankFeedLinked: boolean; expiresInDays?: number; depositsTaken?: boolean; notTakenMessage?: string }>(
+      `/declared-deposits/feed/${leaseId}`),
+    { staleTime: 0, retry: 1 },
+  )
+  const watch = bankWatch({
+    bankFeedLinked: feed.data?.bankFeedLinked, loading: feed.isLoading, failed: feed.isError,
+  })
+  const copy = reportDepositCopy(watch, feed.data?.expiresInDays)
+
   const amount = Number(amountText)
-  const canSubmit = confirmed && amount > 0 && !!declaredDate && !submitting
+  // 10/5 (Nic): the reference number from the bank's receipt is required.
+  // 10/6 (Nic): and about what time they were at the bank.
+  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim() && !!hour && !submitting && copy.canReport
 
   async function submit() {
     setError(null); setSubmitting(true)
     try {
       const res: any = await apiPost('/declared-deposits', {
         leaseId, amount, declaredDate, method,
-        reference: reference.trim() || undefined,
+        reference: reference.trim(),
+        depositHour: hour === DEPOSIT_AFTER_HOURS ? DEPOSIT_AFTER_HOURS : Number(hour),
       })
-      setDone(res?.data?.message ?? 'Reported.')
+      // The photo goes on the report just made (or the one already made).
+      let photoNote = ''
+      if (photo && res?.data?.id) {
+        try {
+          const fd = new FormData()
+          fd.append('photo', photo)
+          await apiUpload(`/declared-deposits/${res.data.id}/receipt-photo`, fd)
+        } catch {
+          photoNote = ` ${PHOTO_NOT_SENT}`
+        }
+      }
+      // The server's own sentence is the authority: it checks the bank link
+      // at the moment of reporting.
+      setDone((res?.data?.message
+        ?? (res?.data?.alreadyReported ? alreadyReportedMessage(watch) : 'Reported.')) + photoNote)
       onReported()
     } catch (e: any) {
       setError(e?.message || 'We could not record that. Try again.')
@@ -82,7 +133,16 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
           Report a deposit you made at the bank
         </div>
 
-        {done ? (
+        {feed.data?.depositsTaken === false ? (
+          // 10/6 (Nic): the landlord does not take rent deposited at their bank here.
+          <>
+            <div style={{ marginTop: 14, fontSize: '.82rem', lineHeight: 1.55, color: 'var(--t1)' }}>
+              {feed.data.notTakenMessage ?? BANK_DEPOSIT_REPORT_NOT_TAKEN}
+            </div>
+            <button className="btn-primary" style={{ width: '100%', marginTop: 16 }}
+              onClick={onClose}>Done</button>
+          </>
+        ) : done ? (
           <>
             <div style={{
               marginTop: 14, padding: 12, borderRadius: 8,
@@ -97,9 +157,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
         ) : (
           <>
             <div style={{ fontSize: '.8rem', color: 'var(--t2)', lineHeight: 1.55, marginTop: 6 }}>
-              If you deposited rent straight into your landlord's account, tell us and
-              we'll watch for it. When it appears we'll apply it automatically — and
-              date it to the day <em>you</em> paid, not the day the bank posted it.
+              {copy.intro}
             </div>
 
             {/* Nic's warning, given its own weight rather than buried in help text. */}
@@ -109,9 +167,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
               border: '1px solid var(--warn-bd, rgba(200,150,40,.35))',
               fontSize: '.78rem', lineHeight: 1.55, color: 'var(--t1)',
             }}>
-              <strong>Only after you've actually paid.</strong> Give the bank a few hours
-              to show the deposit — if you report it before you've been, there'll be
-              nothing for us to match and the report will expire.
+              <strong>{ONLY_AFTER_YOU_PAID}</strong> {copy.warning}
             </div>
 
             <label style={{ display: 'block', marginTop: 14, fontSize: '.75rem', color: 'var(--t3)' }}>
@@ -127,6 +183,25 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
             <input type="date" value={declaredDate} max={todayISO()}
               onChange={(e) => setDeclaredDate(e.target.value)} style={inputStyle} />
 
+            {/* 10/6 (Nic): required — "for people that pay the exact same
+                amount, the probability that they're going to be in the bank
+                at exactly the same time also kind of shrinks." */}
+            <label htmlFor="report-deposit-hour"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              {DEPOSIT_HOUR_QUESTION}
+            </label>
+            <select id="report-deposit-hour" value={hour} required
+              onChange={(e) => setHour(e.target.value)} style={inputStyle}>
+              <option value="" disabled>Pick a time</option>
+              {DEPOSIT_HOURS.map((h) => (
+                <option key={h} value={String(h)}>{depositHourLabel(h)}</option>
+              ))}
+              <option value={DEPOSIT_AFTER_HOURS}>{DEPOSIT_AFTER_HOURS_LABEL}</option>
+            </select>
+            <div style={{ fontSize: '.72rem', color: 'var(--t3)', lineHeight: 1.5, marginTop: 4 }}>
+              {DEPOSIT_HOUR_HINT}
+            </div>
+
             <label style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
               How did you pay?
             </label>
@@ -134,7 +209,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
                 same amount on the same day — a bank memo describes what was
                 deposited even when it names nobody. */}
             <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
-              {MANUAL_PAYMENT_METHODS.map((m) => (
+              {DEPOSITABLE_PAYMENT_METHODS.map((m) => (
                 <button key={m} type="button" onClick={() => setMethod(m)}
                   className={method === m ? 'btn-primary' : 'btn-ghost'}
                   style={{ fontSize: '.78rem', padding: '6px 12px' }}>
@@ -143,12 +218,27 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
               ))}
             </div>
 
-            <label style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
-              Check or money-order number <span style={{ color: 'var(--t3)' }}>(optional)</span>
+            {/* 10/5 (Nic): required — it tells this deposit apart from anyone
+                else's for the same amount. */}
+            <label htmlFor="report-deposit-reference"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              {DEPOSIT_REFERENCE_LABEL}
             </label>
-            <input value={reference} maxLength={120}
+            <input id="report-deposit-reference" value={reference} maxLength={120} required
               onChange={(e) => setReference(e.target.value)} style={inputStyle}
-              placeholder="Helps us find it faster" />
+              placeholder="e.g. 004417" />
+
+            <label htmlFor="report-deposit-photo"
+              style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
+              Photo of the bank’s receipt <span style={{ color: 'var(--t3)' }}>(optional)</span>
+            </label>
+            <input id="report-deposit-photo" type="file" accept="image/*" style={{ ...inputStyle, padding: '7px 9px' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null
+                const problem = bankReceiptPhotoProblem(f)
+                if (problem) { setError(problem); setPhoto(null); e.target.value = ''; return }
+                setError(null); setPhoto(f)
+              }} />
 
             {/* The load-bearing sentence. A tenant who thinks this paid their rent
                 stops worrying about a bill that is still due. */}
@@ -158,10 +248,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
             }}>
               <input type="checkbox" checked={confirmed} style={{ marginTop: 3 }}
                 onChange={(e) => setConfirmed(e.target.checked)} />
-              <span>
-                I've already made this deposit, and I understand my balance stays the
-                same until it shows up in the bank.
-              </span>
+              <span>{copy.confirm}</span>
             </label>
 
             {error && (
@@ -193,22 +280,50 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
  * tenant needs to see and act on, and a confirmed one is the reassurance that
  * the thing they did worked.
  */
-export function ReportedDeposits({ reports, onWithdrawn }: {
+/** The server's answer to an "I hadn't paid" it would not do. */
+export interface WithdrawRefusal { id: string; message: string }
+
+export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, standalone }: {
   reports: any[]
   onWithdrawn: () => void
+  /**
+   * S655 review: a page can hold the refusal itself (pass both). The refused
+   * report was usually just applied to the bill, often paying it off, and the
+   * reload that follows takes away the balance card this list sits in — held
+   * in here, the answer went with the card. Without these, the list holds it.
+   */
+  refusal?: WithdrawRefusal | null
+  onRefusal?: (r: WithdrawRefusal | null) => void
+  /** Its own block on the page rather than a section of a card. */
+  standalone?: boolean
 }) {
   const [busy, setBusy] = useState<string | null>(null)
-  const open = reports.filter(r => r.status === 'pending' || r.status === 'unconfirmed')
-  if (open.length === 0) return null
+  const [ownRefusal, setOwnRefusal] = useState<WithdrawRefusal | null>(null)
+  const withdrawError = onRefusal ? (refusal ?? null) : ownRefusal
+  const setWithdrawError = onRefusal ?? setOwnRefusal
+  // 10/5 (Nic): a report the bank showed on a later day stays here, saying
+  // the bank's date was used and why.
+  const open = reports.filter(r => r.status === 'pending' || r.status === 'unconfirmed'
+    || (r.status === 'confirmed' && r.bankDateUsed && r.bankPostedDate))
+  // A refused "I hadn't paid" is usually a report matched or closed in the
+  // meantime, which has just left the open list: when it was the only one,
+  // the list stays up to say what happened rather than vanishing.
+  if (open.length === 0 && !withdrawError) return null
+  const standing = withdrawError ? reportStandsNow(reports.find(r => r.id === withdrawError.id)) : null
 
   async function withdraw(id: string) {
-    setBusy(id)
-    try { await apiDelete(`/declared-deposits/${id}`); onWithdrawn() }
-    finally { setBusy(null) }
+    setBusy(id); setWithdrawError(null)
+    try { await apiDelete(`/declared-deposits/${id}`) }
+    catch (e: any) {
+      // Said once, in the server's words. The list reloads below, and the line
+      // under it says where the report stands now.
+      setWithdrawError({ id, message: e?.message || 'We could not take that report back. Try again.' })
+    }
+    finally { setBusy(null); onWithdrawn() }
   }
 
   return (
-    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
+    <div style={standalone ? undefined : { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
       <div style={{
         fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)',
         textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
@@ -222,12 +337,26 @@ export function ReportedDeposits({ reports, onWithdrawn }: {
         }}>
           <span style={{ color: 'var(--t2)', lineHeight: 1.5 }}>
             {formatCurrency(Number(r.amount))} on {r.declaredDate}
-            <span style={{ color: 'var(--t3)' }}> · {r.method.replace('_', ' ')}</span>
+            {/* 10/6 (Nic): about what time they said they were at the bank. */}
+            {reportedTimeText({ hour: r.depositHour, afterHours: r.afterHours }) && (
+              <span style={{ color: 'var(--t3)' }}>
+                {', '}{reportedTimeText({ hour: r.depositHour, afterHours: r.afterHours })}
+              </span>
+            )}
+            <span style={{ color: 'var(--t3)' }}>
+              {' · '}{MANUAL_PAYMENT_METHOD_LABELS[r.method as ManualPaymentMethod] ?? 'Other'}
+            </span>
+            {r.reference && (
+              <span style={{ color: 'var(--t3)' }}>{' · Ref '}{r.reference}</span>
+            )}
             <div style={{ color: 'var(--t3)', fontSize: '.72rem', marginTop: 2 }}>
               {r.status === 'pending'
-                ? 'Waiting for it to appear in the bank. Your balance is unchanged until it does.'
-                : (r.resolutionNote || 'We could not find a matching deposit.')}
+                ? pendingReportStatus(r.bankFeedLinked)
+                : r.status === 'confirmed'
+                  ? bankDateUsedText(r.declaredDate, r.bankPostedDate)
+                  : (r.resolutionNote || 'We could not find a matching deposit.')}
             </div>
+            {r.receiptPhotoUrl && <ReceiptPhotoButton url={r.receiptPhotoUrl} />}
           </span>
           {r.status === 'pending' && (
             <button className="btn-ghost" disabled={busy === r.id}
@@ -238,6 +367,45 @@ export function ReportedDeposits({ reports, onWithdrawn }: {
           )}
         </div>
       ))}
+      {withdrawError && (
+        <div role="status" style={{ marginTop: 6, fontSize: '.74rem', lineHeight: 1.5 }}>
+          <div style={{ color: 'var(--danger, #d66)' }}>{withdrawError.message}</div>
+          {standing && <div style={{ color: 'var(--t2)', marginTop: 2 }}>{standing}</div>}
+          <button className="btn-ghost" style={{ fontSize: '.72rem', padding: '4px 10px', marginTop: 6 }}
+            onClick={() => setWithdrawError(null)}>
+            OK
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 10/5 (Nic): the tenant's own photo of the bank's receipt, shown in the app (the file sits behind the sign-in). */
+function ReceiptPhotoButton({ url }: { url: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button type="button" className="btn-primary" style={{ fontSize: '.7rem', padding: '3px 10px' }}
+        onClick={() => setOpen(true)}>
+        Photo of the bank’s receipt
+      </button>
+      {open && (
+        <div onClick={() => setOpen(false)} style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,.7)', display: 'flex',
+          alignItems: 'center', justifyContent: 'center', zIndex: 110, padding: 16,
+        }}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: 'var(--bg2)', border: '1px solid var(--b1)', borderRadius: 12, padding: 16,
+            width: '100%', maxWidth: 520,
+          }}>
+            <AuthedImg path={url} alt="Photo of the bank's receipt"
+              style={{ display: 'block', width: '100%', maxHeight: '70vh', objectFit: 'contain', borderRadius: 8 }} />
+            <button type="button" className="btn-ghost" style={{ width: '100%', marginTop: 12 }}
+              onClick={() => setOpen(false)}>Close</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

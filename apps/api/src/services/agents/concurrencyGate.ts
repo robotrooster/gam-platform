@@ -59,7 +59,8 @@ function limit(): number {
 }
 
 let active = 0
-const waiting: Array<() => void> = []
+interface Waiter { release: () => void; key?: string }
+const waiting: Waiter[] = []
 
 export interface GateStats {
   active: number
@@ -69,6 +70,26 @@ export interface GateStats {
 
 export function gateStats(): GateStats {
   return { active, waiting: waiting.length, limit: limit() }
+}
+
+/**
+ * Where a particular conversation sits in the queue right now, 1-based, or 0
+ * if it is not waiting (running, or finished).
+ *
+ * S651: the queue has worked since S628, and nobody waiting in it was ever
+ * told. The reply arrives late with a typing indicator that has been going for
+ * ninety seconds and no explanation, which reads as a broken page rather than
+ * as somebody being busy. This is what a status poll reads to say something
+ * true instead.
+ *
+ * Positions shift as people ahead finish, so this is deliberately computed on
+ * each call rather than handed out once at enqueue time — a number that said
+ * "3 ahead of you" for two minutes after they had gone would be worse than
+ * saying nothing.
+ */
+export function queuePositionOf(key: string): number {
+  const i = waiting.findIndex(w => w.key === key)
+  return i < 0 ? 0 : i + 1
 }
 
 /**
@@ -93,14 +114,15 @@ export function queuePositionMessage(position: number): string | null {
 export async function withConcurrencySlot<T>(
   fn: () => Promise<T>,
   onQueued?: (position: number) => void,
+  key?: string,
 ): Promise<T> {
   const max = limit()
   if (active >= max) {
     const position = waiting.length + 1
     onQueued?.(position)
-    logger.info({ active, waiting: waiting.length, limit: max },
+    logger.info({ active, waiting: waiting.length, limit: max, key },
       'agent: conversation queued — at capacity')
-    await new Promise<void>((resolve) => waiting.push(resolve))
+    await new Promise<void>((resolve) => waiting.push({ release: resolve, key }))
   }
   active++
   try {
@@ -108,7 +130,7 @@ export async function withConcurrencySlot<T>(
   } finally {
     active--
     const next = waiting.shift()
-    if (next) next()
+    if (next) next.release()
   }
 }
 
