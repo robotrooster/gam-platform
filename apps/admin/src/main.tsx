@@ -31,6 +31,7 @@ import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContai
 import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
+import { MetricsHeatMap } from './components/MetricsHeatMap'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API}/api` })
@@ -1826,6 +1827,11 @@ function Metrics(){
         <MetricTile label="Households" value={count(fp.households)} sub="active leases"/>
         <MetricTile label="Residents" value={count(fp.residents)} sub="people on an active lease"/>
       </div>
+
+      {/* 10/12 (Nic): "a heat map, toggleable at the state and county levels. darker colors for more units
+          in that area. toggleable between a heat map for units and money." Units = the Spaces tile above,
+          money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap). */}
+      <MetricsHeatMap data={m.map}/>
 
       {/* ── Paperwork and operations ── */}
       <div className="ct mx-section">Done on GAM</div>

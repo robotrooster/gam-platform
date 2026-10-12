@@ -57,9 +57,25 @@
  * property with a lease, a billed month or a stay on it (LIVE_PROPERTY). A
  * signup that never added a tenant (a test account, a junk organic signup) is
  * not a landlord on the platform yet.
+ *
+ * 10/12 (Nic): THE HEAT MAP — "toggleable at the state and county levels.
+ * darker colors for more units in that area. toggleable between a heat map for
+ * units and money." Two numbers per state and per county (Census FIPS codes),
+ * each the SAME definition as its tile so the map adds up to the tile: units =
+ * "Spaces under management" (open spaces on a live property), money = "Rent
+ * logged through GAM" (RENT_LINES, all time). See PlatformMap / buildPlatformMap.
+ * Properties have no county column; the county comes from the property's own
+ * map location (properties.latitude/longitude) inside the Census county shapes
+ * checked in beside this file (us-atlas, offline — no outside lookup). Anything
+ * that cannot be placed is named and counted in `missing`, never guessed —
+ * including a property whose address was edited after its map location was
+ * found (10/12 (Nic) review: an edit does not look the location up again yet,
+ * so the old point would land it in the old county; MAP_ROWS location_stale).
  */
 import { query } from '../db'
-import { paidByLabel, PROCESSING_FEES } from '@gam/shared'
+import { paidByLabel, PROCESSING_FEES, US_STATE_NAME } from '@gam/shared'
+import { formatState } from '../lib/format'
+import { logger } from '../lib/logger'
 import { realLandlordSql } from './platformRevenue'
 import { platformFeeBill } from './platformFeeBill'
 import { liveReversalSql, reversedUseOfWonDisputeSql } from './creditUse'
@@ -123,6 +139,37 @@ export interface PlatformMetrics {
     workTradeAgreements: number
   }
   growth: Array<{ date: string; rentRoll: number; units: number; occupied: number; tenants: number }>
+  /** 10/12 (Nic): the heat map, by state and by county. */
+  map: PlatformMap
+}
+
+/** 10/12 (Nic): one state or county on the heat map. */
+export interface MapArea {
+  /** Census FIPS code: two digits for a state, five for a county. */
+  fips: string
+  name: string
+  /** The "Spaces under management" tile, in this place: open spaces on a live property. */
+  units: number
+  /** The "Rent logged through GAM" tile, in this place: all time, every way it was paid. */
+  money: number
+  /** Properties counted here: live ones, and any other a rent dollar was logged on. */
+  properties: number
+}
+
+/** Why something is not on a map. Never shown raw — each carries its own words. */
+export type MapGap =
+  | 'unknown_state' | 'no_property' | 'no_location' | 'stale_location' | 'outside_map' | 'wrong_state'
+  | 'no_county_shapes'
+
+export interface PlatformMap {
+  states: Array<MapArea & { abbr: string }>
+  counties: Array<MapArea & { state: string }>
+  /**
+   * 10/12 (Nic): what could not be put on a map, and why — "do not guess
+   * silently". `offStateMap` true: missing from both maps; false: on the state
+   * map, missing from the county map only.
+   */
+  missing: Array<{ reason: MapGap; label: string; offStateMap: boolean; properties: number; units: number; money: number }>
 }
 
 const ELECTRONIC = ['card', 'ach'] as const
@@ -180,14 +227,25 @@ const REFUND_WENT_BACK = (rp: string) =>
   `${rp}.kind <> 'credit' AND ${rp}.status IN ('refunded', 'handed_back') AND ${rp}.reversed_at IS NULL`
 
 /**
+ * 10/12 (Nic): the property a rent bill (a payments alias) is for — the space
+ * it billed, else its lease's space. NULL only for a bill with neither; the
+ * heat map names that money rather than placing it (MapGap 'no_property').
+ */
+const BILL_PROPERTY = (p: string) => `(
+  SELECT bu.property_id FROM units bu
+   WHERE bu.id = COALESCE(${p}.unit_id, (SELECT bl.unit_id FROM leases bl WHERE bl.id = ${p}.lease_id)))`
+
+/**
  * Every dollar of rent logged through GAM, once. Columns: method, at, amount,
  * remittance_id (the tenant payment the money came in on; NULL on a take-back
- * line, so it never adds to a payment count). See the module header.
+ * line, so it never adds to a payment count), property_id (10/12 (Nic): where
+ * the rent was for, so the heat map's money adds up to the tile). See the
+ * module header.
  */
 const RENT_LINES = (): string => `
   -- 1. Money a settled tenant payment applied to a rent bill.
   SELECT r.payment_method AS method, COALESCE(r.settled_at, r.created_at) AS at,
-         ra.amount_applied AS amount, r.id AS remittance_id
+         ra.amount_applied AS amount, r.id AS remittance_id, ${BILL_PROPERTY('p')} AS property_id
     FROM remittance_applications ra
     JOIN tenant_remittances r ON r.id = ra.remittance_id
     JOIN payments p ON p.id = ra.payment_id
@@ -196,7 +254,7 @@ const RENT_LINES = (): string => `
   -- 2. Money paid ahead on a tenant payment that a later rent bill spent, in
   --    that payment's method, on the day it was spent. A spend undone by a
   --    dispute is not money any more — unless GAM won the dispute, which put it back.
-  SELECT sr.payment_method, cu.applied_at, cu.amount, sr.id
+  SELECT sr.payment_method, cu.applied_at, cu.amount, sr.id, ${BILL_PROPERTY('p')}
     FROM credit_uses cu
     JOIN lease_prepaid_credits pc ON pc.id = cu.prepaid_credit_id
     JOIN tenant_remittances sr ON sr.id = pc.source_remittance_id
@@ -208,7 +266,7 @@ const RENT_LINES = (): string => `
   -- 3. What a dispute or bank return took back off a rent bill's money, on
   --    the day it was taken. The tenant is billed again; that re-payment is
   --    part 1 when it comes.
-  SELECT ${REVERSAL_METHOD('pr')}, pr.created_at, -taken.amt, NULL::uuid
+  SELECT ${REVERSAL_METHOD('pr')}, pr.created_at, -taken.amt, NULL::uuid, ${BILL_PROPERTY('p')}
     FROM payment_reversals pr
     JOIN payments p ON p.id = pr.payment_id
     ${TAKEN_FROM_THE_BILL('pr')}
@@ -221,7 +279,11 @@ const RENT_LINES = (): string => `
   --    shortened (a reclassified credit, or one whose anchor bill was rent).
   --    A refund of an overpayment's unspent surplus is left alone — that
   --    money never reached a rent bill, so it was never counted.
-  SELECT r.payment_method, rp.refunded_at, -rp.toward_amount, NULL::uuid
+  --    Where: the stay's space, else the lease the money was for.
+  SELECT r.payment_method, rp.refunded_at, -rp.toward_amount, NULL::uuid,
+         (SELECT ru.property_id FROM units ru
+           WHERE ru.id = COALESCE((SELECT k.unit_id FROM unit_bookings k WHERE k.id = rp.booking_id),
+                                  (SELECT rl.unit_id FROM leases rl WHERE rl.id = COALESCE(pc.lease_id, r.lease_id))))
     FROM stay_refund_parts rp
     JOIN tenant_remittances r ON r.id = rp.remittance_id
     LEFT JOIN lease_prepaid_credits pc ON pc.id = rp.prepaid_credit_id
@@ -285,11 +347,254 @@ const LIVE_PROPERTY = (p: string) => `(
   OR EXISTS (SELECT 1 FROM unit_bookings k JOIN units ku ON ku.id = k.unit_id
               WHERE ku.property_id = ${p}.id AND ${STAY_HELD}))`
 
+// ── The heat map (10/12, Nic) ─────────────────────────────────────────────────
+
+/**
+ * 10/12 (Nic): one row per property on the heat map, plus one row (property_id
+ * NULL) for rent on a bill with no space or lease on record. Units only on a
+ * live property of a real landlord (the "Spaces under management" tile); money
+ * on any property a rent dollar was logged on (the "Rent logged" tile, which
+ * filters by the paying landlord, not by live) — so each map adds up to its tile.
+ */
+const MAP_ROWS = (): string => `
+  WITH rent AS (
+    SELECT x.property_id, SUM(x.amount) AS amount FROM (${RENT_LINES()}) x GROUP BY x.property_id
+  ), place AS (
+    SELECT p.id, p.state, p.latitude, p.longitude, p.address_verification, p.address_verified_at,
+           (${realLandlordSql('p.landlord_id')} AND ${LIVE_PROPERTY('p')}) AS live
+      FROM properties p
+  ), moved AS (
+    -- 10/12 (Nic) review: the last time each property's address was edited
+    -- (routes/properties.ts writes 'property_address_changed'; rows older than
+    -- 24 months move to audit_log_archive, jobs/complianceArchive).
+    SELECT x.entity_id AS property_id, MAX(x.created_at) AS at FROM (
+      SELECT entity_id, created_at FROM audit_log
+       WHERE entity_type = 'property' AND action = 'property_address_changed'
+      UNION ALL
+      SELECT entity_id, created_at FROM audit_log_archive
+       WHERE entity_type = 'property' AND action = 'property_address_changed'
+    ) x GROUP BY x.entity_id
+  )
+  SELECT pl.id AS property_id, pl.state, pl.latitude::float8 AS lat, pl.longitude::float8 AS lng,
+         CASE WHEN pl.live THEN (SELECT COUNT(*)::int FROM units u
+                                  WHERE u.property_id = pl.id AND u.retired_at IS NULL) ELSE 0 END AS units,
+         COALESCE(rent.amount, 0)::text AS money,
+         -- 10/12 (Nic) review: a map location is only trusted for the address
+         -- it was found for. An address edit does not look the location up
+         -- again, and a failed look-up keeps the old point
+         -- (addressVerification.verifyPropertyAddress COALESCEs it), so the
+         -- point is fresh only when a look-up that found the place
+         -- ('geocoded' or 'parcel') ran after the last edit. An 'unverified'
+         -- stamp is a try that found nothing; the point on file is older.
+         (mv.at IS NOT NULL
+          AND (pl.address_verified_at IS NULL OR pl.address_verified_at <= mv.at
+               OR pl.address_verification NOT IN ('geocoded', 'parcel'))) AS location_stale
+    FROM place pl
+    LEFT JOIN rent ON rent.property_id = pl.id
+    LEFT JOIN moved mv ON mv.property_id = pl.id
+   WHERE pl.live OR rent.property_id IS NOT NULL
+  UNION ALL
+  SELECT NULL, NULL, NULL, NULL, 0, rent.amount::text, FALSE FROM rent WHERE rent.property_id IS NULL`
+
+interface MapRow {
+  property_id: string | null
+  state: string | null
+  lat: number | null
+  lng: number | null
+  units: number
+  money: string
+  /** 10/12 (Nic) review: the address was edited after its map location was found (MAP_ROWS). */
+  location_stale: boolean
+}
+
+/** Census FIPS state codes (fixed federal standard), by the two-letter code properties.state holds. */
+const STATE_FIPS: Readonly<Record<string, string>> = {
+  AL: '01', AK: '02', AZ: '04', AR: '05', CA: '06', CO: '08', CT: '09', DE: '10', DC: '11', FL: '12',
+  GA: '13', HI: '15', ID: '16', IL: '17', IN: '18', IA: '19', KS: '20', KY: '21', LA: '22', ME: '23',
+  MD: '24', MA: '25', MI: '26', MN: '27', MS: '28', MO: '29', MT: '30', NE: '31', NV: '32', NH: '33',
+  NJ: '34', NM: '35', NY: '36', NC: '37', ND: '38', OH: '39', OK: '40', OR: '41', PA: '42', RI: '44',
+  SC: '45', SD: '46', TN: '47', TX: '48', UT: '49', VT: '50', VA: '51', WA: '53', WV: '54', WI: '55',
+  WY: '56', AS: '60', GU: '66', MP: '69', PR: '72', VI: '78',
+}
+/** US_STATE_NAME (@gam/shared) covers the 50 states and DC; the territories GAM's address formatter accepts. */
+const TERRITORY_NAME: Readonly<Record<string, string>> = {
+  AS: 'American Samoa', GU: 'Guam', MP: 'Northern Mariana Islands', PR: 'Puerto Rico', VI: 'U.S. Virgin Islands',
+}
+/** For tests: the state table checked against the county shapes' own state names. */
+export const MAP_STATE_FIPS = STATE_FIPS
+
+const MAP_GAP_LABEL: Readonly<Record<MapGap, string>> = {
+  unknown_state: 'the state on its address is not a U.S. state or territory',
+  no_property: 'rent on a bill with no space or lease on record',
+  no_location: 'no map location on file for its address',
+  stale_location: 'its address changed and no map location has been found for the new address',
+  outside_map: 'its map location is not inside any U.S. county',
+  wrong_state: 'its map location is in a different state than its address',
+  no_county_shapes: 'the county map could not be read on the server',
+}
+const OFF_STATE_MAP: ReadonlySet<MapGap> = new Set<MapGap>(['unknown_state', 'no_property'])
+
+/**
+ * 10/12 (Nic): the Census county shapes, for "which county is this property
+ * in". The file beside this one is us-atlas@3.0.1 counties-10m.json, copied
+ * unchanged (ISC; Census Bureau cartographic boundaries, 2017 edition,
+ * simplified — the admin page draws the same edition from the same package, so
+ * a county code here always has a shape there). Read once, on the first map
+ * build, never at start-up; nothing is fetched from anywhere. Simplified edges
+ * mean a property within a few hundred yards of a county line can land in the
+ * neighbor — fine for a heat map, not for anything legal or billed.
+ *
+ * Decoded here rather than with topojson-client: the API carries no map
+ * library, and a TopoJSON polygon is only its arcs, delta-decoded and joined.
+ */
+interface CountyShape {
+  fips: string
+  name: string
+  /** [west, south, east, north] — skips the ray test for nearly every county. */
+  box: [number, number, number, number]
+  /** Polygons → rings → flat [lng, lat, lng, lat, …]. */
+  polygons: number[][][]
+}
+
+function decodeCounties(topo: any): CountyShape[] {
+  const [sx, sy] = topo.transform.scale
+  const [tx, ty] = topo.transform.translate
+  const arcs: number[][] = topo.arcs.map((arc: number[][]) => {
+    const out: number[] = []
+    let x = 0, y = 0
+    for (const [dx, dy] of arc) { x += dx; y += dy; out.push(x * sx + tx, y * sy + ty) }
+    return out
+  })
+  const ring = (ids: number[]): number[] => {
+    const out: number[] = []
+    for (const id of ids) {
+      const a = arcs[id < 0 ? ~id : id]
+      const n = a.length / 2
+      // Each arc after the first starts where the last one ended; skip the repeat.
+      for (let k = out.length ? 1 : 0; k < n; k++) {
+        const j = id < 0 ? n - 1 - k : k
+        out.push(a[2 * j], a[2 * j + 1])
+      }
+    }
+    return out
+  }
+  return topo.objects.counties.geometries.map((g: any): CountyShape => {
+    const parts: number[][][] = g.type === 'Polygon' ? [g.arcs] : g.type === 'MultiPolygon' ? g.arcs : []
+    const polygons = parts.map(rings => rings.map(ring))
+    const box: [number, number, number, number] = [Infinity, Infinity, -Infinity, -Infinity]
+    for (const poly of polygons) {
+      const outer = poly[0] ?? []
+      for (let i = 0; i < outer.length; i += 2) {
+        box[0] = Math.min(box[0], outer[i]); box[2] = Math.max(box[2], outer[i])
+        box[1] = Math.min(box[1], outer[i + 1]); box[3] = Math.max(box[3], outer[i + 1])
+      }
+    }
+    return { fips: String(g.id), name: String(g.properties?.name ?? ''), box, polygons }
+  })
+}
+
+/** Even-odd across every ring of one polygon, so a point in a hole is outside it. */
+function insidePolygon(x: number, y: number, rings: number[][]): boolean {
+  let inside = false
+  for (const r of rings) {
+    for (let i = 0, j = r.length - 2; i < r.length; j = i, i += 2) {
+      const xi = r[i], yi = r[i + 1], xj = r[j], yj = r[j + 1]
+      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside
+    }
+  }
+  return inside
+}
+
+let countyShapes: Promise<CountyShape[]> | null = null
+function loadCountyShapes(): Promise<CountyShape[]> {
+  if (!countyShapes) {
+    countyShapes = import('./platformMetrics.counties-10m.json')
+      .then(m => decodeCounties((m as any).default ?? m))
+      // A failed read is retried on the next build, not remembered.
+      .catch(e => { countyShapes = null; throw e })
+  }
+  return countyShapes
+}
+
+/** 10/12 (Nic): the county a map location falls in, or null when it is in none. */
+export async function countyAt(lat: number, lng: number): Promise<{ fips: string; name: string } | null> {
+  const shapes = await loadCountyShapes()
+  for (const c of shapes) {
+    if (lng < c.box[0] || lng > c.box[2] || lat < c.box[1] || lat > c.box[3]) continue
+    if (c.polygons.some(poly => insidePolygon(lng, lat, poly))) return { fips: c.fips, name: c.name }
+  }
+  return null
+}
+
+/**
+ * 10/12 (Nic): the per-state and per-county totals. A property goes on the
+ * state map by the state on its address, and on the county map by its map
+ * location — only when that location is inside a county of the same state.
+ * Everything else is counted in `missing` with the reason, so the page can say
+ * what is not on the map instead of quietly drawing less.
+ */
+async function buildPlatformMap(rows: MapRow[]): Promise<PlatformMap> {
+  const states = new Map<string, MapArea & { abbr: string }>()
+  const counties = new Map<string, MapArea & { state: string }>()
+  const missing = new Map<MapGap, PlatformMap['missing'][number]>()
+  const miss = (reason: MapGap, units: number, money: number, isProperty: boolean) => {
+    const m = missing.get(reason)
+      ?? { reason, label: MAP_GAP_LABEL[reason], offStateMap: OFF_STATE_MAP.has(reason), properties: 0, units: 0, money: 0 }
+    m.properties += isProperty ? 1 : 0
+    m.units += units
+    m.money += money
+    missing.set(reason, m)
+  }
+  const add = <T extends MapArea>(areas: Map<string, T>, fips: string, blank: () => T, units: number, money: number) => {
+    const a = areas.get(fips) ?? blank()
+    a.properties += 1
+    a.units += units
+    a.money += money
+    areas.set(fips, a)
+  }
+
+  let shapesReadable = true
+  try { await loadCountyShapes() } catch (e) {
+    shapesReadable = false
+    logger.error({ err: e }, '[platformMetrics] county shapes could not be read; the county map is empty')
+  }
+
+  for (const row of rows) {
+    const units = n0(row.units)
+    const money = Number(row.money ?? 0)
+    if (!row.property_id) { miss('no_property', 0, money, false); continue }
+    const abbr = formatState(row.state ?? '')
+    const fips = STATE_FIPS[abbr]
+    if (!fips) { miss('unknown_state', units, money, true); continue }
+    add(states, fips, () => ({ fips, abbr, name: US_STATE_NAME[abbr] ?? TERRITORY_NAME[abbr] ?? abbr,
+                               units: 0, money: 0, properties: 0 }), units, money)
+
+    if (!shapesReadable) { miss('no_county_shapes', units, money, true); continue }
+    if (row.lat == null || row.lng == null) { miss('no_location', units, money, true); continue }
+    // 10/12 (Nic) review: a point found for the old address would put the
+    // property in the old county with no warning — named, never placed.
+    if (row.location_stale) { miss('stale_location', units, money, true); continue }
+    const county = await countyAt(Number(row.lat), Number(row.lng))
+    if (!county) { miss('outside_map', units, money, true); continue }
+    if (county.fips.slice(0, 2) !== fips) { miss('wrong_state', units, money, true); continue }
+    add(counties, county.fips, () => ({ fips: county.fips, name: county.name, state: abbr,
+                                        units: 0, money: 0, properties: 0 }), units, money)
+  }
+
+  const done = <T extends MapArea>(a: T): T => ({ ...a, money: r2(a.money) })
+  const byFips = (a: { fips: string }, b: { fips: string }) => a.fips.localeCompare(b.fips)
+  return {
+    states: [...states.values()].map(done).sort(byFips),
+    counties: [...counties.values()].map(done).sort(byFips),
+    missing: [...missing.values()].map(m => ({ ...m, money: r2(m.money) })),
+  }
+}
+
 export async function computePlatformMetrics(): Promise<PlatformMetrics> {
   const realR = realLandlordSql('r.landlord_id')
   const [
     rentRows, monthRows, tenantMoney, paid, busiest, register, stayDeposits, checks, payouts,
-    footprint, paperwork, operations, growth, bill,
+    footprint, paperwork, operations, growth, bill, mapRows,
   ] = await Promise.all([
     query<{ method: string | null; amount: string; payments: number }>(`
       SELECT x.method,
@@ -422,6 +727,8 @@ export async function computePlatformMetrics(): Promise<PlatformMetrics> {
        WHERE state = '*' AND city = '*'
        ORDER BY snapshot_date`),
     platformFeeBill(),
+    // 10/12 (Nic): the heat map's rows, one per property (MAP_ROWS).
+    query<MapRow>(MAP_ROWS()),
   ])
 
   const byMethod: RentByMethod[] = rentRows
@@ -514,6 +821,7 @@ export async function computePlatformMetrics(): Promise<PlatformMetrics> {
     growth: growth.map(g => ({
       date: g.date, rentRoll: r2(g.rent_roll), units: n0(g.units), occupied: n0(g.occupied_units), tenants: n0(g.active_tenants),
     })),
+    map: await buildPlatformMap(mapRows),
   }
 }
 
