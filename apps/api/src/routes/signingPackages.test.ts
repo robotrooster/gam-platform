@@ -358,7 +358,9 @@ describe('drafting a package as one bundle', () => {
          FROM home_sale_contracts c`)
     expect(rows).toHaveLength(1)
     expect(rows[0].purchase_document_id).toBe(saleDoc.id)
-    expect(rows[0].status).toBe('pending_signature')   // the tenant's signature starts billing
+    // Written waiting; the e-sign route starts it billing on this same landlord
+    // signature right after (10/12, Nic — see homeSaleLandlordSignature.test.ts).
+    expect(rows[0].status).toBe('pending_signature')
     expect(Number(rows[0].sale_price)).toBe(22000)
     expect(Number(rows[0].financed_amount)).toBe(22000)
     expect(Number(rows[0].monthly_payment)).toBe(400)

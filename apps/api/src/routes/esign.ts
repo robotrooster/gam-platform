@@ -6556,6 +6556,20 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       resolveTypedSaleTerms(saleTermsFromFields(
         allFields.filter((f: any) => f.lease_column && String(f.lease_column).startsWith('sale_'))
                  .map((f: any) => ({ lease_column: f.lease_column, value: effVal(f) }))))
+      // 10/12 (Nic): his signature starts the sale billing, so a home can have
+      // a billing sale before its buyer signs. A second installment contract
+      // on the same home used to replace a first one nobody had signed yet;
+      // now the first is already billing and cannot simply give way. Signed
+      // anyway, the new terms would never record and the old ones would go on
+      // billing the buyer every month. Refused here, before anything is signed.
+      const billing = (await client.query(
+        `SELECT 1 FROM home_sale_contracts
+          WHERE unit_id = $1 AND status = 'active' AND purchase_document_id IS DISTINCT FROM $2 LIMIT 1`,
+        [doc.unit_id, doc.id])).rows[0]
+      if (billing) {
+        throw new AppError(409,
+          'This home already has an installment contract that is billing. Void that contract (or cancel the financed sale on the unit) first, then sign this one.')
+      }
     }
 
     const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress
@@ -6630,11 +6644,17 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       }
     }
 
-    await client.query(`
+    // 10/12: only a signer not yet signed. The read at the top takes no lock,
+    // so two submits of the same signature at once (a double click) both got
+    // past "Already signed" and both ran everything after the commit — for an
+    // installment contract, starting the sale twice. The second now waits on
+    // this row, finds it signed, and is turned away with nothing written.
+    const marked = await client.query(`
       UPDATE lease_document_signers
       SET status='signed', signed_at=NOW(), ip_address=$1, user_agent=$2
-      WHERE id=$3`,
+      WHERE id=$3 AND status <> 'signed'`,
       [ip, ua, signer.id])
+    if (!marked.rowCount) throw new AppError(400, 'Already signed')
 
     // S650 (Nic): signing IS the verification. "These people are not gonna get
     // on there and verify an account later on." The signing link went to their
@@ -6682,11 +6702,29 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // when that runs. A tenant finishing later hits the builder's own
     // finalized_at short-circuit and bills nobody twice.
     // S652 (Nic): the installment contract's typed terms become the sale record
-    // on the landlord's signature; the tenant's signature then starts billing.
+    // on the landlord's signature.
+    //
+    // 10/12 (Nic): "We need people to be billed correctly regardless of
+    // signing status." The same signature now starts the sale BILLING, the
+    // way it issues a lease (S647, above). It used to wait for the buyer: at
+    // Country Acres MH 18 and MH 24 the landlord signed on 9/22, the buyers had
+    // not, and October's bills went out without the home payment. The
+    // schedule is written, months before the park's first billing cycle are
+    // stamped as paid outside GAM, and an installment already due goes on the
+    // buyer's open bill for its month. The buyer's signature, when it comes,
+    // finds the contract active and bills nothing twice (the completion call
+    // below is the backstop if this one fails).
+    //
+    // Except a buyer who belongs to ANOTHER company (S655, Nic 10/2: "nobody
+    // is attached to a company without their own signature") — the same
+    // exception the lease issuance makes. Their sale starts on their own
+    // signature, at completion. If the check itself fails, it waits too.
     if (signer.role === 'landlord' && doc.document_type === 'purchase_agreement') {
+      let saleRecorded = false
       try {
         const { applySaleTermsFromDocument } = await import('../services/homeSale')
         await applySaleTermsFromDocument(doc.id)
+        saleRecorded = true
       } catch (e: any) {
         logger.error({ err: e, documentId: doc.id }, '[HomeSale] typed terms did not become a sale record')
         await createAdminNotification({
@@ -6694,6 +6732,32 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           title: `Installment contract signed but its terms did not record — document ${doc.id}`,
           body: e.message, context: { document_id: doc.id },
         }).catch(() => {})
+      }
+      if (saleRecorded) {
+        const buyerWaits = await (await import('../services/newLeaseInvite')).tenantsNeedingOwnSignature(doc.id)
+          .catch((err: any) => {
+            logger.error({ err, documentId: doc.id }, '[HomeSale] own-signature check failed — billing waits for the buyer')
+            return [{ userId: '', name: '' }]
+          })
+        if (buyerWaits.length > 0) {
+          logger.info({ documentId: doc.id }, '[HomeSale] billing waits for the buyer\'s own signature (another company\'s account)')
+        } else {
+          try {
+            await activateHomeSaleContract(doc.id)
+          } catch (e) {
+            logger.error({ err: e, documentId: doc.id }, '[HomeSale][activate-on-landlord-signature]')
+            // 10/12: critical, like a lease that failed to issue on his
+            // signature. Nothing retries this start until the buyer signs, and
+            // until then the sale bills nothing (MH 18 and MH 24 again).
+            await createAdminNotification({
+              severity: 'critical',
+              category: 'home_sale_activation_failed',
+              title:    `Home-sale billing not started on the landlord's signature for agreement ${doc.id}`,
+              body:     e instanceof Error ? e.message : String(e),
+              context:  { document_id: doc.id },
+            }).catch(() => {})
+          }
+        }
       }
     }
 
@@ -6932,10 +6996,13 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         }
       }
 
-      // S629 (Nic): a signed PURCHASE AGREEMENT is what starts a financed home
-      // sale billing. The contract has been sitting in pending_signature with
-      // its terms and no schedule; this writes the installments and makes it
-      // active, so what gets billed is what was signed.
+      // 10/12 (Nic): the LANDLORD's signature starts a financed home sale
+      // billing (the purchase-agreement block above, after his signature).
+      // By completion the contract is normally active already and this finds
+      // nothing to do. It still runs: it starts the sale for a buyer who
+      // belongs to another company (whose own signature is the one that
+      // counts, S655), and it retries a start that failed on the landlord's
+      // signature. (S629 had made completion the start.)
       //
       // Best-effort and post-commit like the neighbors here: the signature is
       // already recorded and must not be rolled back if scheduling fails.

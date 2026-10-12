@@ -55,8 +55,10 @@ const createSchema = z.object({
   numberOfPayments:   z.number().int().positive().max(600).optional(),
   // S629 (Nic): send the purchase agreement for signature and let the SIGNATURE
   // start the billing. The contract is created holding the agreed terms with no
-  // schedule and nothing billed until that document completes. Optional so the
-  // existing direct-create path (a sale papered outside GAM) still works.
+  // schedule and nothing billed until the LANDLORD signs it (10/12, Nic: "we
+  // need people to be billed correctly regardless of signing status" — the
+  // buyer's signature no longer holds it back). Optional so the existing
+  // direct-create path (a sale papered outside GAM) still works.
   templateId:         z.string().uuid().optional(),
 })
 
@@ -130,7 +132,8 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
 
     // S629: draft the purchase agreement from the terms just agreed and bind
     // it to the contract. The document is the authority — the contract stays
-    // pending_signature, with no installments, until it comes back signed.
+    // pending_signature, with no installments, until the landlord signs it
+    // (10/12: his signature starts the billing, as it issues a lease).
     if (body.templateId) {
       // Imported here rather than at module scope: esign.ts imports
       // activateHomeSaleContract from services/homeSale, and a static import

@@ -429,11 +429,20 @@ describe('signing after the bill went out', () => {
     } finally { client.release() }
   }
   async function openBill(s: { unitId: string; leaseId: string; tenantId: string; landlordId: string }, dueDate: string, status = 'pending') {
-    return (await db.query(
+    const id = (await db.query(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
                              due_date, subtotal_rent, subtotal_utilities, total_amount, status)
        VALUES ($1,$2,$3,$4,'INV-HS-0001',$5,450,28.05,478.05,$6) RETURNING id`,
       [s.landlordId, s.tenantId, s.leaseId, s.unitId, dueDate, status])).rows[0].id as string
+    // Its lines, as the monthly run writes them. 10/12: the attach joins only a
+    // bill with a charge still owed on it, so a bill with no lines is not open.
+    for (const [type, amount, desc] of [['rent', 450, 'RENT'], ['utility', 28.05, 'UTILITY']] as const) {
+      await db.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [id, s.unitId, s.leaseId, s.tenantId, s.landlordId, type, amount, status === 'settled' ? 'settled' : 'pending', dueDate, desc])
+    }
+    return id
   }
   const thisMonth = async () =>
     (await queryOne<{ m: string }>(`SELECT date_trunc('month', CURRENT_DATE)::date::text AS m`))!.m
@@ -503,5 +512,47 @@ describe('signing after the bill went out', () => {
     const lines = await query<any>(`SELECT 1 FROM payments WHERE invoice_id=$1 AND type='home_payment'`, [invoiceId])
     expect(lines).toHaveLength(0)
     expect((await attachDueInstallmentsToOpenInvoices(contractId)).attached).toHaveLength(1)
+  })
+})
+
+/**
+ * 10/12: the standalone job skipped any buyer on an active lease at the unit,
+ * trusting the rent bill to carry the installment — but the rent bill carries
+ * it only for the lease's PRIMARY (jobs/invoiceGeneration). A buyer listed as
+ * a co-tenant fell between the two and was never billed at all.
+ */
+describe('a buyer who is a co-tenant on the lease', () => {
+  it('is billed by the standalone run, since the rent bill will not carry it', async () => {
+    const s = await seed()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const primary = await seedTenant(c)
+      await c.query(`UPDATE lease_tenants SET role = 'co_tenant' WHERE lease_id = $1 AND tenant_id = $2`, [s.leaseId, s.tenantId])
+      await seedLeaseTenant(c, { leaseId: s.leaseId, tenantId: primary, role: 'primary' })
+      await createHomeSaleContract(c, {
+        unitId: s.unitId, leaseId: null, tenantId: s.tenantId, landlordId: s.landlordId,
+        salePrice: 1200, downPayment: 0, annualInterestRate: 0, termMonths: 12, startMonth: '2026-01-01', planType: 'flat',
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    expect(await billDueHomeSaleInstallments('2026-01-01')).toBe(1)
+    const rows = await query<any>(
+      `SELECT tenant_id, invoice_id, amount::float AS amount FROM payments WHERE type = 'home_payment'`)
+    expect(rows).toEqual([{ tenant_id: s.tenantId, invoice_id: null, amount: 100 }])
+  })
+
+  it('a PRIMARY buyer is still left to the rent bill', async () => {
+    const s = await seed()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await createHomeSaleContract(c, {
+        unitId: s.unitId, leaseId: null, tenantId: s.tenantId, landlordId: s.landlordId,
+        salePrice: 1200, downPayment: 0, annualInterestRate: 0, termMonths: 12, startMonth: '2026-01-01', planType: 'flat',
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    expect(await billDueHomeSaleInstallments('2026-01-01')).toBe(0)
   })
 })

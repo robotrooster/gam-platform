@@ -9,17 +9,22 @@
 // would collide with the rent idempotency unique + trigger rent late-fee/eviction
 // logic that must not apply to a purchase installment).
 import type { PoolClient } from 'pg'
-import { query, queryOne, getClient } from '../db'
+import { query, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
+import { lockHousehold } from './moneyPredicates'
 import { computeAmortization } from '@gam/shared'
 import { z } from 'zod'
 
 type Client = PoolClient
 
 export interface CreateHomeSaleInput {
-  /** S629: hold the terms unsigned — no schedule, nothing billed, until the agreement completes. */
+  /**
+   * S629: hold the terms with no schedule and nothing billed until the
+   * agreement is signed. 10/12 (Nic): the LANDLORD's signature is the one that
+   * starts the billing (activateHomeSaleContract), not the buyer's.
+   */
   pendingSignature?: boolean
   unitId: string
   /**
@@ -74,9 +79,9 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
   const { monthlyPayment, schedule } = computeAmortization(financed, input.annualInterestRate, input.termMonths)
 
   // S629: `pendingSignature` holds the agreed terms WITHOUT generating a
-  // schedule, so nothing bills until the purchase agreement comes back signed.
-  // Same rule the leases follow: the signed document is the authority, and
-  // money only moves behind one.
+  // schedule, so nothing bills until the purchase agreement is signed. 10/12
+  // (Nic): signed by the LANDLORD — the same rule the leases follow since S647.
+  // The signed document is the authority, and money only moves behind one.
   const status = input.pendingSignature ? 'pending_signature' : 'active'
 
   const contract = (await client.query<any>(
@@ -92,9 +97,9 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
      status])).rows[0]
 
   // A contract awaiting signature has agreed terms and no schedule. The
-  // schedule is written by activateHomeSaleContract when the document
-  // completes — writing it now would mean a tenant who never signs still has
-  // installments sitting in the billing tables.
+  // schedule is written by activateHomeSaleContract when the landlord signs
+  // the agreement (10/12) — writing it now would put installments in the
+  // billing tables for paper nobody has signed.
   if (status === 'pending_signature') return contract
 
   // Precompute the billing month per installment (start_month + (n-1) months).
@@ -111,55 +116,112 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
 }
 
 /**
- * S629 — SIGNATURE IS WHAT STARTS THE BILLING.
+ * 10/12 (Nic) — THE LANDLORD'S SIGNATURE STARTS THE BILLING.
  *
- * Called when a purchase agreement completes. Generates the amortization
- * schedule and flips the contract to active, so the months a tenant is billed
- * are the months of the contract they actually signed.
+ *   "We need people to be billed correctly regardless of signing status."
  *
- * Idempotent: the e-sign completion path is best-effort and post-commit, so it
- * can be retried, and a contract already active must not have a second
+ * S629 made the purchase agreement's COMPLETION start a home sale billing, so
+ * it waited on the buyer. Country Acres MH 18 and MH 24 are what that cost: the
+ * landlord signed both installment contracts on 9/22, the buyers had not, and
+ * their October bills went out with rent and water and no home payment. A
+ * lease has billed on the landlord's signature since S647 ("Bill it out to
+ * everybody upon my signature"); a home sale now does the same. Called from his
+ * signature on the purchase agreement (routes/esign.ts), and again when the
+ * document completes, where it finds nothing left to do.
+ *
+ * Writes the amortization schedule and makes the contract active, then puts
+ * each installment already due onto the buyer's open bill for its month
+ * (attachDueInstallmentsToOpenInvoices). Installments before the property's
+ * first billing cycle were paid outside GAM and are stamped so. Months still
+ * to come bill in their own month, never early — the rule a lease follows.
+ *
+ * Idempotent: the e-sign paths that call it are best-effort and post-commit,
+ * so it can be retried, and a contract already active must not have a second
  * schedule written under it.
  */
 export async function activateHomeSaleContract(documentId: string): Promise<{ activated: boolean }> {
   const client = await getClient()
+  let written: { contractId: string; installments: number } | null = null
   try {
     await client.query('BEGIN')
-    const c = (await client.query<any>(
-      `SELECT * FROM home_sale_contracts
-        WHERE purchase_document_id = $1 AND status = 'pending_signature'
-        FOR UPDATE`, [documentId])).rows[0]
-    if (!c) { await client.query('ROLLBACK'); return { activated: false } }
-
-    const financed = Number(c.financed_amount)
-    const { schedule } = computeAmortization(financed, Number(c.annual_interest_rate), c.term_months)
-
-    for (const row of schedule) {
-      await client.query(
-        `INSERT INTO home_sale_installments
-           (contract_id, installment_number, billing_month, amount, principal_portion, interest_portion, remaining_balance)
-         VALUES ($1,$2, ($3::date + ($4::int || ' months')::interval)::date, $5,$6,$7,$8)`,
-        [c.id, row.installmentNumber, c.start_month, row.installmentNumber - 1,
-         row.amount.toFixed(2), row.principalPortion.toFixed(2), row.interestPortion.toFixed(2),
-         row.remainingBalance.toFixed(2)])
-    }
-    await client.query(
-      `UPDATE home_sale_contracts SET status='active', updated_at=NOW() WHERE id=$1`, [c.id])
-    await client.query('COMMIT')
-    logger.info({ contractId: c.id, documentId, installments: schedule.length },
-      'home sale: purchase agreement signed — billing schedule created')
-    // S654 (Nic, Shane Rueff MH 11): "if he signs today and the bill was
-    // generated yesterday, that $150 needs to go on this month's bill as well
-    // after he signs." Best-effort after the commit: the signature and the
-    // schedule stand even if this fails, and the monthly run still picks the
-    // installment up as a straggler.
-    await attachDueInstallmentsToOpenInvoices(c.id).catch(err =>
-      logger.error({ err, contractId: c.id }, 'home sale: could not put due installments on the open bill'))
-    return { activated: true }
+    written = await writeScheduleAndActivate(client, documentId)
+    await client.query(written ? 'COMMIT' : 'ROLLBACK')
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally { client.release() }
+  if (!written) return { activated: false }
+
+  logger.info({ contractId: written.contractId, documentId, installments: written.installments },
+    'home sale: purchase agreement signed — billing schedule created')
+  // S654 (Nic, Shane Rueff MH 11): "if he signs today and the bill was
+  // generated yesterday, that $150 needs to go on this month's bill as well
+  // after he signs." Best-effort after the commit: the signature and the
+  // schedule stand even if this fails, and the monthly run still picks the
+  // installment up as a straggler.
+  await attachDueInstallmentsToOpenInvoices(written.contractId).catch(err =>
+    logger.error({ err, contractId: written!.contractId }, 'home sale: could not put due installments on the open bill'))
+  return { activated: true }
+}
+
+/** One installment put on a bill, as the attach and the 10/12 script report it. */
+export type AttachedInstallment = { installmentNumber: number; amount: number; invoiceId: string; dueDate: string }
+
+/** What activating one contract did, inside the caller's transaction. */
+export interface ActivationReport {
+  contractId: string
+  installmentsCreated: number
+  stampedOffPlatform: number
+  attached: AttachedInstallment[]
+}
+
+/**
+ * activateHomeSaleContract on a transaction the CALLER owns: the schedule, the
+ * stamps for months paid outside GAM, and the lines on open bills, all on
+ * `client`, so a dry run can roll every bit of it back (the 10/12 one-time
+ * script). Null when the document has no contract waiting to start.
+ */
+export async function activateHomeSaleContractIn(client: Client, documentId: string): Promise<ActivationReport | null> {
+  // 10/12: the buyer's household before the contract's row lock — the order a
+  // void takes them in (lib/voidDocument). Here both are held in one
+  // transaction, and the other order could deadlock against a void.
+  const who = (await client.query<{ tenant_id: string; landlord_id: string }>(
+    `SELECT tenant_id, landlord_id FROM home_sale_contracts
+      WHERE purchase_document_id = $1 AND status = 'pending_signature'`, [documentId])).rows[0]
+  if (!who) return null
+  await lockHousehold(client, who.tenant_id, who.landlord_id)
+  const written = await writeScheduleAndActivate(client, documentId)
+  if (!written) return null
+  const r = await attachDueInstallmentsIn(client, written.contractId)
+  return { contractId: written.contractId, installmentsCreated: written.installments,
+           stampedOffPlatform: r.stampedOffPlatform, attached: r.attached }
+}
+
+/** The schedule and the flip to active, on the caller's transaction. */
+async function writeScheduleAndActivate(
+  client: Client, documentId: string,
+): Promise<{ contractId: string; installments: number } | null> {
+  const c = (await client.query<any>(
+    `SELECT * FROM home_sale_contracts
+      WHERE purchase_document_id = $1 AND status = 'pending_signature'
+      FOR UPDATE`, [documentId])).rows[0]
+  if (!c) return null
+
+  const financed = Number(c.financed_amount)
+  const { schedule } = computeAmortization(financed, Number(c.annual_interest_rate), c.term_months)
+
+  for (const row of schedule) {
+    await client.query(
+      `INSERT INTO home_sale_installments
+         (contract_id, installment_number, billing_month, amount, principal_portion, interest_portion, remaining_balance)
+       VALUES ($1,$2, ($3::date + ($4::int || ' months')::interval)::date, $5,$6,$7,$8)`,
+      [c.id, row.installmentNumber, c.start_month, row.installmentNumber - 1,
+       row.amount.toFixed(2), row.principalPortion.toFixed(2), row.interestPortion.toFixed(2),
+       row.remainingBalance.toFixed(2)])
+  }
+  await client.query(
+    `UPDATE home_sale_contracts SET status='active', updated_at=NOW() WHERE id=$1`, [c.id])
+  return { contractId: c.id, installments: schedule.length }
 }
 
 /**
@@ -170,84 +232,152 @@ export async function activateHomeSaleContract(documentId: string): Promise<{ ac
  * For each unbilled installment whose billing month has arrived (and is on or
  * after the property's first billing cycle — earlier ones were paid outside GAM
  * and are stamped so, exactly as billDueHomeSaleInstallments does), find the
- * still-open invoice on the contract's lease for THAT month and add a
- * home_payment line to it, written the same way the monthly run writes one.
- * No open bill for that month (none yet, or already paid) → left for the
- * monthly run, which bills stragglers; a paid bill never grows a line.
+ * buyer's still-open bill for THAT month and add a home_payment line to it,
+ * written the same way the monthly run writes one. No open bill for that month
+ * (none yet, already paid, or paid and still clearing) → left for the monthly
+ * run, which bills stragglers; a paid bill never grows a line.
  *
  * Idempotent: the partial-unique index on payments.home_sale_installment_id
  * and the installment's own payment_id stamp mean an installment bills once.
- * `dryRun` reports what would be attached and changes nothing.
+ * `dryRun` does the whole thing and rolls it back: what it reports is what a
+ * real run would do, and nothing changes.
  */
 export async function attachDueInstallmentsToOpenInvoices(
   contractId: string, opts: { dryRun?: boolean } = {},
-): Promise<{ attached: { installmentNumber: number; amount: number; invoiceId: string; dueDate: string }[] }> {
-  const attached: { installmentNumber: number; amount: number; invoiceId: string; dueDate: string }[] = []
-  const c = await queryOne<any>(
-    `SELECT c.id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total, p.first_billing_cycle
+): Promise<{ attached: AttachedInstallment[] }> {
+  const client = await getClient()
+  let r: { attached: AttachedInstallment[]; stampedOffPlatform: number; household: { tenantId: string; landlordId: string } | null }
+  try {
+    await client.query('BEGIN')
+    r = await attachDueInstallmentsIn(client, contractId)
+    await client.query(opts.dryRun ? 'ROLLBACK' : 'COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+  // 10/6 (Nic): "a credit against the entire balance" — money the buyer paid
+  // ahead goes on the balance the line just joined, the way it does when the
+  // monthly run writes the bill. Its own transaction after ours; never throws.
+  if (!opts.dryRun && r.attached.length && r.household) {
+    const { runWholeBillCheckAfterCommit } = await import('./creditUse')
+    await runWholeBillCheckAfterCommit(r.household)
+  }
+  return { attached: r.attached }
+}
+
+/** The attach, on the caller's transaction (no BEGIN/COMMIT of its own). */
+async function attachDueInstallmentsIn(client: Client, contractId: string): Promise<{
+  attached: AttachedInstallment[]; stampedOffPlatform: number; household: { tenantId: string; landlordId: string } | null
+}> {
+  const attached: AttachedInstallment[] = []
+  // 10/12: no lease link required. The contract's lease_id is context only
+  // (S651 — a sale stands on its own), and every contract the packet signs is
+  // written with none; this used to require one, so a sale signed from the
+  // packet could never land on the open bill.
+  const c = (await client.query<any>(
+    `SELECT c.id, c.unit_id, c.tenant_id, c.landlord_id, c.installments_total,
+            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+            -- "This month" is the park's month (S654), not the server's.
+            to_char(date_trunc('month', (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date), 'YYYY-MM-DD') AS this_month
        FROM home_sale_contracts c
        JOIN units u ON u.id = c.unit_id JOIN properties p ON p.id = u.property_id
-      WHERE c.id = $1 AND c.status = 'active' AND c.lease_id IS NOT NULL`, [contractId])
-  if (!c) return { attached }
+      WHERE c.id = $1 AND c.status = 'active'`, [contractId])).rows[0]
+  if (!c) return { attached, stampedOffPlatform: 0, household: null }
 
-  if (!opts.dryRun && c.first_billing_cycle) {
-    await query(
+  // S655: lines go on the buyer's bill, so this writes the household's money —
+  // the household lock first, like every other writer of it.
+  await lockHousehold(client, c.tenant_id, c.landlord_id)
+  // 10/12 (Nic): the read above took no lock. A void of the agreement holds
+  // this same household lock while it takes the sale back (lib/voidDocument
+  // unwindHomeSaleOnVoid), and its deletes clear each installment's payment_id
+  // — so after waiting here the installments would look unbilled again, and a
+  // cancelled sale's home payments would go back on the buyer's bill. Read the
+  // sale again under its row lock, now that nothing else can be mid-void, and
+  // stop if it is no longer billing.
+  const live = (await client.query(
+    `SELECT 1 FROM home_sale_contracts WHERE id = $1 AND status = 'active' FOR UPDATE`, [c.id])).rows[0]
+  if (!live) return { attached, stampedOffPlatform: 0, household: null }
+
+  let stampedOffPlatform = 0
+  if (c.first_billing_cycle) {
+    stampedOffPlatform = (await client.query(
       `UPDATE home_sale_installments SET settled_off_platform_at = NOW()
         WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
-          AND billing_month < date_trunc('month', $2::date)::date`, [c.id, c.first_billing_cycle])
+          AND billing_month < date_trunc('month', $2::date)::date`, [c.id, c.first_billing_cycle])).rowCount ?? 0
   }
-  const due = await query<any>(
+  const due = (await client.query<any>(
     `SELECT id, installment_number, amount::text AS amount, billing_month::text AS billing_month
        FROM home_sale_installments
       WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
-        AND billing_month <= date_trunc('month', CURRENT_DATE)::date
+        AND billing_month <= $3::date
         AND ($2::date IS NULL OR billing_month >= date_trunc('month', $2::date)::date)
-      ORDER BY installment_number`, [c.id, c.first_billing_cycle])
+      ORDER BY installment_number`, [c.id, c.first_billing_cycle, c.this_month])).rows
 
   for (const d of due) {
-    const client = await getClient()
-    try {
-      await client.query('BEGIN')
-      const inv = (await client.query<{ id: string; due_date: string }>(
-        `SELECT id, due_date::text AS due_date FROM invoices
-          WHERE lease_id = $1 AND status IN ('pending','partial')
-            AND date_trunc('month', due_date)::date = $2::date
-          ORDER BY due_date LIMIT 1
-          FOR UPDATE`, [c.lease_id, d.billing_month])).rows[0]
-      if (!inv) { await client.query('ROLLBACK'); continue }
-      const amount = Number(d.amount)
-      if (opts.dryRun) {
-        attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
-        await client.query('ROLLBACK'); continue
-      }
-      const ins = await client.query<{ id: string }>(
-        `INSERT INTO payments (
-           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, notes, home_sale_installment_id
-         ) VALUES ($1,$2,$3,$4,$5,'home_payment',$6,'pending',$7,'HOMEPMT',$8,$9)
-         ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
-         RETURNING id`,
-        [inv.id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, amount.toFixed(2), inv.due_date,
-         `Home payment ${d.installment_number} of ${c.installments_total}`, d.id])
-      if (!ins.rows.length) { await client.query('ROLLBACK'); continue }
-      await client.query(
-        `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
-        [ins.rows[0].id, d.id])
-      await client.query(
-        `UPDATE invoices
-            SET subtotal_home_payments = COALESCE(subtotal_home_payments, 0) + $2,
-                total_amount = total_amount + $2,
-                updated_at = NOW()
-          WHERE id = $1`, [inv.id, amount.toFixed(2)])
-      await client.query('COMMIT')
-      attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => {})
-      throw e
-    } finally { client.release() }
+    // The buyer's open bill for the installment's month: the bill of the
+    // ACTIVE lease on this unit where the buyer is the primary resident —
+    // the same rule the monthly run uses to put an installment on a rent bill
+    // (jobs/invoiceGeneration: same unit, the lease's primary is the buyer).
+    // Billed to the buyer, so never a sublessee's bill. The month's regular
+    // bill (the one with the rent on it) before any other bill that month.
+    //
+    // 10/12 (Nic): "open" means money is still OWED on it, not just a status.
+    // The bill's status counts only settled lines (fn_invoice_status_rollup),
+    // so a bill paid in full by bank transfer still reads 'pending' while the
+    // money clears. A line added to it then would be the one unpaid charge on
+    // a bill the tenant paid on time — late fees from the grace end, and a
+    // paid bill that grew a line. So: no bill with a payment still clearing,
+    // and only a bill with a charge (other than a late fee) still unpaid,
+    // which also passes over bills the status leaves open after they were
+    // fully paid (from the deposit, or with a returned or voided line). Never
+    // the opening-balance bill either (the old system's balance, usually
+    // exempt from late fees) — a current installment belongs on the month's
+    // own bill. Anything passed over here waits for the monthly run, which
+    // bills it on the next bill, as it does when the bill is already settled.
+    const inv = (await client.query<{ id: string; due_date: string; lease_id: string }>(
+      `SELECT i.id, i.due_date::text AS due_date, i.lease_id
+         FROM invoices i
+         JOIN leases l ON l.id = i.lease_id
+        WHERE i.status IN ('pending','partial')
+          AND NOT i.is_opening_balance
+          AND date_trunc('month', i.due_date)::date = $3::date
+          AND l.unit_id = $2 AND l.status = 'active'
+          AND (i.tenant_id = $1 OR i.tenant_id IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM payments x WHERE x.invoice_id = i.id AND x.status = 'processing')
+          AND EXISTS (SELECT 1 FROM payments o
+                       WHERE o.invoice_id = i.id AND o.type <> 'late_fee' AND o.status IN ('pending','failed'))
+          AND EXISTS (SELECT 1 FROM v_lease_active_tenants v
+                       WHERE v.lease_id = l.id AND v.role = 'primary' AND v.tenant_id = $1)
+        ORDER BY EXISTS (SELECT 1 FROM payments r WHERE r.invoice_id = i.id AND r.type = 'rent') DESC,
+                 i.due_date, i.id
+        LIMIT 1
+        FOR UPDATE OF i`, [c.tenant_id, c.unit_id, d.billing_month])).rows[0]
+    if (!inv) continue
+    const amount = Number(d.amount)
+    const ins = await client.query<{ id: string }>(
+      `INSERT INTO payments (
+         invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+         type, amount, status, due_date, entry_description, notes, home_sale_installment_id
+       ) VALUES ($1,$2,$3,$4,$5,'home_payment',$6,'pending',$7,'HOMEPMT',$8,$9)
+       ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [inv.id, c.unit_id, inv.lease_id, c.tenant_id, c.landlord_id, amount.toFixed(2), inv.due_date,
+       `Home payment ${d.installment_number} of ${c.installments_total}`, d.id])
+    if (!ins.rows.length) continue
+    await client.query(
+      `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
+      [ins.rows[0].id, d.id])
+    await client.query(
+      `UPDATE invoices
+          SET subtotal_home_payments = COALESCE(subtotal_home_payments, 0) + $2,
+              total_amount = total_amount + $2,
+              updated_at = NOW()
+        WHERE id = $1`, [inv.id, amount.toFixed(2)])
+    attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
   }
-  if (attached.length && !opts.dryRun) await reconcileHomeSaleContract(c.id)
-  return { attached }
+  // A stamped month counts as paid, a line on a bill as billed.
+  if (attached.length || stampedOffPlatform) await reconcileHomeSaleContract(c.id, client)
+  return { attached, stampedOffPlatform, household: { tenantId: c.tenant_id, landlordId: c.landlord_id } }
 }
 
 /**
@@ -255,39 +385,72 @@ export async function attachDueInstallmentsToOpenInvoices(
  * (linked payment settled) installments. When every installment is settled, mark
  * the contract paid_off and flip the unit to tenant-owned (the buyer now owns the
  * home). Idempotent — safe to run repeatedly (daily cron + post-settle).
+ *
+ * `client`: run inside the caller's transaction (the attach holds the
+ * contract's row lock, so a second connection would wait on it for good).
  */
-export async function reconcileHomeSaleContract(contractId: string): Promise<void> {
-  const c = await queryOne<any>(`SELECT id, unit_id, status, installments_total FROM home_sale_contracts WHERE id=$1`, [contractId])
+export async function reconcileHomeSaleContract(contractId: string, client?: Client): Promise<void> {
+  const run = async <T = any>(sql: string, params: any[]): Promise<T[]> =>
+    client ? (await client.query(sql, params)).rows as T[] : query<T>(sql, params)
+  const c = (await run<any>(`SELECT id, unit_id, status, installments_total FROM home_sale_contracts WHERE id=$1`, [contractId]))[0]
   if (!c || c.status !== 'active') return
 
-  const counts = await queryOne<{ billed: string; paid: string }>(
+  const counts = (await run<{ billed: string; paid: string }>(
     `SELECT
         COUNT(*) FILTER (WHERE i.payment_id IS NOT NULL OR i.settled_off_platform_at IS NOT NULL) AS billed,
         COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit') OR i.settled_off_platform_at IS NOT NULL) AS paid
        FROM home_sale_installments i
        LEFT JOIN payments p ON p.id = i.payment_id
-      WHERE i.contract_id = $1`, [contractId])
+      WHERE i.contract_id = $1`, [contractId]))[0]
   const billed = parseInt(counts?.billed ?? '0', 10)
   const paid = parseInt(counts?.paid ?? '0', 10)
 
-  await query(`UPDATE home_sale_contracts SET installments_billed=$2, installments_paid=$3, updated_at=NOW() WHERE id=$1`,
+  await run(`UPDATE home_sale_contracts SET installments_billed=$2, installments_paid=$3, updated_at=NOW() WHERE id=$1`,
     [contractId, billed, paid])
 
   if (paid >= c.installments_total) {
-    await query(`UPDATE home_sale_contracts SET status='paid_off', paid_off_at=NOW(), updated_at=NOW() WHERE id=$1 AND status='active'`, [contractId])
+    // 10/12 (Nic): the landlord's signature starts a sale billing, so a sale
+    // whose every month falls before the park's first billing cycle is fully
+    // "paid outside GAM" the moment he signs — before the buyer has signed
+    // anything, while the agreement can still be voided. Handing the home over
+    // then would leave it with a buyer who never signed if the paper is voided
+    // (a void cannot take a paid-off sale back). So the payoff waits while the
+    // agreement is still open and no buyer has signed it; the daily reconcile
+    // finishes it once one has. A sale with no agreement in GAM (papered
+    // outside) and one the buyer signed pay off as before.
+    const done = await run<{ id: string }>(
+      `UPDATE home_sale_contracts hc SET status='paid_off', paid_off_at=NOW(), updated_at=NOW()
+        WHERE hc.id=$1 AND hc.status='active'
+          AND NOT EXISTS (
+            SELECT 1 FROM lease_documents d
+             WHERE d.id = hc.purchase_document_id AND d.status <> 'completed'
+               AND NOT EXISTS (SELECT 1 FROM lease_document_signers s
+                                WHERE s.document_id = d.id AND s.signed_at IS NOT NULL
+                                  AND s.role NOT IN ('landlord', 'witness')))
+        RETURNING hc.id`, [contractId])
+    if (!done.length) return
     // Buyer now owns the home — flip dwelling ownership AND record the buyer as
     // the home owner (the sale document trail lives on the contract).
-    await query(`UPDATE units SET dwelling_ownership='tenant', updated_at=NOW() WHERE id=$1`, [c.unit_id])
-    const buyer = await queryOne<{ user_id: string }>(
-      `SELECT t.user_id FROM home_sale_contracts hsc JOIN tenants t ON t.id = hsc.tenant_id WHERE hsc.id=$1`, [contractId])
+    await run(`UPDATE units SET dwelling_ownership='tenant', updated_at=NOW() WHERE id=$1`, [c.unit_id])
+    const buyer = (await run<{ user_id: string }>(
+      `SELECT t.user_id FROM home_sale_contracts hsc JOIN tenants t ON t.id = hsc.tenant_id WHERE hsc.id=$1`, [contractId]))[0]
     if (buyer?.user_id) {
       const { setHomeOwner } = await import('./homeOwnership')
-      const client = await getClient()
+      if (client) {
+        // Best-effort as below, without taking the caller's transaction with it.
+        await client.query('SAVEPOINT home_sale_owner')
+        try {
+          await setHomeOwner(client as any, { unitId: c.unit_id, ownerUserId: buyer.user_id, acquiredVia: 'financed_payoff' })
+          await client.query('RELEASE SAVEPOINT home_sale_owner')
+        } catch (e) { await client.query('ROLLBACK TO SAVEPOINT home_sale_owner') }
+        return
+      }
+      const own = await getClient()
       try {
-        await client.query('BEGIN')
-        await setHomeOwner(client as any, { unitId: c.unit_id, ownerUserId: buyer.user_id, acquiredVia: 'financed_payoff' })
-        await client.query('COMMIT')
-      } catch (e) { await client.query('ROLLBACK').catch(() => {}) } finally { client.release() }
+        await own.query('BEGIN')
+        await setHomeOwner(own as any, { unitId: c.unit_id, ownerUserId: buyer.user_id, acquiredVia: 'financed_payoff' })
+        await own.query('COMMIT')
+      } catch (e) { await own.query('ROLLBACK').catch(() => {}) } finally { own.release() }
     }
   }
 }
@@ -333,9 +496,15 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
         -- bill, the email and the who-owes page all carry it. Only a buyer
         -- with no lease here — the investor who owns homes in parks he does
         -- not own — is billed standalone.
+        --
+        -- 10/12: only where the rent bill WILL carry it — the buyer is the
+        -- lease's PRIMARY, the rule jobs/invoiceGeneration uses to pick it up.
+        -- A buyer listed as a co-tenant was skipped here for being on the
+        -- lease and skipped there for not being its primary, so nothing ever
+        -- billed their home payment.
         AND NOT EXISTS (
           SELECT 1 FROM leases l
-          JOIN v_lease_active_tenants v ON v.lease_id = l.id
+          JOIN v_lease_active_tenants v ON v.lease_id = l.id AND v.role = 'primary'
           WHERE l.unit_id = c.unit_id AND l.status = 'active' AND v.tenant_id = c.tenant_id)
       ORDER BY c.id, i.installment_number ASC`,
     [asOfMonth])
@@ -568,9 +737,11 @@ export function resolveTypedSaleTerms(t: TypedSaleTerms, tz: string | null = nul
 
 /**
  * On the landlord's signature of an installment contract: the typed terms
- * become the sale record (pending the tenant's signature, which activates
- * billing), and the derived boxes — amount financed, final payment amount and
- * month — are stamped so the printed paper agrees with the record.
+ * become the sale record, and the derived boxes — amount financed, final
+ * payment amount and month — are stamped so the printed paper agrees with the
+ * record. The record is written 'pending_signature'; the same signature then
+ * starts it billing (10/12, Nic — routes/esign.ts calls activateHomeSaleContract
+ * right after this), so the buyer's signature is no longer what bills it.
  */
 export async function applySaleTermsFromDocument(documentId: string): Promise<{ contractId: string }> {
   const client = await getClient()
@@ -583,6 +754,15 @@ export async function applySaleTermsFromDocument(documentId: string): Promise<{ 
          LEFT JOIN properties p ON p.id = u.property_id
         WHERE d.id = $1 FOR UPDATE OF d`, [documentId])).rows[0]
     if (!doc?.unit_id) throw new AppError(400, 'This installment contract is not attached to a unit.')
+    // 10/12 (Nic): this paper's sale already started — its own landlord
+    // signature made it billing. A second run (a double-clicked signature, or
+    // a second landlord-side signer) has nothing to record. Without this it
+    // found no waiting record, tried to write a new one beside the live sale,
+    // was refused, and raised a false "terms did not record" alarm.
+    const started = (await client.query<{ id: string }>(
+      `SELECT id FROM home_sale_contracts
+        WHERE purchase_document_id = $1 AND status IN ('active', 'paid_off') LIMIT 1`, [documentId])).rows[0]
+    if (started) { await client.query('COMMIT'); return { contractId: started.id } }
     const fields = (await client.query<any>(
       `SELECT id, lease_column, value FROM lease_document_fields WHERE document_id = $1 AND lease_column LIKE 'sale_%'`, [documentId])).rows
     const terms = resolveTypedSaleTerms(saleTermsFromFields(fields), doc.timezone)

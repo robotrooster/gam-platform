@@ -179,6 +179,28 @@ function qualifyingInvoicesSql(rowFilter: string): string {
           SELECT 1 FROM payments pb
            WHERE pb.invoice_id = i.id AND pb.type != 'late_fee'
              AND pb.status NOT IN ('settled')
+             -- 10/12 (Nic): a charge the tenant could not have seen cannot make
+             -- them late. Since the landlord's signature starts a home sale
+             -- billing, an installment can join a bill that is ALREADY late
+             -- (services/homeSale attachDueInstallmentsToOpenInvoices — MH 18
+             -- and MH 24 at Country Acres, put on October's bill on the 12th).
+             -- Such a line never counts as the unpaid charge that keeps a bill
+             -- late: once everything else is paid, the fees stop exactly as
+             -- they would have without it (an accruing fee would otherwise
+             -- restart and back-fill every day since the due date). A fee
+             -- already on the bill stays as it is, and a percent fee is figured
+             -- on the rent alone (processInvoice), so the line never makes one
+             -- bigger. An installment line written with the bill (the monthly
+             -- run) still counts — even when that run wrote the bill late (a
+             -- catch-up after a held meter read or a missed run), so only a
+             -- line added on a later day than the bill itself is passed over;
+             -- so does a line re-billed after a bounced payment (no
+             -- installment id on it — services/paymentReversal).
+             AND NOT (pb.home_sale_installment_id IS NOT NULL
+                      AND (pb.created_at AT TIME ZONE p.timezone)::date
+                          > (i.created_at AT TIME ZONE p.timezone)::date
+                      AND (pb.created_at AT TIME ZONE p.timezone)::date
+                          >= (i.due_date + (COALESCE(l.late_fee_grace_days, sa.late_fee_grace_days, 5) || ' days')::interval)::date)
         )
         -- (b) Postmark rule: an in-flight payment (ACH 'processing' takes
         --     2-4 business days) counts as paid on its initiation date. No
