@@ -24,10 +24,10 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy,
 } from 'lucide-react'
 import axios from 'axios'
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
@@ -212,7 +212,8 @@ const css=`
 :root{--bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
   --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
   --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;
+  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
+  --s1:var(--bg3);--s2:var(--bg4);
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
 html{-webkit-font-smoothing:antialiased;height:100%}
 body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
@@ -311,6 +312,31 @@ html{font-size:17px}
 :root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input{color-scheme:light}
 :root[data-theme="light"] a{color:var(--gold-ink)}
 :root[data-theme="light"] .ni.active{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.28)}
+/* 10/12 (Nic): the Metrics page. Tiles wrap to whatever width there is. */
+.mx-hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.mx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.mx-big{font-family:var(--font-d);font-size:clamp(1.45rem,2.3vw,2.1rem);font-weight:800;color:var(--gold);line-height:1.1;margin-bottom:6px;overflow-wrap:break-word}
+.mx-v{font-size:clamp(1.1rem,1.6vw,1.35rem);overflow-wrap:break-word}
+.mx-section{margin:6px 0 10px}
+/* 10/12: at phone width the fixed 220px sidebar left the page about 150px to
+   draw in. Below 760px the sidebar becomes a top bar whose links scroll
+   sideways, and the page scrolls as one column. Desktop is untouched. */
+@media(max-width:760px){
+  body{overflow:auto;height:auto}
+  .shell{flex-direction:column;height:auto;overflow:visible}
+  .sidebar{position:static;width:100%;flex-direction:column;overflow:visible;border-right:none;border-bottom:1px solid var(--b0)}
+  .logo{padding:10px 16px}
+  .nav{display:flex;flex-wrap:nowrap;gap:4px;overflow-x:auto;padding:6px 10px;-webkit-overflow-scrolling:touch}
+  .nav .nl{display:none}
+  .nav .ni{width:auto;flex-shrink:0;white-space:nowrap}
+  .sfooter{display:flex;align-items:center;justify-content:space-between;padding:6px 10px}
+  .sfooter .ni{width:auto}
+  .main{margin-left:0;height:auto;overflow:visible}
+  .topbar{padding:0 16px}
+  .page{padding:16px;overflow:visible}
+  .ph{flex-wrap:wrap;gap:8px}
+  .mx-big{font-size:1.6rem}
+}
 `
 
 // ── LAYOUT ────────────────────────────────────────────────────
@@ -331,6 +357,8 @@ function Layout(){
         <nav className="nav">
           <div className="nl">Platform</div>
           {isSuperAdmin&&<NavLink to="/overview" className={({isActive})=>`ni${isActive?' active':''}`}><LayoutDashboard size={15}/> Overview</NavLink>}
+          {/* 10/12 (Nic): "I want a page specifically for Metrics." */}
+          {isSuperAdmin&&<NavLink to="/metrics" className={({isActive})=>`ni${isActive?' active':''}`}><Trophy size={15}/> Metrics</NavLink>}
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
@@ -1071,7 +1099,26 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
           :gap>0?`The balance holds ${money(gap)} more than GAM’s records say (${money(r.book)})`
           :`The balance is ${money(-gap)} short of what GAM’s records say (${money(r.book)})`}
       </div>}
-      <div className="ks" style={{marginTop:2}}>book: {money(bal.revenueThisMonth||0)} earned this month, {money(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${money(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div>
+      {/* 10/12 (Nic): "two numbers means two sources" — and it is two: the
+          figure above is GAM's cash on the Stripe balance, this one is what the
+          revenue book says GAM has earned. "book:" read like a third set of
+          records beside "GAM's records" above it, and "of that still owed"
+          claimed the landlords' open charges sit inside the earned figure,
+          which holds only for platform fees (a card-reader installment owed is
+          not in the revenue book). Same numbers, plainer words. Nothing about
+          how either number is worked out changed here. */}
+      <div className="ks" style={{marginTop:2}}>Earned, per the revenue book: {money(bal.revenueThisMonth||0)} this month, {money(bal.revenueAllTime||0)} all time</div>
+      {/* 10/12 (Nic) review: this total is every open landlord charge — a
+          card-reader installment is not a fee — and a payout is not the only
+          way it is collected. So it names what is owed, kind by kind, and both
+          ways GAM collects it (services/landlordGamAccount: netted from the
+          next payout; a bank debit only when the balance passes the
+          property's limit with no payout to take it from). */}
+      {(bal.owedByLandlordsUncollected||0)>0&&<div className="ks">
+        Landlords still owe GAM {money(bal.owedByLandlordsUncollected)}
+        {(bal.owedByLandlordsByKind||[]).length>0&&<> ({(bal.owedByLandlordsByKind as any[]).map((k:any)=>`${k.label.toLowerCase()} ${money(k.amount)}`).join(', ')})</>}
+        {' '}— taken from their next payout, or by bank debit if it passes their limit first
+      </div>}
       {r&&<button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>}
       {r&&showCheck&&<div style={{marginTop:8}}>
         <div className="dr"><span className="dk">Bank and card fees on payments that cleared</span><span className="dv mono">{money(r.collectedParts?.processingFees)}</span></div>
@@ -1270,6 +1317,177 @@ function ProcessingMarginCard({m}:{m:any}){
     </div>)
 }
 
+/** Month 'YYYY-MM' in words: '2026-10' → 'October 2026'. */
+const monthName=(ym?:string|null)=>{
+  const m=/^(\d{4})-(\d{2})/.exec(ym||'')
+  if(!m)return ym||''
+  return new Date(Number(m[1]),Number(m[2])-1,1).toLocaleString('en-US',{month:'long',year:'numeric'})
+}
+
+/**
+ * Recurring revenue + the income pies (all from platform_revenue_ledger).
+ * 10/12 (Nic): one component, on the Overview and on the Metrics page — "we
+ * have these pie charts on here, which is nice." The recurring line is the
+ * month's platform-fee bill as GAM billed it, top-ups included, and it
+ * follows the book: it refreshes on the page's 30-second beat, so a space the
+ * nightly top-up bills shows without a reload.
+ */
+function PlatformRevenueCard(){
+  const{user}=useAuth()
+  const{data:compositionAll,isError:compositionFailed}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:30000,refetchInterval:30000,refetchOnWindowFocus:true})
+  const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
+  const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  const[showByProperty,setShowByProperty]=useState(false)
+  return(<>
+      {(()=>{
+        const colorOf=incomeColorOf
+        // S652: the legend is built from what the SERVER actually returned, not
+        // from a list kept in parallel here. A hand-maintained copy is how a
+        // slice ends up on the chart with no name beside it, or a name with no
+        // slice — and the whole point of this pass is that the page agrees with
+        // itself.
+        const SRC=Array.from(new Map(
+          ((compositionAll?.periods||[]) as any[])
+            .flatMap((p:any)=>p.sources||[])
+            .filter((s:any)=>s.amount!==0)
+            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
+        ).values())
+        // S652 (Nic): "just reconcile all the different KPI cards where they're
+        // getting their numbers from the same source. That way, everything
+        // balances out." This used to read a re-derived run-rate ($120) while
+        // the bill that actually went out was $130. It now comes from the same
+        // ledger the pies below are drawn from.
+        // 10/12 (Nic) review: "not loaded yet" and "could not be read" are not
+        // "nothing billed yet". Before the first answer arrives the card said
+        // $0.00 · nothing billed yet, which is false; it now waits, or says the
+        // read failed. "Nothing billed yet" is kept for an answer with no month.
+        const loaded=compositionAll!=null
+        const recurringMonthly=compositionAll?.recurringMonthly??0
+        const recurringMonth=compositionAll?.recurringMonth as string|undefined
+        const recurringAnnual=compositionAll?.recurringAnnual??0
+        const recurringSpaces:number=compositionAll?.recurringSpaces??0
+        const notCollected:number=compositionAll?.recurringNotCollected??0
+        const byProperty:any[]=compositionAll?.recurringByProperty||[]
+        const byPropertyText=byProperty.map((p:any)=>`${p.name}: ${p.spaces} space${p.spaces===1?'':'s'} · ${formatCurrency(p.billed)}`).join('\n')
+        const periods:any[]=compositionAll?.periods||[]
+        // Small-donut geometry (stroke-dasharray technique).
+        const R=40,SW=12,C=2*Math.PI*R
+        return(
+          <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
+            {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
+            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',flexWrap:'wrap',gap:16,marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
+              <div style={{flex:'1 1 280px',minWidth:0}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{loaded?formatCurrency(recurringMonthly):'…'}</div>
+                {/* 10/12 (Nic): "is there only 12 units there?" — the month it is
+                    for in words, how many spaces it bills, and who it bills,
+                    so the split never has to be worked out by hand. */}
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}} title={byPropertyText||undefined}>
+                  {!loaded
+                    ?(compositionFailed?'The bill could not be read just now. It tries again every 30 seconds.':'Loading…')
+                    :recurringMonth
+                    ?`platform fees billed for ${monthName(recurringMonth)} · ${recurringSpaces.toLocaleString()} occupied space${recurringSpaces===1?'':'s'} · spaces filled mid-month included`
+                    :'nothing billed yet · $2 per occupied space'}
+                </div>
+                {notCollected>0&&<div style={{fontSize:'.74rem',color:'var(--amber)',marginTop:4}}>{formatCurrency(notCollected)} of it not collected yet — see by property</div>}
+                {byProperty.length>0&&<button className="btn btn-primary btn-sm" style={{marginTop:10}} onClick={()=>setShowByProperty(v=>!v)}>{showByProperty?'Hide by property':'By property'}</button>}
+              </div>
+              <div style={{flex:'0 0 auto',textAlign:'right'}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{loaded?formatCurrency(recurringAnnual):'…'}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
+              </div>
+              {showByProperty&&byProperty.length>0&&<div style={{flexBasis:'100%'}}>
+                {byProperty.map((p:any)=>(
+                  <div key={p.propertyId||p.name} className="dr" style={{flexWrap:'wrap',gap:'2px 12px',alignItems:'baseline'}}>
+                    <span className="dk" style={{color:'var(--t1)'}}>{p.name}</span>
+                    <span className="dv mono" style={{marginLeft:'auto'}}>{p.spaces.toLocaleString()} space{p.spaces===1?'':'s'} · {formatCurrency(p.billed)}</span>
+                    {p.notCollected>0&&<span style={{flexBasis:'100%',fontSize:'.72rem',color:'var(--amber)'}}>
+                      {formatCurrency(p.notCollected)} not collected yet — {p.payoutBankLinked
+                        ?'it comes out of their next payout'
+                        :'no payout bank linked yet, so it comes out of their first payout'}
+                    </span>}
+                  </div>
+                ))}
+              </div>}
+            </div>
+            {/* Income composition — a wall of pies, one per time window */}
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
+              <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em'}}>Income composition by period <span style={{color:'var(--t3)',opacity:.7,textTransform:'none',letterSpacing:0}}>(incl. one-time)</span></div>
+              <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+                {SRC.map(s=>(
+                  <div key={s.key} style={{display:'flex',alignItems:'center',gap:6}}>
+                    <div style={{width:9,height:9,borderRadius:'50%',background:colorOf(s.key),flexShrink:0}}/>
+                    <span style={{fontSize:'.7rem',color:'var(--t2)'}}>{s.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{display:'flex',gap:16,flexWrap:'wrap',justifyContent:'space-between'}}>
+              {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>{!loaded&&compositionFailed?'The income pies could not be read just now.':'Loading…'}</div>}
+              {periods.map((p:any)=>{
+                const g=p.gross||0
+                let acc=0
+                const segs=(p.sources||[]).filter((s:any)=>s.amount>0).map((s:any)=>{const len=g>0?(s.amount/g)*C:0;const o=acc;acc+=len;return{key:s.key,len,off:o}})
+                return(
+                  <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
+                    style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
+                    onMouseEnter={e=>{(e.currentTarget as HTMLDivElement).style.background='rgba(201,162,39,.07)'}}
+                    onMouseLeave={e=>{(e.currentTarget as HTMLDivElement).style.background='transparent'}}>
+                    <div style={{fontSize:'.72rem',color:'var(--t1)',fontWeight:600,marginBottom:8}}>{p.label}</div>
+                    <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
+                      <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
+                      {segs.map((s:any)=>(
+                        <circle key={s.key} cx={52} cy={52} r={R} fill="none" stroke={colorOf(s.key)} strokeWidth={SW}
+                          strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
+                      ))}
+                      <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
+                    </svg>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })()}
+      {breakdownWindow&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setBreakdownWindow(null)}}>
+          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:24}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:18,paddingBottom:16,borderBottom:'1px solid var(--b0)'}}>
+              <div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Income breakdown</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:800,color:'var(--t0)'}}>{breakdown?.label||''}</div>
+                <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(breakdown?.gross||0)} total</div>
+              </div>
+              <button onClick={()=>setBreakdownWindow(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.4rem',cursor:'pointer',lineHeight:1}}>×</button>
+            </div>
+            {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
+              <div style={{display:'flex',flexDirection:'column',gap:16}}>
+                {(breakdown?.sources||[]).map((s:any)=>{
+                  const pct=breakdown?.gross>0?(s.amount/breakdown.gross)*100:0
+                  const zero=s.amount===0&&s.count===0
+                  return(
+                    <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8}}>
+                        <div style={{width:11,height:11,borderRadius:'50%',background:incomeColorOf(s.key),flexShrink:0}}/>
+                        <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
+                        {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
+                      </div>
+                      <div style={{display:'flex',alignItems:'baseline',gap:8}}>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct.toFixed(0)}%</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+  </>)
+}
+
 function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
@@ -1281,9 +1499,8 @@ function Overview(){
   // number on this page now comes from platform_revenue_ledger. The endpoint
   // still exists for forecasting work; it just does not feed a card that reads
   // as fact.
-  const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
-  const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
-  const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // 10/12: the income-composition and breakdown queries moved into
+  // PlatformRevenueCard (shared with the Metrics page).
   // S650 (Nic): whose money is actually on the Stripe balance, and what part of it is GAM's.
   const{data:bal}=useQuery('platform-balance',()=>get<any>('/admin/platform-balance'),{enabled:!!user&&isSuperAdmin,staleTime:60000})
   const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
@@ -1426,131 +1643,226 @@ function Overview(){
         <div className="card">
           <div className="ct">FlexPay Reserve &amp; Float</div>
           <div className="dr"><span className="dk">Default reserve balance</span><span className="dv mono">{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
+          {/* 10/12: the label said 3% while the target is figured at 10% (S642, DEFAULT_RESERVE_RATE above). */}
+          <div className="dr"><span className="dk">Target (10% of FlexPay float)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${reservePct>=100?'bg2':reservePct>=50?'ba':'br'}`}>{reservePct.toFixed(0)}%</span></div>
           <div className="dr"><span className="dk">Float bankroll needed</span><span className="dv mono">{formatCurrency(floatBankroll)}</span></div>
-          <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,lineHeight:1.5}}>Reserve absorbs FlexPay defaults — 3% of the FlexPay float (money at risk), not total rent. Bankroll = rent of income-verified tenants who requested FlexPay (survey inquiry approved) — the capital to front if they enroll. Verified SSI/SSDI income without a FlexPay request does NOT count. Float yield income begins at ODFI partnership.</div>
+          <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,lineHeight:1.5}}>Reserve absorbs FlexPay defaults — 10% of the FlexPay float (money at risk), not total rent. Bankroll = rent of income-verified tenants who requested FlexPay (survey inquiry approved) — the capital to front if they enroll. Verified SSI/SSDI income without a FlexPay request does NOT count. Float yield income begins at ODFI partnership.</div>
         </div>
       </div>}
-      {isSuperAdmin&&<>
-      {/* ── Platform Revenue: recurring ARR + full income composition ── */}
-      {(()=>{
-        const colorOf=incomeColorOf
-        // S652: the legend is built from what the SERVER actually returned, not
-        // from a list kept in parallel here. A hand-maintained copy is how a
-        // slice ends up on the chart with no name beside it, or a name with no
-        // slice — and the whole point of this pass is that the page agrees with
-        // itself.
-        const SRC=Array.from(new Map(
-          ((compositionAll?.periods||[]) as any[])
-            .flatMap((p:any)=>p.sources||[])
-            .filter((s:any)=>s.amount!==0)
-            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
-        ).values())
-        // S652 (Nic): "just reconcile all the different KPI cards where they're
-        // getting their numbers from the same source. That way, everything
-        // balances out." This used to read a re-derived run-rate ($120) while
-        // the bill that actually went out was $130. It now comes from the same
-        // ledger the pies below are drawn from.
-        const recurringMonthly=compositionAll?.recurringMonthly??0
-        const recurringMonth=compositionAll?.recurringMonth as string|undefined
-        const recurringAnnual=compositionAll?.recurringAnnual??0
-        const periods:any[]=compositionAll?.periods||[]
-        // Small-donut geometry (stroke-dasharray technique).
-        const R=40,SW=12,C=2*Math.PI*R
-        return(
-          <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
-            {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
-            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
-              <div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
-                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>
-                  {recurringMonth?`platform fees billed ${recurringMonth} · $2 per occupied space`:'platform fees per month · $2 per occupied space'}
-                </div>
-              </div>
-              <div style={{textAlign:'right'}}>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(recurringAnnual)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
-              </div>
-            </div>
-            {/* Income composition — a wall of pies, one per time window */}
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
-              <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em'}}>Income composition by period <span style={{color:'var(--t3)',opacity:.7,textTransform:'none',letterSpacing:0}}>(incl. one-time)</span></div>
-              <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
-                {SRC.map(s=>(
-                  <div key={s.key} style={{display:'flex',alignItems:'center',gap:6}}>
-                    <div style={{width:9,height:9,borderRadius:'50%',background:colorOf(s.key),flexShrink:0}}/>
-                    <span style={{fontSize:'.7rem',color:'var(--t2)'}}>{s.label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div style={{display:'flex',gap:16,flexWrap:'wrap',justifyContent:'space-between'}}>
-              {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>Loading…</div>}
-              {periods.map((p:any)=>{
-                const g=p.gross||0
-                let acc=0
-                const segs=(p.sources||[]).filter((s:any)=>s.amount>0).map((s:any)=>{const len=g>0?(s.amount/g)*C:0;const o=acc;acc+=len;return{key:s.key,len,off:o}})
-                return(
-                  <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
-                    style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
-                    onMouseEnter={e=>{(e.currentTarget as HTMLDivElement).style.background='rgba(201,162,39,.07)'}}
-                    onMouseLeave={e=>{(e.currentTarget as HTMLDivElement).style.background='transparent'}}>
-                    <div style={{fontSize:'.72rem',color:'var(--t1)',fontWeight:600,marginBottom:8}}>{p.label}</div>
-                    <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
-                      <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
-                      {segs.map((s:any)=>(
-                        <circle key={s.key} cx={52} cy={52} r={R} fill="none" stroke={colorOf(s.key)} strokeWidth={SW}
-                          strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
-                      ))}
-                      <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
-                    </svg>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )
-      })()}
-      {breakdownWindow&&(
-        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setBreakdownWindow(null)}}>
-          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:24}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:18,paddingBottom:16,borderBottom:'1px solid var(--b0)'}}>
-              <div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Income breakdown</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:800,color:'var(--t0)'}}>{breakdown?.label||''}</div>
-                <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(breakdown?.gross||0)} total</div>
-              </div>
-              <button onClick={()=>setBreakdownWindow(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.4rem',cursor:'pointer',lineHeight:1}}>×</button>
-            </div>
-            {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
-              <div style={{display:'flex',flexDirection:'column',gap:16}}>
-                {(breakdown?.sources||[]).map((s:any)=>{
-                  const pct=breakdown?.gross>0?(s.amount/breakdown.gross)*100:0
-                  const zero=s.amount===0&&s.count===0
-                  return(
-                    <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
-                      <div style={{display:'flex',alignItems:'center',gap:8}}>
-                        <div style={{width:11,height:11,borderRadius:'50%',background:incomeColorOf(s.key),flexShrink:0}}/>
-                        <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
-                        {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
-                      </div>
-                      <div style={{display:'flex',alignItems:'baseline',gap:8}}>
-                        <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
-                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct.toFixed(0)}%</span>
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-      </> }
+      {/* 10/12 (Nic): the recurring bill and the income pies live in one component,
+          shown here and on the Metrics page. */}
+      {isSuperAdmin&&<PlatformRevenueCard/>}
       <DepositTrust/>
+    </div>
+  )
+}
+
+// ── METRICS (10/12) ───────────────────────────────────────────
+// Nic: "I want a page specifically for vanity metrics. I want to track things
+// like total rents that we've ever processed electronically through card or
+// ACH ... how much money we have logged for rent collected through the
+// platform all time, whether that's paid in cash or check in person ... I
+// still want to show that we've helped landlords log, you know, $6 million or
+// whatever." Every number comes from GET /admin/metrics (services/
+// platformMetrics), which says what each one counts and what it leaves out.
+// The recurring bill, the income pies and the tenant-payments heartbeat are
+// the same components the Overview shows.
+
+const METHOD_COLORS:Record<string,string>={card:'var(--gold)',ach:'var(--blue)',cash:'var(--green)',check:'var(--purple)',money_order:'var(--amber)',bank_deposit:'var(--teal)'}
+const methodColor=(m:string)=>METHOD_COLORS[m]||'var(--t3)'
+const count=(n:number|null|undefined)=>Number(n||0).toLocaleString('en-US')
+const plural=(n:number,one:string,many=one+'s')=>`${count(n)} ${n===1?one:many}`
+/** 'YYYY-MM-DD' in words, read as a calendar day (no time zone shift). */
+const dayName=(d?:string|null)=>{
+  const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(d||'')
+  if(!m)return d||''
+  return new Date(Number(m[1]),Number(m[2])-1,Number(m[3])).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})
+}
+const monthShort=(ym:string)=>{
+  const m=/^(\d{4})-(\d{2})/.exec(ym)
+  if(!m)return ym
+  // "Sep 2026", never "Sep 26" — that reads as a day.
+  return new Date(Number(m[1]),Number(m[2])-1,1).toLocaleDateString('en-US',{month:'short',year:'numeric'})
+}
+
+function MetricTile({label,value,sub,tone}:{label:string;value:React.ReactNode;sub?:React.ReactNode;tone?:'gold'|'g'|'b'|'a'}){
+  return(
+    <div className="kpi">
+      <div className="kl">{label}</div>
+      <div className={`kv mx-v${tone?' '+tone:''}`}>{value}</div>
+      {sub&&<div className="ks">{sub}</div>}
+    </div>)
+}
+
+/** The tenant-payments heartbeat with its own window, for pages other than the Overview. */
+function RentHeartbeat(){
+  const{user}=useAuth()
+  const[months,setMonths]=useState(6)
+  const{data=[]}=useQuery<any[]>(['rent-volume-trend',months],()=>get<any[]>(`/admin/rent-volume-trend?months=${months}`),{enabled:!!user})
+  return<RentVolumeMonitor months={data} windowMonths={months} onWindowChange={setMonths}/>
+}
+
+function Metrics(){
+  const{user}=useAuth()
+  const{data:m,isError}=useQuery<any>('admin-metrics',()=>get<any>('/admin/metrics'),{enabled:!!user,staleTime:60000,refetchInterval:60000})
+
+  const header=(
+    <div className="ph">
+      <div>
+        <h1 className="pt">Metrics</h1>
+        <p className="ps">Everything that has moved through GAM, all time{m?.firstPaymentOn?` · first payment ${dayName(m.firstPaymentOn)}`:''}</p>
+      </div>
+    </div>)
+  // 10/12 (Nic) review: a failed refresh (an API restart during a deploy, a
+  // network blip) must not throw away numbers already on screen. The error
+  // takes the page only when there is nothing to show; otherwise the page
+  // stays and says the last refresh failed.
+  if(!m)return<div>{header}{isError
+    ?<div className="alert ae">The metrics could not be loaded just now. They try again every minute.</div>
+    :<div style={{color:'var(--t3)'}}>Loading metrics…</div>}</div>
+
+  const rent=m.rent, logged=rent.logged, elec=rent.electronic
+  const methods:any[]=(logged.byMethod||[]).filter((x:any)=>x.amount>0)
+  const months=(rent.byMonth||[]).map((r:any)=>({label:monthShort(r.month),electronic:r.electronic,byHand:r.byHand}))
+  const growth=(m.growth||[]).map((g:any)=>({...g,label:dayName(g.date).replace(/, \d{4}$/,'')}))
+  const mi=m.moneyIn, pay=m.payments, fp=m.footprint, pw=m.paperwork, op=m.operations
+  const tooltipStyle={background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:8,fontSize:'.75rem',color:'var(--t0)'}
+
+  return(
+    <div>
+      {header}
+      {isError&&<div className="ks" style={{marginTop:-8,marginBottom:12,color:'var(--amber)'}}>The last refresh failed — these are the numbers from {new Date(m.asOf).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}. It tries again every minute.</div>}
+
+      {/* ── The headline numbers ── */}
+      <div className="mx-hero" style={{marginBottom:16}}>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Rent logged through GAM</div>
+          <div className="mx-big">{formatCurrency(logged.total)}</div>
+          <div className="ks">{plural(logged.payments,'rent payment')}, every way it was paid — card, bank, cash, check, money order and bank deposit</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Rent processed electronically</div>
+          <div className="mx-big">{formatCurrency(elec.total)}</div>
+          <div className="ks">Card {formatCurrency(elec.card)} · Bank (ACH) {formatCurrency(elec.ach)} · {plural(elec.payments,'payment')}</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Money paid in through GAM</div>
+          <div className="mx-big">{formatCurrency(mi.total)}</div>
+          <div className="ks">rent, utilities, fees and deposits, register sales, stays and background checks — card fees not included</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Paid out to landlords</div>
+          <div className="mx-big">{formatCurrency(m.payouts.amount)}</div>
+          <div className="ks">{plural(m.payouts.count,'payout')} to landlords' banks</div>
+        </div>
+      </div>
+
+      {/* ── Rent by how it was paid ── */}
+      <div className="grid2 mx-pair" style={{marginBottom:16}}>
+        <div className="card">
+          <div className="ct">Rent logged, by how it was paid</div>
+          {methods.length===0?<div style={{color:'var(--t3)',fontSize:'.8rem'}}>No rent has been paid yet.</div>:<>
+            <div style={{display:'flex',height:14,borderRadius:7,overflow:'hidden',background:'var(--bg3)',marginBottom:14}}>
+              {methods.map((x:any)=><div key={x.method} title={`${x.label}: ${formatCurrency(x.amount)}`} style={{width:`${logged.total>0?(x.amount/logged.total)*100:0}%`,background:methodColor(x.method)}}/>)}
+            </div>
+            {methods.map((x:any)=>(
+              <div key={x.method} className="dr" style={{gap:10}}>
+                <span className="dk" style={{display:'flex',alignItems:'center',gap:8,minWidth:0}}>
+                  <span style={{width:9,height:9,borderRadius:'50%',background:methodColor(x.method),flexShrink:0}}/>
+                  <span style={{color:'var(--t1)'}}>{x.label}</span>
+                  <span style={{fontSize:'.68rem'}}>{plural(x.payments,'payment')}</span>
+                </span>
+                <span className="dv mono" style={{whiteSpace:'nowrap'}}>{formatCurrency(x.amount)} <span style={{color:'var(--t3)',fontSize:'.7rem'}}>{logged.total>0?((x.amount/logged.total)*100).toFixed(0):0}%</span></span>
+              </div>
+            ))}
+            <div className="dr"><span className="dk">Electronic</span><span className="dv mono">{formatCurrency(elec.total)}</span></div>
+            <div className="dr"><span className="dk">Logged by hand (cash, check, money order, bank deposit)</span><span className="dv mono">{formatCurrency(logged.byHand)}</span></div>
+          </>}
+        </div>
+        <div className="card">
+          <div className="ct">Rent logged, month by month</div>
+          {months.length===0?<div style={{color:'var(--t3)',fontSize:'.8rem'}}>No rent has been paid yet.</div>:<>
+            <div style={{height:220}}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={months} margin={{top:4,right:4,left:0,bottom:0}}>
+                  <XAxis dataKey="label" tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false}/>
+                  <YAxis tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} width={48} tickFormatter={(v:number)=>v>=1000?`$${Math.round(v/1000)}k`:`$${v}`}/>
+                  <Tooltip contentStyle={tooltipStyle} cursor={{fill:'var(--bg3)'}} formatter={(v:any,name:any)=>[formatCurrency(Number(v)),name==='electronic'?'Electronic':'Logged by hand']}/>
+                  <Bar dataKey="electronic" stackId="rent" fill="var(--gold)" maxBarSize={64}/>
+                  <Bar dataKey="byHand" stackId="rent" fill="var(--blue)" radius={[4,4,0,0]} maxBarSize={64}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{display:'flex',gap:14,flexWrap:'wrap',marginTop:8}}>
+              <span style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t2)'}}><span style={{width:9,height:9,borderRadius:'50%',background:'var(--gold)'}}/>Electronic (card and bank)</span>
+              <span style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t2)'}}><span style={{width:9,height:9,borderRadius:'50%',background:'var(--blue)'}}/>Logged by hand</span>
+            </div>
+          </>}
+        </div>
+      </div>
+
+      {/* ── Payments ── */}
+      <div className="ct mx-section">Payments</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Tenant payments" value={count(pay.count)} tone="gold" sub={`${formatCurrency(mi.tenantPayments.amount)} toward rent, utilities, fees and deposits`}/>
+        <MetricTile label="Paid electronically" value={formatCurrency(mi.tenantPayments.electronic)} sub="tenant payments by card or bank"/>
+        <MetricTile label="Logged by hand" value={formatCurrency(mi.tenantPayments.byHand)} sub="cash, check, money order and bank deposit"/>
+        <MetricTile label="Average payment" value={formatCurrency(pay.average)} sub={`middle payment ${formatCurrency(pay.median)}`}/>
+        <MetricTile label="Biggest payment" value={formatCurrency(pay.biggest)} sub={pay.biggestElectronic>0?`biggest electronic ${formatCurrency(pay.biggestElectronic)}`:undefined}/>
+        {pay.busiestDay&&<MetricTile label="Busiest day" value={dayName(pay.busiestDay.date)} sub={`${plural(pay.busiestDay.count,'payment')} · ${formatCurrency(pay.busiestDay.amount)}`}/>}
+        <MetricTile label="Register and pay-link sales" value={formatCurrency(mi.registerSales.amount)} sub={plural(mi.registerSales.count,'sale')}/>
+        {mi.stayDepositsOnline.count>0&&<MetricTile label="Stay deposits paid online" value={formatCurrency(mi.stayDepositsOnline.amount)} sub={plural(mi.stayDepositsOnline.count,'deposit')}/>}
+      </div>
+
+      {/* ── Footprint ── */}
+      <div className="ct mx-section">On GAM today</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Rent under management" value={formatCurrency(fp.rentRollMonthly)} tone="gold" sub={`a month, from active leases · ${formatCurrency(fp.rentRollMonthly*12)} a year`}/>
+        {/* 10/12 (Nic) review: live only — a property with a lease, a billed month or a stay (services/platformMetrics LIVE_PROPERTY). */}
+        <MetricTile label="Landlords" value={count(fp.landlords)} sub="people with a property live on GAM"/>
+        <MetricTile label="Properties" value={count(fp.properties)} sub={`in ${plural(fp.cities,'city','cities')} across ${plural(fp.states,'state')}`}/>
+        <MetricTile label="Spaces under management" value={count(fp.units)} sub={fp.spacesBilledMonth?`${count(fp.spacesBilled)} occupied and billed for ${monthName(fp.spacesBilledMonth)}`:undefined}/>
+        <MetricTile label="Households" value={count(fp.households)} sub="active leases"/>
+        <MetricTile label="Residents" value={count(fp.residents)} sub="people on an active lease"/>
+      </div>
+
+      {/* ── Paperwork and operations ── */}
+      <div className="ct mx-section">Done on GAM</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Leases signed" value={count(pw.leasesSigned)} tone="gold" sub="signed on GAM, start to finish"/>
+        <MetricTile label="Documents signed" value={count(pw.documentsSigned)} sub="leases, addendums and purchase agreements"/>
+        <MetricTile label="Signatures collected" value={count(pw.signatures)}/>
+        <MetricTile label="Meter readings" value={count(op.meterReadings)}/>
+        <MetricTile label="Utility bills sent" value={count(op.utilityBills)} sub={`${formatCurrency(op.utilityBilled)} billed`}/>
+        {op.electricKwh>0&&<MetricTile label="Electricity billed" value={`${count(op.electricKwh)} kWh`}/>}
+        {op.stays>0&&<MetricTile label="Stay nights" value={count(op.stayNights)} sub={plural(op.stays,'stay')}/>}
+        {op.homeSales>0&&<MetricTile label="Home sales" value={count(op.homeSales)} sub={`${formatCurrency(op.homeSalesValue)} in home sales billed on GAM`}/>}
+        <MetricTile label="Background checks" value={count(op.backgroundChecksRun)} sub={mi.backgroundChecks.count>0?`${formatCurrency(mi.backgroundChecks.amount)} paid by applicants`:undefined}/>
+        {op.workTradeAgreements>0&&<MetricTile label="Work-trade agreements" value={count(op.workTradeAgreements)}/>}
+      </div>
+
+      {/* ── Growth ── */}
+      {growth.length>1&&<div className="card" style={{marginBottom:16}}>
+        <div className="ct">Rent under management over time</div>
+        <div style={{height:200}}>
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={growth} margin={{top:4,right:4,left:0,bottom:0}}>
+              <XAxis dataKey="label" tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} minTickGap={24}/>
+              <YAxis tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} width={48} tickFormatter={(v:number)=>v>=1000?`$${Math.round(v/1000)}k`:`$${v}`}/>
+              <Tooltip contentStyle={tooltipStyle} formatter={(v:any)=>[formatCurrency(Number(v)),'Rent a month']}/>
+              <Area type="monotone" dataKey="rentRoll" stroke="var(--gold)" fill="var(--gold)" fillOpacity={0.15} strokeWidth={2}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="ks" style={{marginTop:4}}>Rent on active leases, from the platform's daily snapshot</div>
+      </div>}
+
+      {/* ── GAM's own revenue and the tenant-payments heartbeat (same as the Overview) ── */}
+      <div className="ct mx-section">Revenue and payments</div>
+      <PlatformRevenueCard/>
+      <div style={{marginTop:16}}><RentHeartbeat/></div>
+      <div className="ks" style={{marginTop:12}}>Updated {new Date(m.asOf).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · refreshes every minute · demo accounts, GAM's own accounts and signups with no tenants yet are left out</div>
     </div>
   )
 }
@@ -2618,8 +2930,9 @@ function Bool({ v }: { v: boolean }) {
 function Reserve(){
   const{user}=useAuth()
   const{data:stats}=useQuery('admin-overview',()=>get<any>('/admin/overview'),{enabled:!!user})
-  // Matches the Overview reserve/float model (S566): reserve target = 3% of the
-  // FlexPay FLOAT (money at risk), NOT total platform rent; bankroll = rent of
+  // Matches the Overview reserve/float model (S566): reserve target = a share of the
+  // FlexPay FLOAT (money at risk) — 10% since S642; 10/12: the labels below still
+  // said 3% — NOT total platform rent; bankroll = rent of
   // income-verified FlexPay tenants; no phases; float yield waits for ODFI.
   // S642: same two-target model as the Overview, read from the same server
   // figure, so the two pages cannot drift.
@@ -2634,17 +2947,17 @@ function Reserve(){
         <div className="card">
           <div className="ct">Default Reserve Fund</div>
           <div className="dr"><span className="dk">Balance</span><span className="dv mono" style={{color:pct>=100?'var(--green)':pct>=50?'var(--amber)':'var(--red)'}}>{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div className="dr"><span className="dk">Target (10% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${pct>=100?'bg2':pct>=50?'ba':'br'}`}>{pct.toFixed(0)}%</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
-            Reserve absorbs FlexPay defaults — sized at 3% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
+            Reserve absorbs FlexPay defaults — sized at 10% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
           </div>
         </div>
         <div className="card">
           <div className="ct">FlexPay Float Bankroll</div>
           <div className="dr"><span className="dk">Bankroll</span><span className="dv mono" style={{color:'var(--blue)'}}>{formatCurrency(floatBankroll)}</span></div>
           <div className="dr"><span className="dk">Basis</span><span className="dv mono">rent of income-verified tenants who requested FlexPay</span></div>
-          <div className="dr"><span className="dk">Reserve needed (3%)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div className="dr"><span className="dk">Reserve needed (10%)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>Bankroll = the rent GAM would front each cycle if these tenants enroll. Float yield income begins at ODFI partnership; no interest is booked before then.</div>
         </div>
       </div>
@@ -4366,6 +4679,7 @@ function App(){
         }>
           <Route index element={<Navigate to={user?.role==='super_admin'?'/overview':'/onboarding'} replace/>}/>
           <Route path="overview"      element={user?.role==='super_admin'?<Overview/>:<Navigate to="/onboarding" replace/>}/>
+          <Route path="metrics"       element={<SuperAdminGuard><Metrics/></SuperAdminGuard>}/>
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>

@@ -51,7 +51,7 @@ import Stripe from 'stripe'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
-import { PROCESSING_FEES, PLATFORM_FEES, processingFeeFor } from '@gam/shared'
+import { PROCESSING_FEES, PLATFORM_FEES, processingFeeFor, LANDLORD_GAM_CHARGE_KIND_LABEL } from '@gam/shared'
 // The demo / GAM-internal account rule, which card sales are on GAM's balance,
 // and the platform fee a tenant's rent payment carried live with the revenue
 // book's writer. (Imported this way round: platformRevenue is loaded by most of
@@ -1834,7 +1834,12 @@ export interface PlatformBalanceBook {
   /** Stripe cost lines GAM already holds (recent), so the live read can find the rest. */
   recordedTxnIds: string[]
   owedByLandlordsUncollected: number
+  /** 10/12 (Nic) review: owedByLandlordsUncollected, kind by kind (platform fees, reader installments …). */
+  owedByLandlordsByKind?: OwedByKind[]
 }
+
+/** 10/12 (Nic) review: one kind of what landlords still owe GAM, named for the screen. */
+export interface OwedByKind { kind: string; label: string; amount: number }
 
 export interface PlatformStripeLive {
   available: number
@@ -1924,6 +1929,7 @@ export interface PlatformBalanceSplit {
     gap: number | null
   } | null
   owedByLandlordsUncollected: number
+  owedByLandlordsByKind: OwedByKind[]
 }
 
 /**
@@ -2029,6 +2035,7 @@ export function splitPlatformBalance(book: PlatformBalanceBook, live: PlatformSt
       gap: gamsOwnC == null ? null : dollars(gamsOwnC - bookC),
     } : null,
     owedByLandlordsUncollected: round2(book.owedByLandlordsUncollected),
+    owedByLandlordsByKind: book.owedByLandlordsByKind ?? [],
   }
 }
 
@@ -2517,9 +2524,13 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     [CLEARING_LOOKBACK_DAYS + 2])
   // S652: the book is what GAM has EARNED; part of it is fees landlords have
   // not paid yet. Said on the card.
-  const [owedBy] = await query<any>(`
-    SELECT COALESCE(SUM(amount - COALESCE(collected_amount, 0)), 0)::float AS amt
-      FROM landlord_gam_charges WHERE amount > COALESCE(collected_amount, 0)`)
+  // 10/12 (Nic) review: kind by kind, so the card names what is owed — a
+  // card-reader installment owed is not a fee, and the card called it one.
+  const owedByKind = await query<{ kind: string; amt: number }>(`
+    SELECT kind, SUM(amount - COALESCE(collected_amount, 0))::float AS amt
+      FROM landlord_gam_charges WHERE amount > COALESCE(collected_amount, 0)
+     GROUP BY kind ORDER BY 2 DESC, kind`)
+  const owedBy = { amt: dollars(owedByKind.reduce((a, r) => a + cents(num(r.amt)), 0)) }
 
   return {
     ownerSharesOwed: round2(num(owed.amt)),
@@ -2551,6 +2562,11 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     flexpayFronted: round2(num(fronted.amt)),
     recordedTxnIds: recent.map(r => r.stripe_txn_id),
     owedByLandlordsUncollected: round2(num(owedBy.amt)),
+    owedByLandlordsByKind: owedByKind.map(r => ({
+      kind: r.kind,
+      label: (LANDLORD_GAM_CHARGE_KIND_LABEL as Record<string, string>)[r.kind] ?? 'Other charges',
+      amount: round2(num(r.amt)),
+    })),
   }
 }
 

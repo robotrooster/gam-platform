@@ -1767,6 +1767,9 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
         gap: r.gap,
       } : null,
       owed_by_landlords_uncollected: split.owedByLandlordsUncollected,
+      // 10/12 (Nic) review: the same figure kind by kind, so the card can say
+      // what it is (platform fees, card-reader installments …).
+      owed_by_landlords_by_kind: split.owedByLandlordsByKind,
       revenue_by_type: revenue,
       revenue_this_month: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.this_month), 0) * 100) / 100,
       revenue_all_time: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.all_time), 0) * 100) / 100,
@@ -1900,8 +1903,13 @@ const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
  * function that says what GAM bills is the one being asked.
  */
 async function currentPlatformRunRate(): Promise<number> {
-  const props = await query<{ id: string }>(`
-    SELECT p.id
+  // 10/12 (Nic): the $10 minimum is per payout account, not per property
+  // (S630 — gam-platform-minimum-per-connect-account). This forecast floored
+  // every property on its own, so two small properties on one payout account
+  // forecast two minimums where the bill charges one. Grouped the way the
+  // accrual's applyConnectAccountMinimums groups them.
+  const props = await query<{ id: string; group_key: string }>(`
+    SELECT p.id, COALESCE(l.stripe_connect_account_id, 'entity:' || l.id::text) AS group_key
       FROM properties p
       JOIN landlords l ON l.id = p.landlord_id
      WHERE l.is_system IS NOT TRUE
@@ -1921,11 +1929,14 @@ async function currentPlatformRunRate(): Promise<number> {
 
   const client = await getClient()
   try {
-    let total = 0
+    const spacesByGroup = new Map<string, number>()
     for (const p of props) {
       const b = await billableUnitsForProperty(client, p.id, monthIso, arrears, NIGHTS_AGGREGATION_UNIT_TYPES)
-      if (b.total > 0) total += launchPlatformFeeForProperty(b.total)
+      if (b.total > 0) spacesByGroup.set(p.group_key, (spacesByGroup.get(p.group_key) ?? 0) + b.total)
     }
+    // max($2 × spaces, $10) once per payout account with something billable.
+    let total = 0
+    for (const spaces of spacesByGroup.values()) total += launchPlatformFeeForProperty(spaces)
     return total
   } finally { client.release() }
 }
@@ -1961,7 +1972,14 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
 // 10/5 (Nic, prepaid stays): a screening margin taken back because the check
 // paid with a stay was cancelled before a report (services/stayTerms
 // restorePrepaidScreening) corrects the Background Checks slice.
-const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
+// 10/12 (Nic): the old screening sweep (jobs/platformFeeAccrual
+// processScreeningFeeSweep) books background checks under the subscription
+// type. It has never posted, but the day it does those checks belong in the
+// Background Checks slice, not in Platform Fees or the recurring card
+// (services/platformFeeBill leaves them out by the same reference).
+const SLICE_TYPE_SQL = `CASE WHEN type = 'platform_fee_subscription' AND reference_type = 'screening_fee_sweep'
+                             THEN 'screening_margin'
+                             WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
                              THEN 'banking_spread'
                              WHEN type = 'adjustment' AND reference_type = 'screening_margin_reversal'
                              THEN 'screening_margin'
@@ -1969,7 +1987,9 @@ const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'proc
                              THEN 'flexpay_subscription'
                              ELSE type END`
 
-async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
+// 10/12 (Nic) review: `platformRunRate` is left out (null) by the polled
+// all-windows read, which does not compute the forecast unless asked.
+async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number | null) {
   const rows = await query<{ type: string; amt: number }>(`
     SELECT ${SLICE_TYPE_SQL} AS type, COALESCE(SUM(amount), 0)::float AS amt
       FROM platform_revenue_ledger
@@ -1996,7 +2016,7 @@ async function computeComposition(key: string, startSql: string, label: string, 
   return {
     window: key, label, gross, sources,
     // Forward-looking, and kept apart from the history on purpose.
-    runRate: +platformRunRate.toFixed(2),
+    ...(platformRunRate == null ? {} : { runRate: +platformRunRate.toFixed(2) }),
   }
 }
 
@@ -2027,31 +2047,27 @@ adminRouter.get('/income/composition', requireSuperAdmin, async (req, res, next)
  * went out is the answer — it is a fact, and it is the number a landlord would
  * quote back at us.
  */
-async function recurringMonthlyFromLedger(): Promise<{ amount: number; month: string | null }> {
-  const recurringTypes = REVENUE_SLICES.filter(sl => sl.recurring).flatMap(sl => sl.types)
-  const rows = await query<{ month: string; amt: number }>(`
-    SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
-           COALESCE(SUM(amount), 0)::float AS amt
-      FROM platform_revenue_ledger
-     WHERE type = ANY($1::text[])
-     GROUP BY 1
-     -- The most recent month that actually billed something. An empty current
-     -- month (the 2nd, before the accrual runs) must not read as a collapse in
-     -- recurring revenue.
-     HAVING COALESCE(SUM(amount), 0) > 0
-     ORDER BY 1 DESC
-     LIMIT 1`, [recurringTypes])
-  const r = rows[0]
-  return { amount: r ? Math.round(Number(r.amt) * 100) / 100 : 0, month: r?.month ?? null }
-}
+//
+// 10/12 (Nic): "as we bill for that month, so next month when it goes up, I
+// want to see what we billed." Still the bill, still the book — now read by
+// the month each line BILLS (an accrual's own month, not the day it was
+// written), without the screening sweep, and split by property with the
+// spaces each was billed for. See services/platformFeeBill.
 
-adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, next) => {
+adminRouter.get('/income/composition/all', requireSuperAdmin, async (req, res, next) => {
   try {
-    const rr = await currentPlatformRunRate()
+    const { platformFeeBill } = await import('../services/platformFeeBill')
+    // 10/12 (Nic) review: the Recurring Revenue card polls this every 30
+    // seconds on the Overview and the Metrics page. The forward run-rate runs
+    // billableUnitsForProperty once per live property, one after another —
+    // hundreds of serial queries per poll at an 11,000-unit PM — for a number
+    // no screen shows. It is computed only when asked for (?withRunRate=1);
+    // the recurring bill and the pies are a handful of aggregates.
+    const rr = req.query.withRunRate === '1' ? await currentPlatformRunRate() : null
     const keys = ['month', 'quarter', 'ytd', 'rolling12', 'all']
     const [periods, recurring] = await Promise.all([
       Promise.all(keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))),
-      recurringMonthlyFromLedger(),
+      platformFeeBill(),
     ])
     res.json({ success: true, data: {
       periods,
@@ -2059,9 +2075,27 @@ adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, 
       recurringMonthly: recurring.amount,
       recurringMonth:   recurring.month,
       recurringAnnual:  Math.round(recurring.amount * 12 * 100) / 100,
-      // The forward number, kept separate and named as what it is.
-      platformRunRate:  +rr.toFixed(2),
+      // 10/12 (Nic): the month's bill, property by property — spaces billed,
+      // dollars billed, and what no payout has taken yet.
+      recurringSpaces:       recurring.spaces,
+      recurringNotCollected: recurring.notCollected,
+      recurringByProperty:   recurring.byProperty,
+      // The forward number, kept separate and named as what it is — only when asked for.
+      ...(rr == null ? {} : { platformRunRate: +rr.toFixed(2) }),
     } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics — 10/12 (Nic): the Metrics page's all-time numbers
+// ("total rents that we've ever processed electronically ... rent collected
+// through the platform all time, whether that's paid in cash or check").
+// Super admin only, like every platform-wide money figure here (S570: the
+// admin role must never see platform financials). Read only; cached a minute
+// (services/platformMetrics).
+adminRouter.get('/metrics', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { platformMetrics } = await import('../services/platformMetrics')
+    res.json({ success: true, data: await platformMetrics() })
   } catch (e) { next(e) }
 })
 
