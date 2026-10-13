@@ -151,3 +151,31 @@ bank-feed match for a disputed pull's return line.
 First bookkeeper invited by Nic 10/13 (Mountain View, full bookkeeping;
 invitation aec4a847, pending). When she accepts, set her money-in filing to
 "May file any deposit" (Nic chose full bookkeeping).
+
+## 10/13 evening: final deploy (live 16:20 Phoenix)
+
+Nic answered every round-2 question (`~/gam-nic-answers-2026-10-13.md`,
+"Afternoon answers") and said "fix all that stuff, do a final deploy."
+
+Shipped (`4e392bd`..`a7d3715`): money rules round 2 (won GAM pull disputes
+undo themselves; $15 when Stripe never states its fee; a voided bank deposit
+voids its income; shortened-stay voids for owner + property managers), card
+readers in GAM's own book as the full purchase (Mountain View: −$331.73 on
+9/28, +$87.50 repaid 10/5), a nightly credit chain check (admin email on a
+break; the restart note admin-only), GAM Books (every company-level cost to
+the Company column by default — Oak Park's $6 posted; reader pieces are
+Supplies when collected — Mountain View rebuilt; hand-typed assets name their
+funding; automatic changes show on the day), and Payments/Rent Roll round 2
+(bookkeepers read both; Outstanding Balances folded into Payments; stay money
+and other money coming in; Delinquent tag; phone cards; health by lease).
+Tests: API 13,694 (711 files), frontends 1,107. Books after: integrity 0,
+drift 0; Oak Park nothing waiting. Record: `~/gam-backups/deploy-1013c/`.
+
+Arturo Melendez, MH 15 (Mountain View): lease drafted into the owner's
+"Waiting on you to sign" (document a2f30572…), fields set to Nic's terms
+(start 10/01, $460, deposit $0, total due $460); nobody emailed. AFTER NIC
+SIGNS: check October is billed once at $460 and that late fees count from
+Oct 1 (Nic: "as if billed on time"); the late-bill rule counts from the day
+written, so expect to adjust it.
+
+Round-2 open questions (21): `~/gam-backups/deploy-1013c/questions_for_nic.txt`.
