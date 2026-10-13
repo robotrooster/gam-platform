@@ -17,7 +17,7 @@ import { backfillInvoices } from './invoiceGeneration'
 import { generateMoveInInvoice } from './moveInBundle'
 import {
   bookingRentForDueDate, syncLeaseWithBookingDates, bankShortenedStayOverpayment, bankShortenedStaysAfterSettle,
-  STAY_SHORTENED_CREDIT_NOTE,
+  STAY_SHORTENED_CREDIT_NOTE, STAY_SHORTENED_RENT_VOID_REASON,
 } from '../services/bookingLeaseBilling'
 import { applyCredit, applyHeldForRemittance, holdCredit, householdQuote, settleWholeBillIfCovered } from '../services/creditUse'
 import { incomeTotals } from '../services/incomeBasis'
@@ -105,12 +105,23 @@ async function atDate<T>(ymd: string, fn: () => Promise<T>): Promise<T> {
   try { return await fn() } finally { vi.useRealTimers() }
 }
 
+/** The lease's live rent rows by due date (10/12: a voided row is a record, not rent). */
 async function rentByDueDate(leaseId: string): Promise<Record<string, number>> {
   const rows = await db.query<any>(
     `SELECT to_char(due_date, 'YYYY-MM-DD') AS d, amount::numeric AS a
-       FROM payments WHERE lease_id=$1 AND type='rent' ORDER BY due_date`, [leaseId])
+       FROM payments WHERE lease_id=$1 AND type='rent' AND status <> 'voided' ORDER BY due_date`, [leaseId])
   const out: Record<string, number> = {}
   for (const r of rows.rows) out[r.d] = Number(r.a)
+  return out
+}
+
+/** 10/12 (Nic): rent the new dates no longer owe is voided as a record, never deleted — by due date, with why. */
+async function voidedRentByDueDate(leaseId: string): Promise<Record<string, { amount: number; reason: string | null }>> {
+  const rows = await db.query<any>(
+    `SELECT to_char(due_date, 'YYYY-MM-DD') AS d, amount::numeric AS a, void_reason
+       FROM payments WHERE lease_id=$1 AND type='rent' AND status = 'voided' ORDER BY due_date`, [leaseId])
+  const out: Record<string, { amount: number; reason: string | null }> = {}
+  for (const r of rows.rows) out[r.d] = { amount: Number(r.a), reason: r.void_reason }
   return out
 }
 
@@ -199,6 +210,9 @@ describe('Master Schedule → lease sync', () => {
     const rents = await rentByDueDate(s.leaseId)
     expect(rents['2026-10-01']).toBeUndefined()
     expect(rents['2026-09-01']).toBe(950)
+    // …kept as a voided record at its amount, with why (10/12: never deleted).
+    expect(await voidedRentByDueDate(s.leaseId)).toEqual({
+      '2026-10-01': { amount: 950, reason: STAY_SHORTENED_RENT_VOID_REASON } })
 
     // Owed now: 674.19 (arrival, 22n × 950/31) + 19n × 950/30 (September) = 601.67 → 1275.86.
     // Settled 1646.67 → credit 370.81, banked for the final bill.
@@ -502,12 +516,14 @@ describe('Master Schedule → lease sync', () => {
     expect(l.rows[0].e).toBe('2026-09-20')
     expect(await rentByDueDate(s.leaseId)).toMatchObject({ '2026-10-01': 950 })
     expect((await rentByDueDate(s.leaseId))['2026-11-01']).toBeUndefined()      // the plain one went
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [nov])).rowCount).toBe(0)
+    // 10/12 (Nic): voided as a record, never deleted; the one a record points at is untouched.
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [nov])).rows[0].status).toBe('voided')
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [oct])).rows[0].status).toBe('pending')
     const credit = await db.query<any>(`SELECT amount_original::float AS a FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
     expect(credit.rows).toEqual([{ a: 370.81 }])
     const admin = (await db.query<any>(`SELECT body FROM admin_notifications WHERE category='stay_shortened_rent_kept'`)).rows
     expect(admin).toHaveLength(1)
-    expect(admin[0].body).toContain('the delete was refused')
+    expect(admin[0].body).toContain('it could not be voided')
   })
 
   // S655 review (round 2): the kept row and the banked credit worked against
@@ -695,7 +711,8 @@ describe('Master Schedule → lease sync', () => {
     expect(octRow.a).toBe(429.03)
     expect(octRow.status).toBe('pending')
     expect(octRow.notes).toBe('Stay now ends October 15, 2026: rent for this date changed from $950.00 to $429.03')
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [nov])).rowCount).toBe(0)
+    // 10/12 (Nic): voided as a record, never deleted.
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [nov])).rows[0].status).toBe('voided')
     // Both bills follow their rent; each keeps its water.
     expect(await invoiceTotals(octInv)).toEqual({ rent: 429.03, utilities: 40, total: 469.03 })
     expect(await invoiceTotals(novInv)).toEqual({ rent: 0, utilities: 35, total: 35 })
@@ -1078,9 +1095,16 @@ describe('Master Schedule → lease sync', () => {
       // Put back to January 28: November is billed whole now; December on is the run's.
       await db.query(`UPDATE unit_bookings SET check_out=$2, nights=171 WHERE id=$1`, [s.bookingId, END])
       await syncLeaseWithBookingDates(s.bookingId!)
+      // 10/12 (Nic): the November rent the mistake took off stays as a voided
+      // record beside the new bill — and no longer holds the month's one rent
+      // slot (ux_payments_unit_rent_due_date_active), so November bills again.
       const nov = (await db.query<any>(
-        `SELECT amount::float AS a, status, is_remainder, notes FROM payments WHERE lease_id=$1 AND type='rent' AND due_date='2026-11-01'`, [s.leaseId])).rows
-      expect(nov).toEqual([{ a: 950, status: 'pending', is_remainder: false, notes: 'Stay now ends January 28, 2027: rent for November 2026' }])
+        `SELECT amount::float AS a, status, is_remainder, notes FROM payments WHERE lease_id=$1 AND type='rent' AND due_date='2026-11-01'
+          ORDER BY created_at, id`, [s.leaseId])).rows
+      expect(nov).toEqual([
+        { a: 950, status: 'voided', is_remainder: false, notes: null },
+        { a: 950, status: 'pending', is_remainder: false, notes: 'Stay now ends January 28, 2027: rent for November 2026' },
+      ])
       expect((await db.query(`SELECT 1 FROM payments WHERE lease_id=$1 AND due_date > '2026-11-01'`, [s.leaseId])).rowCount).toBe(0)
       expect((await db.query(`SELECT 1 FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])).rowCount).toBe(0)
       const ll = (await db.query<any>(`SELECT body FROM notifications WHERE type='booking_lease_sync' AND landlord_id=$1 ORDER BY created_at DESC LIMIT 1`, [s.landlordId])).rows
@@ -1337,8 +1361,13 @@ describe('Master Schedule → lease sync', () => {
     // The guest leaves August 15: 5 nights × 950/31 = $153.23 — the deposit covers it.
     await db.query(`UPDATE unit_bookings SET check_out='2026-08-15', nights=5 WHERE id=$1`, [s.bookingId])
     await syncLeaseWithBookingDates(s.bookingId!)
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [arrival])).rowCount).toBe(0)
-    expect((await db.query(`SELECT 1 FROM invoices WHERE id=$1`, [inv])).rowCount).toBe(0)     // an empty shell goes too
+    // 10/12 (Nic): the arrival bill's rent is voided as a record (never
+    // deleted); its bill, left with nothing live on it, is voided and kept too
+    // (G7), its voided line still on it — and it gives the lease's date back.
+    expect((await db.query(`SELECT status, invoice_id FROM payments WHERE id=$1`, [arrival])).rows)
+      .toEqual([{ status: 'voided', invoice_id: inv }])
+    expect((await db.query(`SELECT status, lease_id, voided_from_lease_id FROM invoices WHERE id=$1`, [inv])).rows)
+      .toEqual([{ status: 'void', lease_id: null, voided_from_lease_id: s.leaseId }])
     // $500 paid − $153.23 owed = $346.77, banked as money paid ahead.
     const credit = await db.query<any>(`SELECT amount_original::float AS a, funded_by FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
     expect(credit.rows).toEqual([{ a: 346.77, funded_by: 'reclassified' }])
@@ -1579,10 +1608,11 @@ describe('landlord credit on nights a shortened stay no longer has', () => {
 
     await shortenTo(s, '2026-10-01')
 
-    // October's rent is not owed any more: the credit came back and the bill went.
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [oct])).rowCount).toBe(0)
+    // October's rent is not owed any more: the credit came back and the bill
+    // went (10/12: voided as a record — the given-back use keeps its target).
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [oct])).rows[0].status).toBe('voided')
     expect((await uses())[0]).toEqual(
-      { status: 'released', release_reason: 'stay_shortened', payment_id: null, amount: 100, source: 'desk', spent_on_record: true })
+      { status: 'released', release_reason: 'stay_shortened', payment_id: oct, amount: 100, source: 'desk', spent_on_record: true })
     expect(await invoiceTotals(octInv)).toEqual({ rent: 0, total: 40 })
     // Nothing stuck on the account, nothing for GAM to clear, nothing banked.
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category='stay_shortened_rent_kept'`)).rowCount).toBe(0)
@@ -2012,8 +2042,11 @@ describe('the credit record for rent a longer stay bills', () => {
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
+  // 10/12 (Nic): "one mark per invoice" — the live mark of the bill this row is
+  // on (a longer stay's extra rent on no invoice is a bill of its own here).
   const markFor = async (paymentId: string) => (await db.query<any>(
-    `SELECT event_type, network_visibility, event_data FROM credit_events WHERE event_data->>'payment_id' = $1`,
+    `SELECT event_type, network_visibility, event_data FROM credit_events
+      WHERE event_data->>'mark_basis' = 'invoice' AND superseded_by IS NULL AND (event_data->'payment_ids') ? $1`,
     [paymentId])).rows
 
   it('a longer-stay bill paid the day it is billed is on time on the credit record (the rest of the month)', async () => {
@@ -2027,7 +2060,8 @@ describe('the credit record for rent a longer stay bills', () => {
     expect(marks).toHaveLength(1)
     expect(marks[0].event_type).toBe('payment_received_on_time')
     expect(marks[0].network_visibility).toBe('visible_to_current_landlord')
-    expect(marks[0].event_data).toMatchObject({ due_date: '2026-10-01', billed_on: '2026-10-10' })
+    // Lateness counts from the day it was written: its grace runs to Oct 14, the 15th is late.
+    expect(marks[0].event_data).toMatchObject({ due_date: '2026-10-01', first_late_day: '2026-10-15' })
   })
 
   it('a longer-stay bill paid the day it is billed is on time on the credit record (a whole month written after the catch-up window)', async () => {
@@ -2041,7 +2075,7 @@ describe('the credit record for rent a longer stay bills', () => {
     const marks = await markFor(billed[0].id)
     expect(marks).toHaveLength(1)
     expect(marks[0].event_type).toBe('payment_received_on_time')
-    expect(marks[0].event_data).toMatchObject({ due_date: '2026-11-01', billed_on: '2026-12-10' })
+    expect(marks[0].event_data).toMatchObject({ due_date: '2026-11-01', first_late_day: '2026-12-15' })
   })
 
   it('a longer-stay bill paid long after it was billed is still late', async () => {

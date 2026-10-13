@@ -1590,9 +1590,14 @@ function HomePage() {
 
       {/* S595 (Nic): Payment Health heartbeat — the tenant's ON-TIME payment
           health as an animated ECG (mirrors the landlord dashboard monitor).
-          Health = % of billed obligations paid on time over the last 6 months
-          (NOT total paid): 100% gold, 80%+ green, below that red. */}
-      {health && health.totalPayments > 0 && (() => {
+          10/12 (Nic): health = months paid on time since joining GAM (all
+          time, the one definition the landlord sees too); the beats are the last 6 months
+          (NOT total paid): 100% gold, 80%+ green, below that red.
+          10/12: shown once a household month has been judged — not when this
+          person has rows of their own: a co-tenant's lease charges are billed
+          under the primary resident, so totalPayments is 0 for every co-tenant
+          while the household's health (what the landlord sees) is not. */}
+      {health && health.onTime && health.onTime.resolved > 0 && (() => {
         const oh = health.onTime
         const monthsAbbr = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         const now = new Date()
@@ -1699,23 +1704,23 @@ function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: 
   return (
     <div className="card" style={{ marginBottom: 24 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health — last 6 months</div>
+        <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health</div>
         <span style={{ fontSize: '.72rem', fontWeight: 700, color: status.color }}>◆ {status.label}</span>
       </div>
       <div className="tphm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
         {hoverIdx == null ? (
           <div className="tphm-readout">
-            <span className="tphm-readout-label">on-time · last 6 mo</span>
+            <span className="tphm-readout-label">months on time · since joining GAM</span>
             <span className="tphm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
           </div>
         ) : (
           <div className="tphm-tip" style={{ left: `clamp(64px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 64px))` }}>
             <div className="tphm-tip-month">{data[hoverIdx].label || '—'}</div>
             <div className="tphm-tip-val" style={{ color: status.color }}>
-              {data[hoverIdx].rate == null ? 'no bills due' : `${Math.round((data[hoverIdx].rate as number) * 100)}% on time`}
+              {data[hoverIdx].rate == null ? 'nothing to judge yet' : data[hoverIdx].rate === 1 ? 'Paid on time' : 'Not on time'}
             </div>
             {data[hoverIdx].total > 0 && (
-              <div className="tphm-tip-sub">{data[hoverIdx].onTime} of {data[hoverIdx].total} paid on time</div>
+              <div className="tphm-tip-sub">Judged on the whole month's bill, after the grace period</div>
             )}
           </div>
         )}
@@ -3695,17 +3700,25 @@ function TenantMyWalkthroughsPage() {
 // Tenant view of own GAM behavioral record. Shows event timeline,
 // payment / property / cooperation roll-ups, and lets tenant open
 // disputes on events they believe are inaccurate. Score itself is
-// internal-only; tenant sees event count + on-time % + streaks.
+// internal-only; tenant sees event count + payment health + streaks.
+//
+// 10/12 (Nic): "the payment history should be a health percentage. one mark
+// per invoice." Each bill carries ONE mark (on time, paid late by its days
+// past grace, partly paid or unpaid past grace — the payment-health rule), and
+// the percent shown is that payment health: bills on time ÷ bills judged
+// (credit stats paymentStats.health). The labels below speak of bills; the
+// grace-period and failed-payment labels are kept for marks written before.
+// (Duplicated in apps/landlord TenantScreeningPage.tsx — keep both in step.)
 
 const EVENT_LABEL: Record<string, string> = {
-  payment_received_on_time:           'Rent paid on time',
+  payment_received_on_time:           'Bill paid on time',
   payment_received_late_grace:        'Paid within grace period',
-  payment_received_late_minor:        'Paid late (minor)',
-  payment_received_late_major:        'Paid late (major)',
-  payment_received_late_severe:       'Paid late (severe)',
-  payment_partial:                    'Partial payment',
+  payment_received_late_minor:        'Bill paid late (1–3 days past grace)',
+  payment_received_late_major:        'Bill paid late (4–15 days past grace)',
+  payment_received_late_severe:       'Bill paid late (16+ days past grace)',
+  payment_partial:                    'Bill partly paid past grace',
   payment_failed_nsf:                 'Payment failed (NSF)',
-  payment_skipped:                    'Payment skipped',
+  payment_skipped:                    'Bill unpaid past grace',
   payment_refunded:                   'Payment refunded',
   lease_signed:                       'Lease signed',
   lease_renewed:                      'Lease renewed',
@@ -3757,8 +3770,9 @@ const EVENT_LABEL: Record<string, string> = {
   multi_landlord_history_clean:       'Clean history across landlords',
 }
 
+// 10/12: a bill paid late is not good news (payment health counts it not on time).
 const POSITIVE_EVENT_TYPES = new Set([
-  'payment_received_on_time','payment_received_late_grace','payment_received_late_minor',
+  'payment_received_on_time','payment_received_late_grace',
   'lease_signed','lease_renewed','lease_terminated_natural','lease_anniversary',
   'proper_notice_given_for_move_out','move_in_inspection_completed','move_out_inspection_completed',
   'move_out_condition_matches_move_in','move_in_photos_submitted','move_out_photos_submitted',
@@ -3803,9 +3817,11 @@ function CreditPage() {
   // Most recent month first
   grouped.reverse()
 
-  const payment = (stats as any)?.paymentStats?.lifetime || {}
-  const onTimePct = payment.onTimePct
-  const totalPayments = payment.totalEvents ?? 0
+  // 10/12 (Nic): the payment health — bills on time ÷ bills judged, one mark per bill.
+  const health = (stats as any)?.paymentStats?.health || {}
+  const healthPct: number | null = typeof health.percent === 'number' ? health.percent : null
+  const billsJudged: number = health.counted ?? 0
+  const billsOnTime: number = health.onTime ?? 0
   const longestStreak = (stats as any)?.paymentStats?.longestOnTimeStreakCount ?? 0
   const currentStreak = (stats as any)?.paymentStats?.currentOnTimeStreakCount ?? 0
 
@@ -3822,7 +3838,8 @@ function CreditPage() {
       <div className="alert a-blue" style={{ marginBottom: 16 }}>
         ℹ️ This is the same record GAM uses internally for FlexPay /
         FlexCharge underwriting. Landlords on the network see specific
-        events, not the underlying score.
+        events, not the underlying score. Each bill counts once: on time
+        when it is paid in full by the last day of its grace period.
       </div>
 
       <div className="grid3" style={{ marginBottom: 16 }}>
@@ -3832,14 +3849,18 @@ function CreditPage() {
           <div className="kpi-s">attested behavior on file</div>
         </div>
         <div className="kpi">
-          <div className="kpi-l">On-time payments</div>
-          <div className="kpi-v">{totalPayments > 0 ? `${onTimePct}%` : '—'}</div>
-          <div className="kpi-s">{totalPayments} payments tracked</div>
+          <div className="kpi-l">Payment health</div>
+          <div className="kpi-v">{healthPct !== null ? `${healthPct}%` : '—'}</div>
+          <div className="kpi-s">
+            {billsJudged > 0
+              ? `${billsOnTime} of ${billsJudged} bill${billsJudged === 1 ? '' : 's'} paid on time`
+              : 'No bills judged yet'}
+          </div>
         </div>
         <div className="kpi">
           <div className="kpi-l">On-time streak</div>
           <div className="kpi-v">{currentStreak}</div>
-          <div className="kpi-s">longest: {longestStreak}</div>
+          <div className="kpi-s">bills in a row · longest: {longestStreak}</div>
         </div>
       </div>
 

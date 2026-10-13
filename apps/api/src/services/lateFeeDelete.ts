@@ -356,8 +356,19 @@ export async function restoreDeletedLateFees(
   for (const id of missing) {
     const f = found.get(id)
     if (!f) continue
+    // 10/12 (Nic) review: a fee deleted before a column was added to payments
+    // has no value for it on record. jsonb_populate_record would hand that
+    // column an explicit NULL — refused by a NOT NULL column (work_trade_credit,
+    // 10/13) and the whole Undo with it. Only the columns the stored row holds
+    // are written; every other column takes its default, as on any new row.
+    const cols = (await client.query<{ cols: string | null }>(
+      `SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) AS cols
+         FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'payments' AND is_generated = 'NEVER'
+          AND column_name = ANY($1::text[])`, [Object.keys(f.row ?? {})])).rows[0]?.cols
+    if (!cols) continue
     await client.query(
-      `INSERT INTO payments SELECT * FROM jsonb_populate_record(NULL::payments, $1::jsonb)`, [JSON.stringify(f.row)])
+      `INSERT INTO payments (${cols}) SELECT ${cols} FROM jsonb_populate_record(NULL::payments, $1::jsonb)`, [JSON.stringify(f.row)])
     await client.query(
       `INSERT INTO audit_log (user_id, action, entity_type, entity_id, new_value)
        VALUES ($1, $2, 'invoice', $3, $4::jsonb)`,

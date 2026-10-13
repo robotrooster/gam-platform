@@ -107,9 +107,11 @@ export async function platformFeeBill(month?: string): Promise<PlatformFeeBill> 
              -- The charge each line raised, matched on the same keys the
              -- accrual and top-up runs wrote it under — one charge per line,
              -- so nothing is counted twice.
+             -- 10/12 (Nic, ledger P0): a charge GAM took back is voided and
+             -- kept; nobody owes it (landlordGamAccount GAM_CHARGE_OWED_SQL).
              (SELECT COALESCE(SUM(c.amount - c.collected_amount), 0)
                 FROM landlord_gam_charges c
-               WHERE c.kind = 'subscription'
+               WHERE c.kind = 'subscription' AND c.voided_at IS NULL
                  AND c.source_id = f.reference_id
                  AND c.source_type = ANY (CASE f.reference_type
                        WHEN 'platform_fee_accrual' THEN ARRAY['platform_fee_accrual', 'platform_fee_topup']

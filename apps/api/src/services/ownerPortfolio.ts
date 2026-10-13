@@ -33,6 +33,7 @@
 
 import { query } from '../db'
 import { round2 } from './workTradeCredit'
+import { householdMonths, currentBillMonth, addMonths } from './householdMonths'
 
 export interface ManagerScorecard {
   /** null for the properties the owner runs themselves. */
@@ -44,13 +45,16 @@ export interface ManagerScorecard {
   vacantUnits: number
   occupancyPct: number | null
   /**
-   * Of the rent that came due in the window, the share that settled on or
-   * before its due date. null when nothing was due — an empty month is not a
-   * 0% score, and showing one would libel a manager with no rent roll yet.
+   * 10/12 (Nic): the one payment-health definition (services/householdMonths)
+   * — of the household-months judged in the window at these properties, the
+   * share paid on time (by the last grace day). null when nothing was judged —
+   * an empty month is not a 0% score, and showing one would libel a manager
+   * with no rent roll yet.
    */
   onTimeRatePct: number | null
+  /** Household-months judged in the window. */
   rentDueCount: number
-  /** Average days between due date and settlement, late payments only. */
+  /** Average days past the grace period, over the months that went past it. */
   avgDaysLate: number | null
   /**
    * Average days a unit sat empty between one lease ending and the next
@@ -106,6 +110,7 @@ export async function ownerPortfolio(opts: {
               CURRENT_DATE AS w_end
      ),
      unit_counts AS (
+       -- 10/12: a retired unit is history, not a space a manager runs.
        SELECT u.property_id,
               COUNT(*)::int AS unit_count,
               COUNT(*) FILTER (
@@ -116,30 +121,7 @@ export async function ownerPortfolio(opts: {
               )::int AS occupied
          FROM units u
          JOIN scope s ON s.id = u.property_id
-        GROUP BY u.property_id
-     ),
-     rent AS (
-       -- Collection timeliness. Only RENT, and only charges that actually came
-       -- due in the window: a manager is judged on the rent they were
-       -- responsible for collecting, not on fees or one-off charges.
-       SELECT u.property_id,
-              COUNT(*)::int AS due_count,
-              COUNT(*) FILTER (
-                WHERE pay.settled_at IS NOT NULL
-                  AND pay.settled_at::date <= pay.due_date
-              )::int AS on_time_count,
-              AVG(
-                CASE WHEN pay.settled_at IS NOT NULL
-                       AND pay.settled_at::date > pay.due_date
-                     THEN (pay.settled_at::date - pay.due_date) END
-              )::float AS avg_days_late
-         FROM payments pay
-         JOIN units u ON u.id = pay.unit_id
-         JOIN scope s ON s.id = u.property_id
-        CROSS JOIN window_bounds wb
-        WHERE pay.type = 'rent'
-          AND pay.status NOT IN ('failed', 'returned')
-          AND pay.due_date >= wb.w_start AND pay.due_date <= wb.w_end
+        WHERE u.retired_at IS NULL
         GROUP BY u.property_id
      ),
      turns AS (
@@ -168,9 +150,6 @@ export async function ownerPortfolio(opts: {
             c.name AS pm_company_name,
             COALESCE(uc.unit_count, 0) AS unit_count,
             COALESCE(uc.occupied, 0)   AS occupied,
-            COALESCE(r.due_count, 0)   AS due_count,
-            COALESCE(r.on_time_count, 0) AS on_time_count,
-            r.avg_days_late,
             COALESCE(t.turnovers, 0)   AS turnovers,
             t.avg_days_to_fill,
             (SELECT w_start::text FROM window_bounds) AS w_start,
@@ -178,10 +157,36 @@ export async function ownerPortfolio(opts: {
        FROM scope s
        LEFT JOIN pm_companies c ON c.id = s.pm_company_id
        LEFT JOIN unit_counts uc ON uc.property_id = s.id
-       LEFT JOIN rent r        ON r.property_id  = s.id
        LEFT JOIN turns t       ON t.property_id  = s.id
       ORDER BY c.name NULLS FIRST, s.name`,
     [opts.landlordIds, months])
+
+  // 10/12 (Nic): collection timeliness is the one payment-health definition —
+  // one stamp per household per bill month at each property, judged after its
+  // grace period, late fees never a bill (services/householdMonths). It used to
+  // count rent rows paid by the due date with no grace at all, so every
+  // tenant who paid on day 3 of a 5-day grace counted against the manager, a
+  // voided row counted, and work trade read late.
+  const through = currentBillMonth()
+  const judged = await householdMonths({
+    landlordIds: opts.landlordIds, from: addMonths(through, -months), through, byProperty: true,
+  })
+  const timeliness = new Map<string, { due: number; onTime: number; lateDays: number; late: number }>()
+  for (const m of judged) {
+    if (!m.property_id || !m.counted) continue
+    const t = timeliness.get(m.property_id) ?? { due: 0, onTime: 0, lateDays: 0, late: 0 }
+    t.due++
+    if (m.on_time) t.onTime++
+    else if (m.days_past_grace > 0) { t.lateDays += m.days_past_grace; t.late++ }
+    timeliness.set(m.property_id, t)
+  }
+  for (const r of rows) {
+    const t = timeliness.get(r.property_id)
+    r.due_count = t?.due ?? 0
+    r.on_time_count = t?.onTime ?? 0
+    r.avg_days_late = t && t.late > 0 ? t.lateDays / t.late : null
+    r.late_count = t?.late ?? 0
+  }
 
   // Fold the per-property rows up into one card per manager. Averages are
   // re-weighted by the counts they came from — averaging two property averages
@@ -209,7 +214,7 @@ export async function ownerPortfolio(opts: {
     g.occupiedUnits += Number(r.occupied)
     g.dueCount      += Number(r.due_count)
     g.onTimeCount   += Number(r.on_time_count)
-    const lateCount = Number(r.due_count) - Number(r.on_time_count)
+    const lateCount = Number(r.late_count)
     if (r.avg_days_late != null && lateCount > 0) {
       g.lateDaysSum += Number(r.avg_days_late) * lateCount
       g.lateCount   += lateCount

@@ -373,16 +373,21 @@ describe('one scripted month at one park: invariants, money in, and every report
       const pl = await computeLandlordPL(p.landlordId, DUE, MONTH_END, [`${MONTH}-01`], basis)
       expect(pl.gross.total).toBe(want)
 
-      const books = await request(app()).get(`/api/books/reports/pl?startDate=${DUE}&endDate=${MONTH_END}&basis=${basis}`)
+      // 10/12 (Nic): no switch — the Books P&L carries both columns (gamPL.view:
+      // Charged and Received); gamRentIncome stays Received for an older screen.
+      const books = await request(app()).get(`/api/books/reports/pl?startDate=${DUE}&endDate=${MONTH_END}`)
         .set('Authorization', `Bearer ${p.token}`)
       expect(books.status, JSON.stringify(books.body)).toBe(200)
-      expect(books.body.data.gamRentIncome).toBe(want)
+      expect(books.body.data.gamPL.view[basis === 'received' ? 'received' : 'charged']).toBe(want)
+      expect(books.body.data.gamRentIncome).toBe(RECEIVED.total)
 
       const agent: any = await getProfitAndLoss.execute(
         { year: Number(MONTH.slice(0, 4)), month: Number(MONTH.slice(5, 7)), basis },
         { userId: p.landlordUserId, role: 'landlord', profileId: '', landlordIds: [p.landlordId] } as any)
       expect(agent.ok).toBe(true)
-      expect(Number(String(agent.income.total).replace(/[$,]/g, ''))).toBe(want)
+      // 10/12 (Nic, L2; ledger P8): the agent's P&L carries Received and
+      // Charged side by side (no basis switch); each column is the report's.
+      expect(agent.income[basis === 'received' ? 'received' : 'charged']).toBe(want)
     }
     const st = await ownerStatement({ landlordId: p.landlordId, periodMonth: MONTH })
     // Through GAM ties to the owner share; the rest the landlord took directly.
@@ -394,26 +399,37 @@ describe('one scripted month at one park: invariants, money in, and every report
   })
 
   it('the Reports summary (this month\'s row, the income card) and the month\'s P&L drill-in agree with the report, both ways', async () => {
+    // 10/12 (Nic): no switch — each report carries both: Charged (the old
+    // Money billed total) and Received (the old Money received total).
     for (const basis of ['received', 'billed'] as const) {
       const want = basis === 'received' ? RECEIVED.total : BILLED.total
-      const sum = await request(app()).get(`/api/reports/summary?basis=${basis}`).set('Authorization', `Bearer ${p.token}`)
+      const col = basis === 'received' ? 'received' : 'charged'
+      const sum = await request(app()).get(`/api/reports/summary`).set('Authorization', `Bearer ${p.token}`)
       expect(sum.status, JSON.stringify(sum.body).slice(0, 500)).toBe(200)
       const row = sum.body.data.monthly.find((m: any) => m.month === MONTH)
       expect(row, `no ${MONTH} row on the Reports summary`).toBeTruthy()
-      expect(row.collected).toBe(want)
+      expect(row[col]).toBe(want)
+      expect(row.collected).toBe(RECEIVED.total)
+      expect(row.owed).toBe(BILLED.stillOwed)
       expect(sum.body.data.incomeCard.received).toEqual({ amount: RECEIVED.total, paidAhead: RECEIVED.paidAhead, clearing: RECEIVED.clearing })
       expect(sum.body.data.incomeCard.billed).toEqual({
         amount: BILLED.total, collected: BILLED.paid + BILLED.coveredByPaidAhead, clearing: BILLED.clearing, stillOwed: BILLED.stillOwed,
       })
-      expect(sum.body.data.ytdMonthly.find((m: any) => m.month === MONTH)?.collected).toBe(want)
+      const ytdRow = sum.body.data.ytdMonthly.find((m: any) => m.month === MONTH)
+      expect(basis === 'received' ? ytdRow?.collected : ytdRow?.charged).toBe(want)
 
       const pl = await request(app())
-        .get(`/api/reports/monthly-pl?year=${Number(MONTH.slice(0, 4))}&month=${Number(MONTH.slice(5, 7))}&basis=${basis}`)
+        .get(`/api/reports/monthly-pl?year=${Number(MONTH.slice(0, 4))}&month=${Number(MONTH.slice(5, 7))}`)
         .set('Authorization', `Bearer ${p.token}`)
       expect(pl.status, JSON.stringify(pl.body).slice(0, 500)).toBe(200)
-      expect(pl.body.data.gross.total).toBe(want)
-      // The drill-in opens the row: the same figure, never a second one.
+      expect(pl.body.data.view[col]).toBe(want)
+      // The drill-in opens the row: the same figures, never a second one.
+      expect(pl.body.data.view[col]).toBe(row[col])
+      expect(pl.body.data.view.owed).toBe(row.owed)
       expect(pl.body.data.gross.total).toBe(row.collected)
+      // One line per day: the days add up to Received.
+      const days = pl.body.data.days.reduce((s: number, d: any) => s + d.received, 0)
+      expect(Math.round(days * 100) / 100).toBe(RECEIVED.total)
     }
   })
 

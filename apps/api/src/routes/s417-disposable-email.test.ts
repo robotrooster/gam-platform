@@ -6,7 +6,7 @@
  *   - POST /api/auth/register
  *   - POST /api/auth/register-prospect
  *   - POST /api/tenants/invite
- *   - POST /api/books/contractors
+ *   - POST /api/books/vendors (a contractor — 10/12, the one Vendors list)
  *   - POST /api/books/vendors
  *   - POST /api/books/employees
  *
@@ -153,9 +153,11 @@ describe('POST /api/tenants/invite — S417 disposable-domain block', () => {
   })
 })
 
-// ─── POST /api/books/contractors ────────────────────────────
+// ─── POST /api/books/vendors (a contractor) ─────────────────
+// 10/12 (Nic): the Contractors list is one Vendors list now; a contractor is a
+// vendor of type contractor, with the same disposable-domain block.
 
-describe('POST /api/books/contractors — S417 disposable-domain block', () => {
+describe('POST /api/books/vendors (contractor) — S417 disposable-domain block', () => {
   it('mailinator email → 400 (even with full required payload)', async () => {
     const c = await db.connect()
     let token = ''
@@ -167,13 +169,13 @@ describe('POST /api/books/contractors — S417 disposable-domain block', () => {
                      profileId: null, landlordIds: [landlordId], permissions: {} })
     } finally { c.release() }
     const res = await request(buildBooksApp())
-      .post('/api/books/contractors')
+      .post('/api/books/vendors')
       .set('Authorization', `Bearer ${token}`)
       .send({
-        firstName: 'Jane', lastName: 'Doe',
-        businessName: 'Acme', email: `c-${randomUUID()}@mailinator.com`,
+        vendorType: 'contractor', is1099: true, name: 'Jane Doe', contactName: 'Jane Doe',
+        email: `c-${randomUUID()}@mailinator.com`,
         phone: '5555550100', address: '1 St',
-        entityType: 'individual', ssnLast4: '1234',
+        taxClassification: 'individual', taxId: '123-45-1234',
         trade: 'plumbing', payRate: 75, payUnit: 'hour',
         w9OnFile: true,
       })
@@ -199,6 +201,7 @@ describe('POST /api/books/vendors — S417 disposable-domain block', () => {
       .post('/api/books/vendors')
       .set('Authorization', `Bearer ${token}`)
       .send({
+        vendorType: 'supplier',
         name: 'Acme',
         contactName: 'Joe',
         email: `v-${randomUUID()}@yopmail.com`,

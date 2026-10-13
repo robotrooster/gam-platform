@@ -229,16 +229,21 @@ describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', ()
 })
 
 describe('GET /api/tenants/me/payment-health', () => {
-  it('computes on-time rate from the tenant\'s own payments', async () => {
+  // 10/12 (Nic): "Payment health = ONE definition everywhere, per HOUSEHOLD
+  // per BILL MONTH" — the tenant sees the figure the landlord sees: months
+  // paid on time over the last 12, judged after the grace period (the
+  // property's 5 days when the lease names none).
+  it('counts months, not payments: one paid on time, one paid past grace → 50%', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try {
-      // 3 settled, 1 failed → 3/4 = 75%. One payment per unit to avoid the
-      // (unit_id, due_date) active-rent unique index (all share CURRENT_DATE).
-      const statuses: Array<'settled' | 'failed'> = ['settled', 'settled', 'settled', 'failed']
-      for (const status of statuses) {
-        const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
-        await seedRentPayment(client, { unitId, tenantId: f.tenantId, landlordId: f.landlordId, amount: 1000, status })
+      // Two months ago, paid on day 3 (on time); last month, paid on day 12 (past grace).
+      for (const [monthsAgo, paidOnDay] of [[2, 3], [1, 12]]) {
+        await client.query(
+          `WITH d AS (SELECT (date_trunc('month', CURRENT_DATE) - ($5 || ' months')::interval)::date AS due)
+           INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, created_at, settled_at, manual_method)
+           SELECT $1,$2,$3,$4,'rent',1000,'settled','RENT',d.due,d.due,(d.due + ($6 - 1) * interval '1 day' + interval '19 hours'),'cash' FROM d`,
+          [f.unitId, f.leaseId, f.tenantId, f.landlordId, monthsAgo, paidOnDay])
       }
     } finally { client.release() }
 
@@ -246,20 +251,21 @@ describe('GET /api/tenants/me/payment-health', () => {
       .get('/api/tenants/me/payment-health')
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.totalPayments).toBe(4)
-    expect(res.body.data.settledCount).toBe(3)
-    expect(res.body.data.failedCount).toBe(1)
-    expect(res.body.data.onTimeRate).toBe(75)
+    expect(res.body.data.totalPayments).toBe(2)
+    expect(res.body.data.settledCount).toBe(2)
+    expect(res.body.data.onTime).toMatchObject({ pct: 50, resolved: 2, onTimeCount: 1 })
+    // The per-row rate (paid rows ÷ rows) is gone: one figure, everywhere.
+    expect(res.body.data.onTimeRate).toBeUndefined()
   })
 
-  it('no payments → 0% rate, zero counts', async () => {
+  it('no bills → nothing to judge yet, zero counts', async () => {
     const f = await seedTFixture()
     const res = await request(buildApp())
       .get('/api/tenants/me/payment-health')
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.totalPayments).toBe(0)
-    expect(res.body.data.onTimeRate).toBe(0)
+    expect(res.body.data.onTime).toMatchObject({ pct: null, resolved: 0 })
   })
 })
 

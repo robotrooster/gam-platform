@@ -108,8 +108,10 @@ async function stack(opts: { partial?: boolean; rent?: number } = {}): Promise<S
 async function bill(s: Stack, charges: Array<{ type: 'rent' | 'utility'; amount: number }>, daysAgo = 0) {
   const total = charges.reduce((t, x) => t + x.amount, 0)
   const inv = (await db.query<{ id: string }>(
-    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-     VALUES ($1, $2, $3, $4, $5, (NOW() AT TIME ZONE $6)::date - $7::int, $8, $8, 'pending') RETURNING id`,
+    // 10/12 (Nic): written on its due date, like its charges below (a bill
+    // written after its due date counts from the day it was written).
+    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, (NOW() AT TIME ZONE $6)::date - $7::int, $8, $8, 'pending', NOW() - ($7::int || ' days')::interval) RETURNING id`,
     [s.landlordId, s.tenantId, s.leaseId, s.unitId, `INV-${Math.random().toString(36).slice(2, 9)}`, TZ, daysAgo, total])).rows[0].id
   const ids: string[] = []
   for (const ch of charges) {
@@ -133,9 +135,11 @@ const rowsOfInvoice = async (invoiceId: string) => (await db.query<any>(
   `SELECT id, type, amount::float AS amount, status, is_remainder FROM payments
     WHERE invoice_id = $1 AND type <> 'late_fee' ORDER BY is_remainder, created_at, id`, [invoiceId])).rows
 
-const marksOn = async (paymentIds: string[]) => (await db.query<{ event_type: string; payment_id: string }>(
-  `SELECT event_type, event_data->>'payment_id' AS payment_id FROM credit_events
-    WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = ANY($1::text[])`, [paymentIds])).rows
+// 10/12 (Nic): "one mark per invoice" — the live marks of the BILLS these rows are on.
+const marksOn = async (paymentIds: string[]) => (await db.query<{ event_type: string; data: any }>(
+  `SELECT DISTINCT e.id, e.event_type, e.event_data AS data
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = ANY($1::uuid[]) AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [paymentIds])).rows
 
 const tinyJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xd9])
 
@@ -423,19 +427,22 @@ describe('Accept partial payments (per property, default off)', () => {
     expect((await db.query(`SELECT 1 FROM payments WHERE invoice_id = $1 AND type = 'late_fee'`, [b.invoiceId])).rowCount).toBe(0)
   })
 
-  it('no on-time or late mark on a part payment; the bill gets its mark the day it is paid in full', async () => {
+  // 10/12 (Nic): "the payment history should be a health percentage. one mark
+  // per invoice." A bill part paid past its grace period is a partly-paid bill
+  // (the health stamp's yellow); paid in full, its ONE mark becomes what it is.
+  it('a part payment past grace marks the bill partly paid; paid in full, the bill\'s one mark becomes paid late', async () => {
     const s = await stack({ partial: true })
     await db.query(`UPDATE leases SET late_fee_grace_days = 3 WHERE id = $1`, [s.leaseId])
     const b = await bill(s, [{ type: 'rent', amount: 600 }], 10)
     const part = await record(s, b.ids[0], { method: 'bank_deposit', amountTendered: 500, reference: 'DEP-MARK' })
     expect(part.status).toBe(200)
     const restId = part.body.data.stillOwedRows[0].id
-    expect(await marksOn([b.ids[0], restId])).toEqual([])
+    expect((await marksOn([b.ids[0], restId])).map(m => m.event_type)).toEqual(['payment_partial'])
     const full = await record(s, restId, { method: 'cash', amountTendered: 100 })
     expect(full.status).toBe(200)
     const marks = await marksOn([b.ids[0], restId])
     expect(marks).toHaveLength(1)
-    expect(marks[0].payment_id).toBe(restId)
+    expect([...marks[0].data.payment_ids].sort()).toEqual([b.ids[0], restId].sort())
     // Paid in full ten days after the due date, past a three-day grace: late —
     // counted from the bill the rest belongs to, not from the day the rest row was written.
     expect(marks[0].event_type).toMatch(/^payment_received_late_/)

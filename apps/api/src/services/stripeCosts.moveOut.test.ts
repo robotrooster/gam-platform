@@ -49,7 +49,17 @@ let onBalance = 0
 const liveNow = (): PlatformStripeLive => ({
   available: onBalance / 100, pending: 0, clearingOnBalance: {}, paidOutToGamBank: 0, costsNotYetRecorded: 0,
 })
-const check = async () => splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+/**
+ * 10/12 (Nic, A3): every check here also proves the bridge (earnings ledger →
+ * GAM's own) ends exactly where the check ends — its leftover is the check's
+ * difference, to the cent, whatever the dispute or move-out did.
+ */
+const check = async () => {
+  const split = splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+  expect(split.reconciliation?.bridge).toBeTruthy()
+  expect(split.reconciliation?.bridge?.leftover).toBe(split.reconciliation?.gap)
+  return split
+}
 const thisMonth = async () => (await db.query<{ m: string }>(`SELECT to_char(NOW(), 'YYYY-MM') AS m`)).rows[0].m
 /** The processing margin the revenue book says for `month` (per-payment rows, corrections, the true-up). */
 const bookMargin = async (month: string) => Number((await db.query<{ amt: string }>(
@@ -109,7 +119,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
       [s.unitId, s.leaseId, s.tenantId, s.landlordId])
     onBalance += c2(500)
     const fee = await returnFee(s)
-    expect((await check()).reconciliation).toMatchObject({ gap: 0 })
+    expect((await check()).reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
 
     const draft = await createOrFetchDraft(s.leaseId)
     const final = await finalizeDepositReturn(draft.id, s.ownerUserId)
@@ -120,18 +130,29 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     expect(book.gamOwnedBillLinesByKind).toEqual([{ kind: 'return_fee', label: 'Returned bank payment fees', amount: 4 }])
     expect(book.collected.gamOwnedBillLines).toBe(4)
     const after = splitPlatformBalance(book, liveNow())
-    expect(after.reconciliation).toMatchObject({ gap: 0 })
+    expect(after.reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(after.gamsOwn).toBe(4)                       // GAM held $500, owes back $496, keeps its own $4
 
     const month = await thisMonth()
     expect(await billedFeesPaid(month)).toEqual([[4, 1]])
     const card = await marginForMonth(month)
     expect(card.feesBack.items!.find(i => i.kind === 'billed_fee_paid')!.who).toMatch(/paid from the deposit at move-out/)
+    // Before the true-up the $4 is the bridge's processing line (not trued up yet) —
+    // never "GAM's own lines … not in the earnings ledger" (10/12, A3 review).
+    const untrued = (await check()).reconciliation!.bridge!.timing
+    expect(untrued).toEqual([expect.objectContaining({ key: 'processing', amount: 4 })])
     // The true-up books the card's figure; run twice, the $4 is still on the book once.
     await trueUpProcessingMargin(month)
     await trueUpProcessingMargin(month)
     expect(await bookMargin(month)).toBe(card.margin)
     expect(card.feesBack.total).toBe(4)
+    // 10/12 (A3 review): once trued up, the returned-payment fee is in the
+    // earnings ledger's processing figure, so the bridge names it nowhere —
+    // no processing gap that never clears, no "not in the earnings ledger".
+    const trued = await check()
+    expect(trued.reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
+    expect(trued.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('processing')
+    expect(trued.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('gam_bill_lines')
   })
 
   it('the deposit the landlord holds pays GAM\'s $4 fee: nothing counts until the landlord\'s next payout nets it, then $4 once, and the check ties at both steps', async () => {
@@ -155,7 +176,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     const before = await loadPlatformBalanceBook()
     expect(before.gamOwnedBillLinesByKind).toEqual([])
     expect(before.heldItemsOwed).toBe(100)
-    expect(splitPlatformBalance(before, liveNow()).reconciliation).toMatchObject({ gap: 0 })
+    expect(splitPlatformBalance(before, liveNow()).reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(await billedFeesPaid(month)).toEqual([])
 
     // The weekly payout nets it: the landlord is sent $96, GAM keeps $4.
@@ -166,7 +187,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     expect(netted.gamOwnedBillLinesByKind).toEqual([{ kind: 'return_fee', label: 'Returned bank payment fees', amount: 4 }])
     expect(netted.heldItemsOwed).toBe(0)
     const split = splitPlatformBalance(netted, liveNow())
-    expect(split.reconciliation).toMatchObject({ gap: 0 })
+    expect(split.reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(split.gamsOwn).toBe(4)
 
     expect(await billedFeesPaid(month)).toEqual([[4, 1]])
@@ -193,7 +214,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
        VALUES ($1, 'pos_sale', 'sale_escrow_cash', 100, 'register sale')`, [s.landlordId])
     onBalance += c2(100)
     const fee = await returnFee(s)
-    expect((await check()).reconciliation).toMatchObject({ gap: 0 })
+    expect((await check()).reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
 
     const draft = await createOrFetchDraft(s.leaseId)
     const final = await finalizeDepositReturn(draft.id, s.ownerUserId)
@@ -211,7 +232,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     expect(before.gamOwnedBillLinesByKind).toEqual([{ kind: 'return_fee', label: 'Returned bank payment fees', amount: 4 }])
     expect(before.heldItemsOwed).toBe(96)
     const beforeSplit = splitPlatformBalance(before, liveNow())
-    expect(beforeSplit.reconciliation).toMatchObject({ gap: 0 })
+    expect(beforeSplit.reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(beforeSplit.gamsOwn).toBe(4)
     expect(await billedFeesPaid(month)).toEqual([[4, 1]])
 
@@ -223,7 +244,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     expect(netted.gamOwnedBillLinesByKind).toEqual([{ kind: 'return_fee', label: 'Returned bank payment fees', amount: 4 }])
     expect(netted.heldItemsOwed).toBe(0)
     const split = splitPlatformBalance(netted, liveNow())
-    expect(split.reconciliation).toMatchObject({ gap: 0 })
+    expect(split.reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(split.gamsOwn).toBe(4)
     expect(await billedFeesPaid(month)).toEqual([[4, 1]])
 
@@ -267,7 +288,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     const before = await loadPlatformBalanceBook()
     expect(before.collected.gamOwnedBillLines).toBe(3)
     expect(before.heldItemsOwed).toBe(100)
-    expect(splitPlatformBalance(before, liveNow()).reconciliation).toMatchObject({ gap: 0 })
+    expect(splitPlatformBalance(before, liveNow()).reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(await billedFeesPaid(await thisMonth())).toEqual([[3, 1]])
 
     const sent = await reconcilePlatformHeldPayments(s.ownerUserId)
@@ -275,7 +296,7 @@ describe('GAM\'s own lines a move-out pays from the deposit are GAM\'s revenue, 
     onBalance -= c2(sent.amount)
     const netted = await loadPlatformBalanceBook()
     expect(netted.collected.gamOwnedBillLines).toBe(4)
-    expect(splitPlatformBalance(netted, liveNow()).reconciliation).toMatchObject({ gap: 0 })
+    expect(splitPlatformBalance(netted, liveNow()).reconciliation).toMatchObject({ gap: 0, bridge: { leftover: 0 } })
     expect(await billedFeesPaid(await thisMonth())).toEqual([[4, 2]])
   })
 })

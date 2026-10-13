@@ -5,12 +5,13 @@
  * by the landlord or a trusted work trader; a neighbor's contact details never
  * reach a work trader.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
+import { ensureWorkTradeExtraHoursSchema } from '../test/pendingWorkTradeSchema'
 import { workTradeRouter } from './workTrade'
 import { maintenanceRouter } from './maintenance'
 import { errorHandler } from '../middleware/errorHandler'
@@ -24,6 +25,8 @@ function app() {
   return a
 }
 
+// 10/12: the work-trade extra-hours columns/table, until they reach schema.sql.
+beforeAll(ensureWorkTradeExtraHoursSchema)
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_wtjobs'

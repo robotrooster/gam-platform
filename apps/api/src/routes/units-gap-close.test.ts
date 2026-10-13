@@ -195,6 +195,25 @@ describe('PATCH /api/units/:id/status', () => {
     expect(res.body.error).toMatch(/eviction mode/i)
   })
 
+  // 10/12: 'utility_service' is in the shared status list now (it matches the
+  // database), but a service point is made by a utility service agreement only.
+  it("'utility_service' can't be set here, and a service point can't be moved off it here", async () => {
+    const f = await seed()
+    const set = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/status`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'utility_service' })
+    expect(set.status).toBe(400)
+    expect(set.body.error).toMatch(/utility service agreement/i)
+    await db.query(`UPDATE units SET status = 'utility_service' WHERE id = $1`, [f.aUnitId])
+    const off = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/status`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'available' })
+    expect(off.status).toBe(400)
+    expect(off.body.error).toMatch(/utility service point/i)
+  })
+
   it('cross-landlord → 403', async () => {
     const f = await seed()
     const res = await request(buildApp())

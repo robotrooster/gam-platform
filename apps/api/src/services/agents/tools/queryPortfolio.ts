@@ -45,21 +45,85 @@
 
 import { query } from '../../../db'
 import { openBalanceSql, openAmountSql } from '../../openBalances'
+import { householdMonths, currentBillMonth, ALL_TIME_FROM } from '../../householdMonths'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Subject = 'tenants' | 'units' | 'properties'
 
-interface Measure {
+interface RankRow {
+  label: string
+  value: number | string | null
+  detail: string | null
+}
+
+interface MeasureBase {
   /** what the number means, in the words a landlord would use */
   means: string
-  /** SELECT label, value FROM ... WHERE landlord scope — $1 is landlord id */
-  sql: string
   unit: string
+}
+
+/** SELECT label, value, detail FROM ... WHERE landlord scope — $1 is landlord id */
+interface SqlMeasure extends MeasureBase {
+  sql: string
+}
+
+/**
+ * 10/12 (Nic): a measure ranked from a shared service rather than SQL written
+ * here — payment health is judged in code (services/householdMonths
+ * judgeMonth), and a second SQL copy of that judgment is the disagreement the
+ * one definition exists to end. Still a closed vocabulary: the function is
+ * named here, the landlord ids are the actor's, nothing the model says reaches it.
+ */
+interface ComputedMeasure extends MeasureBase {
+  rows: (landlordIds: string[]) => Promise<RankRow[]>
+}
+
+type Measure = SqlMeasure | ComputedMeasure
+
+/**
+ * Late months per household, all time (since the household's first bill on
+ * GAM — 10/12, Nic: "payment health and a tenant's history are ALL-TIME, not 12
+ * months"), from the one payment-health definition — the same judged months
+ * get_late_payment_history, get_portfolio_stats, the Rent Roll and the tenant
+ * report read. A month counts once it is judged (not still due, not a partial
+ * inside its grace period); late = judged and not paid on time. Work trade,
+ * voided and returned lines, $0 lines, money still clearing, bank-deposit days
+ * and the day GAM wrote the bill are all handled there, once.
+ */
+async function lateMonthsByHousehold(landlordIds: string[]): Promise<RankRow[]> {
+  const months = await householdMonths({ landlordIds, from: ALL_TIME_FROM, through: currentBillMonth() })
+  // An account with several companies can judge one household under each; its
+  // months are added together (one person, one row).
+  const byHousehold = new Map<string, { late: number; judged: number }>()
+  for (const m of months) {
+    if (!m.counted) continue
+    const e = byHousehold.get(m.household_id) ?? { late: 0, judged: 0 }
+    e.judged++
+    if (!m.on_time) e.late++
+    byHousehold.set(m.household_id, e)
+  }
+  if (byHousehold.size === 0) return []
+  // The household is keyed by its primary resident: that is the name it ranks under.
+  const names = await query<{ id: string; label: string }>(
+    `SELECT t.id::text AS id, u.first_name || ' ' || u.last_name AS label
+       FROM tenants t JOIN users u ON u.id = t.user_id
+      WHERE t.id = ANY($1::uuid[])`,
+    [[...byHousehold.keys()]],
+  )
+  const nameOf = new Map(names.map((n) => [n.id, n.label]))
+  const out: RankRow[] = []
+  for (const [hh, e] of byHousehold) {
+    const label = nameOf.get(hh)
+    if (!label) continue
+    out.push({ label, value: e.late, detail: `${e.judged} month${e.judged === 1 ? '' : 's'} judged` })
+  }
+  return out
 }
 
 /**
  * Every ranking the platform can honestly produce. Adding one means adding SQL
- * here — there is no path by which the model invents a measure.
+ * (or naming a shared service's function) here — there is no path by which the
+ * model invents a measure.
  */
 const MEASURES: Record<Subject, Record<string, Measure>> = {
   tenants: {
@@ -103,20 +167,18 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     late_payments: {
-      means: 'how many times their rent arrived after their own grace period',
-      unit: 'late payments',
-      sql: `SELECT u.first_name || ' ' || u.last_name AS label,
-                   COUNT(*) FILTER (
-                     WHERE COALESCE(p.settled_at, NOW())
-                           > p.due_date + (COALESCE(l.late_fee_grace_days, 0) || ' days')::interval
-                   )::int AS value,
-                   COUNT(*)::text || ' charges' AS detail
-              FROM payments p
-              JOIN leases l  ON l.id = p.lease_id
-              JOIN tenants t ON t.id = p.tenant_id
-              JOIN users u   ON u.id = t.user_id
-             WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
-             GROUP BY t.id, u.first_name, u.last_name`,
+      means: 'how many months their household’s bill was not paid in full by the end of its grace period, since they joined GAM (the Rent Roll’s judgment)',
+      unit: 'late months',
+      // 10/12 (Nic): "Payment health = ONE definition everywhere, per HOUSEHOLD
+      // per BILL MONTH, never per line." This counted payment LINES by their
+      // settled_at, so a rent line work trade paid (settled at $0 when the month
+      // closed, about the 1st of the next month) was late every month, a bounce
+      // counted twice (the 'returned' original and the row the reversal
+      // reopened), and a bank payment started inside grace but still clearing
+      // was late — the agent's "who pays late most" disagreed with
+      // get_late_payment_history, the Rent Roll and the tenant report. It now
+      // counts the household's judged months from services/householdMonths.
+      rows: lateMonthsByHousehold,
     },
     // S655 (money plan, Step 11): the Outstanding page's own rule
     // (services/openBalances.openBalanceSql) — never a payment still clearing,
@@ -341,13 +403,24 @@ export const queryPortfolio: AgentTool = {
     // The landlord filter lives inside every branch's SQL above ($1). Ordering
     // and limit are applied here from validated values — nothing the model
     // supplies is interpolated into SQL.
-    const rows = await query<any>(
-      `SELECT label, value, detail FROM (${m.sql}) q
-        WHERE value IS NOT NULL
-        ORDER BY value ${desc ? 'DESC' : 'ASC'} NULLS LAST
-        LIMIT ${limit}`,
-      [actorLandlordIds(actor)],
-    )
+    let rows: RankRow[]
+    if ('sql' in m) {
+      rows = await query<RankRow>(
+        `SELECT label, value, detail FROM (${m.sql}) q
+          WHERE value IS NOT NULL
+          ORDER BY value ${desc ? 'DESC' : 'ASC'} NULLS LAST
+          LIMIT ${limit}`,
+        [actorLandlordIds(actor)],
+      )
+    } else {
+      // 10/12: a computed measure is ranked the same way here — value order,
+      // then name so a tie reads the same every time it is asked.
+      rows = (await m.rows(actorLandlordIds(actor)))
+        .filter((r) => r.value !== null && r.value !== undefined)
+        .sort((a, z) => (desc ? Number(z.value) - Number(a.value) : Number(a.value) - Number(z.value))
+          || a.label.localeCompare(z.label))
+        .slice(0, limit)
+    }
 
     if (rows.length === 0) {
       return {

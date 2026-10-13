@@ -63,7 +63,11 @@ describe('action parity — what a person can do, the agent should be able to do
     expect(reachable).toBeGreaterThan(250)
     // 10/6: 451 after the per-property bank-deposit setting and the bank
     // feed's deposit matching each added a mutating route.
-    expect(reachable).toBeLessThan(475)
+    // 10/12 (Nic, GAM Books ledger): the loan register and fixed assets added
+    // nine (routes/booksLoansAssets.ts, each named in actionGap DELIBERATE)
+    // and the Contractors list took two away (contractors are vendors now),
+    // beside the ledger's other phases.
+    expect(reachable).toBeLessThan(500)
   })
 
   it('nothing from another portal has crept into a landlord or tenant agent', async () => {
@@ -143,7 +147,13 @@ describe('action parity — what a person can do, the agent should be able to do
     //
     // The ratchet is doing its job by making this visible: it must only ever move
     // down for a stated reason, never because something quietly stopped working.
-    expect(writes.size).toBeGreaterThanOrEqual(229)
+    //
+    // 10/12 (Nic): 229 → 227. add_contractor and update_contractor are gone
+    // with the Contractors routes — "one list of everyone the company pays";
+    // a contractor is a vendor of type contractor, which add_vendor and
+    // update_vendor (both still here, now with the type and the 1099 box)
+    // cover. A duplicate path removed, not a capability lost.
+    expect(writes.size).toBeGreaterThanOrEqual(227)
   })
 })
 

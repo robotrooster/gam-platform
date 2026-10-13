@@ -3872,9 +3872,19 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     // Everything that can be refunded was (a background check it carried stays GAM's).
     const isFullRefund = cumulativeRefunded >= txTotalNum - screeningKept - 0.005
 
-    await client.query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method)
-      VALUES ($1,$2,$3,$4,$5,$6)`,
-      [tx.id, posLandlordId(req), refundAmt, reason||null, items ? JSON.stringify(items) : null, resolvedMethod])
+    // 10/12 (Nic, ledger P1): the tax this refund gives back, stored with it
+    // (earlyCheckOut.saleRefundTax — one rule for every refund writer).
+    // 10/12 (ledger P1 review): a card sale's total carries the card fee the
+    // guest paid on top, and this refund can hand that back too. Its share is
+    // stored as the card fee given back (earlyCheckOut.saleRefundCardFeeShare)
+    // and left out of the tax — it was never the sale's income or its tax.
+    const { saleRefundTax, saleRefundCardFeeShare } = await import('../services/earlyCheckOut')
+    const cardFeeBack = await saleRefundCardFeeShare(client, tx.id, refundAmt)
+    const taxRefunded = await saleRefundTax(client, tx.id, refundAmt, cardFeeBack)
+    await client.query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method,tax_refunded,card_fee_refunded)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [tx.id, posLandlordId(req), refundAmt, reason||null, items ? JSON.stringify(items) : null, resolvedMethod,
+       taxRefunded.toFixed(2), cardFeeBack.toFixed(2)])
 
     await client.query(`UPDATE pos_transactions SET
       status=$1, refund_amount=$2, refunded_at=NOW() WHERE id=$3`,
@@ -3975,7 +3985,9 @@ posRouter.post('/transactions/:id/void', requirePerm('pos.void'), async (req, re
       // 10/3 (review): never a card or charge-account sale, or one that paid a
       // pay link, a stay or a delivery ticket (voidBlockedSql).
       if (now.why) throw new AppError(409, VOID_BLOCKED_WORDS[now.why as VoidBlocked])
-      await client.query('UPDATE pos_transactions SET status=$1, void_reason=$2 WHERE id=$3',
+      // 10/12 (Nic, ledger P1): voided_at — the moment, not only the reason;
+      // the ledger reverses the sale on that day.
+      await client.query('UPDATE pos_transactions SET status=$1, void_reason=$2, voided_at=NOW() WHERE id=$3',
         ['voided', reason || null, tx.id])
       const took = (await client.query<{ item_id: string; qty: string }>(
         `SELECT item_id, SUM(stock_before - stock_after)::text AS qty FROM pos_inventory_log
@@ -5630,8 +5642,8 @@ posRouter.get('/held-payments', requirePerm('pos.ring_sale'), async (req: any, r
     // not say) but has no payout line yet gets its one line now. recordHeldItem
     // is keyed on the refund, so this can never write a second one.
     if (ids.length) {
-      const missing = await query<{ landlord_id: string; stripe_refund_id: string; fee: string }>(
-        `SELECT h.landlord_id, h.stripe_refund_id, h.stripe_fee_kept::text AS fee
+      const missing = await query<{ landlord_id: string; stripe_refund_id: string; fee: string; property_id: string | null }>(
+        `SELECT h.landlord_id, h.stripe_refund_id, h.stripe_fee_kept::text AS fee, h.property_id
            FROM pos_held_payments h
           WHERE h.landlord_id = ANY($1::uuid[]) AND h.status = 'refunded'
             AND h.stripe_refund_id IS NOT NULL AND h.stripe_fee_kept > 0
@@ -5639,7 +5651,7 @@ posRouter.get('/held-payments', requirePerm('pos.ring_sale'), async (req: any, r
                              WHERE i.source_type = 'refund' AND i.source_id = h.stripe_refund_id)
           LIMIT 20`, [ids])
       for (const m of missing) {
-        await chargeKeptFeeToLandlord(m.landlord_id, m.stripe_refund_id, Number(m.fee))
+        await chargeKeptFeeToLandlord(m.landlord_id, m.stripe_refund_id, Number(m.fee), m.property_id)
           .catch((e) => logger.error({ err: e, refundId: m.stripe_refund_id }, '[pay-link] could not write the kept-fee payout line'))
       }
     }
@@ -5683,12 +5695,15 @@ posRouter.get('/held-payments', requirePerm('pos.ring_sale'), async (req: any, r
 /** decisions #22: Stripe's kept fee on a refunded held payment, as one negative
  *  line on the landlord's next payout (source 'refund', keyed on the refund). */
 async function chargeKeptFeeToLandlord(landlordId: string, refundId: string, kept: number,
+                                       /** 10/12 (Nic, ledger P1): the held payment's property (pos_held_payments.property_id). */
+                                       propertyId: string | null,
                                        runner?: { query: (sql: string, params: any[]) => Promise<any> }): Promise<void> {
   const { recordHeldItem } = await import('../services/heldPayouts')
   await recordHeldItem({
     landlordId, sourceType: 'refund', sourceId: refundId, amount: -Math.abs(kept),
     description: "Stripe's processing fee kept on a refunded pay-link payment",
-  } as any, runner as any)
+    property: { propertyId },
+  }, runner as any)
 }
 
 // POST /api/pos/held-payments/:id/refund — decisions #13: "Refund this
@@ -5710,7 +5725,7 @@ posRouter.post('/held-payments/:id/refund', requirePerm('pos.ring_sale'), async 
       // decisions #22: a refund recorded before the fee line existed still gets
       // its one line now (recordHeldItem writes it at most once).
       if (row.stripe_fee_kept != null && Number(row.stripe_fee_kept) > 0 && row.stripe_refund_id) {
-        await chargeKeptFeeToLandlord(row.landlord_id, row.stripe_refund_id, Number(row.stripe_fee_kept))
+        await chargeKeptFeeToLandlord(row.landlord_id, row.stripe_refund_id, Number(row.stripe_fee_kept), row.property_id ?? null)
       }
       return res.json({ success: true, data: { refunded: true, amount: Number(row.amount), already: true,
         stripeFeeKept: row.stripe_fee_kept == null ? null : Number(row.stripe_fee_kept) } })
@@ -5752,7 +5767,7 @@ posRouter.post('/held-payments/:id/refund', requirePerm('pos.ring_sale'), async 
         `UPDATE pos_held_payments SET status = 'refunded', refunded_at = NOW(), refunded_by = $2, stripe_refund_id = $3,
                 stripe_fee_kept = $4
           WHERE id = $1 AND status = 'held'`, [row.id, req.user.userId, refundId, kept])
-      if (kept != null && kept > 0) await chargeKeptFeeToLandlord(row.landlord_id, refundId, kept, tx)
+      if (kept != null && kept > 0) await chargeKeptFeeToLandlord(row.landlord_id, refundId, kept, row.property_id ?? null, tx)
       await tx.query('COMMIT')
     } catch (e) {
       await tx.query('ROLLBACK').catch(() => {})

@@ -219,16 +219,38 @@ export function feeCountedMonthStaySql(b: string, month: string): string {
  * `ownerUseWhen` limits owner use (a unit STATUS, so only true of the present)
  * — the landlord's estimate passes "this month or later" so it never backdates
  * today's status onto a past month. Being a status, owner use cleared mid-month
- * is the one thing this cannot see in the past.
+ * is the one thing this cannot see in the past — unless the caller asks for
+ * `ownerUseFromJournal`: 10/12 (Nic) review, the monthly report of a month
+ * that has ended reads each unit's status through the month from the change
+ * journal (audit_row_changes, never pruned — 10/12): owner use at the month's
+ * start, or switched to owner use during it, the way the bill counted it on
+ * the 1st and topped it up during the month. Before the journal began a unit's
+ * status is the oldest one it recorded (or today's when it never changed).
  *
  * Inner aliases are prefixed so a caller's correlated `p` / `m` are never
  * shadowed.
  */
 export function occupiedSpacesSql(
-  propertyId: string, month: string, opts: { ownerUseWhen?: string } = {},
+  propertyId: string, month: string, opts: { ownerUseWhen?: string; ownerUseFromJournal?: boolean } = {},
 ): string {
   const m = `(${month})::date`
   const monthEnd = `(${m} + INTERVAL '1 month' - INTERVAL '1 day')`
+  // The month's first moment and the next month's, on the property's calendar.
+  const tz = `COALESCE(os_op.timezone, 'America/Phoenix')`
+  const startTs = `((${m})::timestamp AT TIME ZONE ${tz})`
+  const nextTs = `((${m} + INTERVAL '1 month')::timestamp AT TIME ZONE ${tz})`
+  const ownerUse = opts.ownerUseFromJournal
+    ? `(os_o.retired_at IS NULL OR os_o.retired_at >= ${startTs})
+           AND (COALESCE((SELECT os_arc.old_row->>'status' FROM audit_row_changes os_arc
+                           WHERE os_arc.table_name = 'units' AND os_arc.row_id = os_o.id
+                             AND os_arc.changed_at >= ${startTs}
+                           ORDER BY os_arc.changed_at, os_arc.id LIMIT 1), os_o.status) = 'owner_use'
+                OR EXISTS (SELECT 1 FROM audit_row_changes os_arc
+                            WHERE os_arc.table_name = 'units' AND os_arc.row_id = os_o.id
+                              AND os_arc.changed_at >= ${startTs} AND os_arc.changed_at < ${nextTs}
+                              AND os_arc.new_row->>'status' = 'owner_use'))`
+    : `os_o.status = 'owner_use' AND os_o.retired_at IS NULL
+           AND (${opts.ownerUseWhen ?? 'TRUE'})`
   return `
     SELECT DISTINCT ON (occ.unit_id) occ.unit_id, occ.kind
       FROM (
@@ -253,9 +275,9 @@ export function occupiedSpacesSql(
         -- S652: owner-occupied (see billableUnitsForProperty for why).
         SELECT os_o.id, 3, 'owner_use'
           FROM units os_o
+          JOIN properties os_op ON os_op.id = os_o.property_id
          WHERE os_o.property_id = ${propertyId}
-           AND os_o.status = 'owner_use' AND os_o.retired_at IS NULL
-           AND (${opts.ownerUseWhen ?? 'TRUE'})
+           AND ${ownerUse}
         UNION ALL
         -- S615/S616: a space next door on a utility charge (see below).
         SELECT os_sa.unit_id, 4, 'utility_service'

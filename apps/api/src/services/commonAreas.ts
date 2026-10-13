@@ -278,12 +278,11 @@ export function eventReleasedNotice(a: {
  *   'paid'   settled, clearing or paid from the deposit — the caller decides
  *            (a refund due, or a deposit that stands);
  *   'voided' owed, so it comes off and the reservation is marked fee_voided:
- *            nothing was ever tried on it → it was never charged, and the row
- *            is removed; a payment WAS tried on it (paymentTriedSql, the one
- *            definition in lib/unwindIssuedLease) → receipts and return logs
- *            point at it, so the row is kept as a record with status
- *            'voided' (decisions #48.5): owed by nobody, paid by nothing, in
- *            no balance, never deleted;
+ *            the row is kept as a record with status 'voided' (decisions
+ *            #48.5): owed by nobody, paid by nothing, in no balance, never
+ *            deleted. 10/12 (Nic): a fee nothing was ever tried on used to be
+ *            removed outright; it is voided the same way now (keep
+ *            everything — services/chargeVoids);
  *   'kept'   owed, but it cannot come off here (ReservationFeeKeptWhy): it
  *            stays, and the caller tells GAM after its commit
  *            (alertReservationFeeKept);
@@ -349,12 +348,12 @@ export async function voidUnpaidReservationFee(
     if (owed.length === 0) return markFeeVoided(client, r.id)
     let out: 'voided' | 'kept' = 'voided'
     for (const n of owed) {
-      if (await voidOwedRow(client, r.id, n.id, stop, { canDelete: false, keepPointer: true }) === 'kept') out = 'kept'
+      if (await voidOwedRow(client, r.id, n.id, stop) === 'kept') out = 'kept'
     }
     return out
   }
   if (pay.status !== 'pending' && pay.status !== 'failed') return 'kept'
-  return voidOwedRow(client, r.id, r.fee_payment_id, stop, { canDelete: true, keepPointer: false })
+  return voidOwedRow(client, r.id, r.fee_payment_id, stop)
 }
 
 const cents = (d: number) => Math.round(d * 100)
@@ -411,13 +410,12 @@ const SHARED_RETRY_TO_COME_SQL = `(${retryToComeSql('p')}
 
 /**
  * One owed row of a reservation fee (the fee itself, or the row a dispute
- * reopened) comes off — removed when nothing was ever tried on it and
- * `canDelete`, else voided as a record — or is 'kept' (ReservationFeeKeptWhy).
+ * reopened) comes off — voided as a record (10/12 (Nic): never deleted, even
+ * when nothing was ever tried on it) — or is 'kept' (ReservationFeeKeptWhy).
  * The caller holds the household lock.
  */
 async function voidOwedRow(
   client: PoolClient, reservationId: string, paymentId: string, stop: string[] | undefined,
-  o: { canDelete: boolean; keepPointer: boolean },
 ): Promise<'voided' | 'kept'> {
   const row = (await client.query<{ status: string; tried: boolean; moving: boolean; shared: boolean }>(
     `SELECT p.status, ${paymentTriedSql('p')} AS tried,
@@ -428,26 +426,10 @@ async function voidOwedRow(
   // A payment on it may still be going through, or a retry still to come
   // carries the household's other charges with it: left as it is.
   if (row.moving || row.shared) return 'kept'
-  if (row.tried || !o.canDelete) {
-    if (stop && row.status === 'failed') stop.push(...await stopRetryOfFeeAlone(client, paymentId))
-    return voidAsRecord(client, reservationId, paymentId)
-  }
-  // Its own savepoint: a record this list does not know about keeps the row
-  // instead of rolling back the cancel with it — and then it is voided as a
-  // record instead (decisions #48.5), never left owed.
-  await client.query('SAVEPOINT reservation_fee_void')
-  try {
-    await client.query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [paymentId])
-    await client.query('RELEASE SAVEPOINT reservation_fee_void')
-  } catch (e) {
-    await client.query('ROLLBACK TO SAVEPOINT reservation_fee_void')
-    logger.warn({ err: e, reservationId, paymentId }, '[common-areas] unpaid fee could not be removed — voided as a record')
-    return voidAsRecord(client, reservationId, paymentId)
-  }
-  await client.query(
-    `UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL, updated_at = now() WHERE id = $1`,
-    [reservationId])
-  return 'voided'
+  // A bank retry still to come on a failed fee is stopped first (only when it
+  // carries the fee alone); nothing to stop on one nothing was tried on.
+  if (stop && row.status === 'failed' && row.tried) stop.push(...await stopRetryOfFeeAlone(client, paymentId))
+  return voidAsRecord(client, reservationId, paymentId)
 }
 
 async function creditSpentOn(client: PoolClient, paymentId: string): Promise<boolean> {
@@ -459,7 +441,8 @@ async function creditSpentOn(client: PoolClient, paymentId: string): Promise<boo
  * decisions #48.5: a charge nobody owes that a payment touched (or that a
  * record points at) is voided in a recorded way — status 'voided', stamped
  * with when and why, kept forever, in no balance (every balance reads
- * pending/failed). The reservation keeps pointing at its fee (fee_payment_id)
+ * pending/failed). 10/12 (Nic): so is one nothing ever touched (keep
+ * everything). The reservation keeps pointing at its fee (fee_payment_id)
  * and is marked fee_voided. Credit already SPENT on it cannot ride on a voided
  * charge (trg_payments_voided_is_a_record): that fee is 'kept' for GAM to
  * sort out with the landlord. The caller holds the household lock and the row.
@@ -849,7 +832,7 @@ export async function decideAllWaitingReservationFees(pageSize = 200): Promise<R
  *     deposit) → a refundable fee is flagged fee_refund_due and the landlord
  *     is told to refund it ('refund_due'); an event deposit stands ('stands');
  *   - it failed for good, or nothing is left in flight → the fee comes off
- *     (voidUnpaidReservationFee: removed, or voided as a record, and a bank
+ *     (voidUnpaidReservationFee: voided as a record, and a bank
  *     retry of the fee alone is stopped) — never collected, and the landlord
  *     is never told to refund it ('voided'); a fee that cannot come off
  *     ('kept') is told to GAM and the tenant, as at a cancel.

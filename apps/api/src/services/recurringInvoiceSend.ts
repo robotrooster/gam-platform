@@ -218,6 +218,7 @@ async function tryOffSessionCharge(args: OffSessionArgs): Promise<boolean> {
       const { recordHeldItem, businessInvoiceCutCents } = await import('./heldPayouts')
       await recordHeldItem({
         businessId: args.businessId, sourceType: 'business_invoice_payment', sourceId: pi.id,
+        property: { propertyId: null },  // 10/12 (Nic, ledger P1): a business's line is company-level
         amount: (args.amountCents - businessInvoiceCutCents(args.amountCents)) / 100,
         description: 'Invoice auto-charge',
       })

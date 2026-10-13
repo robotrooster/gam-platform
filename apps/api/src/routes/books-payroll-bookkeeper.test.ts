@@ -9,17 +9,18 @@
  *   - POST   /api/books/payroll/runs/:id/void     (reverse YTD if approved)
  *   - GET    /api/books/bookkeeper/clients
  *   - GET    /api/books/bookkeeper/all
- *   - POST   /api/books/bookkeeper/assign
  *   - DELETE /api/books/bookkeeper/revoke
+ *
+ * 10/11 (Nic): POST /api/books/bookkeeper/assign was RETIRED — it attached a
+ * bookkeeper with no properties named, and the Team page invite (property
+ * boxes) is the one way in. Its tests went with it.
  *
  * S592 (Nic): POST /api/books/bookkeeper/invite was REMOVED — bookkeepers are
  * now invited by the landlord from their Team page (canonical email-link flow,
  * /api/scopes/bookkeeper/invite), where the bookkeeper sets their own password.
  * That block's tests were removed with it.
  *
- * Production bugs fixed in the S385 arc (retained assign/revoke):
- *   - **POST /bookkeeper/assign**: same flaw — landlord A could assign
- *     any bookkeeper to landlord B's books.
+ * Production bugs fixed in the S385 arc (retained revoke):
  *   - **DELETE /bookkeeper/revoke**: same flaw — landlord A could
  *     revoke landlord B's bookkeeper at will (denial-of-service).
  *
@@ -35,7 +36,7 @@ import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 
 import { booksRouter } from './books'
 import { errorHandler } from '../middleware/errorHandler'
@@ -79,9 +80,11 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'bookkeeper', 'Book', 'A', TRUE) RETURNING id`,
       [`bk-${randomUUID()}@test.dev`])
+    // 10/11: a bookkeeper keeps the properties ticked for them — A's one park.
+    const parkA = await seedProperty(client, { landlordId: aId, ownerUserId: aUid, managedByUserId: aUid })
     await client.query(
-      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)
-       VALUES ($1, $2, 'read_write')`, [bk.rows[0].id, aId])
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids)
+       VALUES ($1, $2, 'read_write', $3)`, [bk.rows[0].id, aId, [parkA]])
     await client.query('COMMIT')
     const sign = (p: object) => jwt.sign(p, process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
@@ -305,6 +308,54 @@ describe('POST /payroll/runs (calculate draft)', () => {
   })
 })
 
+describe('10/11: hours typed 0, and the Additional Medicare Tax', () => {
+  const run = (f: PortfolioFixture, body: object) => request(buildApp())
+    .post('/api/books/payroll/runs').set('Authorization', `Bearer ${f.landlordAToken}`)
+    .send({ periodStart: '2026-01-01', periodEnd: '2026-01-14', payDate: '2026-01-20', payFrequency: 'biweekly', ...body })
+
+  it('an hourly employee with 0 hours typed is paid $0, not a full period; a blank box still takes the default', async () => {
+    const f = await seedPortfolio()
+    const zero = await seedEmployee(f.landlordAId, { payType: 'hourly', payRate: 25, firstName: 'Zed' })
+    const blank = await seedEmployee(f.landlordAId, { payType: 'hourly', payRate: 25, firstName: 'Bo' })
+    const res = await run(f, { employeeIds: [zero, blank], hoursMap: { [zero]: 0, [blank]: '' } })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    const byEmp = new Map(res.body.data.lines.map((l: any) => [l.employee_id, l]))
+    expect(Number((byEmp.get(zero) as any).gross_pay)).toBe(0)
+    expect(Number((byEmp.get(zero) as any).hours_worked)).toBe(0)
+    expect(Number((byEmp.get(blank) as any).gross_pay)).toBe(2000)   // 25 × 80, every two weeks
+  })
+
+  it('negative hours are refused in words, not as a withholding error', async () => {
+    const f = await seedPortfolio()
+    const emp = await seedEmployee(f.landlordAId, { payType: 'hourly', payRate: 25, firstName: 'Neg', lastName: 'Ative' })
+    const res = await run(f, { employeeIds: [emp], hoursMap: { [emp]: -5 } })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Enter the hours Neg Ative worked (0 or more).')
+  })
+
+  it('the 0.9% applies only to wages over $200,000 for the year, and the employer matches 1.45% only', async () => {
+    const f = await seedPortfolio()
+    const emp = await seedEmployee(f.landlordAId, { payType: 'salary', payRate: 260000 })   // 10,000 every two weeks
+    // 10/12 (Nic, ledger P7): a run records the employer's Medicare on itself
+    // (1.45% of 195,000 = 2,827.50), as the migration backfilled every older run.
+    const prior = await db.query<{ id: string }>(
+      `INSERT INTO payroll_runs (landlord_id, period_start, period_end, pay_date, pay_frequency, status, total_gross, total_employer_medicare)
+       VALUES ($1, '2025-12-01', '2025-12-14', '2026-01-02', 'biweekly', 'approved', 195000, 2827.50) RETURNING id`, [f.landlordAId])
+    await db.query(
+      `INSERT INTO payroll_run_lines (run_id, employee_id, pay_type, gross_pay, federal_tax, state_tax, ss_tax, medicare_tax, net_pay, employer_medicare_tax)
+       VALUES ($1, $2, 'salary', 195000, 0, 0, 0, 0, 195000, 2827.50)`, [prior.rows[0].id, emp])
+    const res = await run(f, { employeeIds: [emp] })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    // 10,000 × 1.45% + (205,000 − 200,000) × 0.9% = 145 + 45
+    expect(Number(res.body.data.lines[0].medicare_tax)).toBe(190)
+    await request(buildApp()).post(`/api/books/payroll/runs/${res.body.data.id}/approve`).set('Authorization', `Bearer ${f.landlordAToken}`)
+    const tax = await request(buildApp()).get('/api/books/tax/summary?year=2026').set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(tax.status, JSON.stringify(tax.body)).toBe(200)
+    // Employer: 1.45% of every approved dollar this year (205,000), never the employee's 0.9%.
+    expect(Number(tax.body.data.payroll.employer_medicare)).toBe(2972.5)
+  })
+})
+
 describe('POST /payroll/runs/:id/approve', () => {
   async function seedDraftRun(f: PortfolioFixture, empId: string, grossPay = 2000) {
     const r = await db.query<{ id: string }>(
@@ -452,50 +503,6 @@ describe('GET /bookkeeper/all', () => {
       .get('/api/books/bookkeeper/all')
       .set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(res.status).toBe(403)
-  })
-})
-
-describe('POST /bookkeeper/assign — S385 cross-landlord fix', () => {
-  it('landlord A assigning to landlord B → 403', async () => {
-    const f = await seedPortfolio()
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/assign')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ bookkeeperUserId: f.bookkeeperUserId, landlordId: f.landlordBId, accessLevel: 'read_write' })
-    expect(res.status).toBe(403)
-    // Confirm no scope row was added.
-    const scopes = await db.query(
-      `SELECT id FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
-      [f.bookkeeperUserId, f.landlordBId])
-    expect(scopes.rows).toHaveLength(0)
-  })
-
-  it('landlord A assigning to own landlord A → happy (upsert)', async () => {
-    const f = await seedPortfolio()
-    // Already exists from fixture. Re-assign with read_only — should upsert.
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/assign')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ bookkeeperUserId: f.bookkeeperUserId, landlordId: f.landlordAId, accessLevel: 'read_only' })
-    expect(res.status).toBe(200)
-    const scopes = await db.query<{ access_level: string }>(
-      `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
-      [f.bookkeeperUserId, f.landlordAId])
-    expect(scopes.rows[0].access_level).toBe('read_only')
-  })
-
-  // S592: the target must already be a bookkeeper — assigning an arbitrary user
-  // (here landlord A's own user id, into their own books so the scope guard
-  // passes) is rejected, and no dormant scope row is written.
-  it('S592: assigning a NON-bookkeeper user → 404, no scope row', async () => {
-    const f = await seedPortfolio()
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/assign')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ bookkeeperUserId: f.landlordAUserId, landlordId: f.landlordAId, accessLevel: 'read_write' })
-    expect(res.status).toBe(404)
-    const scopes = await db.query(`SELECT id FROM bookkeeper_scopes WHERE user_id=$1`, [f.landlordAUserId])
-    expect(scopes.rows).toHaveLength(0)
   })
 })
 

@@ -61,7 +61,9 @@ export async function collectionsBook(): Promise<CollectionsBook> {
             EXISTS (SELECT 1 FROM properties p
                      WHERE p.landlord_id = l.id AND p.review_status = 'active') AS has_property
        FROM landlords l
-       JOIN landlord_gam_charges c ON c.landlord_id = l.id
+       -- 10/12 (ledger P0): a voided charge (taken back, kept on file) was never
+       -- owed — billed and outstanding leave it out, as when it was deleted.
+       JOIN landlord_gam_charges c ON c.landlord_id = l.id AND c.voided_at IS NULL
       WHERE l.is_demo = FALSE
       GROUP BY l.id
       ORDER BY (COALESCE(SUM(c.amount),0) - COALESCE(SUM(c.collected_amount),0)) DESC`)

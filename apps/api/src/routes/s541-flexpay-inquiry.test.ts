@@ -456,6 +456,31 @@ describe('S541 FlexPay demand-test gate', () => {
     expect(row.est_float_days).toBe(23)       // 28 − default grace 5
   })
 
+  // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." The
+  // float is measured from the late-fee engine's grace end: a lease with no
+  // grace of its own at a 2-day park fronts on the 2nd, not the 5th.
+  it('the float counts from the property\'s grace when the lease names none; a lease grace still wins', async () => {
+    const f = await fixture()
+    const app = buildApp()
+    const t = tok(f.tenantUserId, 'tenant', f.tenantId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
+    const leaseOf = `SELECT l.id, u.property_id FROM lease_tenants lt
+                       JOIN leases l ON l.id = lt.lease_id JOIN units u ON u.id = l.unit_id
+                      WHERE lt.tenant_id = $1`
+    const { rows: [ctx] } = await db.query<{ id: string; property_id: string }>(leaseOf, [f.tenantId])
+    await db.query(`UPDATE leases SET late_fee_grace_days = NULL WHERE id = $1`, [ctx.id])
+    await db.query(`UPDATE properties SET late_fee_grace_days = 2 WHERE id = $1`, [ctx.property_id])
+
+    await request(app).post('/api/tenants/flexpay/inquiry')
+      .set('Authorization', `Bearer ${t}`).send({ incomeSource: 'ssi', benefitDay: 10 })
+    const list = async () => (await request(app).get('/api/admin/flexpay/inquiries')
+      .set('Authorization', `Bearer ${a}`)).body.data[0]
+    expect((await list()).est_float_days).toBe(8)   // day 10 − the park's grace 2
+
+    await db.query(`UPDATE leases SET late_fee_grace_days = 4 WHERE id = $1`, [ctx.id])
+    expect((await list()).est_float_days).toBe(6)   // day 10 − the lease's own 4
+  })
+
   it('S545c: birthdate mismatch silently holds — out of queue, tenant sees nothing, release restores the spot', async () => {
     const f = await fixture()
     const app = buildApp()

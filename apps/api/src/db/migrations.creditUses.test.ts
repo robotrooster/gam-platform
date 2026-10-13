@@ -55,6 +55,8 @@ interface ChargeOpts {
   unitId?: string | null; leaseId?: string | null; tenantId?: string; landlordId?: string
   intent?: string | null; chargeId?: string | null; manualMethod?: string | null
   platformHeld?: boolean; dueDate?: string
+  /** When GAM wrote the row (default now). 10/12 (Nic, LF2): lateness counts from the later of the due date and this. */
+  writtenAt?: string
 }
 // Rent is unique per lease and due date (ux_payments_rent_idempotent), so every
 // charge gets its own day unless a test names one.
@@ -69,9 +71,9 @@ async function charge(c: PoolClient, f: Household, o: ChargeOpts = {}): Promise<
     `INSERT INTO payments
        (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
         due_date, revenue_owner, lease_fee_id, reversal_id, work_trade_suspended_at,
-        stripe_payment_intent_id, stripe_charge_id, manual_method, platform_held, settled_at)
+        stripe_payment_intent_id, stripe_charge_id, manual_method, platform_held, settled_at, created_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,$11,$12,$13,$14,$15,$16,$17,
-             CASE WHEN $7 = 'settled' THEN now() END)
+             CASE WHEN $7 = 'settled' THEN now() END, COALESCE($18::timestamptz, now()))
      RETURNING id`,
     [o.unitId === undefined ? f.unitId : o.unitId,
      o.leaseId === undefined ? f.leaseId : o.leaseId,
@@ -79,7 +81,7 @@ async function charge(c: PoolClient, f: Household, o: ChargeOpts = {}): Promise<
      o.type ?? 'rent', o.amount ?? 460, status, o.entry ?? 'RENT',
      o.dueDate ?? nextDue(), o.owner ?? 'landlord', o.leaseFeeId ?? null, o.reversalId ?? null,
      o.workTrade ? new Date() : null, o.intent ?? null, o.chargeId ?? null, o.manualMethod ?? null,
-     o.platformHeld ?? false])
+     o.platformHeld ?? false, o.writtenAt ?? null])
   return r.rows[0].id
 }
 
@@ -1090,7 +1092,9 @@ describe('S655 expand migrations', () => {
       await c.query(`UPDATE units SET status = 'active' WHERE id = $1`, [f.unitId])
       // $460 of saved credit used to hide a $460 late rent entirely.
       await issued(c, f, 460)
-      const late = await charge(c, f, { dueDate: '2026-01-01' })
+      // Written before it was due: a bill GAM wrote today for 1/1 would count its
+      // lateness from today (10/12, Nic, LF2 — migration 20261013120000).
+      const late = await charge(c, f, { dueDate: '2026-01-01', writtenAt: '2025-12-25T12:00:00Z' })
       expect((await c.query(`SELECT status FROM units WHERE id = $1`, [f.unitId])).rows[0].status).toBe('delinquent')
       // Paying the rent clears it.
       await c.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = $1`, [late])

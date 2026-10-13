@@ -35,6 +35,8 @@
  *     re-stamps access_level from the live scope row onto
  *     req.user.permissions, so a revoked / downgraded scope takes
  *     effect immediately instead of being stuck on the JWT.
+ *     10/12 (Nic): one level — the row decides whether they keep the
+ *     client; access_level no longer narrows what they may do.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -43,7 +45,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 
 import { booksRouter } from './books'
 import { errorHandler } from '../middleware/errorHandler'
@@ -92,9 +94,12 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'bookkeeper', 'Book', 'A', TRUE) RETURNING id`,
       [`bka-${randomUUID()}@test.dev`])
+    // 10/11: a bookkeeper keeps the properties ticked for them — A's one park.
+    // 10/12 (Nic): the Books ledger is the company-wide box's, ticked for them.
+    const parkA = await seedProperty(client, { landlordId: landlordAId, ownerUserId: landlordAUserId, managedByUserId: landlordAUserId })
     await client.query(
-      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level) VALUES ($1, $2, 'read_write')`,
-      [bkA.rows[0].id, landlordAId])
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide) VALUES ($1, $2, 'read_write', $3, TRUE)`,
+      [bkA.rows[0].id, landlordAId, [parkA]])
     // Bookkeeper user with NO scope rows.
     const bkU = await client.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
@@ -175,19 +180,31 @@ describe('bookkeeper scope validation — S383 fix', () => {
     expect(res.body.data[0].name).toBe('A Bank')
   })
 
-  it('bookkeeper JWT claims read_write but live scope is read_only → middleware re-stamps; writes blocked', async () => {
+  // 10/12 (Nic, ledger decision 2): "Full bookkeeping … One level, no
+  // per-bookkeeper switch." The live scope row still decides — but only
+  // whether they keep this client at all, never a read-only level.
+  it('10/12 one level: a live row that says read_only still writes; a removed row stops writes on the next request', async () => {
     const f = await seedPortfolio()
-    // Downgrade bkA's scope to read_only on the live row.
     await db.query(
       `UPDATE bookkeeper_scopes SET access_level='read_only' WHERE user_id=$1 AND landlord_id=$2`,
       [f.bkAUserId, f.landlordAId])
-    // bkAToken (NOT bkAReadOnly) still claims read_write in its JWT.
+    // bkAReadOnly's pass says read_only too: neither decides.
     const res = await request(buildApp())
+      .post('/api/books/accounts')
+      .set('Authorization', `Bearer ${f.bkAReadOnly}`)
+      .set('X-Client-Id', f.landlordAId)
+      .send({ code: '9999', name: 'Written by the bookkeeper', type: 'asset' })
+    expect(res.status).not.toBe(403)
+    expect(res.status).toBeLessThan(300)
+    expect((await db.query(`SELECT 1 FROM books_accounts WHERE landlord_id = $1 AND code = '9999'`, [f.landlordAId])).rowCount).toBe(1)
+    // The owner removes them: the very next write is refused, whatever the pass says.
+    await db.query(`DELETE FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`, [f.bkAUserId, f.landlordAId])
+    const after = await request(buildApp())
       .post('/api/books/accounts')
       .set('Authorization', `Bearer ${f.bkAToken}`)
       .set('X-Client-Id', f.landlordAId)
-      .send({ code: '9999', name: 'Should not write', type: 'asset' })
-    expect(res.status).toBe(403)
+      .send({ code: '9998', name: 'Should not write', type: 'asset' })
+    expect(after.status).toBe(403)
   })
 })
 
@@ -236,7 +253,8 @@ describe('POST /accounts', () => {
       .set('Authorization', `Bearer ${f.landlordAToken}`)
       .send({ name: 'Missing Code' })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/required/i)
+    // 10/11: said plainly ("Enter an account code.").
+    expect(res.body.error).toMatch(/account code/i)
   })
 
   it('duplicate code per landlord → 409', async () => {
@@ -397,6 +415,22 @@ describe('POST /employees', () => {
     expect(Number(res.body.data.state_withholding_pct)).toBe(2.5)
     expect(res.body.data.landlord_id).toBe(f.landlordAId)
     expect(res.body.data.pay_frequency).toBe('biweekly')
+  })
+
+  it('10/11: a phone with an extension past the column size is refused in words, not "value too long"', async () => {
+    const f = await seedPortfolio()
+    const res = await request(buildApp())
+      .post('/api/books/employees')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({ ...happyPayload(), phone: '(602) 555-1234 ext. 12' })
+    expect(res.status).toBe(400)
+    expect(JSON.stringify(res.body)).toContain('A phone number is 20 characters at most.')
+    const emp = (await request(buildApp()).post('/api/books/employees')
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send(happyPayload())).body.data
+    const edit = await request(buildApp()).patch(`/api/books/employees/${emp.id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ title: 'x'.repeat(101) })
+    expect(edit.status).toBe(400)
+    expect(edit.body.error).toBe('A title is 100 characters at most.')
   })
 
   it('legacy azWithholdingPct accepted in place of stateWithholdingPct', async () => {

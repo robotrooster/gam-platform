@@ -5,7 +5,7 @@
  * Scenario throughout: rent due the 1st, 3-day grace, DAILY accrual.
  */
 import { describe, it, expect } from 'vitest'
-import { nextAccrualDate } from '@gam/shared'
+import { nextAccrualDate, lateFeeStartDate, addAccrualPeriods } from '@gam/shared'
 
 const DUE = '2026-05-01'
 const GRACE = 3
@@ -51,5 +51,33 @@ describe('nextAccrualDate — accrualFrom modes', () => {
   it('monthly retroactive anchors on the due date with last-day clamp', () => {
     expect(nextAccrualDate('2026-01-31', 0, 'monthly', 1, 'due_date_inclusive')).toBe('2026-01-31')
     expect(nextAccrualDate('2026-01-31', 0, 'monthly', 2, 'due_date_inclusive')).toBe('2026-02-28')
+  })
+})
+
+// 10/12 (Nic): "zero grace: NEXT DAY is late (paying on the due date is on
+// time)" — the first late day is the start + max(grace, 1).
+describe('a grace of 0: the first late day is the day after', () => {
+  it('lateFeeStartDate never returns the due date itself', () => {
+    expect(lateFeeStartDate(DUE, 0)).toBe('2026-05-02')
+    expect(lateFeeStartDate(DUE, 1)).toBe('2026-05-02')
+    expect(lateFeeStartDate(DUE, 5)).toBe('2026-05-06')
+  })
+
+  it('counted from the grace end, the first daily fee after it is the next day', () => {
+    expect(nextAccrualDate(DUE, 0, 'daily', 1, 'grace_end')).toBe('2026-05-03')
+  })
+
+  it('a count back still starts at the due date (grace never moves it)', () => {
+    expect(nextAccrualDate(DUE, 0, 'daily', 1, 'due_date_inclusive')).toBe('2026-05-01')
+  })
+})
+
+describe('addAccrualPeriods', () => {
+  it('days, weeks, and months clamped from the anchor day', () => {
+    expect(addAccrualPeriods('2026-05-06', 'daily', 3)).toBe('2026-05-09')
+    expect(addAccrualPeriods('2026-05-06', 'weekly', 2)).toBe('2026-05-20')
+    expect(addAccrualPeriods('2026-01-31', 'monthly', 1)).toBe('2026-02-28')
+    expect(addAccrualPeriods('2026-01-31', 'monthly', 2)).toBe('2026-03-31')
+    expect(addAccrualPeriods('2026-11-15', 'monthly', 3)).toBe('2027-02-15')
   })
 })

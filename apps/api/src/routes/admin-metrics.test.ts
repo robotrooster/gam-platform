@@ -298,6 +298,20 @@ describe('Recurring Revenue card: the platform-fee bill, from the book', () => {
     expect(res.body.data.recurringByProperty).toHaveLength(1)
     expect(res.body.data.recurringByProperty[0].propertyId).toBe(propertyId)
   })
+
+  // 10/12 (Nic, A4): the card opens onto this list; a charge GAM took back is
+  // voided and kept (ledger P0), and nobody owes it.
+  it('a platform-fee charge GAM voided is not "not collected yet"', async () => {
+    const { p2 } = await billFixture()
+    await db.query(
+      `UPDATE landlord_gam_charges SET voided_at = NOW(), void_reason = 'bank_debit_not_made'
+        WHERE property_id = $1 AND kind = 'subscription'`, [p2])
+    const res = await request(buildApp()).get('/api/admin/income/composition/all')
+      .set('Authorization', `Bearer ${await staffToken('super_admin')}`)
+    const by = Object.fromEntries(res.body.data.recurringByProperty.map((p: any) => [p.propertyId, p]))
+    expect(by[p2]).toMatchObject({ spaces: 12, billed: 24, notCollected: 0 })
+    expect(res.body.data.recurringNotCollected).toBe(0)
+  })
 })
 
 // ─── 10/12 (Nic) review fixes ───────────────────────────────────────────────
@@ -527,5 +541,103 @@ describe('10/12 review: the polled recurring read and what landlords owe', () =>
       { kind: 'device_installment', label: 'Card reader installment', amount: 87.5 },
       { kind: 'subscription', label: 'Platform fee', amount: 24 },
     ])
+  })
+})
+
+// ─── 10/12 (Nic, A5 + H1): occupied spaces, counted the way GAM bills ────────
+
+describe('10/12 (A5/H1): Active Units and the heat map count occupied spaces the way GAM bills them', () => {
+  /**
+   * One live park: a lease, an owner-occupied space, a month stay, a space
+   * marked 'active' with nobody in it (Springville's case, S652), a site with
+   * only a nightly stay, a lease that ended last month, and a retired space.
+   * Plus a demo landlord's leased space and a signup that never went live.
+   */
+  async function park() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET state = 'AZ' WHERE id = $1`, [propertyId])
+      const u: string[] = []
+      for (let i = 0; i < 7; i++) u.push(await seedUnit(c, { propertyId, landlordId }))
+      const [leased, ownerUse, monthStay, markedActive, nightly, endedLastMonth, retired] = u
+      const t = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId: await seedLease(c, { unitId: leased, landlordId, rentAmount: 500 }), tenantId: t })
+      await c.query(`UPDATE units SET status = 'owner_use' WHERE id = $1`, [ownerUse])
+      await c.query(`UPDATE units SET status = 'active' WHERE id = $1`, [markedActive])
+      await c.query(
+        `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, status, lease_type)
+         VALUES ($1, $3, CURRENT_DATE - 5, CURRENT_DATE + 40, 'confirmed', 'month_to_month'),
+                ($2, $3, CURRENT_DATE, CURRENT_DATE + 2, 'confirmed', 'nightly')`, [monthStay, nightly, landlordId])
+      const ended = await seedLease(c, { unitId: endedLastMonth, landlordId, rentAmount: 400, status: 'expired' })
+      await c.query(`UPDATE leases SET end_date = CURRENT_DATE - 45 WHERE id = $1`, [ended])
+      await c.query(`UPDATE units SET retired_at = NOW() WHERE id = $1`, [retired])
+
+      const demo = await seedLandlord(c)
+      await c.query(`UPDATE landlords SET is_demo = TRUE WHERE id = $1`, [demo.landlordId])
+      const dp = await seedProperty(c, { landlordId: demo.landlordId, ownerUserId: demo.userId, managedByUserId: demo.userId })
+      await seedLease(c, { unitId: await seedUnit(c, { propertyId: dp, landlordId: demo.landlordId }), landlordId: demo.landlordId })
+
+      const junk = await seedLandlord(c)
+      const jp = await seedProperty(c, { landlordId: junk.landlordId, ownerUserId: junk.userId, managedByUserId: junk.userId })
+      for (let i = 0; i < 4; i++) await seedUnit(c, { propertyId: jp, landlordId: junk.landlordId })
+      await c.query('COMMIT')
+      return { propertyId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('Active Units = the lease, owner use and month stay; vacant = the rest of the open spaces', async () => {
+    await park()
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${await staffToken('super_admin')}`)
+    expect(res.status).toBe(200)
+    const d = res.body.data
+    expect(d.active_units).toBe(3)
+    expect(d.total_spaces).toBe(6)     // the retired space is gone; the demo and the junk signup are not on GAM
+    expect(d.vacant_units).toBe(3)     // marked 'active' with nobody in it, nightly only, ended last month
+    expect(d.spaces_month).toMatch(/^\d{4}-\d{2}-01$/)
+  })
+
+  it('the Metrics tile and the heat map\'s occupied view read the same count, and add up', async () => {
+    await park()
+    const m = await metrics()
+    expect(m.footprint).toMatchObject({ units: 6, occupiedSpaces: 3, vacantSpaces: 3 })
+    expect(m.footprint.occupiedMonth).toMatch(/^\d{4}-\d{2}-01$/)
+    expect(m.map.states).toEqual([expect.objectContaining({ abbr: 'AZ', units: 6, occupied: 3, properties: 1 })])
+    // No map location on file: the county map names it, with its occupied spaces.
+    expect(m.map.missing).toEqual([expect.objectContaining({ reason: 'no_location', units: 6, occupied: 3 })])
+  })
+
+  it('the Onboarding page\'s Vacant Units tile is the same count (10/12, A5 "match billing"), in a regular admin\'s portfolio', async () => {
+    const { propertyId } = await park()
+    const superToken = await staffToken('super_admin')
+    const overview = (await request(buildApp()).get('/api/admin/overview').set('Authorization', `Bearer ${superToken}`)).body.data
+    const onboarding = await request(buildApp()).get('/api/admin/onboarding/overview').set('Authorization', `Bearer ${superToken}`)
+    expect(onboarding.status).toBe(200)
+    expect(onboarding.body.data.vacant_units).toBe(overview.vacant_units)
+    expect(onboarding.body.data.vacant_units).toBe(3)
+    // A regular admin sees the count for the landlords they closed or service — none until assigned.
+    const adminToken = await staffToken('admin')
+    const adminId = (jwt.decode(adminToken) as any).userId
+    expect((await request(buildApp()).get('/api/admin/onboarding/overview')
+      .set('Authorization', `Bearer ${adminToken}`)).body.data.vacant_units).toBe(0)
+    await db.query(
+      `UPDATE landlords SET portfolio_manager_id = $1 WHERE id = (SELECT landlord_id FROM properties WHERE id = $2)`,
+      [adminId, propertyId])
+    expect((await request(buildApp()).get('/api/admin/onboarding/overview')
+      .set('Authorization', `Bearer ${adminToken}`)).body.data.vacant_units).toBe(3)
+  })
+
+  it('a space leased at any point this month counts for the month — leaving never lowers it', async () => {
+    const { propertyId } = await park()
+    // The lease ends the day before today (still this month unless today is the 1st).
+    await db.query(
+      `UPDATE leases SET status = 'expired', end_date = GREATEST(CURRENT_DATE - 1, date_trunc('month', CURRENT_DATE)::date)
+        WHERE unit_id IN (SELECT id FROM units WHERE property_id = $1) AND status = 'active'`, [propertyId])
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${await staffToken('super_admin')}`)
+    expect(res.body.data.active_units).toBe(3)
   })
 })

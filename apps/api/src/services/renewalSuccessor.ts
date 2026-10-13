@@ -67,6 +67,7 @@
  * the landlord's signature refuse the same things in the same words.
  */
 import { AppError } from '../middleware/errorHandler'
+import { voidUnowedCharges } from './chargeVoids'
 import { nextDueDateAfter } from '@gam/shared'
 
 type Q = (sql: string, params?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }>
@@ -164,7 +165,7 @@ export async function returnDepositToEndedLease(q: Q, newLeaseId: string, endedL
                            AND COALESCE(collected_amount, 0) >= total_amount - $3::numeric
                           THEN 'funded' ELSE status END,
             updated_at = NOW()
-      WHERE lease_id = $1 AND flex_deposit_enabled = FALSE`,
+      WHERE lease_id = $1 AND flex_deposit_enabled = FALSE AND status <> 'voided'`,
     [newLeaseId, endedLeaseId, increase.toFixed(2)])
   return r.rowCount ?? 0
 }
@@ -491,8 +492,11 @@ export function sayKeptCharges(kept: KeptCharge[]): string {
  *
  *   - a utility bill on it that nobody has paid goes back, unbilled, to the
  *     lease that ended (the usage is real and the household's), and its unpaid
- *     charge row goes;
- *   - its unpaid charge rows ('pending' / 'failed') are removed;
+ *     charge row is voided;
+ *   - its unpaid charge rows ('pending' / 'failed') are voided. 10/12 (Nic):
+ *     they used to be DELETED; each is now kept as a record (status 'voided'
+ *     with when and why, decisions #48.5 — services/chargeVoids), in no
+ *     balance or total;
  *   - its open bills ('pending' / 'partial'), read BEFORE anything is removed:
  *       · a bill with no money left on it that moved is voided at $0, with any
  *         open work-trade settlement on it;
@@ -519,16 +523,24 @@ export function sayKeptCharges(kept: KeptCharge[]): string {
  * Money that MOVED (settled, processing, paid from a deposit) is never touched:
  * returning or moving it is what the hold waits on.
  *
- * Each removal is tried on its own (a savepoint), so one charge row that another
+ * Each void is tried on its own (a savepoint), so one charge row that another
  * record still points at — a bank remittance applied to it, an ACH log entry —
  * stays where it is and is counted in `kept` (and named in `keptCharges`) for GAM
- * to take off by hand, instead of failing the whole step on every run. Run
+ * to take off by hand, instead of failing the whole step on every run (the rows
+ * the database refused to delete — services/chargeVoids chargeHeldByRecordSql). Run
  * INSIDE a transaction. Idempotent: run again it finds nothing new to do.
  *
- * Returns how many charge rows came off (`charges`), bills voided (`bills`),
+ * Returns how many charge rows were voided (`charges`), bills voided (`bills`),
  * bills rebuilt around money still on them (`retotaled`), utility bills sent
  * back (`utilityBills`), and what stayed (`kept` / `keptCharges`).
  */
+/** 10/12 (Nic, G8): why an open work-trade period on a new lease that will never start was voided (kept, never deleted). */
+export const WORK_TRADE_PERIOD_NEVER_STARTS_VOID =
+  'Voided: the new lease will never start, so this period has nothing left to credit'
+/** Why a charge on a new lease that will never start is not owed (payments.void_reason). */
+export const NEW_LEASE_NEVER_STARTS_CHARGE_REASON =
+  'The new lease it was billed on will never start (the lease before it ended early and nobody signed the new one), so it is not owed.'
+
 export async function clearNeverOwedOnHeldNewLease(
   q: Q, newLeaseId: string, endedLeaseId: string,
 ): Promise<{
@@ -546,6 +558,13 @@ export async function clearNeverOwedOnHeldNewLease(
       return false
     }
   }
+  // 10/12 (Nic): a charge row is voided as a record, never deleted. One the
+  // void leaves alone (a record points at it) throws, so its savepoint rolls
+  // back whatever went with it (the utility bill's move) and it is kept.
+  const voidOne = async (id: string) => {
+    const { voided } = await voidUnowedCharges(q, [id], NEW_LEASE_NEVER_STARTS_CHARGE_REASON)
+    if (voided.length === 0) throw new Error(`charge ${id} kept: a record points at it`)
+  }
   // The open bills, read before anything below re-rolls their status.
   const open = (await q(
     `SELECT id FROM invoices WHERE lease_id = $1 AND status IN ('pending', 'partial') ORDER BY due_date, id`,
@@ -561,7 +580,7 @@ export async function clearNeverOwedOnHeldNewLease(
             pm.invoice_id, pm.amount::text AS amount, to_char(pm.due_date, 'YYYY-MM-DD') AS due_date
        FROM utility_bills ub
        LEFT JOIN payments pm ON pm.id = ub.payment_id
-      WHERE ub.lease_id = $1
+      WHERE ub.lease_id = $1 AND ub.voided_at IS NULL
         AND (ub.payment_id IS NULL OR pm.status IN ('pending', 'failed'))
       ORDER BY ub.billing_cycle_month, ub.id`, [newLeaseId])).rows
   for (const b of utility) {
@@ -572,9 +591,7 @@ export async function clearNeverOwedOnHeldNewLease(
                 status = CASE WHEN status = 'billed' THEN 'unbilled' ELSE status END,
                 updated_at = NOW()
           WHERE id = $1`, [b.id, endedLeaseId])
-      if (b.payment_id) {
-        await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending', 'failed')`, [b.payment_id])
-      }
+      if (b.payment_id) await voidOne(b.payment_id)
     })
     if (moved) {
       utilityBills++
@@ -598,7 +615,7 @@ export async function clearNeverOwedOnHeldNewLease(
   const keptWithBill = new Set(keptCharges.map(k => k.paymentId).filter(Boolean))
   for (const r of unpaid) {
     if (keptWithBill.has(r.id)) continue
-    if (await alone(() => q(`DELETE FROM payments WHERE id = $1`, [r.id]))) {
+    if (await alone(() => voidOne(r.id))) {
       charges++
       if (r.invoice_id) touched.add(r.invoice_id)
     } else {
@@ -617,7 +634,11 @@ export async function clearNeverOwedOnHeldNewLease(
         WHERE invoice_id = $1 AND status IN ('settled', 'processing', 'paid_via_deposit') LIMIT 1`,
       [invoiceId])).rows.length > 0
     if (!movedLeft) {
-      await q(`DELETE FROM work_trade_settlements WHERE invoice_id = $1 AND status = 'open'`, [invoiceId])
+      // 10/12 (Nic, G8): the open work-trade period is voided and kept, never deleted.
+      await q(
+        `UPDATE work_trade_settlements
+            SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+          WHERE invoice_id = $1 AND status = 'open'`, [invoiceId, WORK_TRADE_PERIOD_NEVER_STARTS_VOID])
       await q(
         `UPDATE invoices SET status = 'void', total_amount = 0, updated_at = NOW()
           WHERE id = $1 AND status <> 'void'`, [invoiceId])
@@ -627,7 +648,11 @@ export async function clearNeverOwedOnHeldNewLease(
     // Money moved on it, and nothing was taken off it: it is left exactly as it is.
     if (!touched.has(invoiceId)) continue
     // Nothing on it is owed any more, so no hours are credited against it.
-    await q(`DELETE FROM work_trade_settlements WHERE invoice_id = $1 AND status = 'open'`, [invoiceId])
+    // 10/12 (Nic, G8): the open period is voided and kept, never deleted.
+    await q(
+      `UPDATE work_trade_settlements
+          SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+        WHERE invoice_id = $1 AND status = 'open'`, [invoiceId, WORK_TRADE_PERIOD_NEVER_STARTS_VOID])
     const changed = await q(
       `WITH lines AS (
          SELECT p.type, p.amount, p.lease_fee_id, p.work_trade_suspended_at
@@ -663,7 +688,8 @@ export async function clearNeverOwedOnHeldNewLease(
     // paid: when every line left is paid (settled, or paid from the deposit) —
     // a returned line is not in its total, and its re-billed charge came off
     // above — the bill reads 'settled'. Done here, not in the shared rollup,
-    // which every bill on the platform runs.
+    // which every bill on the platform runs. 10/12: a line voided above is a
+    // record on the bill, not a line of it, and is left out the same way.
     await q(
       `UPDATE invoices i SET status = 'settled', updated_at = NOW()
         WHERE i.id = $1 AND i.status NOT IN ('settled', 'void')
@@ -671,7 +697,7 @@ export async function clearNeverOwedOnHeldNewLease(
                        WHERE p.invoice_id = i.id AND p.status IN ('settled', 'paid_via_deposit'))
           AND NOT EXISTS (SELECT 1 FROM payments p
                            WHERE p.invoice_id = i.id
-                             AND p.status NOT IN ('settled', 'paid_via_deposit', 'returned'))`, [invoiceId])
+                             AND p.status NOT IN ('settled', 'paid_via_deposit', 'returned', 'voided'))`, [invoiceId])
     if (changed.rows.length) retotaled++
   }
   return { charges, bills, retotaled, utilityBills, kept: keptCharges.length, keptCharges }

@@ -45,6 +45,7 @@ import { isUsFederalHoliday } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { stampPayoutTransfers } from '../services/payoutComposition'
+import { SOLE_COMPANY_ON_ACCOUNT_SQL } from '../services/connectPayoutSync'
 import { takePayoutCut } from '../services/payoutCut'
 import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldForAccount, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
@@ -710,8 +711,11 @@ async function processOneCandidate(
       `INSERT INTO disbursements
          (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id, stripe_account_id)
        VALUES ($1, $4, $2, 'processing', $3, $6::timestamptz, 0,
-               -- S652: the company whose Connect account this is, so the row says who
-               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1),
+               -- S652: the company whose Connect account this is, so the row says who.
+               -- 10/12 (Nic, ledger P0): only when it is the ONE company paid
+               -- through this account; never the first of several (no first
+               -- company wins) — a shared account's payout carries both.
+               ${SOLE_COMPANY_ON_ACCOUNT_SQL('$5::text')},
                $5)
        ON CONFLICT (stripe_payout_id) WHERE stripe_payout_id IS NOT NULL
        DO UPDATE SET trigger_type = EXCLUDED.trigger_type, user_id = EXCLUDED.user_id,

@@ -113,6 +113,7 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
   if (owed > 0) {
     await recordHeldItem({
       landlordId: s.landlordId, sourceType: 'pos_sale', sourceId: tx.id,
+      property: { saleId: tx.id },  // 10/12 (Nic, ledger P1): the sale's property
       amount: owed, description: 'Register card sale',
     }, client)
   }

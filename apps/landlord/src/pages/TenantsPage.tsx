@@ -6,6 +6,7 @@ import { Plus, UserPlus, MailWarning } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
+import { healthColor } from '../lib/paymentStamps'
 
 
 /**
@@ -121,7 +122,7 @@ export function TenantsPage() {
           {/* S655 (Nic, 10/2): no SSI/SSDI column. "That's our check for the
               flex products" — GAM-side only. */}
           <table className="data-table" style={{minWidth:880}}>
-            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Charges paid on time, work trade counted as paid">Payment health</th><th>Rent</th><th>ACH</th></tr></thead>
+            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Months paid on time since joining GAM — judged on the whole month's bill after its grace period; late fees never count as a bill; a month work trade covers counts as on time">Payment health</th><th>Rent</th><th>ACH</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (
                 <tr key={u.id} onClick={() => u.tenantId && navigate(`/tenants/${u.tenantId}`)} style={{ cursor: u.tenantId ? 'pointer' : 'default' }}>
@@ -129,11 +130,13 @@ export function TenantsPage() {
                   <td className="mono">{u.unitNumber}</td>
                   <td style={{fontSize:'.82rem'}}>{u.propertyName}</td>
                   {/* S652 (Nic): the percentage on the first screen, between property
-                      and rent. Work trade reads 100% — hours paid it. */}
+                      and rent. 10/12 (Nic): the one definition — months paid on
+                      time since the household joined GAM (all time, per bill month). */}
                   <td className="mono">{u.paymentHealth == null
                     ? <span style={{color:'var(--text-3)'}}>—</span>
-                    : <span style={{fontWeight:700,color:Number(u.paymentHealth)>=90?'var(--green)':Number(u.paymentHealth)>=70?'var(--amber)':'var(--red)'}}>{Number(u.paymentHealth)}%</span>}</td>
-                  <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}
+                    : <span style={{fontWeight:700,color:healthColor(Number(u.paymentHealth))}}>{Number(u.paymentHealth)}%</span>}</td>
+                  {/* 10/12 (Nic): the lease's rent, not the space's listed price (the Rent Roll's figure). */}
+                  <td className="mono">{(u.leaseRentAmount ?? u.rentAmount) ? `$${Number(u.leaseRentAmount ?? u.rentAmount).toLocaleString()}` : '—'}
                     {u.workTradeRent && <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>traded for work</div>}</td>
                   {/* S640 (Nic): a work-trade resident pays in hours and will
                       never link a bank, so "ACH pending" is a chore that can

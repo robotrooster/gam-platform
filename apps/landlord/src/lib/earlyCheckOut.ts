@@ -37,6 +37,16 @@ export interface CheckoutQuote {
   }>
   canRefund: boolean
   canCheckOut?: boolean
+  /**
+   * 10/12 (Nic, G6): rent for nights after the day they left that a payment
+   * was tried on. Checking out ends the lease that day, and the landlord
+   * chooses, with the check-out: take those charges off, or keep them owed.
+   */
+  pastEndAttempted?: {
+    words: string
+    charges: Array<{ paymentId: string; dueDate: string; amount: number }>
+    choices: { void: string; keep: string }
+  } | null
   waitsForRefund: string | null
   /** For staff without "Check guests out" on a guest who still owes. */
   waitsForCheckOut?: string | null

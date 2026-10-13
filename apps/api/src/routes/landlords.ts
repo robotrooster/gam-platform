@@ -7,6 +7,8 @@ import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
 // owns; writes name their target and are authorized against it.
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
+// 10/12 (Nic): one rule for "can this account's rent be paid out".
+import { payoutReadiness } from '../lib/payoutReadiness'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
@@ -50,6 +52,8 @@ import { unitNumberNeedsPrefix } from '@gam/shared'
 import { checkAgainstStatute } from '../services/stateLaw'
 import { assertLateFeeDecisionForUnit, assertLateFeeDecision } from '../services/lateFeePolicy'
 import { assertUnitCanAcceptNewLease } from '../services/leaseOnboarding'
+// 10/12 (Nic): the one lateness rule every money screen and the late-fee engine share.
+import { graceDaysSql, lateCountsFromSql, pastGraceSql, propertyDaySql, writtenAtSql } from '../services/lateness'
 import {
   recordValidateAttempt,
   recordCommitAttempt,
@@ -146,20 +150,18 @@ export const adminLandlordsListHandler = async (req: any, res: any, next: any) =
         -- billing card — while GAM was perfectly able to pay them and deduct
         -- its fee from those payouts.
         --
-        -- Connect IS the billing account. There is no second one. The legacy
-        -- catalog still counts, for the multi-owner allocation-split case that
-        -- genuinely uses it.
+        -- Connect IS the billing account. There is no second one.
         --
         -- The same fix landed on /me/todos in S605 and on /auth/me earlier this
         -- session; THIS is the endpoint the Settings page actually reads, which
         -- is why the badge never changed.
-        (
-          COALESCE(l.connect_payouts_enabled, FALSE)
-          OR EXISTS (
-            SELECT 1 FROM user_bank_accounts ba
-             WHERE ba.user_id = l.user_id AND ba.status = 'active'
-          )
-        ) AS bank_account_ready
+        --
+        -- 10/12 (Nic): and ONLY Connect. The legacy catalog used to count too,
+        -- so a landlord who typed a routing number into the old Add Bank
+        -- Account form showed "ready" with no Stripe account at all — Country
+        -- Acres did exactly that on 10/5 and waited for microdeposits that
+        -- could never come. That form is gone; ready means Stripe can pay them.
+        COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready
       FROM landlords l
       JOIN users u ON u.id = l.user_id
       LEFT JOIN users pmu ON pmu.id = l.portfolio_manager_id
@@ -613,16 +615,12 @@ landlordsRouter.get('/:id', async (req, res, next) => {
         -- Nic: "the bank account on the billing should be the same account
         -- automatically as the one that Stripe has for know your customer for
         -- doing deposits. We are billing out of that same account. Landlords
-        -- can't have some separate account." Connect IS the billing account;
-        -- the legacy catalog is only still consulted for the multi-owner
-        -- allocation-split case that genuinely uses it.
-        (
-          COALESCE(l.connect_payouts_enabled, FALSE)
-          OR EXISTS (
-            SELECT 1 FROM user_bank_accounts ba
-             WHERE ba.user_id = l.user_id AND ba.status = 'active'
-          )
-        ) AS bank_account_ready
+        -- can't have some separate account." Connect IS the billing account.
+        --
+        -- 10/12 (Nic): ONLY Connect. A row in the legacy bank catalog (the old
+        -- Add Bank Account form, now removed) used to count as ready too, and
+        -- it never set up payouts — see routes/bankAccounts.ts.
+        COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready
       FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [id])
     if (!landlord) throw new AppError(404, 'Landlord not found')
     res.json({ success: true, data: landlord })
@@ -724,15 +722,26 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         -- hidden: a landlord should be able to see what the trades are worth.
         -- S650 (Nic): a HIBERNATING lease is asleep — the space stays occupied
         -- and unavailable, and nothing bills. Out of Expected, like work trade.
-        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
+        -- 10/12 (Nic): the rent the LEASE bills, not the unit's listed rent
+        -- (RV 33 lists $589; its lease bills $495) — the figure the Rent Roll
+        -- this card opens totals (services/rentRoll lease_rent): every space
+        -- an active lease holds (not retired), whatever its status says. A
+        -- space marked occupied with NO active lease bills nobody, so it adds
+        -- nothing — it used to add its listed rent, and the card read $1,750
+        -- above the Rent Roll it opens (R&N's Springville SFH TOWN HOME).
+        COALESCE(SUM(CASE WHEN al.rent_amount IS NOT NULL AND u.retired_at IS NULL
                             AND NOT COALESCE(wt.trades_rent, FALSE)
-                            AND NOT COALESCE(hb.asleep, FALSE) THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
-        COUNT(*) FILTER (WHERE u.status IN ('active','delinquent','suspended')
+                            AND NOT COALESCE(hb.asleep, FALSE) THEN al.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        -- The spaces summed into it (the card's "payable across N").
+        COUNT(*) FILTER (WHERE al.rent_amount IS NOT NULL AND u.retired_at IS NULL
+                           AND NOT COALESCE(wt.trades_rent, FALSE)
+                           AND NOT COALESCE(hb.asleep, FALSE))::int AS payable_rent_units,
+        COUNT(*) FILTER (WHERE al.rent_amount IS NOT NULL AND u.retired_at IS NULL
                            AND NOT COALESCE(wt.trades_rent, FALSE)
                            AND COALESCE(hb.asleep, FALSE))::int AS hibernating_units,
-        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
-                            AND COALESCE(wt.trades_rent, FALSE) THEN u.rent_amount ELSE 0 END),0) AS work_trade_rent,
-        COUNT(*) FILTER (WHERE u.status IN ('active','delinquent','suspended')
+        COALESCE(SUM(CASE WHEN al.rent_amount IS NOT NULL AND u.retired_at IS NULL
+                            AND COALESCE(wt.trades_rent, FALSE) THEN al.rent_amount ELSE 0 END),0) AS work_trade_rent,
+        COUNT(*) FILTER (WHERE al.rent_amount IS NOT NULL AND u.retired_at IS NULL
                            AND COALESCE(wt.trades_rent, FALSE))::int AS work_trade_units,
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
@@ -749,6 +758,14 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         SELECT TRUE AS asleep FROM leases hl
          WHERE hl.unit_id = u.id AND hl.status = 'active' AND hl.is_hibernating LIMIT 1
       ) hb ON TRUE
+      -- 10/12: the active lease's own rent (LIMIT 1: nothing at the schema
+      -- layer stops two active leases on one unit, and a duplicate must not
+      -- double the roll).
+      LEFT JOIN LATERAL (
+        SELECT rl.rent_amount FROM leases rl
+         WHERE rl.unit_id = u.id AND rl.status = 'active'
+         ORDER BY rl.start_date DESC LIMIT 1
+      ) al ON TRUE
       WHERE u.landlord_id = ANY($1)
         AND ($2::uuid IS NULL OR p.id = $2)`, [scopeIds, propertyFilter])
     // S605 (Nic): the dashboard never said that payouts were unverified, so a
@@ -837,7 +854,12 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     const trendBreakdowns = trendMonths.map(ym => ({
       ym,
-      b: breakdownFrom(basis, billedByMonth.get(ym) ?? [], receivedByMonth ? (receivedByMonth.get(ym) ?? []) : null),
+      // 10/12 (Nic, review): each month's own end — on the books Owed is the
+      // balance on the last day of THAT month, not of the six read together.
+      b: breakdownFrom(basis, billedByMonth.get(ym) ?? [], receivedByMonth ? (receivedByMonth.get(ym) ?? []) : null, {
+        start: `${ym}-01`,
+        end: new Date(Date.UTC(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), 0)).toISOString().slice(0, 10),
+      }),
     }))
     const trend = trendBreakdowns.map(({ ym, b }) => {
       const rent = b.categories.find(c => c.category === 'space_rent')?.amount ?? 0
@@ -1039,6 +1061,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
        WHERE u.landlord_id = ANY($1)
          AND p.status IN ('pending', 'failed')
          AND p.work_trade_suspended_at IS NULL
+         -- 10/12 (Nic): a $0 line is ignored — nothing is owed on it, so a unit
+         -- whose only open line is $0 does not "owe" (past grace already
+         -- ignored it; the headline said "owes" with nothing owed).
+         AND p.amount > 0
          AND NOT EXISTS (
            SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
          AND ($2::uuid IS NULL OR u.property_id = $2)`, [scopeIds, propertyFilter])
@@ -1065,13 +1091,59 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     //                       not exempt, and the onboarding first-bill waiver
     //                       does not apply (the same test the late-fee engine
     //                       makes, voided history invoices excluded).
+    //
+    // 10/12 (Nic): past grace is the one lateness rule (services/lateness) the
+    // late-fee engine, Outstanding, the Rent Roll and the 7am delinquency job
+    // share. It said "today > due + grace", counted from the due date: on the
+    // first late day (the 6th, with 5 days of grace) the fee charged and this
+    // said not past grace, and a bill written after its due date ("late counts
+    // from the DAY IT WAS WRITTEN") read past grace days early. Now: late from
+    // the lateness start (the due date, or the day GAM wrote the charge when
+    // later — writtenAtSql) + GREATEST(grace, 1): with a grace of 0, the day
+    // after. A $0 line is never owed, so it is never past grace.
+    //
+    // 10/12: "more than $0" is either fee. Every Oak Park lease has a $0 first
+    // fee and $5 a day counted back to the due date (68 active leases); the
+    // engine charges them, and this read "no fee will be charged" for every one.
+    //
+    // 10/12 (Nic, Q-a): a charge added to a bill already late "rides the
+    // original due date" — the late-fee engine starts its clock on the day the
+    // BILL was written (jobs/lateFees qualifyingInvoicesSql: i.created_at), not
+    // the day the line was. So "accruing" — the same test the engine makes —
+    // reads the engine's clock (engine_past_grace): a $40 utility line joined
+    // to a bill due 10 days ago is fined that night, and the card said nothing
+    // was accruing. Also as the engine: a charge on no bill is never fined (the
+    // engine fines bills only); a home-sale installment added to a bill after
+    // its first late day never keeps the bill late; a bill already fined keeps
+    // its fees running; and nothing is fined while a payment on the bill is
+    // still clearing (the postmark rule). Past grace itself (Outstanding vs
+    // delinquent) stays on each line's own clock, the shared rule
+    // (services/lateness writtenAtSql) — whether Outstanding, the delinquency
+    // trigger and credit history should ride the bill's clock too is Nic's.
+    const today = propertyDaySql('NOW()', 'pr')
+    const lateStart = lateCountsFromSql('p.due_date', propertyDaySql(writtenAtSql('p'), 'pr'), today)
+    const engineStart = lateCountsFromSql('i.due_date', propertyDaySql('i.created_at', 'pr'), today)
+    const grace = graceDaysSql('l', 'pr')
     const [delinq] = await query<any>(`
       WITH open_rows AS (
         SELECT p.unit_id, i.id AS invoice_id,
-               ((NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
-                  > p.due_date + COALESCE(l.late_fee_grace_days, pr.late_fee_grace_days, 5)) AS past_grace,
+               (p.amount > 0 AND ${pastGraceSql(today, lateStart, grace)}) AS past_grace,
+               (p.amount > 0 AND i.id IS NOT NULL
+                 AND NOT (p.home_sale_installment_id IS NOT NULL
+                          AND ${propertyDaySql('p.created_at', 'pr')} > ${propertyDaySql('i.created_at', 'pr')}
+                          AND ${pastGraceSql(propertyDaySql('p.created_at', 'pr'), engineStart, grace)})
+                 AND NOT EXISTS (SELECT 1 FROM payments pf
+                                  WHERE pf.invoice_id = i.id AND pf.type <> 'late_fee' AND pf.status = 'processing')
+                 AND (${pastGraceSql(today, engineStart, grace)}
+                      -- jobs/lateFees CHARGED_LATE_FEE_STATUSES_SQL: a fee charged on the bill.
+                      OR EXISTS (SELECT 1 FROM payments lf
+                                  WHERE lf.invoice_id = i.id AND lf.type = 'late_fee'
+                                    AND lf.status IN ('pending', 'processing', 'settled', 'failed', 'paid_via_deposit')))) AS engine_past_grace,
                (COALESCE(l.late_fee_enabled, false)
-                 AND COALESCE(l.late_fee_initial_amount, 0) > 0
+                 AND l.late_fee_initial_amount IS NOT NULL
+                 AND (l.late_fee_initial_amount > 0
+                      OR (l.late_fee_accrual_type IS NOT NULL AND l.late_fee_accrual_period IS NOT NULL
+                          AND COALESCE(l.late_fee_accrual_amount, 0) > 0))
                  AND NOT COALESCE(i.late_fee_exempt, false)
                  AND NOT (COALESCE(l.is_existing_tenancy, false)
                           AND COALESCE(pr.onboarding_late_fee_waiver, false)
@@ -1090,7 +1162,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
            AND NOT EXISTS (SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
            AND ($2::uuid IS NULL OR u.property_id = $2))
       SELECT COUNT(DISTINCT unit_id) FILTER (WHERE past_grace)::int AS past_grace_units,
-             COUNT(DISTINCT unit_id) FILTER (WHERE past_grace AND fee_reaches)::int AS accruing_units
+             COUNT(DISTINCT unit_id) FILTER (WHERE engine_past_grace AND fee_reaches)::int AS accruing_units
         FROM open_rows`, [scopeIds, propertyFilter])
 
     // Leases expiring soon — active leases whose end_date falls inside the next
@@ -1222,100 +1294,11 @@ landlordsRouter.get('/:id/next-payout', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
-  try {
-    // S633: a rent roll is a list of what is rented — an account's, across every
-    // company it owns, unless an explicit entity is named.
-    const rentRollIds = req.params.id === 'me' && req.user!.role === 'landlord'
-      ? landlordScopeIds(req.user!)
-      : [req.params.id]
-    if (!rentRollIds.every(x => canViewLandlordFinances(req.user, x))) {
-      throw new AppError(403, 'Forbidden')
-    }
-    // S637 (Nic): "The rent roll page has nothing... there's active leases on
-    // both properties at this point, so it should be showing something."
-    //
-    // The S633 conversion was done HALFWAY here, which is worse than not at
-    // all: it built the full entity set, authorized EVERY id in it — and then
-    // queried with `rentRollIds[0]`. So the permission check said "you may see
-    // both companies" and the query returned one, whichever sorted first. On an
-    // account with two companies the roll silently lost half the portfolio, and
-    // the Expected Monthly Rent KPI it exists to explain disagreed with it.
-    //
-    // A rent roll is a list of what is rented. It spans the account.
-    const rows = await query<any>(`
-      SELECT u.id AS unit_id, u.unit_number, u.status, u.rent_amount,
-        p.id AS property_id, p.name AS property_name,
-        l.id AS lease_id, l.start_date, l.end_date, l.lease_type,
-        vuo.primary_first_name AS tenant_first,
-        vuo.primary_last_name AS tenant_last,
-        vuo.tenant_count,
-        -- ── S640 (Nic): "RV nine is showing active, but no name in there on the
-        -- expected monthly rent. Oh — that's because the lease is starting for
-        -- October first, not now." ────────────────────────────────────────────
-        --
-        -- He worked it out himself, which is the tell: the page made him. A
-        -- space held for somebody who has signed for next month is not the same
-        -- as a space with nobody on it, and the roll showed them identically —
-        -- a blank name beside a rent figure. Name the incoming resident and the
-        -- date, and there is nothing left to work out.
-        up.first_name AS upcoming_first, up.last_name AS upcoming_last,
-        up.start_date AS upcoming_start,
-        -- S640: this page explains the Expected Monthly Rent card, so it has to
-        -- split the roll the same way the card does. A traded space stays on
-        -- the list — it IS rented, and hiding it would make the roll disagree
-        -- with the unit count beside it — but its rent is labeled and totaled
-        -- separately, because it is never arriving as money.
-        COALESCE(wt.trades_rent, FALSE) AS work_trade,
-        -- S650: asleep — listed, totaled apart, never payable.
-        COALESCE(l.is_hibernating, FALSE) AS hibernating
-      FROM units u
-      JOIN properties p ON p.id = u.property_id
-      LEFT JOIN LATERAL (
-        SELECT TRUE AS trades_rent FROM work_trade_agreements a
-         WHERE a.unit_id = u.id AND a.status = 'active'
-           AND 'rent' = ANY(a.covered_charges) LIMIT 1
-      ) wt ON TRUE
-      -- LATERAL + LIMIT 1: nothing enforces one active lease per unit at the
-      -- schema layer, and a stray duplicate would double-count the roll.
-      LEFT JOIN LATERAL (
-        SELECT id, start_date, end_date, lease_type, is_hibernating FROM leases
-        WHERE unit_id = u.id AND status = 'active'
-        ORDER BY start_date DESC LIMIT 1
-      ) l ON TRUE
-      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
-      -- Only consulted when there is no active lease — an occupied space is
-      -- described by who lives there now, never by who is arriving.
-      LEFT JOIN LATERAL (
-        SELECT us.first_name, us.last_name, fl.start_date
-          FROM leases fl
-          JOIN lease_tenants flt ON flt.lease_id = fl.id AND flt.role = 'primary'
-          JOIN tenants ft ON ft.id = flt.tenant_id
-          JOIN users us ON us.id = ft.user_id
-         WHERE fl.unit_id = u.id AND l.id IS NULL
-           AND fl.status IN ('active', 'pending')
-           AND fl.start_date > CURRENT_DATE
-         ORDER BY fl.start_date ASC LIMIT 1
-      ) up ON TRUE
-      WHERE u.landlord_id = ANY($1::uuid[])
-        AND u.status IN ('active','delinquent','suspended')
-      ORDER BY p.name, u.unit_number`, [rentRollIds])
-    // A hibernating lease with a (paused) trade is asleep first: nothing is
-    // owed in money OR in hours while it sleeps.
-    for (const r of rows as any[]) if (r.hibernating) r.work_trade = false
-    const cash = rows.filter((r: any) => !r.work_trade && !r.hibernating)
-        .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
-    const traded = rows.filter((r: any) => r.work_trade)
-        .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
-    res.json({ success: true, data: {
-      rows,
-      total: Math.round(cash * 100) / 100,
-      work_trade_total: Math.round(traded * 100) / 100,
-      work_trade_units: rows.filter((r: any) => r.work_trade).length,
-      hibernating_units: rows.filter((r: any) => r.hibernating).length,
-    } })
-  } catch (e) { next(e) }
-})
+// 10/12 (Nic): GET /:id/rent-roll is retired. The Rent Roll is the combined
+// page now (GET /api/balances/rent-roll, services/rentRoll): one row per
+// household with the LEASE's rent — this listed each unit's advertised rent
+// (RV 33 at $589 while its lease bills $495) — plus what was charged, paid and
+// owed and how on time they pay. Nothing calls this route any more.
 
 // POST /api/landlords/complete-onboarding
 // S131: stays requireLandlord — only the landlord themselves finishes
@@ -1703,36 +1686,27 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     const scopeIds = landlordScopeIds(req.user!)
     const userId = req.user!.userId
 
-    // S67: bank readiness derives from active user_bank_accounts. The
-    // landlord's user_id is the catalog owner under the 16a per-property
-    // routing model. Owner-financial concern — always shown to the
-    // calling owner regardless of property delegation.
+    // Owner-financial concern — always shown to the calling owner regardless
+    // of property delegation.
     // S605 (Nic): this asked "have you added a row to the legacy bank catalog?"
     // — but rent pays out through STRIPE CONNECT (autoPayouts.ts fires
     // stripe.payouts.create against the Connect account and never reads that
     // table). So a landlord who completed Stripe onboarding, bank account and
     // all, was still told to "Add a bank account", which read as though the
     // whole Stripe process hadn't saved. Ready now means what it actually
-    // means: Stripe can pay you. The legacy catalog still counts, for the
-    // multi-owner allocation-split case that does use it.
-    // READY IF ANY ENTITY IN SCOPE CAN BE PAID. A co-owner of a fully set-up
-    // entity must not be nagged about the empty one registration gave them —
-    // there is no money in it to route anywhere. If they later add a property
-    // of their own, the entity stops being empty and the gate correctly
-    // returns, which is when it actually matters.
-    const bankReady = await queryOne<{ ready: boolean }>(`
-      SELECT EXISTS (
-        SELECT 1 FROM landlords l
-         WHERE l.id = ANY($1)
-           AND (
-             l.connect_payouts_enabled
-             OR EXISTS (
-               SELECT 1 FROM user_bank_accounts ba
-                WHERE ba.user_id = l.user_id AND ba.status = 'active'
-             )
-           )
-      ) AS ready
-    `, [scopeIds])
+    // means: Stripe can pay you.
+    // 10/12 (Nic): and nothing else. The legacy catalog used to count as well,
+    // so a row typed into the old Add Bank Account form cleared this task with
+    // no Stripe account behind it (Country Acres, 10/5). That form is removed.
+    // A co-owner of a fully set-up entity must not be nagged about the empty
+    // one registration gave them — there is no money in it to route anywhere.
+    // 10/12 (Nic): but "any entity in scope can be paid" also let a paid
+    // company answer for one that HAS a property. Blu co-owns Oak Park (paid)
+    // and owns TruBlu Management LLC (Country Acres, no Stripe account), and
+    // this to-do never showed. Ready now means every company with a property
+    // can be paid; only when none has a property does "any company can be
+    // paid" decide. One rule, shared with the agent: lib/payoutReadiness.ts.
+    const payouts = await payoutReadiness(scopeIds)
 
     // ── LEASE ISSUES ──────────────────────────────────────
     // needs_review OR expiring within that lease's own expiration_notice_days window
@@ -1858,14 +1832,23 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       })
     }
 
-    // 1. Landlord has no active bank account in their catalog yet
-    if (!bankReady?.ready) {
+    // 1. No company in scope can be paid by Stripe yet.
+    // 10/12 (Nic): the wording sent people to type a bank account into the old
+    // catalog form, which never set up payouts. Name what is actually needed.
+    if (!payouts.ready) {
+      // 10/12 (Nic): with several companies, say WHICH one can't be paid —
+      // "set up payouts" read as done to an owner whose other company was
+      // already paid. One unpaid company opens the page already on it.
+      const names = payouts.unpaid.map((c) => c.businessName || 'Unnamed company')
+      const named = scopeIds.length > 1 && names.length > 0
       ach.push({
         id: 'landlord-bank',
         type: 'landlord_bank',
-        title: 'Add a bank account',
-        subtitle: 'Required to receive disbursements. Add via the Banking page.',
-        href: '/banking',
+        title: 'Set up payouts',
+        subtitle: named
+          ? `${names.join(', ')} can't be paid yet. Verify ${names.length === 1 ? 'it' : 'them'} with Stripe on the Disbursement Account page.`
+          : 'Required to receive rent. Verify your business with Stripe on the Disbursement Account page.',
+        href: named && payouts.unpaid.length === 1 ? `/banking?entity=${payouts.unpaid[0].id}` : '/banking',
       })
     }
 
@@ -6484,7 +6467,9 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
          FROM landlord_gam_charges c
          LEFT JOIN properties p ON p.id = c.property_id
          LEFT JOIN landlords  l ON l.id = c.landlord_id
-        WHERE c.landlord_id = ANY($1::uuid[])
+        -- 10/12 (ledger P0): a charge GAM took back is voided and kept, where it
+        -- used to be deleted; it stays off this list as it did then.
+        WHERE c.landlord_id = ANY($1::uuid[]) AND c.voided_at IS NULL
         ORDER BY c.created_at DESC
         LIMIT 200`,
       [landlordIds])

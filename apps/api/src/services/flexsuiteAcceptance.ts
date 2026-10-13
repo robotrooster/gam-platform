@@ -368,9 +368,10 @@ export async function getPendingReAcceptances(
                WHERE sd.tenant_id = $1
                  AND sd.flex_deposit_enabled = TRUE
                  AND sd.flex_deposit_plan_status IN ('active','accelerated')
+                 AND sd.status <> 'voided'
             ) AS enrolled,
             (SELECT installment_count FROM security_deposits
-              WHERE tenant_id = $1 AND flex_deposit_enabled = TRUE
+              WHERE tenant_id = $1 AND flex_deposit_enabled = TRUE AND status <> 'voided'
               ORDER BY created_at DESC LIMIT 1) AS installment_count,
             (SELECT a.template_version
                FROM flexsuite_enrollment_acceptances a
@@ -438,6 +439,7 @@ export async function renderReAcceptanceTerms(args: {
       WHERE sd.tenant_id = $1
         AND sd.flex_deposit_enabled = TRUE
         AND sd.flex_deposit_plan_status = 'active'
+        AND sd.status <> 'voided'
       ORDER BY sd.created_at DESC LIMIT 1`,
     [args.tenantId],
   )

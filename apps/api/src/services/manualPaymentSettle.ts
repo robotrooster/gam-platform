@@ -71,7 +71,7 @@ import {
 } from './creditUse'
 import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } from './allocation'
 import { afterRowsSettled } from './settleHooks'
-import { reconcileSettledDepositPayment, type DepositRecordRaised } from './leaseFeesSync'
+import { reconcileSettledDepositPayment, stampDepositCollectedBy, type DepositRecordRaised } from './leaseFeesSync'
 import { logger } from '../lib/logger'
 import { activateBillingForMoneyMoved } from './billingActivation'
 import { PART_PAYMENT_REST_NOTE } from './creditLedgerEmitters'
@@ -527,6 +527,11 @@ export async function deskQuote(
  */
 async function recordDepositsCollected(client: PoolClient, settledIds: readonly string[]): Promise<DepositRecordRaised[]> {
   if (settledIds.length === 0) return []
+  // 10/12 (Nic, ledger P1): who collected each deposit payment settled here
+  // is stored now (payments.deposit_collected_by) — every one, a pet, key or
+  // cleaning deposit and a reopened move-out charge included, though only a
+  // security deposit moves its record below.
+  await stampDepositCollectedBy(client, settledIds)
   // Fix pass 2 (review): a reopened deposit charge of a finalized move-out,
   // paid again here, is no deposit held for the tenancy: resolveReopenedPaidAgain
   // (run first) stamped it as that move-out's money, refilling what a dispute

@@ -608,6 +608,9 @@ describe('the whole-bill rule', () => {
     const h = await household()
     await generateInvoices(new Date('2026-08-01T15:00:00Z'))
     const inv = (await db.query<{ id: string }>(`SELECT id FROM invoices WHERE lease_id = $1 AND due_date = '2026-08-01'`, [h.leaseId])).rows[0]
+    // 10/12 (Nic): the run wrote it on August 1st (replayed today, it is
+    // stamped today — and a bill written after its due date counts from then).
+    await db.query(`UPDATE invoices SET created_at = '2026-08-01T15:00:00Z' WHERE id = $1`, [inv.id])
     // A goodwill credit for the whole bill lands after the bill went out —
     // created straight on the table, so the after-commit check has not run.
     await db.query(

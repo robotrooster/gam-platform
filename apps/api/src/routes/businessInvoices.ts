@@ -660,6 +660,7 @@ businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) =
         if (refund.heldOnPlatform) {
           await recordHeldItem({
             businessId, sourceType: 'refund', sourceId: refund.refundId,
+            property: { propertyId: null },  // 10/12 (Nic, ledger P1): a business's line is company-level
             amount: -take, description: `Refund on invoice ${inv.invoice_number}`,
           })
         }

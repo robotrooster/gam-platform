@@ -74,8 +74,9 @@ async function owes(p: { landlordId: string; propertyId: string }, tenantId: str
     [p.landlordId, tenantId, s.leaseId, s.unitId, `INV-LD-${++seq}`, dueDate, total])
   for (const [type, amt] of lines) {
     await db.query(
-      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9)`,
+      // 10/12: written on its due date, so lateness counts from the due date.
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$8::date)`,
       [inv.rows[0].id, s.unitId, s.leaseId, tenantId, p.landlordId, type, amt, dueDate, type.toUpperCase()])
   }
   return s
@@ -97,7 +98,9 @@ describe('S654 runLateBalanceDigest', () => {
     expect(ctx.landlordId).toBe(p.landlordId)
     expect(items).toHaveLength(2)
     const billyLine = items.find((i: any) => i.tenantId === billy)
-    expect(billyLine).toMatchObject({ tenantName: 'Billy Miranda', amount: 902.29, daysLate: 30 })
+    // 10/12 (Nic): days past the grace period — due 30 days ago, the 5 grace
+    // days are the due day and the 4 after it, so 26 days past grace.
+    expect(billyLine).toMatchObject({ tenantName: 'Billy Miranda', amount: 902.29, daysLate: 26 })
     expect(billyLine.unitNumber.split(', ').sort()).toEqual(['RV 34', 'RV 35'])
     expect(items.find((i: any) => i.tenantId === rashawn).amount).toBe(1462)
     expect(items.reduce((s: number, i: any) => s + i.amount, 0)).toBeCloseTo(2364.29, 2)
@@ -137,6 +140,26 @@ describe('S654 runLateBalanceDigest', () => {
     expect(digestMock).not.toHaveBeenCalled()
   })
 
+  // 10/12: the email says each person has "a balance past its grace period" —
+  // so a bill still inside its grace is not in the amount (on 10/2–10/5 a
+  // household late on September's electric was listed with October's rent too).
+  it('only what is past its grace period is in the amount', async () => {
+    const p = await company()
+    const t = await resident('Sam Lateelectric')
+    const s = await owes(p, t, 'RV 44', daysAgo(30), [['utility', 40]])
+    const inv = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
+       VALUES ($1,$2,$3,$4,$5,$6,495,'pending') RETURNING id`,
+      [p.landlordId, t, s.leaseId, s.unitId, `INV-LD-${++seq}`, daysAgo(2)])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,$5,'rent',495,'pending',$6,'RENT',$6::date)`,
+      [inv.rows[0].id, s.unitId, s.leaseId, t, p.landlordId, daysAgo(2)])
+    await runLateBalanceDigest()
+    const { items } = digestMock.mock.calls[0][0]
+    expect(items).toEqual([expect.objectContaining({ tenantId: t, amount: 40 })])
+  })
+
   it('a unit in eviction mode is left out', async () => {
     const p = await company()
     const s = await owes(p, await resident('Josh Roby'), 'MH 03', daysAgo(10), [['rent', 440]])
@@ -174,6 +197,6 @@ describe('S655 the digest is the full overdue balance', () => {
       [inv, s.unitId, s.leaseId, t, p.landlordId, daysAgo(2)])
     await runLateBalanceDigest()
     const { items } = digestMock.mock.calls[0][0]
-    expect(items).toEqual([expect.objectContaining({ tenantId: t, amount: 455, daysLate: 10 })])
+    expect(items).toEqual([expect.objectContaining({ tenantId: t, amount: 455, daysLate: 6 })])
   })
 })

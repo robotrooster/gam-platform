@@ -16,14 +16,16 @@
  */
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
-import { processingFeeFor } from '@gam/shared'
+import { processingFeeFor, HELD_ITEM_SOURCES, type HeldItemSource } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { disputeFeePropertySql } from './incomeBasis'
 
-export const HELD_ITEM_SOURCES = [
-  'pos_sale', 'booking_deposit', 'business_invoice_payment',
-  'business_pos_sale', 'refund', 'dispute', 'platform_fee', 'prepaid_draw',
-] as const
-export type HeldItemSource = typeof HELD_ITEM_SOURCES[number]
+// 10/12 (Nic, ledger P0): the list lives in @gam/shared now, next to the
+// table's CHECK it mirrors — it was declared here and left out
+// 'deposit_settlement', which the table has allowed since S655 (the move-out
+// writers had to go around recordHeldItem in raw SQL to write one).
+export { HELD_ITEM_SOURCES }
+export type { HeldItemSource }
 
 export interface HeldItem {
   landlordId?: string | null
@@ -32,6 +34,135 @@ export interface HeldItem {
   sourceId: string
   amount: number
   description?: string
+  /**
+   * 10/12 (Nic, ledger P1): the property this line belongs to, written with
+   * it (held_payout_items.property_id) — the ledger keeps every line on its
+   * property. Required, so no writer can forget it: name it outright, or name
+   * the thing the line is about and it is read from that (HeldItemProperty).
+   * `{ propertyId: null }` only for a company-level line (a business's).
+   */
+  property: HeldItemProperty
+}
+
+/**
+ * 10/12 (Nic, ledger P1) — where a held line's property comes from, read in
+ * the same INSERT that writes the line (so it is what was true then):
+ *   propertyId   the writer knows it (null: company-level — a business's line)
+ *   paymentId    the charge row's space
+ *   reversalId   the disputed or returned payment's space
+ *   leaseId      the lease's space · unitId the space's property
+ *   bookingId    the booking's site · saleId the register sale's property
+ *   creditUseId  the paid-ahead money's property (the lease that received it)
+ *   refundPartId a stay, move-out or paid-ahead refund part's space
+ *   depositReturnId a move-out's space
+ *   charge       a Stripe charge (PaymentIntent): the one property it paid for
+ *                this landlord; null when it paid at more than one (company-level)
+ *   disputeFeeLine  a rent dispute's fee line ('stripe_fee_kept:…', and its
+ *                won-dispute give-back): its source id. 10/12 (ledger P1
+ *                review): placed by the ONE rule Money received and the owner
+ *                statement place it by (incomeBasis.disputeFeePropertySql:
+ *                the remittance's lease, else the largest share, else the bills
+ *                its paid-ahead money paid, else the lease it arrived on, else
+ *                the landlord's first property) — never company-level, so the
+ *                stored property ties to the statement it is on. ('charge'
+ *                gave NULL for a charge that paid at two properties, or that
+ *                reached its bills only as paid-ahead money.)
+ */
+export type HeldItemProperty =
+  | { propertyId: string | null }
+  | { paymentId: string }
+  | { reversalId: string }
+  | { leaseId: string }
+  | { unitId: string }
+  | { bookingId: string }
+  | { saleId: string }
+  | { creditUseId: string }
+  | { refundPartId: string }
+  | { depositReturnId: string }
+  | { charge: string }
+  | { disputeFeeLine: string }
+
+/** The property expression for one HeldItemProperty: `$k` is its key, `$l` the landlord. */
+export function heldItemPropertySql(p: HeldItemProperty, k: string, l: string): { sql: string; key: string | null } {
+  if ('propertyId' in p) return { sql: `${k}::uuid`, key: p.propertyId }
+  if ('paymentId' in p) {
+    return { sql: `(SELECT hu.property_id FROM payments hp JOIN units hu ON hu.id = hp.unit_id WHERE hp.id = ${k}::uuid)`, key: p.paymentId }
+  }
+  if ('reversalId' in p) {
+    return {
+      sql: `(SELECT hu.property_id FROM payment_reversals hr JOIN payments hp ON hp.id = hr.payment_id
+               JOIN units hu ON hu.id = hp.unit_id WHERE hr.id = ${k}::uuid)`,
+      key: p.reversalId,
+    }
+  }
+  if ('leaseId' in p) {
+    return { sql: `(SELECT hu.property_id FROM leases hl JOIN units hu ON hu.id = hl.unit_id WHERE hl.id = ${k}::uuid)`, key: p.leaseId }
+  }
+  if ('unitId' in p) return { sql: `(SELECT hu.property_id FROM units hu WHERE hu.id = ${k}::uuid)`, key: p.unitId }
+  if ('bookingId' in p) {
+    return { sql: `(SELECT hu.property_id FROM unit_bookings hb JOIN units hu ON hu.id = hb.unit_id WHERE hb.id = ${k}::uuid)`, key: p.bookingId }
+  }
+  if ('saleId' in p) return { sql: `(SELECT ht.property_id FROM pos_transactions ht WHERE ht.id = ${k}::uuid)`, key: p.saleId }
+  if ('creditUseId' in p) {
+    return {
+      sql: `(SELECT hu.property_id FROM credit_uses hc
+               LEFT JOIN lease_prepaid_credits hpc ON hpc.id = hc.prepaid_credit_id
+               JOIN leases hl ON hl.id = COALESCE(hpc.received_lease_id, hpc.lease_id, hc.lease_id)
+               JOIN units hu ON hu.id = hl.unit_id
+              WHERE hc.id = ${k}::uuid)`,
+      key: p.creditUseId,
+    }
+  }
+  if ('refundPartId' in p) {
+    return {
+      sql: `(SELECT COALESCE(bu.property_id, du.property_id, cu.property_id, pu.property_id)
+               FROM stay_refund_parts hrp
+               LEFT JOIN unit_bookings hb ON hb.id = hrp.booking_id
+               LEFT JOIN units bu ON bu.id = hb.unit_id
+               LEFT JOIN deposit_returns hdr ON hdr.id = hrp.deposit_return_id
+               LEFT JOIN leases dl ON dl.id = hdr.lease_id
+               LEFT JOIN units du ON du.id = dl.unit_id
+               LEFT JOIN paid_ahead_choices hpc ON hpc.id = hrp.paid_ahead_choice_id
+               LEFT JOIN leases cl ON cl.id = hpc.lease_id
+               LEFT JOIN units cu ON cu.id = cl.unit_id
+               LEFT JOIN lease_prepaid_credits hlp ON hlp.id = hrp.prepaid_credit_id
+               LEFT JOIN leases pl ON pl.id = COALESCE(hlp.received_lease_id, hlp.lease_id)
+               LEFT JOIN units pu ON pu.id = pl.unit_id
+              WHERE hrp.id = ${k}::uuid)`,
+      key: p.refundPartId,
+    }
+  }
+  if ('disputeFeeLine' in p) {
+    return {
+      sql: `(SELECT hfp.property_id
+               FROM (SELECT ${l}::uuid AS landlord_id, 'dispute'::text AS source_type, ${k}::text AS source_id) hfl
+               CROSS JOIN LATERAL ${disputeFeePropertySql('hfl')} hfp)`,
+      key: p.disputeFeeLine,
+    }
+  }
+  if ('depositReturnId' in p) {
+    return {
+      sql: `(SELECT hu.property_id FROM deposit_returns hdr JOIN leases hl ON hl.id = hdr.lease_id
+               JOIN units hu ON hu.id = hl.unit_id WHERE hdr.id = ${k}::uuid)`,
+      key: p.depositReturnId,
+    }
+  }
+  return {
+    sql: `(SELECT CASE WHEN COUNT(DISTINCT hx.pid) = 1 THEN (array_agg(hx.pid))[1] END FROM (
+             SELECT hu.property_id AS pid FROM payments hp JOIN units hu ON hu.id = hp.unit_id
+              WHERE hp.stripe_payment_intent_id = ${k}::text AND hp.landlord_id = ${l}::uuid
+             UNION ALL
+             SELECT ht.property_id FROM pos_transactions ht
+              WHERE ht.stripe_payment_intent_id = ${k}::text AND ht.landlord_id = ${l}::uuid
+             UNION ALL
+             SELECT hu.property_id FROM unit_bookings hb JOIN units hu ON hu.id = hb.unit_id
+              WHERE hb.stripe_payment_intent_id = ${k}::text AND hb.landlord_id = ${l}::uuid
+             UNION ALL
+             SELECT hh.property_id FROM pos_held_payments hh
+              WHERE hh.stripe_payment_intent_id = ${k}::text AND hh.landlord_id = ${l}::uuid
+           ) hx WHERE hx.pid IS NOT NULL)`,
+    key: p.charge,
+  }
 }
 
 type Runner = Pick<PoolClient, 'query'>
@@ -58,11 +189,13 @@ export async function recordHeldItem(item: HeldItem, runner?: Runner): Promise<b
   const amount = Math.round(item.amount * 100) / 100
   if (amount === 0) return false
   if (!item.landlordId === !item.businessId) throw new Error('A held item has exactly one payee')
-  const sql = `INSERT INTO held_payout_items (landlord_id, business_id, source_type, source_id, amount, description)
-               VALUES ($1, $2, $3, $4, $5, $6)
+  // 10/12 (Nic, ledger P1): a business has no properties — its lines are company-level.
+  const where = item.businessId ? { sql: '$7::uuid', key: null } : heldItemPropertySql(item.property, '$7', '$1')
+  const sql = `INSERT INTO held_payout_items (landlord_id, business_id, source_type, source_id, amount, description, property_id)
+               VALUES ($1::uuid, $2, $3, $4, $5, $6, ${where.sql})
                ON CONFLICT (source_type, source_id) DO NOTHING
                RETURNING id`
-  const params = [item.landlordId ?? null, item.businessId ?? null, item.sourceType, item.sourceId, amount, item.description ?? null]
+  const params = [item.landlordId ?? null, item.businessId ?? null, item.sourceType, item.sourceId, amount, item.description ?? null, where.key]
   const rows = runner ? (await runner.query(sql, params)).rows : await query(sql, params)
   return rows.length > 0
 }
@@ -238,6 +371,7 @@ async function chargebackUnderLock(
     const recorded = await recordHeldItem({
       landlordId: payee.landlord_id, businessId: payee.business_id,
       sourceType: 'dispute', sourceId: wonChargebackReturnSourceId(input.stripeDisputeId),
+      property: { charge: pi },  // 10/12 (Nic, ledger P1): the disputed charge's property
       amount: backCents / 100,
       description: `Chargeback on a ${payee.what} given back: the card company decided the dispute for us`,
     }, client)
@@ -267,6 +401,7 @@ async function chargebackUnderLock(
   const recorded = await recordHeldItem({
     landlordId: payee.landlord_id, businessId: payee.business_id,
     sourceType: 'dispute', sourceId: input.stripeDisputeId,
+    property: { charge: pi },  // 10/12 (Nic, ledger P1): the disputed charge's property
     amount: -owedBack, description: `Chargeback on a ${payee.what} (includes Stripe's dispute fee)`,
   }, client)
   if (!recorded) return { handled: false, reason: 'already recorded' }

@@ -37,8 +37,16 @@
 // this a trade rather than paid labor — the cap that used to enforce that
 // (clamping a single month to 100%) still holds per month, it just no longer
 // throws the excess away.
+//
+// 10/12 (Nic) — UNLESS THE LANDLORD PAYS FOR EXTRA HOURS. Per agreement, the
+// landlord picks what hours beyond what a month and any carried shortfall
+// needed do: bank them (the default, everything above), or pay them at an
+// hourly rate (`extraHours: 'pay'`). Paid extra hours come back as
+// `payableHours` and do not bank. Banked hours still never become cash: new
+// work always meets the needs first, so what is paid is only work beyond them.
 
 import { round2 } from './workTradeCredit'
+import type { WorkTradeSettlementStatus } from '@gam/shared'
 
 /** Hours are logged to the quarter-hour in practice; 2dp is well inside that. */
 export function round2h(hours: number): number {
@@ -89,7 +97,8 @@ export interface PeriodOutcome {
    * persists it; a period that settles or bills stops aging.
    */
   agedCloses: number
-  status: 'open' | 'settled' | 'billed'
+  /** A run's outcome is never 'voided' (a voided period is never fed in). */
+  status: Exclude<WorkTradeSettlementStatus, 'voided'>
 }
 
 export interface SettlementInput {
@@ -110,6 +119,19 @@ export interface SettlementInput {
    * able to physically catch up."
    */
   carryForwardMonths: number
+  /**
+   * 10/12: approved hours from OLDER months that no close has counted and that
+   * their own months no longer need (an approval that landed after its month
+   * closed). New work, like `hoursWorked` — not banked credit — so it fills this
+   * month's gap before the bank does, and in 'pay' mode what is left is paid.
+   */
+  lateSurplusHours?: number
+  /**
+   * 10/12 (Nic): what approved hours beyond what this month and any carried
+   * shortfall needed do. 'bank' (default) banks them; 'pay' returns them as
+   * `payableHours` for the landlord to pay at the agreement's rate.
+   */
+  extraHours?: 'bank' | 'pay'
 }
 
 export interface SettlementResult {
@@ -125,6 +147,15 @@ export interface SettlementResult {
   billedPeriods: string[]
   /** True when a deficit aged out — the caller ends the agreement. */
   endsAgreement: boolean
+  /**
+   * 10/12: hours of NEW work this run had left over after every need — this
+   * month's, then any carried shortfall. In 'bank' mode they are inside
+   * `bankedHours` already and this says how many this run added; in 'pay' mode
+   * they are NOT banked (see `payableHours`).
+   */
+  extraHours: number
+  /** 10/12: 'pay' mode only — the extra hours the landlord pays for. 0 in 'bank'. */
+  payableHours: number
 }
 
 /**
@@ -189,10 +220,14 @@ export function proratedTarget(
  */
 export function settleMonth(input: SettlementInput): SettlementResult {
   const { periods, carryForwardMonths } = input
+  const pays = input.extraHours === 'pay'
   if (periods.length === 0) {
+    // Nothing to apply anything to: new work is all extra.
+    const fresh = round2h(Math.max(0, input.hoursWorked) + Math.max(0, input.lateSurplusHours ?? 0))
     return {
-      periods: [], bankedHours: round2h(input.bankedHours),
+      periods: [], bankedHours: round2h(Math.max(0, input.bankedHours) + (pays ? 0 : fresh)),
       billedAmount: 0, billedPeriods: [], endsAgreement: false,
+      extraHours: fresh, payableHours: pays ? fresh : 0,
     }
   }
 
@@ -220,35 +255,48 @@ export function settleMonth(input: SettlementInput): SettlementResult {
   //    ordering is what lets an old deficit actually age.
   let pool = round2h(Math.max(0, input.hoursWorked))
   pool = round2h(pool - give(closing, pool))
+  // 10/12: approvals that landed after their own (older) month closed are new
+  // work too, so they fill this month's gap next — before banked credit.
+  pool = round2h(pool + Math.max(0, input.lateSurplusHours ?? 0))
+  pool = round2h(pool - give(closing, pool))
 
-  // 2. Still short? Draw on the bank. A tenant who worked ahead has already
-  //    earned this month.
-  let bank = round2h(Math.max(0, input.bankedHours))
-  if (want(closing) > 0 && bank > 0) {
-    const drawn = give(closing, bank)
-    bank = round2h(bank - drawn)
-  }
-
-  // 3. Surplus flows back to older deficits, oldest first — catching up is the
+  // 2. Surplus flows back to older deficits, oldest first — catching up is the
   //    point of carrying hours forward at all. Each older month is credited at
   //    ITS OWN frozen rate, which happens automatically: the rate lives on the
   //    period, not on the run.
   //
-  //    The bank is spent before this month's surplus purely for tidiness; both
-  //    are hours and neither is worth more than the other.
+  //    10/12: new work goes to the older deficits BEFORE the bank. In 'bank'
+  //    mode the order changes nothing (every hour left ends up in the bank
+  //    either way, and each period receives the same total oldest-first). In
+  //    'pay' mode it is the rule Nic set: extra hours are the hours worked
+  //    beyond what the month AND any carried shortfall needed — so the
+  //    shortfall is paid down with work first, and banked credit is never
+  //    turned into wages by letting it cover a deficit the new hours would
+  //    have covered.
   const older = state.slice(0, -1)
-  for (const s of older) {
-    if (bank <= 0) break
-    const drawn = give(s, bank)
-    bank = round2h(bank - drawn)
-  }
   for (const s of older) {
     if (pool <= 0) break
     pool = round2h(pool - give(s, pool))
   }
 
-  // 4. Whatever is left banks, without limit.
-  bank = round2h(bank + pool)
+  // 3. Still short? Draw on the bank. A tenant who worked ahead has already
+  //    earned these months.
+  let bank = round2h(Math.max(0, input.bankedHours))
+  if (want(closing) > 0 && bank > 0) {
+    const drawn = give(closing, bank)
+    bank = round2h(bank - drawn)
+  }
+  for (const s of older) {
+    if (bank <= 0) break
+    const drawn = give(s, bank)
+    bank = round2h(bank - drawn)
+  }
+
+  // 4. Whatever new work is left is EXTRA. 'bank' (the default): it banks,
+  //    without limit. 'pay' (10/12, Nic): the landlord pays it at the
+  //    agreement's rate, so it does not bank.
+  const extraHours = round2h(Math.max(0, pool))
+  if (!pays) bank = round2h(bank + extraHours)
 
   // 5. Age the open periods and bill out any whose window has closed.
   //
@@ -301,6 +349,8 @@ export function settleMonth(input: SettlementInput): SettlementResult {
     // and the agreement ends. The manual "end it now" path settles the same way
     // — see settleOnEnd.
     endsAgreement: billedPeriods.length > 0,
+    extraHours,
+    payableHours: pays ? extraHours : 0,
   }
 }
 
@@ -324,8 +374,10 @@ export function settleMonth(input: SettlementInput): SettlementResult {
 export function settleOnEnd(
   periods: SettlementPeriod[], bankedHours: number,
   uncountedHours: Record<string, number> = {},
+  opts: { lateSurplusHours?: number; extraHours?: 'bank' | 'pay' } = {},
 ): SettlementResult {
   let bank = round2h(Math.max(0, bankedHours))
+  const pays = opts.extraHours === 'pay'
   let billedAmount = 0
   const billedPeriods: string[] = []
 
@@ -337,16 +389,25 @@ export function settleOnEnd(
     s.now = round2h(s.now + used)
     return used
   }
-  // Each period's own uncounted hours first; the surplus is banked.
+  // Each period's own uncounted hours first. 10/12: the surplus is NEW work
+  // (`fresh`), kept apart from banked credit: it pays down the remaining
+  // deficits before the bank does, and in 'pay' mode what is left is paid.
+  let fresh = round2h(Math.max(0, opts.lateSurplusHours ?? 0))
   for (const s of state) {
     const own = round2h(Math.max(0, uncountedHours[s.p.periodMonth] ?? 0))
-    bank = round2h(bank + own - give(s, own))
+    fresh = round2h(fresh + own - give(s, own))
   }
 
   // Oldest first. Which month a banked hour lands on is not cosmetic — periods
   // carry different frozen rates, so the order changes what the tenant is
   // billed. Oldest-first is the same order catch-up uses during a normal close,
-  // and it clears the debt that has been outstanding longest.
+  // and it clears the debt that has been outstanding longest. New work first,
+  // then the bank (10/12 — see settleMonth step 2; in 'bank' mode the order
+  // changes nothing, since every hour is spent oldest-first either way).
+  for (const s of state) {
+    if (fresh <= 0) break
+    fresh = round2h(fresh - give(s, fresh))
+  }
   const outcomes: PeriodOutcome[] = state.map(s => {
     const p = s.p
     if (bank > 0) bank = round2h(bank - give(s, bank))
@@ -377,9 +438,16 @@ export function settleOnEnd(
     // a trade, not wages (Nic's standing rule), and there is no month left for
     // them to buy. Zeroed here so the figure the caller writes back is honest
     // rather than a balance nobody can ever spend.
+    //
+    // 10/12: NEW work left over is different on an agreement set to pay extra
+    // hours — those hours were worked beyond everything the trade asked, and
+    // the landlord chose to pay for such hours (`payableHours`). On a 'bank'
+    // agreement they would have banked, and the bank ends here, so they go too.
     bankedHours: 0,
     billedAmount: round2(billedAmount),
     billedPeriods,
     endsAgreement: true,
+    extraHours: round2h(Math.max(0, fresh)),
+    payableHours: pays ? round2h(Math.max(0, fresh)) : 0,
   }
 }

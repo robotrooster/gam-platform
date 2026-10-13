@@ -8,9 +8,10 @@ import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 import { PostPaymentForm } from '../components/RecordPaymentWindow'
 import {
-  money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay, chargeTimeliness,
+  money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay,
   CREDIT_USE_RULE, serverMessage, type TenantCredit,
 } from '../lib/creditDesk'
+import { healthColor, healthWord } from '../lib/paymentStamps'
 import '../styles/credit-desk.css'
 
 /**
@@ -38,14 +39,23 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const [showPaymentDetail, setShowPaymentDetail] = useState(false)
+  // 10/12: the payment report opens for the owner or "View all payments" (the
+  // route's gate, GET /tenants/:id/payment-report). Staff who see the health
+  // card through the books permission are not offered a report they cannot open.
+  const { can } = usePerms()
+  const opensReport = can('payments.view_all')
   // 10/6 (Nic): the late fee being deleted from the Payment History (one at a time).
   const [deletingFee, setDeletingFee] = useState<string | null>(null)
+  // 10/12 (Nic): the household's Payment History, a page at a time (no 36-row cap).
+  const [historyPage, setHistoryPage] = useState(1)
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
   // account management.
-  const { data, isLoading, error, refetch, isFetching } = useQuery(['tenant-profile', id], () => apiGet<any>(`/tenants/${id}/profile`), {
+  const { data, isLoading, error, refetch, isFetching } = useQuery(['tenant-profile', id, historyPage],
+    () => apiGet<any>(`/tenants/${id}/profile${historyPage > 1 ? `?historyPage=${historyPage}` : ''}`), {
+    // Turning a page keeps the page on screen until the next one arrives.
+    keepPreviousData: true,
     // A refusal or a missing person will not change on a retry: say it once.
     retry: (count: number, e: any) => {
       const status = e?.response?.status
@@ -105,8 +115,12 @@ export function TenantDetailPage() {
   // money figures from the server; the payment cards are left out for them.
   const paymentsHidden = !!data.paymentsHidden
   const currentUnit = units?.find((u: any) => u.isCurrent)
-  const onTimeColor = stats.onTimeRate >= 90 ? 'var(--green)' : stats.onTimeRate >= 75 ? 'var(--amber)' : 'var(--red)'
-  const onTimeLabel = stats.onTimeRate >= 90 ? 'Excellent' : stats.onTimeRate >= 75 ? 'Good' : 'Needs Attention'
+  // 10/12 (Nic): the one payment-health figure — the household's months paid
+  // on time, all time since it joined GAM (null until a month is judged).
+  const health = stats.health ?? null
+  const rate: number | null = stats.onTimeRate ?? null
+  const onTimeColor = healthColor(rate)
+  const onTimeLabel = healthWord(rate)
   return (
     <div>
       <div className="page-header">
@@ -141,7 +155,7 @@ export function TenantDetailPage() {
               { label: 'Tenant Since', val: calendarDay(stats.firstPayment) ? monthTitle(calendarDay(stats.firstPayment)!) : '--', color: 'var(--text-0)' },
               { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
-              { label: 'On-Time Rate', val: stats.onTimeRate + '%', color: onTimeColor, sub: onTimeLabel },
+              { label: 'Payment Health', val: rate === null ? '—' : rate + '%', color: onTimeColor, sub: onTimeLabel },
               { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ]).map(s => (
               <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
@@ -167,28 +181,32 @@ export function TenantDetailPage() {
                 </div>
               ))}
             </div>
-            {/* W-25 (S531): the health card drills into per-payment lateness —
-                aggregate health hides whether "late" meant 2 days or 3 weeks. */}
+            {/* W-25 (S531): the health card drills into how late — aggregate
+                health hides whether "late" meant 2 days or 3 weeks. 10/12
+                (Nic): it opens the household's payment report (days past
+                grace, the pattern, partials, every charge). */}
             {!paymentsHidden && (
-            <div className="card" style={{ cursor: 'pointer' }} onClick={() => setShowPaymentDetail(true)} title="See how late each payment actually was">
+            <div className="card" style={{ cursor: opensReport ? 'pointer' : undefined }}
+              onClick={opensReport ? () => navigate(`/tenants/${id}/report`) : undefined}
+              title={opensReport ? 'Open the full payment report' : undefined}>
               <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
                 <span>Payment Health</span>
-                <span style={{ fontSize: '.68rem', color: 'var(--gold)', fontWeight: 600 }}>View detail →</span>
+                {opensReport && <span style={{ fontSize: '.68rem', color: 'var(--gold)', fontWeight: 600 }}>Full report →</span>}
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
-                <div style={{ width: 56, height: 56, borderRadius: '50%', background: onTimeColor + '18', border: '3px solid ' + onTimeColor, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 800, color: onTimeColor }}>{stats.onTimeRate}%</span>
+                <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'var(--bg-3)', border: '3px solid ' + onTimeColor, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 800, color: onTimeColor }}>{rate === null ? '—' : `${rate}%`}</span>
                 </div>
                 <div>
                   <div style={{ fontSize: '.85rem', fontWeight: 700, color: onTimeColor }}>{onTimeLabel}</div>
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>On-time payment rate</div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>{health?.label ?? 'Months paid on time'} · since joining GAM</div>
                 </div>
               </div>
               {[
-                { label: 'Settled', val: stats.settledCount },
-                { label: 'Late', val: stats.lateCount },
-                { label: 'Failed', val: stats.failedCount },
-                { label: 'Avg Payment', val: fmt(stats.avgPayment) },
+                { label: 'Months on time', val: health ? `${health.onTime} of ${health.counted}` : '—' },
+                { label: 'Paid late', val: health?.paidLate ?? 0 },
+                { label: 'Partial', val: health?.partial ?? 0 },
+                { label: 'Outstanding', val: health?.outstanding ?? 0 },
               ].map(row => (
                 <div key={row.label} className="data-row">
                   <span className="data-key">{row.label}</span>
@@ -230,16 +248,24 @@ export function TenantDetailPage() {
 
           {!paymentsHidden && (
           <div className="card" style={{ marginBottom: 16 }}>
-            <div className="card-title" style={{ marginBottom: 14 }}>Payment History</div>
+            {/* 10/12 (Nic): "The profile Payment History also gets the 'What it's
+                for' column and covers the household." Every charge, newest first,
+                a page at a time; the full report has them all on one page. */}
+            <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <span>Payment History — household</span>
+              {opensReport && <button className="btn btn-primary btn-sm" onClick={() => navigate(`/tenants/${id}/report`)}>Full report</button>}
+            </div>
             {payments?.length === 0 ? (
               <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>No payments yet.</div>
             ) : (
+              <div style={{ overflowX: 'auto' }}>
               <table className="data-table">
-                <thead><tr><th>Date</th><th>Property</th><th>Unit</th><th>Amount</th><th>Status</th></tr></thead>
+                <thead><tr><th>Date</th><th>What it's for</th><th>Property</th><th>Unit</th><th>Amount</th><th>Status</th></tr></thead>
                 <tbody>
                   {payments?.map((p: any) => (
                     <tr key={p.id}>
                       <td className="mono" style={{ fontSize: '.72rem' }}>{dayWord(p.dueDate, '')}</td>
+                      <td style={{ fontSize: '.78rem' }}>{p.label ?? humanize(p.type)}{p.detail && <div style={{ fontSize: '.66rem', color: 'var(--text-3)' }}>{p.detail}</div>}</td>
                       <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
                       <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
@@ -256,7 +282,9 @@ export function TenantDetailPage() {
                   ))}
                 </tbody>
               </table>
+              </div>
             )}
+            <HistoryPager page={data.paymentsPage} busy={isFetching} onPage={setHistoryPage} />
           </div>
           )}
 
@@ -285,71 +313,6 @@ export function TenantDetailPage() {
         </div>
       )}
 
-      {showPaymentDetail && (
-        <PaymentTimelinessModal payments={payments || []} tenantName={`${tenant.firstName} ${tenant.lastName}`} onClose={() => setShowPaymentDetail(false)} />
-      )}
-    </div>
-  )
-}
-
-// W-25 (S531): per-payment timeliness drill-in. Days late = settled_at vs
-// due_date (day-sliced per the date-serialization rule); unpaid past-due rows
-// show days overdue against today.
-function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: any[]; tenantName: string; onClose: () => void }) {
-  // The day it settled is read on this device's calendar (a payment at 6 pm in
-  // Phoenix is already "tomorrow" in UTC), the due day as the calendar day it
-  // is; a payment still clearing, or paid from the deposit, is never "overdue",
-  // and every status is said in words (lib/creditDesk chargeTimeliness).
-  const TONE_BADGE = { good: 'badge-green', warn: 'badge-amber', bad: 'badge-red', info: 'badge-blue', muted: 'badge-muted' } as const
-  const rows = payments.map((p: any) => {
-    const t = chargeTimeliness(p)
-    return { ...p, due: t.due, settled: t.settled, late: t.late, label: t.label, cls: TONE_BADGE[t.tone] }
-  })
-  const settledRows = rows.filter(r => r.status === 'settled' && r.due && r.settled)
-  const onTime = settledRows.filter(r => r.late === 0).length
-  const worst = settledRows.reduce((m, r) => Math.max(m, r.late), 0)
-  const avgLate = (() => {
-    const lateOnes = settledRows.filter(r => r.late > 0)
-    if (!lateOnes.length) return 0
-    return Math.round(lateOnes.reduce((s2, r) => s2 + r.late, 0) / lateOnes.length)
-  })()
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 640 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Payment Timeliness — {tenantName}</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
-          {[
-            { label: 'Paid on time', val: `${onTime} of ${settledRows.length}`, color: 'var(--green)' },
-            { label: 'Avg days late (when late)', val: avgLate ? `${avgLate}d` : '—', color: avgLate > 7 ? 'var(--red)' : 'var(--amber)' },
-            { label: 'Worst', val: worst ? `${worst}d late` : '—', color: worst > 7 ? 'var(--red)' : worst ? 'var(--amber)' : 'var(--text-3)' },
-          ].map(k => (
-            <div key={k.label} style={{ background: 'var(--bg-3)', borderRadius: 10, padding: '10px 12px' }}>
-              <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>{k.label}</div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.95rem', fontWeight: 700, color: k.color }}>{k.val}</div>
-            </div>
-          ))}
-        </div>
-        <div style={{ maxHeight: 380, overflowY: 'auto' }}>
-          <table className="data-table">
-            <thead><tr><th>Due</th><th>Paid</th><th>Amount</th><th>Type</th><th>Timeliness</th></tr></thead>
-            <tbody>
-              {rows.map((r: any) => (
-                <tr key={r.id}>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? dayWord(r.due, '') : '—'}</td>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? dayWord(r.settled, '') : '—'}</td>
-                  <td className="mono">{r.amount != null ? `$${Number(r.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'}</td>
-                  <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{humanize(r.type)}</td>
-                  <td><span className={`badge ${r.cls}`}>{r.label}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Close</button>
-        </div>
-      </div>
     </div>
   )
 }
@@ -639,6 +602,32 @@ function PhotosAndNoticesCard({ tenantId }: { tenantId: string }) {
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 10/12 (Nic): which charges of the household's Payment History are showing,
+ * and the way to the newer or older ones (the server sends a page at a time).
+ */
+export function HistoryPager({ page, busy, onPage }: {
+  page?: { page: number; pageSize: number; total: number } | null
+  busy: boolean
+  onPage: (n: number) => void
+}) {
+  if (!page || page.total <= page.pageSize) return null
+  const pages = Math.max(1, Math.ceil(page.total / page.pageSize))
+  const first = (page.page - 1) * page.pageSize + 1
+  const last = Math.min(page.total, page.page * page.pageSize)
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+      <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+        {first > page.total ? `No charges on this page — ${page.total} in all` : `Charges ${first}–${last} of ${page.total}, newest first`}
+      </span>
+      <span style={{ display: 'flex', gap: 8 }}>
+        <button className="btn btn-primary btn-sm" disabled={busy || page.page <= 1} onClick={() => onPage(page.page - 1)}>Newer</button>
+        <button className="btn btn-primary btn-sm" disabled={busy || page.page >= pages} onClick={() => onPage(page.page + 1)}>Older</button>
+      </span>
     </div>
   )
 }

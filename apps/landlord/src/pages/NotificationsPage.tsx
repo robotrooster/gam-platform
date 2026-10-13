@@ -38,9 +38,23 @@ const TYPE_LABEL: Record<string, string> = {
   // 'Email undeliverable', which is jargon for the one notice that has to be
   // read and acted on. (memory: gam-no-raw-enums-in-ui)
   email_undeliverable:           'Email not arriving',
+  // 10/12 (Nic): the morning home-sale start (services/homeSale
+  // tellLandlordSaleStarted / tellOnceSaleNotStarted). humanize() read them as
+  // 'Home sale started' — the notice is about the buyer's home PAYMENTS.
+  home_sale_started:             'Home payments started',
+  home_sale_not_started:         'Home payments not started',
+}
+
+// Types whose place is a page, not a record in `data` (the home-sale notices
+// carry the agreement's documentId, which has no page of its own: the signed
+// contract lives on GoldSign).
+const TYPE_ROUTE: Record<string, string> = {
+  home_sale_started:     '/esign',
+  home_sale_not_started: '/esign',
 }
 
 function deepLinkFor(n: Notification): string | null {
+  if (TYPE_ROUTE[n.type]) return TYPE_ROUTE[n.type]
   const d = n.data ?? {}
   if (d.inspectionId) return `/inspections/${d.inspectionId}`
   if (d.entryRequestId) return `/entry-requests/${d.entryRequestId}`

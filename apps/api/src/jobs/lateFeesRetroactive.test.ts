@@ -43,9 +43,12 @@ async function seedRetroLease(accrualFrom: string, opts: { grace: number; accrua
          late_fee_accrual_amount=$4, late_fee_accrual_type='flat', late_fee_accrual_period='daily',
          late_fee_accrual_from=$5 WHERE id=$1`,
       [leaseId, opts.grace, opts.initial, opts.accrual, accrualFrom])
+    // 10/12 (Nic): written before it came due, as the monthly run writes it
+    // (a bill written after its due date counts from the day it was written).
     const inv = await c.query<{ id: string }>(
-      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-       VALUES ($1,$8,$2,$3,$4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending') RETURNING id`,
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1,$8,$2,$3,$4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending',
+               NOW() - make_interval(days => $6::int + 3)) RETURNING id`,
       [ll.landlordId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, opts.daysOverdue, rent, tenantId])
     const pay = await c.query<{ id: string }>(
       `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)

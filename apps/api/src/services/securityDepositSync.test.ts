@@ -88,7 +88,8 @@ async function getDeposit(client: PoolClient, leaseId: string) {
   const r = await client.query(
     `SELECT total_amount::text, collected_amount::text, status, held_by,
             flex_deposit_enabled
-       FROM security_deposits WHERE lease_id = $1 ORDER BY created_at DESC LIMIT 1`,
+       FROM security_deposits WHERE lease_id = $1 AND status <> 'voided'
+      ORDER BY created_at DESC LIMIT 1`,
     [leaseId],
   )
   return r.rows[0] ?? null
@@ -219,16 +220,20 @@ describe('syncSecurityDepositRow — idempotency / no-clobber', () => {
     })
   })
 
-  it('amount→0 removes an untouched row but keeps a funded one', async () => {
+  it('amount→0 voids an untouched row (kept as a record) but keeps a funded one', async () => {
     await withTx(async (client, s) => {
-      // untouched → removed
+      // untouched → no longer the lease's deposit. 10/12 (Nic, G8 — keep
+      // everything): the record is voided and kept, never deleted.
       await syncSecurityDepositRow(s.leaseId, 1000, client)
       await syncSecurityDepositRow(s.leaseId, 0, client)
       expect(await getDeposit(client, s.leaseId)).toBeNull()
+      const kept = await client.query(
+        `SELECT status, total_amount::text, voided_at IS NOT NULL AS stamped FROM security_deposits WHERE lease_id = $1`, [s.leaseId])
+      expect(kept.rows).toEqual([{ status: 'voided', total_amount: '1000.00', stamped: true }])
       // recreate + mark collected → not removed
       await syncSecurityDepositRow(s.leaseId, 1000, client)
       await client.query(
-        `UPDATE security_deposits SET collected_amount = 500 WHERE lease_id = $1`, [s.leaseId])
+        `UPDATE security_deposits SET collected_amount = 500 WHERE lease_id = $1 AND status <> 'voided'`, [s.leaseId])
       await syncSecurityDepositRow(s.leaseId, 0, client)
       expect(await getDeposit(client, s.leaseId)).not.toBeNull()
     })

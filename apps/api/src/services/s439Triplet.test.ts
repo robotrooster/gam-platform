@@ -250,20 +250,36 @@ describe('getApplicableTaxForms', () => {
     expect((await getApplicableTaxForms(ctx.landlordId, 2099)).map(f => f.form_code)).not.toContain('W2')
   })
 
-  it('with_contractors_paid_600 fires only when a contractor\'s ytd_paid ≥ 600', async () => {
+  // 10/12 (Nic): "contractors get a 1099 box and their payments add up per
+  // calendar year" — the 1099-NEC form applies when a vendor with the 1099
+  // box was paid at least that year's threshold (2099 uses the latest known,
+  // $2,000), counting the payments on its expenses, card payments left out.
+  it('with_contractors_paid_600 fires only when a 1099 vendor was paid the year\'s threshold', async () => {
     const ctx = await seedTaxCtx()
     await seedTaxForm({ state: 'US', formCode: '1099NEC', appliesTo: 'with_contractors_paid_600' })
-    // No contractor → excluded.
+    const vendor = async (is1099: boolean) => (await db.query<{ id: string }>(
+      `INSERT INTO books_vendors (landlord_id, name, vendor_type, is_1099) VALUES ($1, 'C', $2, $3) RETURNING id`,
+      [ctx.landlordId, is1099 ? 'contractor' : 'supplier', is1099])).rows[0].id
+    const pay = async (vendorId: string, amount: number, method = 'check') => {
+      const e = (await db.query<{ id: string }>(
+        `INSERT INTO landlord_expenses (landlord_id, category, amount, expense_date, vendor_id, payments_tracked)
+         VALUES ($1, 'repairs', $2, '2099-03-01', $3, TRUE) RETURNING id`, [ctx.landlordId, amount, vendorId])).rows[0].id
+      await db.query(
+        `INSERT INTO landlord_expense_payments (expense_id, landlord_id, paid_on, amount, method, source)
+         VALUES ($1, $2, '2099-03-01', $3, $4, 'payment')`, [e, ctx.landlordId, amount, method])
+    }
+    // No 1099 vendor → excluded.
     expect((await getApplicableTaxForms(ctx.landlordId, 2099)).map(f => f.form_code)).not.toContain('1099NEC')
-    // Contractor under threshold → still excluded.
-    await db.query(
-      `INSERT INTO books_contractors (landlord_id, first_name, last_name, ytd_paid)
-       VALUES ($1, 'C', 'Low', 599.99)`, [ctx.landlordId])
+    // A 1099 vendor under the threshold, and a supplier (no 1099 box) over it → still excluded.
+    const low = await vendor(true)
+    await pay(low, 1999.99)
+    await pay(await vendor(false), 5000)
     expect((await getApplicableTaxForms(ctx.landlordId, 2099)).map(f => f.form_code)).not.toContain('1099NEC')
-    // Contractor at threshold → included.
-    await db.query(
-      `INSERT INTO books_contractors (landlord_id, first_name, last_name, ytd_paid)
-       VALUES ($1, 'C', 'High', 600.00)`, [ctx.landlordId])
+    // A card payment does not count toward it (the card company reports it).
+    await pay(low, 100, 'card')
+    expect((await getApplicableTaxForms(ctx.landlordId, 2099)).map(f => f.form_code)).not.toContain('1099NEC')
+    // At the threshold → included.
+    await pay(low, 0.01)
     expect((await getApplicableTaxForms(ctx.landlordId, 2099)).map(f => f.form_code)).toContain('1099NEC')
   })
 

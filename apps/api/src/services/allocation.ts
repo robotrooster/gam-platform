@@ -33,6 +33,7 @@
 
 import type { PoolClient } from 'pg'
 import { AppError } from '../middleware/errorHandler'
+import { PM_PAYOUT_USER_SQL, noPmRecipientMessage } from './pmPayoutRecipient'
 import { logger } from '../lib/logger'
 
 export type PaymentMethod = 'ach' | 'card'
@@ -120,8 +121,8 @@ interface PropertyAndRuleRow {
 // (leasing_fee + maintenance_markup_pct fire on different triggers and
 // are no-ops here.)
 interface PmFeeRow {
-  pm_bank_account_id: string | null    // pm_companies.bank_account_id
-  pm_payout_user_id: string | null     // user_bank_accounts.user_id behind that bank
+  pm_bank_account_id: string | null    // pm_companies.bank_account_id (legacy catalog; usually NULL)
+  pm_payout_user_id: string | null     // that bank's user, else the company's active owner (10/12)
   fee_type: string
   percent: string | null
   flat_amount: string | null
@@ -484,10 +485,12 @@ export async function executeRentAllocation(
         `with pm_fee_plan_id=${prop.pm_fee_plan_id} but the join returned no rows. ` +
         `Verify the plan still exists and belongs to the company.`)
     }
+    // 10/12 (Nic): the cut no longer needs a legacy catalog bank — it is
+    // booked to the company's active owner and paid to the company's Stripe
+    // Connect account (services/pmPayoutRecipient.ts). Only a company with
+    // neither has nobody to book it to.
     if (pmContext.pm_payout_user_id === null) {
-      throw new AppError(409,
-        `PM company ${prop.pm_company_id} has no bank routing (bank_account_id is null). ` +
-        `Set bank_account_id on the pm_company before this property's rent can be allocated.`)
+      throw new AppError(409, noPmRecipientMessage(prop.pm_company_id))
     }
     pmCompanyFee = computePmCutForRent(pmContext, splittableIncome)
   }
@@ -521,7 +524,23 @@ export async function executeRentAllocation(
   const shortBy = round2(
     (pmCompanyFee - pmPaid) + (managerFee - managerPaid)
     + Math.max(0, supersedenceAmount + subleaseMarkup - Math.max(0, splittableHeld)))
-  if (shortBy > 0.005 || splittableHeld < -0.005) {
+
+  // 10/12 (Nic, G5): a processing fee the landlord covers that is bigger than
+  // the money GAM holds from this payment — the landlord covers the $6 bank
+  // fee on a $4 payment: $4 is withheld, $2 is not covered. The uncovered part
+  // is the landlord's, never GAM's: it becomes a GAM charge on their account
+  // (kind 'uncovered_processing_fee'), collected like every other — out of the
+  // next payout, or the next bank pull once it is over the threshold. One per
+  // charge row (its source is the row), so a re-run cannot bill it twice.
+  const landlordFeeWithheld = round2(Math.min(landlordFee, heldGross))
+  const landlordFeeUncovered = round2(landlordFee - landlordFeeWithheld)
+  let uncoveredBilled = false
+  if (landlordFeeUncovered > 0.005) {
+    uncoveredBilled = await billUncoveredFee(client, {
+      payment, propertyId: prop.property_id, paymentMethod, fee: landlordFee, held: heldGross, uncovered: landlordFeeUncovered,
+    })
+  }
+  if (shortBy > 0.005 || (splittableHeld < -0.005 && !uncoveredBilled)) {
     await recordAllocationAlert(client, {
       paymentId: payment.id,
       propertyId: prop.property_id,
@@ -533,7 +552,9 @@ export async function executeRentAllocation(
         `manager $${managerFee.toFixed(2)}, supersedence $${supersedenceAmount.toFixed(2)}, ` +
         `sublease markup $${subleaseMarkup.toFixed(2)}. Paid: PM $${pmPaid.toFixed(2)}, manager ` +
         `$${managerPaid.toFixed(2)}, owner $${ownerShare.toFixed(2)}; $${shortBy.toFixed(2)} was not covered. ` +
-        `Collect it from the landlord directly.`,
+        (uncoveredBilled
+          ? `The $${landlordFeeUncovered.toFixed(2)} of the processing fee GAM held nothing for is billed to the landlord as a GAM charge; the rest — collect it from the landlord directly.`
+          : `Collect it from the landlord directly.`),
       context: {
         payment_id: payment.id, property_id: prop.property_id, gam_held_part: heldGross, income,
         landlord_fee: landlordFee, pm_company_fee: pmCompanyFee, manager_fee: managerFee,
@@ -581,6 +602,8 @@ export async function executeRentAllocation(
   // assigned bank account (16a invariant: ledger entries are user-scoped;
   // the bank's owner is the recipient). bank_account_id is snapshotted at
   // write time so future bank reassignments don't retroactively re-route.
+  // 10/12: with no catalog bank (the normal case now), the company's active
+  // owner, bank_account_id NULL; the transfer goes to the company's Connect.
   if (pmPaid > 0 && pmContext) {
     await postUserLedgerEntry(client, {
       userId: pmContext.pm_payout_user_id!,
@@ -594,6 +617,30 @@ export async function executeRentAllocation(
     })
   }
 
+  // 10/12 (Nic, ledger P1): the split itself, as it was made — what was
+  // withheld, what each cut was due and paid, what nobody covered. Until now
+  // only the results above were kept; the fee withheld and any shortfall were
+  // computed and thrown away (the shortfall reached only the admin notice), so
+  // a ledger rebuilt later could not say where the held money went.
+  // (landlordFeeWithheld / landlordFeeUncovered are worked out above, where
+  // the uncovered part is billed — G5.)
+  await recordAllocationSplit(client, {
+    payment,
+    propertyId: prop.property_id,
+    fromStripeCharge: !opts.feeAlreadyCollected,
+    grossHeld: heldGross,
+    landlordFeeWithheld,
+    landlordFeeUncovered,
+    supersedence: supersedenceAmount,
+    subleaseMarkup,
+    pmFeeDue: pmCompanyFee,
+    pmPaid,
+    managerFeeDue: managerFee,
+    managerPaid,
+    shortBy: round2(Math.max(0, shortBy)),
+    ownerShare,
+  })
+
   if (bankingSpread !== 0) {
     await postPlatformLedgerEntry(client, {
       type: 'banking_spread',
@@ -606,6 +653,100 @@ export async function executeRentAllocation(
       propertyId: prop.property_id,
       notes: `Banking spread on ${paymentMethod} rent payment ${payment.id}`,
     })
+  }
+}
+
+/**
+ * 10/12 (Nic, ledger P1) — one allocation_splits row: how the money GAM held
+ * for the landlord on one settled row was split, written in the allocation's
+ * own transaction (append-only; the table refuses changes). The pieces always
+ * add up: grossHeld = landlordFeeWithheld + supersedence + subleaseMarkup +
+ * pmFeeDue + managerFeeDue + ownerShare − shortBy.
+ *
+ * remittance_id: the receipt whose Stripe charge paid the row — only on a
+ * Stripe settle (a credit, FlexPay or desk settle passes feeAlreadyCollected:
+ * that money came from an earlier charge, not this row's). credit_use_id: the
+ * GAM-held credit spend that paid the row, when exactly one did (none or
+ * several: NULL — the spends are on credit_uses by payment).
+ */
+async function recordAllocationSplit(
+  client: PoolClient,
+  s: {
+    payment: PaymentRow
+    propertyId: string
+    fromStripeCharge: boolean
+    grossHeld: number
+    landlordFeeWithheld: number
+    landlordFeeUncovered: number
+    supersedence: number
+    subleaseMarkup: number
+    pmFeeDue: number
+    pmPaid: number
+    managerFeeDue: number
+    managerPaid: number
+    shortBy: number
+    ownerShare: number
+  },
+): Promise<void> {
+  const pi = s.payment.stripe_payment_intent_id
+  const inserted = await client.query<{ id: string }>(
+    `INSERT INTO allocation_splits
+       (payment_id, landlord_id, property_id, remittance_id, credit_use_id,
+        gross_held, landlord_fee_withheld, landlord_fee_uncovered, supersedence, sublease_markup,
+        pm_fee_due, pm_paid, manager_fee_due, manager_paid, short_by, owner_share)
+     VALUES ($1, $2, $3,
+             CASE WHEN $4::text IS NULL THEN NULL ELSE
+               (SELECT r.id FROM tenant_remittances r WHERE r.stripe_payment_intent_id = $4::text
+                 ORDER BY r.created_at, r.id LIMIT 1) END,
+             (SELECT CASE WHEN COUNT(*) = 1 THEN (array_agg(v.id))[1] END
+                FROM v_credit_uses v WHERE v.payment_id = $1 AND v.status = 'applied' AND v.gam_held),
+             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     -- 10/12 (ledger P1 review): one split per payment, and the table refuses
+     -- DELETE, so a second could never be taken back. A payment allocated
+     -- again (its owner share removed and re-booked by hand) or a backfill
+     -- that got there first keeps the split already on record; a settle is
+     -- never failed over it.
+     ON CONFLICT (payment_id) DO NOTHING
+     RETURNING id`,
+    [s.payment.id, s.payment.landlord_id, s.propertyId,
+     s.fromStripeCharge && pi && !s.payment.manual_method ? pi : null,
+     s.grossHeld.toFixed(2), s.landlordFeeWithheld.toFixed(2), s.landlordFeeUncovered.toFixed(2),
+     s.supersedence.toFixed(2), s.subleaseMarkup.toFixed(2),
+     s.pmFeeDue.toFixed(2), s.pmPaid.toFixed(2), s.managerFeeDue.toFixed(2), s.managerPaid.toFixed(2),
+     s.shortBy.toFixed(2), s.ownerShare.toFixed(2)])
+  // 10/12 (Nic, L18): "manager fee bigger than money held → BILL THE LANDLORD
+  // (unpaid part = bill the landlord owes the manager)". The cut GAM held too
+  // little to pay becomes a real unpaid bill on the landlord's Expenses, linked
+  // to this split (its cost is posted by the split itself — ledger
+  // 'allocation'; the bill carries what the landlord pays the manager).
+  const splitId = inserted.rows[0]?.id
+  const owedCents = Math.max(0, Math.round((s.pmFeeDue - s.pmPaid) * 100)) + Math.max(0, Math.round((s.managerFeeDue - s.managerPaid) * 100))
+  if (splitId && owedCents > 0) await billManagersUnpaidCut(client, s.payment.landlord_id, s.propertyId, splitId, owedCents)
+}
+
+/**
+ * The L18 bill, in the allocation's transaction behind a savepoint: a books
+ * problem never blocks money, so a failure here is logged for an admin and the
+ * allocation goes on (the split's own ledger posting still books the amount
+ * owed to Accounts payable; the nightly Accounts payable tie-out lists it).
+ */
+async function billManagersUnpaidCut(client: PoolClient, landlordId: string, propertyId: string, splitId: string, owedCents: number): Promise<void> {
+  await client.query('SAVEPOINT l18_manager_bill')
+  try {
+    const p = (await client.query<{ name: string | null; pm: string | null; day: string }>(
+      `SELECT p.name, pc.name AS pm, (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date::text AS day
+         FROM properties p LEFT JOIN pm_companies pc ON pc.id = p.pm_company_id WHERE p.id = $1`, [propertyId])).rows[0]
+    const { createMoneyOutExpense } = await import('./landlordExpenses')
+    await createMoneyOutExpense(client, {
+      landlordId, categoryKey: 'management', amount: owedCents / 100,
+      expenseDate: p?.day ?? new Date().toISOString().slice(0, 10), dueDate: null,
+      description: `Management fee GAM held too little to pay${p?.name ? `: ${p.name}` : ''}`,
+      vendor: p?.pm ?? null, propertyId, allocationSplitId: splitId,
+    })
+    await client.query('RELEASE SAVEPOINT l18_manager_bill')
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT l18_manager_bill')
+    logger.error({ err: e, splitId, landlordId }, '[allocation] the manager\'s unpaid cut was not billed on Expenses (L18)')
   }
 }
 
@@ -691,13 +832,15 @@ async function bookFeeWithNoHeldShare(
     const whole = await wholeChargeFee(client, paymentMethod, prop, charge, opts)
     const payer = paymentMethod === 'ach' ? prop.ach_fee_payer : prop.card_fee_payer
     if (payer === 'landlord' && whole.customerFee > 0) {
+      // 10/12 (Nic, ledger P1): the line names its property (the row's).
       await client.query(
-        `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description)
-         VALUES ($1, 'platform_fee', $2, $3, $4)
+        `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description, property_id)
+         VALUES ($1, 'platform_fee', $2, $3, $4, $5)
          ON CONFLICT (source_type, source_id) DO NOTHING`,
         [payment.landlord_id, `processing_fee:${pi}`, (-whole.customerFee).toFixed(2),
          `${paymentMethod === 'ach' ? 'Bank payment' : 'Card'} fee you cover for your tenant ` +
-         `($${charge.feeBase.toFixed(2)} payment; credit paid your charges on it)`])
+         `($${charge.feeBase.toFixed(2)} payment; credit paid your charges on it)`,
+         prop.property_id])
     }
     const spread = round2(whole.customerFee - whole.stripeCost)
     if (spread !== 0) {
@@ -726,6 +869,41 @@ async function bookFeeWithNoHeldShare(
         `Usually a property missing its payout setup; fix it and book the fee for this payment.`,
       context: { payment_id: payment.id, stripe_payment_intent_id: pi, fee_base: charge.feeBase },
     })
+  }
+}
+
+/**
+ * 10/12 (Nic, G5) — bill the landlord the part of a processing fee they cover
+ * that was more than the money GAM held from the payment. A GAM charge (kind
+ * 'uncovered_processing_fee', source the charge row), collected from the next
+ * payout or bank pull like every GAM charge (services/landlordGamAccount). In
+ * its own savepoint: a failure here never undoes the tenant's settle — it is
+ * told to an admin by the caller's alert instead (returns false).
+ */
+async function billUncoveredFee(
+  client: PoolClient,
+  u: { payment: PaymentRow; propertyId: string; paymentMethod: PaymentMethod; fee: number; held: number; uncovered: number },
+): Promise<boolean> {
+  await client.query('SAVEPOINT uncovered_fee')
+  try {
+    const { chargeLandlord } = await import('./landlordGamAccount')
+    const what = u.paymentMethod === 'ach' ? 'bank payment' : 'card'
+    await chargeLandlord(client, {
+      landlordId: u.payment.landlord_id,
+      propertyId: u.propertyId,
+      kind: 'uncovered_processing_fee',
+      amount: u.uncovered,
+      sourceType: 'allocation_uncovered_fee',
+      sourceId: u.payment.id,
+      notes: `The ${what} fee you cover for your tenant was $${u.fee.toFixed(2)}, more than the $${u.held.toFixed(2)} GAM held from that payment; ` +
+        `$${u.held.toFixed(2)} came out of it and the other $${u.uncovered.toFixed(2)} is billed here`,
+    })
+    await client.query('RELEASE SAVEPOINT uncovered_fee')
+    return true
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT uncovered_fee')
+    logger.error({ err: e, paymentId: u.payment.id, uncovered: u.uncovered }, '[allocation] the uncovered processing fee could not be billed to the landlord')
+    return false
   }
 }
 
@@ -878,10 +1056,10 @@ async function fetchActiveProcessingRate(
   return rate
 }
 
-// S110: pull pm_fee_plan + pm_company bank routing for a property. Returns
-// null when either side isn't configured (no PM contracted, or PM hasn't
-// set bank routing — which the property-assignment route should have
-// blocked, but allocation defends in depth).
+// S110: pull pm_fee_plan + pm_company payout recipient for a property.
+// Returns null when the plan does not exist for that company. 10/12: the
+// recipient is the legacy catalog bank's user, else the company's active
+// owner (services/pmPayoutRecipient.ts); NULL only when it has neither.
 async function fetchPmFeeContext(
   client: PoolClient,
   pmCompanyId: string,
@@ -889,7 +1067,7 @@ async function fetchPmFeeContext(
 ): Promise<PmFeeRow | null> {
   const res = await client.query<PmFeeRow>(
     `SELECT c.bank_account_id AS pm_bank_account_id,
-            ba.user_id        AS pm_payout_user_id,
+            ${PM_PAYOUT_USER_SQL} AS pm_payout_user_id,
             fp.fee_type, fp.percent, fp.flat_amount,
             fp.floor_amount, fp.ceiling_amount
        FROM pm_companies c

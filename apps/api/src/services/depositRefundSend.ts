@@ -68,6 +68,7 @@ import { logger } from '../lib/logger'
 import { todayIn, dateIn } from '../lib/timezone'
 import { lockHousehold } from './moneyPredicates'
 import { replyToProperty } from './replyRouting'
+import { recordHeldItem } from './heldPayouts'
 import {
   planRefund, runCardPart, givePartBackInCash, findSentRefund, livePartSql, money,
   DEPOSIT_PART_TOO_OLD, DEPOSIT_PART_DISPUTED, DEPOSIT_PART_TAKEN_BACK, type MoneySource,
@@ -777,9 +778,10 @@ export async function retryDepositRefundPart(leaseId: string, partId: string): P
  * 'cash-part:<part>' — the move-out's own kind of payout line, as finalize
  * writes). earlyCheckOut.givePartBackInCash writes it in the same transaction
  * that records the cash part; giveDepositPartBackInCash does for a part with
- * no payment behind it. Written as SQL: heldPayouts.HELD_ITEM_SOURCES (the
- * code list) does not name 'deposit_settlement' though the table's CHECK
- * allows it (reported). Returns whether it was written now.
+ * no payment behind it. Returns whether it was written now. (10/12: through
+ * recordHeldItem — it used to be raw SQL because the code list of held item
+ * sources left out 'deposit_settlement'; @gam/shared HELD_ITEM_SOURCES now
+ * names it.)
  */
 export async function releaseDepositCashPart(runner: Pick<PoolClient, 'query'>, cashPartId: string): Promise<boolean> {
   const r = (await runner.query<{ landlord_id: string; toward: string; unit_number: string | null; tenant_name: string | null }>(
@@ -793,13 +795,14 @@ export async function releaseDepositCashPart(runner: Pick<PoolClient, 'query'>, 
        LEFT JOIN users u ON u.id = t.user_id
       WHERE p.id = $1 AND p.kind = 'cash' AND p.status = 'handed_back'`, [cashPartId])).rows[0]
   if (!r || toCents(r.toward) <= 0) return false
-  const ins = await runner.query(
-    `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description)
-     VALUES ($1, 'deposit_settlement', $2, $3, $4)
-     ON CONFLICT (source_type, source_id) DO NOTHING RETURNING id`,
-    [r.landlord_id, `cash-part:${cashPartId}`, toDollars(toCents(r.toward)).toFixed(2),
-     `Move-out at ${r.unit_number ?? 'the space'}: deposit refund given back in cash to ${r.tenant_name ?? 'the tenant'}`])
-  return (ins.rows?.length ?? 0) > 0
+  return recordHeldItem({
+    landlordId: r.landlord_id,
+    sourceType: 'deposit_settlement',
+    sourceId: `cash-part:${cashPartId}`,
+    property: { refundPartId: cashPartId },  // 10/12 (Nic, ledger P1): the move-out's space
+    amount: toDollars(toCents(r.toward)),
+    description: `Move-out at ${r.unit_number ?? 'the space'}: deposit refund given back in cash to ${r.tenant_name ?? 'the tenant'}`,
+  }, runner)
 }
 
 /**

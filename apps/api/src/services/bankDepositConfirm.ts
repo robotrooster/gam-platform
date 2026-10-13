@@ -284,7 +284,8 @@ async function lateFeeCutoffDate(
                  SELECT COALESCE((SELECT pr.timezone FROM units u JOIN properties pr ON pr.id = u.property_id
                                    WHERE u.id = p.unit_id), 'America/Phoenix') AS zone) tz
               WHERE p.invoice_id = $1 AND p.type <> 'late_fee' AND p.amount > 0
-                AND p.status <> 'returned'
+                -- 10/12: a voided line (owed by nobody) is never open.
+                AND p.status NOT IN ('returned', 'voided')
                 AND p.work_trade_suspended_at IS NULL
                 AND NOT (p.id = ANY($2::uuid[]))) x`,
     [invoiceId, [...settlingIds]])).rows[0]
@@ -925,7 +926,7 @@ export async function confirmDepositMatch(
          FROM payments p
          JOIN LATERAL (
            SELECT id, held_by FROM security_deposits
-            WHERE lease_id = p.lease_id ORDER BY created_at DESC LIMIT 1
+            WHERE lease_id = p.lease_id AND status <> 'voided' ORDER BY created_at DESC LIMIT 1
          ) sd ON TRUE
         WHERE p.id = ANY($1::uuid[]) AND p.type = 'deposit' AND p.lease_fee_id IS NULL AND p.status = 'settled'
           AND sd.id = ANY($2::uuid[])
@@ -1569,9 +1570,15 @@ export async function undoDepositMatch(input: {
       // Owed again as it was: pending, or failed (payable). A bank retry this
       // deposit replaced was canceled, so it is not scheduled again.
       const prior = r.priorStatus === 'failed' ? 'failed' : 'pending'
+      // 10/12 (ledger P1 review): who collected a deposit is cleared with the
+      // settle it described (payments.deposit_collected_by): left 'landlord',
+      // the tenant's later online payment of this same row kept it, and the
+      // books would put money GAM holds in the landlord's bank. The old value
+      // stays in audit_row_changes (payments is journaled).
       const u = await client.query(
         `UPDATE payments
             SET status = $2, settled_at = NULL, manual_method = NULL, next_retry_at = NULL, platform_held = FALSE,
+                deposit_collected_by = NULL,
                 notes = COALESCE(notes || ' — ', '') || $3
           WHERE id = $1 AND status = 'settled'`,
         [r.paymentId, prior, `Bank deposit match undone ${day} — owed again`])
@@ -1642,11 +1649,15 @@ export async function undoDepositMatch(input: {
       `UPDATE bank_deposit_allocations SET reversed_at = NOW(), reversed_by = $2
         WHERE bank_transaction_id = $1 AND reversed_at IS NULL`, [txn.id, input.undoneBy])
     await client.query(
+      // 10/12 (Nic, ledger P1): when and by whom, on the receipt itself — the
+      // status alone said only that it was closed, and the bank line's own undo
+      // marker is replaced the next time it is matched.
       `UPDATE tenant_remittances
           SET status = 'failed', updated_at = NOW(),
+              undone_at = NOW(), undone_by = $3,
               notes = COALESCE(notes || ' — ', '') || $2
         WHERE id = $1 AND status = 'settled'`,
-      [snap.receiptId, `Undone ${day}: this bank deposit was taken back off the bills it paid`])
+      [snap.receiptId, `Undone ${day}: this bank deposit was taken back off the bills it paid`, input.undoneBy])
     // The on-time marks this settle wrote were never earned by this money:
     // withdrawn (a mark pointing at itself is withdrawn; the score skips it).
     // 10/6: a mark a later late-fee delete replaced (re-rated from the
@@ -1664,6 +1675,12 @@ export async function undoDepositMatch(input: {
         break
       }
     }
+    // 10/12 (Nic): "one mark per invoice." The bills these rows are on are
+    // judged again now the match is undone — the rows owed again, the bank's
+    // day gone — so a bill marked paid by this deposit reads what it is now
+    // (unpaid past grace, partly paid, or not judged yet). services/creditBillMarks.
+    const { syncBillMarksAfterSettle } = await import('./creditLedgerEmitters')
+    for (const ch of await syncBillMarksAfterSettle(client, reopenedIds)) ch.subjectIds.forEach(sid => subjects.add(sid))
     if (snap.declarationId) {
       await client.query(
         `UPDATE tenant_declared_deposits

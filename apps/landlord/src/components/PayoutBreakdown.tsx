@@ -25,6 +25,9 @@ export function PayoutBreakdown({ breakdown }: { breakdown: any }) {
   }
   const payments: any[] = breakdown.payments ?? []
   const held: any[] = breakdown.heldItems ?? []
+  // 10/12 (Nic, G3): a transfer sent on its own — a move-out's deposit share
+  // ("Deposit returned at move-out") — on its own line, named.
+  const direct: any[] = breakdown.directTransfers ?? []
   const adjustments: any[] = breakdown.adjustments ?? []
   return (
     <table className="data-table" style={{ fontSize: '.78rem' }}>
@@ -46,6 +49,13 @@ export function PayoutBreakdown({ breakdown }: { breakdown: any }) {
             <td />
             <td colSpan={3}>{h.label}</td>
             <td className="mono" style={{ textAlign: 'right' }}>{money(h.amount)}</td>
+          </tr>
+        ))}
+        {direct.map((x: any) => (
+          <tr key={x.intentId}>
+            <td />
+            <td colSpan={3}>{x.label}</td>
+            <td className="mono" style={{ textAlign: 'right' }}>{money(x.amount)}</td>
           </tr>
         ))}
         {adjustments.map((a: any) => (

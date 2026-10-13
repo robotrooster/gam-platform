@@ -15,6 +15,7 @@
  */
 import { getClient } from '../db'
 import { emitPaymentSettledEvent, classifyPaymentTier } from '../services/creditLedgerEmitters'
+import { graceDaysSql } from '../services/lateness'
 
 const APPLY = process.argv.includes('--apply')
 
@@ -24,11 +25,18 @@ async function main() {
     await c.query('BEGIN')
     const { rows } = await c.query<any>(`
       SELECT p.id, p.tenant_id, p.type, p.amount, p.due_date, p.settled_at, p.manual_method,
-             COALESCE(l.late_fee_grace_days, 5) AS grace,
+             -- 10/12 (Nic): "Grace = lease, else property, else 5 — the only
+             -- chain." Lease-else-5 graded desk payments against a different
+             -- grace than the credit history (creditLedgerEmitters billFacts,
+             -- same helper): a park with a shorter grace got good marks for
+             -- late payments, one with a longer grace lost marks it earned.
+             ${graceDaysSql('l', 'pr')}::int AS grace,
              u.first_name || ' ' || u.last_name AS tenant
         FROM payments p
         JOIN tenants t ON t.id = p.tenant_id JOIN users u ON u.id = t.user_id
         LEFT JOIN leases l ON l.id = p.lease_id
+        LEFT JOIN units pu ON pu.id = COALESCE(p.unit_id, l.unit_id)
+        LEFT JOIN properties pr ON pr.id = pu.property_id
        WHERE p.status = 'settled' AND p.manual_method IS NOT NULL AND p.manual_method <> 'prior_arrangement'
          AND p.type IN ('rent','utility') AND p.due_date IS NOT NULL AND p.settled_at IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM credit_events ce WHERE ce.event_data->>'payment_id' = p.id::text)

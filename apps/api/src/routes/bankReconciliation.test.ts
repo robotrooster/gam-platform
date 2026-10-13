@@ -1,120 +1,109 @@
-// S568: bank reconciliation — GAM disbursed figure, bank charges, difference.
-import { describe, it, expect, beforeEach } from 'vitest'
+// S568 → 10/12 (Nic, ledger P9): the landlord's own bank-reconciliation door,
+// re-based on the ledger. It STARTS a statement (the assistant's
+// record_bank_reconciliation) and lists the history; ticking and finishing are
+// on the Bank Reconciliation page (routes/booksClose.test.ts).
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { cleanupAllSchema, seedProperty } from '../test/dbHelpers'
+import { ledgerCompany, inTx, type LedgerCompany } from '../test/ledgerFixtures'
 import { bankReconciliationRouter } from './bankReconciliation'
-import { expensesRouter } from './expenses'
 import { errorHandler } from '../middleware/errorHandler'
+import { drainLedgerOutbox } from '../services/ledgerEngine'
+import { registerProductionLedgerProjectors, unregisterProductionLedgerProjectors } from '../services/ledgerProjectors'
+import { createLandlordExpense } from '../services/landlordExpenses'
 
 function buildApp() {
   const app = express()
   app.use(express.json())
   app.use('/api/bank-reconciliations', bankReconciliationRouter)
-  app.use('/api/expenses', expensesRouter)
   app.use(errorHandler)
   return app
 }
+const app = buildApp()
 
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_bankrec'
+  registerProductionLedgerProjectors()
 })
+afterEach(() => unregisterProductionLedgerProjectors())
 
-async function seed() {
-  const c = await db.connect()
-  try {
-    await c.query('BEGIN')
-    const { userId: llUser, landlordId } = await seedLandlord(c)
-    const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
-    const unitId = await seedUnit(c, { propertyId, landlordId })
-    // GAM sent them $2,000 in the period.
-    await c.query(
-      `INSERT INTO disbursements (landlord_id, user_id, amount, target_date, status)
-       VALUES ($1, $2, 2000, '2026-08-15', 'settled')`, [landlordId, llUser])
-    await c.query('COMMIT')
-    const token = jwt.sign({ userId: llUser, role: 'landlord', email: 'll@t.dev', profileId: landlordId, permissions: {} },
-      process.env.JWT_SECRET!, { expiresIn: '1h' })
-    return { landlordId, propertyId, unitId, token }
-  } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+const passFor = (userId: string, landlordIds: string[]) =>
+  jwt.sign({ userId, role: 'landlord', email: 'll@t.dev', profileId: null, landlordIds, permissions: {} },
+    process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+/** A company with one linked bank and $40 paid from it by hand on Sept 6. */
+async function companyWithBank(co?: LedgerCompany): Promise<LedgerCompany & { connectionId: string }> {
+  const c = co ?? await ledgerCompany()
+  const connectionId = (await db.query<{ id: string }>(
+    `INSERT INTO bank_connections (landlord_id, provider, status, display_name) VALUES ($1, 'stripe_fc', 'active', 'Operating') RETURNING id`,
+    [c.landlordId])).rows[0].id
+  await createLandlordExpense({
+    landlordId: c.landlordId, propertyId: c.propertyId, category: 'repairs', amount: 40, expenseDate: '2026-09-06',
+    payment: { method: 'bank', bankConnectionId: connectionId },
+  })
+  expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+  return { ...c, connectionId }
 }
 
-describe('bank reconciliation', () => {
-  it('context returns GAM disbursed + logged bank charges', async () => {
-    const f = await seed()
-    // Log a bank fee via /expenses (flows to P&L + shows in reconciliation).
-    await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${f.token}`)
-      .send({ unitId: f.unitId, category: 'bank_fees', amount: 25, expenseDate: '2026-08-20', description: 'Wire fee' }).expect(200)
+describe('the landlord\'s bank reconciliation door, on the ledger', () => {
+  it('starts a statement on the company\'s one linked bank at the figure printed on it, and lists it', async () => {
+    const co = await companyWithBank()
+    const auth = { Authorization: `Bearer ${passFor(co.ownerUserId, [co.landlordId])}` }
+    // The old body still works: periodStart is accepted and not needed.
+    const res = await request(app).post('/api/bank-reconciliations').set(auth)
+      .send({ periodStart: '2026-09-01', periodEnd: '2026-09-30', statementBalance: -40 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data.reconciliation).toMatchObject({ status: 'open', statementDate: '2026-09-30', statementBalance: -40 })
+    expect(res.body.data.account).toMatchObject({ bankConnectionId: co.connectionId, linked: true })
+    expect(res.body.data).toMatchObject({ difference: -40, canFinish: false })
+    expect(res.body.data.lines.map((l: any) => l.amount)).toEqual([-40])
 
-    const res = await request(buildApp()).get('/api/bank-reconciliations/context?from=2026-08-01&to=2026-08-31')
-      .set('Authorization', `Bearer ${f.token}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.gamDisbursed).toBe(2000)
-    expect(res.body.data.bankChargesTotal).toBe(25)
-    expect(res.body.data.bankCharges).toHaveLength(1)
-  })
-
-  // S654 (Nic, DIRECTIVE): no default company. Each company has its own bank,
-  // so a two-company account names the company on every read and write here —
-  // and what it names is where the bank charge and the reconciliation land.
-  it('S654: a two-company account reconciles the company it names', async () => {
-    const c = await db.connect()
-    let userId = '', llA = '', llB = ''
-    try {
-      await c.query('BEGIN')
-      const a = await seedLandlord(c); userId = a.userId; llA = a.landlordId
-      const b = await c.query<{ id: string }>(
-        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [userId])
-      llB = b.rows[0].id
-      await c.query(
-        `INSERT INTO disbursements (landlord_id, user_id, amount, target_date, status)
-         VALUES ($1, $3, 1000, '2026-08-15', 'settled'), ($2, $3, 3000, '2026-08-15', 'settled')`, [llA, llB, userId])
-      await c.query('COMMIT')
-    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
-    const token = jwt.sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
-      process.env.JWT_SECRET!, { expiresIn: '1h' })
-    const app = buildApp()
-
-    // Naming nothing is asked, never defaulted.
-    const ask = await request(app).get('/api/bank-reconciliations/context?from=2026-08-01&to=2026-08-31')
-      .set('Authorization', `Bearer ${token}`)
-    expect(ask.status).toBe(400)
-
-    // The bank charge lands in the company named.
-    await request(app).post('/api/expenses').set('Authorization', `Bearer ${token}`)
-      .send({ landlordId: llB, category: 'bank_fees', amount: 15, expenseDate: '2026-08-20', description: 'Wire fee' })
-      .expect(200)
-    const ctxB = await request(app).get(`/api/bank-reconciliations/context?from=2026-08-01&to=2026-08-31&entityId=${llB}`)
-      .set('Authorization', `Bearer ${token}`)
-    expect(ctxB.status).toBe(200)
-    expect(ctxB.body.data.gamDisbursed).toBe(3000)
-    expect(ctxB.body.data.bankChargesTotal).toBe(15)
-    const ctxA = await request(app).get(`/api/bank-reconciliations/context?from=2026-08-01&to=2026-08-31&entityId=${llA}`)
-      .set('Authorization', `Bearer ${token}`)
-    expect(ctxA.body.data.gamDisbursed).toBe(1000)
-    expect(ctxA.body.data.bankChargesTotal).toBe(0)
-
-    const saved = await request(app).post('/api/bank-reconciliations').set('Authorization', `Bearer ${token}`)
-      .send({ landlordId: llB, periodStart: '2026-08-01', periodEnd: '2026-08-31', statementBalance: 2985 })
-    expect(saved.status, JSON.stringify(saved.body)).toBe(200)
-    expect(Number(saved.body.data.difference)).toBe(-15)
-    const histB = await request(app).get(`/api/bank-reconciliations?entityId=${llB}`).set('Authorization', `Bearer ${token}`)
-    expect(histB.body.data).toHaveLength(1)
-    const histA = await request(app).get(`/api/bank-reconciliations?entityId=${llA}`).set('Authorization', `Bearer ${token}`)
-    expect(histA.body.data).toHaveLength(0)
-  })
-
-  it('saving a reconciliation computes difference = statement − GAM disbursed', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-reconciliations').set('Authorization', `Bearer ${f.token}`)
-      .send({ periodStart: '2026-08-01', periodEnd: '2026-08-31', statementBalance: 1975 })
-    expect(res.status).toBe(200)
-    expect(Number(res.body.data.book_balance)).toBe(2000)
-    expect(Number(res.body.data.difference)).toBe(-25)   // statement short by the $25 bank fee
-    expect(res.body.data.status).toBe('completed')
-    const list = await request(buildApp()).get('/api/bank-reconciliations').set('Authorization', `Bearer ${f.token}`)
+    const list = await request(app).get('/api/bank-reconciliations').set(auth)
+    expect(list.status).toBe(200)
     expect(list.body.data).toHaveLength(1)
+    expect(list.body.data[0]).toMatchObject({ status: 'open', statementDate: '2026-09-30', accountName: expect.stringMatching(/Checking: Operating/) })
+
+    // The statement's last day is required; a balance must be a number.
+    expect((await request(app).post('/api/bank-reconciliations').set(auth).send({ statementBalance: 1 })).status).toBe(400)
+    expect((await request(app).post('/api/bank-reconciliations').set(auth).send({ periodEnd: '2026-09-30', statementBalance: 'lots' })).status).toBe(400)
+  })
+
+  it('a company with no bank account on its books yet is told to link one; naming another company\'s account is refused', async () => {
+    const co = await ledgerCompany()
+    const auth = { Authorization: `Bearer ${passFor(co.ownerUserId, [co.landlordId])}` }
+    const none = await request(app).post('/api/bank-reconciliations').set(auth).send({ periodEnd: '2026-09-30', statementBalance: 0 })
+    expect(none.status).toBe(409)
+    expect(none.body.error).toMatch(/Link the bank/)
+    const other = await companyWithBank()
+    const theirs = await request(app).post('/api/bank-reconciliations').set(auth)
+      .send({ periodEnd: '2026-09-30', statementBalance: 0, accountId: other.connectionId })
+    expect(theirs.status).toBe(404)
+  })
+
+  // S654 (Nic, DIRECTIVE): no default company. A two-company account names the
+  // company on every read and write here.
+  it('S654: a two-company account reconciles the company it names, never a default', async () => {
+    const a = await companyWithBank()
+    const b = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, billing_starts_at, books_start_date) VALUES ($1, DATE '2000-01-01', DATE '2026-01-01') RETURNING id`,
+      [a.ownerUserId])).rows[0].id
+    await db.query(`DELETE FROM ledger_outbox WHERE source_type = 'opening' AND source_id = $1`, [b])
+    const propB = await inTx(c => seedProperty(c, { landlordId: b, ownerUserId: a.ownerUserId, managedByUserId: a.ownerUserId }))
+    await companyWithBank({ ...a, landlordId: b, propertyId: propB, owner: { landlordId: b } })
+    const auth = { Authorization: `Bearer ${passFor(a.ownerUserId, [a.landlordId, b])}` }
+
+    const ask = await request(app).post('/api/bank-reconciliations').set(auth).send({ periodEnd: '2026-09-30', statementBalance: -40 })
+    expect(ask.status).toBe(400)
+    const inB = await request(app).post('/api/bank-reconciliations').set(auth)
+      .send({ landlordId: b, periodEnd: '2026-09-30', statementBalance: -40 })
+    expect(inB.status, JSON.stringify(inB.body)).toBe(200)
+    expect((await request(app).get(`/api/bank-reconciliations?entityId=${b}`).set(auth)).body.data).toHaveLength(1)
+    expect((await request(app).get(`/api/bank-reconciliations?entityId=${a.landlordId}`).set(auth)).body.data).toHaveLength(0)
+    expect((await request(app).get(`/api/bank-reconciliations?entityId=${randomUUID()}`).set(auth)).status).toBe(403)
   })
 })

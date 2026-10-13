@@ -88,8 +88,11 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
     `INSERT INTO home_sale_contracts
        (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
         annual_interest_rate, term_months, monthly_payment, start_month, installments_total, plan_type,
-        status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        status, activated_at)
+     -- 10/12 (Nic, ledger P1): a sale written active is active from now
+     -- (activated_at); one awaiting signature gets it when the landlord signs.
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+             CASE WHEN $14 = 'active' THEN NOW() END)
      RETURNING *`,
     [input.unitId, input.leaseId ?? null, input.tenantId, input.landlordId, input.salePrice.toFixed(2),
      input.downPayment.toFixed(2), financed.toFixed(2), input.annualInterestRate, input.termMonths,
@@ -219,9 +222,350 @@ async function writeScheduleAndActivate(
        row.amount.toFixed(2), row.principalPortion.toFixed(2), row.interestPortion.toFixed(2),
        row.remainingBalance.toFixed(2)])
   }
+  // 10/12 (Nic, ledger P1): the day it went active is stored (activated_at) —
+  // the ledger dates the sale from it and reads it against the books' start.
   await client.query(
-    `UPDATE home_sale_contracts SET status='active', updated_at=NOW() WHERE id=$1`, [c.id])
+    `UPDATE home_sale_contracts SET status='active', activated_at = COALESCE(activated_at, NOW()), updated_at=NOW()
+      WHERE id=$1`, [c.id])
   return { contractId: c.id, installments: schedule.length }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10/12 (Nic): A SALE THE LANDLORD SIGNED THAT DID NOT START IS TRIED AGAIN
+// EVERY MORNING.
+//
+// His signature starts a home sale billing — routes/esign.ts calls
+// activateHomeSaleContract right after it. That call is best-effort, after the
+// signature is committed: when it fails, the sale sits 'pending_signature' and
+// bills nothing until the buyer signs (MH 18 and MH 24 all over again). Asked
+// what should happen then, Nic: "Retry every morning." So the daily home-sale
+// run (billDueHomeSaleInstallments, 04:20 Phoenix) first starts every such
+// sale, with the same steps the 10/12 one-time script used
+// (scripts/oct12_activate_landlord_signed_home_sales.ts calls
+// startLandlordSignedSaleIn too). The landlord is told either way: the morning
+// it starts, and — once — the morning it could not.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A sale whose agreement the landlord signed and that is still waiting to start. */
+export interface LandlordSignedSaleWaiting {
+  contract_id: string
+  document_id: string
+  property_id: string
+  property: string
+  unit: string
+  tenant_id: string
+  landlord_id: string
+  /** The day the landlord signed, in the property's calendar ('YYYY-MM-DD'); null if not stamped. */
+  landlord_signed_on: string | null
+}
+
+/**
+ * Every sale the landlord has signed that is still 'pending_signature': its
+ * agreement is neither voided nor failed, and a landlord signer has signed it.
+ * `q` is a client inside a transaction, or db's `query`.
+ *
+ * `signedMinutesAgo` (the morning retry): only a signature at least that old.
+ * 10/12: the signature commits before its own path records the typed terms and
+ * starts the sale (routes/esign.ts), so a retry landing in that gap saw a
+ * signed sale "not started", told the landlord and raised a critical alert
+ * seconds before the signature started it — and that alert then stood in for
+ * any real one on the agreement. `documentId`: just that agreement's sale.
+ */
+export async function landlordSignedSalesWaiting(
+  q: { query: Function },
+  o: { signedMinutesAgo?: number; documentId?: string } = {},
+): Promise<LandlordSignedSaleWaiting[]> {
+  const params: unknown[] = []
+  const signedBefore = o.signedMinutesAgo != null
+    ? `AND (s.signed_at IS NULL OR s.signed_at < NOW() - make_interval(mins => $${params.push(o.signedMinutesAgo)}::int))` : ''
+  const onlyDoc = o.documentId != null ? `AND d.id = $${params.push(o.documentId)}::uuid` : ''
+  return rowsFrom(q,
+    `SELECT c.id AS contract_id, c.purchase_document_id AS document_id, p.id AS property_id,
+            p.name AS property, u.unit_number AS unit, c.tenant_id, c.landlord_id,
+            ls.signed_on AS landlord_signed_on
+       FROM home_sale_contracts c
+       JOIN lease_documents d ON d.id = c.purchase_document_id
+       JOIN units u ON u.id = c.unit_id
+       JOIN properties p ON p.id = u.property_id
+       CROSS JOIN LATERAL (
+         SELECT COUNT(*) AS n,
+                (MIN(s.signed_at) AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date::text AS signed_on
+           FROM lease_document_signers s
+          WHERE s.document_id = d.id AND s.role = 'landlord' AND s.status = 'signed' ${signedBefore}
+       ) ls
+      WHERE c.status = 'pending_signature'
+        AND d.status NOT IN ('voided', 'execution_failed')
+        AND ls.n > 0
+        ${onlyDoc}
+      ORDER BY p.name, u.unit_number`, params)
+}
+
+/**
+ * What starting one waiting sale did. Only 'started' changed anything.
+ *   buyer_signs     — the buyer belongs to another company, so their own
+ *                     signature starts it (S655). Expected; not a failure.
+ *   nothing_waiting — another path started it first (the buyer signed).
+ *   terms           — the terms typed on the agreement cannot be read, or are
+ *                     not the sale on file. Never billed on the wrong terms.
+ */
+export type SaleStartOutcome =
+  | { started: ActivationReport }
+  | { skipped: 'buyer_signs' | 'nothing_waiting' | 'terms'; why: string }
+
+/**
+ * Start one landlord-signed sale on the caller's transaction (the 10/12 script
+ * rolls a dry run back; the morning retry commits each sale on its own).
+ * The steps the landlord's signature takes (routes/esign.ts), after its terms
+ * were recorded: the buyer of another company waits for their own signature,
+ * then activateHomeSaleContractIn writes the schedule, stamps the months paid
+ * outside GAM and puts what is due on the buyer's open bill. Idempotent: a
+ * sale already started is found by nothing here (activation reads only
+ * 'pending_signature' contracts, under the contract's row lock).
+ */
+export async function startLandlordSignedSaleIn(client: Client, w: LandlordSignedSaleWaiting): Promise<SaleStartOutcome> {
+  // Imported here: newLeaseInvite pulls in half the e-sign stack.
+  const { tenantsNeedingOwnSignature } = await import('./newLeaseInvite')
+  if ((await tenantsNeedingOwnSignature(w.document_id)).length > 0) {
+    return { skipped: 'buyer_signs', why: 'the buyer belongs to another company — their own signature starts it (S655)' }
+  }
+  const disagreement = await paperDisagreesWithSale(client, w.document_id, w.contract_id)
+  if (disagreement) return { skipped: 'terms', why: disagreement }
+  const r = await activateHomeSaleContractIn(client, w.document_id)
+  if (!r) return { skipped: 'nothing_waiting', why: 'nothing waiting on this agreement' }
+  return { started: r }
+}
+
+/** The sale terms the landlord types on an agreement (the rest are printed from the record). */
+const TYPED_SALE_COLUMNS = [
+  'sale_price', 'sale_down_payment', 'sale_monthly_payment', 'sale_term_months',
+  'sale_interest_rate', 'sale_first_payment_month',
+]
+
+/**
+ * S652 (Nic): "the paper is the record". On his signature the typed terms
+ * become the sale (applySaleTermsFromDocument) and only then does it start. If
+ * that recording failed, the contract still waiting under the agreement holds
+ * the terms it was drafted with — which he may have typed over. Starting it
+ * then would bill numbers nobody signed, so a sale whose agreement carries
+ * typed terms starts only when they are the sale on file (the same comparison
+ * the recording makes to keep a record). An agreement with no typed terms
+ * leaves the contract's own. Read-only. Null = fine to start; else why not.
+ */
+async function paperDisagreesWithSale(client: Client, documentId: string, contractId: string): Promise<string | null> {
+  const fields = await saleFieldsOn(client, documentId)
+  if (!carriesTypedSaleTerms(fields)) return null
+  const k = (await client.query<SaleTermsOnFile & { timezone: string | null }>(
+    `SELECT c.sale_price, c.down_payment, c.annual_interest_rate, c.term_months,
+            to_char(c.start_month, 'YYYY-MM-DD') AS start_month, p.timezone
+       FROM home_sale_contracts c
+       JOIN units u ON u.id = c.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE c.id = $1`, [contractId])).rows[0]
+  if (!k) return null
+  const onPaper = saleTermsFromFields(fields)
+  let terms: ReturnType<typeof resolveTypedSaleTerms>
+  try {
+    terms = resolveTypedSaleTerms(onPaper, k.timezone)
+  } catch (e) {
+    return `the terms typed on the agreement cannot be read (${e instanceof Error ? e.message : String(e)})`
+  }
+  // A blank first-payment month is "next month" from the day it is read, so a
+  // later morning would read a different month. The record holds the one
+  // worked out when he signed.
+  if (!onPaper.startMonth) terms = { ...terms, startMonth: k.start_month }
+  return sameSaleTerms(k, terms) ? null : 'the terms typed on the agreement are not the sale on file'
+}
+
+/** The sale_* fields on an agreement. */
+async function saleFieldsOn(q: { query: Function }, documentId: string): Promise<Array<{ lease_column: string | null; value: string | null }>> {
+  return rowsFrom(q,
+    `SELECT lease_column, value FROM lease_document_fields
+      WHERE document_id = $1 AND lease_column LIKE 'sale_%'`, [documentId])
+}
+
+/** Did the landlord type any sale terms on the agreement? (None typed: the contract's own terms stand.) */
+function carriesTypedSaleTerms(fields: Array<{ lease_column: string | null; value: string | null }>): boolean {
+  return fields.some(f => f.lease_column != null && TYPED_SALE_COLUMNS.includes(f.lease_column)
+                          && f.value != null && String(f.value).trim() !== '')
+}
+
+/** A sale's agreed terms as stored (numerics as pg returns them, start month as 'YYYY-MM-DD'). */
+type SaleTermsOnFile = {
+  sale_price: string | number; down_payment: string | number; annual_interest_rate: string | number
+  term_months: string | number; start_month: string
+}
+
+/** Do the stored terms say what the typed ones do? (applySaleTermsFromDocument keeps a record only when they do.) */
+function sameSaleTerms(onFile: SaleTermsOnFile, t: { salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string }): boolean {
+  return Number(onFile.sale_price) === t.salePrice && Number(onFile.down_payment) === t.downPayment
+    && Number(onFile.annual_interest_rate) === t.annualInterestRate && Number(onFile.term_months) === t.termMonths
+    && String(onFile.start_month).slice(0, 10) === t.startMonth
+}
+
+/** How old a landlord signature must be before the morning retry touches its sale (see landlordSignedSalesWaiting). */
+const RETRY_SIGNED_MINUTES_AGO = 15
+
+/**
+ * The morning retry: start every landlord-signed sale still waiting, each in
+ * its own transaction so one that fails leaves the rest to start. Called by
+ * the daily home-sale run before it bills. Never throws for one sale.
+ *
+ * 10/12: it retries the WHOLE signature step, recording the typed terms first
+ * (applySaleTermsFromDocument), not only the start. When the recording is what
+ * failed on his signature, the contract still holds the drafted terms; a retry
+ * of the start alone found the paper disagreeing with them, told everyone once
+ * and skipped the sale every morning after — and he cannot change a paper he
+ * has signed. The recording is safe to repeat: it does nothing for a started
+ * sale and keeps a record that already matches. A blank first-payment month
+ * still means the month after the day he SIGNED, not after this morning.
+ */
+export async function retryLandlordSignedHomeSaleStarts(): Promise<{ started: number; notStarted: number }> {
+  const waiting = await landlordSignedSalesWaiting({ query }, { signedMinutesAgo: RETRY_SIGNED_MINUTES_AGO })
+  let started = 0
+  let notStarted = 0
+  for (const signed of waiting) {
+    let w: LandlordSignedSaleWaiting | undefined = signed
+    let outcome: SaleStartOutcome | null = null
+    let error: string | null = null
+    try {
+      // An agreement with no typed terms keeps the contract's own (as
+      // paperDisagreesWithSale does): there is nothing to record.
+      if (carriesTypedSaleTerms(await saleFieldsOn({ query }, signed.document_id))) {
+        await applySaleTermsFromDocument(signed.document_id, { asOf: signed.landlord_signed_on })
+        // Recording the typed terms writes a new contract when they differ
+        // from the drafted one (its id changes): read the waiting sale again.
+        w = (await landlordSignedSalesWaiting({ query }, { documentId: signed.document_id }))[0]
+      }
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e)
+      logger.error({ err: e, contractId: signed.contract_id, documentId: signed.document_id },
+        'home sale: the morning retry could not record the terms typed on a landlord-signed agreement')
+    }
+    if (!w) continue   // started meanwhile (the buyer signed): nothing to do, nobody to tell
+    if (!error) {
+      const client = await getClient()
+      try {
+        await client.query('BEGIN')
+        outcome = await startLandlordSignedSaleIn(client, w)
+        await client.query('started' in outcome ? 'COMMIT' : 'ROLLBACK')
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {})
+        error = e instanceof Error ? e.message : String(e)
+        logger.error({ err: e, contractId: w.contract_id, documentId: w.document_id },
+          'home sale: the morning retry could not start a landlord-signed sale')
+      } finally { client.release() }
+    }
+
+    try {
+      if (outcome && 'started' in outcome) {
+        started++
+        logger.info({ contractId: w.contract_id, documentId: w.document_id, attached: outcome.started.attached.length },
+          'home sale: started by the morning retry (it did not start on the landlord\'s signature)')
+        // 10/6 (Nic): money the buyer paid ahead goes on the balance the
+        // home payment just joined, as the signature path does. Never throws.
+        if (outcome.started.attached.length) {
+          const { runWholeBillCheckAfterCommit } = await import('./creditUse')
+          await runWholeBillCheckAfterCommit({ tenantId: w.tenant_id, landlordId: w.landlord_id })
+        }
+        await tellLandlordSaleStarted(w, outcome.started)
+        continue
+      }
+      // Waiting on the buyer of another company, or already started by the
+      // buyer's signature: nothing went wrong, nobody is told.
+      if (outcome && outcome.skipped !== 'terms') continue
+      notStarted++
+      await tellOnceSaleNotStarted(w, outcome ? 'terms' : 'error', outcome?.why ?? error ?? 'unknown error')
+    } catch (e) {
+      logger.error({ err: e, contractId: w.contract_id }, 'home sale: telling the landlord about the morning retry failed')
+    }
+  }
+  if (started || notStarted) logger.info({ started, notStarted }, '[home-sale-start-retry]')
+  return { started, notStarted }
+}
+
+/** The people who run the property — the landlord's side of a notice (S183 resolver). */
+async function propertyContacts(propertyId: string): Promise<Array<{ user_id: string; email: string }>> {
+  const { getPropertyResponsibleParty } = await import('./responsibleParty')
+  const rp = await getPropertyResponsibleParty(propertyId)
+  return rp ? (rp.primaries.length ? rp.primaries : [rp.owner]) : []
+}
+
+async function tellLandlordSaleStarted(w: LandlordSignedSaleWaiting, r: ActivationReport): Promise<void> {
+  const { createNotification, emailTemplate } = await import('./notifications')
+  const { portalLink } = await import('../lib/portalUrls')
+  const where = `${w.unit} at ${w.property}`
+  const day = (iso: string) => new Date(`${iso.slice(0, 10)}T00:00:00Z`)
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+  const added = r.attached.map(a =>
+    `home payment ${a.installmentNumber} ($${a.amount.toFixed(2)}) on the buyer's bill due ${day(a.dueDate)}`)
+  const lines = added.length
+    ? `It put ${added.join(' and ')}.`
+    : `Each home payment goes on the buyer's bill in its month.`
+  const body = `The installment contract you signed for ${where} did not start billing when you signed it. GAM started it this morning. ${lines}`
+  for (const contact of await propertyContacts(w.property_id)) {
+    await createNotification({
+      userId: contact.user_id, landlordId: w.landlord_id,
+      type: 'home_sale_started',
+      title: `Home payments started — ${where}`,
+      body,
+      data: { documentId: w.document_id, contractId: w.contract_id },
+      actionUrl: '/esign',
+      sendEmail: true, emailTo: contact.email,
+      emailHtml: emailTemplate(escapeHtml(`Home payments started — ${where}`), `<p>${escapeHtml(body)}</p>`,
+        { label: 'Open documents', url: portalLink('landlord', 'esign') }),
+    })
+  }
+}
+
+/**
+ * Told once per agreement, not every morning (one email per thing): the first
+ * morning it could not start, the landlord and GAM's admins hear why; later
+ * mornings keep trying quietly. The admin record is the "already told" mark —
+ * it is written whatever anyone's notification settings are, and it is kept
+ * (moved to the archive, never deleted).
+ */
+async function tellOnceSaleNotStarted(w: LandlordSignedSaleWaiting, kind: 'terms' | 'error', why: string): Promise<void> {
+  const told = await query(
+    `SELECT 1 FROM admin_notifications
+      WHERE category = 'home_sale_start_retry_failed' AND context->>'document_id' = $1
+     UNION ALL
+     SELECT 1 FROM admin_notifications_archive
+      WHERE category = 'home_sale_start_retry_failed' AND context->>'document_id' = $1
+     LIMIT 1`, [w.document_id])
+  if (told.length) return
+  const { createAdminNotification } = await import('./adminNotifications')
+  await createAdminNotification({
+    severity: 'critical',
+    category: 'home_sale_start_retry_failed',
+    title: `Home-sale billing still not started for ${w.property} ${w.unit} (agreement ${w.document_id})`,
+    body: `The landlord signed the installment contract; the sale has not started billing. The morning run keeps trying. ${why}`,
+    context: { document_id: w.document_id, contract_id: w.contract_id, kind },
+  })
+  const { createNotification, emailTemplate } = await import('./notifications')
+  const { portalLink } = await import('../lib/portalUrls')
+  const where = `${w.unit} at ${w.property}`
+  const body = kind === 'terms'
+    ? `The installment contract you signed for ${where} has not started billing: the payment terms typed on it do not match the sale on file, so no home payments go on the buyer's bills until that is fixed. GAM support has been told.`
+    : `The installment contract you signed for ${where} has not started billing, so no home payments are going on the buyer's bills yet. GAM tries again every morning, and GAM support has been told.`
+  for (const contact of await propertyContacts(w.property_id)) {
+    await createNotification({
+      userId: contact.user_id, landlordId: w.landlord_id,
+      type: 'home_sale_not_started',
+      title: `Home payments not started — ${where}`,
+      body,
+      data: { documentId: w.document_id, contractId: w.contract_id },
+      actionUrl: '/esign',
+      sendEmail: true, emailTo: contact.email,
+      emailHtml: emailTemplate(escapeHtml(`Home payments not started — ${where}`), `<p>${escapeHtml(body)}</p>`,
+        { label: 'Open documents', url: portalLink('landlord', 'esign') }),
+    })
+  }
+}
+
+/** A property or unit name goes into the email's HTML (emailTemplate takes markup, the title too). */
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
 /**
@@ -471,6 +815,11 @@ export async function reconcileAllHomeSaleContracts(): Promise<void> {
  * Returns the number of installments billed.
  */
 export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<number> {
+  // 10/12 (Nic): "Retry every morning." A sale the landlord signed that did not
+  // start on his signature is started first, so whatever of it is due bills
+  // this morning with everything else. Its failure never stops the billing.
+  await retryLandlordSignedHomeSaleStarts().catch(err =>
+    logger.error({ err }, 'home sale: the morning retry of landlord-signed sales failed'))
   // S652 (Nic): the contract keeps its true terms — John Sheptock's started in
   // January 2021 — but GAM bills only from the property's first billing cycle.
   // Every installment before that was paid outside GAM and is stamped so, once;
@@ -714,14 +1063,16 @@ export function saleTermsFromFields(fields: Array<{ lease_column: string | null;
 
 /**
  * What the typed terms mean, or why they cannot bill — said in the landlord's words.
- * `tz` is the property's zone, for the default first payment month.
+ * `tz` is the property's zone, for the default first payment month. `asOf`
+ * ('YYYY-MM-DD', the park's calendar) is the day "next month" counts from —
+ * the day he signed, when that is not today (the morning retry).
  */
-export function resolveTypedSaleTerms(t: TypedSaleTerms, tz: string | null = null): { planType: 'flat' | 'amortized'; salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string } {
+export function resolveTypedSaleTerms(t: TypedSaleTerms, tz: string | null = null, asOf?: string | null): { planType: 'flat' | 'amortized'; salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string } {
   const n = t.numberOfPayments
   if (!n || n <= 0) throw new AppError(400, 'The installment contract needs the number of payments.')
   // S654: "next month" counts from the park's today. From UTC, a contract
   // signed on the last evening of a month in Phoenix skipped a month.
-  const start = t.startMonth ?? monthStartOf(addDaysTo(monthStartOf(todayIn(tz)), 32))
+  const start = t.startMonth ?? monthStartOf(addDaysTo(monthStartOf(asOf ?? todayIn(tz)), 32))
   // Same amount every month, no interest: the plain case — price is the sum.
   if (t.monthlyAmount && t.monthlyAmount > 0 && (!t.annualInterestRate || t.annualInterestRate === 0)
       && (t.salePrice == null || Math.abs(t.salePrice - t.downPayment - t.monthlyAmount * n) < 1)) {
@@ -743,7 +1094,11 @@ export function resolveTypedSaleTerms(t: TypedSaleTerms, tz: string | null = nul
  * starts it billing (10/12, Nic — routes/esign.ts calls activateHomeSaleContract
  * right after this), so the buyer's signature is no longer what bills it.
  */
-export async function applySaleTermsFromDocument(documentId: string): Promise<{ contractId: string }> {
+export async function applySaleTermsFromDocument(
+  documentId: string,
+  /** The day he signed (park calendar), when recording later than that day — see resolveTypedSaleTerms. */
+  o: { asOf?: string | null } = {},
+): Promise<{ contractId: string }> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -765,7 +1120,7 @@ export async function applySaleTermsFromDocument(documentId: string): Promise<{ 
     if (started) { await client.query('COMMIT'); return { contractId: started.id } }
     const fields = (await client.query<any>(
       `SELECT id, lease_column, value FROM lease_document_fields WHERE document_id = $1 AND lease_column LIKE 'sale_%'`, [documentId])).rows
-    const terms = resolveTypedSaleTerms(saleTermsFromFields(fields), doc.timezone)
+    const terms = resolveTypedSaleTerms(saleTermsFromFields(fields), doc.timezone, o.asOf)
     const buyer = (await client.query<any>(
       `SELECT t.id FROM lease_document_signers s JOIN tenants t ON t.user_id = s.user_id
         WHERE s.document_id = $1 AND s.role IN ('primary','purchaser') ORDER BY s.order_index LIMIT 1`, [documentId])).rows[0]
@@ -780,10 +1135,7 @@ export async function applySaleTermsFromDocument(documentId: string): Promise<{ 
               to_char(start_month, 'YYYY-MM-DD') AS start_month, plan_type
          FROM home_sale_contracts WHERE unit_id = $1 AND status = 'pending_signature' FOR UPDATE`, [doc.unit_id])).rows[0]
     let contract: any = null
-    if (existing && existing.purchase_document_id === documentId
-        && Number(existing.sale_price) === terms.salePrice && Number(existing.down_payment) === terms.downPayment
-        && Number(existing.annual_interest_rate) === terms.annualInterestRate && Number(existing.term_months) === terms.termMonths
-        && String(existing.start_month).slice(0, 10) === terms.startMonth) {
+    if (existing && existing.purchase_document_id === documentId && sameSaleTerms(existing, terms)) {
       contract = (await client.query<any>(`SELECT * FROM home_sale_contracts WHERE id = $1`, [existing.id])).rows[0]
     } else {
       if (existing) {

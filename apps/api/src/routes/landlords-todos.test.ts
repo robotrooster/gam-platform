@@ -105,15 +105,31 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.counts.total).toBe(2)
   })
 
-  it('bank account active → no landlord-bank todo', async () => {
+  // 10/12 (Nic): the task clears on live Stripe Connect payouts only. A row in
+  // the legacy bank catalog (the removed Add Bank Account form) used to clear
+  // it — and it never set up a payout (Country Acres, 10/5).
+  it('Stripe Connect payouts live → no landlord-bank todo', async () => {
+    const f = await seedTFixture()
+    await db.query(`UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`, [f.landlordId])
+    const res = await getTodos(f.landlordToken)
+    expect(res.status).toBe(200)
+    const bankTodos = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
+    expect(bankTodos.length).toBe(0)
+  })
+
+  it('an active legacy bank row alone → the todo stays, and says to set up payouts with Stripe', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try { await seedUserBankAccount(client, { userId: f.landlordUserId }) }
     finally { client.release() }
     const res = await getTodos(f.landlordToken)
     expect(res.status).toBe(200)
-    const bankTodos = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
-    expect(bankTodos.length).toBe(0)
+    const [todo] = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
+    expect(todo).toMatchObject({
+      title: 'Set up payouts',
+      subtitle: 'Required to receive rent. Verify your business with Stripe on the Disbursement Account page.',
+      href: '/banking',
+    })
   })
 
   it('lease needs_review → leases[] has needs_review item', async () => {
@@ -541,7 +557,8 @@ describe('to-dos for a co-owner of somebody else’s entity', () => {
           profileId: partner.landlordId,
           landlordIds: [partner.landlordId, owner.landlordId], permissions: {} },
         process.env.JWT_SECRET!, { expiresIn: '1h' })
-      return { token, propertyId, ownerLandlordId: owner.landlordId }
+      return { token, propertyId, ownerLandlordId: owner.landlordId,
+               partnerLandlordId: partner.landlordId, partnerUserId: partner.userId }
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
   }
@@ -574,6 +591,29 @@ describe('to-dos for a co-owner of somebody else’s entity', () => {
     const res = await getTodos(token)
     expect(res.status).toBe(200)
     expect((res.body.data.ach as any[]).map((t) => t.id)).toContain('landlord-bank')
+  })
+
+  // 10/12 (Nic): Blu co-owns Oak Park (paid) and owns TruBlu Management LLC,
+  // which holds Country Acres and has no Stripe account. "Any company in scope
+  // can be paid" let Oak Park answer for TruBlu, so the to-do never showed.
+  it('demands payouts for the co-owner’s OWN company once it has a property', async () => {
+    const f = await seedCoOwner()
+    const own = { id: f.partnerLandlordId, user_id: f.partnerUserId }
+    await db.query(`UPDATE landlords SET business_name = 'TruBlu Management LLC' WHERE id = $1`, [own.id])
+    const client = await db.connect()
+    try {
+      await seedProperty(client, { landlordId: own.id, ownerUserId: own.user_id, managedByUserId: own.user_id })
+    } finally { client.release() }
+
+    const res = await getTodos(f.token)
+    expect(res.status).toBe(200)
+    const [todo] = (res.body.data.ach as any[]).filter((t) => t.id === 'landlord-bank')
+    expect(todo, 'a paid co-owned company hid the unpaid company that holds a property').toBeTruthy()
+    expect(todo).toMatchObject({
+      title: 'Set up payouts',
+      subtitle: "TruBlu Management LLC can't be paid yet. Verify it with Stripe on the Disbursement Account page.",
+      href: `/banking?entity=${own.id}`,
+    })
   })
 })
 

@@ -248,6 +248,25 @@ describe('GET /api/admin/onboarding/overview', () => {
     // Fixture: 1 landlord, no bank account → landlords_no_bank = 1
     expect(d.landlords_no_bank).toBe(1)
   })
+
+  // 10/12 (Nic): "no bank" = Stripe cannot pay them. A legacy catalog row
+  // (the removed Add Bank Account form) never set up a payout, so it does not
+  // take a landlord off this count; live Connect payouts do.
+  it('counts by Stripe Connect payouts, not legacy bank rows', async () => {
+    const f = await seedAFixture()
+    const get = () => request(buildApp())
+      .get('/api/admin/onboarding/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    await db.query(
+      `INSERT INTO user_bank_accounts
+         (user_id, nickname, account_holder_name, account_type,
+          routing_number, account_number_last4, account_number_encrypted, status)
+       VALUES ($1, 'Op', 'Holder', 'checking', '110000000', '1234', 'enc', 'active')`,
+      [f.landlordUserId])
+    expect((await get()).body.data.landlords_no_bank).toBe(1)
+    await db.query(`UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`, [f.landlordId])
+    expect((await get()).body.data.landlords_no_bank).toBe(0)
+  })
 })
 
 describe('GET /api/admin/tenants', () => {

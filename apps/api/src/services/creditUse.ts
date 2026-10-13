@@ -2805,6 +2805,7 @@ async function recoverChoiceMoney(
       if (take > 0 && i.kind === 'cash_instead' && i.gamHeld && !i.released && i.onChoice && i.releaseCap > 0) {
         await recordHeldItem({
           landlordId: i.landlordId, sourceType: 'prepaid_draw', sourceId: `cash-part:${i.partId}`, amount: toDollars(i.releaseCap),
+          property: { refundPartId: i.partId! },  // 10/12 (Nic, ledger P1)
           description: cashPartReleaseWords(i.unitNumber),
         }, client)
         i.released = true
@@ -2815,6 +2816,7 @@ async function recoverChoiceMoney(
       if (i.kind === 'cash_instead' && i.gamHeld && i.released && back > 0) {
         const wrote = await recordHeldItem({
           landlordId: i.landlordId, sourceType: 'dispute', sourceId: choiceNetSourceId(chargeKey, i.partId!), amount: -toDollars(back),
+          property: { refundPartId: i.partId! },  // 10/12 (Nic, ledger P1)
           description: `${i.unitNumber ? `${i.unitNumber}: ` : ''}money GAM paid you for a refund you handed back in cash was taken back by ${byBank ? 'their bank (a returned payment)' : 'the card company (a dispute)'} — it comes off your next payout; the tenant owes you the refund again`,
         }, client)
         if (wrote) {
@@ -2842,6 +2844,7 @@ async function recoverChoiceMoney(
     if (i.gamHeld && !i.released) continue
     const wrote = await recordHeldItem({
       landlordId: i.landlordId, sourceType: 'dispute', sourceId: choiceNetSourceId(chargeKey, i.useId), amount: -toDollars(take),
+      property: { creditUseId: i.useId },  // 10/12 (Nic, ledger P1): the paid-ahead money's property
       description: `${i.unitNumber ? `${i.unitNumber}: ` : ''}money paid ahead that you kept was taken back by ${byBank ? 'their bank (a returned payment)' : 'the card company (a dispute)'} — it comes off your next payout`,
     }, client)
     if (wrote) {

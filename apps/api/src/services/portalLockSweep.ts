@@ -76,7 +76,8 @@ export async function lockCandidates(): Promise<{ due: LockCandidate[]; warning:
                WHERE p.landlord_id = l.id AND p.status = 'settled'
                  AND p.created_at >= NOW() - INTERVAL '35 days') AS has_flow
        FROM landlords l
-       JOIN landlord_gam_charges c ON c.landlord_id = l.id AND c.collected_amount < c.amount
+       -- 10/12: a voided charge (kept, never deleted) is owed by nobody.
+       JOIN landlord_gam_charges c ON c.landlord_id = l.id AND c.collected_amount < c.amount AND c.voided_at IS NULL
       WHERE l.is_demo = FALSE AND l.platform_locked_at IS NULL
       GROUP BY l.id`)
 
@@ -123,7 +124,7 @@ export async function runPortalLockSweep(): Promise<{
       WHERE l.platform_locked_at IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM landlord_gam_charges c
-           WHERE c.landlord_id = l.id AND c.collected_amount < c.amount)
+           WHERE c.landlord_id = l.id AND c.collected_amount < c.amount AND c.voided_at IS NULL)
       RETURNING l.id, l.business_name`)
   for (const r of released) {
     logger.warn({ landlordId: r.id }, '[portal-lock] balance settled — access restored')

@@ -214,7 +214,7 @@ describe('a voided charge is never counted as a payment', () => {
       userId: h.userId, role: 'tenant', email: 't@t.dev', profileId: h.tenantId, permissions: {},
     })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
-    expect(res.body.data).toMatchObject({ totalPayments: 1, settledCount: 1, onTimeRate: 100 })
+    expect(res.body.data).toMatchObject({ totalPayments: 1, settledCount: 1 })
     expect(res.body.data.onTime).toMatchObject({ resolved: 1, onTimeCount: 1, pct: 100 })
   })
 })

@@ -953,6 +953,17 @@ describe('S655: move-out pools paid-ahead money through the credit ledger', () =
     expect(params).toMatchObject({ amount: 60000, destination: 'acct_landlord_test' })
     expect(opts).toEqual({ idempotencyKey: `deposit_disb_${draftId}` })
     expect((await db.query(`SELECT COUNT(*)::int AS n FROM held_payout_items`)).rows[0].n).toBe(0)
+    // 10/12 (Nic, ledger P0): the transfer has a record, so the payout that
+    // carries it to the bank lists it and the books can post it.
+    const { rows: intents } = await db.query<any>(
+      `SELECT purpose, deposit_return_id, landlord_id, amount::text AS amount, status, stripe_transfer_id,
+              stripe_idempotency_key, destination_connect_account_id
+         FROM platform_transfer_intents`)
+    expect(intents).toEqual([{
+      purpose: 'deposit_settlement', deposit_return_id: draftId, landlord_id: stack.landlordId, amount: '600.00',
+      status: 'transferred', stripe_transfer_id: 'tr_test', stripe_idempotency_key: `deposit_disb_${draftId}`,
+      destination_connect_account_id: 'acct_landlord_test',
+    }])
   })
 
   it('the deposit never pays a work-trade line or GAM’s FlexPay collection', async () => {
@@ -1509,6 +1520,30 @@ describe('Step 9 review: the move-out pool is split by who holds each deposit', 
     expect(stripeMocks.transfersCreate).toHaveBeenCalledTimes(1)
     expect((stripeMocks.transfersCreate.mock.calls[0] as [any])[0]).toMatchObject({ amount: 25000 })
     expect(await heldItems()).toEqual([])
+  })
+
+  it('10/12 review: a landlord transfer that could not even be recorded is told to GAM as never sent', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 500, heldBy: 'gam_escrow', cleaningFeeAmount: 300 })
+    await db.query(`UPDATE landlords SET stripe_connect_account_id='acct_landlord_test' WHERE id=$1`, [stack.landlordId])
+    // Writing the transfer's record fails (as an INSERT error would): nothing
+    // is recorded and Stripe is never asked.
+    await db.query(`CREATE OR REPLACE FUNCTION test_refuse_transfer_record() RETURNS trigger AS $$
+                    BEGIN RAISE EXCEPTION 'record refused (test)'; END $$ LANGUAGE plpgsql`)
+    await db.query(`CREATE TRIGGER test_refuse_transfer_record BEFORE INSERT ON platform_transfer_intents
+                    FOR EACH ROW EXECUTE FUNCTION test_refuse_transfer_record()`)
+    try {
+      const draft = await createOrFetchDraft(stack.leaseId)
+      await finalizeDepositReturn(draft.id, stack.ownerUserId)
+      expect(stripeMocks.transfersCreate).not.toHaveBeenCalled()
+      // The notice paymentReversal reads to know the landlord was never paid this share.
+      const notes = (await db.query(
+        `SELECT context FROM admin_notifications WHERE category = 'deposit_disbursement_transfer_failed'`)).rows
+      expect(notes).toHaveLength(1)
+      expect(notes[0].context).toMatchObject({ deposit_return_id: draft.id, lease_id: stack.leaseId, amount: 300 })   // 500 held − 200 refunded
+    } finally {
+      await db.query(`DROP TRIGGER IF EXISTS test_refuse_transfer_record ON platform_transfer_intents`)
+      await db.query(`DROP FUNCTION IF EXISTS test_refuse_transfer_record()`)
+    }
   })
 
   it('landlord-held deposit, one deposit paid through GAM and one at the desk: GAM releases what it holds, and only that', async () => {

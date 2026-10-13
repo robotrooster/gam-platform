@@ -5,7 +5,11 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES, BANK_TXN_STATUSES } from '@gam/shared'
+import { MERCHANT_RULE_SCOPES, BANK_TXN_STATUSES, BANK_OUT_MATCH_KINDS, BANK_IN_MATCH_KINDS, EXPENSE_MATCH_MAX } from '@gam/shared'
+import { companyWideRefusal, bookkeeperMayWrite, READ_ONLY_REFUSAL } from '../lib/bookkeeperScope'
+import {
+  moneyOutMatchesFor, matchLineToExpenses, matchLineToRecord, assertBookkeeperMayFileLine, assertBookkeeperMayFileTransfer,
+} from '../services/bankMoneyOut'
 import { queryOne } from '../db'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { logger } from '../lib/logger'
@@ -13,10 +17,41 @@ import { NOT_RENT_MARK } from '../services/bankDepositCandidates'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
+  splitTransaction, undoSplit, SPLIT_MAX_PARTS, undoFiling, stopPayerAutoFiling,
 } from '../services/bankFeed'
 
 export const bankFeedRouter = Router()
 bankFeedRouter.use(requireAuth)
+
+/**
+ * 10/12 (Nic, L19; design §11): bank lines are the owner's, and a
+ * bookkeeper's with the bank — the company-wide box (10/12, ledger decision 2:
+ * one level, so every such bookkeeper files). Money going out is open to them; money coming in only as the
+ * owner chose for them (assertBookkeeperMayFileLine on each filing route).
+ * Never a tenant's payment: confirming a deposit, a recorded deposit and "Not
+ * rent" stay the owner's (requireLandlord, and off the bookkeeper allowlist).
+ */
+function bankGate(write: boolean) {
+  return (req: any, res: any, next: any) => {
+    const role = req.user?.role
+    if (role === 'landlord' || role === 'admin' || role === 'super_admin') return next()
+    if (role === 'bookkeeper') {
+      if (!req.user.bookkeeperScope?.companyWide) {
+        return res.status(403).json({ success: false, error: companyWideRefusal('The bank account') })
+      }
+      // 10/12 (Nic) review, SECURITY: THIS company's scope row, read live
+      // (lib/bookkeeperScope), never the sign-in pass's value. 10/12 (Nic):
+      // one level — refused only without a scope row on the company.
+      if (write && !bookkeeperMayWrite(req.user.bookkeeperScope)) {
+        return res.status(403).json({ success: false, error: READ_ONLY_REFUSAL })
+      }
+      return next()
+    }
+    return res.status(403).json({ success: false, error: 'Insufficient permissions' })
+  }
+}
+const requireBankViewer = bankGate(false)
+const requireBankFiler = bankGate(true)
 
 // A landlord acts as themselves; landlord-scoped staff act on their landlord.
 /**
@@ -99,7 +134,7 @@ bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) =>
 })
 
 // GET /api/bank-feed/connections
-bankFeedRouter.get('/connections', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.get('/connections', requireBankViewer, async (req: any, res, next) => {
   try {
     res.json({ success: true, data: await listConnections(scope(req)) })
   } catch (e) { next(e) }
@@ -132,40 +167,209 @@ bankFeedRouter.post('/connections/:id/disconnect', requireLandlord, async (req: 
 })
 
 // GET /api/bank-feed/transactions?status=needs_review&connectionId=&limit=
-bankFeedRouter.get('/transactions', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.get('/transactions', requireBankViewer, async (req: any, res, next) => {
   try {
     const q = z.object({
       // S655: the shared list, not a re-declared copy of it.
       status: z.enum(BANK_TXN_STATUSES).optional(),
       connectionId: z.string().uuid().optional(),
       limit: z.coerce.number().int().positive().max(500).optional(),
+      // 10/12: one line (the Expenses page links to the bank line an expense came from).
+      lineId: z.string().uuid().optional(),
     }).parse(req.query)
-    res.json({ success: true, data: await listTransactions(scope(req), q) })
+    const rows = await listTransactions(scope(req), q)
+    // 10/12 (Nic, L19): a bookkeeper reads the same lines with any email or
+    // phone number on a memo taken out (routes/financials memoWithoutContact).
+    if (req.user?.role === 'bookkeeper') {
+      const { memoWithoutContact } = await import('./financials')
+      for (const r of rows as any[]) {
+        if (typeof r.description === 'string') r.description = memoWithoutContact(r.description)
+        if (typeof r.normalized_merchant === 'string') r.normalized_merchant = memoWithoutContact(r.normalized_merchant)
+      }
+    }
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
 // POST /api/bank-feed/transactions/:id/categorize
-bankFeedRouter.post('/transactions/:id/categorize', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.post('/transactions/:id/categorize', requireBankFiler, async (req: any, res, next) => {
   try {
     const body = z.object({
       // S605: accepts BOTH sides — the service picks by the transaction's sign
       // (expense categories for money out, income for money in) and rejects a
       // mismatch, so widening here can't file a deposit as 'repairs'.
-      category: z.enum([...EXPENSE_CATEGORIES, ...OTHER_INCOME_CATEGORIES] as unknown as [string, ...string[]]),
+      // 10/12 (Nic, L5): a company's own category (categoryId), or GAM's
+      // starting key (category); the service checks it is the company's and
+      // of the line's direction.
+      category: z.string().max(60).default('other'),
+      categoryId: z.string().uuid().nullable().optional(),
       scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
       unitId: z.string().uuid().nullable().optional(),
       propertyId: z.string().uuid().nullable().optional(),
       vendor: z.string().max(200).nullable().optional(),
       description: z.string().max(500).nullable().optional(),
+      // 10/12 review (Nic L5, match first): "none of these" — money going out
+      // that fits a record to the cent is refused (409 MATCH_FIRST) without it.
+      notAMatch: z.boolean().optional(),
     }).parse(req.body)
-    res.json({ success: true, data: await categorizeTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id, body as any) })
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await categorizeTransaction(landlordId, req.params.id, body as any) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/split — 10/12 (Nic): "categories are
+// separate. if a deposit is multiple sources it should be split for record
+// keeping." Files one bank line as parts, each with its own category and its
+// own unit or property, adding up to the bank's amount to the cent. On a line
+// already filed from the Bank page (as one category, or in parts) it replaces
+// that filing; the old rows are voided, never deleted. Body { parts: [{
+// category, amount, scopeKind, unitId | propertyId, description? }] }. The
+// owner's, like filing (services/bankFeed splitTransaction). 10/12 (Nic): the
+// reply carries payerQuestion for a deposit whose payer files itself (or
+// would) — the page asks whether that payer should stop; yes is
+// POST /transactions/:id/stop-auto-filing.
+bankFeedRouter.post('/transactions/:id/split', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      parts: z.array(z.object({
+        // Both sides, as on categorize: the service picks the list by the
+        // line's sign and refuses a part from the other one.
+        // 10/12 (Nic, L5): or one of the company's own categories (categoryId).
+        category: z.string().max(60).default('other'),
+        categoryId: z.string().uuid().nullable().optional(),
+        amount: z.number().positive().max(100_000_000),
+        scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
+        unitId: z.string().uuid().nullable().optional(),
+        propertyId: z.string().uuid().nullable().optional(),
+        description: z.string().max(500).nullable().optional(),
+      })).max(SPLIT_MAX_PARTS),
+      // 10/12 review (Nic L5, match first): as on categorize.
+      notAMatch: z.boolean().optional(),
+    }).parse(req.body)
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await splitTransaction(landlordId, req.params.id, body.parts as any, { by: req.user.userId ?? null, notAMatch: body.notAMatch }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/split/undo — 10/12 (Nic): the split's
+// parts are voided (kept on file) and the line goes back to review.
+bankFeedRouter.post('/transactions/:id/split/undo', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await undoSplit(landlordId, req.params.id, { undoneBy: req.user.userId ?? null }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/undo-filing — 10/12 (Nic): "every
+// bank filing (hand-filed too) can be undone (kept on record)." Takes back how
+// a line is filed, whichever way: one category the owner picked, a filing the
+// feed made by itself, a split, or the owner's Ignore. What it booked is voided
+// (never deleted, stamped with the line) and the line goes back to review,
+// never again filed by itself (services/bankFeed undoFiling). The owner's.
+bankFeedRouter.post('/transactions/:id/undo-filing', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    // 10/12 review (L19): undoing a transfer releases the line it arrived as too.
+    await assertBookkeeperMayFileTransfer(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await undoFiling(landlordId, req.params.id, { undoneBy: req.user.userId ?? null }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/stop-auto-filing — 10/12 (Nic): "after
+// a split, ASK whether future deposits from that payer should stop filing
+// automatically." The owner's yes: deposits from this line's payer stop filing
+// themselves (services/bankFeed stopPayerAutoFiling). No body — the payer is
+// the line's own, never a name sent in. A no needs no call.
+bankFeedRouter.post('/transactions/:id/stop-auto-filing', requireLandlord, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    res.json({ success: true, data: await stopPayerAutoFiling(landlordId, req.params.id) })
   } catch (e) { next(e) }
 })
 
 // POST /api/bank-feed/transactions/:id/ignore
-bankFeedRouter.post('/transactions/:id/ignore', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.post('/transactions/:id/ignore', requireBankFiler, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await ignoreTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id) })
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await ignoreTransaction(landlordId, req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// ── 10/12 (Nic, L5): money going out matches what is already on record ─────
+//
+// "money out = ONE record": a line going out is matched FIRST to what already
+// has its record — one or several open expenses (a bill, a check written),
+// GAM's fee debit, a register refund or a refund check, or a transfer to
+// another of the company's linked accounts — and filed as a new expense only
+// when nothing fits (categorize / split above). Undone like any filing
+// (POST /transactions/:id/undo-filing). services/bankMoneyOut.
+
+// GET /api/bank-feed/transactions/:id/matches — what this money-out line could be, in that order.
+bankFeedRouter.get('/transactions/:id/matches', requireBankViewer, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const found = await moneyOutMatchesFor(landlordId, req.params.id)
+    // 10/12 review (L19): a bookkeeper is offered only the transfers they may
+    // file (the line arriving is money coming in, the owner's choice for them).
+    if (req.user?.role === 'bookkeeper') {
+      const allowed: typeof found.records = []
+      for (const r of found.records) {
+        if (r.kind !== 'transfer') { allowed.push(r); continue }
+        try { await assertBookkeeperMayFileLine(req.user, landlordId, r.id); allowed.push(r) } catch { /* not theirs to file */ }
+      }
+      found.records = allowed
+    }
+    res.json({ success: true, data: found })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-expenses — { expenseIds?, paymentIds? }:
+// the open expenses this line paid (each paid from it), and/or checks already
+// recorded as written that it cleared. They add up to the line, except one
+// expense the line paid only part of.
+bankFeedRouter.post('/transactions/:id/match-expenses', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      expenseIds: z.array(z.string().uuid()).max(EXPENSE_MATCH_MAX).optional(),
+      paymentIds: z.array(z.string().uuid()).max(EXPENSE_MATCH_MAX).optional(),
+    }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    res.json({ success: true, data: await matchLineToExpenses({
+      landlordId, lineId: req.params.id, expenseIds: body.expenseIds, paymentIds: body.paymentIds, by: req.user.userId ?? null,
+    }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-record — { kind, recordId }: GAM's
+// fee debit, a register refund by check, a refund check, or a transfer (the
+// line it arrived as). The same amount to the cent.
+// 10/12 (Nic): or a loan (recordId = the loan) — money out as its payment
+// ({ split } in cents: principal + interest + escrow = the line, else GAM's
+// suggestion), money in as its money arriving. A bookkeeper matches money in
+// only as the owner chose for them (Nic L19).
+const splitCents = z.number().int().min(0)
+bankFeedRouter.post('/transactions/:id/match-record', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      kind: z.enum([...BANK_OUT_MATCH_KINDS.filter(k => k !== 'expenses'), ...BANK_IN_MATCH_KINDS] as string[] as [string, ...string[]]),
+      recordId: z.string().uuid(),
+      split: z.object({ principalCents: splitCents, interestCents: splitCents, escrowCents: splitCents }).nullish(),
+    }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    // 10/12 review (L19): a transfer files the money arriving on the other
+    // account too — under the owner's choice for this bookkeeper.
+    if (body.kind === 'transfer') await assertBookkeeperMayFileTransfer(req.user, landlordId, req.params.id, body.recordId)
+    await matchLineToRecord({
+      landlordId, lineId: req.params.id, kind: body.kind as any, recordId: body.recordId, by: req.user.userId ?? null,
+      split: body.split ?? null,
+    })
+    res.json({ success: true })
   } catch (e) { next(e) }
 })
 

@@ -154,7 +154,7 @@ async function inTx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
-const sum = (xs: any[], k: 'units' | 'money' | 'properties') => xs.reduce((s, x) => s + x[k], 0)
+const sum = (xs: any[], k: 'units' | 'occupied' | 'money' | 'properties') => xs.reduce((s, x) => s + x[k], 0)
 
 describe('GET /api/admin/metrics: the heat map', () => {
   it('totals units and rent by state and county, and adds up to the tiles with what it could not place', async () => {
@@ -227,6 +227,18 @@ describe('GET /api/admin/metrics: the heat map', () => {
     expect(sum(map.states, 'money') + sum(offState, 'money')).toBeCloseTo(m.rent.logged.total, 2)
     expect(sum(map.counties, 'money') + sum(map.missing, 'money')).toBeCloseTo(m.rent.logged.total, 2)
     expect(fx.amado.propertyId).toBeTruthy()
+
+    // 10/12 (Nic, H1): occupied the way GAM bills — every live place leases its
+    // first space and no other — adds up to the tile's occupied figure the same way.
+    expect(state.AZ.occupied).toBe(3)
+    expect(state.IL.occupied).toBe(1)
+    expect(state.NC.occupied).toBe(1)
+    expect(county['04023'].occupied).toBe(1)
+    expect(missing.unknown_state.occupied).toBe(1)
+    expect(missing.no_property.occupied).toBe(0)
+    expect(m.footprint).toMatchObject({ occupiedSpaces: 6, vacantSpaces: 3 })
+    expect(sum(map.states, 'occupied') + sum(offState, 'occupied')).toBe(m.footprint.occupiedSpaces)
+    expect(sum(map.counties, 'occupied') + sum(map.missing, 'occupied')).toBe(m.footprint.occupiedSpaces)
   })
 
   it('a disputed rent payment and its re-payment count once, in the county the rent was for', async () => {

@@ -13,11 +13,16 @@ import {
   LandlordAssignableRole,
   MAINTENANCE_JOB_CATEGORIES,
   BOOKKEEPER_ACCESS_LEVELS,
+  BOOKKEEPER_ONE_LEVEL,
+  BOOKKEEPER_MONEY_IN_FILING,
+  DEFAULT_BOOKKEEPER_MONEY_IN_FILING,
+  type BookkeeperAccessChoice,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
 // S641: one resolver for portal URLs — never a localhost link in production.
 import { portalUrl, portalLink } from '../lib/portalUrls'
 import { resolveLandlordTarget, landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
+import { keptIdsSql, coversAllSql, companyWideSql, formerSql, bookkeeperScopesOf } from '../lib/bookkeeperScope'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
@@ -68,28 +73,232 @@ const mwScopeSchema = z.object({
   allProperties: z.boolean().default(false),
 })
 
-// 10/11 (Nic): a bookkeeper keeps one company's books, narrowed to some of its
-// properties when the owner picks them ("a bookkeeper for the Mountain View
-// property... They don't need to see anything with Oak Park"). No properties
-// named, or an empty list, = every property of the company (stored NULL). The
-// access level now governs only the GAM Books ledger tools; the financial
-// pages give every bookkeeper the same "look + add expenses", so the Team page
-// no longer asks and a new invite takes the ledger's read-only default.
+// 10/11 (Nic): a bookkeeper keeps one company's books, and inside it exactly
+// the properties the owner ticks ("a bookkeeper for the Mountain View
+// property... They don't need to see anything with Oak Park"). Every property
+// is its own box, and a property the company adds later arrives unticked,
+// because the stored list never grows on its own. 10/12 (Nic, ledger decision
+// 2): "Full bookkeeping … never tenant-account actions … One level, no
+// per-bookkeeper switch" — there is no access level to ask: every bookkeeper
+// is written BOOKKEEPER_ONE_LEVEL and does the bookkeeping on what is ticked.
+//
+// 10/12 (Nic): two more boxes, the owner's choice per bookkeeper:
+//   companyWide     "Company-wide: bank account, payouts and payroll" — the
+//                   bank account, payouts, payroll and the company's Books
+//                   ledger and reports. Its own box, never inferred from the
+//                   property boxes.
+//   showLeaseDates  "Show lease start and end dates" on their rent roll (off
+//                   unless ticked; never the lease text or documents).
+// A bookkeeper may keep NO property when companyWide is ticked (a company with
+// no property yet included). Only nothing at all is refused.
+//
+// 10/12 (Nic): three more boxes, the owner's choice per bookkeeper, all off
+// unless ticked (lib/bookkeeperScope):
+//   companyLedger        BK1 "May use the whole-company ledger" — the GAM
+//                        Books ledger without the company-wide box
+//   wholeCompanyReports  BK2 "Company reports show the whole company" — else
+//                        only their properties' money in them
+//   seesMonthlyReport    "Sees the monthly property report on screen"
+// None of them alone is something to keep: a bookkeeper still needs a
+// property or Company-wide (the ledger box is for a property bookkeeper).
+const NOTHING_TICKED = 'Tick at least one property or Company-wide.'
+const bkPropertyIdsSchema = z.array(
+  z.string().uuid('That is not one of your properties.'),
+  { required_error: NOTHING_TICKED, invalid_type_error: NOTHING_TICKED },
+)
+// 10/12 (Nic, ledger decision 2): "One level, no per-bookkeeper switch" —
+// accessLevel is still accepted from an older screen and ignored; every
+// bookkeeper is written BOOKKEEPER_ONE_LEVEL (full bookkeeping, never a
+// tenant's account).
 const bkScopeSchema = z.object({
-  accessLevel: z.enum(BOOKKEEPER_ACCESS_LEVELS).default('read_only'),
-  propertyIds: z.array(z.string().uuid()).nullable().optional(),
+  accessLevel: z.enum(BOOKKEEPER_ACCESS_LEVELS).optional(),
+  propertyIds: bkPropertyIdsSchema.default([]),
+  companyWide: z.boolean().default(false),
+  showLeaseDates: z.boolean().default(false),
+  companyLedger: z.boolean().default(false),
+  wholeCompanyReports: z.boolean().default(false),
+  seesMonthlyReport: z.boolean().default(false),
+  // 10/12 (Nic, L19): what they may file of the money coming in on the bank
+  // feed — the owner's choice per bookkeeper (money going out is open to them).
+  moneyInFiling: z.enum(BOOKKEEPER_MONEY_IN_FILING).default(DEFAULT_BOOKKEEPER_MONEY_IN_FILING),
+})
+// PATCH: whatever is sent is changed; a field left out stays as it is. A
+// change that leaves nothing ticked at all is refused like the invite.
+const bkScopePatchSchema = z.object({
+  accessLevel: z.enum(BOOKKEEPER_ACCESS_LEVELS).optional(),
+  propertyIds: bkPropertyIdsSchema.optional(),
+  companyWide: z.boolean().optional(),
+  showLeaseDates: z.boolean().optional(),
+  companyLedger: z.boolean().optional(),
+  wholeCompanyReports: z.boolean().optional(),
+  seesMonthlyReport: z.boolean().optional(),
+  moneyInFiling: z.enum(BOOKKEEPER_MONEY_IN_FILING).optional(),
 })
 
-/** 10/11: the properties named must be the company's own; [] → null (all). */
-async function bookkeeperPropertyIds(landlordId: string, ids: string[] | null | undefined): Promise<string[] | null> {
+/**
+ * 10/12 (Nic, L19): "bookkeepers filing money coming in → LANDLORD'S CHOICE
+ * per bookkeeper". A deposit a bookkeeper files leaves the rent queue, so only
+ * the owner (or a GAM admin) changes it from the default.
+ */
+const OWNER_CHOOSES_MONEY_IN = 'Only the owner chooses what a bookkeeper may file of the money coming in.'
+
+/** 10/11: zod's own words for a bookkeeper's boxes, without the field path. */
+function parseBookkeeperScope<T extends z.ZodTypeAny>(schema: T, raw: unknown): z.infer<T> {
+  const r = schema.safeParse(raw ?? {})
+  if (!r.success) throw new AppError(400, r.error.issues[0]?.message || NOTHING_TICKED)
+  return r.data
+}
+
+/**
+ * 10/11 (SECURITY): the properties this caller may hand a bookkeeper in this
+ * company. null = any of them (an owner, or staff who cover every property);
+ * else only the properties in the caller's own scope there.
+ *
+ * Without it a property manager kept to Mountain View, holding the team
+ * permissions, could give a bookkeeper Oak Park's books, every property, or
+ * remove a bookkeeper the owner set up for Oak Park: their own reach stops at
+ * Mountain View, and so does what they can give away.
+ */
+const STAFF_SCOPE_TABLES: Record<string, string> = {
+  property_manager: 'property_manager_scopes',
+  onsite_manager:   'onsite_manager_scopes',
+  maintenance:      'maintenance_worker_scopes',
+}
+async function callerPropertyLimit(req: any, landlordId: string): Promise<string[] | null> {
+  const role = req.user?.role
+  if (role === 'admin' || role === 'super_admin' || role === 'landlord') return null
+  const table = STAFF_SCOPE_TABLES[role]
+  if (!table) return []
+  const row = await queryOne<{ property_ids: string[] | null; all_properties: boolean }>(
+    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 AND landlord_id = $2 LIMIT 1`,
+    [req.user.userId, landlordId])
+  if (!row) return []
+  if (row.all_properties) return null
+  return row.property_ids ?? []
+}
+
+const NOT_YOURS_TO_GIVE = 'You can only give a bookkeeper properties you manage yourself.'
+const NOT_YOURS_TO_CHANGE = 'This bookkeeper keeps properties you do not manage. Ask the owner to change or remove them.'
+// 10/12: refused for a box the bookkeeper holds (company-wide, the ledger,
+// whole-company reports, the monthly report) — not for their properties,
+// which NOT_YOURS_TO_CHANGE said even when every one was the caller's.
+const NOT_YOURS_BOXES_TO_CHANGE = 'This bookkeeper has access you cannot give yourself. Ask the owner, or someone who has that access, to change or remove them.'
+
+/**
+ * 10/11: the properties ticked must be the company's own and — for staff
+ * acting on the team — inside the caller's own scope. 10/12: the list may be
+ * empty (a company-wide-only bookkeeper); "nothing at all" is the caller's to
+ * refuse, since only it sees the company-wide box. Ticking every property no
+ * longer opens the company-wide pages (that is the company-wide box alone),
+ * so staff whose own list covers every property may tick every box.
+ */
+async function bookkeeperPropertyIds(
+  landlordId: string, ids: string[], limit: string[] | null,
+): Promise<string[]> {
   const uniq = Array.from(new Set(ids ?? []))
-  if (!uniq.length) return null
+  if (!uniq.length) return []
   const rows = await query<{ id: string }>(
     `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [uniq, landlordId])
   if (rows.length !== uniq.length) {
     throw new AppError(400, "Pick properties that belong to the company whose books they keep.")
   }
+  if (limit !== null && uniq.some(id => !limit.includes(id))) throw new AppError(403, NOT_YOURS_TO_GIVE)
   return uniq
+}
+
+/**
+ * 10/12 (Nic, SECURITY): who may give (or take back) a bookkeeper's
+ * company-wide box — the company's bank account, payouts and payroll. The
+ * owner (and GAM staff acting for them); or a team member who holds the team
+ * permission (the route's own gate) AND company-wide access themselves: set
+ * to every property of the company with "View books" on (the company's Books,
+ * payroll included). A manager kept to Mountain View cannot hand anyone the
+ * company's bank.
+ */
+// 10/12: the refusals said "Only the owner can give…", which was not true — a
+// team member with company-wide access of their own gives these too
+// (callerHasCompanyWide). Said to the person refused, as NOT_YOURS_MONTHLY is.
+const HAS_COMPANY_WIDE_WORDS = 'only if you have company-wide access yourself: every property, with "View books" on'
+const NOT_YOURS_COMPANY_WIDE = `You can give a bookkeeper the company-wide books (the bank account, payouts and payroll) ${HAS_COMPANY_WIDE_WORDS}.`
+async function callerHasCompanyWide(req: any, landlordId: string): Promise<boolean> {
+  const role = req.user?.role
+  if (role === 'admin' || role === 'super_admin' || role === 'landlord') return true
+  const table = STAFF_SCOPE_TABLES[role]
+  if (!table) return false
+  const row = await queryOne<{ all_properties: boolean; permissions: Record<string, unknown> | null }>(
+    `SELECT all_properties, permissions FROM ${table} WHERE user_id = $1 AND landlord_id = $2 LIMIT 1`,
+    [req.user.userId, landlordId])
+  return !!row?.all_properties && row?.permissions?.['books.view'] === true
+}
+
+/**
+ * 10/12 (Nic, SECURITY): staff may only give a bookkeeper what they hold
+ * themselves. The whole-company ledger (BK1) and the whole company's reports
+ * (BK2) are whole-company access — given, like the company-wide box, only by
+ * the owner or staff with company-wide access of their own
+ * (callerHasCompanyWide). The monthly report only by someone who sees it
+ * themselves: the owner, or staff holding the Monthly report tab
+ * ("reports.tab.monthly") on their own row, read fresh.
+ */
+const NOT_YOURS_LEDGER = `You can give a bookkeeper the whole-company ledger ${HAS_COMPANY_WIDE_WORDS}.`
+const NOT_YOURS_WHOLE_REPORTS = `You can give a bookkeeper the whole company's reports ${HAS_COMPANY_WIDE_WORDS}.`
+const NOT_YOURS_MONTHLY = 'You can give a bookkeeper the monthly property report only if you see it yourself.'
+async function callerSeesMonthlyReport(req: any, landlordId: string): Promise<boolean> {
+  const role = req.user?.role
+  if (role === 'admin' || role === 'super_admin' || role === 'landlord') return true
+  const table = STAFF_SCOPE_TABLES[role]
+  if (!table) return false
+  const row = await queryOne<{ permissions: Record<string, unknown> | null }>(
+    `SELECT permissions FROM ${table} WHERE user_id = $1 AND landlord_id = $2 LIMIT 1`,
+    [req.user.userId, landlordId])
+  return row?.permissions?.['reports.tab.monthly'] === true
+}
+
+/**
+ * 10/12: the boxes this caller turns ON (off before, on after) must be theirs
+ * to give. Turning one off is a change to the bookkeeper, which
+ * assertBookkeeperWithinCaller already allows only to staff who could give it.
+ */
+async function assertBoxesTheirsToGive(
+  req: any, landlordId: string,
+  before: { companyWide?: boolean; companyLedger?: boolean; wholeCompanyReports?: boolean; seesMonthlyReport?: boolean },
+  after: { companyWide?: boolean; companyLedger?: boolean; wholeCompanyReports?: boolean; seesMonthlyReport?: boolean },
+): Promise<void> {
+  const on = (k: keyof typeof after) => after[k] === true && before[k] !== true
+  if (on('companyWide') && !(await callerHasCompanyWide(req, landlordId))) throw new AppError(403, NOT_YOURS_COMPANY_WIDE)
+  if (on('companyLedger') && !(await callerHasCompanyWide(req, landlordId))) throw new AppError(403, NOT_YOURS_LEDGER)
+  if (on('wholeCompanyReports') && !(await callerHasCompanyWide(req, landlordId))) throw new AppError(403, NOT_YOURS_WHOLE_REPORTS)
+  if (on('seesMonthlyReport') && !(await callerSeesMonthlyReport(req, landlordId))) throw new AppError(403, NOT_YOURS_MONTHLY)
+}
+
+/**
+ * 10/11: staff may change or remove a bookkeeper only when every property the
+ * bookkeeper keeps today is inside the staff member's own scope. 10/12: and,
+ * when the bookkeeper holds the company-wide box, only staff who could give
+ * it (callerHasCompanyWide) — changing or removing such a bookkeeper decides
+ * who sees the company's bank.
+ *
+ * 10/12 review (SECURITY): and every FORMER property they keep (a sold
+ * property's history, read only) inside it too. Removing a bookkeeper takes
+ * their former properties with it (ON DELETE CASCADE), so a manager kept to
+ * Alder could otherwise wipe a bookkeeper's access to Birch's history — a
+ * property that manager never had.
+ */
+async function assertBookkeeperWithinCaller(
+  req: any, limit: string[] | null, userId: string, landlordId: string,
+): Promise<void> {
+  const [row] = await bookkeeperScopesOf(userId, landlordId)
+  if (!row) return
+  if (limit !== null && row.kept_ids.some(id => !limit.includes(id))) throw new AppError(403, NOT_YOURS_TO_CHANGE)
+  if (limit !== null && (row.former ?? []).some(f => !limit.includes(f.propertyId))) throw new AppError(403, NOT_YOURS_TO_CHANGE)
+  if (row.company_wide && !(await callerHasCompanyWide(req, landlordId))) throw new AppError(403, NOT_YOURS_BOXES_TO_CHANGE)
+  // 10/12 (Nic): and the ledger, whole-company reports and monthly report
+  // boxes — changing or removing a bookkeeper who holds one decides who sees
+  // it, so only staff who could give it.
+  if ((row.company_ledger || row.whole_company_reports) && !(await callerHasCompanyWide(req, landlordId))) {
+    throw new AppError(403, NOT_YOURS_BOXES_TO_CHANGE)
+  }
+  if (row.sees_monthly_report && !(await callerSeesMonthlyReport(req, landlordId))) throw new AppError(403, NOT_YOURS_BOXES_TO_CHANGE)
 }
 
 function validateScopePayload(role: LandlordAssignableRole, raw: unknown): any {
@@ -97,7 +306,7 @@ function validateScopePayload(role: LandlordAssignableRole, raw: unknown): any {
     case 'property_manager': return pmScopeSchema.parse(raw)
     case 'onsite_manager':   return osScopeSchema.parse(raw)
     case 'maintenance':      return mwScopeSchema.parse(raw)
-    case 'bookkeeper':       return bkScopeSchema.parse(raw)
+    case 'bookkeeper':       return parseBookkeeperScope(bkScopeSchema, raw)
   }
 }
 
@@ -125,15 +334,45 @@ function isAssignableRole(s: string): s is LandlordAssignableRole {
  * Same fix as the eleven sites in background.ts, plus the S633 preference for
  * DERIVING over asking: a team member is scoped to a property, and the property
  * already names its company, so an account with two companies has nothing to
- * choose. Only a role with no property at all (bookkeeper) can be ambiguous,
- * and that one asks.
+ * choose. 10/11: a bookkeeper who ticks a property is derived the same way.
+ * 10/12: a company-wide-only bookkeeper names no property, so an account with
+ * several companies names the company (the Team page always sends it); a
+ * request that names neither is asked.
  */
 async function getLandlordIdFromReq(req: any): Promise<string> {
   const explicit = req.body?.landlordId ?? req.query?.landlordId ?? null
-  if (explicit) return resolveLandlordTarget(req.user, String(explicit), 'team member')
+  if (explicit) {
+    // 10/11: the Team page names the bookkeeper's company on every edit and
+    // remove. resolveLandlordTarget refuses every team role, so a property
+    // manager holding the team permissions got "That company is not yours to
+    // act on" for their OWN company. Naming the company they already work for
+    // is the same as naming none; any other company still goes through the
+    // resolver and is refused.
+    const u = req.user
+    if (u && u.role !== 'landlord' && u.role !== 'admin' && u.role !== 'super_admin'
+        && u.landlordId && String(explicit) === u.landlordId) {
+      return u.landlordId
+    }
+    return resolveLandlordTarget(req.user, String(explicit), 'team member')
+  }
 
   const propertyId = req.body?.scope?.propertyIds?.[0]
-  if (propertyId) return landlordIdForProperty(req.user, String(propertyId), query)
+  if (propertyId) {
+    // 10/11: a bookkeeper invite that names properties reached a manager's
+    // invite to landlordIdForProperty, which refuses every team role —
+    // even for a property of their own company. (Before, "every property" sent
+    // none and fell through to the manager branch below.) A manager naming a
+    // property of their own company gets that company; what they may give
+    // inside it is checked by callerPropertyLimit. Other roles are unchanged.
+    const u = req.user
+    if (req.params?.roleType === 'bookkeeper' && u && u.role !== 'landlord'
+        && u.role !== 'admin' && u.role !== 'super_admin' && u.landlordId) {
+      const own = await queryOne<{ landlord_id: string }>(
+        `SELECT landlord_id FROM properties WHERE id = $1`, [String(propertyId)])
+      if (own?.landlord_id === u.landlordId) return u.landlordId
+    }
+    return landlordIdForProperty(req.user, String(propertyId), query)
+  }
 
   if (req.user?.role === 'property_manager' && req.user?.landlordId) {
     return req.user.landlordId
@@ -195,22 +434,40 @@ async function insertScopeRow(
       return rows[0]
     }
     case 'bookkeeper': {
-      // 10/11: the properties were checked against the company at invite time;
-      // a property sold since cannot be in a company's list, so re-check here.
+      // 10/11: every box is ticked by hand, so an invitation that names no
+      // property (one sent before boxes existed) grants nothing: it never
+      // writes a row that a reader could take for "every property". 10/12
+      // (Nic): unless it carries the company-wide box — a bookkeeper may keep
+      // the company-wide books with no property ticked.
+      const companyWide = payload.companyWide === true
       const named: string[] = Array.isArray(payload.propertyIds) ? payload.propertyIds : []
-      let propertyIds: string[] | null = null
-      if (named.length) {
-        const { rows: ok } = await client.query(
-          `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [named, landlordId])
-        const kept: string[] = ok.map((r: any) => r.id)
-        propertyIds = kept
-        if (!kept.length) throw new AppError(409, 'The properties on this invitation no longer belong to that company. Ask for a new invitation.')
+      if (!named.length && !companyWide) throw new AppError(409, 'This invitation names no properties. Ask for a new one.')
+      // The properties were checked against the company at invite time; one
+      // sold or moved since is no longer the company's, so re-check: keep the
+      // ones it still owns, and refuse when nothing is left to keep.
+      const { rows: ok } = named.length
+        ? await client.query(
+            `SELECT id FROM properties WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [named, landlordId])
+        : { rows: [] as any[] }
+      const propertyIds: string[] = ok.map((r: any) => r.id)
+      if (!propertyIds.length && !companyWide) {
+        throw new AppError(409, 'The properties on this invitation no longer belong to that company. Ask for a new invitation.')
       }
+      // 10/12 (Nic): the ledger, whole-company reports and monthly report
+      // boxes ride the invitation like the others (checked when it was sent);
+      // an invitation sent before they existed carries none of them.
       const { rows } = await client.query(
         `INSERT INTO bookkeeper_scopes
-           (user_id, landlord_id, access_level, property_ids)
-         VALUES ($1,$2,$3,$4) RETURNING *`,
-        [userId, landlordId, payload.accessLevel || 'read_only', propertyIds])
+           (user_id, landlord_id, access_level, property_ids, company_wide, show_lease_dates,
+            company_ledger, whole_company_reports, sees_monthly_report, money_in_filing)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        // 10/12 (Nic): one level, whatever an older invitation's payload says.
+        [userId, landlordId, BOOKKEEPER_ONE_LEVEL, propertyIds, companyWide,
+         payload.showLeaseDates === true, payload.companyLedger === true,
+         payload.wholeCompanyReports === true, payload.seesMonthlyReport === true,
+         // 10/12 (Nic, L19): the owner's choice on the invitation, else the default.
+         (BOOKKEEPER_MONEY_IN_FILING as readonly string[]).includes(payload.moneyInFiling)
+           ? payload.moneyInFiling : DEFAULT_BOOKKEEPER_MONEY_IN_FILING])
       return rows[0]
     }
   }
@@ -300,10 +557,25 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
          FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
         WHERE s.landlord_id = ANY($1::uuid[])`, [landlordIds])
 
+    // 10/11: a bookkeeper's boxes as they stand today (lib/bookkeeperScope):
+    // propertyIds = the ticked properties still the company's, coversCompany =
+    // every property it owns today is ticked. A property bought since shows on
+    // the row as not ticked, rather than quietly counted in. 10/12: the
+    // company-wide box, the lease-dates box, and the former properties (sold
+    // or moved out while they kept them: read only, up to the day they left).
     const bkRows = await query<any>(
       `SELECT 'bookkeeper' AS role, s.user_id, s.landlord_id, la.business_name AS company_name,
               jsonb_build_object('access_level', s.access_level) AS permissions,
-              jsonb_build_object('accessLevel', s.access_level, 'propertyIds', s.property_ids) AS scope,
+              jsonb_build_object('accessLevel', s.access_level,
+                                 'propertyIds', to_jsonb(${keptIdsSql('s')}),
+                                 'coversCompany', ${coversAllSql('s')},
+                                 'companyWide', ${companyWideSql('s')},
+                                 'showLeaseDates', s.show_lease_dates,
+                                 'companyLedger', s.company_ledger,
+                                 'wholeCompanyReports', s.whole_company_reports,
+                                 'seesMonthlyReport', s.sees_monthly_report,
+                                 'moneyInFiling', s.money_in_filing,
+                                 'formerProperties', ${formerSql('s')}) AS scope,
               s.created_at, s.updated_at,
               u.email, u.first_name, u.last_name, u.phone
          FROM bookkeeper_scopes s JOIN users u ON u.id = s.user_id JOIN landlords la ON la.id = s.landlord_id
@@ -312,13 +584,32 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
     const members = [...pmRows, ...omRows, ...mwRows, ...bkRows]
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
+    // 10/11: a pending bookkeeper invitation says which properties it carries.
+    // 10/12: and whether it carries the company-wide and lease-dates boxes.
     const invitations = await query<any>(
-      `SELECT id, email, role, status, expires_at, created_at, accepted_at, revoked_at
+      `SELECT id, email, role, status, expires_at, created_at, accepted_at, revoked_at, landlord_id,
+              CASE WHEN role = 'bookkeeper' AND jsonb_typeof(scope_payload->'propertyIds') = 'array'
+                   THEN scope_payload->'propertyIds' END AS property_ids,
+              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'companyWide')::boolean, FALSE) END AS company_wide,
+              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'showLeaseDates')::boolean, FALSE) END AS show_lease_dates,
+              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'companyLedger')::boolean, FALSE) END AS company_ledger,
+              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'wholeCompanyReports')::boolean, FALSE) END AS whole_company_reports,
+              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'seesMonthlyReport')::boolean, FALSE) END AS sees_monthly_report
          FROM invitations
         WHERE landlord_id = ANY($1::uuid[]) AND status = 'pending'
         ORDER BY created_at DESC`, [landlordIds])
 
-    res.json({ success: true, data: { members, invitations } })
+    // 10/12 review (deploy order): the Team page sends a company-wide-only
+    // bookkeeper as propertyIds [] + companyWide, and an untick-everything edit
+    // as propertyIds []. The API before 10/12 dropped companyWide and read []
+    // as "every property, the whole company". This flag tells the page it is
+    // talking to an API that reads the boxes as boxes; without it the page
+    // saves no bookkeeper (apps/landlord TeamPage), so a frontend that reaches
+    // production ahead of this API can never widen anyone.
+    // 10/12 (Nic): bookkeeperMoreBoxes says the same of the ledger, whole-company
+    // reports and monthly report boxes: an API from before them would drop
+    // them, so the page shows them only when this API reads them.
+    res.json({ success: true, data: { members, invitations, bookkeeperBoxes: true, bookkeeperMoreBoxes: true } })
   } catch (e) { next(e) }
 })
 
@@ -479,7 +770,19 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
     }).parse(req.body)
     const scope = validateScopePayload(role, body.scope)
     if (role === 'bookkeeper') {
-      scope.propertyIds = await bookkeeperPropertyIds(landlordId, scope.propertyIds)
+      // 10/12 (Nic): any property boxes and/or the company-wide box; a company
+      // with no property yet may have a company-wide bookkeeper. Nothing at
+      // all is refused. Staff give only properties they manage, and the
+      // company-wide box only with company-wide access of their own.
+      scope.propertyIds = await bookkeeperPropertyIds(
+        landlordId, scope.propertyIds, await callerPropertyLimit(req, landlordId))
+      if (!scope.propertyIds.length && !scope.companyWide) throw new AppError(400, NOTHING_TICKED)
+      // 10/12 (Nic): every box ticked must be the inviter's to give.
+      await assertBoxesTheirsToGive(req, landlordId, {}, scope)
+      // 10/12 (Nic, L19): money coming in beyond the default is the owner's to give.
+      if (scope.moneyInFiling !== DEFAULT_BOOKKEEPER_MONEY_IN_FILING && !['landlord', 'admin', 'super_admin'].includes(String(req.user?.role ?? ''))) {
+        throw new AppError(403, OWNER_CHOOSES_MONEY_IN)
+      }
     }
 
     // W-10 (S529): staff are PERMANENTLY locked to the property they are
@@ -550,12 +853,13 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
 
 // PATCH /api/scopes/:roleType/:userId/permissions — sub-permission toggle update.
 // S80 / Item 8a. Replaces full-scope PATCH for the permissions field only.
-// Bookkeeper rejected — use PATCH /scopes/bookkeeper/:userId for accessLevel.
+// Bookkeeper rejected — use PATCH /scopes/bookkeeper/:userId for their boxes.
+// 10/12 (Nic): a bookkeeper has no permission toggles and no access level (one level).
 scopesRouter.patch('/:roleType/:userId/permissions', requirePerm('team.manage_permissions'), async (req, res, next) => {
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    if (role === 'bookkeeper') throw new AppError(400, 'Bookkeeper uses accessLevel, not permissions toggles')
+    if (role === 'bookkeeper') throw new AppError(400, 'A bookkeeper has no permission toggles. Change what they keep with their boxes on the Team page.')
     const landlordIds = await teamLandlordIds(req)
     const body = z.object({ permissions: z.record(z.boolean()) }).parse(req.body)
     const table = SCOPE_TABLES[role]
@@ -585,7 +889,9 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
     const landlordIds = await teamLandlordIds(req)
-    const scope = validateScopePayload(role, req.body)
+    const scope = role === 'bookkeeper'
+      ? parseBookkeeperScope(bkScopePatchSchema, req.body)
+      : validateScopePayload(role, req.body)
 
     // S236: self-edit guard. Same reasoning as the /permissions
     // sibling — a manager could grant themselves access to additional
@@ -639,27 +945,68 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
            scope.allProperties, req.params.userId, landlordIds])
         break
       case 'bookkeeper': {
-        // 10/11: change which properties they keep (and, for the Books ledger,
-        // the access level — left as it is when not sent). Their company
-        // cannot change: a bookkeeper for another company is a new invitation.
-        const raw = (req.body ?? {}) as { accessLevel?: string; propertyIds?: string[] | null; landlordId?: string }
+        // 10/11: change which properties they keep (10/12: and their boxes;
+        // one level, so no access level). A field left out stays as it is; ticking nothing
+        // was refused by the schema above. Their company cannot change: a
+        // bookkeeper for another company is a new invitation.
+        const raw = (req.body ?? {}) as { landlordId?: string }
         // The row the Team page names (one per company they keep), else their oldest.
         const target = typeof raw.landlordId === 'string' && landlordIds.includes(raw.landlordId)
           ? [raw.landlordId] : landlordIds
-        const existing = await queryOne<{ landlord_id: string; access_level: string; property_ids: string[] | null }>(
-          `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
+        const existing = await queryOne<{
+          landlord_id: string; access_level: string; property_ids: string[] | null
+          company_wide: boolean; show_lease_dates: boolean; kept_count: number
+          company_ledger: boolean; whole_company_reports: boolean; sees_monthly_report: boolean
+          money_in_filing: string
+        }>(
+          `SELECT landlord_id, access_level, property_ids, ${companyWideSql('bs')} AS company_wide, show_lease_dates,
+                  company_ledger, whole_company_reports, sees_monthly_report, money_in_filing,
+                  cardinality(${keptIdsSql('bs')}) AS kept_count
+             FROM bookkeeper_scopes bs
             WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])
             ORDER BY created_at LIMIT 1`, [req.params.userId, target])
         if (!existing) throw new AppError(404, 'Scope row not found')
-        const propertyIds = raw.propertyIds !== undefined
-          ? await bookkeeperPropertyIds(existing.landlord_id, scope.propertyIds)
+        // Staff change a bookkeeper only inside their own properties, and give
+        // only properties inside them (10/12: and the company-wide box only
+        // with company-wide access of their own).
+        const limit = await callerPropertyLimit(req, existing.landlord_id)
+        await assertBookkeeperWithinCaller(req, limit, req.params.userId, existing.landlord_id)
+        const propertyIds = scope.propertyIds !== undefined
+          ? await bookkeeperPropertyIds(existing.landlord_id, scope.propertyIds, limit)
           : existing.property_ids
+        const companyWide = scope.companyWide ?? existing.company_wide
+        // 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+        const companyLedger = scope.companyLedger ?? existing.company_ledger
+        const wholeCompanyReports = scope.wholeCompanyReports ?? existing.whole_company_reports
+        const seesMonthlyReport = scope.seesMonthlyReport ?? existing.sees_monthly_report
+        // A box turned on must be the caller's to give (staff: only what they hold).
+        await assertBoxesTheirsToGive(req, existing.landlord_id,
+          { companyWide: existing.company_wide, companyLedger: existing.company_ledger,
+            wholeCompanyReports: existing.whole_company_reports, seesMonthlyReport: existing.sees_monthly_report },
+          { companyWide, companyLedger, wholeCompanyReports, seesMonthlyReport })
+        // 10/12: a change to what is ticked may not leave nothing at all. (A
+        // change to the lease-dates box alone stands: a
+        // bookkeeper whose only property was sold keeps its history, ticked or not.)
+        if (scope.propertyIds !== undefined || scope.companyWide !== undefined) {
+          const keptAfter = scope.propertyIds !== undefined ? (propertyIds ?? []).length : existing.kept_count
+          if (!keptAfter && !companyWide) throw new AppError(400, NOTHING_TICKED)
+        }
+        // 10/12 (Nic, L19): money coming in — the owner's choice alone.
+        const moneyInFiling = scope.moneyInFiling ?? existing.money_in_filing
+        if (moneyInFiling !== existing.money_in_filing && !['landlord', 'admin', 'super_admin'].includes(String(req.user?.role ?? ''))) {
+          throw new AppError(403, OWNER_CHOOSES_MONEY_IN)
+        }
         updated = await queryOne<any>(
           `UPDATE bookkeeper_scopes SET
-             access_level = $1, property_ids = $2, updated_at = NOW()
-           WHERE user_id = $3 AND landlord_id = $4 RETURNING *`,
-          [raw.accessLevel ? scope.accessLevel : existing.access_level, propertyIds,
-           req.params.userId, existing.landlord_id])
+             access_level = $1, property_ids = $2, company_wide = $3, show_lease_dates = $4,
+             company_ledger = $7, whole_company_reports = $8, sees_monthly_report = $9, money_in_filing = $10,
+             updated_at = NOW()
+           WHERE user_id = $5 AND landlord_id = $6 RETURNING *`,
+          // 10/12 (Nic): one level — an access level sent by an older screen changes nothing.
+          [BOOKKEEPER_ONE_LEVEL, propertyIds, companyWide,
+           scope.showLeaseDates ?? existing.show_lease_dates,
+           req.params.userId, existing.landlord_id,
+           companyLedger, wholeCompanyReports, seesMonthlyReport, moneyInFiling])
         break
       }
     }
@@ -669,6 +1016,12 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
 })
 
 // DELETE /api/scopes/:roleType/:userId — remove scope row (revoke access)
+//
+// 10/11: ?landlordId= names the company they stop working for. A person can
+// keep the books (or work) for two companies of one account; this removed them
+// from every one of the account's companies when the owner meant one. With no
+// company named, a person on more than one of them is asked about, not removed
+// from all of them.
 scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions'), async (req, res, next) => {
   try {
     const role = req.params.roleType
@@ -676,9 +1029,23 @@ scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions')
     const landlordIds = await teamLandlordIds(req)
     const table = SCOPE_TABLES[role]
 
+    const named = typeof req.query.landlordId === 'string' ? req.query.landlordId : null
+    if (named && !landlordIds.includes(named)) throw new AppError(404, 'Scope row not found')
+    const rows = await query<{ landlord_id: string }>(
+      `SELECT landlord_id FROM ${table} WHERE user_id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [req.params.userId, named ? [named] : landlordIds])
+    if (!rows.length) throw new AppError(404, 'Scope row not found')
+    if (rows.length > 1) {
+      throw new AppError(400, 'They work for more than one of your companies. Say which company to remove them from.')
+    }
+    const landlordId = rows[0].landlord_id
+    if (role === 'bookkeeper') {
+      await assertBookkeeperWithinCaller(req, await callerPropertyLimit(req, landlordId), req.params.userId, landlordId)
+    }
+
     const deleted = await queryOne<any>(
-      `DELETE FROM ${table} WHERE user_id = $1 AND landlord_id = ANY($2::uuid[]) RETURNING *`,
-      [req.params.userId, landlordIds])
+      `DELETE FROM ${table} WHERE user_id = $1 AND landlord_id = $2 RETURNING *`,
+      [req.params.userId, landlordId])
     if (!deleted) throw new AppError(404, 'Scope row not found')
     res.json({ success: true, data: deleted })
   } catch (e) { next(e) }
@@ -761,6 +1128,24 @@ scopesRouter.post('/invitations/:id/revoke', requirePerm('team.invite'), async (
 
 export const invitationsRouter = Router()
 
+/**
+ * 10/12 (Nic): a bookkeeper invitation's boxes, for the accept page's summary
+ * (packages/shared bookkeeperAccessSummary). Counts and flags only.
+ */
+function bookkeeperAccessOf(raw: unknown): BookkeeperAccessChoice {
+  let p: any = raw ?? {}
+  if (typeof p === 'string') { try { p = JSON.parse(p) } catch { p = {} } }
+  return {
+    companyWide: p?.companyWide === true,
+    showLeaseDates: p?.showLeaseDates === true,
+    propertyCount: Array.isArray(p?.propertyIds) ? p.propertyIds.length : 0,
+    // 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+    companyLedger: p?.companyLedger === true,
+    wholeCompanyReports: p?.wholeCompanyReports === true,
+    seesMonthlyReport: p?.seesMonthlyReport === true,
+  }
+}
+
 // GET /api/invitations/:token — accept-screen payload
 invitationsRouter.get('/:token', async (req, res, next) => {
   try {
@@ -801,6 +1186,11 @@ invitationsRouter.get('/:token', async (req, res, next) => {
         firstName:   inv.first_name || null,
         lastName:    inv.last_name || null,
         phone:       inv.phone || null,
+        // 10/12 (Nic): what a bookkeeper invitation gives, so the accept page
+        // says it (bookkeeperAccessSummary, packages/shared) — the bank account
+        // and payroll only when the company-wide box is ticked. Boxes only:
+        // no property is named to whoever holds the link.
+        ...(inv.role === 'bookkeeper' ? { bookkeeperAccess: bookkeeperAccessOf(inv.scope_payload) } : {}),
       }
     })
   } catch (e) { next(e) }

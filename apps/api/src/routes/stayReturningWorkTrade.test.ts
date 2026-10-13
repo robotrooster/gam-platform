@@ -21,7 +21,7 @@
  *
  * Stripe, the pay links the schedule hands to, and the emails are mocked.
  */
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { vi, describe, it, expect, beforeEach, beforeAll } from 'vitest'
 
 const h = vi.hoisted(() => ({
   screeningMock: vi.fn(async (..._a: any[]) => 'msg_mock'),
@@ -60,6 +60,7 @@ import { randomUUID } from 'crypto'
 import { WORK_TRADE_COVERABLE } from '@gam/shared'
 import { db, getClient, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedTenant, seedUtilityMeter } from '../test/dbHelpers'
+import { ensureWorkTradeExtraHoursSchema } from '../test/pendingWorkTradeSchema'
 import { camelCaseKeys } from '../lib/caseConversion'
 import { errorHandler } from '../middleware/errorHandler'
 import { unitsRouter } from './units'
@@ -96,6 +97,8 @@ function app() {
   return a
 }
 
+// 10/12: the work-trade extra-hours columns/table, until they reach schema.sql.
+beforeAll(ensureWorkTradeExtraHoursSchema)
 beforeEach(async () => {
   await cleanupAllSchema()
   for (const m of Object.values(h)) m.mockClear()

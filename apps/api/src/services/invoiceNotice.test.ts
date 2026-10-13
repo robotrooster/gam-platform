@@ -131,6 +131,23 @@ describe('invoice notices', () => {
     expect(rows[0].sent_at).not.toBeNull()
   })
 
+  // 10/12 (Nic): a charge nobody owes is voided as a record, never deleted
+  // (services/chargeVoids). It stays on its bill, but it is never a line the
+  // tenant is sent.
+  it('a voided line is never on the bill email', async () => {
+    const { invoiceId } = await seedInvoice({ utilityOwed: 35 })
+    await db.query(
+      `UPDATE payments SET status = 'voided', voided_at = now(), void_reason = 'Test: not owed'
+        WHERE invoice_id = $1 AND type = 'utility'`, [invoiceId])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(1)
+    const mail = lastSend()
+    expect(mail.subject).toContain('$460.00')
+    expect(mail.html).toContain('Rent')
+    expect(mail.html).not.toContain('$35.00')
+    expect(mail.html).not.toContain('Water')
+  })
+
   // S652 (Nic): Donald Hamp paid by check the day his bill was made; the next
   // morning's pass mailed him "$137.43 due".
   it('a bill paid before it was announced is never announced as due', async () => {

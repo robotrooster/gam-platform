@@ -42,7 +42,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seed
 import { todayIn, addDaysTo } from '../lib/timezone'
 import { balancesRouter } from './balances'
 import { errorHandler } from '../middleware/errorHandler'
-import { listOpenTenantBalances } from '../services/openBalances'
+import { listOpenTenantBalances, daysPastGrace } from '../services/openBalances'
 import {
   LEDGER_TOTAL_COUNTS_HELD_DEPOSITS, CREDIT_TAKEN_BACK_MARKS_RETURNED, LEDGER_PAYMENT_STATUS_LABEL,
   creditPaidOnDay, countsInLedgerTotal, isTrustHeldDeposit, ledgerPaymentStatus, returnedByPart,
@@ -114,8 +114,9 @@ async function bill(p: { landlordId: string }, tenantId: string, s: { unitId: st
   const ids: string[] = []
   for (const [type, amt, notes] of lines) {
     ids.push((await db.query<{ id: string }>(
-      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10) RETURNING id`,
+      // 10/12: written on its due date, so lateness counts from the due date.
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, notes, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$8::date) RETURNING id`,
       [inv.rows[0].id, s.unitId, s.leaseId, tenantId, p.landlordId, type, amt, dueDate, ENTRY[type] ?? type.toUpperCase(), notes ?? null])).rows[0].id)
   }
   return ids
@@ -169,7 +170,7 @@ async function ledger(token: string, month?: string) {
 }
 
 describe('decisions #35.1: a payment is filed under the month of the bill it paid', () => {
-  it('a September bill paid on Oct 3 is September\'s, "paid Oct 3", late from its due date', async () => {
+  it('a September bill paid on Oct 3 is September\'s, "paid Oct 3", days past its grace period', async () => {
     const p = await park()
     const t = await resident('Lou Later')
     const s = await space(p, 'RV 20')
@@ -183,7 +184,8 @@ describe('decisions #35.1: a payment is filed under the month of the bill it pai
     expect(sept.payments).toHaveLength(1)
     expect(sept.payments[0]).toMatchObject({
       id: r, paid_on: '2026-10-03', arrived_on: '2026-10-03', amount: 450, paid_for: 'September rent',
-      days_late: 32, timing_label: '32 days late',
+      // 10/12 (Nic): days past the grace period — the 5th was the last grace day.
+      days_late: 28, timing_label: '28 days past grace',
     })
     expect((await ledger(ownerToken(p), '2026-10')).body.data.payments).toEqual([])
   })
@@ -247,9 +249,9 @@ describe('decisions #35.1: a payment is filed under the month of the bill it pai
     expect(sept.payments).toHaveLength(1)
     expect(octM.payments).toHaveLength(1)
     // The same payment, each month showing only what went to its bills.
-    expect(sept.payments[0]).toMatchObject({ id: r, amount: 450, owed: 450, paid_for: 'September rent', paid_on: '2026-10-04' })
+    expect(sept.payments[0]).toMatchObject({ id: r, amount: 450, applied: 450, paid_for: 'September rent', paid_on: '2026-10-04' })
     expect(sept.payments[0].lines.map((l: any) => l.payment_id)).toEqual([sep])
-    expect(octM.payments[0]).toMatchObject({ id: r, amount: 480, owed: 480, paid_for: 'October rent, October water', timing_label: 'On time' })
+    expect(octM.payments[0]).toMatchObject({ id: r, amount: 480, applied: 480, paid_for: 'October rent, October water', timing_label: 'On time' })
     expect(sept.totals.paid).toBe(450)
     expect(octM.totals.paid).toBe(480)
   })
@@ -270,7 +272,7 @@ describe('one line per payment, its charges nested', () => {
     expect(payments).toHaveLength(1)
     const [pay] = payments
     expect(pay).toMatchObject({
-      name: 'Jane Doe', unit_number: 'RV 14', paid_on: '2026-10-01', owed: 925, amount: 925,
+      name: 'Jane Doe', unit_number: 'RV 14', paid_on: '2026-10-01', applied: 925, amount: 925,
       method: 'check', method_label: 'Check', status: 'settled', status_label: 'Paid',
       paid_for: 'October rent, October water', timing_label: 'On time', kind: 'receipt',
     })
@@ -300,7 +302,7 @@ describe('one line per payment, its charges nested', () => {
     expect(payments).toHaveLength(1)
     // What went to September's bills: $485.45 of money and the $450 credit. The
     // $0.55 the desk kept is paid-ahead money, not a line on the roll (#36.A).
-    expect(payments[0]).toMatchObject({ owed: 935.45, amount: 485.45, credit_applied: 450, method_label: 'Money order', paid_for: 'September move-in fee, September rent' })
+    expect(payments[0]).toMatchObject({ applied: 935.45, amount: 485.45, credit_applied: 450, method_label: 'Money order', paid_for: 'September move-in fee, September rent' })
     expect(payments[0]).not.toHaveProperty('kept_as_credit')
     expect(payments[0].lines.find((l: any) => l.payment_id === rent)).toMatchObject({ paid: 450, credit: 450 })
     expect(payments[0].lines.find((l: any) => l.payment_id === fee)).toMatchObject({ paid: 35.45, credit: 0 })
@@ -331,13 +333,13 @@ describe('Todd: a two-month check, filed by the bills it paid (#35.1, #36.A)', (
     const sep = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(sep.payments).toHaveLength(1)
     // The check's second month is paid-ahead money: not a line of its own.
-    expect(sep.payments[0]).toMatchObject({ id: r, amount: 460, owed: 460, credit_applied: 0, paid_for: 'September rent', paid_on: '2026-09-18' })
+    expect(sep.payments[0]).toMatchObject({ id: r, amount: 460, applied: 460, credit_applied: 0, paid_for: 'September rent', paid_on: '2026-09-18' })
     expect(sep.totals).toMatchObject({ paid: 460, paid_from_credit: 0 })
 
     const octM = (await ledger(ownerToken(p), '2026-10')).body.data
     expect(octM.payments).toHaveLength(1)
     expect(octM.payments[0]).toMatchObject({
-      kind: 'credit', amount: 0, credit_applied: 460, owed: 460, method: 'credit', method_label: 'Paid from credit',
+      kind: 'credit', amount: 0, credit_applied: 460, applied: 460, method: 'credit', method_label: 'Paid from credit',
       paid_for: 'October rent', paid_on: '2026-10-01', timing_label: 'On time', status: 'settled',
       // No money arrived in October: the check's money arrived in September.
       arrived_on: null,
@@ -396,7 +398,7 @@ describe('decisions #36.A: money paid ahead pays each later month\'s bill, and e
       const month = (await ledger(ownerToken(h.p), due.slice(0, 7))).body.data
       expect(month.payments).toHaveLength(1)
       expect(month.payments[0]).toMatchObject({
-        kind: 'credit', amount: 0, credit_applied: 1000, owed: 1000, method_label: 'Paid from credit',
+        kind: 'credit', amount: 0, credit_applied: 1000, applied: 1000, method_label: 'Paid from credit',
         paid_on: due, arrived_on: null, timing_label: 'On time', status: 'settled',
       })
       expect(month.payments[0].paid_for).toMatch(/ rent$/)
@@ -414,7 +416,8 @@ describe('decisions #36.A: money paid ahead pays each later month\'s bill, and e
     const today = todayIn(null)
     const month = (await ledger(ownerToken(h.p), lastMonthDue.slice(0, 7))).body.data
     expect(month.payments).toHaveLength(1)
-    const late = Math.round((Date.parse(today) - Date.parse(lastMonthDue)) / 86_400_000)
+    // 10/12: days past the grace period (property grace 5: the due day and the 4 after it).
+    const late = daysPastGrace(lastMonthDue, today, 5)
     expect(month.payments[0]).toMatchObject({ kind: 'credit', paid_on: today, method_label: 'Paid from credit', days_late: late })
   })
 
@@ -482,7 +485,7 @@ describe('statutory deposit interest', () => {
 })
 
 describe('on time or N days late', () => {
-  it('measured from the due date of the oldest bill it paid, honoring the grace period', async () => {
+  it('days past the grace period of the oldest bill it paid (10/12: the 6th is the first late day)', async () => {
     const p = await park()
     const onTime = await resident('Grace Kept')
     const late = await resident('Grace Missed')
@@ -490,14 +493,14 @@ describe('on time or N days late', () => {
     const b = await space(p, 'RV 4')
     const [r1] = await bill(p, onTime, a, '2026-09-01', [['rent', 300]])
     const [r2] = await bill(p, late, b, '2026-09-01', [['rent', 300]])
-    for (const [tenant, sp, row, at] of [[onTime, a, r1, '2026-09-06T18:00:00Z'], [late, b, r2, '2026-09-09T18:00:00Z']] as const) {
+    for (const [tenant, sp, row, at] of [[onTime, a, r1, '2026-09-05T18:00:00Z'], [late, b, r2, '2026-09-09T18:00:00Z']] as const) {
       const r = await receipt({ tenantId: tenant, leaseId: sp.leaseId, landlordId: p.landlordId, amount: 300, applied: 300, method: 'cash', createdAt: at })
       await apply(r, row, 300)
       await settle([row], at, 'cash')
     }
     const { payments } = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(payments.find((x: any) => x.tenant_id === onTime)).toMatchObject({ days_late: 0, timing_label: 'On time' })
-    expect(payments.find((x: any) => x.tenant_id === late)).toMatchObject({ days_late: 8, timing_label: '8 days late' })
+    expect(payments.find((x: any) => x.tenant_id === late)).toMatchObject({ days_late: 4, timing_label: '4 days past grace' })
   })
 })
 
@@ -976,7 +979,7 @@ describe('never on a landlord\'s ledger', () => {
       [s.unitId, s.leaseId, t, p.landlordId])
     const data = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(data.payments).toHaveLength(1)
-    expect(data.payments[0]).toMatchObject({ amount: 460, owed: 460, paid_for: 'September rent' })
+    expect(data.payments[0]).toMatchObject({ amount: 460, applied: 460, paid_for: 'September rent' })
     expect(JSON.stringify(data)).not.toMatch(/flexpay/i)
     // No Stripe id ever leaves the server.
     expect(JSON.stringify(data)).not.toContain('pi_mix')
@@ -999,7 +1002,7 @@ describe('a security deposit held in trust', () => {
     await settle([rent, deposit], '2026-09-01T17:00:00Z', 'cash')
     const data = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(data.payments).toHaveLength(1)
-    expect(data.payments[0]).toMatchObject({ amount: 800, owed: 800 })
+    expect(data.payments[0]).toMatchObject({ amount: 800, applied: 800 })
     expect(data.payments[0].lines.map((l: any) => l.payment_id).sort()).toEqual([rent, deposit].sort())
     expect(data.payments[0].lines.find((l: any) => l.payment_id === deposit)).toMatchObject({ label: 'Security deposit', paid: 300 })
     // Not decided by Nic; until he answers the total agrees with the reports.
@@ -1126,7 +1129,7 @@ describe('a co-resident pays at the desk with the household\'s credit', () => {
     await settle([rent], at, 'cash')
     const data = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(data.payments).toHaveLength(1)
-    expect(data.payments[0]).toMatchObject({ id: r, kind: 'receipt', name: 'Co Tenant', amount: 500, credit_applied: 100, owed: 600 })
+    expect(data.payments[0]).toMatchObject({ id: r, kind: 'receipt', name: 'Co Tenant', amount: 500, credit_applied: 100, applied: 600 })
     expect(data.totals).toMatchObject({ paid: 500, paid_from_credit: 100 })
   })
 
@@ -1146,7 +1149,7 @@ describe('a co-resident pays at the desk with the household\'s credit', () => {
     await settle([rent, rent2], at, 'cash')
     const data = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(data.payments).toHaveLength(1)
-    expect(data.payments[0]).toMatchObject({ id: r, amount: 500, credit_applied: 80, owed: 580 })
+    expect(data.payments[0]).toMatchObject({ id: r, amount: 500, credit_applied: 80, applied: 580 })
     expect(data.payments[0].lines.map((l: any) => l.payment_id).sort()).toEqual([rent, rent2].sort())
   })
 })

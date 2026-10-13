@@ -74,7 +74,17 @@ async function stripeCharges(id: string, txnType: string, category: string, amou
      VALUES ($1, $2, $3, $4, NOW())`, [id, txnType, category, amount])
   onBalance -= c2(amount)
 }
-const check = async () => splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+/**
+ * 10/12 (Nic, A3): every check here also proves the bridge (earnings ledger →
+ * GAM's own) ends exactly where the check ends — its leftover is the check's
+ * difference, to the cent, whatever the dispute or move-out did.
+ */
+const check = async () => {
+  const split = splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+  expect(split.reconciliation?.bridge).toBeTruthy()
+  expect(split.reconciliation?.bridge?.leftover).toBe(split.reconciliation?.gap)
+  return split
+}
 
 beforeEach(async () => {
   await cleanupAllSchema()

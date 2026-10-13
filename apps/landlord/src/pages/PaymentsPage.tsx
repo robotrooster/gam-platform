@@ -377,7 +377,10 @@ export function PaymentsPage() {
               <thead>
                 <tr>
                   <th>Paid</th><th>Who</th><th>Space</th><th>For</th>
-                  <th style={{ textAlign: 'right' }}>Owed</th><th style={{ textAlign: 'right' }}>Paid</th>
+                  {/* 10/12: this column was headed "Owed", but it is what the
+                      payment put toward the month's bills (money plus credit) —
+                      nothing here is still owed (the Rent Roll says that). */}
+                  <th style={{ textAlign: 'right' }} title="What this payment put toward the month's bills: money plus account credit">Applied</th><th style={{ textAlign: 'right' }}>Paid</th>
                   <th>How</th><th>On time</th><th>Status</th>
                 </tr>
               </thead>
@@ -398,7 +401,7 @@ export function PaymentsPage() {
                           {p.propertyName && <div className="cd-ledger-sub">{p.propertyName}</div>}
                         </td>
                         <td>{p.paidFor}</td>
-                        <td className="mono" style={{ textAlign: 'right' }}>{money(p.owed)}</td>
+                        <td className="mono" style={{ textAlign: 'right' }}>{money(p.applied)}</td>
                         <td className="mono" style={{ textAlign: 'right' }}>
                           {creditOnly ? <span className="cd-ledger-sub">from credit</span> : money(p.amount)}
                           {!creditOnly && toCents(p.creditApplied) > 0 && <div className="cd-ledger-sub">+ {money(p.creditApplied)} from credit</div>}
@@ -453,7 +456,11 @@ export function PaymentsPage() {
                             )}
                             {l.unitNumber && l.unitNumber !== p.unitNumber && <span className="cd-ledger-sub"> · {l.unitNumber}</span>}
                           </td>
-                          <td className="mono" style={{ textAlign: 'right' }}>{money(l.amount)}</td>
+                          {/* Applied to this charge by this payment; the charge's own amount beside it when it differs. */}
+                          <td className="mono" style={{ textAlign: 'right' }}>
+                            {money(l.paid + l.credit)}
+                            {toCents(l.paid) + toCents(l.credit) !== toCents(l.amount) && <div className="cd-ledger-sub">of {money(l.amount)} charged</div>}
+                          </td>
                           <td className="mono" style={{ textAlign: 'right' }}>
                             {toCents(l.paid) > 0 && money(l.paid)}
                             {toCents(l.credit) > 0 && <div className="cd-ledger-sub">{money(l.credit)} from credit</div>}

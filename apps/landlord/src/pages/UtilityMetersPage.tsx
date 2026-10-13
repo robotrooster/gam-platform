@@ -2,9 +2,9 @@ import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'r
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
-import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check } from 'lucide-react'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check, PowerOff } from 'lucide-react'
+import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
 const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => api.post(url, form).then(r => r.data) }
@@ -1871,6 +1871,9 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const [editMeter, setEditMeter] = useState<any>(null)
   // S609: the meter whose units are being picked (null = picker closed).
   const [pickFor, setPickFor] = useState<any>(null)
+  // 10/12 (Nic), M1: the broken meter being put back in service — "Repaired"
+  // or "Works, tenant uses no power" (null = closed).
+  const [backInService, setBackInService] = useState<any>(null)
   const unitLabel = (id: string) => { const u = units.find(x => x.id === id); return u ? `Unit ${u.unitNumber}` : id.slice(0, 8) }
   // S613: the flat-charge amount lives on the PROPERTY rate, so a card that says
   // "flat $25/mo" has to read it from there — the meter row deliberately has no
@@ -1976,24 +1979,24 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const assign = useMutation(({ id, unitId }: any) => apiPost(`/utility/meters/${id}/units`, { unitId }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not assign unit') })
   const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
-  const setBroken = useMutation(({ id, broken, startingReading }: any) => apiPatch(`/utility/meters/${id}`, {
-      outOfService: broken,
-      ...(startingReading != null ? { repairedStartingReading: startingReading } : {}),
-    }),
+  // Marks a meter broken. Back into service goes through MeterBackInServiceModal.
+  const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  // 10/12 (Nic, review): take "Works, tenant uses no power" back. On a master or
+  // a flat-rate meter nothing else could ("Mark broken" is a submeter's alone),
+  // so one press or a mis-click stayed on the meter for good. The same button,
+  // lit while it stands, asks and takes it back.
+  const withdrawNoUse = useMutation((id: string) => apiPatch(`/utility/meters/${id}`, { zeroUseWithdrawn: true }),
+    { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  const askWithdrawNoUse = (m: any) => appConfirm(
+    `Take back "${meterWorksNoUseLabel(m.utilityType)}" on ${m.label}? `
+      + (m.billingMethod === 'submeter'
+        ? 'From now on, a read that does not move while somebody lives there is treated as a stuck meter again.'
+        : 'How this meter bills does not change.'),
+    { confirmLabel: 'Take it back' }).then(ok => { if (ok) withdrawNoUse.mutate(m.id) })
   // S648 (Nic): a repaired or replaced meter starts from what it reads NOW —
-  // 0 for a new one, whatever is on the dial for a refurbished one.
-  const markRepaired = (m: any) => {
-    appPrompt(
-      'What does the repaired or replaced meter read right now? Enter 0 for a brand-new meter. Its next bill is measured from this number.',
-      { title: `Mark ${m.label} repaired` },
-    ).then(v => {
-      if (v == null) return
-      const n = Number(String(v).replace(/[,\s]/g, ''))
-      if (String(v).trim() === '' || !Number.isFinite(n) || n < 0) { toast.error('Enter the number shown on the meter.'); return }
-      setBroken.mutate({ id: m.id, broken: false, startingReading: n })
-    })
-  }
+  // 0 for a new one, whatever is on the dial for a refurbished one. 10/12 (Nic,
+  // M1): beside it, "Works, tenant uses no power" (MeterBackInServiceModal).
   // S613 (Nic): a meter can be configured perfectly and bill nothing, because a
   // unit bills a utility only where its LEASE passes it through. Assigning
   // twenty-seven units to a brand-new trash charge hits that on twenty-seven
@@ -2124,9 +2127,44 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: '1.15rem' }}>{UTILITY_ICONS[m.utilityType]}</span>
           <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{m.label}</div>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
+              {m.label}
+              {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+              {!m.outOfService && m.zeroUseConfirmedAt && (
+                <span className="badge badge-muted" style={{ fontSize:'.62rem' }}
+                  title={`Confirmed working with nobody using any — ${worksNoUseEffect(m)}.`}>
+                  uses no {UTILITY_USAGE_NOUN[m.utilityType as UtilityType] ?? 'power'}
+                </span>
+              )}
+            </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{methodLabel(m)}</div>
           </div>
+          {/* 10/12 (Nic): "Works, tenant uses no power" — "Any meter", the
+              master too: put back in service when marked broken, or say it
+              while in service. */}
+          {m.outOfService && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Put back in service — Repaired, or ${meterWorksNoUseLabel(m.utilityType)}`}
+              onClick={() => setBackInService(m)}>
+              <Wrench size={13} style={{ color: 'var(--gold)' }} />
+            </button>
+          )}
+          {!m.outOfService && !m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`${meterWorksNoUseLabel(m.utilityType)} — ${worksNoUseEffect(m)}`}
+              onClick={() => setBackInService(m)}>
+              <PowerOff size={13} style={{ color: 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic, review): ...and taken back with the same button. */}
+          {!m.outOfService && m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Take back "${meterWorksNoUseLabel(m.utilityType)}"`}
+              disabled={withdrawNoUse.isLoading}
+              onClick={() => askWithdrawNoUse(m)}>
+              <PowerOff size={13} style={{ color: 'var(--gold)' }} />
+            </button>
+          )}
           {/* S609 (Nic): a meter used to be uneditable once created — a typo in
               the label meant deleting a master and losing its unit assignments. */}
           <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
@@ -2239,6 +2277,14 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
             <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
               {m.label}
               {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+              {/* 10/12 (Nic), M1: confirmed working with nobody using any —
+                  says why its flat reads bill $0 instead of being flagged. */}
+              {!m.outOfService && m.zeroUseConfirmedAt && (
+                <span className="badge badge-muted" style={{ fontSize:'.62rem' }}
+                  title={`Confirmed working with nobody using any — ${worksNoUseEffect(m)}.`}>
+                  uses no {UTILITY_USAGE_NOUN[m.utilityType as UtilityType] ?? 'power'}
+                </span>
+              )}
               {/* S605 (Nic): the failure this exists to stop is a SILENT one —
                   a submeter with no opening read bills nothing and says nothing
                   until the cycle has already closed. */}
@@ -2251,15 +2297,42 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
               {m.outOfService && (m.estimatesStuckMeters
                 ? <> · billed from the lowest comparable spot until repaired</>
                 : <> · not billing until repaired</>)}
+              {!m.outOfService && m.zeroUseConfirmedAt && <> · {worksNoUseEffect(m)}</>}
             </div>
             {(m.hasBaseline === false || m.openingRead) && <BaselineFixer m={m} />}
           </div>
-          {m.billingMethod === 'submeter' && (
+          {/* 10/12 (Nic): "Works, tenant uses no power" is on any meter, so a
+              meter of any kind marked broken can be put back here too. Only a
+              submeter is offered "Mark broken" (as before). */}
+          {(m.billingMethod === 'submeter' || m.outOfService) && (
             <button className="btn btn-ghost btn-sm"
-              title={m.outOfService ? 'Mark repaired — enter the new reading'
+              title={m.outOfService ? `Put back in service — Repaired, or ${meterWorksNoUseLabel(m.utilityType)}`
                 : m.estimatesStuckMeters ? 'Mark broken — bills from comparable spots' : 'Mark broken — stops billing until repaired'}
-              onClick={() => m.outOfService ? markRepaired(m) : setBroken.mutate({ id: m.id, broken: true })}>
+              onClick={() => m.outOfService ? setBackInService(m) : setBroken.mutate({ id: m.id, broken: true })}>
               <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic), Q-d: "Works, tenant uses no power" is usable on a meter
+              any time — not only once it has been flagged. Beside "Mark broken"
+              on a meter in service, so a landlord can say it before the flat
+              reads flag it (a resident who is away). */}
+          {/* 10/12 (Nic): "Any meter" — not only a submeter. */}
+          {!m.outOfService && !m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`${meterWorksNoUseLabel(m.utilityType)} — ${worksNoUseEffect(m)}`}
+              onClick={() => setBackInService(m)}>
+              <PowerOff size={13} style={{ color: 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic, review): lit while it stands; pressed, it is taken
+              back — on a master the landlord pays or a flat-rate meter, the
+              only way to (they have no "Mark broken"). */}
+          {!m.outOfService && m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Take back "${meterWorksNoUseLabel(m.utilityType)}"`}
+              disabled={withdrawNoUse.isLoading}
+              onClick={() => askWithdrawNoUse(m)}>
+              <PowerOff size={13} style={{ color: 'var(--gold)' }} />
             </button>
           )}
           <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
@@ -2352,6 +2425,191 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         unitHasSubmeter={unitHasSubmeter} unitLabel={unitLabel}
         conflictingMeterFor={conflictingMeterFor}
         onClose={() => setPickFor(null)} onSaved={onChanged} />}
+      {backInService && <MeterBackInServiceModal meter={backInService}
+        onClose={() => setBackInService(null)} onSaved={onChanged} />}
+    </div>
+  )
+}
+
+/**
+ * 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
+ * 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+ * occupancy)."
+ *
+ * A meter marked broken — it read the same number twice while the space was
+ * occupied (S648) — comes back into service one of two ways:
+ *   Repaired — fixed or replaced. It starts again from what it reads now (S648:
+ *     0 for a brand-new meter, whatever is on the dial for a refurbished one).
+ *   Works, tenant uses no power — it was never broken; the household on it uses
+ *     none. No new reading. Zero use bills $0 and is not flagged (or estimated)
+ *     again until the meter moves, the household leaves, or it is marked
+ *     broken by hand — or taken back (10/12 review: the same button, lit).
+ *
+ * 10/12 (Nic), Q-f: "past estimates when picking 'Works': LANDLORD'S CHOICE at
+ * that moment (void unpaid estimated charges from the flagged period, or leave
+ * them)." When the property billed estimates while this meter was flagged and
+ * some are still unpaid, "Works" asks before it saves: "Also void the N unpaid
+ * estimated charges from while it was flagged ($X)?" Voided charges stay on
+ * record; paid ones are never touched.
+ *
+ * 10/12 (Nic), Q-d: "usable on ANY meter, any time." Opened on a meter still in
+ * service (its own button beside "Mark broken"), the window offers only "Works,
+ * tenant uses no power": nothing was broken, so there is nothing to repair and
+ * no flagged period to ask about.
+ */
+/**
+ * 10/12 (Nic): "Works, tenant uses no power" is on any meter ("Any meter").
+ * What it does to the bill depends on the meter: on a submeter a flat read
+ * bills $0 instead of being flagged (the stuck-meter test is a submeter's
+ * alone); on a master or a flat-rate meter it is recorded and nothing about
+ * how the meter bills changes.
+ */
+function worksNoUseEffect(m: { billingMethod?: string }): string {
+  return m.billingMethod === 'submeter' ? 'zero use bills $0 until it moves' : 'confirmed working, nobody using it'
+}
+
+function MeterBackInServiceModal({ meter, onClose, onSaved }: {
+  meter: any; onClose: () => void; onSaved: () => void
+}) {
+  const [reading, setReading] = useState('')
+  // 10/12 (Q-f): the "also void the estimates?" question, open once "Works" is pressed.
+  const [askVoid, setAskVoid] = useState(false)
+  const digits = Number(meter.digits) || METER_READING_DEFAULT_DIGITS
+  const readingOk = new RegExp(`^\\d{1,${digits}}$`).test(reading)
+  const worksLabel = meterWorksNoUseLabel(meter.utilityType)
+  const noun = UTILITY_USAGE_NOUN[meter.utilityType as UtilityType] ?? 'power'
+  // 10/12 (Nic), Q-d: on a meter in service the window offers only "Works,
+  // tenant uses no power" — nothing was broken, so nothing to repair and no
+  // estimates to ask about.
+  const flagged = !!meter.outOfService
+  // The unpaid estimates from while it was flagged — the same list the void takes off.
+  const { data: estimates, isLoading: estimatesLoading, isError: estimatesFailed, refetch: refetchEstimates } = useQuery(['meter-flagged-estimates', meter.id],
+    () => apiGet<{ count: number; amount: number; charges: Array<{ id: string; state: string; cycleMonth: string; amount: number; invoiceNumber: string | null }> }>(
+      `/utility/meters/${meter.id}/flagged-estimates`),
+    { enabled: flagged, staleTime: 0 })
+  const waiting = estimates?.count ?? 0
+  const save = useMutation((body: {
+    outOfService: false; repairedStartingReading?: number; zeroUseConfirmed?: true; voidFlaggedEstimates?: boolean
+    voidEstimateIds?: string[]
+  }) => apiPatch(`/utility/meters/${meter.id}`, body), {
+    onSuccess: (r: any, body) => {
+      const v = r?.flaggedEstimatesVoided
+      const plural = (n: number) => `${n} estimated charge${n === 1 ? '' : 's'}`
+      const voidedWords = v?.voided?.count
+        ? ` Voided ${plural(v.voided.count)} (${fmt(v.voided.amount)}).`
+        : ''
+      // 10/12 (review): say why each one stayed — it was not always a payment.
+      const k = v?.keptBy ?? {}
+      const keptWords = [
+        k.paid?.count ? ` ${plural(k.paid.count)} (${fmt(k.paid.amount)}) stayed: a payment reached ${k.paid.count === 1 ? 'it' : 'them'} first.` : '',
+        k.heldByRecord?.count ? ` ${plural(k.heldByRecord.count)} (${fmt(k.heldByRecord.amount)}) stayed: account credit, a bank match or a receipt is tied to ${k.heldByRecord.count === 1 ? 'it' : 'them'}.` : '',
+        k.changed?.count ? ` ${plural(k.changed.count)} (${fmt(k.changed.amount)}) had already changed (taken off or moved onto a bill).` : '',
+        k.failed?.count ? ` ${plural(k.failed.count)} (${fmt(k.failed.amount)}) could not be voided just now — nothing about ${k.failed.count === 1 ? 'it' : 'them'} changed; try again from the meter.` : '',
+      ].join('')
+      toast(body.zeroUseConfirmed
+        ? (flagged
+          ? `${meter.label} is back in service — ${worksNoUseEffect(meter)}.${voidedWords}${keptWords}`
+          : `${meter.label} confirmed working — ${worksNoUseEffect(meter)}.`)
+        : `${meter.label} marked repaired — its next bill is measured from ${body.repairedStartingReading}`)
+      onSaved()
+      onClose()
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter'),
+  })
+  // "Yes, void them" sends the charges this window showed — only those come off.
+  const works = (voidFlaggedEstimates?: boolean) => save.mutate({
+    outOfService: false, zeroUseConfirmed: true,
+    ...(voidFlaggedEstimates !== undefined ? { voidFlaggedEstimates } : {}),
+    ...(voidFlaggedEstimates ? { voidEstimateIds: (estimates?.charges ?? []).map(c => c.id) } : {}),
+  })
+  const choice: CSSProperties = { border: '1px solid var(--border-1)', borderRadius: 'var(--r-md)', padding: 12, marginBottom: 10 }
+  const why: CSSProperties = { fontSize: '.76rem', color: 'var(--text-3)', margin: '4px 0 10px', lineHeight: 1.45 }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {flagged
+            ? <><Wrench size={16} style={{ color: 'var(--gold)' }} /> Put {meter.label} back in service</>
+            : <><PowerOff size={16} style={{ color: 'var(--gold)' }} /> Confirm {meter.label} works</>}
+        </div>
+        {/* 10/12: a flat charge (or trash) has no dial to read, so there is no
+            "Repaired" reading to take — only "Works". */}
+        {flagged && meter.billingMethod !== 'flat_rate' && meter.utilityType !== 'trash' && <div style={choice}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Repaired</div>
+          <div style={why}>
+            It was fixed or replaced. Enter what it reads right now — 0 for a brand-new meter. Its next bill is
+            measured from this number.
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input className="form-input mono" type="text" inputMode="numeric" maxLength={digits} autoComplete="off"
+              value={reading} onChange={e => setReading(e.target.value.replace(/\D/g, '').slice(0, digits))}
+              placeholder={`up to ${digits} digits`} style={{ flex: 1, minWidth: 0, letterSpacing: '.12em' }} />
+            <button className="btn btn-primary" disabled={!readingOk || save.isLoading}
+              onClick={() => save.mutate({ outOfService: false, repairedStartingReading: Number(reading) })}>
+              Repaired
+            </button>
+          </div>
+        </div>}
+        <div style={choice}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{worksLabel}</div>
+          <div style={why}>
+            {meter.billingMethod !== 'submeter'
+              ? <>The meter works — nobody on it uses any {noun}. {flagged ? 'No new reading: it goes back in service. ' : ''}It
+                is recorded on the meter; how this meter bills does not change.</>
+              : flagged
+              ? <>The meter was never broken — the household on it uses no {noun}. No new reading: zero use bills $0 and is
+                not flagged again until the meter moves.</>
+              : <>The meter works — the household on it uses no {noun} (away, not plugged in). Zero use bills $0 and is not
+                flagged until the meter moves.</>}
+          </div>
+          {/* 10/12 (review): if the estimates could not be read, "Works" waits —
+              saving without asking would take the landlord's choice away for
+              good (the meter is no longer flagged once it is back). */}
+          {flagged && estimatesFailed && !askVoid && (
+            <div style={{ ...why, color: 'var(--red)' }}>
+              Could not check for estimated charges from while it was flagged.{' '}
+              <button className="btn btn-primary btn-sm" onClick={() => refetchEstimates()}>Try again</button>
+            </div>
+          )}
+          {!askVoid && (
+            <button className="btn btn-primary" disabled={save.isLoading || (flagged && (estimatesLoading || estimatesFailed))}
+              onClick={() => waiting > 0 ? setAskVoid(true) : works()}>
+              {worksLabel}
+            </button>
+          )}
+          {askVoid && estimates && (
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45 }}>
+                Also void the {waiting} unpaid estimated charge{waiting === 1 ? '' : 's'} from while it was
+                flagged ({fmt(estimates.amount)})?
+              </div>
+              <div style={{ ...why, margin: '6px 0 8px' }}>
+                {estimates.charges.map((c, i) => (
+                  <div key={i}>
+                    {monthLabel(c.cycleMonth)} estimate — {fmt(c.amount)}
+                    {c.invoiceNumber ? ` on ${c.invoiceNumber}`
+                      : c.state === 'held' ? ' (held until the lease is signed)' : ' (not on a bill yet)'}
+                  </div>
+                ))}
+                <div style={{ marginTop: 6 }}>
+                  Voided charges stay on record and nobody owes them. Anything already paid is never touched.
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(true)}>
+                  Yes, void {waiting === 1 ? 'it' : 'them'}
+                </button>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(false)}>
+                  No, leave {waiting === 1 ? 'it' : 'them'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
     </div>
   )
 }

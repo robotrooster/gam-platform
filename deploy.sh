@@ -68,6 +68,9 @@ ok(){ echo "${GREEN}✓${OFF} $*"; }
 warn(){ echo "${YEL}•${OFF} $*"; }
 bad(){ echo "${RED}✗${OFF} $*"; }
 FAILED=0
+# 10/12 review: set when the API did not build, load or answer. Every frontend
+# step below is skipped then — see "API first" after the API step.
+API_FAILED=0
 
 echo "═══ GAM deploy $(date '+%Y-%m-%d %H:%M:%S') ═══"
 $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
@@ -179,22 +182,34 @@ if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
     # match, so launchctl dies of SIGPIPE and the PIPELINE reports failure —
     # for a job that had loaded on attempt 1. `launchctl print` asks launchd
     # directly and pipes nothing.
-    if ! launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; fi
+    if ! launchctl print "gui/$(id -u)/com.gam.api" >/dev/null 2>&1; then bad "launchd did not load com.gam.api (see /tmp/gam-deploy-launchd.log)"; FAILED=1; API_FAILED=1; fi
     # Give it a moment, then prove it is actually answering.
     for i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4000/api/sales/demo/slots 2>/dev/null)
       [ "$code" = "200" ] && break
       sleep 1
     done
-    if [ "${code:-}" = "200" ]; then ok "restarted and answering"; else bad "restarted but NOT answering (last code: ${code:-none})"; FAILED=1; fi
+    if [ "${code:-}" = "200" ]; then ok "restarted and answering"; else bad "restarted but NOT answering (last code: ${code:-none})"; FAILED=1; API_FAILED=1; fi
     # The thing answering must be OUR job — a ts-node dev process on :4000 is
     # the watchdog's doing and serves source, not the build.
     if lsof -nP -iTCP:4000 -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | xargs -I{} ps -o command= -p {} 2>/dev/null | grep "ts-node" >/dev/null; then
-      bad "a DEV api (ts-node) holds :4000 — kill it and let launchd's com.gam.api take the port"; FAILED=1
+      bad "a DEV api (ts-node) holds :4000 — kill it and let launchd's com.gam.api take the port"; FAILED=1; API_FAILED=1
     fi
   fi
 else
-  bad "BUILD FAILED — see /tmp/gam-deploy-api.log"; FAILED=1
+  bad "BUILD FAILED — see /tmp/gam-deploy-api.log"; FAILED=1; API_FAILED=1
+fi
+
+# ── API first: no frontend ships in front of an API that did not go live ──
+# 10/12 review (deploy order). A frontend is built for the API in this tree. If
+# the API step failed, production still runs the OLD API, and a new screen in
+# front of it can do the wrong thing rather than merely look wrong: the 10/12
+# Team page sends a company-wide-only bookkeeper as "no property", which the
+# API before 10/12 read as every property and the whole company. This script
+# used to note the failure and deploy every frontend anyway. Now nothing after
+# this point ships until the API is live (fix it, then run deploy.sh again).
+if [ "$API_FAILED" -ne 0 ]; then
+  echo; bad "API did not go live — marketing, every frontend and the storefront are SKIPPED (production keeps their current builds)"
 fi
 
 # ── marketing ────────────────────────────────────────────────────────────
@@ -219,7 +234,9 @@ fi
 # was true and meaningless. Build and publish to Vercel here, and verify by
 # fetching CONTENT, not a status code.
 echo; echo "── marketing (Vercel: goldassetmanagement.com) ──"
-if $CHECK_ONLY; then
+if [ "$API_FAILED" -ne 0 ]; then
+  warn "skipped: the API did not go live"
+elif $CHECK_ONLY; then
   warn "would build + vercel deploy --prebuilt --prod"
 else
   if ! (cd apps/marketing && node build.js && node package-output.js) >/tmp/gam-deploy-marketing.log 2>&1; then
@@ -257,6 +274,7 @@ fi
 for entry in "${FRONTENDS[@]}"; do
   app="${entry%%:*}"; domain="${entry##*:}"
   echo; echo "── $app ($domain) ──"
+  if [ "$API_FAILED" -ne 0 ]; then warn "skipped: the API did not go live"; continue; fi
   [ -d "apps/$app" ] || { warn "no such app, skipping"; continue; }
   [ -f "apps/$app/.vercel/project.json" ] || { warn "not Vercel-linked, skipping"; continue; }
 
@@ -302,7 +320,9 @@ done
 # the page was not live.
 echo; echo "── storefront (self-hosted: *.gam.biz) ──"
 STOREFRONT_PROBE="${STOREFRONT_PROBE_URL:-https://mountain-view-rv-ranch-2843.gam.biz/}"
-if ! (cd apps/storefront && npm run build) >/tmp/gam-deploy-storefront.log 2>&1; then
+if [ "$API_FAILED" -ne 0 ]; then
+  warn "skipped: the API did not go live"
+elif ! (cd apps/storefront && npm run build) >/tmp/gam-deploy-storefront.log 2>&1; then
   bad "BUILD FAILED — see /tmp/gam-deploy-storefront.log"; FAILED=1
 else
   sf_local=$(ls apps/storefront/dist/assets/index-*.js 2>/dev/null | head -1 | xargs basename 2>/dev/null)

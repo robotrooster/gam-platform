@@ -180,9 +180,24 @@ async function runServiceGeneration(
             AND ub.payment_id IS NULL
             AND ub.status IN ('unbilled','billed')
             AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
+            -- 10/12 (Nic): "$0 lines are ignored." A reading that bills nothing
+            -- never becomes a line; it is marked billed (below) instead.
+            AND (ub.charge_amount + ub.tax_amount) > 0
           ORDER BY ub.billing_cycle_month ASC, ub.id ASC`,
         [sa.id, dueDate],
       )
+      // 10/12 (Nic): the $0 readings this cycle are billed as nothing — read,
+      // charged nothing, no line — so no later run picks them up again
+      // (the same rule as jobs/invoiceGeneration).
+      await query(
+        `UPDATE utility_bills ub
+            SET status = 'billed', billed_at = COALESCE(ub.billed_at, NOW()), updated_at = NOW()
+          WHERE ub.service_agreement_id = $1
+            AND ub.payment_id IS NULL
+            AND ub.status = 'unbilled'
+            AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
+            AND (ub.charge_amount + ub.tax_amount) = 0`,
+        [sa.id, dueDate])
 
       // Nothing to say — say nothing. A $0 invoice for a space whose meter has
       // not been read yet is noise to the payer and clutter on the ledger, and

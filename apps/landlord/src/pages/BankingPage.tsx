@@ -1,359 +1,54 @@
 /**
- * S66: Banking page — owner manages their per-user bank account catalog.
+ * Disbursement Account — where a landlord (or a manager with direct deposit)
+ * gets paid: Stripe's "Verify your business & get paid" setup and its status.
  *
- * UX: list view + add form + per-row archive. No edit (nickname-only edit
- * is API-supported but not surfaced yet — Nic asks for it later if needed).
- * Routing/account numbers are immutable; a number change = add new + archive
- * old.
- *
- * Account numbers are encrypted at rest server-side. UI only ever sees the
- * last4. The full number is decrypted at payout fire time and via a
- * super_admin reveal flow.
+ * 10/12 (Nic): "Remove the old form." This page also carried the S66 manual
+ * "Add Bank Account" form, its list and archive buttons — GAM's own bank
+ * catalog from before Stripe Connect. Payouts run only through Connect
+ * (jobs/autoPayouts.ts pays the Connect account and never reads that catalog),
+ * so a bank typed in there set up nothing and never reached Stripe. Country
+ * Acres' owner did exactly that on 10/5 and waited for microdeposits that
+ * could never come. The form, list and archive buttons are gone; the API
+ * refuses new entries (routes/bankAccounts.ts) and keeps the existing rows.
  */
 
-import { useState, useEffect, useMemo } from 'react'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { Landmark, Plus, X, Check, Archive } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { useQuery, useQueryClient } from 'react-query'
+import { useSearchParams } from 'react-router-dom'
+import { Landmark } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
-import {
-  ACCOUNT_TYPE_VALUES,
-  ACCOUNT_HOLDER_TYPE_VALUES,
-  AccountType,
-  AccountHolderType,
-  connectRequirementLabels,
-} from '@gam/shared'
+import { connectRequirementLabels } from '@gam/shared'
 import { loadConnectAndInitialize } from '@stripe/connect-js'
 import type { StripeConnectInstance } from '@stripe/connect-js'
 import {
   ConnectAccountOnboarding, ConnectComponentsProvider,
 } from '@stripe/react-connect-js'
-import { appConfirm } from '../components/dialogs'
-import { EntityPicker } from '../components/EntityPicker'
-
-interface BankAccountRow {
-  id: string
-  nickname: string
-  accountHolderName: string
-  accountHolderType: AccountHolderType
-  accountType: AccountType
-  routingNumber: string
-  accountNumberLast4: string
-  status: 'active' | 'archived'
-  createdAt: string
-}
-
-const lbl: React.CSSProperties = {
-  fontSize: '.72rem',
-  fontWeight: 600,
-  color: 'var(--text-3)',
-  textTransform: 'uppercase',
-  letterSpacing: '.06em',
-  display: 'block',
-  marginBottom: 5,
-}
+import { EntityPicker, useEntities } from '../components/EntityPicker'
+import { companiesMissingPayouts, companyName, type PayoutCompany } from '../lib/payoutReadiness'
 
 export function BankingPage() {
-  const qc = useQueryClient()
   const { user } = useAuth()
-  const [showAdd, setShowAdd] = useState(false)
 
   // S168: managers landing on /banking after the landlord enabled their
-  // direct deposit toggle only need the Stripe Connect onboarding pane.
-  // The legacy 16a per-user bank-account catalog is a landlord-only
-  // construct (used for historical / manual ledger payouts under the
-  // GAM-rail era) — irrelevant to managers, who are paid only via the
-  // Connect destination Transfer path.
+  // direct deposit toggle onboard their OWN Connect account for manager fees.
   const isManager = user?.role === 'property_manager'
 
-  const { data: accounts = [], isLoading } = useQuery<BankAccountRow[]>(
-    'bank-accounts', () => apiGet('/bank-accounts'),
-    { enabled: !isManager }
-  )
-
-  const archiveMut = useMutation(
-    (id: string) => apiPost(`/bank-accounts/${id}/archive`),
-    { onSuccess: () => qc.invalidateQueries('bank-accounts') }
-  )
-
-  if (isManager) {
-    return (
-      <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
-          <Landmark size={22} color="var(--gold)" />
-          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Disbursement Account</h1>
-        </div>
+  return (
+    <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
+        <Landmark size={22} color="var(--gold)" />
+        <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Disbursement Account</h1>
+      </div>
+      {isManager && (
         <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
           Your landlord has enabled direct deposit on your account. Link your
           bank account below so your manager fees can be paid out. Once set up,
           every rent payment you're cut from will deposit to your bank
           automatically.
         </div>
-        <StripeConnectSection />
-      </div>
-    )
-  }
-
-  return (
-    <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <Landmark size={22} color="var(--gold)" />
-          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Disbursement Account</h1>
-        </div>
-        {(
-          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
-            <Plus size={14} /> Add Account
-          </button>
-        )}
-      </div>
-
-      {/* S160: Stripe Connect Express onboarding section. Sits above the
-            legacy 16a bank account catalog — under S113 destination charges,
-            Stripe Connect IS the rail and the bank catalog stays for
-            historical/manual ledger payouts. */}
+      )}
       <StripeConnectSection />
-
-      {/* S605 (Nic): this list is NOT the payout account and never was — rent
-          pays out through Stripe Connect (jobs/autoPayouts.ts fires
-          stripe.payouts.create against the Connect account; it never reads this
-          table). It exists for advanced multi-owner allocation splits. Sitting
-          directly under a completed Stripe section with an empty state reading
-          "Add one to start routing rent payouts", it looked like the Stripe
-          onboarding hadn't saved and the landlord had to enter their bank a
-          second time. Say plainly that it's optional. */}
-      <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 18, lineHeight: 1.5 }}>
-        <strong style={{ color: 'var(--text-2)' }}>Optional — most landlords never need this.</strong>{' '}
-        Rent already pays out to the account you gave Stripe above. Accounts added here are only
-        for splitting a property's income between multiple owners. Routing and account numbers
-        can't be edited once saved; to change one, add a new account and archive the old one.
-      </div>
-
-      {isLoading && <div style={{ color: 'var(--text-3)' }}>Loading…</div>}
-
-      {!isLoading && accounts.length === 0 && (
-        <div style={{
-          padding: '32px 24px', textAlign: 'center',
-          background: 'var(--bg-1)', border: '1px solid var(--border-0)',
-          borderRadius: 12, color: 'var(--text-3)', fontSize: '.85rem'
-        }}>
-          Nothing here, and that's normal — your rent payouts are already set up through Stripe above.
-        </div>
-      )}
-
-      {!isLoading && accounts.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {accounts.map(a => (
-            <div key={a.id} style={{
-              display: 'grid',
-              gridTemplateColumns: '1fr auto',
-              alignItems: 'center', gap: 12,
-              padding: '14px 16px',
-              background: a.status === 'archived' ? 'var(--bg-1)' : 'var(--bg-2)',
-              border: '1px solid var(--border-0)',
-              borderRadius: 10,
-              opacity: a.status === 'archived' ? 0.6 : 1,
-            }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                  <span style={{ fontWeight: 600, fontSize: '.95rem' }}>{a.nickname}</span>
-                  <span style={{
-                    fontSize: '.65rem',
-                    padding: '2px 7px',
-                    borderRadius: 4,
-                    textTransform: 'uppercase',
-                    letterSpacing: '.05em',
-                    background: a.accountHolderType === 'business' ? 'rgba(201,162,39,.12)' : 'rgba(255,255,255,.06)',
-                    color: a.accountHolderType === 'business' ? 'var(--gold)' : 'var(--text-3)',
-                  }}>{a.accountHolderType}</span>
-                  {a.status === 'archived' && (
-                    <span style={{
-                      fontSize: '.65rem',
-                      padding: '2px 7px',
-                      borderRadius: 4,
-                      textTransform: 'uppercase',
-                      letterSpacing: '.05em',
-                      background: 'rgba(255,71,87,.1)',
-                      color: 'var(--red)',
-                    }}>archived</span>
-                  )}
-                </div>
-                <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-                  {a.accountHolderName} • {a.accountType} •••• {a.accountNumberLast4}
-                </div>
-              </div>
-              {a.status === 'active' && (
-                <button
-                  className="btn btn-ghost btn-sm"
-                  onClick={() => {
-                    appConfirm(`Archive "${a.nickname}"? This cannot be undone.`, { danger: true, confirmLabel: 'Archive' }).then(ok => { if (ok) archiveMut.mutate(a.id) })
-                  }}
-                  disabled={archiveMut.isLoading}
-                  title="Archive"
-                >
-                  <Archive size={14} />
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {showAdd && <AddBankAccountModal onClose={() => setShowAdd(false)} />}
-    </div>
-  )
-}
-
-function AddBankAccountModal({ onClose }: { onClose: () => void }) {
-  const qc = useQueryClient()
-  const [form, setForm] = useState({
-    nickname: '',
-    accountHolderName: '',
-    accountHolderType: 'individual' as AccountHolderType,
-    accountType: 'checking' as AccountType,
-    routingNumber: '',
-    accountNumber: '',
-    confirm_accountNumber: '',
-  })
-  const [errors, setErrors] = useState<Record<string, string>>({})
-
-  const mut = useMutation(
-    (data: any) => apiPost('/bank-accounts', data),
-    {
-      onSuccess: () => { qc.invalidateQueries('bank-accounts'); onClose() },
-      onError: (e: any) => {
-        setErrors({ submit: e?.response?.data?.error || 'Failed to add account' })
-      },
-    }
-  )
-
-  const submit = () => {
-    const errs: Record<string, string> = {}
-    if (!form.accountHolderName.trim()) errs.accountHolderName = 'Required'
-    if (!/^\d{9}$/.test(form.routingNumber.replace(/\D/g, ''))) errs.routingNumber = 'Must be 9 digits'
-    const acct = form.accountNumber.replace(/\D/g, '')
-    if (acct.length < 4 || acct.length > 17) errs.accountNumber = 'Must be 4–17 digits'
-    if (form.accountNumber !== form.confirm_accountNumber) errs.confirm_accountNumber = 'Account numbers do not match'
-    setErrors(errs)
-    if (Object.keys(errs).length > 0) return
-    mut.mutate({
-      nickname: form.nickname.trim(),
-      accountHolderName: form.accountHolderName.trim(),
-      accountHolderType: form.accountHolderType,
-      accountType: form.accountType,
-      routingNumber: form.routingNumber.replace(/\D/g, ''),
-      accountNumber: acct,
-    })
-  }
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 520, width: '95vw' }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div className="modal-title" style={{ marginBottom: 0 }}>Add Bank Account</div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          {/* S637: optional — the server names it from the account details if
-              this is left blank. It stopped a co-owner who simply had not
-              thought to name his own bank account. */}
-          <label style={lbl}>Nickname <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--text-3)' }}>(optional — e.g. "Acme Holdings LLC")</span></label>
-          <input className="input" style={{ width: '100%' }} value={form.nickname}
-            onChange={e => setForm(f => ({ ...f, nickname: e.target.value }))} />
-          {errors.nickname && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.nickname}</div>}
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-          <div>
-            <label style={lbl}>Holder Type</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              {ACCOUNT_HOLDER_TYPE_VALUES.map(v => (
-                <button key={v} type="button"
-                  onClick={() => setForm(f => ({ ...f, accountHolderType: v }))}
-                  style={{
-                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer', fontSize: '.78rem',
-                    textTransform: 'capitalize',
-                    border: `1px solid ${form.accountHolderType === v ? 'var(--gold)' : 'var(--border-0)'}`,
-                    background: form.accountHolderType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                    color: 'var(--text-0)',
-                  }}>{v}</button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label style={lbl}>Account Type</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              {ACCOUNT_TYPE_VALUES.map(v => (
-                <button key={v} type="button"
-                  onClick={() => setForm(f => ({ ...f, accountType: v }))}
-                  style={{
-                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer', fontSize: '.78rem',
-                    textTransform: 'capitalize',
-                    border: `1px solid ${form.accountType === v ? 'var(--gold)' : 'var(--border-0)'}`,
-                    background: form.accountType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                    color: 'var(--text-0)',
-                  }}>{v}</button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Account Holder Name</label>
-          <input className="input" style={{ width: '100%' }} value={form.accountHolderName}
-            placeholder={form.accountHolderType === 'business' ? 'Legal entity name' : 'Full name on account'}
-            onChange={e => setForm(f => ({ ...f, accountHolderName: e.target.value }))} />
-          {errors.accountHolderName && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountHolderName}</div>}
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Routing Number (9 digits)</label>
-          <input className="input" style={{ width: '100%' }} value={form.routingNumber}
-            inputMode="numeric" maxLength={9}
-            onChange={e => setForm(f => ({ ...f, routingNumber: e.target.value }))} />
-          {errors.routingNumber && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.routingNumber}</div>}
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Account Number</label>
-          <input className="input" style={{ width: '100%' }} value={form.accountNumber}
-            inputMode="numeric"
-            onChange={e => setForm(f => ({ ...f, accountNumber: e.target.value }))} />
-          {errors.accountNumber && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountNumber}</div>}
-        </div>
-
-        <div style={{ marginBottom: 14 }}>
-          <label style={lbl}>Confirm Account Number</label>
-          <input className="input" style={{ width: '100%' }} value={form.confirm_accountNumber}
-            inputMode="numeric"
-            onChange={e => setForm(f => ({ ...f, confirm_accountNumber: e.target.value }))} />
-          {errors.confirm_accountNumber && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.confirm_accountNumber}</div>}
-        </div>
-
-        {/* S637: the button used to appear dead when a field above the fold
-            failed — setErrors re-renders and returns before any request, so
-            there is no spinner and no network call, and the message sits at the
-            top of a long form. Say it again where the button is. */}
-        {Object.keys(errors).filter(k => k !== 'submit').length > 0 && (
-          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-            Check the highlighted {Object.keys(errors).filter(k => k !== 'submit').length === 1 ? 'field' : 'fields'} above — scroll up to see which.
-          </div>
-        )}
-
-        {errors.submit && (
-          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-            {errors.submit}
-          </div>
-        )}
-
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={mut.isLoading}>
-            {mut.isLoading ? <span className="spinner" /> : <><Check size={14} /> Add Account</>}
-          </button>
-        </div>
-      </div>
     </div>
   )
 }
@@ -379,7 +74,33 @@ function StripeConnectSection() {
   // S629 (Nic): this was pinned to profileId, so a landlord with two LLCs saw
   // and onboarded exactly one of them — the other could never link a bank at
   // all. Banking is per entity, so the entity is a choice on this page.
-  const [entityId, setEntityId] = useState<string>(isOwner ? (user?.profileId ?? '') : '')
+  //
+  // 10/12 (Nic): it still STARTED on user.profileId, which /auth/me fills with
+  // the account's OLDEST company. Blu co-owns Oak Park (8/14, paid) and owns
+  // TruBlu Management LLC (8/28, Country Acres, no Stripe account), so this
+  // page opened on Oak Park and told the Country Acres owner "Ready — you're
+  // all set", with no button to set TruBlu up. It starts on no company (S654:
+  // none is the default) and lands on one only for a reason: the company a
+  // to-do or banner linked to (?entity=), or the ONE company with a property
+  // that can't be paid yet. A single-company account is chosen by EntityPicker.
+  const [searchParams] = useSearchParams()
+  const linkedEntity = searchParams.get('entity') ?? ''
+  const [entityId, setEntityId] = useState<string>('')
+  const { data: entityList = [] } = useEntities()
+  const entities = entityList as PayoutCompany[]
+  const unpaid = companiesMissingPayouts(entities)
+  // Once, when the list arrives — after that the picker is the owner's.
+  const landed = useRef(false)
+  useEffect(() => {
+    if (landed.current || !isOwner || entityId || entities.length < 2) return
+    landed.current = true
+    if (linkedEntity && entities.some(e => e.id === linkedEntity)) setEntityId(linkedEntity)
+    else if (unpaid.length === 1) setEntityId(unpaid[0].id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOwner, entityId, entities, linkedEntity])
+  // Another company with a property still can't be paid — say so even while
+  // a paid one is on screen, so "all set" never reads as the whole account.
+  const otherUnpaid = unpaid.filter(e => e.id !== entityId)
   const connectEntity = isOwner ? 'landlord' : 'user'
   const connectEntityQS = isOwner ? `entity=landlord&entityId=${entityId}` : 'entity=user'
   const connectOnboardBody = isOwner
@@ -455,6 +176,7 @@ function StripeConnectSection() {
     }
   }
 
+  const noCompanyChosen = isOwner && !entityId
   const statusLabel = useMemo(() => {
     if (ready)                            return { tone: 'green', text: 'Ready' }
     if (statusQ.data?.exists)             return { tone: 'gold',  text: statusQ.data?.detailsSubmitted ? 'Verifying…' : 'Onboarding incomplete' }
@@ -476,20 +198,34 @@ function StripeConnectSection() {
               what I need to do, that's where the friction lives." */}
           <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Verify your business &amp; get paid</div>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4 }}>
-            {ready
+            {noCompanyChosen
+              ? 'Choose the company above to see its payout status and set it up.'
+              : ready
               ? (statusQ.data?.payoutBank?.last4
                   ? `You're all set. Rent deposits to ${statusQ.data.payoutBank.bankName ?? 'your bank'} ••${statusQ.data.payoutBank.last4}.`
                   : "You're all set. Rent deposits to the account you gave Stripe.")
               : 'Required before tenants can pay rent. Stripe (our payments partner) verifies who you are, then you add the account rent gets deposited into.'}
           </div>
         </div>
+        {!noCompanyChosen && (
         <span style={{
           padding: '4px 12px', borderRadius: 14, fontSize: '.74rem', fontWeight: 600,
           background: statusLabel.tone === 'green' ? 'rgba(38,167,90,.16)' : 'rgba(220,165,40,.16)',
           color: statusLabel.tone === 'green' ? 'var(--green, #2ea35a)' : 'var(--gold)',
           textTransform: 'uppercase', letterSpacing: '.04em', whiteSpace: 'nowrap',
         }}>{statusLabel.text}</span>
+        )}
       </div>
+
+      {isOwner && otherUnpaid.length > 0 && (
+        <div style={{ marginTop: 12, padding: 10, background: 'rgba(220,165,40,.08)', border: '1px solid rgba(220,165,40,.3)', borderRadius: 6, fontSize: '.76rem', color: 'var(--text-2)' }}>
+          <strong style={{ color: 'var(--gold)' }}>
+            {otherUnpaid.map(companyName).join(', ')} can&apos;t be paid yet.
+          </strong>{' '}
+          Rent for {otherUnpaid.length === 1 ? 'its' : 'their'} properties has nowhere to go until payouts are set up —
+          choose {otherUnpaid.length === 1 ? 'it' : 'one'} above.
+        </div>
+      )}
 
       {(statusQ.data?.requirementsCurrentlyDue ?? []).length > 0 && (
         <div style={{ marginTop: 12, padding: 10, background: 'var(--bg-2)', borderRadius: 6, fontSize: '.74rem', color: 'var(--text-2)' }}>

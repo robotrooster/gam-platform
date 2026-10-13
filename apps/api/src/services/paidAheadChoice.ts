@@ -1516,6 +1516,7 @@ export async function decidePaidAhead(input: DecideChoiceInput): Promise<DecideC
       for (const u of gamHeld) {
         const ok = await recordHeldItem({
           landlordId: lease.landlord_id, sourceType: 'prepaid_draw', sourceId: u.id, amount: Number(u.amount),
+          property: { creditUseId: u.id },  // 10/12 (Nic, ledger P1): the paid-ahead money's property
           description: `${lease.unit_number}: money paid ahead through GAM on an ended lease, kept by you`,
         }, client)
         if (ok) released = round2(released + Number(u.amount))
@@ -1655,6 +1656,7 @@ async function releaseCashInsteadHeld(where: { choiceId?: string; leaseId?: stri
     if (!(Number(r.release) > 0.005)) continue
     await recordHeldItem({
       landlordId: r.landlord_id, sourceType: 'prepaid_draw', sourceId: `cash-part:${r.id}`, amount: Number(r.release),
+      property: { refundPartId: r.id },  // 10/12 (Nic, ledger P1)
       description: cashPartReleaseWords(r.unit_number),
     })
   }

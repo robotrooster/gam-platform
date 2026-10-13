@@ -23,6 +23,7 @@ import {
   WORK_TRADE_COVERABLE_LABEL, WORK_TRADE_FIELD_PERMISSIONS, WORK_TRADE_FIELD_PERMISSION_LABEL,
 } from '@gam/shared'
 import { ReadingWalkModal } from './MeterWalk'
+import { ExtraHoursSetting, ExtraHoursPayables, ExtraHoursRecord } from './WorkTradeExtraHours'
 
 export type PanelApi = {
   get: (url: string) => Promise<any>
@@ -56,10 +57,15 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const { data, isLoading } = useQuery<any>(key, () => api.get(`/work-trade/${agreementId}`))
   const { data: standing } = useQuery<any>(['wt-standing', agreementId],
     () => api.get(`/work-trade/${agreementId}/standing`).catch(() => null))
-  const refresh = () => { qc.invalidateQueries(key); qc.invalidateQueries(['wt-standing', agreementId]); qc.invalidateQueries('work-trade') }
-  const say = (m: string, kind?: 'error') => notify?.(m, kind)
-
   const isLandlord = side === 'landlord'
+  // 10/12: paid extra hours owed for this agreement, with both ways to pay them.
+  const { data: payables = [] } = useQuery<any[]>(['wt-extra-hours', agreementId],
+    () => api.get(`/work-trade/${agreementId}/extra-hours`), { enabled: isLandlord })
+  const refresh = () => {
+    qc.invalidateQueries(key); qc.invalidateQueries(['wt-standing', agreementId]); qc.invalidateQueries('work-trade')
+    qc.invalidateQueries(['wt-extra-hours', agreementId]); qc.invalidateQueries('wt-extra-hours-open')
+  }
+  const say = (m: string, kind?: 'error') => notify?.(m, kind)
   const a = data?.agreement
   const logs: any[] = data?.logs ?? []
   const stats = data?.stats
@@ -162,6 +168,36 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
           No hours are tracked on this agreement. The charges it covers are simply not billed.
         </div>
       )}
+
+      {/* ── 10/12: extra hours — beyond what the trade needs ── */}
+      {tracks && (isLandlord ? (
+        <div className="card" style={card}>
+          <ExtraHoursSetting key={`${a.extraHoursMode}-${a.extraHoursRate}-${a.extraHoursPayMethod}`}
+            agreement={a} api={api} onSaved={refresh} notify={say} />
+          {(payables as any[]).length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <div style={label}>Paid extra hours</div>
+              <ExtraHoursPayables rows={payables as any[]} api={api} onChanged={refresh} notify={say} />
+            </div>
+          )}
+          {standing?.extraHours?.recent?.some((e: any) => e.how === 'banked') && (
+            <div style={{ marginTop: 14 }}>
+              <div style={label}>Extra hours banked</div>
+              <ExtraHoursRecord extra={standing.extraHours} side="landlord" only="banked" />
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="card" style={card}>
+          <div style={label}>Extra hours</div>
+          <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: standing?.extraHours?.recent?.length ? 6 : 0 }}>
+            {standing?.extraHours?.mode === 'pay'
+              ? 'Hours you work beyond what your agreement needs are paid separately by your landlord.'
+              : 'Hours you work beyond what your agreement needs are banked toward future months.'}
+          </div>
+          <ExtraHoursRecord extra={standing?.extraHours} side="tenant" />
+        </div>
+      ))}
 
       {/* ── what they do ── */}
       <div className="card" style={card}>

@@ -37,6 +37,7 @@ import { recordPlatformRevenue } from './platformRevenue'
 import { extractReturnCode, decideRetry, bankRefusedDebit } from './achRetry'
 import { logger } from '../lib/logger'
 import { dateIn, monthStartOf } from '../lib/timezone'
+import { graceDaysSql } from './lateness'
 
 // ============================================================
 // FlexPay — tenant-paid payment-scheduling subscription.
@@ -175,7 +176,6 @@ export const FLEXPAY_REHAB_CLEAN_PULLS = 12
  * tenant at cost with no markup (FlexPay terms § 4.2). One source: the terms.
  */
 export const FLEXPAY_ACH_RETURN_FEE = FLEXPAY_RETURNED_PULL_FEE
-export const FLEXPAY_DEFAULT_GRACE_DAYS = 5  // when lease.late_fee_grace_days is NULL (same as lateFees.ts)
 /** Runs that may fail to create the pull intent before the advance is defaulted. */
 export const FLEXPAY_MAX_PULL_CREATE_ATTEMPTS = 3
 /**
@@ -509,6 +509,7 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
       WHERE tenant_id = $1
         AND flex_deposit_enabled = TRUE
         AND flex_deposit_plan_status = 'active'
+        AND status <> 'voided'
       LIMIT 1`,
     [tenantId],
   )
@@ -819,7 +820,13 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
   }
   if (!(await isFlexPayVisible())) return out
 
-  // Grace is the late-fee engine's own: COALESCE(lease grace, 5). The opening
+  // Grace is the late-fee engine's own: the lease's, else the property's,
+  // else 5 (10/12, Nic: "Grace = lease, else property, else 5 — the only
+  // chain"), read from services/lateness so there is one definition and no
+  // second copy of the default here. Reading lease-else-5 here while the
+  // engine read the property's meant a park with a grace under 5 fined a
+  // FlexPay tenant before FlexPay paid the rent — the one thing FlexPay
+  // exists to prevent. The opening
   // balance invoice of a landlord's old system is not a monthly bill.
   const rows = await query<CoverCandidate>(
     `SELECT t.id AS tenant_id, t.flexpay_pull_day AS pull_day,
@@ -835,12 +842,12 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
        JOIN units u          ON u.id = l.unit_id
        JOIN properties p     ON p.id = u.property_id
        CROSS JOIN LATERAL (
-         SELECT ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
-                (i.due_date + COALESCE(l.late_fee_grace_days, $1) - 1)::date AS last_grace_day
+         SELECT ($1::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
+                (i.due_date + ${graceDaysSql('l', 'p')} - 1)::date AS last_grace_day
        ) day
       WHERE t.flexpay_enrolled = TRUE
         AND t.flexpay_pull_day IS NOT NULL
-        AND day.last_grace_day BETWEEN day.today_local - $3::int AND day.today_local
+        AND day.last_grace_day BETWEEN day.today_local - $2::int AND day.today_local
         AND (day.last_grace_day = day.today_local
              OR (-- A catch-up: enrolled before that day began, and nothing made
                  -- for this bill yet — no advance for the cycle, or (a second
@@ -849,7 +856,7 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
                  ${promisedAndUncoveredSql('t', 'i', 'p', 'day.last_grace_day')}))
         AND (SELECT COUNT(*) FROM (${flexPayCountedLeasesSql('t.id')}) counted) = 1
       ORDER BY t.id, i.due_date, i.id`,
-    [FLEXPAY_DEFAULT_GRACE_DAYS, now, FLEXPAY_COVER_CATCHUP_DAYS],
+    [now, FLEXPAY_COVER_CATCHUP_DAYS],
   )
 
   // One advance per (tenant, cycle): a tenant whose current and new lease both
@@ -945,17 +952,17 @@ async function alertMissedCovers(now: Date): Promise<number> {
          JOIN units u          ON u.id = l.unit_id
          JOIN properties p     ON p.id = u.property_id
          CROSS JOIN LATERAL (
-           SELECT ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
-                  (i.due_date + COALESCE(l.late_fee_grace_days, $1) - 1)::date AS last_grace_day
+           SELECT ($1::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
+                  (i.due_date + ${graceDaysSql('l', 'p')} - 1)::date AS last_grace_day
          ) day
         WHERE t.flexpay_enrolled = TRUE
           AND t.flexpay_pull_day IS NOT NULL
-          AND day.last_grace_day = day.today_local - ($3::int + 1)
+          AND day.last_grace_day = day.today_local - ($2::int + 1)
           AND ${promisedAndUncoveredSql('t', 'i', 'p', 'day.last_grace_day')}
           AND (SELECT COUNT(*) FROM (${flexPayCountedLeasesSql('t.id')}) counted) = 1
           AND EXISTS (SELECT 1 FROM payments cp WHERE cp.invoice_id = i.id AND ${coverLineSql('cp')})
         ORDER BY t.id, i.due_date, i.id`,
-      [FLEXPAY_DEFAULT_GRACE_DAYS, now, FLEXPAY_COVER_CATCHUP_DAYS])
+      [now, FLEXPAY_COVER_CATCHUP_DAYS])
     for (const m of missed) {
       const open = round2(Number(m.open_lines))
       const lateFees = round2(Number(m.late_fees))
@@ -1402,9 +1409,11 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
             AND NOT (p.id = ANY($2::uuid[]))
           ORDER BY ${allocationOrderSql('p')}`,
         [invoiceIds, leftoverIds])).rows)
+      // 10/12: a voided line (owed by nobody, decisions #48.5) is a record on
+      // the bill, not a line of it.
       wholeBillSettled = (await client.query(
         `SELECT 1 FROM payments p
-          WHERE p.invoice_id = ANY($1::uuid[]) AND p.type <> 'late_fee' AND p.status <> 'settled'
+          WHERE p.invoice_id = ANY($1::uuid[]) AND p.type <> 'late_fee' AND p.status NOT IN ('settled', 'voided')
           LIMIT 1`,
         [invoiceIds])).rowCount === 0
 
@@ -1662,7 +1671,7 @@ async function alertLateCover(
     const fees = await queryOne<{ n: number; total: string }>(
       `SELECT COUNT(*)::int AS n, COALESCE(SUM(amount), 0)::text AS total
          FROM payments
-        WHERE invoice_id = ANY($1::uuid[]) AND type = 'late_fee' AND status <> 'returned'`,
+        WHERE invoice_id = ANY($1::uuid[]) AND type = 'late_fee' AND status NOT IN ('returned', 'voided')`,
       [invoiceIds])
     const gamPaid = round2(paidByGam.reduce((s, l) => s + l.amount, 0))
     const lateFees = round2(Number(fees?.total ?? 0) - gamPaid)
@@ -2613,21 +2622,23 @@ async function afterGamFirstRouting(paymentId: string, tenantId: string, r: Appl
           { statement_id: t.ref_id, paid_via_payment_id: paymentId, amount: t.amount })
         continue
       }
-      await getStripe().transfers.create(
-        {
-          amount:      Math.round(t.amount * 100),
-          currency:    'usd',
-          destination: t.destination_connect_account,
-          description: `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
-          metadata: {
-            gam_purpose:             'flexcharge_merchant_payout',
-            gam_statement_id:        t.ref_id,
-            gam_via_supersedence:    'true',
-            gam_paid_via_payment_id: paymentId,
-          },
+      // 10/12 (Nic, ledger P0): recorded before Stripe is asked, under the
+      // webhook's own key (routes/webhooks afterSucceededCommit).
+      const { fireRecordedDirectTransfer } = await import('./landlordPassthrough')
+      await fireRecordedDirectTransfer({
+        purpose:                     'flexcharge_merchant',
+        destinationConnectAccountId: t.destination_connect_account,
+        amount:                      t.amount,
+        flexchargeStatementId:       t.ref_id,
+        idempotencyKey:              `flexcharge_payout_super_${t.ref_id}`,
+        description:                 `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
+        metadata: {
+          gam_purpose:             'flexcharge_merchant_payout',
+          gam_statement_id:        t.ref_id,
+          gam_via_supersedence:    'true',
+          gam_paid_via_payment_id: paymentId,
         },
-        { idempotencyKey: `flexcharge_payout_super_${t.ref_id}` },
-      )
+      })
     } catch (e) {
       logger.error({ err: e, statement_id: t.ref_id, paid_via_payment_id: paymentId }, '[flexpay][pull] supersedence merchant transfer failed')
       await alertAdmin('warn', 'flexcharge_merchant_transfer_failed_supersedence',

@@ -5,10 +5,14 @@ import {
   OUTSTANDING_ROW_STATUS_LABEL,
 } from '../services/openBalances'
 import { listPaymentsByMonth, isLedgerMonth } from '../services/paymentsByMonth'
+import { z } from 'zod'
+import { buildRentRoll, movedOutRules } from '../services/rentRoll'
+import { RENT_ROLL_MOVED_OUT_RULES, RENT_ROLL_MOVED_OUT_LABEL } from '@gam/shared'
+import { currentBillMonth } from '../services/householdMonths'
 import { AppError } from '../middleware/errorHandler'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
 import { tenantLivesHereSql } from '../services/posPeople'
-import { landlordScopeIds } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
@@ -222,6 +226,85 @@ balancesRouter.get('/payments-by-month', requirePerm('payments.view_all'), async
   } catch (e) { next(e) }
 })
 
+/**
+ * GET /api/balances/rent-roll?through=YYYY-MM — THE RENT ROLL (10/12, Nic): one
+ * row per household per property folder, with the picked month's Charged (late
+ * fees included, and named), Paid, Owed, status color, payment health and a
+ * strip of monthly stamps — the one payment-health definition
+ * (services/householdMonths) read whole. It replaces the old Rent Roll and the
+ * Payments ledger as the place to look. 10/12 (Nic): health and the stamp
+ * history are ALL-TIME (since each household joined GAM), not 12 months — the
+ * strip is every month, so the old `months=6|12` choice is gone (a stale
+ * client that still sends it is answered all time).
+ *
+ * WHO (Nic, 10/12): "owner plus anyone with 'View all payments'
+ * (payments.view_all), staff limited to their properties" — the Payments
+ * ledger's permission, answered 403 server-side for anyone else. "Grand totals
+ * follow the existing rule for who sees totals" (decisions #25,
+ * openBalances seesGrandTotals): the folder and page totals ride only for the
+ * viewers it admits; every other figure is per household.
+ */
+const rentRollQuery = z.object({
+  through: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Pick a month as YYYY-MM, for example 2026-10.').optional(),
+})
+balancesRouter.get('/rent-roll', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const parsed = rentRollQuery.safeParse(req.query)
+    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick a month as YYYY-MM.')
+    const data = await buildRentRoll({
+      landlordIds: landlordScopeIds(req.user!),
+      propertyIds: await getScopedPropertyIds(req.user),
+      through: parsed.data.through ?? currentBillMonth(),
+      withTotals: seesGrandTotals(req.user),
+    })
+    // 10/12 (Nic): the moved-out setting is the landlord's choice — only the
+    // owner (or GAM acting for them) changes it; everyone else sees which it is.
+    res.json({ success: true, data: { ...data, can_change_moved_out: MOVED_OUT_EDITOR_ROLES.has(req.user?.role ?? '') } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * PUT /api/balances/rent-roll/moved-out { landlordId?, rule } — 10/12 (Nic):
+ * "who stays on the Rent Roll after moving out = LANDLORD'S CHOICE (a setting
+ * on the page: billed in last 12 months / while they owe / all time)." One
+ * company's rule (landlords.rent_roll_moved_out; RENT_ROLL_MOVED_OUT_RULES).
+ *
+ * WHO: the landlord's choice, so the account owner (and GAM's admins acting
+ * for them, as the monthly report's recipient list allows) — a team member
+ * sees the rule on the page but cannot change it. The company is named, or the
+ * account's only one (resolveLandlordTarget: never a guess when it owns more).
+ * Keep everything: the change is written to audit_log with what it was.
+ */
+const MOVED_OUT_EDITOR_ROLES = new Set(['landlord', 'admin', 'super_admin'])
+const movedOutBody = z.object({
+  landlordId: z.string().uuid().optional(),
+  rule: z.enum(RENT_ROLL_MOVED_OUT_RULES, { errorMap: () => ({ message: `Pick one: ${RENT_ROLL_MOVED_OUT_RULES.map(r => RENT_ROLL_MOVED_OUT_LABEL[r]).join(', ')}.` }) }),
+})
+balancesRouter.put('/rent-roll/moved-out', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    if (!MOVED_OUT_EDITOR_ROLES.has(req.user?.role ?? '')) {
+      throw new AppError(403, 'Only the account owner chooses who stays on the Rent Roll after moving out.')
+    }
+    const parsed = movedOutBody.safeParse(req.body ?? {})
+    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick who stays on the Rent Roll after moving out.')
+    const landlordId = resolveLandlordTarget(req.user!, parsed.data.landlordId, 'setting')
+    // One statement: the row is locked, changed only when the choice is new,
+    // and the change is journaled with what it was — two presses at once can
+    // never record the wrong "was".
+    await query(`
+      WITH old AS (SELECT id, rent_roll_moved_out AS rule FROM landlords WHERE id = $1 FOR UPDATE),
+           upd AS (UPDATE landlords l SET rent_roll_moved_out = $2, updated_at = now()
+                     FROM old WHERE l.id = old.id AND old.rule IS DISTINCT FROM $2
+                   RETURNING old.rule AS was)
+      INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+      SELECT $3, 'rent_roll_moved_out_changed', 'landlord', $1, jsonb_build_object('rule', upd.was), jsonb_build_object('rule', $2::text)
+        FROM upd`, [landlordId, parsed.data.rule, req.user!.userId])
+    const [mine] = await movedOutRules([landlordId])
+    if (!mine) throw new AppError(404, 'Company not found')
+    res.json({ success: true, data: mine })
+  } catch (e) { next(e) }
+})
+
 /** The group a charge on no invoice is shown under (a counter charge, a carried balance). */
 export const NOT_ON_A_BILL = 'Not on a bill'
 
@@ -277,6 +360,10 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
            -- GAM's FlexPay pull is the tenant's arrangement with GAM: it never
            -- appears anywhere a landlord or their staff can see (CLAUDE.md).
            AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+           -- 10/12 (Nic, G9): a voided line (owed by nobody, kept as a record)
+           -- is not one of the bill's lines here; it stays on file and in the
+           -- full history.
+           AND p.status <> 'voided'
       ),
       open_bills AS (
         SELECT DISTINCT m.invoice_id FROM mine m

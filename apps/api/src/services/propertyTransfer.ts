@@ -138,11 +138,20 @@ async function transferPropertyWith(client: PoolClient, args: TransferArgs): Pro
         WHERE property_id = $1`, [propertyId, toLandlordId])
     moved.maintenance_schedules = sm.rowCount ?? 0
 
-    const rec = await client.query<{ id: string }>(
+    const rec = await client.query<{ id: string; transferred_at: Date }>(
       `INSERT INTO property_transfers
          (property_id, from_landlord_id, to_landlord_id, transferred_by, moved, note)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING id`,
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING id, transferred_at`,
       [propertyId, fromLandlordId, toLandlordId, byUserId, JSON.stringify(moved), note ?? null])
+
+    // 10/11 (Nic): the property comes off every bookkeeper's ticked list of the
+    // old company — a property that arrives at a company arrives unticked, and
+    // a stale box would tick itself again if it ever came back. 10/12 (Nic): a
+    // CLEAN CUT, not a loss: each of those bookkeepers keeps it as a former
+    // property, dated by this transfer — its history for the days it was the
+    // company's, read only, forever, and nothing after. The buyer's
+    // bookkeepers are untouched: it arrives unticked for them.
+    await keepBookkeepersHistory(client, propertyId, fromLandlordId, rec.rows[0].id, rec.rows[0].transferred_at)
 
     logger.info({ propertyId, fromLandlordId, toLandlordId, moved }, '[property-transfer] complete')
 
@@ -157,6 +166,70 @@ async function transferPropertyWith(client: PoolClient, args: TransferArgs): Pro
                  'before rent collected on this property can reach them.',
       }),
     }
+  }
+}
+
+/**
+ * 10/12 (Nic) — A SALE IS A CLEAN CUT FOR THE OLD COMPANY'S BOOKKEEPERS.
+ *
+ *   Bookkeepers keep READ access to that property's history for the period it
+ *   belonged to the company — forever — and see nothing after the transfer
+ *   date (unless they keep the books for the new owner separately).
+ *
+ * Replaces the 10/11 pruning, which dropped the property and its history in
+ * one step (and left a bookkeeper whose only box it was with nothing). For
+ * every bookkeeper of the selling company who had it ticked, on this
+ * transaction:
+ *   - it is kept as a former property (bookkeeper_former_properties), dated
+ *     by this transfer (property_transfers.transferred_at) — the readers cut
+ *     its money at the property's own day of the transfer (lib/bookkeeperScope);
+ *   - it comes off their ticked list, so it never ticks itself again.
+ * A bookkeeper whose only box it was keeps the company — its former property's
+ * history, and the company-wide box if they hold it — and is no longer
+ * refused. An old NULL row ("every property", the expand window) is written
+ * out to the company's properties as they stand now, with its company-wide
+ * box, so the sold property is not swept back in by NULL.
+ *
+ * A pending invitation is not a bookkeeper yet: the property is trimmed off
+ * it (the invitee never kept its books). One left with no property and no
+ * company-wide box is refused when accepted ("names no properties").
+ */
+async function keepBookkeepersHistory(
+  client: PoolClient, propertyId: string, fromLandlordId: string, transferId: string, transferredAt: Date,
+): Promise<void> {
+  const kept = await client.query(
+    `WITH ticked AS (
+       SELECT id FROM bookkeeper_scopes
+        WHERE landlord_id = $2 AND (property_ids IS NULL OR $1::uuid = ANY(property_ids))
+     ), former AS (
+       INSERT INTO bookkeeper_former_properties (bookkeeper_scope_id, property_id, property_transfer_id, left_at)
+       SELECT id, $1::uuid, $3::uuid, $4::timestamptz FROM ticked
+       ON CONFLICT DO NOTHING
+       RETURNING bookkeeper_scope_id
+     )
+     UPDATE bookkeeper_scopes bs
+        SET property_ids = CASE
+              WHEN bs.property_ids IS NULL
+                THEN ARRAY(SELECT p.id FROM properties p WHERE p.landlord_id = $2 ORDER BY p.created_at, p.id)
+              ELSE array_remove(bs.property_ids, $1::uuid)
+            END,
+            company_wide = bs.company_wide OR bs.property_ids IS NULL,
+            updated_at = NOW()
+      WHERE bs.id IN (SELECT id FROM ticked)
+      RETURNING bs.id`,
+    [propertyId, fromLandlordId, transferId, transferredAt])
+  await client.query(
+    `UPDATE invitations
+        SET scope_payload = jsonb_set(scope_payload, '{propertyIds}',
+              COALESCE((SELECT jsonb_agg(e) FROM jsonb_array_elements(scope_payload->'propertyIds') e
+                         WHERE e #>> '{}' <> $1::text), '[]'::jsonb))
+      WHERE landlord_id = $2 AND role = 'bookkeeper' AND status = 'pending'
+        AND jsonb_typeof(scope_payload->'propertyIds') = 'array'
+        AND scope_payload->'propertyIds' ? $1::text`,
+    [propertyId, fromLandlordId])
+  if (kept.rowCount) {
+    logger.info({ propertyId, fromLandlordId, bookkeepers: kept.rowCount },
+      '[property-transfer] bookkeepers keep the property as a former one (history up to the transfer, read only)')
   }
 }
 

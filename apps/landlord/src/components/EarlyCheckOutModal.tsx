@@ -52,6 +52,8 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<{ words: string[]; failed: { id: string; words: string } | null } | null>(null)
+  // 10/12 (Nic, G6): the landlord's answer for rent a payment was tried on, past the day they left.
+  const [pastEnd, setPastEnd] = useState<'void' | 'keep' | null>(null)
 
   // The quote — fresh whenever the day changes (an error about the old day goes with it).
   useEffect(() => {
@@ -62,6 +64,7 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
       .then((x) => {
         if (!live) return
         setQuote(x)
+        if (!x.pastEndAttempted) setPastEnd(null)
         if (!leftOn) setLeftOn(x.leftOn)
         setChoice((c) => (c && x.choices.some((k) => k.choice === c) ? c : null))
       })
@@ -92,6 +95,7 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
       const r: any = await apiPost(base, {
         leftOn: quote.checkedOut ? null : leftOn, choice, quoteToken: quote.quoteToken, idempotencyKey: key,
         refundAmount: choice === 'refund_other' ? refundAmountFor(quote, choice, typed) : null,
+        ...(pastEnd ? { pastEndAttempted: pastEnd } : {}),
       })
       const out = r?.data
       refresh()
@@ -105,6 +109,12 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
       setDone({ words: out?.words ?? [], failed: failedPart({ decision: out?.decision ?? null }) })
     } catch (e: any) {
       const data = e?.response?.data
+      // 10/12 (G6): rent past the day they left that a payment was tried on
+      // turned up since the window opened — asked here, with the charges.
+      if (data?.code === 'stay_shortened_attempted') {
+        setQuote((q) => q ? { ...q, pastEndAttempted: { words: data.error, charges: data.charges ?? [], choices: data.choices ?? { void: 'Take those charges off', keep: 'Keep them owed' } } } : q)
+        setPastEnd(null)
+      }
       if (data?.code === 'checkout_changed' && data?.data) {
         setQuote(data.data)
         setChoice((c) => (c && data.data.choices.some((k: any) => k.choice === c) ? c : null))
@@ -142,6 +152,7 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
   const wait = quote ? waitLine(quote) : null
   const toRetry = retryParts(quote)
   const stuck = decided && !quote?.canRefund && quote?.decision?.parts.some((p) => p.status === 'failed')
+  const askPastEnd = !!quote?.pastEndAttempted && !quote.checkedOut && !decided
 
   return (
     <div className="modal-overlay" onClick={close}>
@@ -264,6 +275,20 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
               </div>
             )}
 
+            {askPastEnd && quote.pastEndAttempted && (
+              <div style={{ display: 'grid', gap: 8 }}>
+                <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-1)', lineHeight: 1.5 }}>{quote.pastEndAttempted.words}</div>
+                {(['void', 'keep'] as const).map((c) => (
+                  <button key={c} type="button" disabled={busy} onClick={() => setPastEnd(c)}
+                    style={{ textAlign: 'left', padding: '10px 14px', borderRadius: 10, cursor: 'pointer',
+                             background: pastEnd === c ? 'var(--bg-3)' : 'var(--bg-2)',
+                             border: `2px solid ${pastEnd === c ? 'var(--gold)' : 'var(--border-1)'}` }}>
+                    <div style={{ fontSize: '.86rem', fontWeight: 700, color: 'var(--text-0)' }}>{quote.pastEndAttempted!.choices[c]}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+
             {wait && <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.5 }}>{wait}</div>}
             {quote.checkedOut && quote.question === 'overpaid' && !quote.canRefund && (
               <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>Only someone with "Issue refunds" can decide this.</div>
@@ -273,7 +298,7 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
 
             <div className="modal-footer" style={{ display: 'flex', gap: 8 }}>
               <button className="btn btn-ghost" onClick={close} disabled={busy}>{decided ? 'Close' : 'Cancel'}</button>
-              {canConfirm(quote, choice, typed) && (
+              {canConfirm(quote, choice, typed) && (!askPastEnd || !!pastEnd) && (
                 <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={busy} onClick={confirm}>
                   {busy ? 'Saving…' : confirmLabel(quote, choice, typed)}
                 </button>

@@ -33,6 +33,7 @@ import { getClient } from '../db'
 import type { PoolClient } from 'pg'
 import { logger } from '../lib/logger'
 import { dateIn, monthStartOf } from '../lib/timezone'
+import { PM_PAYOUT_USER_SQL, noPmRecipientMessage } from '../services/pmPayoutRecipient'
 
 interface AccrualResult {
   monthScanned: string
@@ -313,7 +314,7 @@ async function accruePmCompanyFee(
              fp.flat_amount,
              fp.flat_amount AS per_unit_amount, -- per_unit also stored in flat_amount per S109 route
              c.bank_account_id AS pm_bank_account_id,
-             ba.user_id        AS pm_payout_user_id
+             ${PM_PAYOUT_USER_SQL} AS pm_payout_user_id
         FROM pm_fee_plans fp
         JOIN pm_companies c ON c.id = fp.pm_company_id
    LEFT JOIN user_bank_accounts ba ON ba.id = c.bank_account_id
@@ -325,12 +326,12 @@ async function accruePmCompanyFee(
     }
     const plan = planRes.rows[0]
     if (plan.pm_payout_user_id === null) {
-      // PM company has no bank routing — accrual cannot post (no user_id
-      // for the ledger entry). Same defense as allocation.ts.
+      // 10/12 (Nic): no legacy catalog bank AND no active owner — nobody to
+      // book the cut to. A catalog bank is no longer required (the cut is
+      // paid to the company's Stripe Connect account); same rule as
+      // allocation.ts, one definition in services/pmPayoutRecipient.ts.
       await client.query('ROLLBACK')
-      throw new Error(
-        `PM company ${pmCompanyId} has no bank routing — set bank_account_id before accrual can run.`
-      )
+      throw new Error(noPmRecipientMessage(pmCompanyId))
     }
 
     // Occupied = an active lease covering this month. Same rule as

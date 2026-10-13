@@ -194,7 +194,8 @@ describe('Cancel reservation opens the never-moved-in confirm (decisions #53)', 
     const { resolve } = await import('path')
     const file = [resolve(process.cwd(), 'src/pages/DashboardPage.tsx'), resolve(process.cwd(), 'apps/landlord/src/pages/DashboardPage.tsx')].find(f => existsSync(f))!
     const src = readFileSync(file, 'utf8')
-    expect(src).toMatch(/useQuery<DashStats>\(\s*\['dashboard', propertyId, basis\]/)
+    // 10/12 (Nic): the Money received / Money billed switch is gone, so the key is the property alone.
+    expect(src).toMatch(/useQuery<DashStats>\(\s*\['dashboard', propertyId\]/)
     expect(src).toMatch(/useQuery<any>\(\s*'landlord-todos'/)
     const { LEASE_CLOSE_REFRESH_KEYS } = await import('./LeasesPage')
     expect(LEASE_CLOSE_REFRESH_KEYS).toEqual(expect.arrayContaining(['dashboard', 'landlord-todos', 'leases', 'schedule']))

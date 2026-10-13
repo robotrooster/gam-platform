@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
-import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
+import { humanize , DISBURSEMENT_TRIGGER_LABEL, LANDLORD_GAM_CHARGE_KIND_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useEntities } from '../components/EntityPicker'
 import { usePerms } from '../lib/permissions'
@@ -21,11 +21,11 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 // somebody opens when a payout looks wrong — the explanation belongs where the
 // question gets asked.
 
-const GAM_CHARGE_LABEL: Record<string, string> = {
-  subscription:       'Platform fee',
-  // S651: shown as its own line on purpose — see services/landlordGamDebit.ts.
-  bank_debit_cost:    'Bank transfer cost',
-}
+// S651: the bank transfer cost is shown as its own line on purpose — see
+// services/landlordGamDebit.ts. 10/12: every kind's words from the one shared
+// list (a failed pull's cost, an uncovered processing fee, a card reader
+// piece, a background check), never a raw kind name.
+const GAM_CHARGE_LABEL: Record<string, string> = LANDLORD_GAM_CHARGE_KIND_LABEL
 
 function GamChargesSection({ companyId }: { companyId: string }) {
   const { data } = useQuery<any>('gam-charges', () => apiGet('/landlords/me/gam-charges'))
@@ -104,8 +104,12 @@ function GamChargesSection({ companyId }: { companyId: string }) {
                                      padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
               <span style={{ color: 'var(--text-2)' }}>
                 {new Date(d.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                {' · '}charges {fmt(d.chargesAmount)} + bank transfer cost {fmt(d.bankCostAmount)}
-                {d.status === 'failed' && d.failureReason ? ` — your bank declined it: ${d.failureReason}` : ''}
+                {/* 10/12 (Nic, G1): a transfer that did not go through costs no
+                    $6 — what it actually cost is its own line above ("Bank
+                    transfer that did not go through"), and the charges stay owed. */}
+                {d.status === 'failed'
+                  ? ` · this transfer did not go through${d.failureReason ? ` — your bank declined it: ${d.failureReason}` : ''}; the charges on it are still owed`
+                  : <>{' · '}charges {fmt(d.chargesAmount)} + bank transfer cost {fmt(d.bankCostAmount)}</>}
               </span>
               <span className="mono">{fmt(d.totalAmount)}</span>
             </div>

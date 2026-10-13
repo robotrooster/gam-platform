@@ -32,6 +32,7 @@ import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, h
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 import { MetricsHeatMap } from './components/MetricsHeatMap'
+import { ReaderOrdersDesk } from './components/ReaderOrdersDesk'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API}/api` })
@@ -524,10 +525,13 @@ function AdminOnboardingOverview(){
           <div className={`kv ${(stats?.tenantsNoFlex||0)>0?'a':'g'}`}>{stats?.tenantsNoFlex||0}</div>
           <div className="ks">No flex products enrolled</div>
         </div>
+        {/* 10/12 (Nic, A5: "match billing"): the Overview's vacant count — spaces
+            under management not occupied this month the way GAM bills them —
+            in this admin's portfolio. It counted unit status before. */}
         <div className="kpi">
           <div className="kl">Vacant Units</div>
           <div className="kv b">{stats?.vacantUnits||0}</div>
-          <div className="ks">{stats?.unitsNoTenant||0} without tenant assigned</div>
+          <div className="ks">counted the way GAM bills · {stats?.unitsNoTenant||0} without tenant assigned</div>
         </div>
       </div>
 
@@ -1068,7 +1072,7 @@ function AgentAnalytics(){
   )
 }
 
-const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600'}
+const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600',card_reader_markup:'#a855f7'}
 const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
 
 // ── 10/3 (Nic): the two admin money cards ──────────────────────────────────
@@ -1080,7 +1084,12 @@ const money=(n:number|null|undefined)=>n==null?'—':formatCurrency(n)
 /** GAM's own money: what is GAM's, what sits beside it, and the check against GAM's records. */
 function GamsOwnMoneyCard({bal}:{bal:any}){
   const[showCheck,setShowCheck]=useState(false)
+  const[showBridge,setShowBridge]=useState(false)
   const r=bal.reconciliation
+  const br=r?.bridge
+  const leftoverZero=br!=null&&Math.abs(br.leftover)<0.005
+  // A signed amount on a bridge line: "+$4.00" / "−$4.00".
+  const signed=(n:number)=>Math.abs(n)<0.005?money(0):n>0?`+${money(n)}`:`−${money(-n)}`
   const c=bal.clearing||{}
   const gap=r?.gap
   const ties=gap!=null&&Math.abs(gap)<0.005
@@ -1106,9 +1115,12 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
           records beside "GAM's records" above it, and "of that still owed"
           claimed the landlords' open charges sit inside the earned figure,
           which holds only for platform fees (a card-reader installment owed is
-          not in the revenue book). Same numbers, plainer words. Nothing about
+          not in the revenue book — 10/12: only its markup part is, Q-g). Same numbers, plainer words. Nothing about
           how either number is worked out changed here. */}
-      <div className="ks" style={{marginTop:2}}>Earned, per the revenue book: {money(bal.revenueThisMonth||0)} this month, {money(bal.revenueAllTime||0)} all time</div>
+      {/* 10/12 (Nic, A3): "rename 'book' so it doesn't collide with 'GAM's
+          records'" — the earned figure is GAM's earnings ledger
+          (platform_revenue_ledger); "GAM's records" stays the check's name. */}
+      <div className="ks" style={{marginTop:2}}>Earned, per GAM's earnings ledger: {money(bal.revenueThisMonth||0)} this month, {money(bal.revenueAllTime||0)} all time</div>
       {/* 10/12 (Nic) review: this total is every open landlord charge — a
           card-reader installment is not a fee — and a payout is not the only
           way it is collected. So it names what is owed, kind by kind, and both
@@ -1120,7 +1132,37 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
         {(bal.owedByLandlordsByKind||[]).length>0&&<> ({(bal.owedByLandlordsByKind as any[]).map((k:any)=>`${k.label.toLowerCase()} ${money(k.amount)}`).join(', ')})</>}
         {' '}— taken from their next payout, or by bank debit if it passes their limit first
       </div>}
-      {r&&<button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>}
+      {r&&<div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:8}}>
+        {br&&<button className="btn btn-primary btn-sm" onClick={()=>setShowBridge(v=>!v)}>{showBridge?'Hide the bridge':'Show the bridge'}</button>}
+        <button className="btn btn-primary btn-sm" onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>
+      </div>}
+      {/* 10/12 (Nic, A3): "SHOW THE BRIDGE (earned − billed-not-collected +
+          reader payments − payouts to GAM bank = money in Stripe)". From the
+          earnings ledger to the headline, line by line, every timing item
+          named; the leftover must read $0.00 (services/stripeCosts
+          platformBalanceBridge). */}
+      {br&&showBridge&&<div style={{marginTop:8}}>
+        <div className="dr"><span className="dk">Earned, all time (GAM's earnings ledger)</span><span className="dv mono">{money(br.earned)}</span></div>
+        {(br.platformFeesNotCollected||0)!==0&&<div className="dr"><span className="dk">Less platform fees billed, not collected yet</span><span className="dv mono">−{money(br.platformFeesNotCollected)}</span></div>}
+        {/* 10/12 (G5 review): a fee a landlord covers that was more than the
+            payment (the $6 bank fee on a $4 payment) — the rest is billed to
+            the landlord; earned in full, on the balance once collected. */}
+        {(br.processingFeesNotCollected||0)!==0&&<div className="dr"><span className="dk">Less processing fees landlords cover beyond the payment, billed, not collected yet</span><span className="dv mono">−{money(br.processingFeesNotCollected)}</span></div>}
+        {/* 10/12 (Nic, Q-g): cost first — of the reader payments collected,
+            GAM's cost of the readers coming back is its own line (never
+            earnings); the markup is already inside "Earned". */}
+        {(br.readerMarkupNotCollected||0)!==0&&<div className="dr"><span className="dk">Less card-reader markup billed, not collected yet</span><span className="dv mono">−{money(br.readerMarkupNotCollected)}</span></div>}
+        {(br.readerCostRecovered||0)!==0&&<div className="dr"><span className="dk">Plus card-reader cost repaid by landlords (GAM's cost of the readers — not earnings)</span><span className="dv mono">+{money(br.readerCostRecovered)}</span></div>}
+        {(br.readerPaymentsCollected||0)!==0&&<div className="ks" style={{marginTop:-2,marginBottom:4}}>Card-reader payments collected: {money(br.readerPaymentsCollected)} = {money(br.readerCostRecovered||0)} cost repaid + {money(br.readerMarkupCollected||0)} markup (inside Earned)</div>}
+        {(br.paidOutToGamBank||0)!==0&&<div className="dr"><span className="dk">Less paid out to GAM's own bank</span><span className="dv mono">−{money(br.paidOutToGamBank)}</span></div>}
+        {(br.timing||[]).length>0&&<div className="ks" style={{marginTop:6}}>Timing and the rest, each named:</div>}
+        {(br.timing||[]).map((t:any)=>(
+          <div key={t.key} className="dr"><span className="dk">{t.label}</span><span className="dv mono">{signed(t.amount)}</span></div>
+        ))}
+        <div className="dr"><span className="dk">Comes to</span><span className="dv mono">{money(br.gamsOwn)}</span></div>
+        <div className="dr"><span className="dk">GAM's own on the Stripe balance</span><span className="dv mono">{money(br.onBalance)}</span></div>
+        <div className="dr"><span className="dk">Leftover (must read $0.00)</span><span className="dv mono" style={{color:leftoverZero?'var(--green)':'var(--amber)'}}>{money(br.leftover)}</span></div>
+      </div>}
       {r&&showCheck&&<div style={{marginTop:8}}>
         <div className="dr"><span className="dk">Bank and card fees on payments that cleared</span><span className="dv mono">{money(r.collectedParts?.processingFees)}</span></div>
         <div className="dr"><span className="dk">Register and pay-link card fees</span><span className="dv mono">{money(r.collectedParts?.registerCardFees)}</span></div>
@@ -1150,7 +1192,7 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
         <div className="dr"><span className="dk">The Stripe balance says</span><span className="dv mono">{money(r.onBalance)}</span></div>
         <div className="dr"><span className="dk">Difference</span><span className="dv mono" style={{color:ties?'var(--green)':'var(--amber)'}}>{money(gap)}</span></div>
         <div className="ks" style={{marginTop:6}}>Not in this check: money a tenant's payment carried toward an older FlexDeposit or FlexCharge balance, and what GAM has paid Checkr. The Checkr line is every background check applicants paid that was not refunded — once GAM pays Checkr, that line reads high and GAM's own reads low by what was paid. A dispute GAM wins puts the money back on the balance: the fee on top in it is counted here (and what the landlords were charged for it is owed back to them), but GAM's records do not undo the rent part of the dispute yet, so that part reads as a difference of its amount.</div>
-        <div className="ks" style={{marginTop:4}}>Not in the earnings book one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings book only through the nightly processing true-up; businesses' invoicing fees are not in the earnings book at all yet.</div>
+        <div className="ks" style={{marginTop:4}}>Not in GAM's earnings ledger one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings ledger only through the nightly processing true-up; businesses' invoicing fees are not in the earnings ledger at all. Of a card reader's payments only the markup is in the earnings ledger (booked when the payment carrying it is billed); the part that repays what the reader cost GAM never is.</div>
       </div>}
     </div>)
 }
@@ -1338,6 +1380,7 @@ function PlatformRevenueCard(){
   const{data:compositionAll,isError:compositionFailed}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:30000,refetchInterval:30000,refetchOnWindowFocus:true})
   const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
   const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // 10/12 (Nic, A4): "make it CLICKABLE to open a list of properties (spaces + $ each)".
   const[showByProperty,setShowByProperty]=useState(false)
   return(<>
       {(()=>{
@@ -1377,7 +1420,13 @@ function PlatformRevenueCard(){
           <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
             {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
             <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',flexWrap:'wrap',gap:16,marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
-              <div style={{flex:'1 1 280px',minWidth:0}}>
+              <div className={byProperty.length>0?'rr-open':undefined} style={{flex:'1 1 280px',minWidth:0}}
+                {...(byProperty.length>0?{
+                  role:'button',tabIndex:0,'aria-haspopup':'dialog' as const,
+                  'aria-label':`Recurring revenue: see each property billed for ${monthName(recurringMonth)}`,
+                  onClick:()=>setShowByProperty(true),
+                  onKeyDown:(e:React.KeyboardEvent)=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setShowByProperty(true)}},
+                }:{})}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{loaded?formatCurrency(recurringMonthly):'…'}</div>
                 {/* 10/12 (Nic): "is there only 12 units there?" — the month it is
@@ -1391,26 +1440,13 @@ function PlatformRevenueCard(){
                     :'nothing billed yet · $2 per occupied space'}
                 </div>
                 {notCollected>0&&<div style={{fontSize:'.74rem',color:'var(--amber)',marginTop:4}}>{formatCurrency(notCollected)} of it not collected yet — see by property</div>}
-                {byProperty.length>0&&<button className="btn btn-primary btn-sm" style={{marginTop:10}} onClick={()=>setShowByProperty(v=>!v)}>{showByProperty?'Hide by property':'By property'}</button>}
+                {byProperty.length>0&&<div style={{fontSize:'.72rem',color:'var(--gold)',marginTop:8,fontWeight:600}}>See each property ›</div>}
               </div>
               <div style={{flex:'0 0 auto',textAlign:'right'}}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{loaded?formatCurrency(recurringAnnual):'…'}</div>
                 <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
               </div>
-              {showByProperty&&byProperty.length>0&&<div style={{flexBasis:'100%'}}>
-                {byProperty.map((p:any)=>(
-                  <div key={p.propertyId||p.name} className="dr" style={{flexWrap:'wrap',gap:'2px 12px',alignItems:'baseline'}}>
-                    <span className="dk" style={{color:'var(--t1)'}}>{p.name}</span>
-                    <span className="dv mono" style={{marginLeft:'auto'}}>{p.spaces.toLocaleString()} space{p.spaces===1?'':'s'} · {formatCurrency(p.billed)}</span>
-                    {p.notCollected>0&&<span style={{flexBasis:'100%',fontSize:'.72rem',color:'var(--amber)'}}>
-                      {formatCurrency(p.notCollected)} not collected yet — {p.payoutBankLinked
-                        ?'it comes out of their next payout'
-                        :'no payout bank linked yet, so it comes out of their first payout'}
-                    </span>}
-                  </div>
-                ))}
-              </div>}
             </div>
             {/* Income composition — a wall of pies, one per time window */}
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
@@ -1486,7 +1522,76 @@ function PlatformRevenueCard(){
           </div>
         </div>
       )}
+      {showByProperty&&<RecurringByPropertyDialog bill={compositionAll} onClose={()=>setShowByProperty(false)}/>}
+      <style>{`
+        .rr-open { cursor: pointer; border-radius: 10px; margin: -8px; padding: 8px; transition: background .15s; }
+        .rr-open:hover { background: var(--bg3); }
+        .rr-open:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+      `}</style>
   </>)
+}
+
+/**
+ * 10/12 (Nic, A4): "Recurring revenue card: make it CLICKABLE to open a list of
+ * properties (spaces + $ each)". The month's platform-fee bill, property by
+ * property — the spaces each was billed for and the dollars — from the same
+ * read as the card (GET /admin/income/composition/all → services/platformFeeBill),
+ * so the list always adds up to the card.
+ */
+function RecurringByPropertyDialog({bill,onClose}:{bill:any;onClose:()=>void}){
+  const rows:any[]=bill?.recurringByProperty||[]
+  const total=bill?.recurringMonthly??0
+  const spaces:number=bill?.recurringSpaces??0
+  const notCollected:number=bill?.recurringNotCollected??0
+  const closeRef=React.useRef<HTMLButtonElement>(null)
+  // The card re-reads every 30 seconds and hands a new onClose each time;
+  // focus moves to Close once, when the list opens, not on every re-read.
+  const onCloseRef=React.useRef(onClose)
+  onCloseRef.current=onClose
+  useEffect(()=>{
+    closeRef.current?.focus()
+    const onKey=(e:KeyboardEvent)=>{if(e.key==='Escape')onCloseRef.current()}
+    window.addEventListener('keydown',onKey)
+    return()=>window.removeEventListener('keydown',onKey)
+  },[])
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:16}} onClick={e=>{if(e.target===e.currentTarget)onClose()}}>
+      <div role="dialog" aria-modal="true" aria-labelledby="rr-dialog-title" style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:20}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:14,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Recurring revenue by property</div>
+            <div id="rr-dialog-title" style={{fontFamily:'var(--font-d)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)'}}>Platform fees billed for {monthName(bill?.recurringMonth)}</div>
+            <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(total)} · {spaces.toLocaleString()} space{spaces===1?'':'s'}</div>
+          </div>
+          <button ref={closeRef} className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        </div>
+        <div style={{overflowX:'auto'}}>
+          <table className="tbl" style={{width:'100%'}}>
+            <thead><tr><th>Property</th><th style={{textAlign:'right'}}>Spaces billed</th><th style={{textAlign:'right'}}>Billed</th><th style={{textAlign:'right'}}>Not collected yet</th></tr></thead>
+            <tbody>
+              {rows.map((p:any)=>(
+                <tr key={p.propertyId||p.name}>
+                  <td style={{color:'var(--t0)',overflowWrap:'anywhere'}}>{p.name}
+                    {p.notCollected>0&&<div style={{fontSize:'.7rem',color:'var(--amber)'}}>{p.payoutBankLinked
+                      ?'comes out of their next payout'
+                      :'no payout bank linked yet, so it comes out of their first payout'}</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}}>{Number(p.spaces||0).toLocaleString()}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(p.billed)}</td>
+                  <td className="mono" style={{textAlign:'right',color:p.notCollected>0?'var(--amber)':'var(--t3)'}}>{p.notCollected>0?formatCurrency(p.notCollected):'—'}</td>
+                </tr>
+              ))}
+              <tr>
+                <td style={{fontWeight:700,color:'var(--t0)'}}>Total</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{spaces.toLocaleString()}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{formatCurrency(total)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700,color:notCollected>0?'var(--amber)':'var(--t3)'}}>{notCollected>0?formatCurrency(notCollected):'—'}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>)
 }
 
 function Overview(){
@@ -1591,7 +1696,12 @@ function Overview(){
 
       {/* ── Row 2: Units + Flex + Rent Volume ── */}
       <div className="grid3" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.activeUnits||0).toLocaleString()}</div><div className="ks">{stats?.vacantUnits||0} vacant</div></div>
+        {/* 10/12 (Nic, A5): "MATCH BILLING (occupied = billable evidence; vacant =
+            rest; retired excluded)". Occupied = the spaces GAM bills this month
+            (a lease, a month stay, owner use or a utility arrangement); vacant =
+            the rest of the spaces under management. Nightly and weekly stays
+            bill by their nights after the month, so they are not spaces here. */}
+        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.activeUnits||0).toLocaleString()}</div><div className="ks">{(stats?.vacantUnits||0).toLocaleString()} vacant of {(stats?.totalSpaces||0).toLocaleString()} spaces · counted the way GAM bills {stats?.spacesMonth?monthName(stats.spacesMonth):'this month'}</div></div>
         <div className="kpi">
           <div className="kl">Flex Products</div>
           <div className="kv gold">{(stats?.flexCredit||0)+(stats?.flexDeposit||0)+(stats?.flexPay||0)}</div>
@@ -1823,14 +1933,19 @@ function Metrics(){
         {/* 10/12 (Nic) review: live only — a property with a lease, a billed month or a stay (services/platformMetrics LIVE_PROPERTY). */}
         <MetricTile label="Landlords" value={count(fp.landlords)} sub="people with a property live on GAM"/>
         <MetricTile label="Properties" value={count(fp.properties)} sub={`in ${plural(fp.cities,'city','cities')} across ${plural(fp.states,'state')}`}/>
-        <MetricTile label="Spaces under management" value={count(fp.units)} sub={fp.spacesBilledMonth?`${count(fp.spacesBilled)} occupied and billed for ${monthName(fp.spacesBilledMonth)}`:undefined}/>
+        {/* 10/12 (Nic, A5/H1): occupied = the spaces GAM bills this month (the Overview's
+            Active Units and the heat map's "Occupied (billed)" view read the same count). */}
+        <MetricTile label="Spaces under management" value={count(fp.units)} sub={fp.occupiedMonth!=null
+          ?`${count(fp.occupiedSpaces)} occupied in ${monthName(fp.occupiedMonth)}, counted the way GAM bills · ${count(fp.vacantSpaces)} vacant${fp.spacesBilledMonth?` · ${count(fp.spacesBilled)} billed for ${monthName(fp.spacesBilledMonth)}`:''}`
+          :fp.spacesBilledMonth?`${count(fp.spacesBilled)} occupied and billed for ${monthName(fp.spacesBilledMonth)}`:undefined}/>
         <MetricTile label="Households" value={count(fp.households)} sub="active leases"/>
         <MetricTile label="Residents" value={count(fp.residents)} sub="people on an active lease"/>
       </div>
 
       {/* 10/12 (Nic): "a heat map, toggleable at the state and county levels. darker colors for more units
           in that area. toggleable between a heat map for units and money." Units = the Spaces tile above,
-          money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap). */}
+          money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap).
+          10/12 (Nic, H1): Units toggles Occupied (billed) — the tile's occupied count — and All spaces. */}
       <MetricsHeatMap data={m.map}/>
 
       {/* ── Paperwork and operations ── */}
@@ -2637,66 +2752,10 @@ function ReaderOrdersBadge() {
   return <span style={{ marginLeft: 'auto', background: '#c9a227', color: '#060809', borderRadius: 10, padding: '0 7px', fontSize: '.68rem', fontWeight: 800 }}>{n}</span>
 }
 
+// 10/12 (Nic): the desk itself — with what each reader cost GAM and the
+// markup it earns — lives in components/ReaderOrdersDesk.
 function ReaderOrders() {
-  const qc = useQueryClient()
-  const { data: orders = [], isLoading } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'))
-  const [draft, setDraft] = React.useState<Record<string, any>>({})
-  const [busy, setBusy] = React.useState<string | null>(null)
-  const [msg, setMsg] = React.useState<string | null>(null)
-  const STATUSES = ['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']
-  const LABEL: Record<string, string> = { requested: 'Requested', ordered: 'Ordered from Stripe', shipped: 'Shipped', delivered: 'Delivered', registered: 'Registered — ready', cancelled: 'Cancelled' }
-  const save = async (o: any) => {
-    const d = draft[o.id] || {}
-    setBusy(o.id); setMsg(null)
-    try {
-      await api.patch(`/admin/reader-orders/${o.id}`, {
-        status: d.status ?? o.status, stripeHardwareOrderId: d.stripeHardwareOrderId ?? o.stripeHardwareOrderId ?? null,
-        serial: d.serial ?? o.serial ?? null, trackingUrl: d.trackingUrl ?? o.trackingUrl ?? null,
-      })
-      setDraft(prev => { const n = { ...prev }; delete n[o.id]; return n })
-      qc.invalidateQueries('admin-reader-orders'); setMsg('Saved')
-    } catch (e: any) { setMsg(e?.response?.data?.error || 'Could not save') } finally { setBusy(null) }
-  }
-  const field = (o: any, k: string, placeholder: string) => (
-    <input className="inp" style={{ width: '100%', fontSize: '.78rem' }} placeholder={placeholder}
-      value={draft[o.id]?.[k] ?? o[k] ?? ''} onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), [k]: e.target.value } }))} />
-  )
-  return (
-    <div>
-      <div className="ph"><div><h1 className="pt">Reader Orders</h1><p className="ps">Card readers landlords asked for — order in Stripe's shop, pre-registered to the location shown, shipped to the address shown</p></div></div>
-      {msg && <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 8 }}>{msg}</div>}
-      {isLoading ? <div style={{ color: 'var(--t3)' }}>Loading…</div> : (orders as any[]).length === 0 ? (
-        <div className="card" style={{ padding: 24, color: 'var(--t3)' }}>No reader requests yet.</div>
-      ) : (
-        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-          <table className="tbl" style={{ minWidth: 1100 }}>
-            <thead><tr><th>Requested</th><th>Landlord · property</th><th>Ship to</th><th>Stripe location</th><th>Plan</th><th>Status</th><th>Stripe order</th><th>Serial</th><th>Tracking</th><th></th></tr></thead>
-            <tbody>
-              {(orders as any[]).map(o => (
-                <tr key={o.id}>
-                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>{new Date(o.createdAt).toLocaleDateString()}</td>
-                  <td style={{ fontSize: '.82rem' }}><div style={{ fontWeight: 600 }}>{o.businessName || o.landlordEmail}</div><div style={{ color: 'var(--t3)', fontSize: '.74rem' }}>{o.propertyName}</div></td>
-                  <td style={{ fontSize: '.74rem', color: 'var(--t2)' }}>{o.shipName}{o.shipCompany ? ` · ${o.shipCompany}` : ''}<br />{o.shipLine1}{o.shipLine2 ? `, ${o.shipLine2}` : ''}<br />{o.shipCity}, {o.shipState} {o.shipZip}{o.shipPhone ? <><br />{o.shipPhone}</> : null}</td>
-                  <td className="mono" style={{ fontSize: '.72rem', color: o.stripeTerminalLocationId ? 'var(--t2)' : 'var(--red)' }}>{o.stripeTerminalLocationId || 'no location — open the property'}</td>
-                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>${Number(o.price).toFixed(2)} · {o.installments} × ${Number(o.installmentAmount).toFixed(2)}<br /><span style={{ color: 'var(--t3)' }}>{o.installmentsRaised} of {o.installments} raised</span></td>
-                  <td>
-                    <select className="inp" style={{ fontSize: '.78rem' }} value={draft[o.id]?.status ?? o.status}
-                      onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), status: e.target.value } }))}>
-                      {STATUSES.map(st => <option key={st} value={st}>{LABEL[st]}</option>)}
-                    </select>
-                  </td>
-                  <td style={{ minWidth: 150 }}>{field(o, 'stripeHardwareOrderId', 'thor_…')}</td>
-                  <td style={{ minWidth: 140 }}>{field(o, 'serial', 'serial number')}</td>
-                  <td style={{ minWidth: 160 }}>{field(o, 'trackingUrl', 'tracking link')}</td>
-                  <td><button className="btn btn-primary btn-sm" disabled={busy === o.id} onClick={() => save(o)}>{busy === o.id ? '…' : 'Save'}</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  )
+  return <ReaderOrdersDesk api={api}/>
 }
 
 function ConnectAccounts() {
@@ -4801,15 +4860,22 @@ function SystemFeatures(){
 }
 
 // ── DISPUTES (credit ledger) ─────────────────────────────────
+// 10/12 (Nic): "the payment history should be a health percentage. one mark
+// per invoice." A payment mark is the whole BILL's now (rent, utilities and
+// fees together), so it reads per bill — the same words as the landlord's
+// screening page and the tenant's credit page (TenantScreeningPage.tsx,
+// apps/tenant main.tsx EVENT_LABEL; creditMarkLabels.test.ts keeps the three
+// in step). The event types are unchanged; the grace-period and failed-payment
+// labels stay for marks written before.
 const DISPUTE_EVENT_LABEL: Record<string,string> = {
-  payment_received_on_time:           'Rent paid on time',
+  payment_received_on_time:           'Bill paid on time',
   payment_received_late_grace:        'Paid within grace period',
-  payment_received_late_minor:        'Paid late (minor)',
-  payment_received_late_major:        'Paid late (major)',
-  payment_received_late_severe:       'Paid late (severe)',
-  payment_partial:                    'Partial payment',
+  payment_received_late_minor:        'Bill paid late (1–3 days past grace)',
+  payment_received_late_major:        'Bill paid late (4–15 days past grace)',
+  payment_received_late_severe:       'Bill paid late (16+ days past grace)',
+  payment_partial:                    'Bill partly paid past grace',
   payment_failed_nsf:                 'Payment failed (NSF)',
-  payment_skipped:                    'Payment skipped',
+  payment_skipped:                    'Bill unpaid past grace',
   lease_signed:                       'Lease signed',
   lease_renewed:                      'Lease renewed',
   lease_terminated_natural:           'Lease completed',
@@ -4976,7 +5042,7 @@ function Disputes(){
                       <div style={{color:'var(--t0)',fontWeight:600}}>{d.disputingSubjectType}</div>
                       <div className="mono" style={{fontSize:'.65rem',color:'var(--t3)'}}>{d.disputingSubjectRefId?.slice(0,8)}…</div>
                     </td>
-                    <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{DISPUTE_EVENT_LABEL[d.disputedEventType] || d.disputedEventType}</td>
+                    <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{DISPUTE_EVENT_LABEL[d.disputedEventType] || humanize(d.disputedEventType)}</td>
                     <td style={{fontSize:'.78rem'}}>{humanize(d.reason)}</td>
                     <td>
                       {d.evidenceCount > 0
@@ -5005,7 +5071,7 @@ function Disputes(){
                   <span style={{fontSize:'.7rem',color:'var(--t3)'}}>filed {new Date(detail.createdAt).toLocaleString()}</span>
                 </div>
                 <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.05rem',color:'var(--t0)'}}>
-                  {DISPUTE_EVENT_LABEL[detail.disputedEventType] || detail.disputedEventType}
+                  {DISPUTE_EVENT_LABEL[detail.disputedEventType] || humanize(detail.disputedEventType)}
                 </div>
                 <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>
                   Disputing party: {detail.disputingSubjectType} <span className="mono">{detail.disputingSubjectRefId}</span>
@@ -5124,7 +5190,7 @@ function Disputes(){
                         )}
                         {cReplaceWithSame && (
                           <div style={{fontSize:'.72rem',color:'var(--t3)'}}>
-                            Re-emits as <span className="mono">{detail.disputedEventType}</span> with <code>dispute_corrected: true</code> in event_data. Use this when the original happened but the data was wrong.
+                            Re-emits as <strong>{DISPUTE_EVENT_LABEL[detail.disputedEventType] || humanize(detail.disputedEventType)}</strong> with <code>dispute_corrected: true</code> in event_data. Use this when the original happened but the data was wrong.
                           </div>
                         )}
                       </div>

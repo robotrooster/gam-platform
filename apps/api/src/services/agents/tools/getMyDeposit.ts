@@ -39,7 +39,7 @@ export const getMyDeposit: AgentTool = {
   async execute(_args, actor: AgentActor) {
     const deposits = await query<DepositRow>(
       `SELECT total_amount, collected_amount, status, damage_claimed, held_by
-         FROM security_deposits WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1`,
+         FROM security_deposits WHERE tenant_id = $1 AND status <> 'voided' ORDER BY created_at DESC LIMIT 1`,
       [actor.profileId]
     )
     if (deposits.length === 0) {

@@ -77,7 +77,7 @@ export async function getQualificationStatus(tenantId: string): Promise<Qualific
             sd.flex_deposit_enabled AS flex_deposit_enabled,
             sd.installments_remaining AS flex_installments_remaining
        FROM tenants t
-       LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+       LEFT JOIN security_deposits sd ON sd.tenant_id = t.id AND sd.status <> 'voided'
       WHERE t.id = $1
       LIMIT 1`,
     [tenantId],

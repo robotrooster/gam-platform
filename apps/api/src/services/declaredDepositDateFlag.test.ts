@@ -101,11 +101,12 @@ const report = async (id: string) => (await db.query(
 const settledOn = async (id: string) => (await db.query(
   `SELECT to_char(settled_at,'YYYY-MM-DD') AS d FROM payments WHERE id = $1`, [id])).rows[0].d
 /** The rent's live payment mark: its tier and the day it counts from (10/6: the bank-validated day). */
+// 10/12 (Nic): "one mark per invoice" — the live mark of the BILL the rent is on,
+// and the day the bill was paid in full (the day the mark counts from).
 const markOf = async (id: string) => (await db.query<{ event_type: string; paid_on: string; data: any }>(
-  `SELECT event_type, to_char((event_data->>'paid_at')::timestamptz AT TIME ZONE 'America/Phoenix', 'YYYY-MM-DD') AS paid_on,
-          event_data AS data
-     FROM credit_events WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1
-      AND superseded_by IS NULL`, [id])).rows
+  `SELECT e.event_type, e.event_data->>'paid_in_full_on' AS paid_on, e.event_data AS data
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [id])).rows
 const confirm = (s: Stack) => confirmDepositMatch({
   bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash', declarationId: s.declarationId,
 })

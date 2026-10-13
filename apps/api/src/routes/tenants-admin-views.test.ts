@@ -191,7 +191,11 @@ describe('GET /:id/profile — lifetime tenant profile', () => {
     expect(res.body.data.stats.failedCount).toBe(1)
     expect(res.body.data.stats.totalPaid).toBeCloseTo(2100, 2)
     expect(res.body.data.stats.avgPayment).toBeCloseTo(1050, 2)
-    expect(res.body.data.stats.onTimeRate).toBe(67)  // 2/3 = 0.666… → 67
+    // 10/12 (Nic): the one payment-health figure — months, not rows. Last
+    // month's bill is paid; this month's (the failed $1,200 beside a paid
+    // $1,000) is still inside its grace period, so it is not judged yet.
+    expect(res.body.data.stats.onTimeRate).toBe(100)
+    expect(res.body.data.stats.health).toMatchObject({ percent: 100, on_time: 1, counted: 1 })
     expect(res.body.data.stats.maintenanceCount).toBe(1)
     expect(res.body.data.stats.unitsOccupied).toBe(1)
   })
@@ -203,16 +207,30 @@ describe('GET /:id/profile — lifetime tenant profile', () => {
   it('lateCount counts ledger late-payment events, once per charge, and ignores the old daily counter', async () => {
     const f = await seedPortfolio()
     await db.query(`UPDATE tenants SET late_payment_count=30 WHERE id=$1`, [f.tenantId])
+    // 10/12 (Nic): "one mark per invoice" — five bills, each paid on its own day.
     const { emitPaymentSettledEvent } = await import('../services/creditLedgerEmitters')
     const c = await db.connect()
     try {
-      const day = 86_400_000
-      const due = new Date('2026-06-01T00:00:00Z')
       // on time, within grace, 2 days past grace, 10 days past grace, 40 days past grace
-      for (const lateDays of [0, 3, 7, 15, 45]) {
+      const lateDays = [0, 3, 7, 15, 45]
+      for (let i = 0; i < lateDays.length; i++) {
+        const due = `2026-0${i + 1}-01`
+        const lease = (await c.query<{ id: string }>(
+          `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, late_fee_grace_days)
+           VALUES ($1,$2,500,'fixed_term','expired',$3::date,5) RETURNING id`, [f.unitId, f.landlordId, due])).rows[0].id
+        await c.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1,$2,'primary')`, [lease, f.tenantId])
+        const inv = (await c.query<{ id: string }>(
+          `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6::date,500,'settled',$6::date - 5) RETURNING id`,
+          [f.landlordId, f.tenantId, lease, f.unitId, `INV-LC-${i}-${randomUUID().slice(0, 6)}`, due])).rows[0].id
+        const pid = (await c.query<{ id: string }>(
+          `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
+                                 due_date, created_at, settled_at)
+           VALUES ($1,$2,$3,$4,$5,'rent',500,'settled','RENT',$6::date,$6::date - 5,($6::date + $7::int) + time '12:00') RETURNING id`,
+          [inv, f.unitId, lease, f.tenantId, f.landlordId, due, lateDays[i]])).rows[0].id
         await emitPaymentSettledEvent(c, {
-          tenantId: f.tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '500',
-          dueDate: due, settledAt: new Date(due.getTime() + lateDays * day), graceDays: 5, stripePaymentIntentId: null,
+          tenantId: f.tenantId, paymentId: pid, paymentType: 'rent', amount: '500',
+          dueDate: due, settledAt: new Date(), graceDays: 5, stripePaymentIntentId: null,
         })
       }
     } finally { c.release() }
@@ -367,14 +385,19 @@ describe('GET /:id/profile — a landlord sees only its own company', () => {
     await db.query(
       `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
        VALUES ($1, $2, 40, 40)`, [m.bLeaseId, m.a.tenantId])
-    // A late mark recorded on company A's charge.
+    // A late mark recorded on company A's charge (10/12: its bill's one mark).
     const { emitPaymentSettledEvent } = await import('../services/creditLedgerEmitters')
     const c = await db.connect()
     try {
-      const due = new Date('2026-03-01T00:00:00Z')
+      const inv = (await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+         SELECT p.landlord_id, p.tenant_id, $2, p.unit_id, $3, p.due_date, p.amount, 'settled', p.due_date - 5
+           FROM payments p WHERE p.id = $1 RETURNING id`, [aPay, m.a.leaseId, `INV-A-${randomUUID().slice(0, 6)}`])).rows[0].id
+      await c.query(`UPDATE payments SET invoice_id = $2, lease_id = $3, created_at = due_date - 5,
+                            settled_at = due_date + 20 + time '12:00' WHERE id = $1`, [aPay, inv, m.a.leaseId])
       await emitPaymentSettledEvent(c, {
         tenantId: m.a.tenantId, paymentId: aPay, paymentType: 'rent', amount: '700',
-        dueDate: due, settledAt: new Date(due.getTime() + 20 * 86_400_000), graceDays: 5, stripePaymentIntentId: null,
+        dueDate: '2026-03-01', settledAt: new Date(), graceDays: 5, stripePaymentIntentId: null,
       })
     } finally { c.release() }
 
@@ -415,6 +438,30 @@ describe('GET /:id/profile — a landlord sees only its own company', () => {
     expect(resAdmin.body.data.payments).toHaveLength(2)
     expect(resAdmin.body.data.stats.lateCount).toBe(1)
     expect(resAdmin.body.data.paidAhead).toBe(340)
+  })
+
+  // 10/12 (Nic: "one mark per invoice"): a bill mark names every line of the
+  // bill (payment_ids); payment_id is only its first line. The late count read
+  // payment_id alone, so a bill whose first line is not this viewer's was left
+  // out even when the bill has lines of theirs.
+  it("lateCount reads every line a bill's mark names, not only its first", async () => {
+    const m = await seedMovedResident()
+    const aPay = await payment(m.a.unitId, m.a.tenantId, m.a.landlordId, 700, 6)
+    const bPay = await payment(m.bUnitId, m.a.tenantId, m.bLandlordId, 900, 1)
+    const { appendEvent } = await import('../services/creditLedger')
+    const mark = (paymentIds: string[], key: string) => appendEvent({
+      subjectType: 'tenant', subjectRefId: m.a.tenantId, eventType: 'payment_received_late_major',
+      eventData: { mark_basis: 'invoice', bill_key: key, payment_ids: paymentIds, payment_id: paymentIds[0] },
+      occurredAt: new Date('2026-09-20T12:00:00Z'),
+      attestationSource: 'system_derived', networkVisibility: 'visible_to_current_landlord',
+    })
+    await mark([aPay, bPay], 'bill-1')     // first line company A's, second company B's
+    await mark([aPay], 'bill-2')           // company A's lines only
+    const lateFor = async (token: string) => (await request(buildApp())
+      .get(`/api/tenants/${m.a.tenantId}/profile`).set('Authorization', `Bearer ${token}`)).body.data.stats.lateCount
+    expect(await lateFor(m.bToken)).toBe(1)
+    expect(await lateFor(m.a.landlordToken)).toBe(2)
+    expect(await lateFor(m.a.adminToken)).toBe(2)
   })
 
   it('gives a landlord only the contact fields the page uses — no bank, Stripe, birth date or Flex fields', async () => {

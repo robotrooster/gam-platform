@@ -669,6 +669,17 @@ export const OTHER_INCOME_CATEGORY_LABEL: Record<OtherIncomeCategory, string> = 
   sale_proceeds: 'Sale proceeds', owner_contribution: 'Owner contribution', interest: 'Interest earned',
   other: 'Other income',
 }
+/**
+ * 10/11 (Nic): money in that a bank line can be filed as but that is NOT
+ * income. An owner putting their own money into the business
+ * (owner_contribution) is not something the business earned, and the proceeds
+ * of selling an asset (sale_proceeds) are not operating income. Both stay
+ * filed and visible — Bank activity says what each line was filed as, and the
+ * P&L shows them beside the total on their own lines — but they never count
+ * toward income (services/incomeBasis reads this list).
+ */
+export const OTHER_INCOME_NOT_INCOME_CATEGORIES = ['owner_contribution', 'sale_proceeds'] as const satisfies readonly OtherIncomeCategory[]
+export type OtherIncomeNotIncomeCategory = typeof OTHER_INCOME_NOT_INCOME_CATEGORIES[number]
 
 // S570 (Nic): bank feed (Stripe Financial Connections). A landlord links their
 // operating bank read-only; transactions sync in and get categorized into the
@@ -1642,9 +1653,10 @@ export type RouteStopStatus = typeof ROUTE_STOP_STATUSES[number]
 // per-route checks against these keys is its own dedicated session — see
 // DEFERRED.md item 8 follow-up "Wire sub-permission gates into routes."
 //
-// Bookkeeper is intentionally absent: bookkeeper access is a single
-// access_level toggle (read_only | read_write) on bookkeeper_scopes —
-// see BOOKKEEPER_ACCESS_LEVELS. Bookkeepers operate at landlord scope
+// Bookkeeper is intentionally absent: bookkeepers have no permission keys.
+// 10/12 (Nic): one level — every bookkeeper does full bookkeeping, never a
+// tenant's account; the owner's boxes on bookkeeper_scopes decide what they
+// keep (see BOOKKEEPER_ACCESS_LEVELS). Bookkeepers operate at landlord scope
 // (or property level), not within a property, so per-feature subdivision
 // doesn't fit the role.
 //
@@ -2055,6 +2067,12 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     sections: [{ label: 'Access & actions', items: [
       { key: 'payments.view',           label: 'View payments',
         hint: 'Shows the Payments page with only unpaid bills: no paid history and no work-trade lines. They can email a resident a reminder of what they owe. Taking money needs "Record a cash / check payment".' },
+      // 10/12 (Nic): "anyone allowed to see all payments" reaches the Rent Roll.
+      // The key gated the Rent Roll, the full Payments ledger and each
+      // resident's payment report (routes/balances, routes/tenants) but was
+      // never listed here, so nobody on a team could be given it.
+      { key: 'payments.view_all',       label: 'View all payments', sensitive: true,
+        hint: 'Every payment at the properties they are assigned to, paid and unpaid: the full Payments ledger, the Rent Roll, and each resident\'s payment history and report. Taking money needs "Record a cash / check payment".' },
       // ── S640 (Nic): THE FRONT DESK TAKES CASH ────────────────────────────
       //
       //   "She needs to be able to record payments for people that come in to
@@ -2099,6 +2117,11 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
         // assigned properties (the engine applies property scope server-side).
         { key: 'reports.tab.custom',    label: 'Custom & T-12',
           hint: 'Has no effect for staff: custom reports are owner-only.' },
+        // 10/12 (Nic): the monthly property report — tenants and leases,
+        // payments, money and operations — on screen and as a PDF. A staffer
+        // granted it sees only the properties they are assigned to.
+        { key: 'reports.tab.monthly',   label: 'Monthly report', sensitive: true,
+          hint: 'The monthly property report for the properties they are assigned to: leases started and ended, who paid on time or late (with names), what was charged, received and owed, expenses, and operations. Includes the printable copy.' },
       ]},
       { label: 'Actions', items: [
         { key: 'reports.export', label: 'Export / print',
@@ -2358,26 +2381,150 @@ export interface MaintenanceWorkerScope {
   updatedAt:     Date
 }
 
+// 10/12 (Nic, ledger decision 2): "Full bookkeeping … never tenant-account
+// actions … One level, no per-bookkeeper switch." bookkeeper_scopes.access_level
+// keeps its two values (keep-everything; the CHECK lists them), but nothing
+// decides by it any more: every bookkeeper a company keeps does its full
+// bookkeeping (lib/bookkeeperScope bookkeeperMayWrite). New rows are written
+// 'read_write' (migration 20261014240000); the owner's boxes still decide WHAT
+// they keep (properties, company-wide, ledger, money coming in).
 export const BOOKKEEPER_ACCESS_LEVELS = ['read_only', 'read_write'] as const
 export type BookkeeperAccessLevel = typeof BOOKKEEPER_ACCESS_LEVELS[number]
+/** 10/12 (Nic): the one level every bookkeeper is written with. */
+export const BOOKKEEPER_ONE_LEVEL: BookkeeperAccessLevel = 'read_write'
 
 export interface BookkeeperScope {
   id:          string
   userId:      string
   landlordId:  string
   accessLevel: BookkeeperAccessLevel
-  /** 10/11: the company's properties they keep; null = all of them. */
-  propertyIds: string[] | null
+  /** 10/11 (Nic): the company's properties ticked for them — every property is
+   *  its own box, and a property the company adds later arrives unticked.
+   *  "Every property" is worked out per request against what the company owns
+   *  today, never stored (apps/api lib/bookkeeperScope). 10/12: may be empty
+   *  when companyWide is ticked. */
+  propertyIds: string[]
+  /** 10/12 (Nic): "Company-wide: bank account, payouts and payroll" — its own
+   *  box, the owner's choice; also opens the company's Books ledger and
+   *  reports (P&L, cash flow, owner statements). */
+  companyWide: boolean
+  /** 10/12 (Nic): "Show lease start and end dates" on their rent roll. */
+  showLeaseDates: boolean
+  /** 10/12 (Nic, BK1): "May use the whole-company ledger" — the GAM Books
+   *  ledger without the company-wide box (never the bank account or payouts). */
+  companyLedger: boolean
+  /** 10/12 (Nic, BK2): "Company reports show the whole company" — else only
+   *  their properties' money in the Books P&L, cash flow and owner statements. */
+  wholeCompanyReports: boolean
+  /** 10/12 (Nic): "Sees the monthly property report on screen". */
+  seesMonthlyReport: boolean
   createdAt:   Date
   updatedAt:   Date
 }
 
+/** 10/12: the boxes a bookkeeper summary is said from. */
+export interface BookkeeperAccessChoice {
+  /** How many property boxes are ticked. */
+  propertyCount: number
+  companyWide: boolean
+  showLeaseDates?: boolean
+  /** 10/12 (Nic, BK1): the whole-company Books ledger without the company-wide box. */
+  companyLedger?: boolean
+  /** 10/12 (Nic, BK2): the company reports carry the whole company's money. */
+  wholeCompanyReports?: boolean
+  /** 10/12 (Nic): the monthly property report on screen. */
+  seesMonthlyReport?: boolean
+}
+
 /**
- * 10/11 (Nic): what a bookkeeper gets, said once — the Team page's invite and
- * the accept page both show it. "Look + add expenses" was Nic's choice.
+ * 10/11 (Nic): what a bookkeeper gets, said once. Tenant names are allowed
+ * wherever the books need them; contact details, leases, documents and requests
+ * are not. Two readers, two wordings of the same access: the owner on the Team
+ * page (who ticks the boxes), and the person invited on the accept page (who
+ * ticks nothing, so "the properties you tick" would be wrong for them).
+ *
+ * 10/12 (Nic): a function of the boxes. Payroll and the bank account are named
+ * only when the company-wide box is ticked; lease dates only when that box is.
+ * 10/12 (Nic, ledger decision 2): one level — every bookkeeper does the full
+ * bookkeeping on what they keep and never touches a tenant's account; there is
+ * no read-only bookkeeper to describe.
  */
-export const BOOKKEEPER_ACCESS_SUMMARY =
-  'Sees money in (by type), money out, receipts and maintenance costs. Can add expenses. Never sees tenants or leases.'
+export function bookkeeperAccessSummary(choice: BookkeeperAccessChoice, reader: 'owner' | 'invitee' = 'owner'): string {
+  const owner = reader === 'owner'
+  const props = choice.propertyCount > 0
+  const money = 'money in and who paid it, money out and receipts, and maintenance costs'
+    + (choice.showLeaseDates ? ', with each lease\'s start and end dates' : '')
+  const parts: string[] = []
+  if (props) {
+    parts.push(owner
+      ? `Keeps the books for the properties you tick: ${money}.`
+      : `You keep the books for the properties the owner ticked for you: ${money}.`)
+  }
+  // 10/12 (Nic, BK2): whose money the company reports carry — the whole
+  // company's when that box is ticked, else the ticked properties' only.
+  const whole = choice.wholeCompanyReports === true
+  if (choice.companyWide) {
+    const wide = 'the company\'s bank account, payouts and payroll, and its company-level P&L, cash flow and owner statements'
+    // 10/12 review (Nic): the property money inside those company reports
+    // follows the property boxes (routes/books companyReportPropertyScope).
+    parts.push(whole
+      ? (props
+        ? (owner ? `Company-wide: also ${wide}, with the whole company's money in them.`
+                 : `You also see ${wide}, with the whole company's money in them.`)
+        : (owner ? `Company-wide only: ${wide}, with the whole company's money in them.`
+                 : `You keep the company-wide books: ${wide}, with the whole company's money in them.`))
+      : props
+        ? (owner ? `Company-wide: also ${wide}, with only the ticked properties' money in them.`
+                 : `You also see ${wide}, with only your properties' money in them.`)
+        : (owner ? `Company-wide only: ${wide} — no property's own money.` : `You keep the company-wide books: ${wide} — no property's own money.`))
+  } else if (choice.companyLedger) {
+    // 10/12 (Nic, BK1): the ledger on its own, never the bank or payouts.
+    const ledger = 'the company\'s Books ledger: chart of accounts, journal, bills, vendors, payroll, tax, P&L and balance sheet'
+    const inPl = whole ? 'the whole company\'s money in the P&L' : (owner ? 'only the ticked properties\' money in the P&L' : 'only your properties\' money in the P&L')
+    parts.push(owner
+      ? `Also uses ${ledger}, with ${inPl}. Never the bank account or payouts.`
+      : `You also use ${ledger}, with ${inPl}. Never the bank account or payouts.`)
+  }
+  // 10/12 (Nic): the monthly property report, their properties only.
+  if (choice.seesMonthlyReport && props) {
+    parts.push(owner ? 'Sees the monthly property report on screen for those properties.'
+                     : 'You see the monthly property report on screen for your properties.')
+  }
+  // 10/12 (Nic, ledger decision 2): "Full bookkeeping … never tenant-account
+  // actions … One level, no per-bookkeeper switch." What they do on what they
+  // keep, said from the same boxes (payroll and the bank only when a box gives
+  // them), and the one thing no bookkeeper ever does.
+  const does: string[] = []
+  if (props) does.push('expenses and bills')
+  if (choice.companyWide) does.push('the bank lines going out')
+  if (choice.companyWide || choice.companyLedger) does.push('vendors', 'payroll', 'journal entries')
+  if (does.length) {
+    const list = does.length === 1 ? does[0] : `${does.slice(0, -1).join(', ')} and ${does[does.length - 1]}`
+    parts.push(owner
+      ? `They do the full bookkeeping on what they keep (${list}), never a tenant's account: they never record a rent payment or give a credit, late fee or refund.`
+      : `You do the full bookkeeping on what you keep (${list}), never a tenant's account: you never record a rent payment or give a credit, late fee or refund.`)
+  }
+  if (!parts.length) {
+    parts.push(owner
+      ? 'Tick the properties they keep, Company-wide, or both.'
+      : 'Nothing is ticked for you yet.')
+  }
+  const never = choice.showLeaseDates
+    ? 'a lease\'s text or its documents, applications, maintenance requests, or tenants\' phone numbers and emails'
+    : 'leases, applications, documents, maintenance requests, or tenants\' phone numbers and emails'
+  parts.push(owner ? `Never sees ${never}.` : `You never see ${never}.`)
+  return parts.join(' ')
+}
+
+// 10/11: GAM Books' own lists — account types, payroll, contractors (W-9),
+// vendors — and the arithmetic the API and the Books screens share.
+export * from './booksLedger'
+// 10/12 (Nic, ledger P6): money out is one record — categories the landlord
+// makes, expense payments, bank lines matched to what GAM already has.
+export * from './booksMoneyOut'
+// 10/12 (Nic, ledger P6): one list of everyone the company pays (vendors, with
+// the 1099 box for contractors), loans and fixed assets with depreciation.
+export * from './booksVendorsLoans'
 
 // ── INVITATIONS & PLATFORM EVENTS ──────────────────────────
 // The platform-wide audit trail. Every meaningful state change
@@ -2441,6 +2588,8 @@ export interface MaintenanceWorkerScopePayload {
 
 export interface BookkeeperScopePayload {
   accessLevel: BookkeeperAccessLevel
+  /** 10/11: the properties ticked on the invitation (at least one). */
+  propertyIds: string[]
 }
 
 export type LandlordAssignableScopePayload =
@@ -2504,7 +2653,14 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
 // LEASE (jobs/platformFeeAccrual.ts) — never charges it. A landlord cannot use
 // the status to dodge the fee on a real tenant, because a unit with no lease
 // also cannot collect rent through GAM.
-export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended', 'owner_use'] as const
+//
+// 10/12 (Nic): 'utility_service' joins the list. The units CHECK has carried it
+// since S614 (a space this landlord only bills utilities for — a service point,
+// never leased; routes/utilityServiceAgreements creates it), but the list here
+// stopped at owner_use, so the one source of truth had drifted from the
+// database. It is set only by creating a service agreement: PATCH
+// /api/units/:id/status refuses it (routes/units.ts).
+export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended', 'owner_use', 'utility_service'] as const
 export type UnitStatus = typeof UNIT_STATUSES[number]
 export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   vacant:     'Vacant',
@@ -2513,6 +2669,47 @@ export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   delinquent: 'Delinquent',
   suspended:  'Suspended',
   owner_use:  'Owner Use',
+  utility_service: 'Utility Service',
+}
+
+// ─── Payment health: one stamp per household per bill month (10/12, Nic) ────
+//
+// "Payment health = ONE definition everywhere, per HOUSEHOLD per BILL MONTH,
+//  never per line. Late fees are never a bill and never decide a month's color
+//  or health; $0 lines are ignored." The stamp a month earns is decided in ONE
+// place (apps/api/src/services/householdMonths.ts); every screen reads these
+// words and colors.
+//   paid_on_time  GREEN   every charge paid in full by the last grace day (a
+//                         month work trade covers in full is paid on time)
+//   partial       YELLOW  some money in, not paid in full (stays yellow past
+//                         grace; Owed shows what is left)
+//   paid_late     ORANGE  paid in full, after the grace period
+//   outstanding   RED     nothing paid and past the grace period
+//   due           GRAY    not yet past the grace period and nothing paid
+export const PAYMENT_STAMPS = ['paid_on_time', 'partial', 'paid_late', 'outstanding', 'due'] as const
+export type PaymentStamp = typeof PAYMENT_STAMPS[number]
+export const PAYMENT_STAMP_LABEL: Record<PaymentStamp, string> = {
+  paid_on_time: 'Paid on time',
+  partial:      'Partial',
+  paid_late:    'Paid late',
+  outstanding:  'Outstanding',
+  due:          'Due',
+}
+/** The letter on a stamp, so the strip reads without color. */
+export const PAYMENT_STAMP_LETTER: Record<PaymentStamp, string> = {
+  paid_on_time: 'P',
+  partial:      '½',
+  paid_late:    'L',
+  outstanding:  'O',
+  due:          '·',
+}
+/** Where a household's grace days come from: the lease, else the property, else GAM's default of 5. */
+export const GRACE_SOURCES = ['lease', 'property', 'default'] as const
+export type GraceSource = typeof GRACE_SOURCES[number]
+export const GRACE_SOURCE_LABEL: Record<GraceSource, string> = {
+  lease:    'from the lease',
+  property: 'from the property settings',
+  default:  'GAM default',
 }
 
 // Statuses that occupy a unit without producing rent. Excluded from
@@ -4072,6 +4269,21 @@ export const EARLY_CHECKOUT_CHOICE_LABEL: Record<EarlyCheckoutChoice, string> = 
   refund_unused: 'Refund the unused nights',
   refund_other: 'Refund a different amount',
 }
+/**
+ * 10/12 (Nic, G6): a stay shortened (an Edit or drag of its dates, or an early
+ * check-out) past unpaid rent that a payment was tried on — a declined card, a
+ * returned bank pull. The landlord chooses at that moment:
+ *   'void' — take those charges off (any money paid on them comes back to the
+ *            guest as credit);
+ *   'keep' — they stay owed.
+ * Single source for stay_shortened_charge_choices_choice_check.
+ */
+export const STAY_SHORTENED_CHARGE_CHOICES = ['void', 'keep'] as const
+export type StayShortenedChargeChoice = typeof STAY_SHORTENED_CHARGE_CHOICES[number]
+export const STAY_SHORTENED_CHARGE_CHOICE_LABEL: Record<StayShortenedChargeChoice, string> = {
+  void: 'Take those charges off',
+  keep: 'Keep them owed',
+}
 /** A money question waiting on a stay (stay_checkout_decisions.status). 'undone': the check-out was put back. */
 export const STAY_CHECKOUT_DECISION_STATUSES = ['pending', 'decided', 'undone'] as const
 export type StayCheckoutDecisionStatus = typeof STAY_CHECKOUT_DECISION_STATUSES[number]
@@ -4444,6 +4656,26 @@ export const UTILITY_UNIT_LABEL: Record<UtilityType, string> = {
   propane:  'gal',
 }
 
+/**
+ * 10/12 (Nic), M1: what a household that uses none of this utility uses none
+ * of. The choice beside "Repaired" on a meter marked broken reads
+ * "Works, tenant uses no power" on an electric meter (Nic's words) and says
+ * the same thing in its own terms on the others.
+ */
+export const UTILITY_USAGE_NOUN: Record<UtilityType, string> = {
+  water:    'water',
+  sewer:    'water',
+  electric: 'power',
+  gas:      'gas',
+  trash:    'trash service',
+  propane:  'propane',
+}
+
+/** The "Works, tenant uses no power" choice, worded for the meter's utility. */
+export function meterWorksNoUseLabel(utilityType: string): string {
+  return `Works, tenant uses no ${UTILITY_USAGE_NOUN[utilityType as UtilityType] ?? 'power'}`
+}
+
 export type UtilityRowTag =
   | 'utility_water_responsibility'
   | 'utility_gas_responsibility'
@@ -4700,10 +4932,10 @@ export interface Landlord {
   user?: User
   businessName?: string
   ein?: string                   // Tax ID
-  // S67: bankAccountReady is server-derived from active user_bank_accounts.
-  // Replaces the pre-16a stripeAccountId / stripeBankVerified fields which
-  // were Stripe-Connect-specific and incorrect under the merchant-of-record
-  // model.
+  // 10/12: bankAccountReady is server-derived from the landlord company's
+  // Stripe Connect payouts (landlords.connect_payouts_enabled) and nothing
+  // else. The S67 derivation from the legacy user_bank_accounts catalog is
+  // gone — that catalog never set up a payout.
   bankAccountReady?: boolean
   onboardingComplete: boolean
   units?: Unit[]
@@ -6007,6 +6239,11 @@ export const DISBURSEMENT_STATUS_LABEL: Record<DisbursementStatus, string> = {
 // old rows still carry it, so it keeps a name.
 export const LANDLORD_GAM_CHARGE_KINDS = [
   'subscription', 'manual_payment_fee', 'bank_debit_cost', 'device_installment', 'screening_fee',
+  // 10/12 (Nic, G1): what a failed or returned bank pull of GAM's fees actually
+  // cost GAM — "gam eats no fees of failed pulls ever" — billed at cost.
+  // 10/12 (Nic, G5): the part of a processing fee the landlord covers that is
+  // more than the money GAM held from that payment.
+  'bank_debit_failed_cost', 'uncovered_processing_fee',
 ] as const
 export type LandlordGamChargeKind = typeof LANDLORD_GAM_CHARGE_KINDS[number]
 export const LANDLORD_GAM_CHARGE_KIND_LABEL: Record<LandlordGamChargeKind, string> = {
@@ -6015,6 +6252,8 @@ export const LANDLORD_GAM_CHARGE_KIND_LABEL: Record<LandlordGamChargeKind, strin
   bank_debit_cost:    'Bank transfer cost',
   device_installment: 'Card reader installment',
   screening_fee:      'Background check',
+  bank_debit_failed_cost:   'Bank transfer that did not go through (what it cost)',
+  uncovered_processing_fee: 'Processing fee you cover (more than the payment)',
 }
 
 // trigger_type is nullable in DB; null = legacy row pre-S64.
@@ -6029,8 +6268,20 @@ export type DisbursementTriggerType = typeof DISBURSEMENT_TRIGGER_TYPES[number]
 export const SECURITY_DEPOSIT_HELD_BY_VALUES = ['gam_escrow', 'landlord'] as const
 export type SecurityDepositHeldBy = typeof SECURITY_DEPOSIT_HELD_BY_VALUES[number]
 
-export const SECURITY_DEPOSIT_STATUSES = ['pending', 'funded', 'partial', 'disbursed', 'claimed'] as const
+// 10/12 (Nic, G8): 'voided' — a deposit record that was only ever a pending
+// line with nothing collected, on a lease voided before signing or never moved
+// into, is kept as a voided record (it used to be deleted). Every reader of a
+// lease's or a tenant's deposit leaves it out.
+export const SECURITY_DEPOSIT_STATUSES = ['pending', 'funded', 'partial', 'disbursed', 'claimed', 'voided'] as const
 export type SecurityDepositStatus = typeof SECURITY_DEPOSIT_STATUSES[number]
+
+// 10/12 (Nic, ledger P1): payments.deposit_collected_by — who COLLECTED a
+// deposit payment, stored once when it settles (decisions #46.3: by card or
+// bank onto GAM's balance → 'gam'; in person or into the landlord's own bank →
+// 'landlord'). Matches the payments_deposit_collected_by_check CHECK and the
+// values leaseFeesSync.depositCollectedBySql returns.
+export const DEPOSIT_COLLECTED_BY_VALUES = ['gam', 'landlord'] as const
+export type DepositCollectedBy = typeof DEPOSIT_COLLECTED_BY_VALUES[number]
 
 // ── PM (third-party property-management) companies — S108 ────────────────
 // Distinct from the OWNER's in-house property managers (those live in
@@ -6585,8 +6836,9 @@ export const BANK_ACCOUNT_STATUS_VALUES = ['active', 'archived'] as const
 export type BankAccountStatus = typeof BANK_ACCOUNT_STATUS_VALUES[number]
 
 /**
- * POST /api/bank-accounts payload. routing_number + account_number raw on
- * the wire (TLS only); server encrypts at rest and only ever returns last4.
+ * The old POST /api/bank-accounts payload. 10/12: that endpoint now refuses
+ * new entries (payouts are set up with Stripe on the Disbursement Account
+ * page); the shape is kept only as a record of what existing rows hold.
  */
 export interface BankAccountInput {
   nickname: string
@@ -6893,6 +7145,14 @@ export const CREDIT_SUPERSEDE_REASONS = [
   'correction_after_dispute',
   'data_entry_error_corrected',
   'attestation_invalidated',
+  // 10/12 (Nic): "the payment history should be a health percentage. one mark
+  // per invoice." A bill's mark replaced by the one its new outcome earns
+  // (outstanding → paid late, a payment reversed, a bank match moving the day),
+  // and a per-line mark written before 10/12 replaced by its bill's mark
+  // (apps/api services/creditBillMarks). credit_events.superseded_reason is
+  // TEXT with no CHECK: no migration.
+  'bill_status_changed',
+  'replaced_by_bill_mark',
 ] as const
 export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
 
@@ -7178,6 +7438,69 @@ export const DISBURSEMENT_TRIGGER_LABEL: Record<string, string> = {
 export const WORK_TRADE_LOG_STATUS_LABEL: Record<string, string> = {
   pending: 'Logged', approved: 'Approved', rejected: 'Denied',
 }
+
+// work_trade_settlements.status — a month's work-trade period is open until
+// its month closes, then settled (the hours covered it) or billed (the
+// shortfall was billed). 10/12 (Nic, G8): 'voided' — a period on a bill that
+// will never be owed (a lease voided before signing, a new lease that never
+// starts, a stay shortened past the bill), kept as a record, never deleted.
+// The CHECK (migration 20261013235130) lists the same values.
+export const WORK_TRADE_SETTLEMENT_STATUSES = ['open', 'settled', 'billed', 'voided'] as const
+export type WorkTradeSettlementStatus = typeof WORK_TRADE_SETTLEMENT_STATUSES[number]
+
+// 10/12 (Nic): "He may be doing more work than what the work trade covers. And
+// instead of giving him credit ahead for his rent, it may be compensation on top
+// of the rent." The LANDLORD PICKS PER AGREEMENT what approved hours beyond what
+// a month needs (after any carried shortfall) do:
+//   bank — banked toward future months (what every agreement did before this)
+//   pay  — paid at an hourly rate the landlord sets, through payroll or a
+//          contractor payment. Paid extra hours are wages; the TRADE hours never
+//          carry a rate for the tenant (S643).
+// The migration's CHECKs list the same values.
+export const WORK_TRADE_EXTRA_HOURS_MODES = ['bank', 'pay'] as const
+export type WorkTradeExtraHoursMode = typeof WORK_TRADE_EXTRA_HOURS_MODES[number]
+export const WORK_TRADE_EXTRA_HOURS_MODE_LABEL: Record<WorkTradeExtraHoursMode, string> = {
+  bank: 'Bank them toward future months',
+  pay: 'Pay them at an hourly rate',
+}
+export const WORK_TRADE_EXTRA_PAY_METHODS = ['payroll_w2', 'contractor_1099'] as const
+export type WorkTradeExtraPayMethod = typeof WORK_TRADE_EXTRA_PAY_METHODS[number]
+export const WORK_TRADE_EXTRA_PAY_METHOD_LABEL: Record<WorkTradeExtraPayMethod, string> = {
+  payroll_w2: 'Payroll (W-2)',
+  contractor_1099: 'Contractor payment (1099)',
+}
+// Neutral copy only — no legal advice (national platform rule).
+export const WORK_TRADE_EXTRA_HOURS_NOTICE =
+  'Paying a tenant for work may make them your employee or contractor. Check your local laws.'
+// A payable record of paid extra hours. 'sent_to_books' = queued for GAM Books
+// payroll or contractor payment; 'paid' = paid (by hand, or once Books pays it).
+export const WORK_TRADE_EXTRA_PAYABLE_STATUSES = ['unpaid', 'sent_to_books', 'paid'] as const
+export type WorkTradeExtraPayableStatus = typeof WORK_TRADE_EXTRA_PAYABLE_STATUSES[number]
+export const WORK_TRADE_EXTRA_PAYABLE_STATUS_LABEL: Record<WorkTradeExtraPayableStatus, string> = {
+  unpaid: 'Not paid yet', sent_to_books: 'Sent to GAM Books', paid: 'Paid',
+}
+// How extra hours were paid by hand (Mark paid).
+export const WORK_TRADE_EXTRA_PAID_HOW = ['check', 'cash'] as const
+export type WorkTradeExtraPaidHow = typeof WORK_TRADE_EXTRA_PAID_HOW[number]
+export const WORK_TRADE_EXTRA_PAID_HOW_LABEL: Record<WorkTradeExtraPaidHow, string> = {
+  check: 'Check', cash: 'Cash',
+}
+// 10/12 (Nic, ledger P6/P7): how a record of extra hours ended up paid — by
+// hand (above), or in GAM Books ('gam_books': a payroll run paid it, or the
+// contractor-payment expense it became was paid there). Mirrors
+// work_trade_extra_hours_paid_how_check. Mark paid offers only the by-hand two.
+export const WORK_TRADE_EXTRA_PAID_HOW_RECORDED = [...WORK_TRADE_EXTRA_PAID_HOW, 'gam_books'] as const
+export type WorkTradeExtraPaidHowRecorded = typeof WORK_TRADE_EXTRA_PAID_HOW_RECORDED[number]
+export const WORK_TRADE_EXTRA_PAID_HOW_RECORDED_LABEL: Record<WorkTradeExtraPaidHowRecorded, string> = {
+  ...WORK_TRADE_EXTRA_PAID_HOW_LABEL, gam_books: 'Paid in GAM Books',
+}
+
+// 10/12 (Nic): when a landlord takes a charge type OFF a work trade while open
+// charges of that type are parked under it, it is the landlord's choice at that
+// moment: keep those open charges covered, or put them back on the tenant's
+// balance. Charges already paid or settled at a month close are never touched.
+export const WORK_TRADE_COVERAGE_REMOVAL_CHOICES = ['keep_covered', 'put_back'] as const
+export type WorkTradeCoverageRemovalChoice = typeof WORK_TRADE_COVERAGE_REMOVAL_CHOICES[number]
 
 // What rate a SUBMETERED unit on a RUBS master's line is billed at (S607).
 //   property_rate — the rate the landlord published (default). A predictable
@@ -7863,3 +8186,126 @@ export function installmentSplit(total: number, n: number): number[] {
   out[n - 1] += cents - base * n
   return out.map(c => c / 100)
 }
+
+// ── 10/12 (Nic): what a reader cost GAM, and what of its price is earnings ──
+// "331.73 after tax and shipping. 299 base. those orders are going to need to
+// be tracked because shipping will vary." Each order records GAM's actual cost
+// (base price, tax, shipping — or tax and shipping as one amount when the
+// receipt does not split them), entered on GAM's desk, editable until the
+// reader ships (after that only the same total split differently), every entry
+// kept. Markup = what the landlord is charged − GAM's total cost.
+//
+// COST FIRST (Nic 10/12): the payments repay GAM's cost first; the markup lands
+// in the last piece(s). Mountain View: 4 × $87.50 against $331.73 → pieces 1-3
+// are all cost ($262.50), piece 4 is $69.23 cost + $18.27 markup. Only the
+// markup is GAM's earnings (platform_revenue_ledger 'device_markup', booked when
+// the piece carrying it is billed, like a platform fee); the cost part is GAM's
+// own money coming back and never earnings.
+
+/** Mirrors pos_reader_order_costs_source_check. */
+export const READER_ORDER_COST_SOURCES = ['desk', 'backfill'] as const
+export type ReaderOrderCostSource = typeof READER_ORDER_COST_SOURCES[number]
+export const READER_ORDER_COST_SOURCE_LABEL: Record<ReaderOrderCostSource, string> = {
+  desk:     'Entered on the desk',
+  backfill: 'Recorded from Nic’s figures (10/12)',
+}
+
+export interface ReaderCostParts {
+  basePrice: number
+  tax?: number | null
+  shipping?: number | null
+  /** Tax and shipping as one amount, when the receipt does not split them. Never beside tax or shipping. */
+  taxAndShipping?: number | null
+}
+
+const rc = (n: number | null | undefined) => Math.round(Number(n ?? 0) * 100)
+
+/** GAM's total cost of a reader, to the cent. */
+export function readerCostTotal(c: ReaderCostParts): number {
+  return (rc(c.basePrice) + rc(c.tax) + rc(c.shipping) + rc(c.taxAndShipping)) / 100
+}
+
+/** One monthly piece of a reader's price, split cost first. */
+export interface ReaderPieceSplit { n: number; amount: number; cost: number; markup: number }
+
+/**
+ * The pieces of a reader's price, each split into GAM's cost and markup, cost
+ * first: the first pieces repay the cost; whatever of a piece is left once the
+ * cost is covered is markup. Unknown cost (null): every dollar counts as cost
+ * — GAM books no earnings it cannot show. A cost above the price: every piece
+ * is cost and nothing is markup (the shortfall is GAM's loss on that reader).
+ */
+export function readerPieceSplit(price: number, installments: number, totalCost: number | null): ReaderPieceSplit[] {
+  const pieces = installmentSplit(price, installments).map(rc)
+  let costLeft = totalCost == null ? Infinity : Math.max(0, rc(totalCost))
+  return pieces.map((p, i) => {
+    const cost = Math.min(p, costLeft)
+    costLeft -= cost
+    return { n: i + 1, amount: p / 100, cost: cost / 100, markup: (p - cost) / 100 }
+  })
+}
+
+/** A piece GAM has billed (a landlord_gam_charges row of the order). */
+export interface ReaderPieceBilled { n: number; amount: number; collected: number; voided?: boolean }
+
+export interface ReaderOrderMoney {
+  charged: number
+  totalCost: number | null
+  /** charged − totalCost; negative when the reader cost GAM more than it charges. null: cost not entered. */
+  markup: number | null
+  split: ReaderPieceSplit[]
+  /** Billed so far (pieces raised and not voided). */
+  billed: number
+  /** Collected so far, on every piece. */
+  collected: number
+  /** The markup in the pieces billed so far — what GAM's earnings ledger books. */
+  markupBilled: number
+  /** Of what was collected, the markup (cost first, across the whole order). */
+  markupCollected: number
+  /** Of what was collected, GAM's cost coming back. */
+  costRecovered: number
+  /** markupBilled − markupCollected. */
+  markupNotCollected: number
+}
+
+/**
+ * One reader order's money: the split of every piece, and — over the pieces
+ * billed so far — the markup billed, collected and still owed. Cost first
+ * holds across the whole order: of everything collected, the first dollars up
+ * to GAM's cost are cost, the rest markup (never more than the markup billed).
+ */
+export function readerOrderMoney(o: {
+  price: number; installments: number; totalCost: number | null; pieces: ReaderPieceBilled[]
+}): ReaderOrderMoney {
+  const split = readerPieceSplit(o.price, o.installments, o.totalCost)
+  let billed = 0, collected = 0, markupBilled = 0
+  for (const p of o.pieces) {
+    collected += rc(p.collected)
+    if (p.voided) continue
+    billed += rc(p.amount)
+    markupBilled += rc(split[p.n - 1]?.markup ?? 0)
+  }
+  const markupCollected = o.totalCost == null ? 0
+    : Math.min(markupBilled, Math.max(0, collected - rc(o.totalCost)))
+  return {
+    charged: rc(o.price) / 100,
+    totalCost: o.totalCost == null ? null : rc(o.totalCost) / 100,
+    markup: o.totalCost == null ? null : (rc(o.price) - rc(o.totalCost)) / 100,
+    split,
+    billed: billed / 100,
+    collected: collected / 100,
+    markupBilled: markupBilled / 100,
+    markupCollected: markupCollected / 100,
+    costRecovered: (collected - markupCollected) / 100,
+    markupNotCollected: (markupBilled - markupCollected) / 100,
+  }
+}
+
+// 10/12 (Nic): held items, transfer purposes and GAM-charge voids (ledger P0).
+export * from './landlordGamMoney'
+
+// 10/12 (Nic): Charged / Received / Owed columns and the monthly property report.
+export * from './monthlyReport'
+
+// 10/12 (Nic): who stays on the Rent Roll after moving out (the landlord's choice, per company).
+export * from './rentRoll'

@@ -13,6 +13,7 @@
  * THIS COPY: the landlord portal (gam_token, its own sign-in and dialogs).
  */
 import { useNavigate } from 'react-router-dom'
+import { useQuery } from 'react-query'
 import { api, apiGet, apiPost, apiPatch } from '../lib/api'
 import { toast as appToast, appConfirm as appAsk } from '../components/dialogs'
 import { useAuth } from '../context/AuthContext'
@@ -60,6 +61,15 @@ export function appConfirm(message: string, opts: { title?: string; confirmLabel
 
 /** The report tabs a bookkeeper sees (the API serves them nothing else). */
 const BOOKKEEPER_CAN = new Set(['reports.tab.overview', 'reports.tab.property', 'reports.export'])
+/**
+ * 10/12 (Nic): the report tabs a bookkeeper sees only with the owner's box —
+ * the monthly property report ("Sees the monthly property report on screen").
+ * Read off GET /financials/scope (the menu reads the same query); the server
+ * refuses the report without the box either way.
+ */
+const BOOKKEEPER_BOX_CAN: Record<string, (scope: { seesMonthlyReport?: boolean }) => boolean> = {
+  'reports.tab.monthly': scope => scope.seesMonthlyReport === true,
+}
 
 export interface Viewer {
   role: string
@@ -85,10 +95,13 @@ export function useViewer(): Viewer {
   const navigate = useNavigate()
   const role = user?.role || 'landlord'
   const isBookkeeper = role === 'bookkeeper'
+  const { data: scope } = useQuery<{ seesMonthlyReport?: boolean }>('financials-scope',
+    () => apiGet('/financials/scope'), { enabled: isBookkeeper, staleTime: 60_000 })
+  const bookkeeperCan = (perm: string) => BOOKKEEPER_CAN.has(perm) || (!!scope && !!BOOKKEEPER_BOX_CAN[perm]?.(scope))
   return {
     role,
     isBookkeeper,
-    can: (perm: string) => isBookkeeper ? BOOKKEEPER_CAN.has(perm) : can(perm),
+    can: (perm: string) => isBookkeeper ? bookkeeperCan(perm) : can(perm),
     // The portal's own pages, as before — except for a bookkeeper, who has none.
     openOwnerPage: isBookkeeper ? null : (path: string) => navigate(path),
   }

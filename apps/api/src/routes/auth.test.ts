@@ -413,26 +413,25 @@ describe('GET /api/auth/me', () => {
     expect(res.body.data.mustEnrollTotp).toBe(false)    // PM not in MANDATORY_TOTP_ROLES (admin/super_admin only)
   })
 
-  it('user with active bank_account → bank_account_ready=true', async () => {
+  // 10/12 (Nic): ready = the company's Stripe Connect payouts are live, and
+  // nothing else. A row in the legacy bank catalog (the removed Add Bank
+  // Account form) used to count — Country Acres typed a bank in on 10/5, read
+  // as ready, and waited for microdeposits that could never come.
+  it('Stripe Connect payouts live → bank_account_ready=true', async () => {
+    const u = await seedLoggedInUser({ role: 'landlord' })
+    await db.query(`UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`, [u.profileId])
+    const res = await request(buildApp())
+      .get('/api/auth/me').set('Authorization', `Bearer ${u.token}`)
+    expect(res.body.data.bank_account_ready).toBe(true)
+  })
+
+  it('an active legacy bank row with no Connect payouts → bank_account_ready stays false', async () => {
     const u = await seedLoggedInUser({ role: 'landlord' })
     await db.query(
       `INSERT INTO user_bank_accounts
          (user_id, nickname, account_holder_name, account_type,
           routing_number, account_number_last4, account_number_encrypted, status)
        VALUES ($1, 'Op', 'Holder', 'checking', '110000000', '1234', 'enc', 'active')`,
-      [u.userId])
-    const res = await request(buildApp())
-      .get('/api/auth/me').set('Authorization', `Bearer ${u.token}`)
-    expect(res.body.data.bank_account_ready).toBe(true)
-  })
-
-  it('archived bank_account → bank_account_ready stays false (only "active" counts)', async () => {
-    const u = await seedLoggedInUser({ role: 'landlord' })
-    await db.query(
-      `INSERT INTO user_bank_accounts
-         (user_id, nickname, account_holder_name, account_type,
-          routing_number, account_number_last4, account_number_encrypted, status)
-       VALUES ($1, 'Op', 'Holder', 'checking', '110000000', '1234', 'enc', 'archived')`,
       [u.userId])
     const res = await request(buildApp())
       .get('/api/auth/me').set('Authorization', `Bearer ${u.token}`)

@@ -331,6 +331,12 @@ describe('MH 25 replay: the $10 goes on the next bill by itself, the landlord is
   it('August: nothing paid ahead is left; unpaid after the grace days, the $25 late fee posts', async () => {
     await generateInvoices(new Date('2026-08-01T15:00:00Z'))
     const aug = await billFor(p, '2026-08-01')
+    // 10/12 (Nic): the run wrote it on August 1st (replayed today, it is
+    // stamped today — and a bill written after its due date counts from then).
+    await db.query(`UPDATE invoices SET created_at = '2026-08-01T15:00:00Z' WHERE id = $1`, [aug.id])
+    // Its lines too: the delinquency check (20261013120000) reads each line's
+    // own written day (services/lateness writtenAtSql), like Outstanding.
+    await db.query(`UPDATE payments SET created_at = '2026-08-01T15:00:00Z' WHERE invoice_id = $1`, [aug.id])
     expect(Number(aug.total_amount)).toBe(460)
     expect(await usesOf(creditId)).toHaveLength(1)    // July's $10 only
 

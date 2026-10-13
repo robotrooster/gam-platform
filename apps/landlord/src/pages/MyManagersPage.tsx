@@ -99,12 +99,15 @@ export function MyManagersPage() {
               <Row label="Occupied"
                    value={`${m.occupiedUnits} of ${m.unitCount}`}
                    sub={m.occupancyPct == null ? undefined : pct(m.occupancyPct)} />
-              <Row label="Rent collected on time"
+              {/* 10/12 (Nic): one payment-health definition — household
+                  months judged after the grace period (services/
+                  ownerPortfolio), and lateness in days past grace. */}
+              <Row label="Rent paid on time (months)"
                    value={pct(m.onTimeRatePct)}
                    sub={m.rentDueCount > 0
-                     ? `${m.rentDueCount} charges due`
+                     ? `${m.rentDueCount} household-month${m.rentDueCount === 1 ? '' : 's'} judged`
                      : 'nothing has come due yet'} />
-              <Row label="When late, by"
+              <Row label="When late, days past grace"
                    value={days(m.avgDaysLate)}
                    sub={m.avgDaysLate == null ? 'nothing paid late' : 'on average'} />
               <Row label="Days to fill a space"

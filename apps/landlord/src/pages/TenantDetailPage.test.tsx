@@ -24,7 +24,7 @@ const server = vi.hoisted(() => ({
 vi.mock('../lib/api', () => ({
   apiGet: async (url: string) => {
     server.gets.push(url)
-    if (url === '/tenants/t1/profile') return JSON.parse(JSON.stringify(server.profile))
+    if (url === '/tenants/t1/profile' || url.startsWith('/tenants/t1/profile?')) return JSON.parse(JSON.stringify(server.profile))
     return []
   },
   apiPost: async (url: string, body: any) => {
@@ -34,7 +34,8 @@ vi.mock('../lib/api', () => ({
   },
   apiPatch: async () => ({ success: true, data: {} }),
 }))
-vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { role: 'landlord', permissions: {} } }) }))
+const auth = vi.hoisted(() => ({ user: { role: 'landlord', permissions: {} as Record<string, boolean> } }))
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: auth.user }) }))
 vi.mock('../components/dialogs', () => ({
   toast: Object.assign(vi.fn(), { error: vi.fn() }),
   appConfirm: vi.fn(async () => false),
@@ -62,6 +63,7 @@ let host: HTMLDivElement
 let root: Root
 beforeEach(() => {
   server.gets = []; server.posts = []; server.postHold = null; server.profile = profile()
+  auth.user = { role: 'landlord', permissions: {} }
   host = document.createElement('div')
   document.body.appendChild(host)
   root = createRoot(host)
@@ -195,5 +197,61 @@ describe('10/6 (Nic): "Delete this late fee" on the Payment History', () => {
     await act(async () => { btn(/^Delete this late fee$/)!.click() })
     await until(() => server.posts.length === 1, 'the delete')
     expect(server.posts[0].url).toBe('/payments/lf1/delete-late-fee')
+  })
+})
+
+describe('10/12 (Nic): the Payment History is the household\'s, with what each charge is for, a page at a time', () => {
+  const charge = (i: number) => ({ id: `c${i}`, type: 'rent', label: i % 2 ? 'Electric' : 'Rent', detail: null, dueDate: '2026-10-01',
+    propertyName: 'Oak Park', unitNumber: 'MH 04', amount: 460, status: 'pending' })
+
+  it('says what each charge is for, and turns pages from the server — no 36-row cap', async () => {
+    server.profile = profile({
+      payments: Array.from({ length: 50 }, (_, i) => charge(i)),
+      paymentsPage: { page: 1, pageSize: 50, total: 57 },
+    })
+    await render()
+    expect(text()).toContain("What it's for")
+    expect(text()).toContain('Electric')
+    expect(text()).toContain('Charges 1–50 of 57, newest first')
+    const older = btn(/^Older$/)!
+    expect(older.className).toContain('btn-primary')
+    expect(btn(/^Newer$/)!.disabled).toBe(true)
+    server.profile = profile({ payments: Array.from({ length: 7 }, (_, i) => charge(50 + i)), paymentsPage: { page: 2, pageSize: 50, total: 57 } })
+    await act(async () => { older.click() })
+    await until(() => server.gets.includes('/tenants/t1/profile?historyPage=2'), 'page two')
+    await until(() => text().includes('Charges 51–57 of 57'), 'page two on screen')
+    expect(btn(/^Older$/)!.disabled).toBe(true)
+  })
+
+  it('one page needs no pager', async () => {
+    server.profile = profile({ payments: [charge(1)], paymentsPage: { page: 1, pageSize: 50, total: 1 } })
+    await render()
+    expect(text()).not.toContain('newest first')
+    expect(btn(/^Older$/)).toBeUndefined()
+  })
+
+  it('the health card shows the one figure in the shared color and opens the full report', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' } } })
+    await render()
+    expect(text()).toContain('72%, 8 of 11 months')
+    // 10/12 (Nic): all time, since the household joined GAM — never "last 12 months".
+    expect(text()).toContain('since joining GAM')
+    expect(text()).not.toContain('last 12 months')
+    expect(text()).toContain('Needs attention')
+    expect(text()).toContain('8 of 11')
+    expect(btn(/^Full report$/)!.className).toContain('btn-primary')
+  })
+
+  // 10/12: the report's gate is "View all payments". Staff who see the health
+  // through the books permission are not offered a report they cannot open.
+  it('staff with only the books permission see the health but no way into the report', async () => {
+    auth.user = { role: 'property_manager', permissions: { 'books.view': true } }
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' } } })
+    await render()
+    expect(text()).toContain('72%, 8 of 11 months')
+    expect(text()).not.toContain('Full report')
+    expect(btn(/^Full report$/)).toBeUndefined()
   })
 })

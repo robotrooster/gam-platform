@@ -55,7 +55,7 @@ const line = (over: any = {}) => ({
 })
 const payment = (over: any = {}) => ({
   id: 'rcpt1', kind: 'receipt', name: 'Glenda Moss', unitNumber: 'MH 04', propertyName: 'Oak Park',
-  paidOn: '2026-09-03', arrivedOn: '2026-09-05', owed: 460, amount: 460, creditApplied: 0, returned: 0, creditReturned: 0,
+  paidOn: '2026-09-03', arrivedOn: '2026-09-05', applied: 460, amount: 460, creditApplied: 0, returned: 0, creditReturned: 0,
   method: 'ach', methodLabel: 'Bank', status: 'settled', statusLabel: 'Paid', paidFor: 'September rent',
   daysLate: 0, timingLabel: 'On time', lines: [line()], ...over,
 })
@@ -248,7 +248,7 @@ describe('what each line says', () => {
 
 describe('credit a dispute or bank return took back (Step 11’s creditReturned)', () => {
   it('a bill paid from credit whose credit was taken back says so on the payment, on its charge and why', async () => {
-    server.month = month([payment({ kind: 'credit', amount: 0, creditApplied: 10, creditReturned: 10, owed: 10,
+    server.month = month([payment({ kind: 'credit', amount: 0, creditApplied: 10, creditReturned: 10, applied: 10,
       status: 'returned', statusLabel: 'Returned', method: null, methodLabel: 'Paid from credit', arrivedOn: null,
       lines: [line({ amount: 460, paid: 0, credit: 10, creditReturned: 10 })] })])
     await render()

@@ -6,10 +6,16 @@
  * One of the shared financial pages: the same bytes in the landlord portal and
  * GAM Books (financials-parity.test.ts). The P&L's own maintenance figure for
  * the same days (GET /financials/maintenance-costs).
+ *
+ * 10/12 (Nic, L6): "a repair closed with a cost → landlord's choice (auto
+ * unpaid bill vs 'Record as bill' button)". Each repair says whether its cost
+ * is a bill on Expenses (paid or not); without one, and unless the company
+ * chose automatic bills, "Record as bill" adds it there as an unpaid bill.
  */
 import { useState } from 'react'
-import { useQuery } from 'react-query'
-import { finGet } from './adapter'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { EXPENSE_PAY_STATE_LABEL, type ExpensePayState } from '@gam/shared'
+import { finGet, finPost, toast } from './adapter'
 import {
   useFinancialsScope, usePeriod, periodQuery, money, dayName, errorWords,
   PropertyPicker, PeriodPicker, PageHead, Notice,
@@ -18,6 +24,8 @@ import {
 interface CostLine {
   id: string; day: string; categoryLabel: string; amount: number
   unitNumber: string | null; propertyName: string | null
+  /** 10/12 (Nic, L6): its bill on Expenses, and whether "Record as bill" is offered. */
+  billId: string | null; billPayState: ExpensePayState | null; canRecordBill: boolean
 }
 interface CostData {
   lines: CostLine[]
@@ -36,6 +44,14 @@ export function MaintenanceCostsPage() {
   )
   const lines = data?.lines ?? []
   const severalProperties = (scope?.properties.length ?? 0) > 1
+  const qc = useQueryClient()
+  const recordBill = useMutation(
+    (id: string) => finPost(`/expenses/repairs/${id}/bill`, {}),
+    { onSuccess: () => {
+        qc.invalidateQueries('financials-maintenance'); qc.invalidateQueries('landlord-expenses')
+        toast('Added to Expenses as a bill to pay.')
+      },
+      onError: (e: any) => toast(errorWords(e, 'Could not record the bill.')) })
 
   return (
     <div className="fin">
@@ -77,7 +93,7 @@ export function MaintenanceCostsPage() {
         ) : (
           <table className="data-table">
             <thead><tr>
-              <th>Finished</th><th>Kind</th>{severalProperties && <th>Property</th>}<th>Unit</th><th className="fin-num">Cost</th>
+              <th>Finished</th><th>Kind</th>{severalProperties && <th>Property</th>}<th>Unit</th><th className="fin-num">Cost</th><th>Bill</th>
             </tr></thead>
             <tbody>
               {lines.map(l => (
@@ -87,6 +103,14 @@ export function MaintenanceCostsPage() {
                   {severalProperties && <td className="fin-muted">{l.propertyName || '—'}</td>}
                   <td className="fin-muted">{l.unitNumber ? `#${l.unitNumber}` : '—'}</td>
                   <td className="fin-num">{money(l.amount)}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    {l.billId ? <span className="fin-muted">On Expenses · {EXPENSE_PAY_STATE_LABEL[l.billPayState ?? 'unpaid']}</span>
+                      : l.canRecordBill ? (
+                        <button className="btn btn-primary btn-sm" disabled={recordBill.isLoading} onClick={() => recordBill.mutate(l.id)}>
+                          Record as bill
+                        </button>
+                      ) : <span className="fin-muted">—</span>}
+                  </td>
                 </tr>
               ))}
             </tbody>

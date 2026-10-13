@@ -1390,7 +1390,8 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
     base(
       h('Overdue balances this morning') +
       p(`Hi ${escapeHtml(landlordName)},`) +
-      p(`${who} a balance five or more days past due. See who in your portal.`) +
+      // 10/12 (Nic): late means past the grace period (the lease's, else the property's, else 5 days).
+      p(`${who} a balance past its grace period. See who in your portal.`) +
       btnWithLink('Open Outstanding Balances', portalLink('landlord', 'balances'))
     ),
     {
@@ -3070,5 +3071,71 @@ export async function emailScreeningApplyLink(
       relatedEntityId: ctx?.backgroundCheckId ?? null,
     },
     'support',
+  )
+}
+
+// ── 10/12 (Nic): THE MONTHLY PROPERTY REPORT ──────────────────
+//
+//   "EMAILED at month close WITH A PDF attachment so they can put it to their
+//    books" — to the people the owner picks (jobs/monthlyPropertyReportEmail).
+//
+// The email is a short cover: each property's Charged / Received / Owed and
+// how many households are past grace. The report itself — names included —
+// is the attached PDF (services/monthlyReportPdf). A link to the report page
+// is added only for someone who signs in to the landlord portal.
+export interface MonthlyReportEmailRow { name: string; charged: number; received: number; owed: number; lateHouseholds: number }
+
+export async function emailMonthlyPropertyReport(args: {
+  to: string
+  recipientName: string | null
+  companyName: string
+  monthLabel: string
+  rows: MonthlyReportEmailRow[]
+  pdf: Buffer
+  filename: string
+  reportUrl: string | null
+  landlordId: string
+  sendId: string
+  /** 10/12 review: an outside address answers to the account owner (replyRouting); unset = GAM support. */
+  replyTo?: ReplyTo
+}): Promise<string | null> {
+  const dollars = (n: number) => `${n < 0 ? '−' : ''}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const cell = 'padding:6px 8px;border-bottom:1px solid #1e2530;font-size:.8rem;color:#b8c4d8'
+  const num = `${cell};text-align:right;white-space:nowrap`
+  const head = 'padding:6px 8px;font-size:.66rem;color:#7a8699;text-transform:uppercase;letter-spacing:.05em'
+  const table = args.rows.length ? `
+    <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;margin:8px 0 16px">
+      <tr><td style="${head}">Property</td><td style="${head};text-align:right">Received</td><td style="${head};text-align:right">Charged</td><td style="${head};text-align:right">Owed</td><td style="${head};text-align:right">Past grace</td></tr>
+      ${args.rows.map(r => `<tr>
+        <td style="${cell};color:#eef1f8">${escapeHtml(r.name)}</td>
+        <td style="${num}">${dollars(r.received)}</td>
+        <td style="${num}">${dollars(r.charged)}</td>
+        <td style="${num}">${dollars(r.owed)}</td>
+        <td style="${num}">${r.lateHouseholds} household${r.lateHouseholds === 1 ? '' : 's'}</td>
+      </tr>`).join('')}
+    </table>` : ''
+  const greeting = args.recipientName ? `Hi ${escapeHtml(args.recipientName.split(' ')[0])},` : 'Hello,'
+  const html = base(
+    h(`${escapeHtml(args.companyName)} — ${escapeHtml(args.monthLabel)}`) +
+    p(greeting) +
+    p(`The monthly property report for ${escapeHtml(args.monthLabel)} is attached as a PDF: tenants and leases, payments, money (received, charged and owed), expenses and operations for each property.`) +
+    table +
+    p('Received is the money that arrived in the month, Charged is what was billed for it, and Owed is what is still unpaid of those bills today.') +
+    (args.reportUrl ? btnWithLink('Open the report', args.reportUrl) : '') +
+    `<div style="margin-top:20px;font-size:.72rem;color:#4a5568">You get this report because the account owner added you to its list. They can change who receives it on the Reports page.</div>`
+  )
+  return send(
+    args.to,
+    `Monthly property report — ${args.companyName} — ${args.monthLabel}`,
+    html,
+    {
+      category: 'monthly_property_report',
+      landlordId: args.landlordId,
+      relatedEntityType: 'monthly_report_send',
+      relatedEntityId: args.sendId,
+      replyTo: args.replyTo,
+    },
+    'noreply',
+    [{ filename: args.filename, content: args.pdf }],
   )
 }

@@ -26,11 +26,13 @@ import { db, query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
-import { createLandlordExpense } from './landlordExpenses'
+import { createLandlordExpense, insertPayment } from './landlordExpenses'
+// 10/12 (Nic, ledger P6, L5): the company's own categories.
+import { resolveCategory, type ResolvedCategory } from './booksCategories'
 import { payoutCompositions } from './payoutComposition'
 import type { PoolClient } from 'pg'
 import type { MerchantRuleScope, BankTxnBankStatus } from '@gam/shared'
-import { OTHER_INCOME_CATEGORIES, EXPENSE_CATEGORIES, BANK_TXN_HIDDEN_REASONS, isRentChannelPayer } from '@gam/shared'
+import { OTHER_INCOME_CATEGORIES, BANK_TXN_HIDDEN_REASONS, isRentChannelPayer, BOOKS_LOAN_MATCH_WINDOW_DAYS } from '@gam/shared'
 import { payableRowSql, bankPayableRowSql } from './moneyPredicates'
 import { BANK_BOILERPLATE_WORDS, memoSaysTransfer } from './bankDepositMatch'
 
@@ -467,6 +469,11 @@ export async function upsertTransactions(
       if (r.kind === 'tenant') await alertMatchedDepositVoided(r.id)
       else if (r.kind === 'slip') await alertSlipDepositVoided(r.id)
     }
+    // 10/12 (Nic, L5): money out matched to expenses, GAM's debit, a refund
+    // check or a transfer never left — the match is undone by itself and the
+    // bills are unpaid again (services/bankMoneyOut).
+    const { releaseVoidedMoneyOutMatches } = await import('./bankMoneyOut')
+    await releaseVoidedMoneyOutMatches(voidedMatched)
   }
   if (replacedOldCopy || keptOldCopy || followed || notPostedYet) {
     logger.info({ connectionId, inserted, replacedOldCopy, keptOldCopy, followed, notPostedYet },
@@ -504,6 +511,7 @@ async function followTheBank(
       if (s.status === 'categorized' || s.status === 'matched') {
         logger.warn({ transactionId: s.id, status: s.status }, '[bank-feed] the bank voided a transaction that was already filed')
       }
+      if (s.status === 'categorized') await voidFiledLinePayments(client, s.id)
       if (s.status === 'matched') voidedMatched.push(s.id)
     }
     // S655 review: a copy voided means the transaction it copies was voided.
@@ -537,6 +545,26 @@ async function followTheBank(
 }
 
 /**
+ * 10/12 review (Nic L5, design §12 "a bank void voids the payment"): a
+ * money-out line filed as a new expense (one category, or split into parts)
+ * that the bank then voided never paid anything. The payments the filing made
+ * from the line are voided (kept on record) in the sync's own transaction, so
+ * the books stop crediting the bank for money that never left; the expense
+ * stays, owed again, and the line stays filed and flagged until the owner
+ * undoes it on the Bank page. A payment recorded by hand that the line had
+ * cleared (a check) goes back to waiting for its bank line.
+ */
+async function voidFiledLinePayments(client: PoolClient, lineId: string): Promise<void> {
+  await client.query(
+    `UPDATE landlord_expense_payments
+        SET voided_at = now(), void_reason = 'The bank voided this transaction', updated_at = now()
+      WHERE bank_transaction_id = $1 AND voided_at IS NULL AND source IN ('bank_match', 'migrated')`, [lineId])
+  await client.query(
+    `UPDATE landlord_expense_payments SET bank_transaction_id = NULL, updated_at = now()
+      WHERE bank_transaction_id = $1 AND voided_at IS NULL AND source = 'payment'`, [lineId])
+}
+
+/**
  * The bank voided a transaction whose kept copy (the original a hidden copy
  * points at) is this row. Untouched, it is hidden as voided — under the same
  * re-check every sync change makes. Filed, it stays in the books and is
@@ -555,6 +583,7 @@ async function voidTheOriginal(client: PoolClient, id: string, voidedMatched: st
   if (flagged && (flagged.status === 'categorized' || flagged.status === 'matched')) {
     logger.warn({ transactionId: id, status: flagged.status }, '[bank-feed] the bank voided a transaction that was already filed (seen on its copy)')
   }
+  if (flagged?.status === 'categorized') await voidFiledLinePayments(client, id)
   if (flagged?.status === 'matched') voidedMatched.push(id)
 }
 
@@ -917,6 +946,8 @@ type DepositDecision =
 
 interface AutoFileRule {
   id: string; category: string; scope_kind: MerchantRuleScope; property_id: string | null; unit_id: string | null
+  /** 10/12 (Nic, L5): the company's own category the payer files under. */
+  category_id?: string | null
 }
 
 async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKind>): Promise<Omit<ReconcileResult, 'payouts'>> {
@@ -1153,7 +1184,7 @@ async function actOnDeposit(txn: DepositRow, d: DepositDecision): Promise<boolea
       const row = (await client.query(
         `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str FROM bank_transactions WHERE id = $1`, [txn.id])).rows[0]
       await fileAsIncome(client, txn.landlord_id, row, {
-        category: d.rule.category, scopeKind: d.rule.scope_kind,
+        category: d.rule.category, categoryId: d.rule.category_id ?? null, scopeKind: d.rule.scope_kind,
         unitId: d.rule.unit_id, propertyId: d.rule.property_id,
         description: row.description ?? null, vendor: row.normalized_merchant ?? null,
       })
@@ -1225,13 +1256,13 @@ async function autoFileRuleFor(txn: DepositRow): Promise<AutoFileRule | null> {
   // landlord's own money — never income that files itself.
   if (memoSaysTransfer(merchant) || memoSaysTransfer(txn.description)) return null
   const rule = await queryOne<AutoFileRule & { last_direction: string | null; auto_file_income: boolean }>(
-    `SELECT id, category, scope_kind, property_id, unit_id, last_direction, auto_file_income
+    `SELECT id, category, category_id, scope_kind, property_id, unit_id, last_direction, auto_file_income
        FROM landlord_merchant_rules WHERE landlord_id = $1 AND normalized_merchant = $2`, [txn.landlord_id, merchant])
   if (!rule || rule.last_direction !== 'in' || !rule.auto_file_income) return null
   if (!(OTHER_INCOME_CATEGORIES as readonly string[]).includes(rule.category)) return null
   if (await payerEverMatchedToTenantBill(txn.landlord_id, merchant)) return null
   if (await equalsAnyOpenBill(txn.landlord_id, txn.amount)) return null
-  return { id: rule.id, category: rule.category, scope_kind: rule.scope_kind, property_id: rule.property_id, unit_id: rule.unit_id }
+  return { id: rule.id, category: rule.category, category_id: rule.category_id ?? null, scope_kind: rule.scope_kind, property_id: rule.property_id, unit_id: rule.unit_id }
 }
 
 /**
@@ -1246,16 +1277,19 @@ export async function undoAutoFile(
   try {
     await client.query('BEGIN')
     const t = (await client.query<any>(
-      `SELECT id, status, landlord_other_income_id, auto_filed_rule_id, auto_filed_at, normalized_merchant
+      `SELECT id, status, landlord_other_income_id, auto_filed_rule_id, auto_filed_at, normalized_merchant, bank_status
          FROM bank_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [txnId, landlordId])).rows[0]
     if (!t) throw new AppError(404, 'Transaction not found')
     if (!t.auto_filed_rule_id || t.status !== 'categorized') {
       throw new AppError(409, 'This deposit was not filed by itself, so there is nothing to undo here.')
     }
     if (t.landlord_other_income_id) {
+      // 10/12: stamped with the line it came from, as every undone filing is,
+      // so the line's filing history stays on file with it.
       const v = await client.query(
-        `UPDATE landlord_other_income SET status = 'voided', voided_at = now(), updated_at = now()
-          WHERE id = $1 AND landlord_id = $2 AND status = 'active'`, [t.landlord_other_income_id, landlordId])
+        `UPDATE landlord_other_income SET status = 'voided', voided_at = now(), updated_at = now(),
+                bank_transaction_id = COALESCE(bank_transaction_id, $3)
+          WHERE id = $1 AND landlord_id = $2 AND status = 'active'`, [t.landlord_other_income_id, landlordId, txnId])
       if ((v.rowCount ?? 0) !== 1) {
         throw new AppError(409, 'The income this deposit filed was changed since, so it can’t be undone here.')
       }
@@ -1264,11 +1298,15 @@ export async function undoAutoFile(
       version: 1, undone: true, undoneAt: new Date().toISOString(), undoneBy: opts.undoneBy,
       was: { kind: 'auto_filed', ruleId: t.auto_filed_rule_id, incomeId: t.landlord_other_income_id, filedAt: t.auto_filed_at },
     }
+    // 10/12: a deposit the bank voided after it filed itself has nothing to
+    // file again — it is set aside as the bank's void (as undoSplit does), not
+    // put back in review where it could be neither filed nor split.
     await client.query(
       `UPDATE bank_transactions
-          SET status = 'needs_review', landlord_other_income_id = NULL, categorized_at = NULL,
+          SET status = $3, ignored_reason = CASE WHEN $3 = 'ignored' THEN 'bank_void' ELSE ignored_reason END,
+              landlord_other_income_id = NULL, categorized_at = NULL,
               auto_filed_rule_id = NULL, auto_filed_at = NULL, auto_settle_undo = $2::jsonb, updated_at = now()
-        WHERE id = $1`, [txnId, JSON.stringify(marker)])
+        WHERE id = $1`, [txnId, JSON.stringify(marker), t.bank_status === 'void' ? 'ignored' : 'needs_review'])
     let stopped: string | null = null
     if (opts.stopAutoFiling) {
       await client.query(
@@ -1317,6 +1355,8 @@ export async function suggestForMerchant(landlordId: string, normalizedMerchant:
 async function rememberMerchantChoice(landlordId: string, normalizedMerchant: string, input: {
   category: string; scopeKind: MerchantRuleScope; propertyId: string | null; unitId: string | null
   direction: 'in' | 'out'; description?: string | null
+  /** 10/12 (Nic, L5): the company's own category (category stays the older reports' word). */
+  categoryId?: string | null
 }) {
   if (!normalizedMerchant) return
   let direction: 'in' | 'out' | null = input.direction
@@ -1329,26 +1369,35 @@ async function rememberMerchantChoice(landlordId: string, normalizedMerchant: st
   }
   await query(
     `INSERT INTO landlord_merchant_rules
-       (landlord_id, normalized_merchant, category, scope_kind, property_id, unit_id, last_direction)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
+       (landlord_id, normalized_merchant, category, scope_kind, property_id, unit_id, last_direction, category_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (landlord_id, normalized_merchant) DO UPDATE
-       SET category=EXCLUDED.category, scope_kind=EXCLUDED.scope_kind,
+       SET category=EXCLUDED.category, category_id=EXCLUDED.category_id, scope_kind=EXCLUDED.scope_kind,
            property_id=EXCLUDED.property_id, unit_id=EXCLUDED.unit_id,
            last_direction=EXCLUDED.last_direction,
            hit_count=landlord_merchant_rules.hit_count + 1,
            last_used_at=now(), updated_at=now()`,
-    [landlordId, normalizedMerchant, input.category, input.scopeKind, input.propertyId, input.unitId, direction])
+    [landlordId, normalizedMerchant, input.category, input.scopeKind, input.propertyId, input.unitId, direction,
+     input.categoryId ?? null])
 }
 
 // ── Categorize (2-click → expense or income) ────────────────────────────────
 
 type CategorizeInput = {
+  /** GAM's starting category key (the old fixed lists). */
   category: string
+  /** 10/12 (Nic, L5): one of the company's own categories (wins over `category`). */
+  categoryId?: string | null
   scopeKind: MerchantRuleScope
   unitId?: string | null
   propertyId?: string | null
   vendor?: string | null
   description?: string | null
+  /**
+   * 10/12 review (Nic L5, match first): the person said this money-out line is
+   * none of the records it fits to the cent (refuseFilingWhenMoneyOutFits).
+   */
+  notAMatch?: boolean
 }
 
 /**
@@ -1371,6 +1420,14 @@ function assertFileable(txn: any) {
     throw new AppError(409, txn.matched_payment_id && !txn.matched_disbursement_id
       ? 'This deposit is already applied to a tenant’s rent, so it’s counted in your income automatically. Recording it again would double it.'
       : 'This deposit is money GAM already sent you, so it’s counted in your income automatically. Recording it again would double it.')
+  }
+  // 10/12 (Nic) review: a deposit slip (or office cash GAM worked out) and a
+  // tenant's receipt keep their match in auto_settle_undo, with no payment id
+  // on the line. A line like that the owner ignored is still matched: its
+  // rent and other money are booked, so filing it would count them twice.
+  const undoMark = txn.auto_settle_undo ?? {}
+  if (undoMark.kind === 'deposit_slip' || Object.prototype.hasOwnProperty.call(undoMark, 'receiptId')) {
+    throw new AppError(409, 'This deposit is matched to a deposit slip or a tenant’s payment, so it’s counted in your income automatically. Recording it again would double it.')
   }
   if (txn.bank_status === 'void' || txn.ignored_reason === 'bank_void') {
     throw new AppError(409, 'Your bank voided this transaction, so there’s nothing to file.')
@@ -1400,7 +1457,7 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
   const client = await getClient()
   let remembered: {
     normalizedMerchant: string; propertyId: string | null; unitId: string | null
-    direction: 'in' | 'out'; description: string | null
+    direction: 'in' | 'out'; description: string | null; category: ResolvedCategory
   } | null = null
   let result: { expenseId?: string; incomeId?: string }
   try {
@@ -1420,12 +1477,20 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
       result = { incomeId: r.incomeId }
       remembered = {
         normalizedMerchant: txn.normalized_merchant, propertyId: r.propertyId, unitId: r.unitId,
-        direction: 'in', description: txn.description ?? null,
+        direction: 'in', description: txn.description ?? null, category: r.category,
       }
     } else {
-      if (!EXPENSE_CATEGORIES.includes(input.category as any)) {
-        throw new AppError(400, 'Pick an expense category for money going out')
-      }
+      // 10/12 review (Nic L5, design §12): money going out is matched FIRST to
+      // what already has its record; filed as a new expense only when nothing
+      // fits to the cent, or the person says it is none of them.
+      const { refuseFilingWhenMoneyOutFits } = await import('./bankMoneyOut')
+      await refuseFilingWhenMoneyOutFits(landlordId, txnId, input.notAMatch)
+      // 10/12 (Nic, L5): one of the company's own categories, or GAM's starting key.
+      const cat = await resolveCategory(client, landlordId, 'expense', { categoryId: input.categoryId, key: input.categoryId ? null : input.category })
+        .catch((e: unknown) => {
+          if (e instanceof AppError && e.statusCode === 400 && !input.categoryId) throw new AppError(400, 'Pick an expense category for money going out')
+          throw e
+        })
       // Scope → expense shape.
       let unitId: string | null = null
       let propertyId: string | null = null
@@ -1443,6 +1508,21 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
         // still accepted (existing merchant rules carry it) but no longer branches.
         // Retiring the duplicate value needs its own migration + backfill.
       }
+      // 10/12 (Nic): a line whose filing was undone carries what that filing
+      // held onto this one — its receipt, the vendor the owner corrected, the
+      // utility. One expense holds one receipt: several (parts of an undone
+      // split, each with its own) would leave all but one out of the books, so
+      // that filing is refused and the owner splits the line again instead.
+      const carried = await undoneFilingExpenses(client, landlordId, txn)
+      const receipts = [...new Map(carried.filter(c => !!c.receipt_url).map(c => [c.receipt_url!, c])).values()]
+      if (receipts.length > 1) {
+        throw new AppError(409,
+          `When this line was last filed, its parts carried ${receipts.length} different receipts `
+          + `(${receipts.map(r => r.receipt_name || 'a receipt').join(', ')}). One expense holds one receipt, `
+          + 'so filing it as one category would leave the others out of your books. Split it again, so each receipt stays with its part.')
+      }
+      const vendors = [...new Set(carried.map(c => c.vendor).filter((v): v is string => !!v))]
+      const utilityTypes = [...new Set(carried.map(c => c.utility_type).filter((v): v is string => !!v))]
       // createLandlordExpense checks the unit/property belong to this landlord.
       // S655 review: on THIS transaction's client, so the expense and the row
       // marked filed commit together or not at all — never an expense booked
@@ -1451,13 +1531,27 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
         landlordId,
         propertyId,
         unitId,
-        category: input.category,
+        categoryId: cat.id,
         amount: Math.abs(Number(txn.amount)),
         description: input.description ?? txn.description ?? null,
-        vendor: input.vendor ?? txn.normalized_merchant ?? null,
+        vendor: input.vendor ?? (vendors.length === 1 ? vendors[0] : null) ?? txn.normalized_merchant ?? null,
         expenseDate: txn.posted_date_str,
         isCommon,
+        utilityType: cat.legacyKey === 'utilities' && utilityTypes.length === 1 ? utilityTypes[0] : null,
+        // 10/12 (Nic, L5): the bank line pays it (below), whole, on the bank's day.
+        payment: null,
       }, client)
+      await insertPayment(client, {
+        expenseId: expense.id, landlordId, paidOn: txn.posted_date_str, amountCents: cents(Math.abs(Number(txn.amount))),
+        method: 'bank', bankConnectionId: txn.bank_connection_id, bankTransactionId: txn.id, source: 'bank_match',
+        memo: null, createdBy: null,
+      })
+      if (receipts.length === 1) {
+        const r = receipts[0]
+        await client.query(
+          `UPDATE landlord_expenses SET receipt_url = $2, receipt_name = $3, receipt_mime = $4, receipt_size = $5
+            WHERE id = $1`, [expense.id, r.receipt_url, r.receipt_name, r.receipt_mime, r.receipt_size])
+      }
       await client.query(
         `UPDATE bank_transactions
             SET status='categorized', ignored_reason=NULL, expense_id=$2, categorized_at=now(), updated_at=now()
@@ -1465,7 +1559,7 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
       result = { expenseId: expense.id }
       remembered = {
         normalizedMerchant: txn.normalized_merchant, propertyId, unitId,
-        direction: 'out', description: txn.description ?? null,
+        direction: 'out', description: txn.description ?? null, category: cat,
       }
     }
     await client.query('COMMIT')
@@ -1478,7 +1572,7 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
   // Remember the merchant choice (outside the txn — a best-effort learning write).
   if (remembered) {
     await rememberMerchantChoice(landlordId, remembered.normalizedMerchant, {
-      category: input.category, scopeKind: input.scopeKind,
+      category: remembered.category.legacyKey, categoryId: remembered.category.id, scopeKind: input.scopeKind,
       propertyId: remembered.propertyId, unitId: remembered.unitId,
       direction: remembered.direction, description: remembered.description,
     })
@@ -1497,47 +1591,681 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
  * shape createLandlordExpense gives an expense.
  */
 async function fileAsIncome(client: PoolClient, landlordId: string, txn: any, input: CategorizeInput) {
-  if (!OTHER_INCOME_CATEGORIES.includes(input.category as any)) {
-    throw new AppError(400, 'Pick an income category for money coming in')
-  }
+  // 10/12 (Nic, L5): one of the company's own income categories, or GAM's starting key.
+  const category = await resolveCategory(client, landlordId, 'income', { categoryId: input.categoryId, key: input.categoryId ? null : input.category })
+    .catch((e: unknown) => {
+      if (e instanceof AppError && e.statusCode === 400 && !input.categoryId) throw new AppError(400, 'Pick an income category for money coming in')
+      throw e
+    })
 
-  let unitId: string | null = null
-  let propertyId: string | null = null
-  let rowPropertyId: string | null = null
-  let isCommon = false
+  const { unitId, propertyId, rowPropertyId, isCommon } = await placeIncome(client, landlordId, input)
+
+  const inc = await client.query(
+    `INSERT INTO landlord_other_income
+       (landlord_id, property_id, unit_id, category, category_id, amount, description, payer, income_date, is_common)
+     VALUES ($1,$2,$3,$4,$10,$5,$6,$7,$8,$9) RETURNING id`,
+    [landlordId, rowPropertyId, unitId, category.legacyKey, Math.abs(Number(txn.amount)),
+     input.description ?? txn.description ?? null,
+     input.vendor ?? txn.normalized_merchant ?? null, txn.posted_date_str, isCommon, category.id])
+  await client.query(
+    `UPDATE bank_transactions
+        SET status='categorized', ignored_reason=NULL, landlord_other_income_id=$2, categorized_at=now(), updated_at=now()
+      WHERE id=$1`, [txn.id, inc.rows[0].id])
+  return { incomeId: inc.rows[0].id as string, propertyId, unitId, category }
+}
+
+/**
+ * Where a money-in filing lands: on a unit (its property recorded too, the
+ * shape createLandlordExpense gives an expense) or on a property (common). S655:
+ * the unit or property must be this landlord's. Shared by the one-category
+ * filing and by each part of a split (10/12).
+ */
+async function placeIncome(client: PoolClient, landlordId: string, input: {
+  scopeKind: MerchantRuleScope | string; unitId?: string | null; propertyId?: string | null
+}): Promise<{ unitId: string | null; propertyId: string | null; rowPropertyId: string | null; isCommon: boolean }> {
   if (input.scopeKind === 'unit') {
     if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
     const u = (await client.query<{ property_id: string; landlord_id: string }>(
       `SELECT property_id, landlord_id FROM units WHERE id = $1`, [input.unitId])).rows[0]
     if (!u || u.landlord_id !== landlordId) throw new AppError(400, 'Unit does not belong to you')
-    unitId = input.unitId
-    rowPropertyId = u.property_id
-  } else {
-    if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
-    const p = (await client.query<{ landlord_id: string }>(
-      `SELECT landlord_id FROM properties WHERE id = $1`, [input.propertyId])).rows[0]
-    if (!p || p.landlord_id !== landlordId) throw new AppError(400, 'Property does not belong to you')
-    propertyId = input.propertyId
-    rowPropertyId = input.propertyId
-    isCommon = true
+    return { unitId: input.unitId, propertyId: null, rowPropertyId: u.property_id, isCommon: false }
+  }
+  if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
+  const p = (await client.query<{ landlord_id: string }>(
+    `SELECT landlord_id FROM properties WHERE id = $1`, [input.propertyId])).rows[0]
+  if (!p || p.landlord_id !== landlordId) throw new AppError(400, 'Property does not belong to you')
+  return { unitId: null, propertyId: input.propertyId, rowPropertyId: input.propertyId, isCommon: true }
+}
+
+// ── Split one bank line into parts (10/12, Nic) ─────────────────────────────
+//
+//   "categories are separate. if a deposit is multiple sources it should be
+//    split for record keeping"
+//
+// Mountain View's $48.39 Square deposit of 10/1 is propane sales and an
+// overnight stay; filed as one category, one of them is in the wrong place on
+// every report. A split files the line as PARTS, each with its own category
+// and its own unit or property, adding up to the bank's amount to the cent.
+//
+// Each part is an ordinary money row — landlord_other_income for money in,
+// landlord_expenses for money out — carrying bank_transaction_id (migration
+// 20261013121000). So everything that counts other income or expenses
+// (services/incomeBasis for the P&L, expense totals, the reports) counts each
+// part in its own category with no change of its own. The line itself is
+// 'categorized' with BOTH of its single-filing links (landlord_other_income_id,
+// expense_id) empty — that is what says "filed in parts".
+//
+// Keep everything: changing a split voids the old parts and writes the new
+// ones in one transaction; undoing it voids the parts and puts the line back
+// in review. A voided part is never deleted and keeps pointing at its line,
+// and the one-category filing a split replaces is voided and stamped the same
+// way, so a line's whole filing history stays on file (and every change is in
+// audit_row_changes).
+//
+// It is filing, not a tenant action: the same people who file a bank line
+// split one (the owner; the Bank page is the owner's — requireLandlord, never
+// a bookkeeper's session, lib/bookkeeperAccess).
+
+/** 10/12: the most parts one bank line splits into. */
+export const SPLIT_MAX_PARTS = 20
+
+export type SplitPartInput = {
+  /** GAM's starting category key (the old fixed lists). */
+  category: string
+  /** 10/12 (Nic, L5): one of the company's own categories (wins over `category`). */
+  categoryId?: string | null
+  amount: number
+  scopeKind: MerchantRuleScope
+  unitId?: string | null
+  propertyId?: string | null
+  description?: string | null
+}
+
+/** An expense a split replaces: what the owner may have added to it since it was filed. */
+type CarriedExpense = {
+  category: string; amount: string; vendor: string | null; utility_type: string | null
+  receipt_url: string | null; receipt_name: string | null; receipt_mime: string | null; receipt_size: number | null
+}
+
+/**
+ * 10/12 review: which receipt each new part carries. One receipt on what is
+ * replaced (a one-category filing, or parts that shared it) covers the whole
+ * line, so every part carries it. Several different receipts each stay with
+ * the new part of the same category and amount; one with no such part would
+ * fall out of the books, so the split is refused rather than lose it.
+ */
+export function receiptsForParts(
+  carried: ReadonlyArray<CarriedExpense>, parts: ReadonlyArray<Pick<SplitPartInput, 'category' | 'amount'>>,
+): Array<CarriedExpense | null> {
+  const withReceipt = carried.filter(c => !!c.receipt_url)
+  const distinct = [...new Map(withReceipt.map(c => [c.receipt_url!, c])).values()]
+  if (distinct.length === 0) return parts.map(() => null)
+  if (distinct.length === 1) return parts.map(() => distinct[0])
+  const out: Array<CarriedExpense | null> = parts.map(() => null)
+  const placed = new Set<string>()
+  for (const r of withReceipt) {
+    if (placed.has(r.receipt_url!)) continue
+    const i = parts.findIndex((p, k) => out[k] === null && p.category === r.category
+      && Math.round(Number(p.amount) * 100) === Math.round(Number(r.amount) * 100))
+    if (i >= 0) { out[i] = r; placed.add(r.receipt_url!) }
+  }
+  const lost = distinct.filter(r => !placed.has(r.receipt_url!))
+  if (lost.length) {
+    throw new AppError(409,
+      `This line's parts carry ${distinct.length} different receipts, and ${lost.length === 1 ? 'one' : lost.length} of them `
+      + `(${lost.map(r => r.receipt_name || 'a receipt').join(', ')}) would not be on any new part. `
+      + 'Keep a part with the same category and amount as the part it is attached to, so the receipt stays with it.')
+  }
+  return out
+}
+
+/**
+ * 10/12 (Nic): "every bank filing can be undone." The expenses a person's
+ * undo took out of the books for this line — the most recent batch (a filing
+ * undone, or a split undone, voids its rows in one transaction, so they share
+ * one voided_at) — read only for a line that carries an undo mark. Filing the
+ * line again carries what they held (a receipt, a corrected vendor, the
+ * utility), so undo-then-file-again never drops a receipt out of the books.
+ */
+async function undoneFilingExpenses(client: PoolClient, landlordId: string, txn: any): Promise<CarriedExpense[]> {
+  const mark = txn.auto_settle_undo
+  if (!mark || typeof mark !== 'object' || !(FILING_UNDONE_MARK in mark || 'splitUndone' in mark)) return []
+  // 10/12 (Nic) review: the line's own expenses, and those of the older copies
+  // of it a re-linked bank sent again (hidden as copies of this line,
+  // duplicate_of_id) — the sync moves the undo mark onto the copy it keeps, so
+  // the undone filing's receipt, vendor and utility must come with it.
+  const lines = `(SELECT $2::uuid UNION SELECT d.id FROM bank_transactions d WHERE d.duplicate_of_id = $2 AND d.landlord_id = $1)`
+  return (await client.query<CarriedExpense>(
+    `SELECT category, amount::text AS amount, vendor, utility_type,
+            receipt_url, receipt_name, receipt_mime, receipt_size
+       FROM landlord_expenses e
+      WHERE e.landlord_id = $1 AND e.bank_transaction_id IN ${lines} AND e.status = 'voided'
+        AND e.voided_at = (SELECT MAX(x.voided_at) FROM landlord_expenses x
+                            WHERE x.landlord_id = $1 AND x.bank_transaction_id IN ${lines} AND x.status = 'voided')`,
+    [landlordId, txn.id])).rows
+}
+
+/** The live parts of a split line (both kinds — a line only ever has one). */
+async function activePartIds(client: PoolClient, txnId: string): Promise<{ income: string[]; expense: string[] }> {
+  const inc = await client.query<{ id: string }>(
+    `SELECT id FROM landlord_other_income WHERE bank_transaction_id = $1 AND status = 'active' FOR UPDATE`, [txnId])
+  const exp = await client.query<{ id: string }>(
+    `SELECT id FROM landlord_expenses WHERE bank_transaction_id = $1 AND status = 'active' FOR UPDATE`, [txnId])
+  return { income: inc.rows.map(r => r.id), expense: exp.rows.map(r => r.id) }
+}
+
+/**
+ * File a bank line as parts, or change the parts of a line already split.
+ *
+ * Splittable: a line waiting on review (or one the owner ignored themselves,
+ * as for a one-category filing — assertFileable), or a line already FILED
+ * from the Bank page — as one category, by the owner or by itself, or in
+ * parts — whose filing the split replaces. Never a line matched to money GAM
+ * already has on record (a payout, a tenant's deposit, a deposit slip): that
+ * money reaches the books through its payments, and a split of it would count
+ * it twice.
+ */
+export async function splitTransaction(landlordId: string, txnId: string, parts: SplitPartInput[], opts: { by?: string | null; notAMatch?: boolean } = {}):
+  Promise<{ incomeIds: string[]; expenseIds: string[]; replaced: number; payerQuestion: PayerQuestion | null }> {
+  if (!Array.isArray(parts) || parts.length < 2) {
+    throw new AppError(400, 'A split needs at least two parts. To file it as one, pick its category and press Confirm.')
+  }
+  if (parts.length > SPLIT_MAX_PARTS) throw new AppError(400, `A bank line splits into at most ${SPLIT_MAX_PARTS} parts.`)
+  let saved!: {
+    incomeIds: string[]; expenseIds: string[]; replaced: number
+    moneyIn: boolean; merchant: string | null; description: string | null
+  }
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const txn = (await client.query(
+      `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [txnId, landlordId])).rows[0]
+    if (!txn) throw new AppError(404, 'Transaction not found')
+
+    const wasFiled = txn.status === 'categorized'
+    if (wasFiled) {
+      // Already filed from the Bank page: the split replaces that filing. The
+      // same refusals as a first filing for anything that is not money to file.
+      if (txn.bank_status === 'void' || txn.ignored_reason === 'bank_void') {
+        throw new AppError(409, 'Your bank voided this transaction, so there’s nothing to file.')
+      }
+      if (txn.matched_disbursement_id || txn.matched_payment_id) {
+        throw new AppError(409, 'This deposit is money GAM already has on record, so it’s counted in your income automatically. Splitting it would count it twice.')
+      }
+    } else {
+      assertFileable(txn)
+    }
+
+    const amount = Number(txn.amount)
+    if (amount === 0) throw new AppError(400, 'This transaction has no amount to split')
+    const moneyIn = amount > 0
+    // 10/12 review (Nic L5, match first): a money-out line filed for the first
+    // time is matched first to a record it fits to the cent (as categorize).
+    if (!moneyIn && !wasFiled) {
+      const { refuseFilingWhenMoneyOutFits } = await import('./bankMoneyOut')
+      await refuseFilingWhenMoneyOutFits(landlordId, txnId, opts.notAMatch)
+    }
+    let sumCents = 0
+    // 10/12 (Nic, L5): each part's category — one of the company's own, or
+    // GAM's starting key — of the line's direction.
+    const partCats: ResolvedCategory[] = []
+    for (const [i, part] of parts.entries()) {
+      const n = i + 1
+      partCats.push(await resolveCategory(client, landlordId, moneyIn ? 'income' : 'expense',
+        { categoryId: part.categoryId, key: part.categoryId ? null : part.category }).catch((e: unknown) => {
+        if (e instanceof AppError && e.statusCode < 500) {
+          throw new AppError(e.statusCode, e.statusCode === 400 && !part.categoryId
+            ? (moneyIn ? `Part ${n}: pick an income category for money coming in` : `Part ${n}: pick an expense category for money going out`)
+            : `Part ${n}: ${e.message}`)
+        }
+        throw e
+      }))
+      const c = Math.round(Number(part.amount) * 100)
+      if (!Number.isFinite(c) || c <= 0) throw new AppError(400, `Part ${n}: enter an amount above $0.00`)
+      if (Math.abs(Number(part.amount) * 100 - c) > 1e-6) throw new AppError(400, `Part ${n}: an amount is dollars and cents`)
+      if (part.scopeKind === 'unit' ? !part.unitId : !part.propertyId) {
+        throw new AppError(400, part.scopeKind === 'unit' ? `Part ${n}: pick a unit` : `Part ${n}: pick a property`)
+      }
+      sumCents += c
+    }
+    const totalCents = cents(Math.abs(amount))
+    if (sumCents !== totalCents) {
+      const diff = (Math.abs(totalCents - sumCents) / 100).toFixed(2)
+      throw new AppError(400,
+        `The parts add up to $${(sumCents / 100).toFixed(2)}, but your bank shows $${(totalCents / 100).toFixed(2)}. ` +
+        (sumCents < totalCents ? `$${diff} is not in any part yet.` : `That is $${diff} too much.`))
+    }
+
+    // 10/12 review: what the owner added to the expense(s) this replaces — a
+    // receipt attached on the Expenses page, the utility it was for, a vendor
+    // they corrected — rides onto the new parts, so changing how a line is
+    // split never takes a receipt out of the books (a voided row is listed
+    // nowhere). Read before the old rows are voided.
+    // 10/12 (Nic): "every bank filing can be undone." A line back in review
+    // after its filing was undone carries what that filing held the same way
+    // (undoneFilingExpenses), so undo-then-file-again loses no receipt either.
+    const carried = moneyIn ? [] : !wasFiled ? await undoneFilingExpenses(client, landlordId, txn) : (await client.query<CarriedExpense>(
+      `SELECT category, amount::text AS amount, vendor, utility_type,
+              receipt_url, receipt_name, receipt_mime, receipt_size
+         FROM landlord_expenses
+        WHERE landlord_id = $1 AND status = 'active'
+          AND (id = $2 OR bank_transaction_id = $3)`, [landlordId, txn.expense_id ?? null, txnId])).rows
+
+    // The filing this replaces is voided, never deleted, and points at the
+    // line it came from.
+    let replaced = 0
+    if (wasFiled) {
+      if (txn.landlord_other_income_id) {
+        const v = await client.query(
+          `UPDATE landlord_other_income
+              SET status = 'voided', voided_at = now(), updated_at = now(),
+                  bank_transaction_id = COALESCE(bank_transaction_id, $3)
+            WHERE id = $1 AND landlord_id = $2 AND status = 'active'`, [txn.landlord_other_income_id, landlordId, txnId])
+        replaced += v.rowCount ?? 0
+      }
+      if (txn.expense_id) {
+        const v = await client.query(
+          `UPDATE landlord_expenses
+              SET status = 'voided', voided_at = now(), updated_at = now(),
+                  bank_transaction_id = COALESCE(bank_transaction_id, $3)
+            WHERE id = $1 AND landlord_id = $2 AND status = 'active'`, [txn.expense_id, landlordId, txnId])
+        replaced += v.rowCount ?? 0
+      }
+      const live = await activePartIds(client, txnId)
+      if (live.income.length) {
+        await client.query(
+          `UPDATE landlord_other_income SET status = 'voided', voided_at = now(), updated_at = now()
+            WHERE id = ANY($1::uuid[])`, [live.income])
+      }
+      if (live.expense.length) {
+        await client.query(
+          `UPDATE landlord_expenses SET status = 'voided', voided_at = now(), updated_at = now()
+            WHERE id = ANY($1::uuid[])`, [live.expense])
+      }
+      replaced += live.income.length + live.expense.length
+    }
+
+    const incomeIds: string[] = []
+    const expenseIds: string[] = []
+    const receiptFor = receiptsForParts(carried, parts)
+    const vendors = [...new Set(carried.map(c => c.vendor).filter((v): v is string => !!v))]
+    const utilityTypes = [...new Set(carried.map(c => c.utility_type).filter((v): v is string => !!v))]
+    for (const [i, part] of parts.entries()) {
+      const partAmount = Math.round(Number(part.amount) * 100) / 100
+      // 10/12 review: an ownership refusal says which part it is about, like
+      // every other part error (an account with two companies sees both
+      // companies' properties on the page).
+      const which = <T>(work: () => Promise<T>): Promise<T> => work().catch(e => {
+        if (e instanceof AppError && e.statusCode < 500 && !/^Part \d+:/.test(e.message)) throw new AppError(e.statusCode, `Part ${i + 1}: ${e.message}`)
+        throw e
+      })
+      if (moneyIn) {
+        const at = await which(() => placeIncome(client, landlordId, part))
+        const row = await client.query<{ id: string }>(
+          `INSERT INTO landlord_other_income
+             (landlord_id, property_id, unit_id, category, amount, description, payer, income_date, is_common,
+              created_by, bank_transaction_id, category_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+          [landlordId, at.rowPropertyId, at.unitId, partCats[i].legacyKey, partAmount.toFixed(2),
+           part.description ?? txn.description ?? null, txn.normalized_merchant ?? null,
+           txn.posted_date_str, at.isCommon, opts.by ?? null, txnId, partCats[i].id])
+        incomeIds.push(row.rows[0].id)
+      } else {
+        // createLandlordExpense checks the unit/property belong to this landlord.
+        const expense = await which(() => createLandlordExpense({
+          landlordId, createdBy: opts.by ?? null,
+          propertyId: part.scopeKind === 'unit' ? null : part.propertyId ?? null,
+          unitId: part.scopeKind === 'unit' ? part.unitId ?? null : null,
+          categoryId: partCats[i].id, amount: partAmount,
+          description: part.description ?? txn.description ?? null,
+          // The vendor the owner put on what this replaces, when they all named one.
+          vendor: vendors.length === 1 ? vendors[0] : txn.normalized_merchant ?? null,
+          expenseDate: txn.posted_date_str,
+          isCommon: part.scopeKind !== 'unit',
+          utilityType: partCats[i].legacyKey === 'utilities' && utilityTypes.length === 1 ? utilityTypes[0] : null,
+          bankTransactionId: txnId,
+        }, client))
+        const receipt = receiptFor[i]
+        if (receipt) {
+          await client.query(
+            `UPDATE landlord_expenses SET receipt_url = $2, receipt_name = $3, receipt_mime = $4, receipt_size = $5
+              WHERE id = $1`, [expense.id, receipt.receipt_url, receipt.receipt_name, receipt.receipt_mime, receipt.receipt_size])
+        }
+        expenseIds.push(expense.id)
+      }
+    }
+
+    // Filed in parts: both single-filing links empty (the parts point here),
+    // and a filing the feed made by itself is the owner's now.
+    await client.query(
+      `UPDATE bank_transactions
+          SET status = 'categorized', ignored_reason = NULL,
+              landlord_other_income_id = NULL, expense_id = NULL,
+              auto_filed_rule_id = NULL, auto_filed_at = NULL,
+              categorized_at = now(), updated_at = now()
+        WHERE id = $1`, [txnId])
+    await client.query('COMMIT')
+    saved = { incomeIds, expenseIds, replaced, moneyIn, merchant: txn.normalized_merchant ?? null, description: txn.description ?? null }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+  // 10/12 (Nic): "after a split, ASK whether future deposits from that payer
+  // should stop filing automatically." Asked of a deposit only (money going
+  // out never files itself), and only when the answer can change anything.
+  const payerQuestion = saved.moneyIn
+    ? await payerQuestionFor(landlordId, saved.merchant, saved.description).catch(e => {
+        logger.warn({ err: e, transactionId: txnId }, '[bank-feed] payer question skipped')
+        return null
+      })
+    : null
+  return { incomeIds: saved.incomeIds, expenseIds: saved.expenseIds, replaced: saved.replaced, payerQuestion }
+}
+
+/**
+ * Undo a split: its parts are voided (kept on file) and the line goes back to
+ * review, to be filed again as one category or split again (a line the bank
+ * has since voided is set aside as the bank's void instead). Like undoing a
+ * filing the feed made by itself, the line is marked as a person's, so the
+ * feed never files, matches or settles it by itself afterwards (RECONCILABLE_SQL
+ * leaves out any row whose auto_settle_undo is set). The mark is merged into
+ * what the column holds, so a "not rent" mark or an earlier undone match stays.
+ */
+export async function undoSplit(landlordId: string, txnId: string, opts: { undoneBy?: string | null } = {}):
+  Promise<{ id: string; voidedParts: number }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const txn = (await client.query(
+      `SELECT id, status, landlord_other_income_id, expense_id, bank_status
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [txnId, landlordId])).rows[0]
+    if (!txn) throw new AppError(404, 'Transaction not found')
+    const live = await activePartIds(client, txnId)
+    const n = live.income.length + live.expense.length
+    if (txn.status !== 'categorized' || txn.landlord_other_income_id || txn.expense_id || n === 0) {
+      throw new AppError(409, 'This bank line is not split, so there is no split to undo.')
+    }
+    if (live.income.length) {
+      await client.query(
+        `UPDATE landlord_other_income SET status = 'voided', voided_at = now(), updated_at = now()
+          WHERE id = ANY($1::uuid[])`, [live.income])
+    }
+    if (live.expense.length) {
+      await client.query(
+        `UPDATE landlord_expenses SET status = 'voided', voided_at = now(), updated_at = now()
+          WHERE id = ANY($1::uuid[])`, [live.expense])
+    }
+    const mark = {
+      at: new Date().toISOString(), by: opts.undoneBy ?? null,
+      incomeIds: live.income, expenseIds: live.expense,
+    }
+    // 10/12 review: a line the bank voided after it was split has nothing to
+    // file again — back in review it could be neither confirmed nor split, and
+    // it was offered for tenant matching. It goes where the feed puts an
+    // untouched voided line (followTheBank): ignored, as the bank's void.
+    const bankVoided = txn.bank_status === 'void'
+    await client.query(
+      `UPDATE bank_transactions
+          SET status = $3, ignored_reason = CASE WHEN $3 = 'ignored' THEN 'bank_void' ELSE ignored_reason END,
+              categorized_at = NULL,
+              auto_settle_undo = COALESCE(auto_settle_undo, '{}'::jsonb) || jsonb_build_object('splitUndone', $2::jsonb),
+              updated_at = now()
+        WHERE id = $1`, [txnId, JSON.stringify(mark), bankVoided ? 'ignored' : 'needs_review'])
+    await client.query('COMMIT')
+    return { id: txnId, voidedParts: n }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+// ── Undo any bank filing (10/12, Nic) ───────────────────────────────────────
+//
+//   "every bank filing (hand-filed too) can be undone (kept on record)"
+//
+// A filing the feed made by itself (undoAutoFile) and a split (undoSplit)
+// could be taken back; a line the owner filed as ONE category could not, and
+// neither could a line they ignored. Now every one of them can, the same way:
+// what the filing booked is voided — never deleted, and stamped with the line
+// it came from (bank_transaction_id) so the line's whole filing history stays
+// on file — and the line goes back to review, marked as a person's (the
+// FILING_UNDONE_MARK in auto_settle_undo, merged into what the column holds),
+// so the feed never files, matches or settles it by itself afterwards
+// (RECONCILABLE_SQL). A line the bank has since voided is set aside as the
+// bank's void instead, as undoSplit does: there is nothing to file again.
+
+/** The key in bank_transactions.auto_settle_undo that says a person undid this line's filing. */
+export const FILING_UNDONE_MARK = 'filingUndone'
+
+export type UndoneFilingKind = 'one_category' | 'split' | 'auto_filed' | 'ignored' | 'matched'
+
+/**
+ * Take back how a bank line is filed — whichever way it was filed — and put the
+ * line back in review. The owner's, like filing (requireLandlord). Refused for
+ * a line in review (nothing to undo) and for a line matched to money GAM has on
+ * record (that is a match, with its own Undo, or a GAM payout, which is never
+ * filed at all).
+ */
+export async function undoFiling(landlordId: string, txnId: string, opts: { undoneBy?: string | null } = {}):
+  Promise<{ id: string; kind: UndoneFilingKind; voided: number; status: string }> {
+  const peek = await queryOne<{
+    status: string; ignored_reason: string | null; auto_filed_rule_id: string | null
+    expense_id: string | null; landlord_other_income_id: string | null; matched_kind: string | null
+  }>(`SELECT status, ignored_reason, auto_filed_rule_id, expense_id, landlord_other_income_id, matched_kind
+        FROM bank_transactions WHERE id = $1 AND landlord_id = $2`, [txnId, landlordId])
+  if (!peek) throw new AppError(404, 'Transaction not found')
+  // The two kinds that already had their own undo keep it; each re-checks the
+  // line under its own lock.
+  const statusNow = async () =>
+    (await queryOne<{ status: string }>(`SELECT status FROM bank_transactions WHERE id = $1`, [txnId]))?.status ?? 'needs_review'
+  if (peek.status === 'categorized' && peek.auto_filed_rule_id) {
+    await undoAutoFile(landlordId, txnId, { undoneBy: opts.undoneBy ?? null })
+    return { id: txnId, kind: 'auto_filed', voided: peek.landlord_other_income_id ? 1 : 0, status: await statusNow() }
+  }
+  if (peek.status === 'categorized' && !peek.expense_id && !peek.landlord_other_income_id) {
+    const r = await undoSplit(landlordId, txnId, { undoneBy: opts.undoneBy ?? null })
+    return { id: txnId, kind: 'split', voided: r.voidedParts, status: await statusNow() }
+  }
+  // 10/12 (Nic, L5): a money-out line matched to expenses, GAM's fee debit, a
+  // refund check or a transfer — "Unfile": the payments it made are voided
+  // (kept) and the line goes back to review (services/bankMoneyOut).
+  if (peek.status === 'matched' && peek.matched_kind) {
+    const { unmatchMoneyOut } = await import('./bankMoneyOut')
+    const r = await unmatchMoneyOut(landlordId, txnId, { by: opts.undoneBy ?? null })
+    return { id: txnId, kind: 'matched', voided: r.voidedPayments, status: await statusNow() }
   }
 
-  const inc = await client.query(
-    `INSERT INTO landlord_other_income
-       (landlord_id, property_id, unit_id, category, amount, description, payer, income_date, is_common)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-    [landlordId, rowPropertyId, unitId, input.category, Math.abs(Number(txn.amount)),
-     input.description ?? txn.description ?? null,
-     input.vendor ?? txn.normalized_merchant ?? null, txn.posted_date_str, isCommon])
-  await client.query(
-    `UPDATE bank_transactions
-        SET status='categorized', ignored_reason=NULL, landlord_other_income_id=$2, categorized_at=now(), updated_at=now()
-      WHERE id=$1`, [txn.id, inc.rows[0].id])
-  return { incomeId: inc.rows[0].id as string, propertyId, unitId }
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const t = (await client.query<any>(
+      `SELECT id, status, ignored_reason, bank_status, auto_filed_rule_id, expense_id, landlord_other_income_id,
+              matched_payment_id, matched_disbursement_id, auto_settle_undo, matched_kind
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [txnId, landlordId])).rows[0]
+    if (!t) throw new AppError(404, 'Transaction not found')
+    const bankVoided = t.bank_status === 'void'
+    const at = new Date().toISOString()
+    const by = opts.undoneBy ?? null
+
+    // A line the owner ignored: back where it was before — matched, if it was
+    // a matched line they hid; otherwise in review. 10/12 (Nic) review: a
+    // match is not only a payment or a GAM payout — a deposit slip (or office
+    // cash GAM worked out) keeps its match in auto_settle_undo, and a tenant's
+    // receipt names itself there too. Such a line back in review could be
+    // filed or confirmed a second time while the slip and its rent stayed
+    // booked: the same deposit counted twice.
+    if (t.status === 'ignored' && t.ignored_reason === 'landlord') {
+      const undoMark = t.auto_settle_undo ?? {}
+      const liveMatch = !!(t.matched_payment_id || t.matched_disbursement_id || t.matched_kind
+        || undoMark.kind === 'deposit_slip' || Object.prototype.hasOwnProperty.call(undoMark, 'receiptId'))
+      const back = bankVoided ? 'ignored' : liveMatch ? 'matched' : 'needs_review'
+      await client.query(
+        `UPDATE bank_transactions
+            SET status = $3, ignored_reason = CASE WHEN $3 = 'ignored' THEN 'bank_void' ELSE NULL END,
+                auto_settle_undo = COALESCE(auto_settle_undo, '{}'::jsonb)
+                                   || jsonb_build_object('${FILING_UNDONE_MARK}', $2::jsonb),
+                updated_at = now()
+          WHERE id = $1`, [txnId, JSON.stringify({ at, by, was: 'ignored' }), back])
+      await client.query('COMMIT')
+      return { id: txnId, kind: 'ignored', voided: 0, status: back }
+    }
+
+    // Everything that is not a one-category filing says what it is instead.
+    if (t.status !== 'categorized' || t.auto_filed_rule_id || (!t.expense_id && !t.landlord_other_income_id)) {
+      throw new AppError(409,
+        t.status === 'needs_review' ? 'This bank line is waiting in review, so there is no filing to undo.'
+        : t.status === 'matched' ? 'This line is matched to money GAM already has on record, not filed. Use Undo this match where it is offered.'
+        : t.status === 'ignored' ? 'GAM set this line aside itself (a copy, a bank void, or from before your books start), so there is no filing to undo.'
+        : 'This bank line changed meanwhile. Reload the page and try again.')
+    }
+
+    // What the filing booked is voided, stamped with the line it came from.
+    // A row already voided (an expense removed on the Expenses page before
+    // 10/12 refused that) is only stamped — the line still comes back.
+    let voided = 0
+    for (const [table, rowId] of [
+      ['landlord_expenses', t.expense_id], ['landlord_other_income', t.landlord_other_income_id],
+    ] as const) {
+      if (!rowId) continue
+      const v = await client.query<{ was: string }>(
+        `WITH old AS (SELECT id, status FROM ${table} WHERE id = $1 AND landlord_id = $2 FOR UPDATE)
+         UPDATE ${table} x
+            SET status = CASE WHEN old.status = 'active' THEN 'voided' ELSE x.status END,
+                voided_at = CASE WHEN old.status = 'active' THEN now() ELSE x.voided_at END,
+                bank_transaction_id = COALESCE(x.bank_transaction_id, $3), updated_at = now()
+           FROM old WHERE x.id = old.id
+         RETURNING old.status AS was`, [rowId, landlordId, txnId])
+      voided += v.rows.filter(r => r.was === 'active').length
+    }
+    const mark = {
+      at, by, was: 'one_category',
+      ...(t.expense_id ? { expenseId: t.expense_id } : {}),
+      ...(t.landlord_other_income_id ? { incomeId: t.landlord_other_income_id } : {}),
+    }
+    const back = bankVoided ? 'ignored' : 'needs_review'
+    await client.query(
+      `UPDATE bank_transactions
+          SET status = $3, ignored_reason = CASE WHEN $3 = 'ignored' THEN 'bank_void' ELSE ignored_reason END,
+              expense_id = NULL, landlord_other_income_id = NULL, categorized_at = NULL,
+              auto_settle_undo = COALESCE(auto_settle_undo, '{}'::jsonb)
+                                 || jsonb_build_object('${FILING_UNDONE_MARK}', $2::jsonb),
+              updated_at = now()
+        WHERE id = $1`, [txnId, JSON.stringify(mark), back])
+    await client.query('COMMIT')
+    return { id: txnId, kind: 'one_category', voided, status: back }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+// ── After a split: does this payer keep filing itself? (10/12, Nic) ─────────
+//
+//   "after a split, ASK whether future deposits from that payer should stop
+//    filing automatically"
+//
+// A deposit from a payer the owner already filed as one category files itself
+// the same way next time (autoFileRuleFor). A split says that payer's deposits
+// can hold more than one kind of money — Mountain View's Square deposit was
+// propane and a night's stay — so the owner is asked, right after the split,
+// whether that payer's deposits should stop filing themselves. Yes turns it
+// off for that payer (landlord_merchant_rules.auto_file_income, the switch
+// "Undo and stop filing" already throws); no leaves everything as it is.
+
+/** What the owner is asked after splitting a deposit. */
+export interface PayerQuestion {
+  /** The payer, as GAM keys it (the bank memo's leading words). */
+  payer: string
+  /** True: the next deposit from them files itself today. False: it would, once one is filed as one category. */
+  filesItself: boolean
+  /** The category it files itself under today, when it does. */
+  category: string | null
+}
+
+/**
+ * The question to ask after splitting a deposit from this payer, or null when
+ * the answer could change nothing: a memo that names no payer, a rent channel,
+ * a transfer between accounts, a payer that ever paid a tenant's bill (none of
+ * those ever file themselves), or a payer already stopped.
+ */
+export async function payerQuestionFor(landlordId: string, merchant: string | null, description: string | null):
+  Promise<PayerQuestion | null> {
+  const payer = merchant ?? ''
+  if (!payer || !namesAPayer(payer)) return null
+  if (isRentChannelPayer(payer) || isRentChannelPayer(description)) return null
+  if (memoSaysTransfer(payer) || memoSaysTransfer(description)) return null
+  const rule = await queryOne<{ category: string; last_direction: string | null; auto_file_income: boolean }>(
+    `SELECT category, last_direction, auto_file_income FROM landlord_merchant_rules
+      WHERE landlord_id = $1 AND normalized_merchant = $2`, [landlordId, payer])
+  if (rule && !rule.auto_file_income) return null
+  if (await payerEverMatchedToTenantBill(landlordId, payer)) return null
+  const filesItself = !!rule && rule.last_direction === 'in'
+    && (OTHER_INCOME_CATEGORIES as readonly string[]).includes(rule.category)
+  return { payer, filesItself, category: filesItself ? rule!.category : null }
+}
+
+/**
+ * The owner's "yes": deposits from this line's payer stop filing themselves.
+ * Only money in ever files itself, so a line of money going out is refused.
+ * When GAM has never remembered this payer, the remembered choice is written
+ * now — from how this line is filed (its largest part, or its one category) —
+ * with no direction, so it pre-fills the next deposit for the owner to confirm
+ * and never files one by itself. Pressing it twice is harmless.
+ */
+export async function stopPayerAutoFiling(landlordId: string, txnId: string):
+  Promise<{ payer: string; alreadyStopped: boolean }> {
+  const t = await queryOne<{ amount: string; normalized_merchant: string | null }>(
+    `SELECT amount::text AS amount, normalized_merchant FROM bank_transactions WHERE id = $1 AND landlord_id = $2`,
+    [txnId, landlordId])
+  if (!t) throw new AppError(404, 'Transaction not found')
+  if (!(Number(t.amount) > 0)) {
+    throw new AppError(409, 'Only money coming in ever files itself. Money going out always waits for you.')
+  }
+  const payer = t.normalized_merchant ?? ''
+  if (!payer || !namesAPayer(payer)) {
+    throw new AppError(409, 'This deposit names no payer, so nothing from it ever files itself.')
+  }
+  const existing = await queryOne<{ id: string; auto_file_income: boolean }>(
+    `SELECT id, auto_file_income FROM landlord_merchant_rules WHERE landlord_id = $1 AND normalized_merchant = $2`,
+    [landlordId, payer])
+  if (existing) {
+    if (existing.auto_file_income) {
+      await query(`UPDATE landlord_merchant_rules SET auto_file_income = FALSE, updated_at = now() WHERE id = $1`, [existing.id])
+    }
+    return { payer, alreadyStopped: !existing.auto_file_income }
+  }
+  // Where this line is filed now: its largest part, else its one category.
+  const place = await queryOne<{ category: string; property_id: string | null; unit_id: string | null }>(
+    `SELECT category, property_id, unit_id FROM (
+       SELECT category, amount, property_id, unit_id FROM landlord_other_income
+        WHERE landlord_id = $1 AND status = 'active'
+          AND (bank_transaction_id = $2 OR id = (SELECT landlord_other_income_id FROM bank_transactions WHERE id = $2))
+     ) x ORDER BY amount DESC, category LIMIT 1`, [landlordId, txnId])
+  const category = place && (OTHER_INCOME_CATEGORIES as readonly string[]).includes(place.category) ? place.category : 'other'
+  await query(
+    `INSERT INTO landlord_merchant_rules
+       (landlord_id, normalized_merchant, category, scope_kind, property_id, unit_id, last_direction, auto_file_income)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, FALSE)
+     ON CONFLICT (landlord_id, normalized_merchant) DO UPDATE SET auto_file_income = FALSE, updated_at = now()`,
+    [landlordId, payer, category, place?.unit_id ? 'unit' : 'property_common', place?.unit_id ? null : place?.property_id ?? null,
+     place?.unit_id ?? null])
+  return { payer, alreadyStopped: false }
 }
 
 /** The landlord dismisses a row. Recorded as THEIR call, so nothing automatic ever undoes it. */
 export async function ignoreTransaction(landlordId: string, txnId: string) {
+  // 10/12 (Nic, L5): a line matched to expenses (or GAM's debit, a refund
+  // check, a transfer) is in the books through that match — Undo it first.
+  const matched = await queryOne<{ id: string }>(
+    `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND matched_kind IS NOT NULL`, [txnId, landlordId])
+  if (matched) throw new AppError(409, 'This line is matched to what it paid. Undo that match first, then ignore it.')
   const res = await queryOne<{ id: string }>(
     `UPDATE bank_transactions SET status='ignored', ignored_reason='landlord', updated_at=now()
       WHERE id=$1 AND landlord_id=$2 AND status IN ('needs_review','matched') RETURNING id`,
@@ -1698,17 +2426,22 @@ export async function listConnections(landlordId: string) {
  * List transactions with each row's auto-suggestion attached (so the review queue
  * can pre-fill without an N+1 from the client). Defaults to the review queue.
  */
-export async function listTransactions(landlordId: string, opts: { status?: string; connectionId?: string; limit?: number } = {}) {
+export async function listTransactions(landlordId: string, opts: {
+  status?: string; connectionId?: string; limit?: number
+  /** 10/12: just this line — the Expenses page sends the owner to the bank line an expense came from. */
+  lineId?: string
+} = {}) {
   // S655: a copy from an earlier link, or a transaction the bank voided, is kept
   // on file but never listed — it is not money that moved.
   const conds = ['bt.landlord_id = $1', `NOT (COALESCE(bt.ignored_reason, '') = ANY($2::text[]))`]
   const params: any[] = [landlordId, [...BANK_TXN_HIDDEN_REASONS]]
+  if (opts.lineId) { params.push(opts.lineId); conds.push(`bt.id = $${params.length}`) }
   if (opts.status) { params.push(opts.status); conds.push(`bt.status = $${params.length}`) }
   if (opts.connectionId) { params.push(opts.connectionId); conds.push(`bt.bank_connection_id = $${params.length}`) }
   const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500)
   const rows = await query<any>(
     `SELECT bt.id, bt.amount::float AS amount, bt.posted_date, bt.description,
-            bt.normalized_merchant, bt.status, bt.currency,
+            bt.normalized_merchant, bt.status, bt.currency, bt.landlord_id,
             -- S655: why it is ignored, and what the bank says about it
             bt.ignored_reason, bt.bank_status,
             c.display_name AS connection_name,
@@ -1731,9 +2464,66 @@ export async function listTransactions(landlordId: string, opts: { status?: stri
               AND ((bt.auto_settle_undo ? 'receiptId') OR bt.auto_settle_undo->>'kind' = 'deposit_slip')) AS can_undo,
             slip.slip_deposit_date, slip.slip_item_count, slip.slip_other_amount, slip.slip_source,
             dep.unit_number AS matched_unit_number, dep.tenant_name AS matched_tenant_name,
-            dep.charge_count AS matched_charge_count
+            dep.charge_count AS matched_charge_count,
+            -- 10/12 (Nic): what a filed line was filed as, so the page can say
+            -- so and a split can start from it; and a split line's parts.
+            COALESCE(foi.category, fe.category) AS filed_category,
+            COALESCE(foi.property_id, fe.property_id) AS filed_property_id,
+            COALESCE(foi.unit_id, fe.unit_id) AS filed_unit_id,
+            parts.split_parts,
+            -- 10/12 (Nic, L5): the company's own category it was filed under, and
+            -- what a money-out line was matched to (expenses it paid, GAM's
+            -- debit, a refund check, a transfer).
+            COALESCE(foi.category_id, fe.category_id) AS filed_category_id,
+            (SELECT fc.name FROM books_categories fc WHERE fc.id = COALESCE(foi.category_id, fe.category_id)) AS filed_category_name,
+            bt.matched_kind AS out_match_kind, outm.out_match_expenses,
+            -- 10/12 (Nic): the loan a line was matched to (its payment, or its money arriving).
+            CASE WHEN bt.matched_kind IN ('loan_payment', 'loan_funding') THEN (
+              SELECT ml.name FROM books_loans ml
+               WHERE ml.id = COALESCE(
+                 (SELECT lp.loan_id FROM books_loan_payments lp WHERE lp.bank_transaction_id = bt.id AND lp.voided_at IS NULL LIMIT 1),
+                 (SELECT lf.id FROM books_loans lf WHERE lf.funded_bank_transaction_id = bt.id AND lf.voided_at IS NULL LIMIT 1))
+            ) END AS out_match_loan_name,
+            -- 10/12 (Nic): a deposit waiting in review that one of the company's
+            -- loans fits (made into this account, this amount, within the match
+            -- window) — the page offers "Is this money from your loan?".
+            (bt.status = 'needs_review' AND bt.amount > 0 AND EXISTS (
+              SELECT 1 FROM books_loans fl
+               WHERE fl.landlord_id = bt.landlord_id AND fl.voided_at IS NULL AND fl.funded_to = 'bank'
+                 AND fl.funded_bank_transaction_id IS NULL AND fl.original_amount = bt.amount
+                 AND abs(fl.start_date - bt.posted_date) <= ${BOOKS_LOAN_MATCH_WINDOW_DAYS}
+                 AND (fl.funded_bank_connection_id IS NULL OR fl.funded_bank_connection_id = bt.bank_connection_id))) AS loan_funding_fits
        FROM bank_transactions bt
        JOIN bank_connections c ON c.id = bt.bank_connection_id
+       LEFT JOIN landlord_other_income foi ON foi.id = bt.landlord_other_income_id AND foi.status = 'active'
+       LEFT JOIN landlord_expenses fe ON fe.id = bt.expense_id AND fe.status = 'active'
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object(
+                  'id', x.id, 'category', x.category, 'amount', x.amount::float,
+                  'property_id', x.property_id, 'unit_id', x.unit_id, 'description', x.description,
+                  'property_name', pp.name, 'unit_number', pu.unit_number,
+                  'category_id', x.category_id, 'category_name', pc.name)
+                ORDER BY x.amount DESC, x.category, x.id) AS split_parts
+           FROM (SELECT id, category, category_id, amount, property_id, unit_id, description FROM landlord_other_income
+                  WHERE bank_transaction_id = bt.id AND status = 'active'
+                 UNION ALL
+                 SELECT id, category, category_id, amount, property_id, unit_id, description FROM landlord_expenses
+                  WHERE bank_transaction_id = bt.id AND status = 'active') x
+           LEFT JOIN properties pp ON pp.id = x.property_id
+           LEFT JOIN units pu ON pu.id = x.unit_id
+           LEFT JOIN books_categories pc ON pc.id = x.category_id
+       ) parts ON bt.status = 'categorized' AND bt.landlord_other_income_id IS NULL AND bt.expense_id IS NULL
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object(
+                  'expense_id', e.id, 'amount', mp.amount::float, 'category_name', mc.name,
+                  'vendor_name', COALESCE(mv.name, e.vendor), 'description', e.description)
+                ORDER BY e.expense_date, e.id) AS out_match_expenses
+           FROM landlord_expense_payments mp
+           JOIN landlord_expenses e ON e.id = mp.expense_id
+           LEFT JOIN books_categories mc ON mc.id = e.category_id
+           LEFT JOIN books_vendors mv ON mv.id = e.vendor_id
+          WHERE mp.bank_transaction_id = bt.id AND mp.voided_at IS NULL
+       ) outm ON bt.matched_kind = 'expenses'
        LEFT JOIN landlord_merchant_rules r
               ON r.landlord_id = bt.landlord_id AND r.normalized_merchant = bt.normalized_merchant
        LEFT JOIN LATERAL (

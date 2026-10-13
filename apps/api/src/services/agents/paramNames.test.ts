@@ -26,14 +26,24 @@ import { PORTAL_ACTIONS } from './portalActions'
 const API = join(__dirname, '../../')
 const ROUTES = join(API, 'routes')
 
-/** router variable -> the source of the file that declares it. */
+/**
+ * router variable -> the source of the file that declares it, and of every
+ * other route file that hangs routes on it (10/12: routes/booksLoansAssets.ts
+ * registers the Vendors, Loans and Fixed assets routes on booksRouter).
+ */
 function sourceByRouter(): Record<string, string> {
   const out: Record<string, string> = {}
+  const extra: Record<string, string[]> = {}
   for (const fn of readdirSync(ROUTES)) {
     if (!fn.endsWith('.ts') || fn.endsWith('.test.ts')) continue
     const src = readFileSync(join(ROUTES, fn), 'utf8')
-    for (const m of src.matchAll(/export const (\w+Router)\s*[:=]/g)) out[m[1]] = src
+    const own = new Set<string>()
+    for (const m of src.matchAll(/export const (\w+Router)\s*[:=]/g)) { out[m[1]] = src; own.add(m[1]) }
+    for (const r of new Set([...src.matchAll(/\b(\w+Router)\.(?:get|post|patch|put|delete)\(\s*'/g)].map(m => m[1]))) {
+      if (!own.has(r)) (extra[r] ||= []).push(src)
+    }
   }
+  for (const [r, srcs] of Object.entries(extra)) if (out[r]) out[r] = [out[r], ...srcs].join('\n')
   return out
 }
 

@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { computeLandlordPL, landlordIncomeSql, landlordDepositSql } from './landlordPL'
+import { computeLandlordPL, landlordIncomeSql, landlordDepositSql, landlordPLExpenses, landlordPLExpensesByProperty, NO_PROPERTY_KEY } from './landlordPL'
 
 beforeEach(cleanupAllSchema)
 
@@ -261,5 +261,124 @@ describe('computeLandlordPL — S655 bases', () => {
     expect(park2Only.expenses.maintenance).toBe(60)
     expect(park2Only.expenses.enteredExpenses).toBe(0)     // neither park 1's nor the company's
     expect(park2Only.expenses.platformFee).toBeLessThanOrEqual(all.expenses.platformFee)
+
+    // 10/12 review: every property's expenses in one pass (the monthly report)
+    // are exactly the one-property P&L's, and with the company's own costs
+    // they add up to the whole company's.
+    const months = ['2026-09-01']
+    const byProp = await landlordPLExpensesByProperty(f.landlordId, '2026-09-01', '2026-09-30', months)
+    expect(byProp.get(p1.property_id)).toEqual(await landlordPLExpenses(f.landlordId, '2026-09-01', '2026-09-30', months, [p1.property_id]))
+    expect(byProp.get(park2!)).toEqual(await landlordPLExpenses(f.landlordId, '2026-09-01', '2026-09-30', months, [park2!]))
+    expect(byProp.get(NO_PROPERTY_KEY)).toMatchObject({ enteredExpenses: 40, maintenance: 0 })
+    const whole = await landlordPLExpenses(f.landlordId, '2026-09-01', '2026-09-30', months)
+    const sum = [...byProp.values()].reduce((t, e) => t + e.total, 0)
+    expect(Math.round(sum * 100) / 100).toBe(whole.total)
+    // Narrowed to one property: that property only, no company bucket.
+    const one = await landlordPLExpensesByProperty(f.landlordId, '2026-09-01', '2026-09-30', months, [park2!])
+    expect([...one.keys()]).toEqual([park2!])
+    expect(one.get(park2!)).toEqual(byProp.get(park2!))
+  })
+})
+
+/**
+ * 10/11 (Nic): "Payment processing fees". A property that covers its tenants'
+ * card or bank fee has it taken out of the landlord's share when the payment
+ * settles (allocation), while income counts the whole rent — so the fee is an
+ * expense, read from what allocation booked (customer_fee_charged on its
+ * banking_spread rows), counted only when the tenant's payment carried no fee
+ * on top (tenant_remittances), and never the platform fee a property passes to
+ * its tenants (that is the platform fee line's).
+ */
+describe('computeLandlordPL — payment processing fees the landlord covers (10/11)', () => {
+  async function propertyOf(unitId: string): Promise<string> {
+    const { rows: [u] } = await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [unitId])
+    return u.property_id
+  }
+
+  /**
+   * A rent row paid through Stripe on `pi`, settled at `settledAt`, its
+   * remittance carrying `onTop` dollars of fee on top of the rent, and the
+   * banking spread allocation booked with the fee it charged (`fee`).
+   */
+  async function stripePaid(f: { landlordId: string; unitId: string; tenantId: string }, o: {
+    amount: number; settledAt: string; pi: string; onTop: number; fee: number; method?: 'ach' | 'card'; due?: string
+  }): Promise<{ paymentId: string; remittanceId: string }> {
+    const propertyId = await propertyOf(f.unitId)
+    const { rows: [p] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at,
+                             stripe_payment_intent_id, platform_held)
+       VALUES ($1,$2,$3,'rent',$4,'settled','RENT',$5::date,$6::timestamptz,$7,TRUE) RETURNING id`,
+      [f.unitId, f.tenantId, f.landlordId, o.amount, o.due ?? '2026-09-01', o.settledAt, o.pi])
+    const { rows: [r] } = await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, landlord_id, amount, applied_amount, status, payment_method,
+                                       stripe_payment_intent_id, gross_amount, processing_fee_amount, settled_at)
+       VALUES ($1,$2,$3,$3,'settled',$4,$5,$6,$7,$8::timestamptz) RETURNING id`,
+      [f.tenantId, f.landlordId, o.amount, o.method ?? 'ach', o.pi, o.amount + o.onTop, o.onTop, o.settledAt])
+    await db.query(
+      `INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,$3)`,
+      [r.id, p.id, o.amount])
+    await db.query(
+      `INSERT INTO platform_revenue_ledger (type, amount, balance_after, reference_id, reference_type, property_id,
+                                            customer_fee_charged, created_at, notes)
+       VALUES ('banking_spread', $1, $1, $2, 'payment', $3, $4, $5::timestamptz, 'test spread')`,
+      [Math.round((o.fee - 1) * 100) / 100, p.id, propertyId, o.fee, o.settledAt])
+    return { paymentId: p.id, remittanceId: r.id }
+  }
+
+  it('the $6 bank fee a landlord covers is an expense; a fee the tenant paid on top is not', async () => {
+    const f = await seed()
+    await stripePaid(f, { amount: 1000, settledAt: '2026-09-03T10:00:00-07:00', pi: 'pi_landlord_covers', onTop: 0, fee: 6 })
+    await stripePaid(f, { amount: 500, settledAt: '2026-09-04T10:00:00-07:00', pi: 'pi_tenant_pays', onTop: 18.05, fee: 18.05,
+                          method: 'card', due: '2026-09-02' })
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(pl.gross.rent).toBe(1500)
+    expect(pl.expenses.processingFees).toBe(6)
+    expect(pl.expenses.total).toBe(Math.round((pl.expenses.platformFee + 6) * 100) / 100)
+    expect(pl.net).toBe(Math.round((1500 - pl.expenses.total) * 100) / 100)
+  })
+
+  it('a platform fee the property passed to its tenants rides in the payment but is not a processing fee', async () => {
+    const f = await seed()
+    const propertyId = await propertyOf(f.unitId)
+    const { remittanceId } = await stripePaid(f, { amount: 1000, settledAt: '2026-09-03T10:00:00-07:00', pi: 'pi_with_platform_fee', onTop: 24, fee: 6 })
+    // The tenant's $24 platform fee charge, paid by the same remittance.
+    const { rows: [pf] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at, revenue_owner)
+       VALUES ($1,$2,$3,'platform_fee',24,'settled','SUBSCRIP','2026-09-01','2026-09-03T10:00:00-07:00','gam') RETURNING id`,
+      [f.unitId, f.tenantId, f.landlordId])
+    await db.query(`INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,24)`, [remittanceId, pf.id])
+    await db.query(
+      `INSERT INTO platform_fee_accruals (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account,
+                                          total_amount, payer, tenant_charge_id, updated_at)
+       VALUES ($1,$2,'2026-09-01',2,10,24,'tenant',$3, now() + interval '1 minute')`,
+      [f.landlordId, propertyId, pf.id])
+    const pl = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    // The $24 on top was the platform fee, not a processing fee: the $6 is still the landlord's.
+    expect(pl.expenses.processingFees).toBe(6)
+  })
+
+  it('counts on the day the payment settled at the property, and a property-scoped P&L carries only its own', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let unit2: string
+    try {
+      const { rows: [l] } = await c.query<{ user_id: string }>(`SELECT user_id FROM landlords WHERE id = $1`, [f.landlordId])
+      const park2 = await seedProperty(c, { landlordId: f.landlordId, ownerUserId: l.user_id, managedByUserId: l.user_id })
+      unit2 = await seedUnit(c, { propertyId: park2, landlordId: f.landlordId, rentAmount: 500 })
+    } finally { c.release() }
+    await stripePaid(f, { amount: 1000, settledAt: '2026-09-30T23:30:00-07:00', pi: 'pi_last_day', onTop: 0, fee: 6 })
+    await stripePaid(f, { amount: 1000, settledAt: '2026-10-01T00:30:00-07:00', pi: 'pi_next_month', onTop: 0, fee: 6, due: '2026-10-01' })
+    await stripePaid({ ...f, unitId: unit2! }, { amount: 500, settledAt: '2026-09-10T10:00:00-07:00', pi: 'pi_park2', onTop: 0, fee: 6 })
+
+    const sept = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'])
+    expect(sept.expenses.processingFees).toBe(12)
+    const park1Only = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'], 'received',
+      [await propertyOf(f.unitId)])
+    expect(park1Only.expenses.processingFees).toBe(6)
+    const oct = await computeLandlordPL(f.landlordId, '2026-10-01', '2026-10-31', ['2026-10-01'])
+    expect(oct.expenses.processingFees).toBe(6)
+    // The same under Money billed: an expense is dated by when it was taken.
+    const septBilled = await computeLandlordPL(f.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'], 'billed')
+    expect(septBilled.expenses.processingFees).toBe(12)
   })
 })

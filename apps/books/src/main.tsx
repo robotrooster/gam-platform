@@ -23,21 +23,53 @@ import { BankActivityPage } from './financials/BankActivityPage'
 import { PayoutsPage } from './financials/PayoutsPage'
 import { FinancialsViewerContext } from './financials/adapter'
 import './financialsHost.css'
+// 10/12 (Nic): "Bookkeeping" in the landlord menu brings these pages inside the
+// landlord portal — so each Books page is its own file in src/bookkeeping, the
+// same bytes there and in apps/landlord (bookkeeping-parity.test.ts).
+import { BooksDashboardPage } from './bookkeeping/BooksDashboardPage'
+import { ChartOfAccountsPage } from './bookkeeping/ChartOfAccountsPage'
+import { EmployeesPage } from './bookkeeping/EmployeesPage'
+import { ContractorsPage } from './bookkeeping/ContractorsPage'
+import { VendorsPage } from './bookkeeping/VendorsPage'
+// 10/12 (Nic): loans and fixed assets (the same bytes in apps/landlord).
+import { LoansPage } from './bookkeeping/LoansPage'
+import { FixedAssetsPage } from './bookkeeping/FixedAssetsPage'
+import { RunPayrollPage } from './bookkeeping/RunPayrollPage'
+import { PayHistoryPage } from './bookkeeping/PayHistoryPage'
+import { TaxFormsPage } from './bookkeeping/TaxFormsPage'
+import { JournalEntriesPage } from './bookkeeping/JournalEntriesPage'
+import { TransactionsPage } from './bookkeeping/TransactionsPage'
+import { BankReconcilePage } from './bookkeeping/BankReconcilePage'
+// 10/12 (Nic, ledger P9): close a month (the same page in the landlord portal's Bookkeeping menu).
+import { CloseMonthPage } from './bookkeeping/CloseMonthPage'
+import { BillsPage } from './bookkeeping/BillsPage'
+import { CashFlowPage } from './bookkeeping/CashFlowPage'
+import { OwnerStatementsPage } from './bookkeeping/OwnerStatementsPage'
+import { TaxCenterPage } from './bookkeeping/TaxCenterPage'
+import { ProfitLossPage } from './bookkeeping/ProfitLossPage'
+import { BalanceSheetPage } from './bookkeeping/BalanceSheetPage'
+// 10/12 (Nic, ledger P8): the trial balance and the general ledger.
+import { TrialBalancePage } from './bookkeeping/TrialBalancePage'
+import { GeneralLedgerPage } from './bookkeeping/GeneralLedgerPage'
+// 10/12 (Nic): the company's books settings and what its books start with —
+// the same pages the landlord portal's Bookkeeping menu shows.
+import { BooksSettingsPage } from './bookkeeping/BooksSettingsPage'
+import { OpeningBalancesPage } from './bookkeeping/OpeningBalancesPage'
+// 10/12 (Nic, L5): the company's own categories for money out and in.
+import { CategoriesPage } from './bookkeeping/CategoriesPage'
+import { BooksViewerContext, BOOKS_PATHS } from './bookkeeping/adapter'
+import { ComingSoon } from './bookkeeping/common'
 import React, { createContext, useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'react-query'
 import axios from 'axios'
+import { formatCurrency, applyCamelizeInterceptor, humanize, UNIT_STATUS_LABEL, MONEY_COLUMN_LABEL } from '@gam/shared'
+import { DialogHost } from './components/dialogs'
 import {
-  formatCurrency, applyCamelizeInterceptor, humanize,
-  INCOME_BASES, DEFAULT_INCOME_BASIS, INCOME_BASIS_LABEL, INCOME_BASIS_NOTE, UNIT_STATUS_LABEL,
-  type IncomeBasis,
-} from '@gam/shared'
-import { toast, appConfirm, DialogHost } from './components/dialogs'
-import {
-  rentRollVariance, rentPayers, splitBeside, loadErrorText, localToday, PAID_AHEAD_COUNTED_NOTE,
+  rentRollVariance, rentPayers, loadErrorText,
   companyChoiceState, companyName, type CompanyChoice,
-} from './lib/booksMoney'
+} from './bookkeeping/booksMoney'
 
 const ENV = (import.meta as any).env || {}
 const API = ENV.VITE_API_URL || 'http://localhost:4000'
@@ -58,9 +90,6 @@ api.interceptors.request.use(c=>{ let cid:string|null=null; try{ cid=localStorag
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
-const post=<T,>(url:string,body?:any)=>api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
-const patch=<T,>(url:string,body?:any)=>api.patch<{success:boolean;data:T}>(url,body).then(r=>r.data)
-const del=(url:string)=>api.delete(url).then(r=>r.data)
 
 // S568 (Nic): NO admins in the customer Books portal — GAM's own platform
 // bookkeeping lives on the super-admin side. Books is for landlords + their
@@ -295,16 +324,12 @@ button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-famil
 .frow{margin-bottom:14px}
 .frow2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
 label{display:block;font-size:.72rem;font-weight:600;color:var(--t3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em}
-input[type=text],input[type=email],input[type=number],input[type=date],input[type=password],select,textarea{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none;transition:border .12s}
+/* 10/12: tel too — the Employees, Contractors and Vendors phone boxes were drawn unstyled. */
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=password],select,textarea{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none;transition:border .12s}
 input:focus,select:focus,textarea:focus{border-color:var(--gold)}
 .factions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;padding-top:14px;border-top:1px solid var(--b0)}
 @keyframes spin{to{transform:rotate(360deg)}}
 /* S655: the "Money received" / "Money billed" switch */
-.basis-sw{display:inline-flex;gap:3px;padding:3px;background:var(--bg3);border:1px solid var(--b1);border-radius:999px}
-.basis-sw button{border:none;background:transparent;color:var(--t2);font-family:var(--font-b);font-size:.74rem;font-weight:600;padding:5px 12px;border-radius:999px;cursor:pointer;white-space:nowrap}
-.basis-sw button:hover{color:var(--t0)}
-.basis-sw button.on{background:var(--gold);color:#080a0c}
-.basis-note{font-size:.72rem;color:var(--t3);line-height:1.5;margin:-8px 0 16px;max-width:760px}
 .dr-sub .dk{padding-left:14px}
 .bnote{margin-top:10px;font-size:.72rem;color:var(--t3);line-height:1.5}
 /* S655: which company's books (a landlord account with several) */
@@ -313,21 +338,6 @@ input:focus,select:focus,textarea:focus{border-color:var(--gold)}
 .company-pick-list .btn{justify-content:space-between;padding:11px 14px;font-size:.84rem;text-align:left;flex-wrap:wrap}
 .company-pick-sub{font-weight:500;font-size:.72rem;opacity:.75}
 `
-
-// ── MODAL ─────────────────────────────────────────────────────────────
-function Modal({title,onClose,children}:{title:string;onClose:()=>void;children:React.ReactNode}){
-  return(
-    <div className="overlay" onClick={e=>{if(e.target===e.currentTarget)onClose()}}>
-      <div className="modal">
-        <div className="modal-h">
-          <span className="modal-t">{title}</span>
-          <button onClick={onClose} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.2rem',cursor:'pointer'}}>✕</button>
-        </div>
-        {children}
-      </div>
-    </div>
-  )
-}
 
 // ── LAYOUT ─────────────────────────────────────────────────────────────
 function Layout(){
@@ -338,10 +348,28 @@ function Layout(){
   // its owner and its bookkeeper; business accounts keep their own Books.
   const isBookkeeper=user?.role==='bookkeeper'
   const showFinancials=user?.role==='landlord'||isBookkeeper
-  // 10/11: the bank account and payouts are company-wide; a bookkeeper kept to
-  // some of a company's properties is refused both, so the tabs are not shown.
-  const{data:finScope}=useQuery<{wholeCompany:boolean}>('financials-scope',()=>get<{wholeCompany:boolean}>('/financials/scope'),{enabled:isBookkeeper,staleTime:60_000})
-  const showCompanyWide=!isBookkeeper||finScope?.wholeCompany!==false
+  // 10/12 (Nic): a business account's books have no landlord settings or
+  // opening balances (routes/booksSettings answers landlord companies only).
+  const isBusiness=user?.role==='business_owner'||user?.role==='business_staff'
+  // 10/12 (Nic): the bank account, payouts and payroll — and with them the
+  // company's own books (its ledger, bills, bank reconciliation and company
+  // reports) — are the company-wide box's, the owner's choice per bookkeeper;
+  // the server refuses them without it, so the tabs are not shown. A
+  // bookkeeper with no property ticked (company-wide only) has no property
+  // money, so those tabs go instead. Hidden until the scope is known.
+  const location=useLocation()
+  const{data:finScope}=useQuery<{companyWide:boolean;ledger?:boolean;properties:any[]}>('financials-scope',()=>get<{companyWide:boolean;ledger?:boolean;properties:any[]}>('/financials/scope'),{enabled:isBookkeeper,staleTime:60_000})
+  const showCompanyWide=!isBookkeeper||finScope?.companyWide===true
+  // 10/12 (Nic, BK1): the company's Books ledger (payroll, chart, journal,
+  // transactions, bank reconciliation, bills, P&L, balance sheet, tax) is the
+  // company-wide box's OR "May use the whole-company ledger" — the server's own
+  // list (routes/books BOOKS_LEDGER). Bank Activity, Payouts, Cash Flow and
+  // Owner Statements carry the payouts and stay the company-wide box's.
+  const showLedger=showCompanyWide||finScope?.ledger===true
+  const showPropertyMoney=!isBookkeeper||(finScope?.properties?.length??0)>0
+  React.useEffect(()=>{
+    if(isBookkeeper&&finScope&&!showPropertyMoney&&location.pathname==='/financials/income')navigate('/financials/bank-activity',{replace:true})
+  },[isBookkeeper,finScope,showPropertyMoney,location.pathname,navigate])
   return(
     <div className="shell">
       <aside className="sidebar">
@@ -351,40 +379,64 @@ function Layout(){
         </div>
         <nav className="nav">
           <div className="nl">Overview</div>
-          <NavLink to="/dashboard" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Dashboard</NavLink>
+          {showLedger&&<NavLink to={BOOKS_PATHS.dashboard} className={({isActive})=>`ni${isActive?' active':''}`}>📊 Dashboard</NavLink>}
           {(user?.role==='bookkeeper'||isAdmin)&&<NavLink to="/clients" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 My Clients</NavLink>}
           {showFinancials&&<>
             <div className="nl" style={{marginTop:8}}>Financials</div>
-            <NavLink to="/financials/income"            className={({isActive})=>`ni${isActive?' active':''}`}>💵 Money In</NavLink>
-            <NavLink to="/financials/expenses"          className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Expenses</NavLink>
-            <NavLink to="/financials/maintenance-costs" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Maintenance Costs</NavLink>
-            <NavLink to="/financials/reports"           className={({isActive})=>`ni${isActive?' active':''}`}>📊 Reports</NavLink>
+            {showPropertyMoney&&<>
+              <NavLink to="/financials/income"            className={({isActive})=>`ni${isActive?' active':''}`}>💵 Money In</NavLink>
+              <NavLink to="/financials/expenses"          className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Expenses</NavLink>
+              <NavLink to="/financials/maintenance-costs" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Maintenance Costs</NavLink>
+              <NavLink to="/financials/reports"           className={({isActive})=>`ni${isActive?' active':''}`}>📊 Reports</NavLink>
+            </>}
+            {/* 10/12 (Nic): the company's own categories, for the owner and EVERY bookkeeper — not only one with the
+                ledger (the server lets each keep them; pointing one at an account needs the ledger, and the page says so). */}
+            {!isBusiness&&<NavLink to={BOOKS_PATHS.categories} className={({isActive})=>`ni${isActive?' active':''}`}>🏷 Categories</NavLink>}
             {showCompanyWide&&<NavLink to="/financials/bank-activity" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Activity</NavLink>}
             {showCompanyWide&&<NavLink to="/financials/payouts"       className={({isActive})=>`ni${isActive?' active':''}`}>💸 Payouts</NavLink>}
           </>}
+          {showLedger&&<>
           <div className="nl" style={{marginTop:8}}>Payroll</div>
-          <NavLink to="/payroll/employees"   className={({isActive})=>`ni${isActive?' active':''}`}>👥 Employees (W-2)</NavLink>
-          <NavLink to="/payroll/contractors" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Contractors (1099)</NavLink>
-          <NavLink to="/payroll/vendors"     className={({isActive})=>`ni${isActive?' active':''}`}>🏪 Vendors</NavLink>
-          <NavLink to="/payroll/runs"        className={({isActive})=>`ni${isActive?' active':''}`}>▶ Run Payroll</NavLink>
-          <NavLink to="/payroll/history"     className={({isActive})=>`ni${isActive?' active':''}`}>🕐 Pay History</NavLink>
-          <NavLink to="/payroll/tax-forms"   className={({isActive})=>`ni${isActive?' active':''}`}>📋 Tax Forms</NavLink>
+          <NavLink to={BOOKS_PATHS.employees} className={({isActive})=>`ni${isActive?' active':''}`}>👥 Employees (W-2)</NavLink>
+          {/* 10/12 (Nic): one list of everyone the company pays — contractors are vendors (the old Contractors address opens it). */}
+          <NavLink to={BOOKS_PATHS.vendors} className={({isActive})=>`ni${isActive?' active':''}`}>🏪 Vendors & Contractors</NavLink>
+          <NavLink to={BOOKS_PATHS.runPayroll} className={({isActive})=>`ni${isActive?' active':''}`}>▶ Run Payroll</NavLink>
+          <NavLink to={BOOKS_PATHS.payHistory} className={({isActive})=>`ni${isActive?' active':''}`}>🕐 Pay History</NavLink>
+          <NavLink to={BOOKS_PATHS.taxForms} className={({isActive})=>`ni${isActive?' active':''}`}>📋 Tax Forms</NavLink>
           <div className="nl" style={{marginTop:8}}>Bookkeeping</div>
-          <NavLink to="/books/accounts"     className={({isActive})=>`ni${isActive?' active':''}`}>📂 Chart of Accounts</NavLink>
-          <NavLink to="/books/journal"      className={({isActive})=>`ni${isActive?' active':''}`}>📓 Journal Entries</NavLink>
-          <NavLink to="/books/transactions" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Transactions</NavLink>
-          <NavLink to="/books/reconcile"    className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Reconciliation</NavLink>
-          <div className="nl" style={{marginTop:8}}>Property Finance</div>
-          {/* 10/11 (Nic): the rent roll names every tenant — never a bookkeeper's. */}
-          {!isBookkeeper&&<NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>}
-          <NavLink to="/bills"         className={({isActive})=>`ni${isActive?' active':''}`}>📄 Bills & AP</NavLink>
+          <NavLink to={BOOKS_PATHS.accounts} className={({isActive})=>`ni${isActive?' active':''}`}>📂 Chart of Accounts</NavLink>
+          <NavLink to={BOOKS_PATHS.journal} className={({isActive})=>`ni${isActive?' active':''}`}>📓 Journal Entries</NavLink>
+          {/* 10/12 (Nic, L5): a landlord company's Transactions and Bills moved onto Expenses; a business keeps them. */}
+          {isBusiness&&<NavLink to={BOOKS_PATHS.transactions} className={({isActive})=>`ni${isActive?' active':''}`}>💳 Transactions</NavLink>}
+          <NavLink to={BOOKS_PATHS.reconcile} className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Bank Reconciliation</NavLink>
+          {/* 10/12 (Nic, L3): closing a month is the company-wide box's (who may close is the owner's Books Settings choice). */}
+          {!isBusiness&&showCompanyWide&&<NavLink to={BOOKS_PATHS.closeMonth} className={({isActive})=>`ni${isActive?' active':''}`}>🔒 Close Month</NavLink>}
+          <NavLink to={BOOKS_PATHS.loans} className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Loans</NavLink>
+          <NavLink to={BOOKS_PATHS.fixedAssets} className={({isActive})=>`ni${isActive?' active':''}`}>🏗 Fixed Assets</NavLink>
+          {/* 10/12 (Nic): how the company's books count money, and what they start with. */}
+          {!isBusiness&&<NavLink to={BOOKS_PATHS.booksSettings} className={({isActive})=>`ni${isActive?' active':''}`}>⚙ Books Settings</NavLink>}
+          {!isBusiness&&<NavLink to={BOOKS_PATHS.openingBalances} className={({isActive})=>`ni${isActive?' active':''}`}>🧮 Opening Balances</NavLink>}
+          </>}
+          {(showPropertyMoney||showLedger)&&<div className="nl" style={{marginTop:8}}>Property Finance</div>}
+          {/* 10/11 (Nic): tenant names are allowed wherever bookkeeping needs them,
+              so the rent roll is a bookkeeper's too — without the tenants'
+              contact or account details (the server leaves them out). */}
+          {showPropertyMoney&&<NavLink to="/rent-roll"     className={({isActive})=>`ni${isActive?' active':''}`}>🏘 Rent Roll</NavLink>}
+          {/* 10/12 (Nic): the company's books below are the company-wide box's;
+              BK1: the ledger's (bills, P&L, balance sheet, tax) with the ledger box too. */}
+          {showLedger&&<>
+          {isBusiness&&<NavLink to={BOOKS_PATHS.bills} className={({isActive})=>`ni${isActive?' active':''}`}>📄 Bills & AP</NavLink>}
           <div className="nl" style={{marginTop:8}}>Reports</div>
-          <NavLink to="/reports/pl"               className={({isActive})=>`ni${isActive?' active':''}`}>📈 P&amp;L</NavLink>
-          <NavLink to="/reports/balance-sheet"    className={({isActive})=>`ni${isActive?' active':''}`}>⚖ Balance Sheet</NavLink>
-          <NavLink to="/reports/cash-flow"        className={({isActive})=>`ni${isActive?' active':''}`}>💧 Cash Flow</NavLink>
-          <NavLink to="/reports/owner-statements" className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Owner Statements</NavLink>
+          <NavLink to={BOOKS_PATHS.profitLoss} className={({isActive})=>`ni${isActive?' active':''}`}>📈 P&amp;L</NavLink>
+          <NavLink to={BOOKS_PATHS.balanceSheet} className={({isActive})=>`ni${isActive?' active':''}`}>⚖ Balance Sheet</NavLink>
+          {/* 10/12 (Nic, ledger P8): the trial balance and the general ledger (a landlord company's books). */}
+          {!isBusiness&&<NavLink to={BOOKS_PATHS.trialBalance} className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Trial Balance</NavLink>}
+          {!isBusiness&&<NavLink to={BOOKS_PATHS.generalLedger} className={({isActive})=>`ni${isActive?' active':''}`}>📒 General Ledger</NavLink>}
+          {showCompanyWide&&<NavLink to={BOOKS_PATHS.cashFlow} className={({isActive})=>`ni${isActive?' active':''}`}>💧 Cash Flow</NavLink>}
+          {showCompanyWide&&<NavLink to={BOOKS_PATHS.ownerStatements} className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Owner Statements</NavLink>}
           <div className="nl" style={{marginTop:8}}>Tax</div>
-          <NavLink to="/tax" className={({isActive})=>`ni${isActive?' active':''}`}>🏛 Tax Center</NavLink>
+          <NavLink to={BOOKS_PATHS.taxCenter} className={({isActive})=>`ni${isActive?' active':''}`}>🏛 Tax Center</NavLink>
+          </>}
           {isAdmin&&<><div className="nl" style={{marginTop:8}}>Admin</div>
           <NavLink to="/admin/companies" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 All Companies</NavLink>
           <NavLink to="/admin/audit"     className={({isActive})=>`ni${isActive?' active':''}`}>🔍 Audit Log</NavLink></>}
@@ -406,1705 +458,24 @@ function Layout(){
             <span className="badge bgold">Beta</span>
           </div>
         </header>
-        <div className="page"><CompanyGate><Outlet/></CompanyGate></div>
+        <div className="page"><CompanyGate><BooksViewerContext.Provider value={{role:user?.role??''}}><Outlet/></BooksViewerContext.Provider></CompanyGate></div>
       </div>
-    </div>
-  )
-}
-
-// ── DASHBOARD ──────────────────────────────────────────────────────────
-function Dashboard(){
-  const{data:employees=[]}=useQuery('emp',()=>get<any[]>('/books/employees'))
-  const{data:contractors=[]}=useQuery('con',()=>get<any[]>('/books/contractors'))
-  const{data:vendors=[]}=useQuery('ven',()=>get<any[]>('/books/vendors'))
-  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const now=new Date()
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">Books Dashboard</h1><p className="ps">{now.toLocaleString('default',{month:'long',year:'numeric'})}</p></div>
-        <span className="badge bgold">📒 GAM Books</span>
-      </div>
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Employees (W-2)</div><div className="kv b">{(employees as any[]).filter((e:any)=>e.status==='active').length}</div><div className="ks">{(employees as any[]).length} total</div></div>
-        <div className="kpi"><div className="kl">Contractors (1099)</div><div className="kv gold">{(contractors as any[]).filter((c:any)=>c.status==='active').length}</div><div className="ks">{(contractors as any[]).length} total</div></div>
-        <div className="kpi"><div className="kl">Vendors</div><div className="kv t">{(vendors as any[]).length}</div><div className="ks">Active vendors</div></div>
-        <div className="kpi"><div className="kl">Chart of Accounts</div><div className="kv">{(accounts as any[]).length}</div><div className="ks">Active accounts</div></div>
-      </div>
-      <div className="grid2">
-        <div className="card">
-          <div className="ct">Quick Actions</div>
-          <div style={{display:'flex',flexDirection:'column',gap:8}}>
-            <a href="/payroll/employees"   className="btn bg-btn">👥 Add Employee</a>
-            <a href="/payroll/contractors" className="btn bg-btn">🔧 Add Contractor</a>
-            <a href="/payroll/vendors"     className="btn bg-btn">🏪 Add Vendor</a>
-            <a href="/books/accounts"      className="btn bp">📂 Manage Chart of Accounts</a>
-          </div>
-        </div>
-        <div className="card">
-          <div className="ct">YTD Payroll Summary</div>
-          <div className="dr"><span className="dk">Employee gross pay</span><span className="dv mono">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0))}</span></div>
-          <div className="dr"><span className="dk">Contractor payments</span><span className="dv mono">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0))}</span></div>
-          <div className="dr"><span className="dk">Vendor payments</span><span className="dv mono">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</span></div>
-          <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total YTD disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0)+(contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0)+(vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</span></div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── CHART OF ACCOUNTS ─────────────────────────────────────────────────
-const ACCOUNT_TYPES=['asset','liability','equity','income','expense']
-const TYPE_COLORS:Record<string,string>={asset:'bb',liability:'br',equity:'ba',income:'bg2',expense:'bgold'}
-const TYPE_LABELS:Record<string,string>={asset:'Asset',liability:'Liability',equity:'Equity',income:'Income',expense:'Expense'}
-
-function ChartOfAccounts(){
-  const qc=useQueryClient()
-  const{data:accounts=[],isLoading}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const[tab,setTab]=useState('all')
-  const[showAdd,setShowAdd]=useState(false)
-  const[seeding,setSeeding]=useState(false)
-  const[form,setForm]=useState({code:'',name:'',type:'asset',subtype:'',description:''})
-  const[saving,setSaving]=useState(false)
-  const[err,setErr]=useState('')
-
-  const filtered=tab==='all'?(accounts as any[]):(accounts as any[]).filter((a:any)=>a.type===tab)
-  const grouped=ACCOUNT_TYPES.reduce((acc:any,t)=>({...acc,[t]:(accounts as any[]).filter((a:any)=>a.type===t).length}),{})
-
-  const seedAccounts=async()=>{
-    setSeeding(true)
-    try{
-      const r=await post('/books/accounts/seed')
-      qc.invalidateQueries('acct')
-      toast((r.data as any).message)
-    }catch(e:any){toast.error(e.response?.data?.error||'Seed failed')}
-    finally{setSeeding(false)}
-  }
-
-  const addAccount=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/accounts',form)
-      qc.invalidateQueries('acct')
-      setShowAdd(false)
-      setForm({code:'',name:'',type:'asset',subtype:'',description:''})
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed to save')}
-    finally{setSaving(false)}
-  }
-
-  const deactivate=async(id:string)=>{
-    if(!(await appConfirm('Deactivate this account?', { danger: true, confirmLabel: 'Deactivate' })))return
-    await patch(`/books/accounts/${id}`,{active:false})
-    qc.invalidateQueries('acct')
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">📂 Chart of Accounts</h1><p className="ps">{(accounts as any[]).length} accounts · double-entry bookkeeping foundation</p></div>
-        <div style={{display:'flex',gap:8}}>
-          {(accounts as any[]).length===0&&<button className="btn bt" onClick={seedAccounts} disabled={seeding}>{seeding?<><span className="spinner"/>Seeding…</>:'⚡ Seed Standard COA'}</button>}
-          <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Account</button>
-        </div>
-      </div>
-
-      {(accounts as any[]).length===0&&!isLoading&&(
-        <div className="alert agold">No accounts yet. Click <strong>⚡ Seed Standard COA</strong> to load 38 standard property management accounts instantly.</div>
-      )}
-
-      <div className="grid4" style={{marginBottom:16}}>
-        {ACCOUNT_TYPES.map(t=>(
-          <div key={t} className="kpi" style={{cursor:'pointer',border:tab===t?'1px solid var(--gold)':'1px solid var(--b1)'}} onClick={()=>setTab(tab===t?'all':t)}>
-            <div className="kl">{TYPE_LABELS[t]}s</div>
-            <div className="kv">{grouped[t]||0}</div>
-          </div>
-        ))}
-      </div>
-
-      <div className="tabs">
-        <button className={`tab ${tab==='all'?'on':''}`} onClick={()=>setTab('all')}>All ({(accounts as any[]).length})</button>
-        {ACCOUNT_TYPES.map(t=><button key={t} className={`tab ${tab===t?'on':''}`} onClick={()=>setTab(t)}>{TYPE_LABELS[t]} ({grouped[t]||0})</button>)}
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Code</th><th>Account Name</th><th>Type</th><th>Subtype</th><th>Balance</th><th>System</th><th></th></tr></thead>
-            <tbody>
-              {(filtered as any[]).length?(filtered as any[]).map((a:any)=>(
-                <tr key={a.id}>
-                  <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{a.code}</td>
-                  <td style={{color:'var(--t0)',fontWeight:500}}>{a.name}</td>
-                  <td><span className={`badge ${TYPE_COLORS[a.type]||'bmu'}`}>{TYPE_LABELS[a.type]||a.type}</span></td>
-                  <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{a.subtype||'—'}</td>
-                  <td className="mono">{formatCurrency(a.balance)}</td>
-                  <td>{a.isSystem?<span className="badge bmu">System</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td><button className="btn bd bsm" onClick={()=>deactivate(a.id)}>Deactivate</button></td>
-                </tr>
-              )):<tr><td colSpan={7}><div className="empty">No {tab==='all'?'':TYPE_LABELS[tab].toLowerCase()} accounts.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Account" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={addAccount}>
-            <div className="frow2">
-              <div><label>Account Code</label><input type="text" value={form.code} onChange={e=>setForm(f=>({...f,code:e.target.value}))} placeholder="e.g. 4010" required/></div>
-              <div><label>Type</label>
-                <select value={form.type} onChange={e=>setForm(f=>({...f,type:e.target.value}))}>
-                  {ACCOUNT_TYPES.map(t=><option key={t} value={t}>{TYPE_LABELS[t]}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="frow"><label>Account Name</label><input type="text" value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="e.g. Rental Income" required/></div>
-            <div className="frow"><label>Subtype (optional)</label><input type="text" value={form.subtype} onChange={e=>setForm(f=>({...f,subtype:e.target.value}))} placeholder="e.g. operating, bank, current…"/></div>
-            <div className="frow"><label>Description (optional)</label><textarea rows={2} value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))}/></div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Account'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── EMPLOYEES ─────────────────────────────────────────────────────────
-const PAY_FREQS=['weekly','biweekly','semimonthly','monthly']
-const FILE_STATUS=['single','married','married_higher','head_of_household']
-
-function Employees(){
-  const qc=useQueryClient()
-  const{data:employees=[],isLoading}=useQuery('emp',()=>get<any[]>('/books/employees'))
-  const[showAdd,setShowAdd]=useState(false)
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const initForm={firstName:'',lastName:'',email:'',phone:'',title:'',department:'',payType:'salary',payRate:'',payFrequency:'biweekly',filingStatus:'single',federalAllowances:'0',stateWithholdingPct:'0',startDate:'',ssnLast4:''}
-  const[form,setForm]=useState(initForm)
-  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
-
-  const activeEmp=(employees as any[]).filter((e:any)=>e.status==='active')
-  const ytdGross=(employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0)
-
-  const calcPaycheck=(rate:number,freq:string,type:string)=>{
-    const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
-    const annual=type==='salary'?rate:rate*2080
-    return annual/(periods[freq]||26)
-  }
-
-  const addEmp=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/employees',{...form,payRate:+form.payRate,federalAllowances:+form.federalAllowances,stateWithholdingPct:+form.stateWithholdingPct})
-      qc.invalidateQueries('emp')
-      setShowAdd(false);setForm(initForm)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed to save')}
-    finally{setSaving(false)}
-  }
-
-  const toggleStatus=async(id:string,current:string)=>{
-    await patch(`/books/employees/${id}`,{status:current==='active'?'inactive':'active'})
-    qc.invalidateQueries('emp')
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">👥 Employees (W-2)</h1><p className="ps">{activeEmp.length} active · {(employees as any[]).length} total</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Employee</button>
-      </div>
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Active W-2</div><div className="kv b">{activeEmp.length}</div><div className="ks">Receiving payroll</div></div>
-        <div className="kpi"><div className="kl">YTD Gross Pay</div><div className="kv gold">{formatCurrency(ytdGross)}</div><div className="ks">All employees</div></div>
-        <div className="kpi"><div className="kl">YTD Federal W/H</div><div className="kv a">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdFederalTax||0),0))}</div><div className="ks">Withheld YTD</div></div>
-        <div className="kpi"><div className="kl">YTD State W/H</div><div className="kv t">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdStateTax||0),0))}</div><div className="ks">Per-employee flat %</div></div>
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Employee</th><th>Title</th><th>Pay Type</th><th>Rate</th><th>Frequency</th><th>Per Check</th><th>YTD Gross</th><th>Status</th><th></th></tr></thead>
-            <tbody>
-              {(employees as any[]).length?(employees as any[]).map((emp:any)=>(
-                <tr key={emp.id}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.firstName} {emp.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.email||'—'}</div></td>
-                  <td style={{fontSize:'.75rem'}}>{emp.title||'—'}{emp.department&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.department}</div>}</td>
-                  <td><span className={`badge ${emp.payType==='salary'?'bb':'ba'}`}>{emp.payType}</span></td>
-                  <td className="mono">{emp.payType==='salary'?formatCurrency(emp.payRate)+'/yr':formatCurrency(emp.payRate)+'/hr'}</td>
-                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.payFrequency}</td>
-                  <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(calcPaycheck(+emp.payRate,emp.payFrequency,emp.payType))}</td>
-                  <td className="mono">{formatCurrency(emp.ytdGross)}</td>
-                  <td><span className={`badge ${emp.status==='active'?'bg2':'bmu'}`}>{emp.status}</span></td>
-                  <td><button className="btn bg-btn bsm" onClick={()=>toggleStatus(emp.id,emp.status)}>{emp.status==='active'?'Deactivate':'Activate'}</button></td>
-                </tr>
-              )):<tr><td colSpan={9}><div className="empty">No employees yet. Add your first W-2 employee.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Employee (W-2)" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={addEmp}>
-            <div className="frow2">
-              <div><label>First Name</label><input type="text" value={form.firstName} onChange={f('firstName')} required/></div>
-              <div><label>Last Name</label><input type="text" value={form.lastName} onChange={f('lastName')} required/></div>
-            </div>
-            <div className="frow2">
-              <div><label>Email</label><input type="email" value={form.email} onChange={f('email')}/></div>
-              <div><label>Phone</label><input type="text" value={form.phone} onChange={f('phone')}/></div>
-            </div>
-            <div className="frow2">
-              <div><label>Title</label><input type="text" value={form.title} onChange={f('title')} placeholder="Property Manager"/></div>
-              <div><label>Department</label><input type="text" value={form.department} onChange={f('department')}/></div>
-            </div>
-            <div className="frow2">
-              <div><label>Pay Type</label>
-                <select value={form.payType} onChange={f('payType')}>
-                  <option value="salary">Salary (annual)</option>
-                  <option value="hourly">Hourly</option>
-                </select>
-              </div>
-              <div><label>{form.payType==='salary'?'Annual Salary':'Hourly Rate'}</label>
-                <input type="number" min="0" step="0.01" value={form.payRate} onChange={f('payRate')} required placeholder={form.payType==='salary'?'50000':'18.00'}/>
-              </div>
-            </div>
-            <div className="frow2">
-              <div><label>Pay Frequency</label>
-                <select value={form.payFrequency} onChange={f('payFrequency')}>
-                  {PAY_FREQS.map(p=><option key={p} value={p}>{p.charAt(0).toUpperCase()+p.slice(1)}</option>)}
-                </select>
-              </div>
-              <div><label>Filing Status</label>
-                <select value={form.filingStatus} onChange={f('filingStatus')}>
-                  {FILE_STATUS.map(s=><option key={s} value={s}>{humanize(s)}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="frow2">
-              <div><label>State Withholding %</label><input type="number" min="0" max="10" step="0.1" value={form.stateWithholdingPct} onChange={f('stateWithholdingPct')}/></div>
-              <div><label>Start Date</label><input type="date" value={form.startDate} onChange={f('startDate')}/></div>
-            </div>
-            <div className="frow"><label>SSN Last 4 (optional)</label><input type="text" maxLength={4} value={form.ssnLast4} onChange={f('ssnLast4')} placeholder="For tax forms"/></div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Employee'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── CONTRACTORS ───────────────────────────────────────────────────────
-const ENTITY_TYPES=['individual','llc','s_corp','c_corp','partnership']
-const TRADES=['General Contractor','Electrician','Plumber','HVAC','Roofer','Painter','Landscaper','Handyman','Cleaner','Pest Control','Other']
-
-function Contractors(){
-  const qc=useQueryClient()
-  const{data:contractors=[],isLoading}=useQuery('con',()=>get<any[]>('/books/contractors'))
-  const[showAdd,setShowAdd]=useState(false)
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const init={firstName:'',lastName:'',businessName:'',email:'',phone:'',ein:'',ssnLast4:'',entityType:'individual',trade:'',payRate:'',payUnit:'project',w9OnFile:false}
-  const[form,setForm]=useState(init)
-  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
-
-  const active=(contractors as any[]).filter((c:any)=>c.status==='active')
-  const w9Missing=(contractors as any[]).filter((c:any)=>!c.w9OnFile&&+c.ytdPaid>=600)
-
-  const add=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/contractors',{...form,payRate:form.payRate?+form.payRate:null})
-      qc.invalidateQueries('con');setShowAdd(false);setForm(init)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
-
-  const toggleW9=async(id:string,current:boolean)=>{
-    await patch(`/books/contractors/${id}`,{w9OnFile:!current})
-    qc.invalidateQueries('con')
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">🔧 Contractors (1099)</h1><p className="ps">{active.length} active · {(contractors as any[]).length} total</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Contractor</button>
-      </div>
-
-      {w9Missing.length>0&&<div className="alert aw">⚠ {w9Missing.length} contractor(s) paid $600+ without W-9 on file — 1099-NEC required at year end.</div>}
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Active Contractors</div><div className="kv gold">{active.length}</div><div className="ks">{(contractors as any[]).length} total</div></div>
-        <div className="kpi"><div className="kl">YTD Contractor Pay</div><div className="kv t">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0))}</div><div className="ks">Total disbursed</div></div>
-        <div className="kpi"><div className="kl">W-9 on File</div><div className={`kv ${w9Missing.length>0?'r':'g'}`}>{(contractors as any[]).filter((c:any)=>c.w9OnFile).length}/{(contractors as any[]).length}</div><div className="ks">Required for 1099</div></div>
-        <div className="kpi"><div className="kl">1099-NEC Needed</div><div className={`kv ${w9Missing.length>0?'a':'g'}`}>{(contractors as any[]).filter((c:any)=>+c.ytdPaid>=600).length}</div><div className="ks">Paid $600+ YTD</div></div>
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Name / Business</th><th>Trade</th><th>Entity</th><th>Rate</th><th>YTD Paid</th><th>W-9</th><th>1099</th><th>Status</th></tr></thead>
-            <tbody>
-              {(contractors as any[]).length?(contractors as any[]).map((c:any)=>(
-                <tr key={c.id}>
-                  <td>
-                    <div style={{fontWeight:600,color:'var(--t0)'}}>{c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')||'—'}</div>
-                    {c.businessName&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{[c.firstName,c.lastName].filter(Boolean).join(' ')}</div>}
-                    <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{c.email||''}</div>
-                  </td>
-                  <td style={{fontSize:'.75rem'}}>{c.trade||'—'}</td>
-                  <td><span className="badge bmu">{c.entityType?humanize(c.entityType):'—'}</span></td>
-                  <td className="mono">{c.payRate?formatCurrency(c.payRate)+'/'+c.payUnit:'—'}</td>
-                  <td className="mono" style={{color:+c.ytdPaid>=600?'var(--amber)':'var(--t1)'}}>{formatCurrency(c.ytdPaid)}</td>
-                  <td>
-                    <button className={`badge ${c.w9OnFile?'bg2':'br'}`} style={{cursor:'pointer',border:'none'}} onClick={()=>toggleW9(c.id,c.w9OnFile)}>
-                      {c.w9OnFile?'✓ On File':'Missing'}
-                    </button>
-                  </td>
-                  <td>{+c.ytdPaid>=600?<span className="badge ba">Required</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td><span className={`badge ${c.status==='active'?'bg2':'bmu'}`}>{c.status}</span></td>
-                </tr>
-              )):<tr><td colSpan={8}><div className="empty">No contractors yet.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Contractor (1099)" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={add}>
-            <div className="frow"><label>Entity Type</label>
-              <select value={form.entityType} onChange={f('entityType')}>
-                {ENTITY_TYPES.map(t=><option key={t} value={t}>{humanize(t).toUpperCase()}</option>)}
-              </select>
-            </div>
-            {form.entityType==='individual'&&<div className="frow2">
-              <div><label>First Name</label><input type="text" value={form.firstName} onChange={f('firstName')}/></div>
-              <div><label>Last Name</label><input type="text" value={form.lastName} onChange={f('lastName')}/></div>
-            </div>}
-            {form.entityType!=='individual'&&<div className="frow"><label>Business Name</label><input type="text" value={form.businessName} onChange={f('businessName')} required/></div>}
-            <div className="frow2">
-              <div><label>Email</label><input type="email" value={form.email} onChange={f('email')}/></div>
-              <div><label>Phone</label><input type="text" value={form.phone} onChange={f('phone')}/></div>
-            </div>
-            <div className="frow2">
-              <div><label>Trade / Specialty</label>
-                <select value={form.trade} onChange={f('trade')}>
-                  <option value="">Select trade…</option>
-                  {TRADES.map(t=><option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-              <div><label>EIN (or SSN last 4)</label><input type="text" value={form.ein} onChange={f('ein')} placeholder="XX-XXXXXXX"/></div>
-            </div>
-            <div className="frow2">
-              <div><label>Default Rate</label><input type="number" min="0" step="0.01" value={form.payRate} onChange={f('payRate')} placeholder="0.00"/></div>
-              <div><label>Per</label>
-                <select value={form.payUnit} onChange={f('payUnit')}>
-                  <option value="project">Project</option>
-                  <option value="hour">Hour</option>
-                  <option value="day">Day</option>
-                </select>
-              </div>
-            </div>
-            <div className="frow" style={{display:'flex',alignItems:'center',gap:10}}>
-              <input type="checkbox" id="w9" checked={form.w9OnFile} onChange={e=>setForm(p=>({...p,w9OnFile:e.target.checked}))} style={{width:'auto'}}/>
-              <label htmlFor="w9" style={{textTransform:'none',letterSpacing:0,fontSize:'.82rem',marginBottom:0}}>W-9 on file</label>
-            </div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Contractor'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── VENDORS ───────────────────────────────────────────────────────────
-const VENDOR_CATS=['Utilities','Insurance','Property Tax','Mortgage / Loan','Landscaping','Pest Control','Cleaning','Repairs','Software','Professional Services','Supplies','Other']
-const PAY_TERMS=['net15','net30','net45','net60','due_on_receipt','prepaid']
-
-function Vendors(){
-  const qc=useQueryClient()
-  const{data:vendors=[],isLoading}=useQuery('ven',()=>get<any[]>('/books/vendors'))
-  const[showAdd,setShowAdd]=useState(false)
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const init={name:'',contactName:'',email:'',phone:'',address:'',category:'',paymentTerms:'net30',accountNumber:'',taxId:'',notes:''}
-  const[form,setForm]=useState(init)
-  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
-
-  const overdue=(vendors as any[]).filter((v:any)=>+v.apBalance>0)
-
-  const add=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/vendors',form)
-      qc.invalidateQueries('ven');setShowAdd(false);setForm(init)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">🏪 Vendors</h1><p className="ps">{(vendors as any[]).length} active vendors</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Vendor</button>
-      </div>
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Active Vendors</div><div className="kv t">{(vendors as any[]).length}</div><div className="ks">In your vendor list</div></div>
-        <div className="kpi"><div className="kl">Total AP Balance</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.apBalance||0),0))}</div><div className="ks">Outstanding bills</div></div>
-        <div className="kpi"><div className="kl">YTD Vendor Payments</div><div className="kv gold">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</div><div className="ks">Total paid YTD</div></div>
-        <div className="kpi"><div className="kl">Vendors with Balance</div><div className={`kv ${overdue.length>0?'a':'g'}`}>{overdue.length}</div><div className="ks">Open AP</div></div>
-      </div>
-
-      {overdue.length>0&&<div className="alert aw">📄 {overdue.length} vendor(s) have open balances. Go to Bills &amp; AP to process payments.</div>}
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Vendor</th><th>Contact</th><th>Category</th><th>Payment Terms</th><th>AP Balance</th><th>YTD Paid</th><th>Account #</th></tr></thead>
-            <tbody>
-              {(vendors as any[]).length?(vendors as any[]).map((v:any)=>(
-                <tr key={v.id}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)'}}>{v.name}</div></td>
-                  <td><div style={{fontSize:'.75rem'}}>{v.contactName||'—'}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{v.email||''}</div></td>
-                  <td>{v.category?<span className="badge bmu">{humanize(v.category)}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{v.paymentTerms?humanize(v.paymentTerms):'—'}</td>
-                  <td className="mono" style={{color:+v.apBalance>0?'var(--red)':'var(--t3)'}}>{+v.apBalance>0?formatCurrency(v.apBalance):'—'}</td>
-                  <td className="mono">{formatCurrency(v.ytdPaid)}</td>
-                  <td className="mono" style={{fontSize:'.72rem',color:'var(--t3)'}}>{v.accountNumber||'—'}</td>
-                </tr>
-              )):<tr><td colSpan={7}><div className="empty">No vendors yet. Add vendors to track bills and AP.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Vendor" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={add}>
-            <div className="frow"><label>Vendor Name</label><input type="text" value={form.name} onChange={f('name')} required placeholder="e.g. APS Electric, City of Phoenix Water"/></div>
-            <div className="frow2">
-              <div><label>Contact Name</label><input type="text" value={form.contactName} onChange={f('contactName')}/></div>
-              <div><label>Phone</label><input type="text" value={form.phone} onChange={f('phone')}/></div>
-            </div>
-            <div className="frow"><label>Email</label><input type="email" value={form.email} onChange={f('email')}/></div>
-            <div className="frow2">
-              <div><label>Category</label>
-                <select value={form.category} onChange={f('category')}>
-                  <option value="">Select…</option>
-                  {VENDOR_CATS.map(c=><option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-              <div><label>Payment Terms</label>
-                <select value={form.paymentTerms} onChange={f('paymentTerms')}>
-                  {PAY_TERMS.map(t=><option key={t} value={t}>{humanize(t)}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="frow2">
-              <div><label>Account # (optional)</label><input type="text" value={form.accountNumber} onChange={f('accountNumber')}/></div>
-              <div><label>Tax ID / EIN (optional)</label><input type="text" value={form.taxId} onChange={f('taxId')}/></div>
-            </div>
-            <div className="frow"><label>Notes</label><textarea rows={2} value={form.notes} onChange={f('notes')}/></div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Vendor'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-
-// ── RUN PAYROLL ───────────────────────────────────────────────────────
-const FREQ_OPTIONS=[
-  {value:'weekly',    label:'Weekly'},
-  {value:'biweekly',  label:'Bi-Weekly'},
-  {value:'semimonthly',label:'Semi-Monthly'},
-  {value:'monthly',   label:'Monthly'},
-]
-
-function RunPayroll(){
-  const qc=useQueryClient()
-  const{data:employees=[]}=useQuery('emp',()=>get<any[]>('/books/employees'))
-  const active=(employees as any[]).filter((e:any)=>e.status==='active')
-  const[step,setStep]=useState<'setup'|'review'|'done'>('setup')
-  const[selectedIds,setSelectedIds]=useState<string[]>([])
-  const[hoursMap,setHoursMap]=useState<Record<string,string>>({})
-  // Bookkeeper enters federal + state income-tax withholding per employee (GAM
-  // auto-fills only SS + Medicare). Keyed by employee id.
-  const[taxMap,setTaxMap]=useState<Record<string,{federal:string,state:string}>>({})
-  const setTax=(id:string,k:'federal'|'state',v:string)=>setTaxMap(m=>({...m,[id]:{federal:m[id]?.federal||'',state:m[id]?.state||'',[k]:v}}))
-  const[freq,setFreq]=useState('biweekly')
-  const[periodStart,setPeriodStart]=useState('')
-  const[periodEnd,setPeriodEnd]=useState('')
-  const[payDate,setPayDate]=useState('')
-  const[draftRun,setDraftRun]=useState<any>(null)
-  const[calculating,setCalculating]=useState(false)
-  const[approving,setApproving]=useState(false)
-  const[err,setErr]=useState('')
-
-  const toggleEmp=(id:string)=>setSelectedIds(s=>s.includes(id)?s.filter(x=>x!==id):[...s,id])
-  const toggleAll=()=>setSelectedIds(s=>s.length===active.length?[]:active.map((e:any)=>e.id))
-
-  const calcRun=async(e:React.FormEvent)=>{
-    e.preventDefault();setCalculating(true);setErr('')
-    try{
-      const r=await post<any>('/books/payroll/runs',{
-        periodStart,periodEnd,payDate,payFrequency:freq,
-        employeeIds:selectedIds,
-        hoursMap:Object.fromEntries(Object.entries(hoursMap).map(([k,v])=>[k,+v])),
-        taxMap:Object.fromEntries(selectedIds.map(id=>[id,{federal:+(taxMap[id]?.federal||0),state:+(taxMap[id]?.state||0)}]))
-      })
-      setDraftRun(r.data)
-      setStep('review')
-    }catch(ex:any){setErr(ex.response?.data?.error||'Calculation failed')}
-    finally{setCalculating(false)}
-  }
-
-  const approve=async()=>{
-    if(!(await appConfirm('Approve this payroll run? YTD totals will be updated for all employees.', { confirmLabel: 'Approve' })))return
-    setApproving(true);setErr('')
-    try{
-      await post(`/books/payroll/runs/${draftRun.id}/approve`)
-      qc.invalidateQueries('emp')
-      qc.invalidateQueries('payroll-runs')
-      setStep('done')
-    }catch(ex:any){setErr(ex.response?.data?.error||'Approval failed')}
-    finally{setApproving(false)}
-  }
-
-  const voidRun=async()=>{
-    if(!(await appConfirm('Void this draft run?', { danger: true, confirmLabel: 'Void' })))return
-    await post(`/books/payroll/runs/${draftRun.id}/void`)
-    setDraftRun(null);setStep('setup')
-    qc.invalidateQueries('payroll-runs')
-  }
-
-  const fmtFreq=(f:string)=>FREQ_OPTIONS.find(o=>o.value===f)?.label||f
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">▶ Run Payroll</h1><p className="ps">Calculate, review, and approve payroll for your employees</p></div>
-        {step!=='setup'&&<button className="btn bg-btn" onClick={()=>{setStep('setup');setDraftRun(null)}}>← Start Over</button>}
-      </div>
-
-      {err&&<div className="alert ae">{err}</div>}
-
-      {/* STEP 1 — SETUP */}
-      {step==='setup'&&(
-        <form onSubmit={calcRun}>
-          <div className="grid2" style={{marginBottom:16}}>
-            <div className="card">
-              <div className="ct">Pay Period</div>
-              <div className="frow"><label>Pay Frequency</label>
-                <select value={freq} onChange={e=>setFreq(e.target.value)}>
-                  {FREQ_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <div className="frow2">
-                <div><label>Period Start</label><input type="date" value={periodStart} onChange={e=>setPeriodStart(e.target.value)} required/></div>
-                <div><label>Period End</label><input type="date" value={periodEnd} onChange={e=>setPeriodEnd(e.target.value)} required/></div>
-              </div>
-              <div className="frow"><label>Pay Date</label><input type="date" value={payDate} onChange={e=>setPayDate(e.target.value)} required/></div>
-            </div>
-
-            <div className="card">
-              <div className="ct">Deduction Summary (per paycheck)</div>
-              <div className="dr"><span className="dk">Social Security</span><span className="dv mono">6.2% (up to $168,600/yr) — auto</span></div>
-              <div className="dr"><span className="dk">Medicare</span><span className="dv mono">1.45% (+0.9% over $200k) — auto</span></div>
-              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono">You enter, per employee</span></div>
-              <div className="dr"><span className="dk">State W/H</span><span className="dv mono">You enter, per employee</span></div>
-              <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)'}}>GAM auto-calculates Social Security &amp; Medicare (fixed statutory rates). Enter federal &amp; state income-tax withholding for each employee below — leave blank for $0.</div>
-            </div>
-          </div>
-
-          <div className="card" style={{marginBottom:16}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-              <div className="ct" style={{marginBottom:0}}>Select Employees ({selectedIds.length}/{active.length})</div>
-              <button type="button" className="btn bg-btn bsm" onClick={toggleAll}>{selectedIds.length===active.length?'Deselect All':'Select All'}</button>
-            </div>
-            {active.length===0?<div className="empty">No active employees. Add employees first.</div>:(
-              <table className="tbl">
-                <thead><tr><th style={{width:40}}></th><th>Employee</th><th>Type</th><th>Rate</th><th>Hours (if hourly)</th><th>Est. Gross</th><th>Federal W/H</th><th>State W/H</th></tr></thead>
-                <tbody>
-                  {active.map((emp:any)=>{
-                    const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
-                    const ppy=periods[freq]||26
-                    const h=+(hoursMap[emp.id]||'80')
-                    const gross=emp.payType==='salary'?(+emp.payRate/ppy):(+emp.payRate*h)
-                    return(
-                      <tr key={emp.id} style={{background:selectedIds.includes(emp.id)?'rgba(201,162,39,.04)':''}}>
-                        <td><input type="checkbox" checked={selectedIds.includes(emp.id)} onChange={()=>toggleEmp(emp.id)} style={{width:'auto',cursor:'pointer'}}/></td>
-                        <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.firstName} {emp.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.title||''}</div></td>
-                        <td><span className={`badge ${emp.payType==='salary'?'bb':'ba'}`}>{emp.payType}</span></td>
-                        <td className="mono">{emp.payType==='salary'?formatCurrency(emp.payRate)+'/yr':formatCurrency(emp.payRate)+'/hr'}</td>
-                        <td>{emp.payType==='hourly'?(
-                          <input type="number" min="0" step="0.5" style={{width:80}} value={hoursMap[emp.id]||'80'} onChange={e=>setHoursMap(m=>({...m,[emp.id]:e.target.value}))} disabled={!selectedIds.includes(emp.id)}/>
-                        ):<span style={{color:'var(--t3)'}}>—</span>}</td>
-                        <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(gross)}</td>
-                        <td><input type="number" min="0" step="0.01" style={{width:90}} placeholder="0.00" value={taxMap[emp.id]?.federal||''} onChange={e=>setTax(emp.id,'federal',e.target.value)} disabled={!selectedIds.includes(emp.id)}/></td>
-                        <td><input type="number" min="0" step="0.01" style={{width:90}} placeholder="0.00" value={taxMap[emp.id]?.state||''} onChange={e=>setTax(emp.id,'state',e.target.value)} disabled={!selectedIds.includes(emp.id)}/></td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            )}
-          </div>
-
-          <div style={{display:'flex',justifyContent:'flex-end'}}>
-            <button type="submit" className="btn bp" disabled={calculating||selectedIds.length===0} style={{padding:'10px 24px',fontSize:'.9rem'}}>
-              {calculating?<><span className="spinner"/>Calculating…</>:`Calculate Payroll for ${selectedIds.length} Employee${selectedIds.length!==1?'s':''} →`}
-            </button>
-          </div>
-        </form>
-      )}
-
-      {/* STEP 2 — REVIEW */}
-      {step==='review'&&draftRun&&(
-        <div>
-          <div className="grid4" style={{marginBottom:16}}>
-            <div className="kpi"><div className="kl">Total Gross Pay</div><div className="kv gold">{formatCurrency(draftRun.totalGross)}</div><div className="ks">{draftRun.employeeCount} employees · {fmtFreq(draftRun.payFrequency)}</div></div>
-            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.totalFederalTax)+(+draftRun.totalStateTax)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</div><div className="ks">Fed + State + SS + Medicare</div></div>
-            <div className="kpi"><div className="kl">Total Net Pay</div><div className="kv g">{formatCurrency(draftRun.totalNet)}</div><div className="ks">Employee take-home</div></div>
-            <div className="kpi"><div className="kl">Pay Date</div><div className="kv b" style={{fontSize:'1.1rem'}}>{new Date(draftRun.payDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div><div className="ks">Period: {new Date(draftRun.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(draftRun.periodEnd+'T12:00:00').toLocaleDateString()}</div></div>
-          </div>
-
-          <div className="card" style={{marginBottom:16,padding:0}}>
-            <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>Pay Run Breakdown</div></div>
-            <table className="tbl">
-              <thead><tr><th>Employee</th><th>Pay Type</th><th>Gross</th><th>Federal W/H</th><th>SS (6.2%)</th><th>Medicare</th><th>State</th><th>Net Pay</th></tr></thead>
-              <tbody>
-                {draftRun.lines?.map((line:any)=>(
-                  <tr key={line.id}>
-                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.firstName} {line.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.title||''}{line.hoursWorked?' · '+line.hoursWorked+' hrs':''}</div></td>
-                    <td><span className={`badge ${line.payType==='salary'?'bb':'ba'}`}>{line.payType}</span></td>
-                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(line.grossPay)}</td>
-                    <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(line.federalTax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.ssTax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.medicareTax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.stateTax)}</td>
-                    <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(line.netPay)}</td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr style={{background:'var(--bg3)'}}>
-                  <td colSpan={2} style={{padding:'10px 12px',fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>TOTALS</td>
-                  <td className="mono" style={{fontWeight:700,color:'var(--gold)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalGross)}</td>
-                  <td className="mono" style={{color:'var(--red)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalFederalTax)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalSs)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalMedicare)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalStateTax)}</td>
-                  <td className="mono" style={{fontWeight:700,color:'var(--green)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalNet)}</td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-
-          <div className="card" style={{marginBottom:16}}>
-            <div className="ct">Employer Tax Liability (this run)</div>
-            <div className="dr"><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.totalSs)}</span></div>
-            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.totalMedicare)}</span></div>
-            <div className="dr"><span className="dk">Total employer tax cost</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>{formatCurrency((+draftRun.totalSs)+(+draftRun.totalMedicare))}</span></div>
-            <div className="dr"><span className="dk">Total cost to employer (gross + employer taxes)</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((+draftRun.totalGross)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</span></div>
-          </div>
-
-          <div style={{display:'flex',gap:12,justifyContent:'flex-end'}}>
-            <button className="btn bd" onClick={voidRun}>Void Draft</button>
-            <button className="btn bp" onClick={approve} disabled={approving} style={{padding:'10px 28px',fontSize:'.9rem'}}>
-              {approving?<><span className="spinner"/>Approving…</>:'✓ Approve & Post Payroll'}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* STEP 3 — DONE */}
-      {step==='done'&&(
-        <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
-          <div style={{fontSize:'3rem',marginBottom:16}}>✅</div>
-          <h2 style={{color:'var(--green)',marginBottom:8}}>Payroll Approved!</h2>
-          <p style={{color:'var(--t2)',marginBottom:4}}>Total gross: <strong style={{color:'var(--t0)'}}>{formatCurrency(draftRun?.totalGross)}</strong></p>
-          <p style={{color:'var(--t2)',marginBottom:24}}>Net pay: <strong style={{color:'var(--green)'}}>{formatCurrency(draftRun?.totalNet)}</strong> for {draftRun?.employeeCount} employee{draftRun?.employeeCount!==1?'s':''}</p>
-          <p style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:24}}>YTD totals have been updated. View the run in Pay History.</p>
-          <div style={{display:'flex',gap:12,justifyContent:'center'}}>
-            <button className="btn bg-btn" onClick={()=>{setStep('setup');setDraftRun(null);setSelectedIds([]);setHoursMap({})}}>Run Another Payroll</button>
-            <a href="/payroll/history" className="btn bp">View Pay History →</a>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── PAY HISTORY ───────────────────────────────────────────────────────
-function PayHistory(){
-  const{data:runs=[],isLoading}=useQuery('payroll-runs',()=>get<any[]>('/books/payroll/runs'))
-  const[selected,setSelected]=useState<any>(null)
-  const{data:runDetail}=useQuery(['payroll-run',selected?.id],()=>get<any>(`/books/payroll/runs/${selected.id}`),{enabled:!!selected?.id})
-  const qc=useQueryClient()
-
-  const voidRun=async(id:string)=>{
-    if(!(await appConfirm('Void this approved run? YTD totals will be reversed.', { danger: true, confirmLabel: 'Void' })))return
-    await post(`/books/payroll/runs/${id}/void`)
-    qc.invalidateQueries('payroll-runs')
-    qc.invalidateQueries('emp')
-    setSelected(null)
-  }
-
-  const STATUS:Record<string,string>={draft:'ba',approved:'bg2',voided:'bmu'}
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">🕐 Pay History</h1><p className="ps">{(runs as any[]).length} payroll runs</p></div>
-        <a href="/payroll/runs" className="btn bp">▶ New Run</a>
-      </div>
-
-      <div className="grid2" style={{gap:16}}>
-        <div className="card" style={{padding:0}}>
-          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-            <table className="tbl">
-              <thead><tr><th>Pay Date</th><th>Period</th><th>Freq</th><th>Employees</th><th>Gross</th><th>Net</th><th>Status</th></tr></thead>
-              <tbody>
-                {(runs as any[]).length?(runs as any[]).map((r:any)=>(
-                  <tr key={r.id} style={{cursor:'pointer',background:selected?.id===r.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(r)}>
-                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{new Date(r.payDate+'T12:00:00').toLocaleDateString()}</td>
-                    <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{new Date(r.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(r.periodEnd+'T12:00:00').toLocaleDateString()}</td>
-                    <td><span className="badge bmu" style={{fontSize:'.6rem'}}>{r.payFrequency}</span></td>
-                    <td className="mono">{r.employeeCount}</td>
-                    <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(r.totalGross)}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(r.totalNet)}</td>
-                    <td><span className={`badge ${STATUS[r.status]||'bmu'}`}>{r.status}</span></td>
-                  </tr>
-                )):<tr><td colSpan={7}><div className="empty">No payroll runs yet.</div></td></tr>}
-              </tbody>
-            </table>
-          )}
-        </div>
-
-        <div>
-          {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a run to view details</div>}
-          {selected&&runDetail&&(
-            <div className="card">
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
-                <div>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)'}}>Pay Date: {new Date(runDetail.payDate+'T12:00:00').toLocaleDateString()}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(runDetail.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(runDetail.periodEnd+'T12:00:00').toLocaleDateString()} · {runDetail.payFrequency}</div>
-                </div>
-                <span className={`badge ${STATUS[runDetail.status]||'bmu'}`}>{runDetail.status}</span>
-              </div>
-              <div className="dr"><span className="dk">Gross Pay</span><span className="dv mono" style={{color:'var(--gold)'}}>{formatCurrency(runDetail.totalGross)}</span></div>
-              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(runDetail.totalFederalTax)}</span></div>
-              <div className="dr"><span className="dk">SS + Medicare</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency((+runDetail.totalSs)+(+runDetail.totalMedicare))}</span></div>
-              <div className="dr"><span className="dk">State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.totalStateTax)}</span></div>
-              <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Net Pay</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(runDetail.totalNet)}</span></div>
-
-              <div style={{marginTop:16}}>
-                <div className="ct">Employee Lines</div>
-                {runDetail.lines?.map((l:any)=>(
-                  <div key={l.id} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                    <div>
-                      <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--t0)'}}>{l.firstName} {l.lastName}</div>
-                      <div style={{fontSize:'.68rem',color:'var(--t3)'}}>Gross {formatCurrency(l.grossPay)} · Net {formatCurrency(l.netPay)}</div>
-                    </div>
-                    <span className="mono" style={{color:'var(--green)',fontWeight:600}}>{formatCurrency(l.netPay)}</span>
-                  </div>
-                ))}
-              </div>
-
-              {runDetail.status==='approved'&&(
-                <div style={{marginTop:16}}>
-                  <button className="btn bd bsm" onClick={()=>voidRun(runDetail.id)}>Void This Run</button>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-
-// ── JOURNAL ENTRIES ───────────────────────────────────────────────────
-function JournalEntries(){
-  const qc=useQueryClient()
-  const{data:entries=[],isLoading}=useQuery('journal',()=>get<any[]>('/books/journal'))
-  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const[showAdd,setShowAdd]=useState(false)
-  const[selectedEntry,setSelectedEntry]=useState<any>(null)
-  const{data:entryDetail}=useQuery(['je',selectedEntry?.id],()=>get<any>('/books/journal/'+selectedEntry.id),{enabled:!!selectedEntry?.id})
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const initForm={date:localToday(),description:'',reference:'',lines:[{accountId:'',description:'',debit:'',credit:''},{accountId:'',description:'',debit:'',credit:''}]}
-  const[form,setForm]=useState(initForm)
-
-  const totalDebits=form.lines.reduce((s,l)=>s+(+l.debit||0),0)
-  const totalCredits=form.lines.reduce((s,l)=>s+(+l.credit||0),0)
-  const balanced=Math.abs(totalDebits-totalCredits)<0.01&&totalDebits>0
-
-  const addLine=()=>setForm(f=>({...f,lines:[...f.lines,{accountId:'',description:'',debit:'',credit:''}]}))
-  const removeLine=(i:number)=>setForm(f=>({...f,lines:f.lines.filter((_,idx)=>idx!==i)}))
-  const updateLine=(i:number,k:string,v:string)=>setForm(f=>({...f,lines:f.lines.map((l,idx)=>idx===i?{...l,[k]:v}:l)}))
-
-  const submit=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/journal',{...form,lines:form.lines.filter(l=>l.accountId).map(l=>({...l,debit:+l.debit||0,credit:+l.credit||0}))})
-      qc.invalidateQueries('journal');qc.invalidateQueries('acct')
-      setShowAdd(false);setForm(initForm)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
-
-  const voidEntry=async(id:string)=>{
-    if(!(await appConfirm('Void this journal entry? Account balances will be reversed.', { danger: true, confirmLabel: 'Void' })))return
-    await post('/books/journal/'+id+'/void')
-    qc.invalidateQueries('journal');qc.invalidateQueries('acct')
-    setSelectedEntry(null)
-  }
-
-  const STATUS:Record<string,string>={posted:'bg2',voided:'bmu',draft:'ba'}
-  const incomeAccts=(accounts as any[]).filter((a:any)=>a.type==='income')
-  const expenseAccts=(accounts as any[]).filter((a:any)=>a.type==='expense')
-  const assetAccts=(accounts as any[]).filter((a:any)=>a.type==='asset')
-  const liabAccts=(accounts as any[]).filter((a:any)=>a.type==='liability')
-  const equityAccts=(accounts as any[]).filter((a:any)=>a.type==='equity')
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">📓 Journal Entries</h1><p className="ps">{(entries as any[]).length} entries · double-entry bookkeeping</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ New Entry</button>
-      </div>
-
-      {(accounts as any[]).length===0&&<div className="alert aw">⚠ No chart of accounts found. <a href="/books/accounts">Set up your accounts</a> before creating journal entries.</div>}
-
-      <div className="grid2" style={{gap:16}}>
-        <div className="card" style={{padding:0}}>
-          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-            <table className="tbl">
-              <thead><tr><th>#</th><th>Date</th><th>Description</th><th>Debits</th><th>Status</th></tr></thead>
-              <tbody>
-                {(entries as any[]).length?(entries as any[]).map((e:any)=>(
-                  <tr key={e.id} style={{cursor:'pointer',background:selectedEntry?.id===e.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelectedEntry(e)}>
-                    <td className="mono" style={{color:'var(--t3)',fontSize:'.7rem'}}>{e.entryNumber}</td>
-                    <td className="mono" style={{fontSize:'.75rem'}}>{new Date(e.date+'T12:00:00').toLocaleDateString()}</td>
-                    <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{e.description}</td>
-                    <td className="mono">{formatCurrency(e.totalDebits)}</td>
-                    <td><span className={`badge ${STATUS[e.status]||'bmu'}`}>{e.status}</span></td>
-                  </tr>
-                )):<tr><td colSpan={5}><div className="empty">No journal entries yet.</div></td></tr>}
-              </tbody>
-            </table>
-          )}
-        </div>
-
-        <div>
-          {!selectedEntry&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select an entry to view detail</div>}
-          {selectedEntry&&entryDetail&&(
-            <div className="card">
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
-                <div>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',marginBottom:4}}>Entry #{entryDetail.entryNumber}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(entryDetail.date+'T12:00:00').toLocaleDateString()} · {humanize(entryDetail.type)}</div>
-                  <div style={{fontSize:'.82rem',color:'var(--t1)',marginTop:4}}>{entryDetail.description}</div>
-                  {entryDetail.reference&&<div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:2}}>Ref: {entryDetail.reference}</div>}
-                </div>
-                <span className={`badge ${STATUS[entryDetail.status]||'bmu'}`}>{entryDetail.status}</span>
-              </div>
-              <table className="tbl" style={{marginBottom:12}}>
-                <thead><tr><th>Account</th><th>Description</th><th style={{textAlign:'right'}}>Debit</th><th style={{textAlign:'right'}}>Credit</th></tr></thead>
-                <tbody>
-                  {entryDetail.lines?.map((l:any)=>(
-                    <tr key={l.id}>
-                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.75rem'}}>{l.code} · {l.accountName}</div></td>
-                      <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{l.description||'—'}</td>
-                      <td className="mono" style={{textAlign:'right',color:+l.debit>0?'var(--t0)':'var(--t3)'}}>{+l.debit>0?formatCurrency(l.debit):'—'}</td>
-                      <td className="mono" style={{textAlign:'right',color:+l.credit>0?'var(--t0)':'var(--t3)'}}>{+l.credit>0?formatCurrency(l.credit):'—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr style={{background:'var(--bg3)'}}>
-                    <td colSpan={2} style={{padding:'8px 12px',fontWeight:700,color:'var(--t0)',fontSize:'.72rem'}}>TOTALS</td>
-                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.totalDebits)}</td>
-                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.totalCredits)}</td>
-                  </tr>
-                </tfoot>
-              </table>
-              {entryDetail.status==='posted'&&<button className="btn bd bsm" onClick={()=>voidEntry(entryDetail.id)}>Void Entry</button>}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {showAdd&&(
-        <Modal title="New Journal Entry" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={submit}>
-            <div className="frow2">
-              <div><label>Date</label><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} required/></div>
-              <div><label>Reference (optional)</label><input type="text" value={form.reference} onChange={e=>setForm(f=>({...f,reference:e.target.value}))} placeholder="Invoice #, check #…"/></div>
-            </div>
-            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))} required placeholder="e.g. Record rent income for April"/></div>
-
-            <div style={{marginBottom:10}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-                <label style={{marginBottom:0}}>Lines</label>
-                <button type="button" className="btn bg-btn bsm" onClick={addLine}>+ Add Line</button>
-              </div>
-              <table style={{width:'100%',borderCollapse:'collapse',fontSize:'.75rem'}}>
-                <thead><tr>
-                  <th style={{textAlign:'left',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Account</th>
-                  <th style={{textAlign:'left',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Note</th>
-                  <th style={{textAlign:'right',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Debit</th>
-                  <th style={{textAlign:'right',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Credit</th>
-                  <th></th>
-                </tr></thead>
-                <tbody>
-                  {form.lines.map((line,i)=>(
-                    <tr key={i}>
-                      <td style={{padding:'3px 4px'}}>
-                        <select value={line.accountId} onChange={e=>updateLine(i,'accountId',e.target.value)} style={{width:'100%',fontSize:'.72rem',padding:'5px 6px'}}>
-                          <option value="">Select…</option>
-                          {[['Assets',assetAccts],['Liabilities',liabAccts],['Equity',equityAccts],['Income',incomeAccts],['Expenses',expenseAccts]].map(([label,grp]:any)=>
-                            (grp as any[]).length>0&&<optgroup key={label} label={label}>{(grp as any[]).map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}</optgroup>
-                          )}
-                        </select>
-                      </td>
-                      <td style={{padding:'3px 4px'}}><input type="text" value={line.description} onChange={e=>updateLine(i,'description',e.target.value)} placeholder="optional" style={{fontSize:'.72rem',padding:'5px 6px'}}/></td>
-                      <td style={{padding:'3px 4px'}}><input type="number" min="0" step="0.01" value={line.debit} onChange={e=>updateLine(i,'debit',e.target.value)} style={{textAlign:'right',fontSize:'.72rem',padding:'5px 6px',width:90}}/></td>
-                      <td style={{padding:'3px 4px'}}><input type="number" min="0" step="0.01" value={line.credit} onChange={e=>updateLine(i,'credit',e.target.value)} style={{textAlign:'right',fontSize:'.72rem',padding:'5px 6px',width:90}}/></td>
-                      <td style={{padding:'3px 4px'}}>{form.lines.length>2&&<button type="button" onClick={()=>removeLine(i)} style={{background:'none',border:'none',color:'var(--red)',cursor:'pointer',fontSize:'.9rem'}}>✕</button>}</td>
-                    </tr>
-                  ))}
-                  <tr style={{background:'var(--bg3)'}}>
-                    <td colSpan={2} style={{padding:'6px 8px',fontSize:'.72rem',color:'var(--t3)',fontWeight:600}}>TOTALS</td>
-                    <td style={{padding:'6px 8px',textAlign:'right',fontFamily:'var(--font-m)',fontSize:'.78rem',color:balanced?'var(--green)':'var(--amber)'}}>{formatCurrency(totalDebits)}</td>
-                    <td style={{padding:'6px 8px',textAlign:'right',fontFamily:'var(--font-m)',fontSize:'.78rem',color:balanced?'var(--green)':'var(--amber)'}}>{formatCurrency(totalCredits)}</td>
-                    <td/>
-                  </tr>
-                </tbody>
-              </table>
-              {!balanced&&totalDebits>0&&<div style={{fontSize:'.72rem',color:'var(--amber)',marginTop:6}}>⚠ Entry out of balance by {formatCurrency(Math.abs(totalDebits-totalCredits))}</div>}
-              {balanced&&<div style={{fontSize:'.72rem',color:'var(--green)',marginTop:6}}>✓ Entry is balanced</div>}
-            </div>
-
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving||!balanced}>{saving?<><span className="spinner"/>Posting…</>:'Post Entry'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── TRANSACTIONS ──────────────────────────────────────────────────────
-function Transactions(){
-  const qc=useQueryClient()
-  const{data:txs=[],isLoading}=useQuery('txs',()=>get<any[]>('/books/transactions'))
-  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const[tab,setTab]=useState<'all'|'income'|'expense'>('all')
-  const[showAdd,setShowAdd]=useState(false)
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const init={date:localToday(),description:'',amount:'',type:'expense',category:'',accountId:'',reference:''}
-  const[form,setForm]=useState(init)
-  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
-
-  const filtered=tab==='all'?(txs as any[]):(txs as any[]).filter((t:any)=>t.type===tab)
-  const totalIncome=(txs as any[]).filter((t:any)=>t.type==='income').reduce((s:number,t:any)=>s+(+t.amount),0)
-  const totalExpense=(txs as any[]).filter((t:any)=>t.type==='expense').reduce((s:number,t:any)=>s+(+t.amount),0)
-  const unreconciled=(txs as any[]).filter((t:any)=>!t.reconciled).length
-
-  const add=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/transactions',{...form,amount:+form.amount})
-      qc.invalidateQueries('txs');setShowAdd(false);setForm(init)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
-
-  const reconcile=async(id:string)=>{
-    await patch('/books/transactions/'+id+'/reconcile')
-    qc.invalidateQueries('txs')
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">💳 Transactions</h1><p className="ps">{(txs as any[]).length} transactions · {unreconciled} unreconciled</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Transaction</button>
-      </div>
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Total Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{(txs as any[]).filter((t:any)=>t.type==='income').length} transactions</div></div>
-        <div className="kpi"><div className="kl">Total Expenses</div><div className="kv r">{formatCurrency(totalExpense)}</div><div className="ks">{(txs as any[]).filter((t:any)=>t.type==='expense').length} transactions</div></div>
-        <div className="kpi"><div className="kl">Net</div><div className={`kv ${totalIncome-totalExpense>=0?'g':'r'}`}>{formatCurrency(totalIncome-totalExpense)}</div><div className="ks">Income minus expenses</div></div>
-        <div className="kpi"><div className="kl">Unreconciled</div><div className={`kv ${unreconciled>0?'a':'g'}`}>{unreconciled}</div><div className="ks">Pending reconciliation</div></div>
-      </div>
-
-      <div className="tabs">
-        <button className={`tab ${tab==='all'?'on':''}`} onClick={()=>setTab('all')}>All ({(txs as any[]).length})</button>
-        <button className={`tab ${tab==='income'?'on':''}`} onClick={()=>setTab('income')}>Income ({(txs as any[]).filter((t:any)=>t.type==='income').length})</button>
-        <button className={`tab ${tab==='expense'?'on':''}`} onClick={()=>setTab('expense')}>Expenses ({(txs as any[]).filter((t:any)=>t.type==='expense').length})</button>
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Account</th><th>Amount</th><th>Type</th><th>Reconciled</th></tr></thead>
-            <tbody>
-              {(filtered as any[]).length?(filtered as any[]).map((t:any)=>(
-                <tr key={t.id}>
-                  <td className="mono" style={{fontSize:'.72rem'}}>{new Date(t.date+'T12:00:00').toLocaleDateString()}</td>
-                  <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{t.description}</td>
-                  <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{t.category||'—'}</td>
-                  <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{t.accountName?t.code+' · '+t.accountName:'—'}</td>
-                  <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)',fontWeight:600}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
-                  <td><span className={t.type==='income'?'badge bg2':'badge br'}>{t.type}</span></td>
-                  <td>{t.reconciled?<span className="badge bg2">✓</span>:<button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>Mark</button>}</td>
-                </tr>
-              )):<tr><td colSpan={7}><div className="empty">No transactions yet.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Transaction" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={add}>
-            <div className="frow2">
-              <div><label>Date</label><input type="date" value={form.date} onChange={f('date')} required/></div>
-              <div><label>Type</label>
-                <select value={form.type} onChange={f('type')}>
-                  <option value="income">Income</option>
-                  <option value="expense">Expense</option>
-                </select>
-              </div>
-            </div>
-            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={f('description')} required/></div>
-            <div className="frow2">
-              <div><label>Amount</label><input type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required/></div>
-              <div><label>Category</label><input type="text" value={form.category} onChange={f('category')} placeholder="e.g. Repairs, Rent"/></div>
-            </div>
-            <div className="frow"><label>Account</label>
-              <select value={form.accountId} onChange={f('accountId')}>
-                <option value="">— Uncategorized —</option>
-                {(accounts as any[]).map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
-              </select>
-            </div>
-            <div className="frow"><label>Reference (optional)</label><input type="text" value={form.reference} onChange={f('reference')} placeholder="Check #, invoice #…"/></div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Transaction'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── BANK RECONCILE ────────────────────────────────────────────────────
-function BankReconcile(){
-  const{data:txs=[],isLoading}=useQuery('txs-unrec',()=>get<any[]>('/books/transactions?reconciled=false'))
-  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const[statementBal,setStatementBal]=useState('')
-  const[selectedAcct,setSelectedAcct]=useState('')
-  const qc=useQueryClient()
-  const bankAccts=(accounts as any[]).filter((a:any)=>a.subtype==='bank')
-  const unrecTxs=txs as any[]
-  const bookBal=unrecTxs.reduce((s:number,t:any)=>s+(t.type==='income'?+t.amount:-+t.amount),0)
-  const diff=(+statementBal||0)-bookBal
-
-  const reconcile=async(id:string)=>{
-    await patch('/books/transactions/'+id+'/reconcile')
-    qc.invalidateQueries('txs-unrec')
-  }
-
-  return(
-    <div>
-      <div className="ph"><div><h1 className="pt">🏦 Bank Reconciliation</h1><p className="ps">{unrecTxs.length} unreconciled transactions</p></div></div>
-
-      <div className="grid2" style={{marginBottom:16}}>
-        <div className="card">
-          <div className="ct">Reconciliation Setup</div>
-          <div className="frow"><label>Bank Account</label>
-            <select value={selectedAcct} onChange={e=>setSelectedAcct(e.target.value)}>
-              <option value="">Select bank account…</option>
-              {bankAccts.map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
-            </select>
-          </div>
-          <div className="frow"><label>Statement Ending Balance</label><input type="number" step="0.01" value={statementBal} onChange={e=>setStatementBal(e.target.value)} placeholder="0.00"/></div>
-        </div>
-        <div className="card">
-          <div className="ct">Balance Summary</div>
-          <div className="dr"><span className="dk">Statement balance</span><span className="dv mono">{formatCurrency(+statementBal||0)}</span></div>
-          <div className="dr"><span className="dk">Book balance (unreconciled)</span><span className="dv mono">{formatCurrency(bookBal)}</span></div>
-          <div className="dr" style={{borderTop:'1px solid var(--b1)',marginTop:4,paddingTop:8}}>
-            <span className="dk" style={{fontWeight:700}}>Difference</span>
-            <span style={{color:Math.abs(diff)<0.01?'var(--green)':'var(--red)',fontWeight:700,fontFamily:'var(--font-m)'}}>{formatCurrency(diff)}</span>
-          </div>
-          {Math.abs(diff)<0.01&&statementBal&&<div style={{marginTop:10}}><span className="badge bg2">✓ Reconciled</span></div>}
-        </div>
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-          <div className="ct" style={{marginBottom:0}}>Unreconciled Transactions</div>
-          <span style={{fontSize:'.72rem',color:'var(--t3)'}}>Click to mark reconciled</span>
-        </div>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Date</th><th>Description</th><th>Type</th><th>Amount</th><th></th></tr></thead>
-            <tbody>
-              {unrecTxs.length?unrecTxs.map((t:any)=>(
-                <tr key={t.id}>
-                  <td className="mono" style={{fontSize:'.72rem'}}>{new Date(t.date+'T12:00:00').toLocaleDateString()}</td>
-                  <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{t.description}</td>
-                  <td><span className={`badge ${t.type==='income'?'bg2':'br'}`}>{t.type}</span></td>
-                  <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)'}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
-                  <td><button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>✓ Reconcile</button></td>
-                </tr>
-              )):<tr><td colSpan={5}><div className="empty">All transactions reconciled! 🎉</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </div>
-  )
-}
-
-
-// ── BILLS & AP ────────────────────────────────────────────────────────
-function BillsAP(){
-  const qc=useQueryClient()
-  const{data:bills=[],isLoading}=useQuery('bills',()=>get<any[]>('/books/bills'))
-  const{data:vendors=[]}=useQuery('ven',()=>get<any[]>('/books/vendors'))
-  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
-  const[tab,setTab]=useState<'open'|'paid'|'all'>('open')
-  const[showAdd,setShowAdd]=useState(false)
-  const[err,setErr]=useState('')
-  const[saving,setSaving]=useState(false)
-  const init={vendorId:'',billNumber:'',date:localToday(),dueDate:'',description:'',amount:'',category:'',accountId:'',notes:''}
-  const[form,setForm]=useState(init)
-  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
-
-  const filtered=tab==='all'?(bills as any[]):(bills as any[]).filter((b:any)=>tab==='open'?b.status==='open'||b.status==='partial':b.status==='paid')
-  const totalOpen=(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').reduce((s:number,b:any)=>s+(+b.amount-+b.amountPaid),0)
-  const overdue=(bills as any[]).filter((b:any)=>b.dueDate&&new Date(b.dueDate)<new Date()&&b.status!=='paid')
-
-  const add=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/bills',{...form,amount:+form.amount})
-      qc.invalidateQueries('bills');qc.invalidateQueries('ven')
-      setShowAdd(false);setForm(init)
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
-
-  const payBill=async(id:string,amount:number)=>{
-    await post('/books/bills/'+id+'/pay',{amount})
-    qc.invalidateQueries('bills');qc.invalidateQueries('ven')
-  }
-
-  const STATUS:Record<string,string>={open:'ba',partial:'bb',paid:'bg2',void:'bmu'}
-  const expenseAccts=(accounts as any[]).filter((a:any)=>a.type==='expense')
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">📄 Bills & AP</h1><p className="ps">{(bills as any[]).length} bills · {formatCurrency(totalOpen)} outstanding</p></div>
-        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Bill</button>
-      </div>
-
-      {overdue.length>0&&<div className="alert ae">⚠ {overdue.length} bill{overdue.length!==1?'s':''} overdue. Review and pay to avoid late fees.</div>}
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Open Bills</div><div className="kv a">{(bills as any[]).filter((b:any)=>b.status==='open').length}</div><div className="ks">Awaiting payment</div></div>
-        <div className="kpi"><div className="kl">Total Outstanding</div><div className="kv r">{formatCurrency(totalOpen)}</div><div className="ks">AP balance</div></div>
-        <div className="kpi"><div className="kl">Overdue</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{overdue.length}</div><div className="ks">Past due date</div></div>
-        <div className="kpi"><div className="kl">Paid This Month</div><div className="kv g">{formatCurrency((bills as any[]).filter((b:any)=>b.status==='paid'&&b.paidAt&&new Date(b.paidAt)>=new Date(new Date().getFullYear(),new Date().getMonth(),1)).reduce((s:number,b:any)=>s+(+b.amountPaid),0))}</div><div className="ks">Cleared bills</div></div>
-      </div>
-
-      <div className="tabs">
-        <button className={`tab ${tab==='open'?'on':''}`} onClick={()=>setTab('open')}>Open ({(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').length})</button>
-        <button className={`tab ${tab==='paid'?'on':''}`} onClick={()=>setTab('paid')}>Paid ({(bills as any[]).filter((b:any)=>b.status==='paid').length})</button>
-        <button className={`tab ${tab==='all'?'on':''}`} onClick={()=>setTab('all')}>All ({(bills as any[]).length})</button>
-      </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-          <table className="tbl">
-            <thead><tr><th>Date</th><th>Vendor</th><th>Description</th><th>Due</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead>
-            <tbody>
-              {(filtered as any[]).length?(filtered as any[]).map((b:any)=>{
-                const isOverdue=b.dueDate&&new Date(b.dueDate)<new Date()&&b.status!=='paid'
-                return(
-                  <tr key={b.id} style={{background:isOverdue?'rgba(239,68,68,.03)':''}}>
-                    <td className="mono" style={{fontSize:'.72rem'}}>{new Date(b.date+'T12:00:00').toLocaleDateString()}</td>
-                    <td style={{fontSize:'.75rem',color:'var(--t0)'}}>{b.vendorName||'—'}</td>
-                    <td style={{fontSize:'.78rem'}}>{b.description}</td>
-                    <td className="mono" style={{fontSize:'.72rem',color:isOverdue?'var(--red)':'var(--t3)'}}>{b.dueDate?new Date(b.dueDate+'T12:00:00').toLocaleDateString():'—'}{isOverdue&&' ⚠'}</td>
-                    <td className="mono">{formatCurrency(b.amount)}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{+b.amountPaid>0?formatCurrency(b.amountPaid):'—'}</td>
-                    <td className="mono" style={{color:'var(--red)',fontWeight:600}}>{formatCurrency(+b.amount-+b.amountPaid)}</td>
-                    <td><span className={`badge ${STATUS[b.status]||'bmu'}`}>{b.status}</span></td>
-                    <td>{b.status!=='paid'&&<button className="btn bp bsm" onClick={()=>payBill(b.id,+b.amount-+b.amountPaid)}>Pay Full</button>}</td>
-                  </tr>
-                )
-              }):<tr><td colSpan={9}><div className="empty">No {tab==='open'?'open ':''}bills.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {showAdd&&(
-        <Modal title="Add Bill" onClose={()=>setShowAdd(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={add}>
-            <div className="frow"><label>Vendor</label>
-              <select value={form.vendorId} onChange={f('vendorId')}>
-                <option value="">— No vendor —</option>
-                {(vendors as any[]).map((v:any)=><option key={v.id} value={v.id}>{v.name}</option>)}
-              </select>
-            </div>
-            <div className="frow2">
-              <div><label>Bill Date</label><input type="date" value={form.date} onChange={f('date')} required/></div>
-              <div><label>Due Date</label><input type="date" value={form.dueDate} onChange={f('dueDate')}/></div>
-            </div>
-            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={f('description')} required placeholder="e.g. APS Electric — March"/></div>
-            <div className="frow2">
-              <div><label>Amount</label><input type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required/></div>
-              <div><label>Bill # (optional)</label><input type="text" value={form.billNumber} onChange={f('billNumber')}/></div>
-            </div>
-            <div className="frow"><label>Expense Account</label>
-              <select value={form.accountId} onChange={f('accountId')}>
-                <option value="">— Uncategorized —</option>
-                {expenseAccts.map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
-              </select>
-            </div>
-            <div className="frow"><label>Notes</label><textarea rows={2} value={form.notes} onChange={f('notes')}/></div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Bill'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  )
-}
-
-// ── S655: "Money received" / "Money billed" ─────────────────────────────
-// Nic (10/2): "people need to be able to see it both ways." One switch,
-// default Money received, remembered per browser — every storage touch is
-// wrapped, so a blocked or private browser simply starts on the default.
-const BASIS_KEY='gam_books_income_basis'
-function readBasis():IncomeBasis{
-  try{ const v=localStorage.getItem(BASIS_KEY)||''; return (INCOME_BASES as readonly string[]).includes(v)?v as IncomeBasis:DEFAULT_INCOME_BASIS }
-  catch{ return DEFAULT_INCOME_BASIS }
-}
-function useBasis():[IncomeBasis,(b:IncomeBasis)=>void]{
-  const[b,setB]=useState<IncomeBasis>(readBasis)
-  const set=(n:IncomeBasis)=>{ setB(n); try{ localStorage.setItem(BASIS_KEY,n) }catch{ /* private mode: the switch still works for this visit */ } }
-  return[b,set]
-}
-function BasisSwitch({basis,onChange}:{basis:IncomeBasis;onChange:(b:IncomeBasis)=>void}){
-  return(
-    <div className="basis-sw" role="radiogroup" aria-label="Count money by">
-      {INCOME_BASES.map(b=>(
-        <button key={b} type="button" role="radio" aria-checked={basis===b} className={basis===b?'on':''} onClick={()=>{ if(b!==basis) onChange(b) }}>{INCOME_BASIS_LABEL[b]}</button>
-      ))}
-    </div>
-  )
-}
-const BasisNote=({basis}:{basis:IncomeBasis})=><p className="basis-note">{INCOME_BASIS_NOTE[basis]}</p>
-
-// ── CASH FLOW ────────────────────────────────────────────────────────
-function CashFlow(){
-  const now=new Date()
-  const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
-  const[endDate,setEndDate]=useState(localToday(now))
-  const{data,isLoading,error}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
-
-  const op=(data as any)?.operating
-  const fin=(data as any)?.financing
-  const net=(data as any)?.netCashFlow||0
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">💧 Cash Flow Statement</h1><p className="ps">Money in, by the day it arrived · {new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center'}}>
-          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-          <span style={{color:'var(--t3)'}}>to</span>
-          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-        </div>
-      </div>
-
-      {/* 10/11: a refused report (a bookkeeper kept to some of the company's
-          properties) says why — never a page of $0 that reads as real. */}
-      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the cash flow.')}</div>:<>
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Money In</div><div className="kv g">{formatCurrency(op?.inflows?.total||0)}</div><div className="ks">By the day it arrived</div></div>
-        <div className="kpi"><div className="kl">Operating Outflows</div><div className="kv r">{formatCurrency(op?.outflows?.total||0)}</div><div className="ks">Expenses + payroll + bills</div></div>
-        <div className="kpi"><div className="kl">Financing Outflows</div><div className="kv a">{formatCurrency(fin?.total||0)}</div><div className="ks">Owner disbursements</div></div>
-        <div className="kpi"><div className="kl">Net Cash Flow</div><div className={`kv ${net>=0?'g':'r'}`}>{formatCurrency(net)}</div><div className="ks">{net>=0?'Positive cash flow':'Negative cash flow'}</div></div>
-      </div>
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-        <div className="grid2">
-          <div>
-            <div className="card" style={{marginBottom:12}}>
-              <div className="ct">Operating Activities</div>
-              <div style={{marginBottom:10}}>
-                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Money in, by the day it arrived</div>
-                {/* S655: every inflow line, so they add up to the total. Money
-                    paid ahead is its own line on the day it arrived; a credit
-                    you give never appears (no money moved). */}
-                <div className="dr"><span className="dk">🏘 GAM bills paid (rent, fees, utilities)</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.rentCollected||0)}</span></div>
-                {!!Number(op?.inflows?.paidAhead) && <div className="dr"><span className="dk">Paid ahead for later bills</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op.inflows.paidAhead)}</span></div>}
-                {!!Number(op?.inflows?.registerAndStays) && <div className="dr"><span className="dk">Register sales, stays and pay links</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op.inflows.registerAndStays)}</span></div>}
-                {!!Number(op?.inflows?.moveOut) && <div className="dr"><span className="dk">Move-out settlements</span><span className="dv mono" style={{color:Number(op.inflows.moveOut)<0?'var(--red)':'var(--green)'}}>{formatCurrency(op.inflows.moveOut)}</span></div>}
-                <div className="dr"><span className="dk">Other Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.otherIncome||0)}</span></div>
-                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Inflows</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(op?.inflows?.total||0)}</span></div>
-              </div>
-              <div>
-                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Outflows</div>
-                <div className="dr"><span className="dk">Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.expenses||0)})</span></div>
-                <div className="dr"><span className="dk">Payroll (net)</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.payroll||0)})</span></div>
-                <div className="dr"><span className="dk">Bills Paid</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.bills||0)})</span></div>
-                {!!Number(op?.outflows?.chargebackFees) && <div className="dr"><span className="dk">Chargeback fees</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op.outflows.chargebackFees)})</span></div>}
-                {!!Number(op?.outflows?.refundCardFees) && <div className="dr"><span className="dk">Card fees given back with refunds</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op.outflows.refundCardFees)})</span></div>}
-                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Outflows</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>({formatCurrency(op?.outflows?.total||0)})</span></div>
-              </div>
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Net Operating Cash Flow</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:(op?.net||0)>=0?'var(--green)':'var(--red)',fontSize:'1rem'}}>{formatCurrency(op?.net||0)}</span>
-              </div>
-            </div>
-
-            <div className="card">
-              <div className="ct">Financing Activities</div>
-              <div className="dr"><span className="dk">Owner Disbursements</span><span className="dv mono" style={{color:'var(--amber)'}}>({formatCurrency(fin?.disbursements||0)})</span></div>
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Net Financing</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--amber)',fontSize:'1rem'}}>({formatCurrency(fin?.total||0)})</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="card" style={{alignSelf:'start'}}>
-            <div className="ct">Cash Flow Summary</div>
-            <div className="dr"><span className="dk">Net Operating</span><span className="dv mono" style={{color:(op?.net||0)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(op?.net||0)}</span></div>
-            <div className="dr"><span className="dk">Net Financing</span><span className="dv mono" style={{color:'var(--amber)'}}>({formatCurrency(fin?.total||0)})</span></div>
-            <div style={{borderTop:'2px solid var(--b1)',marginTop:12,paddingTop:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET CASH FLOW</span>
-              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:net>=0?'var(--green)':'var(--red)'}}>{formatCurrency(net)}</span>
-            </div>
-            {/* Beside the totals, never in them. */}
-            {(!!Number((data as any)?.stillClearing)||!!Number((data as any)?.depositsHeld)||!!Number((data as any)?.nonCash?.keptAtMoveOut))&&(
-              <div style={{marginTop:14,paddingTop:10,borderTop:'1px dashed var(--b1)'}}>
-                {!!Number((data as any)?.stillClearing)&&<div className="dr"><span className="dk">Still clearing (not arrived yet)</span><span className="dv mono">{formatCurrency((data as any).stillClearing)}</span></div>}
-                {!!Number((data as any)?.depositsHeld)&&<div className="dr"><span className="dk">Deposits received (held for tenants)</span><span className="dv mono">{formatCurrency((data as any).depositsHeld)}</span></div>}
-                {!!Number((data as any)?.nonCash?.keptAtMoveOut)&&<div className="dr"><span className="dk">Kept from deposits you already held</span><span className="dv mono">{formatCurrency((data as any).nonCash.keptAtMoveOut)}</span></div>}
-              </div>
-            )}
-            <div className="bnote">{(data as any)?.meta?.note||'Money in, by the day it arrived.'}</div>
-          </div>
-        </div>
-      )}
-      </>}
-    </div>
-  )
-}
-
-// ── OWNER STATEMENTS ─────────────────────────────────────────────────
-function OwnerStatements(){
-  const now=new Date()
-  const[startDate,setStartDate]=useState(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`)
-  const[endDate,setEndDate]=useState(localToday(now))
-  const[selectedId,setSelectedId]=useState<string|null>(null)
-  const[basis,setBasis]=useBasis()
-  const{data:statements=[],isLoading,error}=useQuery(['owner-statements',startDate,endDate,basis],()=>get<any[]>(`/books/reports/owner-statements?startDate=${startDate}&endDate=${endDate}&basis=${basis}`))
-  // S655: the selected owner is read from the CURRENT data, so flipping the
-  // switch or the dates updates the statement in place instead of showing a
-  // stale copy counted the other way.
-  const selected=(statements as any[]).find((s:any)=>s.landlord.id===selectedId)??null
-  const word=INCOME_BASIS_LABEL[basis]
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">🏠 Owner Statements</h1><p className="ps">Per-property income statements · {word}</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-          <BasisSwitch basis={basis} onChange={setBasis}/>
-          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-          <span style={{color:'var(--t3)'}}>to</span>
-          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-        </div>
-      </div>
-      <BasisNote basis={basis}/>
-      {!!error&&<div className="alert aw">{loadErrorText(error,'Could not load owner statements.')}</div>}
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-        <div className="grid2" style={{gap:16}}>
-          <div style={{display:'flex',flexDirection:'column',gap:12}}>
-            {(statements as any[]).length?(statements as any[]).map((s:any)=>(
-              <div key={s.landlord.id} className="card" style={{cursor:'pointer',borderColor:selected?.landlord?.id===s.landlord.id?'rgba(201,162,39,.4)':'var(--b1)'}} onClick={()=>setSelectedId(s.landlord.id)}>
-                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
-                  <div>
-                    <div style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>{s.landlord.businessName||s.landlord.firstName+' '+s.landlord.lastName}</div>
-                    <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{s.landlord.email}</div>
-                  </div>
-                  <span className={s.variance>=0?'badge bg2':'badge br'}>{s.variance>=0?'✓ At or over expected':'⚠ Under expected'}</span>
-                </div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginTop:12}}>
-                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Expected</div><div style={{fontFamily:'var(--font-m)',color:'var(--t0)',fontWeight:600}}>{formatCurrency(s.totalExpected)}</div></div>
-                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>{word}</div><div style={{fontFamily:'var(--font-m)',color:'var(--green)',fontWeight:600}}>{formatCurrency(s.totalCollected)}</div></div>
-                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Disbursed</div><div style={{fontFamily:'var(--font-m)',color:'var(--gold)',fontWeight:600}}>{formatCurrency(s.totalDisbursed)}</div></div>
-                </div>
-              </div>
-            )):<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>No owner data for this period.</div>}
-          </div>
-
-          <div>
-            {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select an owner to view statement</div>}
-            {selected&&(
-              <div className="card">
-                <div style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{selected.landlord.businessName||selected.landlord.firstName+' '+selected.landlord.lastName}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</div>
-                </div>
-
-                {selected.properties.map((p:any)=>(
-                  <div key={p.id} style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
-                    <div style={{fontWeight:600,color:'var(--t0)',marginBottom:8}}>{p.name}</div>
-                    <div className="dr"><span className="dk">Units</span><span className="dv mono">{p.occupied}/{p.unitCount} occupied</span></div>
-                    <div className="dr"><span className="dk">Expected Rent</span><span className="dv mono">{formatCurrency(p.expectedRent)}</span></div>
-                    {/* S655: the lines that make up this property's figure. */}
-                    {(p.lines??[]).map((l:any)=>(
-                      <div key={l.line} className="dr dr-sub"><span className="dk">{l.label}</span><span className="dv mono" style={{color:Number(l.amount)<0?'var(--red)':'var(--t1)'}}>{formatCurrency(l.amount)}</span></div>
-                    ))}
-                    <div className="dr"><span className="dk">{word}</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(p.collected)}</span></div>
-                    <div className="dr"><span className="dk">Variance</span><span className="dv mono" style={{color:(+p.collected-+p.expectedRent)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(+p.collected-+p.expectedRent)}</span></div>
-                    {!!Number(p.depositsHeld)&&<div className="dr"><span className="dk">Deposits received (held, not income)</span><span className="dv mono">{formatCurrency(p.depositsHeld)}</span></div>}
-                  </div>
-                ))}
-
-                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Expected</span><span className="dv mono">{formatCurrency(selected.totalExpected)}</span></div>
-                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total {word}</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(selected.totalCollected)}</span></div>
-                {!!Number(selected.totalDepositsHeld)&&<div className="dr"><span className="dk">Deposits received (held, not income)</span><span className="dv mono">{formatCurrency(selected.totalDepositsHeld)}</span></div>}
-                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency(selected.totalDisbursed)}</span></div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── TAX CENTER ────────────────────────────────────────────────────────
-function TaxCenter(){
-  const now=new Date()
-  const[year,setYear]=useState(now.getFullYear())
-  const{data,isLoading}=useQuery(['tax',year],()=>get<any>(`/books/tax/summary?year=${year}`))
-
-  const payroll=(data as any)?.payroll||{}
-  const contractors=(data as any)?.contractors1099||[]
-  const employees=(data as any)?.employees||[]
-  const deadlines=(data as any)?.filingDeadlines||[]
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">🏛 Tax Center</h1><p className="ps">Payroll tax liabilities and filing deadlines</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center'}}>
-          <label style={{marginBottom:0,textTransform:'none',letterSpacing:0,fontSize:'.82rem',color:'var(--t2)'}}>Tax Year</label>
-          <select value={year} onChange={e=>setYear(+e.target.value)} style={{width:'auto',padding:'5px 10px',fontSize:'.82rem'}}>
-            {[now.getFullYear(),now.getFullYear()-1,now.getFullYear()-2].map(y=><option key={y} value={y}>{y}</option>)}
-          </select>
-        </div>
-      </div>
-
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">YTD Gross Payroll</div><div className="kv gold">{formatCurrency(payroll.ytdGross||0)}</div><div className="ks">{payroll.runCount||0} approved runs</div></div>
-        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytdFederal||0)+(+payroll.ytdState||0)+(+payroll.ytdSs||0)+(+payroll.ytdMedicare||0))}</div><div className="ks">Fed + State + SS + Medicare</div></div>
-        <div className="kpi"><div className="kl">Employer Tax Match</div><div className="kv a">{formatCurrency((+payroll.employerSs||0)+(+payroll.employerMedicare||0))}</div><div className="ks">SS + Medicare match</div></div>
-        <div className="kpi"><div className="kl">Total Tax Liability</div><div className="kv r">{formatCurrency(payroll.totalTaxLiability||0)}</div><div className="ks">Employee + employer</div></div>
-      </div>
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-        <div className="grid2" style={{gap:16,marginBottom:16}}>
-          <div className="card">
-            <div className="ct">Payroll Tax Breakdown ({year})</div>
-            <div className="dr"><span className="dk">Federal Income W/H (employee)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.ytdFederal||0)}</span></div>
-            <div className="dr"><span className="dk">Social Security (employee 6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdSs||0)}</span></div>
-            <div className="dr"><span className="dk">Medicare (employee 1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdMedicare||0)}</span></div>
-            <div className="dr"><span className="dk">State W/H (per-employee flat %)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdState||0)}</span></div>
-            <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerSs||0)}</span></div>
-            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerMedicare||0)}</span></div>
-            <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
-              <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liability</span>
-              <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(payroll.totalTaxLiability||0)}</span>
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="ct">Filing Deadlines</div>
-            {/* S203/S204: per-state catalog from services/taxForms.ts.
-                 Shape: { state_code, form_code, form_name, agency,
-                 agency_url, category, frequency, due_dates: [{label, due}],
-                 statute, notes, filing_method }
-                 S207: filing_method='online_portal' rows have no paper
-                 form code; form_code is a descriptive label, link wording
-                 says "Open portal" instead of "File online". */}
-            {deadlines.map((d:any,idx:number)=>{
-              const stateLabel = d.stateCode === 'US' ? 'Federal' : d.stateCode
-              const dues = Array.isArray(d.dueDates) ? d.dueDates : []
-              const isPortal = d.filingMethod === 'online_portal'
-              return (
-                <div key={d.stateCode+'-'+d.formCode+'-'+idx} style={{padding:'10px 0',borderBottom:'1px solid var(--b0)'}}>
-                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4,gap:8}}>
-                    <div style={{display:'flex',alignItems:'baseline',gap:8,flexWrap:'wrap',flex:1,minWidth:0}}>
-                      <span style={{fontFamily:'var(--font-m)',fontWeight:600,color:'var(--gold)',fontSize:'.82rem'}}>
-                        {d.formCode}
-                      </span>
-                      <span className="badge bmu" style={{fontSize:'.62rem'}}>{stateLabel}</span>
-                      <span className="badge bmu" style={{fontSize:'.62rem',textTransform:'capitalize'}}>{humanize(d.category)}</span>
-                      {isPortal && (
-                        <span className="badge ba" style={{fontSize:'.62rem'}}>Online portal</span>
-                      )}
-                    </div>
-                  </div>
-                  <div style={{fontSize:'.75rem',color:'var(--t2)',marginBottom:6}}>{d.formName}</div>
-                  {dues.length > 0 && (
-                    <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:6}}>
-                      {dues.map((row:any,i:number)=>(
-                        <span key={i} className="badge ba" style={{fontSize:'.62rem'}}>
-                          {row.label}: {row.due}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  <div style={{fontSize:'.7rem',color:'var(--t3)',display:'flex',gap:6,flexWrap:'wrap',alignItems:'center'}}>
-                    <span>{d.agency}</span>
-                    {d.agencyUrl && (
-                      <>
-                        <span>·</span>
-                        <a href={d.agencyUrl} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)',textDecoration:'none'}}>
-                          {isPortal ? 'Open portal ↗' : 'File online ↗'}
-                        </a>
-                      </>
-                    )}
-                    {d.statute && (
-                      <>
-                        <span>·</span>
-                        <span style={{fontStyle:'italic'}}>{d.statute}</span>
-                      </>
-                    )}
-                  </div>
-                  {d.notes && (
-                    <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:4,fontStyle:'italic'}}>
-                      {d.notes}
-                    </div>
-                  )}
-                </div>
-              )
-            })}
-            {deadlines.length === 0 && (
-              <div style={{padding:'10px 0',fontSize:'.75rem',color:'var(--t3)'}}>
-                No filing deadlines apply to your current setup. Add employees, contractors, or properties to surface relevant forms.
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {(contractors as any[]).length>0&&(
-        <div className="card" style={{marginBottom:16}}>
-          <div className="ct">1099-NEC Required ({year}) — Contractors Paid $600+</div>
-          {(contractors as any[]).filter((c:any)=>!c.w9OnFile).length>0&&(
-            <div className="alert aw" style={{marginBottom:12}}>⚠ {(contractors as any[]).filter((c:any)=>!c.w9OnFile).length} contractor(s) missing W-9. Collect before Jan 31.</div>
-          )}
-          <table className="tbl">
-            <thead><tr><th>Contractor</th><th>Entity</th><th>YTD Paid</th><th>W-9</th><th>1099 Status</th></tr></thead>
-            <tbody>
-              {(contractors as any[]).map((c:any)=>(
-                <tr key={c.id}>
-                  <td style={{fontWeight:600,color:'var(--t0)'}}>{c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')}</td>
-                  <td><span className="badge bmu">{humanize(c.entityType)}</span></td>
-                  <td className="mono" style={{color:'var(--amber)',fontWeight:600}}>{formatCurrency(c.ytdPaid)}</td>
-                  <td>{c.w9OnFile?<span className="badge bg2">✓ On File</span>:<span className="badge br">Missing</span>}</td>
-                  <td><span className={c.w9OnFile?'badge bg2':'badge ba'}>{c.w9OnFile?'Ready to File':'Needs W-9'}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {employees.length>0&&(
-        <div className="card">
-          <div className="ct">W-2 Employee YTD Summary ({year})</div>
-          <table className="tbl">
-            <thead><tr><th>Employee</th><th>YTD Gross</th><th>Federal W/H</th><th>State</th><th>SS</th><th>Medicare</th><th>Net Pay</th></tr></thead>
-            <tbody>
-              {employees.map((e:any,i:number)=>(
-                <tr key={i}>
-                  <td style={{fontWeight:600,color:'var(--t0)'}}>{e.firstName} {e.lastName}</td>
-                  <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(e.ytdGross)}</td>
-                  <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(e.ytdFederalTax)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdStateTax)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdSs)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdMedicare)}</td>
-                  <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(e.ytdNet)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   )
 }
 
 // ── RENT ROLL ─────────────────────────────────────────────────────────
 function RentRoll(){
-  const[basis,setBasis]=useBasis()
-  const{data,isLoading,error}=useQuery(['rent-roll',basis],()=>get<any>(`/books/rent-roll?basis=${basis}`))
+  // 10/11: a bookkeeper's rent roll carries no tenant contact or bank details
+  // (the server leaves them out), so it has no ACH column.
+  const{user}=useAuth()
+  const showAch=user?.role!=='bookkeeper'
+  const{data,isLoading,error}=useQuery(['rent-roll'],()=>get<any>('/books/rent-roll'))
   const units=(data as any)?.units||[]
+  // 10/12 (Nic): lease start and end dates — a bookkeeper's only when the owner
+  // ticked "Show lease start and end dates" for them (the server says which).
+  const showLease=(data as any)?.showLeaseDates===true
+  const leaseDay=(d:string|null|undefined)=>d?new Date(String(d).slice(0,10)+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'—'
   const occupied=units.filter((u:any)=>u.status!=='vacant')
   // S604/S616: an owner-use space is occupied but pays no rent, and a utility
   // service point is a neighbor's building — neither is expected rent. The
@@ -2112,26 +483,24 @@ function RentRoll(){
   // so the rows add up to the total instead of showing a gap nobody owes
   // (lib/booksMoney: earnsRent, rentRollVariance).
   const payers=rentPayers(units)
-  // S655: THIS month's bills only. Money received: what arrived this month
-  // toward bills due this month or earlier. Money billed: what has been
-  // collected so far of this month's bills.
-  const colLabel=basis==='billed'?'Collected so far':'Received this month'
-
+  // S655: THIS month's bills only. 10/12 (Nic): no Money received / Money
+  // billed switch — side by side, Received leading: what arrived this month
+  // toward bills due this month or earlier, what this month's bills charged,
+  // and what is still owed of them. Variance stays Received less expected rent.
+  const colLabel=`${MONEY_COLUMN_LABEL.received} this month`
   return(
     <div>
       <div className="ph">
         <div><h1 className="pt">🏘 Rent Roll</h1><p className="ps">Live sync from GAM · {units.length} units</p></div>
         <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-          <BasisSwitch basis={basis} onChange={setBasis}/>
           <span className="badge bteal">Live Data</span>
         </div>
       </div>
-      <BasisNote basis={basis}/>
       {!!error&&<div className="alert aw">{loadErrorText(error,'Could not load the rent roll.')}</div>}
 
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Expected Rent (MTD)</div><div className="kv gold">{formatCurrency((data as any)?.totalExpected||0)}</div><div className="ks">payable across {payers.length} of {occupied.length} occupied units</div></div>
-        <div className="kpi"><div className="kl">{colLabel}</div><div className="kv g">{formatCurrency((data as any)?.totalCollected||0)}</div><div className="ks">{basis==='billed'?"Of this month's bills":"Toward this month's bills and older"}</div></div>
+        <div className="kpi"><div className="kl">{colLabel}</div><div className="kv g">{formatCurrency((data as any)?.totalCollected||0)}</div><div className="ks">Toward this month's bills and older · {MONEY_COLUMN_LABEL.charged} {formatCurrency((data as any)?.totalCharged||0)} · {MONEY_COLUMN_LABEL.owed} {formatCurrency((data as any)?.totalOwed||0)}</div></div>
         <div className="kpi"><div className="kl">Variance</div><div className={`kv ${((data as any)?.variance||0)>=0?'g':'r'}`}>{formatCurrency((data as any)?.variance||0)}</div><div className="ks">{colLabel} minus expected rent</div></div>
         <div className="kpi"><div className="kl">Occupancy Rate</div><div className="kv b">{(((data as any)?.occupancyRate||0)*100).toFixed(0)}%</div><div className="ks">{occupied.length}/{units.length} units</div></div>
       </div>
@@ -2139,7 +508,7 @@ function RentRoll(){
       <div className="card" style={{padding:0}}>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
           <table className="tbl">
-            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>{colLabel}</th><th>Variance</th><th>Status</th><th>ACH</th></tr></thead>
+            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th>{showLease&&<th>Lease</th>}<th>Rent</th><th>{colLabel}</th><th>{MONEY_COLUMN_LABEL.charged}</th><th>{MONEY_COLUMN_LABEL.owed}</th><th>Variance</th><th>Status</th>{showAch&&<th>ACH</th>}</tr></thead>
             <tbody>
               {units.length?units.map((u:any)=>{
                 const variance=rentRollVariance(u)
@@ -2148,220 +517,21 @@ function RentRoll(){
                     <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{u.unitNumber}</td>
                     <td style={{fontSize:'.75rem'}}>{u.propertyName}</td>
                     <td style={{fontSize:'.75rem'}}>{u.tenantFirst?u.tenantFirst+' '+u.tenantLast:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
+                    {showLease&&<td style={{fontSize:'.72rem',whiteSpace:'nowrap'}}>{u.leaseStartDate?`${leaseDay(u.leaseStartDate)} – ${u.leaseEndDate?leaseDay(u.leaseEndDate):'month to month'}`:'—'}</td>}
                     <td className="mono">{formatCurrency(u.rentAmount)}</td>
                     <td className="mono" style={{color:'var(--green)'}}>{+u.collectedMtd>0?formatCurrency(u.collectedMtd):'—'}</td>
+                    <td className="mono">{+u.chargedMtd?formatCurrency(u.chargedMtd):'—'}</td>
+                    <td className="mono" style={{color:+u.owedMtd?'var(--amber)':'var(--t3)'}}>{+u.owedMtd?formatCurrency(u.owedMtd):'—'}</td>
                     <td className="mono" style={{color:variance==null?'var(--t3)':variance>=0?'var(--green)':'var(--red)'}}>{variance==null?'—':formatCurrency(variance)}</td>
                     <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{(UNIT_STATUS_LABEL as Record<string,string>)[u.status]??humanize(u.status)}</span></td>
-                    <td>{u.achVerified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                    {showAch&&<td>{u.achVerified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>}
                   </tr>
                 )
-              }):<tr><td colSpan={8}><div className="empty">No units found.</div></td></tr>}
+              }):<tr><td colSpan={9+(showAch?1:0)+(showLease?1:0)}><div className="empty">No units found.</div></td></tr>}
             </tbody>
           </table>
         )}
       </div>
-    </div>
-  )
-}
-
-// ── P&L REPORT ────────────────────────────────────────────────────────
-function ProfitLoss(){
-  const now=new Date()
-  const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
-  const[endDate,setEndDate]=useState(localToday(now))
-  const[basis,setBasis]=useBasis()
-  const{data,isLoading,error}=useQuery(['pl',startDate,endDate,basis],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}&basis=${basis}`))
-
-  const income=(data as any)?.income||[]
-  const expenses=(data as any)?.expenses||[]
-  const totalIncome=(data as any)?.totalIncome||0
-  const totalExpenses=(data as any)?.totalExpenses||0
-  const netIncome=(data as any)?.netIncome||0
-  const gamRent=(data as any)?.gamRentIncome||0
-  // S655: the GAM P&L — the landlord reports' own, under the switch. Its lines
-  // (rent, fees, utilities, paid ahead, register sales, credits given, ...)
-  // add up to its total; its expenses are GAM's platform fee, maintenance, lot
-  // rent and expenses entered in GAM.
-  const gamPL=(data as any)?.gamPL
-  const gamLines:any[]=gamPL?.lineItems??[]
-  const gamBeside:any[]=gamPL?.besideItems??[]
-  // Money billed: collected so far, still clearing and still owed are what
-  // became of the bills — they add up to the total, and still owed is INSIDE
-  // it — so they are shown as that, never as "beside the total". Money
-  // received: the paid-ahead money on hand already counted on the day it
-  // arrived, so it is shown on its own line, never as "beside the total"
-  // (lib/booksMoney: splitBeside).
-  const{outcome:gamOutcome,aside:gamAside,onHand:gamPaidAhead}=splitBeside(gamBeside,basis)
-  const word=INCOME_BASIS_LABEL[basis]
-  // The switch only changes GAM's landlord income; a business's books have none.
-  const{user}=useAuth()
-  const isBusiness=user?.role==='business_owner'||user?.role==='business_staff'
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">📈 Profit & Loss</h1><p className="ps">Income statement · {new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-          {!isBusiness&&<BasisSwitch basis={basis} onChange={setBasis}/>}
-          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-          <span style={{color:'var(--t3)'}}>to</span>
-          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
-        </div>
-      </div>
-      {!isBusiness&&<BasisNote basis={basis}/>}
-      {/* 10/11: a refused report says why — never "$0.00 Profitable" under it. */}
-      {!!error?<div className="alert aw">{loadErrorText(error,'Could not load the profit and loss.')}</div>:<>
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Ledger Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{income.length} income accounts</div></div>
-        {!isBusiness&&<div className="kpi"><div className="kl">GAM Income · {word}</div><div className="kv gold">{formatCurrency(gamRent)}</div><div className="ks">From your GAM properties</div></div>}
-        <div className="kpi"><div className="kl">Ledger Expenses</div><div className="kv r">{formatCurrency(totalExpenses)}</div><div className="ks">{expenses.length} expense accounts</div></div>
-        <div className="kpi"><div className="kl">Ledger Net Income</div><div className={`kv ${netIncome>=0?'g':'r'}`}>{formatCurrency(netIncome)}</div><div className="ks">{netIncome>=0?'Profitable':'Loss'}</div></div>
-      </div>
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-        <div className="grid2">
-          <div>
-            {(gamPL||gamRent!==0)&&(
-              <div className="card" style={{marginBottom:12}}>
-                <div className="ct">🏘 GAM income · {word}</div>
-                {gamLines.length?gamLines.map((l:any)=>(
-                  <div key={l.line} className="dr"><span className="dk">{l.label}</span><span className="dv mono" style={{color:Number(l.amount)<0?'var(--red)':'var(--teal)'}}>{formatCurrency(l.amount)}</span></div>
-                )):<div className="dr"><span className="dk">GAM income</span><span className="dv mono" style={{color:'var(--teal)'}}>{formatCurrency(gamRent)}</span></div>}
-                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total GAM income</span><span className="dv mono" style={{color:'var(--teal)',fontWeight:700}}>{formatCurrency(gamRent)}</span></div>
-                {gamPaidAhead&&(
-                  <div className="dr dr-sub"><span className="dk">{gamPaidAhead.label} — {PAID_AHEAD_COUNTED_NOTE}</span><span className="dv mono">{formatCurrency(gamPaidAhead.amount)}</span></div>
-                )}
-                {gamOutcome.length>0&&(
-                  <div style={{marginTop:6,marginBottom:4}}>
-                    <div className="dk" style={{fontSize:'.68rem',textTransform:'uppercase',letterSpacing:'.06em',color:'var(--t3)'}}>What became of the bills</div>
-                    {gamOutcome.map((b:any)=>(
-                      <div key={b.key} className="dr dr-sub"><span className="dk">{b.label}</span><span className="dv mono">{formatCurrency(b.amount)}</span></div>
-                    ))}
-                  </div>
-                )}
-                {gamPL?.expenses&&(<>
-                  <div className="dr"><span className="dk">GAM platform fee</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.platformFee||0)})</span></div>
-                  {!!Number(gamPL.expenses.maintenance)&&<div className="dr"><span className="dk">Maintenance</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.maintenance)})</span></div>}
-                  {!!Number(gamPL.expenses.lotRent)&&<div className="dr"><span className="dk">Lot rent</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.lotRent)})</span></div>}
-                  {!!Number(gamPL.expenses.enteredExpenses)&&<div className="dr"><span className="dk">Expenses entered in GAM</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(gamPL.expenses.enteredExpenses)})</span></div>}
-                  <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>GAM net</span><span className="dv mono" style={{color:Number(gamPL.net)>=0?'var(--green)':'var(--red)',fontWeight:700}}>{formatCurrency(gamPL.net||0)}</span></div>
-                </>)}
-                {gamAside.length>0&&(
-                  <div style={{marginTop:8,paddingTop:6,borderTop:'1px dashed var(--b1)'}}>
-                    {gamAside.map((b:any)=>(
-                      <div key={b.key} className="dr"><span className="dk">{b.label} (beside the total)</span><span className="dv mono">{formatCurrency(b.amount)}</span></div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            <div className="card" style={{marginBottom:12}}>
-              <div className="ct">Ledger income accounts</div>
-              {income.map((a:any)=>(
-                <div key={a.code} className="dr">
-                  <span className="dk">{a.code} · {a.name}</span>
-                  <span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(a.periodAmount)}</span>
-                </div>
-              ))}
-              {income.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No ledger income recorded. Post journal entries or transactions.</div>}
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Ledger Income</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--green)',fontSize:'1rem'}}>{formatCurrency(totalIncome)}</span>
-              </div>
-            </div>
-
-            <div className="card">
-              <div className="ct">Expenses</div>
-              {expenses.map((a:any)=>(
-                <div key={a.code} className="dr">
-                  <span className="dk">{a.code} · {a.name}</span>
-                  <span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(a.periodAmount)}</span>
-                </div>
-              ))}
-              {expenses.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No expenses recorded.</div>}
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Expenses</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalExpenses)}</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="card" style={{alignSelf:'start'}}>
-            <div className="ct">Ledger Net Income Summary</div>
-            <div className="dr"><span className="dk">Total Ledger Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(totalIncome)}</span></div>
-            <div className="dr"><span className="dk">Total Ledger Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(totalExpenses)})</span></div>
-            <div style={{borderTop:'2px solid var(--b1)',marginTop:12,paddingTop:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET INCOME</span>
-              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:netIncome>=0?'var(--green)':'var(--red)'}}>{formatCurrency(netIncome)}</span>
-            </div>
-            <div style={{marginTop:16,padding:'12px',background:'var(--bg3)',borderRadius:8,fontSize:'.72rem',color:'var(--t3)',lineHeight:1.6}}>
-              <strong style={{color:'var(--t2)'}}>Note:</strong> Net income here is your ledger: the journal entries and transactions posted to your income and expense accounts. GAM income is shown on its own, from your GAM properties, and is not added into the ledger totals.
-            </div>
-          </div>
-        </div>
-      )}
-      </>}
-    </div>
-  )
-}
-
-// ── BALANCE SHEET ─────────────────────────────────────────────────────
-function BalanceSheet(){
-  const{data,isLoading}=useQuery('balance-sheet',()=>get<any>('/books/reports/balance-sheet'))
-  const assets=(data as any)?.assets||[]
-  const liabilities=(data as any)?.liabilities||[]
-  const equity=(data as any)?.equity||[]
-  const totalAssets=(data as any)?.totalAssets||0
-  const totalLiabilities=(data as any)?.totalLiabilities||0
-  const totalEquity=(data as any)?.totalEquity||0
-  const balanced=(data as any)?.balances
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">⚖ Balance Sheet</h1><p className="ps">As of {new Date().toLocaleDateString()}</p></div>
-        {balanced!==undefined&&<span className={`badge ${balanced?'bg2':'br'}`}>{balanced?'✓ Balanced':'⚠ Out of Balance'}</span>}
-      </div>
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
-        <div className="grid2">
-          <div>
-            <div className="card" style={{marginBottom:12}}>
-              <div className="ct">Assets</div>
-              {assets.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
-              {assets.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No asset accounts with balances.</div>}
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Assets</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--blue)',fontSize:'1rem'}}>{formatCurrency(totalAssets)}</span>
-              </div>
-            </div>
-          </div>
-          <div>
-            <div className="card" style={{marginBottom:12}}>
-              <div className="ct">Liabilities</div>
-              {liabilities.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
-              {liabilities.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No liability accounts with balances.</div>}
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liabilities</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalLiabilities)}</span>
-              </div>
-            </div>
-            <div className="card">
-              <div className="ct">Equity</div>
-              {equity.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
-              {equity.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No equity accounts with balances.</div>}
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Equity</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--gold)',fontSize:'1rem'}}>{formatCurrency(totalEquity)}</span>
-              </div>
-              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
-                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liabilities + Equity</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:balanced?'var(--green)':'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalLiabilities+totalEquity)}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -2493,18 +663,11 @@ function CompanyGate({children}:{children:React.ReactNode}){
 function MyClients(){
   const{user,activeClientId,setActiveClient}=useAuth()
   const isAdmin=user?.role==='admin'||user?.role==='super_admin'
-  const{data:clients=[],isLoading,refetch}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'))
+  const{data:clients=[],isLoading}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'))
   const{data:allBookkeepers=[]}=useQuery('all-bk',()=>get<any[]>('/books/bookkeeper/all'),{enabled:isAdmin})
-  const qc=useQueryClient()
-
-  const revoke=async(bookkeeperUserId:string,landlordId:string)=>{
-    if(!(await appConfirm('Revoke this bookkeeper access?', { danger: true, confirmLabel: 'Revoke' })))return
-    await del('/books/bookkeeper/revoke')
-    // Note: delete with body — use post pattern
-    await api.delete('/books/bookkeeper/revoke',{data:{bookkeeperUserId,landlordId}})
-    qc.invalidateQueries('bk-clients')
-    refetch()
-  }
+  // 10/11: the admin "Revoke" button is gone. It sent DELETE twice (once with
+  // no body) and could never be reached: admins are refused at Books sign-in
+  // (ALLOWED_ROLES, S568). Owners remove a bookkeeper on their Team page.
 
   return(
     <div>
@@ -2533,13 +696,16 @@ function MyClients(){
                 <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
                   <h3 style={{color:'var(--t0)',fontSize:'1rem'}}>{cl.businessName||cl.firstName+' '+cl.lastName}</h3>
                   {activeClientId===cl.landlordId&&<span className="badge bgold">Active</span>}
-                  <span className={cl.status==='active'?'badge bg2':'badge br'}>{cl.status}</span>
+                  <span className={cl.status==='active'?'badge bg2':'badge br'}>{humanize(cl.status)}</span>
                 </div>
                 <div style={{display:'flex',gap:20,fontSize:'.75rem',color:'var(--t3)',flexWrap:'wrap'}}>
                   <span>👤 {cl.firstName} {cl.lastName} ({cl.email})</span>
-                  <span>👥 {cl.employeeCount} employees</span>
-                  <span>🔧 {cl.contractorCount} contractors</span>
-                  <span>▶ {cl.payrollRunCount} payroll runs</span>
+                  {/* 10/12 (Nic): payroll is in the company-wide box (BK1: or the ledger box); the server sends its counts only with one. */}
+                  {cl.employeeCount!=null?<>
+                    <span>👥 {cl.employeeCount} employees</span>
+                    <span>🔧 {cl.contractorCount} contractors</span>
+                    <span>▶ {cl.payrollRunCount} payroll runs</span>
+                  </>:<span>Property books only</span>}
                   <span>📅 Since {new Date(cl.accessSince).toLocaleDateString()}</span>
                 </div>
               </div>
@@ -2547,7 +713,6 @@ function MyClients(){
                 <button className="btn bp bsm" onClick={()=>setActiveClient(cl.landlordId,cl.businessName||cl.firstName+' '+cl.lastName)}>
                   {activeClientId===cl.landlordId?'✓ Active':'Switch To'}
                 </button>
-                {isAdmin&&<button className="btn bd bsm" onClick={()=>revoke('',cl.landlordId)}>Revoke</button>}
               </div>
             </div>
           </div>
@@ -2575,21 +740,6 @@ function MyClients(){
         </div>
       )}
 
-    </div>
-  )
-}
-
-// ── STUB ──────────────────────────────────────────────────────────────
-function ComingSoon({title,icon,description}:{title:string;icon:string;description:string}){
-  return(
-    <div>
-      <div className="ph"><div><h1 className="pt">{icon} {title}</h1><p className="ps">{description}</p></div></div>
-      <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
-        <div style={{fontSize:'3rem',marginBottom:16}}>{icon}</div>
-        <h2 style={{color:'var(--t0)',marginBottom:8}}>{title}</h2>
-        <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:420,margin:'0 auto 20px'}}>Coming in the next session.</p>
-        <span className="badge bteal">In Development</span>
-      </div>
     </div>
   )
 }
@@ -2750,25 +900,29 @@ function App(){
   if(loading)return<div className="loading-pg"><span className="spinner" style={{marginRight:10}}/>Loading GAM Books…</div>
   const authed=!!user&&ALLOWED_ROLES.includes(user.role)
   // 10/11: a bookkeeper opens on money in; everyone else on the dashboard.
-  const home=user?.role==='bookkeeper'?'/financials/income':'/dashboard'
+  const home=user?.role==='bookkeeper'?'/financials/income':BOOKS_PATHS.dashboard
   return(
     <Routes>
       <Route path="/login" element={authed?<Navigate to={home} replace/>:<LoginPage/>}/>
       <Route path="/" element={authed?<Layout/>:<Navigate to="/login" replace/>}>
         <Route index element={<Navigate to={home} replace/>}/>
-        <Route path="dashboard"          element={<Dashboard/>}/>
+        <Route path={BOOKS_PATHS.dashboard}       element={<BooksDashboardPage/>}/>
         <Route path="clients"            element={<MyClients/>}/>
-        <Route path="payroll/employees"  element={<Employees/>}/>
-        <Route path="payroll/contractors" element={<Contractors/>}/>
-        <Route path="payroll/vendors"    element={<Vendors/>}/>
-        <Route path="payroll/runs"       element={<RunPayroll/>}/>
-        <Route path="payroll/history"    element={<PayHistory/>}/>
-        <Route path="payroll/tax-forms"  element={<ComingSoon title="Tax Forms" icon="📋" description="W-2s, 1099-NECs, 940, 941, state-specific forms"/>}/>
-        <Route path="books/accounts"     element={<ChartOfAccounts/>}/>
-        <Route path="books/journal"      element={<JournalEntries/>}/>
-        <Route path="books/transactions" element={<Transactions/>}/>
-        <Route path="books/reconcile"    element={<BankReconcile/>}/>
-        <Route path="rent-roll"          element={user?.role==='bookkeeper'?<Navigate to="/financials/income" replace/>:<RentRoll/>}/>
+        <Route path={BOOKS_PATHS.employees}       element={<EmployeesPage/>}/>
+        <Route path={BOOKS_PATHS.contractors}     element={<ContractorsPage/>}/>
+        <Route path={BOOKS_PATHS.vendors}         element={<VendorsPage/>}/>
+        <Route path={BOOKS_PATHS.loans}           element={<LoansPage/>}/>
+        <Route path={BOOKS_PATHS.fixedAssets}     element={<FixedAssetsPage/>}/>
+        <Route path={BOOKS_PATHS.runPayroll}      element={<RunPayrollPage/>}/>
+        <Route path={BOOKS_PATHS.payHistory}      element={<PayHistoryPage/>}/>
+        <Route path={BOOKS_PATHS.taxForms}        element={<TaxFormsPage/>}/>
+        <Route path={BOOKS_PATHS.accounts}        element={<ChartOfAccountsPage/>}/>
+        <Route path={BOOKS_PATHS.journal}         element={<JournalEntriesPage/>}/>
+        <Route path={BOOKS_PATHS.transactions}    element={<TransactionsPage/>}/>
+        <Route path={BOOKS_PATHS.reconcile}       element={<BankReconcilePage/>}/>
+        <Route path={BOOKS_PATHS.closeMonth}      element={<CloseMonthPage/>}/>
+        {/* 10/11 (Nic): open to a bookkeeper again (names in, contact details out). */}
+        <Route path="rent-roll"          element={<RentRoll/>}/>
         {/* 10/11: was a "coming soon" placeholder; the payouts are real now. */}
         <Route path="disbursements"      element={<Navigate to="/financials/payouts" replace/>}/>
         <Route path="financials" element={<FinancialsHost/>}>
@@ -2780,16 +934,22 @@ function App(){
           <Route path="bank-activity"     element={<BankActivityPage/>}/>
           <Route path="payouts"           element={<PayoutsPage/>}/>
         </Route>
-        <Route path="bills"              element={<BillsAP/>}/>
-        <Route path="reports/pl"              element={<ProfitLoss/>}/>
-        <Route path="reports/balance-sheet"   element={<BalanceSheet/>}/>
-        <Route path="reports/cash-flow"       element={<CashFlow/>}/>
-        <Route path="reports/owner-statements" element={<OwnerStatements/>}/>
-        <Route path="tax"                element={<TaxCenter/>}/>
+        <Route path={BOOKS_PATHS.bills}           element={<BillsPage/>}/>
+        <Route path={BOOKS_PATHS.profitLoss}      element={<ProfitLossPage/>}/>
+        <Route path={BOOKS_PATHS.balanceSheet}    element={<BalanceSheetPage/>}/>
+        <Route path={BOOKS_PATHS.trialBalance}    element={<TrialBalancePage/>}/>
+        <Route path={BOOKS_PATHS.generalLedger}   element={<GeneralLedgerPage/>}/>
+        <Route path={BOOKS_PATHS.cashFlow}        element={<CashFlowPage/>}/>
+        <Route path={BOOKS_PATHS.ownerStatements} element={<OwnerStatementsPage/>}/>
+        <Route path={BOOKS_PATHS.taxCenter}       element={<TaxCenterPage/>}/>
+        <Route path={BOOKS_PATHS.booksSettings}   element={<BooksSettingsPage/>}/>
+        <Route path={BOOKS_PATHS.openingBalances} element={<OpeningBalancesPage/>}/>
+        <Route path={BOOKS_PATHS.categories}      element={<CategoriesPage/>}/>
         <Route path="admin/companies"    element={<ComingSoon title="All Companies" icon="🏢" description="Platform-wide books view"/>}/>
         <Route path="admin/audit"        element={<ComingSoon title="Audit Log" icon="🔍" description="Full audit trail for all entries"/>}/>
       </Route>
-      <Route path="*" element={<Navigate to={authed?'/dashboard':'/login'} replace/>}/>
+      {/* 10/11: an unknown address goes to the person's own home — a bookkeeper's is money in. */}
+      <Route path="*" element={<Navigate to={authed?home:'/login'} replace/>}/>
     </Routes>
   )
 }

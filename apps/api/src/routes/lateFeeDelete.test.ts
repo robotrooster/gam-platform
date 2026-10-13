@@ -53,6 +53,7 @@ import { errorHandler } from '../middleware/errorHandler'
 import { confirmDepositMatch, undoDepositMatch, reverseLateFees } from '../services/bankDepositConfirm'
 import { matchRecordedDeposit } from '../services/recordedDepositMatch'
 import { BANK_SHOWS_LATE_FEE_NOTE } from '../services/lateFeeCredit'
+import { restoreDeletedLateFees } from '../services/lateFeeDelete'
 import { createIssuedCredit, applyCredit, holdCredit } from '../services/creditUse'
 import { generateLateFeesForInvoice } from '../jobs/lateFees'
 import {
@@ -109,8 +110,8 @@ async function stack(o: { onboarding: boolean; partial?: boolean }): Promise<Sta
 /** A $600 rent bill due ten days ago (written that day) with a $25 late fee charged five days after the due date, posted then. */
 async function lateBill(s: Stack, o: { feeSettled?: boolean; noFee?: boolean } = {}) {
   const inv = (await db.query<{ id: string }>(
-    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-     VALUES ($1, $2, $3, $4, $5, (NOW() AT TIME ZONE $6)::date - 10, 600, 600, 'pending') RETURNING id`,
+    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, (NOW() AT TIME ZONE $6)::date - 10, 600, 600, 'pending', NOW() - interval '10 days') RETURNING id`,
     [s.landlordId, s.tenantId, s.leaseId, s.unitId, `INV-${randomUUID().slice(0, 8)}`, TZ])).rows[0].id
   const rentId = (await db.query<{ id: string }>(
     `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, created_at)
@@ -147,10 +148,20 @@ const lateFeeCredits = async (feeId: string) => (await db.query<any>(
     ORDER BY u.id`, [feeId])).rows
 const credits = async (tenantId: string) => (await db.query<any>(
   `SELECT amount_original::float AS amount, category, status FROM tenant_credits WHERE tenant_id = $1 ORDER BY created_at`, [tenantId])).rows
+/**
+ * 10/12 (Nic): "one mark per invoice" — the live mark of the BILL a row is on,
+ * and the day the bill was paid in full (the day the mark counts from).
+ */
 const marksOn = async (id: string) => (await db.query<{ event_type: string; paid_on: string }>(
-  `SELECT event_type, to_char((event_data->>'paid_at')::timestamptz AT TIME ZONE $2, 'YYYY-MM-DD') AS paid_on
-     FROM credit_events WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1
-      AND superseded_by IS NULL`, [id, TZ])).rows
+  `SELECT e.event_type, e.event_data->>'paid_in_full_on' AS paid_on
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [id])).rows
+/** The bill mark of the bill a row is on (live, or every one with `all`). */
+const billMarkOf = async (id: string, all = false) => (await db.query<{ id: string; event_data: any; superseded_by: string | null }>(
+  `SELECT e.id, e.event_data, e.superseded_by
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND ($2::boolean OR e.superseded_by IS NULL)
+    ORDER BY e.recorded_at, e.id`, [id, all])).rows
 const LATE = /^payment_received_late_(minor|major|severe)$/
 /** The rent counts LATE, once, from today (the day it was recorded). */
 async function lateFromToday(rentId: string) {
@@ -313,8 +324,7 @@ describe('A. a never-owed late fee is credited — the fee stays, the bill nets 
       expect(await lateFeeCredits(b.feeId!)).toEqual([])
       expect((await db.query(`SELECT 1 FROM audit_log WHERE action = 'late_fee_deleted'`)).rowCount).toBe(0)
       expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
-      expect((await db.query<any>(`SELECT event_data FROM credit_events WHERE event_data->>'payment_id' = $1`, [b.rentId])).rows[0].event_data)
-        .toMatchObject({ bank_validated: true })
+      expect((await billMarkOf(b.rentId))[0].event_data).toMatchObject({ bank_validated: true })
       expect((await db.query<any>(`SELECT status FROM invoices WHERE id = $1`, [b.invoiceId])).rows[0].status).toBe('settled')
       // The tenant's own history says why it is $0.00, in words.
       const mine = await request(app()).get('/api/tenants/payments')
@@ -336,7 +346,7 @@ describe('A. a never-owed late fee is credited — the fee stays, the bill nets 
     expect(await row(b.feeId!)).toMatchObject({ amount: 25, credited: 25 })
   })
 
-  it('undoing a bank match puts the zeroed fee back exactly: owed again at $25, no credit anywhere, no mark left', async () => {
+  it('undoing a bank match puts the zeroed fee back exactly: owed again at $25, no credit anywhere, the bill marked for what it is now', async () => {
     const s = await stack({ onboarding: false })
     const b = await lateBill(s)
     const before = await row(b.feeId!)
@@ -349,7 +359,9 @@ describe('A. a never-owed late fee is credited — the fee stays, the bill nets 
     expect(await row(b.rentId)).toMatchObject({ status: 'pending' })
     expect(await lateFeeCredits(b.feeId!)).toEqual([])
     expect(await credits(s.tenantId)).toEqual([])
-    expect(await marksOn(b.rentId)).toEqual([])
+    // 10/12 ("one mark per invoice"): the on-time mark the match gave the bill is
+    // corrected to what the bill is now — owed again, past its grace period.
+    expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_skipped', paid_on: null }])
     expect((await db.query<any>(`SELECT status FROM invoices WHERE id = $1`, [b.invoiceId])).rows[0].status).not.toBe('settled')
   })
 
@@ -415,6 +427,28 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     expect(LATE_FEE_DELETED_LANDLORD_TEXT).toBe('The late fee was deleted — nothing shows on their record.')
   })
 
+  it('10/12 (Nic) review: a fee deleted before a column was added comes back with that column\'s default, never a refused Undo', async () => {
+    const s = await stack({ onboarding: true })
+    const b = await lateBill(s)
+    const res = await record(s, b.rentId, {
+      method: 'bank_deposit', amountTendered: 600, reference: 'DEP-OLD', depositedOn: b.dueDay, deleteOnboardingLateFees: true,
+    })
+    expect(res.body.data).toMatchObject({ lateFeesDeleted: 1 })
+    // What a fee deleted before payments.work_trade_credit existed has on record: no such key.
+    await db.query(
+      `UPDATE audit_log SET old_value = old_value - 'work_trade_credit' - 'work_trade_settlement_id'
+        WHERE action = 'late_fee_deleted' AND old_value->>'id' = $1`, [b.feeId])
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const back = await restoreDeletedLateFees(c, { paymentIds: [b.feeId!], invoiceIds: [b.invoiceId], restoredBy: s.ownerUserId })
+      expect(back).toEqual([b.feeId])
+      const f = (await c.query<any>(`SELECT amount::float AS amount, status, work_trade_credit::float AS wtc FROM payments WHERE id = $1`, [b.feeId])).rows[0]
+      expect(f).toEqual({ amount: 25, status: 'pending', wtc: 0 })
+      await c.query('ROLLBACK')
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e } finally { c.release() }
+  })
+
   it('only the owner or a property manager may tick it — the front desk is refused and nothing is recorded', async () => {
     const s = await stack({ onboarding: true })
     const b = await lateBill(s)
@@ -464,8 +498,7 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     await handLogged(s, b)
     await lateFromToday(b.rentId)
     const [lfc] = await lateFeeCredits(b.feeId!)
-    const lateMark = (await db.query<{ id: string }>(
-      `SELECT id FROM credit_events WHERE event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [b.rentId])).rows[0].id
+    const lateMark = (await billMarkOf(b.rentId))[0].id
 
     // The line says it can be deleted — to the owner, not to the front desk.
     const desk = await staff(s, 'onsite_manager')
@@ -495,9 +528,9 @@ describe('B. onboarding month: deleted only when the landlord chooses', () => {
     // The late mark is superseded (never edited) by the mark from the deposit's date.
     expect(await marksOn(b.rentId)).toEqual([{ event_type: 'payment_received_on_time', paid_on: b.dueDay }])
     const old = (await db.query<any>(`SELECT superseded_by, superseded_reason FROM credit_events WHERE id = $1`, [lateMark])).rows[0]
-    expect(old.superseded_reason).toBe('data_entry_error_corrected')
+    expect(old.superseded_reason).toBe('bill_status_changed')
     expect((await db.query<any>(`SELECT event_data FROM credit_events WHERE id = $1`, [old.superseded_by])).rows[0].event_data)
-      .toMatchObject({ corrects_event_id: lateMark, late_fee_deleted: true })
+      .toMatchObject({ corrects_event_id: lateMark, stamp: 'paid_on_time' })
   })
 
   it('"Delete this late fee" also takes a fee the code before 10/6 zeroed', async () => {

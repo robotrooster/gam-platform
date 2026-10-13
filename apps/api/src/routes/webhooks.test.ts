@@ -606,16 +606,13 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
     const due = (await db.query<{ d: string }>(
       `SELECT due_date::text AS d FROM payments WHERE id = $1`, [paymentId!])).rows[0].d
 
-    vi.mocked(emitPaymentSettledEvent).mockClear()
     const res = await request(buildApp())
       .post('/webhooks/stripe').set('Content-Type', 'application/json').set('stripe-signature', 't=1,v1=stub')
       .send(buildPaymentIntentSucceeded({ paymentIntentId: 'pi_rent_tz_1', paymentMethod: 'us_bank_account' }))
     expect(res.status).toBe(200)
 
-    expect(vi.mocked(emitPaymentSettledEvent)).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(emitPaymentSettledEvent).mock.calls[0][1]).toMatchObject({
-      paymentId: paymentId!, dueDate: due, propertyTz: tz,
-    })
+    // 10/12 (Nic): "one mark per invoice" — the settle judges the bill the rent
+    // is on (here a charge on no invoice: a bill of its own), on the property's calendar.
     const ev = await db.query<{ event_type: string; event_data: any }>(
       `SELECT ce.event_type, ce.event_data FROM credit_events ce
          JOIN credit_subjects cs ON cs.id = ce.subject_id
@@ -623,6 +620,7 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
     expect(ev.rows).toHaveLength(1)
     expect(ev.rows[0].event_type).toBe('payment_received_on_time')
     expect(ev.rows[0].event_data.due_date).toBe(due)
+    expect(ev.rows[0].event_data.payment_ids).toEqual([paymentId!])
   })
 })
 
@@ -729,8 +727,10 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
          JOIN credit_subjects cs ON cs.id = ce.subject_id
         WHERE cs.subject_ref_id IS NOT NULL`
     )
+    // 10/12 (Nic): "one mark per invoice" — a failed payment is no longer a
+    // mark of its own; its bill's mark shows what came of it.
     expect(events.rows.map((r) => r.event_type))
-      .toContain('payment_failed_nsf')
+      .not.toContain('payment_failed_nsf')
 
     // S654: the due day goes to the ledger as a calendar date, not a Date.
     const due = (await db.query<{ d: string }>(

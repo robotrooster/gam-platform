@@ -6,7 +6,7 @@ import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Chec
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { toast, appConfirm, appPrompt, appChoose } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
 import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
@@ -962,12 +962,30 @@ export function SchedulePage() {
   }
   const avoidedWords = (b: any, unitNumber: string) =>
     `${(b?.guestName || '').trim() || 'This guest'} asked not to be on ${unitNumber}.`
+  // 10/12 (Nic, G6): a shorter stay past rent a payment was tried on — the
+  // landlord chooses here, at the moment: take those charges off (anything
+  // paid on them goes back to the guest as credit), or keep them owed. The
+  // change is sent again with the answer; Cancel saves nothing.
+  const askShortenedIf = (e: any, resend: (choice: string) => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'stay_shortened_attempted') return false
+    const labels = body?.choices ?? {}
+    appChoose(body.error, {
+      title: 'Rent a payment was tried on',
+      choices: [
+        { value: 'void', label: labels.void ?? 'Take those charges off' },
+        { value: 'keep', label: labels.keep ?? 'Keep them owed' },
+      ],
+    }).then(choice => { if (choice) resend(choice) })
+    return true
+  }
 
   const moveBookingMut = useMutation(
-    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean}) =>
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
         unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
         ...(payload.overrideAvoided ? { overrideAvoided: true } : {}),
+        ...(payload.pastEndAttempted ? { pastEndAttempted: payload.pastEndAttempted } : {}),
       }),
     {
       // 10/5 (M3): a drag that made the stay need a background check says what was sent.
@@ -976,6 +994,7 @@ export function SchedulePage() {
         if (takeLatestIfChanged(e)) return
         if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
         if (askAvoidedIf(e, () => moveBookingMut.mutate({ ...payload, overrideAvoided: true }))) return
+        if (askShortenedIf(e, (choice) => moveBookingMut.mutate({ ...payload, pastEndAttempted: choice }))) return
         toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
       }
     }
@@ -1085,7 +1104,7 @@ export function SchedulePage() {
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
   const editBookingMut = useMutation(
-    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean}) =>
+    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${vars.orig.unitId}/bookings/${vars.orig.id}`, {
         guestName: vars.form.guestName.trim() || null,
         guestEmail: vars.form.guestEmail.trim() || null,
@@ -1105,6 +1124,8 @@ export function SchedulePage() {
         ...withTerms(),
         // 10/6: confirmed after "They asked not to be on …" (askAvoidedIf).
         ...(vars.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/12 (G6): the landlord's answer for rent a payment was tried on (askShortenedIf).
+        ...(vars.pastEndAttempted ? { pastEndAttempted: vars.pastEndAttempted } : {}),
         // 10/6 (Nic): returning guest, and the stay's work trade — ticked,
         // changed, or taken off (null). Left out when nothing about it changed.
         ...(editReturning && !vars.orig.returningGuestAt ? { returningGuest: true } : {}),
@@ -1131,6 +1152,7 @@ export function SchedulePage() {
         if (takeLatestIfChanged(e, { inForm: true })) return
         if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
         if (askAvoidedIf(e, () => editBookingMut.mutate({ ...vars, overrideAvoided: true }))) return
+        if (askShortenedIf(e, (choice) => editBookingMut.mutate({ ...vars, pastEndAttempted: choice }))) return
         setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
       },
     }

@@ -372,7 +372,7 @@ describe('late payment sender', () => {
     expect(resendSendMock).toHaveBeenCalledTimes(1)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('2 tenants have an overdue balance')
-    expect(call.html).toContain('2 tenants have a balance five or more days past due')
+    expect(call.html).toContain('2 tenants have a balance past its grace period')
     expect(call.html).toContain('/balances')
     for (const hidden of ['T One', 'T Two', 'A1', 'B2', 'Sunset', '1,200', '450.50', '1,650.50', '$']) {
       expect(call.html).not.toContain(hidden)

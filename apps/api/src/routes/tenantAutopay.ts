@@ -33,6 +33,7 @@ import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { payDateForPullDay } from '../services/autopayProjection'
 import { readStripeMethodFacts } from '../services/tenantBankMethods'
+import { graceDaysSql } from '../services/lateness'
 
 export const tenantAutopayRouter = Router()
 tenantAutopayRouter.use(requireAuth)
@@ -70,9 +71,12 @@ tenantAutopayRouter.get('/', async (req: any, res, next) => {
               -- all. The grace has to travel with the row or the screen cannot
               -- tell the difference.
               --
-              -- Same default the late-fee engine falls back to (5), so the two
-              -- never disagree about which day is safe.
-              COALESCE(l.late_fee_grace_days, 5) AS late_fee_grace_days,
+              -- 10/12 (Nic): "Grace = lease, else property, else 5 — the only
+              -- chain." The late-fee engine's own (services/lateness, one
+              -- definition), so the two never disagree about which day is
+              -- safe. Lease-else-5 told a tenant at a park with a shorter grace
+              -- that a fined day was safe.
+              ${graceDaysSql('l', 'pr')}::int AS late_fee_grace_days,
               l.late_fee_enabled,
               a.id                AS autopay_id,
               a.enabled,

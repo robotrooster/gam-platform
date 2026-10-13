@@ -33,7 +33,8 @@
  */
 import { DEFAULT_INCOME_BASIS, type IncomeBasis } from '@gam/shared'
 import { todayIn, monthStartOf } from './timezone'
-import { incomeEvents, summarize, type IncomeEvent } from '../services/incomeBasis'
+import { incomeEvents, summarize, ledgerOwedDay, type IncomeEvent } from '../services/incomeBasis'
+import type { PropertyCutoff } from './bookkeeperScope'
 
 /** Rent the tenant has SENT — landed, or debited and still clearing. */
 export const RENT_RECEIVED_STATUSES = ['settled', 'processing', 'paid_via_deposit'] as const
@@ -67,16 +68,18 @@ function lastDayOf(monthFirst: string): string {
  *                    income line: the dashboard's "Money received this month"
  *                    card)
  * @param opts.month  any day in the month (default: this month in Phoenix)
+ * @param opts.cutoffs 10/12: a former property's facts after the day it left
+ *                    are left out (a bookkeeper's clean cut at a sale)
  */
 export async function collectedRentMtd(
   landlordIds?: string[] | null,
   property?: string | readonly string[] | null,
-  opts: { scope?: 'rent' | 'all'; month?: string; basis?: IncomeBasis } = {},
+  opts: { scope?: 'rent' | 'all'; month?: string; basis?: IncomeBasis; cutoffs?: readonly PropertyCutoff[] } = {},
 ): Promise<RentCollected> {
   const start = monthStartOf((opts.month ?? todayIn(null)).slice(0, 10))
   const end = lastDayOf(start)
   const propertyIds = property == null ? null : typeof property === 'string' ? [property] : [...property]
-  const q = { landlordIds: landlordIds ?? null, start, end, propertyIds }
+  const q = { landlordIds: landlordIds ?? null, start, end, propertyIds, cutoffs: opts.cutoffs }
   const [rx, bx] = await Promise.all([
     incomeEvents({ ...q, basis: 'received' }),
     incomeEvents({ ...q, basis: 'billed' }),
@@ -130,17 +133,31 @@ export function rentCollectedFrom(
   const pick = (list: readonly IncomeEvent[]) => scope === 'rent' ? list.filter(rentOnly) : list
   const r = summarize(pick(rx), 'received')
   const b = summarize(pick(bx), 'billed')
+  // 10/12 (Nic, ledger P8): on the books, of what was billed — what tenants
+  // paid against bills in the month, and what they still owed at its end
+  // (every bill, design §10); nothing is "clearing" on the books.
+  const fromBooks = bx.some(e => !!e.ledger)
+  const picked = fromBooks ? pick(bx) : []
+  const owedDay = fromBooks ? ledgerOwedDay(picked) : null
+  const sumOf = (f: (e: IncomeEvent) => boolean) => round2(picked.filter(f).reduce((x, e) => x + e.amount, 0))
   return {
     basis,
     collected: r.total,
     inFlight: r.beside.clearing,
     paidAhead: r.lines.paidAhead,
-    billed: {
-      amount: b.total,
-      collected: b.beside.collectedSoFar,
-      clearing: b.beside.clearing,
-      stillOwed: b.beside.stillOwed,
-    },
+    billed: fromBooks
+      ? {
+          amount: b.total,
+          collected: round2(-sumOf(e => e.ledger === 'proof' && e.proofTerm === 'received')) || 0,
+          clearing: 0,
+          stillOwed: sumOf(e => e.ledger === 'owed' && e.day === owedDay),
+        }
+      : {
+          amount: b.total,
+          collected: b.beside.collectedSoFar,
+          clearing: b.beside.clearing,
+          stillOwed: b.beside.stillOwed,
+        },
   }
 }
 

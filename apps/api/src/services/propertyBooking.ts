@@ -728,6 +728,7 @@ export async function confirmBookingDeposit(
       if (held > 0) {
         await recordHeldItem({
           landlordId: b.landlord_id, sourceType: 'booking_deposit', sourceId: bookingId,
+          property: { propertyId: b.property_id },  // 10/12 (Nic, ledger P1): the booked site's property
           // A no-lease stay's first month is paid whole, not as a deposit (R5).
           amount: held, description: Number(b.total_amount) > 0 && Number(b.total_amount) === deposit ? 'Stay payment' : 'Stay deposit',
         }, client)

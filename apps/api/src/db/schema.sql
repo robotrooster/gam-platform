@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict H6Oyfi8aIqwlWwzXxzXE59ElMQvVxTHjVdJV1yG8VAYzAjiH9EuK5lUkEXas5em
+\restrict SaHLosNozZHIKN54A8sxm3HAVQXSUVUgLdhR8qGLD0q2Kd9nMm0GTAc8AqMPdrP
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -168,12 +168,33 @@ $$;
 CREATE FUNCTION public.cancel_unsigned_sale_on_void() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+  buyer_signed boolean;
 BEGIN
   IF NEW.status = 'voided' AND OLD.status IS DISTINCT FROM 'voided' THEN
+    PERFORM 1 FROM home_sale_contracts
+      WHERE purchase_document_id = NEW.id AND status IN ('pending_signature', 'active')
+      FOR UPDATE;
+
+    SELECT EXISTS (
+      SELECT 1 FROM lease_document_signers s
+       WHERE s.document_id = NEW.id AND s.signed_at IS NOT NULL
+         AND s.role NOT IN ('landlord', 'witness')) INTO buyer_signed;
+
+    IF NOT buyer_signed AND EXISTS (
+      SELECT 1 FROM home_sale_contracts c
+        JOIN home_sale_installments i ON i.contract_id = c.id
+        JOIN payments p ON p.home_sale_installment_id = i.id
+       WHERE c.purchase_document_id = NEW.id AND c.status = 'active'
+         AND p.status IN ('pending', 'failed')) THEN
+      RAISE EXCEPTION 'The sale on installment contract % still has home payments on the buyer''s bill. Void it through lib/voidDocument, which takes them off first.', NEW.id
+        USING ERRCODE = 'check_violation';
+    END IF;
+
     UPDATE home_sale_contracts
-       SET status = 'cancelled', updated_at = now()
+       SET status = 'cancelled', cancelled_at = COALESCE(cancelled_at, now()), updated_at = now()
      WHERE purchase_document_id = NEW.id
-       AND status = 'pending_signature';
+       AND (status = 'pending_signature' OR (status = 'active' AND NOT buyer_signed));
   END IF;
   RETURN NEW;
 END;
@@ -5499,7 +5520,7 @@ COMMENT ON COLUMN public.home_sale_contracts.plan_type IS 'S594: amortized (pric
 -- Name: COLUMN home_sale_contracts.purchase_document_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.home_sale_contracts.purchase_document_id IS 'S629: the signed purchase agreement this billing comes from. Set when the contract is drafted for signature; the contract stays pending_signature (no installments, nothing billed) until that document completes.';
+COMMENT ON COLUMN public.home_sale_contracts.purchase_document_id IS 'S629: the signed purchase agreement this billing comes from. 10/12 (Nic): the contract stays pending_signature until the LANDLORD signs it (a buyer who belongs to another company: until the buyer signs, S655); that signature writes the schedule and starts the billing.';
 
 
 --
@@ -31286,5 +31307,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict H6Oyfi8aIqwlWwzXxzXE59ElMQvVxTHjVdJV1yG8VAYzAjiH9EuK5lUkEXas5em
+\unrestrict SaHLosNozZHIKN54A8sxm3HAVQXSUVUgLdhR8qGLD0q2Kd9nMm0GTAc8AqMPdrP
 

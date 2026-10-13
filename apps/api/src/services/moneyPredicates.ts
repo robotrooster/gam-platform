@@ -93,7 +93,7 @@ export function notFlexDepositRowSql(a = 'p'): string {
   const x = alias(a)
   return `NOT (${x}.type = 'deposit' AND ${x}.lease_fee_id IS NULL
           AND EXISTS (SELECT 1 FROM security_deposits fdx
-                       WHERE fdx.lease_id = ${x}.lease_id AND fdx.flex_deposit_enabled IS TRUE))`
+                       WHERE fdx.lease_id = ${x}.lease_id AND fdx.flex_deposit_enabled IS TRUE AND fdx.status <> 'voided'))`
 }
 
 /**
@@ -396,4 +396,23 @@ export async function lockPaymentRowsById(client: PoolClient, paymentIds: readon
     `SELECT id FROM payments WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
     [[...new Set(paymentIds)]])
   return res.rows.map(r => r.id)
+}
+
+/**
+ * 10/12 review: a utility bill that went out to a resident (billed, paid or
+ * disputed) — never one still unbilled (a draft) or voided. One definition for
+ * the admin metrics (services/platformMetrics) and the monthly property report
+ * ("billed back to tenants"), which counted unbilled drafts as billed.
+ */
+export function utilityBillSentSql(a = 'ub'): string {
+  return `${a}.status IN ('billed', 'paid', 'disputed')`
+}
+
+/**
+ * A stay that happened or is booked to happen — confirmed, checked in or
+ * checked out; never a tentative hold, a cancellation or a no-show. The admin
+ * metrics and the monthly property report's stays and nights read it.
+ */
+export function stayHeldSql(a = 'b'): string {
+  return `${a}.status IN ('confirmed', 'checked_in', 'checked_out')`
 }

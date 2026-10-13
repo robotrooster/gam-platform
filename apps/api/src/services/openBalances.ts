@@ -43,10 +43,10 @@
  * owed, not late, owed again if it bounces), the "Work trade" mark (never an
  * amount, never late) and the charge Record payment opens on. decisions #25:
  * a sum across people (outstandingTotals) goes only to a viewer
- * seesGrandTotals admits — account owners and property managers.
+ * seesGrandTotals admits — account owners, property managers and (10/12)
+ * bookkeepers, each over only the properties they may see.
  */
 import type { PoolClient } from 'pg'
-import { FALLBACK_TIMEZONE } from '@gam/shared'
 import { getClient, query } from '../db'
 import type { AuthPayload } from '../middleware/auth'
 import { addDaysTo, todayIn } from '../lib/timezone'
@@ -150,37 +150,20 @@ export function workTradeOpenRowSql(a = 'p'): string {
 
 // ─── Late, one rule ───────────────────────────────────────────────────────────
 //
-// decisions #29: Outstanding shows how late a household is, and the Payments
-// ledger says "on time" or "N days late" for each payment, both "measured from
-// the due date of the oldest bill, honoring the grace period". The same rule
-// the credit history uses (creditLedgerEmitters.classifyPaymentTier): a bill
-// paid on or before its last grace day is on time; after it, it is late by the
-// days since the DUE date. Days are the property's calendar days.
-
-/** The grace period when neither the lease nor the property names one (lateFees, creditLedgerEmitters). */
-export const DEFAULT_LATE_GRACE_DAYS = 5
-
-/** The grace days of a charge: its lease's, else its property's, else the default. */
-export function graceDaysSql(l: string, pr: string): string {
-  return `COALESCE(${alias(l)}.late_fee_grace_days, ${alias(pr)}.late_fee_grace_days, ${DEFAULT_LATE_GRACE_DAYS})`
-}
-
-/** The property's calendar day of an instant (the property alias may be NULL: GAM's fallback zone). */
-export function propertyDaySql(instant: string, pr: string): string {
-  return `((${instant}) AT TIME ZONE COALESCE(${alias(pr)}.timezone, '${FALLBACK_TIMEZONE}'))::date`
-}
-
-/** Days late on `day` for a bill due `due` with `grace` days: 0 through the last grace day. */
-export function daysLateSql(day: string, due: string, grace: string): string {
-  return `(CASE WHEN (${day}) > (${due}) + (${grace}) THEN (${day}) - (${due}) ELSE 0 END)`
-}
-
-/** The same rule in code, on 'YYYY-MM-DD' calendar days. */
-export function daysLate(dueDate: string, day: string, graceDays: number): number {
-  const d = (ymd: string) => Date.UTC(Number(ymd.slice(0, 4)), Number(ymd.slice(5, 7)) - 1, Number(ymd.slice(8, 10)))
-  const after = Math.round((d(day) - d(dueDate)) / 86_400_000)
-  return after > graceDays ? after : 0
-}
+// 10/12 (Nic): the one lateness rule — the first late day (the 6th for the 1st
+// with 5 grace days), days past the grace period, the lease → property → 5
+// grace chain, lateness counting from the day GAM wrote the bill when later.
+// It lives in services/lateness (a leaf, so the credit-history emitter can use
+// it without an import cycle) and is re-exported here, where every money
+// screen reads it.
+export {
+  DEFAULT_LATE_GRACE_DAYS, graceDaysSql, graceDaysOf, propertyDaySql, firstLateDaySql, pastGraceSql,
+  daysPastGraceSql, lateCountsFromSql, writtenAtSql, firstLateDay, lastGraceDay, daysPastGrace,
+  daysLateSql, daysLate,
+} from './lateness'
+import {
+  graceDaysSql, propertyDaySql, lateCountsFromSql, writtenAtSql, daysLateSql, pastGraceSql,
+} from './lateness'
 
 // ─── Who sees a grand total ───────────────────────────────────────────────────
 
@@ -191,9 +174,22 @@ export function daysLate(dueDate: string, day: string, graceDays: number): numbe
  * Per-person balances stay visible to staff who have balances.view. The ONE
  * place this is decided: every response that carries a sum across people (the
  * Outstanding list's totals, a property's total, the Payments ledger's month
- * total) asks this, and leaves the figure out of the reply when it says no.
+ * total, the Reports overview's Outstanding Balance, and the Owed column of
+ * every report on the Reports pages — routes/reports viewForViewer) asks this,
+ * and leaves the figure out of the reply when it says no.
+ *
+ * 10/12 (Nic): "A/R totals visible to bookkeepers." A bookkeeper keeps the
+ * books, and what is owed is half of them. This only lets the total through;
+ * what it sums is the reader's scope, and theirs is THEIR properties: the
+ * Reports pages (the summing readers a bookkeeper can open —
+ * lib/bookkeeperAccess keeps the Outstanding list, the Payments ledger and the
+ * Rent Roll closed to them) narrows to their boxes (getScopedPropertyIds) and,
+ * for a property the company sold, to its bills due by the day it left
+ * (propertyCutoffsOf, the clean cut at a sale). A company-wide-only bookkeeper
+ * keeps no property's money, so (10/12, Nic) the Reports overview leaves the
+ * Outstanding Balance card out for them rather than show "$0" (routes/reports).
  */
-export const GRAND_TOTAL_ROLES = ['admin', 'super_admin', 'landlord', 'property_manager'] as const
+export const GRAND_TOTAL_ROLES = ['admin', 'super_admin', 'landlord', 'property_manager', 'bookkeeper'] as const
 export function seesGrandTotals(user: Pick<AuthPayload, 'role'> | undefined | null): boolean {
   return !!user && (GRAND_TOTAL_ROLES as readonly string[]).includes(user.role)
 }
@@ -379,7 +375,7 @@ export interface OpenSpace {
   oldest_due_date: string
   /** What is owed here, by the month each bill was due, oldest first. */
   months: OpenMonth[]
-  /** 0 when every bill here is inside its grace period; else days since the oldest late bill was due. */
+  /** 0 when every bill here is inside its grace period; else days past the grace period of the latest-running late bill (10/12). */
   days_late: number
   /** A card or bank payment made and still clearing: already paid, never owed, never late. */
   clearing: number
@@ -444,6 +440,13 @@ export interface OpenBalanceFilter {
   overdueDays?: number | null
   /** Leave out units in eviction mode — no one should be chased for those. */
   excludePaymentBlocked?: boolean
+  /**
+   * 10/12: only charges past their grace period (the one rule: the first late
+   * day = lateness start + grace). The overdue digest's "a balance past its
+   * grace period" — without it, a household late on September's electric was
+   * listed with all of October's rent, still inside its grace.
+   */
+  pastGraceOnly?: boolean
   /** Only these people. */
   tenantIds?: string[] | null
   /**
@@ -526,6 +529,13 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
     return f
   }
 
+  // 10/12 (Nic): days past the grace period, counted from the later of the
+  // bill's due date and the day GAM wrote the charge (it is still unpaid, so
+  // "the day it was paid" is today).
+  const todaySql = propertyDaySql('NOW()', 'pr')
+  const lateStartSql = lateCountsFromSql(BILL_DUE, propertyDaySql(writtenAtSql('p'), 'pr'), todaySql)
+  const lateSql = daysLateSql(todaySql, lateStartSql, graceDaysSql('l', 'pr'))
+
   const owedParams: unknown[] = [landlordIds, propertyIds]
   let owedFilters = shared(owedParams)
   if (opts.overdueDays != null) {
@@ -533,7 +543,12 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
     owedParams.push(addDaysTo(todayIn(null), -opts.overdueDays))
     owedFilters += `\n        AND ${BILL_DUE} <= $${owedParams.length}::date`
   }
-  const lateSql = daysLateSql(propertyDaySql('NOW()', 'pr'), BILL_DUE, graceDaysSql('l', 'pr'))
+  if (opts.pastGraceOnly === true) {
+    // A late fee is only ever charged once its bill is past grace, so it is
+    // part of the overdue balance whenever it is owed (its own row is written
+    // after the bill's due date, so the rule would read it as a new bill).
+    owedFilters += `\n        AND (p.type = 'late_fee' OR ${pastGraceSql(todaySql, lateStartSql, graceDaysSql('l', 'pr'))})`
+  }
 
   // What is owed, per space and per month; a person is one line below.
   const owed = await query<OwedGroup>(`

@@ -22,7 +22,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import { PROCESSING_FEES, CARD_DECLINE_FEE, INCOME_BASIS_LABEL } from '@gam/shared'
+import { PROCESSING_FEES, CARD_DECLINE_FEE, INCOME_BASIS_LABEL, MONEY_COLUMNS, MONEY_COLUMN_LABEL } from '@gam/shared'
 
 const ROOT = join(__dirname, 'knowledge-content')
 
@@ -229,10 +229,13 @@ describe('S655 credit is described the way it works', () => {
     expect(article('tenant/how-payments-are-applied.md')).toMatch(/Saved credit doesn't stop a late fee unless it covers the whole bill/)
   })
 
-  it('the profit-and-loss article names both bases in the screens\' own words and never counts a credit as income', () => {
+  it('the profit-and-loss article names the three columns in the screens\' own words, no switch, and never counts a credit as income', () => {
     const text = article('landlord/expenses-and-your-profit-and-loss.md')
-    expect(text).toContain(`**${INCOME_BASIS_LABEL.received}**`)
-    expect(text).toContain(`**${INCOME_BASIS_LABEL.billed}**`)
+    // 10/12 (Nic): no Money received / Money billed switch anywhere — Received,
+    // Charged and Owed side by side, Received first (MONEY_COLUMNS).
+    for (const k of MONEY_COLUMNS) expect(text).toContain(`**${MONEY_COLUMN_LABEL[k]}**`)
+    expect(text).not.toContain(INCOME_BASIS_LABEL.billed)
+    expect(text).toMatch(/There is no switch/)
     expect(text).toMatch(/a credit you give is never income/i)
     // Money received is the day the money arrived (owner correction, 10/2).
     expect(text).toMatch(/counts money on the day it arrived/)
