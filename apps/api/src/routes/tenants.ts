@@ -19,7 +19,7 @@ import { landlordScopeIds } from '../lib/landlordScope'
 import { householdRowSql, tenantCompanies } from '../services/openBalances'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
 import {
-  healthByHousehold, householdsOf, householdMonths, paymentHealth, addMonths, currentBillMonth, ALL_TIME_FROM,
+  healthByHousehold, healthByLease, householdsOf, householdMonths, paymentHealth, addMonths, currentBillMonth, ALL_TIME_FROM,
   type PaymentHealth,
 } from '../services/householdMonths'
 import { portalLink } from '../lib/portalUrls'
@@ -66,6 +66,49 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
         ORDER BY t.id, l.created_at DESC`,
       [landlordIds])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/tenants/health-by-unit — the Tenants list's Payment health column,
+ * per LEASE. 10/13 (Nic): "Tenants list + tenant profile: split health BY
+ * LEASE" — the list is one row per occupied space, and each row's figure is
+ * the health of the lease on that space (the Rent Roll's figure for that
+ * household, services/householdMonths healthByLease), so a person renting two
+ * spots on two leases reads each lease's own number on each row, never one
+ * number for both.
+ *
+ * → [{ unitId, leaseId, percent, label }] for every space with an active
+ * lease the viewer may see (their companies, their properties). Who: as the
+ * list's column always was (routes/units seesHealth) — the owner, or staff with
+ * "View all payments" or the books; anyone else gets [] (S641: "I don't want
+ * her to see ... the payment histories"). GAM admin reads the list's own
+ * column (data: null) — this route answers for the account's companies.
+ * Declared here, before the /:id routes, so the path is never read as an id.
+ */
+tenantsRouter.get('/health-by-unit', requireAuth, async (req: any, res, next) => {
+  try {
+    const role = req.user!.role
+    if (role === 'admin' || role === 'super_admin') return res.json({ success: true, data: null })
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Forbidden')
+    if (!userHasPerm(req.user, 'payments.view_all', 'books.view')) return res.json({ success: true, data: [] })
+    const propertyIds = await (await import('../middleware/auth')).getScopedPropertyIds(req.user)
+    const spaces = await query<{ unit_id: string; lease_id: string }>(`
+      SELECT vuo.unit_id, vuo.active_lease_id AS lease_id
+        FROM v_unit_occupancy vuo
+        JOIN units u ON u.id = vuo.unit_id
+       WHERE vuo.active_lease_id IS NOT NULL
+         AND u.landlord_id = ANY($1::uuid[])
+         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))`, [landlordIds, propertyIds])
+    const health = await healthByLease({ landlordIds, propertyIds, leaseIds: spaces.map(s => s.lease_id) })
+    res.json({
+      success: true,
+      data: spaces.map(s => {
+        const h = health.get(s.lease_id)
+        return { unitId: s.unit_id, leaseId: s.lease_id, percent: h?.percent ?? null, label: h?.label ?? 'No months to judge yet' }
+      }),
+    })
   } catch (e) { next(e) }
 })
 
@@ -2767,6 +2810,10 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
     // (tenantCompanies, the heartbeat's), GAM admin every company the person
     // has been with — so one household reads one number on every screen.
     let health: PaymentHealth | null = null
+    let healthByLeaseRows: Array<{
+      lease_id: string; unit_number: string | null; property_name: string | null; current: boolean; status: string
+      start_date: string | null; end_date: string | null; health: PaymentHealth | null
+    }> = []
     if (seesPayments) {
       const companies = scoped ? landlordScopeIds(req.user!)
         : isSelf ? await tenantCompanies(req.params.id)
@@ -2779,6 +2826,39 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       health = (await healthByHousehold({
         landlordIds: companies, propertyIds: propScope, householdIds: [hh], through: currentBillMonth(),
       })).get(hh) ?? null
+      // 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE" —
+      // every lease this person is on with these companies (at the viewer's
+      // properties) is its own household with its own health, the figure its
+      // Rent Roll row shows; a person on two leases reads each lease's. The
+      // current leases first, then the newest. `status` is the lease's own
+      // (shared LEASE_STATUSES): one not signed yet is 'pending' — never
+      // "ended" (10/13 review: Arturo Melendez's new MH 15 lease read "Ended"
+      // beside his MH 23 while it waited for signatures).
+      const leases = await query<{
+        lease_id: string; unit_number: string | null; property_name: string | null; status: string
+        start_date: string | null; end_date: string | null
+      }>(`
+        SELECT DISTINCT ON (l.id) l.id AS lease_id, u.unit_number, pr.name AS property_name, l.status,
+               to_char(l.start_date, 'YYYY-MM-DD') AS start_date, to_char(l.end_date, 'YYYY-MM-DD') AS end_date
+          FROM lease_tenants lt
+          JOIN leases l ON l.id = lt.lease_id
+          JOIN units u ON u.id = l.unit_id
+          JOIN properties pr ON pr.id = u.property_id
+         WHERE lt.tenant_id = $1 AND lt.status <> 'void'
+           AND l.landlord_id = ANY($2::uuid[])
+           AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+         ORDER BY l.id`, [req.params.id, companies, propScope])
+      const byLease = await healthByLease({
+        landlordIds: companies, propertyIds: propScope, leaseIds: leases.map(l => l.lease_id), through: currentBillMonth(),
+      })
+      healthByLeaseRows = leases
+        .sort((a, z) => Number(z.status === 'active') - Number(a.status === 'active')
+          || (z.start_date ?? '').localeCompare(a.start_date ?? '') || a.lease_id.localeCompare(z.lease_id))
+        .map(l => ({
+          lease_id: l.lease_id, unit_number: l.unit_number, property_name: l.property_name,
+          current: l.status === 'active', status: l.status, start_date: l.start_date, end_date: l.end_date,
+          health: byLease.get(l.lease_id) ?? null,
+        }))
     }
 
     // Maintenance requests — this company's only, for a scoped viewer, and
@@ -2896,6 +2976,8 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           totalPayments: total,
           onTimeRate,
           health,
+          // 10/13 (Nic): the same, lease by lease (each lease its own household).
+          healthByLease: healthByLeaseRows,
           firstPayment: paymentStats?.first_payment,
           lastPayment:  paymentStats?.last_payment,
           unitsOccupied: units.length,
@@ -2910,6 +2992,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           totalPayments: null,
           onTimeRate:   null,
           health:       null,
+          healthByLease: [],
           firstPayment: null,
           lastPayment:  null,
           unitsOccupied: units.length,

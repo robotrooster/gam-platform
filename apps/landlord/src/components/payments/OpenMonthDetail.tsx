@@ -33,12 +33,19 @@ const PAYMENT_BADGE: Record<RentRollPayment['status'], string> = {
   returned: 'badge-red',
 }
 
-export function OpenMonthDetail({ row, month, canAddPhoto }: {
+export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }: {
   row: OpenMonthRow
   /** 'YYYY-MM': the open month (the ledger month its payments are filed under). */
   month: string
   /** May add a missing bank-receipt photo (Take payments). */
   canAddPhoto: boolean
+  /**
+   * Read what the Payments ledger says on each payment (the receipt photo, the
+   * deposit date flag, why one came back). false for a bookkeeper (10/13, Nic:
+   * the pages read-only) — those reads are not theirs (lib/bookkeeperAccess),
+   * so they are never asked.
+   */
+  ledgerFacts?: boolean
 }) {
   const year = month.slice(0, 4)
   // The ledger month, read once while any row with a payment is open; the desk
@@ -46,7 +53,7 @@ export function OpenMonthDetail({ row, month, canAddPhoto }: {
   const { data: ledger, refetch: refetchLedger } = useQuery<{ payments: LedgerRow[] }>(
     ['payments-ledger', 'month', month],
     () => apiGet(`/balances/payments-by-month?month=${month}`),
-    { enabled: row.payments.length > 0, staleTime: 30_000, retry: false })
+    { enabled: ledgerFacts && row.payments.length > 0, staleTime: 30_000, retry: false })
   const ledgerById = new Map((ledger?.payments ?? []).map(p => [p.id, p]))
   const facts = (p: RentRollPayment) => ledgerById.get(p.paymentId)
 
@@ -62,7 +69,7 @@ export function OpenMonthDetail({ row, month, canAddPhoto }: {
     () => readChargesById<ReturnFacts & { id: string }>(
       page => apiGet(`/payments?from=${range!.from}&to=${range!.to}&limit=${CHARGE_PAGE_SIZE}&page=${page}`),
       new Set(wanted)),
-    { enabled: cameBack && !!range && wanted.length > 0, staleTime: 60_000, retry: false })
+    { enabled: ledgerFacts && cameBack && !!range && wanted.length > 0, staleTime: 60_000, retry: false })
   const returnsById = new Map<string, NonNullable<ReturnType<typeof returnDetail>>>()
   for (const r of returnRead?.rows ?? []) {
     const d = returnDetail(r)
@@ -181,6 +188,72 @@ export function OpenMonthDetail({ row, month, canAddPhoto }: {
           </table>
         )}
       </div>
+    </div>
+  )
+}
+
+// ── A STAY GUEST'S ROW OPENED (10/13, Nic) ──────────────────────────────────
+//
+//   "the payments page ... should show all money coming in. The people that
+//    paid short-term stays like Space RV 10 and 11 at Mountain View, those
+//    should have details of the money that was paid."
+//
+// Each payment toward the stay this month — the day, the amount, how it was
+// paid and what it was for (the server's words: "Booking deposit · stay Oct 12
+// – Oct 15 · booking site") — anything an early check-out gave back this
+// month, and the stay itself. Everything is on the row (OpenMonthRow.payments
+// and .stay); nothing more is read.
+export function StayDetail({ row, month }: {
+  row: OpenMonthRow
+  /** 'YYYY-MM': the open month. */
+  month: string
+}) {
+  const year = month.slice(0, 4)
+  const stay = row.stay
+  return (
+    <div className="pay-detail-body">
+      <div className="pay-detail-block">
+        <div className="cd-section-label">Paid this month</div>
+        {row.payments.length === 0 && !stay?.refunds.length ? (
+          <div className="pay-none">Nothing paid toward this stay this month.</div>
+        ) : (
+          <table className="pay-lines">
+            <thead><tr><th>Date</th><th className="num">Amount</th><th>Method</th><th>For</th></tr></thead>
+            <tbody>
+              {row.payments.map(p => (
+                <tr key={p.paymentId} data-line="stay-payment">
+                  <td className="day">{dayWord(p.paidOn, year)}</td>
+                  <td className="num">{money(p.amount)}</td>
+                  <td>{p.methodLabel}</td>
+                  <td>{p.forLabel ?? '—'}</td>
+                </tr>
+              ))}
+              {(stay?.refunds ?? []).map(r => (
+                <tr key={r.refundId} data-line="stay-refund">
+                  <td className="day">{dayWord(r.refundedOn, year)}</td>
+                  <td className="num cd-timing-late">−{money(r.amount)}</td>
+                  <td>Refunded</td>
+                  <td>Back to the guest — {r.label}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {stay && (
+        <div className="pay-detail-block">
+          <div className="cd-section-label">The stay</div>
+          <table className="pay-lines">
+            <tbody>
+              <tr data-line="stay">
+                <td>{dayWord(stay.checkIn, year)} – {dayWord(stay.checkOut, year)}</td>
+                <td>{stay.nights} {stay.nights === 1 ? 'night' : 'nights'}</td>
+                <td>{stay.statusLabel}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }

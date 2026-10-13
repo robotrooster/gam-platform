@@ -59,7 +59,7 @@ function VersionWatch() {
 
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor, HubTabLayout } from './components/layout/Layout'
+import { Layout, LAUNCH_HIDDEN, staffLandingPath, HubTabLayout } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
@@ -79,7 +79,6 @@ import { TenantDetailPage } from './pages/TenantDetailPage'
 import { TenantPaymentReportPage } from './pages/TenantPaymentReportPage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
-import { BalancesPage }    from './pages/BalancesPage'
 import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
@@ -201,10 +200,10 @@ function RoleRedirect() {
   // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
   // front-desk user with no POS access on an empty register). Zero grants →
   // /welcome explains what's missing.
-  // 10/11: a bookkeeper lands on the financial pages (Money in first).
+  // 10/11: a bookkeeper lands on the financial pages (Money in first —
+  // staffLandingPath keeps it so with Payments and the Rent Roll above it).
   if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager' || user.role === 'bookkeeper') {
-    const first = visibleNavItemsFor(user)[0]
-    return <Navigate to={first ? first.to : '/welcome'} replace />
+    return <Navigate to={staffLandingPath(user)} replace />
   }
   if (user.onboardingComplete === false) return <Navigate to="/onboarding" replace />
   return <Navigate to="/dashboard" replace />
@@ -342,7 +341,10 @@ function App() {
                   route only wraps them in the shared sub-tab bar (HubTabLayout). */}
               <Route element={<HubTabLayout hub="financials" />}>
                 <Route path="payments"       element={<PaymentsPage />} />
-                <Route path="balances"       element={<BalancesPage />} />
+                {/* 10/13 (Nic): "REMOVE the Outstanding Balances tab." Its
+                    address (old links, bookmarks, Reports' Outstanding card)
+                    opens Payments, where who owes and Record payment are now. */}
+                <Route path="balances"       element={<Navigate to="/payments" replace />} />
                 <Route path="rent-roll"      element={<RentRollPage />} />
                 <Route path="disbursements"  element={<DisbursementsPage />} />
                 <Route path="income"         element={<IncomePage />} />

@@ -212,3 +212,21 @@ describe('what the desk window recorded is said once, after it closes', () => {
     expect(server.posts.filter(p => p.url.endsWith('/record-manual'))).toHaveLength(1)
   })
 })
+
+// 10/13 (Nic): "REMOVE the Outstanding Balances tab." Front-desk staff who take
+// payments without "View all payments" keep this list under the Payments tab.
+describe('the list of who owes, under the Payments tab', () => {
+  it('carries the name it is given, with the same rows and Record payment', async () => {
+    server.user = { role: 'onsite_manager', permissions: { 'balances.view': true, take_payment: true } }
+    server.balances = [owingRow('t1', 'Glenda', 'chg1')]
+    await render(<BalancesPage title="Payments" />)
+    await until(() => text().includes('Oak Park'), 'the list')
+    expect(host.querySelector('h1.page-title')!.textContent).toBe('Payments')
+    expect(text()).not.toContain('Outstanding Balances')
+    expect(button(/^Record payment$/)).toBeDefined()
+  })
+  it('keeps its own name on its own', async () => {
+    await render(<BalancesPage />)
+    expect(host.querySelector('h1.page-title')!.textContent).toBe('Outstanding Balances')
+  })
+})

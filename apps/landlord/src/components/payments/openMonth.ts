@@ -4,7 +4,9 @@
 // (GET /api/balances/rent-roll/open-month, packages/shared/src/rentRoll.ts),
 // kept here so they are tested on their own. The server decides the money, the
 // status pill and the order; nothing here re-sorts or re-judges a row.
-import { isSpaceOnlyRow, type OpenMonthRow, type RentRollProperty } from '@gam/shared'
+import {
+  isSpaceOnlyRow, isStayRow, type OpenMonthRow, type RentRollProperty, type OpenMonthOtherMoney, type OpenMonthTotals,
+} from '@gam/shared'
 import { money, toCents, toDollars } from '../../lib/creditDesk'
 
 /**
@@ -28,6 +30,59 @@ export function openProperties(properties: readonly RentRollProperty[] | undefin
 /** "Glenda Moss & Russ Fuller" — the lease's residents, primary first (the server's order). */
 export function householdName(row: Pick<OpenMonthRow, 'residents'>): string {
   return row.residents.map(r => r.name).filter(Boolean).join(' & ') || 'No tenant on file'
+}
+
+/**
+ * Who a row is, in words: a household's residents, or — on a stay guest's row
+ * (10/13, Nic: "the people that paid short-term stays") or a space in use — the
+ * guest named on it. null: nobody to name (an empty space).
+ */
+export function rowName(row: Pick<OpenMonthRow, 'residents' | 'occupant' | 'status'>): string | null {
+  if (isStayRow(row)) return row.occupant || 'Stay guest'
+  if (isSpaceOnlyRow(row)) return row.occupant
+  return householdName(row)
+}
+
+/**
+ * A row that opens underneath: a household (its payments and charges) or a
+ * stay guest (10/13: "details of the money that was paid"). A space alone has
+ * nothing to open.
+ */
+export function rowOpens(row: Pick<OpenMonthRow, 'status'>): boolean {
+  return !isSpaceOnlyRow(row)
+}
+
+/**
+ * Under a stay row's Paid: what went back to the guest this month (an early
+ * check-out's refund). Null when nothing did.
+ */
+export function stayRefundWords(row: Pick<OpenMonthRow, 'stay'>): string | null {
+  const back = toCents(row.stay?.refunded)
+  return back > 0 ? `${money(toDollars(back))} refunded` : null
+}
+
+/**
+ * The head of the register-and-pay-links folder (10/13, Nic: "show all money
+ * coming in"): how many sales and refunds, and — only when the server sent the
+ * sums (decisions #25) — what came in and what went back. "9 sales · $187.85",
+ * "2 sales · 1 refund · $45.00 · $5.00 refunded".
+ */
+export function otherMoneyMeta(lines: readonly Pick<OpenMonthOtherMoney, 'kind'>[],
+                               totals?: Pick<OpenMonthTotals, 'otherIn' | 'otherRefunded'>): string {
+  const sales = lines.filter(l => l.kind === 'sale').length
+  const refunds = lines.length - sales
+  const parts = [`${sales} sale${sales === 1 ? '' : 's'}`]
+  if (refunds > 0) parts.push(`${refunds} refund${refunds === 1 ? '' : 's'}`)
+  if (totals) {
+    parts.push(money(totals.otherIn))
+    if (toCents(totals.otherRefunded) > 0) parts.push(`${money(totals.otherRefunded)} refunded`)
+  }
+  return parts.join(' · ')
+}
+
+/** Who paid, in words: their name, else that nobody was named (a walk-in at the register). */
+export function otherMoneyWho(line: Pick<OpenMonthOtherMoney, 'who'>): string {
+  return line.who?.trim() || 'No name given'
 }
 
 /**

@@ -25,16 +25,25 @@
 //                      household whose month has no bill yet
 //   vacant     GRAY    an empty space (the open month's rows only)
 //   occupied   GRAY    a space nobody holds on a lease that is NOT empty (the
-//                      open month's rows only): the owner uses it, a stay guest
-//                      is checked in, or its record says it is in use. Never
-//                      "Vacant" (10/13 review: Nic's gray Vacant row is for an
-//                      EMPTY space). Its words are the space's own record —
-//                      "Owner Use", "Checked in", … — never a payment status.
+//                      open month's rows only): the owner uses it, or its
+//                      record says it is in use. Never "Vacant" (10/13 review:
+//                      Nic's gray Vacant row is for an EMPTY space). Its words
+//                      are the space's own record — "Owner Use", … — never a
+//                      payment status.
+//   stay       GRAY    a stay guest's row (the open month's rows only): a
+//                      guest checked in now, or a stay paid toward this month.
+//                      10/13 (Nic): "the payments page ... should show all money
+//                      coming in. The people that paid short-term stays like
+//                      Space RV 10 and 11 at Mountain View, those should have
+//                      details of the money that was paid." Its words are the
+//                      booking's own ("Checked in", "Checked out", "Confirmed"),
+//                      never a payment status: a stay is paid up front, not
+//                      billed by the month.
 // Late fees never decide it (10/12: "Late fees are never a bill and never
 // decide a month's color"); they are in Invoiced and Owed.
 export const RENT_ROLL_MONTH_STATUSES = ['paid', 'paid_late', 'partial', 'owes', 'due', 'none'] as const
 export type RentRollMonthStatus = typeof RENT_ROLL_MONTH_STATUSES[number]
-export const RENT_ROLL_ROW_STATUSES = [...RENT_ROLL_MONTH_STATUSES, 'vacant', 'occupied'] as const
+export const RENT_ROLL_ROW_STATUSES = [...RENT_ROLL_MONTH_STATUSES, 'vacant', 'occupied', 'stay'] as const
 export type RentRollRowStatus = typeof RENT_ROLL_ROW_STATUSES[number]
 export const RENT_ROLL_STATUS_LABEL: Record<RentRollRowStatus, string> = {
   paid:      'Paid',
@@ -45,6 +54,7 @@ export const RENT_ROLL_STATUS_LABEL: Record<RentRollRowStatus, string> = {
   none:      'No bill',
   vacant:    'Vacant',
   occupied:  'Occupied',
+  stay:      'Stay',
 }
 export const RENT_ROLL_STATUS_COLORS = ['green', 'orange', 'yellow', 'red', 'gray'] as const
 export type RentRollStatusColor = typeof RENT_ROLL_STATUS_COLORS[number]
@@ -57,6 +67,7 @@ export const RENT_ROLL_STATUS_COLOR: Record<RentRollRowStatus, RentRollStatusCol
   none:      'gray',
   vacant:    'gray',
   occupied:  'gray',
+  stay:      'gray',
 }
 
 /**
@@ -66,6 +77,30 @@ export const RENT_ROLL_STATUS_COLOR: Record<RentRollRowStatus, RentRollStatusCol
  */
 export function isSpaceOnlyRow(row: { status: RentRollRowStatus }): boolean {
   return row.status === 'vacant' || row.status === 'occupied'
+}
+
+/**
+ * A stay guest's row (the open month): what was paid toward a stay this month,
+ * opened for the details. No bill, no tenant report, no desk window — a stay
+ * is paid at the register, on a pay link or on the booking site.
+ */
+export function isStayRow(row: { status: RentRollRowStatus }): boolean {
+  return row.status === 'stay'
+}
+
+/**
+ * How a payment toward a stay was made (stay_payments.method — shared
+ * STAY_PAYMENT_METHODS; the keys are kept equal by rentRoll.test.ts). A card
+ * says where it was swiped: the booking site and a pay link paid online are
+ * "Card · online", the register "Card · in person" (the Payments ledger's
+ * words, shared paidByLabel).
+ */
+export const STAY_PAYMENT_METHOD_LABEL: Record<'card' | 'card_on_file' | 'cash' | 'check' | 'charge', string> = {
+  card:         'Card',
+  card_on_file: 'Card on file',
+  cash:         'Cash',
+  check:        'Check',
+  charge:       'Charge account',
 }
 
 /**
@@ -161,6 +196,37 @@ export interface RentRollPayment {
   statusLabel: string
   /** A check or money-order number, a bank deposit's reference; null when none. */
   reference: string | null
+  /**
+   * What it was for, on a stay's row (10/13, Nic: "details of the money that
+   * was paid"): "Stay Oct 4 – Nov 4 · at the register", "Booking deposit · stay
+   * Oct 12 – Oct 15 · booking site". Absent on a household's row — its charges
+   * say what each payment paid.
+   */
+  forLabel?: string | null
+}
+
+/**
+ * A stay's row (OpenMonthRow.stay): the stay itself, and any money that went
+ * back to the guest this month (an early check-out's refund).
+ */
+export interface OpenMonthStay {
+  bookingId: string
+  /** 'YYYY-MM-DD' */
+  checkIn: string
+  checkOut: string
+  nights: number
+  /** The booking's own words: "Checked in", "Checked out", "Confirmed", … (BOOKING_STATUS_LABEL). */
+  statusLabel: string
+  /** Of this month's stay money, what has gone back to the guest this month. */
+  refunded: number
+  refunds: Array<{
+    refundId: string
+    /** 'YYYY-MM-DD': the day it went back. */
+    refundedOn: string
+    amount: number
+    /** The payment it went back to: "Cash · register Oct 6". */
+    label: string
+  }>
 }
 
 /** One charge on a row's bills (the expanded row): what it is for and where it stands. */
@@ -199,8 +265,8 @@ export interface RentRollCharge {
 export interface OpenMonthRow {
   /**
    * Stable row key: 'lease:<id>', 'person:<tenant id>' (a charge on no lease),
-   * 'vacant:<unit id>' (an empty space) or 'space:<unit id>' (a space in use
-   * with nobody on a lease).
+   * 'vacant:<unit id>' (an empty space), 'space:<unit id>' (a space in use
+   * with nobody on a lease) or 'stay:<booking id>' (a stay guest's row).
    */
   key: string
   unitId: string | null
@@ -211,8 +277,8 @@ export interface OpenMonthRow {
   householdId: string | null
   residents: RentRollResident[]
   /**
-   * An occupied space's occupant in words — the stay guest checked in there;
-   * null otherwise (a household's names are `residents`).
+   * A stay row's guest in words (the booking's guest name, else their
+   * account's); null otherwise (a household's names are `residents`).
    */
   occupant: string | null
   /**
@@ -226,7 +292,11 @@ export interface OpenMonthRow {
   invoiced: number
   /** Of `invoiced`, late fees. */
   lateFees: number
-  /** What paid them: money (still clearing included) and account credit — the Paid column. */
+  /**
+   * What paid them: money (still clearing included) and account credit — the
+   * Paid column. On a stay row: the money paid toward the stay this month
+   * (never in Invoiced or Owed: a stay is paid, not billed by the month).
+   */
   paid: number
   /** Of `paid`, money still clearing. */
   clearing: number
@@ -257,7 +327,16 @@ export interface OpenMonthRow {
   workTradeOnly: boolean
   /** 10/13 (Nic): "eviction mode that blocks payments" — payments are blocked on this space. */
   evictionMode: boolean
-  /** The space is marked delinquent. */
+  /**
+   * 10/13 (Nic): a small red "Delinquent" tag beside the name. Delinquent is
+   * past the grace period with money still owed (S654, Nic: "flag a difference
+   * between outstanding and delinquent based on when the grace period ends")
+   * — this month's bill red "Owes +N", or an earlier month's here still owed
+   * past its grace. Judged from the money as the row is built (the one
+   * lateness rule, services/householdMonths), so it clears the moment the
+   * household pays — never the space's overnight flag. Late fees alone never
+   * make a household delinquent (they never decide a month's color).
+   */
   delinquent: boolean
   /**
    * The charge the desk window opens on to log a payment (POST
@@ -266,10 +345,16 @@ export interface OpenMonthRow {
    * is open that the desk may take, or payments are blocked.
    */
   recordWith: string | null
-  /** The expanded row: each payment toward this month's bills, oldest first. */
+  /**
+   * The expanded row: each payment toward this month's bills, oldest first —
+   * on a stay row, each payment toward the stay made this month (`forLabel`
+   * says what it was for).
+   */
   payments: RentRollPayment[]
-  /** The expanded row: every charge on the month's bills. */
+  /** The expanded row: every charge on the month's bills (none on a stay row). */
   charges: RentRollCharge[]
+  /** A stay row's stay (status 'stay'); null on every other row. */
+  stay: OpenMonthStay | null
 }
 
 /**
@@ -290,6 +375,50 @@ export interface RentRollTotals {
 /** The open month's sums: the month's money, and what the rows still owe on earlier months. */
 export interface OpenMonthTotals extends RentRollTotals {
   owedEarlier: number
+  /**
+   * 10/13 (Nic): "show all money coming in" — the money paid toward stays this
+   * month (the stay rows' Paid), apart from the bills' Paid so Invoiced = Paid
+   * + work trade + Owed still adds up; and of it, what went back this month.
+   */
+  stays: number
+  staysRefunded: number
+  /**
+   * 10/13 (Nic): "show ALL money coming in" — the register sales and pay links
+   * this month that are no household's bill and no stay's (OpenMonthRoll
+   * .otherMoney), and of them what went back at the register this month. Apart
+   * from the bills and the stays, so each adds up on its own.
+   */
+  otherIn: number
+  otherRefunded: number
+}
+
+/**
+ * 10/13 (Nic): "the payments page ... should show all money coming in." One
+ * line of the money that came in at the property this month that is no
+ * household's bill and no stay's: a register sale (propane to a walk-in), an
+ * emailed pay link paid by someone with no lease or stay here — or what went
+ * back on one at the register this month (`kind: 'refund'`). A sale that paid
+ * toward a stay as well is here only for the rest of it (the stay's part is on
+ * the stay's row); a refund comes off the sale's other items first (the early
+ * check-out's rule), so only what is beyond them is the stay's. Never a charge
+ * account sale (no money came in: it is collected later), never a voided one,
+ * never the background check GAM keeps, never the card fee paid on top.
+ */
+export interface OpenMonthOtherMoney {
+  /** The sale (register or pay link), or the refund on it. */
+  id: string
+  saleId: string
+  kind: 'sale' | 'refund'
+  /** 'YYYY-MM-DD': the day it came in, or went back (the property's calendar). */
+  day: string
+  /** Money in (a sale) or given back (a refund), dollars. */
+  amount: number
+  /** "Cash", "Card · in person", "Card · online", "Check" … (never a raw value). */
+  methodLabel: string
+  /** What it was for: the items sold and where — "Propane · at the register", "RV site — monthly, Electric (per kWh) · pay link". */
+  forLabel: string
+  /** Who paid: the resident's or the customer's name; null — nobody named (a walk-in). */
+  who: string | null
 }
 
 /** GET /api/balances/rent-roll/open-month?propertyId= — the Payments page. */
@@ -306,6 +435,12 @@ export interface OpenMonthRoll {
    * order (compareSpaces).
    */
   rows: OpenMonthRow[]
+  /**
+   * 10/13 (Nic): "show ALL money coming in" — the register sales and pay links
+   * of the month that are no household's bill and no stay's, and what went
+   * back on them at the register this month, oldest first.
+   */
+  otherMoney: OpenMonthOtherMoney[]
   totals?: OpenMonthTotals
 }
 
@@ -389,8 +524,19 @@ export interface RentRollMovedOutOwing {
   owed: number
   /** The months it still owes on, oldest first. */
   months: Array<{ month: string; owed: number }>
-  /** 'YYYY-MM-DD': the day the lease ended (terminated, else its end date); null when not on record. */
+  /**
+   * 'YYYY-MM-DD': the day the lease ended (terminated, else its end date);
+   * null when not on record, or for a bookkeeper whose owner left "Show lease
+   * start and end dates" unticked (10/12, Nic: the owner's choice per
+   * bookkeeper).
+   */
   leaseEnded: string | null
+  /**
+   * Its bills in the range (zero when none): what the range totals count for
+   * it (10/13, Nic: "Range totals INCLUDE moved-out folder households"), so a
+   * printout or spreadsheet can show where the totals' extra comes from.
+   */
+  inRange: RentRollTotals
 }
 
 /** GET /api/balances/rent-roll/history?propertyId=&from=&to= | &range=all — the Rent Roll page. */
@@ -408,47 +554,30 @@ export interface RentRollHistory {
    * Every household billed in the range, in space order — except anyone who
    * moved out and still owes: they are in `movedOutOwing` alone (10/13, Nic:
    * "Moved-out people who still owe sit in a collapsed 'Moved out, still owes'
-   * folder until paid"), never twice. `totals` and `monthCounts` are these rows'.
+   * folder until paid"), never twice. `monthCounts` are these rows'.
    */
   rows: RentRollHistoryRow[]
   /** Not limited to the range: everyone no longer living here who still owes. */
   movedOutOwing: RentRollMovedOutOwing[]
+  /**
+   * The rows' money for the range AND the "Moved out, still owes" households'
+   * bills in the range (10/13, Nic: "Range totals INCLUDE moved-out folder
+   * households") — the property's whole range, every dollar once.
+   */
   totals?: RentRollTotals
+  /**
+   * Of `totals`, the "Moved out, still owes" households' bills in the range
+   * (the sum of their `inRange`), sent with `totals`: `totals` = the rows'
+   * sums + this, so the printout and the spreadsheet add up.
+   */
+  movedOutTotals?: RentRollTotals
 }
 
 // ─── Retired 10/13 ───────────────────────────────────────────────────────────
 //
-// 10/13 (Nic): "Remove the 'keep moved-out households' setting entirely" — the
-// API no longer reads or writes landlords.rent_roll_moved_out (the column
-// stays: expand, then contract). These constants remain only while the
-// landlord Rent Roll page still imports them; delete them with it.
-//
-// 10/12 (Nic) — THE RENT ROLL: WHO STAYS ON IT AFTER MOVING OUT.
-//
-// "who stays on the Rent Roll after moving out = LANDLORD'S CHOICE (a setting
-//  on the page: billed in last 12 months / while they owe / all time)."
-//
-// Every household on an occupied space is always a row. This decides which
-// households that moved out stay on the page too, per company. Mirrors
-// landlords_rent_roll_moved_out_check (landlords.rent_roll_moved_out).
-//   billed_last_12_months  billed in the 12 months through the month picked
-//                          (the default — the page's rule before 10/12)
-//   while_owing            while they still owe anything there
-//   all_time               every household ever billed there
-export const RENT_ROLL_MOVED_OUT_RULES = ['billed_last_12_months', 'while_owing', 'all_time'] as const
-export type RentRollMovedOutRule = typeof RENT_ROLL_MOVED_OUT_RULES[number]
-export const RENT_ROLL_MOVED_OUT_DEFAULT: RentRollMovedOutRule = 'billed_last_12_months'
-export const RENT_ROLL_MOVED_OUT_LABEL: Record<RentRollMovedOutRule, string> = {
-  billed_last_12_months: 'Billed in the last 12 months',
-  while_owing:           'While they still owe',
-  all_time:              'All time',
-}
-/** The empty page's sentence: who appears here under each rule. */
-export const RENT_ROLL_MOVED_OUT_NOTE: Record<RentRollMovedOutRule, string> = {
-  billed_last_12_months: 'Households on an occupied space, and anyone who moved out but was billed in the last 12 months, appear here.',
-  while_owing:           'Households on an occupied space, and anyone who moved out but still owes, appear here.',
-  all_time:              'Households on an occupied space, and everyone who ever lived here, appear here.',
-}
-export function isRentRollMovedOutRule(v: unknown): v is RentRollMovedOutRule {
-  return typeof v === 'string' && (RENT_ROLL_MOVED_OUT_RULES as readonly string[]).includes(v)
-}
+// 10/13 (Nic): "Remove the 'keep moved-out households' setting entirely." The
+// setting's values (RENT_ROLL_MOVED_OUT_RULES and its labels) were kept here
+// only while the landlord Rent Roll page still imported them; nothing does any
+// more, so they are gone. The column landlords.rent_roll_moved_out and its
+// CHECK stay until a contract migration drops them (expand, then contract) —
+// nothing reads or writes them.

@@ -94,13 +94,19 @@ const NAV_ITEMS: Array<{
   // (the rent roll for the open month) leads the Financials hub, and the Rent
   // Roll (the history) follows it.
   // 10/12 (Nic): kept — "we still need the place to see payments mid month."
-  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null, hub: 'financials', category: 'payments' },
+  // 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages,
+  // read-only" — both are in a bookkeeper's menu (for their properties; the
+  // pages leave every action out for them).
+  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null, hub: 'financials', category: 'payments', bookkeeper: true },
   // 10/12 (Nic): staff with "View all payments" reach the Rent Roll — the page
   // reads what that key opens (GET /balances/rent-roll/*, payments.view_all),
   // so that key, not any key in the Payments category, shows it (see
   // visibleNavItemsFor).
-  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments' },
-  { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null, hub: 'financials', category: 'balances' },
+  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments', bookkeeper: true },
+  // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Its address opens
+  // Payments (main.tsx); front-desk staff who see who owes find that list and
+  // Record payment under Payments (PaymentsPage), so "View who owes" alone
+  // shows the Payments tab (visibleNavItemsFor).
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
   // 10/11 (Nic): money in by type — by month and by day, no names.
   { to: '/income',        icon: BarChart2,        label: 'Money In',         section: null, hub: 'financials', bookkeeper: true },
@@ -293,6 +299,9 @@ export function visibleNavItemsFor(user: NavUser) {
     // key its pages read (GET /balances/rent-roll/*); "View payments" alone shows
     // only unpaid bills, and the rent roll would refuse it.
     if (item.to === '/rent-roll') return perms['payments.view_all'] === true
+    // 10/13 (Nic): the Outstanding Balances tab is gone; who owes and Record
+    // payment are under Payments, so the balances switches show Payments too.
+    if (item.to === '/payments' && ['payments', 'balances'].some(c => (CATALOG_KEYS_BY_CATEGORY[c] || []).some(k => perms[k] === true))) return true
     if (!item.category) return false               // owner-only items (Team, Work Trade)
     // S640: Front Desk moved to its own category; onboarding staff who already
     // had it keep it rather than silently losing a page they use daily.
@@ -313,17 +322,42 @@ export function visibleNavItemsFor(user: NavUser) {
 export function sidebarNavItemsFor(user: NavUser) {
   const out: Array<{ to: string; icon: any; label: string; section: string | null; hub?: Hub }> = []
   const seen = new Set<string>()
-  for (const item of visibleNavItemsFor(user)) {
+  const items = visibleNavItemsFor(user)
+  const bookkeeperFinancials = bookkeeperLanding(user, items)
+  for (const item of items) {
     const hub = item.hub
     if (hub) {
       if (seen.has(hub)) continue
       seen.add(hub)
-      out.push({ to: item.to, icon: HUB_META[hub].icon, label: HUB_META[hub].label, section: item.section, hub })
+      const to = hub === 'financials' && bookkeeperFinancials ? bookkeeperFinancials : item.to
+      out.push({ to, icon: HUB_META[hub].icon, label: HUB_META[hub].label, section: item.section, hub })
     } else {
       out.push(item)
     }
   }
   return out
+}
+
+/**
+ * 10/11: a bookkeeper lands on the financial pages, Money in first — where
+ * they land after signing in and where Financials opens for them. 10/13 (Nic):
+ * Payments and the Rent Roll (read-only) joined their menu above Money in;
+ * where they land did not change (10/13 review: it moved as a side effect of
+ * the menu order). null: not a bookkeeper, or Money in is not theirs.
+ */
+function bookkeeperLanding(user: NavUser, items: ReturnType<typeof visibleNavItemsFor>): string | null {
+  if (user?.role !== 'bookkeeper') return null
+  return items.some(i => i.to === '/income') ? '/income' : null
+}
+
+/**
+ * Where staff and a bookkeeper land after signing in (RoleRedirect, main.tsx):
+ * the first page their permission set grants — the sidebar's own rule — and a
+ * bookkeeper Money in (bookkeeperLanding). Nothing granted: /welcome says why.
+ */
+export function staffLandingPath(user: NavUser): string {
+  const items = visibleNavItemsFor(user)
+  return bookkeeperLanding(user, items) ?? items[0]?.to ?? '/welcome'
 }
 
 /**

@@ -2094,10 +2094,12 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     ]}],
   },
   {
-    category: 'balances', label: 'Outstanding Balances',
+    // 10/13 (Nic): "REMOVE the Outstanding Balances tab" — the list of who owes
+    // is under Payments now (for staff without "View all payments").
+    category: 'balances', label: 'Who owes',
     sections: [{ label: 'Access', items: [
       { key: 'balances.view', label: 'View who owes + contact',
-        hint: 'Shows Outstanding Balances: who owes, their unit, how much, and their phone and email. Look only.' },
+        hint: 'Shows who owes, under Payments: their unit, how much, and their phone and email. Look only.' },
     ]}],
   },
   {
@@ -2297,7 +2299,7 @@ export const PERMISSION_PRESETS: PermissionPreset[] = [
   {
     id: 'front_desk',
     label: 'Front Desk',
-    description: 'The occupancy picture + who owes: Reservations, Leases, Master Schedule, and Outstanding Balances (with contact info).',
+    description: 'The occupancy picture + who owes: Reservations, Leases, Master Schedule, and who owes on the Payments page (with contact info).',
     keys: [
       // Bookings ops now live as tabs inside Master Schedule (Reservations + Requests).
       'bookings.view', 'bookings.change_requests', 'bookings.resolve_change_request', 'bookings.acknowledge',

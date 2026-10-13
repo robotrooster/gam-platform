@@ -20,6 +20,12 @@
  * flag) is kept on the opened row, and somebody who cannot see the page is
  * told where to go next.
  *
+ * 10/13 (Nic), the afternoon answers: bookkeepers see it read-only; the
+ * Outstanding Balances tab is gone (front-desk staff without "View all
+ * payments" find who owes and Record payment here); stay guests' money shows
+ * with its details; a red "Delinquent" tag beside the name; phones get one
+ * card per household.
+ *
  * Fixtures are typed with the wire types from @gam/shared (camelCase keys as
  * the server builds them — the camelize contract).
  */
@@ -28,7 +34,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
-import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge } from '@gam/shared'
+import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge, OpenMonthOtherMoney, OpenMonthTotals } from '@gam/shared'
 
 const server = vi.hoisted(() => ({
   properties: [] as any[],
@@ -94,6 +100,13 @@ vi.mock('../components/RecordPaymentWindow', async () => {
   }
 })
 
+// The list of who owes (Outstanding Balances' page) is tested on its own; here
+// only that front-desk staff get it, under the Payments name.
+vi.mock('./BalancesPage', async () => {
+  const { createElement: h } = await import('react')
+  return { BalancesPage: (p: any) => h('div', { className: 'stub-balances' }, `WHO OWES title=${p.title}`) }
+})
+
 import { PaymentsPage } from './PaymentsPage'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
@@ -118,7 +131,7 @@ const row = (over: Partial<OpenMonthRow> = {}): OpenMonthRow => ({
   invoiced: 460, lateFees: 0, paid: 460, clearing: 0, credit: 0, workTrade: 0, owed: 0, owedEarlier: 0,
   methods: ['Cash'], status: 'paid', statusLabel: 'Paid', statusColor: 'green', daysPastGrace: 0,
   dueDate: '2026-10-01', workTradeOnly: false, evictionMode: false, delinquent: false, recordWith: null,
-  payments: [payment()], charges: [charge()], ...over,
+  payments: [payment()], charges: [charge()], stay: null, ...over,
 })
 const vacant = (space: string, unitId: string): OpenMonthRow => row({
   key: `vacant:${unitId}`, unitId, space, leaseId: null, householdId: null, residents: [],
@@ -126,7 +139,7 @@ const vacant = (space: string, unitId: string): OpenMonthRow => row({
   dueDate: null, payments: [], charges: [],
 })
 const roll = (rows: OpenMonthRow[], over: Partial<OpenMonthRoll> = {}): OpenMonthRoll => ({
-  propertyId: 'p-oak', propertyName: 'Oak Park', month: '2026-10', rows, ...over,
+  propertyId: 'p-oak', propertyName: 'Oak Park', month: '2026-10', rows, otherMoney: [], ...over,
 })
 
 // A month as the server orders it: still owing first, then space order.
@@ -562,13 +575,13 @@ describe('logging a payment right here (the desk window — the one way)', () =>
 
 describe('the month total (decisions #25)', () => {
   it('shows only when the server sent it', async () => {
-    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 960, lateFees: 0, paid: 700, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0 } })
+    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 960, lateFees: 0, paid: 700, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0 } })
     await render()
     await loaded()
     expect(host.querySelector('.cd-totals')!.textContent).toBe('Invoiced $960.00Paid $700.00Owed $260.00')
   })
   it('adds work trade and what is owed from earlier months when there is some — as the Rent Roll does', async () => {
-    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 1460, lateFees: 0, paid: 700, credit: 0, workTrade: 500, owed: 260, owedEarlier: 120 } })
+    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 1460, lateFees: 0, paid: 700, credit: 0, workTrade: 500, owed: 260, owedEarlier: 120, stays: 0, staysRefunded: 0 } })
     await render()
     await loaded()
     expect(host.querySelector('.cd-totals')!.textContent)
@@ -689,18 +702,22 @@ describe('a payment from a bank deposit the tenant dated earlier than the bank',
 // ─── Who may see it ──────────────────────────────────────────────────────────
 
 describe('somebody who cannot see the page is told the next step', () => {
-  it('with Outstanding Balances: a button to it, and nothing is read', async () => {
+  // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Front-desk staff who take
+  // payments but may not see payment histories (S641) keep who owes and Record
+  // payment — here, under Payments; the month (payment histories) is never read.
+  it('front-desk staff who see who owes get that list here, named Payments, and nothing else is read', async () => {
     server.user = { role: 'onsite_manager', permissions: { 'payments.view': true, 'balances.view': true, take_payment: true } }
     await render()
-    expect(text()).toContain('To take a payment, use Outstanding Balances.')
-    expect([...host.querySelectorAll('button')].some(b => b.textContent === 'Open Outstanding Balances')).toBe(true)
+    expect(host.querySelector('.stub-balances')!.textContent).toBe('WHO OWES title=Payments')
+    expect(text()).not.toContain('Outstanding Balances')
     expect(server.gets).toEqual([])
   })
-  it('taking payments without Outstanding Balances: who to ask, and for which switch', async () => {
+  it('taking payments without seeing who owes: who to ask, and for which switch', async () => {
     server.user = { role: 'onsite_manager', permissions: { 'payments.view': true, take_payment: true } }
     await render()
-    expect(text()).toContain('Payments are taken on Outstanding Balances, which your account cannot open yet. Ask the account owner to turn on “View who owes + contact” for you under Team.')
-    expect([...host.querySelectorAll('button')].some(b => b.textContent === 'Open Outstanding Balances')).toBe(false)
+    expect(text()).toContain('Payments are taken here once your account can see who owes. Ask the account owner to turn on “View who owes + contact” for you under Team.')
+    expect(text()).not.toContain('Outstanding Balances')
+    expect(host.querySelector('.stub-balances')).toBeNull()
   })
   it('neither: ask the account owner', async () => {
     server.user = { role: 'onsite_manager', permissions: { 'payments.view': true } }
@@ -759,5 +776,204 @@ describe('Issue credit closes only from its own buttons', () => {
     expect(server.posts).toEqual([{ url: '/tenant-credits', body: { leaseId: 'L1', amount: 25, category: 'goodwill', reason: null } }])
     // A credit can pay a bill by itself: the month is read again.
     await until(() => openMonthReads().length > before, 'the month read again')
+  })
+})
+
+// ─── 10/13 (Nic), the afternoon answers ──────────────────────────────────────
+
+describe('10/13 (Nic): a bookkeeper sees the Payments page read-only', () => {
+  it('the month for their properties, and no Record payment, Issue credit, Import, tenant report or ledger reads', async () => {
+    server.user = { role: 'bookkeeper', permissions: { access_level: 'read_write' } }
+    await render()
+    await loaded()
+    expect(cells('lease:L7').slice(2, 7)).toEqual(['$460.00', '$200.00', '$260.00', 'Cash', 'Owes +3'])
+    expect(btn(/Record payment/)).toBeUndefined()
+    expect(btn(/Issue credit/)).toBeUndefined()
+    expect(btn(/Import payment history/)).toBeUndefined()
+    // The name is just the name: the tenant report is not theirs.
+    expect(host.querySelector('.pay-name')).toBeNull()
+    expect(cells('lease:L7')[1]).toContain('Russ Fuller & Ann Fuller')
+    // A row still opens to its payments and charges — from the row itself, nothing more is read.
+    await click(rowOf('lease:L7'))
+    expect(host.querySelectorAll('tr[data-line="payment"]')).toHaveLength(1)
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
+  })
+})
+
+// 10/13 (Nic): "the payments page ... should show all money coming in. The people
+// that paid short-term stays like Space RV 10 and 11 at Mountain View, those
+// should have details of the money that was paid."
+describe('a stay guest\'s money: on their row, with its details', () => {
+  const stayRow = (over: Partial<OpenMonthRow> = {}): OpenMonthRow => row({
+    key: 'stay:b10', unitId: 'u10', space: 'RV 10', leaseId: null, householdId: null, residents: [], occupant: 'Rhea Register',
+    invoiced: 0, paid: 589, owed: 0, methods: ['Cash'], status: 'stay', statusLabel: 'Checked in', statusColor: 'gray', dueDate: null,
+    payments: [payment({ paymentId: 'sp1', paidOn: '2026-10-06', amount: 589, statusLabel: 'Settled', forLabel: 'Stay Oct 4 – Nov 4 · pay link' })],
+    charges: [], stay: { bookingId: 'b10', checkIn: '2026-10-04', checkOut: '2026-11-04', nights: 31, statusLabel: 'Checked in', refunded: 0, refunds: [] },
+    ...over,
+  })
+
+  it('the row: the guest, what was paid this month and how — no Invoiced, no Owed, no Record payment', async () => {
+    server.rolls['p-oak'] = roll([russ, stayRow()], {
+      totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 589, staysRefunded: 0 },
+    })
+    await render()
+    await loaded()
+    expect(cells('stay:b10').slice(1, 7)).toEqual(['Rhea Register', '', '$589.00', '', 'Cash', 'Checked in'])
+    expect(rowOf('stay:b10')!.querySelector('.pay-pill')!.className).toBe('pay-pill gray')
+    expect(rowOf('stay:b10')!.querySelector('.pay-name')).toBeNull()
+    expect(rowOf('stay:b10')!.querySelector('td.pay-record')!.textContent).toBe('')
+    // The stays' money is its own total, apart from the bills.
+    expect(host.querySelector('.cd-totals')!.textContent).toBe('Invoiced $460.00Paid $200.00Owed $260.00Stays $589.00')
+    // Never in the header's "who is paying?" list.
+    await click(btn(/^Record payment$/))
+    expect(host.querySelector('.modal-overlay')!.textContent).not.toContain('Rhea Register')
+  })
+
+  it('opens to each payment — date, amount, method and what it was for — and the stay; nothing more is read', async () => {
+    server.rolls['p-oak'] = roll([stayRow()])
+    await render()
+    await loaded()
+    await click(rowOf('stay:b10'))
+    const line = host.querySelector('tr[data-line="stay-payment"]')!
+    expect([...line.querySelectorAll('td')].map(td => td.textContent)).toEqual(['Oct 6', '$589.00', 'Cash', 'Stay Oct 4 – Nov 4 · pay link'])
+    expect(host.querySelector('tr[data-line="stay"]')!.textContent).toBe('Oct 4 – Nov 431 nightsChecked in')
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
+  })
+
+  it('money an early check-out gave back this month is said under Paid and in the details', async () => {
+    server.rolls['p-oak'] = roll([stayRow({
+      statusLabel: 'Checked out', paid: 300,
+      payments: [payment({ paymentId: 'sp2', paidOn: '2026-10-01', amount: 300, forLabel: 'Stay Oct 1 – Oct 8 · at the register' })],
+      stay: { bookingId: 'b10', checkIn: '2026-10-01', checkOut: '2026-10-08', nights: 7, statusLabel: 'Checked out', refunded: 100,
+              refunds: [{ refundId: 'rf1', refundedOn: '2026-10-04', amount: 100, label: 'Cash · register Oct 1' }] },
+    })], { totals: { invoiced: 0, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 0, owedEarlier: 0, stays: 300, staysRefunded: 100 } })
+    await render()
+    await loaded()
+    expect(cells('stay:b10')[3]).toBe('$300.00$100.00 refunded')
+    expect(host.querySelector('.cd-totals')!.textContent).toContain('Stays $300.00 ($100.00 refunded)')
+    await click(rowOf('stay:b10'))
+    const back = host.querySelector('tr[data-line="stay-refund"]')!
+    expect([...back.querySelectorAll('td')].map(td => td.textContent)).toEqual(['Oct 4', '−$100.00', 'Refunded', 'Back to the guest — Cash · register Oct 1'])
+  })
+})
+
+// 10/13 (Nic): "the payments page ... should show all money coming in."
+describe('the register\'s and pay links\' money that is no bill and no stay', () => {
+  const line = (over: Partial<OpenMonthOtherMoney> = {}): OpenMonthOtherMoney => ({
+    id: 'sale1', saleId: 'sale1', kind: 'sale', day: '2026-10-01', amount: 23.92, methodLabel: 'Cash',
+    forLabel: 'Propane · at the register', who: null, ...over,
+  })
+  const lines = [
+    line(),
+    line({ id: 'sale2', saleId: 'sale2', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
+      forLabel: 'Electric (per kWh), RV site — monthly · pay link', who: 'Andres Razo' }),
+    line({ id: 'ref1', saleId: 'sale1', kind: 'refund', day: '2026-10-07', amount: 5, forLabel: 'Refund at the register · Propane' }),
+  ]
+  const totals = (over: Partial<OpenMonthTotals> = {}): OpenMonthTotals => ({
+    invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
+    otherIn: 776.09, otherRefunded: 5, ...over,
+  })
+
+  it('a folder under the month, closed until opened, its count and sums on its head; each line its day, what for, who, how and the amount', async () => {
+    server.rolls['p-oak'] = roll([russ], { otherMoney: lines, totals: totals() })
+    await render()
+    await loaded()
+    // Its own sum beside the bills', apart from them.
+    expect(host.querySelector('.cd-totals')!.textContent)
+      .toBe('Invoiced $460.00Paid $200.00Owed $260.00Register & pay links $776.09 ($5.00 refunded)')
+    const folder = host.querySelector('[data-section="other-money"]')!
+    const head = folder.querySelector('button.pay-other-head')!
+    expect(head.textContent).toBe('▸Register sales and pay links2 sales · 1 refund · $776.09 · $5.00 refunded')
+    expect(head.getAttribute('aria-expanded')).toBe('false')
+    expect(folder.querySelector('.pay-other-list')).toBeNull()
+    await click(head)
+    const shown = [...folder.querySelectorAll('li.pay-other-line')]
+    expect(shown.map(li => [li.getAttribute('data-line'), ...[...li.children].map(c => c.textContent)])).toEqual([
+      ['sale', 'Oct 1', 'Propane · at the registerNo name given · Cash', '$23.92'],
+      ['sale', 'Oct 6', 'Electric (per kWh), RV site — monthly · pay linkAndres Razo · Card · online', '$752.17'],
+      ['refund', 'Oct 7', 'Refund at the register · PropaneNo name given · Cash', '−$5.00'],
+    ])
+    // Money already in: nothing to press on it, and nothing more is read.
+    expect(folder.querySelectorAll('li button')).toHaveLength(0)
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
+    await click(head)
+    expect(folder.querySelector('.pay-other-list')).toBeNull()
+  })
+
+  it('without the sums (decisions #25) the folder says only how many; with nothing of the kind there is no folder', async () => {
+    server.rolls['p-oak'] = roll([russ], { otherMoney: lines })
+    await render()
+    await loaded()
+    expect(host.querySelector('button.pay-other-head')!.textContent).toBe('▸Register sales and pay links2 sales · 1 refund')
+    act(() => root.unmount())
+    root = createRoot(host)
+    server.rolls['p-oak'] = roll([russ])
+    await render()
+    await loaded()
+    expect(host.querySelector('[data-section="other-money"]')).toBeNull()
+  })
+
+  it('on a phone it sits under the cards, one line each — never a table that scrolls sideways', async () => {
+    ;(window as any).matchMedia = (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} })
+    try {
+      server.rolls['p-oak'] = roll([russ], { otherMoney: lines })
+      await render()
+      await until(() => !!host.querySelector('.pay-cards'), 'the cards')
+      const folder = host.querySelector('[data-section="other-money"]')!
+      expect(folder.querySelector('table')).toBeNull()
+      await click(folder.querySelector('button.pay-other-head'))
+      expect(folder.querySelectorAll('li.pay-other-line')).toHaveLength(3)
+    } finally { delete (window as any).matchMedia }
+  })
+})
+
+describe('10/13 (Nic): "a \'Delinquent\' tag beside the name"', () => {
+  it('a small red tag on the name\'s line, only on a delinquent household', async () => {
+    server.rolls['p-oak'] = roll([{ ...russ, delinquent: true }, glenda])
+    await render()
+    await loaded()
+    const tag = rowOf('lease:L7')!.querySelector('.pay-tag.delinquent')!
+    expect(tag.textContent).toBe('Delinquent')
+    expect(tag.parentElement!.tagName).toBe('TD')
+    expect(tag.previousElementSibling!.textContent).toBe('Russ Fuller & Ann Fuller')
+    expect(rowOf('lease:L2')!.querySelector('.pay-tag.delinquent')).toBeNull()
+  })
+})
+
+// 10/13 (Nic): "phones = one card per household".
+describe('on a phone: one card per household, never a table that scrolls sideways', () => {
+  const phone = (matches: boolean) => {
+    ;(window as any).matchMedia = (q: string) => ({ matches, media: q, addEventListener: () => {}, removeEventListener: () => {} })
+  }
+  afterEach(() => { delete (window as any).matchMedia })
+
+  it('each row is a card with its figures, method, pill and Record payment; tapping opens its details in the card', async () => {
+    phone(true)
+    await render()
+    await until(() => !!host.querySelector('.pay-cards'), 'the cards')
+    expect(host.querySelector('table.pay-table')).toBeNull()
+    const cards = [...host.querySelectorAll('.pay-card')]
+    expect(cards.map(c => c.getAttribute('data-card-key'))).toEqual(['lease:L7', 'lease:L12', 'lease:L2', 'vacant:u3', 'lease:L10'])
+    const russCard = cards[0]
+    expect(russCard.querySelector('.pay-pill')!.textContent).toBe('Owes +3')
+    expect([...russCard.querySelectorAll('.pay-card-figs > div')].map(d => d.textContent)).toEqual(['Invoiced$460.00', 'Paid$200.00', 'Owed$260.00'])
+    expect(russCard.querySelector('.pay-card-method')!.textContent).toBe('Payment method: Cash')
+    expect(russCard.querySelector('.pay-card-record button')!.textContent).toBe('Record payment')
+    // An empty space: just the space and its pill.
+    expect(cards[3].querySelector('.pay-card-figs')).toBeNull()
+    expect(cards[3].querySelector('.pay-pill')!.textContent).toBe('Vacant')
+    await click(russCard.querySelector('.pay-card-head'))
+    expect(russCard.querySelectorAll('.pay-card-detail tr[data-line="payment"]')).toHaveLength(1)
+    // Record payment from the card opens the desk window, not the details.
+    await click(cards[1].querySelector('.pay-card-record button'))
+    expect(host.querySelector('.stub-desk')!.textContent).toContain('anchor=chg-nora')
+    expect(cards[1].querySelector('.pay-card-detail')).toBeNull()
+  })
+
+  it('a desk-sized screen keeps the table', async () => {
+    phone(false)
+    await render()
+    await loaded()
+    expect(host.querySelector('.pay-cards')).toBeNull()
   })
 })

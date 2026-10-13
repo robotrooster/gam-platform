@@ -6,8 +6,10 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
-  rentRollStatusOf, rentRollStatusText, compareSpaces, isSpaceOnlyRow, RENT_ROLL_ROW_STATUSES, RENT_ROLL_STATUS_LABEL, RENT_ROLL_STATUS_COLOR,
+  rentRollStatusOf, rentRollStatusText, compareSpaces, isSpaceOnlyRow, isStayRow, RENT_ROLL_ROW_STATUSES, RENT_ROLL_STATUS_LABEL,
+  RENT_ROLL_STATUS_COLOR, STAY_PAYMENT_METHOD_LABEL,
 } from './rentRoll'
+import { STAY_PAYMENT_METHODS } from './index'
 
 describe('the status pill', () => {
   it('maps the payment-health stamp: a partial past grace with money still owed is red Owes +N', () => {
@@ -46,6 +48,20 @@ describe('a row that is a space, not a household', () => {
     expect(isSpaceOnlyRow({ status: 'vacant' })).toBe(true)
     expect(isSpaceOnlyRow({ status: 'occupied' })).toBe(true)
     for (const s of ['paid', 'paid_late', 'partial', 'owes', 'due', 'none'] as const) expect(isSpaceOnlyRow({ status: s })).toBe(false)
+  })
+})
+
+// 10/13 (Nic): "the payments page ... should show all money coming in" — a stay guest's row.
+describe('a stay guest\'s row', () => {
+  it('is gray, its own kind — not a space-only row, never a payment status', () => {
+    expect(RENT_ROLL_STATUS_COLOR.stay).toBe('gray')
+    expect(isStayRow({ status: 'stay' })).toBe(true)
+    expect(isSpaceOnlyRow({ status: 'stay' })).toBe(false)
+    for (const s of RENT_ROLL_ROW_STATUSES.filter(x => x !== 'stay')) expect(isStayRow({ status: s })).toBe(false)
+  })
+  it('names every way a stay can be paid (one label per stay_payments method)', () => {
+    expect(Object.keys(STAY_PAYMENT_METHOD_LABEL).sort()).toEqual([...STAY_PAYMENT_METHODS].sort())
+    for (const m of STAY_PAYMENT_METHODS) expect(STAY_PAYMENT_METHOD_LABEL[m]).toMatch(/^[A-Z]/)
   })
 })
 

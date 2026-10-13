@@ -49,7 +49,11 @@ vi.mock('../lib/api', () => ({
   },
 }))
 
-import { RentRollPage, newestFirst, rangeTitle, monthCountWords, rentRollCsv, csvFileName } from './RentRollPage'
+// 10/13 (Nic): a bookkeeper reads the Rent Roll too — the signed-in user decides whether a name opens the report.
+const auth = vi.hoisted(() => ({ user: { role: 'landlord', permissions: {} } as any }))
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: auth.user }) }))
+
+import { RentRollPage, newestFirst, rangeTitle, monthCountWords, rentRollCsv, csvFileName, movedOutInRangeWords } from './RentRollPage'
 import { rangeOfPick, historyPath } from '../components/rentroll/rentRollRange'
 import { localToday } from '../lib/creditDesk'
 import { csvField, csvLine } from '../lib/paymentStamps'
@@ -298,6 +302,21 @@ describe('the Rent Roll: one property at a time', () => {
     expect(summary).toContain('Paid $990.00')
     expect(summary).toContain('Owed $577.47')
     expect(summary).not.toContain('Work trade')
+    expect(summary).not.toContain('moved-out')
+  })
+
+  // 10/13 review: the printed page says where the totals' extra comes from.
+  it('totals that count the moved-out households\' bills say how much of them is theirs', async () => {
+    const marta = { invoiced: 495, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 495 }
+    server.history = q => history(q, {
+      totals: { invoiced: 1485, lateFees: 0, paid: 990, credit: 0, workTrade: 0, owed: 495 }, movedOutTotals: marta,
+      movedOutOwing: [{ key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'],
+        owed: 495, months: [{ month: '2026-09', owed: 495 }], leaseEnded: null, inRange: marta }],
+    })
+    await render()
+    expect(host.querySelector('.rrh-summary .rrh-incl')!.textContent)
+      .toBe('Includes the moved-out households\' bills in this range: invoiced $495.00 · paid $0.00 · owed $495.00')
+    expect(movedOutInRangeWords({ movedOutTotals: { ...marta, invoiced: 0, owed: 0 }, movedOutOwing: [] })).toBeNull()
   })
 
   it('a name opens that household’s report — its lease', async () => {
@@ -307,10 +326,35 @@ describe('the Rent Roll: one property at a time', () => {
     await until(() => text().includes('REPORT g1 ?leaseId=l48'), 'the report')
   })
 
+  // 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
+  it('a bookkeeper reads the same page — Print and Export kept — and a name is just the name (the report is not theirs)', async () => {
+    auth.user = { role: 'bookkeeper', permissions: { access_level: 'read_write' } }
+    server.history = q => history(q, { movedOutOwing: [{
+      key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'], owed: 515,
+      months: [{ month: '2026-08', owed: 495 }], leaseEnded: null, inRange: { invoiced: 495, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 495 },
+    }] })
+    try {
+      await render()
+      const names = [...host.querySelectorAll('.rr-split .rr-name-link')]
+      expect(names.map(n => n.textContent)).toEqual(['Ana Ruiz', 'Gerald Logue'])
+      expect(names.every(n => n.tagName === 'SPAN')).toBe(true)
+      expect(button(/Print/)).toBeDefined()
+      expect(button(/Export CSV/)).toBeDefined()
+      await click(host.querySelector('.rrh-folder-head') as HTMLElement)
+      const row = host.querySelector('.rrh-mo-table tbody tr')!
+      // The lease end date only when the owner ticked the box (the server sends it or not).
+      expect([...row.querySelectorAll('td')].map(td => td.textContent)).toEqual(['RV 7', 'Marta Diaz', '—', 'Aug 2026 $495.00', '$515.00'])
+      expect(row.querySelector('button')).toBeNull()
+    } finally {
+      auth.user = { role: 'landlord', permissions: {} }
+    }
+  })
+
   it('"Moved out, still owes" is collapsed until opened; each household with what it still owes for, its name opening its report', async () => {
     server.history = q => history(q, { movedOutOwing: [{
       key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'], owed: 515,
       months: [{ month: '2026-08', owed: 495 }, { month: '2026-09', owed: 20 }], leaseEnded: '2026-08-31',
+      inRange: { invoiced: 515, lateFees: 20, paid: 0, credit: 0, workTrade: 0, owed: 515 },
     }] })
     await render()
     const head = host.querySelector('.rrh-folder-head') as HTMLButtonElement
@@ -370,19 +414,31 @@ const RANGE_LABELS = () => ['Last month', 'This quarter', 'Last quarter', 'This 
 describe('the spreadsheet and the helpers', () => {
   const q = new URLSearchParams('propertyId=mv&from=2026-08&to=2026-09')
 
-  it('the CSV is the rows as on screen (months newest first), the totals when sent, then "Moved out, still owes"', () => {
+  // 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — 10/13
+  // review: so their bills in the range are a line above the Total, and the
+  // Total is the lines above it added up.
+  it('the CSV is the rows as on screen (months newest first), the folder\'s bills in the range and the totals when sent, then "Moved out, still owes"', () => {
+    const marta = { invoiced: 515, lateFees: 20, paid: 0, credit: 0, workTrade: 0, owed: 515 }
     const h = history(q, {
-      totals: { invoiced: 1567.47, lateFees: 60, paid: 990, credit: 0, workTrade: 0, owed: 577.47 },
+      totals: { invoiced: 2082.47, lateFees: 80, paid: 990, credit: 0, workTrade: 0, owed: 1092.47 },
+      movedOutTotals: marta,
       movedOutOwing: [{ key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'],
-        owed: 515, months: [{ month: '2026-08', owed: 495 }, { month: '2026-09', owed: 20 }], leaseEnded: '2026-08-31' }],
+        owed: 515, months: [{ month: '2026-08', owed: 495 }, { month: '2026-09', owed: 20 }], leaseEnded: '2026-08-31', inRange: marta }],
     })
     const lines = rentRollCsv(h).trimEnd().split('\n')
     expect(lines[0]).toBe('Space,Tenant,Moved out,Invoiced,Late fees,Paid,Account credit,Work trade,Owed,Payment health,September 2026,August 2026')
     expect(lines[1]).toBe('RV 2,Ana Ruiz,,990,0,990,0,0,0,100%,Paid late +5,No bill')
     expect(lines[2]).toBe('RV 10,"Gerald Logue, Gina Logue",,577.47,60,0,0,0,577.47,50%,Owes +7,Paid')
-    expect(lines[3]).toBe(',Total,,1567.47,60,990,0,0,577.47')
-    expect(lines.slice(4)).toEqual(['', '"Moved out, still owes"', 'Space,Tenant,Lease ended,Owed,Still owes for',
-      'RV 7,Marta Diaz,2026-08-31,515,August 2026 $495.00; September 2026 $20.00'])
+    expect(lines[3]).toBe(',"Moved out, still owes — bills in this range",,515,20,0,0,0,515')
+    expect(lines[4]).toBe(',Total,,2082.47,80,990,0,0,1092.47')
+    // The Total is the lines above it, column by column.
+    const nums = (l: string) => l.replace(/^.*?,,/, '').split(',').slice(0, 6).map(Number)
+    const sum = [lines[1], lines[2]].map(l => l.replace(/^RV \d+,(?:"[^"]*"|[^,]*),,/, '').split(',').slice(0, 6).map(Number))
+      .concat([nums(lines[3])]).reduce((s, xs) => s.map((v, i) => Math.round((v + xs[i]) * 100) / 100))
+    expect(sum).toEqual(nums(lines[4]))
+    expect(lines.slice(5)).toEqual(['', '"Moved out, still owes"',
+      'Space,Tenant,Lease ended,Invoiced in range,Paid in range,Owed in range,Owed,Still owes for',
+      'RV 7,Marta Diaz,2026-08-31,515,0,515,515,August 2026 $495.00; September 2026 $20.00'])
     expect(csvFileName(h)).toBe('rent-roll-mountain-view-rv-ranch-2026-08-to-2026-09.csv')
     expect(csvFileName({ ...h, allTime: true })).toBe('rent-roll-mountain-view-rv-ranch-all-time.csv')
     expect(csvFileName({ ...h, from: '2026-09' })).toBe('rent-roll-mountain-view-rv-ranch-2026-09.csv')

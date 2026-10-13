@@ -44,6 +44,16 @@
  *     them (any, only after "Not rent", or never). Never a tenant's payment.
  *     10/13 (Nic): marking a deposit "Not rent" (and taking the mark back) is
  *     theirs too: "owner + bookkeeper (not front-desk staff)".
+ *   - 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages,
+ *     read-only" — GET /api/balances/rent-roll/(properties|open-month|history),
+ *     their property boxes narrowing each (routes/balances). The pages carry
+ *     what Nic asked them to show: each row's charges (what each was for,
+ *     invoiced, paid, owed) and payments (day, amount, method, a check or
+ *     deposit number), stays and the register's money — names, spaces and
+ *     money, scrubbed of contact details. Never the other /api/balances
+ *     routes (who owes with phone and email, GET /balances/:tenantId/invoices,
+ *     the Payments ledger GET /balances/payments-by-month), and never
+ *     recording a payment, a credit or an import (those routes stay refused).
  *   - the P&L reports the shared Reports page reads (overview, by property,
  *     a property's detail, a month's P&L). Never the owner statement, the tax
  *     summary or the 1099 work-trade summary (they carry the company's own
@@ -108,6 +118,17 @@ const RULES: Rule[] = [
   // staff)" — marking a deposit "Not rent", and its Undo. routes/bankFeed
   // holds them to the company-wide box (requireBankFiler) and the row's company.
   { method: 'POST',   test: /^\/api\/bank-feed\/deposits\/[0-9a-f-]{36}\/not-rent(\/undo)?\/?$/i },
+  // 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages,
+  // read-only." The property picker, the open month (the Payments page) and
+  // the history (the Rent Roll) — GETs only, nothing on them writes.
+  // routes/balances narrows each to their property boxes, keeps the clean cut
+  // at a sale, sends no desk window and follows the lease-dates box; every
+  // reply passes the contact scrub (names, spaces and money only). The rows'
+  // charges and payments ride on the open month (the page shows them); the
+  // rest of /api/balances — who owes with contact details, a tenant's
+  // invoices (/balances/:tenantId/invoices), the Payments ledger — stays
+  // refused.
+  { method: 'GET',    test: /^\/api\/balances\/rent-roll\/(properties|open-month|history)\/?$/ },
   // The P&L reports.
   { method: 'GET',    test: /^\/api\/reports\/(summary|monthly-pl|property-pl|site-downtime|property-detail)\/?$/ },
   // 10/12 (Nic): the monthly property report, with the owner's box (see the header).
@@ -151,7 +172,7 @@ export function bookkeeperResponseIsScrubbed(url: string): boolean {
  * reachable at all.
  */
 export const BOOKKEEPER_GRANTED_PERMS: ReadonlySet<string> = new Set([
-  'payments.view_all',      // the P&L reports' gate
+  'payments.view_all',      // the P&L reports' gate, and (10/13) the Payments page and the Rent Roll
   'reports.tab.overview',
   'reports.tab.property',
 ])

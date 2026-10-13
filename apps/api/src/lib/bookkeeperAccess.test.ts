@@ -99,6 +99,10 @@ const EXPECTED_ALLOWED = new Set([
   // 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk staff)".
   'POST /api/bank-feed/deposits/:id/not-rent',
   'POST /api/bank-feed/deposits/:id/not-rent/undo',
+  // 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
+  'GET /api/balances/rent-roll/properties',
+  'GET /api/balances/rent-roll/open-month',
+  'GET /api/balances/rent-roll/history',
   'GET /api/reports/summary',
   'GET /api/reports/monthly-pl',
   'GET /api/reports/property-pl',
@@ -170,6 +174,27 @@ describe('the bookkeeper gate, against every route the API declares', () => {
     expect(isBookkeeperRequestAllowed('GET', '/api/books/rent-roll?basis=billed')).toBe(true)
     expect(isBookkeeperRequestAllowed('GET', '/api/books/accounts')).toBe(true)
     expect(isBookkeeperRequestAllowed('POST', '/api/financials/income')).toBe(false)
+  })
+})
+
+describe('10/13 (Nic): the Payments page and the Rent Roll, read-only', () => {
+  it('opens the three reads and nothing else under /api/balances', () => {
+    for (const path of ['/api/balances/rent-roll/properties', `/api/balances/rent-roll/open-month?propertyId=${UUID}`,
+      `/api/balances/rent-roll/history?propertyId=${UUID}&range=all`]) {
+      expect(isBookkeeperRequestAllowed('GET', path), path).toBe(true)
+      for (const m of ['POST', 'PUT', 'PATCH', 'DELETE']) expect(isBookkeeperRequestAllowed(m, path), `${m} ${path}`).toBe(false)
+    }
+    // Who owes with contact details, a bill's lines, the Payments ledger, the retired routes.
+    for (const path of ['/api/balances', '/api/balances?include=clearing', `/api/balances/${UUID}/invoices`,
+      '/api/balances/payments-by-month', '/api/balances/rent-roll', '/api/balances/rent-roll/moved-out']) {
+      expect(isBookkeeperRequestAllowed('GET', path), path).toBe(false)
+    }
+    // Never a tenant-account action from those pages: recording a payment, a credit, an import.
+    expect(isBookkeeperRequestAllowed('POST', `/api/payments/${UUID}/record-manual`)).toBe(false)
+    expect(isBookkeeperRequestAllowed('POST', '/api/tenant-credits')).toBe(false)
+    expect(isBookkeeperRequestAllowed('POST', '/api/landlords/onboard-payment-history-csv/commit')).toBe(false)
+    // Their replies pass the contact scrub.
+    expect(bookkeeperResponseIsScrubbed('/api/balances/rent-roll/open-month')).toBe(true)
   })
 })
 

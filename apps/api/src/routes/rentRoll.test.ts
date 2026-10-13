@@ -28,6 +28,7 @@ import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
 import { currentBillMonth, addMonths } from '../services/householdMonths'
 import { lateFeeTermsText, latenessPattern, median, firstLateDayText } from '../services/tenantPaymentReport'
+import { splitRegisterMoney } from '../services/rentRoll'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret'
 
@@ -371,23 +372,26 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     const own = await space(p, 'MH 03')
     await db.query(`UPDATE units SET status = 'owner_use' WHERE id = $1`, [own])
     const stay = await space(p, 'RV 10')
-    await db.query(
+    const ginaStay = (await db.query<{ id: string }>(
       `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, status, lease_type)
-       VALUES ($1,$2,'Gina Guest',$3::date,$3::date + 30,'checked_in','month_to_month')`, [stay, p.landlordId, `${THIS}-01`])
+       VALUES ($1,$2,'Gina Guest',$3::date,$3::date + 30,'checked_in','month_to_month') RETURNING id`, [stay, p.landlordId, `${THIS}-01`])).rows[0].id
     // A guest who already checked out leaves the space empty.
     const empty = await space(p, 'RV 11')
     await db.query(
       `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, status, lease_type)
        VALUES ($1,$2,'Carl Checkedout',$3::date,$3::date + 2,'checked_out','nightly')`, [empty, p.landlordId, `${THIS}-01`])
     const d = (await openMonth(owner(p), p.propertyId)).body.data
+    // 10/13 (Nic): a checked-in stay guest is their stay's row ("Checked in"),
+    // in the space's place — nothing paid toward it this month here.
     expect(d.rows.map((r: any) => [r.key, r.space, r.status, r.statusLabel, r.statusColor, r.occupant])).toEqual([
       [`space:${own}`, 'MH 03', 'occupied', 'Owner Use', 'gray', null],
-      [`space:${stay}`, 'RV 10', 'occupied', 'Checked in', 'gray', 'Gina Guest'],
+      [`stay:${ginaStay}`, 'RV 10', 'stay', 'Checked in', 'gray', 'Gina Guest'],
       [`vacant:${empty}`, 'RV 11', 'vacant', 'Vacant', 'gray', null],
     ])
     for (const r of d.rows) {
-      expect(r).toMatchObject({ householdId: null, residents: [], recordWith: null, invoiced: 0, owed: 0, owedEarlier: 0, payments: [], charges: [] })
+      expect(r).toMatchObject({ householdId: null, residents: [], recordWith: null, invoiced: 0, paid: 0, owed: 0, owedEarlier: 0, payments: [], charges: [], delinquent: false })
     }
+    expect(d.rows[1].stay).toMatchObject({ bookingId: ginaStay, checkIn: `${THIS}-01`, nights: 30, statusLabel: 'Checked in', refunded: 0, refunds: [] })
     expect(d.totals).toMatchObject({ invoiced: 0, owed: 0, owedEarlier: 0 })
     // A checked-in guest billed here on no lease is their own row — never the space's row as well.
     const c = await db.connect()
@@ -427,6 +431,511 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
 })
 
 // ─── The Rent Roll page: the history ────────────────────────────────────────
+
+// ─── 10/13 (Nic): stays, the Delinquent tag, the desk window ─────────────────
+
+/** A stay at a space: its booking (the guest named on it). */
+async function stayAt(p: { landlordId: string }, unitId: string, o: {
+  guest: string; checkIn: string; nights: number; status: string; leaseType?: string
+}) {
+  return (await db.query<{ id: string }>(
+    `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, status, lease_type)
+     VALUES ($1,$2,$3,$4::date,$4::date + $5::int,$6,$7) RETURNING id`,
+    [unitId, p.landlordId, o.guest, o.checkIn, o.nights, o.status, o.leaseType ?? 'nightly'])).rows[0].id
+}
+
+/** A register sale toward a stay (stayPayments.recordSaleTowardStay's row), noon on `day` in Phoenix. */
+async function registerSale(p: { landlordId: string; userId: string; propertyId: string }, bookingId: string, o: {
+  method: 'cash' | 'card' | 'check'; toward: number; day: string; payLink?: boolean; balanceLink?: boolean; voided?: boolean
+}) {
+  const at = `${o.day} 12:00:00-07`
+  let linkId: string | null = null
+  if (o.payLink) {
+    linkId = (await db.query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email)
+       VALUES ($1,$2,$3,$4,'one_time','Stay','[]'::jsonb,$5,$5,'guest@t.dev') RETURNING id`,
+      [randomUUID(), p.landlordId, p.propertyId, p.userId, o.toward])).rows[0].id
+    if (o.balanceLink) await db.query(`UPDATE unit_bookings SET balance_pay_link_id = $2 WHERE id = $1`, [bookingId, linkId])
+  }
+  const pi = o.method === 'card' ? `pi_${randomUUID()}` : null
+  const sale = (await db.query<{ id: string }>(
+    `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total, property_id, pay_link_id,
+                                   stripe_payment_intent_id, status, voided_at, created_at)
+     VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10::timestamptz) RETURNING id`,
+    [p.landlordId, p.userId, o.method, o.toward, p.propertyId, linkId, pi, o.voided ? 'voided' : 'completed',
+     o.voided ? at : null, at])).rows[0].id
+  return (await db.query<{ id: string }>(
+    `INSERT INTO stay_payments (booking_id, landlord_id, kind, pos_transaction_id, stripe_payment_intent_id, method, toward_stay, paid_at)
+     VALUES ($1,$2,'pos_sale',$3,$4,$5,$6,$7::timestamptz) RETURNING id`,
+    [bookingId, p.landlordId, sale, pi, o.method, o.toward, at])).rows[0].id
+}
+
+/** The booking site's deposit (stayPayments.recordSiteDeposit's row), noon on `day` in Phoenix. */
+async function siteDepositOn(p: { landlordId: string }, bookingId: string, toward: number, day: string) {
+  return (await db.query<{ id: string }>(
+    `INSERT INTO stay_payments (booking_id, landlord_id, kind, stripe_payment_intent_id, method, toward_stay, paid_at)
+     VALUES ($1,$2,'site_deposit',$3,'card',$4,$5::timestamptz) RETURNING id`,
+    [bookingId, p.landlordId, `pi_${randomUUID()}`, toward, `${day} 12:00:00-07`])).rows[0].id
+}
+
+describe('10/13 (Nic): the stays on the Payments page — "show all money coming in"', () => {
+  // "The people that paid short-term stays like Space RV 10 and 11 at Mountain
+  // View, those should have details of the money that was paid."
+  it('each stay paid this month is a row with the money and its details; never in the bills\' Invoiced, Paid or Owed', async () => {
+    const p = await park()
+    const lena = await household(p, 'RV 1', 'Lena Lease')
+    await rent(p, lena, THIS, 495, 1)
+    // RV 10: checked in, paid at the desk through a pay link, in cash (Mountain View's RV 10 and 11).
+    const rv10 = await space(p, 'RV 10')
+    const rhea = await stayAt(p, rv10, { guest: 'Rhea Register', checkIn: `${THIS}-01`, nights: 31, status: 'checked_in', leaseType: 'month_to_month' })
+    const rheaPaid = await registerSale(p, rhea, { method: 'cash', toward: 589, day: `${THIS}-01`, payLink: true })
+    // RV 11: a guest who came and left this month — the booking site's deposit, then the balance link by card online.
+    const rv11 = await space(p, 'RV 11')
+    const otto = await stayAt(p, rv11, { guest: 'Otto Online', checkIn: `${THIS}-01`, nights: 2, status: 'checked_out' })
+    const ottoDeposit = await siteDepositOn(p, otto, 40, `${THIS}-01`)
+    const ottoBalance = await registerSale(p, otto, { method: 'card', toward: 80, day: `${THIS}-01`, payLink: true, balanceLink: true })
+    await db.query(`UPDATE pos_transactions SET paid_online = TRUE WHERE id = (SELECT pos_transaction_id FROM stay_payments WHERE id = $1)`, [ottoBalance])
+    // RV 12: a stay paid last month only — nothing came in this month: not on it.
+    const rv12 = await space(p, 'RV 12')
+    const lastStay = await stayAt(p, rv12, { guest: 'Lars Lastmonth', checkIn: `${LAST}-03`, nights: 2, status: 'checked_out' })
+    await registerSale(p, lastStay, { method: 'cash', toward: 70, day: `${LAST}-03` })
+    // RV 13: checked in; the register sale toward it was voided — it paid nothing.
+    const rv13 = await space(p, 'RV 13')
+    const vic = await stayAt(p, rv13, { guest: 'Vic Voided', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    await registerSale(p, vic, { method: 'cash', toward: 210, day: `${THIS}-01`, voided: true })
+    // RV 14: a stay that became a lease is that lease's household, never a stay row too.
+    const rv14 = await space(p, 'RV 14')
+    const leased = await stayAt(p, rv14, { guest: 'Lee Leased', checkIn: `${THIS}-01`, nights: 30, status: 'confirmed' })
+    await registerSale(p, leased, { method: 'cash', toward: 150, day: `${THIS}-01` })
+    const c = await db.connect()
+    try {
+      await seedLease(c, { unitId: rv14, landlordId: p.landlordId, rentAmount: 589, startDate: `${THIS}-01`, status: 'pending' })
+    } finally { c.release() }
+    await db.query(`UPDATE leases SET source_booking_id = $2 WHERE unit_id = $1`, [rv14, leased])
+    // Another property's stay is never on this one.
+    const other = await park('Oak Park Motel and RV', p)
+    const elsewhere = await stayAt(other, await space(other, 'RV 10'), { guest: 'Olga Other', checkIn: `${THIS}-01`, nights: 3, status: 'checked_in' })
+    await registerSale(other, elsewhere, { method: 'cash', toward: 99, day: `${THIS}-01` })
+
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    expect(d.rows.map((r: any) => [r.space, r.key, r.status, r.statusLabel, r.occupant ?? r.residents[0]?.name, r.paid])).toEqual([
+      ['RV 1', `lease:${lena.leaseId}`, 'paid', 'Paid', 'Lena Lease', 495],
+      ['RV 10', `stay:${rhea}`, 'stay', 'Checked in', 'Rhea Register', 589],
+      ['RV 11', `stay:${otto}`, 'stay', 'Checked out', 'Otto Online', 120],
+      ['RV 11', `vacant:${rv11}`, 'vacant', 'Vacant', undefined, 0],
+      ['RV 12', `vacant:${rv12}`, 'vacant', 'Vacant', undefined, 0],
+      ['RV 13', `stay:${vic}`, 'stay', 'Checked in', 'Vic Voided', 0],
+      ['RV 14', `vacant:${rv14}`, 'vacant', 'Vacant', undefined, 0],
+    ])
+    const row = (key: string) => d.rows.find((r: any) => r.key === key)
+    const dates = (from: string, nights: number) => {
+      const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+      const end = new Date(`${from}T12:00:00Z`); end.setUTCDate(end.getUTCDate() + nights)
+      const word = (dt: Date) => `${M[dt.getUTCMonth()]} ${dt.getUTCDate()}`
+      return `${word(new Date(`${from}T12:00:00Z`))} – ${word(end)}`
+    }
+    // The detail: date, amount, method and what it was for.
+    expect(row(`stay:${rhea}`)).toMatchObject({
+      invoiced: 0, owed: 0, owedEarlier: 0, methods: ['Cash'], recordWith: null, householdId: null, residents: [], charges: [],
+      delinquent: false, stay: { bookingId: rhea, checkIn: `${THIS}-01`, nights: 31, statusLabel: 'Checked in', refunded: 0, refunds: [] },
+    })
+    expect(row(`stay:${rhea}`).payments).toEqual([{
+      paymentId: rheaPaid, paidOn: `${THIS}-01`, amount: 589, credit: 0, methodLabel: 'Cash', status: 'settled', statusLabel: 'Settled',
+      reference: null, forLabel: `Stay ${dates(`${THIS}-01`, 31)} · pay link`,
+    }])
+    expect(row(`stay:${otto}`).methods).toEqual(['Card · online'])
+    expect(row(`stay:${otto}`).payments.map((x: any) => [x.paymentId, x.amount, x.methodLabel, x.forLabel])).toEqual([
+      [ottoDeposit, 40, 'Card · online', `Booking deposit · stay ${dates(`${THIS}-01`, 2)} · booking site`],
+      [ottoBalance, 80, 'Card · online', `Stay balance · stay ${dates(`${THIS}-01`, 2)} · pay link`],
+    ])
+    expect(row(`stay:${vic}`)).toMatchObject({ paid: 0, methods: [], payments: [] })
+    expect(JSON.stringify(d.rows)).not.toContain('Olga Other')
+    expect(JSON.stringify(d.rows)).not.toContain('Lee Leased')
+    // The stays' money is its own total — the bills still add up without it.
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 709, staysRefunded: 0 })
+  })
+
+  it('money an early check-out gave back this month shows on the stay\'s row', async () => {
+    const p = await park()
+    const rv20 = await space(p, 'RV 20')
+    const early = await stayAt(p, rv20, { guest: 'Ella Early', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    const sp = await registerSale(p, early, { method: 'cash', toward: 300, day: `${THIS}-01` })
+    const decision = (await db.query<{ id: string }>(
+      `INSERT INTO stay_checkout_decisions (booking_id, landlord_id, left_on, question, choice, status, booked_price, stayed_worth, paid,
+                                            refund_total, decided_at)
+       VALUES ($1,$2,$3::date,'overpaid','refund_unused','decided',300,200,300,100,NOW()) RETURNING id`,
+      [early, p.landlordId, `${THIS}-01`])).rows[0].id
+    const refund = (await db.query<{ id: string }>(
+      `INSERT INTO stay_refund_parts (decision_id, booking_id, landlord_id, seq, kind, stay_payment_id, toward_amount, amount,
+                                      label, status, refunded_at)
+       VALUES ($1,$2,$3,1,'cash',$4,100,100,'Cash · register','handed_back',$5::timestamptz) RETURNING id`,
+      [decision, early, p.landlordId, sp, `${THIS}-01 15:00:00-07`])).rows[0].id
+    const d = (await openMonth(owner(p), p.propertyId)).body.data
+    const row = d.rows.find((r: any) => r.key === `stay:${early}`)
+    expect(row).toMatchObject({ paid: 300, statusLabel: 'Checked out' })
+    expect(row.stay).toMatchObject({ refunded: 100, refunds: [{ refundId: refund, refundedOn: `${THIS}-01`, amount: 100, label: 'Cash · register' }] })
+    expect(d.totals).toMatchObject({ stays: 300, staysRefunded: 100 })
+  })
+
+  // 10/13 (Nic): "a 'Delinquent' tag beside the name" — past grace with money
+  // still owed here, this month or an earlier month; never late fees alone.
+  it('Delinquent: past grace with money owed, this month or earlier; cleared the moment it is paid', async () => {
+    const p = await park()
+    const early = await household(p, 'RV 1', 'Ernie Earlier')
+    const sept = await rent(p, early, LAST, 495)            // last month's bill, past grace
+    await rent(p, early, THIS, 495, 1)
+    const fees = await household(p, 'RV 2', 'Fay Fees')
+    await bill(p, fees, LAST, [{ type: 'rent', amount: 495, paidDay: 1 }, { type: 'late_fee', amount: 5, day: 6 }])
+    await rent(p, fees, THIS, 495, 1)
+    const now = await household(p, 'RV 3', 'Nat Now')
+    await rent(p, now, THIS, 495)
+    const paidUp = await household(p, 'RV 4', 'Pat Paid')
+    await rent(p, paidUp, THIS, 495, 1)
+    const tag = async () => Object.fromEntries((await openMonth(owner(p), p.propertyId)).body.data.rows
+      .map((r: any) => [r.residents[0]?.name ?? r.key, r.delinquent]))
+    expect(await tag()).toEqual({
+      'Ernie Earlier': true,
+      // Owes only a late fee: never delinquent (late fees never decide a month's color).
+      'Fay Fees': false,
+      // This month's bill: delinquent once it is past its grace period.
+      'Nat Now': PAST_GRACE_NOW > 0,
+      'Pat Paid': false,
+    })
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = NOW() WHERE id = $1`, [sept.paymentId])
+    expect((await tag())['Ernie Earlier']).toBe(false)
+  })
+
+  it('the desk window rides only for a viewer who may take a payment', async () => {
+    const p = await park()
+    const h = await household(p, 'RV 5', 'Gerald Logue')
+    const r = await rent(p, h, THIS, 495)
+    const recordWith = async (token: string) => (await openMonth(token, p.propertyId)).body.data.rows[0].recordWith
+    expect(await recordWith(owner(p))).toBe(r.paymentId)
+    expect(await recordWith(await teamToken(p, 'onsite_manager', { 'payments.view_all': true, take_payment: true }))).toBe(r.paymentId)
+    expect(await recordWith(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }))).toBeNull()
+  })
+})
+
+// ─── 10/13 (Nic): "show ALL money coming in" — the register and pay links ───
+
+/**
+ * A register sale or a paid pay link at a property, noon on `day` in Phoenix:
+ * its items, how it was paid, who paid, and — when `stays` — its parts toward
+ * stays (stay_payments, as stayPayments.recordSaleTowardStay writes them).
+ */
+async function sale(p: { landlordId: string; userId: string; propertyId: string }, o: {
+  method: 'cash' | 'card' | 'check' | 'charge'; total: number; surcharge?: number; day: string; items: string[]
+  customer?: string; tenantId?: string; payLink?: { label?: string; customerName?: string | null }; paidOnline?: boolean
+  voided?: boolean; stays?: Array<{ bookingId: string; toward: number }>; screening?: number
+}) {
+  const at = `${o.day} 12:00:00-07`
+  let linkId: string | null = null
+  if (o.payLink) {
+    linkId = (await db.query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email,
+                                  customer_name, status, paid_at)
+       VALUES ($1,$2,$3,$4,'one_time',$5,'[]'::jsonb,$6,$6,'payer@t.dev',$7,'paid',$8::timestamptz) RETURNING id`,
+      [randomUUID(), p.landlordId, p.propertyId, p.userId, o.payLink.label ?? 'Pay link', o.total - (o.surcharge ?? 0),
+       o.payLink.customerName ?? null, at])).rows[0].id
+  }
+  let customerId: string | null = null
+  if (o.customer) {
+    const [first, last] = o.customer.split(' ')
+    customerId = (await db.query<{ id: string }>(
+      `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone) VALUES ($1,$2,$3,'cust.secret@t.dev','602-555-0142') RETURNING id`,
+      [p.landlordId, first, last])).rows[0].id
+  }
+  const pi = o.method === 'card' ? `pi_${randomUUID()}` : null
+  const id = (await db.query<{ id: string }>(
+    `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, surcharge, total, property_id, pay_link_id,
+                                   stripe_payment_intent_id, status, voided_at, created_at, paid_online, pos_customer_id, tenant_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15) RETURNING id`,
+    [p.landlordId, p.userId, o.method, o.total - (o.surcharge ?? 0), o.surcharge ?? 0, o.total, p.propertyId, linkId, pi,
+     o.voided ? 'voided' : 'completed', o.voided ? at : null, at, o.paidOnline === true, customerId, o.tenantId ?? null])).rows[0].id
+  for (const name of o.items) {
+    await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,1,1,1)`, [id, name])
+  }
+  for (const s of o.stays ?? []) {
+    await db.query(
+      `INSERT INTO stay_payments (booking_id, landlord_id, kind, pos_transaction_id, stripe_payment_intent_id, method, toward_stay, paid_at)
+       VALUES ($1,$2,'pos_sale',$3,$4,$5,$6,$7::timestamptz)`, [s.bookingId, p.landlordId, id, pi, o.method, s.toward, at])
+  }
+  if (o.screening) {
+    await db.query(`INSERT INTO screening_prepayments (landlord_id, property_id, amount, source, source_id) VALUES ($1,$2,$3,'register',$4)`,
+      [p.landlordId, p.propertyId, o.screening, id])
+  }
+  return id
+}
+
+/** A refund at the register on a sale (routes/pos refund's row), noon on `day` in Phoenix. */
+async function registerRefund(p: { landlordId: string }, saleId: string, amount: number, day: string, method: 'cash' | 'check' = 'cash') {
+  return (await db.query<{ id: string }>(
+    `INSERT INTO pos_refunds (transaction_id, landlord_id, amount, refund_method, created_at) VALUES ($1,$2,$3,$4,$5::timestamptz) RETURNING id`,
+    [saleId, p.landlordId, amount, method, `${day} 12:00:00-07`])).rows[0].id
+}
+
+describe('10/13 (Nic): "the payments page ... should show all money coming in" — the register and pay links', () => {
+  it('every register sale and pay link that is no bill and no stay is a line with its day, amount, method, what it was for and who', async () => {
+    const p = await park()
+    const lena = await household(p, 'RV 1', 'Lena Lease')
+    await rent(p, lena, THIS, 495, 1)
+    // Propane to a walk-in, in cash.
+    const propane = await sale(p, { method: 'cash', total: 23.92, day: `${THIS}-01`, items: ['Propane'] })
+    // A pay link for a site and its electric, emailed to someone with no lease
+    // or stay here (Andres Razo's, RV 27), by card online — the card fee paid
+    // on top is not the property's money.
+    const link = await sale(p, {
+      method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true,
+      items: ['RV site — monthly', 'Electric (per kWh)'], payLink: { customerName: 'Andres Razo' },
+    })
+    // A card swiped at the register by a customer on file.
+    const swiped = await sale(p, { method: 'card', total: 4.19, day: `${THIS}-01`, items: ['Propane'], customer: 'Cora Card' })
+    // Never money in: a charge account (collected later), a voided sale, last month's, another property's.
+    await sale(p, { method: 'charge', total: 30, day: `${THIS}-01`, items: ['Propane'] })
+    await sale(p, { method: 'cash', total: 12, day: `${THIS}-01`, items: ['Firewood'], voided: true })
+    await sale(p, { method: 'cash', total: 16.18, day: `${LAST}-28`, items: ['Propane'] })
+    const oak = await park('Oak Park Motel and RV', p)
+    await sale(oak, { method: 'cash', total: 99, day: `${THIS}-01`, items: ['Ice'] })
+    // A ticket for a stay and propane: the stay's part is the stay's row, the rest is here.
+    const rv10 = await space(p, 'RV 10')
+    const rhea = await stayAt(p, rv10, { guest: 'Rhea Register', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    const mixed = await sale(p, { method: 'cash', total: 320, day: `${THIS}-01`, items: ['RV site — weekly', 'Propane'],
+      stays: [{ bookingId: rhea, toward: 300 }] })
+    // A stay with the guest's background check (GAM's, never the landlord's): nothing else came in.
+    const rv11 = await space(p, 'RV 11')
+    const sam = await stayAt(p, rv11, { guest: 'Sam Screened', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    await sale(p, { method: 'cash', total: 335, day: `${THIS}-01`, items: ['RV site — weekly', 'Background check'],
+      stays: [{ bookingId: sam, toward: 300 }], screening: 35 })
+
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    expect(d.otherMoney.map((x: any) => [x.saleId, x.kind, x.day, x.amount, x.methodLabel, x.forLabel, x.who])).toEqual([
+      [propane, 'sale', `${THIS}-01`, 23.92, 'Cash', 'Propane · at the register', null],
+      [link, 'sale', `${THIS}-01`, 752.17, 'Card · online', 'Electric (per kWh), RV site — monthly · pay link', 'Andres Razo'],
+      [swiped, 'sale', `${THIS}-01`, 4.19, 'Card · in person', 'Propane · at the register', 'Cora Card'],
+      [mixed, 'sale', `${THIS}-01`, 20, 'Cash', 'Propane, RV site — weekly · at the register · the stay’s part is on its row', null],
+    ].sort((a, z) => String(a[0]).localeCompare(String(z[0]))))
+    // The stays' money is the stays' rows; the bills still add up on their own.
+    expect(d.rows.find((r: any) => r.key === `stay:${rhea}`)).toMatchObject({ paid: 300 })
+    expect(d.rows.find((r: any) => r.key === `stay:${sam}`)).toMatchObject({ paid: 300 })
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 600, otherIn: 800.28, otherRefunded: 0 })
+    // Names, never contact details.
+    expect(JSON.stringify(d)).not.toContain('cust.secret')
+    expect(JSON.stringify(d)).not.toContain('602-555-0142')
+    expect(JSON.stringify(d)).not.toContain('payer@t.dev')
+    // Staff who see the page without the sums get the lines, never the totals.
+    const staff = await teamToken(p, 'onsite_manager', { 'payments.view_all': true })
+    const theirs = (await openMonth(staff, p.propertyId)).body.data
+    expect(theirs.otherMoney).toHaveLength(4)
+    expect(theirs.totals).toBeUndefined()
+  })
+
+  it('a refund at the register comes off the sale\'s other items first; only what is beyond them goes back from the stay', async () => {
+    const p = await park()
+    // A stay paid in full at the register, part of it refunded there this month.
+    const rv20 = await space(p, 'RV 20')
+    const ella = await stayAt(p, rv20, { guest: 'Ella Early', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    const ellaSale = await sale(p, { method: 'cash', total: 300, day: `${THIS}-01`, items: ['RV site — weekly'],
+      stays: [{ bookingId: ella, toward: 300 }] })
+    const ellaBack = await registerRefund(p, ellaSale, 100, `${THIS}-01`)
+    // A stay and propane on one ticket; $80 refunded: $50 is the propane, $30 the stay.
+    const rv21 = await space(p, 'RV 21')
+    const mo = await stayAt(p, rv21, { guest: 'Mo Mixed', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    const moSale = await sale(p, { method: 'cash', total: 250, day: `${THIS}-01`, items: ['RV site — weekly', 'Propane'],
+      stays: [{ bookingId: mo, toward: 200 }] })
+    const moBack = await registerRefund(p, moSale, 80, `${THIS}-01`, 'check')
+    // A stay paid last month, refunded at the register this month: on the page for the refund.
+    const rv22 = await space(p, 'RV 22')
+    const lou = await stayAt(p, rv22, { guest: 'Lou Lastmonth', checkIn: `${LAST}-20`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    const louSale = await sale(p, { method: 'cash', total: 210, day: `${LAST}-20`, items: ['RV site — weekly'],
+      stays: [{ bookingId: lou, toward: 210 }] })
+    const louBack = await registerRefund(p, louSale, 60, `${THIS}-01`)
+    // An early check-out's refund handed back at the register is the stay's own part — counted once, there.
+    const rv23 = await space(p, 'RV 23')
+    const eve = await stayAt(p, rv23, { guest: 'Eve Checkout', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    const eveSale = await sale(p, { method: 'cash', total: 300, day: `${THIS}-01`, items: ['RV site — weekly'],
+      stays: [{ bookingId: eve, toward: 300 }] })
+    const eveSp = (await db.query<{ id: string }>(`SELECT id FROM stay_payments WHERE pos_transaction_id = $1`, [eveSale])).rows[0].id
+    const decision = (await db.query<{ id: string }>(
+      `INSERT INTO stay_checkout_decisions (booking_id, landlord_id, left_on, question, choice, status, booked_price, stayed_worth, paid,
+                                            refund_total, decided_at)
+       VALUES ($1,$2,$3::date,'overpaid','refund_unused','decided',300,200,300,100,NOW()) RETURNING id`,
+      [eve, p.landlordId, `${THIS}-01`])).rows[0].id
+    const part = (await db.query<{ id: string }>(
+      `INSERT INTO stay_refund_parts (decision_id, booking_id, landlord_id, seq, kind, stay_payment_id, pos_transaction_id, toward_amount,
+                                      amount, label, status, refunded_at)
+       VALUES ($1,$2,$3,1,'cash',$4,$5,100,100,'Cash · register','handed_back',$6::timestamptz) RETURNING id`,
+      [decision, eve, p.landlordId, eveSp, eveSale, `${THIS}-01 15:00:00-07`])).rows[0].id
+    await db.query(
+      `INSERT INTO pos_refunds (transaction_id, landlord_id, amount, refund_method, stay_refund_part_id, created_at)
+       VALUES ($1,$2,100,'cash',$3,$4::timestamptz)`, [eveSale, p.landlordId, part, `${THIS}-01 15:00:00-07`])
+
+    const d = (await openMonth(owner(p), p.propertyId)).body.data
+    const stay = (id: string) => d.rows.find((r: any) => r.key === `stay:${id}`)
+    expect(stay(ella)).toMatchObject({ paid: 300 })
+    expect(stay(ella).stay).toMatchObject({
+      refunded: 100, refunds: [{ refundId: ellaBack, refundedOn: `${THIS}-01`, amount: 100, label: 'Cash · refund at the register' }],
+    })
+    expect(stay(mo)).toMatchObject({ paid: 200 })
+    expect(stay(mo).stay).toMatchObject({
+      refunded: 30, refunds: [{ refundId: moBack, refundedOn: `${THIS}-01`, amount: 30, label: 'Check · refund at the register' }],
+    })
+    expect(stay(lou)).toMatchObject({ paid: 0, payments: [] })
+    expect(stay(lou).stay).toMatchObject({ refunded: 60, refunds: [{ refundId: louBack, amount: 60 }] })
+    expect(stay(eve).stay).toMatchObject({ refunded: 100, refunds: [{ refundId: part, amount: 100, label: 'Cash · register' }] })
+    expect(d.otherMoney.map((x: any) => [x.saleId, x.kind, x.amount, x.methodLabel])).toEqual([
+      [moSale, 'sale', 50, 'Cash'], [moSale, 'refund', 50, 'Check'],
+    ])
+    expect(d.otherMoney.find((x: any) => x.kind === 'refund')).toMatchObject({ id: moBack, forLabel: 'Refund at the register · Propane, RV site — weekly' })
+    expect(d.totals).toMatchObject({ stays: 800, staysRefunded: 290, otherIn: 50, otherRefunded: 50 })
+  })
+
+  it('a stay put on a charge account paid nothing yet: no money on its row, never in the sums', async () => {
+    const p = await park()
+    const rv30 = await space(p, 'RV 30')
+    const cal = await stayAt(p, rv30, { guest: 'Cal Charge', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    await sale(p, { method: 'charge', total: 300, day: `${THIS}-01`, items: ['RV site — weekly'], stays: [{ bookingId: cal, toward: 300 }] })
+    // One who left: put on the account, nothing came in — not on the page.
+    const rv31 = await space(p, 'RV 31')
+    const cy = await stayAt(p, rv31, { guest: 'Cy Charged', checkIn: `${THIS}-01`, nights: 2, status: 'checked_out' })
+    await sale(p, { method: 'charge', total: 80, day: `${THIS}-01`, items: ['RV site — nightly'], stays: [{ bookingId: cy, toward: 80 }] })
+    const d = (await openMonth(owner(p), p.propertyId)).body.data
+    expect(d.rows.find((r: any) => r.key === `stay:${cal}`)).toMatchObject({ paid: 0, methods: [], payments: [], statusLabel: 'Checked in' })
+    expect(d.rows.some((r: any) => r.key === `stay:${cy}`)).toBe(false)
+    expect(d.otherMoney).toEqual([])
+    expect(d.totals).toMatchObject({ stays: 0, otherIn: 0 })
+  })
+})
+
+describe('splitRegisterMoney: every register dollar in one place', () => {
+  it('a refund comes off the sale\'s other items first, then the stays it paid, by their parts; earlier refunds count first', () => {
+    const { other, stayRefunds } = splitRegisterMoney([{
+      id: 's1', sold_on: '2026-10-02', sold_in_month: true, method: 'cash', paid_online: false, via_link: false,
+      base: '330.00', screening: '0', who: null, items: 'Propane, RV site — weekly, RV site — weekly',
+      stays: [{ bookingId: 'b1', toward: 200 }, { bookingId: 'b2', toward: 100 }],
+      refunds: [
+        { id: 'r0', day: '2026-09-30', inMonth: false, net: 10, method: 'cash' },   // last month: $10 of the $30 propane
+        { id: 'r1', day: '2026-10-05', inMonth: true, net: 80, method: 'check' },   // $20 propane left, then $60 of the stays
+      ],
+    }])
+    expect(other.map(x => [x.id, x.kind, x.amount])).toEqual([['s1', 'sale', 30], ['r1', 'refund', 20]])
+    expect(stayRefunds.get('b1')).toEqual([{ refundId: 'r1:b1', refundedOn: '2026-10-05', amount: 40, label: 'Check · refund at the register' }])
+    expect(stayRefunds.get('b2')).toEqual([{ refundId: 'r1:b2', refundedOn: '2026-10-05', amount: 20, label: 'Check · refund at the register' }])
+  })
+
+  it('a sale from last month is not this month\'s money; the background check GAM keeps never is', () => {
+    const { other } = splitRegisterMoney([
+      { id: 'old', sold_on: '2026-09-28', sold_in_month: false, method: 'cash', paid_online: false, via_link: false,
+        base: 16.18, screening: 0, who: null, items: 'Propane', stays: [], refunds: [] },
+      { id: 'chk', sold_on: '2026-10-02', sold_in_month: true, method: 'card', paid_online: true, via_link: true,
+        base: 35, screening: 35, who: 'Sam Screened', items: 'Background check', stays: [], refunds: [] },
+    ])
+    expect(other).toEqual([])
+  })
+})
+
+// ─── 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only" ─
+
+async function bookkeeperToken(f: { landlordId: string }, propertyIds: string[], o: { companyWide?: boolean; showLeaseDates?: boolean } = {}) {
+  const u = (await db.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+     VALUES ($1,'x','bookkeeper','Bea','Keeper',TRUE) RETURNING id`, [`bk-${randomUUID()}@t.dev`])).rows[0].id
+  await db.query(
+    `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide, show_lease_dates)
+     VALUES ($1,$2,'read_write',$3,$4,$5)`, [u, f.landlordId, propertyIds, o.companyWide === true, o.showLeaseDates === true])
+  return {
+    userId: u,
+    token: jwt.sign({ userId: u, role: 'bookkeeper', email: 'bk@t.dev', profileId: null, landlordId: f.landlordId, permissions: { access_level: 'read_write' } },
+      process.env.JWT_SECRET!, { expiresIn: '10m' }),
+  }
+}
+
+describe('10/13 (Nic): a bookkeeper sees the Payments page and the Rent Roll, read-only, for their properties', () => {
+  it('their property boxes narrow every read; no desk window; contact details never reach them', async () => {
+    const p = await park('Mountain View RV Ranch')
+    const oak = await park('Oak Park Motel and RV', p)
+    const h = await household(p, 'RV 48', 'Gerald Logue')
+    await db.query(`UPDATE users SET email = 'gerald.secret@t.dev', phone = '480-555-0199' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [h.tenantId])
+    await rent(p, h, THIS, 495)
+    await rent(oak, await household(oak, 'MH 03', 'Josh Roby'), THIS, 440)
+    const bk = (await bookkeeperToken(p, [p.propertyId])).token
+
+    const props = await get(bk, '/api/balances/rent-roll/properties')
+    expect(props.status, JSON.stringify(props.body)).toBe(200)
+    expect(props.body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
+    const month = await openMonth(bk, p.propertyId)
+    expect(month.status).toBe(200)
+    expect(month.body.data.rows.map((r: any) => [r.space, r.residents[0]?.name, r.owed, r.recordWith])).toEqual([['RV 48', 'Gerald Logue', 495, null]])
+    // decisions #25: bookkeepers see the sums (A/R totals: yes, 10/12).
+    expect(month.body.data.totals).toMatchObject({ invoiced: 495, owed: 495 })
+    const hist = await history(bk, p.propertyId, `from=${THIS}&to=${THIS}`)
+    expect(hist.status).toBe(200)
+    expect(hist.body.data.rows.map((r: any) => r.residents[0].name)).toEqual(['Gerald Logue'])
+    for (const body of [props.body, month.body, hist.body]) {
+      expect(JSON.stringify(body)).not.toContain('gerald.secret')
+      expect(JSON.stringify(body)).not.toContain('480-555-0199')
+    }
+    // A property not ticked for them is not one they can see.
+    expect((await openMonth(bk, oak.propertyId)).status).toBe(404)
+    expect((await history(bk, oak.propertyId, 'range=all')).status).toBe(404)
+    // Never anything else under /api/balances: who owes with contact details, a bill's lines, the Payments ledger.
+    expect((await get(bk, '/api/balances')).status).toBe(403)
+    expect((await get(bk, `/api/balances/${h.tenantId}/invoices`)).status).toBe(403)
+    expect((await get(bk, `/api/balances/payments-by-month?month=${THIS}`)).status).toBe(403)
+    expect((await request(buildApp()).post('/api/balances/rent-roll/open-month').set('Authorization', `Bearer ${bk}`)).status).toBe(403)
+  })
+
+  it('the lease end date in "Moved out, still owes" follows the owner\'s lease-dates box', async () => {
+    const p = await park()
+    const owen = await household(p, 'RV 40', 'Owen Owes', { status: 'expired' })
+    await rent(p, owen, LAST, 495)
+    await db.query(`UPDATE leases SET end_date = $2 WHERE id = $1`, [owen.leaseId, `${LAST}-15`])
+    const ended = async (token: string) => (await history(token, p.propertyId, `from=${THIS}&to=${THIS}`)).body.data.movedOutOwing[0].leaseEnded
+    expect(await ended((await bookkeeperToken(p, [p.propertyId])).token)).toBeNull()
+    expect(await ended((await bookkeeperToken(p, [p.propertyId], { showLeaseDates: true })).token)).toBe(`${LAST}-15`)
+    expect(await ended(owner(p))).toBe(`${LAST}-15`)
+  })
+
+  // 10/12 (Nic): a property sold out of the company is a CLEAN CUT for its
+  // bookkeeper — its history up to the sale, nothing after; one that was never
+  // theirs is hidden whole.
+  it('the clean cut at a sale: a former property up to its last day, one never theirs not at all', async () => {
+    const p = await park('Alder')
+    const birch = await park('Birch', p)
+    const cedar = await park('Cedar', p)
+    const buyer = await park('Buyer Park')
+    const al = await household(p, 'RV 1', 'Al Alder')
+    await rent(p, al, LAST, 495, 2)
+    const ce = await household(cedar, 'RV 9', 'Cy Cedar')
+    await rent(cedar, ce, LAST, 300, 2)
+    // Bea keeps Alder and Birch, company-wide: the whole company. Cedar was never hers.
+    const bea = await bookkeeperToken(p, [p.propertyId, birch.propertyId], { companyWide: true })
+    const { transferProperty } = await import('../services/propertyTransfer')
+    for (const sold of [p.propertyId, cedar.propertyId]) {
+      const t = await transferProperty({ propertyId: sold, fromLandlordId: p.landlordId, toLandlordId: buyer.landlordId, byUserId: p.userId })
+      await db.query(`UPDATE property_transfers SET transferred_at = $2::timestamptz WHERE id = $1`, [t.transferId, `${LAST}-20 12:00:00-07`])
+      await db.query(`UPDATE bookkeeper_former_properties SET left_at = $2::timestamptz WHERE property_transfer_id = $1`, [t.transferId, `${LAST}-20 12:00:00-07`])
+    }
+    // The seller's own bill on Alder after the sale: the owner's books, never past Bea's cut.
+    await rent(p, al, THIS, 495)
+    const props = (await get(bea.token, '/api/balances/rent-roll/properties')).body.data
+    expect(props.map((x: any) => [x.name, x.owned])).toEqual([['Alder', false], ['Birch', true]])
+    expect((await history(bea.token, cedar.propertyId, 'range=all')).status).toBe(404)
+    expect((await openMonth(bea.token, p.propertyId)).status).toBe(404)
+    const cut = (await history(bea.token, p.propertyId, `from=${LAST}&to=${THIS}`)).body.data
+    expect(cut).toMatchObject({ from: LAST, to: LAST, months: [LAST] })
+    expect(cut.rows.map((r: any) => [r.residents[0].name, r.invoiced, r.paid])).toEqual([['Al Alder', 495, 495]])
+    expect(cut.totals).toMatchObject({ invoiced: 495, owed: 0 })
+    const all = (await history(bea.token, p.propertyId, 'range=all')).body.data
+    expect(all).toMatchObject({ allTime: true, to: LAST })
+    // The owner reads the seller's whole history there, the later bill included.
+    const own = (await history(owner(p), p.propertyId, `from=${LAST}&to=${THIS}`)).body.data
+    expect(own.totals).toMatchObject({ invoiced: 990 })
+  })
+})
 
 describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
   it('every household billed in the range, in space order, with the range\'s money, health and a stamp per month', async () => {
@@ -533,10 +1042,25 @@ describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
       ['RV 10', 'Lena Living', false], ['RV 20', 'Rita Recent', true],
     ])
     expect(d.movedOutOwing.map((m: any) => [m.spaces, m.residents[0].name, m.owed])).toEqual([[['RV 40'], 'Owen Owes', 495]])
-    // The totals and the month's counts are the rows'.
-    expect(d.totals).toMatchObject({ invoiced: 990, paid: 990, owed: 0 })
+    // 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — Owen's
+    // bill in the range is in the property's Invoiced and Owed; the month's
+    // counts are the rows'.
+    expect(d.totals).toMatchObject({ invoiced: 1485, paid: 990, owed: 495 })
+    // 10/13 review: and says which part is theirs, so the export's Total adds up.
+    const zero = { invoiced: 0, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 0 }
+    expect(d.movedOutOwing[0].inRange).toEqual({ ...zero, invoiced: 495, owed: 495 })
+    expect(d.movedOutTotals).toEqual({ ...zero, invoiced: 495, owed: 495 })
+    for (const k of ['invoiced', 'lateFees', 'paid', 'credit', 'workTrade', 'owed'] as const) {
+      expect(d.rows.reduce((s: number, r: any) => s + r[k], 0) + d.movedOutTotals[k], k).toBe(d.totals[k])
+    }
     const counts = Object.fromEntries(d.monthCounts[0].counts.map((c: any) => [c.status, c.households]))
     expect(counts).toMatchObject({ paid: 2, owes: 0, due: 0 })
+    // A folder household billed outside the range adds nothing to it.
+    const before = (await history(owner(p), p.propertyId, `from=${addMonths(LAST, -1)}&to=${addMonths(LAST, -1)}`)).body.data
+    expect(before.movedOutOwing.map((m: any) => m.residents[0].name)).toEqual(['Owen Owes'])
+    expect(before.totals).toMatchObject({ invoiced: 0, paid: 0, owed: 0 })
+    expect(before.movedOutOwing[0].inRange).toEqual(zero)
+    expect(before.movedOutTotals).toEqual(zero)
     // Owen pays: off the folder, a row in the month he was billed.
     await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = NOW() WHERE id = $1`, [owed.paymentId])
     const paid = (await history(owner(p), p.propertyId, `from=${LAST}&to=${LAST}`)).body.data
@@ -649,6 +1173,34 @@ describe('GET /api/tenants/:id/payment-report', () => {
     // "What it's for": every charge line, what it is, paid when and how, days past grace.
     expect(r.history.map((l: any) => l.label)).toEqual(['Rent', 'Rent', 'Rent'])
     expect(r.history[1]).toMatchObject({ how_paid: 'Cash', days_past_grace: 3, paid_on: `${LAST}-08`, charged: 495 })
+  })
+
+  // 10/13 review: the report a name on the Payments page opens says
+  // "Delinquent" when the row does — from the money, never the space's
+  // overnight flag (it lags a payment until the nightly job runs).
+  it('Delinquent is the Payments page\'s rule, lease by lease: past grace with money owed, cleared the moment it is paid', async () => {
+    const p = await park()
+    const mh23 = await household(p, 'MH 23', 'Arturo Melendez')
+    const sept = await rent(p, mh23, LAST, 525)                      // past grace, unpaid
+    const mh15 = await household(p, 'MH 15', 'Arturo Melendez', { tenantId: mh23.tenantId })
+    await rent(p, mh15, LAST, 460, 2)
+    const pat = await household(p, 'MH 24', 'Pat Paid')
+    await rent(p, pat, LAST, 525, 2)
+    // The spaces' overnight flags say the opposite.
+    await db.query(`UPDATE units SET status = 'active' WHERE id = $1`, [mh23.unitId])
+    await db.query(`UPDATE units SET status = 'delinquent' WHERE id = ANY($1::uuid[])`, [[mh15.unitId, pat.unitId]])
+    const flags = async (h: Hh, q = '') => Object.fromEntries((await report(owner(p), h.tenantId, q)).body.data.leases
+      .map((l: any) => [l.unit_number, l.delinquent]))
+    expect(await flags(mh23)).toEqual({ 'MH 23': true, 'MH 15': false })
+    expect(await flags(mh23, `?leaseId=${mh23.leaseId}`)).toEqual({ 'MH 23': true })
+    expect(await flags(mh23, `?leaseId=${mh15.leaseId}`)).toEqual({ 'MH 15': false })
+    expect(await flags(pat)).toEqual({ 'MH 24': false })
+    const rowOf = async (leaseId: string) => (await openMonth(owner(p), p.propertyId)).body.data.rows.find((r: any) => r.leaseId === leaseId)
+    expect((await rowOf(mh23.leaseId)).delinquent).toBe(true)
+    // MH 23 pays this morning: the row and the report drop it at once.
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = NOW() WHERE id = $1`, [sept.paymentId])
+    expect(await flags(mh23, `?leaseId=${mh23.leaseId}`)).toEqual({ 'MH 23': false })
+    expect((await rowOf(mh23.leaseId)).delinquent).toBe(false)
   })
 
   // 10/13 (Nic): a household is a lease — the report one row opens is that lease's, imported history too.
@@ -893,6 +1445,66 @@ describe('one household, one health number on every screen', () => {
     expect(profile.stats.health).toMatchObject({ on_time: rollRow.health.onTime, counted: rollRow.health.counted })
     expect(rep.health).toMatchObject({ percent: rollRow.health.percent, on_time: rollRow.health.onTime, counted: rollRow.health.counted })
     expect(own.onTime).toMatchObject({ pct: rollRow.health.percent, onTimeCount: rollRow.health.onTime, resolved: rollRow.health.counted })
+  })
+})
+
+// 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE."
+describe('the Tenants list and the profile split payment health by lease', () => {
+  it('a person on two leases reads each lease\'s own health on its row and on the profile — the Rent Roll\'s figures', async () => {
+    const p = await park()
+    const a = await household(p, 'RV 30', 'Hal Twice')
+    const b = await household(p, 'RV 31', 'Hal Twice', { tenantId: a.tenantId })
+    await rent(p, a, LAST, 495, 2)      // on time
+    await rent(p, b, LAST, 300, 12)     // 7 days past grace
+    const solo = await household(p, 'RV 40', 'Sol Single')
+    await rent(p, solo, LAST, 495, 2)
+    const rows = (await history(owner(p), p.propertyId, `from=${LAST}&to=${LAST}`)).body.data.rows
+    const rollPct = (leaseId: string) => rows.find((r: any) => r.leaseId === leaseId).health.percent
+
+    const list = await get(owner(p), '/api/tenants/health-by-unit')
+    expect(list.status, JSON.stringify(list.body)).toBe(200)
+    const byUnit = Object.fromEntries(list.body.data.map((x: any) => [x.unitId, [x.leaseId, x.percent]]))
+    expect(byUnit).toEqual({
+      [a.unitId]: [a.leaseId, rollPct(a.leaseId)],
+      [b.unitId]: [b.leaseId, rollPct(b.leaseId)],
+      [solo.unitId]: [solo.leaseId, rollPct(solo.leaseId)],
+    })
+    expect([byUnit[a.unitId][1], byUnit[b.unitId][1]]).toEqual([100, 0])
+
+    const profile = (await get(owner(p), `/api/tenants/${a.tenantId}/profile`)).body.data
+    expect(profile.stats.healthByLease.map((l: any) => [l.unit_number, l.lease_id, l.current, l.health?.percent]).sort())
+      .toEqual([['RV 30', a.leaseId, true, 100], ['RV 31', b.leaseId, true, 0]])
+    expect(profile.stats.healthByLease.find((l: any) => l.lease_id === a.leaseId).health)
+      .toMatchObject({ on_time: 1, counted: 1, label: '100%, 1 of 1 month' })
+
+    // Who: as the list's column always was — staff without the payment permissions get nothing.
+    expect((await get(await teamToken(p, 'onsite_manager', { 'balances.view': true }), '/api/tenants/health-by-unit')).body.data).toEqual([])
+    const staff = (await get(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }), '/api/tenants/health-by-unit')).body.data
+    expect(staff).toHaveLength(3)
+    // A staff member kept to another property sees none of these spaces.
+    const elsewhere = await park('Oak Park Motel and RV', p)
+    expect((await get(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [elsewhere.propertyId]), '/api/tenants/health-by-unit')).body.data).toEqual([])
+    // Another company never.
+    const stranger = await park('Stranger Park')
+    expect((await get(owner(stranger), '/api/tenants/health-by-unit')).body.data).toEqual([])
+  })
+
+  // 10/13 review: Arturo Melendez's new MH 15 lease (waiting for signatures)
+  // read "Ended" beside his MH 23. Each lease says where it stands.
+  it('each lease carries its own status — one not signed yet is pending, never ended', async () => {
+    const p = await park()
+    const mh23 = await household(p, 'MH 23', 'Arturo Melendez')
+    await rent(p, mh23, LAST, 525, 2)
+    const mh15 = await household(p, 'MH 15', 'Arturo Melendez', { tenantId: mh23.tenantId })
+    await db.query(`UPDATE leases SET status = 'pending' WHERE id = $1`, [mh15.leaseId])
+    const old = await household(p, 'MH 09', 'Arturo Melendez', { tenantId: mh23.tenantId, status: 'expired' })
+    await rent(p, old, addMonths(LAST, -1), 525, 2)
+    const profile = (await get(owner(p), `/api/tenants/${mh23.tenantId}/profile`)).body.data
+    const leases = profile.stats.healthByLease.map((l: any) => [l.unit_number, l.status, l.current])
+    expect(leases).toHaveLength(3)
+    expect(leases).toEqual(expect.arrayContaining([['MH 15', 'pending', false], ['MH 09', 'expired', false]]))
+    // The current lease first.
+    expect(leases[0]).toEqual(['MH 23', 'active', true])
   })
 })
 

@@ -9,8 +9,9 @@
  * Every screen that says how a household pays reads it from here: the
  * Payments page and the Rent Roll (GET /api/balances/rent-roll/open-month and
  * /history, services/rentRoll), the tenant payment report (GET
- * /api/tenants/:id/payment-report), the Tenants list's health column, the
- * tenant profile, the tenant's own heartbeat and the credit history's one mark
+ * /api/tenants/:id/payment-report), the Tenants list's health column and the
+ * tenant profile (10/13, Nic: "split health BY LEASE" — healthByLease, each
+ * lease its own household), the tenant's own heartbeat and the credit history's one mark
  * per bill (services/creditBillMarks judges each bill by the same rule). Before this there were five
  * formulas and none of them measured on-time: Gerald Logue read 25% on the
  * Tenants list (paid rows ÷ rows), 6% on his profile (every $5 daily late fee
@@ -80,7 +81,7 @@
  * was charged on its bill (the credit history's 10/6 rule).
  */
 import { query } from '../db'
-import { FALLBACK_TIMEZONE, PAYMENT_STAMPS, PAYMENT_STAMP_LABEL, paidByLabel, type PaymentStamp } from '@gam/shared'
+import { FALLBACK_TIMEZONE, PAYMENT_STAMPS, PAYMENT_STAMP_LABEL, paidByLabel, rentRollStatusOf, type PaymentStamp } from '@gam/shared'
 import {
   graceDaysSql, propertyDaySql, writtenAtSql, lateCountsFromSql, firstLateDaySql, daysPastGraceSql, pastGraceSql,
   openBalanceSql, inFlightRowSql, workTradeOpenRowSql, WORK_TRADE_MARKER_LABEL,
@@ -735,6 +736,20 @@ export function paymentHealth(months: readonly HouseholdMonth[], through: string
   }
 }
 
+/**
+ * 10/13 (Nic): the red "Delinquent" tag. Delinquent is past the grace period
+ * with money still owed (S654, Nic: "flag a difference between outstanding and
+ * delinquent based on when the grace period ends") — any of these months still
+ * owing that reads red "Owes +N" (shared rentRollStatusOf: nothing or part
+ * paid, past grace). Late fees alone never make a month red, so they never
+ * make a household delinquent. Judged from the money, so it clears the moment
+ * the household pays — the one rule for the Payments page's tag and the tenant
+ * report's (never the space's overnight flag, which can lag a payment).
+ */
+export function owesPastGrace(months: readonly Pick<HouseholdMonth, 'stamp' | 'days_past_grace' | 'owed'>[]): boolean {
+  return months.some(m => cents(m.owed) > 0 && rentRollStatusOf(m.stamp, m.days_past_grace) === 'owes')
+}
+
 /** The month a day falls in (YYYY-MM), on GAM's home calendar — the default "through" month. */
 export function currentBillMonth(now: Date = new Date()): string {
   const d = new Intl.DateTimeFormat('en-CA', { timeZone: FALLBACK_TIMEZONE, year: 'numeric', month: '2-digit' }).format(now)
@@ -759,6 +774,30 @@ export async function healthByHousehold(opts: {
   const by = new Map<string, HouseholdMonth[]>()
   for (const m of months) by.set(m.household_id, [...(by.get(m.household_id) ?? []), m])
   for (const [hh, ms] of by) out.set(hh, paymentHealth(ms, through))
+  return out
+}
+
+/**
+ * 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE" — a
+ * person renting two spaces on two leases is two households ("when someone is
+ * renting 2 spots with 2 leases it is 2 households"), and each lease has its
+ * own health, the Rent Roll's figure for that row. Payment health for these
+ * leases, all time (one query): lease id → health. A lease with nothing
+ * billed is absent.
+ */
+export async function healthByLease(opts: {
+  landlordIds: string[]; propertyIds?: string[] | null; leaseIds: string[]; through?: string; asOf?: string | null
+}): Promise<Map<string, PaymentHealth>> {
+  const out = new Map<string, PaymentHealth>()
+  if (!opts.leaseIds.length || !opts.landlordIds.length) return out
+  const through = opts.through ?? currentBillMonth()
+  const months = await householdMonths({
+    landlordIds: opts.landlordIds, propertyIds: opts.propertyIds ?? null, leaseIds: [...new Set(opts.leaseIds)],
+    from: ALL_TIME_FROM, through, asOf: opts.asOf ?? null, byLease: true,
+  })
+  const by = new Map<string, HouseholdMonth[]>()
+  for (const m of months) if (m.lease_id) by.set(m.lease_id, [...(by.get(m.lease_id) ?? []), m])
+  for (const [lease, ms] of by) out.set(lease, paymentHealth(ms, through))
   return out
 }
 

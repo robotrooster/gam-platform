@@ -1,7 +1,10 @@
 // 10/13 (Nic) — the Payments page's small decisions (components/payments/openMonth).
 import { describe, it, expect } from 'vitest'
 import type { OpenMonthRow, RentRollProperty } from '@gam/shared'
-import { propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords, owesHere, payerChoices } from './openMonth'
+import {
+  propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords, owesHere, payerChoices,
+  rowName, rowOpens, stayRefundWords, otherMoneyMeta, otherMoneyWho,
+} from './openMonth'
 
 const property = (over: Partial<RentRollProperty> = {}): RentRollProperty => ({
   propertyId: 'p-oak', name: 'Oak Park', spaces: 29, owned: true, ...over,
@@ -12,7 +15,7 @@ const row = (over: Partial<OpenMonthRow> = {}): OpenMonthRow => ({
   invoiced: 460, lateFees: 0, paid: 200, clearing: 0, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0,
   methods: ['Cash'], status: 'partial', statusLabel: 'Partial', statusColor: 'yellow', daysPastGrace: 0,
   dueDate: '2026-10-01', workTradeOnly: false, evictionMode: false, delinquent: false, recordWith: 'chg1',
-  payments: [], charges: [], ...over,
+  payments: [], charges: [], stay: null, ...over,
 })
 
 describe('which property the page shows', () => {
@@ -89,5 +92,53 @@ describe('Record payment at the top: who can pay, and how', () => {
     const rows = [row(), row({ key: 'b', space: 'RV 12', residents: [{ tenantId: 'x', name: 'Mo Reyes', primary: true }] })]
     expect(payerChoices(rows, 'rv 1').map(c => c.name)).toEqual(['Mo Reyes'])
     expect(payerChoices(rows, 'GLENDA').map(c => c.name)).toEqual(['Glenda Moss'])
+  })
+})
+
+// 10/13 (Nic): "the payments page ... should show all money coming in" — a stay guest's row.
+describe('a stay guest\'s row', () => {
+  const stay = (over: Partial<OpenMonthRow> = {}) => row({
+    key: 'stay:b1', leaseId: null, householdId: null, residents: [], occupant: 'Rhea Register', status: 'stay',
+    statusLabel: 'Checked in', statusColor: 'gray', invoiced: 0, owed: 0, paid: 589, recordWith: null,
+    stay: { bookingId: 'b1', checkIn: '2026-10-04', checkOut: '2026-11-04', nights: 31, statusLabel: 'Checked in', refunded: 0, refunds: [] },
+    ...over,
+  })
+  it('is named for its guest, opens, and takes no payment', () => {
+    expect(rowName(stay())).toBe('Rhea Register')
+    expect(rowName(stay({ occupant: null }))).toBe('Stay guest')
+    expect(rowOpens(stay())).toBe(true)
+    expect(rowTakesPayment(stay(), true)).toBe(false)
+    expect(reportPath(stay())).toBeNull()
+    expect(payerChoices([stay()], '')).toEqual([])
+  })
+  it('says what went back to the guest this month, only when something did', () => {
+    expect(stayRefundWords(stay())).toBeNull()
+    expect(stayRefundWords(stay({ stay: { ...stay().stay!, refunded: 100 } }))).toBe('$100.00 refunded')
+    expect(stayRefundWords(row())).toBeNull()
+  })
+  it('a household is its residents; a space alone names its occupant or nobody, and does not open', () => {
+    expect(rowName(row())).toBe('Glenda Moss')
+    expect(rowName(row({ status: 'vacant', residents: [], occupant: null }))).toBeNull()
+    expect(rowName(row({ status: 'occupied', residents: [], occupant: 'Owner' }))).toBe('Owner')
+    expect(rowOpens(row({ status: 'vacant' }))).toBe(false)
+    expect(rowOpens(row({ status: 'occupied' }))).toBe(false)
+    expect(rowOpens(row())).toBe(true)
+  })
+})
+
+// 10/13 (Nic): "the payments page ... should show all money coming in."
+describe('the register\'s and pay links\' money (its folder\'s head)', () => {
+  it('how many sales and refunds; the sums only when the server sent them', () => {
+    const sale = { kind: 'sale' as const }
+    const refund = { kind: 'refund' as const }
+    expect(otherMoneyMeta([sale])).toBe('1 sale')
+    expect(otherMoneyMeta([sale, sale, refund])).toBe('2 sales · 1 refund')
+    expect(otherMoneyMeta([sale, sale], { otherIn: 776.09, otherRefunded: 0 })).toBe('2 sales · $776.09')
+    expect(otherMoneyMeta([sale, refund, refund], { otherIn: 23.92, otherRefunded: 7 })).toBe('1 sale · 2 refunds · $23.92 · $7.00 refunded')
+  })
+  it('who paid: the name, else that nobody was named', () => {
+    expect(otherMoneyWho({ who: 'Andres Razo' })).toBe('Andres Razo')
+    expect(otherMoneyWho({ who: null })).toBe('No name given')
+    expect(otherMoneyWho({ who: '  ' })).toBe('No name given')
   })
 })

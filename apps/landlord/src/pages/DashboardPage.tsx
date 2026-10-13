@@ -243,14 +243,16 @@ export function DashboardPage() {
         // S641: opens the BALANCES page, not the delinquent-unit filter. The
         // banner now counts anyone owing anything, and /units?status=delinquent
         // would show two of the three — a card that disagrees with the page it
-        // opens is the bug this whole pass has been about.
+        // opens is the bug this whole pass has been about. 10/13 (Nic):
+        // "REMOVE the Outstanding Balances tab" — who owes is on Payments now
+        // (owing rows at the top, "Delinquent" beside the name).
         // S654 (Nic): "until a unit is actually delinquent past its grace
         // period, I would really love for that to say outstanding units… flag a
         // difference between outstanding and delinquent based on when the grace
         // period ends." Outstanding = owes anything; delinquent = a charge still
         // open after its grace period. The late-fee line is only said when a fee
         // will actually be charged — the API reads each lease's own terms.
-        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}>
+        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/payments')}>
           <Clock size={16} />
           {(() => {
             const owing = stats!.unitsOwing ?? stats!.delinquentUnits ?? 0
@@ -319,12 +321,14 @@ export function DashboardPage() {
       <div className="kpi-grid dash-kpis" style={{gridTemplateColumns:"repeat(12, 1fr)", opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}}
            aria-busy={isPreviousData || undefined}>
         {/* Row 1 (span 4): rent money trio */}
-        {/* W-2 (S531): clicks through to the Rent Roll. 10/12 (Nic): both read
-            the rent the active LEASES bill (never a unit's listed rent; a space
-            marked occupied with no active lease adds nothing), with work trade
-            and hibernating leases left out (the figure the 10/12 Rent Roll's lease_rent.expected
-            showed, retired 10/13). */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
+        {/* 10/12 (Nic): the rent the active LEASES bill (never a unit's listed
+            rent; a space marked occupied with no active lease adds nothing),
+            with work trade and hibernating leases left out (the figure the
+            10/12 Rent Roll's lease_rent.expected showed, retired 10/13).
+            10/13 (Nic): "Dashboard 'Expected Monthly Rent' card opens
+            PAYMENTS" — this month's rent roll (it opened the Rent Roll's
+            history before). */}
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
           {/* S641 (Nic): the "$2,869 traded for work on 6" clause is gone — he
@@ -352,8 +356,9 @@ export function DashboardPage() {
             {incomeCard.notes.map(n => <span key={n}>{n}</span>)}
           </div>
         </div>
-        {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
+        {/* S527 W-3: outstanding → the who-owes-what list, not Reports.
+            10/13 (Nic): that list is Payments now (Outstanding Balances removed). */}
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
           {/* S650 (Nic): no small print about work-trade balances here. */}

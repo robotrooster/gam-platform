@@ -41,7 +41,7 @@ import {
 } from '@gam/shared'
 import {
   householdMonths, householdLines, paymentHealth, householdsOf, householdMembers, currentBillMonth, monthsBetween,
-  importedHistory, ALL_TIME_FROM, type HouseholdMonth, type PaymentHealth, type ChargeLine, type ImportedLine,
+  importedHistory, owesPastGrace, ALL_TIME_FROM, type HouseholdMonth, type PaymentHealth, type ChargeLine, type ImportedLine,
 } from './householdMonths'
 import { DEFAULT_LATE_GRACE_DAYS, firstLateDay } from './openBalances'
 import { todayIn } from '../lib/timezone'
@@ -154,6 +154,14 @@ export interface ReportLease {
   first_late_day_text: string
   late_fee_terms: string
   existing_tenancy: boolean
+  /**
+   * 10/13 (Nic): the red "Delinquent" — this lease past its grace period with
+   * money still owed (householdMonths owesPastGrace: the Payments page's tag,
+   * the one rule), judged from its own months, so it clears the moment it is
+   * paid. Never the space's overnight flag (units.status), which lags a
+   * payment until the nightly job runs: the report a name on the Payments page
+   * opens says what the row says.
+   */
   delinquent: boolean
   eviction_mode: boolean
 }
@@ -332,7 +340,7 @@ export async function tenantPaymentReport(opts: {
            l.late_fee_grace_days AS lease_grace, pr.late_fee_grace_days AS property_grace,
            l.late_fee_enabled, l.late_fee_initial_type, l.late_fee_initial_amount, l.late_fee_accrual_type,
            l.late_fee_accrual_amount, l.late_fee_accrual_period, l.late_fee_accrual_from, l.late_fee_cap_type, l.late_fee_cap_amount,
-           (u.status = 'delinquent') AS delinquent, COALESCE(u.payment_block, FALSE) AS eviction_mode
+           COALESCE(u.payment_block, FALSE) AS eviction_mode
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties pr ON pr.id = u.property_id
@@ -342,6 +350,20 @@ export async function tenantPaymentReport(opts: {
        AND ($4::uuid IS NULL OR l.id = $4)
      ORDER BY (l.status = 'active') DESC, l.start_date DESC`, [memberIds, opts.landlordIds, opts.propertyIds, leaseId])
   if (!months.length && !leaseRows.length && !imported.length) return null
+
+  // 10/13 (Nic): "Delinquent" — each lease from its own months (one lease:
+  // the report's own; the person's whole household: each of their leases,
+  // read once), by the Payments page's rule (owesPastGrace).
+  const delinquentLeases = new Set<string>()
+  if (leaseId) {
+    if (owesPastGrace(months)) delinquentLeases.add(leaseId)
+  } else if (leaseRows.length) {
+    const perLease = await householdMonths({
+      landlordIds: opts.landlordIds, propertyIds: opts.propertyIds, asOf: opts.asOf ?? null, householdIds: null,
+      leaseIds: leaseRows.map((l: any) => l.lease_id), from: ALL_TIME_FROM, through, byLease: true,
+    })
+    for (const l of leaseRows) if (owesPastGrace(perLease.filter(m => m.lease_id === l.lease_id))) delinquentLeases.add(l.lease_id)
+  }
 
   const leases: ReportLease[] = leaseRows.map((l: any) => {
     const source: GraceSource = l.lease_grace != null ? 'lease' : l.property_grace != null ? 'property' : 'default'
@@ -353,7 +375,7 @@ export async function tenantPaymentReport(opts: {
       grace_days: Number(grace), grace_source: source, grace_source_label: GRACE_SOURCE_LABEL[source],
       first_late_day_text: firstLateDayText(Number(l.rent_due_day ?? 1), Number(grace)),
       late_fee_terms: lateFeeTermsText(l), existing_tenancy: l.is_existing_tenancy === true,
-      delinquent: l.delinquent === true, eviction_mode: l.eviction_mode === true,
+      delinquent: delinquentLeases.has(l.lease_id), eviction_mode: l.eviction_mode === true,
     }
   })
 

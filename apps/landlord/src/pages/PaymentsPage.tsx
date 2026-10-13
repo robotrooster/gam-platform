@@ -2,7 +2,7 @@ import { Fragment, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
-  TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, isSpaceOnlyRow,
+  TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, isSpaceOnlyRow, isStayRow,
   type OpenMonthRoll, type OpenMonthRow, type RentRollProperty,
 } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
@@ -11,11 +11,15 @@ import { useAuth } from '../context/AuthContext'
 import { X, CheckCircle, Gift, ChevronRight } from 'lucide-react'
 import { money, toCents, monthTitle, serverStatus, serverMessage, CREDIT_USE_RULE } from '../lib/creditDesk'
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
-import { OpenMonthDetail } from '../components/payments/OpenMonthDetail'
+import { OpenMonthDetail, StayDetail } from '../components/payments/OpenMonthDetail'
+import { OtherMoneyFolder } from '../components/payments/OtherMoney'
 import { RecordPaymentPicker } from '../components/payments/RecordPaymentPicker'
 import {
   propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords,
+  rowName, rowOpens, stayRefundWords,
 } from '../components/payments/openMonth'
+import { usePhone } from '../components/payments/usePhone'
+import { BalancesPage } from './BalancesPage'
 import '../styles/credit-desk.css'
 import '../components/payments/payments.css'
 
@@ -62,8 +66,26 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // #25: owners and property managers).
 //
 // WHO (S641, kept): owners, property managers and staff with "View all
-// payments". Anyone else is pointed to Outstanding Balances, where money is
-// taken. The server refuses them too.
+// payments". 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages,
+// read-only" — the month for their properties, no Record payment, Issue credit
+// or Import, and no tenant report from a name. 10/13 (Nic): "REMOVE the
+// Outstanding Balances tab" — front-desk staff who take payments without
+// "View all payments" (S641: no payment histories) get the list of who owes
+// and its Record payment here instead; anyone else is told whom to ask. The
+// server refuses the month to them too.
+//
+// 10/13 (Nic), the afternoon answers: "the payments page ... should show all
+// money coming in. The people that paid short-term stays like Space RV 10 and
+// 11 at Mountain View, those should have details of the money that was paid" —
+// a stay guest's row shows what came in toward the stay this month, and opens
+// to each payment (date, amount, method, what it was for); its money is its
+// own total ("Stays"), never in the bills' Invoiced / Paid / Owed; the rest of
+// "ALL money coming in" — register sales and pay links that are no bill and no
+// stay's (propane to a walk-in, a pay link to someone with no lease or stay) —
+// is a folder under the month (OtherMoneyFolder), its own total. A red
+// "Delinquent" tag beside the name of a household past its grace period with
+// money still owed. "phones = one card per household" — under 640px the rows
+// are cards, never a table that scrolls sideways. No search box.
 
 // S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
 // overcharge, goodwill). Funded by the landlord (they receive less rent) and
@@ -172,8 +194,16 @@ export function PaymentsPage() {
   const { can, isOwner } = usePerms()
   const { user } = useAuth()
   const role = user?.role
-  const seesLedger = can('payments.view_all')
-  const canTake = can('take_payment')
+  // 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
+  // They read the month for the properties their boxes give them (the server
+  // narrows it, and sends no desk window); every action is left out for them —
+  // recording a payment, a credit or an import is never a bookkeeper's (10/12,
+  // Nic: "never tenant-account actions"), and the tenant report a name opens
+  // is not theirs either.
+  const readOnly = role === 'bookkeeper'
+  const seesLedger = readOnly || can('payments.view_all')
+  const canTake = !readOnly && can('take_payment')
+  const phone = usePhone()
   const [params, setParams] = useSearchParams()
   const picked = params.get('property')
 
@@ -237,12 +267,12 @@ export function PaymentsPage() {
         )}
         {/* S641: issuing credit is an owner / property manager act — the route
             refuses anyone else, so nobody else sees the button. */}
-        {(isOwner || role === 'property_manager') && (
+        {!readOnly && (isOwner || role === 'property_manager') && (
           <button className="btn btn-primary" onClick={() => setCreditOpen(true)}>
             <Gift size={15} /> Issue credit
           </button>
         )}
-        {can('payments.import_history') && (
+        {!readOnly && can('payments.import_history') && (
           <button className="btn btn-primary" onClick={() => navigate('/payment-history-onboarding')}>
             Import payment history
           </button>
@@ -262,9 +292,15 @@ export function PaymentsPage() {
       onDone={(msg) => { setCreditOpen(false); setNotice(msg); refresh() }} />
   )
 
+  // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Front-desk staff who
+  // take payments but may not see payment histories (S641) keep the list of
+  // who owes and its Record payment — here, under Payments.
+  if (!seesLedger && can('balances.view')) {
+    return <BalancesPage title="Payments" subtitle="Who owes, every unpaid month, and where you take a payment — open a property, then a name for the charges" />
+  }
+
   if (!seesLedger || refused) {
     // Where to go from here, for exactly the switches this person has.
-    const opensBalances = can('balances.view')
     return (
       <div>
         {header}
@@ -272,15 +308,10 @@ export function PaymentsPage() {
         <div className="card cd-empty">
           <p className="cd-msg">
             Payments already made are shown to owners, property managers and staff allowed to see all payments.
-            {opensBalances
-              ? ' To take a payment, use Outstanding Balances.'
-              : canTake
-                ? ' Payments are taken on Outstanding Balances, which your account cannot open yet. Ask the account owner to turn on “View who owes + contact” for you under Team.'
-                : ' If you need to see payments, ask the account owner.'}
+            {canTake
+              ? ' Payments are taken here once your account can see who owes. Ask the account owner to turn on “View who owes + contact” for you under Team.'
+              : ' If you need to see payments, ask the account owner.'}
           </p>
-          {opensBalances && (
-            <button className="btn btn-primary btn-sm" onClick={() => navigate('/balances')}>Open Outstanding Balances</button>
-          )}
         </div>
         {creditModal}
       </div>
@@ -294,6 +325,63 @@ export function PaymentsPage() {
     <button className="btn btn-ghost btn-sm" onClick={() => pick(null)}>Change property</button>
   )
   const colCount = canTake ? 8 : 7
+
+  /** The name, and the tags beside it: Delinquent, moved out, eviction mode. */
+  const who = (r: OpenMonthRow) => {
+    const name = rowName(r)
+    const report = readOnly ? null : reportPath(r)
+    return (
+      <>
+        {name === null ? <span className="pay-muted">—</span> : report ? (
+          <button type="button" className="pay-name" title="Open their payment report"
+            onClick={e => { e.stopPropagation(); navigate(report) }}>
+            {name}
+          </button>
+        ) : <span className={isStayRow(r) ? 'pay-guest' : undefined}>{name}</span>}
+        {/* 10/13 (Nic): "a 'Delinquent' tag beside the name". */}
+        {r.delinquent && <span className="pay-tag delinquent">Delinquent</span>}
+        {r.movedOut && <div><span className="pay-tag">Moved out</span></div>}
+        {/* 10/13 (Nic): "we have eviction mode that blocks payments". */}
+        {r.evictionMode && <div><span className="pay-tag evict">Eviction mode — payments blocked</span></div>}
+      </>
+    )
+  }
+  /** The Paid cell: what came in, work trade beside it, clearing, a stay's refund. */
+  const paidCell = (r: OpenMonthRow) => {
+    const paid = paidWords(r)
+    const refundedWords = stayRefundWords(r)
+    return (
+      <>
+        {paid.amount ?? <span className="pay-muted">—</span>}
+        {/* As on the Rent Roll: work trade's value beside Paid. */}
+        {paid.workTrade && <span className="pay-sub">{paid.workTrade}</span>}
+        {toCents(r.clearing) > 0 && <span className="pay-sub">{money(r.clearing)} still clearing</span>}
+        {refundedWords && <span className="pay-sub">{refundedWords}</span>}
+      </>
+    )
+  }
+  /** The Owed cell: this month's, and what is still owed from earlier months. */
+  const owedCell = (r: OpenMonthRow) => {
+    const earlier = earlierWords(r)
+    return (
+      <>
+        {toCents(r.owed) > 0 ? <span className="pay-owed">{money(r.owed)}</span> : <span className="pay-muted">—</span>}
+        {/* 10/13 (Nic): "outstanding balances are always at the top" — earlier months too. */}
+        {earlier && <span className="pay-sub pay-earlier">{earlier}</span>}
+      </>
+    )
+  }
+  const methodsText = (r: OpenMonthRow) => r.methods.length > 0 ? r.methods.join(', ') : <span className="pay-muted">—</span>
+  /** A stay is paid, never billed by the month: no Invoiced, no Owed. */
+  const billed = (r: OpenMonthRow) => !isSpaceOnlyRow(r) && !isStayRow(r)
+  const detail = (r: OpenMonthRow, month: string) => isStayRow(r)
+    ? <StayDetail row={r} month={month} />
+    : <OpenMonthDetail row={r} month={month} canAddPhoto={canTake} ledgerFacts={!readOnly} />
+  const recordButton = (r: OpenMonthRow) => rowTakesPayment(r, canTake) && (
+    <button className="btn btn-primary btn-sm" onClick={e => { e.stopPropagation(); openRecord(r) }}>
+      Record payment
+    </button>
+  )
 
   let body: JSX.Element
   if (propsQ.isLoading) {
@@ -342,7 +430,8 @@ export function PaymentsPage() {
   } else {
     const t = roll.totals
     body = (
-      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+      <>
+      <div className="card" style={{ padding: 0, overflowX: phone ? undefined : 'auto' }}>
         <div className="pay-head">
           <h2 className="pay-title">{roll.propertyName} · {monthTitle(roll.month)}</h2>
           {changeButton}
@@ -354,11 +443,55 @@ export function PaymentsPage() {
               {toCents(t.workTrade) > 0 && <span>Work trade <strong>{money(t.workTrade)}</strong></span>}
               <span>Owed <strong>{money(t.owed)}</strong></span>
               {toCents(t.owedEarlier) > 0 && <span>Owed from earlier months <strong>{money(t.owedEarlier)}</strong></span>}
+              {/* 10/13 (Nic): "show all money coming in" — the stays, apart from the bills. */}
+              {toCents(t.stays) > 0 && (
+                <span>Stays <strong>{money(t.stays)}</strong>
+                  {toCents(t.staysRefunded) > 0 && <> ({money(t.staysRefunded)} refunded)</>}</span>
+              )}
+              {/* "ALL money coming in" — the register's and pay links' other money, its own sum. */}
+              {toCents(t.otherIn) > 0 && (
+                <span>Register &amp; pay links <strong>{money(t.otherIn)}</strong>
+                  {toCents(t.otherRefunded) > 0 && <> ({money(t.otherRefunded)} refunded)</>}</span>
+              )}
             </div>
           )}
         </div>
         {roll.rows.length === 0 ? (
           <div className="cd-empty">No spaces at this property yet.</div>
+        ) : phone ? (
+          // 10/13 (Nic): "phones = one card per household" — no sideways scrolling.
+          <div className="pay-cards">
+            {roll.rows.map(r => {
+              const opens = rowOpens(r)
+              const open = opens && openKeys.has(r.key)
+              const record = recordButton(r)
+              return (
+                <div key={r.key} className={`pay-card${opens ? ' pay-click' : ''}${open ? ' pay-open' : ''}`} data-card-key={r.key}>
+                  <div className="pay-card-head" onClick={opens ? () => toggle(r.key) : undefined}
+                    role={opens ? 'button' : undefined} tabIndex={opens ? 0 : undefined} aria-expanded={opens ? open : undefined}
+                    onKeyDown={opens ? e => {
+                      if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r.key) }
+                    } : undefined}>
+                    <div className="pay-card-top">
+                      <span className="pay-space">{opens && <span className="pay-caret">{open ? '▾' : '▸'}</span>}{r.space ?? '—'}</span>
+                      <span className={`pay-pill ${r.statusColor}`}>{r.statusLabel}</span>
+                    </div>
+                    <div className="pay-card-who">{who(r)}</div>
+                    {!isSpaceOnlyRow(r) && (
+                      <div className={`pay-card-figs${billed(r) ? '' : ' one'}`}>
+                        {billed(r) && <div>Invoiced<strong>{toCents(r.invoiced) > 0 ? money(r.invoiced) : '—'}</strong></div>}
+                        <div>Paid<strong>{paidCell(r)}</strong></div>
+                        {billed(r) && <div>Owed<strong>{owedCell(r)}</strong></div>}
+                      </div>
+                    )}
+                    {!isSpaceOnlyRow(r) && <div className="pay-card-method">Payment method: {methodsText(r)}</div>}
+                  </div>
+                  {record && <div className="pay-card-record">{record}</div>}
+                  {open && <div className="pay-card-detail">{detail(r, roll.month)}</div>}
+                </div>
+              )
+            })}
+          </div>
         ) : (
           <table className="data-table pay-table" style={{ minWidth: 860 }}>
             <thead>
@@ -373,72 +506,34 @@ export function PaymentsPage() {
               {/* The server's order: still owing first, then space order (10/13). */}
               {roll.rows.map(r => {
                 // A space nobody holds on a lease (Vacant, or in use): no money, nothing to open.
-                const vacant = isSpaceOnlyRow(r)
-                const open = !vacant && openKeys.has(r.key)
-                const report = reportPath(r)
-                const paid = paidWords(r)
-                const earlier = earlierWords(r)
+                const opens = rowOpens(r)
+                const open = opens && openKeys.has(r.key)
                 return (
                   <Fragment key={r.key}>
-                    <tr className={`pay-row${vacant ? '' : ' pay-click'}${open ? ' pay-open' : ''}`} data-key={r.key}
-                      onClick={vacant ? undefined : () => toggle(r.key)}
-                      tabIndex={vacant ? undefined : 0} aria-expanded={vacant ? undefined : open}
-                      onKeyDown={vacant ? undefined : e => {
+                    <tr className={`pay-row${opens ? ' pay-click' : ''}${open ? ' pay-open' : ''}`} data-key={r.key}
+                      onClick={opens ? () => toggle(r.key) : undefined}
+                      tabIndex={opens ? 0 : undefined} aria-expanded={opens ? open : undefined}
+                      onKeyDown={opens ? e => {
                         if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r.key) }
-                      }}
-                      title={vacant ? undefined : open ? 'Hide the payments and charges' : 'Show the payments and charges'}>
+                      } : undefined}
+                      title={opens ? (open ? 'Hide the payments and charges' : 'Show the payments and charges') : undefined}>
                       <td className="pay-space">
-                        {!vacant && <span className="pay-caret">{open ? '▾' : '▸'}</span>}
+                        {opens && <span className="pay-caret">{open ? '▾' : '▸'}</span>}
                         {r.space ?? '—'}
                       </td>
-                      <td>
-                        {vacant ? (r.occupant ?? <span className="pay-muted">—</span>) : report ? (
-                          <button type="button" className="pay-name" title="Open their payment report"
-                            onClick={e => { e.stopPropagation(); navigate(report) }}>
-                            {householdName(r)}
-                          </button>
-                        ) : householdName(r)}
-                        {r.movedOut && <div><span className="pay-tag">Moved out</span></div>}
-                        {/* 10/13 (Nic): "we have eviction mode that blocks payments". */}
-                        {r.evictionMode && <div><span className="pay-tag evict">Eviction mode — payments blocked</span></div>}
-                      </td>
+                      <td>{who(r)}</td>
                       <td className="num mono">
-                        {vacant ? null : toCents(r.invoiced) > 0 ? money(r.invoiced) : <span className="pay-muted">—</span>}
+                        {!billed(r) ? null : toCents(r.invoiced) > 0 ? money(r.invoiced) : <span className="pay-muted">—</span>}
                       </td>
-                      <td className="num mono">
-                        {vacant ? null : (
-                          <>
-                            {paid.amount ?? <span className="pay-muted">—</span>}
-                            {/* As on the Rent Roll: work trade's value beside Paid. */}
-                            {paid.workTrade && <span className="pay-sub">{paid.workTrade}</span>}
-                            {toCents(r.clearing) > 0 && <span className="pay-sub">{money(r.clearing)} still clearing</span>}
-                          </>
-                        )}
-                      </td>
-                      <td className="num mono">
-                        {vacant ? null : (
-                          <>
-                            {toCents(r.owed) > 0 ? <span className="pay-owed">{money(r.owed)}</span> : <span className="pay-muted">—</span>}
-                            {/* 10/13 (Nic): "outstanding balances are always at the top" — earlier months too. */}
-                            {earlier && <span className="pay-sub pay-earlier">{earlier}</span>}
-                          </>
-                        )}
-                      </td>
-                      <td>{vacant ? null : r.methods.length > 0 ? r.methods.join(', ') : <span className="pay-muted">—</span>}</td>
+                      <td className="num mono">{isSpaceOnlyRow(r) ? null : paidCell(r)}</td>
+                      <td className="num mono">{billed(r) ? owedCell(r) : null}</td>
+                      <td>{isSpaceOnlyRow(r) ? null : methodsText(r)}</td>
                       <td><span className={`pay-pill ${r.statusColor}`}>{r.statusLabel}</span></td>
-                      {canTake && (
-                        <td className="pay-record">
-                          {rowTakesPayment(r, canTake) && (
-                            <button className="btn btn-primary btn-sm" onClick={e => { e.stopPropagation(); openRecord(r) }}>
-                              Record payment
-                            </button>
-                          )}
-                        </td>
-                      )}
+                      {canTake && <td className="pay-record">{recordButton(r)}</td>}
                     </tr>
                     {open && (
                       <tr className="pay-detail">
-                        <td colSpan={colCount}><OpenMonthDetail row={r} month={roll.month} canAddPhoto={canTake} /></td>
+                        <td colSpan={colCount}>{detail(r, roll.month)}</td>
                       </tr>
                     )}
                   </Fragment>
@@ -448,6 +543,9 @@ export function PaymentsPage() {
           </table>
         )}
       </div>
+      {/* 10/13 (Nic): "show ALL money coming in" — what is no bill and no stay. */}
+      <OtherMoneyFolder lines={roll.otherMoney ?? []} month={roll.month} totals={t} />
+      </>
     )
   }
 

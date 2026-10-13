@@ -8,6 +8,7 @@ import {
   type RentRollStatusColor,
 } from '@gam/shared'
 import { api } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { money, monthTitle, localToday, dayWord } from '../lib/creditDesk'
 import { shortMonth, stripYear, healthColor, healthText, csvLine, downloadText } from '../lib/paymentStamps'
 import {
@@ -45,6 +46,13 @@ import '../components/rentroll/rentroll.css'
  * until paid. The "keep moved-out households" setting and the instruction
  * paragraph are gone. A name opens that household's tenant report.
  *
+ * 10/13 (Nic), the afternoon answers: "Bookkeepers SEE the Payments and Rent
+ * Roll pages, read-only" — the same page for their properties (the server
+ * narrows it), Print and Export kept, the name not a link. "Range totals
+ * INCLUDE moved-out folder households" — the summary's Invoiced / Paid / Owed
+ * count the "Moved out, still owes" households' bills in the range too (the
+ * server's totals).
+ *
  * Every figure is the server's (GET /api/balances/rent-roll/history —
  * services/rentRoll, the one payment-health definition, the 10/6 hand-logged
  * rule included). Totals across households show only when the server sent
@@ -75,6 +83,21 @@ export function monthCountWords(c: RentRollMonthCount | undefined): Array<{ stat
     .map(x => ({ status: x.status, text: `${x.households} ${x.label.toLowerCase()}`, color: RENT_ROLL_STATUS_COLOR[x.status] }))
 }
 
+/** The line naming the folder households' part of the range totals (the spreadsheet, the summary). */
+export const MOVED_OUT_IN_RANGE = 'Moved out, still owes — bills in this range'
+
+/**
+ * What the summary says of the folder households' part of its totals (10/13,
+ * Nic: "Range totals INCLUDE moved-out folder households"), so the printed
+ * page says where the totals' extra comes from. Null when they were billed
+ * nothing in the range (or no totals were sent).
+ */
+export function movedOutInRangeWords(h: Pick<RentRollHistory, 'movedOutTotals' | 'movedOutOwing'>): string | null {
+  const mo = h.movedOutTotals
+  if (!mo || !h.movedOutOwing.length || (mo.invoiced <= 0 && mo.paid <= 0 && mo.owed <= 0 && mo.workTrade <= 0)) return null
+  return `Includes the moved-out households' bills in this range: invoiced ${money(mo.invoiced)} · paid ${money(mo.paid)} · owed ${money(mo.owed)}`
+}
+
 /** The rent roll as a spreadsheet: the rows as on screen, then the totals (when sent), then "Moved out, still owes". */
 export function rentRollCsv(h: RentRollHistory): string {
   const months = newestFirst(h.months)
@@ -92,12 +115,21 @@ export function rentRollCsv(h: RentRollHistory): string {
   }
   if (h.totals) {
     const t = h.totals
+    // 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — their
+    // bills in the range on a line of their own, above the Total, so the
+    // Total is the lines above it added up (10/13 review: it was not).
+    const mo = h.movedOutTotals
+    if (mo && h.movedOutOwing.length) {
+      lines.push(csvLine(['', MOVED_OUT_IN_RANGE, '', mo.invoiced, mo.lateFees, mo.paid, mo.credit, mo.workTrade, mo.owed]))
+    }
     lines.push(csvLine(['', 'Total', '', t.invoiced, t.lateFees, t.paid, t.credit, t.workTrade, t.owed]))
   }
   if (h.movedOutOwing.length) {
-    lines.push('', csvLine(['Moved out, still owes']), csvLine(['Space', 'Tenant', 'Lease ended', 'Owed', 'Still owes for']))
+    lines.push('', csvLine(['Moved out, still owes']),
+      csvLine(['Space', 'Tenant', 'Lease ended', 'Invoiced in range', 'Paid in range', 'Owed in range', 'Owed', 'Still owes for']))
     for (const m of h.movedOutOwing) {
-      lines.push(csvLine([m.spaces.join(' '), names(m.residents), m.leaseEnded ?? '', m.owed,
+      lines.push(csvLine([m.spaces.join(' '), names(m.residents), m.leaseEnded ?? '',
+        m.inRange?.invoiced ?? 0, m.inRange?.paid ?? 0, m.inRange?.owed ?? 0, m.owed,
         m.months.map(x => `${monthTitle(x.month)} ${money(x.owed)}`).join('; ')]))
     }
   }
@@ -111,10 +143,15 @@ export function csvFileName(h: Pick<RentRollHistory, 'propertyName' | 'from' | '
   return `rent-roll-${slug}-${span}.csv`
 }
 
-/** A household's name: opens its tenant report (that lease's household). */
+/**
+ * A household's name: opens its tenant report (that lease's household). 10/13
+ * (Nic): a bookkeeper reads the Rent Roll read-only — the report is not theirs
+ * (lib/bookkeeperAccess), so for them the name is just the name.
+ */
 function NameLink({ row }: { row: { householdId: string | null; leaseId: string | null; residents: RentRollResident[] } }) {
   const navigate = useNavigate()
-  const to = reportPath(row)
+  const role = useAuth()?.user?.role
+  const to = role === 'bookkeeper' ? null : reportPath(row)
   const name = householdName(row.residents)
   const all = householdNames(row.residents)
   const others = row.residents.length > 1
@@ -283,6 +320,7 @@ export function RentRollPage() {
                     <span>Paid <strong>{money(data.totals.paid)}</strong></span>
                     {data.totals.workTrade > 0 && <span>Work trade <strong>{money(data.totals.workTrade)}</strong></span>}
                     <span>Owed <strong className="owed">{money(data.totals.owed)}</strong></span>
+                    {movedOutInRangeWords(data) && <span className="rrh-incl">{movedOutInRangeWords(data)}</span>}
                   </>
                 )}
               </div>

@@ -11,7 +11,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const server = vi.hoisted(() => ({
   profile: null as any,
@@ -79,11 +79,18 @@ async function render() {
     root.render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={['/tenants/t1']}>
-          <Routes><Route path="/tenants/:id" element={<TenantDetailPage />} /></Routes>
+          <Routes>
+            <Route path="/tenants/:id" element={<TenantDetailPage />} />
+            <Route path="/tenants/:id/report" element={<ReportProbe />} />
+          </Routes>
         </MemoryRouter>
       </QueryClientProvider>)
   })
   await until(() => text().includes('Glenda Moss'), 'the page')
+}
+function ReportProbe() {
+  const loc = useLocation()
+  return <div className="report-probe">REPORT {loc.pathname}{loc.search}</div>
 }
 const text = () => host.textContent ?? ''
 const btn = (re: RegExp) => [...host.querySelectorAll('button')].find(b => re.test(b.textContent ?? ''))
@@ -253,5 +260,59 @@ describe('10/12 (Nic): the Payment History is the household\'s, with what each c
     expect(text()).toContain('72%, 8 of 11 months')
     expect(text()).not.toContain('Full report')
     expect(btn(/^Full report$/)).toBeUndefined()
+  })
+})
+
+// 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE."
+describe('payment health, lease by lease', () => {
+  const leaseHealth = (leaseId: string, unitNumber: string, percent: number | null, current = true, status = current ? 'active' : 'expired') => ({
+    leaseId, unitNumber, propertyName: 'Mountain View', current, status, startDate: '2026-01-01', endDate: null,
+    health: percent === null ? null : {
+      percent, onTime: percent === 100 ? 1 : 0, counted: 1, paidLate: percent === 100 ? 0 : 1, partial: 0, outstanding: 0,
+      label: `${percent}%, ${percent === 100 ? 1 : 0} of 1 month`,
+    },
+  })
+  const click = async (el: Element | null | undefined) => { await act(async () => { (el as HTMLElement).click() }) }
+
+  it('a person on two leases sees each lease\'s own health, each opening its own report — never one number for both', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 50,
+      health: { percent: 50, onTime: 1, counted: 2, paidLate: 1, partial: 0, outstanding: 0, label: '50%, 1 of 2 months' },
+      healthByLease: [leaseHealth('L30', 'RV 30', 100), leaseHealth('L31', 'RV 31', 0)] } })
+    await render()
+    expect(text()).toContain('Payment Health — by lease')
+    const blocks = [...host.querySelectorAll('[data-lease]')]
+    expect(blocks.map(b => b.getAttribute('data-lease'))).toEqual(['L30', 'L31'])
+    expect(blocks[0].textContent).toContain('RV 30 · Mountain View')
+    expect(blocks[0].textContent).toContain('100%, 1 of 1 month')
+    expect(blocks[1].textContent).toContain('0%, 0 of 1 month')
+    expect(blocks[1].textContent).toContain('1 late, 0 partial, 0 outstanding')
+    // The tile names each lease; the household's one number is not shown.
+    expect(text()).toContain('RV 30 100% · RV 31 0%')
+    expect(text()).not.toContain('50%, 1 of 2 months')
+    await click([...blocks[1].querySelectorAll('button')].find(b => b.textContent === 'Report'))
+    await until(() => text().includes('REPORT /tenants/t1/report?leaseId=L31'), 'that lease\'s report')
+  })
+
+  // 10/13 review: Arturo Melendez's new MH 15 lease, waiting for signatures,
+  // read "Ended" beside his MH 23.
+  it('each lease says where it stands: Current, Pending (not signed yet) or Ended', async () => {
+    server.profile = profile({ stats: { ...profile().stats,
+      healthByLease: [leaseHealth('L23', 'MH 23', 100), leaseHealth('L15', 'MH 15', null, false, 'pending'), leaseHealth('L09', 'MH 09', 0, false)] } })
+    await render()
+    const badge = (lease: string) => host.querySelector(`[data-lease="${lease}"] .badge`)!
+    expect([badge('L23').textContent, badge('L15').textContent, badge('L09').textContent]).toEqual(['Current', 'Pending', 'Ended'])
+    expect(badge('L15').className).toBe('badge badge-gold')
+    expect(host.querySelector('[data-lease="L15"]')!.textContent).toContain('No months to judge yet')
+  })
+
+  it('one lease: its figure on the card, and the full report opens for that lease', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' },
+      healthByLease: [leaseHealth('L4', 'MH 04', 100)] } })
+    await render()
+    expect(text()).not.toContain('by lease')
+    expect(text()).toContain('100%, 1 of 1 month')
+    await click(btn(/^Full report$/))
+    await until(() => text().includes('REPORT /tenants/t1/report?leaseId=L4'), 'the lease\'s report')
   })
 })

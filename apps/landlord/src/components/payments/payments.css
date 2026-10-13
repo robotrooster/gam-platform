@@ -66,6 +66,10 @@
 }
 /* 10/13 (Nic): "we have eviction mode that blocks payments". */
 .pay-tag.evict { background: var(--red-bg); color: var(--red); }
+/* 10/13 (Nic): "a 'Delinquent' tag beside the name" — small, red, on the name's line. */
+.pay-tag.delinquent { background: var(--red-bg); color: var(--red); margin: 0 0 0 6px; vertical-align: 1px; }
+/* A stay guest's name: not a link (no tenant report for a stay). */
+.pay-guest { color: var(--text-0); font-weight: 600; }
 .pay-record { text-align: right; white-space: nowrap; }
 
 /* The one status pill, in Nic's colors (10/12–10/13): green Paid, orange
@@ -97,7 +101,60 @@
 .pay-lines .day { white-space: nowrap; font-family: var(--font-mono); }
 .pay-none { font-size: .76rem; color: var(--text-3); padding: 4px 0; }
 
+/* ── Phones: one card per household (10/13, Nic: "phones = one card per
+   household") — the page draws these instead of the table under 640px
+   (components/payments/usePhone), the Rent Roll's card pattern. ── */
+.pay-card { border-bottom: 1px solid var(--border-0); }
+.pay-card:last-child { border-bottom: none; }
+.pay-card.pay-open { background: var(--gold-bg); }
+.pay-card-head { padding: 12px 14px; }
+.pay-card.pay-click .pay-card-head { cursor: pointer; }
+.pay-card-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.pay-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pay-card-who { margin-top: 4px; font-size: .86rem; color: var(--text-0); overflow-wrap: anywhere; }
+.pay-card-figs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0 4px; font-size: .72rem; color: var(--text-2); }
+.pay-card-figs.one { grid-template-columns: 1fr; }
+.pay-card-figs strong { display: block; font-family: var(--font-mono); font-size: .86rem; color: var(--text-0); }
+.pay-card-figs .pay-sub { white-space: normal; }
+.pay-card-method { font-size: .74rem; color: var(--text-2); }
+.pay-card-record { padding: 0 14px 12px; }
+.pay-card-record .btn { width: 100%; justify-content: center; }
+.pay-card-detail { background: var(--bg-3); border-top: 1px solid var(--border-0); }
+.pay-card-detail .pay-detail-body { padding: 10px 12px; }
+.pay-card-detail .pay-lines .pay-sub { white-space: normal; }
+/* A wide charge table stays inside its card, never the page. */
+.pay-card-detail .pay-detail-block { overflow-x: auto; flex-basis: 100%; }
+
 @media (max-width: 640px) {
   .pay-head .cd-totals { margin-left: 0; width: 100%; }
   .pay-detail-body { padding: 10px 12px; }
+}
+
+/* ── 10/13 (Nic): "show ALL money coming in" — the register's and the pay
+   links' money that is no bill and no stay: a folder under the month, closed
+   until opened (components/payments/OtherMoney). One grid line each, so a
+   phone never scrolls it sideways. ── */
+.pay-other { padding: 0; overflow: hidden; margin-top: 14px; }
+.pay-other-head {
+  width: 100%; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 12px 16px;
+  background: transparent; border: none; color: var(--text-0); font-family: var(--font-body);
+  font-size: .86rem; font-weight: 700; text-align: left; cursor: pointer;
+}
+.pay-other-head:hover { background: var(--bg-3); }
+.pay-other-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.pay-other-meta { margin-left: auto; font-weight: 400; font-size: .76rem; color: var(--text-3); }
+.pay-other-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--border-0); }
+.pay-other-line {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline;
+  padding: 8px 16px; border-bottom: 1px solid var(--border-0); font-size: .78rem; color: var(--text-1);
+}
+.pay-other-line:last-child { border-bottom: none; }
+.pay-other-line .day { font-family: var(--font-mono); white-space: nowrap; color: var(--text-2); }
+.pay-other-line .num { font-family: var(--font-mono); white-space: nowrap; text-align: right; color: var(--text-0); }
+.pay-other-line .num.cd-timing-late { color: var(--amber); }
+.pay-other-for { min-width: 0; overflow-wrap: anywhere; }
+.pay-other-for .pay-sub { white-space: normal; }
+@media (max-width: 640px) {
+  .pay-other-head, .pay-other-line { padding-left: 12px; padding-right: 12px; }
+  .pay-other-meta { margin-left: 0; width: 100%; }
 }

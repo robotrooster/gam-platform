@@ -13,7 +13,9 @@ import { AppError } from '../middleware/errorHandler'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
 import { tenantLivesHereSql } from '../services/posPeople'
 import { landlordScopeIds } from '../lib/landlordScope'
-import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
+import {
+  requireAuth, requirePerm, getScopedPropertyIds, userHasPerm, propertyCutoffsOf, bookkeeperRequestScopeOf,
+} from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
 // balance + their contact info, so a front-counter person knows who to call.
@@ -203,8 +205,9 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
  *
  * WHO (S641, kept by #29): settled history is for owners, property managers
  * and staff with "View all payments" (payments.view_all). Staff with only
- * "View payments" never see it — they get Outstanding Balances and Record
- * payment — so this answers 403 for them, server-side. Property-locked staff
+ * "View payments" never see it — they get the list of who owes and Record
+ * payment (10/13: under the Payments tab, the Outstanding Balances tab being
+ * gone) — so this answers 403 for them, server-side. Property-locked staff
  * see only their properties. The month total goes only to owners and property
  * managers (decisions #25); for anyone else it is not in the reply at all.
  */
@@ -243,6 +246,14 @@ balancesRouter.get('/payments-by-month', requirePerm('payments.view_all'), async
  * server-side for anyone else; staff limited to their properties (a property
  * that is not theirs is a 404, never another property's money). Sums across
  * households ride only for a viewer seesGrandTotals admits (decisions #25).
+ * 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
+ * These three GETs are on the bookkeeper allowlist (lib/bookkeeperAccess) and
+ * a bookkeeper holds payments.view_all there; their property boxes narrow
+ * every read (getScopedPropertyIds), the clean cut at a sale holds
+ * (propertyCutoffsOf), the folder's lease end date follows the owner's
+ * lease-dates box, and no row carries a desk window (only a viewer who may
+ * take a payment gets one — recording a tenant's payment is never a
+ * bookkeeper's, 10/12). Nothing here writes.
  *
  * 10/13 (Nic): "Remove the 'keep moved-out households' setting entirely" — the
  * old GET /rent-roll (every property side by side) and its PUT
@@ -267,6 +278,7 @@ async function rentRollPropertyFor(req: import('express').Request, propertyId: s
     landlordIds: landlordScopeIds(req.user!),
     scopedPropertyIds: await getScopedPropertyIds(req.user),
     propertyId,
+    cutoffs: await propertyCutoffsOf(req.user),
   })
   if (!property) throw new AppError(404, 'That property is not one you can see.')
   return property
@@ -277,6 +289,7 @@ balancesRouter.get('/rent-roll/properties', requirePerm('payments.view_all'), as
     const data = await rentRollProperties({
       landlordIds: landlordScopeIds(req.user!),
       scopedPropertyIds: await getScopedPropertyIds(req.user),
+      cutoffs: await propertyCutoffsOf(req.user),
     })
     res.json({ success: true, data })
   } catch (e) { next(e) }
@@ -291,6 +304,8 @@ balancesRouter.get('/rent-roll/open-month', requirePerm('payments.view_all'), as
     if (!property.owned) throw new AppError(404, 'That property is no longer yours — its bills from before are on the Rent Roll.')
     const data = await buildOpenMonth({
       landlordIds: landlordScopeIds(req.user!), property, withTotals: seesGrandTotals(req.user),
+      // The desk window only for a viewer who may log a payment (never a bookkeeper).
+      mayRecord: userHasPerm(req.user, 'take_payment'),
     })
     res.json({ success: true, data })
   } catch (e) { next(e) }
@@ -306,6 +321,8 @@ balancesRouter.get('/rent-roll/history', requirePerm('payments.view_all'), async
     const property = await rentRollPropertyFor(req, propertyId)
     const data = await buildRentRollHistory({
       landlordIds: landlordScopeIds(req.user!), property, from, to, allTime, withTotals: seesGrandTotals(req.user),
+      // 10/12 (Nic): lease dates are the owner's box per bookkeeper.
+      showLeaseDates: req.user!.role !== 'bookkeeper' || (await bookkeeperRequestScopeOf(req.user!)).showLeaseDates,
     }).catch(e => { throw e instanceof RentRollRangeError ? new AppError(400, e.message) : e })
     res.json({ success: true, data })
   } catch (e) { next(e) }

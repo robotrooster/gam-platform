@@ -66,6 +66,8 @@
 .rrh-summary strong { font-family: var(--font-mono); color: var(--text-0); }
 .rrh-summary .rrh-range { font-weight: 700; color: var(--text-0); }
 .rrh-summary .owed { color: var(--gold); }
+/* 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — what of them is theirs. */
+.rrh-summary .rrh-incl { flex-basis: 100%; font-size: .72rem; color: var(--text-3); }
 
 /* The table: Space · Tenant beside the columns that scroll (styles/rent-roll.css .rr-split). */
 .rrh-card { padding: 0; overflow: hidden; margin-bottom: 14px; }

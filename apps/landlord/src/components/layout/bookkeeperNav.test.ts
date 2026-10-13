@@ -5,11 +5,14 @@
 // sub-tabs like Financials; the bank account, payouts and the company's books
 // are the company-wide box's; staff with "View all payments" reach the Rent
 // Roll. 10/13 (Nic): "payments first" — Payments leads Financials.
+// 10/13 (Nic), the afternoon answers: "Bookkeepers SEE the Payments and Rent
+// Roll pages, read-only" (with any property money), and "REMOVE the
+// Outstanding Balances tab".
 import { describe, it, expect } from 'vitest'
-import { visibleNavItemsFor, sidebarNavItemsFor } from './Layout'
+import { visibleNavItemsFor, sidebarNavItemsFor, staffLandingPath } from './Layout'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
 
-const PROPERTY_MONEY = ['/income', '/reports', '/expenses', '/maintenance-costs']
+const PROPERTY_MONEY = ['/payments', '/rent-roll', '/income', '/reports', '/expenses', '/maintenance-costs']
 // 10/12 (Nic): Categories is every bookkeeper's, whatever is ticked for them —
 // the server lets each keep the company's categories (routes/expenses).
 const EVERY_BOOKKEEPER = [BOOKS_PATHS.categories]
@@ -32,7 +35,7 @@ describe('landlord portal navigation for a bookkeeper', () => {
   it('hides tenants, leases, documents, messages, schedule, screening, team and settings', () => {
     const shown = new Set(paths({ role: 'bookkeeper', companyWide: true }))
     for (const path of ['/tenants', '/leases', '/documents', '/esign', '/schedule', '/background', '/pool',
-      '/screening', '/team', '/settings', '/payments', '/balances', '/rent-roll', '/maintenance', '/pos',
+      '/screening', '/team', '/settings', '/balances', '/maintenance', '/pos',
       '/dashboard', '/properties', '/units', '/disbursements', '/bank', '/banking', '/front-desk']) {
       expect(shown.has(path), `${path} should be hidden from a bookkeeper`).toBe(false)
     }
@@ -87,6 +90,20 @@ describe('landlord portal navigation for a bookkeeper', () => {
       .toEqual(sorted([...COMPANY_WIDE_FINANCIALS, ...BOOKKEEPING]))
   })
 
+  // 10/11: a bookkeeper lands on Money in. 10/13 review: Payments and the Rent
+  // Roll joining their menu above it must not move where they land.
+  it('lands on Money in after signing in, and Financials opens there — Payments and the Rent Roll are in the menu', () => {
+    for (const u of [{ role: 'bookkeeper' }, { role: 'bookkeeper', companyWide: true }, { role: 'bookkeeper', ledger: true }]) {
+      expect(staffLandingPath(u), JSON.stringify(u)).toBe('/income')
+      expect(sidebarNavItemsFor(u).find(s => s.label === 'Financials')?.to, JSON.stringify(u)).toBe('/income')
+      expect(paths(u), JSON.stringify(u)).toEqual(expect.arrayContaining(['/payments', '/rent-roll']))
+    }
+    // No property money: no Money in — the first page they have, as for staff.
+    expect(staffLandingPath({ role: 'bookkeeper', companyWide: true, propertyMoney: false }))
+      .toBe(visibleNavItemsFor({ role: 'bookkeeper', companyWide: true, propertyMoney: false })[0].to)
+    expect(staffLandingPath({ role: 'bookkeeper', propertyMoney: false })).toBe(BOOKS_PATHS.categories)
+  })
+
   it('a staff permission map never widens it', () => {
     const items = paths({ role: 'bookkeeper', permissions: { 'tenants.view': true, 'leases.view': true, 'payments.view_all': true } as any })
     expect(sorted(items)).toEqual(sorted([...PROPERTY_MONEY, ...EVERY_BOOKKEEPER]))
@@ -96,9 +113,18 @@ describe('landlord portal navigation for a bookkeeper', () => {
 describe('landlord portal navigation for the owner', () => {
   it('keeps the owner-only financial tabs and gains Money In and Maintenance Costs', () => {
     const shown = new Set(paths({ role: 'landlord' }))
-    for (const path of ['/payments', '/balances', '/rent-roll', '/disbursements', '/reports', '/expenses',
+    for (const path of ['/payments', '/rent-roll', '/disbursements', '/reports', '/expenses',
       '/income', '/maintenance-costs', '/bank', '/banking']) {
       expect(shown.has(path), `${path} should show for the owner`).toBe(true)
+    }
+  })
+
+  // 10/13 (Nic): "REMOVE the Outstanding Balances tab."
+  it('has no Outstanding Balances tab — for anyone', () => {
+    for (const u of [{ role: 'landlord' }, { role: 'admin' }, { role: 'onsite_manager', permissions: { 'balances.view': true } },
+      { role: 'property_manager', permissions: { 'payments.view_all': true, 'balances.view': true } }, { role: 'bookkeeper', companyWide: true }]) {
+      expect(paths(u), JSON.stringify(u)).not.toContain('/balances')
+      expect(visibleNavItemsFor(u).some(i => i.label === 'Outstanding Balances'), JSON.stringify(u)).toBe(false)
     }
   })
 
@@ -159,6 +185,19 @@ describe('landlord portal navigation for staff', () => {
     for (const path of ['/income', '/maintenance-costs', '/bank-activity', '/payouts', '/expenses', ...BOOKKEEPING]) {
       expect(shown.has(path), path).toBe(false)
     }
+  })
+
+  it('staff land on the first page their switches grant; none at all: the welcome page', () => {
+    expect(staffLandingPath({ role: 'onsite_manager', permissions: { 'payments.view_all': true } })).toBe('/payments')
+    expect(staffLandingPath({ role: 'onsite_manager', permissions: {} })).toBe('/welcome')
+  })
+
+  // 10/13 (Nic): who owes and Record payment are under Payments now.
+  it('"View who owes" alone shows the Payments tab (where that list is now) — never the Rent Roll', () => {
+    const desk = paths({ role: 'onsite_manager', permissions: { 'balances.view': true } })
+    expect(desk).toContain('/payments')
+    expect(desk).not.toContain('/rent-roll')
+    expect(paths({ role: 'onsite_manager', permissions: {} })).not.toContain('/payments')
   })
 
   it('"View all payments" reaches the Rent Roll; "View payments" alone does not', () => {

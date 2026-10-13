@@ -71,13 +71,13 @@ interface Waiting {
 /**
  * Where to record a rent payment before ticking it. Neither the Bank page nor
  * the Front Desk has a Record payment button, so the next step names the
- * screens that do (RecordPaymentWindow is on the Outstanding Balances page and
- * on each resident's page) — only the ones this person can open. Somebody who
+ * screens that do (Record payment is on the Payments page — 10/13 (Nic): the
+ * Outstanding Balances tab is gone — and on each resident's page) — only the ones this person can open. Somebody who
  * can open neither (a staffer who only takes payments) is told who can.
  */
 function recordRentFirst(can: (k: string) => boolean): string {
   const pages = [
-    can('balances.view') ? 'the Outstanding Balances page' : null,
+    can('balances.view') ? 'the Payments page' : null,
     can('tenants.view') ? 'the resident\u2019s page' : null,
   ].filter(Boolean)
   return pages.length > 0

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
-import { humanize, PAYMENT_STATUS_LABEL, type PaymentStatus } from '@gam/shared'
+import { humanize, PAYMENT_STATUS_LABEL, LEASE_STATUS_LABEL, type PaymentStatus, type LeaseStatus } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
@@ -35,6 +35,28 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 // hold separate tabs at different properties, so a tenant-detail
 // view isn't the right surface anymore. Dedicated landlord
 // FlexCharge dashboard lands in S254.
+
+/** 10/13 (Nic): one lease's payment health on the profile (GET /tenants/:id/profile stats.healthByLease). */
+interface LeaseHealthRow {
+  leaseId: string
+  unitNumber: string | null
+  propertyName: string | null
+  current: boolean
+  /** The lease's own status (shared LEASE_STATUSES). */
+  status?: LeaseStatus
+  health: { percent: number | null; onTime: number; counted: number; paidLate: number; partial: number; outstanding: number; label: string } | null
+}
+
+/**
+ * Where one lease stands, beside its health: Current (active), not signed yet
+ * (pending — 10/13 review: a new lease waiting for signatures read "Ended"),
+ * else Ended.
+ */
+export function LeaseHealthBadge({ lease }: { lease: Pick<LeaseHealthRow, 'current' | 'status'> }) {
+  if (lease.current) return <span className="badge badge-green">Current</span>
+  if (lease.status === 'pending') return <span className="badge badge-gold">{LEASE_STATUS_LABEL.pending}</span>
+  return <span className="badge badge-muted">Ended</span>
+}
 
 export function TenantDetailPage() {
   const { id } = useParams()
@@ -117,10 +139,19 @@ export function TenantDetailPage() {
   const currentUnit = units?.find((u: any) => u.isCurrent)
   // 10/12 (Nic): the one payment-health figure — the household's months paid
   // on time, all time since it joined GAM (null until a month is judged).
-  const health = stats.health ?? null
-  const rate: number | null = stats.onTimeRate ?? null
+  // 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE" — each
+  // lease the person is on is its own household with its own figure (the
+  // server's stats.healthByLease, current leases first). One lease: its
+  // figure. Several: each, side by side. None on file: the household's.
+  const byLease: LeaseHealthRow[] = stats.healthByLease ?? []
+  const health = byLease.length === 1 ? (byLease[0].health ?? null) : (stats.health ?? null)
+  const rate: number | null = byLease.length === 1 ? (byLease[0].health?.percent ?? null) : (stats.onTimeRate ?? null)
   const onTimeColor = healthColor(rate)
   const onTimeLabel = healthWord(rate)
+  const severalLeases = byLease.length > 1
+  /** The report for one lease (that lease's household), or the person's whole one. */
+  const reportFor = (leaseId?: string | null) => `/tenants/${id}/report${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ''}`
+  const singleLeaseId = byLease.length === 1 ? byLease[0].leaseId : null
   return (
     <div>
       <div className="page-header">
@@ -155,7 +186,10 @@ export function TenantDetailPage() {
               { label: 'Tenant Since', val: calendarDay(stats.firstPayment) ? monthTitle(calendarDay(stats.firstPayment)!) : '--', color: 'var(--text-0)' },
               { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
-              { label: 'Payment Health', val: rate === null ? '—' : rate + '%', color: onTimeColor, sub: onTimeLabel },
+              severalLeases
+                ? { label: 'Payment Health', val: byLease.map(l => `${l.unitNumber ?? '—'} ${l.health?.percent == null ? '—' : `${l.health.percent}%`}`).join(' · '),
+                    color: 'var(--text-0)', sub: 'by lease' }
+                : { label: 'Payment Health', val: rate === null ? '—' : rate + '%', color: onTimeColor, sub: onTimeLabel },
               { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ]).map(s => (
               <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
@@ -185,9 +219,40 @@ export function TenantDetailPage() {
                 health hides whether "late" meant 2 days or 3 weeks. 10/12
                 (Nic): it opens the household's payment report (days past
                 grace, the pattern, partials, every charge). */}
-            {!paymentsHidden && (
+            {!paymentsHidden && severalLeases && (
+            <div className="card">
+              <div className="card-title" style={{ marginBottom: 14 }}>Payment Health — by lease</div>
+              {byLease.map(l => {
+                const pct = l.health?.percent ?? null
+                const color = healthColor(pct)
+                return (
+                  <div key={l.leaseId} data-lease={l.leaseId} style={{ padding: '10px 0', borderTop: '1px solid var(--border-0)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-3)', border: '3px solid ' + color, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem', fontWeight: 800, color }}>{pct === null ? '—' : `${pct}%`}</span>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '.84rem', fontWeight: 700, color: 'var(--text-0)' }}>
+                          {l.unitNumber ?? 'Lease'}{l.propertyName ? ` · ${l.propertyName}` : ''}{' '}
+                          <LeaseHealthBadge lease={l} />
+                        </div>
+                        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                          {l.health?.label ?? 'No months to judge yet'} · since joining GAM
+                          {l.health && ` · ${l.health.paidLate} late, ${l.health.partial} partial, ${l.health.outstanding} outstanding`}
+                        </div>
+                      </div>
+                      {opensReport && (
+                        <button className="btn btn-primary btn-sm" onClick={() => navigate(reportFor(l.leaseId))}>Report</button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            )}
+            {!paymentsHidden && !severalLeases && (
             <div className="card" style={{ cursor: opensReport ? 'pointer' : undefined }}
-              onClick={opensReport ? () => navigate(`/tenants/${id}/report`) : undefined}
+              onClick={opensReport ? () => navigate(reportFor(singleLeaseId)) : undefined}
               title={opensReport ? 'Open the full payment report' : undefined}>
               <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
                 <span>Payment Health</span>
@@ -253,7 +318,7 @@ export function TenantDetailPage() {
                 a page at a time; the full report has them all on one page. */}
             <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
               <span>Payment History — household</span>
-              {opensReport && <button className="btn btn-primary btn-sm" onClick={() => navigate(`/tenants/${id}/report`)}>Full report</button>}
+              {opensReport && <button className="btn btn-primary btn-sm" onClick={() => navigate(reportFor(singleLeaseId))}>Full report</button>}
             </div>
             {payments?.length === 0 ? (
               <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>No payments yet.</div>
