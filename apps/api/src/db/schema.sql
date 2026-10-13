@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict lyJsPhBqlrX1tvJcUvOZWc5aF61CS7a335E40OYqztqBLs4hwehSBiFdOUgsqn8
+\restrict 6rFhAGJtmNWN95Ib8KKKaII7tZrqSFm8SddeIuWm7H3ibacmF8eNq8OO5HbiHXU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4153,7 +4153,7 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -4171,7 +4171,7 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -4189,14 +4189,14 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text)
+           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text)) r
+           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text)) r
     CROSS JOIN LATERAL (SELECT 'gam_debit'::text, r.id::text, r.landlord_id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
@@ -6291,28 +6291,14 @@ CREATE FUNCTION public.pos_reader_order_costs_lock() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 DECLARE
-  cur     numeric;
-  nxt     numeric;
+  prev date;
 BEGIN
   PERFORM 1 FROM pos_reader_orders o WHERE o.id = NEW.reader_order_id FOR UPDATE;
-  IF NOT EXISTS (SELECT 1 FROM landlord_gam_charges g
-                   JOIN platform_revenue_ledger r
-                     ON r.reference_id = g.id AND r.type = 'device_markup'
-                    AND r.reference_type = 'reader_order_installment'
-                  WHERE g.reader_order_id = NEW.reader_order_id) THEN
-    RETURN NEW;
-  END IF;
-  SELECT c.total_cost INTO cur FROM pos_reader_order_costs c
+  SELECT c.effective_on INTO prev FROM pos_reader_order_costs c
    WHERE c.reader_order_id = NEW.reader_order_id ORDER BY c.seq DESC LIMIT 1;
-  IF NOT FOUND THEN
-    RETURN NEW;
-  END IF;
-  -- total_cost is generated after BEFORE triggers run: work it out here.
-  nxt := NEW.base_price + COALESCE(NEW.tax_amount, 0) + COALESCE(NEW.shipping_amount, 0)
-         + COALESCE(NEW.tax_and_shipping_amount, 0);
-  IF nxt IS DISTINCT FROM cur THEN
-    RAISE EXCEPTION 'reader order % has markup booked as GAM earnings, so its cost is fixed at % (an entry may only split the same total differently, not make it %)',
-      NEW.reader_order_id, cur, nxt
+  IF FOUND AND NEW.effective_on < prev THEN
+    RAISE EXCEPTION 'reader order %: a cost entry applies from its own date, on or after the entry it corrects (%), not %',
+      NEW.reader_order_id, prev, NEW.effective_on
       USING ERRCODE = 'check_violation';
   END IF;
   RETURN NEW;
@@ -8031,7 +8017,9 @@ CREATE TABLE public.books_accounts (
     replaced_by_account_id uuid,
     retired_at timestamp with time zone,
     retired_by uuid,
+    replaced_from date,
     CONSTRAINT books_accounts_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1)),
+    CONSTRAINT books_accounts_replaced_from_has_replacement CHECK (((replaced_from IS NULL) OR (replaced_by_account_id IS NOT NULL))),
     CONSTRAINT books_accounts_type_check CHECK (((type)::text = ANY ((ARRAY['asset'::character varying, 'liability'::character varying, 'equity'::character varying, 'income'::character varying, 'expense'::character varying])::text[])))
 );
 
@@ -8041,6 +8029,13 @@ CREATE TABLE public.books_accounts (
 --
 
 COMMENT ON COLUMN public.books_accounts.replaced_by_account_id IS '10/12 (Nic): a retired account''s replacement. Its posted lines stay where they are; the map and new postings use the replacement.';
+
+
+--
+-- Name: COLUMN books_accounts.replaced_from; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_accounts.replaced_from IS '10/13 (Nic): the first day replaced_by_account_id took this deleted account''s postings — the books'' first open day when it was deleted (closed months keep this account). Postings already sitting before it stay here; anything posted on or after it, and every posting written after the deletion (a late record for a closed month included), goes to the replacement. NULL = not deleted through retireAccount.';
 
 
 --
@@ -11909,8 +11904,16 @@ CREATE TABLE public.landlord_gam_debits (
     failure_cost_amount numeric(12,2),
     failure_cost_charge_id uuid,
     failure_cost_read_at timestamp with time zone,
+    disputed_at timestamp with time zone,
+    stripe_dispute_id text,
+    dispute_reopened_amount numeric(12,2),
+    dispute_cost_amount numeric(12,2),
+    dispute_cost_charge_id uuid,
+    dispute_cost_read_at timestamp with time zone,
     CONSTRAINT landlord_gam_debits_bank_cost_amount_check CHECK ((bank_cost_amount >= (0)::numeric)),
     CONSTRAINT landlord_gam_debits_charges_amount_check CHECK ((charges_amount > (0)::numeric)),
+    CONSTRAINT landlord_gam_debits_dispute_cost_shape CHECK ((((dispute_cost_amount IS NULL) OR (dispute_cost_amount >= (0)::numeric)) AND ((dispute_cost_amount IS NULL) = (dispute_cost_read_at IS NULL)) AND ((dispute_cost_read_at IS NULL) OR (disputed_at IS NOT NULL)) AND ((dispute_cost_charge_id IS NULL) OR (dispute_cost_amount > (0)::numeric)))),
+    CONSTRAINT landlord_gam_debits_disputed_shape CHECK ((((disputed_at IS NULL) = (stripe_dispute_id IS NULL)) AND ((disputed_at IS NULL) = (dispute_reopened_amount IS NULL)) AND ((disputed_at IS NULL) OR (status = 'succeeded'::text)) AND ((dispute_reopened_amount IS NULL) OR (dispute_reopened_amount >= (0)::numeric)))),
     CONSTRAINT landlord_gam_debits_failure_cost_check CHECK ((((failure_cost_amount IS NULL) OR (failure_cost_amount >= (0)::numeric)) AND ((failure_cost_amount IS NULL) = (failure_cost_read_at IS NULL)) AND ((failure_cost_charge_id IS NULL) OR (failure_cost_amount > (0)::numeric)))),
     CONSTRAINT landlord_gam_debits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'succeeded'::text, 'failed'::text, 'canceled'::text]))),
     CONSTRAINT landlord_gam_debits_total_amount_check CHECK ((total_amount > (0)::numeric))
@@ -11936,6 +11939,48 @@ COMMENT ON COLUMN public.landlord_gam_debits.failure_cost_amount IS '10/12 (G1):
 --
 
 COMMENT ON COLUMN public.landlord_gam_debits.failure_cost_charge_id IS '10/12 (G1): the landlord_gam_charges row (kind bank_debit_failed_cost) that bills failure_cost_amount.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.disputed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.disputed_at IS '10/13 (Nic): when the landlord''s bank disputed this pull and took the money back — every fee it collected was made owed again (collected_amount reduced by what this pull took for it), its own $6 cost line voided (Nic G1), and an admin told. The pull stays succeeded and its landlord_gam_charge_collections rows stay as written; they no longer count toward collected_amount. NULL = not disputed.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.stripe_dispute_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.stripe_dispute_id IS '10/13: the Stripe dispute that took this pull back (connect_disputes.stripe_dispute_id). Set with disputed_at.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_reopened_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_reopened_amount IS '10/13: what the dispute made owed again across the pull''s charges (its own $6 cost line is voided instead, not counted here). Set with disputed_at.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_cost_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_amount IS '10/13 (Nic G1, "gam eats no fees of failed pulls ever"): what the disputed pull actually cost GAM — Stripe''s fee on the pull plus Stripe''s dispute fee — billed to the landlord at cost. NULL = not read from Stripe yet (the nightly sweep asks again).';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_cost_charge_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_charge_id IS '10/13: the landlord_gam_charges row (kind bank_debit_failed_cost, source_type gam_bank_debit_disputed) that bills dispute_cost_amount. NULL when it cost nothing.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_cost_read_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_read_at IS '10/13: when dispute_cost_amount was read from Stripe. NULL = not read yet.';
 
 
 --
@@ -15421,6 +15466,7 @@ CREATE TABLE public.pos_reader_order_costs (
     source text DEFAULT 'desk'::text NOT NULL,
     entered_by_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    effective_on date DEFAULT ((now() AT TIME ZONE 'America/Phoenix'::text))::date NOT NULL,
     CONSTRAINT pos_reader_order_costs_base_price_check CHECK ((base_price >= (0)::numeric)),
     CONSTRAINT pos_reader_order_costs_shipping_amount_check CHECK ((shipping_amount >= (0)::numeric)),
     CONSTRAINT pos_reader_order_costs_source_check CHECK ((source = ANY (ARRAY['desk'::text, 'backfill'::text]))),
@@ -15434,7 +15480,7 @@ CREATE TABLE public.pos_reader_order_costs (
 -- Name: TABLE pos_reader_order_costs; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.pos_reader_order_costs IS '10/12 (Nic): GAM''s actual cost of each card reader order (base, tax, shipping), one row per entry, never edited or deleted; the order''s cost is its latest entry (highest seq). Fixed once markup figured from it is booked as GAM earnings (only the same total may be re-split). Markup = pos_reader_orders.price − total_cost.';
+COMMENT ON TABLE public.pos_reader_order_costs IS '10/12 (Nic): GAM''s actual cost of each card reader order (base, tax, shipping), one row per entry, never edited or deleted; the order''s cost is its latest entry (highest seq). 10/13 (Nic): "allow dated cost corrections" — each entry applies from its effective_on (the first: the day GAM bought the reader; a later one: a correction, never dated before the entry it corrects); a piece of the plan carries the markup under the entry in force the day it was billed. Markup = pos_reader_orders.price − total_cost; a negative markup is a loss.';
 
 
 --
@@ -15449,6 +15495,13 @@ COMMENT ON COLUMN public.pos_reader_order_costs.tax_and_shipping_amount IS '10/1
 --
 
 COMMENT ON COLUMN public.pos_reader_order_costs.source IS '10/12: desk = typed on the admin Reader Orders desk; backfill = recorded from Nic''s figures by migration 20261013160100. @gam/shared READER_ORDER_COST_SOURCES.';
+
+
+--
+-- Name: COLUMN pos_reader_order_costs.effective_on; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_reader_order_costs.effective_on IS '10/13 (Nic): "allow dated cost corrections" — the day this entry applies from: the first entry, the day GAM bought the reader; a correction, its own date. On or after the entry before it (pos_reader_order_costs_lock).';
 
 
 --
@@ -19635,6 +19688,7 @@ CREATE TABLE public.utility_meters (
     reading_multiplier numeric(10,4) DEFAULT 1 NOT NULL,
     zero_use_confirmed_at timestamp with time zone,
     zero_use_confirmed_by_user_id uuid,
+    zero_use_stops_flat_charge boolean DEFAULT false NOT NULL,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
     CONSTRAINT utility_meters_digits_check CHECK (
@@ -19705,6 +19759,13 @@ COMMENT ON COLUMN public.utility_meters.zero_use_confirmed_at IS '10/12 (Nic): w
 --
 
 COMMENT ON COLUMN public.utility_meters.zero_use_confirmed_by_user_id IS '10/12 (Nic): who chose "Works, tenant uses no power" (or confirmed it with a repair). Set and cleared together with zero_use_confirmed_at.';
+
+
+--
+-- Name: COLUMN utility_meters.zero_use_stops_flat_charge; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.zero_use_stops_flat_charge IS '10/13 (Nic): the landlord''s answer to "Stop the flat charge too?" when marking a flat-rate meter "Works, nobody using it". TRUE: the flat charge is not billed while zero_use_confirmed_at is set, and bills again once it is cleared. Counts only while zero_use_confirmed_at is set; written and cleared with it.';
 
 
 --
@@ -29208,6 +29269,13 @@ CREATE UNIQUE INDEX landlord_gam_debits_pi_idx ON public.landlord_gam_debits USI
 
 
 --
+-- Name: landlord_gam_debits_stripe_dispute_id_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlord_gam_debits_stripe_dispute_id_key ON public.landlord_gam_debits USING btree (stripe_dispute_id) WHERE (stripe_dispute_id IS NOT NULL);
+
+
+--
 -- Name: landlord_member_history_by_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -37178,6 +37246,14 @@ ALTER TABLE ONLY public.landlord_gam_charges
 
 
 --
+-- Name: landlord_gam_debits landlord_gam_debits_dispute_cost_charge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_debits
+    ADD CONSTRAINT landlord_gam_debits_dispute_cost_charge_id_fkey FOREIGN KEY (dispute_cost_charge_id) REFERENCES public.landlord_gam_charges(id);
+
+
+--
 -- Name: landlord_gam_debits landlord_gam_debits_failure_cost_charge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -42286,5 +42362,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict lyJsPhBqlrX1tvJcUvOZWc5aF61CS7a335E40OYqztqBLs4hwehSBiFdOUgsqn8
+\unrestrict 6rFhAGJtmNWN95Ib8KKKaII7tZrqSFm8SddeIuWm7H3ibacmF8eNq8OO5HbiHXU
 
