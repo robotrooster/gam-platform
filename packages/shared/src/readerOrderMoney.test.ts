@@ -88,6 +88,23 @@ describe('readerOrderMoney', () => {
   })
 })
 
+// 10/13 (Nic): "record each reader as a GAM expense (loss if cost > charge)".
+describe('a reader that cost GAM more than it charges is a loss', () => {
+  it('readerOrderMoney names the loss; none when it earns markup; unknown with no cost', () => {
+    const at = (totalCost: number | null) => readerOrderMoney({ price: 350, installments: 4, totalCost, pieces: [] })
+    expect(at(331.73)).toMatchObject({ markup: 18.27, loss: 0 })
+    expect(at(361.2)).toMatchObject({ markup: -11.2, loss: 11.2 })
+    expect(at(350)).toMatchObject({ markup: 0, loss: 0 })
+    expect(at(null)).toMatchObject({ markup: null, loss: null })
+  })
+
+  it('a loss carries no markup in any piece, billed or not', () => {
+    const m = readerOrderMoney({ price: 350, installments: 4, totalCost: 361.2,
+      pieces: [1, 2, 3, 4].map(n => ({ n, amount: 87.5, collected: 87.5 })) })
+    expect(m).toMatchObject({ markupBilled: 0, markupCollected: 0, costRecovered: 350, loss: 11.2 })
+  })
+})
+
 describe('READER_ORDER_COST_SOURCES', () => {
   it('every source has words for the desk', () => {
     for (const s of READER_ORDER_COST_SOURCES) expect(READER_ORDER_COST_SOURCE_LABEL[s]).toBeTruthy()

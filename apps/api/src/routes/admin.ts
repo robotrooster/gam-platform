@@ -4328,9 +4328,13 @@ adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next
  * will vary." GAM's actual cost of the reader, typed from the shop receipt:
  * base price, tax and shipping — or tax and shipping as one figure when the
  * receipt does not split them. Each save is a new entry (the old ones are
- * kept); fixed once markup figured from it is booked as GAM's earnings (10/12
- * review — then only the same total may be split differently). Returns the
- * order as the desk shows it.
+ * kept). 10/13 (Nic): "allow dated cost corrections" — `effectiveOn`
+ * ('YYYY-MM-DD') is the day the entry applies from: the day GAM bought the
+ * reader, or the day a correction (a refund, extra shipping) applies from;
+ * never before the entry it corrects (409). A payment billed on or after it
+ * carries the markup under it; nothing already booked is rewritten (a loss,
+ * and what it changes in a payment already billed, are shown on the desk and
+ * not booked — services/readerOrders). Returns the order as the desk shows it.
  */
 adminRouter.post('/reader-orders/:id/cost', requireSuperAdmin, async (req, res, next) => {
   try {
@@ -4341,6 +4345,7 @@ adminRouter.post('/reader-orders/:id/cost', requireSuperAdmin, async (req, res, 
       shipping: amt.nullable().optional(),
       taxAndShipping: amt.nullable().optional(),
       note: z.string().trim().max(500).nullable().optional(),
+      effectiveOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Give the date as YYYY-MM-DD.').nullable().optional(),
     }).refine(b => b.taxAndShipping == null || (b.tax == null && b.shipping == null),
       { message: 'Enter tax and shipping separately, or as one combined amount — not both.' })
       .parse(req.body)

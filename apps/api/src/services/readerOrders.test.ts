@@ -135,6 +135,7 @@ describe('a request cannot sit unseen', () => {
     expect(adminNote).toHaveBeenCalledTimes(1)
     expect(adminNote.mock.calls[0][0].body).toMatch(/NOT ORDERED/)
     await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_1' })
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)   // the receipt, typed (10/13)
     adminNote.mockClear()
     expect(await chaseReaderOrders(day2)).toEqual({ waiting: 0, sent: false })   // ordered, within 3 days
     const day6 = new Date(Date.now() + 6 * 86400000)
@@ -144,6 +145,70 @@ describe('a request cannot sit unseen', () => {
     await adminUpdateReaderOrder(o.id, { status: 'registered', serial: 'WSC1' })
     adminNote.mockClear()
     expect(await chaseReaderOrders(day6)).toEqual({ waiting: 0, sent: false })
+  })
+
+  // 10/13 (Nic): "flag missing cost in the morning admin email."
+  it('a reader GAM bought with no cost entered is flagged every morning — registered or not — until the cost is typed', async () => {
+    const w = await world()
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    adminNote.mockClear()
+    const day2 = new Date(Date.now() + 2 * 86400000)
+    // A request nobody has ordered: GAM has bought nothing yet — only NOT ORDERED.
+    await chaseReaderOrders(day2)
+    expect(adminNote.mock.calls[0][0].body).not.toMatch(/NO COST ENTERED/)
+    await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_1' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 1, sent: true })
+    const n = adminNote.mock.calls[0][0]
+    expect(n.emailSuperAdmins).toBe(true)
+    expect(n.body).toMatch(/^NO COST ENTERED — .*: ordered [12] day\(s\) ago .*Stripe shop receipt/)
+    // Registered and in use: still flagged, its pieces keep billing.
+    await adminUpdateReaderOrder(o.id, { status: 'registered', serial: 'WSC1' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 1, sent: true })
+    expect(adminNote.mock.calls[0][0].body).toMatch(/NO COST ENTERED/)
+    // The receipt typed: quiet.
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 0, sent: false })
+    expect(adminNote).not.toHaveBeenCalled()
+  })
+
+  it('a request cancelled before anyone ordered it is not flagged for its cost', async () => {
+    const w = await world()
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    await adminUpdateReaderOrder(o.id, { status: 'cancelled' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(new Date(Date.now() + 2 * 86400000))).toEqual({ waiting: 0, sent: false })
+  })
+
+  // 10/13 (review): GAM paid the shop when it ordered — cancelling afterwards does not unbuy it.
+  it('a reader cancelled after GAM ordered it is still flagged until its cost is typed', async () => {
+    const w = await world()
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_1' })
+    await adminUpdateReaderOrder(o.id, { status: 'cancelled' })
+    adminNote.mockClear()
+    const day2 = new Date(Date.now() + 2 * 86400000)
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 1, sent: true })
+    expect(adminNote.mock.calls[0][0].body).toMatch(/^NO COST ENTERED — .*: ordered [12] day\(s\) ago \(cancelled since\) and what the reader cost GAM/)
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(day2)).toEqual({ waiting: 0, sent: false })
+  })
+
+  // 10/13 (review): the title counts orders, not lines.
+  it('one order on two lines (not in use, and no cost) is one order waiting', async () => {
+    const w = await world()
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_1' })
+    await adminUpdateReaderOrder(o.id, { status: 'shipped' })
+    adminNote.mockClear()
+    expect(await chaseReaderOrders(new Date(Date.now() + 12 * 86400000))).toEqual({ waiting: 1, sent: true })
+    const n = adminNote.mock.calls[0][0]
+    expect(n.body.split('\n').map((l: string) => l.split(' — ')[0])).toEqual(['NOT IN USE', 'NO COST ENTERED'])
+    expect(n.title).toBe('1 card reader order waiting on GAM')
+    expect(n.context).toEqual({ count: 1 })
   })
 })
 
@@ -156,6 +221,8 @@ describe('the order finds its reader — nobody types a serial', () => {
     await db.query(`UPDATE properties SET stripe_terminal_location_id = 'tml_mv' WHERE id = $1`, [w.propertyId])
     const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
     await adminUpdateReaderOrder(o.id, { status: 'ordered', stripeHardwareOrderId: 'thor_mv' })
+    // 10/13: GAM types the receipt when it orders (a reader with no cost is its own line in the email).
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
     adminNote.mockClear()
     return o
   }
@@ -256,7 +323,7 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     const w = await world()
     const { o } = await shippedOrder(w)
     let row = (await adminListReaderOrders(o.id))[0]
-    expect(row).toMatchObject({ charged: 350, cost_total: null, markup: null, cost_locked: false })
+    expect(row).toMatchObject({ charged: 350, cost_total: null, markup: null, loss: null, cost_booked: false })
     await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 15.95, note: 'first guess' }, w.userId)
     row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 10.95 }, w.userId)
     expect(row).toMatchObject({
@@ -267,6 +334,8 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     expect(row.cost_history.map((h: any) => Number(h.total))).toEqual([331.73, 336.73])
     expect(row.cost_history[1]).toMatchObject({ note: 'first guess', source: 'desk' })
     expect(row.cost_history[0].entered_by_email).toMatch(/@test\.dev$/)
+    // 10/13: both dated — the first the day GAM ordered it, the typo fixed the same day (on or after it: allowed).
+    expect(row.cost_history.map((h: any) => h.effective_on)).toEqual([row.cost_effective_on, row.cost_effective_on])
     // The plan, cost first.
     expect(row.pieces.map((p: any) => [p.n, p.cost, p.markup, p.billed])).toEqual([
       [1, 87.5, 0, false], [2, 87.5, 0, false], [3, 87.5, 0, false], [4, 69.23, 18.27, false],
@@ -285,28 +354,88 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     await expect(recordReaderOrderCost(o.id, { basePrice: -1 }, w.userId)).rejects.toThrow(/zero or more/)
   })
 
-  // 10/12 (review): fixed once markup figured from it is booked as GAM's earnings — not the day it
-  // ships. A reader usually ships itself before anyone types the receipt, and the piece carrying the
-  // markup (cost first: the last) is billed months later; a typo in between can still be corrected.
-  it('a typo can be corrected after the reader ships; once markup is booked the total is fixed — it may only be split differently — and the database holds that too', async () => {
+  // 10/13 (Nic): "allow dated cost corrections" — a receipt that changes after shipping (a refund,
+  // extra shipping): the old number is kept on record, the new one applies from its date. This
+  // replaces 10/12's "fixed once markup is booked".
+  async function pastOrder(w: any) {
+    // Asked for May 10th, bought from Stripe May 11th, shipped May 20th; pieces June 1st – September 1st.
+    const o = await requestReader({ landlordId: w.landlordId, propertyId: w.propertyId, shipTo, requestedByUserId: w.userId })
+    await db.query(`UPDATE pos_reader_orders SET status = 'shipped', created_at = '2026-05-10T17:00:00Z',
+                           ordered_at = '2026-05-11T17:00:00Z', shipped_at = '2026-05-20T17:00:00Z' WHERE id = $1`, [o.id])
+    expect(await raiseDueInstallments(new Date('2026-09-02T12:00:00Z'))).toBe(4)
+    await db.query(`UPDATE landlord_gam_charges SET created_at = make_timestamptz(2026, 5 + installment_number, 1, 15, 0, 0, 'UTC')
+                     WHERE reader_order_id = $1`, [o.id])
+    return o
+  }
+  const bookRows = async (orderId: string) => (await db.query(
+    `SELECT r.type, r.amount::text AS amount, r.reference_type, to_char(r.created_at AT TIME ZONE 'America/Phoenix', 'YYYY-MM-DD') AS day, r.notes
+       FROM platform_revenue_ledger r
+      WHERE r.reference_id IN (SELECT id FROM landlord_gam_charges WHERE reader_order_id = $1
+                               UNION ALL SELECT id FROM pos_reader_order_costs WHERE reader_order_id = $1)
+      ORDER BY r.created_at, r.id`, [orderId])).rows
+
+  it('a dated correction after the markup is booked: the old figure stays on record, the booked row stays, and the difference is shown as not in GAM\'s book', async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    // The first figure is dated the day GAM bought it; piece 4 (billed September 1st) carries $18.27.
+    let row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    expect(row).toMatchObject({ cost_total: 331.73, cost_effective_on: '2026-05-11', markup: 18.27, loss: 0, booked_total: 18.27, not_booked: 0, cost_booked: true })
+    expect(await bookRows(o.id)).toMatchObject([{ type: 'device_markup', amount: '18.27', day: '2026-09-01' }])
+    // October 1st: $5.00 more shipping turns up. September's $18.27 stays as booked; the $5.00 it
+    // changes in piece 4 is NOT booked (10/13: how a correction goes into GAM's book is Nic's call).
+    row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 15.95, effectiveOn: '2026-10-01', note: 'extra shipping' }, w.userId)
+    expect(row).toMatchObject({ cost_total: 336.73, cost_effective_on: '2026-10-01', markup: 13.27, booked_total: 18.27, not_booked: -5 })
+    expect(row.cost_history.map((h: any) => [Number(h.total), h.effective_on])).toEqual([[336.73, '2026-10-01'], [331.73, '2026-05-11']])
+    expect((await bookRows(o.id)).map((r: any) => [r.type, r.amount, r.day])).toEqual([['device_markup', '18.27', '2026-09-01']])
+    expect(row.book.map((b: any) => [b.amount, b.n, b.voided])).toEqual([[18.27, 4, false]])
+    // Never reaching back before the figure it corrects — on the desk, and at the table.
+    await expect(recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 30, effectiveOn: '2026-09-30' }, w.userId))
+      .rejects.toThrow(/on or after 2026-10-01/)
+    await expect(db.query(`INSERT INTO pos_reader_order_costs (reader_order_id, base_price, effective_on) VALUES ($1, 250, '2026-09-30')`, [o.id]))
+      .rejects.toThrow(/applies from its own date/)
+    // A refund of $10.00 today: the book still holds September's $18.27; $5.00 more than it is not booked.
+    row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 5.95 }, w.userId)
+    expect(row).toMatchObject({ cost_total: 326.73, markup: 23.27, booked_total: 18.27, not_booked: 5 })
+    // The same figure again changes nothing; the monthly run changes nothing.
+    await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 5.95 }, w.userId)
+    await raiseDueInstallments(new Date('2027-02-01T12:00:00Z'))
+    expect(await bookRows(o.id)).toHaveLength(1)
+    // GAM's records under the current cost (the bridge names the $5.00 against the ledger).
+    expect(await readerMarkupFacts()).toEqual({ markupBilled: 23.27, markupCollected: 0 })
+  })
+
+  it('a piece carries the markup under the figure in force the day it was billed: a typo fixed with the date of the figure it fixes books in full', async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    // The typo ($361.20, a loss) books nothing; nothing of the loss is booked either.
+    await recordReaderOrderCost(o.id, { basePrice: 330, tax: 24, shipping: 7.2 }, w.userId)
+    expect(await bookRows(o.id)).toEqual([])
+    // Fixed with the typo's own date (May 11th): in force when piece 4 was billed (September 1st).
+    const row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2026-05-11' }, w.userId)
+    expect(row).toMatchObject({ markup: 18.27, loss: 0, booked_total: 18.27, not_booked: 0 })
+    expect((await bookRows(o.id)).map((r: any) => [r.type, r.amount, r.day])).toEqual([['device_markup', '18.27', '2026-09-01']])
+  })
+
+  it('a correction before the markup piece is billed books nothing; the piece books the new markup the day it is billed', async () => {
     const w = await world()
     const { o, ship } = await shippedOrder(w)
     await ship()
-    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 23.73 }, w.userId)   // 23.73 for 32.73
-    expect(await raiseDueInstallments(new Date('2026-12-01T12:00:00Z'))).toBe(3)   // pieces 1-3: all cost, nothing booked
-    expect((await adminListReaderOrders(o.id))[0].cost_locked).toBe(false)
-    let fixed = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
-    expect(fixed).toMatchObject({ cost_total: 331.73, markup: 18.27, cost_locked: false })
-    // Piece 4 billed January 1st: its $18.27 of markup is booked, and the cost is fixed from here.
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    expect(await raiseDueInstallments(new Date('2026-12-01T12:00:00Z'))).toBe(3)   // pieces 1-3: all cost
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 37.73 }, w.userId)
+    expect(await bookRows(o.id)).toEqual([])
     expect(await raiseDueInstallments(new Date('2027-01-01T12:00:00Z'))).toBe(1)
-    expect((await adminListReaderOrders(o.id))[0].cost_locked).toBe(true)
-    await expect(recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 40 }, w.userId)).rejects.toThrow(/from a cost of \$331\.73/)
-    // The receipt turns up: the same $331.73, now split.
-    const row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 10.95 }, w.userId)
-    expect(row).toMatchObject({ cost_total: 331.73, cost_tax: 21.78, cost_shipping: 10.95, markup: 18.27 })
-    // Straight at the table: refused.
-    await expect(db.query(
-      `INSERT INTO pos_reader_order_costs (reader_order_id, base_price) VALUES ($1, 250)`, [o.id])).rejects.toThrow(/cost is fixed/)
+    expect((await bookRows(o.id)).map((r: any) => [r.type, r.amount])).toEqual([['device_markup', '13.27']])
+  })
+
+  it("the date: the day GAM ordered it unless typed; never a day to come, never before the landlord asked", async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    await expect(recordReaderOrderCost(o.id, { basePrice: 299, effectiveOn: '2099-01-01' }, w.userId)).rejects.toThrow(/not a day still to come/)
+    await expect(recordReaderOrderCost(o.id, { basePrice: 299, effectiveOn: '2026-05-09' }, w.userId)).rejects.toThrow(/before the landlord asked for it \(2026-05-10\)/)
+    await expect(recordReaderOrderCost(o.id, { basePrice: 299, effectiveOn: '2026-02-30' }, w.userId)).rejects.toThrow(/YYYY-MM-DD/)
+    const row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2026-05-12' }, w.userId)
+    expect(row.cost_effective_on).toBe('2026-05-12')
   })
 
   it("Mountain View's plan: pieces 1-3 put nothing on the earnings ledger; piece 4 puts $18.27, once, the day it is billed", async () => {
@@ -348,6 +477,45 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     expect(await markupRows(w.landlordId)).toEqual([])
   })
 
+  // 10/13 (Nic): "record each reader as a GAM expense (loss if cost > charge)". The loss is on the
+  // desk; how it goes into GAM's own book is an open question to Nic, so nothing of it is booked.
+  it("a reader that cost GAM more than it charges shows a LOSS on the desk, not booked; a later refund's markup in a piece already billed is not booked either", async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    let row = await recordReaderOrderCost(o.id, { basePrice: 330, tax: 24, shipping: 7.2 }, w.userId)
+    expect(row).toMatchObject({ cost_total: 361.2, markup: -11.2, loss: 11.2, booked_total: 0, not_booked: -11.2, cost_effective_on: '2026-05-11' })
+    expect(await bookRows(o.id)).toEqual([])
+    // Another monthly run books no markup and no loss.
+    await raiseDueInstallments(new Date('2026-12-01T12:00:00Z'))
+    expect(await bookRows(o.id)).toEqual([])
+    // October 1st: a $20.00 refund — cost $341.20, under the $350.00. Piece 4 (billed September 1st,
+    // under $361.20) carried no markup; the $8.80 the refund makes of it is shown, not booked.
+    row = await recordReaderOrderCost(o.id, { basePrice: 330, tax: 4, shipping: 7.2, effectiveOn: '2026-10-01', note: 'refund' }, w.userId)
+    expect(row).toMatchObject({ markup: 8.8, loss: 0, booked_total: 0, not_booked: 8.8 })
+    expect(await bookRows(o.id)).toEqual([])
+  })
+
+  it('a correction that pushes a reader over its price: the markup already booked stays, the loss and the change are shown, not booked', async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    const row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 61 }, w.userId)   // $360.00
+    expect(row).toMatchObject({ markup: -10, loss: 10, booked_total: 18.27, not_booked: -28.27 })
+    expect((await bookRows(o.id)).map((r: any) => [r.type, r.amount])).toEqual([['device_markup', '18.27']])
+  })
+
+  // 10/13 (review): what the desk says GAM's book holds is what the book holds — a voided
+  // piece's markup row stays in the ledger (voids are the ledger's P0 work), so it counts.
+  it("a voided piece's markup is still in GAM's book, and the desk says so", async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
+    await db.query(`UPDATE landlord_gam_charges SET voided_at = NOW(), void_reason = 'bank_debit_not_made' WHERE reader_order_id = $1 AND installment_number = 4`, [o.id])
+    const row = (await adminListReaderOrders(o.id))[0]
+    expect(row).toMatchObject({ booked_total: 18.27, markup_billed: 0, not_booked: 0 })
+    expect(row.book.map((b: any) => [b.amount, b.n, b.voided])).toEqual([[18.27, 4, true]])
+  })
+
   it("a demo account's reader is never GAM earnings", async () => {
     const w = await world()
     await db.query(`UPDATE landlords SET is_demo = TRUE WHERE id = $1`, [w.landlordId])
@@ -357,6 +525,9 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     await raiseDueInstallments(new Date('2027-01-02T12:00:00Z'))
     expect(await markupRows(w.landlordId)).toEqual([])
     expect(await readerMarkupFacts()).toEqual({ markupBilled: 0, markupCollected: 0 })
+    // Nor a loss (10/13: nothing of a loss is booked for anyone).
+    await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 61 }, w.userId)
+    expect(await bookRows(o.id)).toEqual([])
   })
 
   it('the bridge facts: markup billed, and cost first how much of it was collected', async () => {
@@ -377,9 +548,11 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     await db.query(`UPDATE properties SET name = 'Mountain View RV Ranch' WHERE id = $1`, [w.propertyId])
     await db.query(
       `INSERT INTO pos_reader_orders (id, landlord_id, property_id, status, model, price, installments, installment_amount,
-                                      installments_raised, ship_name, ship_line1, ship_city, ship_state, ship_zip, shipped_at)
+                                      installments_raised, ship_name, ship_line1, ship_city, ship_state, ship_zip, shipped_at,
+                                      created_at, ordered_at)
        VALUES ('288cc5df-5153-4b1c-b5d4-71f15c5c43d9', $1, $2, 'registered', 'stripe_reader_s710', 350, 4, 87.5, 1,
-               'Lisa S', '2843 East Frontage Road', 'Amado', 'AZ', '85645', '2026-09-29T22:04:28Z')`,
+               'Lisa S', '2843 East Frontage Road', 'Amado', 'AZ', '85645', '2026-09-29T22:04:28Z',
+               '2026-09-28T19:00:00Z', '2026-09-28T21:36:53Z')`,
       [w.landlordId, w.propertyId])
     const sql = readFileSync(join(__dirname, '..', 'db', 'migrations', '20261013160100_reader_order_costs.sql'), 'utf8')
     const backfill = sql.slice(sql.indexOf('INSERT INTO pos_reader_order_costs (reader_order_id, base_price, tax_and_shipping_amount'))
@@ -387,10 +560,20 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     const row = (await adminListReaderOrders('288cc5df-5153-4b1c-b5d4-71f15c5c43d9'))[0]
     expect(row).toMatchObject({
       // Piece 1 is all cost, so nothing is booked from it yet: still correctable (10/12 review).
-      cost_base_price: 299, cost_tax_and_shipping: 32.73, cost_total: 331.73, charged: 350, markup: 18.27, cost_locked: false,
+      cost_base_price: 299, cost_tax_and_shipping: 32.73, cost_total: 331.73, charged: 350, markup: 18.27, cost_booked: false,
     })
     expect(row.cost_history).toHaveLength(1)
     expect(row.cost_history[0].source).toBe('backfill')
+    // 10/13: the backfill of 20261015120000 dates it the day GAM bought the reader — September 28th
+    // (ordered 2:36 pm Arizona) — not the day the 10/12 migration wrote it.
+    const dated = readFileSync(join(__dirname, '..', 'db', 'migrations', '20261015120000_reader_order_cost_dated.sql'), 'utf8')
+    const update = dated.slice(dated.indexOf('UPDATE pos_reader_order_costs c'), dated.indexOf('ALTER TABLE pos_reader_order_costs ENABLE TRIGGER'))
+    await db.query('ALTER TABLE pos_reader_order_costs DISABLE TRIGGER pos_reader_order_costs_no_edit')
+    try { await db.query(update) } finally { await db.query('ALTER TABLE pos_reader_order_costs ENABLE TRIGGER pos_reader_order_costs_no_edit') }
+    expect((await adminListReaderOrders('288cc5df-5153-4b1c-b5d4-71f15c5c43d9'))[0].cost_effective_on).toBe('2026-09-28')
+    // A correction typed now (October) applies from its date; the September figure stays.
+    const fixed = await recordReaderOrderCost('288cc5df-5153-4b1c-b5d4-71f15c5c43d9', { basePrice: 299, tax: 21.78, shipping: 10.95 }, w.userId)
+    expect(fixed.cost_history.map((h: any) => h.effective_on)).toEqual([fixed.cost_effective_on, '2026-09-28'])
   })
 
   // 10/12 (review): migrations reach production before the code. A piece the code before 10/12

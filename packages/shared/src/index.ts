@@ -8202,9 +8202,11 @@ export function installmentSplit(total: number, n: number): number[] {
 // "331.73 after tax and shipping. 299 base. those orders are going to need to
 // be tracked because shipping will vary." Each order records GAM's actual cost
 // (base price, tax, shipping — or tax and shipping as one amount when the
-// receipt does not split them), entered on GAM's desk, editable until the
-// reader ships (after that only the same total split differently), every entry
-// kept. Markup = what the landlord is charged − GAM's total cost.
+// receipt does not split them), entered on GAM's desk, every entry kept; 10/13
+// (Nic): "allow dated cost corrections" — a later entry applies from its own
+// date, and a piece of the plan carries the markup under the figure in force
+// the day it is billed (apps/api services/readerOrders bookReaderMarkup).
+// Markup = what the landlord is charged − GAM's total cost.
 //
 // COST FIRST (Nic 10/12): the payments repay GAM's cost first; the markup lands
 // in the last piece(s). Mountain View: 4 × $87.50 against $331.73 → pieces 1-3
@@ -8277,6 +8279,13 @@ export interface ReaderOrderMoney {
   costRecovered: number
   /** markupBilled − markupCollected. */
   markupNotCollected: number
+  /**
+   * 10/13 (Nic): "record each reader as a GAM expense (loss if cost >
+   * charge)" — totalCost − charged when that is above zero, else 0. null: cost
+   * not entered. Shown on GAM's desk; not booked in GAM's own book (how a
+   * reader's expense and loss go there is an open question to Nic).
+   */
+  loss: number | null
 }
 
 /**
@@ -8309,6 +8318,7 @@ export function readerOrderMoney(o: {
     markupCollected: markupCollected / 100,
     costRecovered: (collected - markupCollected) / 100,
     markupNotCollected: (markupBilled - markupCollected) / 100,
+    loss: o.totalCost == null ? null : Math.max(0, rc(o.totalCost) - rc(o.price)) / 100,
   }
 }
 

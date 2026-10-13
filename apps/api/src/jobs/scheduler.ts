@@ -2306,7 +2306,8 @@ export function schedulerInit() {
   cron.schedule('0 8 * * *', checkLeaseExpiryNotices, { timezone: 'America/Phoenix' })
 
   // S652 (Nic): a card-reader request must never sit unseen. Every morning,
-  // one email while anything is waiting on GAM; silent otherwise.
+  // one email while anything is waiting on GAM; silent otherwise. 10/13 (Nic):
+  // it also flags every reader GAM bought whose cost is not entered yet.
   cron.schedule('5 8 * * *', async () => {
     try {
       const { chaseReaderOrders } = await import('../services/readerOrders')

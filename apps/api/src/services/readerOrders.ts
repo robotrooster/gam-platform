@@ -30,10 +30,17 @@ import { getOrCreatePropertyLocation } from './posTerminal'
 import { createAdminNotification } from './adminNotifications'
 import { portalUrl } from '../lib/portalUrls'
 import { recordPlatformRevenue, realLandlordSql } from './platformRevenue'
+import { dateIn, todayIn } from '../lib/timezone'
 import {
   SUPPORTED_CARD_READER, installmentSplit, readerCostTotal, readerOrderMoney, readerPieceSplit,
   type ReaderCostParts, type ReaderPieceBilled,
 } from '@gam/shared'
+
+/**
+ * 10/13: GAM's own calendar — the day GAM bought a reader, the day a cost
+ * correction applies from. GAM runs on Arizona time (the morning jobs do too).
+ */
+const GAM_TZ = 'America/Phoenix'
 
 export interface ShipTo {
   name: string; company?: string | null; line1: string; line2?: string | null
@@ -91,14 +98,24 @@ export async function requestReader(opts: {
 }
 
 /**
+ * 10/13 (review): an order GAM has bought from Stripe's shop — ordered or
+ * further along, or cancelled after it was ordered or shipped. Not a request
+ * nobody ordered, nor one cancelled before anyone did.
+ */
+const READER_BOUGHT_SQL = (o: string) => `(${o}.status IN ('ordered','shipped','delivered','registered')
+  OR (${o}.status = 'cancelled' AND COALESCE(${o}.ordered_at, ${o}.shipped_at, ${o}.delivered_at, ${o}.registered_at) IS NOT NULL))`
+
+/**
  * The morning chase: ONE email while anything is waiting on GAM.
  *
  *   requested            → nobody has ordered it yet (every day until they do)
  *   ordered, no reader   → after 3 days: has Stripe shipped it?
  *   shipped, never online→ after 10 days: did it arrive, is it plugged in?
+ *   bought, no cost      → (10/13) every day until GAM's cost is on the desk
  *
- * One digest, not one email per order (S652: one email per thing). Silent when
- * nothing waits.
+ * One digest, not one email per order (S652: one email per thing), counting
+ * orders — one order can be on two lines (not in use yet, and no cost). Silent
+ * when nothing waits.
  */
 export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiting: number; sent: boolean }> {
   // 10/12 (review): every morning, not only on the 1st, a piece the code before
@@ -129,8 +146,11 @@ export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiti
       ORDER BY o.created_at`)
   const days = (d: any) => Math.floor((now.getTime() - new Date(d).getTime()) / 86400000)
   const lines: string[] = []
+  // 10/13 (review): the title counts orders, not lines.
+  const waitingOrders = new Set<string>()
   for (const o of rows) {
     const name = `${o.business_name ?? 'Landlord'} · ${o.property_name}`
+    const before = lines.length
     if (o.status === 'requested') {
       lines.push(`NOT ORDERED — ${name}: asked ${days(o.created_at)} day(s) ago`)
     } else if (o.status === 'ordered' && days(o.ordered_at ?? o.created_at) >= 3) {
@@ -138,16 +158,37 @@ export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiti
     } else if ((o.status === 'shipped' || o.status === 'delivered') && days(o.shipped_at ?? o.created_at) >= 10) {
       lines.push(`NOT IN USE — ${name}: shipped ${days(o.shipped_at ?? o.created_at)} day(s) ago and Stripe has never seen it switched on — did it arrive, is it plugged in?`)
     }
+    if (lines.length > before) waitingOrders.add(o.id)
+  }
+  // 10/13 (Nic): "flag missing cost in the morning admin email." Every reader
+  // GAM has bought with no cost on the desk — ordered, or further along; and
+  // one cancelled after GAM ordered it (GAM paid the shop; the receipt, or its
+  // refund, is still to be typed). Not a request nobody ordered. Every morning
+  // until it is entered — a registered reader too, since its pieces keep
+  // billing and the markup they carry is only booked once the cost is known.
+  const noCost = await query<any>(
+    `SELECT o.id, o.status, COALESCE(o.ordered_at, o.shipped_at, o.created_at) AS bought_at,
+            p.name AS property_name, l.business_name
+       FROM pos_reader_orders o JOIN properties p ON p.id = o.property_id JOIN landlords l ON l.id = o.landlord_id
+      WHERE ${READER_BOUGHT_SQL('o')}
+        AND NOT EXISTS (SELECT 1 FROM pos_reader_order_costs c WHERE c.reader_order_id = o.id)
+      ORDER BY COALESCE(o.ordered_at, o.shipped_at, o.created_at)`)
+  for (const o of noCost) {
+    lines.push(`NO COST ENTERED — ${o.business_name ?? 'Landlord'} · ${o.property_name}: ordered ${days(o.bought_at)} day(s) ago`
+      + `${o.status === 'cancelled' ? ' (cancelled since)' : ''} and what the reader cost GAM is not on the desk — `
+      + `type the Stripe shop receipt (base price, tax, shipping) on Reader Orders`)
+    waitingOrders.add(o.id)
   }
   if (!lines.length) return { waiting: 0, sent: false }
+  const n = waitingOrders.size
   await createAdminNotification({
     severity: 'warn', category: 'reader_orders_waiting', emailSuperAdmins: true,
-    title: `${lines.length} card reader order${lines.length === 1 ? '' : 's'} waiting on GAM`,
+    title: `${n} card reader order${n === 1 ? '' : 's'} waiting on GAM`,
     body: lines.join('\n'),
-    context: { count: lines.length },
+    context: { count: n },
     action: { label: 'Open Reader Orders', url: `${portalUrl('admin')}/reader-orders` },
   })
-  return { waiting: lines.length, sent: true }
+  return { waiting: n, sent: true }
 }
 
 export function listReaderOrders(landlordId: string, propertyId?: string) {
@@ -170,8 +211,7 @@ export async function cancelReaderRequest(landlordId: string, id: string) {
 // "331.73 after tax and shipping. 299 base. those orders are going to need to
 // be tracked because shipping will vary." Every order carries GAM's actual cost
 // (pos_reader_order_costs: one row per entry, never edited or deleted, the
-// latest wins; fixed once markup figured from it is booked as GAM's earnings —
-// the database refuses a changed total then).
+// latest wins — since 10/13 each dated, below).
 // The desk shows, per order, what the landlord is charged, what GAM paid, and
 // the markup between them.
 //
@@ -182,34 +222,52 @@ export async function cancelReaderRequest(landlordId: string, id: string) {
 // way a platform fee is booked when it is billed. The cost part is GAM's own
 // money coming back, never earnings; the GAM-money bridge shows it on its own
 // line (services/stripeCosts, readerMarkupFacts).
+//
+// 10/13 (Nic): "record each reader as a GAM expense (loss if cost > charge);
+// allow dated cost corrections; flag missing cost in the morning admin email."
+// Every cost entry is dated (effective_on): the first, the day GAM bought the
+// reader — GAM's expense, on the desk with its date; a later one is a
+// correction (a refund, extra shipping) that applies from its own date, the
+// figure before it kept on record. The total is no longer fixed once markup is
+// booked (10/12): the dated correction replaces that. A piece of the plan
+// books the markup it carries under the figure in force the day it was billed
+// (bookReaderMarkup); nothing booked is ever rewritten. The desk shows a loss
+// (a reader that cost GAM more than the landlord is charged) and anything a
+// correction changes in pieces already billed as NOT IN GAM'S BOOK: how a
+// reader's expense, a loss and a correction's difference go into GAM's own
+// book (platform_revenue_ledger) is an open question to Nic — the purchase as
+// an expense row with the repayments as recovery, or only the net result —
+// and nothing of it is booked until he answers.
 
 /** The order's current cost: its latest entry. Use as `LEFT JOIN LATERAL (${LATEST_READER_COST_SQL('o')}) c ON TRUE`. */
 const LATEST_READER_COST_SQL = (order: string) => `
-  SELECT x.base_price, x.tax_amount, x.shipping_amount, x.tax_and_shipping_amount, x.total_cost,
-         x.created_at, x.source
+  SELECT x.id, x.base_price, x.tax_amount, x.shipping_amount, x.tax_and_shipping_amount, x.total_cost,
+         x.created_at, x.source, to_char(x.effective_on, 'YYYY-MM-DD') AS effective_on
     FROM pos_reader_order_costs x WHERE x.reader_order_id = ${order}.id ORDER BY x.seq DESC LIMIT 1`
 
 const centsOf = (n: unknown) => Math.round(Number(n ?? 0) * 100)
 const num = (n: unknown) => (n == null ? null : Number(n))
 
 /**
- * 10/12 (review): markup figured from the order's cost is on GAM's earnings
- * ledger for one of its pieces — from then on the cost total is fixed (the
- * same test as the database's pos_reader_order_costs_lock). Until then a typo
- * can still be corrected, shipped or not: a reader usually ships itself
- * (reconcileReaderOrders) before anyone types the receipt, and the piece that
- * carries markup (cost first: the last) is billed months later.
+ * 10/13: every row GAM's own book holds for one reader order — the markup its
+ * pieces carry ('device_markup', one per piece). `voided` names a row whose
+ * piece was voided after its markup was booked: the row is still in the book.
  */
-const MARKUP_BOOKED_SQL = (orderRef: string) => `EXISTS (
-  SELECT 1 FROM landlord_gam_charges mg
-    JOIN platform_revenue_ledger mr
-      ON mr.reference_id = mg.id AND mr.type = 'device_markup' AND mr.reference_type = 'reader_order_installment'
-   WHERE mg.reader_order_id = ${orderRef})`
+const ORDER_BOOK_ROWS_SQL = (orderRef: string) => `
+  SELECT r.id, r.amount, r.created_at, r.notes, g.installment_number AS n, (g.voided_at IS NOT NULL) AS voided
+    FROM platform_revenue_ledger r
+    JOIN landlord_gam_charges g ON g.id = r.reference_id
+   WHERE r.type = 'device_markup' AND r.reference_type = 'reader_order_installment'
+     AND g.reader_order_id = ${orderRef}`
 
 /**
  * GAM's desk: every order, newest first, with the location Stripe's shop needs
  * — and (10/12) GAM's cost, the price charged, the markup, every cost entry
- * made, and each piece of the plan split cost first. `orderId` reads one.
+ * made, and each piece of the plan split cost first. (10/13) The cost's date
+ * (the day GAM bought it, or the day a correction applies from), the loss when
+ * the reader cost GAM more than it charges, every row GAM's own book holds for
+ * the reader, and what is not in GAM's book (a loss; what a correction changed
+ * in pieces already billed). `orderId` reads one.
  */
 export async function adminListReaderOrders(orderId?: string) {
   const rows = await query<any>(
@@ -217,11 +275,12 @@ export async function adminListReaderOrders(orderId?: string) {
             u.email AS landlord_email,
             c.base_price AS cost_base_price, c.tax_amount AS cost_tax, c.shipping_amount AS cost_shipping,
             c.tax_and_shipping_amount AS cost_tax_and_shipping, c.total_cost AS cost_total,
-            c.created_at AS cost_entered_at,
+            c.created_at AS cost_entered_at, c.effective_on AS cost_effective_on,
             COALESCE((SELECT json_agg(json_build_object(
                         'id', h.id, 'base_price', h.base_price, 'tax', h.tax_amount, 'shipping', h.shipping_amount,
                         'tax_and_shipping', h.tax_and_shipping_amount, 'total', h.total_cost, 'note', h.note,
                         'source', h.source, 'entered_at', h.created_at,
+                        'effective_on', to_char(h.effective_on, 'YYYY-MM-DD'),
                         'entered_by', NULLIF(TRIM(COALESCE(eu.first_name, '') || ' ' || COALESCE(eu.last_name, '')), ''),
                         'entered_by_email', eu.email) ORDER BY h.seq DESC)
                         FROM pos_reader_order_costs h LEFT JOIN users eu ON eu.id = h.entered_by_user_id
@@ -234,7 +293,10 @@ export async function adminListReaderOrders(orderId?: string) {
                                              AND r.reference_type = 'reader_order_installment'))
                         ORDER BY g.installment_number)
                         FROM landlord_gam_charges g WHERE g.reader_order_id = o.id), '[]'::json) AS pieces_billed,
-            ${MARKUP_BOOKED_SQL('o.id')} AS markup_booked_any
+            COALESCE((SELECT json_agg(json_build_object(
+                        'id', b.id, 'amount', b.amount, 'at', b.created_at, 'notes', b.notes, 'n', b.n, 'voided', b.voided)
+                        ORDER BY b.created_at, b.id)
+                        FROM (${ORDER_BOOK_ROWS_SQL('o.id')}) b), '[]'::json) AS book_rows
        FROM pos_reader_orders o
        JOIN properties p ON p.id = o.property_id
        JOIN landlords l ON l.id = o.landlord_id
@@ -252,16 +314,22 @@ export async function adminListReaderOrders(orderId?: string) {
     const money = readerOrderMoney({
       price: Number(r.price), installments: Number(r.installments), totalCost: num(r.cost_total), pieces: billed,
     })
-    const { pieces_billed: _omit, markup_booked_any: bookedAny, ...row } = r
+    const book = (r.book_rows ?? []).map((b: any) => ({
+      id: b.id, at: b.at, amount: Number(b.amount), notes: b.notes ?? null,
+      n: b.n == null ? null : Number(b.n), voided: !!b.voided,
+    }))
+    const bookedLiveC = book.filter((b: any) => !b.voided).reduce((a: number, b: any) => a + centsOf(b.amount), 0)
+    const { pieces_billed: _omit, book_rows: _omitBook, ...row } = r
     return {
       ...row,
       cost_base_price: num(r.cost_base_price), cost_tax: num(r.cost_tax), cost_shipping: num(r.cost_shipping),
       cost_tax_and_shipping: num(r.cost_tax_and_shipping), cost_total: num(r.cost_total),
-      // 10/12 (review): fixed once markup figured from the cost is booked as
-      // GAM's earnings — not the day it ships (MARKUP_BOOKED_SQL).
-      cost_locked: bookedAny === true && r.cost_total != null,
+      // 10/13: markup from the cost is in GAM's book — a new entry is a dated
+      // correction from here (it applies from its own date; the booked rows stay).
+      cost_booked: book.length > 0,
       charged: money.charged,
       markup: money.markup,
+      loss: money.loss,
       markup_billed: money.markupBilled,
       markup_collected: money.markupCollected,
       markup_not_collected: money.markupNotCollected,
@@ -269,6 +337,19 @@ export async function adminListReaderOrders(orderId?: string) {
       billed: money.billed,
       collected: money.collected,
       markup_booked: Math.round(billed.reduce((a, g) => a + centsOf(g.markup_booked), 0)) / 100,
+      // 10/13 (review): what GAM's own book holds for the reader — every row,
+      // a voided piece's markup too (it stays in the book; voids are the
+      // ledger's P0 work), so the desk says what the book says.
+      booked_total: book.reduce((a: number, b: any) => a + centsOf(b.amount), 0) / 100,
+      // 10/13: what the reader comes to under its current cost and is not in
+      // GAM's book — the markup in the pieces billed so far, less a loss,
+      // against the rows booked for those pieces. A loss, or what a dated
+      // correction changed in a piece already billed: neither is booked until
+      // Nic says how a reader's expense goes into GAM's book. (A markup row the
+      // ledger missed shows here too, until the next run writes it.)
+      not_booked: money.totalCost == null ? 0
+        : (centsOf(money.markupBilled) - centsOf(money.loss) - bookedLiveC) / 100,
+      book,
       // Every piece of the plan, cost first, and where each stands.
       pieces: money.split.map(s => {
         const b = billed.find(g => g.n === s.n)
@@ -282,16 +363,26 @@ export async function adminListReaderOrders(orderId?: string) {
   })
 }
 
+const YMD = /^\d{4}-\d{2}-\d{2}$/
+const isRealDay = (s: string) => YMD.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s
+
 /**
  * 10/12 (Nic): GAM's desk records what a reader actually cost GAM — base
  * price, tax and shipping (or tax and shipping as one figure when the receipt
  * does not split them). Each save is a new entry; the old ones are kept.
- * Fixed once markup figured from it is booked as GAM's earnings
- * (MARKUP_BOOKED_SQL): after that an entry may only split the same total
- * differently (a first entry is allowed if none was ever made). Any markup
- * already billed under the new cost is booked at once.
+ *
+ * 10/13 (Nic): "allow dated cost corrections" — every entry carries the day it
+ * applies from (`effectiveOn`, 'YYYY-MM-DD', GAM's calendar). The first is the
+ * day GAM bought the reader (left out: the day it was ordered from Stripe, or
+ * today); a correction — a refund, extra shipping, after shipping or not — is
+ * dated the day it applies from (left out: today), never before the entry it
+ * corrects, never a day still to come, never before the landlord asked for the
+ * reader. A piece billed on or after its date carries the markup under it
+ * (bookReaderMarkup); nothing already booked is rewritten, and what it changes
+ * in a piece already billed is shown on the desk, not booked (open question).
  */
-export async function recordReaderOrderCost(orderId: string, parts: ReaderCostParts & { note?: string | null },
+export async function recordReaderOrderCost(orderId: string,
+  parts: ReaderCostParts & { note?: string | null; effectiveOn?: string | null },
   enteredByUserId: string | null) {
   const vals = [parts.basePrice, parts.tax, parts.shipping, parts.taxAndShipping]
   if (!Number.isFinite(parts.basePrice) || vals.some(v => v != null && !(Number.isFinite(v) && v >= 0))) {
@@ -300,86 +391,116 @@ export async function recordReaderOrderCost(orderId: string, parts: ReaderCostPa
   if (parts.taxAndShipping != null && (parts.tax != null || parts.shipping != null)) {
     throw new AppError(400, 'Enter tax and shipping separately, or as one combined amount — not both.')
   }
+  if (parts.effectiveOn != null && !isRealDay(parts.effectiveOn)) {
+    throw new AppError(400, 'Give the date as YYYY-MM-DD.')
+  }
+  const today = todayIn(GAM_TZ)
+  if (parts.effectiveOn != null && parts.effectiveOn > today) {
+    throw new AppError(400, 'A cost applies from today or a day already past — not a day still to come.')
+  }
   const total = readerCostTotal(parts)
+  let effectiveOn = parts.effectiveOn ?? null
   const client = await getClient()
   try {
     await client.query('BEGIN')
-    const o = (await client.query<any>(
-      `SELECT o.id, ${MARKUP_BOOKED_SQL('o.id')} AS booked FROM pos_reader_orders o WHERE o.id = $1 FOR UPDATE OF o`, [orderId])).rows[0]
+    const o = (await client.query<{ id: string; created_at: Date; ordered_at: Date | null }>(
+      `SELECT o.id, o.created_at, o.ordered_at FROM pos_reader_orders o WHERE o.id = $1 FOR UPDATE OF o`, [orderId])).rows[0]
     if (!o) throw new AppError(404, 'Reader order not found')
-    const cur = (await client.query<{ total_cost: string }>(
-      `SELECT total_cost FROM pos_reader_order_costs WHERE reader_order_id = $1 ORDER BY seq DESC LIMIT 1`, [orderId])).rows[0]
-    if (o.booked && cur && centsOf(cur.total_cost) !== centsOf(total)) {
-      throw new AppError(409,
-        `This reader's markup is already booked as GAM's earnings from a cost of $${Number(cur.total_cost).toFixed(2)}, `
-        + `so its cost is fixed at that. You can split that same total differently, but not change it.`)
+    const cur = (await client.query<{ effective_on: string }>(
+      `SELECT to_char(effective_on, 'YYYY-MM-DD') AS effective_on FROM pos_reader_order_costs
+        WHERE reader_order_id = $1 ORDER BY seq DESC LIMIT 1`, [orderId])).rows[0]
+    effectiveOn ??= cur ? today : (o.ordered_at ? dateIn(GAM_TZ, new Date(o.ordered_at)) : today)
+    const asked = dateIn(GAM_TZ, new Date(o.created_at))
+    if (effectiveOn < asked) {
+      throw new AppError(400, `GAM could not have paid for this reader before the landlord asked for it (${asked}).`)
     }
-    await client.query(
+    if (cur && effectiveOn < cur.effective_on) {
+      throw new AppError(409, `A correction applies from its own date — on or after ${cur.effective_on}, the date of the figure it corrects. `
+        + `The figure before it stays on record for the days before.`)
+    }
+    const ins = await client.query<{ id: string }>(
       `INSERT INTO pos_reader_order_costs
-         (reader_order_id, base_price, tax_amount, shipping_amount, tax_and_shipping_amount, note, source, entered_by_user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, 'desk', $7)`,
+         (reader_order_id, base_price, tax_amount, shipping_amount, tax_and_shipping_amount, note, source, entered_by_user_id, effective_on)
+       VALUES ($1, $2, $3, $4, $5, $6, 'desk', $7, $8) RETURNING id`,
       [orderId, parts.basePrice.toFixed(2), parts.tax?.toFixed(2) ?? null, parts.shipping?.toFixed(2) ?? null,
-       parts.taxAndShipping?.toFixed(2) ?? null, parts.note?.trim() || null, enteredByUserId])
+       parts.taxAndShipping?.toFixed(2) ?? null, parts.note?.trim() || null, enteredByUserId, effectiveOn])
     // A reader that shipped (and billed pieces) before its cost was typed:
-    // book the markup in what is already billed now.
+    // book the markup those pieces carry now.
     await bookReaderMarkup(client, orderId)
     await client.query('COMMIT')
+    logger.info({ orderId, total, effectiveOn, entryId: ins.rows[0]?.id }, '[reader-order] cost recorded')
   } catch (e: any) {
     await client.query('ROLLBACK').catch(() => {})
-    // The database's own lock (pos_reader_order_costs_lock) said no.
-    if (e?.code === '23514' && !e?.constraint && /markup booked/.test(String(e?.message))) {
-      throw new AppError(409, "This reader's markup is already booked as GAM's earnings, so its cost total is fixed. You can split that same total differently, but not change it.")
+    // The database's own rule (pos_reader_order_costs_lock) said no.
+    if (e?.code === '23514' && !e?.constraint && /applies from its own date/.test(String(e?.message))) {
+      throw new AppError(409, 'A correction applies from its own date — on or after the date of the figure it corrects. The figure before it stays on record for the days before.')
     }
     throw e
   } finally { client.release() }
-  logger.info({ orderId, total }, '[reader-order] cost recorded')
   return (await adminListReaderOrders(orderId))[0]
 }
 
 /**
  * Book the markup in every billed piece that carries some and is not on GAM's
  * earnings ledger yet — one 'device_markup' row per piece, referenced to the
- * piece (landlord_gam_charges), dated the day the piece was billed. Idempotent
- * (the ledger refuses a second row for the same piece). An order with no cost
- * entered books nothing: until GAM's cost is known every dollar counts as cost.
- * A demo or GAM-internal account's reader is never earnings (the ledger's own
- * rule), so it is left out here too. Runs inside the caller's transaction.
- * Each order row is locked before its cost is read (10/12 review): a cost
- * entry locks it too (recordReaderOrderCost, pos_reader_order_costs_lock), so
- * markup is never booked from a cost a concurrent entry is replacing.
+ * piece (landlord_gam_charges), dated the day the piece was billed (10/12,
+ * Q-g — cost first). Idempotent (the ledger refuses a second row for the same
+ * piece). An order with no cost entered books nothing: until GAM's cost is
+ * known every dollar counts as cost. A demo or GAM-internal account's reader
+ * is never earnings (the ledger's own rule), so it is left out here too. Runs
+ * inside the caller's transaction. Each order row is locked before its cost is
+ * read (10/12 review): a cost entry locks it too (recordReaderOrderCost,
+ * pos_reader_order_costs_lock), so markup is never booked from a cost a
+ * concurrent entry is replacing.
+ *
+ * 10/13 (Nic): "allow dated cost corrections" — a piece carries the markup
+ * under the cost entry in force the day it was billed: the latest dated on or
+ * before that day (an order's first entry covers every day before it, so a
+ * cost typed late still books what its pieces carried). A row once booked is
+ * never rewritten. Nothing else is booked here: a loss, and what a correction
+ * changes in a piece already billed, wait on Nic's answer on how a reader's
+ * expense goes into GAM's book (the desk shows them, adminListReaderOrders
+ * not_booked).
+ *
+ * Returns how many rows it booked.
  */
 export async function bookReaderMarkup(client: PoolClient, orderId?: string): Promise<number> {
   const orders = await client.query<any>(
-    `SELECT o.id, o.price, o.installments, o.property_id, p.name AS property_name, c.total_cost
+    `SELECT o.id, o.price, o.installments, o.property_id, p.name AS property_name
        FROM pos_reader_orders o
        JOIN properties p ON p.id = o.property_id
-       JOIN LATERAL (${LATEST_READER_COST_SQL('o')}) c ON TRUE
       WHERE ($1::uuid IS NULL OR o.id = $1::uuid)
         AND ${realLandlordSql('p.landlord_id')}
+        AND EXISTS (SELECT 1 FROM pos_reader_order_costs x WHERE x.reader_order_id = o.id)
         AND EXISTS (SELECT 1 FROM landlord_gam_charges g WHERE g.reader_order_id = o.id)
       ORDER BY o.id
       FOR UPDATE OF o`,
     [orderId ?? null])
   let booked = 0
   for (const o of orders.rows) {
-    const split = readerPieceSplit(Number(o.price), Number(o.installments), Number(o.total_cost))
-    if (!split.some(s => s.markup > 0)) continue
-    const pieces = await client.query<{ id: string; installment_number: number; created_at: Date }>(
-      `SELECT g.id, g.installment_number, g.created_at FROM landlord_gam_charges g
-        WHERE g.reader_order_id = $1 AND g.voided_at IS NULL
+    const price = Number(o.price), installments = Number(o.installments)
+    const entries = (await client.query<{ total_cost: string; effective_on: string }>(
+      `SELECT total_cost, to_char(effective_on, 'YYYY-MM-DD') AS effective_on
+         FROM pos_reader_order_costs WHERE reader_order_id = $1 ORDER BY seq`, [o.id])).rows
+    const pieces = (await client.query<{ id: string; n: number; billed_at: Date; billed_on: string }>(
+      `SELECT g.id, g.installment_number AS n, g.created_at AS billed_at,
+              to_char(g.created_at AT TIME ZONE '${GAM_TZ}', 'YYYY-MM-DD') AS billed_on
+         FROM landlord_gam_charges g
+        WHERE g.reader_order_id = $1 AND g.voided_at IS NULL AND g.installment_number IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM platform_revenue_ledger r
                            WHERE r.type = 'device_markup' AND r.reference_id = g.id
                              AND r.reference_type = 'reader_order_installment')
-        ORDER BY g.installment_number`, [o.id])
-    for (const g of pieces.rows) {
-      const s = split[g.installment_number - 1]
+        ORDER BY g.installment_number`, [o.id])).rows
+    for (const g of pieces) {
+      const inForce = [...entries].reverse().find(e => e.effective_on <= g.billed_on) ?? entries[0]
+      const s = readerPieceSplit(price, installments, Number(inForce.total_cost))[g.n - 1]
       if (!s || s.markup <= 0) continue
       await recordPlatformRevenue({
         type: 'device_markup', amount: s.markup,
         referenceId: g.id, referenceType: 'reader_order_installment', propertyId: o.property_id,
-        notes: `Card reader markup — ${o.property_name}, payment ${s.n} of ${o.installments} `
-          + `(charged $${Number(o.price).toFixed(2)}, GAM's cost $${Number(o.total_cost).toFixed(2)})`,
-        at: g.created_at,
+        notes: `Card reader markup — ${o.property_name}, payment ${s.n} of ${installments} `
+          + `(charged $${price.toFixed(2)}, GAM's cost $${Number(inForce.total_cost).toFixed(2)})`,
+        at: g.billed_at,
       }, client)
       booked++
     }

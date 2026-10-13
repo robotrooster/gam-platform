@@ -60,7 +60,7 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     const res = await request(buildApp()).post(`/api/admin/reader-orders/${f.order}/cost`)
       .set('Authorization', `Bearer ${f.superToken}`).send({ basePrice: 299, taxAndShipping: 32.73 })
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ charged: 350, cost_total: 331.73, markup: 18.27, cost_locked: false })
+    expect(res.body.data).toMatchObject({ charged: 350, cost_total: 331.73, markup: 18.27, loss: 0, cost_booked: false })
     const list = await request(buildApp()).get('/api/admin/reader-orders').set('Authorization', `Bearer ${f.superToken}`)
     expect(list.status).toBe(200)
     const row = list.body.data.find((o: any) => o.id === f.order)
@@ -76,25 +76,44 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     expect(log.rows.map((r: any) => r.action_type)).toEqual(['reader_order_cost_recorded'])
   })
 
-  // 10/12 (review): fixed once markup figured from the cost is booked as GAM's earnings — not the
-  // day the reader ships (it usually ships itself before anyone types the receipt).
-  it('refuses a changed total once markup is booked (409) — a typo after shipping is still corrected — and a bad body (400)', async () => {
+  // 10/13 (Nic): "allow dated cost corrections" — after the markup is booked too (10/12's "fixed once
+  // booked" is replaced): the old figure stays on record, the new one applies from its date. What it
+  // changes in a piece already booked is shown, not booked (an open question to Nic).
+  it('takes a dated correction after the markup is booked — the booked row stays, the change is shown as not booked; refuses one dated before the figure it corrects (409), a day to come, and a bad body (400)', async () => {
     const f = await fixture()
     const app = buildApp()
     const post = (body: any) => request(app).post(`/api/admin/reader-orders/${f.order}/cost`)
       .set('Authorization', `Bearer ${f.superToken}`).send(body)
     expect((await post({ basePrice: 299, tax: 1, taxAndShipping: 2 })).status).toBe(400)
     expect((await post({ basePrice: 'lots' })).status).toBe(400)
+    expect((await post({ basePrice: 299, effectiveOn: '10/01/2026' })).status).toBe(400)
+    expect((await post({ basePrice: 299, effectiveOn: '2099-01-01' })).status).toBe(400)
     await db.query(`UPDATE pos_reader_orders SET status = 'shipped', shipped_at = NOW() WHERE id = $1`, [f.order])
-    expect((await post({ basePrice: 299, taxAndShipping: 23.73 })).status).toBe(200)   // the typo
-    expect((await post({ basePrice: 299, taxAndShipping: 32.73 })).status).toBe(200)   // corrected
-    // Every piece billed — the last carries the markup, booked as GAM's earnings: fixed from here.
+    expect((await post({ basePrice: 299, taxAndShipping: 32.73 })).status).toBe(200)
+    // Every piece billed — the last carries $18.27 of markup, booked as GAM's earnings.
     await db.query(`UPDATE pos_reader_orders SET shipped_at = NOW() - INTERVAL '5 months' WHERE id = $1`, [f.order])
     expect(await raiseDueInstallments()).toBe(4)
-    const r = await post({ basePrice: 299, taxAndShipping: 40 })
+    const r = await post({ basePrice: 299, taxAndShipping: 40, note: 'extra shipping' })
+    expect(r.status).toBe(200)
+    expect(r.body.data).toMatchObject({ cost_total: 339, markup: 11, booked_total: 18.27, not_booked: -7.27, cost_booked: true })
+    expect(r.body.data.cost_history).toHaveLength(2)
+    expect(r.body.data.book.map((b: any) => [b.n, b.amount])).toEqual([[4, 18.27]])
+    const back = await post({ basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2000-01-01' })
+    expect(back.status).toBe(400)   // before the landlord asked for it
+    const log = await db.query(`SELECT metadata FROM admin_action_log WHERE target_id = $1 AND action_type = 'reader_order_cost_recorded' ORDER BY created_at`, [f.order])
+    expect(log.rows.map((x: any) => x.metadata?.note ?? null)).toEqual([null, 'extra shipping'])
+  })
+
+  it('a correction dated before the figure it corrects is a 409', async () => {
+    const f = await fixture()
+    await db.query(`UPDATE pos_reader_orders SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1`, [f.order])
+    const post = (body: any) => request(buildApp()).post(`/api/admin/reader-orders/${f.order}/cost`)
+      .set('Authorization', `Bearer ${f.superToken}`).send(body)
+    expect((await post({ basePrice: 299, taxAndShipping: 32.73 })).status).toBe(200)   // dated today
+    const yesterday = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })
+    const r = await post({ basePrice: 299, taxAndShipping: 30, effectiveOn: yesterday })
     expect(r.status).toBe(409)
-    expect(r.body.error).toMatch(/from a cost of \$331\.73/)
-    expect((await post({ basePrice: 299, tax: 20, shipping: 12.73 })).status).toBe(200)
+    expect(r.body.error).toMatch(/on or after/)
   })
 
   it('is for the super admin only', async () => {
