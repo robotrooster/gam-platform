@@ -60,7 +60,9 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     const res = await request(buildApp()).post(`/api/admin/reader-orders/${f.order}/cost`)
       .set('Authorization', `Bearer ${f.superToken}`).send({ basePrice: 299, taxAndShipping: 32.73 })
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ charged: 350, cost_total: 331.73, markup: 18.27, loss: 0, cost_booked: false })
+    // 10/13 (Nic, full purchase): the reader is ordered, so its cost is GAM's expense at once.
+    expect(res.body.data).toMatchObject({ charged: 350, cost_total: 331.73, markup: 18.27, loss: 0, cost_booked: true,
+      purchase_booked: -331.73, booked_total: -331.73, still_to_repay: 331.73 })
     const list = await request(buildApp()).get('/api/admin/reader-orders').set('Authorization', `Bearer ${f.superToken}`)
     expect(list.status).toBe(200)
     const row = list.body.data.find((o: any) => o.id === f.order)
@@ -77,9 +79,9 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
   })
 
   // 10/13 (Nic): "allow dated cost corrections" — after the markup is booked too (10/12's "fixed once
-  // booked" is replaced): the old figure stays on record, the new one applies from its date. What it
-  // changes in a piece already booked is shown, not booked (an open question to Nic).
-  it('takes a dated correction after the markup is booked — the booked row stays, the change is shown as not booked; refuses one dated before the figure it corrects (409), a day to come, and a bad body (400)', async () => {
+  // booked" is replaced): the old figure stays on record, the new one applies from its date. And
+  // (afternoon, full purchase) the difference goes into GAM's book on that date as GAM's expense.
+  it('takes a dated correction after the markup is booked — the booked rows stay, the difference is GAM’s expense on its date; refuses one dated before the figure it corrects (409), a day to come, and a bad body (400)', async () => {
     const f = await fixture()
     const app = buildApp()
     const post = (body: any) => request(app).post(`/api/admin/reader-orders/${f.order}/cost`)
@@ -95,9 +97,16 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     expect(await raiseDueInstallments()).toBe(4)
     const r = await post({ basePrice: 299, taxAndShipping: 40, note: 'extra shipping' })
     expect(r.status).toBe(200)
-    expect(r.body.data).toMatchObject({ cost_total: 339, markup: 11, booked_total: 18.27, not_booked: -7.27, cost_booked: true })
+    expect(r.body.data).toMatchObject({
+      cost_total: 339, markup: 11, booked_total: 11, purchase_booked: -339, cost_repaid_booked: 331.73, markup_booked: 18.27,
+      not_booked: 0, still_to_repay: 7.27, cost_booked: true,
+    })
     expect(r.body.data.cost_history).toHaveLength(2)
-    expect(r.body.data.book.map((b: any) => [b.n, b.amount])).toEqual([[4, 18.27]])
+    expect(r.body.data.book.map((b: any) => [b.kind, b.n, b.amount])).toEqual([
+      ['purchase', null, -331.73],
+      ['cost_repaid', 1, 87.5], ['cost_repaid', 2, 87.5], ['cost_repaid', 3, 87.5], ['cost_repaid', 4, 69.23], ['markup', 4, 18.27],
+      ['purchase', null, -7.27],
+    ])
     const back = await post({ basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2000-01-01' })
     expect(back.status).toBe(400)   // before the landlord asked for it
     const log = await db.query(`SELECT metadata FROM admin_action_log WHERE target_id = $1 AND action_type = 'reader_order_cost_recorded' ORDER BY created_at`, [f.order])
@@ -128,5 +137,24 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     const res = await request(buildApp()).post(`/api/admin/reader-orders/${randomUUID()}/cost`)
       .set('Authorization', `Bearer ${f.superToken}`).send({ basePrice: 299 })
     expect(res.status).toBe(404)
+  })
+
+  // 10/13 (review): the receipt is GAM's purchase, dated the day GAM bought the reader — so it waits
+  // for the order, and an order with its cost in GAM's book never goes back to a request.
+  it('refuses a cost on a request nobody has ordered (409), and an order with its cost back to Requested (409)', async () => {
+    const f = await fixture()
+    const app = buildApp()
+    const auth = { Authorization: `Bearer ${f.superToken}` }
+    await db.query(`UPDATE pos_reader_orders SET status = 'requested' WHERE id = $1`, [f.order])
+    const early = await request(app).post(`/api/admin/reader-orders/${f.order}/cost`).set(auth).send({ basePrice: 299, taxAndShipping: 32.73 })
+    expect(early.status).toBe(409)
+    expect(early.body.error).toMatch(/Mark it Ordered first/)
+    expect((await request(app).patch(`/api/admin/reader-orders/${f.order}`).set(auth).send({ status: 'ordered' })).status).toBe(200)
+    expect((await request(app).post(`/api/admin/reader-orders/${f.order}/cost`).set(auth).send({ basePrice: 299, taxAndShipping: 32.73 })).status).toBe(200)
+    const back = await request(app).patch(`/api/admin/reader-orders/${f.order}`).set(auth).send({ status: 'requested' })
+    expect(back.status).toBe(409)
+    expect(back.body.error).toMatch(/cannot go back to a request/)
+    const list = await request(app).get('/api/admin/reader-orders').set(auth)
+    expect(list.body.data.find((o: any) => o.id === f.order)).toMatchObject({ status: 'ordered', booked_total: -331.73, not_booked: 0 })
   })
 })

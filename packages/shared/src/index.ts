@@ -8204,16 +8204,21 @@ export function installmentSplit(total: number, n: number): number[] {
 // (base price, tax, shipping — or tax and shipping as one amount when the
 // receipt does not split them), entered on GAM's desk, every entry kept; 10/13
 // (Nic): "allow dated cost corrections" — a later entry applies from its own
-// date, and a piece of the plan carries the markup under the figure in force
-// the day it is billed (apps/api services/readerOrders bookReaderMarkup).
+// date, and a piece of the plan is split under the figure in force the day it
+// is billed (apps/api services/readerOrders bookReaderBook).
 // Markup = what the landlord is charged − GAM's total cost.
 //
 // COST FIRST (Nic 10/12): the payments repay GAM's cost first; the markup lands
 // in the last piece(s). Mountain View: 4 × $87.50 against $331.73 → pieces 1-3
 // are all cost ($262.50), piece 4 is $69.23 cost + $18.27 markup. Only the
 // markup is GAM's earnings (platform_revenue_ledger 'device_markup', booked when
-// the piece carrying it is billed, like a platform fee); the cost part is GAM's
-// own money coming back and never earnings.
+// the piece carrying it is billed, like a platform fee).
+//
+// 10/13 (Nic): FULL PURCHASE — "Book the $331.73 as an expense the day we buy
+// it, and each $87.50 payment as paying it back (lowers 'earned all time' until
+// repaid)." GAM's own book holds the purchase as an expense and each piece's
+// cost part as paying it back (readerBookRows, below); the markup is still the
+// only earnings beyond the cost.
 
 /** Mirrors pos_reader_order_costs_source_check. */
 export const READER_ORDER_COST_SOURCES = ['desk', 'backfill'] as const
@@ -8282,8 +8287,8 @@ export interface ReaderOrderMoney {
   /**
    * 10/13 (Nic): "record each reader as a GAM expense (loss if cost >
    * charge)" — totalCost − charged when that is above zero, else 0. null: cost
-   * not entered. Shown on GAM's desk; not booked in GAM's own book (how a
-   * reader's expense and loss go there is an open question to Nic).
+   * not entered. In GAM's own book it is the part of the purchase (an expense)
+   * that the pieces never pay back (readerBookRows).
    */
   loss: number | null
 }
@@ -8321,6 +8326,115 @@ export function readerOrderMoney(o: {
     loss: o.totalCost == null ? null : Math.max(0, rc(o.totalCost) - rc(o.price)) / 100,
   }
 }
+
+// ── 10/13 (Nic): a card reader in GAM's OWN book — the full purchase ──────
+// "Book the $331.73 as an expense the day we buy it, and each $87.50 payment
+// as paying it back (lowers 'earned all time' until repaid)." For every reader
+// GAM bought, GAM's book (platform_revenue_ledger) holds:
+//   - PURCHASE: GAM's cost as an expense (below zero) the day GAM bought it.
+//     A dated cost correction books the difference on its own date — a refund
+//     gives some back, extra shipping takes more — and every row before it
+//     stays as it was ("old figures kept").
+//   - COST REPAID: each piece of the plan, as it is billed, pays the cost back
+//     first (10/12, cost first) — split under the cost in force the day it is
+//     billed.
+//   - MARKUP: what a piece carries beyond the cost, once the cost is repaid —
+//     GAM's earnings ('device_markup', 10/12).
+// Mountain View: −$331.73 on 9/28, +$87.50 a month on pieces 1-3, and piece 4
+// +$69.23 repaid + $18.27 markup. A reader that cost more than it is charged
+// stays below zero by its loss once its last piece is billed.
+
+/**
+ * The reference_type of a reader's purchase and cost-repaid rows, which are
+ * typed 'adjustment' in platform_revenue_ledger (the markup has its own type,
+ * 'device_markup', referenced 'reader_order_installment'). A purchase row
+ * references its cost entry (pos_reader_order_costs), a cost-repaid row its
+ * piece (landlord_gam_charges). Read by the money pies and the bridge.
+ */
+export const READER_BOOK_REFERENCE = { purchase: 'reader_purchase', costRepaid: 'reader_cost_repaid' } as const
+
+export const READER_BOOK_ROW_KINDS = ['purchase', 'cost_repaid', 'markup'] as const
+export type ReaderBookRowKind = typeof READER_BOOK_ROW_KINDS[number]
+export const READER_BOOK_ROW_KIND_LABEL: Record<ReaderBookRowKind, string> = {
+  purchase:    'Bought — GAM’s expense',
+  cost_repaid: 'Cost repaid',
+  markup:      'Markup — GAM’s earnings',
+}
+
+/** One cost entry of an order, in the order they were typed (seq). */
+export interface ReaderCostEntryForBook { id?: string; total: number; effectiveOn: string }
+/** One billed piece of an order: its number, amount and the day it was billed (GAM's calendar, 'YYYY-MM-DD'). */
+export interface ReaderPieceForBook { id?: string; n: number; amount: number; billedOn: string; voided?: boolean }
+
+export interface ReaderBookRow {
+  kind: ReaderBookRowKind
+  /** The cost entry (a purchase) or the piece (cost repaid, markup) the row is for. */
+  ref?: string
+  /** The piece's number (cost repaid, markup). */
+  n?: number
+  /** Signed: a purchase is below zero; a correction that gives money back is above it. */
+  amount: number
+  /** The day it is booked: the entry's effectiveOn, or the day the piece was billed. */
+  on: string
+  /** The cost it was worked out under: the entry's total, or the cost in force the day the piece was billed. */
+  cost: number
+  /** A correction: the figure it replaces. */
+  previousCost?: number
+}
+
+/**
+ * The rows GAM's book should hold for one reader order. Nothing until its
+ * cost is entered (until then no dollar of it can be split); no purchase for an
+ * order GAM never bought (`bought`: ordered from Stripe's shop, or further, or
+ * cancelled after that). Voided pieces are left out. A piece carries the split
+ * under the latest entry dated on or before the day it was billed (an order's
+ * first entry covers every day before it, so a cost typed late still splits
+ * the pieces billed before it).
+ */
+export function readerBookRows(o: {
+  price: number; installments: number; bought: boolean
+  entries: ReaderCostEntryForBook[]; pieces: ReaderPieceForBook[]
+}): ReaderBookRow[] {
+  if (!o.entries.length) return []
+  const rows: ReaderBookRow[] = []
+  if (o.bought) {
+    let prevC: number | null = null
+    for (const e of o.entries) {
+      const c = rc(e.total)
+      const diff = c - (prevC ?? 0)
+      if (diff !== 0) {
+        rows.push({
+          kind: 'purchase', ref: e.id, amount: -diff / 100, on: e.effectiveOn, cost: c / 100,
+          ...(prevC == null ? {} : { previousCost: prevC / 100 }),
+        })
+      }
+      prevC = c
+    }
+  }
+  for (const p of [...o.pieces].filter(p => !p.voided).sort((a, b) => a.n - b.n)) {
+    const inForce = [...o.entries].reverse().find(e => e.effectiveOn <= p.billedOn) ?? o.entries[0]
+    const s = readerPieceSplit(o.price, o.installments, inForce.total)[p.n - 1]
+    if (!s) continue
+    if (s.cost > 0) rows.push({ kind: 'cost_repaid', ref: p.id, n: p.n, amount: s.cost, on: p.billedOn, cost: rc(inForce.total) / 100 })
+    if (s.markup > 0) rows.push({ kind: 'markup', ref: p.id, n: p.n, amount: s.markup, on: p.billedOn, cost: rc(inForce.total) / 100 })
+  }
+  return rows
+}
+
+/** What the rows come to, to the cent: purchase (below zero), cost repaid, markup, and the net. */
+export function readerBookTotals(rows: ReadonlyArray<Pick<ReaderBookRow, 'kind' | 'amount'>>): {
+  purchase: number; costRepaid: number; markup: number; net: number
+} {
+  const t = { purchase: 0, cost_repaid: 0, markup: 0 }
+  for (const r of rows) t[r.kind] += rc(r.amount)
+  return {
+    purchase: t.purchase / 100, costRepaid: t.cost_repaid / 100, markup: t.markup / 100,
+    net: (t.purchase + t.cost_repaid + t.markup) / 100,
+  }
+}
+
+// 10/13 (Nic, full purchase): the admin income pies — a slice below zero (a reader GAM bought) is named, not drawn.
+export * from './incomePie'
 
 // 10/12 (Nic): held items, transfer purposes and GAM-charge voids (ledger P0).
 export * from './landlordGamMoney'

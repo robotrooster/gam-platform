@@ -28,7 +28,7 @@ import {
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS, incomeRing, incomeLegend, incomeShare } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 import { MetricsHeatMap } from './components/MetricsHeatMap'
@@ -1072,7 +1072,9 @@ function AgentAnalytics(){
   )
 }
 
-const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600',card_reader_markup:'#a855f7'}
+// 10/13 (Nic, full purchase): a card reader is three slices — what GAM paid
+// for it (below zero), the pieces paying that back, and the markup once repaid.
+const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600',card_reader_markup:'#a855f7',card_reader_repaid:'#c4b5fd',card_reader_purchases:'#7c3aed'}
 const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
 
 // ── 10/3 (Nic): the two admin money cards ──────────────────────────────────
@@ -1093,6 +1095,9 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
   const c=bal.clearing||{}
   const gap=r?.gap
   const ties=gap!=null&&Math.abs(gap)<0.005
+  // 10/13 (Nic, full purchase): what card readers put in "Earned" (GET /admin/platform-balance readers_in_earned).
+  const rie=bal.readersInEarned
+  const readersIn=rie&&(Math.abs(rie.bought||0)>0.004||Math.abs(rie.costRepaid||0)>0.004||Math.abs(rie.markup||0)>0.004)?rie:null
   return(
     <div className="kpi"><div className="kl">GAM's Own Money</div>
       <div className="kv g">{money(bal.gamsOwn)}</div>
@@ -1114,13 +1119,18 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
           revenue book says GAM has earned. "book:" read like a third set of
           records beside "GAM's records" above it, and "of that still owed"
           claimed the landlords' open charges sit inside the earned figure,
-          which holds only for platform fees (a card-reader installment owed is
-          not in the revenue book — 10/12: only its markup part is, Q-g). Same numbers, plainer words. Nothing about
-          how either number is worked out changed here. */}
+          which holds only for platform fees and card-reader installments
+          (10/13, Nic: full purchase — a reader's pieces are booked as billed,
+          the cost they repay and then the markup). Same numbers, plainer
+          words. Nothing about how either number is worked out changed here. */}
       {/* 10/12 (Nic, A3): "rename 'book' so it doesn't collide with 'GAM's
           records'" — the earned figure is GAM's earnings ledger
           (platform_revenue_ledger); "GAM's records" stays the check's name. */}
       <div className="ks" style={{marginTop:2}}>Earned, per GAM's earnings ledger: {money(bal.revenueThisMonth||0)} this month, {money(bal.revenueAllTime||0)} all time</div>
+      {/* 10/13 (Nic): "Book the $331.73 as an expense the day we buy it, and
+          each $87.50 payment as paying it back (lowers 'earned all time' until
+          repaid)." Says what the readers put in that figure. */}
+      {readersIn&&<div className="ks" style={{fontSize:'.7rem'}}>Card readers in it: {signed(readersIn.bought||0)} bought, {signed(readersIn.costRepaid||0)} cost repaid, {signed(readersIn.markup||0)} markup</div>}
       {/* 10/12 (Nic) review: this total is every open landlord charge — a
           card-reader installment is not a fee — and a payout is not the only
           way it is collected. So it names what is owed, kind by kind, and both
@@ -1148,12 +1158,14 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
             payment (the $6 bank fee on a $4 payment) — the rest is billed to
             the landlord; earned in full, on the balance once collected. */}
         {(br.processingFeesNotCollected||0)!==0&&<div className="dr"><span className="dk">Less processing fees landlords cover beyond the payment, billed, not collected yet</span><span className="dv mono">−{money(br.processingFeesNotCollected)}</span></div>}
-        {/* 10/12 (Nic, Q-g): cost first — of the reader payments collected,
-            GAM's cost of the readers coming back is its own line (never
-            earnings); the markup is already inside "Earned". */}
-        {(br.readerMarkupNotCollected||0)!==0&&<div className="dr"><span className="dk">Less card-reader markup billed, not collected yet</span><span className="dv mono">−{money(br.readerMarkupNotCollected)}</span></div>}
-        {(br.readerCostRecovered||0)!==0&&<div className="dr"><span className="dk">Plus card-reader cost repaid by landlords (GAM's cost of the readers — not earnings)</span><span className="dv mono">+{money(br.readerCostRecovered)}</span></div>}
-        {(br.readerPaymentsCollected||0)!==0&&<div className="ks" style={{marginTop:-2,marginBottom:4}}>Card-reader payments collected: {money(br.readerPaymentsCollected)} = {money(br.readerCostRecovered||0)} cost repaid + {money(br.readerMarkupCollected||0)} markup (inside Earned)</div>}
+        {/* 10/13 (Nic, full purchase): a reader is inside "Earned" as its
+            purchase (GAM's expense) and each payment billed (the cost it
+            repays, then the markup). GAM paid Stripe's shop for it, not from
+            this balance, so the purchase is added back; payments billed and not
+            collected yet are taken off. */}
+        {(br.readerBilledNotCollected||0)!==0&&<div className="dr"><span className="dk">Less card-reader payments billed, not collected yet</span><span className="dv mono">−{money(br.readerBilledNotCollected)}</span></div>}
+        {(br.readerBought||0)!==0&&<div className="dr"><span className="dk">Plus card readers GAM bought — an expense inside Earned, not paid from the Stripe balance</span><span className="dv mono">+{money(br.readerBought)}</span></div>}
+        {(br.readerPaymentsCollected||0)!==0&&<div className="ks" style={{marginTop:-2,marginBottom:4}}>Card-reader payments collected: {money(br.readerPaymentsCollected)} = {money(br.readerCostRepaidCollected||0)} cost repaid + {money(br.readerMarkupCollected||0)} markup (both inside Earned)</div>}
         {(br.paidOutToGamBank||0)!==0&&<div className="dr"><span className="dk">Less paid out to GAM's own bank</span><span className="dv mono">−{money(br.paidOutToGamBank)}</span></div>}
         {(br.timing||[]).length>0&&<div className="ks" style={{marginTop:6}}>Timing and the rest, each named:</div>}
         {(br.timing||[]).map((t:any)=>(
@@ -1192,7 +1204,7 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
         <div className="dr"><span className="dk">The Stripe balance says</span><span className="dv mono">{money(r.onBalance)}</span></div>
         <div className="dr"><span className="dk">Difference</span><span className="dv mono" style={{color:ties?'var(--green)':'var(--amber)'}}>{money(gap)}</span></div>
         <div className="ks" style={{marginTop:6}}>Not in this check: money a tenant's payment carried toward an older FlexDeposit or FlexCharge balance, and what GAM has paid Checkr. The Checkr line is every background check applicants paid that was not refunded — once GAM pays Checkr, that line reads high and GAM's own reads low by what was paid. A dispute GAM wins puts the money back on the balance: the fee on top in it is counted here (and what the landlords were charged for it is owed back to them), but GAM's records do not undo the rent part of the dispute yet, so that part reads as a difference of its amount.</div>
-        <div className="ks" style={{marginTop:4}}>Not in GAM's earnings ledger one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings ledger only through the nightly processing true-up; businesses' invoicing fees are not in the earnings ledger at all. Of a card reader's payments only the markup is in the earnings ledger (booked when the payment carrying it is billed); the part that repays what the reader cost GAM never is.</div>
+        <div className="ks" style={{marginTop:4}}>Not in GAM's earnings ledger one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings ledger only through the nightly processing true-up; businesses' invoicing fees are not in the earnings ledger at all. A card reader is in the earnings ledger as GAM's expense the day GAM bought it, and each payment, as it is billed, as paying that cost back — then the markup once the cost is repaid; GAM paid Stripe's shop for the reader from outside the balance, so this check never counts the purchase.</div>
       </div>}
     </div>)
 }
@@ -1390,12 +1402,10 @@ function PlatformRevenueCard(){
         // slice ends up on the chart with no name beside it, or a name with no
         // slice — and the whole point of this pass is that the page agrees with
         // itself.
-        const SRC=Array.from(new Map(
-          ((compositionAll?.periods||[]) as any[])
-            .flatMap((p:any)=>p.sources||[])
-            .filter((s:any)=>s.amount!==0)
-            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
-        ).values())
+        // 10/13 (review): a color only for a slice some ring draws (above zero
+        // in some window) — a card reader GAM bought, below zero, is named under
+        // its pie instead (@gam/shared incomeLegend).
+        const SRC=incomeLegend(compositionAll?.periods)
         // S652 (Nic): "just reconcile all the different KPI cards where they're
         // getting their numbers from the same source. That way, everything
         // balances out." This used to read a re-derived run-rate ($120) while
@@ -1464,8 +1474,12 @@ function PlatformRevenueCard(){
               {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>{!loaded&&compositionFailed?'The income pies could not be read just now.':'Loading…'}</div>}
               {periods.map((p:any)=>{
                 const g=p.gross||0
-                let acc=0
-                const segs=(p.sources||[]).filter((s:any)=>s.amount>0).map((s:any)=>{const len=g>0?(s.amount/g)*C:0;const o=acc;acc+=len;return{key:s.key,len,off:o}})
+                // 10/13 (Nic, full purchase): a card reader GAM bought is a slice
+                // below zero. The ring is drawn from the slices above zero, each
+                // against their own total (against the net it overflowed the
+                // ring); the middle is the net, and what is below zero is named
+                // under it (@gam/shared incomeRing).
+                const{arcs:segs,below:negs}=incomeRing(p.sources,C)
                 return(
                   <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
                     style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
@@ -1480,6 +1494,9 @@ function PlatformRevenueCard(){
                       ))}
                       <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
                     </svg>
+                    {negs.map((s:any)=>(
+                      <div key={s.key} style={{fontSize:'.66rem',color:'var(--t3)',marginTop:2}}>incl. {s.label} −{formatCurrency(-s.amount)}</div>
+                    ))}
                   </div>
                 )
               })}
@@ -1501,18 +1518,22 @@ function PlatformRevenueCard(){
             {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
               <div style={{display:'flex',flexDirection:'column',gap:16}}>
                 {(breakdown?.sources||[]).map((s:any)=>{
-                  const pct=breakdown?.gross>0?(s.amount/breakdown.gross)*100:0
+                  // 10/13: shares of what came in (the slices above zero); a
+                  // slice below zero (a card reader GAM bought) has none, and
+                  // no color either — the ring never draws it (@gam/shared incomeShare).
+                  const pct=incomeShare(s.amount,breakdown?.sources)
                   const zero=s.amount===0&&s.count===0
+                  const below=s.amount<0
                   return(
                     <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
                       <div style={{display:'flex',alignItems:'center',gap:8}}>
-                        <div style={{width:11,height:11,borderRadius:'50%',background:incomeColorOf(s.key),flexShrink:0}}/>
+                        <div title={below?'Below zero — named under the pie, not drawn on it':undefined} style={{width:11,height:11,borderRadius:'50%',background:below?'transparent':incomeColorOf(s.key),border:below?'1.5px solid var(--t3)':'none',boxSizing:'border-box',flexShrink:0}}/>
                         <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
                         {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
                       </div>
                       <div style={{display:'flex',alignItems:'baseline',gap:8}}>
                         <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
-                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct.toFixed(0)}%</span>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct==null?'':`${pct.toFixed(0)}%`}</span>
                       </div>
                     </div>
                   )

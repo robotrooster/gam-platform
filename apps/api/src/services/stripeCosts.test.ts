@@ -509,7 +509,7 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
     const bridged = (over: Partial<PlatformBalanceBook> = {}): PlatformBalanceBook => ({
       ...book(),
       bridge: {
-        earned: { processing: 80, platform_fees: 154, screening: 10, flexpay: 0, test_sweep: 10.33, reader_markup: 0, other: 0 },
+        earned: { processing: 80, platform_fees: 154, screening: 10, flexpay: 0, test_sweep: 10.33, readers: 0, other: 0 },
         platformFeesNotCollected: 24,
         chargesCollected: { subscription: 130, deviceInstallment: 0, bankDebitCost: 6, other: 0 },
         screeningMargin: 10, screeningFee: 4.10,
@@ -520,76 +520,82 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
     it('earned, less fees not collected, less what went to GAM\'s bank, with Stripe\'s catch-up named, lands on GAM\'s own: $0.00 left over', () => {
       const s = splitPlatformBalance(bridged(), live())
       expect(s.reconciliation!.bridge).toEqual({
-        earned: 254.33, platformFeesNotCollected: 24, processingFeesNotCollected: 0, readerPaymentsCollected: 0,
-        readerCostRecovered: 0, readerMarkupCollected: 0, readerMarkupNotCollected: 0, paidOutToGamBank: 1.21,
+        earned: 254.33, platformFeesNotCollected: 24, processingFeesNotCollected: 0,
+        readerBought: 0, readerBilledNotCollected: 0, readerPaymentsCollected: 0, readerCostRepaidCollected: 0, readerMarkupCollected: 0,
+        paidOutToGamBank: 1.21,
         // Fees collected $341.51 + $2.83 + $4.10 + $6 less Stripe's $267.53 = $86.91 against the ledger's $80.
         timing: [{ key: 'processing', label: BRIDGE_TIMING_LABEL.processing, amount: 6.91 }],
         gamsOwn: 236.03, onBalance: 236.03, leftover: 0,
       })
     })
 
-    it('a card-reader installment collected is added — the earnings ledger has none of it', () => {
+    // 10/13 (Nic, full purchase): "Book the $331.73 as an expense the day we
+    // buy it, and each $87.50 payment as paying it back (lowers 'earned all
+    // time' until repaid)." The reader is inside "earned" — its purchase and
+    // each piece billed (cost repaid, then the markup). GAM paid Stripe's shop
+    // for it, not from the balance, so the bridge adds the purchase back.
+    const withReader = (r: { earned: number; collected: number; facts?: NonNullable<NonNullable<PlatformBalanceBook['bridge']>['readers']> }) => {
       const b = bridged()
-      b.collected = { ...b.collected, landlordChargesCollected: 136 + 87.5 }
-      b.bridge = { ...b.bridge!, chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 87.5 } }
-      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 87.5 })
+      b.collected = { ...b.collected, landlordChargesCollected: 136 + r.collected }
+      b.bridge = {
+        ...b.bridge!,
+        earned: { ...b.bridge!.earned, readers: r.earned },
+        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: r.collected },
+        ...(r.facts ? { readers: r.facts } : {}),
+      }
+      return splitPlatformBalance(b, { ...live(), pending: 4003.60 + r.collected })
+    }
+
+    it("Mountain View today: −$331.73 bought and +$87.50 repaid inside earned, the purchase added back, $0.00 left over", () => {
+      const s = withReader({ earned: -244.23, collected: 87.5,
+        facts: { bought: 331.73, billed: 87.5, collected: 87.5, costRepaidCollected: 87.5, markupCollected: 0 } })
       expect(s.gamsOwn).toBe(323.53)
-      expect(s.reconciliation!.bridge).toMatchObject({
-        readerPaymentsCollected: 87.5, readerCostRecovered: 87.5, readerMarkupCollected: 0, gamsOwn: 323.53, leftover: 0,
-      })
       expect(s.reconciliation!.gap).toBe(0)
+      expect(s.reconciliation!.bridge).toMatchObject({
+        earned: 10.10, readerBought: 331.73, readerBilledNotCollected: 0,
+        readerPaymentsCollected: 87.5, readerCostRepaidCollected: 87.5, readerMarkupCollected: 0, gamsOwn: 323.53, leftover: 0,
+      })
+      expect(s.reconciliation!.bridge!.timing.map(t => t.key)).toEqual(['processing'])
     })
 
     // 10/12 (Nic, Q-g): "COST FIRST — pieces repay GAM's cost first; the
     // markup lands in the last piece(s)." Mountain View: 4 × $87.50 against
-    // $331.73 → piece 4 is $69.23 cost + $18.27 markup. Only the markup is
-    // earnings; the bridge shows the cost on its own line and still ties.
-    it('a reader paid off: the cost comes back on its own line, the $18.27 markup is inside earned, $0.00 left over', () => {
-      const b = bridged()
-      b.collected = { ...b.collected, landlordChargesCollected: 136 + 350 }
-      b.bridge = {
-        ...b.bridge!,
-        earned: { ...b.bridge!.earned, reader_markup: 18.27 },
-        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 350 },
-        readerMarkupBilled: 18.27, readerMarkupCollected: 18.27,
-      }
-      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 350 })
+    // $331.73 → piece 4 is $69.23 cost + $18.27 markup.
+    it('a reader paid off: earned holds the $18.27 it came to, the purchase is added back, $0.00 left over', () => {
+      const s = withReader({ earned: 18.27, collected: 350,
+        facts: { bought: 331.73, billed: 350, collected: 350, costRepaidCollected: 331.73, markupCollected: 18.27 } })
       expect(s.reconciliation!.gap).toBe(0)
       expect(s.reconciliation!.bridge).toMatchObject({
-        earned: 272.60, readerPaymentsCollected: 350, readerCostRecovered: 331.73,
-        readerMarkupCollected: 18.27, readerMarkupNotCollected: 0, gamsOwn: 586.03, leftover: 0,
+        earned: 272.60, readerBought: 331.73, readerBilledNotCollected: 0, readerPaymentsCollected: 350,
+        readerCostRepaidCollected: 331.73, readerMarkupCollected: 18.27, gamsOwn: 586.03, leftover: 0,
       })
-      expect(s.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('reader_markup')
+      expect(s.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('readers')
     })
 
-    it('the last piece billed but not collected yet: its markup is taken off like a platform fee owed, still $0.00', () => {
-      const b = bridged()
-      b.collected = { ...b.collected, landlordChargesCollected: 136 + 262.5 }
-      b.bridge = {
-        ...b.bridge!,
-        earned: { ...b.bridge!.earned, reader_markup: 18.27 },
-        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 262.5 },
-        readerMarkupBilled: 18.27, readerMarkupCollected: 0,
-      }
-      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 262.5 })
+    it('the last piece billed but not collected yet: it is taken off like a platform fee owed, still $0.00', () => {
+      const s = withReader({ earned: 18.27, collected: 262.5,
+        facts: { bought: 331.73, billed: 350, collected: 262.5, costRepaidCollected: 262.5, markupCollected: 0 } })
       expect(s.reconciliation!.bridge).toMatchObject({
-        readerCostRecovered: 262.5, readerMarkupCollected: 0, readerMarkupNotCollected: 18.27, leftover: 0,
+        readerBilledNotCollected: 87.5, readerCostRepaidCollected: 262.5, readerMarkupCollected: 0, leftover: 0,
       })
     })
 
-    it('a markup row the earnings ledger is missing is named, not lost', () => {
-      const b = bridged()
-      b.collected = { ...b.collected, landlordChargesCollected: 136 + 350 }
-      b.bridge = {
-        ...b.bridge!,
-        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 350 },
-        readerMarkupBilled: 18.27, readerMarkupCollected: 18.27,
-      }
-      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 350 })
+    it('a reader row the earnings ledger is missing is named, not lost', () => {
+      const s = withReader({ earned: 0, collected: 350,
+        facts: { bought: 331.73, billed: 350, collected: 350, costRepaidCollected: 331.73, markupCollected: 18.27 } })
       const br = s.reconciliation!.bridge!
-      expect(br.timing.find(t => t.key === 'reader_markup')).toEqual(
-        { key: 'reader_markup', label: BRIDGE_TIMING_LABEL.reader_markup, amount: 18.27 })
+      expect(br.timing.find(t => t.key === 'readers')).toEqual({ key: 'readers', label: BRIDGE_TIMING_LABEL.readers, amount: 18.27 })
       expect(br.leftover).toBe(0)
+    })
+
+    it('a reader payment collected on a reader the ledger does not hold (no cost entered yet) is its own named line', () => {
+      const s = withReader({ earned: 0, collected: 87.5 })
+      expect(s.gamsOwn).toBe(323.53)
+      const br = s.reconciliation!.bridge!
+      expect(br).toMatchObject({ readerBought: 0, readerBilledNotCollected: 0, readerPaymentsCollected: 0, leftover: 0 })
+      expect(br.timing.find(t => t.key === 'reader_payments_not_in_ledger')).toEqual(
+        { key: 'reader_payments_not_in_ledger', label: BRIDGE_TIMING_LABEL.reader_payments_not_in_ledger, amount: 87.5 })
+      expect(s.reconciliation!.gap).toBe(0)
     })
 
     it('every other kind of money is its own named line, and the leftover is always the check\'s difference', () => {

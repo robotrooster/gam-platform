@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest'
 import {
   readerCostTotal, readerPieceSplit, readerOrderMoney,
   READER_ORDER_COST_SOURCES, READER_ORDER_COST_SOURCE_LABEL,
+  readerBookRows, readerBookTotals, READER_BOOK_ROW_KINDS, READER_BOOK_ROW_KIND_LABEL, READER_BOOK_REFERENCE,
 } from './index'
 
 describe('readerCostTotal', () => {
@@ -108,5 +109,80 @@ describe('a reader that cost GAM more than it charges is a loss', () => {
 describe('READER_ORDER_COST_SOURCES', () => {
   it('every source has words for the desk', () => {
     for (const s of READER_ORDER_COST_SOURCES) expect(READER_ORDER_COST_SOURCE_LABEL[s]).toBeTruthy()
+  })
+})
+
+// 10/13 (Nic, afternoon): FULL PURCHASE — "Book the $331.73 as an expense the day we buy it, and
+// each $87.50 payment as paying it back (lowers 'earned all time' until repaid)."
+describe('readerBookRows — a reader in GAM\'s own book', () => {
+  const piece = (n: number, billedOn: string, voided = false) => ({ id: `g${n}`, n, amount: 87.5, billedOn, voided })
+  const mv = { price: 350, installments: 4, bought: true, entries: [{ id: 'c1', total: 331.73, effectiveOn: '2026-09-28' }] }
+
+  it("Mountain View: −$331.73 the day GAM bought it, then +$87.50 of cost repaid a month, and piece 4 is $69.23 repaid + $18.27 markup", () => {
+    expect(readerBookRows({ ...mv, pieces: [] })).toEqual([
+      { kind: 'purchase', ref: 'c1', amount: -331.73, on: '2026-09-28', cost: 331.73 },
+    ])
+    const rows = readerBookRows({ ...mv, pieces: [piece(1, '2026-10-05'), piece(2, '2026-11-01'), piece(3, '2026-12-01'), piece(4, '2027-01-01')] })
+    expect(rows.map(r => [r.kind, r.ref, r.n ?? null, r.amount, r.on])).toEqual([
+      ['purchase', 'c1', null, -331.73, '2026-09-28'],
+      ['cost_repaid', 'g1', 1, 87.5, '2026-10-05'],
+      ['cost_repaid', 'g2', 2, 87.5, '2026-11-01'],
+      ['cost_repaid', 'g3', 3, 87.5, '2026-12-01'],
+      ['cost_repaid', 'g4', 4, 69.23, '2027-01-01'],
+      ['markup', 'g4', 4, 18.27, '2027-01-01'],
+    ])
+    // Paid off: the book holds the markup, and nothing of the cost.
+    expect(readerBookTotals(rows)).toEqual({ purchase: -331.73, costRepaid: 331.73, markup: 18.27, net: 18.27 })
+    // One piece in: it lowers "earned all time" until repaid.
+    expect(readerBookTotals(readerBookRows({ ...mv, pieces: [piece(1, '2026-10-05')] })).net).toBe(-244.23)
+  })
+
+  it('nothing until the cost is entered; no purchase for a reader GAM never bought', () => {
+    expect(readerBookRows({ ...mv, entries: [], pieces: [piece(1, '2026-10-05')] })).toEqual([])
+    expect(readerBookRows({ ...mv, bought: false, pieces: [] })).toEqual([])
+  })
+
+  it('a dated correction books the difference on its own date; the figure before it stays', () => {
+    const rows = readerBookRows({ ...mv, entries: [
+      { id: 'c1', total: 331.73, effectiveOn: '2026-09-28' },
+      { id: 'c2', total: 336.73, effectiveOn: '2026-10-01' },   // extra shipping
+      { id: 'c3', total: 336.73, effectiveOn: '2026-10-02' },   // the same total, split differently
+      { id: 'c4', total: 326.73, effectiveOn: '2026-10-09' },   // a $10.00 refund
+    ], pieces: [] })
+    expect(rows).toEqual([
+      { kind: 'purchase', ref: 'c1', amount: -331.73, on: '2026-09-28', cost: 331.73 },
+      { kind: 'purchase', ref: 'c2', amount: -5, on: '2026-10-01', cost: 336.73, previousCost: 331.73 },
+      { kind: 'purchase', ref: 'c4', amount: 10, on: '2026-10-09', cost: 326.73, previousCost: 336.73 },
+    ])
+    expect(readerBookTotals(rows).purchase).toBe(-326.73)
+  })
+
+  it('each piece is split under the cost in force the day it was billed; the first entry covers the days before it', () => {
+    const rows = readerBookRows({ price: 350, installments: 4, bought: true, entries: [
+      { id: 'c1', total: 331.73, effectiveOn: '2026-12-15' },   // typed late
+      { id: 'c2', total: 250, effectiveOn: '2026-12-20' },      // a refund before piece 4
+    ], pieces: [piece(3, '2026-12-01'), piece(4, '2027-01-01')] })
+    expect(rows.filter(r => r.kind !== 'purchase').map(r => [r.kind, r.n, r.amount, r.cost])).toEqual([
+      ['cost_repaid', 3, 87.5, 331.73],
+      ['markup', 4, 87.5, 250],
+    ])
+  })
+
+  it('a reader that cost GAM more than it charges: every piece is cost repaid, and the loss stays below zero', () => {
+    const rows = readerBookRows({ price: 350, installments: 4, bought: true,
+      entries: [{ id: 'c1', total: 361.2, effectiveOn: '2026-05-11' }],
+      pieces: [1, 2, 3, 4].map(n => piece(n, '2026-09-01')) })
+    expect(rows.filter(r => r.kind === 'markup')).toEqual([])
+    expect(readerBookTotals(rows)).toEqual({ purchase: -361.2, costRepaid: 350, markup: 0, net: -11.2 })
+  })
+
+  it('a voided piece is not booked', () => {
+    const rows = readerBookRows({ ...mv, pieces: [piece(1, '2026-10-05', true)] })
+    expect(rows.map(r => r.kind)).toEqual(['purchase'])
+  })
+
+  it('every kind has words for the desk, and the two references are distinct', () => {
+    for (const k of READER_BOOK_ROW_KINDS) expect(READER_BOOK_ROW_KIND_LABEL[k]).toBeTruthy()
+    expect(READER_BOOK_REFERENCE.purchase).not.toBe(READER_BOOK_REFERENCE.costRepaid)
   })
 })

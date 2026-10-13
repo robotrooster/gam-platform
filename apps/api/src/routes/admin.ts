@@ -18,7 +18,7 @@ import bcrypt from 'bcryptjs'
 import { getClient } from '../db'
 import { emailAdminInvitation } from '../services/email'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES } from '@gam/shared'
+import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES, READER_BOOK_REFERENCE } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
@@ -1708,6 +1708,15 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
              COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0)::float AS this_month,
              COALESCE(SUM(amount), 0)::float AS all_time
         FROM platform_revenue_ledger GROUP BY type ORDER BY all_time DESC`)
+    // 10/13 (Nic, full purchase): "each $87.50 payment as paying it back
+    // (lowers 'earned all time' until repaid)" — what the card readers put in
+    // the earned figure, all time, so the card can say why it is lower.
+    const [readers] = await query<{ bought: number; repaid: number; markup: number }>(`
+      SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.purchase}'), 0)::float AS bought,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.costRepaid}'), 0)::float AS repaid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'device_markup'), 0)::float AS markup
+        FROM platform_revenue_ledger
+       WHERE type = 'device_markup' OR (type = 'adjustment' AND reference_type IN ('${READER_BOOK_REFERENCE.purchase}', '${READER_BOOK_REFERENCE.costRepaid}'))`)
     const r = split.reconciliation
     res.json({ success: true, data: {
       stripe_available: split.stripeAvailable,
@@ -1794,12 +1803,15 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
           // 10/12 (G5 review): the part of a processing fee a landlord covers
           // that the payment could not hold, billed to them and not collected yet.
           processing_fees_not_collected: r.bridge.processingFeesNotCollected,
+          // 10/13 (Nic, full purchase): a card reader is inside `earned` as its
+          // purchase (an expense) and each piece billed (cost repaid, then
+          // markup). The purchase was paid outside the Stripe balance, so it is
+          // added back; pieces billed and not collected yet are taken off.
+          reader_bought: r.bridge.readerBought,
+          reader_billed_not_collected: r.bridge.readerBilledNotCollected,
           reader_payments_collected: r.bridge.readerPaymentsCollected,
-          // 10/12 (Nic, Q-g): cost first — the cost part of the reader
-          // payments is its own line; the markup is inside `earned`.
-          reader_cost_recovered: r.bridge.readerCostRecovered,
+          reader_cost_repaid_collected: r.bridge.readerCostRepaidCollected,
           reader_markup_collected: r.bridge.readerMarkupCollected,
-          reader_markup_not_collected: r.bridge.readerMarkupNotCollected,
           paid_out_to_gam_bank: r.bridge.paidOutToGamBank,
           // Not "items": the camelizer passes an `items` value through untouched.
           timing: r.bridge.timing.map(t => ({ key: t.key, label: t.label, amount: t.amount })),
@@ -1813,6 +1825,7 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
       // what it is (platform fees, card-reader installments …).
       owed_by_landlords_by_kind: split.owedByLandlordsByKind,
       revenue_by_type: revenue,
+      readers_in_earned: { bought: readers.bought, cost_repaid: readers.repaid, markup: readers.markup },
       revenue_this_month: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.this_month), 0) * 100) / 100,
       revenue_all_time: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.all_time), 0) * 100) / 100,
     } })
@@ -1997,9 +2010,16 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
   { key: 'flexpay',            label: 'FlexPay',             types: ['flexpay_subscription'],      recurring: false },
   { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
   { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },
-  // 10/12 (Nic, Q-g): a card reader's markup — only the markup is earnings;
-  // GAM's cost of the reader coming back never reaches the ledger.
-  { key: 'card_reader_markup', label: 'Card Reader Markup',  types: ['device_markup'],             recurring: false },
+  // 10/13 (Nic, full purchase): "Book the $331.73 as an expense the day we buy
+  // it, and each $87.50 payment as paying it back (lowers 'earned all time'
+  // until repaid)." A reader is three slices: what GAM paid for it (below
+  // zero), the pieces paying that cost back, and — once it is repaid — the
+  // markup (10/12, Q-g: cost first; the only part that is earnings beyond the
+  // cost). The purchase and the cost repaid are 'adjustment' rows of their own
+  // reference (SLICE_TYPE_SQL).
+  { key: 'card_reader_purchases', label: 'Card Readers Bought',      types: ['reader_purchase'],     recurring: false },
+  { key: 'card_reader_repaid',    label: 'Card Reader Cost Repaid', types: ['reader_cost_repaid'],  recurring: false },
+  { key: 'card_reader_markup',    label: 'Card Reader Markup',      types: ['device_markup'],       recurring: false },
   { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
 ]
 
@@ -2017,6 +2037,9 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
 // 10/5 (Nic, prepaid stays): a screening margin taken back because the check
 // paid with a stay was cancelled before a report (services/stayTerms
 // restorePrepaidScreening) corrects the Background Checks slice.
+// 10/13 (Nic, full purchase): a card reader's purchase (GAM's expense) and
+// the pieces paying it back are 'adjustment' rows with their own reference;
+// each is its own reader slice, never "Adjustments".
 // 10/12 (Nic): the old screening sweep (jobs/platformFeeAccrual
 // processScreeningFeeSweep) books background checks under the subscription
 // type. It has never posted, but the day it does those checks belong in the
@@ -2030,6 +2053,10 @@ const SLICE_TYPE_SQL = `CASE WHEN type = 'platform_fee_subscription' AND referen
                              THEN 'screening_margin'
                              WHEN type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%'
                              THEN 'flexpay_subscription'
+                             WHEN type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.purchase}'
+                             THEN 'reader_purchase'
+                             WHEN type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.costRepaid}'
+                             THEN 'reader_cost_repaid'
                              ELSE type END`
 
 // 10/12 (Nic) review: `platformRunRate` is left out (null) by the polled
@@ -4332,9 +4359,11 @@ adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next
  * ('YYYY-MM-DD') is the day the entry applies from: the day GAM bought the
  * reader, or the day a correction (a refund, extra shipping) applies from;
  * never before the entry it corrects (409). A payment billed on or after it
- * carries the markup under it; nothing already booked is rewritten (a loss,
- * and what it changes in a payment already billed, are shown on the desk and
- * not booked — services/readerOrders). Returns the order as the desk shows it.
+ * is split under it. (10/13, Nic: full purchase) The entry goes into GAM's
+ * own book at once — the first as the purchase, GAM's expense, on its date; a
+ * correction as the difference on its own date; nothing already booked is
+ * rewritten (services/readerOrders bookReaderBook). Returns the order as the
+ * desk shows it.
  */
 adminRouter.post('/reader-orders/:id/cost', requireSuperAdmin, async (req, res, next) => {
   try {

@@ -2,12 +2,14 @@
  * 10/13 (Nic) — a card reader in GAM's own book, as the admin money card reads it.
  *
  * "record each reader as a GAM expense (loss if cost > charge); allow dated
- * cost corrections." GAM's book (platform_revenue_ledger) holds a reader's
- * markup, piece by piece, under the cost in force the day each piece was
- * billed. How a loss, and what a correction changes in a piece already
- * booked, go into GAM's book is an open question to Nic, so neither is booked
- * — and the bridge from GAM's book to the Stripe balance still ends with $0.00
- * left over, every line named.
+ * cost corrections." And (afternoon) FULL PURCHASE: "Book the $331.73 as an
+ * expense the day we buy it, and each $87.50 payment as paying it back
+ * (lowers 'earned all time' until repaid)." GAM's book (platform_revenue_ledger)
+ * holds the purchase as an expense, each correction on its own date, and each
+ * piece as the cost it repays and then the markup — and the bridge from GAM's
+ * book to the Stripe balance still ends with $0.00 left over, every line
+ * named: GAM paid Stripe's shop for the reader, not from the balance, so the
+ * purchase is added back.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
@@ -75,43 +77,60 @@ async function balance(token: string) {
 }
 
 describe("a reader in GAM's own book still ties the money card to the Stripe balance", () => {
-  it('a reader that cost GAM more than it charges: nothing in GAM’s book, every payment is cost coming back, and the bridge ends at $0.00 with no other line', async () => {
+  it('a reader that cost GAM more than it charges: GAM’s book holds the $11.20 loss, every payment is cost repaid, and the bridge ends at $0.00 with no other line', async () => {
     const f = await paidOffReader()
     await recordReaderOrderCost(f.order, { basePrice: 330, tax: 24, shipping: 7.2 }, f.userId)   // $361.20
     const d = await balance(f.token)
-    expect(d.revenue_all_time).toBe(0)
+    expect(d.revenue_all_time).toBe(-11.2)
+    expect(d.readers_in_earned).toEqual({ bought: -361.2, cost_repaid: 350, markup: 0 })
     expect(d.reconciliation.gap).toBe(0)
     expect(d.reconciliation.bridge).toMatchObject({
-      earned: 0, reader_payments_collected: 350, reader_cost_recovered: 350, reader_markup_collected: 0,
-      reader_markup_not_collected: 0, leftover: 0,
+      earned: -11.2, reader_bought: 361.2, reader_billed_not_collected: 0, reader_payments_collected: 350,
+      reader_cost_repaid_collected: 350, reader_markup_collected: 0, leftover: 0,
     })
     expect(d.reconciliation.bridge.timing).toEqual([])
   })
 
-  it('a reader that earns its markup: $18.27 in GAM’s book, $331.73 of cost coming back, and no other line', async () => {
+  it('a reader that earns its markup: GAM’s book comes to $18.27 — bought, repaid, marked up — and no other line', async () => {
     const f = await paidOffReader()
     await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 32.73 }, f.userId)
     const d = await balance(f.token)
     expect(d.revenue_all_time).toBe(18.27)
+    expect(d.readers_in_earned).toEqual({ bought: -331.73, cost_repaid: 331.73, markup: 18.27 })
     expect(d.reconciliation.bridge).toMatchObject({
-      earned: 18.27, reader_payments_collected: 350, reader_cost_recovered: 331.73, reader_markup_collected: 18.27,
-      reader_markup_not_collected: 0, leftover: 0,
+      earned: 18.27, reader_bought: 331.73, reader_payments_collected: 350, reader_cost_repaid_collected: 331.73,
+      reader_markup_collected: 18.27, reader_billed_not_collected: 0, leftover: 0,
     })
     expect(d.reconciliation.bridge.timing).toEqual([])
   })
 
-  it('a dated correction after the markup is booked: the booked $18.27 stays, and the bridge names the $5.00 the correction changed — not booked — and ends at $0.00', async () => {
+  it('a dated correction after the markup is booked: the $5.00 more is GAM’s expense on its date, the booked rows stay, and the bridge ends at $0.00 with no other line', async () => {
     const f = await paidOffReader()
     await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 32.73 }, f.userId)
     await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 37.73, effectiveOn: '2026-10-01' }, f.userId)
     const d = await balance(f.token)
-    expect(d.revenue_all_time).toBe(18.27)
+    expect(d.revenue_all_time).toBe(13.27)
+    expect(d.readers_in_earned).toEqual({ bought: -336.73, cost_repaid: 331.73, markup: 18.27 })
     expect(d.reconciliation.gap).toBe(0)
     expect(d.reconciliation.bridge).toMatchObject({
-      earned: 18.27, reader_payments_collected: 350, reader_cost_recovered: 336.73, reader_markup_collected: 13.27,
-      reader_markup_not_collected: 0, leftover: 0,
+      earned: 13.27, reader_bought: 336.73, reader_payments_collected: 350, reader_cost_repaid_collected: 331.73,
+      reader_markup_collected: 18.27, reader_billed_not_collected: 0, leftover: 0,
     })
-    // GAM's records under the current cost ($13.27 of markup) against the $18.27 the book holds.
-    expect(d.reconciliation.bridge.timing.map((t: any) => [t.key, t.amount])).toEqual([['reader_markup', -5]])
+    expect(d.reconciliation.bridge.timing).toEqual([])
+  })
+
+  it('a reader row the ledger lost is named on the bridge until the next run writes it back', async () => {
+    const f = await paidOffReader()
+    await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 32.73 }, f.userId)
+    await db.query(`DELETE FROM platform_revenue_ledger WHERE type = 'device_markup'`)
+    let d = await balance(f.token)
+    expect(d.revenue_all_time).toBe(0)
+    expect(d.reconciliation.bridge.timing.map((t: any) => [t.key, t.amount])).toEqual([['readers', 18.27]])
+    expect(d.reconciliation.bridge.leftover).toBe(0)
+    const { chaseReaderOrders } = await import('../services/readerOrders')
+    await chaseReaderOrders()
+    d = await balance(f.token)
+    expect(d.revenue_all_time).toBe(18.27)
+    expect(d.reconciliation.bridge.timing).toEqual([])
   })
 })

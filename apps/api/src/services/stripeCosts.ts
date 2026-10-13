@@ -51,7 +51,7 @@ import Stripe from 'stripe'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
-import { PROCESSING_FEES, PLATFORM_FEES, processingFeeFor, LANDLORD_GAM_CHARGE_KIND_LABEL } from '@gam/shared'
+import { PROCESSING_FEES, PLATFORM_FEES, processingFeeFor, LANDLORD_GAM_CHARGE_KIND_LABEL, READER_BOOK_REFERENCE } from '@gam/shared'
 // The demo / GAM-internal account rule, which card sales are on GAM's balance,
 // and the platform fee a tenant's rent payment carried live with the revenue
 // book's writer. (Imported this way round: platformRevenue is loaded by most of
@@ -1905,10 +1905,12 @@ export interface OwedByKind { kind: string; label: string; amount: number }
 //
 //     earned, all time (the earnings ledger)
 //   − platform fees billed to landlords that no payout or bank pull has collected
-//   − card-reader markup billed that nothing has collected yet
-//   + card-reader cost recovered: of the reader payments collected, GAM's cost
-//     of the readers coming back (10/12, Nic Q-g: cost first; only the markup
-//     is earnings, and it is inside "earned" — the cost part never is)
+//   − card-reader payments billed that nothing has collected yet
+//   + card readers GAM bought (10/13, Nic: full purchase — "Book the $331.73 as
+//     an expense the day we buy it, and each $87.50 payment as paying it
+//     back"): the purchase is inside "earned" as an expense, and each piece as
+//     the cost repaid and then the markup; GAM paid Stripe's shop for the
+//     reader, not from the Stripe balance, so it is added back here
 //   − what has been paid out to GAM's own bank
 //   ± each timing item, named (BRIDGE_TIMING_KEYS)
 //   = what GAM's own should be; the leftover against the balance must read $0.00.
@@ -1927,7 +1929,9 @@ export interface OwedByKind { kind: string; label: string; amount: number }
  * and a screening reversal are background checks; a FlexPay $25 taken back is
  * FlexPay.
  */
-export const EARNINGS_LEDGER_BRIDGE_KINDS = ['processing', 'platform_fees', 'screening', 'flexpay', 'test_sweep', 'reader_markup', 'other'] as const
+// 10/13 (Nic, full purchase): 'readers' is every row a card reader puts in the
+// ledger — its purchase, the cost repaid and the markup (services/readerOrders).
+export const EARNINGS_LEDGER_BRIDGE_KINDS = ['processing', 'platform_fees', 'screening', 'flexpay', 'test_sweep', 'readers', 'other'] as const
 export type EarningsLedgerBridgeKind = typeof EARNINGS_LEDGER_BRIDGE_KINDS[number]
 const NOT_SUBSCRIPTION_SQL = `(${NOT_SUBSCRIPTION_REFERENCES.map(r => `'${r}'`).join(', ')})`
 const EARNINGS_LEDGER_BRIDGE_KIND_SQL = `CASE
@@ -1940,7 +1944,8 @@ const EARNINGS_LEDGER_BRIDGE_KIND_SQL = `CASE
     WHEN type = 'flexpay_subscription'
       OR (type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%') THEN 'flexpay'
     WHEN type = 'adjustment' AND reference_type = 'test_sweep' THEN 'test_sweep'
-    WHEN type = 'device_markup' THEN 'reader_markup'
+    WHEN type = 'device_markup'
+      OR (type = 'adjustment' AND reference_type IN ('${READER_BOOK_REFERENCE.purchase}', '${READER_BOOK_REFERENCE.costRepaid}')) THEN 'readers'
     ELSE 'other' END`
 
 /** What loadPlatformBalanceBook reads for the bridge. */
@@ -1965,18 +1970,17 @@ export interface BridgeBook {
   screeningMargin: number
   screeningFee: number
   /**
-   * 10/12 (Nic, Q-g): card-reader markup, as GAM's records count it
-   * (services/readerOrders readerMarkupFacts): the markup in the pieces billed
-   * so far — what the earnings ledger should hold — and, cost first, how much
-   * of it has been collected. Absent = none.
+   * 10/13 (Nic, full purchase): card readers as GAM's records count them
+   * (services/readerOrders readerBookFacts) — what GAM paid for the readers it
+   * bought, the pieces billed on them (cost repaid + markup), and of those how
+   * much was collected, cost first. Absent = none.
    */
-  readerMarkupBilled?: number
-  readerMarkupCollected?: number
+  readers?: { bought: number; billed: number; collected: number; costRepaidCollected: number; markupCollected: number }
 }
 
 /** The named items between the earnings ledger and the balance. Each is signed: + adds to GAM's own. */
 export const BRIDGE_TIMING_KEYS = [
-  'processing', 'platform_fees', 'screening', 'reader_markup', 'flexpay_fronted', 'dispute_rent_not_repaid',
+  'processing', 'platform_fees', 'screening', 'readers', 'reader_payments_not_in_ledger', 'flexpay_fronted', 'dispute_rent_not_repaid',
   'dispute_gam_lines', 'gam_bill_lines', 'business_invoicing_fees', 'other_charges', 'ledger_other',
 ] as const
 export type BridgeTimingKey = typeof BRIDGE_TIMING_KEYS[number]
@@ -1984,7 +1988,8 @@ export const BRIDGE_TIMING_LABEL: Record<BridgeTimingKey, string> = {
   processing:              "Card and bank fees, and returned-payment and declined-card fees tenants paid, less what Stripe charged, against the earnings ledger's figure (trued up every night)",
   platform_fees:           "Platform fees collected, against the earnings ledger (one paid with rent is booked overnight)",
   screening:               "Background checks, GAM's part, against the earnings ledger",
-  reader_markup:           "Card-reader markup billed, against the earnings ledger",
+  readers:                 "Card readers — bought, cost repaid and markup — as GAM's records count them, against the earnings ledger",
+  reader_payments_not_in_ledger: "Card-reader payments collected that are not in the earnings ledger (a reader whose cost is not entered yet, a voided payment, a demo account's reader)",
   flexpay_fronted:         "FlexPay rent GAM covered, not repaid yet",
   dispute_rent_not_repaid: "Rent and bills taken back in disputes that landlords have not repaid yet",
   dispute_gam_lines:       "GAM's own bill lines taken back in disputes (billed to the tenant again) — returned-payment and declined-card fees are with processing",
@@ -2005,21 +2010,23 @@ export interface PlatformBalanceBridge {
    */
   processingFeesNotCollected: number
   /**
-   * Card-reader installments collected, all of it: readerCostRecovered +
-   * readerMarkupCollected. Shown for reference — the bridge adds the cost
-   * part on its own line; the markup is inside `earned`.
+   * 10/13 (Nic, full purchase): what GAM paid for the card readers it bought.
+   * Inside `earned` as an expense; GAM paid Stripe's shop for them, not from
+   * the Stripe balance, so it is added back (+).
+   */
+  readerBought: number
+  /** Card-reader payments billed (inside `earned`: cost repaid, then markup) that nothing has collected yet (taken off). */
+  readerBilledNotCollected: number
+  /**
+   * Card-reader payments collected on the readers in the earnings ledger:
+   * readerCostRepaidCollected + readerMarkupCollected, both inside `earned`.
+   * Shown for reference.
    */
   readerPaymentsCollected: number
-  /**
-   * 10/12 (Nic, Q-g): of the reader payments collected, GAM's cost of the
-   * readers coming back (cost first). Added: it is GAM's money, and never
-   * earnings, so the earnings ledger has none of it.
-   */
-  readerCostRecovered: number
-  /** Of the reader payments collected, the markup — already inside `earned`. */
+  /** Of those, cost first: GAM's cost of the readers coming back. */
+  readerCostRepaidCollected: number
+  /** Of those, the markup. */
   readerMarkupCollected: number
-  /** Reader markup billed (inside `earned`) that no payout or bank pull has collected yet (taken off). */
-  readerMarkupNotCollected: number
   /** Paid out of the balance to GAM's own bank (taken off). */
   paidOutToGamBank: number
   /** Every named item that is not $0.00, signed. */
@@ -2259,14 +2266,17 @@ function platformBalanceBridge(
   // "other charges"); owed, it is taken off like a platform fee owed.
   const processingNotCollectedC = cents(b.processingFeesNotCollected ?? 0)
   const readerC = cents(b.chargesCollected.deviceInstallment)
-  // 10/12 (Nic, Q-g): cost first — of the reader payments collected, the
-  // markup is GAM's earnings (inside `earned`, booked when billed); the rest is
-  // GAM's cost of the readers coming back, which is its own line. The markup
-  // billed and not collected yet is taken off, as a platform fee's is.
-  const readerMarkupBilledC = cents(b.readerMarkupBilled ?? 0)
-  const readerMarkupCollectedC = Math.min(cents(b.readerMarkupCollected ?? 0), readerC)
-  const readerCostC = readerC - readerMarkupCollectedC
-  const readerMarkupNotCollectedC = readerMarkupBilledC - readerMarkupCollectedC
+  // 10/13 (Nic, full purchase): a card reader is inside `earned` as its
+  // purchase (an expense) and each piece billed (the cost repaid, then the
+  // markup). GAM paid Stripe's shop for the reader, not from the balance: the
+  // purchase is added back. What is billed and not collected yet is taken off,
+  // as a platform fee's is. A reader payment collected outside the readers the
+  // ledger holds is a timing line of its own (reader_payments_not_in_ledger).
+  const rd = b.readers ?? { bought: 0, billed: 0, collected: 0, costRepaidCollected: 0, markupCollected: 0 }
+  const readerBoughtC = cents(rd.bought)
+  const readerBilledC = cents(rd.billed)
+  const readerCollectedC = cents(rd.collected)
+  const readerBilledNotCollectedC = readerBilledC - readerCollectedC
   // Processing as GAM's records count it: every fee GAM collected on a payment
   // (rent and bills, register and pay-link sales, stay deposits, business
   // payments, the card fee on a background check, a landlord's bank-pull cost,
@@ -2296,10 +2306,14 @@ function platformBalanceBridge(
     platform_fees: cents(b.chargesCollected.subscription) + cents(c.tenantPaidPlatformFees)
       - (e('platform_fees') - notCollectedC),
     screening: cents(b.screeningMargin) - e('screening'),
-    // The markup GAM's records say was billed, against what the ledger holds
-    // ($0.00 unless a row is missing — it is written best-effort, and the
-    // next run of the installment job writes it).
-    reader_markup: readerMarkupBilledC - e('reader_markup'),
+    // The readers as GAM's records count them — minus what GAM paid for them,
+    // plus the pieces billed — against what the ledger holds ($0.00 unless a
+    // row is missing: it is written best-effort, and the next morning's run
+    // writes it; or a piece voided after it was booked).
+    readers: readerBilledC - readerBoughtC - e('readers'),
+    // Collected on a reader the ledger does not hold (its cost not entered
+    // yet, a voided piece, a demo account's reader, a piece no order names).
+    reader_payments_not_in_ledger: readerC - readerCollectedC,
     flexpay_fronted: -cents(book.flexpayFronted),
     dispute_rent_not_repaid: -cents(t.rentNotRepaid),
     dispute_gam_lines: -(cents(t.gamLinesTakenBack) - feeLinesTakenBackC),
@@ -2313,16 +2327,17 @@ function platformBalanceBridge(
   const timing = BRIDGE_TIMING_KEYS
     .filter(k => timingC[k] !== 0)
     .map(k => ({ key: k, label: BRIDGE_TIMING_LABEL[k], amount: dollars(timingC[k]) }))
-  const endsC = earnedC - notCollectedC - processingNotCollectedC - readerMarkupNotCollectedC + readerCostC - x.paidOutC
+  const endsC = earnedC - notCollectedC - processingNotCollectedC - readerBilledNotCollectedC + readerBoughtC - x.paidOutC
     + BRIDGE_TIMING_KEYS.reduce((s, k) => s + timingC[k], 0)
   return {
     earned: dollars(earnedC),
     platformFeesNotCollected: dollars(notCollectedC),
     processingFeesNotCollected: dollars(processingNotCollectedC),
-    readerPaymentsCollected: dollars(readerC),
-    readerCostRecovered: dollars(readerCostC),
-    readerMarkupCollected: dollars(readerMarkupCollectedC),
-    readerMarkupNotCollected: dollars(readerMarkupNotCollectedC),
+    readerBought: dollars(readerBoughtC),
+    readerBilledNotCollected: dollars(readerBilledNotCollectedC),
+    readerPaymentsCollected: dollars(readerCollectedC),
+    readerCostRepaidCollected: dollars(cents(rd.costRepaidCollected)),
+    readerMarkupCollected: dollars(cents(rd.markupCollected)),
     paidOutToGamBank: dollars(x.paidOutC),
     timing,
     gamsOwn: dollars(endsC),
@@ -2794,9 +2809,9 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     .filter(b => b.amount !== 0)
   // A stay's background check is counted with the screenings above (A5).
   // 10/12 (Nic, A3): kind by kind, for the bridge — a platform fee is in the
-  // earnings ledger (when it is billed); of a card-reader installment only the
-  // markup is (Q-g, cost first: readerMarkupFacts below), the rest is GAM's
-  // cost of the reader coming back.
+  // earnings ledger (when it is billed); a card-reader installment is too
+  // (10/13, Nic: full purchase — the cost it repays, then the markup, beside
+  // the reader's purchase as an expense: readerBookFacts below).
   const chargesByKind = await query<{ kind: string; amt: number }>(
     `SELECT kind, COALESCE(SUM(collected_amount), 0)::float AS amt FROM landlord_gam_charges
       WHERE kind <> 'screening_fee' GROUP BY kind`)
@@ -2812,8 +2827,8 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
     other: dollars(chargesC - chargeC('subscription') - chargeC('device_installment') - chargeC('bank_debit_cost')
       - chargeC('uncovered_processing_fee')),
   }
-  const { readerMarkupFacts } = await import('./readerOrders')
-  const readerMarkup = await readerMarkupFacts()
+  const { readerBookFacts } = await import('./readerOrders')
+  const readers = await readerBookFacts()
   const earnedByKind = await query<{ kind: EarningsLedgerBridgeKind; amt: number }>(
     `SELECT ${EARNINGS_LEDGER_BRIDGE_KIND_SQL} AS kind, COALESCE(SUM(amount), 0)::float AS amt
        FROM platform_revenue_ledger GROUP BY 1`)
@@ -2904,8 +2919,7 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
       chargesCollected,
       screeningMargin: dollars(screeningMarginC),
       screeningFee: dollars(screeningKeptC - screeningMarginC),
-      readerMarkupBilled: readerMarkup.markupBilled,
-      readerMarkupCollected: readerMarkup.markupCollected,
+      readers,
     },
   }
 }
