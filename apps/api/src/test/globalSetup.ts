@@ -91,6 +91,39 @@ function claimLock(): void {
   fs.writeFileSync(LOCK_PATH, String(process.pid))
 }
 
+/**
+ * 10/13 — TESTING MIGRATIONS THAT ARE NOT ON PRODUCTION YET.
+ *
+ * schema.sql is production's schema, re-dumped only when migrations reach
+ * production, so a new migration file is invisible to the suite until then.
+ * Set TEST_APPLY_MIGRATIONS_AFTER to the newest migration production has
+ * (e.g. 20261014240200): every .sql migration whose name sorts after it is
+ * applied, in name order, on top of schema.sql, each in its own transaction
+ * as the runner does. Unset (deploy.sh, a plain run), nothing changes.
+ * Replaced the per-feature test shims (test/pendingMeterSchema.ts and
+ * friends) retired on 10/13.
+ */
+async function applyMigrationsNotYetInSchema(target: Client): Promise<void> {
+  const after = process.env.TEST_APPLY_MIGRATIONS_AFTER
+  if (!after) return
+  if (!/^\d{14}$/.test(after)) throw new Error(`TEST_APPLY_MIGRATIONS_AFTER must be a 14-digit migration timestamp, got '${after}'`)
+  const dir = path.join(__dirname, '..', 'db', 'migrations')
+  const pending = fs.readdirSync(dir).filter(f => f.endsWith('.sql') && f.slice(0, 14) > after).sort()
+  // pg_dump's schema.sql empties search_path for the session; migrations name
+  // tables unqualified, as the runner's fresh connection allows.
+  if (pending.length) await target.query('RESET search_path')
+  for (const f of pending) {
+    try {
+      await target.query('BEGIN')
+      await target.query(fs.readFileSync(path.join(dir, f), 'utf8'))
+      await target.query('COMMIT')
+    } catch (e: any) {
+      await target.query('ROLLBACK').catch(() => {})
+      throw new Error(`test migration ${f} failed: ${e?.message ?? e}`)
+    }
+  }
+}
+
 export async function setup(): Promise<void> {
   claimLock()
   if (!fs.existsSync(SCHEMA_PATH)) {
@@ -123,6 +156,7 @@ export async function setup(): Promise<void> {
   await target.connect()
   try {
     await target.query(schemaSql)
+    await applyMigrationsNotYetInSchema(target)
   } finally {
     await target.end()
   }
