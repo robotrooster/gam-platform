@@ -11,36 +11,57 @@
  *                    company owned on the cost's day, by how many units each
  *                    had that day (a unit counts from the day it was added
  *                    until the day it was retired)
- * Not chosen yet (NULL): the posting WAITS on the owner ('owner_not_ready':
- * retried every 15 minutes, no admin notice, retried at once when they choose).
- * GAM never picks an accounting method for a company.
+ * 10/13 (Nic): "Company-level costs before the owner picks: post to the
+ * COMPANY column by default" — EVERY company-level cost (GAM's charges,
+ * payroll, loan interest, company-wide bills, depreciation, a card reader
+ * piece): nothing waits on the choice any more. And "a later 'split by units'
+ * splits only NEW costs": a method picked after the books had posted applies
+ * to costs recorded from that moment (landlords.books_company_costs_from) on;
+ * what was recorded before stays in the Company column, rebuilds included.
+ * Each caller says when its cost was recorded (CostRecorded): the record's own
+ * creation, a payroll run's approval, the collection of a fee, the end of a
+ * month of depreciation (and its asset's entry).
  *
  * Only the expense side is split. What is owed (a payroll liability, a bill)
  * stays a company-level line; the engine balances each property with
  * inter-property clearing lines (3950), as it does for every posting.
  *
  * Facts only (ledgerProjectorPurity): the choice is fixed once the company's
- * books have posted (services/booksSettings), and the units and owners on a
- * past day are dated facts — units.created_at / retired_at, and
- * property_transfers for a property sold to or from the company — so a
- * rebuild comes out the same tomorrow.
+ * books have posted (services/booksSettings) and the moment it was made is
+ * stored; the units and owners on a past day are dated facts — units.created_at
+ * / retired_at, and property_transfers for a property sold to or from the
+ * company — so a rebuild comes out the same tomorrow.
  */
 import type { PoolClient } from 'pg'
-import type { BooksCompanyCostMethod, LedgerAccountRole } from '@gam/shared'
+import { DEFAULT_BOOKS_COMPANY_COST_METHOD, type BooksCompanyCostMethod, type LedgerAccountRole } from '@gam/shared'
 import type { DesiredLine } from '../ledgerEngine'
-import { LedgerSourceError } from '../ledgerEngine'
 import { dr, splitCents, companyTzSql, type LineExtra } from './registerBookingPayoutKit'
 
-/** Nic L7: the company's choice, or the posting waits for the owner to make it. */
-export async function requireCompanyCostsMethod(client: PoolClient, landlordId: string): Promise<BooksCompanyCostMethod> {
+/**
+ * 10/13 (Nic): when a company-level cost was recorded — the moment it reached
+ * the books — which decides whether a later pick applies to it. `at` is a
+ * stored timestamp; `monthEnded` is a day on the company's books calendar
+ * whose end the cost waited for (a month of depreciation posts once the month
+ * is over), and the later of the two counts when both are given.
+ */
+export interface CostRecorded { at?: string | null; monthEnded?: string | null }
+
+/**
+ * 10/13 (Nic): the method a company-level cost recorded at `recorded` follows —
+ * the owner's pick when it applies to that cost, else the Company column
+ * (the default while not chosen; a pick made later applies only to new costs).
+ */
+export async function companyCostsMethodFor(client: PoolClient, landlordId: string, recorded: CostRecorded): Promise<BooksCompanyCostMethod> {
   const r = await client.query<{ m: BooksCompanyCostMethod | null }>(
-    `SELECT books_company_costs_method AS m FROM landlords WHERE id = $1`, [landlordId])
-  const m = r.rows[0]?.m ?? null
-  if (!m) {
-    throw new LedgerSourceError('owner_not_ready',
-      'Waiting on the owner: where company-level costs go (a Company column of their own, or split across the properties by units) is not chosen yet on the Books settings page.')
-  }
-  return m
+    `SELECT CASE
+              WHEN l.books_company_costs_method IS NULL THEN NULL
+              WHEN l.books_company_costs_from IS NULL THEN l.books_company_costs_method
+              WHEN GREATEST($2::timestamptz,
+                            ($3::date + 1)::timestamp AT TIME ZONE ${companyTzSql('l.id')}) >= l.books_company_costs_from
+                THEN l.books_company_costs_method
+            END AS m
+       FROM landlords l WHERE l.id = $1`, [landlordId, recorded.at ?? null, recorded.monthEnded ?? null])
+  return r.rows[0]?.m ?? DEFAULT_BOOKS_COMPANY_COST_METHOD
 }
 
 /**
@@ -80,8 +101,8 @@ export async function unitsByPropertyOn(client: PoolClient, landlordId: string, 
 /** How a company-level cost is spread on `day`: one share per property, or company level (null) when nothing to split by. */
 export type CostSpread = { propertyId: string | null; weight: number }[]
 
-export async function companyCostSpread(client: PoolClient, landlordId: string, day: string): Promise<CostSpread> {
-  const method = await requireCompanyCostsMethod(client, landlordId)
+export async function companyCostSpread(client: PoolClient, landlordId: string, day: string, recorded: CostRecorded): Promise<CostSpread> {
+  const method = await companyCostsMethodFor(client, landlordId, recorded)
   if (method === 'company_bucket') return [{ propertyId: null, weight: 1 }]
   const props = await unitsByPropertyOn(client, landlordId, day)
   // A company with no units on that day has nothing to split by: company level.
@@ -94,4 +115,9 @@ export function drSpread(role: LedgerAccountRole, cents: number, spread: CostSpr
   if (!cents) return []
   const pieces = splitCents(cents, spread.map(s => s.weight))
   return spread.flatMap((s, i) => dr(role, pieces[i], { ...extra, propertyId: s.propertyId }))
+}
+
+/** 10/13 (Nic): the same pieces as drSpread, credited — what takes a spread cost back exactly. */
+export function crSpread(role: LedgerAccountRole, cents: number, spread: CostSpread, extra: LineExtra = {}): DesiredLine[] {
+  return drSpread(role, cents, spread, extra).map(l => ({ ...l, debitCents: undefined, creditCents: l.debitCents }))
 }

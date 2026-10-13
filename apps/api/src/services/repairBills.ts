@@ -106,7 +106,10 @@ export async function syncRepairBill(requestId: string, by: string | null): Prom
     let id: string | null = null
     if (!bill) {
       id = await makeBill(c, r, by)
-    } else if (booksCents(bill.paid) === 0 && (booksCents(bill.amount) !== booksCents(r.actual_cost) || bill.day !== r.day)) {
+    } else if (booksCents(bill.paid) === 0 && (booksCents(bill.amount) !== booksCents(r.actual_cost) || bill.day !== r.day)
+               // 10/13: never rewrite a bill a live fixed asset was made from —
+               // the asset carries its cost (a person's edit is refused the same way).
+               && !(await c.query(`SELECT 1 FROM books_fixed_assets WHERE source_expense_id = $1 AND voided_at IS NULL LIMIT 1`, [bill.id])).rows.length) {
       await c.query(
         `UPDATE landlord_expenses SET amount = $2, expense_date = $3, updated_at = now() WHERE id = $1`,
         [bill.id, (booksCents(r.actual_cost) / 100).toFixed(2), r.day])

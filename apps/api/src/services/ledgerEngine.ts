@@ -43,7 +43,9 @@
  *           reads as a correction). A CORRECTION (re-projection of a source
  *           that already posted) to an open month follows the company's choice
  *           (Nic 10/12, L4): 'restate' changes that month; 'day_made' shows it
- *           on the day the fix was made;
+ *           on the day the fix was made — 10/13 (Nic): automatic changes too
+ *           (a fee true-up, a webhook, a rule re-posted by the nightly check);
+ *           only GAM's own rebuilds keep the original dates;
  *        g. lines that do not balance per property get inter-property clearing
  *           lines; lines that do not balance at all are refused;
  *        h. exactly the outbox ids this pass read for the key are deleted, in
@@ -620,6 +622,11 @@ export async function postSource(sourceType: string, sourceId: string, opts: Pos
       // A correction to an open month: the company's choice (L4) — for a real
       // change only; a GAM rebuild or a chart change restates in place. A
       // closed month is never touched: everything lands on the first open day.
+      // 10/13 (Nic): "day-made mode: automatic changes SHOW ON THE DAY" — a
+      // change is a change whoever made it: a person's fix, a Stripe fee
+      // true-up, a webhook, or a rule the nightly check re-posts all show on
+      // the day made; only a rebuild GAM runs keeps the original dates
+      // (ledgerDayMadeAutomatic1013.test.ts).
       const fixDay = g.active && !sameContent && !gamRun && ctx.openMonthFixes === 'day_made' ? ctx.today : null
       const newId = want ? randomUUID() : null
       if (g.active) {

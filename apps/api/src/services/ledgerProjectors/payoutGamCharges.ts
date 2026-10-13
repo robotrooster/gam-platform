@@ -17,17 +17,28 @@
  *                                      small to pay (allocation_splits.landlord_fee_uncovered)
  *   screening_fee                      nothing: the cash sale that took GAM's background-check fee
  *                                      already credited 2080 (registerSale, design H3)
- *   device_installment                 waits — a card reader's pieces post once Nic says whether the
- *                                      reader is equipment the landlord owns (design H4: Dr 2085 /
- *                                      Cr 2080 each piece) or an expense per piece (design Q11)
+ *   device_installment                 nothing of its own — 10/13 (Nic): "Readers on the LANDLORD's
+ *                                      books: each $87.50 → SUPPLIES, in the month GAM COLLECTED it"
+ *                                      (design Q11 answered: an expense per piece, never equipment
+ *                                      the landlord owns). The payout batch or bank pull the piece
+ *                                      came out of posts it — Dr Supplies (5140) where it would have
+ *                                      debited Due to GAM (payoutTransfer; the pull, below) — so the
+ *                                      expense lands on the day GAM collected it, never when charged
  *
- * A voided charge posts nothing (taken back as a correction).
+ * A voided charge posts nothing (taken back as a correction). 10/13 (Nic): a
+ * charge on no property is a company-level cost — the Company column until
+ * the owner picks; a later "split by units" splits only charges made after it
+ * (companyCosts).
  *
  * Source 'gam_debit' = one landlord_gam_debits row: a bank pull of GAM's fees,
  * posted when it succeeds (its settled day, the company's calendar):
  *
  *   Dr Due to GAM (2080)                 each charge it collected, at the charge's property
  *                                        (landlord_gam_charge_collections, design P0)
+ *   Dr Supplies (5140)                   10/13 (Nic): each card reader piece it collected, at the
+ *                                        piece's property (one on no property: a company-level
+ *                                        cost, companyCosts) — the piece is an expense in the
+ *                                        month GAM collected it
  *   Cr Outstanding checks and debits (2015)  the same — cleared when the "GAM FEES" bank line
  *                                        matches it (design H5; never an expense)
  *
@@ -46,6 +57,9 @@
  *                                        the bank line of the return clears it
  *   Cr Due to GAM (2080)                 each charge the pull had paid, owed again,
  *                                        at the charge's property
+ *   Cr Supplies (5140)                   10/13 (Nic): each reader piece it had paid —
+ *                                        not collected after all; the pull that collects
+ *                                        it again expenses it then
  *   (and the Suspense difference back out of Suspense)
  *
  * With the rest of the dispute posting through its own charges — the pull's
@@ -55,13 +69,51 @@
  * dispute_reopened_amount plus that cost, and the next pull that collects them
  * debits it again. The p5_due_to_gam tie-out counts no collection of a disputed
  * pull (payoutChecks), so the books and the money records agree throughout.
+ *
+ * 10/13 (Nic): "Won GAM pull dispute: AUTOMATIC (back to collected; anything
+ * collected twice credited back)." When Stripe decides the dispute for GAM
+ * (landlord_gam_debits.dispute_won_at, services/landlordGamDebit
+ * applyWonGamDebitDispute) the pull's money stands after all, so its
+ * 'cancellation' is no longer wanted and is taken back (the engine reverses it:
+ * the dispute's month restated, or the take-back shown on the win's day under
+ * "show fixes on the day made"). The rest of the win posts through its own
+ * records: the pull's own $6 un-voided (its charge posts again), the dispute's
+ * cost charge voided (taken back) and what Stripe kept billed anew, and each
+ * charge collected twice (or collected and voided) given back on a payout line
+ * (payoutHeldItem: Dr 1050 / Cr 2080). The tie-out counts a won pull's
+ * collections again (payoutChecks).
  */
 import type { PoolClient } from 'pg'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import type { LedgerAccountRole } from '@gam/shared'
 import { cr, dr, toCents, waitsOnRule, localDaySql, propertyTzSql, companyTzSql } from './registerBookingPayoutKit'
-import { companyCostSpread, drSpread } from './companyCosts'
+import { companyCostSpread, drSpread, crSpread, type CostRecorded } from './companyCosts'
+
+/**
+ * 10/13 (Nic): "Readers on the LANDLORD's books: each $87.50 → SUPPLIES, in
+ * the month GAM COLLECTED it." The landlord_gam_charges kind of a card
+ * reader's monthly piece, and what a batch or a pull that collected one posts
+ * for it instead of paying Due to GAM.
+ */
+export const READER_PIECE_KIND = 'device_installment'
+const READER_PIECE_MEMO = 'Card reader piece GAM collected'
+
+/**
+ * 10/13 (Nic): the Supplies expense for reader pieces a batch or a pull
+ * collected at one property (`propertyId`; null: the company's — a
+ * company-level cost, spread as companyCosts says for a cost recorded when the
+ * money was collected). `side` 'cr' takes it back exactly (a disputed pull).
+ */
+export async function readerPieceLines(client: PoolClient, a: {
+  landlordId: string; propertyId: string | null; cents: number; day: string; recorded: CostRecorded; side: 'dr' | 'cr'
+}): Promise<DesiredLine[]> {
+  if (!a.cents) return []
+  const memo = READER_PIECE_MEMO
+  if (a.propertyId) return (a.side === 'dr' ? dr : cr)('supplies', a.cents, { propertyId: a.propertyId, memo })
+  const spread = await companyCostSpread(client, a.landlordId, a.day, a.recorded)
+  return (a.side === 'dr' ? drSpread : crSpread)('supplies', a.cents, spread, { memo })
+}
 
 /** The expense each GAM charge kind is (null: posts nothing of its own). */
 const CHARGE_EXPENSE: Record<string, LedgerAccountRole | null> = {
@@ -91,21 +143,22 @@ const DISPUTED_PULL_COST_MEMO = 'What a bank pull of GAM\'s fees your bank dispu
 export const payoutGamChargeProjector: LedgerProjector = {
   sourceType: 'gam_charge',
   // 10/12 (Nic, review): 2 — a charge on no property follows the company's
-  // choice for company-level costs (Nic L7).
-  ruleVersion: 2,
+  // choice for company-level costs (Nic L7). 10/13 (Nic): 3 — a reader piece
+  // posts nothing of its own (its collection does); the Company column by default.
+  ruleVersion: 3,
 
   async project(client: PoolClient, chargeId: string): Promise<DesiredPosting[]> {
     const c = (await client.query<{
       landlord_id: string; property_id: string | null; kind: string; amount: string; voided_at: string | null; day: string
-      source_type: string | null
+      source_type: string | null; created_at: string
     }>(
-      `SELECT c.landlord_id, c.property_id, c.kind, c.amount::text, c.voided_at::text, c.source_type,
+      `SELECT c.landlord_id, c.property_id, c.kind, c.amount::text, c.voided_at::text, c.source_type, c.created_at::text,
               ${localDaySql('c.created_at', propertyTzSql('c.property_id', 'c.landlord_id'))} AS day
          FROM landlord_gam_charges c WHERE c.id::text = $1`, [chargeId])).rows[0]
     if (!c || c.voided_at) return []
-    if (c.kind === 'device_installment') {
-      throw waitsOnRule('A card reader piece waits on Nic: is the reader equipment the landlord owns, or an expense per piece (design Q11)?')
-    }
+    // 10/13 (Nic): a reader piece is an expense in the month GAM collected it —
+    // the batch or pull that collected it posts it, never the charge.
+    if (c.kind === READER_PIECE_KIND) return []
     if (!(c.kind in CHARGE_EXPENSE)) throw waitsOnRule(`A GAM charge of kind ${c.kind} has no posting rule.`)
     const role = CHARGE_EXPENSE[c.kind]
     if (!role) return []
@@ -117,11 +170,12 @@ export const payoutGamChargeProjector: LedgerProjector = {
     // 10/12 (Nic, review; Nic L7): a charge on no property (the bank cost of a
     // pull, a failed pull's cost) is a company-level cost — a Company column of
     // its own, or split across the properties by units, as the owner chose for
-    // money out, loans and payroll (it waits until they choose). What is owed
-    // to GAM stays at company level.
+    // money out, loans and payroll (10/13: the Company column until they
+    // choose; a later split only for charges made after it). What is owed to
+    // GAM stays at company level.
     const cost = c.property_id
       ? dr(role, amt, { ...at, memo })
-      : drSpread(role, amt, await companyCostSpread(client, c.landlord_id, c.day), { memo })
+      : drSpread(role, amt, await companyCostSpread(client, c.landlord_id, c.day, { at: c.created_at }), { memo })
     return [{ owner: { landlordId: c.landlord_id }, intendedDate: c.day, memo, lines: [
       ...cost, ...cr('due_to_gam', amt, { ...at, memo: 'Owed to GAM' }),
     ] }]
@@ -141,27 +195,44 @@ export const payoutGamChargeProjector: LedgerProjector = {
 export const payoutGamDebitProjector: LedgerProjector = {
   sourceType: 'gam_debit',
   // 10/13 (Nic): 2 — a pull the landlord's bank disputed takes itself back
-  // (its own 'cancellation' posting, on the dispute's day).
-  ruleVersion: 2,
+  // (its own 'cancellation' posting, on the dispute's day). 3 — a card reader
+  // piece it collected is a Supplies expense, not Due to GAM; a dispute GAM
+  // won takes the cancellation back.
+  ruleVersion: 3,
 
   async project(client: PoolClient, debitId: string): Promise<DesiredPosting[]> {
-    const d = (await client.query<{ landlord_id: string; total: string; status: string; day: string | null; disputed_day: string | null }>(
-      `SELECT d.landlord_id, d.total_amount::text AS total, d.status,
+    const d = (await client.query<{
+      landlord_id: string; total: string; status: string; day: string | null; disputed_day: string | null; settled_at: string | null
+      won: boolean
+    }>(
+      `SELECT d.landlord_id, d.total_amount::text AS total, d.status, d.settled_at::text AS settled_at,
+              d.dispute_won_at IS NOT NULL AS won,
               CASE WHEN d.settled_at IS NULL THEN NULL ELSE ${localDaySql('d.settled_at', companyTzSql('d.landlord_id'))} END AS day,
               CASE WHEN d.disputed_at IS NULL THEN NULL ELSE ${localDaySql('d.disputed_at', companyTzSql('d.landlord_id'))} END AS disputed_day
          FROM landlord_gam_debits d WHERE d.id::text = $1`, [debitId])).rows[0]
     if (!d || d.status !== 'succeeded' || !d.day) return []
-    const cols = (await client.query<{ property_id: string | null; s: string }>(
-      `SELECT c.property_id, SUM(col.amount)::text AS s
+    const cols = (await client.query<{ property_id: string | null; piece: boolean; s: string }>(
+      `SELECT c.property_id, c.kind = $2 AS piece, SUM(col.amount)::text AS s
          FROM landlord_gam_charge_collections col JOIN landlord_gam_charges c ON c.id = col.charge_id
         WHERE col.landlord_gam_debit_id::text = $1
-        GROUP BY c.property_id ORDER BY c.property_id NULLS FIRST`, [debitId])).rows
+        GROUP BY c.property_id, c.kind = $2 ORDER BY c.property_id NULLS FIRST, piece`, [debitId, READER_PIECE_KIND])).rows
     const lines: DesiredLine[] = []
     const back: DesiredLine[] = []
     let recorded = 0
     for (const r of cols) {
       const v = toCents(r.s)
       recorded += v
+      if (r.piece) {
+        // 10/13 (Nic): a card reader piece is a Supplies expense in the month
+        // GAM collected it — this pull's day — and comes back off if the bank
+        // takes the pull back. Each cost sits beside the line that paid it.
+        const piece = { landlordId: d.landlord_id, propertyId: r.property_id, cents: v, day: d.day, recorded: { at: d.settled_at } }
+        lines.push(...await readerPieceLines(client, { ...piece, side: 'dr' }))
+        lines.push(...cr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees, until the bank line matches it' }))
+        back.push(...dr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees your bank took back, until the bank line of the return matches it' }))
+        back.push(...await readerPieceLines(client, { ...piece, side: 'cr' }))
+        continue
+      }
       lines.push(...dr('due_to_gam', v, { propertyId: r.property_id, memo: 'GAM charges paid by a bank pull' }))
       lines.push(...cr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees, until the bank line matches it' }))
       back.push(...dr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees your bank took back, until the bank line of the return matches it' }))
@@ -177,8 +248,9 @@ export const payoutGamDebitProjector: LedgerProjector = {
     // 10/13 (Nic): disputed by the landlord's bank — the whole pull came back
     // (a dispute for part of a pull is never placed by itself: it is left
     // undisputed for a person, handleGamDebitDispute), so its own posting
-    // takes back exactly what the pull posted, on the dispute's day.
-    if (d.disputed_day) {
+    // takes back exactly what the pull posted, on the dispute's day — until
+    // GAM wins the dispute: the money stands, and the cancellation is taken back.
+    if (d.disputed_day && !d.won) {
       out.push({ owner, postingKind: 'cancellation', intendedDate: d.disputed_day,
         memo: 'GAM fee pull your bank disputed: the money comes back and the charges are owed again', lines: back })
     }
@@ -188,16 +260,31 @@ export const payoutGamDebitProjector: LedgerProjector = {
   async listSources(client: PoolClient, owner: LedgerOwner, opts: { since?: string | null }): Promise<LedgerSourceRef[]> {
     if (!owner.landlordId) return []
     // 10/13 (Nic): a pull disputed on or after `since` posts its dispute then,
-    // however long before it was paid; it is listed on the day it paid (its
-    // earliest posting).
+    // however long before it was paid — and one whose dispute GAM won since
+    // takes that back; it is listed on the day it paid (its earliest posting).
     const r = await client.query<{ id: string; day: string | null }>(
       `SELECT d.id::text AS id,
               CASE WHEN d.settled_at IS NULL THEN NULL ELSE ${localDaySql('d.settled_at', companyTzSql('d.landlord_id'))} END AS day
          FROM landlord_gam_debits d
         WHERE d.landlord_id = $1
           AND ($2::date IS NULL OR COALESCE(d.settled_at, d.created_at) >= $2::date - INTERVAL '1 day'
-                                OR d.disputed_at >= $2::date - INTERVAL '1 day')`,
+                                OR d.disputed_at >= $2::date - INTERVAL '1 day'
+                                OR d.dispute_won_at >= $2::date - INTERVAL '1 day')`,
       [owner.landlordId, opts.since ?? null])
     return r.rows
   },
+}
+
+/**
+ * 10/13 (Nic): "Readers on the LANDLORD's books: each $87.50 → SUPPLIES, in
+ * the month GAM COLLECTED it." A card reader order (pos_reader_orders) is no
+ * entry on the landlord's books — not equipment they own (design H4), not
+ * owed until collected — so it posts nothing; each piece posts when a batch or
+ * a pull collects it. Registered so its marks drain.
+ */
+export const readerOrderProjector: LedgerProjector = {
+  sourceType: 'reader_order',
+  ruleVersion: 1,
+  async project(): Promise<DesiredPosting[]> { return [] },
+  async listSources(): Promise<LedgerSourceRef[]> { return [] },
 }

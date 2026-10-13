@@ -28,7 +28,12 @@
  *                      start while nothing has posted yet. Every change is
  *                      kept (books_register_stock_changes, 20261014170100):
  *                      the ledger reads the choice in force on a sale's day
- *   company costs      books_company_costs_method (L7)
+ *   company costs      books_company_costs_method (L7) — 10/13 (Nic): "post to
+ *                      the COMPANY column by default" while not chosen, and "a
+ *                      later 'split by units' splits only NEW costs": a pick
+ *                      made after the books posted applies to costs recorded
+ *                      from that moment (books_company_costs_from) on; what
+ *                      is already in the Company column stays there
  *   write-offs         books_write_off_by (L15)
  *   repair bills       books_repair_bills (L6, money out — services/repairBills):
  *                      a repair closed with a cost makes an unpaid bill by
@@ -36,10 +41,13 @@
  *                      which reads as the button). Changeable any time: it
  *                      decides what is made from now on, never what posted.
  * Home sales, work trade and company costs start NOT CHOSEN (NULL): a record
- * whose posting depends on one waits until the owner chooses. Once the
- * company's books have posted, a chosen one no longer changes — a rebuild reads
- * today's choice, so changing it would rewrite what already posted. Choosing
- * one that was never chosen is always allowed (nothing posted under it).
+ * whose posting depends on home sales or work trade waits until the owner
+ * chooses; company-level costs go to the Company column meanwhile (10/13).
+ * Once the company's books have posted, a chosen one no longer changes — a
+ * rebuild reads today's choice, so changing it would rewrite what already
+ * posted. Choosing one that was never chosen is always allowed (nothing posted
+ * under it — company costs posted under the default keep it: the pick applies
+ * from the moment it is made).
  * (Register stock has a starting choice and a from-date instead — above.)
  *
  * THE OPENING BALANCES (books_opening_items; design J1, §15 step 5)
@@ -143,12 +151,18 @@ export interface BooksChoices {
   registerStockMethod: LedgerRegisterStockMethod
   registerStockFrom: string | null
   companyCostsMethod: BooksCompanyCostMethod | null
+  /**
+   * 10/13 (Nic): the moment the company-costs choice was made, when the books
+   * had already posted — it applies to costs recorded from then on (null: to
+   * every cost). While not chosen, costs go to the Company column.
+   */
+  companyCostsFrom: string | null
   writeOffBy: LedgerWriteOffPermission
 }
 
 const CHOICE_COLUMNS = `l.books_start_date::text AS books_start_date, l.books_history_start, l.books_home_sale_method,
   l.books_work_trade_method, l.books_register_stock, l.books_register_stock_from::text AS books_register_stock_from,
-  l.books_company_costs_method, l.books_write_off_by`
+  l.books_company_costs_method, l.books_company_costs_from::text AS books_company_costs_from, l.books_write_off_by`
 
 function choicesOf(row: any): BooksChoices {
   const start: string | null = row.books_start_date ?? null
@@ -160,6 +174,7 @@ function choicesOf(row: any): BooksChoices {
     registerStockMethod: row.books_register_stock ?? DEFAULT_LEDGER_REGISTER_STOCK_METHOD,
     registerStockFrom: row.books_register_stock_from ?? null,
     companyCostsMethod: row.books_company_costs_method ?? null,
+    companyCostsFrom: row.books_company_costs_from ?? null,
     writeOffBy: row.books_write_off_by ?? 'owner',
   }
 }
@@ -189,6 +204,8 @@ export interface BooksSettingsView extends BooksChoices {
   /** 10/12 (Nic, L6): what a repair closed with a cost does (null: not chosen — the button). */
   repairBills: BooksRepairBillMode | null
   closedThrough: string | null
+  /** 10/13 (Nic): the company's calendar day a company-costs choice made after the books posted applies from (null: every cost). */
+  companyCostsFromDay: string | null
   /** The company's calendar day today. */
   today: string
   /** The books have posted: a chosen accounting method no longer changes. */
@@ -204,6 +221,7 @@ async function readSettings(c: PoolClient, viewer: BooksViewer): Promise<BooksSe
     `SELECT l.business_name, ${CHOICE_COLUMNS},
             l.books_close_by, l.books_reopen_by, l.books_open_month_fixes, l.books_repair_bills,
             (l.created_at AT TIME ZONE $2)::date::text AS joined_on,
+            (l.books_company_costs_from AT TIME ZONE $2)::date::text AS company_costs_from_day,
             EXISTS (SELECT 1 FROM ledger_postings p WHERE p.landlord_id = l.id) AS has_postings,
             (SELECT count(*)::int FROM books_opening_items o WHERE o.landlord_id = l.id AND o.voided_at IS NULL) AS opening_items
        FROM landlords l WHERE l.id = $1`, [viewer.landlordId, ctx.timezone])
@@ -225,6 +243,7 @@ async function readSettings(c: PoolClient, viewer: BooksViewer): Promise<BooksSe
     openMonthFixes: row.books_open_month_fixes,
     repairBills: row.books_repair_bills ?? null,
     closedThrough: ctx.closedThrough,
+    companyCostsFromDay: row.company_costs_from_day ?? null,
     today: ctx.today,
     hasPostings: !!row.has_postings,
     openingItems: Number(row.opening_items) || 0,
@@ -332,7 +351,13 @@ export async function updateBooksSettings(args: {
         // ledger_capture_books_start trigger) — the engine re-sorts them.
         // (Loaded when needed, as routes/bankFeed does: the bank feed module is large.)
         const { setBooksStartDate } = await import('./bankFeed')
-        await setBooksStartDate(viewer.landlordId, date, c)
+        // 10/13 review: the database refuses a start that would fall between a
+        // fixed asset and the loan that paid for it (books_start_asset_loan_guard)
+        // — said to the owner in its own words.
+        await setBooksStartDate(viewer.landlordId, date, c).catch((e: any) => {
+          if (e?.code === '23514') throw new AppError(409, String(e.message))
+          throw e
+        })
         ledgerTouched = true
       }
       if (patch.historyStart !== cur.books_history_start) set('books_history_start', patch.historyStart)
@@ -352,6 +377,13 @@ export async function updateBooksSettings(args: {
         throw new AppError(409, `Your books have already posted under ${m.what}, so it cannot change now.`)
       }
       set(m.column, v)
+      // 10/13 (Nic): "a later 'split by units' splits only NEW costs" — what
+      // already posted in the Company column (the default while not chosen)
+      // stays there. Picked before anything posted, it applies to every cost.
+      if (m.key === 'companyCostsMethod') {
+        params.push(hasPostings)
+        sets.push(`books_company_costs_from = CASE WHEN $${params.length}::boolean THEN now() END`)
+      }
       methodChosen = true
     }
     // Register stock (the register lane's books_register_stock): a change

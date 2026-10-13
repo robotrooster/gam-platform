@@ -211,7 +211,7 @@ describe('tax: given back to a customer comes off Collected, never "paid"', () =
 })
 
 describe('GAM\'s company-level charges follow the company\'s choice (Nic L7)', () => {
-  it('split by units: the bank cost of a pull is spread across the properties; with no choice yet it waits on the owner', async () => {
+  it('split by units: the bank cost of a pull is spread across the properties; with no choice yet it goes to the Company column (10/13, Nic)', async () => {
     const co = await tenantCo()
     await addLease(co)   // a unit on the second property
     await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units' WHERE id = $1`, [co.landlordId])
@@ -230,13 +230,24 @@ describe('GAM\'s company-level charges follow the company\'s choice (Nic L7)', (
       .toEqual([[co.propertyId, 3], [co.propertyId2, 3]].sort())
     expect(ls.filter(l => l.role === 'due_to_gam')).toEqual([{ role: 'due_to_gam', property_id: null, dr: 0, cr: 6 }])
 
+    // 10/13 (Nic): "Company-level costs before the owner picks: post to the
+    // COMPANY column by default" — nothing waits on the choice.
     const none = await tenantCo()
     await db.query(`UPDATE landlords SET books_company_costs_method = NULL WHERE id = $1`, [none.landlordId])
-    const waits = await charge(none.landlordId)
-    await drain()
+    const unpicked = await charge(none.landlordId)
+    expect(await drain()).toMatchObject({ failed: 0 })
     const err = (await db.query<{ reason_code: string }>(
-      `SELECT reason_code FROM ledger_source_errors WHERE source_type = 'gam_charge' AND source_id = $1`, [waits])).rows[0]
-    expect(err?.reason_code).toBe('owner_not_ready')
+      `SELECT reason_code FROM ledger_source_errors WHERE source_type = 'gam_charge' AND source_id = $1`, [unpicked])).rows[0]
+    expect(err).toBeUndefined()
+    const cl = (await db.query<{ role: string; property_id: string | null; dr: number; cr: number }>(
+      `SELECT l.account_role AS role, l.property_id, l.debit::float AS dr, l.credit::float AS cr
+         FROM ledger_posting_lines l JOIN ledger_postings p ON p.id = l.posting_id
+        WHERE p.source_type = 'gam_charge' AND p.source_id = $1 AND p.role = 'post' AND p.superseded_at IS NULL
+        ORDER BY l.account_role`, [unpicked])).rows
+    expect(cl).toEqual([
+      { role: 'bank_fees', property_id: null, dr: 6, cr: 0 },
+      { role: 'due_to_gam', property_id: null, dr: 0, cr: 6 },
+    ])
   })
 })
 

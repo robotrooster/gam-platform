@@ -127,7 +127,13 @@ bankFeedRouter.put('/books-start-date', requireLandlord, async (req: any, res, n
     }).parse(req.body)
     const { setBooksStartDate } = await import('../services/bankFeed')
     res.json({ success: true, data: await setBooksStartDate(scope(req), b.date) })
-  } catch (e) { next(e) }
+  } catch (e: any) {
+    // 10/13: a books start that would fall between a fixed asset and the loan
+    // that paid for it is refused by the database (20261015190100) in words —
+    // a 409 with those words, as Books Settings shows it, never a 500.
+    if (e?.code === '23514' || e?.code === 'P0001') return next(new AppError(409, String(e.message || 'That books start is not allowed.')))
+    next(e)
+  }
 })
 
 bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) => {

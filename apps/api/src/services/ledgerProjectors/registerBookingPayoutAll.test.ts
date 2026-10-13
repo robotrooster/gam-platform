@@ -26,10 +26,17 @@ afterEach(() => {
 })
 
 describe('phase P5 end to end', () => {
-  it('registers one projector per source type, and never the reader order (it waits on Nic, design Q11)', () => {
+  // 10/13 (Nic): design Q11 answered — "each $87.50 → SUPPLIES, in the month
+  // GAM COLLECTED it": the reader order is registered so its marks drain, and posts nothing.
+  it('registers one projector per source type; the reader order posts nothing (its pieces post when collected)', async () => {
     const types = P5_LEDGER_PROJECTORS.map(p => p.sourceType)
     expect(new Set(types).size).toBe(types.length)
-    expect(types).not.toContain('reader_order')
+    const order = P5_LEDGER_PROJECTORS.find(p => p.sourceType === 'reader_order')!
+    expect(order).toBeTruthy()
+    const c = await db.connect()
+    try {
+      expect(await order.project(c, '00000000-0000-0000-0000-000000000000')).toEqual([])
+    } finally { c.release() }
   })
 
   it('a rebuild from scratch posts the same lines, and the nightly check (with the P5 tie-outs) finds no drift', async () => {

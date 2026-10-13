@@ -15,8 +15,18 @@
  *                        on its property (its unit's), else company level —
  *                        an expense on no property is split across the
  *                        properties by units or kept in a Company column as
- *                        the owner chose (Nic L7, companyCosts); only an
- *                        expense-type account is split. A bill payroll left
+ *                        the owner chose (Nic L7, companyCosts; 10/13: the
+ *                        Company column until they choose, a later split only
+ *                        for expenses entered after it); only an
+ *                        expense-type account is split. 10/13 (Nic): an
+ *                        expense a fixed asset typed in by hand links ("already
+ *                        an expense": "LINK that expense (cost moves to the
+ *                        asset)") posts its cost to the asset's account
+ *                        (Rental property or Equipment, by the asset's class)
+ *                        instead of its category's, as a capital improvement's
+ *                        does — counted once, on the asset; one filed under a
+ *                        category that already charges to an asset account
+ *                        stays there. A bill payroll left
  *                        (payroll_run_expenses, phase P7) moves that payroll
  *                        liability to Accounts payable instead (Dr the
  *                        liability). The manager's cut GAM held too little to
@@ -37,7 +47,8 @@
  *                          other (how was not recorded)       Suspense: to classify (1099)
  *                        The Accounts payable line carries cash_effect 'out',
  *                        the expense's report category and expense_kind = the
- *                        TYPE of its category's account that day
+ *                        TYPE of its category's account that day ('asset' for
+ *                        an expense a fixed asset links, 10/13)
  *                        (MONEY_OUT_LINE_KINDS: a cash-basis report counts
  *                        'expense' only — never an owner draw or a payroll
  *                        liability paid down).
@@ -69,12 +80,15 @@
  * Facts only (ledgerProjectorPurity): stored amounts, days and links; the
  * category's account on a day comes from the company's dated map
  * (books_category_account_type_on); the cost-split choice is fixed once the
- * books have posted (companyCosts).
+ * books have posted, and applies from a stored moment (companyCosts); the
+ * fixed asset that links an expense is a stored link (books_fixed_assets —
+ * its capture marks the expense and its payments, migration 20261015190100).
  */
 import type { PoolClient } from 'pg'
 import {
-  booksCategoryOnProfitAndLoss, booksCategoryReportCategory, BOOKS_CATEGORY_FALLBACK_ROLE,
+  booksCategoryOnProfitAndLoss, booksCategoryReportCategory, BOOKS_CATEGORY_FALLBACK_ROLE, BOOKS_FIXED_ASSET_CLASS_ROLE,
   type LedgerAccountRole, type LedgerReportCategory, type LandlordExpensePaymentMethod, type MoneyOutLineKind,
+  type BooksFixedAssetClass,
 } from '@gam/shared'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
@@ -102,6 +116,10 @@ interface ExpenseFacts {
   account_type: string | null
   allocation_split_id: string | null
   liability_role: string | null
+  /** 10/13 (Nic): when the expense was entered (a later company-costs pick splits only newer costs). */
+  created_at: string
+  /** 10/13 (Nic): the class of the live fixed asset that links this expense, if any. */
+  asset_class: BooksFixedAssetClass | null
 }
 
 const EXPENSE_FACTS_SQL = `
@@ -110,15 +128,30 @@ const EXPENSE_FACTS_SQL = `
          e.category_id, c.system_key, c.default_role,
          CASE WHEN e.category_id IS NULL THEN NULL ELSE books_category_account_type_on(e.category_id, e.expense_date) END AS account_type,
          e.allocation_split_id,
-         (SELECT x.liability_role FROM payroll_run_expenses x WHERE x.expense_id = e.id LIMIT 1) AS liability_role
+         (SELECT x.liability_role FROM payroll_run_expenses x WHERE x.expense_id = e.id LIMIT 1) AS liability_role,
+         e.created_at::text AS created_at,
+         (SELECT f.asset_class FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL LIMIT 1) AS asset_class
     FROM landlord_expenses e
     LEFT JOIN units u ON u.id = e.unit_id
     LEFT JOIN books_categories c ON c.id = e.category_id`
 
-/** What a category's lines say: where it posts, the report's category, and what kind of money it is. */
-function categoryTags(f: Pick<ExpenseFacts, 'category_id' | 'system_key' | 'default_role' | 'account_type'>): {
+/**
+ * What a category's lines say: where it posts, the report's category, and what
+ * kind of money it is. 10/13 (Nic): an expense a fixed asset links whose
+ * category is not an asset account already posts to the asset's account
+ * (by its class) — "cost moves to the asset" — and reads as an asset, the way
+ * a capital improvement's expense does.
+ */
+function categoryTags(f: Pick<ExpenseFacts, 'category_id' | 'system_key' | 'default_role' | 'account_type' | 'asset_class'>): {
   sel: Pick<DesiredLine, 'role' | 'sub'>; reportCategory: LedgerReportCategory; kind: MoneyOutLineKind | null
 } {
+  if (f.asset_class && (f.account_type ?? 'expense') !== 'asset') {
+    return {
+      sel: { role: BOOKS_FIXED_ASSET_CLASS_ROLE[f.asset_class] as LedgerAccountRole },
+      reportCategory: booksCategoryReportCategory('expense', f.system_key, false),
+      kind: 'asset',
+    }
+  }
   const role = (f.default_role ?? BOOKS_CATEGORY_FALLBACK_ROLE.expense) as LedgerAccountRole
   const onPl = booksCategoryOnProfitAndLoss('expense', f.account_type ?? 'expense')
   return {
@@ -151,8 +184,10 @@ export async function projectExpense(client: PoolClient, expenseId: string): Pro
     if (f.property_id || t.kind !== 'expense') {
       lines.push({ ...t.sel, ...extra, propertyId: f.property_id, debitCents: cents })
     } else {
-      // A cost on no property: split by units, or a Company column (Nic L7).
-      const spread = await companyCostSpread(client, f.landlord_id, f.day)
+      // A cost on no property: split by units, or a Company column (Nic L7;
+      // 10/13: the Company column until the owner picks, a split only for
+      // expenses entered after it).
+      const spread = await companyCostSpread(client, f.landlord_id, f.day, { at: f.created_at })
       for (const l of drSpread(t.sel.role!, cents, spread, extra)) lines.push({ ...l, sub: t.sel.sub })
     }
     lines.push(...cr('accounts_payable', cents, { propertyId: f.property_id, vendorId: f.vendor_id, memo }))

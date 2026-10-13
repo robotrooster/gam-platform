@@ -17,15 +17,16 @@
  *   instant_margin    payoutDisbursement  G3 (GAM's instant-payout margin)
  *   gam_charge        payoutGamCharges    H1, H2, H3 (+ Nic G1 failed-pull cost, G5 uncovered fee)
  *   gam_debit         payoutGamCharges    H5
+ *   reader_order      payoutGamCharges    nothing on the landlord's books (10/13, Nic: each piece is
+ *                                         a Supplies expense when GAM collects it — design Q11)
  *   property_transfer propertyHandover    G5 (a sale that moved leases or deposits waits for the amounts
  *                                         handed over to be recorded; G6 / Nic L17 is payoutAllocation's)
  *
- * Not in the set: 'reader_order' (design H4) waits on Nic's answer to Q11 —
- * is the card reader equipment the landlord owns, or an expense per piece —
- * and a reader piece GAM charge waits with it (payoutGamCharges). The reason
- * is written beside the registry (services/ledgerProjectors
- * LEDGER_SOURCE_TYPES_NOT_POSTED_YET; ledgerCoverage.test.ts holds every
- * source type to a projector or a written reason).
+ * 10/13 (Nic) answered design Q11 for the landlord's books: "Readers on the
+ * LANDLORD's books: each $87.50 → SUPPLIES, in the month GAM COLLECTED it."
+ * The reader is never equipment the landlord owns (no 1530 / 2085, design
+ * H4), so its order posts nothing; each piece is expensed by the batch or
+ * pull that collected it (payoutTransfer, payoutGamCharges).
  */
 import type { LedgerProjector } from '../ledgerEngine'
 import type { LedgerCheck } from '../ledgerCheck'
@@ -37,7 +38,7 @@ import { payoutAllocationProjector } from './payoutAllocation'
 import { payoutHeldItemProjector } from './payoutHeldItem'
 import { payoutTransferProjector } from './payoutTransfer'
 import { payoutDisbursementProjector, payoutConnectPayoutProjector, payoutInstantMarginProjector } from './payoutDisbursement'
-import { payoutGamChargeProjector, payoutGamDebitProjector } from './payoutGamCharges'
+import { payoutGamChargeProjector, payoutGamDebitProjector, readerOrderProjector } from './payoutGamCharges'
 import { propertyTransferProjector } from './propertyHandover'
 import { stripeInTransitCheck, dueToGamCheck } from './payoutChecks'
 
@@ -54,6 +55,7 @@ export const P5_LEDGER_PROJECTORS: readonly LedgerProjector[] = [
   payoutInstantMarginProjector,
   payoutGamChargeProjector,
   payoutGamDebitProjector,
+  readerOrderProjector,
   propertyTransferProjector,
 ]
 

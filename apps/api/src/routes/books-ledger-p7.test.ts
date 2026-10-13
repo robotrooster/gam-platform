@@ -165,25 +165,39 @@ describe('a payroll run posts on its pay date (J3)', () => {
     expect(await roleBalance(co.landlordId, 'accounts_payable')).toBeCloseTo(-(2530.5 + 200 + 40 + 459 + 18 + 30), 2)
   })
 
-  it('waits on the owner until company-level costs have a home (L7), then splits wages by units across the properties', async () => {
+  // 10/13 (Nic): "Company-level costs before the owner picks: post to the
+  // COMPANY column by default"; "a later 'split by units' splits only NEW costs".
+  it('goes to the Company column until the owner picks (L7); a later split by units splits only runs approved after it', async () => {
     const co = await ledgerCompany()
     const a = await employee(co, { first: 'Ann', rate: 26000 })     // 1,000
     const runId = await approvedRun(co, { employeeIds: [a] })
-    await settle()
-    expect(await waitingReason('payroll_run', runId)).toBe('owner_not_ready')
-    expect(await activeLines('payroll_run', runId)).toEqual([])
+    expect(await settle()).toEqual({ failed: 0 })
+    expect(await waitingReason('payroll_run', runId)).toBeNull()
+    const companyOnly = (ls: Line[]) => ls.filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr])
+    expect(companyOnly(await activeLines('payroll_run', runId))).toEqual([[null, 1000]])
     // Three units on the first property, one on the second (the fixture's unit plus three).
     await inTx(async c => {
       for (const [p, n] of [[co.propertyId, 2], [co.propertyId2, 1]] as const) {
         for (let i = 0; i < n; i++) await seedUnit(c, { propertyId: p, landlordId: co.landlordId })
       }
-      // Every unit was there on the pay date.
+      // Every unit was there on the pay dates.
       await c.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
     })
-    await costsMethod(co, 'split_by_units')
+    // The owner picks "split by units" after the books posted (services/booksSettings stamps the moment).
+    await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units', books_company_costs_from = now() WHERE id = $1`,
+      [co.landlordId])
+    // What is already in the Company column stays there — re-posted, or rebuilt.
     await db.query(`INSERT INTO ledger_outbox (source_type, source_id, owner_id) VALUES ('payroll_run', $1, $2)`, [runId, co.landlordId])
     expect(await settle()).toEqual({ failed: 0 })
-    const ls = await activeLines('payroll_run', runId)
+    expect(companyOnly(await activeLines('payroll_run', runId))).toEqual([[null, 1000]])
+    // A run approved after the pick splits.
+    const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-15', periodEnd: '2026-03-28', payDate: '2026-04-03',
+      payFrequency: 'biweekly', employeeIds: [a] })
+    expect(calc.status, JSON.stringify(calc.body)).toBe(201)
+    expect((await post(co, `/payroll/runs/${calc.body.data.id}/approve`)).status).toBe(200)
+    const later = calc.body.data.id as string
+    expect(await settle()).toEqual({ failed: 0 })
+    const ls = await activeLines('payroll_run', later)
     const wages = ls.filter(l => l.role === 'payroll_expense')
     expect(wages.map(l => [l.property, l.dr]).sort()).toEqual([[co.propertyId, 750], [co.propertyId2, 250]].sort())
     // What is owed stays company level; the clearing lines balance each property.

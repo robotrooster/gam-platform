@@ -82,7 +82,9 @@ export const TENANT_CHECK_RULES = {
   receivablesUnkeyed: { types: ['bank_match'] },
   undepositedFunds: { types: ['remittance', 'pos_sale', 'pos_refund', 'refund_part', 'deposit_slip', 'pos_eod', 'bank_match',
     // 10/12 (Nic, ledger P6): a slip's other money filed as other income, and expenses paid in cash from the drawer.
-    'other_income', 'expense_payment'] },
+    'other_income', 'expense_payment',
+    // 10/13 (Nic): a fixed asset typed in by hand, bought with cash on hand.
+    'fixed_asset'] },
   depositsInTransit: { types: ['remittance', 'bank_match'] },
   paidAhead: {
     types: ['payment', 'remittance', 'credit_use', 'prepaid_credit', 'refund_part'],
@@ -182,7 +184,10 @@ export const undepositedFundsCheck: LedgerCheck = {
     // (tenantReceipts B8). 10/12 (Nic, ledger P6): a slip's other money filed
     // as other income goes into the drawer first (design I4: Dr 1040), so it
     // is added back here; and an expense paid in cash from the office drawer
-    // (expense_payment, method 'cash') takes it out.
+    // (expense_payment, method 'cash') takes it out. 10/13 (Nic): so does a
+    // fixed asset typed in by hand that was bought with cash on hand
+    // (books_fixed_assets.funded_by 'cash', ledgerProjectors/loansAssets),
+    // once it is on the books (bought on or after the books start).
     const r = await client.query<{ n: string }>(
       `WITH live_slip AS (
          SELECT s.id, s.other_amount FROM bank_deposit_slips s JOIN bank_transactions bt ON bt.id = s.bank_transaction_id
@@ -212,7 +217,10 @@ export const undepositedFundsCheck: LedgerCheck = {
                     WHERE o.landlord_id = $1 AND o.status = 'active' AND o.voided_at IS NULL
                       AND sb.status = 'matched' AND sb.auto_settle_undo->>'kind' = 'deposit_slip'), 0)
        - COALESCE((SELECT ${C('sum(xp.amount)')} FROM landlord_expense_payments xp
-                    WHERE xp.landlord_id = $1 AND xp.method = 'cash' AND xp.voided_at IS NULL), 0))::text AS n`, [id])
+                    WHERE xp.landlord_id = $1 AND xp.method = 'cash' AND xp.voided_at IS NULL), 0)
+       - COALESCE((SELECT ${C('sum(fa.cost)')} FROM books_fixed_assets fa JOIN landlords fl ON fl.id = fa.landlord_id
+                    WHERE fa.landlord_id = $1 AND fa.funded_by = 'cash' AND fa.voided_at IS NULL AND fa.source_expense_id IS NULL
+                      AND fl.books_start_date IS NOT NULL AND fa.acquired_on >= fl.books_start_date), 0))::text AS n`, [id])
     const expected = new Map([['', cents(r.rows[0]?.n)]])
     return compare('undeposited_funds', await severityFor(client, id, TENANT_CHECK_RULES.undepositedFunds), ledger, expected, [], 1)
   },
@@ -387,7 +395,9 @@ export const outstandingChecksCheck: LedgerCheck = {
     // the return clears it. The bank feed cannot match a return line to its
     // pull yet, so that debit stays, with no time limit, and this check cannot
     // tell a return still on its way from one filed some other way (as other
-    // income, say: the money counted twice).
+    // income, say: the money counted twice). 10/13 (Nic): a dispute GAM won
+    // puts the money back — the pull's own posting takes its cancellation
+    // back — so a won pull is a pull again.
     const ledger = await ledgerBy(client, id, ['outstanding_checks'], [])
     const r = await client.query<{ n: string }>(
       `SELECT (
@@ -402,7 +412,7 @@ export const outstandingChecksCheck: LedgerCheck = {
        -- 10/13 (Nic): a pull the landlord's bank disputed — the money coming back, until the bank line of the return clears it.
        - COALESCE((SELECT ${C('sum(d.total_amount)')} FROM landlord_gam_debits d
                     WHERE d.landlord_id = $1 AND d.status = 'succeeded' AND d.settled_at IS NOT NULL
-                      AND d.disputed_at IS NOT NULL), 0)
+                      AND d.disputed_at IS NOT NULL AND d.dispute_won_at IS NULL), 0)
        - COALESCE((SELECT ${C('sum(-bt.amount)')} FROM bank_transactions bt
                     WHERE bt.landlord_id = $1 AND bt.status = 'matched'
                       AND bt.matched_kind IN ('gam_debit', 'pos_refund', 'refund_part')), 0)

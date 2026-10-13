@@ -105,7 +105,8 @@ describe('the production set', () => {
     const types = all.map(p => p.sourceType)
     expect(new Set(types).size).toBe(types.length)
     expect(types).toContain('bank_match')
-    expect(types).not.toContain('reader_order')
+    // 10/13 (Nic): design Q11 answered — the reader order drains and posts nothing.
+    expect(types).toContain('reader_order')
   })
 
   it('a merged source type posts every part and lists the union of their sources (earliest day wins)', async () => {

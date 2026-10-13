@@ -169,16 +169,29 @@ describe('a loan', () => {
     expect(await balance(co.landlordId, 'mortgage_payable')).toBe(-150000)
   })
 
-  it('a company loan\'s interest goes where the owner puts company-level costs (waits until they choose)', async () => {
+  // 10/13 (Nic): "Company-level costs before the owner picks: post to the
+  // COMPANY column by default"; "a later 'split by units' splits only NEW costs".
+  it('a company loan\'s interest goes to the Company column until the owner picks; a later split takes only payments entered after it', async () => {
     const co = await ledgerCompany()
     const id = await loan(co, { property_id: null })
     const p = await payment(co, id, { paidOn: '2026-04-01', principal: 400, interest: 1000, escrow: 100 })
-    await drainLedgerOutbox()
-    expect(await waiting('loan_payment', p)).toMatchObject({ reason_code: 'owner_not_ready' })
-    await db.query(`UPDATE landlords SET books_company_costs_method = 'company_bucket' WHERE id = $1`, [co.landlordId])
-    await drainLedgerOutbox({ ignoreBackoff: true })
-    expect((await active('loan_payment', p)).filter(l => l.role === 'mortgage_interest').map(l => [l.dr, l.property]))
-      .toEqual([[1000, null]])
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect(await waiting('loan_payment', p)).toBeNull()
+    const interest = async (pid: string) => (await active('loan_payment', pid)).filter(l => l.role === 'mortgage_interest').map(l => [l.dr, l.property])
+    expect(await interest(p)).toEqual([[1000, null]])
+    await db.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
+    await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units', books_company_costs_from = now() WHERE id = $1`, [co.landlordId])
+    // A change to the payment re-posts it: still the Company column (entered before the pick).
+    await db.query(`UPDATE books_loan_payments SET paid_on = '2026-04-02' WHERE id = $1`, [p])
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect(await interest(p)).toEqual([[1000, null]])
+    const later = await payment(co, id, { paidOn: '2026-05-01', principal: 400, interest: 1000, escrow: 100 })
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    const units = (await db.query<{ property_id: string; n: number }>(
+      `SELECT property_id, count(*)::int AS n FROM units WHERE landlord_id = $1 GROUP BY property_id`, [co.landlordId])).rows
+    expect(units.length).toBeGreaterThan(0)
+    expect((await interest(later)).every(([, prop]) => prop !== null)).toBe(true)
+    expect((await interest(later)).reduce((s, [dr]) => s + (dr as number), 0)).toBe(1000)
   })
 
   it('a change to the loan re-posts it and every payment (they carry its property)', async () => {

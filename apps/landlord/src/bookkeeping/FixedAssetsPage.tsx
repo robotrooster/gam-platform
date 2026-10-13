@@ -4,7 +4,10 @@
  * over the life the landlord chooses (straight line), one amount at the end of
  * each month. Land never wears out. An expense filed under a
  * capital-improvement category (one that charges to an asset account) can be
- * turned into an asset here.
+ * turned into an asset here. 10/13 (Nic): an asset typed in by hand ASKS where
+ * the money came from (cash on hand / the owner put money in / a loan /
+ * already an expense) and posts to that; "already an expense" links that
+ * expense and its cost moves to the asset.
  *
  * GAM Books' own page, shown in GAM Books and inside the landlord portal's
  * Bookkeeping menu — the same bytes in apps/books and apps/landlord
@@ -15,6 +18,7 @@ import React, { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   formatCurrency, BOOKS_FIXED_ASSET_CLASSES, BOOKS_FIXED_ASSET_CLASS_LABEL, BOOKS_DEPRECIATION_METHOD_LABEL,
+  BOOKS_FIXED_ASSET_FUNDED_BY, BOOKS_FIXED_ASSET_FUNDED_BY_LABEL, BOOKS_FIXED_ASSET_CLASS_ROLE, BOOKS_LOAN_FUNDED_TO_ASSET_ROLE,
 } from '@gam/shared'
 import { booksGet as get, booksPost as post, booksPatch as patch, toast } from './adapter'
 import { Modal } from './common'
@@ -23,8 +27,16 @@ import { VoidReasonModal } from './VoidReasonModal'
 const day=(d:string|null|undefined)=>d?new Date(`${d.slice(0,10)}T12:00:00`).toLocaleDateString():'—'
 const classLabel=(c:string)=>(BOOKS_FIXED_ASSET_CLASS_LABEL as Record<string,string>)[c]??'—'
 const years=(y:string|number|null|undefined)=>y==null||y===''?'—':`${+y} yr`
+const fundedLabel=(f:string|null|undefined)=>f?(BOOKS_FIXED_ASSET_FUNDED_BY_LABEL as Record<string,string>)[f]??'—':''
+// 10/13 (Nic): what each answer to "where did the money come from" puts on the books.
+const FUNDED_HELP:Record<string,string>={
+  cash:'Paid with cash you had on hand: its cost comes out of your office cash (Undeposited funds).',
+  owner:'You paid for it with your own money: its cost counts as money you put into the company.',
+  loan:'A loan on your Loans page paid the seller: that loan already put its cost on your books.',
+  expense:'You already entered it as an expense: its cost moves from that expense to this asset, so it counts once.',
+}
 
-const blankAsset={name:'',propertyId:'',assetClass:'building',cost:'',salvageValue:'0',acquiredOn:'',inServiceDate:'',lifeYears:'',priorDepreciation:'',notes:''}
+const blankAsset={name:'',propertyId:'',assetClass:'building',cost:'',salvageValue:'0',acquiredOn:'',inServiceDate:'',lifeYears:'',priorDepreciation:'',notes:'',fundedBy:'',fundedLoanId:'',expenseId:''}
 type AssetForm=typeof blankAsset
 
 export function FixedAssetsPage(){
@@ -98,8 +110,9 @@ export function FixedAssetsPage(){
                   <tr key={a.id} style={{opacity:a.voidedAt?.5:1}}>
                     <td>
                       <div style={{fontWeight:600,color:'var(--t0)'}}>{a.name}</div>
-                      <div style={{fontSize:'.66rem',color:'var(--t3)'}}>{classLabel(a.assetClass)}{a.sourceExpenseId?' · from an expense':''}{a.opensAtBooksStart?' · owned before your books start':''}{a.voidedAt?' · voided':''}</div>
+                      <div style={{fontSize:'.66rem',color:'var(--t3)'}}>{classLabel(a.assetClass)}{a.sourceExpenseId?' · from an expense':''}{!a.sourceExpenseId&&a.fundedBy?` · ${fundedLabel(a.fundedBy)}${a.fundedLoanName?`: ${a.fundedLoanName}`:''}`:''}{a.opensAtBooksStart?' · owned before your books start':''}{a.voidedAt?' · voided':''}</div>
                       {a.problem&&<div className="badge ba" style={{marginTop:4}}>{a.problem}</div>}
+                      {!a.voidedAt&&!a.opensAtBooksStart&&!a.sourceExpenseId&&!a.fundedBy&&a.booksStart&&<div className="badge ba" style={{marginTop:4}}>Say where the money came from (Edit) so its cost is on your books</div>}
                     </td>
                     <td style={{fontSize:'.72rem'}}>{a.propertyName??'Company'}</td>
                     <td style={{fontSize:'.72rem'}}>{day(a.inServiceDate)}</td>
@@ -133,17 +146,36 @@ function AssetFormModal({asset,booksStart,properties,onClose,onSaved}:{asset:any
   const[form,setForm]=useState<AssetForm>(()=>asset?{
     name:asset.name??'',propertyId:asset.propertyId??'',assetClass:asset.assetClass,cost:String(+asset.cost),salvageValue:String(+asset.salvageValue||0),
     acquiredOn:asset.acquiredOn??'',inServiceDate:asset.inServiceDate??'',lifeYears:asset.lifeYears!=null?String(+asset.lifeYears):'',
-    priorDepreciation:asset.priorDepreciation!=null?String(+asset.priorDepreciation):'',notes:asset.notes??''}:blankAsset)
+    priorDepreciation:asset.priorDepreciation!=null?String(+asset.priorDepreciation):'',notes:asset.notes??'',
+    fundedBy:asset.fundedBy??'',fundedLoanId:asset.fundedLoanId??'',expenseId:''}:blankAsset)
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
   const set=(k:keyof AssetForm)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
   const fromExpense=!!asset?.sourceExpenseId
   const land=form.assetClass==='land'
-  const owned=!!booksStart&&!!form.acquiredOn&&form.acquiredOn<booksStart&&!fromExpense
+  // "Already an expense": the expense's cost, day and property are the asset's.
+  const linking=!asset&&form.fundedBy==='expense'
+  const owned=!!booksStart&&!!form.acquiredOn&&form.acquiredOn<booksStart&&!fromExpense&&!linking
+  // 10/13 (Nic): "the form ASKS where the money came from" — for anything not owned before the books start.
+  const asks=!fromExpense&&!owned
+  const{data:loans=[]}=useQuery('assetLoans',()=>get<any[]>('/books/loans'),{enabled:asks&&form.fundedBy==='loan'})
+  const{data:expenses=[]}=useQuery('assetExpenses',()=>get<any[]>('/books/fixed-assets/linkable-expenses'),{enabled:linking})
+  // A loan that paid the seller of what this asset is (its posting put the cost on this asset's account).
+  const role=(BOOKS_FIXED_ASSET_CLASS_ROLE as Record<string,string>)[form.assetClass]
+  const loanFits=(l:any)=>!l.voidedAt&&!!l.fundedTo&&(BOOKS_LOAN_FUNDED_TO_ASSET_ROLE as Record<string,string|null>)[l.fundedTo]===role
+  const picked=linking?(expenses as any[]).find(e=>e.id===form.expenseId):null
+  const pickExpense=(e:React.ChangeEvent<HTMLSelectElement>)=>{
+    const x=(expenses as any[]).find(r=>r.id===e.target.value)
+    setForm(p=>({...p,expenseId:e.target.value,name:p.name||x?.description||'',inServiceDate:p.inServiceDate||x?.expenseDate||''}))
+  }
   const save=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
     const body:any={...form,lifeYears:land?'':form.lifeYears,priorDepreciation:owned&&!land?form.priorDepreciation:''}
-    if(fromExpense){delete body.cost;delete body.acquiredOn;delete body.propertyId}
+    if(fromExpense){delete body.cost;delete body.acquiredOn;delete body.propertyId;delete body.fundedBy;delete body.fundedLoanId}
+    if(linking){delete body.cost;delete body.acquiredOn;delete body.propertyId}
+    if(form.fundedBy!=='loan')delete body.fundedLoanId
+    if(!linking)delete body.expenseId
+    if(owned){delete body.fundedBy;delete body.fundedLoanId}
     try{
       if(asset)await patch(`/books/fixed-assets/${asset.id}`,body)
       else await post('/books/fixed-assets',body)
@@ -156,6 +188,28 @@ function AssetFormModal({asset,booksStart,properties,onClose,onSaved}:{asset:any
     <Modal title={asset?`Edit ${asset.name}`:'Add Asset'} onClose={onClose}>
       {err&&<div className="alert ae">{err}</div>}
       <form onSubmit={save}>
+        {asks&&<div className="frow"><label>Where the money came from</label>
+          {BOOKS_FIXED_ASSET_FUNDED_BY.filter(f=>f!=='expense'||!asset).map(f=>(
+            <label key={f} style={{display:'flex',gap:8,alignItems:'flex-start',textTransform:'none',letterSpacing:0,fontWeight:400,fontSize:'.8rem',color:'var(--t1)',marginBottom:6,cursor:'pointer'}}>
+              <input type="radio" name="fundedBy" value={f} checked={form.fundedBy===f} onChange={set('fundedBy')} style={{width:'auto',marginTop:3,accentColor:'var(--gold)'}}/>
+              <span><span style={{fontWeight:600,color:'var(--t0)'}}>{fundedLabel(f)}</span><span style={{display:'block',fontSize:'.72rem',color:'var(--t3)'}}>{FUNDED_HELP[f]}</span></span>
+            </label>
+          ))}
+        </div>}
+        {asks&&form.fundedBy==='loan'&&<div className="frow"><label>The loan</label>
+          <select value={form.fundedLoanId} onChange={set('fundedLoanId')} required>
+            <option value="">Choose the loan that paid the seller</option>
+            {(loans as any[]).filter(loanFits).map(l=><option key={l.id} value={l.id}>{l.name}{l.lenderName?` (${l.lenderName})`:''}</option>)}
+          </select>
+          {!(loans as any[]).some(loanFits)&&<p style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:0}}>No loan on your Loans page paid the seller of {role==='equipment'?'equipment or a vehicle':'a property'}. Add it there first (where the money went: straight to the seller). A loan whose money went into your bank paid nothing itself: file the bank payment as an expense and choose "Already an expense".</p>}
+        </div>}
+        {linking&&<div className="frow"><label>The expense it was</label>
+          <select value={form.expenseId} onChange={pickExpense} required>
+            <option value="">Choose the expense</option>
+            {(expenses as any[]).map(x=><option key={x.id} value={x.id}>{x.description||x.categoryName||'Expense'} · {formatCurrency(x.amount)} · {day(x.expenseDate)}</option>)}
+          </select>
+          {picked&&<p style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:0}}>{formatCurrency(picked.amount)} on {day(picked.expenseDate)}{picked.categoryName?`, filed under ${picked.categoryName}`:''} at {picked.propertyName??'the company'}. Its cost, day and property are the asset's.</p>}
+        </div>}
         <div className="frow2">
           <div><label>Name</label><input type="text" value={form.name} onChange={set('name')} maxLength={120} required placeholder="e.g. Clubhouse, Riding mower"/></div>
           <div><label>What it is</label>
@@ -164,18 +218,18 @@ function AssetFormModal({asset,booksStart,properties,onClose,onSaved}:{asset:any
             </select>
           </div>
         </div>
-        <div className="frow"><label>Property</label>
+        {!linking&&<div className="frow"><label>Property</label>
           <select value={form.propertyId} onChange={set('propertyId')} disabled={fromExpense}>
             <option value="">The company (no one property)</option>
             {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
-        </div>
+        </div>}
         <div className="frow2">
-          <div><label>What it cost</label><input type="number" min="0.01" step="0.01" value={form.cost} onChange={set('cost')} required disabled={fromExpense}/></div>
+          {!linking&&<div><label>What it cost</label><input type="number" min="0.01" step="0.01" value={form.cost} onChange={set('cost')} required disabled={fromExpense}/></div>}
           <div><label>Worth at the end of its life</label><input type="number" min="0" step="0.01" value={form.salvageValue} onChange={set('salvageValue')}/></div>
         </div>
         <div className="frow2">
-          <div><label>Day you bought it</label><input type="date" value={form.acquiredOn} onChange={set('acquiredOn')} required disabled={fromExpense}/></div>
+          {!linking&&<div><label>Day you bought it</label><input type="date" value={form.acquiredOn} onChange={set('acquiredOn')} required disabled={fromExpense}/></div>}
           <div><label>Day it went into service</label><input type="date" value={form.inServiceDate} onChange={set('inServiceDate')} placeholder="Same as bought"/></div>
         </div>
         {!land&&<div className="frow2">
@@ -186,7 +240,6 @@ function AssetFormModal({asset,booksStart,properties,onClose,onSaved}:{asset:any
           <p style={{fontSize:'.76rem',color:'var(--t2)',marginTop:0}}>You owned this before your books start ({day(booksStart)}), so it opens on your books at its cost less the depreciation already taken. Leave this blank to use the straight-line months before that day, or enter the figure from your earlier records.</p>
           <div className="frow" style={{marginBottom:0}}><label>Depreciation already taken (optional)</label><input type="number" min="0" step="0.01" value={form.priorDepreciation} onChange={set('priorDepreciation')}/></div>
         </div>}
-        {!owned&&!fromExpense&&<p style={{fontSize:'.72rem',color:'var(--t3)'}}>Bought on or after your books start: its cost is already on your books through how you paid for it (an expense under a capital-improvement category, a loan, or a journal entry). This adds the depreciation.</p>}
         <div className="frow"><label>Notes (optional)</label><textarea rows={2} value={form.notes} onChange={set('notes')}/></div>
         <div className="factions">
           <button type="button" className="btn bg-btn" onClick={onClose}>Cancel</button>

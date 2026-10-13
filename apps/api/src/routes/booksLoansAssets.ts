@@ -18,8 +18,11 @@
  *              PATCH /loans/:id
  *   ASSETS   fixed assets with straight-line depreciation, a life the landlord
  *            chooses; an expense filed under a capital-improvement category can
- *            become one.
- *              GET   /fixed-assets, /fixed-assets/capital-expenses
+ *            become one. 10/13 (Nic): one typed in by hand ASKS where its
+ *            money came from (cash on hand / owner put money in / loan /
+ *            already an expense) and posts to that; "already an expense"
+ *            LINKS the expense and its cost moves to the asset.
+ *              GET   /fixed-assets, /fixed-assets/capital-expenses, /fixed-assets/linkable-expenses
  *              POST  /fixed-assets, /fixed-assets/from-expense/:expenseId, /fixed-assets/:id/void
  *              PATCH /fixed-assets/:id
  *
@@ -38,6 +41,8 @@ import {
   BOOKS_CONTRACTOR_PAY_UNITS, BOOKS_TAX_ID_PATTERN, BOOKS_VENDOR_1099_TYPE,
   BOOKS_LOAN_FUNDED_TO, BOOKS_LOAN_PAYMENT_METHODS, BOOKS_FIXED_ASSET_CLASSES, BOOKS_DEPRECIATION_METHODS,
   BOOKS_FIXED_ASSET_MAX_LIFE_YEARS, fixedAssetLifeMonths, fixedAssetDepreciates, depreciationSchedule,
+  BOOKS_FIXED_ASSET_FUNDED_BY, BOOKS_FIXED_ASSET_CLASS_ROLE, BOOKS_LOAN_FUNDED_TO_ASSET_ROLE,
+  type BooksFixedAssetClass, type BooksFixedAssetFundedBy, type BooksLoanFundedTo,
 } from '@gam/shared'
 import { db } from '../db'
 import { requireBooksRead, requireBooksWrite } from '../middleware/auth'
@@ -47,7 +52,7 @@ import { currentLedgerXid, kickLedgerAfterCommit } from '../services/ledgerEngin
 import {
   listVendors, vendor1099List, VENDOR_COLUMNS, vendorOut, vendorYearTotals, vendorOwed,
   loanFigures, LOAN_COLUMNS, suggestLoanSplit, assertPrincipalFits,
-  ASSET_COLUMNS, assetFigures, companyToday, capitalExpense, capitalExpenses,
+  ASSET_COLUMNS, assetFigures, companyToday, capitalExpense, capitalExpenses, linkableExpense, linkableExpenses,
   type BooksOwner,
 } from '../services/booksVendorsLoans'
 
@@ -263,6 +268,7 @@ function loanOpeningRules(v: { startDate: string; fundedTo?: string | null; fund
 // ─── Fixed assets ────────────────────────────────────────────────────────────
 
 const ASSET_CLASS_REFUSAL = 'Choose what the asset is: a building, an improvement to a property, equipment, a vehicle or land.'
+const FUNDED_BY_REFUSAL = 'Say where the money for it came from: cash on hand, the owner put money in, a loan, or already an expense.'
 const lifeYears = z.preprocess(v => (v === '' || v == null ? null : Number(v)),
   z.number({ invalid_type_error: 'Enter the life in years.' })
     .gt(0, 'The life is more than 0 years.').max(BOOKS_FIXED_ASSET_MAX_LIFE_YEARS, `The life is ${BOOKS_FIXED_ASSET_MAX_LIFE_YEARS} years at most.`)
@@ -280,8 +286,18 @@ const assetFields = {
   method:            z.preprocess(v => (v == null || v === '' ? 'straight_line' : v), z.enum(BOOKS_DEPRECIATION_METHODS, { errorMap: () => ({ message: 'Depreciation is straight line.' }) })),
   priorDepreciation: z.preprocess(v => (v === '' ? null : v), money('the depreciation already taken').nullable().optional()),
   notes:             nullableText(2000, 'Notes'),
+  // 10/13 (Nic): "the form ASKS where the money came from".
+  fundedBy:          z.preprocess(blank, z.enum(BOOKS_FIXED_ASSET_FUNDED_BY, { errorMap: () => ({ message: FUNDED_BY_REFUSAL }) }).optional()),
+  fundedLoanId:      optUuid('the loan that paid for it'),
 }
-const assetCreateSchema = z.object(assetFields)
+const assetCreateSchema = z.object({
+  ...assetFields,
+  // "Already an expense": the expense it was; its cost, day and property are the asset's.
+  expenseId:         optUuid('the expense it was'),
+  // Given with an expense, these come from the expense.
+  cost:              z.preprocess(blank, assetFields.cost.optional()),
+  acquiredOn:        z.preprocess(blank, assetFields.acquiredOn.optional()),
+})
 const assetPatchSchema = z.object(Object.fromEntries(Object.entries(assetFields).map(([k, v]) => [k, (v as z.ZodTypeAny).optional()]))) as
   z.ZodType<Partial<z.infer<typeof assetCreateSchema>>>
 const fromExpenseSchema = z.object({
@@ -320,6 +336,63 @@ async function booksStartOf(q: Pick<PoolClient, 'query'>, owner: BooksOwner): Pr
   if (owner.col !== 'landlord_id') return null
   const r = await q.query<{ d: string | null }>(`SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [owner.id])
   return r.rows[0]?.d ?? null
+}
+
+/**
+ * 10/13 (Nic): "the form ASKS where the money came from (cash on hand / owner
+ * put money in / loan / already an expense) and posts to that" — for an asset
+ * bought on or after the books start (one bought before opens at the books
+ * start; with no start date yet, it is asked). A loan must be the company's,
+ * live, and one whose money went straight to the seller of what this asset is
+ * (its posting put the cost on this asset's account). Returns what to store.
+ *
+ * 10/13 review: and the loan and the asset sit on the same side of the books
+ * start. A loan made before it opens at what was still owed that day, against
+ * Opening balance equity — its money never put an asset bought on or after the
+ * start on the books, so that asset would depreciate a cost the books never
+ * had. A loan made on or after it posts the cost that day, while an asset
+ * bought before the start opens with its own cost — twice. The database holds
+ * the same rule when the loan's day or the books start moves
+ * (books_loans_asset_guard, books_start_asset_loan_guard).
+ */
+async function assetFunding(q: Pick<PoolClient, 'query'>, owner: BooksOwner, v: {
+  fundedBy?: BooksFixedAssetFundedBy | null; fundedLoanId?: string | null; assetClass: BooksFixedAssetClass; acquiredOn: string
+}, booksStart: string | null): Promise<{ fundedBy: BooksFixedAssetFundedBy | null; fundedLoanId: string | null }> {
+  if (v.fundedBy === 'expense') {
+    throw new AppError(400, 'An asset that was already an expense is added from that expense: choose "Already an expense" when you add it.')
+  }
+  if (v.fundedLoanId && v.fundedBy !== 'loan') throw new AppError(400, 'A loan is only for an asset a loan paid for.')
+  const asked = owner.col === 'landlord_id' && (!booksStart || v.acquiredOn >= booksStart)
+  if (!v.fundedBy) {
+    if (asked) throw new AppError(400, FUNDED_BY_REFUSAL)
+    return { fundedBy: null, fundedLoanId: null }
+  }
+  if (v.fundedBy !== 'loan') return { fundedBy: v.fundedBy, fundedLoanId: null }
+  if (!v.fundedLoanId) throw new AppError(400, 'Choose the loan that paid for it (add it on the Loans page first).')
+  const loan = (await q.query<{ name: string; funded_to: BooksLoanFundedTo | null; voided_at: string | null; start_date: string }>(
+    `SELECT name, funded_to, voided_at::text AS voided_at, start_date::text AS start_date FROM books_loans WHERE id = $1 AND ${owner.col} = $2`,
+    [v.fundedLoanId, owner.id])).rows[0]
+  if (!loan) throw new AppError(404, 'That loan is not this company\'s.')
+  if (loan.voided_at) throw new AppError(409, 'That loan was voided.')
+  const role = loan.funded_to ? BOOKS_LOAN_FUNDED_TO_ASSET_ROLE[loan.funded_to] : null
+  if (!role) {
+    throw new AppError(409, `The money from "${loan.name}" went into your bank account, so the purchase was paid from the bank. ` +
+      'File that bank payment as an expense, then add the asset as "Already an expense".')
+  }
+  if (role !== BOOKS_FIXED_ASSET_CLASS_ROLE[v.assetClass]) {
+    throw new AppError(409, role === 'equipment'
+      ? `"${loan.name}" paid the seller of equipment or a vehicle; this asset is not equipment or a vehicle.`
+      : `"${loan.name}" paid the seller of a property; this asset is equipment or a vehicle.`)
+  }
+  if (booksStart && (loan.start_date < booksStart) !== (v.acquiredOn < booksStart)) {
+    throw new AppError(409, loan.start_date < booksStart
+      ? `"${loan.name}" was made on ${loan.start_date}, before your books start (${booksStart}), so your books open with what was still owed on it ` +
+        'and its money never put this asset\'s cost on them. If it paid for this asset, the asset was bought before your books start too: ' +
+        'enter the day the loan paid the seller.'
+      : `"${loan.name}" was made on ${loan.start_date}, on or after your books start (${booksStart}), and put this asset's cost on your books that day. ` +
+        'An asset bought before your books start opens with its own cost too, so it would count twice: check the day you bought it.')
+  }
+  return { fundedBy: 'loan', fundedLoanId: v.fundedLoanId }
 }
 
 async function assetsOut(q: Pick<PoolClient, 'query'>, owner: BooksOwner, rows: Record<string, any>[]) {
@@ -601,8 +674,9 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
         await c.query(
           `UPDATE books_loan_payments SET voided_at = now(), voided_by = $2, void_reason = $3, updated_at = now()
             WHERE loan_id = $1 AND voided_at IS NULL`, [cur.id, req.user!.userId, `The loan was voided: ${reason}`.slice(0, 500)])
+        // 10/13 (Nic): a loan a fixed asset stands on stays (books_loans_asset_guard says so in plain words).
         await c.query(`UPDATE books_loans SET voided_at = now(), voided_by = $2, void_reason = $3, updated_at = now() WHERE id = $1`,
-          [cur.id, req.user!.userId, reason])
+          [cur.id, req.user!.userId, reason]).catch(dbRefusal)
       })
       res.json({ success: true })
     } catch (e) { next(e) }
@@ -689,25 +763,63 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
     } catch (e) { next(e) }
   })
 
+  // GET /api/books/fixed-assets/linkable-expenses — 10/13 (Nic): the expenses a
+  // fixed asset typed in by hand can say it "already" was (any live purchase
+  // that is no asset yet, and no repair's bill that can still change with its
+  // repair): its cost then moves from the expense to the asset.
+  booksRouter.get('/fixed-assets/linkable-expenses', requireBooksRead, async (req, res, next) => {
+    try {
+      const owner = companyOrNone(deps, req)
+      res.json({ success: true, data: owner?.col === 'landlord_id' ? await linkableExpenses(db, owner.id) : [] })
+    } catch (e) { next(e) }
+  })
+
   // POST /api/books/fixed-assets — add an asset. One bought before the books
-  // start opens at its cost less the depreciation already taken; one bought
-  // after has its cost on the books already (its expense, the loan that bought
-  // it, or a journal entry) and adds the depreciation only.
+  // start opens at its cost less the depreciation already taken. 10/13 (Nic):
+  // one bought on or after it says where its money came from (fundedBy) and
+  // posts to that — cash on hand, the owner's own money, a loan whose money
+  // went straight to the seller (the loan's posting carries the cost), or an
+  // expense already on the books (expenseId: "LINK that expense (cost moves to
+  // the asset)" — its cost, day and property are the asset's).
   booksRouter.post('/fixed-assets', requireBooksWrite, async (req, res, next) => {
     try {
       const owner = companyOf(deps, req)
       const b = parse(assetCreateSchema, req.body)
-      const v = { ...b, inServiceDate: b.inServiceDate ?? b.acquiredOn }
+      if (b.expenseId && b.fundedBy !== 'expense') throw new AppError(400, 'An expense is only for an asset that was already an expense.')
       const row = await inTx(async (c) => {
         await assertOwned(c, owner, { propertyId: b.propertyId })
-        assetRules(v, await booksStartOf(c, owner), false)
+        const booksStart = await booksStartOf(c, owner)
+        if (b.fundedBy === 'expense') {
+          if (owner.col !== 'landlord_id') throw new AppError(400, 'A business\'s books have no expenses record yet.')
+          if (!b.expenseId) throw new AppError(400, 'Choose the expense it was.')
+          await c.query(`SELECT 1 FROM landlord_expenses WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [b.expenseId, owner.id])
+          const e = await linkableExpense(c, owner.id, b.expenseId)
+          const v = {
+            assetClass: b.assetClass, cost: Number(e.amount), salvageValue: b.salvageValue, acquiredOn: e.expense_date,
+            inServiceDate: b.inServiceDate ?? e.expense_date, lifeYears: b.lifeYears ?? null, priorDepreciation: b.priorDepreciation ?? null,
+          }
+          assetRules(v, booksStart, true)
+          const { rows: [a] } = await c.query(
+            `INSERT INTO books_fixed_assets (landlord_id, property_id, name, asset_class, cost, salvage_value, acquired_on,
+                                             in_service_date, life_years, method, source_expense_id, funded_by, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'expense', $12, $13) RETURNING id`,
+            [owner.id, e.property_id, b.name, b.assetClass, e.amount, v.salvageValue, v.acquiredOn, v.inServiceDate,
+             fixedAssetDepreciates(b.assetClass) ? v.lifeYears : null, b.method, e.id, b.notes ?? null, req.user!.userId]).catch(dbRefusal)
+          return (await c.query(`SELECT ${ASSET_COLUMNS} FROM books_fixed_assets a WHERE a.id = $1`, [a.id])).rows[0]
+        }
+        if (b.cost === undefined) throw new AppError(400, 'Enter the cost.')
+        if (b.acquiredOn === undefined) throw new AppError(400, 'Enter the day it was bought.')
+        const v = { ...b, cost: b.cost, acquiredOn: b.acquiredOn, inServiceDate: b.inServiceDate ?? b.acquiredOn }
+        assetRules(v, booksStart, false)
+        const funding = await assetFunding(c, owner, v, booksStart)
         const { rows: [a] } = await c.query(
           `INSERT INTO books_fixed_assets (${owner.col}, property_id, name, asset_class, cost, salvage_value, acquired_on,
-                                           in_service_date, life_years, method, prior_depreciation, notes, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
-          [owner.id, b.propertyId ?? null, b.name, b.assetClass, b.cost, v.salvageValue, b.acquiredOn, v.inServiceDate,
+                                           in_service_date, life_years, method, prior_depreciation, funded_by, funded_loan_id,
+                                           notes, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+          [owner.id, b.propertyId ?? null, b.name, b.assetClass, v.cost, v.salvageValue, v.acquiredOn, v.inServiceDate,
            fixedAssetDepreciates(b.assetClass) ? b.lifeYears ?? null : null, b.method, b.priorDepreciation ?? null,
-           b.notes ?? null, req.user!.userId]).catch(dbRefusal)
+           funding.fundedBy, funding.fundedLoanId, b.notes ?? null, req.user!.userId]).catch(dbRefusal)
         return (await c.query(`SELECT ${ASSET_COLUMNS} FROM books_fixed_assets a WHERE a.id = $1`, [a.id])).rows[0]
       })
       res.status(201).json({ success: true, data: (await assetsOut(db, owner, [row]))[0] })
@@ -733,8 +845,8 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
         assetRules(v, await booksStartOf(c, owner), true)
         const { rows: [a] } = await c.query(
           `INSERT INTO books_fixed_assets (landlord_id, property_id, name, asset_class, cost, salvage_value, acquired_on,
-                                           in_service_date, life_years, method, source_expense_id, notes, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'straight_line', $10, $11, $12) RETURNING id`,
+                                           in_service_date, life_years, method, source_expense_id, funded_by, notes, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'straight_line', $10, 'expense', $11, $12) RETURNING id`,
           [owner.id, e.property_id, (b.name ?? e.description ?? e.category_name ?? 'Capital improvement').slice(0, 120),
            b.assetClass, e.amount, v.salvageValue, v.acquiredOn, v.inServiceDate,
            fixedAssetDepreciates(b.assetClass) ? v.lifeYears : null, e.id, b.notes ?? null, req.user!.userId]).catch(dbRefusal)
@@ -746,7 +858,9 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
 
   // PATCH /api/books/fixed-assets/:id — change what was sent; the opening and
   // every month of depreciation re-post with it. An asset made from an
-  // expense keeps that expense's cost and day.
+  // expense keeps that expense's cost and day. 10/13 (Nic): where the money
+  // came from may be said or corrected (cash on hand, the owner, a loan); an
+  // expense is linked only when the asset is added.
   booksRouter.patch('/fixed-assets/:id', requireBooksWrite, async (req, res, next) => {
     try {
       const owner = companyOf(deps, req)
@@ -761,6 +875,12 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
         if (fromExpense && (b.cost !== undefined || b.acquiredOn !== undefined || b.propertyId !== undefined)) {
           throw new AppError(409, 'This asset was made from an expense: its cost, day and property are the expense\'s. Change the expense instead.')
         }
+        if (fromExpense && ((b.fundedBy !== undefined && b.fundedBy !== 'expense') || b.fundedLoanId !== undefined)) {
+          throw new AppError(409, 'This asset was made from an expense, so the expense paid for it. Change the expense instead.')
+        }
+        if (!fromExpense && b.fundedBy === 'expense') {
+          throw new AppError(409, 'To link an expense, void this asset and add it again as "Already an expense".')
+        }
         await assertOwned(c, owner, { propertyId: b.propertyId })
         const pick = <T>(sent: T | undefined, was: T) => (sent === undefined ? was : sent)
         const assetClass = pick(b.assetClass, cur.asset_class)
@@ -770,13 +890,27 @@ export function registerBooksLoansAssetsRoutes(booksRouter: Router, deps: BooksL
           lifeYears: fixedAssetDepreciates(assetClass) ? pick(b.lifeYears, cur.life_years == null ? null : Number(cur.life_years)) : null,
           priorDepreciation: pick(b.priorDepreciation, cur.prior_depreciation == null ? null : Number(cur.prior_depreciation)),
         }
-        assetRules(v, await booksStartOf(c, owner), fromExpense)
+        const booksStart = await booksStartOf(c, owner)
+        assetRules(v, booksStart, fromExpense)
+        // Where the money came from: as it was, unless sent (a class or day
+        // change re-checks a loan). An asset entered before 10/13 has none
+        // until it is said.
+        let funding = { fundedBy: cur.funded_by as BooksFixedAssetFundedBy | null, fundedLoanId: cur.funded_loan_id as string | null }
+        if (!fromExpense) {
+          const fundedBy = b.fundedBy === undefined ? funding.fundedBy : b.fundedBy
+          const fundedLoanId = b.fundedLoanId !== undefined ? b.fundedLoanId : fundedBy === 'loan' ? funding.fundedLoanId : null
+          if (fundedBy || b.fundedBy !== undefined) {
+            funding = await assetFunding(c, owner, { fundedBy, fundedLoanId, assetClass: v.assetClass, acquiredOn: v.acquiredOn }, booksStart)
+          }
+        }
         await c.query(
           `UPDATE books_fixed_assets SET property_id = $3, name = $4, asset_class = $5, cost = $6, salvage_value = $7,
-                  acquired_on = $8, in_service_date = $9, life_years = $10, prior_depreciation = $11, notes = $12, updated_at = now()
+                  acquired_on = $8, in_service_date = $9, life_years = $10, prior_depreciation = $11, notes = $12,
+                  funded_by = $13, funded_loan_id = $14, updated_at = now()
             WHERE id = $1 AND ${owner.col} = $2`,
           [cur.id, owner.id, pick(b.propertyId, cur.property_id), pick(b.name, cur.name), v.assetClass, v.cost, v.salvageValue,
-           v.acquiredOn, v.inServiceDate, v.lifeYears, v.priorDepreciation, pick(b.notes, cur.notes)]).catch(dbRefusal)
+           v.acquiredOn, v.inServiceDate, v.lifeYears, v.priorDepreciation, pick(b.notes, cur.notes),
+           funding.fundedBy, funding.fundedLoanId]).catch(dbRefusal)
         return (await c.query(`SELECT ${ASSET_COLUMNS} FROM books_fixed_assets a WHERE a.id = $1`, [cur.id])).rows[0]
       })
       res.json({ success: true, data: (await assetsOut(db, owner, [row]))[0] })

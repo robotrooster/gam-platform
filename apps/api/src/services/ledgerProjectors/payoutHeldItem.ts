@@ -33,12 +33,27 @@
  *                             5116; Cr 1050 the line. Won (…:returned_on_win,
  *                             positive): the mirror. Received goes down that day.
  *
+ *   refund  gam_debit_dispute_won:<pull>:<charge>, gam_charge_voided:<charge>
+ *                             10/13 (Nic): "Won GAM pull dispute: AUTOMATIC (back
+ *                             to collected; anything collected twice credited
+ *                             back)" — a GAM charge GAM collected twice (the
+ *                             disputed pull took it, and a payout or a later
+ *                             pull took it again before the win), or collected
+ *                             and then voided (a dispute's cost the win or a
+ *                             re-bill took back), given back on the next payout
+ *                             (services/landlordGamDebit): the second collection
+ *                             debited Due to GAM a second time, so the line
+ *                             credits it back — Dr 1050 / Cr Due to GAM (2080),
+ *                             at the charge's property. A card reader piece is
+ *                             never owed (its collection was a Supplies expense):
+ *                             Dr 1050 / Cr Supplies (5140)
+ *
  * Posts nothing (their source already did; they only feed the nightly 1050
  * check): 'prepaid_draw' — Nic L13: money paid ahead that GAM holds is NOT on
  * the landlord's books until it pays a bill, so there is no 1055 balance to
  * release from; the credit use that spends it (a bill, "Keep it", a move-out)
  * or the refund part that hands it back in cash posts it into 1050 (P4,
- * design C1/C7/C10/D4) — 'pos_sale' (registerSale), 'booking_deposit' (bookingStay), 'refund'
+ * design C1/C7/C10/D4) — 'pos_sale' (registerSale), 'booking_deposit' (bookingStay), any other 'refund'
  * (an early check-out's refund part — design D4 — and Stripe's kept fee on a
  * refunded set-aside payment — registerHeld), and the dispute lines of a rent
  * dispute's owner share ('owner_share_…': the payment reversal and the
@@ -52,8 +67,22 @@ import {
   cr, dr, toCents, splitCents, taxLines, scaleTaxParts, loadSale, saleMakeUp, missingFact, localDaySql,
   propertyTzSql, LODGING_TAX_NAME, type LineExtra,
 } from './registerBookingPayoutKit'
+import { READER_PIECE_KIND, readerPieceLines } from './payoutGamCharges'
 
 const WON = ':returned_on_win'
+
+/**
+ * 10/13 (Nic): the payout lines that give a landlord back a GAM charge
+ * collected twice, or collected and then voided (services/landlordGamDebit
+ * gamDebitWonGiveBackSourceId / gamChargeVoidedGiveBackSourceId — held to these
+ * by ledgerGamDebitDisputeWon.test.ts). The charge is the last part.
+ */
+export const GAM_CHARGE_GIVE_BACK_PREFIXES = ['gam_debit_dispute_won:', 'gam_charge_voided:'] as const
+export function gamChargeGivenBack(sourceType: string, sourceId: string): string | null {
+  if (sourceType !== 'refund' || !GAM_CHARGE_GIVE_BACK_PREFIXES.some(p => sourceId.startsWith(p))) return null
+  const id = sourceId.split(':').pop() ?? ''
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : null
+}
 
 interface HeldRow {
   id: string; landlord_id: string | null; property_id: string | null; source_type: string; source_id: string
@@ -118,11 +147,12 @@ async function chargebackLines(client: PoolClient, h: HeldRow): Promise<DesiredL
 
 export const payoutHeldItemProjector: LedgerProjector = {
   sourceType: 'held_item',
-  ruleVersion: 1,
+  // 10/13 (Nic): 2 — a GAM charge given back on a payout (a won pull dispute, a voided collected charge).
+  ruleVersion: 2,
 
   async project(client: PoolClient, itemId: string): Promise<DesiredPosting[]> {
-    const h = (await client.query<HeldRow>(
-      `SELECT h.id, h.landlord_id, h.property_id, h.source_type, h.source_id, h.amount::text,
+    const h = (await client.query<HeldRow & { created_at: string }>(
+      `SELECT h.id, h.landlord_id, h.property_id, h.source_type, h.source_id, h.amount::text, h.created_at::text,
               ${localDaySql('h.created_at', propertyTzSql('h.property_id', 'h.landlord_id'))} AS day
          FROM held_payout_items h WHERE h.id::text = $1`, [itemId])).rows[0]
     // A business's line waits for the business portal's books (a later phase).
@@ -155,8 +185,28 @@ export const payoutHeldItemProjector: LedgerProjector = {
           lines = await chargebackLines(client, h)
         }
         break
+      case 'refund': {
+        // 10/13 (Nic): a GAM charge given back (collected twice, or collected
+        // and voided). Any other refund line: its own source posts it.
+        const chargeId = gamChargeGivenBack(h.source_type, h.source_id)
+        if (!chargeId || a <= 0) return []
+        const c = (await client.query<{ kind: string }>(
+          `SELECT kind FROM landlord_gam_charges WHERE id = $1 AND landlord_id = $2`, [chargeId, h.landlord_id])).rows[0]
+        if (!c) throw missingFact(`The GAM charge ${chargeId} this payout line gives back is not on record for the company.`)
+        memo = h.source_id.startsWith('gam_charge_voided:')
+          ? 'GAM charge taken back after it was collected: given back on your payout'
+          : 'GAM charge collected twice (your bank\'s dispute on a fee pull was won): given back on your payout'
+        lines = [
+          ...dr('due_from_gam', a, { ...at, memo }),
+          ...(c.kind === READER_PIECE_KIND
+            ? await readerPieceLines(client, { landlordId: h.landlord_id, propertyId: h.property_id, cents: a, day: h.day,
+                recorded: { at: h.created_at }, side: 'cr' })
+            : cr('due_to_gam', a, { ...at, memo })),
+        ]
+        break
+      }
       default:
-        // 'prepaid_draw' (L13), 'pos_sale', 'booking_deposit', 'refund': their own source posts them.
+        // 'prepaid_draw' (L13), 'pos_sale', 'booking_deposit': their own source posts them.
         return []
     }
     if (!lines.length) return []
@@ -169,7 +219,8 @@ export const payoutHeldItemProjector: LedgerProjector = {
       `SELECT h.id::text AS id, ${localDaySql('h.created_at', propertyTzSql('h.property_id', 'h.landlord_id'))} AS day
          FROM held_payout_items h
         WHERE h.landlord_id = $1
-          AND h.source_type IN ('deposit_settlement', 'platform_fee', 'dispute')
+          AND (h.source_type IN ('deposit_settlement', 'platform_fee', 'dispute')
+               OR (h.source_type = 'refund' AND (h.source_id LIKE 'gam_debit_dispute_won:%' OR h.source_id LIKE 'gam_charge_voided:%')))
           AND ($2::date IS NULL OR h.created_at >= $2::date - INTERVAL '1 day')`,
       [owner.landlordId, opts.since ?? null])
     return r.rows

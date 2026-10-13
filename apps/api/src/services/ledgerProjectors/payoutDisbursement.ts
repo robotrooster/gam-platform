@@ -160,8 +160,8 @@ export const payoutInstantMarginProjector: LedgerProjector = {
   ruleVersion: 2,
 
   async project(client: PoolClient, marginId: string): Promise<DesiredPosting[]> {
-    const m = (await client.query<{ landlord_id: string | null; amount: string; status: string; day: string | null }>(
-      `SELECT landlord_id, amount::text, status,
+    const m = (await client.query<{ landlord_id: string | null; amount: string; status: string; day: string | null; collected_at: string | null }>(
+      `SELECT landlord_id, amount::text, status, collected_at::text AS collected_at,
               CASE WHEN collected_at IS NULL OR landlord_id IS NULL THEN NULL
                    ELSE ${localDaySql('collected_at', companyTzSql('landlord_id'))} END AS day
          FROM landlord_instant_margins WHERE id::text = $1`, [marginId])).rows[0]
@@ -170,9 +170,10 @@ export const payoutInstantMarginProjector: LedgerProjector = {
     const memo = 'GAM\'s fee on an instant payout'
     // 10/12 (Nic, review; Nic L7): GAM's fee on a payout belongs to no one
     // property — a Company column of its own, or split by units, as the owner
-    // chose (it waits until they choose). The money left from company level.
+    // chose (10/13: the Company column until they choose; a later split only
+    // for fees collected after it). The money left from company level.
     return [{ owner: { landlordId: m.landlord_id }, intendedDate: m.day, memo, lines: [
-      ...drSpread('gam_platform_fees', amt, await companyCostSpread(client, m.landlord_id, m.day), { memo }),
+      ...drSpread('gam_platform_fees', amt, await companyCostSpread(client, m.landlord_id, m.day, { at: m.collected_at }), { memo }),
       ...cr('stripe_in_transit', amt, { propertyId: null, memo }),
     ] }]
   },

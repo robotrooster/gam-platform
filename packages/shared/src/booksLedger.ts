@@ -668,8 +668,9 @@ export const LEDGER_CAPTURE_COLUMNS = {
   landlord_gam_debits: ['landlord_id', 'charges_amount', 'bank_cost_amount', 'total_amount', 'status', 'charge_ids',
     'settled_at',
     // 10/13 (Nic): a pull the landlord's bank disputed posts its own taking-back
-    // on the dispute's day (migration 20261015140100).
-    'disputed_at'],
+    // on the dispute's day (migration 20261015140100) — taken back itself when
+    // GAM wins the dispute (20261015190200).
+    'disputed_at', 'dispute_won_at'],
   pos_reader_orders: ['landlord_id', 'property_id', 'status', 'price', 'installments', 'installment_amount',
     'installments_raised', 'shipped_at', 'cancelled_at'],
   pos_transactions: ['landlord_id', 'property_id', 'tenant_id', 'payment_method', 'subtotal', 'discount_amount',
@@ -747,7 +748,10 @@ export const LEDGER_CAPTURE_COLUMNS = {
     // 10/12 (Nic, integrate): the bank line that paid it clears it on the bank's day (20261014210100).
     'bank_transaction_id'],
   books_fixed_assets: ['landlord_id', 'business_id', 'property_id', 'name', 'asset_class', 'cost', 'salvage_value',
-    'acquired_on', 'in_service_date', 'life_years', 'method', 'prior_depreciation', 'source_expense_id', 'voided_at'],
+    'acquired_on', 'in_service_date', 'life_years', 'method', 'prior_depreciation', 'source_expense_id', 'voided_at',
+    // 10/13 (Nic): where a hand-typed asset's money came from posts its cost
+    // (migration 20261015190100; the capture also marks the expense it names).
+    'funded_by', 'funded_loan_id'],
   // Dependent tables: a projector reads them, so they mark the key that reads them.
   utility_bills: ['payment_id', 'meter_id', 'landlord_id', 'charge_amount', 'tax_amount', 'utility_type'],
   home_sale_installments: ['contract_id', 'payment_id', 'billing_month', 'amount', 'principal_portion',
@@ -966,9 +970,15 @@ export const BOOKS_WORK_TRADE_METHOD_LABEL: Record<BooksWorkTradeMethod, string>
  * property (payroll, company-wide bills)
  *   company_bucket  stay in a Company column of their own
  *   split_by_units  are split across the properties by how many units each has
+ * 10/13 (Nic): "Company-level costs before the owner picks: post to the
+ * COMPANY column by default" (NULL reads as company_bucket), and "a later
+ * 'split by units' splits only NEW costs" — a pick made after the books posted
+ * applies from landlords.books_company_costs_from on.
  */
 export const BOOKS_COMPANY_COST_METHODS = ['company_bucket', 'split_by_units'] as const
 export type BooksCompanyCostMethod = typeof BOOKS_COMPANY_COST_METHODS[number]
+/** 10/13 (Nic): where company-level costs go while the owner has not picked. */
+export const DEFAULT_BOOKS_COMPANY_COST_METHOD: BooksCompanyCostMethod = 'company_bucket'
 export const BOOKS_COMPANY_COST_METHOD_LABEL: Record<BooksCompanyCostMethod, string> = {
   company_bucket: 'A Company column of their own',
   split_by_units: 'Split across your properties by units',

@@ -20,7 +20,7 @@
 import { describe, it, expect } from 'vitest'
 import fs from 'fs'
 import path from 'path'
-import { registerProductionLedgerProjectors } from './ledgerProjectors'
+import { registerProductionLedgerProjectors, LEDGER_SOURCE_TYPES_NOT_POSTED_YET } from './ledgerProjectors'
 import { registeredLedgerSourceTypes, ledgerProjectorFor } from './ledgerEngine'
 import { otherIncomeTestProjector } from './ledgerTestProjector'
 
@@ -71,8 +71,9 @@ describe('ledger projector purity', () => {
   // 10/12 (Nic, ledger integrate): P4 (tenant money, opening) and P5 (register,
   // bookings, payout chain) post in production; one projector per source type
   // (bank_match is P4's part, merged once P6 adds its own). Never the test
-  // projector, and never the card reader order while Nic has not said whether
-  // the reader is equipment the landlord owns or an expense per piece (design Q11).
+  // projector. 10/13 (Nic) answered design Q11 — "each $87.50 → SUPPLIES, in
+  // the month GAM COLLECTED it" — so the card reader order is registered and
+  // posts nothing (its pieces post when collected).
   it('production registers the P4 and P5 projectors, one per source type, and never the test one', () => {
     registerProductionLedgerProjectors()
     expect([...registeredLedgerSourceTypes()].sort()).toEqual([
@@ -90,6 +91,8 @@ describe('ledger projector purity', () => {
       'pos_eod', 'pos_held', 'pos_refund', 'pos_sale', 'prepaid_credit',
       // 10/12 (Nic, ledger review): a property sold to another company (design G5).
       'property_transfer',
+      // 10/13 (Nic): the card reader order drains and posts nothing (design Q11 answered).
+      'reader_order',
       'refund_part', 'remittance', 'security_deposit', 'transfer_intent',
       // 10/12 (Nic): work-trade extra hours drain and post nothing themselves —
       // they post as what paid them (an expense, a payroll run).
@@ -97,7 +100,7 @@ describe('ledger projector purity', () => {
     ])
     // 10/12 (ledger P6): other income posts through its production projector, never the engine's test one.
     expect(ledgerProjectorFor('other_income')).not.toBe(otherIncomeTestProjector)
-    expect(registeredLedgerSourceTypes()).not.toContain('reader_order')
+    expect(LEDGER_SOURCE_TYPES_NOT_POSTED_YET).not.toHaveProperty('reader_order')
     expect(code(path.join(SERVICES, 'ledgerProjectors.ts'))).not.toMatch(/ledgerTestProjector/)
   })
 })

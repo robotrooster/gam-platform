@@ -240,7 +240,9 @@ describe('G2 / H6: the weekly batch, and G3: the payout to the bank', () => {
 })
 
 describe('H: GAM\'s charges and the bank pull that pays them', () => {
-  it('each kind posts to its own cost; GAM\'s background check is the cash sale\'s; a reader piece waits on Nic; a voided charge posts nothing', async () => {
+  // 10/13 (Nic): "Readers on the LANDLORD's books: each $87.50 → SUPPLIES, in
+  // the month GAM COLLECTED it" — the piece's charge posts nothing of its own.
+  it('each kind posts to its own cost; GAM\'s background check is the cash sale\'s; a reader piece posts when collected, not when charged; a voided charge posts nothing', async () => {
     const co = await ledgerCompany()
     const sub = await charge(co, 'subscription', 10)
     const cost = await charge(co, 'bank_debit_cost', 6)
@@ -256,7 +258,9 @@ describe('H: GAM\'s charges and the bank pull that pays them', () => {
     expect(brief(await active('gam_charge', uncovered))).toEqual([['processing_fees', 2, 0], ['due_to_gam', 0, 2]])
     expect(await active('gam_charge', screening)).toEqual([])
     expect(await active('gam_charge', voided)).toEqual([])
-    expect((await waiting('gam_charge', piece))?.last_error).toMatch(/Q11/)
+    expect(await active('gam_charge', piece)).toEqual([])
+    expect(await waiting('gam_charge', piece)).toBeNull()
+    expect(await balance(co.landlordId, 'supplies')).toBe(0)
   })
 
   it('a bank pull that succeeded pays the charges it collected and is an outstanding debit until the bank line matches it', async () => {
@@ -285,9 +289,10 @@ describe('H: GAM\'s charges and the bank pull that pays them', () => {
     } finally { c.release() }
   })
 
-  // 10/12 (Nic, ledger review): a reader piece collected by a payout batch
-  // debits 2080 while its charge waits on Q11 — reported as waiting, never drift.
-  it('a reader piece a batch collected: 2080 ties on everything else; the piece is reported pending (Q11), never drift', async () => {
+  // 10/13 (Nic): "Readers on the LANDLORD's books: each $87.50 → SUPPLIES, in
+  // the month GAM COLLECTED it" — the batch that kept the piece posts it as
+  // Supplies on its own day; nothing about the piece is owed to GAM.
+  it('a reader piece a batch collected is a Supplies expense on the batch\'s day; 2080 ties with nothing pending', async () => {
     const co = await ledgerCompany()
     const sub = await charge(co, 'subscription', 10)
     const piece = await charge(co, 'device_installment', 87.5)
@@ -300,12 +305,52 @@ describe('H: GAM\'s charges and the bank pull that pays them', () => {
     await db.query(
       `INSERT INTO landlord_gam_charge_collections (charge_id, platform_transfer_intent_id, amount) VALUES ($1, $3, 10), ($2, $3, 87.5)`,
       [sub, piece, intent])
-    await drainLedgerOutbox()
-    expect(await balance(co.landlordId, 'due_to_gam')).toBe(87.5)   // the piece's collection, its charge not posted
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    const ls = await active('transfer_intent', intent)
+    expect(ls[0].day).toBe('2026-09-22')
+    expect(byProp(ls, co).map(x => JSON.stringify(x)).sort()).toEqual([
+      ['due_from_gam', 'p1', 0, 100], ['due_to_gam', 'p1', 10, 0], ['supplies', 'p1', 87.5, 0], ['stripe_in_transit', 'p1', 2.5, 0],
+    ].map(x => JSON.stringify(x)).sort())
+    expect(await active('gam_charge', piece)).toEqual([])
+    expect(await balance(co.landlordId, 'due_to_gam')).toBe(0)
+    expect(await balance(co.landlordId, 'supplies')).toBe(87.5)
     const c = await db.connect()
     try {
-      const f = await dueToGamCheck.run(c, co.owner)
-      expect(f).toEqual([{ check: 'p5_due_to_gam_reader_pieces', severity: 'pending', detail: expect.objectContaining({ collected: 87.5 }) }])
+      expect(await dueToGamCheck.run(c, co.owner)).toEqual([])
+    } finally { c.release() }
+  })
+
+  it('a reader piece a bank pull collected is Supplies on the pull\'s day; a dispute takes it back; one on no property is a company-level cost', async () => {
+    const co = await ledgerCompany()
+    const sub = await charge(co, 'subscription', 10)
+    const piece = await charge(co, 'device_installment', 87.5)
+    const companyPiece = await charge(co, 'device_installment', 87.5, { property: null })
+    const debit = (await db.query<{ id: string }>(
+      `INSERT INTO landlord_gam_debits (landlord_id, charges_amount, bank_cost_amount, total_amount, status, charge_ids, settled_at)
+       VALUES ($1, 185, 0, 185, 'succeeded', $2::uuid[], '2026-09-30 18:00:00+00') RETURNING id`, [co.landlordId, [sub, piece, companyPiece]])).rows[0].id
+    await db.query(
+      `INSERT INTO landlord_gam_charge_collections (charge_id, landlord_gam_debit_id, amount) VALUES ($1, $4, 10), ($2, $4, 87.5), ($3, $4, 87.5)`,
+      [sub, piece, companyPiece, debit])
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    const ls = await active('gam_debit', debit)
+    expect(ls.every(l => l.day === '2026-09-30')).toBe(true)
+    // The company's piece: the Company column (no choice made — 10/13 (Nic) default).
+    expect(byProp(ls, co)).toEqual([
+      ['supplies', null, 87.5, 0], ['outstanding_checks', null, 0, 87.5],
+      ['due_to_gam', 'p1', 10, 0], ['outstanding_checks', 'p1', 0, 10],
+      ['supplies', 'p1', 87.5, 0], ['outstanding_checks', 'p1', 0, 87.5],
+    ])
+    expect(await balance(co.landlordId, 'supplies')).toBe(175)
+    expect(await balance(co.landlordId, 'due_to_gam')).toBe(0)
+    // The landlord's bank disputes the pull: the money comes back, so the pieces were not collected after all.
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = '2026-10-05 18:00:00+00', stripe_dispute_id = 'dp_pull',
+                                                 dispute_reopened_amount = 185 WHERE id = $1`, [debit])
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect(await balance(co.landlordId, 'supplies')).toBe(0)
+    expect(await balance(co.landlordId, 'outstanding_checks')).toBe(0)
+    const c = await db.connect()
+    try {
+      expect(await dueToGamCheck.run(c, co.owner)).toEqual([])
     } finally { c.release() }
   })
 

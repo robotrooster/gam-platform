@@ -130,16 +130,29 @@ describe('I1/I2: an expense and how it was paid', () => {
     expect(repair.category_id).toBeTruthy()
   })
 
-  it('a cost on no property waits for the owner\'s company-costs choice (Nic L7), then posts at company level', async () => {
+  // 10/13 (Nic): "Company-level costs before the owner picks: post to the
+  // COMPANY column by default"; "a later 'split by units' splits only NEW costs".
+  it('a cost on no property goes to the Company column until the owner picks (Nic L7); a later split takes only expenses entered after it', async () => {
     const co = await company({ costs: null })
     const e = await createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04' })
-    await drainLedgerOutbox()
-    expect((await waiting('expense', e.id))?.reason_code).toBe('owner_not_ready')
-    await db.query(`UPDATE landlords SET books_company_costs_method = 'company_bucket' WHERE id = $1`, [co.landlordId])
-    await db.query(`INSERT INTO ledger_outbox (source_type, source_id, owner_id) VALUES ('expense', $1, $2)`, [e.id, co.landlordId])
-    await drainLedgerOutbox({ ignoreBackoff: true })
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect(await waiting('expense', e.id)).toBeNull()
     expect((await active('expense', e.id)).map(l => [l.role, l.property, l.dr, l.cr]))
       .toEqual([['software_subscriptions', null, 49, 0], ['accounts_payable', null, 0, 49]])
+    await db.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
+    await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units', books_company_costs_from = now() WHERE id = $1`, [co.landlordId])
+    // Already in the Company column: it stays there, re-posted or rebuilt.
+    await db.query(`UPDATE landlord_expenses SET amount = 50 WHERE id = $1`, [e.id])
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect((await active('expense', e.id)).map(l => [l.role, l.property, l.dr, l.cr]))
+      .toEqual([['software_subscriptions', null, 50, 0], ['accounts_payable', null, 0, 50]])
+    expect((await rebuildOwner(co.owner, { mode: 'dry_run' })).counts.drift).toBe(0)
+    // Entered after the pick: split across the properties by units.
+    const later = await createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04' })
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    const cost = (await active('expense', later.id)).filter(l => l.role === 'software_subscriptions')
+    expect(cost.every(l => l.property !== null)).toBe(true)
+    expect(cost.reduce((s, l) => s + l.dr, 0)).toBe(49)
   })
 
   it('voiding a hand-logged expense voids its payments with it (kept on record), and both postings are taken back', async () => {

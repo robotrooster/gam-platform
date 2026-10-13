@@ -13,12 +13,17 @@
  *     reversal already took out of 1050 on its own day (design E1): Dr 1050;
  *   - GAM's charges it kept (gam_fees_kept_amount, by the collections recorded
  *     against the batch — landlord_gam_charge_collections, design P0): Dr Due
- *     to GAM (2080) — the "GAM fees netted" (H6);
+ *     to GAM (2080) — the "GAM fees netted" (H6); 10/13 (Nic): a card reader
+ *     piece it kept is Dr Supplies (5140) instead — "each $87.50 → SUPPLIES,
+ *     in the month GAM COLLECTED it" (its charge posts nothing of its own,
+ *     payoutGamCharges);
  *   - the rest is the transfer: Dr Stripe balance, on its way to your bank (1060).
  *
  *   Cr Due from GAM (1050)       each claimed share and line, at its property
  *   Dr Due from GAM (1050)       the netted reversals, at their payments' property
  *   Dr Due to GAM (2080)         each kept GAM charge, at the charge's property
+ *   Dr Supplies (5140)           each kept card reader piece, at its property (one
+ *                                on no property: a company-level cost, companyCosts)
  *   Dr Stripe in transit (1060)  amount, at the properties the money left
  *
  * A fully netted batch (amount 0) posts the same lines without the 1060 line.
@@ -43,6 +48,7 @@ import type { PoolClient } from 'pg'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import { cr, dr, toCents, splitCents, waitsOnRule, localDaySql, companyTzSql, type LineExtra } from './registerBookingPayoutKit'
+import { readerPieceLines, READER_PIECE_KIND } from './payoutGamCharges'
 
 interface IntentRow {
   id: string; landlord_id: string | null; amount: string; gross_owed: string; netted_amount: string
@@ -159,7 +165,8 @@ export async function batchByProperty(client: PoolClient, i: IntentRow): Promise
 export const payoutTransferProjector: LedgerProjector = {
   sourceType: 'transfer_intent',
   // 2 (10/12 integrate): a move-out's escrow settlement leaves 1070 (and 1050 for paid-ahead GAM held).
-  ruleVersion: 2,
+  // 3 (10/13, Nic): a card reader piece the batch kept is a Supplies expense, not Due to GAM.
+  ruleVersion: 3,
 
   async project(client: PoolClient, intentId: string): Promise<DesiredPosting[]> {
     const i = await loadIntent(client, intentId)
@@ -184,10 +191,24 @@ export const payoutTransferProjector: LedgerProjector = {
       ] }]
     }
     const b = await batchByProperty(client, i)
+    // 10/13 (Nic): the card reader pieces this batch kept, by property — a
+    // Supplies expense on the batch's day (never more than the batch kept there).
+    const pieces: ByProperty = new Map()
+    for (const r of (await client.query<{ property_id: string | null; s: string }>(
+      `SELECT c.property_id, SUM(col.amount)::text AS s
+         FROM landlord_gam_charge_collections col JOIN landlord_gam_charges c ON c.id = col.charge_id
+        WHERE col.platform_transfer_intent_id::text = $1 AND c.kind = $2 GROUP BY c.property_id`, [i.id, READER_PIECE_KIND])).rows) {
+      add(pieces, r.property_id, toCents(r.s))
+    }
     const lines: DesiredLine[] = []
     for (const [k, v] of b.claimed) lines.push(...cr('due_from_gam', v, { propertyId: prop(k), memo: 'Paid out in this week\'s batch' }))
     for (const [k, v] of b.netted) lines.push(...dr('due_from_gam', v, { propertyId: prop(k), memo: 'A reversed payment repaid from this batch' }))
-    for (const [k, v] of b.kept) lines.push(...dr('due_to_gam', v, { propertyId: prop(k), memo: 'GAM charges taken from this batch' }))
+    for (const [k, v] of b.kept) {
+      const piece = Math.min(pieces.get(k) ?? 0, v)
+      lines.push(...dr('due_to_gam', v - piece, { propertyId: prop(k), memo: 'GAM charges taken from this batch' }))
+      lines.push(...await readerPieceLines(client, {
+        landlordId: i.landlord_id, propertyId: prop(k), cents: piece, day: i.day, recorded: { at: i.transferred_at }, side: 'dr' }))
+    }
     for (const [k, v] of b.toStripe) lines.push(...dr('stripe_in_transit', v, { propertyId: prop(k), memo: 'Sent to your Stripe account' }))
     return [{ owner, intendedDate: i.day, memo: 'Weekly payout batch', lines }]
   },

@@ -244,6 +244,44 @@ export const BOOKS_FIXED_ASSET_CLASS_ROLE: Record<BooksFixedAssetClass, 'rental_
   vehicle:     'equipment',
   land:        'rental_property',
 }
+/**
+ * books_fixed_assets.funded_by — 10/13 (Nic): "Fixed asset typed by hand: the
+ * form ASKS where the money came from (cash on hand / owner put money in /
+ * loan / already an expense) and posts to that." Asked of an asset bought on
+ * or after the books start (one bought before opens at the books start):
+ *   cash     cash on hand — Dr the asset's account / Cr Undeposited funds
+ *            (1040, the office drawer, where "Cash from the office" comes from)
+ *   owner    the owner put money in — Dr the asset's account / Cr Owner equity
+ *            and contributions (3010)
+ *   loan     a loan on the Loans page whose money went straight to the seller
+ *            (funded_loan_id): the loan's own posting put the cost on the
+ *            asset's account, so the asset posts none of its own
+ *   expense  already an expense (source_expense_id): "LINK that expense (cost
+ *            moves to the asset)" — the expense posts its cost to the asset's
+ *            account instead of its category's, counted once
+ * Mirrors books_fixed_assets_funded_by_check (migration 20261015190100).
+ */
+export const BOOKS_FIXED_ASSET_FUNDED_BY = ['cash', 'owner', 'loan', 'expense'] as const
+export type BooksFixedAssetFundedBy = typeof BOOKS_FIXED_ASSET_FUNDED_BY[number]
+export const BOOKS_FIXED_ASSET_FUNDED_BY_LABEL: Record<BooksFixedAssetFundedBy, string> = {
+  cash:    'Cash on hand',
+  owner:   'The owner put money in',
+  loan:    'A loan',
+  expense: 'Already an expense',
+}
+/**
+ * The loans that can have paid for an asset of each posting role: a loan whose
+ * money went straight to the seller of a property puts its cost on Rental
+ * property, one to the seller of equipment or a vehicle on Equipment
+ * (BOOKS_LOAN_FUNDED_TO). A loan whose money went into the bank paid nothing
+ * itself — the purchase came out of the bank.
+ */
+export const BOOKS_LOAN_FUNDED_TO_ASSET_ROLE: Record<BooksLoanFundedTo, 'rental_property' | 'equipment' | null> = {
+  bank:      null,
+  property:  'rental_property',
+  equipment: 'equipment',
+}
+
 /** The classes that never depreciate. */
 export const BOOKS_FIXED_ASSET_NOT_DEPRECIATED = ['land'] as const satisfies readonly BooksFixedAssetClass[]
 export function fixedAssetDepreciates(assetClass: string): boolean {

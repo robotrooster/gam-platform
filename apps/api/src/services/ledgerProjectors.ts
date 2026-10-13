@@ -68,7 +68,9 @@ import { workTradeHoursProjector } from './ledgerProjectors/workTradeHours'
  * ledgerPending): they are not drained by anything yet.
  */
 export const LEDGER_SOURCE_TYPES_NOT_POSTED_YET: Readonly<Partial<Record<LedgerSourceType, string>>> = {
-  reader_order: 'Waits on Nic (design Q11): is a card reader equipment the landlord owns (Dr 1530 / Cr 2085, design H4), or an expense per piece?',
+  // 10/13 (Nic): reader_order left this list — design Q11 answered ("each
+  // $87.50 → SUPPLIES, in the month GAM COLLECTED it"): the order posts
+  // nothing and each piece posts when collected (ledgerProjectors/payoutGamCharges).
   // 10/12 (Nic): work_trade_hours left this list — Mark paid now records a
   // PAID expense under "Work trade labor" (services/workTradeBooksPay), so every
   // way extra hours are paid posts through its own record and the hours post

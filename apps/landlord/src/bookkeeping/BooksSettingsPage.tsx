@@ -46,6 +46,8 @@ export interface BooksSettings {
   registerStockMethod: string
   registerStockFrom: string | null
   companyCostsMethod: string | null
+  /** 10/13 (Nic): the day a company-costs choice made after the books posted applies from (null: every cost). */
+  companyCostsFromDay: string | null
   writeOffBy: string
   /** 10/12 (Nic, L6): what a repair closed with a cost does (null: not chosen — the button). */
   repairBills: string | null
@@ -280,8 +282,12 @@ export function BooksSettingsPage() {
         ))}
       </Section>
 
-      <Section title="Costs that are no one property's">
-        {data.companyCostsMethod === null && <NotChosen />}
+      {/* 10/13 (Nic): "Company-level costs before the owner picks: post to the
+          COMPANY column by default"; "a later 'split by units' splits only NEW costs". */}
+      <Section title="Costs that are no one property's" help={data.companyCostsMethod !== null && data.companyCostsFromDay
+        ? `Your choice applies to costs recorded from ${longCalendarDate(data.companyCostsFromDay)} on. Costs recorded before then stay in the Company column.`
+        : undefined}>
+        {data.companyCostsMethod === null && <div className="alert aw" style={{ marginBottom: 10 }}>Not chosen yet. Until you choose, these costs go to the Company column. Choosing to split them by units splits only costs recorded from then on; what is already in the Company column stays there.</div>}
         {BOOKS_COMPANY_COST_METHODS.map(v => (
           <Choice key={v} name="companyCostsMethod" value={v} checked={form.companyCostsMethod === v}
             disabled={ro || lockedMethod(data.companyCostsMethod)}

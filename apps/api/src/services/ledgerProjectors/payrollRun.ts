@@ -26,8 +26,9 @@
  *
  * WHERE IT LANDS (Nic 10/12, L7 — companyCosts): payroll belongs to no one
  * property. The two expense lines are company level, or split across the
- * properties by units, as the owner chose; the posting waits until they have.
- * What is owed stays company level (one tax account, one payroll).
+ * properties by units, as the owner chose — 10/13 (Nic): the Company column
+ * until they choose, and a later "split by units" splits only runs approved
+ * after it. What is owed stays company level (one tax account, one payroll).
  *
  * WHAT CLEARS IT: the run's take-home pay and each tax it left owed become
  * unpaid expenses on the Expenses record when the run is approved
@@ -54,6 +55,8 @@ interface RunRow {
   status: string
   voided_at: string | null
   pay_date: string
+  /** 10/13 (Nic): when the run reached the books (approved) — a later company-costs pick splits only newer costs. */
+  recorded_at: string | null
 }
 
 interface LineSums {
@@ -71,7 +74,8 @@ export const payrollRunProjector: LedgerProjector = {
   async project(client: PoolClient, runId: string): Promise<DesiredPosting[]> {
     if (!isUuid(runId)) return []
     const run = (await client.query<RunRow>(
-      `SELECT r.landlord_id, r.status, r.voided_at::text AS voided_at, r.pay_date::text AS pay_date
+      `SELECT r.landlord_id, r.status, r.voided_at::text AS voided_at, r.pay_date::text AS pay_date,
+              COALESCE(r.approved_at, r.created_at)::text AS recorded_at
          FROM payroll_runs r WHERE r.id = $1`, [runId])).rows[0]
     // A business's payroll waits for the business portal's books (a later phase).
     if (!run || !run.landlord_id) return []
@@ -102,7 +106,7 @@ export const payrollRunProjector: LedgerProjector = {
     const gross = c(s.gross)
     const employerTaxes = c(s.er_ss) + c(s.er_med) + c(s.futa) + c(s.suta)
     const landlordId = run.landlord_id
-    const spread = await companyCostSpread(client, landlordId, run.pay_date)
+    const spread = await companyCostSpread(client, landlordId, run.pay_date, { at: run.recorded_at })
     const memo = `Payroll paid ${run.pay_date}`
     const owed = { propertyId: null }
     const lines: DesiredLine[] = [

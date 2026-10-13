@@ -13,24 +13,29 @@
  *                                 instant fees) − GAM's instant margins collected
  *   p5_due_to_gam (2080)          every live GAM charge − what has been collected
  *                                 on it (landlord_gam_charge_collections); a
- *                                 card reader's pieces are left out while they
- *                                 wait on Nic (design Q11) — on BOTH sides:
- *                                 10/12 (Nic, ledger review) a batch or a bank
- *                                 pull that collected a piece still debits 2080
- *                                 (it collects every charge it carried), so what
- *                                 was collected on pieces is added back to the
- *                                 ledger side and reported on its own as
- *                                 'pending' (waiting on Q11), never as drift.
+ *                                 card reader's pieces are never owed on the
+ *                                 landlord's books — 10/13 (Nic): "each $87.50
+ *                                 → SUPPLIES, in the month GAM COLLECTED it":
+ *                                 the charge posts nothing and the batch or
+ *                                 pull that collects a piece debits Supplies,
+ *                                 not 2080 (payoutGamCharges, payoutTransfer),
+ *                                 so pieces are on neither side.
  *                                 10/13 (Nic): a bank pull the landlord's
  *                                 bank disputed collected nothing — its
  *                                 charges are owed again and its own posting
  *                                 credits 2080 back (payoutGamCharges) — so
- *                                 its collections count on neither side
+ *                                 its collections count on neither side,
+ *                                 until GAM wins the dispute: then they
+ *                                 count again ("back to collected"), and a
+ *                                 charge collected twice, or collected and
+ *                                 then voided, is given back on a payout line
+ *                                 that credits 2080 back (payoutHeldItem) —
+ *                                 so every charge's collections count, live
+ *                                 or voided, less what was given back
  *
  * 10/12 (Nic, ledger review): a difference is 'pending' while a record that
  * posts to the account still waits to post (services/ledgerPending), else
- * drift. A reader piece's own waiting charge does not hold 2080 back (it is
- * left out of both sides).
+ * drift.
  *
  * Both compare the whole history: a company whose books start after its first
  * money needs its opening posting (design J1, which carries every projection
@@ -46,10 +51,13 @@ import type { LedgerCheck, LedgerFinding, LedgerFindingSeverity } from '../ledge
 import type { LedgerOwner } from '../ledgerOwner'
 import { toCents } from './registerBookingPayoutKit'
 import { loadPendingScope, waitingFor, severityOf, type PendingRule } from '../ledgerPending'
+import { READER_PIECE_KIND } from './payoutGamCharges'
 
 /** What posts to Stripe in transit (1060) and to Due to GAM (2080). */
 export const STRIPE_IN_TRANSIT_RULE: PendingRule = { types: ['transfer_intent', 'disbursement', 'instant_margin'] }
-export const DUE_TO_GAM_RULE: PendingRule = { types: ['gam_charge', 'gam_debit', 'transfer_intent', 'pos_sale'] }
+export const DUE_TO_GAM_RULE: PendingRule = { types: ['gam_charge', 'gam_debit', 'transfer_intent', 'pos_sale',
+  // 10/13 (Nic): a GAM charge given back on a payout line (a won pull dispute).
+  'held_item'] }
 
 async function roleBalance(client: PoolClient, landlordId: string, role: string): Promise<number> {
   const r = await client.query<{ n: string }>(
@@ -101,41 +109,23 @@ export const dueToGamCheck: LedgerCheck = {
   async run(client: PoolClient, owner: LedgerOwner): Promise<LedgerFinding[]> {
     if (!owner.landlordId) return []
     const ledger = -(await roleBalance(client, owner.landlordId, 'due_to_gam'))
-    const r = (await client.query<{ owed: string; pieces: string; piece_ids: string[] | null }>(
-      // 10/13 (Nic): a disputed pull's collections are owed again — they count nowhere.
-      `SELECT COALESCE((SELECT SUM(c.amount - COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col
-                                                         WHERE col.charge_id = c.id
-                                                           AND NOT EXISTS (SELECT 1 FROM landlord_gam_debits dd
-                                                                            WHERE dd.id = col.landlord_gam_debit_id
-                                                                              AND dd.disputed_at IS NOT NULL)), 0))
-                          FROM landlord_gam_charges c
-                         WHERE c.landlord_id = $1 AND c.voided_at IS NULL AND c.kind <> 'device_installment'), 0)::text AS owed,
-              -- A reader piece collected by a sent batch or a bank pull that went through (and was not
-              -- disputed: a disputed pull's own posting credits 2080 back): those debited 2080.
-              COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col
-                          JOIN landlord_gam_charges c ON c.id = col.charge_id
-                         WHERE c.landlord_id = $1 AND c.kind = 'device_installment'
-                           AND (EXISTS (SELECT 1 FROM platform_transfer_intents i
-                                         WHERE i.id = col.platform_transfer_intent_id AND i.status = 'transferred' AND i.transferred_at IS NOT NULL)
-                                OR EXISTS (SELECT 1 FROM landlord_gam_debits d
-                                            WHERE d.id = col.landlord_gam_debit_id AND d.status = 'succeeded' AND d.settled_at IS NOT NULL
-                                              AND d.disputed_at IS NULL))), 0)::text AS pieces,
-              (SELECT array_agg(c.id::text) FROM landlord_gam_charges c
-                WHERE c.landlord_id = $1 AND c.kind = 'device_installment') AS piece_ids`, [owner.landlordId])).rows[0]
-    const pieces = toCents(r.pieces)
-    const pieceIds = new Set(r.piece_ids ?? [])
-    const out: LedgerFinding[] = []
-    if (ledger + pieces !== toCents(r.owed)) {
-      const waiting = waitingFor(await loadPendingScope(client, owner.landlordId), DUE_TO_GAM_RULE,
-        s => s.type === 'gam_charge' && pieceIds.has(s.id))
-      out.push(...drift('p5_due_to_gam', ledger + pieces, toCents(r.owed), {}, severityOf(waiting)))
-    }
-    if (pieces !== 0) {
-      out.push({ check: 'p5_due_to_gam_reader_pieces', severity: 'pending', detail: {
-        collected: pieces / 100,
-        why: 'Card reader pieces collected from a payout or a bank pull: their charge waits on Nic (design Q11 — is the reader equipment the landlord owns, or an expense per piece?), so Due to GAM (2080) carries what was collected on them until the charge posts.',
-      } })
-    }
-    return out
+    // 10/13 (Nic): what is owed = every live charge − what was collected on any
+    // charge (a disputed pull's collections count only once GAM won the
+    // dispute) + what was given back of a charge collected twice or collected
+    // and voided. A card reader piece is never owed on the landlord's books.
+    const r = (await client.query<{ owed: string }>(
+      `WITH ch AS (SELECT c.id, c.amount, c.voided_at FROM landlord_gam_charges c WHERE c.landlord_id = $1 AND c.kind <> $2)
+       SELECT (COALESCE((SELECT SUM(ch.amount) FROM ch WHERE ch.voided_at IS NULL), 0)
+             - COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col JOIN ch ON ch.id = col.charge_id
+                          WHERE NOT EXISTS (SELECT 1 FROM landlord_gam_debits dd
+                                             WHERE dd.id = col.landlord_gam_debit_id
+                                               AND dd.disputed_at IS NOT NULL AND dd.dispute_won_at IS NULL)), 0)
+             + COALESCE((SELECT SUM(h.amount) FROM held_payout_items h JOIN ch ON ch.id::text = split_part(h.source_id, ':', -1)
+                          WHERE h.landlord_id = $1 AND h.source_type = 'refund' AND h.amount > 0
+                            AND (h.source_id LIKE 'gam_debit_dispute_won:%' OR h.source_id LIKE 'gam_charge_voided:%')), 0))::text AS owed`,
+      [owner.landlordId, READER_PIECE_KIND])).rows[0]
+    if (ledger === toCents(r.owed)) return []
+    const waiting = waitingFor(await loadPendingScope(client, owner.landlordId), DUE_TO_GAM_RULE)
+    return drift('p5_due_to_gam', ledger, toCents(r.owed), {}, severityOf(waiting))
   },
 }

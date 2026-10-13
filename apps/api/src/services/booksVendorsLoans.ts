@@ -25,7 +25,9 @@
  *              loan. unmatchLoanBankLine takes it back (the Bank page's Undo).
  *   ASSETS   assetFigures — depreciation so far and what the asset is worth on
  *            the books; capitalExpense — an expense that can become an asset
- *            (its category charges to an asset account);
+ *            (its category charges to an asset account); linkableExpense —
+ *            10/13 (Nic) an expense a fixed asset typed in by hand "already"
+ *            was ("LINK that expense (cost moves to the asset)");
  *            markDepreciationMonthsDue — marks each month of depreciation for
  *            posting once the month is over (run with the minute ledger drain).
  */
@@ -558,7 +560,8 @@ export const ASSET_COLUMNS = `
   a.notes, a.created_at, a.updated_at, a.voided_at::text AS voided_at, a.void_reason,
   (SELECT x.books_start_date::text FROM landlords x WHERE x.id = a.landlord_id) AS books_start,
   (SELECT p.name FROM properties p WHERE p.id = a.property_id) AS property_name,
-  (SELECT e.description FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_description`
+  (SELECT e.description FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_description,
+  a.funded_by, a.funded_loan_id, (SELECT l.name FROM books_loans l WHERE l.id = a.funded_loan_id) AS funded_loan_name`
 
 export interface AssetFigures {
   /** Bought before the books start (and not from an expense): it opens at its cost less what was already taken. */
@@ -619,6 +622,24 @@ export async function companyToday(q: Q, landlordId: string | null): Promise<str
 }
 
 /**
+ * 10/13 review: a repair's bill that nothing is paid on yet still follows its
+ * repair. With the company's 'automatic' repair bills (services/repairBills
+ * syncRepairBill — the company may switch to it at any time), a corrected
+ * repair cost or day rewrites the bill's amount and day, with no person
+ * editing it (a person's edit of an expense an asset was made from is refused:
+ * landlordExpenses SYSTEM_LINK_EDIT_REFUSAL). An asset copies its expense's
+ * cost and day when it is made, and its depreciation would stay on the old
+ * figures while the expense posted the new one to the asset's account — so
+ * such a bill becomes an asset only once something is paid on it (the sync
+ * leaves a bill alone then). As SQL over landlord_expenses `e`; the sum is
+ * the sync's own.
+ */
+const REPAIR_BILL_FOLLOWS_REPAIR_SQL = `(e.maintenance_request_id IS NOT NULL
+  AND COALESCE((SELECT sum(p.amount) FROM landlord_expense_payments p WHERE p.expense_id = e.id AND p.voided_at IS NULL), 0) = 0)`
+const REPAIR_BILL_REFUSAL = 'That expense is the bill for a repair, and nothing is paid on it yet, so it can still change with the repair ' +
+  '(its cost or day corrected). Record what was paid on it first, then make it a fixed asset.'
+
+/**
  * An expense that can become a fixed asset: active, the company's, with no
  * live asset made from it yet, filed under a category that charges to an
  * ASSET account (a capital improvement — its cost is already on the books as
@@ -632,7 +653,7 @@ export async function capitalExpense(q: Q, landlordId: string, expenseId: string
   const e = (await q.query<{
     id: string; amount: string; expense_date: string; description: string | null; property_id: string | null
     status: string; voided_at: string | null; category_id: string | null; category_name: string | null
-    account_type: string | null; account_name: string | null; has_asset: boolean
+    account_type: string | null; account_name: string | null; has_asset: boolean; follows_repair: boolean
   }>(
     `SELECT e.id, e.amount::text AS amount, e.expense_date::text AS expense_date, e.description, e.property_id,
             e.status, e.voided_at::text AS voided_at, e.category_id,
@@ -640,17 +661,71 @@ export async function capitalExpense(q: Q, landlordId: string, expenseId: string
             COALESCE((SELECT a.type FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)),
                      books_category_account_type(e.category_id)) AS account_type,
             (SELECT a.name FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)) AS account_name,
-            EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL) AS has_asset
+            EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL) AS has_asset,
+            ${REPAIR_BILL_FOLLOWS_REPAIR_SQL} AS follows_repair
        FROM landlord_expenses e WHERE e.id = $1 AND e.landlord_id = $2`, [expenseId, landlordId])).rows[0]
   if (!e) throw new AppError(404, 'That expense is not this company\'s.')
   if (e.status !== 'active' || e.voided_at) throw new AppError(409, 'That expense was voided.')
   if (e.has_asset) throw new AppError(409, 'That expense is already a fixed asset.')
+  if (e.follows_repair) throw new AppError(409, REPAIR_BILL_REFUSAL)
   if (!e.category_id) throw new AppError(409, 'That expense has no category. File it under a capital-improvement category first.')
   if (e.account_type !== 'asset') {
     throw new AppError(409, `That expense is filed under ${e.category_name ?? 'a category'}${e.account_name ? `, which charges to ${e.account_name}` : ''} — not an asset account. ` +
       'Only an expense filed under a capital-improvement category (one that charges to an asset account, such as Rental property or Equipment) can become a fixed asset.')
   }
   return e
+}
+
+/**
+ * The live expenses a fixed asset typed in by hand can link (10/13, Nic:
+ * "already an expense → LINK that expense (cost moves to the asset)"), as
+ * SQL over landlord_expenses `e`: active, no live asset made from it, a cost
+ * of the company's own (never a bill a payroll run left, or a manager's cut
+ * GAM held too little to pay — those are liabilities, not purchases), filed
+ * under an expense or asset account (not an owner draw or a loan paid down),
+ * and no repair's bill that can still change with its repair.
+ */
+const LINKABLE_EXPENSE_SQL = `e.status = 'active' AND e.voided_at IS NULL AND e.amount > 0 AND e.allocation_split_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM payroll_run_expenses x WHERE x.expense_id = e.id)
+  AND NOT EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL)
+  AND NOT ${REPAIR_BILL_FOLLOWS_REPAIR_SQL}
+  AND COALESCE(CASE WHEN e.category_id IS NULL THEN NULL ELSE books_category_account_type_on(e.category_id, e.expense_date) END,
+               'expense') IN ('expense', 'asset')`
+
+/** An expense a hand-typed asset can link, or refused in plain words. Its cost, day and property become the asset's. */
+export async function linkableExpense(q: Q, landlordId: string, expenseId: string): Promise<{
+  id: string; amount: string; expense_date: string; description: string | null; property_id: string | null
+}> {
+  const e = (await q.query<{
+    id: string; amount: string; expense_date: string; description: string | null; property_id: string | null; ok: boolean
+    status: string; voided_at: string | null; has_asset: boolean; follows_repair: boolean
+  }>(
+    `SELECT e.id, e.amount::text AS amount, e.expense_date::text AS expense_date, e.description,
+            COALESCE((SELECT u.property_id FROM units u WHERE u.id = e.unit_id), e.property_id) AS property_id,
+            e.status, e.voided_at::text AS voided_at,
+            EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL) AS has_asset,
+            ${REPAIR_BILL_FOLLOWS_REPAIR_SQL} AS follows_repair,
+            (${LINKABLE_EXPENSE_SQL}) AS ok
+       FROM landlord_expenses e WHERE e.id = $1 AND e.landlord_id = $2`, [expenseId, landlordId])).rows[0]
+  if (!e) throw new AppError(404, 'That expense is not this company\'s.')
+  if (e.status !== 'active' || e.voided_at) throw new AppError(409, 'That expense was voided.')
+  if (e.has_asset) throw new AppError(409, 'That expense is already a fixed asset.')
+  if (e.follows_repair) throw new AppError(409, REPAIR_BILL_REFUSAL)
+  if (!e.ok) throw new AppError(409, 'That expense is not a purchase (a payroll bill, a manager\'s cut, an owner draw or a loan paid down), so it cannot be a fixed asset.')
+  return e
+}
+
+/** 10/13 (Nic): the expenses a hand-typed asset can link (linkableExpense would take each), newest first. */
+export async function linkableExpenses(q: Q, landlordId: string): Promise<Record<string, unknown>[]> {
+  const r = await q.query(
+    `SELECT e.id, e.amount::float AS amount, e.expense_date::text AS expense_date, e.description,
+            COALESCE((SELECT u.property_id FROM units u WHERE u.id = e.unit_id), e.property_id) AS property_id,
+            (SELECT p.name FROM properties p WHERE p.id = COALESCE((SELECT u.property_id FROM units u WHERE u.id = e.unit_id), e.property_id)) AS property_name,
+            (SELECT c.name FROM books_categories c WHERE c.id = e.category_id) AS category_name
+       FROM landlord_expenses e
+      WHERE e.landlord_id = $1 AND ${LINKABLE_EXPENSE_SQL}
+      ORDER BY e.expense_date DESC, e.id`, [landlordId])
+  return r.rows
 }
 
 /** Expenses that could become fixed assets (capitalExpense would take each). */
@@ -665,6 +740,7 @@ export async function capitalExpenses(q: Q, landlordId: string): Promise<Record<
         AND COALESCE((SELECT a.type FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)),
                      books_category_account_type(e.category_id)) = 'asset'
         AND NOT EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL)
+        AND NOT ${REPAIR_BILL_FOLLOWS_REPAIR_SQL}
       ORDER BY e.expense_date DESC, e.id`, [landlordId])
   return r.rows
 }
