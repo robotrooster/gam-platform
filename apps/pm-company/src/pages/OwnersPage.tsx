@@ -300,7 +300,8 @@ function OwnerStatement(props: {
               marginTop: 12, padding: '10px 12px', border: '1px dashed var(--border-0)', borderRadius: 8,
               fontSize: '.78rem', color: 'var(--text-2)', maxWidth: 680,
             }}>
-              <strong style={{ color: 'var(--text-1)' }}>Money billed in {monthWords(s.periodMonth || props.month)} {money(s.totals.billed.billed)}</strong>
+              {/* 10/12 (Nic): no "Money billed" wording anywhere — the column is Charged. */}
+              <strong style={{ color: 'var(--text-1)' }}>Charged in {monthWords(s.periodMonth || props.month)} {money(s.totals.billed.billed)}</strong>
               {' — '}collected so far {money(s.totals.billed.collectedSoFar)}
               {s.totals.billed.clearing ? ` · clearing ${money(s.totals.billed.clearing)}` : ''}
               {' · '}still owed {money(s.totals.billed.stillOwed)}.

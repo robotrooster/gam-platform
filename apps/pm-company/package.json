@@ -4,7 +4,8 @@
   "scripts": {
     "dev": "vite --port 3011",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@gam/shared": "*",
