@@ -18,6 +18,12 @@
  * shape here. The territories (Puerto Rico and the rest) are not in the drawn
  * picture; a territory with units or rent is named under the map instead.
  *
+ * 10/12 (Nic, H1): "heat map Units: TOGGLE BOTH (occupied/billed vs all
+ * spaces)". The Units view shows either the spaces occupied this month as GAM
+ * bills them (`occupied`: a lease, a month stay, owner use or a utility
+ * arrangement — the Overview's Active Units count) or every space under
+ * management (`units`). H2 (Nic: "brightest = most (OK)"): unchanged.
+ *
  * "Darker for more": the color runs from faint to strong gold. In the light
  * theme strong is a deep, dark gold; on the dark theme strong is full gold —
  * the strongest color that page has (a near-black "most" would vanish into
@@ -38,13 +44,15 @@ import { geoPath } from 'd3-geo'
 import type { Topology, GeometryCollection } from 'topojson-specification'
 import { formatCurrency } from '@gam/shared'
 
-export interface MapArea { fips: string; name: string; units: number; money: number; properties: number }
+export interface MapArea { fips: string; name: string; units: number; occupied?: number; money: number; properties: number }
 export interface MapMissing {
   reason: string
   label: string
   offStateMap: boolean
   properties: number
   units: number
+  /** 10/12 (Nic, H1): of `units`, occupied this month as GAM bills them. */
+  occupied?: number
   money: number
 }
 export interface PlatformMapData {
@@ -55,6 +63,10 @@ export interface PlatformMapData {
 
 type Level = 'state' | 'county'
 type Measure = 'units' | 'money'
+/** 10/12 (Nic, H1): which spaces the Units view counts. */
+type Spaces = 'occupied' | 'all'
+/** The number a place is colored by. */
+type Field = 'units' | 'occupied' | 'money'
 
 interface Shape { fips: string; name: string; d: string }
 interface Shapes {
@@ -98,7 +110,11 @@ function buildShapes(topo: Topology): Shapes {
 
 const count = (n: number) => Math.round(n).toLocaleString('en-US')
 const unitsText = (n: number) => `${count(n)} ${n === 1 ? 'unit' : 'units'}`
-const valueText = (measure: Measure, n: number) => measure === 'units' ? unitsText(n) : formatCurrency(n)
+const occupiedText = (n: number) => `${count(n)} occupied ${n === 1 ? 'unit' : 'units'}`
+const valueText = (field: Field, n: number) =>
+  field === 'money' ? formatCurrency(n) : field === 'occupied' ? occupiedText(n) : unitsText(n)
+/** A place's number for a field; an API that does not send `occupied` yet reads as none. */
+const valueOf = (a: { units: number; occupied?: number; money: number }, field: Field) => Number(a[field] ?? 0)
 const propertiesText = (n: number) => `${count(n)} ${n === 1 ? 'property' : 'properties'}`
 
 /** Strength of a place's color, 0.18 (a little) to 1 (the most anywhere). */
@@ -141,6 +157,8 @@ function Toggle<T extends string>({ label, value, options, onChange }: {
 export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefined }) {
   const [level, setLevel] = useState<Level>('state')
   const [measure, setMeasure] = useState<Measure>('units')
+  const [spaces, setSpaces] = useState<Spaces>('occupied')
+  const field: Field = measure === 'money' ? 'money' : spaces === 'occupied' ? 'occupied' : 'units'
   const [shapes, setShapes] = useState<Shapes | null>(null)
   const [failed, setFailed] = useState(false)
   const [attempt, setAttempt] = useState(0)
@@ -166,12 +184,12 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
     () => (level === 'state' ? data?.states : data?.counties) ?? [],
     [data, level])
   const byFips = useMemo(() => new Map(areas.map(a => [a.fips, a])), [areas])
-  const max = useMemo(() => Math.max(0, ...areas.map(a => a[measure])), [areas, measure])
+  const max = useMemo(() => Math.max(0, ...areas.map(a => valueOf(a, field))), [areas, field])
   const shade = useMemo(() => {
     const m = new Map<string, number>()
-    for (const a of areas) { const o = strength(a[measure], max); if (o > 0) m.set(a.fips, o) }
+    for (const a of areas) { const o = strength(valueOf(a, field), max); if (o > 0) m.set(a.fips, o) }
     return m
-  }, [areas, measure, max])
+  }, [areas, field, max])
   const drawn = shapes ? (level === 'state' ? shapes.states : shapes.counties) : []
   const drawnFips = useMemo(() => new Set(drawn.map(s => s.fips)), [drawn])
 
@@ -187,28 +205,29 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
   }
 
   // Places with a number that the drawn picture has no shape for (the territories).
-  const undrawn = shapes ? areas.filter(a => a[measure] !== 0 && !drawnFips.has(a.fips)) : []
+  const undrawn = shapes ? areas.filter(a => valueOf(a, field) !== 0 && !drawnFips.has(a.fips)) : []
   const missing = (data?.missing ?? [])
-    .filter(x => (level === 'county' || x.offStateMap) && x[measure] !== 0)
+    .filter(x => (level === 'county' || x.offStateMap) && valueOf(x, field) !== 0)
   const rankedAll = useMemo(
-    () => areas.filter(a => a[measure] > 0).sort((a, b) => b[measure] - a[measure]),
-    [areas, measure])
+    () => areas.filter(a => valueOf(a, field) > 0).sort((a, b) => valueOf(b, field) - valueOf(a, field)),
+    [areas, field])
   const ranked = showAll ? rankedAll : rankedAll.slice(0, TOP)
-  const nothing = areas.every(a => !(a[measure] > 0))
+  const nothing = areas.every(a => !(valueOf(a, field) > 0))
   // 10/12 (Nic) review: no `map` at all (an API that does not send it yet) is
   // not an empty map — it must not say "no units" beside tiles with real totals.
   const unavailable = data == null
   const emptyText = unavailable
     ? 'Map numbers are not available yet.'
     // There are numbers, but none could be placed on this map (named below).
-    : missing.some(x => x[measure] > 0)
-      ? `No ${measure === 'units' ? 'units' : 'rent'} could be placed on the ${level === 'state' ? 'state' : 'county'} map — see below.`
-      : measure === 'units' ? 'No units under management yet.' : 'No rent has been logged yet.'
+    : missing.some(x => valueOf(x, field) > 0)
+      ? `No ${field === 'money' ? 'rent' : field === 'occupied' ? 'occupied units' : 'units'} could be placed on the ${level === 'state' ? 'state' : 'county'} map — see below.`
+      : field === 'money' ? 'No rent has been logged yet.'
+        : field === 'occupied' ? 'No units are occupied this month.' : 'No units under management yet.'
 
   // 10/12 (Nic) review: the color key, painted from the same strengths as the
   // map — the faint end is the smallest place's own color, the full end the
   // biggest's, and the steps between are even steps in value.
-  const lowest = rankedAll.length ? rankedAll[rankedAll.length - 1][measure] : 0
+  const lowest = rankedAll.length ? valueOf(rankedAll[rankedAll.length - 1], field) : 0
   const keySteps = lowest > 0 && lowest < max ? [0, 1, 2, 3, 4].map(i => lowest + ((max - lowest) * i) / 4) : [max]
 
   const focus = hover?.fips ?? selected
@@ -229,13 +248,15 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
     setSelected(cur => (fips && fips !== cur ? fips : null))
   }
 
-  const measureWord = measure === 'units' ? 'units under management' : 'rent logged through GAM (all time)'
+  const measureWord = field === 'money' ? 'rent logged through GAM (all time)'
+    : field === 'occupied' ? 'units occupied this month, counted the way GAM bills them' : 'units under management'
   const levelWord = level === 'state' ? 'state' : 'county'
   const readout = (fips: string) => {
     const a = byFips.get(fips)
     return {
       name: placeName(fips),
-      value: a && a[measure] !== 0 ? valueText(measure, a[measure]) : measure === 'units' ? 'No units' : 'No rent logged',
+      value: a && valueOf(a, field) !== 0 ? valueText(field, valueOf(a, field))
+        : field === 'money' ? 'No rent logged' : field === 'occupied' ? 'None occupied' : 'No units',
       sub: a && a.properties > 0 ? propertiesText(a.properties) : '',
     }
   }
@@ -252,6 +273,10 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
             options={[{ value: 'state', label: 'State' }, { value: 'county', label: 'County' }]}/>
           <Toggle label="What the color shows" value={measure} onChange={setMeasure}
             options={[{ value: 'units', label: 'Units' }, { value: 'money', label: 'Money' }]}/>
+          {measure === 'units' && (
+            <Toggle label="Which units" value={spaces} onChange={setSpaces}
+              options={[{ value: 'occupied', label: 'Occupied (billed)' }, { value: 'all', label: 'All spaces' }]}/>
+          )}
         </div>
       </div>
       <div className="ks" style={{ margin: '4px 0 12px' }}>
@@ -314,10 +339,10 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
                 </span>
               </span>
               {keySteps.length > 1 && <>
-                <span className="mhm-key mono">{valueText(measure, lowest)}</span>
+                <span className="mhm-key mono">{valueText(field, lowest)}</span>
                 <span style={{ color: 'var(--t3)' }}>to</span>
               </>}
-              <span className="mhm-key mono">{valueText(measure, max)}</span>
+              <span className="mhm-key mono">{valueText(field, max)}</span>
             </div>
           )}
         </div>
@@ -335,7 +360,7 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
                 className={`mhm-row${selected === a.fips ? ' on' : ''}`}
                 onClick={() => setSelected(cur => (cur === a.fips ? null : a.fips))}>
                 <span className="mhm-row-name">{placeName(a.fips)}</span>
-                <span className="mhm-row-value mono">{valueText(measure, a[measure])}</span>
+                <span className="mhm-row-value mono">{valueText(field, valueOf(a, field))}</span>
               </button>
             ))}
           {rankedAll.length > TOP && (
@@ -352,12 +377,12 @@ export function MetricsHeatMap({ data }: { data: PlatformMapData | null | undefi
           <div className="kl" style={{ marginBottom: 4 }}>Not on this map</div>
           {missing.map(x => (
             <div key={x.reason} className="ks">
-              {x.properties > 0 ? `${propertiesText(x.properties)} · ` : ''}{valueText(measure, x[measure])} — {x.label}
+              {x.properties > 0 ? `${propertiesText(x.properties)} · ` : ''}{valueText(field, valueOf(x, field))} — {x.label}
             </div>
           ))}
           {undrawn.map(a => (
             <div key={a.fips} className="ks">
-              {placeName(a.fips)} · {valueText(measure, a[measure])} — outside the drawn map (U.S. territories are not drawn)
+              {placeName(a.fips)} · {valueText(field, valueOf(a, field))} — outside the drawn map (U.S. territories are not drawn)
             </div>
           ))}
         </div>
