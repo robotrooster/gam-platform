@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 6rFhAGJtmNWN95Ib8KKKaII7tZrqSFm8SddeIuWm7H3ibacmF8eNq8OO5HbiHXU
+\restrict c3yIfwGE7MDeAPX2ES4JdnORdvcFxhRhbKfYC1Wh956aNw07PctqoTpFxGtEcOR
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -857,6 +857,39 @@ END $$;
 
 
 --
+-- Name: books_loans_asset_guard(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_loans_asset_guard() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  a record;
+BEGIN
+  IF (NEW.voided_at IS NOT NULL AND OLD.voided_at IS NULL) OR NEW.funded_to IS DISTINCT FROM OLD.funded_to THEN
+    SELECT f.name INTO a FROM books_fixed_assets f WHERE f.funded_loan_id = NEW.id AND f.voided_at IS NULL LIMIT 1;
+    IF FOUND THEN
+      RAISE EXCEPTION 'This loan paid for the fixed asset "%". Void the asset on the Fixed assets page first.', a.name
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  IF NEW.start_date IS DISTINCT FROM OLD.start_date THEN
+    SELECT f.name, f.acquired_on, x.books_start_date INTO a
+      FROM books_fixed_assets f JOIN landlords x ON x.id = f.landlord_id
+     WHERE f.funded_loan_id = NEW.id AND f.voided_at IS NULL AND x.books_start_date IS NOT NULL
+       AND (NEW.start_date < x.books_start_date) <> (f.acquired_on < x.books_start_date)
+     LIMIT 1;
+    IF FOUND THEN
+      RAISE EXCEPTION 'This loan paid for the fixed asset "%", bought on %. Your books start on %, and the loan''s day cannot be on the other side of that day from the asset''s (the asset''s cost would count twice, or not at all). Change the asset''s day on the Fixed assets page first.',
+        a.name, a.acquired_on, a.books_start_date
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
 -- Name: books_loans_guard(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1147,6 +1180,30 @@ END $$;
 --
 
 COMMENT ON FUNCTION public.books_seed_categories(p_landlord uuid) IS '10/12 (Nic, L5): adds GAM''s starting categories a company does not have yet (BOOKS_DEFAULT_*_CATEGORIES), Work trade labor included (20261014240100). Idempotent.';
+
+
+--
+-- Name: books_start_asset_loan_guard(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_start_asset_loan_guard() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  a record;
+BEGIN
+  SELECT f.name AS asset_name, f.acquired_on, l.name AS loan_name, l.start_date INTO a
+    FROM books_fixed_assets f JOIN books_loans l ON l.id = f.funded_loan_id
+   WHERE f.landlord_id = NEW.id AND f.voided_at IS NULL AND f.funded_by = 'loan'
+     AND (l.start_date < NEW.books_start_date) <> (f.acquired_on < NEW.books_start_date)
+   LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION 'Your books cannot start on %: the fixed asset "%" (bought on %) and the loan "%" that paid for it (made on %) would be on different sides of that day, so the asset''s cost would count twice, or not at all. Change the asset''s day or the loan''s first.',
+      NEW.books_start_date, a.asset_name, a.acquired_on, a.loan_name, a.start_date
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
 
 
 --
@@ -2953,7 +3010,7 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -2967,7 +3024,12 @@ BEGIN
                  + make_interval(months => COALESCE(round(r.life_years * 12)::int, 0) - 1),
                interval '1 month') AS m
        WHERE r.life_years IS NOT NULL
-         AND (m + interval '1 month')::date <= CURRENT_DATE) k(source_type, source_id, owner_id)
+         AND (m + interval '1 month')::date <= CURRENT_DATE
+      UNION ALL
+      SELECT 'expense', r.source_expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -2981,7 +3043,7 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -2995,7 +3057,12 @@ BEGIN
                  + make_interval(months => COALESCE(round(r.life_years * 12)::int, 0) - 1),
                interval '1 month') AS m
        WHERE r.life_years IS NOT NULL
-         AND (m + interval '1 month')::date <= CURRENT_DATE) k(source_type, source_id, owner_id)
+         AND (m + interval '1 month')::date <= CURRENT_DATE
+      UNION ALL
+      SELECT 'expense', r.source_expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -3009,14 +3076,14 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text)
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text)) r
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text)) r
     CROSS JOIN LATERAL (SELECT 'fixed_asset'::text, r.id::text, COALESCE(r.landlord_id, r.business_id)
       UNION ALL
       SELECT 'fixed_asset', r.id::text || '|' || to_char(m, 'YYYY-MM'), COALESCE(r.landlord_id, r.business_id)
@@ -3027,7 +3094,12 @@ BEGIN
                  + make_interval(months => COALESCE(round(r.life_years * 12)::int, 0) - 1),
                interval '1 month') AS m
        WHERE r.life_years IS NOT NULL
-         AND (m + interval '1 month')::date <= CURRENT_DATE) k(source_type, source_id, owner_id)
+         AND (m + interval '1 month')::date <= CURRENT_DATE
+      UNION ALL
+      SELECT 'expense', r.source_expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -4153,7 +4225,7 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at,dispute_won_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -4171,7 +4243,7 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at,dispute_won_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -4189,14 +4261,14 @@ CREATE FUNCTION public.ledger_capture_landlord_gam_debits_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at
+  -- ledger columns: landlord_id,charges_amount,bank_cost_amount,total_amount,status,charge_ids,settled_at,disputed_at,dispute_won_at
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text)
+           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text, o.dispute_won_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text, n.dispute_won_at::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text)) r
+           WHERE ROW(o.landlord_id::text, o.charges_amount::text, o.bank_cost_amount::text, o.total_amount::text, o.status::text, o.charge_ids::text, o.settled_at::text, o.disputed_at::text, o.dispute_won_at::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.charges_amount::text, n.bank_cost_amount::text, n.total_amount::text, n.status::text, n.charge_ids::text, n.settled_at::text, n.disputed_at::text, n.dispute_won_at::text)) r
     CROSS JOIN LATERAL (SELECT 'gam_debit'::text, r.id::text, r.landlord_id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
@@ -8206,9 +8278,13 @@ CREATE TABLE public.books_fixed_assets (
     voided_at timestamp with time zone,
     voided_by uuid,
     void_reason text,
+    funded_by text,
+    funded_loan_id uuid,
     CONSTRAINT books_fixed_assets_class_check CHECK ((asset_class = ANY (ARRAY['building'::text, 'improvement'::text, 'equipment'::text, 'vehicle'::text, 'land'::text]))),
     CONSTRAINT books_fixed_assets_cost_check CHECK (((cost > (0)::numeric) AND (salvage_value >= (0)::numeric) AND (salvage_value <= cost))),
     CONSTRAINT books_fixed_assets_dates_check CHECK ((in_service_date >= acquired_on)),
+    CONSTRAINT books_fixed_assets_funded_by_check CHECK (((funded_by IS NULL) OR (funded_by = ANY (ARRAY['cash'::text, 'owner'::text, 'loan'::text, 'expense'::text])))),
+    CONSTRAINT books_fixed_assets_funded_shape CHECK ((((funded_loan_id IS NOT NULL) = (NOT (funded_by IS DISTINCT FROM 'loan'::text))) AND ((funded_by IS DISTINCT FROM 'expense'::text) OR (source_expense_id IS NOT NULL)) AND ((source_expense_id IS NULL) OR (funded_by IS NULL) OR (funded_by = 'expense'::text)))),
     CONSTRAINT books_fixed_assets_life_check CHECK ((((asset_class = 'land'::text) AND (life_years IS NULL)) OR ((asset_class <> 'land'::text) AND (life_years > (0)::numeric) AND (life_years <= (100)::numeric) AND ((life_years * (12)::numeric) = round((life_years * (12)::numeric)))))),
     CONSTRAINT books_fixed_assets_method_check CHECK ((method = 'straight_line'::text)),
     CONSTRAINT books_fixed_assets_name_check CHECK (((length(btrim(name)) >= 1) AND (length(btrim(name)) <= 120))),
@@ -8237,6 +8313,20 @@ COMMENT ON COLUMN public.books_fixed_assets.prior_depreciation IS '10/12: for an
 --
 
 COMMENT ON COLUMN public.books_fixed_assets.source_expense_id IS '10/12 (Nic): the expense this asset was made from (filed under a capital-improvement category — one charging to an asset account). Its cost is on the books through that expense.';
+
+
+--
+-- Name: COLUMN books_fixed_assets.funded_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_assets.funded_by IS '10/13 (Nic): where the money for an asset typed in by hand came from — cash (cash on hand: Cr Undeposited funds 1040), owner (Cr Owner equity and contributions 3010), loan (funded_loan_id; the loan''s own posting carries the cost), expense (source_expense_id; the expense''s cost moves to the asset''s account). NULL: not asked (bought before the books start), or entered before 10/13. BOOKS_FIXED_ASSET_FUNDED_BY.';
+
+
+--
+-- Name: COLUMN books_fixed_assets.funded_loan_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_assets.funded_loan_id IS '10/13 (Nic): for funded_by = loan, the loan (Loans page) whose money went straight to the seller of this asset.';
 
 
 --
@@ -11843,7 +11933,7 @@ CREATE TABLE public.landlord_gam_charges (
     CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text, 'device_installment'::text, 'screening_fee'::text, 'bank_debit_failed_cost'::text, 'uncovered_processing_fee'::text]))),
     CONSTRAINT landlord_gam_charges_reader_piece_check CHECK ((((reader_order_id IS NULL) = (installment_number IS NULL)) AND ((installment_number IS NULL) OR (installment_number > 0)))),
     CONSTRAINT landlord_gam_charges_void_is_stamped CHECK (((voided_at IS NULL) = (void_reason IS NULL))),
-    CONSTRAINT landlord_gam_charges_void_reason_check CHECK (((void_reason IS NULL) OR (void_reason = ANY (ARRAY['bank_debit_not_made'::text, 'screening_payment_taken_back'::text, 'bank_debit_failed'::text]))))
+    CONSTRAINT landlord_gam_charges_void_reason_check CHECK (((void_reason IS NULL) OR (void_reason = ANY (ARRAY['bank_debit_not_made'::text, 'screening_payment_taken_back'::text, 'bank_debit_failed'::text, 'dispute_won'::text, 'dispute_cost_rebilled'::text]))))
 );
 
 
@@ -11910,9 +12000,17 @@ CREATE TABLE public.landlord_gam_debits (
     dispute_cost_amount numeric(12,2),
     dispute_cost_charge_id uuid,
     dispute_cost_read_at timestamp with time zone,
+    dispute_fee_amount numeric(12,2),
+    dispute_fee_assumed_at timestamp with time zone,
+    dispute_fee_stated_at timestamp with time zone,
+    dispute_won_at timestamp with time zone,
+    dispute_won_restored_amount numeric(12,2),
+    dispute_won_given_back_amount numeric(12,2),
     CONSTRAINT landlord_gam_debits_bank_cost_amount_check CHECK ((bank_cost_amount >= (0)::numeric)),
     CONSTRAINT landlord_gam_debits_charges_amount_check CHECK ((charges_amount > (0)::numeric)),
     CONSTRAINT landlord_gam_debits_dispute_cost_shape CHECK ((((dispute_cost_amount IS NULL) OR (dispute_cost_amount >= (0)::numeric)) AND ((dispute_cost_amount IS NULL) = (dispute_cost_read_at IS NULL)) AND ((dispute_cost_read_at IS NULL) OR (disputed_at IS NOT NULL)) AND ((dispute_cost_charge_id IS NULL) OR (dispute_cost_amount > (0)::numeric)))),
+    CONSTRAINT landlord_gam_debits_dispute_fee_shape CHECK ((((dispute_fee_amount IS NULL) OR ((dispute_fee_amount >= (0)::numeric) AND (dispute_cost_read_at IS NOT NULL))) AND ((dispute_fee_assumed_at IS NULL) OR (dispute_fee_amount IS NOT NULL)) AND ((dispute_fee_stated_at IS NULL) OR (dispute_fee_amount IS NOT NULL)))),
+    CONSTRAINT landlord_gam_debits_dispute_won_shape CHECK ((((dispute_won_at IS NULL) OR (disputed_at IS NOT NULL)) AND ((dispute_won_at IS NULL) = (dispute_won_restored_amount IS NULL)) AND ((dispute_won_at IS NULL) = (dispute_won_given_back_amount IS NULL)) AND ((dispute_won_restored_amount IS NULL) OR (dispute_won_restored_amount >= (0)::numeric)) AND ((dispute_won_given_back_amount IS NULL) OR (dispute_won_given_back_amount >= (0)::numeric)))),
     CONSTRAINT landlord_gam_debits_disputed_shape CHECK ((((disputed_at IS NULL) = (stripe_dispute_id IS NULL)) AND ((disputed_at IS NULL) = (dispute_reopened_amount IS NULL)) AND ((disputed_at IS NULL) OR (status = 'succeeded'::text)) AND ((dispute_reopened_amount IS NULL) OR (dispute_reopened_amount >= (0)::numeric)))),
     CONSTRAINT landlord_gam_debits_failure_cost_check CHECK ((((failure_cost_amount IS NULL) OR (failure_cost_amount >= (0)::numeric)) AND ((failure_cost_amount IS NULL) = (failure_cost_read_at IS NULL)) AND ((failure_cost_charge_id IS NULL) OR (failure_cost_amount > (0)::numeric)))),
     CONSTRAINT landlord_gam_debits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'succeeded'::text, 'failed'::text, 'canceled'::text]))),
@@ -11966,14 +12064,14 @@ COMMENT ON COLUMN public.landlord_gam_debits.dispute_reopened_amount IS '10/13: 
 -- Name: COLUMN landlord_gam_debits.dispute_cost_amount; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_amount IS '10/13 (Nic G1, "gam eats no fees of failed pulls ever"): what the disputed pull actually cost GAM — Stripe''s fee on the pull plus Stripe''s dispute fee — billed to the landlord at cost. NULL = not read from Stripe yet (the nightly sweep asks again).';
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_amount IS '10/13 (Nic G1): what the dispute costs the landlord now, billed at cost — Stripe''s fee on the pull plus Stripe''s dispute fee; after a win (dispute_won_at), only the part of the dispute fee Stripe kept. A correction or a win re-bills it (migration 20261015180000). NULL = not read from Stripe yet (the nightly sweep asks again).';
 
 
 --
 -- Name: COLUMN landlord_gam_debits.dispute_cost_charge_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_charge_id IS '10/13: the landlord_gam_charges row (kind bank_debit_failed_cost, source_type gam_bank_debit_disputed) that bills dispute_cost_amount. NULL when it cost nothing.';
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_charge_id IS '10/13: the landlord_gam_charges row (kind bank_debit_failed_cost, source_type gam_bank_debit_disputed) that bills dispute_cost_amount now. A re-bill voids the one before it (reason dispute_cost_rebilled or dispute_won) and points here at the new one (source_id md5(''<pull id>:<basis>'')::uuid). NULL when it costs nothing.';
 
 
 --
@@ -11981,6 +12079,48 @@ COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_charge_id IS '10/13: t
 --
 
 COMMENT ON COLUMN public.landlord_gam_debits.dispute_cost_read_at IS '10/13: when dispute_cost_amount was read from Stripe. NULL = not read yet.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_fee_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_fee_amount IS '10/13 (Nic): Stripe''s dispute fee inside dispute_cost_amount — Stripe''s own word, or $15 (Stripe''s usual fee) when Stripe had not stated it three days after the dispute (dispute_fee_assumed_at). NULL = not read yet.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_fee_assumed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_fee_assumed_at IS '10/13 (Nic: "Dispute fee unknown → bill $15"): when $15 was billed as the dispute fee because Stripe had not stated it. Kept as history; dispute_fee_stated_at says when Stripe''s word replaced it.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_fee_stated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_fee_stated_at IS '10/13: when Stripe''s own word on its dispute fee was recorded — at the first read, or correcting the $15 assumed (the bill re-billed to it, never billed twice). NULL with dispute_fee_assumed_at set: still the $15, and the sweep keeps asking Stripe.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_won_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_won_at IS '10/13 (Nic: "Won GAM pull dispute: AUTOMATIC (back to collected; anything collected twice credited back)"): when Stripe''s win for GAM was applied — every charge the pull collected back to collected, its own $6 cost line un-voided and collected (+$6 earned again on GAM''s book: banking_spread, reference_type gam_bank_debit_dispute_won), what was collected twice given back on held_payout_items lines (refund, gam_debit_dispute_won:<pull>:<charge>), the dispute''s cost charge voided (dispute_won; collected part given back, gam_charge_voided:<charge>). The pull''s ''cancellation'' posting is taken back by the ledger. NULL = not won (or not applied yet).';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_won_restored_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_won_restored_amount IS '10/13: what the win put back to collected across the pull''s charges, its own $6 cost line included. Set with dispute_won_at.';
+
+
+--
+-- Name: COLUMN landlord_gam_debits.dispute_won_given_back_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_debits.dispute_won_given_back_amount IS '10/13: what the win gave back to the landlord on their next payout (held_payout_items, source_type refund): charges collected again since the dispute (collected twice), what the pull had paid on charges voided since (gam_debit_dispute_won:<pull>:<charge> both), and what was collected on the voided dispute cost charge (gam_charge_voided:<charge>). Set with dispute_won_at.';
 
 
 --
@@ -12290,6 +12430,7 @@ CREATE TABLE public.landlords (
     books_register_stock text DEFAULT 'expense_when_bought'::text NOT NULL,
     books_register_stock_from date,
     books_repair_bills text,
+    books_company_costs_from timestamp with time zone,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_books_close_by_check CHECK ((books_close_by = ANY (ARRAY['owner'::text, 'owner_or_bookkeeper'::text]))),
     CONSTRAINT landlords_books_company_costs_method_check CHECK (((books_company_costs_method IS NULL) OR (books_company_costs_method = ANY (ARRAY['company_bucket'::text, 'split_by_units'::text])))),
@@ -12518,6 +12659,13 @@ COMMENT ON COLUMN public.landlords.books_register_stock_from IS '10/12 (Nic, L8)
 --
 
 COMMENT ON COLUMN public.landlords.books_repair_bills IS '10/12 (Nic, L6): what a repair closed with a cost does — ''automatic'' makes an unpaid bill by itself, ''button'' only on "Record as bill". NULL = not chosen yet (the button is offered).';
+
+
+--
+-- Name: COLUMN landlords.books_company_costs_from; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.books_company_costs_from IS '10/13 (Nic): the moment books_company_costs_method was picked, when the books had already posted — the method applies to company-level costs recorded from then on; costs recorded before stay in the Company column (the default while not chosen). NULL = the method applies to every cost.';
 
 
 --
@@ -24523,6 +24671,13 @@ CREATE INDEX books_fixed_assets_landlord ON public.books_fixed_assets USING btre
 
 
 --
+-- Name: books_fixed_assets_loan; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_fixed_assets_loan ON public.books_fixed_assets USING btree (funded_loan_id) WHERE (funded_loan_id IS NOT NULL);
+
+
+--
 -- Name: books_fixed_assets_one_per_expense; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -32034,6 +32189,13 @@ CREATE TRIGGER books_loan_payments_guard BEFORE INSERT OR DELETE OR UPDATE ON pu
 
 
 --
+-- Name: books_loans books_loans_asset_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER books_loans_asset_guard BEFORE UPDATE OF voided_at, funded_to, start_date ON public.books_loans FOR EACH ROW EXECUTE FUNCTION public.books_loans_asset_guard();
+
+
+--
 -- Name: books_loans books_loans_guard; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -32052,6 +32214,13 @@ CREATE TRIGGER books_period_closes_append_only BEFORE DELETE OR UPDATE ON public
 --
 
 CREATE TRIGGER books_register_stock_changes_append_only BEFORE DELETE OR UPDATE ON public.books_register_stock_changes FOR EACH ROW EXECUTE FUNCTION public.books_register_stock_changes_append_only();
+
+
+--
+-- Name: landlords books_start_asset_loan_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER books_start_asset_loan_guard BEFORE UPDATE OF books_start_date ON public.landlords FOR EACH ROW WHEN (((new.books_start_date IS NOT NULL) AND (new.books_start_date IS DISTINCT FROM old.books_start_date))) EXECUTE FUNCTION public.books_start_asset_loan_guard();
 
 
 --
@@ -42362,5 +42531,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 6rFhAGJtmNWN95Ib8KKKaII7tZrqSFm8SddeIuWm7H3ibacmF8eNq8OO5HbiHXU
+\unrestrict c3yIfwGE7MDeAPX2ES4JdnORdvcFxhRhbKfYC1Wh956aNw07PctqoTpFxGtEcOR
 
