@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3npZxSXd1V3yEFoL0AuCxmhZTaikLSqwz7tpAwOs8PYoN2HWQzDhYWUYthssmJH
+\restrict lyJsPhBqlrX1tvJcUvOZWc5aF61CS7a335E40OYqztqBLs4hwehSBiFdOUgsqn8
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -27129,6 +27129,13 @@ CREATE INDEX idx_payments_unit ON public.payments USING btree (unit_id);
 
 
 --
+-- Name: idx_payments_unit_open_rent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_unit_open_rent ON public.payments USING btree (unit_id) WHERE ((type = 'rent'::text) AND (status = ANY (ARRAY['pending'::text, 'failed'::text])) AND (work_trade_suspended_at IS NULL) AND (amount > (0)::numeric));
+
+
+--
 -- Name: idx_payments_work_trade_settlement; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -42279,5 +42286,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3npZxSXd1V3yEFoL0AuCxmhZTaikLSqwz7tpAwOs8PYoN2HWQzDhYWUYthssmJH
+\unrestrict lyJsPhBqlrX1tvJcUvOZWc5aF61CS7a335E40OYqztqBLs4hwehSBiFdOUgsqn8
 
