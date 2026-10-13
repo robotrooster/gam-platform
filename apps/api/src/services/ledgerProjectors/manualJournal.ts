@@ -20,8 +20,16 @@
  * control role uses: receivables, money GAM holds, deposits owed …, migration
  * 20261013200400) while the posting's own balance check reads the posting.
  *
- * A line on an account since deleted (retired) posts to the account that
- * took its place (the engine resolves it: booksLedgerChart.resolveAccount).
+ * A line names its account as the bookkeeper entered it; the engine decides
+ * where a deleted (retired) account's line lands (booksLedgerChart
+ * accountTakingOver — resolveAccount hands the named account through as is).
+ * 10/13 (Nic): an entry posted, or posted again, after the deletion puts the
+ * line on the account that took its place. An entry already posted keeps the
+ * deleted account while its posting sits in a month that was closed when the
+ * account was deleted (before books_accounts.replaced_from); one sitting in an
+ * open month moves with the open months. Taking a posting back (a void, or the
+ * first half of a re-post) mirrors it line for line, so that reversal is on
+ * the account the posting was on.
  *
  * A voided entry posts nothing: the engine takes its posting back (a
  * correction; in the first open month when the entry's month is closed). A

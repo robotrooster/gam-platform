@@ -37,6 +37,26 @@
  *                   re-posting and move to the replacement (a reversal and a
  *                   new posting each, dated as they were — posted lines are
  *                   never changed).
+ *   accountTakingOver  10/13 (Nic): a deleted account's replacement takes
+ *                   everything written after the deletion. A record dated
+ *                   inside an already-CLOSED month that arrives after its
+ *                   account was deleted posts as a correction in the open
+ *                   month — to the REPLACEMENT (Nic chose "The replacement").
+ *                   A line resolves on its own day (the map, or the account a
+ *                   journal line names); the engine then hands each deleted
+ *                   account to the one that took its place: always for a
+ *                   new posting it writes now (every write lands in an open
+ *                   month), and for a posting already in the books only from
+ *                   the day the replacement took over (replaced_from, the
+ *                   first open day at the deletion) — so a closed month's
+ *                   postings keep the account they were posted to, and a
+ *                   month reopened later never reads as drift. A reversal
+ *                   is never handed on: it negates the posting it takes back
+ *                   line for line, so taking back a closed month's posting
+ *                   on a deleted account (a void, or a change to the record)
+ *                   puts that reversal on the deleted account, in the open
+ *                   month; a changed record's new version goes to the
+ *                   replacement.
  *
  * CONTROL ACCOUNTS (10/12 (Nic) review). A control role's account (receivables,
  * money GAM holds, deposits owed …, LEDGER_CONTROL_ROLES) is proven against the
@@ -73,10 +93,22 @@ export interface MapRow {
   effective_from: string
 }
 
+/**
+ * 10/13 (Nic): a deleted (retired) account — the account that took its place,
+ * and the first day it did (books_accounts.replaced_from; null when the
+ * account was turned off outside retireAccount: nothing already posted moves).
+ */
+export interface RetiredAccount {
+  next: string
+  from: string | null
+}
+
 /** What a company's chart looks like to the engine during one transaction. */
 export interface ChartState {
   owner: LedgerOwner
   map: MapRow[]
+  /** 10/13 (Nic): the company's deleted accounts that name a replacement, by id. */
+  retired: Map<string, RetiredAccount>
 }
 
 /** A line's account, resolved. */
@@ -104,6 +136,49 @@ async function loadMap(client: PoolClient, owner: LedgerOwner): Promise<MapRow[]
        FROM books_account_map WHERE ${ownerColOf(owner)} = $1
       ORDER BY map_kind, map_value, effective_from DESC, id DESC`, [ownerIdOf(owner)])
   return r.rows.map(x => ({ ...x, id: Number(x.id) }))
+}
+
+/** 10/13 (Nic): the company's deleted accounts and the accounts that took their places. */
+async function loadRetired(client: PoolClient, owner: LedgerOwner): Promise<Map<string, RetiredAccount>> {
+  const r = await client.query<{ id: string; next: string; from: string | null }>(
+    `SELECT id, replaced_by_account_id AS next, replaced_from::text AS "from"
+       FROM books_accounts
+      WHERE ${ownerColOf(owner)} = $1 AND active IS FALSE AND replaced_by_account_id IS NOT NULL`, [ownerIdOf(owner)])
+  return new Map(r.rows.map(x => [x.id, { next: x.next, from: x.from }]))
+}
+
+/**
+ * The company's chart as it stands, read only (the nightly check and a dry
+ * run): nothing is seeded and no sub-account is added.
+ */
+export async function readChart(client: PoolClient, owner: LedgerOwner): Promise<ChartState> {
+  return { owner, map: await loadMap(client, owner), retired: await loadRetired(client, owner) }
+}
+
+/**
+ * 10/13 (Nic): the account a line resolved to `accountId` posts to.
+ *   `on` omitted — a new posting written now (never a reversal, which
+ *     negates its original line for line): a deleted account hands it to the
+ *     account that took its place (followed through a chain of deletions,
+ *     never round a loop). Every write lands in an open month, and the open
+ *     months are the replacement's — a late record for a closed month too
+ *     (Nic: "The replacement").
+ *   `on` = the day a posting already in the books sits on (its accounting
+ *     date): handed on only where the replacement had taken over by that day
+ *     (replaced_from). A closed month's posting keeps the account it was
+ *     posted to; what sat in the open months moves.
+ */
+export function accountTakingOver(chart: Pick<ChartState, 'retired'>, accountId: string, on?: string): string {
+  let at = accountId
+  const seen = new Set<string>([at])
+  for (let hop = 0; hop < 20; hop++) {
+    const r = chart.retired.get(at)
+    if (!r || seen.has(r.next)) break
+    if (on !== undefined && (r.from === null || on < r.from)) break
+    seen.add(r.next)
+    at = r.next
+  }
+  return at
 }
 
 /** The map row in force on `day` for (kind, value): the latest effective_from on or before it. */
@@ -160,7 +235,7 @@ export async function ensureChart(client: PoolClient, owner: LedgerOwner): Promi
   let map = await loadMap(client, owner)
   const roleMapped = new Set(map.filter(m => m.map_kind === 'role').map(m => m.map_value))
   const missing = LEDGER_ACCOUNT_ROLE_DEFS.filter(d => !roleMapped.has(d.role))
-  if (missing.length === 0) return { owner, map }
+  if (missing.length === 0) return { owner, map, retired: await loadRetired(client, owner) }
 
   await lockChart(client, owner)
   // Re-read under the lock: another poster may have seeded meanwhile.
@@ -209,7 +284,7 @@ export async function ensureChart(client: PoolClient, owner: LedgerOwner): Promi
     everTargets.add(accountId)
     if (def.control) everControlTargets.add(accountId)
   }
-  return { owner, map: await loadMap(client, owner) }
+  return { owner, map: await loadMap(client, owner), retired: await loadRetired(client, owner) }
 }
 
 /** A line's account selector: a posting role, optionally a bank's or a tax's own sub-account under it. */
@@ -221,9 +296,12 @@ export interface AccountSelector {
 }
 
 /**
- * The account a line posts to on `day`. A bank connection or named tax seen
- * for the first time gets its own sub-account under its parent role's account
- * (unless `readOnly`, which returns null instead of writing).
+ * The account a line posts to on `day`, as the chart had it that day (the map
+ * row in force, or the account a journal line names). A deleted account's
+ * replacement is the engine's to apply (accountTakingOver: it depends on
+ * where the posting lands). A bank connection or named tax seen for the first
+ * time gets its own sub-account under its parent role's account (unless
+ * `readOnly`, which returns null instead of writing).
  */
 export async function resolveAccount(
   client: PoolClient, state: ChartState, sel: AccountSelector, day: string, opts: { readOnly?: boolean } = {},
@@ -234,7 +312,9 @@ export async function resolveAccount(
     // account that took its place takes the line too, as it takes every
     // posting role that pointed there: retirement moves an account's open
     // months to its replacement (its closed months keep their postings).
-    return { accountId: await liveAccountOf(client, sel.accountId), accountRole: sel.role ?? null, mapKind: null, mapValue: null }
+    // 10/13 (Nic): the engine hands it on (accountTakingOver), by where the
+    // posting lands — never here, where a closed month's line would move too.
+    return { accountId: sel.accountId, accountRole: sel.role ?? null, mapKind: null, mapValue: null }
   }
   if (sel.sub) {
     const { kind, value } = sel.sub
@@ -292,25 +372,6 @@ export async function resolveAccount(
   const hit = mapRowOn(state.map, 'role', sel.role, day) ?? earliest(state.map, 'role', sel.role)
   if (!hit) return null
   return { accountId: hit.account_id, accountRole: sel.role, mapKind: 'role', mapValue: sel.role }
-}
-
-/**
- * 10/12 (Nic, ledger P7): the account `accountId` stands for today — itself,
- * or, once it has been retired, the account that took its place (followed
- * through a chain of retirements, never round a loop).
- */
-async function liveAccountOf(client: PoolClient, accountId: string): Promise<string> {
-  let at = accountId
-  const seen = new Set<string>([at])
-  for (let hop = 0; hop < 20; hop++) {
-    const r = await client.query<{ next: string | null }>(
-      `SELECT CASE WHEN active IS FALSE THEN replaced_by_account_id END AS next FROM books_accounts WHERE id = $1`, [at])
-    const next = r.rows[0]?.next ?? null
-    if (!next || seen.has(next)) break
-    seen.add(next)
-    at = next
-  }
-  return at
 }
 
 /** The earliest row for (kind, value): covers a day before any row's effective_from. */
@@ -399,6 +460,12 @@ async function sharingRefusal(
  * has a line resolved through `key` (or, with `accountId`, on that account),
  * dated `from` or later — in the caller's transaction, so the change and the
  * marks commit together. Returns how many sources were marked.
+ *
+ * 10/13 (Nic): `from` is an intended day for a repoint (a repoint follows the
+ * day a record is dated) and the day a posting sits on for a deleted account
+ * (its open months move to the replacement — a correction already sitting in
+ * an open month for a closed month's record included; its accounting date is
+ * never before its intended date, so every open-month record is in).
  */
 async function requeuePosted(
   c: PoolClient, owner: LedgerOwner, from: string, by: { key: MapKey } | { accountId: string },
@@ -417,7 +484,7 @@ async function requeuePosted(
          SELECT DISTINCT p.source_type, p.source_id, $1::uuid
            FROM ledger_postings p JOIN ledger_posting_lines l ON l.posting_id = p.id
           WHERE p.${col} = $1 AND p.role = 'post' AND p.superseded_at IS NULL
-            AND l.account_id = $2 AND p.intended_date >= $3::date`,
+            AND l.account_id = $2 AND p.accounting_date >= $3::date`,
         [ownerIdOf(owner), by.accountId, from])
   return r.rowCount ?? 0
 }
@@ -555,10 +622,15 @@ export async function retireAccount(args: {
       // The open months' postings on it move to the replacement at the next drain.
       await requeuePosted(c, args.owner, ctx.firstOpenDay ?? LEDGER_MAP_BEGINNING, { accountId: acct.id })
     }
+    // 10/13 (Nic): the first day the replacement takes over — what is posted
+    // before it (the closed months) stays here; everything else, and every
+    // record that arrives from now on, posts to the replacement.
     await c.query(
       `UPDATE books_accounts
-          SET active = FALSE, replaced_by_account_id = $2, retired_at = now(), retired_by = $3, updated_at = now()
-        WHERE id = $1`, [acct.id, replacement?.id ?? null, args.actorUserId])
+          SET active = FALSE, replaced_by_account_id = $2, replaced_from = $4::date,
+              retired_at = now(), retired_by = $3, updated_at = now()
+        WHERE id = $1`,
+      [acct.id, replacement?.id ?? null, args.actorUserId, replacement ? ctx.firstOpenDay ?? LEDGER_MAP_BEGINNING : null])
     return { repointed: pointing, hadHistory }
   })
 }

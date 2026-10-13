@@ -358,7 +358,11 @@ export async function projectBankMatchMoneyOut(client: PoolClient, lineId: strin
     }]
   }
   const record = t.matched_kind === 'gam_debit' && t.matched_gam_debit_id
-    ? await payoutGamDebitProjector.project(client, t.matched_gam_debit_id)
+    // 10/13 (Nic): the pull's own posting. A pull the landlord's bank disputed
+    // also posts the money coming back (its 'cancellation'); that is the
+    // return's to clear, never the pull's bank line — counted here it would
+    // net the pull's line to nothing.
+    ? (await payoutGamDebitProjector.project(client, t.matched_gam_debit_id)).filter(p => (p.postingKind ?? 'main') === 'main')
     : t.matched_kind === 'pos_refund' && t.matched_pos_refund_id
       ? await registerRefundProjector.project(client, t.matched_pos_refund_id)
       : t.matched_kind === 'refund_part' && t.matched_refund_part_id

@@ -20,7 +20,12 @@
  *                                 (it collects every charge it carried), so what
  *                                 was collected on pieces is added back to the
  *                                 ledger side and reported on its own as
- *                                 'pending' (waiting on Q11), never as drift
+ *                                 'pending' (waiting on Q11), never as drift.
+ *                                 10/13 (Nic): a bank pull the landlord's
+ *                                 bank disputed collected nothing — its
+ *                                 charges are owed again and its own posting
+ *                                 credits 2080 back (payoutGamCharges) — so
+ *                                 its collections count on neither side
  *
  * 10/12 (Nic, ledger review): a difference is 'pending' while a record that
  * posts to the account still waits to post (services/ledgerPending), else
@@ -97,18 +102,24 @@ export const dueToGamCheck: LedgerCheck = {
     if (!owner.landlordId) return []
     const ledger = -(await roleBalance(client, owner.landlordId, 'due_to_gam'))
     const r = (await client.query<{ owed: string; pieces: string; piece_ids: string[] | null }>(
+      // 10/13 (Nic): a disputed pull's collections are owed again — they count nowhere.
       `SELECT COALESCE((SELECT SUM(c.amount - COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col
-                                                         WHERE col.charge_id = c.id), 0))
+                                                         WHERE col.charge_id = c.id
+                                                           AND NOT EXISTS (SELECT 1 FROM landlord_gam_debits dd
+                                                                            WHERE dd.id = col.landlord_gam_debit_id
+                                                                              AND dd.disputed_at IS NOT NULL)), 0))
                           FROM landlord_gam_charges c
                          WHERE c.landlord_id = $1 AND c.voided_at IS NULL AND c.kind <> 'device_installment'), 0)::text AS owed,
-              -- A reader piece collected by a sent batch or a bank pull that went through: those debited 2080.
+              -- A reader piece collected by a sent batch or a bank pull that went through (and was not
+              -- disputed: a disputed pull's own posting credits 2080 back): those debited 2080.
               COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col
                           JOIN landlord_gam_charges c ON c.id = col.charge_id
                          WHERE c.landlord_id = $1 AND c.kind = 'device_installment'
                            AND (EXISTS (SELECT 1 FROM platform_transfer_intents i
                                          WHERE i.id = col.platform_transfer_intent_id AND i.status = 'transferred' AND i.transferred_at IS NOT NULL)
                                 OR EXISTS (SELECT 1 FROM landlord_gam_debits d
-                                            WHERE d.id = col.landlord_gam_debit_id AND d.status = 'succeeded' AND d.settled_at IS NOT NULL))), 0)::text AS pieces,
+                                            WHERE d.id = col.landlord_gam_debit_id AND d.status = 'succeeded' AND d.settled_at IS NOT NULL
+                                              AND d.disputed_at IS NULL))), 0)::text AS pieces,
               (SELECT array_agg(c.id::text) FROM landlord_gam_charges c
                 WHERE c.landlord_id = $1 AND c.kind = 'device_installment') AS piece_ids`, [owner.landlordId])).rows[0]
     const pieces = toCents(r.pieces)

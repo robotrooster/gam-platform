@@ -1147,6 +1147,11 @@ export async function ledgerCashFlow(s: LedgerScope, start: string, end: string)
   const [rows, clears, c] = await Promise.all([flows, clearings, cash])
   // What each cleared record paid for: its own posting's lines other than the
   // check (and cash, and the clearing between properties), by property.
+  // 10/13 (Nic): never its taking-back (posting kind 'cancellation': a GAM fee
+  // pull the landlord's bank later disputed, ledgerProjectors/payoutGamCharges)
+  // — that posting is the money coming back, not what the bank line paid, and
+  // read with it the pull's GAM charges would net to nothing and the line would
+  // fall back to "checks and bank debits that cleared", in a month already shown.
   type Paid = { role: string | null; account_id: string; name: string; type: string; kind: string | null; property_id: string | null; cents: number }
   const mains = new Map<string, Paid[]>()
   const keys = [...new Set(clears.filter(x => x.main_type && x.main_id).map(x => `${x.landlord_id}|${x.main_type}|${x.main_id}`))]
@@ -1159,7 +1164,8 @@ export async function ledgerCashFlow(s: LedgerScope, start: string, end: string)
          JOIN ledger_posting_lines l ON l.posting_id = ps.id
          JOIN books_accounts a ON a.id = l.account_id
         WHERE ps.landlord_id::text || '|' || ps.source_type || '|' || ps.source_id = ANY($1::text[])
-          AND ps.role = 'post' AND ps.superseded_at IS NULL AND ps.posting_kind IS DISTINCT FROM 'bank_clear'
+          AND ps.role = 'post' AND ps.superseded_at IS NULL
+          AND ps.posting_kind IS DISTINCT FROM 'bank_clear' AND ps.posting_kind IS DISTINCT FROM 'cancellation'
           AND NOT (${effectiveRoleSql('l', 'a')} = ANY($2::text[]) OR ${effectiveRoleSql('l', 'a')} IN ('outstanding_checks', 'interproperty_clearing'))
         GROUP BY 1, 2, 3, 4, 5, 6, 7 HAVING SUM(l.credit - l.debit) <> 0`, [keys, CASH_ROLES])
     for (const r of ml) {

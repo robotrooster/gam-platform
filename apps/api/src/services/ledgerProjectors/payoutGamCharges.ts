@@ -34,6 +34,27 @@
  * A pull for more than the charges on record (a pull raised by code from
  * before 10/12) puts the difference in Suspense (1099) to classify. A failed
  * pull posts nothing; what it cost is its own charge (above).
+ *
+ * 10/13 (Nic): "GAM fee pull disputed by landlord's bank: AUTOMATIC — the
+ * disputed fees reopen as owed by the landlord, collected on the next pull,
+ * admin told." A pull the landlord's bank disputed (disputed_at; it stays
+ * 'succeeded', services/landlordGamDebit handleGamDebitDispute) posts a second
+ * posting of its own, on the dispute's day (the company's calendar), that
+ * takes back exactly what the pull posted:
+ *
+ *   Dr Outstanding checks and debits (2015)  the bank money coming back, until
+ *                                        the bank line of the return clears it
+ *   Cr Due to GAM (2080)                 each charge the pull had paid, owed again,
+ *                                        at the charge's property
+ *   (and the Suspense difference back out of Suspense)
+ *
+ * With the rest of the dispute posting through its own charges — the pull's
+ * own $6 cost line voided (its charge taken back: Dr 2080 / Cr Bank fees) and
+ * what the dispute cost GAM billed at cost (bank_debit_failed_cost, source
+ * 'gam_bank_debit_disputed': Dr 5116 / Cr 2080) — Due to GAM is up by exactly
+ * dispute_reopened_amount plus that cost, and the next pull that collects them
+ * debits it again. The p5_due_to_gam tie-out counts no collection of a disputed
+ * pull (payoutChecks), so the books and the money records agree throughout.
  */
 import type { PoolClient } from 'pg'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
@@ -58,6 +79,14 @@ const CHARGE_MEMO: Record<string, string> = {
   bank_debit_failed_cost: 'What a failed bank pull of GAM\'s fees cost',
   uncovered_processing_fee: 'Processing fee you cover, more than the payment',
 }
+/**
+ * 10/13 (Nic): the cost of a pull the landlord's bank disputed is a
+ * bank_debit_failed_cost charge too (G1), from this source
+ * (services/landlordGamDebit GAM_DEBIT_DISPUTE_COST_SOURCE) — the pull did go
+ * through, so its memo says what happened.
+ */
+const DISPUTED_PULL_COST_SOURCE = 'gam_bank_debit_disputed'
+const DISPUTED_PULL_COST_MEMO = 'What a bank pull of GAM\'s fees your bank disputed cost'
 
 export const payoutGamChargeProjector: LedgerProjector = {
   sourceType: 'gam_charge',
@@ -66,8 +95,11 @@ export const payoutGamChargeProjector: LedgerProjector = {
   ruleVersion: 2,
 
   async project(client: PoolClient, chargeId: string): Promise<DesiredPosting[]> {
-    const c = (await client.query<{ landlord_id: string; property_id: string | null; kind: string; amount: string; voided_at: string | null; day: string }>(
-      `SELECT c.landlord_id, c.property_id, c.kind, c.amount::text, c.voided_at::text,
+    const c = (await client.query<{
+      landlord_id: string; property_id: string | null; kind: string; amount: string; voided_at: string | null; day: string
+      source_type: string | null
+    }>(
+      `SELECT c.landlord_id, c.property_id, c.kind, c.amount::text, c.voided_at::text, c.source_type,
               ${localDaySql('c.created_at', propertyTzSql('c.property_id', 'c.landlord_id'))} AS day
          FROM landlord_gam_charges c WHERE c.id::text = $1`, [chargeId])).rows[0]
     if (!c || c.voided_at) return []
@@ -78,7 +110,9 @@ export const payoutGamChargeProjector: LedgerProjector = {
     const role = CHARGE_EXPENSE[c.kind]
     if (!role) return []
     const amt = toCents(c.amount)
-    const memo = CHARGE_MEMO[c.kind]
+    const memo = c.kind === 'bank_debit_failed_cost' && c.source_type === DISPUTED_PULL_COST_SOURCE
+      ? DISPUTED_PULL_COST_MEMO
+      : CHARGE_MEMO[c.kind]
     const at = { propertyId: c.property_id }
     // 10/12 (Nic, review; Nic L7): a charge on no property (the bank cost of a
     // pull, a failed pull's cost) is a company-level cost — a Company column of
@@ -106,12 +140,15 @@ export const payoutGamChargeProjector: LedgerProjector = {
 
 export const payoutGamDebitProjector: LedgerProjector = {
   sourceType: 'gam_debit',
-  ruleVersion: 1,
+  // 10/13 (Nic): 2 — a pull the landlord's bank disputed takes itself back
+  // (its own 'cancellation' posting, on the dispute's day).
+  ruleVersion: 2,
 
   async project(client: PoolClient, debitId: string): Promise<DesiredPosting[]> {
-    const d = (await client.query<{ landlord_id: string; total: string; status: string; day: string | null }>(
+    const d = (await client.query<{ landlord_id: string; total: string; status: string; day: string | null; disputed_day: string | null }>(
       `SELECT d.landlord_id, d.total_amount::text AS total, d.status,
-              CASE WHEN d.settled_at IS NULL THEN NULL ELSE ${localDaySql('d.settled_at', companyTzSql('d.landlord_id'))} END AS day
+              CASE WHEN d.settled_at IS NULL THEN NULL ELSE ${localDaySql('d.settled_at', companyTzSql('d.landlord_id'))} END AS day,
+              CASE WHEN d.disputed_at IS NULL THEN NULL ELSE ${localDaySql('d.disputed_at', companyTzSql('d.landlord_id'))} END AS disputed_day
          FROM landlord_gam_debits d WHERE d.id::text = $1`, [debitId])).rows[0]
     if (!d || d.status !== 'succeeded' || !d.day) return []
     const cols = (await client.query<{ property_id: string | null; s: string }>(
@@ -120,26 +157,46 @@ export const payoutGamDebitProjector: LedgerProjector = {
         WHERE col.landlord_gam_debit_id::text = $1
         GROUP BY c.property_id ORDER BY c.property_id NULLS FIRST`, [debitId])).rows
     const lines: DesiredLine[] = []
+    const back: DesiredLine[] = []
     let recorded = 0
     for (const r of cols) {
       const v = toCents(r.s)
       recorded += v
       lines.push(...dr('due_to_gam', v, { propertyId: r.property_id, memo: 'GAM charges paid by a bank pull' }))
       lines.push(...cr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees, until the bank line matches it' }))
+      back.push(...dr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees your bank took back, until the bank line of the return matches it' }))
+      back.push(...cr('due_to_gam', v, { propertyId: r.property_id, memo: 'GAM charges owed again: your bank disputed the pull that paid them' }))
     }
     const extra = toCents(d.total) - recorded
     lines.push(...dr('suspense', extra, { propertyId: null, memo: 'Pulled beyond the GAM charges on record — to classify' }))
     lines.push(...cr('outstanding_checks', extra, { propertyId: null, memo: 'Bank pull of GAM\'s fees, until the bank line matches it' }))
-    return [{ owner: { landlordId: d.landlord_id }, intendedDate: d.day, memo: 'GAM fees paid by bank pull', lines }]
+    back.push(...dr('outstanding_checks', extra, { propertyId: null, memo: 'Bank pull of GAM\'s fees your bank took back, until the bank line of the return matches it' }))
+    back.push(...cr('suspense', extra, { propertyId: null, memo: 'Pulled beyond the GAM charges on record — taken back by your bank' }))
+    const owner = { landlordId: d.landlord_id }
+    const out: DesiredPosting[] = [{ owner, intendedDate: d.day, memo: 'GAM fees paid by bank pull', lines }]
+    // 10/13 (Nic): disputed by the landlord's bank — the whole pull came back
+    // (a dispute for part of a pull is never placed by itself: it is left
+    // undisputed for a person, handleGamDebitDispute), so its own posting
+    // takes back exactly what the pull posted, on the dispute's day.
+    if (d.disputed_day) {
+      out.push({ owner, postingKind: 'cancellation', intendedDate: d.disputed_day,
+        memo: 'GAM fee pull your bank disputed: the money comes back and the charges are owed again', lines: back })
+    }
+    return out
   },
 
   async listSources(client: PoolClient, owner: LedgerOwner, opts: { since?: string | null }): Promise<LedgerSourceRef[]> {
     if (!owner.landlordId) return []
+    // 10/13 (Nic): a pull disputed on or after `since` posts its dispute then,
+    // however long before it was paid; it is listed on the day it paid (its
+    // earliest posting).
     const r = await client.query<{ id: string; day: string | null }>(
       `SELECT d.id::text AS id,
               CASE WHEN d.settled_at IS NULL THEN NULL ELSE ${localDaySql('d.settled_at', companyTzSql('d.landlord_id'))} END AS day
          FROM landlord_gam_debits d
-        WHERE d.landlord_id = $1 AND ($2::date IS NULL OR COALESCE(d.settled_at, d.created_at) >= $2::date - INTERVAL '1 day')`,
+        WHERE d.landlord_id = $1
+          AND ($2::date IS NULL OR COALESCE(d.settled_at, d.created_at) >= $2::date - INTERVAL '1 day'
+                                OR d.disputed_at >= $2::date - INTERVAL '1 day')`,
       [owner.landlordId, opts.since ?? null])
     return r.rows
   },

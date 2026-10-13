@@ -666,7 +666,10 @@ export const LEDGER_CAPTURE_COLUMNS = {
   landlord_gam_charges: ['landlord_id', 'property_id', 'kind', 'amount', 'source_type', 'source_id', 'voided_at',
     'created_at', 'reader_order_id', 'installment_number'],
   landlord_gam_debits: ['landlord_id', 'charges_amount', 'bank_cost_amount', 'total_amount', 'status', 'charge_ids',
-    'settled_at'],
+    'settled_at',
+    // 10/13 (Nic): a pull the landlord's bank disputed posts its own taking-back
+    // on the dispute's day (migration 20261015140100).
+    'disputed_at'],
   pos_reader_orders: ['landlord_id', 'property_id', 'status', 'price', 'installments', 'installment_amount',
     'installments_raised', 'shipped_at', 'cancelled_at'],
   pos_transactions: ['landlord_id', 'property_id', 'tenant_id', 'payment_method', 'subtotal', 'discount_amount',

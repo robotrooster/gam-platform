@@ -25,7 +25,14 @@
  *           exclusively, so the lock date cannot move under us);
  *        d. each line's posting role is resolved to the company's account
  *           through books_account_map on the line's intended date (the chart is
- *           fully editable — Nic 10/12);
+ *           fully editable — Nic 10/12). 10/13 (Nic): a new posting written
+ *           now never names a deleted account — the account that took its
+ *           place takes the line, a late record for a closed month included
+ *           ("The replacement"); an active posting is unchanged while it
+ *           carries what was right where it sits (a closed month keeps the
+ *           account it was posted to — booksLedgerChart.accountTakingOver).
+ *           A reversal (step e) still negates the posting it takes back line
+ *           for line, on the accounts it was posted to — a deleted one too;
  *        e. fingerprint = sha256 of the intended lines (date, resolved account,
  *           property and other dimensions, cents). Equal to the active
  *           posting's: nothing to do. Otherwise the active posting is
@@ -74,7 +81,10 @@ import {
   type LedgerOwner, type LedgerOwnerContext, ownerIdOf, ownerColOf, ownerKeyOf, ownerFromRow, ownerLockText,
   loadOwnerContext, maxIso, sameOwner, ISO_DAY, pinBooksTimezone, addDaysIso,
 } from './ledgerOwner'
-import { ensureChart, resolveAccount, LedgerOwnerNotReadyError, type ChartState, type AccountSelector, type ResolvedAccount } from './booksLedgerChart'
+import {
+  ensureChart, readChart, resolveAccount, accountTakingOver, LedgerOwnerNotReadyError,
+  type ChartState, type AccountSelector, type ResolvedAccount,
+} from './booksLedgerChart'
 
 // ─── What a projector returns ────────────────────────────────────────────────
 
@@ -339,6 +349,22 @@ async function resolveLines(
   return out
 }
 
+/**
+ * 10/13 (Nic): the lines with each deleted account handed to the account that
+ * took its place (booksLedgerChart.accountTakingOver) — every one of them for
+ * a new posting written now (`on` omitted; a reversal is never handed on: it
+ * negates the active posting line for line), or only where the replacement had
+ * taken over by `on`, the day an active posting sits on. "A record dated
+ * inside an already-closed month that arrives after its account was deleted
+ * posts as a correction in the open month to the replacement."
+ */
+function takenOver(chart: ChartState, lines: ResolvedLine[], on?: string): ResolvedLine[] {
+  return lines.map((l) => {
+    const accountId = accountTakingOver(chart, l.account.accountId, on)
+    return accountId === l.account.accountId ? l : { ...l, account: { ...l.account, accountId } }
+  })
+}
+
 function tuplesOf(day: string, lines: ResolvedLine[]): string[] {
   return lines.map(l => lineTuple(day, {
     accountId: l.account.accountId, accountRole: l.account.accountRole, mapKind: l.account.mapKind, mapValue: l.account.mapValue,
@@ -561,14 +587,27 @@ export async function postSource(sourceType: string, sourceId: string, opts: Pos
       }
       let lines: ResolvedLine[] | null = null
       let fingerprint: string | null = null
+      // 10/13 (Nic): what the active posting rightly carries where it sits — a
+      // deleted account handed on only where its replacement had taken over
+      // by that day (a closed month keeps the account it was posted to).
+      let keptFingerprint: string | null = null
       if (want) {
         let chart = charts.get(ownerKeyOf(g.owner))
         if (!chart) { chart = await ensureChart(client, g.owner); charts.set(ownerKeyOf(g.owner), chart) }
-        lines = await resolveLines(client, chart, want, false)
-        fingerprint = fingerprintOf(tuplesOf(want.intendedDate, lines!))
+        const asOfDay = (await resolveLines(client, chart, want, false))!
+        // 10/13 (Nic): a new posting written now never names a deleted
+        // account — it lands in an open month, and the open months are the
+        // replacement's (a late record for a closed month too: "The
+        // replacement"). The reversal below still negates the active posting
+        // line for line, on the accounts it was posted to.
+        lines = takenOver(chart, asOfDay)
+        fingerprint = fingerprintOf(tuplesOf(want.intendedDate, lines))
+        if (g.active) keptFingerprint = fingerprintOf(tuplesOf(want.intendedDate, takenOver(chart, asOfDay, g.active.accounting_date)))
       }
       const forced = opts.force === true || (!!opts.force && typeof opts.force === 'object' && sameOwner(opts.force, g.owner))
-      if (g.active && want && g.active.fingerprint === fingerprint && !forced) { result.unchanged++; continue }
+      if (g.active && want && (g.active.fingerprint === fingerprint || g.active.fingerprint === keptFingerprint) && !forced) {
+        result.unchanged++; continue
+      }
       if (!g.active && !want) continue
 
       // 10/12 (Nic) review: is this a landlord's fix, or only the chart moving
@@ -760,6 +799,7 @@ export async function diffSource(client: PoolClient, sourceType: string, sourceI
     if (!contexts.has(k)) contexts.set(k, await loadOwnerContext(client, o))
     return contexts.get(k)!
   }
+  const charts = new Map<string, ChartState>()
   const matched = new Set<string>()
   for (const d of desired) {
     const a = active.find(x => sameOwner(ownerFromRow(x), d.owner) && x.posting_kind === d.postingKind)
@@ -771,17 +811,20 @@ export async function diffSource(client: PoolClient, sourceType: string, sourceI
       out.push({ ...base, status: a ? 'stale' : 'equal', desiredFingerprint: null }); continue
     }
     let lines: ResolvedLine[] | null = null
+    let chart: ChartState | undefined
     try {
-      const map = (await client.query<any>(
-        `SELECT id::int AS id, map_kind, map_value, account_id, effective_from::text AS effective_from
-           FROM books_account_map WHERE ${ownerColOf(d.owner)} = $1`, [ownerIdOf(d.owner)])).rows
-      lines = await resolveLines(client, { owner: d.owner, map }, d, true)
+      chart = charts.get(ownerKeyOf(d.owner))
+      if (!chart) { chart = await readChart(client, d.owner); charts.set(ownerKeyOf(d.owner), chart) }
+      lines = await resolveLines(client, chart, d, true)
     } catch (e) {
       out.push({ ...base, status: 'error', message: e instanceof Error ? e.message : String(e) }); continue
     }
     if (!lines) { out.push({ ...base, status: 'unresolved' }); continue }
-    const fp = fingerprintOf(tuplesOf(d.intendedDate, lines))
-    out.push({ ...base, desiredFingerprint: fp, status: !a ? 'missing' : a.fingerprint === fp ? 'equal' : 'changed' })
+    // 10/13 (Nic): as postSource decides it — what a posting written now
+    // carries, or what the active posting rightly carries where it sits.
+    const fp = fingerprintOf(tuplesOf(d.intendedDate, takenOver(chart, lines)))
+    const kept = a ? fingerprintOf(tuplesOf(d.intendedDate, takenOver(chart, lines, a.accounting_date))) : null
+    out.push({ ...base, desiredFingerprint: fp, status: !a ? 'missing' : a.fingerprint === fp || a.fingerprint === kept ? 'equal' : 'changed' })
   }
   for (const a of active) {
     if (matched.has(a.id)) continue
