@@ -10,6 +10,11 @@
  * Every figure is the server's; the page says it. Days late are days past the
  * grace period, and a charge still owed inside its grace is "Not late yet",
  * never "On time".
+ *
+ * 10/13 (Nic): "this is the kind of information I want to see on the customer
+ * history" — the all-time month stamps in the Rent Roll's colors and words,
+ * "How late" over EVERY billed month (it showed 2 of 5 open months), the
+ * "What it's for" history; opened from a Rent Roll row, that row's lease.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
@@ -23,7 +28,9 @@ vi.mock('../lib/api', () => ({
     get: async (url: string) => {
       server.gets.push(url)
       if (server.fail) throw server.fail
-      if (url === '/tenants/t1/payment-report') return { data: { success: true, data: JSON.parse(JSON.stringify(server.report)) } }
+      if (url === '/tenants/t1/payment-report' || url.startsWith('/tenants/t1/payment-report?leaseId=')) {
+        return { data: { success: true, data: JSON.parse(JSON.stringify(server.report)) } }
+      }
       throw new Error(`unexpected api.get ${url}`)
     },
   },
@@ -31,12 +38,24 @@ vi.mock('../lib/api', () => ({
 
 import { TenantPaymentReportPage } from './TenantPaymentReportPage'
 import { healthColor, lineLateness } from '../lib/paymentStamps'
+import { RENT_ROLL_STATUS_COLOR, rentRollStatusOf, rentRollStatusText } from '@gam/shared'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
+/** The month's pill as the server builds it (services/tenantPaymentReport monthStatus). */
+const pill = (s: string | null, days: number) => {
+  const status = rentRollStatusOf(s as any, days)
+  const d = status === 'paid_late' || status === 'owes' ? days : 0
+  return { status, statusLabel: rentRollStatusText({ status, daysPastGrace: d }), statusColor: RENT_ROLL_STATUS_COLOR[status] }
+}
 const stamp = (month: string, s: string | null, over: any = {}) => ({
   month, stamp: s, stampLabel: s, daysPastGrace: 0, charged: s ? 495 : 0, paid: 0, credit: 0, workTrade: 0, owed: 0,
-  paidInFullOn: null, onboarding: false, workTradeOnly: false, counted: !!s, ...over,
+  paidInFullOn: null, onboarding: false, workTradeOnly: false, counted: !!s, ...pill(s, over.daysPastGrace ?? 0), ...over,
+})
+/** A "How late" month: every billed month (10/13). */
+const lateMonth = (month: string, s: string, over: any = {}) => ({
+  month, daysPastGrace: 0, paidInFullOn: null, stillOpen: false, firstLateDay: `${month}-06`, dueDate: `${month}-01`,
+  charged: 495, paid: 495, owed: 0, ...pill(s, over.daysPastGrace ?? 0), ...over,
 })
 const line = (over: any = {}) => ({
   paymentId: 'p1', householdId: 'g1', month: '2026-10', dueDate: '2026-10-01', label: 'Rent', detail: null, type: 'rent',
@@ -63,7 +82,11 @@ function report(over: any = {}) {
       stamp('2026-10', 'outstanding', { daysPastGrace: 7, owed: 577.47 }),
     ],
     howLate: {
-      months: [{ month: '2026-10', daysPastGrace: 7, paidInFullOn: null, stillOpen: true, firstLateDay: '2026-10-06' }],
+      // 10/13: every billed month, newest first — the open one and the one paid in September.
+      months: [
+        lateMonth('2026-10', 'outstanding', { daysPastGrace: 7, stillOpen: true, charged: 577.47, paid: 0, owed: 577.47 }),
+        lateMonth('2026-09', 'paid_on_time', { paidInFullOn: '2026-09-17' }),
+      ],
       pattern: null, median: null, min: null, max: null, average: null,
       distribution: [
         { bucket: 'within_grace', label: 'Paid within grace', months: 1 },
@@ -101,12 +124,12 @@ async function until(check: () => boolean, what: string) {
   }
   throw new Error(`timed out waiting for ${what}\n${text()}`)
 }
-async function render(wait = 'Payment report') {
+async function render(wait = 'Payment report', path = '/tenants/t1/report') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   await act(async () => {
     root.render(
       <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={['/tenants/t1/report']}>
+        <MemoryRouter initialEntries={[path]}>
           <Routes><Route path="/tenants/:id/report" element={<TenantPaymentReportPage />} /></Routes>
         </MemoryRouter>
       </QueryClientProvider>)
@@ -126,11 +149,16 @@ describe('the tenant payment report', () => {
     expect(text()).toContain('$5 a day, counted back to the due date')
     expect(text()).toContain('Existing tenancy — the first month is good news only')
     expect(text()).toContain('Delinquent')
-    // Nothing paid late yet: the open month is listed "so far", not as a pattern.
+    // Nothing paid late yet: the open month is the worst "so far", not a pattern.
     expect(text()).toContain('Nothing paid late yet')
-    expect(text()).toContain('7 so far')
-    // Stamps carry letters as well as colors.
-    expect([...host.querySelectorAll('.tr-strip .rr-stamp')].map(s => s.textContent)).toContain('O+7')
+    expect(text()).toMatch(/Worst October( 2026)? \(7 days so far\)/)
+    // 10/13: the months wear the Rent Roll's stamps, in words — never letter codes.
+    const pills = [...host.querySelectorAll('.tr-months .rrs')]
+    expect(pills.map(s => s.textContent)).toEqual(['Owes +7', 'Paid'])
+    expect(pills[0].className).toContain('red')
+    expect(pills[1].className).toContain('green')
+    expect(pills[1].className).toContain('onboarding')
+    expect(text()).not.toMatch(/\b[POLD]\+\d/)
   })
 
   // 10/12 (Nic): "payment health and a tenant's history are ALL-TIME (since the
@@ -150,7 +178,7 @@ describe('the tenant payment report', () => {
     expect(text()).toContain('Months, all time')
     expect(text()).not.toContain('last 12')
     expect(text()).toContain('All time: December 2025 – October 2026')
-    const months = [...host.querySelectorAll('.tr-strip .rr-stamp-month')].map(s => s.textContent)
+    const months = [...host.querySelectorAll('.tr-months .tr-month-name')].map(s => s.textContent)
     expect(months).toHaveLength(11)
     expect(months[0]).toBe('Oct')
     expect(months[1]).toBe('Sep')
@@ -171,6 +199,66 @@ describe('the tenant payment report', () => {
     const show = [...table.querySelectorAll('button')].find(b => b.textContent === 'show days') as HTMLButtonElement
     await act(async () => { show.click() })
     expect(table.querySelectorAll('tr.tr-fees')).toHaveLength(12)
+  })
+
+  // 10/13 (Nic): "A 'What it's for' history: every charge line with what it was
+  // for (rent, water, late fee…), amount, when and how paid, days late."
+  it('"What it\'s for": a payment logged by hand after the late fee says so; money still clearing says so', async () => {
+    server.report = report({ history: [
+      line({ paymentId: 'h1', month: '2026-08', dueDate: '2026-08-01', paid: 495, owed: 0, paidOn: '2026-08-14', howPaid: 'Cash',
+        daysPastGrace: 8, loggedAfterLateFee: true }),
+      line({ paymentId: 'h2', label: 'Water', type: 'utility', charged: 31.2, paid: 31.2, owed: 0, paidOn: '2026-10-02',
+        howPaid: 'Bank (ACH)', daysPastGrace: 0, clearing: 31.2 }),
+    ] })
+    await render()
+    const section = [...host.querySelectorAll('.tr-section')].find(x => x.querySelector('h2')?.textContent === "What it's for — every charge")!
+    expect(section).toBeTruthy()
+    const rows = [...section.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(td => td.textContent))
+    expect(rows[0]).toEqual(['Aug 1, 2026', 'Rent', 'RV 48', '$495.00', '$495.00', 'Aug 14, 2026', 'Cash', '8logged after the late fee', '$0.00'])
+    expect(rows[1][1]).toBe('Water')
+    expect(rows[1][6]).toBe('Bank (ACH)$31.20 still clearing')
+    expect(rows[1][7]).toBe('On time')
+  })
+
+  // 10/13 (Nic): "The 'How late' table must cover every billed month (today it
+  // showed 2 of 5 open months)."
+  it('"How late" lists every billed month, newest first, each with its stamp, money and dates; the pattern stays', async () => {
+    server.report = report({
+      howLate: {
+        months: [
+          lateMonth('2026-10', 'outstanding', { daysPastGrace: 7, stillOpen: true, charged: 577.47, paid: 0, owed: 577.47 }),
+          lateMonth('2026-09', 'partial', { stillOpen: true, charged: 495, paid: 200, owed: 295 }),
+          lateMonth('2026-08', 'paid_late', { daysPastGrace: 3, paidInFullOn: '2026-08-09' }),
+          lateMonth('2026-07', 'partial', { daysPastGrace: 12, stillOpen: true, charged: 495, paid: 100, owed: 395 }),
+          lateMonth('2026-06', 'paid_on_time', { paidInFullOn: '2026-06-01' }),
+        ],
+        pattern: 'Usually 3 days past grace', median: 3, min: 3, max: 3, average: 3,
+        distribution: [{ bucket: 'within_grace', label: 'Paid within grace', months: 0 }, { bucket: 'd1_3', label: '1–3 days past grace', months: 1 }],
+        worst: { month: '2026-07', daysPastGrace: 12 }, trend: null,
+      },
+    })
+    await render()
+    const section = [...host.querySelectorAll('.tr-section')].find(x => x.querySelector('h2')?.textContent === 'How late')!
+    expect(section.querySelector('.tr-pattern')?.textContent).toBe('Usually 3 days past grace')
+    expect(section.textContent).toMatch(/Average 3 days past grace · worst July( 2026)? \(12 days so far\)/)
+    const rows = [...section.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(td => td.textContent))
+    expect(rows).toHaveLength(5)
+    expect(rows.map(r => r[1])).toEqual(['Owes +7', 'Partial', 'Paid late +3', 'Owes +12', 'Paid'])
+    expect(rows[0]).toEqual(['October 2026', 'Owes +7', '$577.47', '$0.00', '$577.47', 'Oct 6, 2026', 'Not yet'])
+    expect(rows[2]).toEqual(['August 2026', 'Paid late +3', '$495.00', '$495.00', '$0.00', 'Aug 6, 2026', 'Aug 9, 2026'])
+    // Paid within grace: it never became late, so no "late from" day.
+    expect(rows[4]).toEqual(['June 2026', 'Paid', '$495.00', '$495.00', '$0.00', '—', 'Jun 1, 2026'])
+    expect(section.querySelectorAll('tbody .rrs.orange')).toHaveLength(1)
+    expect(section.querySelectorAll('tbody .rrs.red')).toHaveLength(2)
+    expect(section.querySelectorAll('tbody .rrs.yellow')).toHaveLength(1)
+  })
+
+  // 10/13 (Nic): "when someone is renting 2 spots with 2 leases it is 2 households."
+  it('opened from a Rent Roll row, the report is that lease: the server is asked for it and its space is named', async () => {
+    server.report = report({ leaseId: 'l1' })
+    await render('Payment report', '/tenants/t1/report?leaseId=l1')
+    expect(server.gets).toEqual(['/tenants/t1/payment-report?leaseId=l1'])
+    expect(host.querySelector('.page-subtitle')?.textContent).toMatch(/^RV 48 · Mountain View · Household: Gerald Logue, Gina Logue/)
   })
 
   it('partial payments: how many, the average first payment, the days to settle the rest, and what is still open', async () => {

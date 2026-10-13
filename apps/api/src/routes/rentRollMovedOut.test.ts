@@ -1,13 +1,15 @@
 /**
- * 10/12 (Nic) — the Rent Roll's moved-out setting, imported payment history
- * and the onboarding month, through the routes.
+ * 10/13 (Nic) — the Rent Roll without the moved-out setting, imported payment
+ * history, the onboarding month, two companies on one bill and a property sold
+ * out of the account, through the routes.
  *
- *   "who stays on the Rent Roll after moving out = LANDLORD'S CHOICE (a
- *    setting on the page: billed in last 12 months / while they owe / all
- *    time)."
+ *   "Remove the 'keep moved-out households' setting entirely. Rent Roll =
+ *    current residents + a collapsed 'Moved out, still owes' folder until
+ *    paid." (10/13 answers; replaces 10/12's "who stays on the Rent Roll after
+ *    moving out = LANDLORD'S CHOICE")
  *   "CSV-imported old payment history does NOT count toward payment health —
  *    health starts with the first bill GAM wrote; imported history still shows
- *    in the report."
+ *    in the report." (10/12)
  *   The onboarding month is the first rent GAM wrote — never a voided line.
  */
 import { randomUUID } from 'crypto'
@@ -21,8 +23,6 @@ import { balancesRouter } from './balances'
 import { tenantsRouter } from './tenants'
 import { errorHandler } from '../middleware/errorHandler'
 import { currentBillMonth, addMonths, importedNoteParts, importedFromLabel } from '../services/householdMonths'
-import { keepsMovedOut } from '../services/rentRoll'
-import { RENT_ROLL_MOVED_OUT_RULES, RENT_ROLL_MOVED_OUT_LABEL } from '@gam/shared'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret'
 
@@ -99,161 +99,81 @@ const ownerToken = (f: { userId: string }, landlordIds: string[]) => jwt.sign(
   { userId: f.userId, role: 'landlord', email: 'll@t.dev', profileId: null, landlordIds, permissions: {} },
   process.env.JWT_SECRET!, { expiresIn: '10m' })
 
-async function staffToken(f: { landlordId: string }, permissions: Record<string, boolean>) {
-  const u = await db.query<{ id: string }>(
-    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-     VALUES ($1,'x','property_manager','Team','Member',TRUE) RETURNING id`, [`pm-${randomUUID()}@t.dev`])
-  await db.query(`INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties, property_ids) VALUES ($1,$2,TRUE,'{}')`,
-    [u.rows[0].id, f.landlordId])
-  return jwt.sign({ userId: u.rows[0].id, role: 'property_manager', email: 'pm@t.dev', profileId: null, landlordId: f.landlordId, permissions },
-    process.env.JWT_SECRET!, { expiresIn: '10m' })
-}
+const get = (token: string, path: string) => request(buildApp()).get(path).set('Authorization', `Bearer ${token}`)
+const history = (token: string, propertyId: string, q: string) => get(token, `/api/balances/rent-roll/history?propertyId=${propertyId}&${q}`)
+const names = (rows: any[]) => rows.map((r: any) => r.residents[0]?.name).sort()
 
-const roll = (token: string) => request(buildApp()).get(`/api/balances/rent-roll?through=${THIS}`).set('Authorization', `Bearer ${token}`)
-const setRule = (token: string, body: Record<string, unknown>) =>
-  request(buildApp()).put('/api/balances/rent-roll/moved-out').set('Authorization', `Bearer ${token}`).send(body)
-const names = (d: any) => d.properties.flatMap((f: any) => f.rows.map((r: any) => r.name)).sort()
-
-describe('who stays on the Rent Roll after moving out — the landlord\'s choice', () => {
-  it('billed in the last 12 months by default; while they still owe; all time — and an occupied space is always a row', async () => {
+describe('no moved-out setting: current residents, and "Moved out, still owes" until paid', () => {
+  it('the company\'s old setting decides nothing any more', async () => {
     const p = await park()
     const owner = ownerToken(p, [p.landlordId])
     await rent(p, await household(p, 'RV 10', 'Lena Living'), THIS, 495, 2)
-    const recent = await household(p, 'RV 20', 'Rita Recent', { movedOut: true })
-    await rent(p, recent, addMonths(THIS, -11), 495, 2)                 // moved out, paid, billed 11 months back
-    const owes = await household(p, 'RV 40', 'Owen Owes', { movedOut: true })
-    await rent(p, owes, addMonths(THIS, -14), 495)                      // moved out over a year ago, still owes
     const gone = await household(p, 'RV 30', 'Gus Gone', { movedOut: true })
     await rent(p, gone, addMonths(THIS, -13), 495, 2)                   // moved out over a year ago, paid
-
-    const first = (await roll(owner)).body.data
-    expect(first.moved_out).toEqual([{ landlord_id: p.landlordId, company_name: 'Mountain View LLC',
-      rule: 'billed_last_12_months', rule_label: 'Billed in the last 12 months' }])
-    expect(first.can_change_moved_out).toBe(true)
-    expect(names(first)).toEqual(['Lena Living', 'Rita Recent'])
-
-    const owing = await setRule(owner, { rule: 'while_owing' })
-    expect(owing.status, JSON.stringify(owing.body)).toBe(200)
-    expect(owing.body.data).toMatchObject({ landlord_id: p.landlordId, rule: 'while_owing', rule_label: 'While they still owe' })
-    const d2 = (await roll(owner)).body.data
-    expect(names(d2)).toEqual(['Lena Living', 'Owen Owes'])
-    // Kept for longer than a year: the row still says where it lived.
-    expect(d2.properties[0].rows.find((r: any) => r.name === 'Owen Owes').units).toEqual(['RV 40'])
-
-    await setRule(owner, { rule: 'all_time' })
-    expect(names((await roll(owner)).body.data)).toEqual(['Gus Gone', 'Lena Living', 'Owen Owes', 'Rita Recent'])
-    // Saving the same choice again records nothing new; every change is kept.
-    await setRule(owner, { rule: 'all_time' })
-    const log = (await db.query(
-      `SELECT old_value->>'rule' AS was, new_value->>'rule' AS now FROM audit_log
-        WHERE action = 'rent_roll_moved_out_changed' AND entity_id = $1 ORDER BY created_at`, [p.landlordId])).rows
-    expect(log).toEqual([{ was: 'billed_last_12_months', now: 'while_owing' }, { was: 'while_owing', now: 'all_time' }])
+    const owes = await household(p, 'RV 40', 'Owen Owes', { movedOut: true })
+    await rent(p, owes, addMonths(THIS, -14), 495)                      // moved out over a year ago, still owes
+    const before = (await history(owner, p.propertyId, `from=${THIS}&to=${THIS}`)).body.data
+    // The column is left in place (expand, then contract) — and read by nothing.
+    for (const rule of ['all_time', 'while_owing', 'billed_last_12_months']) {
+      await db.query(`UPDATE landlords SET rent_roll_moved_out = $2 WHERE id = $1`, [p.landlordId, rule])
+      const d = (await history(owner, p.propertyId, `from=${THIS}&to=${THIS}`)).body.data
+      expect(d).toEqual(before)
+    }
+    expect(names(before.rows)).toEqual(['Lena Living'])
+    expect(names(before.movedOutOwing)).toEqual(['Owen Owes'])
+    // A staff member sees exactly the same.
+    const u = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','property_manager','Team','Member',TRUE) RETURNING id`, [`pm-${randomUUID()}@t.dev`])
+    await db.query(`INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties, property_ids) VALUES ($1,$2,TRUE,'{}')`,
+      [u.rows[0].id, p.landlordId])
+    const staff = jwt.sign({ userId: u.rows[0].id, role: 'property_manager', email: 'pm@t.dev', profileId: null, landlordId: p.landlordId,
+      permissions: { 'payments.view_all': true } }, process.env.JWT_SECRET!, { expiresIn: '10m' })
+    const seen = (await history(staff, p.propertyId, `from=${THIS}&to=${THIS}`)).body.data
+    expect(names(seen.rows)).toEqual(['Lena Living'])
+    expect(names(seen.movedOutOwing)).toEqual(['Owen Owes'])
   })
 
-  it('only the owner changes it; staff see it; a bad choice and another company are refused', async () => {
-    const p = await park()
-    await rent(p, await household(p, 'RV 10', 'Lena Living'), THIS, 495, 2)
-    const staff = await staffToken(p, { 'payments.view_all': true })
-    const seen = (await roll(staff)).body.data
-    expect(seen.moved_out[0].rule).toBe('billed_last_12_months')
-    expect(seen.can_change_moved_out).toBe(false)
-    const refused = await setRule(staff, { rule: 'all_time' })
-    expect(refused.status).toBe(403)
-    expect(refused.body.error).toMatch(/account owner/i)
-
-    const owner = ownerToken(p, [p.landlordId])
-    const bad = await setRule(owner, { rule: 'forever' })
-    expect(bad.status).toBe(400)
-    expect(bad.body.error).toBe(`Pick one: ${RENT_ROLL_MOVED_OUT_RULES.map(r => RENT_ROLL_MOVED_OUT_LABEL[r]).join(', ')}.`)
-    const stranger = await park('Someone Else', 'Someone Else LLC')
-    expect((await setRule(owner, { landlordId: stranger.landlordId, rule: 'all_time' })).status).toBe(403)
-    expect((await db.query(`SELECT rent_roll_moved_out FROM landlords WHERE id = $1`, [stranger.landlordId])).rows[0].rent_roll_moved_out)
-      .toBe('billed_last_12_months')
-  })
-
-  it('per company: an account with two companies names which one, and each company\'s rule keeps its own households', async () => {
-    const a = await park('Alpha Park', 'Alpha LLC')
-    const b = await (async () => {
-      const c = await db.connect()
-      try {
-        const id = (await c.query<{ id: string }>(
-          `INSERT INTO landlords (user_id, business_name, billing_starts_at) VALUES ($1, 'Bravo LLC', DATE '2000-01-01') RETURNING id`, [a.userId])).rows[0].id
-        const propertyId = await seedProperty(c, { landlordId: id, ownerUserId: a.userId, managedByUserId: a.userId })
-        await c.query(`UPDATE properties SET name = 'Bravo Park', timezone = 'America/Phoenix' WHERE id = $1`, [propertyId])
-        return { userId: a.userId, landlordId: id, propertyId }
-      } finally { c.release() }
-    })()
-    await rent(a, await household(a, 'A1', 'Ann Gone', { movedOut: true }), addMonths(THIS, -20), 495, 2)
-    await rent(b, await household(b, 'B1', 'Bob Gone', { movedOut: true }), addMonths(THIS, -20), 495, 2)
-    const owner = ownerToken(a, [a.landlordId, b.landlordId])
-    const ask = await setRule(owner, { rule: 'all_time' })
-    expect(ask.status).toBe(400)
-    expect(ask.body.error).toMatch(/more than one company/i)
-    expect((await setRule(owner, { landlordId: b.landlordId, rule: 'all_time' })).status).toBe(200)
-    const d = (await roll(owner)).body.data
-    expect(d.moved_out.map((m: any) => [m.company_name, m.rule])).toEqual([['Alpha LLC', 'billed_last_12_months'], ['Bravo LLC', 'all_time']])
-    expect(names(d)).toEqual(['Bob Gone'])
-  })
-
-  it('the rule on its own', () => {
-    const m = (month: string, owed = 0) => ({ month, owed } as any)
-    expect(keepsMovedOut('billed_last_12_months', [m('2025-11')], '2025-11')).toBe(true)
-    expect(keepsMovedOut('billed_last_12_months', [m('2025-10', 50)], '2025-11')).toBe(false)
-    expect(keepsMovedOut('while_owing', [m('2020-01', 0.01)], '2025-11')).toBe(true)
-    expect(keepsMovedOut('while_owing', [m('2026-10', 0)], '2025-11')).toBe(false)
-    expect(keepsMovedOut('all_time', [m('2001-01')], '2025-11')).toBe(true)
-    expect(keepsMovedOut('all_time', [], '2025-11')).toBe(false)
-  })
-})
-
-describe('10/12 (Nic) review: the moved-out setting never loses money, and each company is judged on its own months', () => {
-  it('while they still owe: a household that moved out and paid this month is not a row, but its rent is in this month\'s totals', async () => {
-    const p = await park()
-    const owner = ownerToken(p, [p.landlordId])
-    await rent(p, await household(p, 'RV 10', 'Lena Living'), THIS, 495, 2)
-    await rent(p, await household(p, 'RV 20', 'Mona Moved', { movedOut: true }), THIS, 495, 2)   // moved out mid-month, paid in full
-    expect((await setRule(owner, { rule: 'while_owing' })).status).toBe(200)
-    const d = (await roll(owner)).body.data
-    expect(names(d)).toEqual(['Lena Living'])
-    expect(d.totals).toMatchObject({ charged: 990, paid: 990, owed: 0 })
-    expect(d.properties[0].totals).toMatchObject({ charged: 990, paid: 990, owed: 0 })
-    // The default setting shows her, and the totals are the same.
-    await setRule(owner, { rule: 'billed_last_12_months' })
-    const d2 = (await roll(owner)).body.data
-    expect(names(d2)).toEqual(['Lena Living', 'Mona Moved'])
-    expect(d2.totals).toMatchObject({ charged: 990, paid: 990, owed: 0 })
-  })
-
-  it('a property sold out of the account keeps the seller\'s own setting for the seller\'s old bills', async () => {
+  it('a property sold out of the account: the seller still finds its own old bills on the Rent Roll, and no open month', async () => {
     const p = await park('Alder Park', 'Seller LLC')
     const owner = ownerToken(p, [p.landlordId])
-    await rent(p, await household(p, 'RV 1', 'Sam Sold', { movedOut: true }), addMonths(THIS, -20), 495, 2)
-    expect((await setRule(owner, { rule: 'all_time' })).status).toBe(200)
-    expect(names((await roll(owner)).body.data)).toEqual(['Sam Sold'])
+    const sam = await household(p, 'RV 1', 'Sam Sold', { movedOut: true })
+    await rent(p, sam, addMonths(THIS, -20), 495)
     // Alder is transferred to another account's company (properties are never deleted).
     const buyer = await park('Buyer Home', 'Buyer LLC')
     await db.query(`UPDATE properties SET landlord_id = $2 WHERE id = $1`, [p.propertyId, buyer.landlordId])
     await db.query(`UPDATE units SET landlord_id = $2 WHERE property_id = $1`, [p.propertyId, buyer.landlordId])
-    expect(names((await roll(owner)).body.data)).toEqual(['Sam Sold'])
+    const picker = (await get(owner, '/api/balances/rent-roll/properties')).body.data
+    expect(picker).toEqual([expect.objectContaining({ propertyId: p.propertyId, name: 'Alder Park', owned: false })])
+    const d = (await history(owner, p.propertyId, 'range=all')).body.data
+    // Sam moved out still owing: the "Moved out, still owes" folder holds him,
+    // and only it (10/13, Nic) — never a row as well.
+    expect(d.rows).toEqual([])
+    expect(names(d.movedOutOwing)).toEqual(['Sam Sold'])
+    expect((await get(owner, `/api/balances/rent-roll/open-month?propertyId=${p.propertyId}`)).status).toBe(404)
+    // The buyer never sees the seller's bills.
+    const buyerSees = (await history(ownerToken(buyer, [buyer.landlordId]), p.propertyId, 'range=all')).body.data
+    expect(buyerSees.rows).toEqual([])
+    expect(buyerSees.movedOutOwing).toEqual([])
   })
 
-  it('one household billed by two of the account\'s companies in the same month: the months add up, never overwrite', async () => {
+  it('one lease billed by two of the account\'s companies in the same month: one household, the months add up', async () => {
     const a = await park('Alpha Park', 'Alpha LLC')
     const bId = (await db.query<{ id: string }>(
       `INSERT INTO landlords (user_id, business_name, billing_starts_at) VALUES ($1, 'Bravo LLC', DATE '2000-01-01') RETURNING id`, [a.userId])).rows[0].id
     const h = await household(a, 'A1', 'Hal Both')
-    await rent(a, h, THIS, 495, 2)
-    // A counter charge on no space at each company, the same month.
-    for (const [landlordId, amount] of [[a.landlordId, 20], [bId, 30]] as const) {
-      await db.query(
-        `INSERT INTO payments (tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
-         VALUES ($1,$2,'fee',$3,'pending',$4::date,'OTHERFEE',$4::date)`, [h.tenantId, landlordId, amount, `${THIS}-01`])
-    }
-    const d = (await roll(ownerToken(a, [a.landlordId, bId]))).body.data
-    const noSpace = d.properties.find((f: any) => f.property_id === null)
-    expect(noSpace.rows).toHaveLength(1)
-    expect(noSpace.rows[0].current).toMatchObject({ charged: 50, owed: 50 })
-    expect(d.totals).toMatchObject({ charged: 545, owed: 50 })
+    const inv = await rent(a, h, THIS, 495, 2)
+    // A neighbor company's charge on the household's bill (S616), and one on no bill.
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,'fee',30,'pending',$5::date,'OTHERFEE',$5::date)`, [inv, h.unitId, h.tenantId, bId, `${THIS}-01`])
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,'fee',20,'pending',$4::date,'OTHERFEE',$4::date)`, [h.unitId, h.tenantId, a.landlordId, `${THIS}-01`])
+    const d = (await history(ownerToken(a, [a.landlordId, bId]), a.propertyId, `from=${THIS}&to=${THIS}`)).body.data
+    expect(d.rows).toHaveLength(1)
+    expect(d.rows[0]).toMatchObject({ leaseId: h.leaseId, invoiced: 545, paid: 495, owed: 50 })
+    expect(d.totals).toMatchObject({ invoiced: 545, owed: 50 })
   })
 })
 
@@ -268,7 +188,7 @@ describe('imported payment history: shown in the report, never counted', () => {
     await rent(p, h, LAST, 495, 12)     // the first bill GAM wrote — the onboarding month, paid late
     await rent(p, h, THIS, 495, 2)      // on time
 
-    const rep = await request(buildApp()).get(`/api/tenants/${h.tenantId}/payment-report`).set('Authorization', `Bearer ${owner}`)
+    const rep = await get(owner, `/api/tenants/${h.tenantId}/payment-report`)
     expect(rep.status, JSON.stringify(rep.body)).toBe(200)
     const r = rep.body.data
     expect(r.on_gam_since).toBe(LAST)
@@ -283,10 +203,14 @@ describe('imported payment history: shown in the report, never counted', () => {
       expect.objectContaining({ paid_on: `${before}-14`, label: 'Rent', amount: 495, imported_from: 'Buildium', method: 'Check', reference: '1042', unit_number: 'RV 7' }),
     ])
 
-    const row = (await roll(owner)).body.data.properties[0].rows.find((x: any) => x.household_id === h.tenantId)
+    // The Rent Roll, all time: from the first bill GAM wrote — the imports are no month.
+    const d = (await history(owner, p.propertyId, 'range=all')).body.data
+    expect(d).toMatchObject({ from: LAST, to: THIS, months: [LAST, THIS] })
+    const row = d.rows.find((x: any) => x.householdId === h.tenantId)
     expect(row.health).toMatchObject({ percent: 100, counted: 1 })
     expect(row.stamps.map((s: any) => s.month)).toEqual([LAST, THIS])
-    expect(row.stamps[0]).toMatchObject({ stamp: 'paid_late', onboarding: true })
+    expect(row.stamps[0]).toMatchObject({ status: 'paid_late', onboarding: true })
+    expect(row).toMatchObject({ invoiced: 990, paid: 990, owed: 0 })
   })
 
   it('the import\'s note in words', () => {
@@ -312,7 +236,7 @@ describe('the onboarding month is the first rent GAM wrote', () => {
       [h.unitId, h.leaseId, h.tenantId, p.landlordId, `${addMonths(LAST, -1)}-01`])
     await rent(p, h, LAST, 495, 12)     // the real first bill: onboarding, paid late — left out
     await rent(p, h, THIS, 495, 2)
-    const r = (await request(buildApp()).get(`/api/tenants/${h.tenantId}/payment-report`).set('Authorization', `Bearer ${owner}`)).body.data
+    const r = (await get(owner, `/api/tenants/${h.tenantId}/payment-report`)).body.data
     expect(r.onboarding_month).toBe(LAST)
     expect(r.health).toMatchObject({ percent: 100, on_time: 1, counted: 1 })
   })

@@ -322,8 +322,8 @@ export function DashboardPage() {
         {/* W-2 (S531): clicks through to the Rent Roll. 10/12 (Nic): both read
             the rent the active LEASES bill (never a unit's listed rent; a space
             marked occupied with no active lease adds nothing), with work trade
-            and hibernating leases left out — the Rent Roll's lease_rent.expected
-            is this figure. */}
+            and hibernating leases left out (the figure the 10/12 Rent Roll's lease_rent.expected
+            showed, retired 10/13). */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>

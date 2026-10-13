@@ -2454,8 +2454,17 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
 // work for that have had this person; staff assigned to particular properties
 // see only those properties. GAM admin sees every company the person has been
 // with. A resident never opens it here.
+//
+// ?leaseId= (10/13, Nic: "when someone is renting 2 spots with 2 leases it is
+// 2 households") — the report of one Payments / Rent Roll row: that lease
+// alone. The person must be on it and the viewer must see it, else 404.
 tenantsRouter.get('/:id/payment-report', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
+    const leaseIdRaw = req.query.leaseId
+    if (leaseIdRaw !== undefined && (typeof leaseIdRaw !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(leaseIdRaw))) {
+      throw new AppError(400, 'That lease is not one GAM knows.')
+    }
     const role = req.user!.role
     if (role === 'tenant') throw new AppError(403, 'Forbidden')
     const isAdmin = role === 'admin' || role === 'super_admin'
@@ -2471,7 +2480,9 @@ tenantsRouter.get('/:id/payment-report', requirePerm('payments.view_all'), async
     const landlordIds = isAdmin ? related : landlordScopeIds(req.user!)
     const propertyIds = isAdmin ? null : await (await import('../middleware/auth')).getScopedPropertyIds(req.user)
     const { tenantPaymentReport } = await import('../services/tenantPaymentReport')
-    const report = await tenantPaymentReport({ tenantId: req.params.id, landlordIds, propertyIds })
+    const report = await tenantPaymentReport({
+      tenantId: req.params.id, landlordIds, propertyIds, leaseId: (leaseIdRaw as string | undefined) ?? null,
+    })
     if (!report) throw new AppError(404, 'There is no payment history for this resident at the properties you can see.')
     res.json({ success: true, data: report })
   } catch (e) { next(e) }

@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Printer } from 'lucide-react'
-import { PAYMENT_STAMP_LABEL } from '@gam/shared'
+import { PAYMENT_STAMP_LABEL, type RentRollMonthStatus, type RentRollStatusColor } from '@gam/shared'
 import { api } from '../lib/api'
 import { money, monthTitle, dayWord, monthWord } from '../lib/creditDesk'
-import { stampText, stampTitle, shortMonth, stripYear, healthColor, lineLateness, type StampMonth, type HealthFigure, type ChargeLine } from '../lib/paymentStamps'
+import { shortMonth, stripYear, healthColor, lineLateness, type StampMonth, type HealthFigure, type ChargeLine } from '../lib/paymentStamps'
+import { StatusStamp, monthStampTitle } from '../components/rentroll/StatusStamp'
 import '../styles/rent-roll.css'
+import '../components/rentroll/rentroll.css'
 
 /**
  * THE TENANT PAYMENT REPORT (10/12, Nic) — /tenants/:id/report, printable.
@@ -28,6 +30,21 @@ import '../styles/rent-roll.css'
  * health — health starts with the first bill GAM wrote; imported history still
  * shows in the report." It is its own section at the end, each line labeled
  * with where it came from.
+ *
+ * 10/13 (Nic): "this is the kind of information I want to see on the customer
+ * history". Opened from a name on the Payments page or the Rent Roll, the
+ * report is that row's household — its lease (?leaseId=: "when someone is
+ * renting 2 spots with 2 leases it is 2 households"); from the tenant profile
+ * (no lease named), the person's whole household. The all-time month history
+ * wears the Rent Roll's colored stamps in words (green "Paid", orange "Paid
+ * late +5", yellow "Partial", red "Owes +3", gray "Due"; a month with no bill
+ * a dash). "How late" lists EVERY billed month (it showed only the months past
+ * grace — 2 of 5 open months), each with its stamp, money and dates. "What
+ * it's for" is every charge line: what it was for, amount, when and how paid,
+ * days past grace — a payment logged by hand after the late fee posted says it
+ * counts late from the day it was logged (the 10/6 rule). The 10/12 breakdown
+ * stays: how late they usually are, the average partial payment and how long
+ * the difference takes to settle.
  */
 
 interface ReportLease {
@@ -36,7 +53,15 @@ interface ReportLease {
   graceDays: number; graceSourceLabel: string; firstLateDayText: string; lateFeeTerms: string; existingTenancy: boolean
   delinquent: boolean; evictionMode: boolean
 }
-interface HistoryLine extends ChargeLine { lateFeeCount?: number; lateFeeFrom?: string; lateFeeTo?: string; lateFees?: ChargeLine[] }
+interface HistoryLine extends ChargeLine {
+  lateFeeCount?: number; lateFeeFrom?: string; lateFeeTo?: string; lateFees?: ChargeLine[]
+  /** 10/6 (Nic): logged by hand after its bill's late fee — counted as paid the day GAM recorded it. */
+  loggedAfterLateFee?: boolean
+  /** Money on it still clearing (counted as paid). */
+  clearing?: number
+}
+/** A month's pill in the Rent Roll's words (10/13) — the server's status, words and color. */
+interface MonthPill { status: RentRollMonthStatus; statusLabel: string; statusColor: RentRollStatusColor }
 /** A payment brought in from another platform's history (never counted). */
 interface ImportedLine {
   paymentId: string; paidOn: string; label: string; unitNumber: string | null; amount: number
@@ -44,6 +69,8 @@ interface ImportedLine {
 }
 interface Report {
   householdId: string
+  /** 10/13: the one lease the report covers (opened from a Payments / Rent Roll row); null = the person's whole household. */
+  leaseId?: string | null
   members: Array<{ tenantId: string; name: string; role: string | null }>
   name: string
   leases: ReportLease[]
@@ -51,9 +78,13 @@ interface Report {
   onboardingMonth: string | null
   balanceOwedNow: number
   health: HealthFigure
-  stamps: Array<StampMonth & { counted: boolean }>
+  stamps: Array<StampMonth & { counted: boolean } & MonthPill>
   howLate: {
-    months: Array<{ month: string; daysPastGrace: number; paidInFullOn: string | null; stillOpen: boolean; firstLateDay: string | null }>
+    /** 10/13 (Nic): EVERY billed month, newest first. `paid` includes account credit. */
+    months: Array<{
+      month: string; daysPastGrace: number; paidInFullOn: string | null; stillOpen: boolean; firstLateDay: string | null
+      dueDate: string | null; charged: number; paid: number; owed: number
+    } & MonthPill>
     pattern: string | null; median: number | null; min: number | null; max: number | null; average: number | null
     distribution: Array<{ bucket: string; label: string; months: number }>
     worst: { month: string; daysPastGrace: number } | null
@@ -81,10 +112,14 @@ const KV = ({ k, v }: { k: string; v: React.ReactNode }) => (
 
 export function TenantPaymentReportPage() {
   const { id } = useParams<{ id: string }>()
+  const [params] = useSearchParams()
+  // 10/13: a name on the Payments page or the Rent Roll opens that row's lease.
+  const leaseId = params.get('leaseId')
   const navigate = useNavigate()
   const [openFees, setOpenFees] = useState<Set<string>>(() => new Set())
-  const { data: r, isLoading, error, refetch, isFetching } = useQuery(['tenant-payment-report', id],
-    () => api.get(`/tenants/${id}/payment-report`).then(x => x.data.data as Report), {
+  const { data: r, isLoading, error, refetch, isFetching } = useQuery(['tenant-payment-report', id, leaseId],
+    () => api.get(`/tenants/${id}/payment-report${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ''}`)
+      .then(x => x.data.data as Report), {
       enabled: !!id,
       // A refusal or a resident with no history here will not change on a retry: say it once.
       retry: (count: number, e: any) => { const st = e?.response?.status; return !(st >= 400 && st < 500) && count < 2 },
@@ -113,6 +148,16 @@ export function TenantPaymentReportPage() {
 
   const h = r.health
   const maxBucket = Math.max(1, ...r.howLate.distribution.map(d => d.months))
+  // One lease's report names its space up top.
+  const lease = r.leaseId ? r.leases.find(l => l.leaseId === r.leaseId) ?? null : null
+  // The 10/12 breakdown under the pattern: the average, the worst month, the trend.
+  const hl = r.howLate
+  const lateNote = [
+    hl.average !== null ? `average ${hl.average} days past grace` : null,
+    hl.worst ? `worst ${monthWord(hl.worst.month)} (${hl.worst.daysPastGrace} day${hl.worst.daysPastGrace === 1 ? '' : 's'}${hl.months.find(m => m.month === hl.worst!.month)?.stillOpen ? ' so far' : ''})` : null,
+    hl.trend && hl.trend.recent !== null && hl.trend.earlier !== null
+      ? `last 3 late months average ${hl.trend.recent} days, before that ${hl.trend.earlier}` : null,
+  ].filter((x): x is string => !!x).join(' · ').replace(/^./, c => c.toUpperCase())
   return (
     <div>
       <div className="page-header">
@@ -121,6 +166,7 @@ export function TenantPaymentReportPage() {
           <div>
             <h1 className="page-title" style={{ marginBottom: 2 }}>Payment report — {r.name}</h1>
             <p className="page-subtitle">
+              {lease ? `${lease.unitNumber} · ${lease.propertyName} · ` : ''}
               {r.members.length > 1 ? `Household: ${r.members.map(m => m.name).join(', ')} · ` : ''}
               {r.onGamSince ? `On GAM since ${monthTitle(r.onGamSince)}` : 'No bills yet'}
               {r.onboardingMonth ? ` · onboarding month ${monthWord(r.onboardingMonth)}` : ''}
@@ -137,12 +183,15 @@ export function TenantPaymentReportPage() {
             <span className="tr-health-pct" style={{ color: healthColor(h.percent) }}>{h.percent === null ? '—' : `${h.percent}%`}</span>
             <span style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>{h.label}<br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>All time: {monthTitle(h.from)} – {monthTitle(h.through)}</span></span>
           </div>
-          {/* Every month since the household's first bill, newest first. */}
-          <div className="tr-strip">
+          {/* 10/13: every month since the household's first bill, newest first,
+              in the Rent Roll's colored stamps and words. */}
+          <div className="tr-months">
             {[...r.stamps].reverse().map(s => (
-              <div key={s.month} style={{ textAlign: 'center' }}>
-                <span className={`rr-stamp ${s.stamp ?? 'none'}${s.onboarding ? ' onboarding' : ''}`} title={stampTitle(s)}>{stampText(s)}</span>
-                <span className="rr-stamp-month">{shortMonth(s.month)}{stripYear(s.month, h.through) ?? ''}</span>
+              <div key={s.month} className="tr-month">
+                <StatusStamp status={s.status} label={s.statusLabel} color={s.statusColor} onboarding={s.onboarding}
+                  title={monthStampTitle({ month: s.month, statusLabel: s.statusLabel, invoiced: s.charged, paid: s.paid + s.credit,
+                    credit: s.credit, workTrade: s.workTrade, owed: s.owed, onboarding: s.onboarding })} />
+                <span className="tr-month-name">{shortMonth(s.month)}{stripYear(s.month, h.through) ?? ''}</span>
               </div>
             ))}
           </div>
@@ -185,16 +234,11 @@ export function TenantPaymentReportPage() {
       <div className="card tr-section">
         <h2 className="card-title">How late</h2>
         {r.howLate.months.length === 0 ? (
-          <div style={{ fontSize: '.82rem', color: 'var(--text-2)' }}>No month has gone past its grace period.</div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)' }}>No month has been billed yet.</div>
         ) : (
           <>
-            <div className="tr-pattern">{r.howLate.pattern ?? 'Nothing paid late yet — the months below are still open'}</div>
-            <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10 }}>
-              {r.howLate.average !== null ? `Average ${r.howLate.average} days past grace` : 'Days past grace so far'}
-              {r.howLate.worst ? ` · worst ${monthWord(r.howLate.worst.month)} (${r.howLate.worst.daysPastGrace} days)` : ''}
-              {r.howLate.trend && r.howLate.trend.recent !== null && r.howLate.trend.earlier !== null
-                ? ` · last 3 late months average ${r.howLate.trend.recent} days, before that ${r.howLate.trend.earlier}` : ''}
-            </div>
+            <div className="tr-pattern">{r.howLate.pattern ?? 'Nothing paid late yet'}</div>
+            {lateNote && <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10 }}>{lateNote}</div>}
             <div className="tr-bars" style={{ marginBottom: 12 }}>
               {r.howLate.distribution.map(d => (
                 <div key={d.bucket} className="tr-bar">
@@ -206,14 +250,20 @@ export function TenantPaymentReportPage() {
             </div>
             <div className="tr-history-wrap">
               <table className="tr-history">
-                <thead><tr><th>Month</th><th>Late from</th><th>Paid in full</th><th className="num">Days past grace</th></tr></thead>
+                {/* 10/13 (Nic): every billed month, newest first — the stamp says how
+                    late ("Paid late +5", "Owes +7": days past grace). */}
+                <thead><tr><th>Month</th><th>Status</th><th className="num">Invoiced</th><th className="num">Paid</th><th className="num">Owed</th><th>Late from</th><th>Paid in full</th></tr></thead>
                 <tbody>
                   {r.howLate.months.map(m => (
                     <tr key={m.month}>
                       <td>{monthTitle(m.month)}</td>
-                      <td>{m.firstLateDay ? dayWord(m.firstLateDay, '') : '—'}</td>
+                      <td><StatusStamp status={m.status} label={m.statusLabel} color={m.statusColor} /></td>
+                      <td className="num">{money(m.charged)}</td>
+                      <td className="num">{money(m.paid)}</td>
+                      <td className="num">{m.owed > 0 ? <span className="rr-owed">{money(m.owed)}</span> : money(0)}</td>
+                      {/* A month paid within grace never became late: no "late from" day. */}
+                      <td>{m.firstLateDay && m.status !== 'paid' ? dayWord(m.firstLateDay, '') : '—'}</td>
                       <td>{m.stillOpen ? 'Not yet' : m.paidInFullOn ? dayWord(m.paidInFullOn, '') : '—'}</td>
-                      <td className="num">{m.daysPastGrace}{m.stillOpen ? ' so far' : ''}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -246,7 +296,7 @@ export function TenantPaymentReportPage() {
       </div>
 
       <div className="card tr-section">
-        <h2 className="card-title">Every charge</h2>
+        <h2 className="card-title">What it's for — every charge</h2>
         <div className="tr-history-wrap">
           <table className="tr-history">
             <thead><tr><th>Due</th><th>What it's for</th><th>Space</th><th className="num">Charged</th><th className="num">Paid</th><th>Paid on</th><th>How paid</th><th className="num">Days past grace</th><th className="num">Owed</th></tr></thead>
@@ -271,8 +321,15 @@ export function TenantPaymentReportPage() {
                     <td className="num">{money(l.charged)}</td>
                     <td className="num">{l.workTrade > 0 ? 'Work trade' : money(l.paid + l.credit)}{l.credit > 0 && <span className="rr-sub">incl. {money(l.credit)} credit</span>}</td>
                     <td>{l.paidOn ? dayWord(l.paidOn, '') : '—'}</td>
-                    <td>{l.howPaid ?? '—'}</td>
-                    <td className="num">{lineLateness(l)}</td>
+                    <td>
+                      {l.howPaid ?? '—'}
+                      {(l.clearing ?? 0) > 0 && <span className="rr-sub">{money(l.clearing!)} still clearing</span>}
+                    </td>
+                    <td className="num">
+                      {lineLateness(l)}
+                      {/* 10/6 (Nic): hand-logged after the late fee posted — late from the day it was logged. */}
+                      {l.loggedAfterLateFee && <span className="rr-sub">logged after the late fee</span>}
+                    </td>
                     <td className="num">{l.owed > 0 ? <span className="rr-owed">{money(l.owed)}</span> : money(0)}</td>
                   </tr>,
                   ...(open ? (l.lateFees ?? []).map(f => (

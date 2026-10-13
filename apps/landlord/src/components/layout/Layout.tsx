@@ -90,13 +90,16 @@ const NAV_ITEMS: Array<{
   // Financials — S575: one "Financials" sidebar item, these render as sub-tabs.
   // Items without a `category` stay owner-only (staff can't see them). Tab order
   // is display order; the first the user can access is the landing tab.
-  // 10/12 (Nic): the Rent Roll leads the Financials hub, and staff with "View
-  // all payments" reach it — the page reads what that key opens
-  // (GET /balances/rent-roll, payments.view_all), so that key, not any key in
-  // the Payments category, shows it (see visibleNavItemsFor).
-  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments' },
+  // 10/13 (Nic): "payments first. with a way to log the payments" — Payments
+  // (the rent roll for the open month) leads the Financials hub, and the Rent
+  // Roll (the history) follows it.
   // 10/12 (Nic): kept — "we still need the place to see payments mid month."
   { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null, hub: 'financials', category: 'payments' },
+  // 10/12 (Nic): staff with "View all payments" reach the Rent Roll — the page
+  // reads what that key opens (GET /balances/rent-roll/*, payments.view_all),
+  // so that key, not any key in the Payments category, shows it (see
+  // visibleNavItemsFor).
+  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments' },
   { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null, hub: 'financials', category: 'balances' },
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
   // 10/11 (Nic): money in by type — by month and by day, no names.
@@ -287,7 +290,7 @@ export function visibleNavItemsFor(user: NavUser) {
     // S168: /banking for property_manager — only when direct-deposit is on.
     if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
     // 10/12 (Nic): the Rent Roll is for staff with "View all payments" — the
-    // key its page reads (GET /balances/rent-roll); "View payments" alone shows
+    // key its pages read (GET /balances/rent-roll/*); "View payments" alone shows
     // only unpaid bills, and the rent roll would refuse it.
     if (item.to === '/rent-roll') return perms['payments.view_all'] === true
     if (!item.category) return false               // owner-only items (Team, Work Trade)

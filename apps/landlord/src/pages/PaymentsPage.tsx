@@ -1,93 +1,69 @@
-import { Fragment, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { useQuery, useMutation } from 'react-query'
-import { TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, declaredDateFlagText } from '@gam/shared'
+import { Fragment, useRef, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import {
+  TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, isSpaceOnlyRow,
+  type OpenMonthRoll, type OpenMonthRow, type RentRollProperty,
+} from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
-import { SearchBox } from '../components/ListControls'
-import { X, CheckCircle, Gift } from 'lucide-react'
+import { X, CheckCircle, Gift, ChevronRight } from 'lucide-react'
+import { money, toCents, monthTitle, serverStatus, serverMessage, CREDIT_USE_RULE } from '../lib/creditDesk'
+import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
+import { OpenMonthDetail } from '../components/payments/OpenMonthDetail'
+import { RecordPaymentPicker } from '../components/payments/RecordPaymentPicker'
 import {
-  money, toCents, monthTitle, dayWord, readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
-  serverStatus, serverMessage, returnDetail, chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE,
-  ZERO_TOLERANCE_TEXT, CREDIT_TAKEN_BACK_TEXT, CREDIT_USE_RULE,
-  type LedgerPayment, type ReturnFacts,
-} from '../lib/creditDesk'
+  propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords,
+} from '../components/payments/openMonth'
 import '../styles/credit-desk.css'
+import '../components/payments/payments.css'
 
 // 10/5 (Nic): the photo of a bank's receipt on a payment (its own file, so the
 // bank review shows the tenant's photo without loading this page).
 export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
-import { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 
-// ── THE PAYMENTS TAB: PAYMENTS ALREADY MADE, BY MONTH ──────────────────────
+// ── THE PAYMENTS PAGE: THE RENT ROLL FOR THE OPEN MONTH ─────────────────────
 //
-// Decisions #29 (Nic, 10/3 — replaces #28): "PAYMENTS tab = a ledger of
-// payments that have already happened, STAMPED BY MONTH: one section per month,
-// newest first, with a month picker to jump back (not one endless list) ... One
-// line per payment per #26 ... 'Show line items' toggle remembered per person.
-// Work-trade households get one line per month 'Work trade — covered' (no
-// amount) so the month reads complete. Bank payments still clearing are listed
-// and marked 'clearing'; a returned one is marked 'returned'. A month total
-// shows only to owners / property managers (#25). The Payments tab loses its
-// Record payment button and its duplicate outstanding table; the current month
-// shows one plain pointer line 'N households still owe — see Outstanding
-// Balances' (a count, no dollars)."
+// 10/13 (Nic): "the payments page is the rent roll for the open month. And the
+// rent roll page is the historical lookup for previous reportings ... you
+// select either property and view only those properties ... in order of space
+// number ... showing what was invoiced what was paid any difference in the
+// balance if they make a partial payment ... I don't think we need to have the
+// on time column at all. Like underneath paid, it can show ... a +5 showing
+// days past grace ... The payment method is a fine column. And then We just
+// need the invoiced amount paid and amount still owed if any ... for the open
+// month I want it to be in order of space number but below any outstanding
+// balances. So outstanding balances are always at the top of this list. And
+// then once it's paid, it drops down and inserts itself in order of space
+// number."
 //
-// #35.1 / #36.A: a payment is filed under the month of the BILL it paid (a
-// September bill paid Oct 3 is under September, "paid Oct 3, 2 days late"); a
-// payment that paid several months' bills shows under each with its part; a
-// bill paid from paid-ahead credit shows "Paid from credit" on the day it was
-// applied. The server decides all of that (services/paymentsByMonth); this
-// page lays it out.
+// Answered 10/13: pick the property first, every time — except a company with
+// one property opens straight to it. One row per household (a lease), every
+// space shown (an empty one a gray Vacant row; one in use with nobody on a
+// lease says what is there — "Owner Use", a stay guest "Checked in" — never
+// Vacant). Columns Space · Tenant · Invoiced · Paid · Owed · Payment method ·
+// Status — no On time column. One status pill: green Paid, orange "Paid late
+// +N", yellow Partial, red "Owes +N", gray "Due <date>", gray Vacant; work
+// trade covering the month is Paid, method "Work trade", its value beside Paid
+// as on the Rent Roll ("+ $X work trade"). Owed is this month's; what is still
+// owed on earlier months shows under it, and keeps the row at the top until
+// paid ("outstanding balances are always at the top"). Clicking the ROW opens
+// each payment and every charge with what it's for; clicking the NAME opens
+// the tenant report. Eviction mode shows on the row ("we have eviction mode
+// that blocks payments"). "payments first. with a way to log the payments":
+// the first Financials tab, and Record payment right here — the desk window
+// and posting a payment ahead, the one way a payment is logged by hand.
 //
-// WHO (S641, kept by #29): owners, property managers and staff with "View all
+// The server builds it all (GET /balances/rent-roll/properties and
+// /rent-roll/open-month, services/rentRoll — owed rows first, each group in
+// space order); this page lays it out and never re-sorts or re-judges a row.
+// A sum across households is shown only when the server sent one (decisions
+// #25: owners and property managers).
+//
+// WHO (S641, kept): owners, property managers and staff with "View all
 // payments". Anyone else is pointed to Outstanding Balances, where money is
 // taken. The server refuses them too.
-
-interface LedgerLine {
-  paymentId: string
-  label: string
-  detail: string | null
-  dueDate: string
-  amount: number
-  paid: number
-  credit: number
-  returned: number
-  /**
-   * Of `credit`, paid-ahead credit whose own money a card dispute or bank
-   * return took back after it paid this charge (the charge is owed again for
-   * it). Beside `credit`, never inside `returned` (fix pass 2).
-   */
-  creditReturned: number
-  unitNumber: string | null
-  propertyName: string | null
-}
-interface LedgerRow extends LedgerPayment {
-  kind: 'receipt' | 'credit' | 'settled'
-  arrivedOn: string | null
-  method: string | null
-  lines: LedgerLine[]
-}
-interface PaymentsMonth {
-  month: string
-  months: string[]
-  payments: LedgerRow[]
-  workTrade: Array<{ tenantId: string; name: string; unitNumber: string | null; propertyName: string | null; label: string }>
-  stillOweHouseholds: number | null
-  /**
-   * decisions #25: owners and property managers only. `paidFromCredit` is the
-   * credit that still stands; credit whose money was taken back since is
-   * `creditReturnedSince`, beside it (services/paymentsByMonth LedgerTotals).
-   */
-  totals?: { paid: number; paidFromCredit: number; returnedSince: number; creditReturnedSince: number; clearing: number; payments: number }
-}
-
-const STATUS_BADGE: Record<LedgerRow['status'], string> = {
-  settled: 'badge-green',
-  clearing: 'badge-blue',
-  returned: 'badge-red',
-}
 
 // S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
 // overcharge, goodwill). Funded by the landlord (they receive less rent) and
@@ -192,67 +168,73 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
 
 export function PaymentsPage() {
   const navigate = useNavigate()
+  const qc = useQueryClient()
   const { can, isOwner } = usePerms()
   const { user } = useAuth()
   const role = user?.role
   const seesLedger = can('payments.view_all')
-  const [month, setMonth] = useState<string | null>(null)
-  const { data, isLoading, error, refetch, isFetching } = useQuery<PaymentsMonth>(
-    ['payments-ledger', month ?? 'current'],
-    () => apiGet<PaymentsMonth>(`/balances/payments-by-month${month ? `?month=${month}` : ''}`),
-    { enabled: seesLedger, keepPreviousData: true, retry: (n: number, e: unknown) => serverStatus(e) !== 403 && n < 2 })
-  // decisions #26: "a toggle shows the line-item breakdown; each person's choice is remembered."
-  const [showItems, setShowItems] = useState(() => readShowLineItems(user?.id))
-  const [openIds, setOpenIds] = useState<Set<string>>(() => new Set())
-  const toggleOne = (id: string) => setOpenIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
-  const [search, setSearch] = useState('')
+  const canTake = can('take_payment')
+  const [params, setParams] = useSearchParams()
+  const picked = params.get('property')
+
+  const propsQ = useQuery<RentRollProperty[]>(
+    ['payments-page', 'properties'], () => apiGet<RentRollProperty[]>('/balances/rent-roll/properties'),
+    { enabled: seesLedger, retry: (n: number, e: unknown) => serverStatus(e) !== 403 && n < 2 })
+  const properties = openProperties(propsQ.data)
+  const propertyId = propsQ.data ? propertyToShow(picked, propsQ.data) : null
+  // Under 'payments-ledger': the desk window and posting ahead refresh it
+  // themselves the moment a payment is logged.
+  const rollQ = useQuery<OpenMonthRoll>(
+    ['payments-ledger', 'open-month', propertyId],
+    () => apiGet<OpenMonthRoll>(`/balances/rent-roll/open-month?propertyId=${encodeURIComponent(propertyId ?? '')}`),
+    { enabled: seesLedger && !!propertyId,
+      retry: (n: number, e: unknown) => ![400, 403, 404].includes(serverStatus(e) ?? 0) && n < 2 })
+  const roll = rollQ.data && rollQ.data.propertyId === propertyId ? rollQ.data : undefined
+  const refused = serverStatus(propsQ.error) === 403 || serverStatus(rollQ.error) === 403
+
+  // Which rows are open (the row's payments and charges underneath).
+  const [openKeys, setOpenKeys] = useState<Set<string>>(() => new Set())
+  const toggle = (key: string) => setOpenKeys(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
+  const pick = (id: string | null) => {
+    setOpenKeys(new Set())
+    setParams(id ? { property: id } : {})
+  }
+
+  // Logging a payment: the desk window on a row's open charge, the "who is
+  // paying?" list, a payment posted ahead. One message at a time: the last thing
+  // that happened (what the desk window recorded shows once it is closed).
+  const [recording, setRecording] = useState<{ anchorId: string; tenantId: string | null; name: string } | null>(null)
+  const [picking, setPicking] = useState(false)
+  const [posting, setPosting] = useState<{ tenantId: string; name: string } | null>(null)
   const [creditOpen, setCreditOpen] = useState(false)
-  const [creditNotice, setCreditNotice] = useState<string | null>(null)
-
-  const refused = serverStatus(error) === 403
-
-  // WHY A PAYMENT CAME BACK (S655 review): the bank's return code, in words,
-  // and the zero-tolerance mark (the bank said the debit was not authorized, so
-  // bank payments from that person are stopped). The old payment detail window
-  // showed them; the ledger by month does not carry them, so they are read for
-  // the charges a returned payment paid from the payments list — the same
-  // viewers, and only in a month that has something returned.
-  // Fix round 2: the list is read page by page until every returned charge is
-  // found (a month of a large portfolio is more than one 1,000-charge page), and
-  // the page says so if the page limit ever stops it short.
-  const returnedLines = (data?.payments ?? [])
-    .filter(p => p.status === 'returned' || toCents(p.returned) > 0)
-    .flatMap(p => p.lines)
-  const returnRange = chargeMonthsRange(returnedLines.map(l => l.dueDate))
-  const wantedReturnIds = [...new Set(returnedLines.map(l => l.paymentId).filter(Boolean))].sort()
-  const { data: returnRead } = useQuery<{ rows: Array<ReturnFacts & { id: string }>; complete: boolean }>(
-    ['payments-returns', returnRange?.from ?? '', returnRange?.to ?? '', wantedReturnIds.join(',')],
-    () => readChargesById<ReturnFacts & { id: string }>(
-      page => apiGet(`/payments?from=${returnRange!.from}&to=${returnRange!.to}&limit=${CHARGE_PAGE_SIZE}&page=${page}`),
-      new Set(wantedReturnIds)),
-    { enabled: seesLedger && !refused && !!returnRange && wantedReturnIds.length > 0, staleTime: 60_000, retry: false })
-  const returnRows = returnRead?.rows ?? []
-  const returnsIncomplete = returnRead?.complete === false
-  const returnsById = new Map<string, NonNullable<ReturnType<typeof returnDetail>>>()
-  for (const r of returnRows) {
-    const d = returnDetail(r)
-    if (d && r.id) returnsById.set(r.id, d)
+  const [notice, setNotice] = useState<string | null>(null)
+  const recorded = useRef<string | null>(null)
+  const refresh = () => { void qc.invalidateQueries('payments-ledger') }
+  const openRecord = (row: OpenMonthRow) => {
+    if (!row.recordWith) return
+    setNotice(null)
+    // A new window starts with nothing recorded: an earlier window's words can
+    // never surface when this one closes.
+    recorded.current = null
+    setRecording({ anchorId: row.recordWith, tenantId: row.householdId, name: householdName(row) })
   }
-  const paymentReturns = (p: LedgerRow) => {
-    const seen = new Map<string, NonNullable<ReturnType<typeof returnDetail>>>()
-    for (const l of p.lines) {
-      const d = returnsById.get(l.paymentId)
-      if (d && !seen.has(d.text)) seen.set(d.text, d)
-    }
-    return [...seen.values()]
+  const openAhead = (row: OpenMonthRow) => {
+    if (!row.householdId) return
+    setNotice(null)
+    setPosting({ tenantId: row.householdId, name: householdName(row) })
   }
+
   const header = (
     <div className="page-header">
       <div>
         <h1 className="page-title">Payments</h1>
-        <p className="page-subtitle">Payments already made, filed under the month of the bill they paid</p>
+        <p className="page-subtitle">This month: invoiced, paid and still owed, one property at a time</p>
       </div>
       <div className="cd-actions">
+        {/* S641: only for someone who can finish it (Take payments). */}
+        {canTake && roll && !refused && (
+          <button className="btn btn-primary" onClick={() => { setNotice(null); setPicking(true) }}>Record payment</button>
+        )}
         {/* S641: issuing credit is an owner / property manager act — the route
             refuses anyone else, so nobody else sees the button. */}
         {(isOwner || role === 'property_manager') && (
@@ -268,24 +250,31 @@ export function PaymentsPage() {
       </div>
     </div>
   )
-  const modals = creditOpen && (
+  const noticeBar = notice && (
+    <div className="alert alert-success cd-notice" role="status">
+      <CheckCircle size={15} />
+      <span>{notice}</span>
+      <button className="btn btn-ghost btn-sm" aria-label="Dismiss" onClick={() => setNotice(null)}><X size={13} /></button>
+    </div>
+  )
+  const creditModal = creditOpen && (
     <IssueCreditModal onClose={() => setCreditOpen(false)}
-      onDone={(msg) => { setCreditOpen(false); setCreditNotice(msg) }} />
+      onDone={(msg) => { setCreditOpen(false); setNotice(msg); refresh() }} />
   )
 
   if (!seesLedger || refused) {
     // Where to go from here, for exactly the switches this person has.
     const opensBalances = can('balances.view')
-    const takesPayments = can('take_payment')
     return (
       <div>
         {header}
+        {noticeBar}
         <div className="card cd-empty">
           <p className="cd-msg">
             Payments already made are shown to owners, property managers and staff allowed to see all payments.
             {opensBalances
               ? ' To take a payment, use Outstanding Balances.'
-              : takesPayments
+              : canTake
                 ? ' Payments are taken on Outstanding Balances, which your account cannot open yet. Ask the account owner to turn on “View who owes + contact” for you under Team.'
                 : ' If you need to see payments, ask the account owner.'}
           </p>
@@ -293,204 +282,203 @@ export function PaymentsPage() {
             <button className="btn btn-primary btn-sm" onClick={() => navigate('/balances')}>Open Outstanding Balances</button>
           )}
         </div>
-        {modals}
+        {creditModal}
       </div>
     )
   }
 
-  const shownMonth = data?.month ?? month ?? ''
-  const year = shownMonth.slice(0, 4)
-  const payments = (data?.payments ?? []).filter(p => ledgerMatches(p, search))
-  const workTrade = (data?.workTrade ?? []).filter(w => ledgerMatches({ name: w.name, unitNumber: w.unitNumber, propertyName: w.propertyName, paidFor: '' }, search))
-  const pointer = stillOweLine(data?.stillOweHouseholds)
-  const t = data?.totals
+  // "Change property" — offered when there is another to pick (or the one asked
+  // for could not be shown).
+  const canChange = properties.length > 1 || (!!picked && picked !== propertyToShow(null, propsQ.data))
+  const changeButton = canChange && (
+    <button className="btn btn-ghost btn-sm" onClick={() => pick(null)}>Change property</button>
+  )
+  const colCount = canTake ? 8 : 7
+
+  let body: JSX.Element
+  if (propsQ.isLoading) {
+    body = <div className="card cd-empty">Loading…</div>
+  } else if (propsQ.error) {
+    body = (
+      <div className="card cd-empty">
+        <p className="cd-msg">{serverMessage(propsQ.error, 'The properties could not be read.')}</p>
+        <button className="btn btn-primary btn-sm" disabled={propsQ.isFetching} onClick={() => propsQ.refetch()}>
+          {propsQ.isFetching ? 'Reading…' : 'Read them again'}
+        </button>
+      </div>
+    )
+  } else if (!propertyId) {
+    // 10/13 (Nic): "you select either property and view only those properties."
+    body = properties.length === 0 ? (
+      <div className="card cd-empty">No properties yet.</div>
+    ) : (
+      <div className="card pay-pick">
+        <div className="pay-pick-head">Which property?</div>
+        {properties.map(p => (
+          <button key={p.propertyId} type="button" className="pay-prop" onClick={() => pick(p.propertyId)}>
+            <span className="pay-prop-name">{p.name}</span>
+            <span className="pay-prop-meta">{p.spaces} {p.spaces === 1 ? 'space' : 'spaces'}</span>
+            <ChevronRight size={15} />
+          </button>
+        ))}
+      </div>
+    )
+  } else if (rollQ.isLoading || (!roll && !rollQ.error)) {
+    body = <div className="card cd-empty">Loading…</div>
+  } else if (!roll) {
+    body = (
+      <div className="card cd-empty">
+        <p className="cd-msg">{serverMessage(rollQ.error, 'This month could not be read.')}</p>
+        <div className="cd-actions" style={{ justifyContent: 'center' }}>
+          {![400, 404].includes(serverStatus(rollQ.error) ?? 0) && (
+            <button className="btn btn-primary btn-sm" disabled={rollQ.isFetching} onClick={() => rollQ.refetch()}>
+              {rollQ.isFetching ? 'Reading…' : 'Read it again'}
+            </button>
+          )}
+          {changeButton}
+        </div>
+      </div>
+    )
+  } else {
+    const t = roll.totals
+    body = (
+      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+        <div className="pay-head">
+          <h2 className="pay-title">{roll.propertyName} · {monthTitle(roll.month)}</h2>
+          {changeButton}
+          {/* decisions #25: a sum across households only when the server sent it. */}
+          {t && (
+            <div className="cd-totals">
+              <span>Invoiced <strong>{money(t.invoiced)}</strong></span>
+              <span>Paid <strong>{money(t.paid)}</strong></span>
+              {toCents(t.workTrade) > 0 && <span>Work trade <strong>{money(t.workTrade)}</strong></span>}
+              <span>Owed <strong>{money(t.owed)}</strong></span>
+              {toCents(t.owedEarlier) > 0 && <span>Owed from earlier months <strong>{money(t.owedEarlier)}</strong></span>}
+            </div>
+          )}
+        </div>
+        {roll.rows.length === 0 ? (
+          <div className="cd-empty">No spaces at this property yet.</div>
+        ) : (
+          <table className="data-table pay-table" style={{ minWidth: 860 }}>
+            <thead>
+              <tr>
+                <th>Space</th><th>Tenant</th>
+                <th className="num">Invoiced</th><th className="num">Paid</th><th className="num">Owed</th>
+                <th>Payment method</th><th>Status</th>
+                {canTake && <th aria-label="Record payment"></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {/* The server's order: still owing first, then space order (10/13). */}
+              {roll.rows.map(r => {
+                // A space nobody holds on a lease (Vacant, or in use): no money, nothing to open.
+                const vacant = isSpaceOnlyRow(r)
+                const open = !vacant && openKeys.has(r.key)
+                const report = reportPath(r)
+                const paid = paidWords(r)
+                const earlier = earlierWords(r)
+                return (
+                  <Fragment key={r.key}>
+                    <tr className={`pay-row${vacant ? '' : ' pay-click'}${open ? ' pay-open' : ''}`} data-key={r.key}
+                      onClick={vacant ? undefined : () => toggle(r.key)}
+                      tabIndex={vacant ? undefined : 0} aria-expanded={vacant ? undefined : open}
+                      onKeyDown={vacant ? undefined : e => {
+                        if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r.key) }
+                      }}
+                      title={vacant ? undefined : open ? 'Hide the payments and charges' : 'Show the payments and charges'}>
+                      <td className="pay-space">
+                        {!vacant && <span className="pay-caret">{open ? '▾' : '▸'}</span>}
+                        {r.space ?? '—'}
+                      </td>
+                      <td>
+                        {vacant ? (r.occupant ?? <span className="pay-muted">—</span>) : report ? (
+                          <button type="button" className="pay-name" title="Open their payment report"
+                            onClick={e => { e.stopPropagation(); navigate(report) }}>
+                            {householdName(r)}
+                          </button>
+                        ) : householdName(r)}
+                        {r.movedOut && <div><span className="pay-tag">Moved out</span></div>}
+                        {/* 10/13 (Nic): "we have eviction mode that blocks payments". */}
+                        {r.evictionMode && <div><span className="pay-tag evict">Eviction mode — payments blocked</span></div>}
+                      </td>
+                      <td className="num mono">
+                        {vacant ? null : toCents(r.invoiced) > 0 ? money(r.invoiced) : <span className="pay-muted">—</span>}
+                      </td>
+                      <td className="num mono">
+                        {vacant ? null : (
+                          <>
+                            {paid.amount ?? <span className="pay-muted">—</span>}
+                            {/* As on the Rent Roll: work trade's value beside Paid. */}
+                            {paid.workTrade && <span className="pay-sub">{paid.workTrade}</span>}
+                            {toCents(r.clearing) > 0 && <span className="pay-sub">{money(r.clearing)} still clearing</span>}
+                          </>
+                        )}
+                      </td>
+                      <td className="num mono">
+                        {vacant ? null : (
+                          <>
+                            {toCents(r.owed) > 0 ? <span className="pay-owed">{money(r.owed)}</span> : <span className="pay-muted">—</span>}
+                            {/* 10/13 (Nic): "outstanding balances are always at the top" — earlier months too. */}
+                            {earlier && <span className="pay-sub pay-earlier">{earlier}</span>}
+                          </>
+                        )}
+                      </td>
+                      <td>{vacant ? null : r.methods.length > 0 ? r.methods.join(', ') : <span className="pay-muted">—</span>}</td>
+                      <td><span className={`pay-pill ${r.statusColor}`}>{r.statusLabel}</span></td>
+                      {canTake && (
+                        <td className="pay-record">
+                          {rowTakesPayment(r, canTake) && (
+                            <button className="btn btn-primary btn-sm" onClick={e => { e.stopPropagation(); openRecord(r) }}>
+                              Record payment
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                    {open && (
+                      <tr className="pay-detail">
+                        <td colSpan={colCount}><OpenMonthDetail row={r} month={roll.month} canAddPhoto={canTake} /></td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div>
       {header}
+      {noticeBar}
+      {body}
 
-      {creditNotice && (
-        <div className="alert alert-success cd-notice" role="status">
-          <CheckCircle size={15} />
-          <span>{creditNotice}</span>
-          <button className="btn btn-ghost btn-sm" aria-label="Dismiss" onClick={() => setCreditNotice(null)}><X size={13} /></button>
-        </div>
+      {recording && (
+        <RecordPaymentWindow anchorPaymentId={recording.anchorId} tenantId={recording.tenantId} name={recording.name}
+          onClose={() => {
+            setRecording(null)
+            if (recorded.current) { setNotice(recorded.current); recorded.current = null }
+            refresh()
+          }}
+          onRecorded={(m) => { recorded.current = m }} />
       )}
-
-      <div className="cd-ledger-bar">
-        <select className="form-select cd-month-select" aria-label="Month" value={shownMonth}
-          onChange={e => { setMonth(e.target.value); setOpenIds(new Set()) }}>
-          {(data?.months ?? (shownMonth ? [shownMonth] : [])).map(m => <option key={m} value={m}>{monthTitle(m)}</option>)}
-        </select>
-        <SearchBox value={search} onChange={setSearch} placeholder="Search name, space, what it paid for…" />
-        <label className="cd-toggle">
-          <input type="checkbox" checked={showItems}
-            onChange={e => { setShowItems(e.target.checked); writeShowLineItems(user?.id, e.target.checked); setOpenIds(new Set()) }} />
-          Show line items
-        </label>
-      </div>
-
-      {isLoading ? (
-        <div className="card cd-empty">Loading…</div>
-      ) : error ? (
-        <div className="card cd-empty">
-          <p className="cd-msg">{serverMessage(error, 'The payments could not be read.')}</p>
-          <button className="btn btn-primary btn-sm" disabled={isFetching} onClick={() => refetch()}>{isFetching ? 'Reading…' : 'Read them again'}</button>
-        </div>
-      ) : (
-        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-          <div className="cd-month-head">
-            <h2 className="cd-month-title">{monthTitle(shownMonth)}</h2>
-            <span className="cd-line-meta">{data?.payments.length ?? 0} payment{(data?.payments.length ?? 0) === 1 ? '' : 's'} on this month&apos;s bills</span>
-            {/* decisions #25: the month total exists only when the server sent it (owners, property managers). */}
-            {t && (
-              <div className="cd-totals">
-                <span>Paid <strong>{money(t.paid)}</strong></span>
-                {t.paidFromCredit > 0 && <span>From credit <strong>{money(t.paidFromCredit)}</strong></span>}
-                {/* Fix pass 2: credit a dispute or bank return took back is not in "From
-                    credit" (every dollar counted once) — said beside it, so the
-                    rows below add up. */}
-                {toCents(t.creditReturnedSince) > 0 && <span>Credit taken back since <strong>{money(t.creditReturnedSince)}</strong></span>}
-                {t.clearing > 0 && <span>Still clearing <strong>{money(t.clearing)}</strong></span>}
-                {t.returnedSince > 0 && <span>Taken back since <strong>{money(t.returnedSince)}</strong></span>}
-              </div>
-            )}
-          </div>
-          {pointer && (
-            <div className="cd-pointer">
-              <span>{pointer}</span>
-              <button className="btn btn-primary btn-sm" onClick={() => navigate('/balances')}>Open Outstanding Balances</button>
-            </div>
-          )}
-          {returnsIncomplete && (
-            <div className="cd-note cd-pointer">
-              Some returned payments this month may show no reason — the month has too many charges to read them all
-              here. GAM support can tell you why any of them came back.
-            </div>
-          )}
-          {payments.length === 0 && workTrade.length === 0 ? (
-            <div className="cd-empty">
-              {search ? 'No payment this month matches that.' : 'No payments on this month’s bills yet.'}
-            </div>
-          ) : (
-            <table className="data-table" style={{ minWidth: 980 }}>
-              <thead>
-                <tr>
-                  <th>Paid</th><th>Who</th><th>Space</th><th>For</th>
-                  {/* 10/12: this column was headed "Owed", but it is what the
-                      payment put toward the month's bills (money plus credit) —
-                      nothing here is still owed (the Rent Roll says that). */}
-                  <th style={{ textAlign: 'right' }} title="What this payment put toward the month's bills: money plus account credit">Applied</th><th style={{ textAlign: 'right' }}>Paid</th>
-                  <th>How</th><th>On time</th><th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {payments.map(p => {
-                  const open = showItems || openIds.has(p.id)
-                  const creditOnly = toCents(p.amount) === 0 && toCents(p.creditApplied) > 0
-                  return (
-                    <Fragment key={p.id}>
-                      <tr className="cd-ledger-row" onClick={() => toggleOne(p.id)} title={open ? 'Hide the charges' : 'Show the charges it paid'}>
-                        <td className="mono">
-                          {dayWord(p.paidOn, year)}
-                          {p.arrivedOn && p.arrivedOn !== p.paidOn && <div className="cd-ledger-sub">arrived {dayWord(p.arrivedOn, year)}</div>}
-                        </td>
-                        <td>{p.name}</td>
-                        <td>
-                          {p.unitNumber || '—'}
-                          {p.propertyName && <div className="cd-ledger-sub">{p.propertyName}</div>}
-                        </td>
-                        <td>{p.paidFor}</td>
-                        <td className="mono" style={{ textAlign: 'right' }}>{money(p.applied)}</td>
-                        <td className="mono" style={{ textAlign: 'right' }}>
-                          {creditOnly ? <span className="cd-ledger-sub">from credit</span> : money(p.amount)}
-                          {!creditOnly && toCents(p.creditApplied) > 0 && <div className="cd-ledger-sub">+ {money(p.creditApplied)} from credit</div>}
-                          {creditOnly && <div>{money(p.creditApplied)}</div>}
-                          {toCents(p.returned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(p.returned)} taken back</div>}
-                          {toCents(p.creditReturned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(p.creditReturned)} credit taken back</div>}
-                        </td>
-                        <td>
-                          {p.methodLabel}
-                          {p.reference && <div className="cd-ledger-sub">#{p.reference}</div>}
-                          {p.method === 'bank_deposit' && (
-                            <BankReceiptPhoto receiptId={p.receiptId} url={p.depositPhotoUrl}
-                              canAdd={can('take_payment')} onAdded={() => refetch()} />
-                          )}
-                          {/* 10/5 (Nic): the tenant's report this deposit confirmed — their
-                              photo, and the flag when the bank showed a later day. */}
-                          {p.tenantReceiptPhotoUrl && (
-                            <BankReceiptPhoto receiptId={p.receiptId} url={p.tenantReceiptPhotoUrl}
-                              canAdd={false} onAdded={() => {}} label="Tenant's photo of the bank receipt" />
-                          )}
-                          {p.depositDateFlag && (
-                            <div className="cd-ledger-sub cd-timing-late" role="note">
-                              {declaredDateFlagText(p.depositDateFlag.said, p.depositDateFlag.bank)}
-                            </div>
-                          )}
-                        </td>
-                        <td className={p.daysLate > 0 ? 'cd-timing-late' : undefined}>{p.timingLabel}</td>
-                        <td>
-                          <span className={`badge ${STATUS_BADGE[p.status] ?? 'badge-muted'}`}>{p.statusLabel}</span>
-                          {(p.status === 'returned' || toCents(p.returned) > 0) && (() => {
-                            const why = paymentReturns(p)
-                            return (<>
-                              {why.map(d => <div key={d.text} className="cd-ledger-sub cd-return">{d.text}</div>)}
-                              {why.some(d => d.zeroTolerance) && <div className="cd-ledger-sub cd-return cd-strong-sub">{ZERO_TOLERANCE_TEXT}</div>}
-                            </>)
-                          })()}
-                          {/* The bill's own charges were not disputed: the payment that put
-                              the credit on their account was. Said here, since no return
-                              reason sits on these charges. */}
-                          {toCents(p.creditReturned) > 0 && (
-                            <div className="cd-ledger-sub cd-return">{CREDIT_TAKEN_BACK_TEXT}</div>
-                          )}
-                        </td>
-                      </tr>
-                      {open && p.lines.map(l => (
-                        <tr key={`${p.id}:${l.paymentId}`} className="cd-ledger-items">
-                          <td className="cd-ledger-indent mono">due {dayWord(l.dueDate, year)}</td>
-                          <td colSpan={3}>
-                            {l.label}{l.detail ? <span className="cd-ledger-sub"> · {l.detail}</span> : null}
-                            {returnsById.get(l.paymentId) && (
-                              <span className="cd-ledger-sub cd-return"> · {returnsById.get(l.paymentId)!.text}</span>
-                            )}
-                            {l.unitNumber && l.unitNumber !== p.unitNumber && <span className="cd-ledger-sub"> · {l.unitNumber}</span>}
-                          </td>
-                          {/* Applied to this charge by this payment; the charge's own amount beside it when it differs. */}
-                          <td className="mono" style={{ textAlign: 'right' }}>
-                            {money(l.paid + l.credit)}
-                            {toCents(l.paid) + toCents(l.credit) !== toCents(l.amount) && <div className="cd-ledger-sub">of {money(l.amount)} charged</div>}
-                          </td>
-                          <td className="mono" style={{ textAlign: 'right' }}>
-                            {toCents(l.paid) > 0 && money(l.paid)}
-                            {toCents(l.credit) > 0 && <div className="cd-ledger-sub">{money(l.credit)} from credit</div>}
-                            {toCents(l.returned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(l.returned)} taken back</div>}
-                            {toCents(l.creditReturned) > 0 && <div className="cd-ledger-sub cd-timing-late">{money(l.creditReturned)} credit taken back</div>}
-                          </td>
-                          <td colSpan={3}></td>
-                        </tr>
-                      ))}
-                    </Fragment>
-                  )
-                })}
-              </tbody>
-            </table>
-          )}
-          {/* #29: a work-trade household's month reads complete — never an amount. */}
-          {workTrade.length > 0 && (
-            <>
-              <div className="cd-worktrade-head">Work trade</div>
-              {workTrade.map(w => (
-                <div key={w.tenantId} className="cd-worktrade-line">
-                  {w.label} · {w.name}{w.unitNumber ? ` · ${w.unitNumber}` : ''}{w.propertyName ? ` · ${w.propertyName}` : ''}
-                </div>
-              ))}
-            </>
-          )}
-        </div>
+      {picking && roll && (
+        <RecordPaymentPicker rows={roll.rows}
+          onClose={() => setPicking(false)}
+          onRecord={(r) => { setPicking(false); openRecord(r) }}
+          onAhead={(r) => { setPicking(false); openAhead(r) }} />
       )}
-
-      {modals}
+      {posting && (
+        <PostPaymentForm tenantId={posting.tenantId} name={posting.name}
+          onClose={() => setPosting(null)}
+          onChangePerson={() => { setPosting(null); setPicking(true) }}
+          onPosted={(m) => { setPosting(null); setNotice(m); refresh() }} />
+      )}
+      {creditModal}
     </div>
   )
 }

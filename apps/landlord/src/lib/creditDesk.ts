@@ -1263,35 +1263,6 @@ export const CREDIT_USE_RULE =
 
 // ─── The Payments ledger (decisions #26, #29, #35.1, #36.A) ──────────────────
 
-const LINE_ITEMS_KEY = 'gam.payments.showLineItems'
-
-export interface FlagStore { getItem(k: string): string | null; setItem(k: string, v: string): void }
-
-function browserStore(): FlagStore | null {
-  try {
-    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null
-  } catch {
-    return null
-  }
-}
-
-/** decisions #26: "each person's choice is remembered" — per signed-in person, on this device (there is no server preference). Off by default. */
-export function readShowLineItems(userId: string | null | undefined, store: FlagStore | null = browserStore()): boolean {
-  try {
-    return store?.getItem(`${LINE_ITEMS_KEY}.${userId ?? 'anyone'}`) === '1'
-  } catch {
-    return false
-  }
-}
-
-export function writeShowLineItems(userId: string | null | undefined, on: boolean, store: FlagStore | null = browserStore()): void {
-  try {
-    store?.setItem(`${LINE_ITEMS_KEY}.${userId ?? 'anyone'}`, on ? '1' : '0')
-  } catch {
-    /* blocked storage: the toggle still works for this visit */
-  }
-}
-
 export interface LedgerPayment {
   id: string
   name: string
@@ -1411,17 +1382,4 @@ export async function readChargesById<T extends { id: string }>(
     if (got.length < pageSize) return { rows, complete: true }
   }
   return { rows, complete: missing.size === 0 }
-}
-
-/** Search the ledger by who, where, or what it paid for. */
-export function ledgerMatches(p: Pick<LedgerPayment, 'name' | 'unitNumber' | 'propertyName' | 'paidFor'>, q: string): boolean {
-  const s = q.trim().toLowerCase()
-  if (!s) return true
-  return [p.name, p.unitNumber, p.propertyName, p.paidFor].some(v => String(v ?? '').toLowerCase().includes(s))
-}
-
-/** The current month's pointer (decisions #29): a count, never dollars. Null when there is nothing to say. */
-export function stillOweLine(n: number | null | undefined): string | null {
-  if (n == null || !(n > 0)) return null
-  return `${n} household${n === 1 ? '' : 's'} still owe${n === 1 ? 's' : ''} — see Outstanding Balances`
 }

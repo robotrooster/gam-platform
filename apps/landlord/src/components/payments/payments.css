@@ -1,0 +1,103 @@
+/* 10/13 (Nic): the Payments page — the rent roll for the open month, one
+   property at a time. Every class the page and its parts use that is not a
+   shared one (data-table, badge, btn, cd-*) has its rule here. Colors are theme
+   tokens; the two pill colors the palette lacks (yellow, orange) are defined
+   below for both themes. */
+
+:root {
+  --pay-yellow: #eab308;
+  --pay-yellow-bg: rgba(234, 179, 8, .12);
+  --pay-orange: #f97316;
+  --pay-orange-bg: rgba(249, 115, 22, .12);
+}
+:root[data-theme="light"] {
+  --pay-yellow: #a16207;
+  --pay-yellow-bg: rgba(234, 179, 8, .18);
+  --pay-orange: #c2410c;
+  --pay-orange-bg: rgba(249, 115, 22, .14);
+}
+
+/* ── Which property ── */
+.pay-pick { padding: 0; overflow: hidden; max-width: 560px; }
+.pay-pick-head {
+  padding: 12px 16px; border-bottom: 1px solid var(--border-0);
+  font-size: .9rem; font-weight: 700; color: var(--text-0);
+}
+.pay-prop {
+  width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 12px 16px; background: transparent; border: none; border-bottom: 1px solid var(--border-0);
+  color: var(--text-0); font-family: var(--font-body); font-size: .86rem; cursor: pointer;
+}
+.pay-prop:last-child { border-bottom: none; }
+.pay-prop:hover { background: var(--bg-3); }
+.pay-prop:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.pay-prop-name { font-weight: 600; flex: 1; min-width: 0; }
+.pay-prop-meta { font-size: .74rem; color: var(--text-3); white-space: nowrap; }
+
+/* ── The month ── */
+.pay-head {
+  padding: 12px 16px; border-bottom: 1px solid var(--border-0);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.pay-title { font-size: 1rem; font-weight: 700; color: var(--text-0); margin: 0; }
+.pay-head .cd-totals { margin-left: auto; }
+.pay-table th.num, .pay-table td.num { text-align: right; }
+.pay-table td { vertical-align: top; }
+.pay-row.pay-click { cursor: pointer; }
+.pay-row.pay-click:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.pay-row.pay-open td { background: var(--gold-bg); }
+.pay-space { font-family: var(--font-mono); white-space: nowrap; color: var(--text-0); }
+.pay-caret { display: inline-block; width: 12px; color: var(--text-3); font-size: .7rem; margin-right: 4px; }
+.pay-name {
+  background: none; border: none; padding: 0; color: var(--text-0); font-weight: 600; font-size: inherit;
+  font-family: var(--font-body); cursor: pointer; text-align: left;
+}
+.pay-name:hover { color: var(--gold); text-decoration: underline; }
+.pay-name:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.pay-muted { color: var(--text-3); }
+.pay-sub { display: block; font-size: .68rem; color: var(--text-3); font-weight: 400; white-space: nowrap; font-family: var(--font-body); }
+.pay-owed { color: var(--gold); font-weight: 700; }
+/* 10/13 (Nic): what is still owed on earlier months, under this month's Owed. */
+.pay-sub.pay-earlier { color: var(--gold); font-weight: 600; }
+.pay-tag {
+  display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px;
+  font-size: .64rem; font-weight: 700; white-space: nowrap;
+  background: var(--bg-4); color: var(--text-2);
+}
+/* 10/13 (Nic): "we have eviction mode that blocks payments". */
+.pay-tag.evict { background: var(--red-bg); color: var(--red); }
+.pay-record { text-align: right; white-space: nowrap; }
+
+/* The one status pill, in Nic's colors (10/12–10/13): green Paid, orange
+   Paid late +N, yellow Partial, red Owes +N, gray Due <date> / Vacant / No bill,
+   and gray for a space in use with nobody on a lease ("Owner Use", "Checked in"). */
+.pay-pill {
+  display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
+  font-size: .72rem; font-weight: 700; white-space: nowrap; border: 1px solid transparent;
+}
+.pay-pill.green  { background: var(--green-bg); color: var(--green); border-color: rgba(34,197,94,.3); }
+.pay-pill.orange { background: var(--pay-orange-bg); color: var(--pay-orange); border-color: rgba(249,115,22,.35); }
+.pay-pill.yellow { background: var(--pay-yellow-bg); color: var(--pay-yellow); border-color: rgba(234,179,8,.35); }
+.pay-pill.red    { background: var(--red-bg); color: var(--red); border-color: rgba(239,68,68,.35); }
+.pay-pill.gray   { background: var(--bg-4); color: var(--text-2); border-color: var(--border-1); }
+
+/* ── A row opened: each payment, and every charge with what it is for ── */
+.pay-detail > td { padding: 0; background: var(--bg-3); }
+.pay-detail-body { display: flex; gap: 24px; flex-wrap: wrap; padding: 12px 16px 14px 34px; }
+.pay-detail-block { flex: 1 1 300px; min-width: 0; }
+.pay-detail-block .cd-section-label { margin: 0 0 6px; }
+.pay-lines { width: 100%; border-collapse: collapse; font-size: .76rem; }
+.pay-lines th, .pay-lines td {
+  padding: 5px 8px; border-bottom: 1px solid var(--border-0); text-align: left;
+  color: var(--text-1); vertical-align: top;
+}
+.pay-lines th { font-size: .62rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); }
+.pay-lines tr:last-child td { border-bottom: none; }
+.pay-lines .num { text-align: right; font-family: var(--font-mono); white-space: nowrap; }
+.pay-lines .day { white-space: nowrap; font-family: var(--font-mono); }
+.pay-none { font-size: .76rem; color: var(--text-3); padding: 4px 0; }
+
+@media (max-width: 640px) {
+  .pay-head .cd-totals { margin-left: 0; width: 100%; }
+  .pay-detail-body { padding: 10px 12px; }
+}

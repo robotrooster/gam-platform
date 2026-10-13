@@ -3,8 +3,8 @@
 // the maintenance costs" — and the owner keeps every tab they had.
 // 10/12 (Nic): "Bookkeeping" brings the GAM Books pages inside the portal, as
 // sub-tabs like Financials; the bank account, payouts and the company's books
-// are the company-wide box's; the Rent Roll leads Financials and staff with
-// "View all payments" reach it; the Payments tab stays.
+// are the company-wide box's; staff with "View all payments" reach the Rent
+// Roll. 10/13 (Nic): "payments first" — Payments leads Financials.
 import { describe, it, expect } from 'vitest'
 import { visibleNavItemsFor, sidebarNavItemsFor } from './Layout'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
@@ -108,12 +108,12 @@ describe('landlord portal navigation for the owner', () => {
     expect(shown.has('/payouts')).toBe(false)
   })
 
-  it('the Rent Roll leads the Financials hub, and Payments stays', () => {
+  // 10/13 (Nic): "payments first. with a way to log the payments."
+  it('Payments leads the Financials hub, the Rent Roll right after it', () => {
     const fin = visibleNavItemsFor({ role: 'landlord' }).filter(i => i.hub === 'financials')
-    expect(fin[0].to).toBe('/rent-roll')
-    expect(fin.map(i => i.to)).toContain('/payments')
+    expect(fin.slice(0, 2).map(i => i.to)).toEqual(['/payments', '/rent-roll'])
     const side = sidebarNavItemsFor({ role: 'landlord' })
-    expect(side.find(s => s.label === 'Financials')?.to).toBe('/rent-roll')
+    expect(side.find(s => s.label === 'Financials')?.to).toBe('/payments')
   })
 
   it('gains Bookkeeping: every GAM Books page as a sub-tab, in Books\' order', () => {

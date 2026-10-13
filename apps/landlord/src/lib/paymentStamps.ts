@@ -4,8 +4,8 @@
  * (the server's services/householdMonths decides every stamp; this only says
  * it). Words and letters come from the shared maps, never a raw value.
  */
-import { PAYMENT_STAMP_LABEL, PAYMENT_STAMP_LETTER, type PaymentStamp } from '@gam/shared'
-import { money, dayWord, monthTitle } from './creditDesk'
+import type { PaymentStamp } from '@gam/shared'
+import { monthTitle } from './creditDesk'
 
 /** One month of one household, as the server sends it (camelCase on the wire). */
 export interface StampMonth {
@@ -61,26 +61,6 @@ export interface ChargeLine {
   isLateFee: boolean
 }
 
-/** The counts per stamp, as the server's camelCased keys. */
-export interface StampCounts {
-  month: string
-  paidOnTime: number
-  partial: number
-  paidLate: number
-  outstanding: number
-  due: number
-  workTrade: number
-}
-
-/** The camelCase key a stamp's count travels under. */
-export const STAMP_COUNT_KEY: Record<PaymentStamp, keyof Omit<StampCounts, 'month' | 'workTrade'>> = {
-  paid_on_time: 'paidOnTime',
-  partial: 'partial',
-  paid_late: 'paidLate',
-  outstanding: 'outstanding',
-  due: 'due',
-}
-
 /** 'Oct' for '2026-10'. */
 export function shortMonth(ym: string): string {
   return monthTitle(ym).slice(0, 3)
@@ -93,39 +73,6 @@ export function shortMonth(ym: string): string {
  */
 export function stripYear(ym: string, through: string): string | null {
   return ym.slice(0, 4) === through.slice(0, 4) ? null : `’${ym.slice(2, 4)}`
-}
-
-/** The letter (and, for a late month, the days past grace) on a stamp. */
-export function stampText(s: Pick<StampMonth, 'stamp' | 'daysPastGrace'>): string {
-  if (!s.stamp) return '–'
-  if ((s.stamp === 'paid_late' || s.stamp === 'outstanding' || s.stamp === 'partial') && s.daysPastGrace > 0) {
-    return `${PAYMENT_STAMP_LETTER[s.stamp]}+${s.daysPastGrace}`
-  }
-  return PAYMENT_STAMP_LETTER[s.stamp]
-}
-
-/** What a stamp says on hover or tap: the month, the words, the money and the day. */
-export function stampTitle(s: StampMonth): string {
-  const head = `${monthTitle(s.month)}: ${s.stamp ? PAYMENT_STAMP_LABEL[s.stamp] : 'Nothing billed'}`
-  if (!s.stamp) return head
-  const bits = [head]
-  if (s.workTradeOnly) bits.push('covered by work trade')
-  if (s.daysPastGrace > 0) bits.push(`${s.daysPastGrace} day${s.daysPastGrace === 1 ? '' : 's'} past grace`)
-  bits.push(`charged ${money(s.charged)}`, `paid ${money(s.paid + s.credit)}`)
-  if (s.workTrade > 0) bits.push(`work trade ${money(s.workTrade)}`)
-  if (s.owed > 0) bits.push(`owed ${money(s.owed)}`)
-  if (s.paidInFullOn) bits.push(`paid in full ${dayWord(s.paidInFullOn)}`)
-  if (s.onboarding) bits.push('onboarding month')
-  return bits.join(' · ')
-}
-
-/** The status words under the pill: "paid Oct 3", "+7 days past grace", "due". */
-export function statusNote(s: StampMonth | null): string | null {
-  if (!s || !s.stamp) return null
-  if (s.stamp === 'paid_on_time') return s.workTradeOnly ? 'work trade' : s.paidInFullOn ? `paid ${dayWord(s.paidInFullOn)}` : null
-  if (s.stamp === 'paid_late') return `paid ${dayWord(s.paidInFullOn)} · ${s.daysPastGrace}d past grace`
-  if (s.daysPastGrace > 0) return `${s.daysPastGrace} day${s.daysPastGrace === 1 ? '' : 's'} past grace`
-  return s.stamp === 'due' ? 'not late yet' : null
 }
 
 /**

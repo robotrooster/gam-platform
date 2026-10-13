@@ -137,17 +137,19 @@ describe('S640 work trade is out of the money totals', () => {
     expect(Number(res.body.data.work_trade_rent)).toBe(0)
   })
 
-  // 10/12 (Nic): the Rent Roll the card opens is the combined page
-  // (GET /api/balances/rent-roll); it totals the leases' rent the same way.
-  it('the rent roll splits the same way the card does, and still lists the space', async () => {
+  // 10/13 (Nic): the Rent Roll the card opens is one property at a time now
+  // (GET /api/balances/rent-roll/history); the work-trade space is still a
+  // row — its rent covered by work trade, never money and never owed.
+  it('the rent roll still lists the space; its rent is work trade, apart from money and from what is owed', async () => {
     const f = await seed()
     const res = await request(buildApp())
-      .get('/api/balances/rent-roll').set('Authorization', `Bearer ${f.token}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.lease_rent).toEqual({ expected: 500, traded_for_work: 460 })
-    const rows = res.body.data.properties.flatMap((p: any) => p.rows)
+      .get(`/api/balances/rent-roll/history?propertyId=${f.propertyId}&range=all`).set('Authorization', `Bearer ${f.token}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const rows = res.body.data.rows
     expect(rows).toHaveLength(2)
-    expect(rows.filter((r: any) => r.work_trade)).toHaveLength(1)
+    expect(rows.find((r: any) => r.householdId === f.tradeTenantId)).toMatchObject({ invoiced: 460, workTrade: 460, paid: 0, owed: 0 })
+    expect(rows.find((r: any) => r.householdId === f.cashTenantId)).toMatchObject({ invoiced: 500, workTrade: 0, owed: 500 })
+    expect(res.body.data.totals).toMatchObject({ invoiced: 960, workTrade: 460, owed: 500 })
   })
 
   // The regression this protects against: a NULL from the work-trade lateral

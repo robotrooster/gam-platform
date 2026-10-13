@@ -174,6 +174,84 @@ export function writtenAtSql(p = 'p'): string {
                 ELSE GREATEST(${x}.created_at, ${workTradeReleasedAtSql(x)}) END)`
 }
 
+// ─── Logged by hand after the late fee (10/6, Nic) ────────────────────────────
+//
+// 10/6 (Nic), CONFIRMED TABLE: "Landlord logs by hand, no bank match → late
+// fee: credit against the bill; history: LATE." A line the desk logged by hand
+// (cash, check, money order, a deposit it typed in) after a late fee was
+// charged on its bill, with no bank line matched to it, counts from the day GAM
+// recorded it — never from an earlier day typed on it ("the late payment still
+// shows on their payment history" — no exceptions). A bank match decides by the
+// bank's day instead; a late fee the landlord deleted (voided) or the bank took
+// off ($0) is not on the bill.
+//
+// 10/13 (Nic): "Hand-logged payment entered AFTER the late fee posted counts
+// late from the day it was logged (Nic's 10/6 rule) — the Rent Roll follows
+// it, same as credit history." The credit history (services/creditBillMarks
+// billsJudgeSql) and the payment health every screen reads
+// (services/householdMonths rowsCteSql) judge the same line by the pieces
+// below, so the two can never disagree.
+
+/**
+ * The bill a charge row (alias `p`) is on: its own invoice, else its lease's
+ * invoice due the same day (a longer stay's extra rent is written on no
+ * invoice). NULL: a bill of its own. The same as creditBillMarks' bill key.
+ */
+export function billInvoiceOfRowSql(p = 'p'): string {
+  const x = alias(p)
+  return `COALESCE(${x}.invoice_id,
+            (SELECT lt_ai.id FROM invoices lt_ai
+              WHERE ${x}.invoice_id IS NULL AND ${x}.lease_id IS NOT NULL
+                AND lt_ai.lease_id = ${x}.lease_id AND lt_ai.due_date = ${x}.due_date AND lt_ai.status <> 'void'
+              ORDER BY lt_ai.created_at, lt_ai.id LIMIT 1))`
+}
+
+/**
+ * When GAM recorded the charge row `p` as paid (a timestamp): the change in the
+ * journal (audit_row_changes, the audit_payments trigger) that settled it — the
+ * latest one, so a payment undone and recorded again counts from the second
+ * time. NULL when the journal has none (a row written settled).
+ */
+export function recordedPaidAtSql(p = 'p'): string {
+  const x = alias(p)
+  return `(SELECT MAX(lt_ar.changed_at) FROM audit_row_changes lt_ar
+            WHERE lt_ar.table_name = 'payments' AND lt_ar.row_id = ${x}.id
+              AND lt_ar.new_row->>'status' IN ('settled', 'paid_via_deposit')
+              AND COALESCE(lt_ar.old_row->>'status', '') NOT IN ('settled', 'paid_via_deposit'))`
+}
+
+/**
+ * When the first late fee still standing on the bill `billInv` was charged (a
+ * timestamp), or on the row `p` itself when it is one. A voided fee or one the
+ * bank took off ($0) is not on the bill.
+ */
+export function firstLateFeeAtSql(p: string, billInv: string): string {
+  const x = alias(p)
+  return `(SELECT MIN(lt_f.created_at) FROM payments lt_f
+            WHERE lt_f.type = 'late_fee' AND lt_f.amount > 0 AND lt_f.status <> 'voided'
+              AND (lt_f.invoice_id = ${billInv} OR lt_f.id = ${x}.id))`
+}
+
+/**
+ * The day (property calendar) GAM recorded a line logged by hand after its
+ * bill's late fee — the day it counts as paid from (10/6) — or NULL when the
+ * rule does not touch it. `r` is a row that carries: manual_method, status,
+ * in_flight, wt_open, wt_note_value, bank_day, recorded_at (recordedPaidAtSql),
+ * first_fee_at (firstLateFeeAtSql) and timezone; `bankValidated`, a column
+ * that is TRUE for a line a bank line is paying right now (the credit
+ * history's), or omitted.
+ */
+export function handLoggedRecordedDaySql(r: string, bankValidated?: string): string {
+  const x = alias(r)
+  const notBank = bankValidated ? ` AND NOT ${x}.${alias(bankValidated)}` : ''
+  return `(CASE WHEN ${x}.manual_method IS NOT NULL AND ${x}.status IN ('settled','paid_via_deposit') AND NOT ${x}.in_flight
+                     AND NOT (${x}.wt_open OR ${x}.wt_note_value > 0)
+                     AND ${x}.bank_day IS NULL${notBank}
+                     AND ${x}.first_fee_at IS NOT NULL AND ${x}.recorded_at IS NOT NULL
+                     AND ${x}.first_fee_at <= ${x}.recorded_at
+                THEN ${propertyDaySql(`${x}.recorded_at`, x)} END)`
+}
+
 /** 'YYYY-MM-DD' → epoch days, for the code versions below. */
 function dayNumber(ymd: string): number {
   return Math.round(Date.UTC(Number(ymd.slice(0, 4)), Number(ymd.slice(5, 7)) - 1, Number(ymd.slice(8, 10))) / 86_400_000)

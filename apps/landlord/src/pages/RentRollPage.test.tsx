@@ -1,76 +1,132 @@
 /**
- * 10/12 (Nic) — the Rent Roll: property folders (a single property opens by
- * itself), one row per household with the lease's rent, Charged with its late
- * fees named, Paid, Owed, a colored status that also says it in words, payment
- * health, and a strip of monthly stamps with the month's counts. A name opens
- * the tenant report. Totals across people show only when the server sent them.
+ * 10/13 (Nic) — the Rent Roll is the history lookup, one property at a time:
+ *
+ *   "the rent roll page is the historical lookup for previous reportings for
+ *    quarters or years or individual months or whatever … I don't like having
+ *    Mountain View and Oak Park options right next to each other at the top …
+ *    I don't want to be able to have one property looking one way and one
+ *    property looking another way … too much … clutter."
+ *
+ * Answered 10/13: pick the property first (one property opens straight to
+ * it); quick picks Last month · This quarter · Last quarter · This year · Last
+ * year · All time and a custom start/end month, one view for every property;
+ * rows in space order with Invoiced · Paid · Owed, health and a colored stamp
+ * per month in words; a collapsed "Moved out, still owes" folder; no
+ * moved-out setting, no instruction paragraph; Print and Export CSV stay; a
+ * name opens that household's (lease's) report. Every figure is the server's.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation, useParams } from 'react-router-dom'
+import { RENT_ROLL_STATUS_COLOR, rentRollStatusText, type RentRollMonthStatus } from '@gam/shared'
 
-const server = vi.hoisted(() => ({ roll: null as any, gets: [] as string[], hold: null as Promise<void> | null, puts: [] as Array<{ url: string; body: any }> }))
+const server = vi.hoisted(() => ({
+  properties: [] as any[],
+  propsFail: null as any,
+  history: null as null | ((q: URLSearchParams) => any),
+  gets: [] as string[],
+  hold: null as Promise<void> | null,
+  puts: [] as string[],
+}))
 vi.mock('../lib/api', () => ({
   api: {
     get: async (url: string) => {
       server.gets.push(url)
-      if (server.hold) await server.hold
-      if (url.startsWith('/balances/rent-roll')) return { data: { success: true, data: JSON.parse(JSON.stringify(server.roll)) } }
+      if (url === '/balances/rent-roll/properties') {
+        if (server.propsFail) throw server.propsFail
+        return { data: { success: true, data: JSON.parse(JSON.stringify(server.properties)) } }
+      }
+      if (url.startsWith('/balances/rent-roll/history?')) {
+        if (server.hold) await server.hold
+        const q = new URLSearchParams(url.split('?')[1])
+        return { data: { success: true, data: JSON.parse(JSON.stringify(server.history!(q))) } }
+      }
       throw new Error(`unexpected api.get ${url}`)
     },
-    put: async (url: string, body: any) => {
-      server.puts.push({ url, body })
-      if (url === '/balances/rent-roll/moved-out') {
-        const r = server.roll.movedOut.find((m: any) => m.landlordId === body.landlordId)
-        r.rule = body.rule
-        return { data: { success: true, data: r } }
-      }
-      throw new Error(`unexpected api.put ${url}`)
-    },
+    put: async (url: string) => { server.puts.push(url); throw new Error(`unexpected api.put ${url}`) },
   },
 }))
 
-import { RentRollPage, countsText, pickerMonths, newestFirst, movedOutNote } from './RentRollPage'
-import { csvField, csvLine, stripYear } from '../lib/paymentStamps'
+import { RentRollPage, newestFirst, rangeTitle, monthCountWords, rentRollCsv, csvFileName } from './RentRollPage'
+import { rangeOfPick, historyPath } from '../components/rentroll/rentRollRange'
+import { localToday } from '../lib/creditDesk'
+import { csvField, csvLine } from '../lib/paymentStamps'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
-const stamp = (month: string, s: string | null, over: any = {}) => ({
-  month, stamp: s, stampLabel: s, daysPastGrace: 0, charged: s ? 495 : 0, chargedLateFees: 0, paid: 0, credit: 0, workTrade: 0,
-  owed: 0, firstPaidOn: null, paidInFullOn: null, onboarding: false, workTradeOnly: false, ...over,
-})
-const counts = (month: string, over: any = {}) => ({ month, paidOnTime: 0, partial: 0, paidLate: 0, outstanding: 0, due: 0, workTrade: 0, ...over })
-const MONTHS = ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10']
+const MV = { propertyId: 'mv', name: 'Mountain View RV Ranch', spaces: 52, owned: true }
+const OP = { propertyId: 'op', name: 'Oak Park', spaces: 29, owned: true }
 
-function gerald() {
-  const oct = stamp('2026-10', 'outstanding', { daysPastGrace: 7, charged: 577.47, chargedLateFees: 60, owed: 577.47 })
+/** A month's stamp as the server builds it (the shared words and colors). */
+const stamp = (month: string, status: RentRollMonthStatus, over: any = {}) => {
+  const days = over.daysPastGrace ?? 0
   return {
-    householdId: 'g1', name: 'Gerald Logue', propertyId: 'mv', units: ['RV 48'], leaseRent: 495,
-    current: oct,
-    stamps: [...MONTHS.slice(0, 4).map(m => stamp(m, null)), stamp('2026-09', 'paid_on_time', { onboarding: true, paid: 495, paidInFullOn: '2026-09-17' }), oct],
-    health: { percent: 50, onTime: 1, counted: 2, paidLate: 0, partial: 0, outstanding: 1, notCounted: 0, workTrade: 0, from: '2025-11', through: '2026-10', label: '50%, 1 of 2 months' },
-    delinquent: true, evictionMode: false, workTrade: false,
-    lines: [{ paymentId: 'l1', householdId: 'g1', month: '2026-10', dueDate: '2026-10-01', label: 'Rent', detail: null, type: 'rent',
-      unitNumber: 'RV 48', propertyName: 'Mountain View', charged: 495, paid: 0, credit: 0, workTrade: 0, owed: 495, paidOn: null,
-      howPaid: null, daysPastGrace: 7, invoiceId: 'i1', isLateFee: false }],
+    month, status, statusLabel: rentRollStatusText({ status, daysPastGrace: days }), statusColor: RENT_ROLL_STATUS_COLOR[status],
+    daysPastGrace: days, invoiced: status === 'none' ? 0 : 495, paid: 0, credit: 0, workTrade: 0, owed: 0, onboarding: false, ...over,
+  }
+}
+const health = (percent: number | null, label: string) => ({
+  percent, onTime: 1, counted: 2, paidLate: 0, partial: 0, outstanding: 1, notCounted: 0, workTrade: 0, from: '2026-03', through: '2026-09', label,
+})
+const resident = (tenantId: string, name: string, primary = true) => ({ tenantId, name, primary })
+
+function gerald(months: string[]) {
+  return {
+    key: 'lease:l48', leaseId: 'l48', householdId: 'g1', residents: [resident('g1', 'Gerald Logue'), resident('g2', 'Gina Logue', false)],
+    spaces: ['RV 10'], movedOut: false,
+    invoiced: 577.47, lateFees: 60, paid: 0, credit: 0, workTrade: 0, owed: 577.47,
+    health: health(50, '50%, 1 of 2 months'),
+    stamps: months.map(m => m === months[months.length - 1]
+      ? stamp(m, 'owes', { daysPastGrace: 7, invoiced: 577.47, owed: 577.47 })
+      : stamp(m, 'paid', { paid: 495, onboarding: true })),
+  }
+}
+function ana(months: string[]) {
+  return {
+    key: 'lease:l2', leaseId: 'l2', householdId: 'a1', residents: [resident('a1', 'Ana Ruiz')],
+    spaces: ['RV 2'], movedOut: false,
+    invoiced: 990, lateFees: 0, paid: 990, credit: 0, workTrade: 0, owed: 0,
+    health: health(100, '100%, 2 of 2 months'),
+    stamps: months.map(m => m === months[0] ? stamp(m, 'none') : stamp(m, 'paid_late', { daysPastGrace: 5, paid: 495 })),
   }
 }
 
-function roll(over: any = {}) {
+function history(q: URLSearchParams, over: any = {}) {
+  const all = q.get('range') === 'all'
+  const from = all ? '2026-03' : q.get('from')!
+  const to = all ? '2026-10' : q.get('to')!
+  const months: string[] = []
+  for (let m = from; m <= to; m = `${Number(m.slice(5)) === 12 ? Number(m.slice(0, 4)) + 1 : m.slice(0, 4)}-${String(Number(m.slice(5)) % 12 + 1).padStart(2, '0')}`) months.push(m)
+  const propertyId = q.get('propertyId')!
   return {
-    through: '2026-10', months: MONTHS,
-    properties: [{ propertyId: 'mv', propertyName: 'Mountain View RV Ranch', occupied: 1, rows: [gerald()],
-      counts: MONTHS.map(m => counts(m, m === '2026-10' ? { outstanding: 1 } : m === '2026-09' ? { paidOnTime: 1 } : {})) }],
-    counts: MONTHS.map(m => counts(m, m === '2026-10' ? { outstanding: 1 } : m === '2026-09' ? { paidOnTime: 1 } : {})),
+    propertyId, propertyName: propertyId === 'op' ? 'Oak Park' : 'Mountain View RV Ranch', from, to, allTime: all, months,
+    monthCounts: months.map(m => ({ month: m, counts: [
+      { status: 'paid', label: 'Paid', households: 0 },
+      { status: 'paid_late', label: 'Paid late', households: m === months[0] ? 0 : 1 },
+      { status: 'partial', label: 'Partial', households: 0 },
+      { status: 'owes', label: 'Owes', households: m === months[months.length - 1] ? 1 : 0 },
+      { status: 'due', label: 'Due', households: 0 },
+    ] })),
+    // In space order, as the server sends them: RV 2 before RV 10.
+    rows: [ana(months), gerald(months)],
+    movedOutOwing: [],
     ...over,
   }
 }
 
+const today = localToday()
+const lastMonth = rangeOfPick('last_month', today) as { all: false; from: string; to: string }
+
 let host: HTMLDivElement
 let root: Root
-beforeEach(() => { server.gets = []; server.puts = []; server.hold = null; host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host) })
+beforeEach(() => {
+  server.gets = []; server.puts = []; server.hold = null; server.propsFail = null
+  server.properties = [MV]
+  server.history = q => history(q)
+  host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host)
+})
 afterEach(() => { act(() => root.unmount()); host.remove() })
 
 const text = () => host.textContent ?? ''
@@ -81,203 +137,257 @@ async function until(check: () => boolean, what: string) {
   }
   throw new Error(`timed out waiting for ${what}\n${text()}`)
 }
-async function render(wait = 'Mountain View RV Ranch') {
+function Report() {
+  const { id } = useParams()
+  const loc = useLocation()
+  return <div>REPORT {id} {loc.search}</div>
+}
+function Where() {
+  const loc = useLocation()
+  return <span data-where={loc.search} />
+}
+async function render(wait: string | (() => boolean) = 'Ana Ruiz', search = '') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   await act(async () => {
     root.render(
       <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={['/rent-roll']}>
+        <MemoryRouter initialEntries={[`/rent-roll${search}`]}>
           <Routes>
-            <Route path="/rent-roll" element={<RentRollPage />} />
-            <Route path="/tenants/:id/report" element={<div>REPORT PAGE</div>} />
+            <Route path="/rent-roll" element={<><RentRollPage /><Where /></>} />
+            <Route path="/tenants/:id/report" element={<Report />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>)
   })
-  await until(() => text().includes(wait), 'the page')
+  await until(typeof wait === 'string' ? () => text().includes(wait) : wait, 'the page')
+}
+const historyGets = () => server.gets.filter(u => u.startsWith('/balances/rent-roll/history'))
+const button = (label: string | RegExp) => [...host.querySelectorAll('button')]
+  .find(b => typeof label === 'string' ? b.textContent?.trim() === label : label.test(b.textContent ?? '')) as HTMLButtonElement
+const click = async (b: HTMLElement) => { await act(async () => { b.click() }) }
+const where = () => host.querySelector('[data-where]')?.getAttribute('data-where') ?? ''
+const select = async (el: HTMLSelectElement, value: string) => {
+  await act(async () => { el.value = value; el.dispatchEvent(new Event('change', { bubbles: true })) })
 }
 
-describe('the Rent Roll', () => {
-  it('a single property opens by itself; the household row says what was charged, owed, how late and how healthy', async () => {
-    server.roll = roll()
+describe('the Rent Roll: one property at a time', () => {
+  it('a company with one property opens straight to it, on last month; no moved-out setting, no instruction paragraph', async () => {
     await render()
-    // 10/12 (Nic): all time — no 6- or 12-month choice is asked for.
-    expect(server.gets[0]).toMatch(/^\/balances\/rent-roll\?through=\d{4}-\d{2}$/)
-    expect(text()).toContain('Gerald Logue')
-    expect(text()).toContain('RV 48')
-    expect(text()).toContain('$495.00')                  // the lease's rent
-    expect(text()).toContain('$577.47')                  // charged, late fees included …
-    expect(text()).toContain('incl. $60.00 late fees')   // … and named
-    expect(text()).toContain('Outstanding')
-    expect(text()).toContain('7 days past grace')
-    expect(text()).toContain('Delinquent')
-    expect(text()).toContain('50%')
-    expect(text()).toContain('1 of 2 mo')
-    // The stamps carry letters, not only colors; the onboarding month is marked.
-    const stamps = [...host.querySelectorAll('.rr-split .rr-stamp')]
-    expect(stamps.map(s => s.textContent)).toContain('O+7')
-    expect(stamps.some(s => s.classList.contains('onboarding') && s.textContent === 'P')).toBe(true)
-    // The month header counts the late households.
-    expect(host.querySelector('.rr-month-late')?.textContent).toBe('1 late')
+    expect(historyGets()).toEqual([historyPath('mv', lastMonth)])
+    expect(host.querySelector('.rrh-head-name')?.textContent).toBe('Mountain View RV Ranch')
+    // Nothing to go back to with one property.
+    expect(button(/All properties/)).toBeUndefined()
+    expect(text()).not.toContain('Pick a property')
+    expect(text()).not.toContain('Keep moved-out households')
+    expect(host.querySelector('.rr-moved-out')).toBeNull()
+    expect(host.querySelector('.page-subtitle')).toBeNull()
+    expect(server.puts).toEqual([])
+    // Print and Export CSV stay, gold.
+    expect(button(/Print/).className).toContain('btn-primary')
+    expect(button(/Export CSV/).className).toContain('btn-primary')
+    expect(button('Last month').getAttribute('aria-pressed')).toBe('true')
   })
 
-  // 10/12 (Nic): "the full stamp history as a horizontally scrolling strip
-  // (newest first visible), name column beside it not over it."
-  it('the full stamp history scrolls sideways beside the names, newest month first; a past year is marked', async () => {
-    const all = ['2025-11', '2025-12', ...MONTHS]
-    const r = gerald()
-    r.stamps = [stamp('2025-11', 'paid_late', { daysPastGrace: 2, paid: 495 }), stamp('2025-12', null), ...r.stamps]
-    server.roll = roll({
-      months: all,
-      properties: [{ propertyId: 'mv', propertyName: 'Mountain View RV Ranch', occupied: 1, rows: [r], counts: all.map(m => counts(m)) }],
-      counts: all.map(m => counts(m)),
-    })
-    await render()
-    expect(text()).not.toContain('Show 12 months')
-    // The names are their own table, beside the scrolling one — never inside it.
-    expect(host.querySelector('.rr-split > .rr-fixed .rr-name-link')?.textContent).toBe('Gerald Logue')
-    expect(host.querySelector('.rr-split > .rr-scroll .rr-name-link')).toBeNull()
-    const scroller = host.querySelector('.rr-split > .rr-scroll')!
-    expect(scroller.getAttribute('role')).toBe('region')
-    // Every month, newest first, right after the month's figures.
-    const heads = [...scroller.querySelectorAll('thead th.stampcol')].map(th => th.getAttribute('title'))
-    expect(heads).toEqual(['October 2026', 'September 2026', 'August 2026', 'July 2026', 'June 2026', 'May 2026',
-      'December 2025', 'November 2025'])
-    expect(scroller.querySelectorAll('thead th.stampcol')[7].textContent).toContain('’25')
-    const rowStamps = [...scroller.querySelectorAll('tbody .rr-stamp')].map(s => s.textContent)
-    expect(rowStamps[0]).toBe('O+7')
-    expect(rowStamps[rowStamps.length - 1]).toBe('L+2')
-    // The phone card carries the whole strip too, newest first.
-    const card = [...host.querySelectorAll('.rr-card-stamps .rr-stamp-month')].map(s => s.textContent)
-    expect(card).toHaveLength(8)
-    expect(card[0]).toBe('Oct')
-    expect(card[7]).toBe('Nov’25')
+  it('two properties: the page asks first and never shows them side by side; inside one, "All properties" goes back', async () => {
+    server.properties = [MV, OP]
+    await render('Pick a property')
+    expect(historyGets()).toEqual([])
+    const picks = [...host.querySelectorAll('.rrh-prop')].map(b => b.textContent)
+    expect(picks).toEqual(['Mountain View RV Ranch52 spaces', 'Oak Park29 spaces'])
+    await click(host.querySelectorAll('.rrh-prop')[1] as HTMLElement)
+    await until(() => host.querySelector('.rrh-head-name')?.textContent === 'Oak Park' && text().includes('Ana Ruiz'), 'Oak Park')
+    expect(historyGets()).toEqual([historyPath('op', lastMonth)])
+    // Inside a property: no other property's name or figures.
+    expect(text()).not.toContain('Mountain View')
+    expect(button(/All properties/).className).toContain('btn-ghost')
+    await click(button(/All properties/))
+    await until(() => text().includes('Pick a property'), 'the pick again')
   })
 
-  it('totals show only when the server sent them', async () => {
-    server.roll = roll()
+  it('one view for every property: the range picked in one stays when another is opened', async () => {
+    server.properties = [MV, OP]
+    await render('Pick a property')
+    await click(host.querySelectorAll('.rrh-prop')[0] as HTMLElement)
+    await until(() => text().includes('Ana Ruiz'), 'Mountain View')
+    await click(button('Last year'))
+    const lastYear = rangeOfPick('last_year', today)
+    await until(() => historyGets().includes(historyPath('mv', lastYear)), 'last year')
+    expect(where()).toContain('range=last_year')
+    await click(button(/All properties/))
+    await until(() => text().includes('Pick a property'), 'the pick')
+    await click(host.querySelectorAll('.rrh-prop')[1] as HTMLElement)
+    await until(() => historyGets().includes(historyPath('op', lastYear)), 'Oak Park, last year')
+    expect(button('Last year').getAttribute('aria-pressed')).toBe('true')
+    expect(button('Last month').getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('each quick pick asks for its months; All time asks for all; From/To is a custom range that never runs backwards', async () => {
     await render()
-    expect(text()).not.toContain('Charged ·')
+    for (const [label, pick] of [['This quarter', 'this_quarter'], ['Last quarter', 'last_quarter'], ['This year', 'this_year']] as const) {
+      await click(button(label))
+      await until(() => historyGets().includes(historyPath('mv', rangeOfPick(pick, today))), label)
+      expect(button(label).className).toContain('btn-primary')
+    }
+    await click(button('All time'))
+    await until(() => historyGets().includes('/balances/rent-roll/history?propertyId=mv&range=all'), 'all time')
+    await until(() => text().includes('All time · March – October 2026'), 'the all-time title')
+    // All time's months are known now: the boxes show them.
+    const from = host.querySelector('select.rrh-from') as HTMLSelectElement
+    const to = host.querySelector('select.rrh-to') as HTMLSelectElement
+    expect([from.value, to.value]).toEqual(['2026-03', '2026-10'])
+    await select(from, '2026-05')
+    await until(() => historyGets().includes(historyPath('mv', { all: false, from: '2026-05', to: '2026-10' })), 'the custom range')
+    expect(RANGE_LABELS().every(l => button(l).getAttribute('aria-pressed') === 'false')).toBe(true)
+    // An end before the start moves the start to it.
+    await select(host.querySelector('select.rrh-to') as HTMLSelectElement, '2026-04')
+    await until(() => historyGets().includes(historyPath('mv', { all: false, from: '2026-04', to: '2026-04' })), 'the end moved the start')
+    expect(where()).toBe('?from=2026-04&to=2026-04')
+  })
+
+  it('rows in space order; Invoiced, Paid and Owed for the range; health; one stamp per month in words, newest first', async () => {
+    await render(undefined, '?range=this_year')
+    const fixed = [...host.querySelectorAll('.rr-split .rr-fixed tbody tr')].map(r => r.textContent)
+    expect(fixed[0]).toBe('RV 2Ana Ruiz')
+    expect(fixed[1]).toBe('RV 10Gerald Logue+ Gina Logue')
+    const scroll = host.querySelector('.rr-split .rr-scroll')!
+    const heads = [...scroll.querySelectorAll('thead th')].map(th => th.textContent)
+    expect(heads.slice(0, 4)).toEqual(['Invoiced', 'Paid', 'Owed', 'Health'])
+    const range = rangeOfPick('this_year', today) as { from: string; to: string }
+    const monthHeads = [...scroll.querySelectorAll('thead th.rrh-stampcol')].map(th => th.getAttribute('title'))
+    expect(monthHeads[0]).toBe(new Date(Number(range.to.slice(0, 4)), Number(range.to.slice(5)) - 1, 1).toLocaleString('en-US', { month: 'long', year: 'numeric' }))
+    const gerald = [...scroll.querySelectorAll('tbody tr')][1]
+    const cells = [...gerald.querySelectorAll('td')].map(td => td.textContent)
+    expect(cells[0]).toBe('$577.47incl. $60.00 late fees')
+    expect(cells[1]).toBe('$0.00')
+    expect(cells[2]).toBe('$577.47')
+    expect(cells[3]).toBe('50%')
+    // Newest month first: the red "Owes +7" sits right after Health.
+    const geraldStamps = [...gerald.querySelectorAll('.rrs')]
+    expect(geraldStamps[0].textContent).toBe('Owes +7')
+    expect(geraldStamps[0].className).toContain('red')
+    const anaStamps = [...[...scroll.querySelectorAll('tbody tr')][0].querySelectorAll('.rrs')]
+    expect(anaStamps[0].textContent).toBe('Paid late +5')
+    expect(anaStamps[0].className).toContain('orange')
+    // No cryptic letter codes; a month with no bill is a quiet dash that says so on hover.
+    expect(text()).not.toMatch(/\b[POLD]\+\d/)
+    const none = anaStamps[anaStamps.length - 1]
+    expect(none.textContent).toBe('—')
+    expect(none.getAttribute('title')).toMatch(/No bill$/)
+    // Each month's households in words, in their colors.
+    const foot = [...scroll.querySelectorAll('tfoot td.rrh-stampcol')]
+    expect(foot[0].textContent).toBe('1 paid late1 owes')
+    expect(foot[0].querySelector('.rrs-count.red')?.textContent).toBe('1 owes')
+  })
+
+  it('a month in another year than the range’s end carries its year', async () => {
+    await render(undefined, '?from=2025-11&to=2026-01')
+    const heads = [...host.querySelectorAll('.rr-scroll thead th.rrh-stampcol')].map(th => th.textContent)
+    expect(heads).toEqual(['Jan', 'Dec’25', 'Nov’25'])
+    expect(text()).toContain('November 2025 – January 2026')
+  })
+
+  it('totals across households show only when the server sent them', async () => {
+    await render()
+    expect(host.querySelector('.rrh-summary')?.textContent).toBe(rangeTitle({ from: lastMonth.from, to: lastMonth.to, allTime: false }))
     act(() => root.unmount())
     root = createRoot(host)
-    server.roll = roll({ totals: { charged: 577.47, chargedLateFees: 60, paid: 0, credit: 0, workTrade: 0, owed: 577.47 } })
-    server.roll.properties[0].totals = { charged: 577.47, chargedLateFees: 60, paid: 0, credit: 0, workTrade: 0, owed: 577.47 }
+    server.history = q => history(q, { totals: { invoiced: 1567.47, lateFees: 60, paid: 990, credit: 0, workTrade: 0, owed: 577.47 } })
     await render()
-    expect(text()).toContain('Charged · Oct')
-    expect(text()).toContain('Owed$577.47')
+    const summary = host.querySelector('.rrh-summary')!.textContent
+    expect(summary).toContain('Invoiced $1,567.47')
+    expect(summary).toContain('Paid $990.00')
+    expect(summary).toContain('Owed $577.47')
+    expect(summary).not.toContain('Work trade')
   })
 
-  it('a name opens the tenant report', async () => {
-    server.roll = roll()
+  it('a name opens that household’s report — its lease', async () => {
     await render()
-    const link = host.querySelector('.rr-split .rr-name-link') as HTMLButtonElement
-    await act(async () => { link.click() })
-    await until(() => text().includes('REPORT PAGE'), 'the report')
+    const link = [...host.querySelectorAll('.rr-split .rr-name-link')].find(b => b.textContent === 'Gerald Logue') as HTMLButtonElement
+    await click(link)
+    await until(() => text().includes('REPORT g1 ?leaseId=l48'), 'the report')
   })
 
-  it('the chevron shows the month’s charges with what each is for', async () => {
-    server.roll = roll()
+  it('"Moved out, still owes" is collapsed until opened; each household with what it still owes for, its name opening its report', async () => {
+    server.history = q => history(q, { movedOutOwing: [{
+      key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'], owed: 515,
+      months: [{ month: '2026-08', owed: 495 }, { month: '2026-09', owed: 20 }], leaseEnded: '2026-08-31',
+    }] })
     await render()
-    const caret = host.querySelector('.rr-split .rr-caret') as HTMLButtonElement
-    await act(async () => { caret.click() })
-    expect(host.querySelector('.rr-split-only .rr-lines-table')?.textContent).toContain('Rent')
+    const head = host.querySelector('.rrh-folder-head') as HTMLButtonElement
+    expect(head.textContent).toBe('Moved out, still owes1 household')
+    expect(head.getAttribute('aria-expanded')).toBe('false')
+    expect(text()).not.toContain('Marta Diaz')
+    await click(head)
+    const row = host.querySelector('.rrh-mo-table tbody tr')!
+    expect([...row.querySelectorAll('td')].map(td => td.textContent)).toEqual(
+      ['RV 7', 'Marta Diaz', 'Aug 31, 2026', 'Aug 2026 $495.00 · Sep 2026 $20.00', '$515.00'])
+    await click(row.querySelector('.rr-name-link') as HTMLElement)
+    await until(() => text().includes('REPORT m1 ?leaseId=l9'), 'the report')
   })
 
-  // 10/12: on a long folder the panel opens far below the row — it is brought into view.
-  it('the chevron brings the month’s charges into view', async () => {
-    server.roll = roll()
-    const scrolled: Element[] = []
-    const had = (Element.prototype as any).scrollIntoView
-    ;(Element.prototype as any).scrollIntoView = function (this: Element) { scrolled.push(this) }
-    try {
-      await render()
-      const caret = host.querySelector('.rr-split .rr-caret') as HTMLButtonElement
-      await act(async () => { caret.click() })
-      expect(scrolled).toContain(host.querySelector('.rr-split-only'))
-    } finally {
-      (Element.prototype as any).scrollIntoView = had
-    }
+  it('no folder when nobody who moved out still owes; a range nobody was billed in says so', async () => {
+    server.history = q => history(q, { rows: [] })
+    await render('Nobody was billed here')
+    expect(host.querySelector('.rrh-folder')).toBeNull()
   })
 
-  // 10/12: while a newly picked month loads, the figures on screen are the last
-  // month's — they keep that month's name, dimmed, never the new month's.
-  it('a newly picked month keeps the last figures under their own month, dimmed, until the new ones arrive', async () => {
-    server.roll = roll()
+  // 10/12: while a new range loads, the figures on screen keep their own range's name, dimmed.
+  it('another range keeps the last figures under their own name, dimmed, until the new ones arrive', async () => {
     await render()
     let release!: () => void
     server.hold = new Promise<void>(r => { release = r })
-    const select = host.querySelector('select.rr-month') as HTMLSelectElement
-    const picked = [...select.options].map(o => o.value).find(v => v !== '2026-10' && v !== select.value)!
-    await act(async () => { select.value = picked; select.dispatchEvent(new Event('change', { bubbles: true })) })
-    const summary = () => host.querySelector('.rr-summary') as HTMLElement
+    await click(button('Last year'))
+    const summary = () => host.querySelector('.rrh-summary') as HTMLElement
     expect(summary().getAttribute('aria-busy')).toBe('true')
-    expect(summary().textContent).toContain('October 2026')
-    expect(host.querySelector('.rr-folder')!.getAttribute('aria-busy')).toBe('true')
-    server.roll = roll({ through: picked })
+    expect(summary().textContent).toBe(rangeTitle({ from: lastMonth.from, to: lastMonth.to, allTime: false }))
+    expect(host.querySelector('.rrh-card')!.getAttribute('aria-busy')).toBe('true')
     server.hold = null
     await act(async () => { release() })
-    await until(() => summary().getAttribute('aria-busy') === null, 'the picked month')
-    expect(summary().textContent).not.toContain('October 2026')
+    await until(() => summary().getAttribute('aria-busy') === null, 'last year')
+    const ly = rangeOfPick('last_year', today) as { from: string; to: string }
+    expect(summary().textContent).toBe(rangeTitle({ from: ly.from, to: ly.to, allTime: false }))
   })
 
-  it('search finds by name or space; nothing found says so', async () => {
-    server.roll = roll()
-    await render()
-    const input = host.querySelector('input.search-input') as HTMLInputElement
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
-    await act(async () => { setter.call(input, 'zzz'); input.dispatchEvent(new Event('input', { bubbles: true })) })
-    expect(text()).toContain('No one matches')
-  })
-})
-
-// 10/12 (Nic): "who stays on the Rent Roll after moving out = LANDLORD'S
-// CHOICE (a setting on the page: billed in last 12 months / while they owe /
-// all time)."
-describe('who stays after moving out', () => {
-  const mv = (over: any = {}) => ({ landlordId: 'c1', companyName: 'Mountain View LLC', rule: 'billed_last_12_months', ruleLabel: 'Billed in the last 12 months', ...over })
-
-  it('the owner picks it on the page; the choice is saved and the roll read again', async () => {
-    server.roll = roll({ movedOut: [mv()], canChangeMovedOut: true })
-    await render()
-    const select = host.querySelector('.rr-moved-out select') as HTMLSelectElement
-    expect(select).toBeTruthy()
-    expect(select.closest('label')?.textContent).toContain('Keep moved-out households')
-    expect([...select.options].map(o => o.textContent)).toEqual(['Billed in the last 12 months', 'While they still owe', 'All time'])
-    expect(select.value).toBe('billed_last_12_months')
-    const before = server.gets.length
-    await act(async () => { select.value = 'while_owing'; select.dispatchEvent(new Event('change', { bubbles: true })) })
-    await until(() => server.gets.length > before, 'the roll read again')
-    expect(server.puts).toEqual([{ url: '/balances/rent-roll/moved-out', body: { landlordId: 'c1', rule: 'while_owing' } }])
-    await until(() => (host.querySelector('.rr-moved-out select') as HTMLSelectElement).value === 'while_owing', 'the new choice')
+  it('without "View all payments" the page says which permission it needs', async () => {
+    server.propsFail = { response: { status: 403, data: { error: 'Insufficient permissions' } } }
+    await render('View all payments')
+    expect(text()).not.toContain('Insufficient permissions')
   })
 
-  it('anyone else reads it in words, with nothing to change', async () => {
-    server.roll = roll({ movedOut: [mv({ rule: 'all_time', ruleLabel: 'All time' })], canChangeMovedOut: false })
-    await render()
-    expect(host.querySelector('.rr-moved-out select')).toBeNull()
-    expect(host.querySelector('.rr-moved-out')?.textContent).toBe('Keep moved-out householdsAll time')
-  })
-
-  it('an account with two companies has one choice per company, by name', async () => {
-    server.roll = roll({ movedOut: [mv(), mv({ landlordId: 'c2', companyName: 'Oak Park LLC', rule: 'all_time', ruleLabel: 'All time' })], canChangeMovedOut: true })
-    await render()
-    const items = [...host.querySelectorAll('.rr-moved-out-item')]
-    expect(items.map(i => i.querySelector('span')?.textContent)).toEqual([
-      'Mountain View LLC: keep moved-out households', 'Oak Park LLC: keep moved-out households'])
-    expect(items.map(i => (i.querySelector('select') as HTMLSelectElement).value)).toEqual(['billed_last_12_months', 'all_time'])
-  })
-
-  it('the empty page says who appears under the rule', async () => {
-    server.roll = roll({ properties: [], movedOut: [mv({ rule: 'while_owing', ruleLabel: 'While they still owe' })], canChangeMovedOut: true })
-    await render('No households yet')
-    expect(text()).toContain('anyone who moved out but still owes')
-    expect(movedOutNote(undefined)).toContain('billed in the last 12 months')
-    expect(movedOutNote([mv({ rule: 'all_time' })])).toContain('everyone who ever lived here')
-    expect(movedOutNote([mv(), mv({ landlordId: 'c2', rule: 'all_time' })])).toContain('each company keeps')
+  it('a property in the address that is not the viewer’s is not opened; the pick is asked, the view kept', async () => {
+    server.properties = [MV, OP]
+    await render('Pick a property', '?property=elsewhere&range=last_year')
+    // Nothing of any property shows (the server answers 404 for one that is not theirs).
+    expect(text()).not.toContain('Ana Ruiz')
+    expect(host.querySelector('.rrh-head')).toBeNull()
+    await click(host.querySelectorAll('.rrh-prop')[0] as HTMLElement)
+    await until(() => historyGets().includes(historyPath('mv', rangeOfPick('last_year', today))), 'Mountain View, last year')
   })
 })
 
-describe('helpers', () => {
+const RANGE_LABELS = () => ['Last month', 'This quarter', 'Last quarter', 'This year', 'Last year', 'All time']
+
+describe('the spreadsheet and the helpers', () => {
+  const q = new URLSearchParams('propertyId=mv&from=2026-08&to=2026-09')
+
+  it('the CSV is the rows as on screen (months newest first), the totals when sent, then "Moved out, still owes"', () => {
+    const h = history(q, {
+      totals: { invoiced: 1567.47, lateFees: 60, paid: 990, credit: 0, workTrade: 0, owed: 577.47 },
+      movedOutOwing: [{ key: 'lease:l9', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], spaces: ['RV 7'],
+        owed: 515, months: [{ month: '2026-08', owed: 495 }, { month: '2026-09', owed: 20 }], leaseEnded: '2026-08-31' }],
+    })
+    const lines = rentRollCsv(h).trimEnd().split('\n')
+    expect(lines[0]).toBe('Space,Tenant,Moved out,Invoiced,Late fees,Paid,Account credit,Work trade,Owed,Payment health,September 2026,August 2026')
+    expect(lines[1]).toBe('RV 2,Ana Ruiz,,990,0,990,0,0,0,100%,Paid late +5,No bill')
+    expect(lines[2]).toBe('RV 10,"Gerald Logue, Gina Logue",,577.47,60,0,0,0,577.47,50%,Owes +7,Paid')
+    expect(lines[3]).toBe(',Total,,1567.47,60,990,0,0,577.47')
+    expect(lines.slice(4)).toEqual(['', '"Moved out, still owes"', 'Space,Tenant,Lease ended,Owed,Still owes for',
+      'RV 7,Marta Diaz,2026-08-31,515,August 2026 $495.00; September 2026 $20.00'])
+    expect(csvFileName(h)).toBe('rent-roll-mountain-view-rv-ranch-2026-08-to-2026-09.csv')
+    expect(csvFileName({ ...h, allTime: true })).toBe('rent-roll-mountain-view-rv-ranch-all-time.csv')
+    expect(csvFileName({ ...h, from: '2026-09' })).toBe('rent-roll-mountain-view-rv-ranch-2026-09.csv')
+  })
+
   // 10/12: names are typed by tenants; one that starts like a formula must not run in Excel.
   it('a CSV field that starts like a formula reads as text; numbers stay numbers', () => {
     expect(csvField('=HYPERLINK("http://x","y")')).toBe(`"'=HYPERLINK(""http://x"",""y"")"`)
@@ -287,20 +397,21 @@ describe('helpers', () => {
     expect(csvField(-5)).toBe('-5')
     expect(csvField('Gerald Logue')).toBe('Gerald Logue')
     expect(csvLine(['a,b', 3, null])).toBe('"a,b",3,')
+    const h = history(q, { rows: [{ ...ana(['2026-08', '2026-09']), residents: [resident('x', '=cmd()')] }] })
+    expect(rentRollCsv(h).split('\n')[1]).toMatch(/^RV 2,'=cmd\(\),/)
   })
-  it('counts say each stamp in words', () => {
-    expect(countsText(counts('2026-10', { paidOnTime: 3, paidLate: 1, outstanding: 2 }))).toBe('3 on time · 1 paid late · 2 outstanding')
-  })
-  it('the strip reads newest first; another year than the picked one is marked', () => {
+
+  it('the range on screen in words; a month’s counts in words and colors; newest first', () => {
+    expect(rangeTitle({ from: '2026-09', to: '2026-09', allTime: false })).toBe('September 2026')
+    expect(rangeTitle({ from: '2026-07', to: '2026-09', allTime: false })).toBe('July – September 2026')
+    expect(rangeTitle({ from: '2025-11', to: '2026-01', allTime: false })).toBe('November 2025 – January 2026')
+    expect(rangeTitle({ from: '2026-03', to: '2026-10', allTime: true })).toBe('All time · March – October 2026')
+    expect(monthCountWords({ month: '2026-10', counts: [
+      { status: 'paid', label: 'Paid', households: 8 }, { status: 'paid_late', label: 'Paid late', households: 3 },
+      { status: 'partial', label: 'Partial', households: 0 },
+    ] })).toEqual([{ status: 'paid', text: '8 paid', color: 'green' }, { status: 'paid_late', text: '3 paid late', color: 'orange' }])
+    expect(monthCountWords(undefined)).toEqual([])
     expect(newestFirst(['2026-08', '2026-09', '2026-10'])).toEqual(['2026-10', '2026-09', '2026-08'])
     expect(newestFirst(undefined)).toEqual([])
-    expect(stripYear('2025-12', '2026-10')).toBe('’25')
-    expect(stripYear('2026-01', '2026-10')).toBeNull()
-  })
-  it('the picker offers 24 months, newest first', () => {
-    const m = pickerMonths('2026-10-12')
-    expect(m).toHaveLength(24)
-    expect(m[0]).toBe('2026-10')
-    expect(m[10]).toBe('2025-12')
   })
 })

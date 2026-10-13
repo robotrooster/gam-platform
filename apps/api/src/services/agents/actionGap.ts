@@ -430,9 +430,8 @@ const DELIBERATE = new Map(Object.entries({
   'reports POST /monthly-report/recipients':
     'chooses who receives the company\'s books every month (names and money of every resident, attached as a PDF), including outside addresses the owner types. The owner\'s own choice on the Reports page with the team and the list on screen; an assistant that mishears an address mails the company\'s books to a stranger.',
 
-  // 10/12 (Nic): who stays on the Rent Roll after moving out — "LANDLORD'S CHOICE (a setting on the page)".
-  'balances PUT /rent-roll/moved-out':
-    'the owner\'s choice of which moved-out households the Rent Roll keeps (billed in the last 12 months, while they still owe, or all time). A setting on the Rent Roll itself, picked with its effect on screen; it changes how one page lists people, never money or a record, and the landlord\'s choice is the owner\'s to make, not an assistant\'s.',
+  // 10/13 (Nic): the Rent Roll's moved-out setting is removed ("Remove the
+  // 'keep moved-out households' setting entirely") — its PUT is gone with it.
 
   // 10/12 (Nic): the company's books settings and opening balances — "landlord's
   // choice" each (routes/booksSettings.ts, the Books Settings and Opening

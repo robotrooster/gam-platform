@@ -16,10 +16,9 @@ import {
   creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText, lateFeeOutcomeText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases, withReaderTaken, readerFinishedMessage,
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
-  readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
   deskFigures, sameFigures, figuresMovedMessage, payerHits, matchPayerHits, returnDetail, chargeMonthsRange,
   readChargesById, plainRefusal, localToday, calendarDay, localDayOf, awaitingOpensAtWord,
-  type DeskQuote, type DeskQuoteRow, type TenderInput, type OutstandingRow, type LedgerPayment, type PickerLease,
+  type DeskQuote, type DeskQuoteRow, type TenderInput, type OutstandingRow, type PickerLease,
 } from './creditDesk'
 import { PAYMENT_STATUSES, PAYMENT_STATUS_LABEL } from '@gam/shared'
 
@@ -543,37 +542,6 @@ describe('the tenant page shows total credit and usable credit', () => {
 })
 
 describe('the Payments ledger (decisions #26, #29)', () => {
-  const p: LedgerPayment = {
-    id: 'x', name: 'Jane Doe', unitNumber: 'RV 14', propertyName: 'Mountain View', paidOn: '2026-10-01',
-    applied: 925, amount: 925, creditApplied: 0, returned: 0, creditReturned: 0, methodLabel: 'Card', status: 'settled',
-    statusLabel: 'Paid', paidFor: 'October rent', daysLate: 0, timingLabel: 'On time',
-  }
-  it('searches who, where and what it paid for', () => {
-    expect(ledgerMatches(p, 'jane')).toBe(true)
-    expect(ledgerMatches(p, 'rv 14')).toBe(true)
-    expect(ledgerMatches(p, 'october')).toBe(true)
-    expect(ledgerMatches(p, 'trash')).toBe(false)
-  })
-  it('the current month points to Outstanding Balances with a count, never dollars', () => {
-    expect(stillOweLine(3)).toBe('3 households still owe — see Outstanding Balances')
-    expect(stillOweLine(1)).toBe('1 household still owes — see Outstanding Balances')
-    expect(stillOweLine(0)).toBeNull()
-    expect(stillOweLine(null)).toBeNull()
-  })
-  it('remembers Show line items per person, off by default', () => {
-    const data: Record<string, string> = {}
-    const store = { getItem: (k: string) => data[k] ?? null, setItem: (k: string, v: string) => { data[k] = v } }
-    expect(readShowLineItems('u1', store)).toBe(false)
-    writeShowLineItems('u1', true, store)
-    expect(readShowLineItems('u1', store)).toBe(true)
-    expect(readShowLineItems('u2', store)).toBe(false)
-  })
-  it('blocked storage never breaks the page (the toggle just is not remembered)', () => {
-    const broken = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('blocked') } }
-    expect(readShowLineItems('u1', broken)).toBe(false)
-    expect(() => writeShowLineItems('u1', true, broken)).not.toThrow()
-    expect(readShowLineItems('u1', null)).toBe(false)
-  })
   it('says why a payment came back in words, with the bank code beside it and the zero-tolerance mark', () => {
     expect(returnDetail({ returnCode: 'R01', returnReason: 'Insufficient funds', zeroToleranceFlag: false }))
       .toEqual({ text: 'Bank return: there was not enough money in the account (R01)', zeroTolerance: false })

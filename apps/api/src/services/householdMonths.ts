@@ -6,10 +6,12 @@
  *    never per line. Late fees are never a bill and never decide a month's
  *    color or health; $0 lines are ignored."
  *
- * Every screen that says how a household pays reads it from here: the Rent
- * Roll (GET /api/balances/rent-roll), the tenant payment report (GET
+ * Every screen that says how a household pays reads it from here: the
+ * Payments page and the Rent Roll (GET /api/balances/rent-roll/open-month and
+ * /history, services/rentRoll), the tenant payment report (GET
  * /api/tenants/:id/payment-report), the Tenants list's health column, the
- * tenant profile and the tenant's own heartbeat. Before this there were five
+ * tenant profile, the tenant's own heartbeat and the credit history's one mark
+ * per bill (services/creditBillMarks judges each bill by the same rule). Before this there were five
  * formulas and none of them measured on-time: Gerald Logue read 25% on the
  * Tenants list (paid rows ÷ rows), 6% on his profile (every $5 daily late fee
  * counted as its own bill) and 0% on his own screen (a blank lease grace read
@@ -54,7 +56,19 @@
  * or the day GAM wrote the line when later (lateCountsFrom), the first late
  * day is start + grace (the 6th for the 1st with 5 days), grace = the lease's,
  * else the property's, else 5. "Days past grace" = days after the last grace
- * day (paid on the 6th = 1).
+ * day (paid on the 6th = 1). 10/13 (Nic): a line logged by hand AFTER its
+ * bill's late fee was charged, with no bank line matched to it, counts as paid
+ * the day GAM recorded it (the 10/6 rule, services/lateness
+ * handLoggedRecordedDaySql) — the credit history's rule, so the Rent Roll and
+ * the credit history never disagree.
+ *
+ * A HOUSEHOLD ON THE RENT ROLL IS A LEASE (10/13, Nic: "when someone is renting
+ * 2 spots with 2 leases it is 2 households"; payment health counts each lease
+ * separately). `byLease` groups the months per lease as well (lease_id): a
+ * charge's lease is its own, else its bill's, else the lease the person billed
+ * lives on with that company — the one on the charge's own space when they
+ * hold two (leaseOfRowSql); a charge on no lease of a person with none is
+ * their own (lease_id null).
  *
  * HEALTH = months paid on time ÷ months counted, over ALL TIME: every month
  * since the household's first bill on GAM (10/12, Nic: "payment health and a
@@ -72,7 +86,9 @@ import {
   openBalanceSql, inFlightRowSql, workTradeOpenRowSql, WORK_TRADE_MARKER_LABEL,
 } from './openBalances'
 import { payableRowSql } from './moneyPredicates'
-import { WORK_TRADE_HELD_NOTE_PARTS } from './lateness'
+import {
+  WORK_TRADE_HELD_NOTE_PARTS, billInvoiceOfRowSql, recordedPaidAtSql, firstLateFeeAtSql, handLoggedRecordedDaySql,
+} from './lateness'
 import { chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
 import { isCsvImportPlatform, getPaymentPlatformConfig } from '../lib/csvImportMappings'
 
@@ -135,6 +151,29 @@ export function householdOfRowSql(p = 'p', inv = 'inv'): string {
       COALESCE(${p}.tenant_id, ${inv}.tenant_id))`
 }
 
+/**
+ * The lease a charge row (alias `p`, its invoice `inv`) belongs to — the Rent
+ * Roll's household (10/13, Nic: two leases are two households): its own lease,
+ * else its bill's, else the lease the person billed lives on with the same
+ * company — an active one first, and among those the one on the charge's own
+ * space ("when someone is renting 2 spots with 2 leases it is 2 households":
+ * a counter charge on one of the two spots is that spot's lease, never the
+ * other's), then the newest, as householdOfRowSql orders them.
+ * NULL: a charge on no lease of a person who has none with the company.
+ */
+export function leaseOfRowSql(p = 'p', inv = 'inv'): string {
+  return `COALESCE(${p}.lease_id, ${inv}.lease_id,
+      (SELECT hh_l.id FROM lease_tenants hh_me
+         JOIN leases hh_l ON hh_l.id = hh_me.lease_id
+        WHERE hh_me.tenant_id = COALESCE(${p}.tenant_id, ${inv}.tenant_id)
+          AND hh_l.landlord_id = ${p}.landlord_id
+          AND hh_me.status IN ('active','pending_add','pending_remove')
+          AND EXISTS (SELECT 1 FROM lease_tenants hh_p
+                       WHERE hh_p.lease_id = hh_me.lease_id AND hh_p.role = 'primary' AND hh_p.status <> 'void')
+        ORDER BY (hh_l.status = 'active') DESC, (hh_l.unit_id = COALESCE(${p}.unit_id, ${inv}.unit_id)) IS TRUE DESC,
+                 hh_l.start_date DESC, hh_l.id LIMIT 1))`
+}
+
 /** The value a line a past work trade covered at $0 carries in its note ("Covered by work trade ($12.34)"). */
 const WT_NOTE_VALUE = `COALESCE(substring(p.notes from 'Covered by work trade \\(\\$([0-9]+(\\.[0-9]+)?)\\)')::numeric, 0)`
 
@@ -148,20 +187,37 @@ export interface HouseholdMonthScope {
   /** Bill months, inclusive (YYYY-MM). */
   from: string
   through: string
-  /** One row per household per property (the Rent Roll's folders); else per household. */
+  /** One row per household per property (the monthly report's properties); else per household. */
   byProperty?: boolean
+  /**
+   * 10/13 (Nic): one row per LEASE as well (the Rent Roll's households: "2
+   * spots with 2 leases it is 2 households"); HouseholdMonth.lease_id.
+   */
+  byLease?: boolean
+  /** Only these leases' charges (leaseOfRowSql); null = all. */
+  leaseIds?: string[] | null
   /** The day to judge on ('YYYY-MM-DD'); default each property's today. For tests. */
   asOf?: string | null
+}
+
+/** The parameters every query over rowsCteSql binds, in order ($1–$7). */
+function rowsParams(scope: HouseholdMonthScope): unknown[] {
+  return [scope.landlordIds, scope.propertyIds ?? null, `${scope.from}-01`, `${addMonths(scope.through, 1)}-01`,
+    scope.householdIds ?? null, scope.asOf ?? null, scope.leaseIds ?? null]
 }
 
 /**
  * Every charge row in scope, with what it is, its money parts and its
  * lateness — the one place both the months and the lines are built from.
  * $1 companies, $2 properties, $3 first day, $4 first day after, $5
- * households, $6 the day to judge on (null: each property's today).
+ * households, $6 the day to judge on (null: each property's today), $7 leases
+ * (rowsParams).
  */
 function rowsCteSql(): string {
   const today = `COALESCE($6::date, ${propertyDaySql('NOW()', 'pr')})`
+  // 10/6 (Nic): only a line the desk logged by hand and settled can be counted
+  // from the day GAM recorded it, so the journal is read for those alone.
+  const handLogged = `p.manual_method IS NOT NULL AND p.status IN ('settled','paid_via_deposit')`
   return `
   base AS (
     SELECT p.id, p.landlord_id, p.type, p.status, p.amount, p.invoice_id, p.lease_id, p.notes, p.entry_description,
@@ -170,6 +226,11 @@ function rowsCteSql(): string {
            u.property_id, pr.name AS property_name, u.unit_number,
            COALESCE(inv.due_date, p.due_date) AS bill_due,
            ${householdOfRowSql('p', 'inv')} AS household_id,
+           ${leaseOfRowSql('p', 'inv')} AS lease_key,
+           -- 10/6 (Nic): when GAM recorded it as paid, and when its bill's
+           -- first late fee still standing was charged (handLoggedRecordedDaySql).
+           CASE WHEN ${handLogged} THEN ${recordedPaidAtSql('p')} END AS recorded_at,
+           CASE WHEN ${handLogged} THEN ${firstLateFeeAtSql('p', billInvoiceOfRowSql('p'))} END AS first_fee_at,
            ${graceDaysSql('l', 'pr')}::int AS grace,
            CASE WHEN l.late_fee_grace_days IS NOT NULL THEN 'lease'
                 WHEN pr.late_fee_grace_days IS NOT NULL THEN 'property' ELSE 'default' END AS grace_source,
@@ -238,7 +299,7 @@ function rowsCteSql(): string {
                             WHEN b.in_flight THEN b.amount - b.credit_set ELSE 0 END) AS paid,
            GREATEST(0, CASE WHEN b.in_flight THEN b.amount - b.credit_set ELSE 0 END) AS clearing,
            CASE WHEN b.is_open THEN GREATEST(0, b.amount - b.credit_applied) ELSE 0 END AS owed,
-           -- The day it was paid in full (property calendar): a line work trade
+           -- The day the money came (property calendar): a line work trade
            -- covered, its due date; a bank deposit matched to it, the bank's day;
            -- else the later of the receipt's postmark and the day credit paid it
            -- (never before the bill's due date: creditPaidOnDay); else the day
@@ -249,16 +310,28 @@ function rowsCteSql(): string {
                            GREATEST(${propertyDaySql('b.receipt_at', 'b')},
                                     CASE WHEN b.credit_at IS NOT NULL THEN GREATEST(${propertyDaySql('b.credit_at', 'b')}, b.bill_due) END),
                            b.settled_day, b.today)
-           END AS paid_day
+           END AS money_day,
+           ${handLoggedRecordedDaySql('b')} AS recorded_day
       FROM base b
      WHERE NOT b.not_owed_any_more
        AND (b.amount > 0 OR b.wt_note_value > 0)
        AND ($5::uuid[] IS NULL OR b.household_id = ANY($5::uuid[]))
+       AND ($7::uuid[] IS NULL OR b.lease_key = ANY($7::uuid[]))
+  ),
+  dated AS (
+    -- The day it counts as paid in full: the day the money came, or — logged
+    -- by hand after its bill's late fee (10/6, Nic) — the day GAM recorded it
+    -- when that is later (the credit history's billsJudgeSql reads the same).
+    SELECT r.*,
+           CASE WHEN r.recorded_day IS NOT NULL AND r.money_day IS NOT NULL THEN GREATEST(r.money_day, r.recorded_day)
+                ELSE r.money_day END AS paid_day,
+           (r.recorded_day IS NOT NULL AND r.money_day IS NOT NULL AND r.recorded_day > r.money_day) AS logged_after_fee
+      FROM rows r
   ),
   timed AS (
     SELECT r.*,
            ${lateCountsFromSql('r.bill_due', 'r.written_day', 'COALESCE(r.paid_day, r.today)')} AS late_start
-      FROM rows r
+      FROM dated r
   ),
   judged AS (
     SELECT t.*,
@@ -276,12 +349,15 @@ function rowsCteSql(): string {
  * The work trade a month-close settled (jobs/workTradeSettlement adds the
  * hours' value to the invoice's work_trade_credit_amount and settles the
  * covered lines at $0, or reduces a line it covers in part). Per household
- * and bill month, so a closed work-trade month still reads as covered.
+ * and bill month, so a closed work-trade month still reads as covered. `leases`
+ * is the placeholder of the lease filter (rowsParams' $7, or the one a query
+ * of its own binds).
  */
-function closedWorkTradeCteSql(): string {
+function closedWorkTradeCteSql(leases = '$7'): string {
+  if (!/^\$\d+$/.test(leases)) throw new Error(`householdMonths: "${leases}" is not a placeholder`)
   return `
   wt_closed AS (
-    SELECT inv.id AS invoice_id, inv.landlord_id,
+    SELECT inv.id AS invoice_id, inv.landlord_id, inv.lease_id,
            (SELECT hh_lt.tenant_id FROM lease_tenants hh_lt
              WHERE hh_lt.lease_id = inv.lease_id AND hh_lt.role = 'primary' AND hh_lt.status <> 'void'
              ORDER BY (hh_lt.status = 'active') DESC, hh_lt.created_at, hh_lt.id LIMIT 1) AS lease_primary,
@@ -297,10 +373,11 @@ function closedWorkTradeCteSql(): string {
        AND inv.due_date >= $3::date AND inv.due_date < $4::date
   ),
   wt_closed_hh AS (
-    SELECT w.invoice_id, w.landlord_id, COALESCE(w.lease_primary, w.tenant_id) AS household_id, w.property_id, w.property_name,
-           w.unit_number, w.bill_due, w.amount
+    SELECT w.invoice_id, w.landlord_id, COALESCE(w.lease_primary, w.tenant_id) AS household_id, w.lease_id AS lease_key,
+           w.property_id, w.property_name, w.unit_number, w.bill_due, w.amount
       FROM wt_closed w
      WHERE ($5::uuid[] IS NULL OR COALESCE(w.lease_primary, w.tenant_id) = ANY($5::uuid[]))
+       AND (${leases}::uuid[] IS NULL OR w.lease_id = ANY(${leases}::uuid[]))
   )`
 }
 
@@ -310,9 +387,11 @@ function closedWorkTradeCteSql(): string {
 export interface HouseholdMonth {
   landlord_id: string
   household_id: string
-  /** Set when grouped by property (the Rent Roll's folders). */
+  /** Set when grouped by property (the monthly report's properties). */
   property_id: string | null
   property_name: string | null
+  /** Set when grouped by lease (byLease, the Rent Roll's households); null otherwise, or a charge on no lease. */
+  lease_id: string | null
   /** YYYY-MM: the bills' month. */
   month: string
   units: string[]
@@ -361,6 +440,7 @@ export interface HouseholdMonth {
 
 export interface MonthAgg {
   landlord_id: string; household_id: string; property_id: string | null; property_name: string | null; month: string
+  lease_id: string | null
   units: string[] | null
   charged: string; charged_late: string; charged_base: string
   paid: string; clearing: string; credit: string; wt: string; wt_base: string
@@ -425,7 +505,7 @@ export async function householdMonths(scope: HouseholdMonthScope): Promise<House
  * household months are the property months added up (foldAggs) and judged the
  * same way — exactly what the second read returned.
  */
-export async function householdMonthsBoth(scope: Omit<HouseholdMonthScope, 'byProperty'>): Promise<{
+export async function householdMonthsBoth(scope: Omit<HouseholdMonthScope, 'byProperty' | 'byLease'>): Promise<{
   byProperty: HouseholdMonth[]; byHousehold: HouseholdMonth[]
   /**
    * 10/12 (Nic) review: the property months with the account's companies
@@ -437,7 +517,7 @@ export async function householdMonthsBoth(scope: Omit<HouseholdMonthScope, 'byPr
    */
   byPropertyAcrossCompanies: HouseholdMonth[]
 }> {
-  const aggs = await monthAggs({ ...scope, byProperty: true })
+  const aggs = await monthAggs({ ...scope, byProperty: true, byLease: false })
   return {
     byProperty: aggs.map(judgeAgg),
     byHousehold: foldAggs(aggs).map(judgeAgg),
@@ -469,7 +549,8 @@ function foldAggsBy(aggs: readonly MonthAgg[], keyOf: (r: MonthAgg) => string, k
     const k = keyOf(r)
     const o = out.get(k)
     if (!o) {
-      out.set(k, keepProperty ? { ...r, units: [...(r.units ?? [])] } : { ...r, property_id: null, property_name: null, units: [...(r.units ?? [])] })
+      out.set(k, keepProperty ? { ...r, units: [...(r.units ?? [])] }
+        : { ...r, property_id: null, property_name: null, lease_id: null, units: [...(r.units ?? [])] })
       continue
     }
     o.units = [...new Set([...(o.units ?? []), ...(r.units ?? [])])]
@@ -494,23 +575,36 @@ async function monthAggs(scope: HouseholdMonthScope): Promise<MonthAgg[]> {
   if (!scope.landlordIds.length) return []
   if (!isBillMonth(scope.from) || !isBillMonth(scope.through)) throw new Error('householdMonths: months are YYYY-MM')
   const byProperty = scope.byProperty === true
+  const byLease = scope.byLease === true
   const propCols = byProperty ? 'x.property_id, x.property_name' : 'NULL::uuid AS property_id, NULL::text AS property_name'
   const groupProp = byProperty ? ', x.property_id, x.property_name' : ''
+  // 10/13 (Nic): per lease, a lease is one household whichever company billed
+  // a line on its bill (a neighbor company's utility on a converged invoice,
+  // S616) — the lease is the key, never the company; a charge on no lease is
+  // its household's (no first-company-wins: their months add up).
+  const leaseCol = byLease ? 'x.lease_key::text AS lease_id' : 'NULL::text AS lease_id'
+  const landlordCol = byLease ? '(array_agg(x.landlord_id::text ORDER BY x.landlord_id::text))[1] AS landlord_id' : 'x.landlord_id'
+  const householdCol = byLease
+    ? '(array_agg(x.household_id::text ORDER BY x.household_id::text))[1] AS household_id'
+    : 'x.household_id::text AS household_id'
+  const groupWho = byLease
+    ? 'x.lease_key, CASE WHEN x.lease_key IS NULL THEN x.household_id END'
+    : 'x.landlord_id, x.household_id'
   const rows = await query<MonthAgg>(`
     WITH ${rowsCteSql()},
     ${closedWorkTradeCteSql()},
     parts AS (
-      SELECT j.landlord_id, j.household_id, j.property_id, j.property_name, j.unit_number, j.bill_due,
+      SELECT j.landlord_id, j.household_id, j.lease_key, j.property_id, j.property_name, j.unit_number, j.bill_due,
              j.is_base, j.is_late_fee, j.charged, j.paid, j.clearing, j.credit, j.wt, j.owed,
              j.days_past_grace, j.past_grace_now, j.paid_day, j.first_late_day, j.onboarding, j.grace
         FROM judged j
       UNION ALL
-      SELECT w.landlord_id, w.household_id, w.property_id, w.property_name, w.unit_number, w.bill_due,
+      SELECT w.landlord_id, w.household_id, w.lease_key, w.property_id, w.property_name, w.unit_number, w.bill_due,
              TRUE, FALSE, w.amount, 0, 0, 0, w.amount, 0,
              0, FALSE, w.bill_due, NULL::date, FALSE, NULL::int
         FROM wt_closed_hh w
     )
-    SELECT x.landlord_id, x.household_id::text AS household_id, ${propCols},
+    SELECT ${landlordCol}, ${householdCol}, ${propCols}, ${leaseCol},
            to_char(x.bill_due, 'YYYY-MM') AS month,
            array_remove(array_agg(DISTINCT x.unit_number), NULL) AS units,
            SUM(x.charged)::text                                        AS charged,
@@ -535,10 +629,9 @@ async function monthAggs(scope: HouseholdMonthScope): Promise<MonthAgg[]> {
            MAX(x.grace) FILTER (WHERE x.is_base)::int                             AS grace
       FROM parts x
      WHERE x.household_id IS NOT NULL
-     GROUP BY x.landlord_id, x.household_id${groupProp}, to_char(x.bill_due, 'YYYY-MM')
-     ORDER BY to_char(x.bill_due, 'YYYY-MM'), x.household_id`,
-    [scope.landlordIds, scope.propertyIds ?? null, `${scope.from}-01`, `${addMonths(scope.through, 1)}-01`,
-     scope.householdIds ?? null, scope.asOf ?? null])
+     GROUP BY ${groupWho}${groupProp}, to_char(x.bill_due, 'YYYY-MM')
+     ORDER BY to_char(x.bill_due, 'YYYY-MM'), ${byLease ? '2' : 'x.household_id'}`,
+    rowsParams(scope))
   // pg returns numeric aggregates as text and ints as numbers; the folds above rely on it.
   return rows.map(r => ({ ...r, base_rows: Number(r.base_rows ?? 0) }))
 }
@@ -557,6 +650,7 @@ function judgeAgg(r: MonthAgg): HouseholdMonth {
     household_id: r.household_id,
     property_id: r.property_id,
     property_name: r.property_name,
+    lease_id: r.lease_id ?? null,
     month: r.month,
     units: [...(r.units ?? [])].sort(),
     charged: dollars(cents(r.charged)),
@@ -724,6 +818,8 @@ export const HOW_PAID_OTHER_LABEL: Record<HowPaidOther, string> = {
 export interface ChargeLine {
   payment_id: string
   household_id: string
+  /** The lease it belongs to (leaseOfRowSql: the Rent Roll's household, 10/13); null: on no lease. */
+  lease_id: string | null
   /** YYYY-MM: the bill month it belongs to. */
   month: string
   /** YYYY-MM-DD: its bill's due date. */
@@ -747,10 +843,14 @@ export interface ChargeLine {
   /** The invoice it is on (late fees collapse per bill). */
   invoice_id: string | null
   is_late_fee: boolean
+  /** 10/6 (Nic): logged by hand after its bill's late fee — counted as paid the day GAM recorded it. */
+  logged_after_late_fee: boolean
+  /** Money on it is still clearing (counted as paid: the postmark rule). */
+  clearing: number
 }
 
 interface LineRow {
-  id: string; household_id: string; bill_due: string; type: string; status: string; amount: string
+  id: string; household_id: string; lease_id: string | null; bill_due: string; type: string; status: string; amount: string
   notes: string | null; entry_description: string | null; utility_type: string | null; fee_type: string | null
   fee_description: string | null; origin_notes: string | null
   unit_number: string | null; property_id: string | null; property_name: string | null
@@ -758,6 +858,7 @@ interface LineRow {
   paid_day: string | null; days_past_grace: number; invoice_id: string | null
   manual_method: string | null; receipt_method: string | null; payment_channel: string | null
   stripe_payment_intent_id: string | null
+  logged_after_fee: boolean; clearing: string
 }
 
 /** Every charge line of these households in the months, newest first. */
@@ -765,18 +866,18 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
   if (!scope.landlordIds.length) return []
   const rows = await query<LineRow>(`
     WITH ${rowsCteSql()}
-    SELECT j.id, j.household_id::text AS household_id, to_char(j.bill_due, 'YYYY-MM-DD') AS bill_due,
+    SELECT j.id, j.household_id::text AS household_id, j.lease_key::text AS lease_id, to_char(j.bill_due, 'YYYY-MM-DD') AS bill_due,
            j.type, j.status, j.amount::text AS amount, j.notes, j.entry_description,
            ${chargeLabelColumnsSql('j')},
            j.unit_number, j.property_id, j.property_name,
            j.charged::text AS charged, j.paid::text AS paid, j.credit::text AS credit, j.wt::text AS wt, j.owed::text AS owed,
            to_char(CASE WHEN j.owed = 0 THEN j.paid_day END, 'YYYY-MM-DD') AS paid_day,
            j.days_past_grace::int AS days_past_grace, j.invoice_id,
-           j.manual_method, j.receipt_method, j.payment_channel, j.stripe_payment_intent_id
+           j.manual_method, j.receipt_method, j.payment_channel, j.stripe_payment_intent_id,
+           j.logged_after_fee, j.clearing::text AS clearing
       FROM judged j
      ORDER BY j.bill_due DESC, j.type, j.created_at DESC, j.id`,
-    [scope.landlordIds, scope.propertyIds ?? null, `${scope.from}-01`, `${addMonths(scope.through, 1)}-01`,
-     scope.householdIds ?? null, scope.asOf ?? null])
+    rowsParams(scope))
   const out: ChargeLine[] = rows.map(r => {
     const wt = cents(r.wt), paidC = cents(r.paid), creditC = cents(r.credit)
     const how = wt > 0 ? HOW_PAID_OTHER_LABEL.work_trade
@@ -788,6 +889,7 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
     return {
       payment_id: r.id,
       household_id: r.household_id,
+      lease_id: r.lease_id ?? null,
       month: r.bill_due.slice(0, 7),
       due_date: r.bill_due,
       label: chargeLabel(labelRow),
@@ -806,6 +908,8 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
       days_past_grace: Number(r.days_past_grace) || 0,
       invoice_id: r.invoice_id,
       is_late_fee: r.type === 'late_fee',
+      logged_after_late_fee: r.logged_after_fee === true,
+      clearing: dollars(cents(r.clearing)),
     }
   })
   // 10/12: what a month close settled (jobs/workTradeSettlement creditInvoice)
@@ -817,12 +921,13 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
   // report's history did not add up to its months (INV-2026-00019). One line
   // per bill, named for the charges the trade covered on it.
   const closed = await query<{
-    invoice_id: string; household_id: string; bill_due: string; unit_number: string | null
+    invoice_id: string; household_id: string; lease_id: string | null; bill_due: string; unit_number: string | null
     property_id: string | null; property_name: string | null; amount: string
     covered: Array<Record<string, string | null>> | null
   }>(`
-    WITH ${closedWorkTradeCteSql()}
-    SELECT w.invoice_id, w.household_id::text AS household_id, to_char(w.bill_due, 'YYYY-MM-DD') AS bill_due,
+    WITH ${closedWorkTradeCteSql('$6')}
+    SELECT w.invoice_id, w.household_id::text AS household_id, w.lease_key::text AS lease_id,
+           to_char(w.bill_due, 'YYYY-MM-DD') AS bill_due,
            w.unit_number, w.property_id, w.property_name, w.amount::text AS amount,
            (SELECT json_agg(json_build_object(
                      'type', cp.type, 'entry_description', cp.entry_description, 'notes', cp.notes,
@@ -837,7 +942,7 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
       FROM wt_closed_hh w
      WHERE w.household_id IS NOT NULL`,
     [scope.landlordIds, scope.propertyIds ?? null, `${scope.from}-01`, `${addMonths(scope.through, 1)}-01`,
-     scope.householdIds ?? null])
+     scope.householdIds ?? null, scope.leaseIds ?? null])
   const closedLines: ChargeLine[] = closed.map(w => {
     const covered = w.covered ?? []
     const labels = [...new Set(covered.map(c => chargeLabel(c as unknown as Parameters<typeof chargeLabel>[0])))]
@@ -845,6 +950,7 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
     return {
       payment_id: `work-trade:${w.invoice_id}`,
       household_id: w.household_id,
+      lease_id: w.lease_id ?? null,
       month: w.bill_due.slice(0, 7),
       due_date: w.bill_due,
       label: labels.length ? labels.join(' and ') : 'Charges the work trade covered',
@@ -863,6 +969,8 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
       days_past_grace: 0,
       invoice_id: w.invoice_id,
       is_late_fee: false,
+      logged_after_late_fee: false,
+      clearing: 0,
     }
   })
   if (!closedLines.length) return out
@@ -919,11 +1027,17 @@ export function importedNoteParts(notes: string | null | undefined): { method: s
   return { method, reference }
 }
 
-/** These households' imported payment history, newest first. */
+/**
+ * These households' imported payment history, newest first — or, with
+ * `leaseIds`, these leases' alone (10/13, Nic: a household is a lease; the
+ * report one Rent Roll row opens never lists the person's other lease), each
+ * line's lease decided as the months' are (leaseOfRowSql).
+ */
 export async function importedHistory(scope: {
-  landlordIds: string[]; propertyIds?: string[] | null; householdIds: string[]
+  landlordIds: string[]; propertyIds?: string[] | null; householdIds: string[]; leaseIds?: string[] | null
 }): Promise<ImportedLine[]> {
-  if (!scope.landlordIds.length || !scope.householdIds.length) return []
+  const leaseIds = scope.leaseIds ?? null
+  if (!scope.landlordIds.length || (leaseIds ? !leaseIds.length : !scope.householdIds.length)) return []
   const rows = await query<{
     id: string; household_id: string; paid_on: string; type: string; status: string; entry_description: string | null
     notes: string | null; unit_number: string | null; property_id: string | null; property_name: string | null
@@ -931,7 +1045,7 @@ export async function importedHistory(scope: {
     utility_type: string | null; fee_type: string | null; fee_description: string | null; origin_notes: string | null
   }>(`
     SELECT x.* FROM (
-      SELECT p.id, ${householdOfRowSql('p', 'inv')}::text AS household_id,
+      SELECT p.id, ${householdOfRowSql('p', 'inv')}::text AS household_id, ${leaseOfRowSql('p', 'inv')} AS lease_key,
              to_char(p.due_date, 'YYYY-MM-DD') AS paid_on, p.type, p.status, p.entry_description, p.notes,
              ${chargeLabelColumnsSql('p')},
              u.unit_number, u.property_id, pr.name AS property_name, p.amount::text AS amount, p.import_source,
@@ -945,9 +1059,9 @@ export async function importedHistory(scope: {
          AND p.import_source IS NOT NULL
          AND p.status NOT IN ('voided', 'returned')
     ) x
-     WHERE x.household_id = ANY($3::text[])
+     WHERE CASE WHEN $4::uuid[] IS NULL THEN x.household_id = ANY($3::text[]) ELSE x.lease_key = ANY($4::uuid[]) END
      ORDER BY x.paid_on DESC, x.created_at DESC, x.id`,
-    [scope.landlordIds, scope.propertyIds ?? null, scope.householdIds])
+    [scope.landlordIds, scope.propertyIds ?? null, scope.householdIds, leaseIds])
   return rows.map(r => {
     // The note is the import's breadcrumb, never what the charge is for.
     const labelRow = { ...r, notes: null, origin_notes: null } as unknown as Parameters<typeof chargeLabel>[0]

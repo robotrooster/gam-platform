@@ -724,7 +724,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         -- and unavailable, and nothing bills. Out of Expected, like work trade.
         -- 10/12 (Nic): the rent the LEASE bills, not the unit's listed rent
         -- (RV 33 lists $589; its lease bills $495) — the figure the Rent Roll
-        -- this card opens totals (services/rentRoll lease_rent): every space
+        -- this card opened totaled (the 10/12 lease_rent block, gone 10/13): every space
         -- an active lease holds (not retired), whatever its status says. A
         -- space marked occupied with NO active lease bills nobody, so it adds
         -- nothing — it used to add its listed rent, and the card read $1,750
@@ -1295,7 +1295,7 @@ landlordsRouter.get('/:id/next-payout', async (req, res, next) => {
 })
 
 // 10/12 (Nic): GET /:id/rent-roll is retired. The Rent Roll is the combined
-// page now (GET /api/balances/rent-roll, services/rentRoll): one row per
+// pages now (10/13: GET /api/balances/rent-roll/open-month and /history, services/rentRoll): one row per
 // household with the LEASE's rent — this listed each unit's advertised rent
 // (RV 33 at $589 while its lease bills $495) — plus what was charged, paid and
 // owed and how on time they pay. Nothing calls this route any more.

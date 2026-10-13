@@ -6,13 +6,13 @@ import {
 } from '../services/openBalances'
 import { listPaymentsByMonth, isLedgerMonth } from '../services/paymentsByMonth'
 import { z } from 'zod'
-import { buildRentRoll, movedOutRules } from '../services/rentRoll'
-import { RENT_ROLL_MOVED_OUT_RULES, RENT_ROLL_MOVED_OUT_LABEL } from '@gam/shared'
-import { currentBillMonth } from '../services/householdMonths'
+import {
+  rentRollProperty, rentRollProperties, buildOpenMonth, buildRentRollHistory, RentRollRangeError,
+} from '../services/rentRoll'
 import { AppError } from '../middleware/errorHandler'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
 import { tenantLivesHereSql } from '../services/posPeople'
-import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
@@ -227,81 +227,87 @@ balancesRouter.get('/payments-by-month', requirePerm('payments.view_all'), async
 })
 
 /**
- * GET /api/balances/rent-roll?through=YYYY-MM — THE RENT ROLL (10/12, Nic): one
- * row per household per property folder, with the picked month's Charged (late
- * fees included, and named), Paid, Owed, status color, payment health and a
- * strip of monthly stamps — the one payment-health definition
- * (services/householdMonths) read whole. It replaces the old Rent Roll and the
- * Payments ledger as the place to look. 10/12 (Nic): health and the stamp
- * history are ALL-TIME (since each household joined GAM), not 12 months — the
- * strip is every month, so the old `months=6|12` choice is gone (a stale
- * client that still sends it is answered all time).
+ * THE PAYMENTS PAGE AND THE RENT ROLL (10/13, Nic): "the payments page is the
+ * rent roll for the open month. And the rent roll page is the historical
+ * lookup for previous reportings for quarters or years or individual months or
+ * whatever." One property at a time ("you select either property and view only
+ * those properties"). services/rentRoll's header is the contract:
  *
- * WHO (Nic, 10/12): "owner plus anyone with 'View all payments'
- * (payments.view_all), staff limited to their properties" — the Payments
- * ledger's permission, answered 403 server-side for anyone else. "Grand totals
- * follow the existing rule for who sees totals" (decisions #25,
- * openBalances seesGrandTotals): the folder and page totals ride only for the
- * viewers it admits; every other figure is per household.
+ *   GET /api/balances/rent-roll/properties                      the picker
+ *   GET /api/balances/rent-roll/open-month?propertyId=          the Payments page
+ *   GET /api/balances/rent-roll/history?propertyId=&from=&to=   the Rent Roll page
+ *                                       (&range=all for all time)
+ *
+ * WHO — unchanged from the Rent Roll and the Payments ledger: the account
+ * owner and anyone with "View all payments" (payments.view_all), answered 403
+ * server-side for anyone else; staff limited to their properties (a property
+ * that is not theirs is a 404, never another property's money). Sums across
+ * households ride only for a viewer seesGrandTotals admits (decisions #25).
+ *
+ * 10/13 (Nic): "Remove the 'keep moved-out households' setting entirely" — the
+ * old GET /rent-roll (every property side by side) and its PUT
+ * /rent-roll/moved-out are gone; nothing reads or writes
+ * landlords.rent_roll_moved_out any more (the column stays: expand, then
+ * contract). People no longer living there who still owe are the history's
+ * "Moved out, still owes" folder until paid.
  */
-const rentRollQuery = z.object({
-  through: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Pick a month as YYYY-MM, for example 2026-10.').optional(),
+const RENT_ROLL_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/
+const rentRollPropertyQuery = z.object({
+  propertyId: z.string({ required_error: 'Pick a property.' }).uuid('Pick a property.'),
 })
-balancesRouter.get('/rent-roll', requirePerm('payments.view_all'), async (req, res, next) => {
+const rentRollHistoryQuery = rentRollPropertyQuery.extend({
+  from: z.string().regex(RENT_ROLL_MONTH, 'Pick months as YYYY-MM, for example 2026-10.').optional(),
+  to: z.string().regex(RENT_ROLL_MONTH, 'Pick months as YYYY-MM, for example 2026-10.').optional(),
+  range: z.enum(['all'], { errorMap: () => ({ message: 'The only named range is all (all time).' }) }).optional(),
+})
+
+/** The property asked for, once the viewer may see it (404 otherwise). */
+async function rentRollPropertyFor(req: import('express').Request, propertyId: string) {
+  const property = await rentRollProperty({
+    landlordIds: landlordScopeIds(req.user!),
+    scopedPropertyIds: await getScopedPropertyIds(req.user),
+    propertyId,
+  })
+  if (!property) throw new AppError(404, 'That property is not one you can see.')
+  return property
+}
+
+balancesRouter.get('/rent-roll/properties', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const parsed = rentRollQuery.safeParse(req.query)
-    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick a month as YYYY-MM.')
-    const data = await buildRentRoll({
+    const data = await rentRollProperties({
       landlordIds: landlordScopeIds(req.user!),
-      propertyIds: await getScopedPropertyIds(req.user),
-      through: parsed.data.through ?? currentBillMonth(),
-      withTotals: seesGrandTotals(req.user),
+      scopedPropertyIds: await getScopedPropertyIds(req.user),
     })
-    // 10/12 (Nic): the moved-out setting is the landlord's choice — only the
-    // owner (or GAM acting for them) changes it; everyone else sees which it is.
-    res.json({ success: true, data: { ...data, can_change_moved_out: MOVED_OUT_EDITOR_ROLES.has(req.user?.role ?? '') } })
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 
-/**
- * PUT /api/balances/rent-roll/moved-out { landlordId?, rule } — 10/12 (Nic):
- * "who stays on the Rent Roll after moving out = LANDLORD'S CHOICE (a setting
- * on the page: billed in last 12 months / while they owe / all time)." One
- * company's rule (landlords.rent_roll_moved_out; RENT_ROLL_MOVED_OUT_RULES).
- *
- * WHO: the landlord's choice, so the account owner (and GAM's admins acting
- * for them, as the monthly report's recipient list allows) — a team member
- * sees the rule on the page but cannot change it. The company is named, or the
- * account's only one (resolveLandlordTarget: never a guess when it owns more).
- * Keep everything: the change is written to audit_log with what it was.
- */
-const MOVED_OUT_EDITOR_ROLES = new Set(['landlord', 'admin', 'super_admin'])
-const movedOutBody = z.object({
-  landlordId: z.string().uuid().optional(),
-  rule: z.enum(RENT_ROLL_MOVED_OUT_RULES, { errorMap: () => ({ message: `Pick one: ${RENT_ROLL_MOVED_OUT_RULES.map(r => RENT_ROLL_MOVED_OUT_LABEL[r]).join(', ')}.` }) }),
-})
-balancesRouter.put('/rent-roll/moved-out', requirePerm('payments.view_all'), async (req, res, next) => {
+balancesRouter.get('/rent-roll/open-month', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    if (!MOVED_OUT_EDITOR_ROLES.has(req.user?.role ?? '')) {
-      throw new AppError(403, 'Only the account owner chooses who stays on the Rent Roll after moving out.')
-    }
-    const parsed = movedOutBody.safeParse(req.body ?? {})
-    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick who stays on the Rent Roll after moving out.')
-    const landlordId = resolveLandlordTarget(req.user!, parsed.data.landlordId, 'setting')
-    // One statement: the row is locked, changed only when the choice is new,
-    // and the change is journaled with what it was — two presses at once can
-    // never record the wrong "was".
-    await query(`
-      WITH old AS (SELECT id, rent_roll_moved_out AS rule FROM landlords WHERE id = $1 FOR UPDATE),
-           upd AS (UPDATE landlords l SET rent_roll_moved_out = $2, updated_at = now()
-                     FROM old WHERE l.id = old.id AND old.rule IS DISTINCT FROM $2
-                   RETURNING old.rule AS was)
-      INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
-      SELECT $3, 'rent_roll_moved_out_changed', 'landlord', $1, jsonb_build_object('rule', upd.was), jsonb_build_object('rule', $2::text)
-        FROM upd`, [landlordId, parsed.data.rule, req.user!.userId])
-    const [mine] = await movedOutRules([landlordId])
-    if (!mine) throw new AppError(404, 'Company not found')
-    res.json({ success: true, data: mine })
+    const parsed = rentRollPropertyQuery.safeParse(req.query)
+    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick a property.')
+    const property = await rentRollPropertyFor(req, parsed.data.propertyId)
+    // A property sold out of the account has history (the Rent Roll), never an open month.
+    if (!property.owned) throw new AppError(404, 'That property is no longer yours — its bills from before are on the Rent Roll.')
+    const data = await buildOpenMonth({
+      landlordIds: landlordScopeIds(req.user!), property, withTotals: seesGrandTotals(req.user),
+    })
+    res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+balancesRouter.get('/rent-roll/history', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const parsed = rentRollHistoryQuery.safeParse(req.query)
+    if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick a property and months.')
+    const { propertyId, from, to, range } = parsed.data
+    const allTime = range === 'all'
+    if (!allTime && (!from || !to)) throw new AppError(400, 'Pick a start month and an end month, or all time.')
+    const property = await rentRollPropertyFor(req, propertyId)
+    const data = await buildRentRollHistory({
+      landlordIds: landlordScopeIds(req.user!), property, from, to, allTime, withTotals: seesGrandTotals(req.user),
+    }).catch(e => { throw e instanceof RentRollRangeError ? new AppError(400, e.message) : e })
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 

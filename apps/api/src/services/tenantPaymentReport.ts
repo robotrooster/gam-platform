@@ -19,9 +19,26 @@
  * imported from another platform (the payment-history CSV) is listed on its
  * own, labeled with where it came from, and never counted (10/12, Nic: "health
  * starts with the first bill GAM wrote").
+ *
+ * 10/13 (Nic): "this is the kind of information I want to see on the customer
+ * history". Opened from a name on the Payments page or the Rent Roll, the
+ * report is that row's household — its LEASE (`leaseId`: "when someone is
+ * renting 2 spots with 2 leases it is 2 households"); opened from the tenant
+ * profile (no lease named), the person's whole household as before. "How
+ * late" lists EVERY billed month (it showed only the months past grace: 2 of 5
+ * open months), each with its status in the Rent Roll's words (`status`:
+ * paid | paid_late | partial | owes | due — a partial past grace is "Owes +N"),
+ * and so does every stamp of the all-time strip. The 10/12 breakdown stays:
+ * how late they usually are (paid-late months), the average partial payment and
+ * how long the difference takes to settle; `history` is the "What it's for"
+ * list — every charge line: what it's for, amount, paid date, how paid, days
+ * past grace.
  */
 import { query } from '../db'
-import { LEASE_TYPE_LABEL, GRACE_SOURCE_LABEL, type LeaseType, type GraceSource } from '@gam/shared'
+import {
+  LEASE_TYPE_LABEL, GRACE_SOURCE_LABEL, RENT_ROLL_STATUS_COLOR, rentRollStatusOf, rentRollStatusText,
+  type LeaseType, type GraceSource, type RentRollMonthStatus, type RentRollStatusColor,
+} from '@gam/shared'
 import {
   householdMonths, householdLines, paymentHealth, householdsOf, householdMembers, currentBillMonth, monthsBetween,
   importedHistory, ALL_TIME_FROM, type HouseholdMonth, type PaymentHealth, type ChargeLine, type ImportedLine,
@@ -150,8 +167,24 @@ export interface HistoryLine extends ChargeLine {
   late_fees?: ChargeLine[]
 }
 
+/** A month's pill in the Rent Roll's words (10/13). */
+export interface MonthStatus {
+  status: RentRollMonthStatus
+  status_label: string
+  status_color: RentRollStatusColor
+}
+
+/** The Rent Roll's pill for a judged month (no bill: 'none'). */
+export function monthStatus(m: Pick<HouseholdMonth, 'stamp' | 'days_past_grace'> | undefined): MonthStatus {
+  const status = rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0)
+  const days = status === 'paid_late' || status === 'owes' ? (m?.days_past_grace ?? 0) : 0
+  return { status, status_label: rentRollStatusText({ status, daysPastGrace: days }), status_color: RENT_ROLL_STATUS_COLOR[status] }
+}
+
 export interface TenantPaymentReport {
   household_id: string
+  /** 10/13: the one lease the report covers (opened from a Rent Roll row); null = the person's whole household. */
+  lease_id: string | null
   members: Array<{ tenant_id: string; name: string; role: string | null }>
   name: string
   leases: ReportLease[]
@@ -160,10 +193,26 @@ export interface TenantPaymentReport {
   onboarding_month: string | null
   balance_owed_now: number
   health: PaymentHealth
-  /** Every month from the household's first bill on GAM through the month judged to, oldest first (10/12: all time; stamp null = nothing billed that month). */
-  stamps: Array<Pick<HouseholdMonth, 'month' | 'stamp' | 'stamp_label' | 'days_past_grace' | 'charged' | 'paid' | 'credit' | 'work_trade' | 'owed' | 'paid_in_full_on' | 'onboarding' | 'work_trade_only' | 'counted'>>
+  /**
+   * Every month from the household's first bill on GAM through the month
+   * judged to, oldest first (10/12: all time; stamp null = nothing billed that
+   * month). 10/13: `status` / `status_label` / `status_color` are the Rent
+   * Roll's pill for the month (rentRollStatusOf: a partial past grace is
+   * "Owes +N"; no bill, 'none').
+   */
+  stamps: Array<Pick<HouseholdMonth, 'month' | 'stamp' | 'stamp_label' | 'days_past_grace' | 'charged' | 'paid' | 'credit' | 'work_trade' | 'owed' | 'paid_in_full_on' | 'onboarding' | 'work_trade_only' | 'counted'> & MonthStatus>
   how_late: {
-    months: Array<{ month: string; days_past_grace: number; paid_in_full_on: string | null; still_open: boolean; first_late_day: string | null }>
+    /**
+     * 10/13 (Nic): EVERY billed month, newest first — on time, late, part paid
+     * or still owed — with its days past grace (0: within grace). `still_open`:
+     * something on its bills (rent, utilities, fees) is still owed;
+     * `due_date`: the bill's due date.
+     */
+    months: Array<{
+      month: string; days_past_grace: number; paid_in_full_on: string | null; still_open: boolean
+      first_late_day: string | null; due_date: string | null
+      charged: number; paid: number; owed: number
+    } & MonthStatus>
     pattern: string | null
     median: number | null
     min: number | null
@@ -210,26 +259,58 @@ export async function tenantPaymentReport(opts: {
   tenantId: string
   landlordIds: string[]
   propertyIds: string[] | null
+  /**
+   * 10/13 (Nic): the household is the LEASE ("2 spots with 2 leases it is 2
+   * households") — the report of one Rent Roll row. The person must be on it,
+   * and it must be one the viewer may see; otherwise null (404).
+   */
+  leaseId?: string | null
   through?: string
   asOf?: string | null
 }): Promise<TenantPaymentReport | null> {
   if (!opts.landlordIds.length) return null
+  const leaseId = opts.leaseId ?? null
+  let lease: { unit_id: string; primary_id: string | null } | null = null
+  if (leaseId) {
+    ;[lease] = await query<{ unit_id: string; primary_id: string | null }>(`
+      SELECT l.unit_id,
+             (SELECT lt.tenant_id FROM lease_tenants lt
+               WHERE lt.lease_id = l.id AND lt.role = 'primary' AND lt.status <> 'void'
+               ORDER BY (lt.status = 'active') DESC, lt.created_at, lt.id LIMIT 1) AS primary_id
+        FROM leases l JOIN units u ON u.id = l.unit_id
+       WHERE l.id = $1 AND l.landlord_id = ANY($2::uuid[])
+         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+         AND EXISTS (SELECT 1 FROM lease_tenants me WHERE me.lease_id = l.id AND me.tenant_id = $4 AND me.status <> 'void')`,
+      [leaseId, opts.landlordIds, opts.propertyIds, opts.tenantId])
+    if (!lease) return null
+  }
   // 10/12: a viewer kept to some properties gets the household of the person's
   // lease AT THOSE properties — never one from the company's other parks.
-  const householdId = (await householdsOf([opts.tenantId], opts.landlordIds, opts.propertyIds)).get(opts.tenantId) ?? opts.tenantId
+  const householdId = lease
+    ? (lease.primary_id ?? opts.tenantId)
+    : (await householdsOf([opts.tenantId], opts.landlordIds, opts.propertyIds)).get(opts.tenantId) ?? opts.tenantId
   const through = opts.through ?? currentBillMonth()
-  const scope = { landlordIds: opts.landlordIds, propertyIds: opts.propertyIds, householdIds: [householdId], asOf: opts.asOf ?? null }
+  // One lease: every charge of the lease (whoever on it was billed); else the household's.
+  const scope = {
+    landlordIds: opts.landlordIds, propertyIds: opts.propertyIds, asOf: opts.asOf ?? null,
+    householdIds: leaseId ? null : [householdId], leaseIds: leaseId ? [leaseId] : null,
+  }
   const [months, lines, imported] = await Promise.all([
-    householdMonths({ ...scope, from: ALL_TIME_FROM, through }),
+    // One lease is one month per bill month, whichever company billed a line on it (byLease).
+    householdMonths({ ...scope, from: ALL_TIME_FROM, through, byLease: !!leaseId }),
     householdLines({ ...scope, from: ALL_TIME_FROM, through }),
-    importedHistory({ landlordIds: opts.landlordIds, propertyIds: opts.propertyIds, householdIds: [householdId] }),
+    // One lease: its own imported lines only, never the person's other lease's.
+    importedHistory({ landlordIds: opts.landlordIds, propertyIds: opts.propertyIds, householdIds: [householdId], leaseIds: scope.leaseIds }),
   ])
 
   // 10/12: a viewer kept to some properties (S655) sees the household as it
   // lived there — its residents on a lease at those properties, never a
   // co-tenant from the company's other parks. The primary resident is put to
   // the same test (a Park B primary's name never reaches a Park A-only viewer).
-  const memberIds = (await query<{ id: string }>(`
+  const memberIds = leaseId
+    ? (await query<{ tenant_id: string }>(
+        `SELECT DISTINCT tenant_id FROM lease_tenants WHERE lease_id = $1 AND status <> 'void'`, [leaseId])).map(r => r.tenant_id)
+    : (await query<{ id: string }>(`
     SELECT m.id FROM unnest($1::uuid[]) AS m(id)
      WHERE $3::uuid[] IS NULL
         OR EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id JOIN units u ON u.id = l.unit_id
@@ -258,7 +339,8 @@ export async function tenantPaymentReport(opts: {
      WHERE l.landlord_id = ANY($2::uuid[])
        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
        AND l.id IN (SELECT lt.lease_id FROM lease_tenants lt WHERE lt.tenant_id = ANY($1::uuid[]) AND lt.status <> 'void')
-     ORDER BY (l.status = 'active') DESC, l.start_date DESC`, [memberIds, opts.landlordIds, opts.propertyIds])
+       AND ($4::uuid IS NULL OR l.id = $4)
+     ORDER BY (l.status = 'active') DESC, l.start_date DESC`, [memberIds, opts.landlordIds, opts.propertyIds, leaseId])
   if (!months.length && !leaseRows.length && !imported.length) return null
 
   const leases: ReportLease[] = leaseRows.map((l: any) => {
@@ -287,7 +369,7 @@ export async function tenantPaymentReport(opts: {
       month, stamp: m?.stamp ?? null, stamp_label: m?.stamp_label ?? null, days_past_grace: m?.days_past_grace ?? 0,
       charged: m?.charged ?? 0, paid: m?.paid ?? 0, credit: m?.credit ?? 0, work_trade: m?.work_trade ?? 0, owed: m?.owed ?? 0,
       paid_in_full_on: m?.paid_in_full_on ?? null, onboarding: m?.onboarding ?? false, work_trade_only: m?.work_trade_only ?? false,
-      counted: m?.counted ?? false,
+      counted: m?.counted ?? false, ...monthStatus(m),
     }
   })
 
@@ -349,7 +431,8 @@ export async function tenantPaymentReport(opts: {
       LEFT JOIN units u ON u.id = a.unit_id
      WHERE a.tenant_id = ANY($1::uuid[]) AND a.landlord_id = ANY($2::uuid[])
        AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
-     ORDER BY (a.status = 'active') DESC, a.start_date DESC`, [memberIds, opts.landlordIds, opts.propertyIds])
+       AND ($4::uuid IS NULL OR a.unit_id = $4)
+     ORDER BY (a.status = 'active') DESC, a.start_date DESC`, [memberIds, opts.landlordIds, opts.propertyIds, lease?.unit_id ?? null])
   const hours = agreements.some(a => a.tracks_hours) ? await query<{ month: string; worked: string; target: string }>(`
     SELECT to_char(s.period_month, 'YYYY-MM') AS month, SUM(s.hours_worked)::text AS worked, SUM(s.target_hours)::text AS target
       FROM work_trade_settlements s
@@ -406,6 +489,7 @@ export async function tenantPaymentReport(opts: {
   const primary = people.find(p => p.id === householdId)
   return {
     household_id: householdId,
+    lease_id: leaseId,
     members: people.map(p => ({ tenant_id: p.id, name: p.name, role: p.role }))
       .sort((a, z) => Number(z.tenant_id === householdId) - Number(a.tenant_id === householdId) || a.name.localeCompare(z.name)),
     name: primary?.name || people[0]?.name || 'Resident',
@@ -416,9 +500,12 @@ export async function tenantPaymentReport(opts: {
     health,
     stamps,
     how_late: {
-      months: lateMonths.map(m => ({
+      // 10/13 (Nic): every billed month, newest first — never only the late ones.
+      months: judged.map(m => ({
         month: m.month, days_past_grace: m.days_past_grace, paid_in_full_on: m.paid_in_full_on,
-        still_open: m.stamp !== 'paid_late', first_late_day: m.first_late_day,
+        still_open: cents(m.owed_base) > 0, first_late_day: m.first_late_day, due_date: dueOf.get(m.month) ?? null,
+        charged: m.charged, paid: dollars(cents(m.paid) + cents(m.credit)), owed: m.owed,
+        ...monthStatus(m),
       })).reverse(),
       pattern: latenessPattern(lateDays),
       median: median(lateDays),

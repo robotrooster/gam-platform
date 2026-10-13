@@ -19,6 +19,7 @@ import {
   householdMonths, householdMonthsBoth, householdLines, paymentHealth, judgeMonth, healthByHousehold, householdsOf, addMonths, monthsBetween,
   type HouseholdMonth,
 } from './householdMonths'
+import { judgeBills } from './creditBillMarks'
 
 const AS_OF = '2026-10-12'
 const TZ = 'America/Phoenix'
@@ -370,6 +371,142 @@ describe('householdMonthsBoth — one read, both groupings', () => {
       ['2026-09', 'paid_late', 820, 25],
       ['2026-10', 'partial', 837.17, 637.17],
     ])
+  })
+})
+
+// 10/13 (Nic): "when someone is renting 2 spots with 2 leases it is 2
+// households" — the Rent Roll's rows and payment health count each lease.
+describe('householdMonths byLease — a household is a lease', () => {
+  it('two leases of one person: two households by lease, one by person; a lease-less charge joins the person\'s lease', async () => {
+    const w = await world()
+    const c = await db.connect()
+    let w2: World
+    try {
+      const unitId = await seedUnit(c, { propertyId: w.propertyId, landlordId: w.landlordId, rentAmount: 300 })
+      // The newer of the two leases (world()'s starts 2026-09-01).
+      const leaseId = await seedLease(c, { unitId, landlordId: w.landlordId, rentAmount: 300, startDate: '2026-09-15' })
+      await seedLeaseTenant(c, { leaseId, tenantId: w.tenantId, role: 'primary' })
+      w2 = { ...w, unitId, leaseId }
+    } finally { c.release() }
+    await bill(w, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' }])
+    await bill(w2, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 300, status: 'settled', method: 'cash', paidAt: '2026-09-12 10:00' }])
+    // A counter charge on no lease and no bill: the person's newest active lease takes it.
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,'fee',20,'pending','2026-09-01','OTHERFEE','2026-08-30')`, [w2.unitId, w.tenantId, w.landlordId])
+    const scope = { landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF }
+    const perLease = await householdMonths({ ...scope, byLease: true })
+    expect(perLease.map(m => [m.lease_id, m.household_id, m.charged, m.stamp]).sort()).toEqual([
+      [w.leaseId, w.tenantId, 495, 'paid_on_time'],
+      // its rent paid late and the counter fee still owed: part paid
+      [w2.leaseId, w.tenantId, 320, 'partial'],
+    ].sort())
+    const perPerson = await householdMonths(scope)
+    expect(perPerson.map(m => [m.lease_id, m.charged, m.stamp])).toEqual([[null, 815, 'partial']])
+    // One lease alone, and its lines.
+    const one = await householdMonths({ ...scope, leaseIds: [w.leaseId] })
+    expect(one.map(m => [m.charged, m.stamp])).toEqual([[495, 'paid_on_time']])
+    const lines = await householdLines({ ...scope, leaseIds: [w2.leaseId] })
+    expect(lines.map(l => [l.lease_id, l.type, l.charged]).sort()).toEqual([[w2.leaseId, 'fee', 20], [w2.leaseId, 'rent', 300]].sort())
+  })
+
+  // "2 spots with 2 leases it is 2 households": a charge on no lease on one of
+  // the two spots is that spot's lease, never the newer lease's.
+  it('a lease-less charge on the older lease\'s space is the older lease\'s', async () => {
+    const w = await world()
+    const c = await db.connect()
+    let w2: World
+    try {
+      const unitId = await seedUnit(c, { propertyId: w.propertyId, landlordId: w.landlordId, rentAmount: 300 })
+      const leaseId = await seedLease(c, { unitId, landlordId: w.landlordId, rentAmount: 300, startDate: '2026-09-15' })
+      await seedLeaseTenant(c, { leaseId, tenantId: w.tenantId, role: 'primary' })
+      w2 = { ...w, unitId, leaseId }
+    } finally { c.release() }
+    await bill(w, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' }])
+    await bill(w2, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 300, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' }])
+    // A counter charge on world()'s space — the OLDER lease's — on no lease and no bill.
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,'fee',20,'pending','2026-09-01','OTHERFEE','2026-08-30')`, [w.unitId, w.tenantId, w.landlordId])
+    const perLease = await householdMonths({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF, byLease: true })
+    expect(perLease.map(m => [m.lease_id, m.charged, m.stamp]).sort()).toEqual([
+      [w.leaseId, 515, 'partial'],
+      [w2.leaseId, 300, 'paid_on_time'],
+    ].sort())
+    const lines = await householdLines({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF, leaseIds: [w.leaseId] })
+    expect(lines.map(l => [l.type, l.charged]).sort()).toEqual([['fee', 20], ['rent', 495]])
+  })
+
+  it('a neighbor company\'s line on the lease\'s bill is the same household, never a second one', async () => {
+    const w = await world()
+    const other = (await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, business_name, billing_starts_at) VALUES ($1, 'Bravo LLC', DATE '2000-01-01') RETURNING id`, [w.userId])).rows[0].id
+    const [rent] = await bill(w, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' }])
+    const inv = (await db.query<{ invoice_id: string }>(`SELECT invoice_id FROM payments WHERE id = $1`, [rent])).rows[0].invoice_id
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,'utility',40,'pending','2026-09-01','UTILITY','2026-08-30')`, [inv, w.unitId, w.tenantId, other])
+    const ms = await householdMonths({ landlordIds: [w.landlordId, other], from: '2026-09', through: '2026-09', asOf: AS_OF, byLease: true })
+    expect(ms.map(m => [m.lease_id, m.charged, m.owed, m.stamp])).toEqual([[w.leaseId, 535, 40, 'partial']])
+  })
+})
+
+// 10/13 (Nic): "Hand-logged payment entered AFTER the late fee posted counts
+// late from the day it was logged (Nic's 10/6 rule) — the Rent Roll follows
+// it, same as credit history."
+describe('householdMonths — logged by hand after the late fee (10/6), the credit history\'s rule', () => {
+  it('counts from the day GAM recorded it, exactly as the credit history judges the bill; without the fee, the typed day', async () => {
+    const w = await world()
+    const today = (await db.query<{ d: string }>(`SELECT (NOW() AT TIME ZONE $1)::date::text AS d`, [TZ])).rows[0].d
+    const due = (await db.query<{ d: string }>(`SELECT ($1::date - 20)::text AS d`, [today])).rows[0].d
+    const [rent] = await bill(w, due, `${due} 05:00`, [{ type: 'rent', amount: 495 }])
+    const inv = (await db.query<{ invoice_id: string }>(`SELECT invoice_id FROM payments WHERE id = $1`, [rent])).rows[0].invoice_id
+    const fee = (await db.query<{ id: string }>(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,$5,'late_fee',25,'pending',$6::date + 5,'LATEFEE', NOW() - interval '15 days') RETURNING id`,
+      [inv, w.unitId, w.leaseId, w.tenantId, w.landlordId, due])).rows[0].id
+    // The desk logs the cash today, typed as paid on the due day.
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = ($2::timestamp AT TIME ZONE $3) WHERE id = $1`,
+      [rent, `${due} 10:00`, TZ])
+    const month = due.slice(0, 7)
+    const judge = async () => {
+      const [m] = await householdMonths({ landlordIds: [w.landlordId], from: month, through: month })
+      const [b] = await judgeBills(db, [inv])
+      return { m, b }
+    }
+    const late = await judge()
+    expect(late.m).toMatchObject({ stamp: 'paid_late', paid_in_full_on: today })
+    expect(late.b).toMatchObject({ stamp: 'paid_late', paidInFullOn: today, loggedAfterLateFee: true })
+    expect(late.m.days_past_grace).toBe(late.b.days)
+    const [line] = (await householdLines({ landlordIds: [w.landlordId], from: month, through: month })).filter(l => l.type === 'rent')
+    expect(line).toMatchObject({ paid_on: today, logged_after_late_fee: true })
+    // The landlord deletes the fee: the typed day stands, on both.
+    await db.query(`UPDATE payments SET status = 'voided', voided_at = NOW(), void_reason = 'deleted' WHERE id = $1`, [fee])
+    const clean = await judge()
+    expect(clean.m).toMatchObject({ stamp: 'paid_on_time', paid_in_full_on: due })
+    expect(clean.b).toMatchObject({ stamp: 'paid_on_time', paidInFullOn: due, loggedAfterLateFee: false })
+  })
+
+  it('a bank line matched to it decides the day instead', async () => {
+    const w = await world()
+    const [rent] = await bill(w, '2026-09-01', '2026-08-30 05:00', [{ type: 'rent', amount: 495 }])
+    const inv = (await db.query<{ invoice_id: string }>(`SELECT invoice_id FROM payments WHERE id = $1`, [rent])).rows[0].invoice_id
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,$5,'late_fee',25,'pending','2026-09-06','LATEFEE',('2026-09-06 00:05'::timestamp AT TIME ZONE $6))`,
+      [inv, w.unitId, w.leaseId, w.tenantId, w.landlordId, TZ])
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = ('2026-09-03 10:00'::timestamp AT TIME ZONE $2) WHERE id = $1`, [rent, TZ])
+    const conn = (await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1,'stripe_fc','active') RETURNING id`, [w.landlordId])).rows[0].id
+    const txn = (await db.query<{ id: string }>(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
+       VALUES ($1,$2,$3,'2026-09-03',495,'BRANCH DEPOSIT','matched') RETURNING id`, [conn, w.landlordId, randomUUID()])).rows[0].id
+    await db.query(`INSERT INTO bank_deposit_allocations (bank_transaction_id, payment_id, landlord_id, amount, effective_paid_date)
+                    VALUES ($1,$2,$3,495,'2026-09-03')`, [txn, rent, w.landlordId])
+    const [sep] = await householdMonths({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF })
+    expect(sep).toMatchObject({ stamp: 'paid_on_time', paid_in_full_on: '2026-09-03' })
+    const [b] = await judgeBills(db, [inv], { asOf: AS_OF })
+    expect(b).toMatchObject({ stamp: 'paid_on_time', paidInFullOn: '2026-09-03', loggedAfterLateFee: false })
   })
 })
 
