@@ -259,3 +259,111 @@ describe('Not a rent payment', () => {
     expect((await txn(id)).auto_settle_undo).toBeNull()
   })
 })
+
+// ── 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk
+// staff)." A bookkeeper with the bank (the company-wide box) marks it and takes
+// the mark back; the front desk, who take payments, never does.
+describe('who may say a deposit is not rent (10/13, Nic)', () => {
+  async function bookkeeper(p: Park, o: { companyWide?: boolean; moneyIn?: 'any' | 'after_not_rent' | 'never' } = {}) {
+    const bkId = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'bookkeeper', 'Bea', 'Keeper', TRUE) RETURNING id`, [`bk-${randomUUID()}@test.dev`])).rows[0].id
+    await db.query(
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide, money_in_filing)
+       VALUES ($1, $2, 'read_write', $3, $4, $5)`, [bkId, p.landlordId, [p.propertyId], o.companyWide ?? true, o.moneyIn ?? 'after_not_rent'])
+    return {
+      bkId,
+      token: jwt.sign({ userId: bkId, role: 'bookkeeper', email: 'bk@t.dev', profileId: null, landlordId: p.landlordId,
+        permissions: { access_level: 'read_write' } }, SECRET, { expiresIn: '1h' }),
+    }
+  }
+  async function frontDesk(p: Park) {
+    const u = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Desk', 'Clerk', TRUE) RETURNING id`, [`desk-${randomUUID()}@test.dev`])).rows[0].id
+    await db.query(`INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties) VALUES ($1, $2, TRUE)`, [u, p.landlordId])
+    return jwt.sign({ userId: u, role: 'onsite_manager', email: 'desk@t.dev', profileId: null, landlordId: p.landlordId,
+      permissions: { take_payment: true, 'payments.view_all': true } }, SECRET, { expiresIn: '1h' })
+  }
+  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` })
+
+  it('a bookkeeper with the bank marks a deposit "Not rent" (the mark names them) and takes it back', async () => {
+    const p = await park()
+    const bk = await bookkeeper(p)
+    const id = await deposit(p, 'ONLINE TRANSFER FROM CHK 1234')
+    const res = await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toMatchObject({ id, setAside: true })
+    expect((await txn(id)).auto_settle_undo.notRent).toMatchObject({ by: bk.bkId })
+    expect(await unmatchedIds(p)).toEqual([])
+    const back = await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent/undo`).set(bearer(bk.token)).send({})
+    expect(back.status, JSON.stringify(back.body)).toBe(200)
+    expect((await txn(id)).auto_settle_undo).toBeNull()
+  })
+
+  it('"only after Not rent": once the bookkeeper marks it, they may file it', async () => {
+    const p = await park()
+    const bk = await bookkeeper(p, { moneyIn: 'after_not_rent' })
+    const id = await deposit(p, 'ONLINE TRANSFER FROM CHK 1234')
+    const file = () => request(app()).post(`/api/bank-feed/transactions/${id}/categorize`).set(bearer(bk.token))
+      .send({ category: 'owner_contribution', scopeKind: 'property_common', propertyId: p.propertyId })
+    const refused = await file()
+    expect(refused.status).toBe(403)
+    // The button is on the owner's Bank page only, so the words do not send them looking for it.
+    expect(refused.body.error).toBe('This deposit may be a tenant\'s rent. It has to be marked "Not rent" first; then you can file it.')
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})).status).toBe(200)
+    expect((await file()).status).toBe(200)
+    expect((await txn(id)).status).toBe('categorized')
+  })
+
+  it('"may file any deposit": the bookkeeper may mark it too', async () => {
+    const p = await park()
+    const bk = await bookkeeper(p, { moneyIn: 'any' })
+    const id = await deposit(p, 'ONLINE TRANSFER FROM CHK 1234')
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})).status).toBe(200)
+    expect((await txn(id)).auto_settle_undo.notRent).toMatchObject({ by: bk.bkId })
+  })
+
+  it('Nic L19: a bookkeeper the owner keeps away from money coming in ("never") neither marks it nor takes the owner\'s mark back', async () => {
+    const p = await park()
+    const bk = await bookkeeper(p, { moneyIn: 'never' })
+    const id = await deposit(p, 'ONLINE TRANSFER FROM CHK 1234')
+    const refused = await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})
+    expect(refused.status).toBe(403)
+    expect(refused.body.error).toBe('The owner keeps money coming in to themselves, so "Not rent" is theirs to mark.')
+    expect((await txn(id)).auto_settle_undo).toBeNull()
+    expect(await unmatchedIds(p)).toEqual([id])
+    // The owner's mark stands against them too.
+    await notRent(p, id)
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent/undo`).set(bearer(bk.token)).send({})).status).toBe(403)
+    expect((await txn(id)).auto_settle_undo).not.toBeNull()
+  })
+
+  it('a bookkeeper without the bank (no company-wide box) is refused, and nothing changes', async () => {
+    const p = await park()
+    const bk = await bookkeeper(p, { companyWide: false })
+    const id = await deposit(p, 'DEPOSIT')
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})).status).toBe(403)
+    expect((await txn(id)).auto_settle_undo).toBeNull()
+  })
+
+  it('front-desk staff who take payments may not, either way', async () => {
+    const p = await park()
+    const desk = await frontDesk(p)
+    const id = await deposit(p, 'DEPOSIT')
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(desk)).send({})).status).toBe(403)
+    expect((await txn(id)).auto_settle_undo).toBeNull()
+    await notRent(p, id)
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent/undo`).set(bearer(desk)).send({})).status).toBe(403)
+    expect((await txn(id)).auto_settle_undo).not.toBeNull()
+  })
+
+  it('a bookkeeper of another company cannot mark this company\'s deposit', async () => {
+    const p = await park()
+    const q = await park()
+    const bk = await bookkeeper(q)
+    const id = await deposit(p, 'DEPOSIT')
+    expect((await request(app()).post(`/api/bank-feed/deposits/${id}/not-rent`).set(bearer(bk.token)).send({})).status).toBe(404)
+    expect((await txn(id)).auto_settle_undo).toBeNull()
+  })
+})

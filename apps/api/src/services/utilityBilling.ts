@@ -5,6 +5,8 @@ import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
 import { UTILITY_TYPE_LABEL, UTILITY_UNIT_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel, type UtilityType } from '@gam/shared'
 import { PAUSED_CYCLE_NOTE, PAUSED_CYCLE_MARKER_SQL } from './utilityPausedCycle'
+// 10/13 (Nic): "Works, nobody using it" on a flat-rate meter may stop its flat charge.
+import { ZERO_USE_CLEARED_SET, flatChargeStopped } from './meterRepair'
 
 // S90: utility bill generation engine.
 //
@@ -253,7 +255,7 @@ export async function flagBrokenMeter(
   // record, on the same connection as the flag (the change journal keeps it).
   if (m.zero_use_confirmed_at) {
     await run(
-      `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL
+      `UPDATE utility_meters SET ${ZERO_USE_CLEARED_SET}
         WHERE id = $1`, [meterId])
   }
   const who = await run(
@@ -604,7 +606,7 @@ async function zeroUseMeterMoved(
  */
 async function clearZeroUseConfirmation(meterId: string, cycleReadDate: string): Promise<boolean> {
   const cleared = await query<{ id: string }>(
-    `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL, updated_at = NOW()
+    `UPDATE utility_meters SET ${ZERO_USE_CLEARED_SET}, updated_at = NOW()
       WHERE id = $1 AND zero_use_confirmed_at IS NOT NULL
         AND zero_use_confirmed_at < $2::date
       RETURNING id`, [meterId, cycleReadDate])
@@ -1086,6 +1088,7 @@ export async function generateBillsForMeter(
       && await clearZeroUseConfirmation(meterId, lastDayOfCycle(cycleIso))) {
     meter.zero_use_confirmed_at = null
     meter.zero_use_confirmed_by_user_id = null
+    meter.zero_use_stops_flat_charge = false
   }
 
   if (meter.billing_method === 'master_bill_to_landlord') {
@@ -1152,6 +1155,17 @@ export async function generateBillsForMeter(
   }
 
   if (meter.billing_method === 'flat_rate') {
+    // 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it':
+    // LANDLORD'S CHOICE, asked at the moment of marking ('Stop the flat charge
+    // too?')." Answered yes, nothing is billed while the meter is marked
+    // unused — to any unit on it — and the flat charge starts again with the
+    // first cycle after the mark is gone (taken back, marked broken, or ended
+    // above once the household it was confirmed for left). Answered no, it
+    // bills as always (services/meterRepair flatChargeStopped).
+    if (flatChargeStopped(meter)) {
+      return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+        reason: 'confirmed working with nobody using it, and the landlord stopped the flat charge while it is' }
+    }
     // S558 (Nic): fixed per-unit charge with NO meter reading (e.g. a flat trash
     // buildback). Each served unit bills the flat amount as its own line item so
     // the tenant sees exactly what they pay for, instead of it being folded into

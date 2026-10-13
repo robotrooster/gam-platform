@@ -46,7 +46,7 @@ import {
 } from '@gam/shared'
 import { db, getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { insertPayment } from './landlordExpenses'
+import { insertPayment, systemLinkSql } from './landlordExpenses'
 import { NOT_RENT_MARK } from './bankDepositCandidates'
 // 10/12 (Nic): a mortgage payment leaving the bank is the loan payment, and a
 // loan's money arriving is the loan — never an expense or income of its own.
@@ -577,6 +577,125 @@ export async function releaseVoidedMoneyOutMatches(lineIds: string[]): Promise<n
   return n
 }
 
+// ── 10/13 (Nic): THE BANK VOIDS A LINE THAT WAS FILED AS A NEW EXPENSE ─────
+//
+//   "Bank voids a line filed as a new expense: VOID the expense too (kept on
+//    record as voided)."
+//
+// A money-out line filed on the Bank page as a new expense — one category, or
+// split into parts — that the bank then voids never paid anything, and the
+// expense it made was never spent. The sync already voids the payments the
+// filing made from the line (services/bankFeed voidFiledLinePayments); this
+// voids the expenses themselves, in the sync's own transaction: status
+// 'voided' with the day, never deleted, each stamped with the line it came
+// from (bank_transaction_id). The line is then set aside as the bank's void —
+// 'ignored', reason 'bank_void' — exactly where undoing the filing of a
+// bank-voided line puts it (bankFeed undoFiling), with what was voided on the
+// line (BANK_VOIDED_FILING_MARK). It used to stay filed and flagged, the
+// expense owed again, until the owner undid it on the Bank page; the owner is
+// now told in a notice instead (tellOwnerBankVoidedFiling).
+//
+// Left as before (filed and flagged, for the owner to change on the Bank
+// page): an expense another feature keeps (a fixed asset made from it — the
+// asset's void comes first, as on the Expenses page), and one that still has a
+// payment on it that the line did not make. A line filed as income is not an
+// expense, and stays as it was.
+
+/** The key in bank_transactions.auto_settle_undo that records the expenses voided with the bank's void. */
+export const BANK_VOIDED_FILING_MARK = 'bankVoidedFiling'
+
+/**
+ * Void the expenses a bank-voided line was filed as, and set the line aside as
+ * the bank's void. Runs in the caller's transaction, with the line locked (the
+ * sync). Returns how many expenses were voided and whether the line was set
+ * aside.
+ */
+export async function voidExpensesOfBankVoidedLine(client: Runner, lineId: string): Promise<{ voided: number; released: boolean }> {
+  const t = (await client.query<{
+    id: string; landlord_id: string; status: string; bank_status: string | null
+    expense_id: string | null; landlord_other_income_id: string | null
+  }>(
+    `SELECT id, landlord_id, status, bank_status, expense_id, landlord_other_income_id
+       FROM bank_transactions WHERE id = $1`, [lineId])).rows[0]
+  if (!t || t.status !== 'categorized' || t.bank_status !== 'void' || t.landlord_other_income_id) return { voided: 0, released: false }
+  // The one-category filing's expense, and a split's parts (they name the line).
+  const exps = (await client.query<{ id: string; status: string; system_link: string | null; paid_otherwise: boolean }>(
+    `SELECT e.id, e.status, ${systemLinkSql('e')} AS system_link,
+            EXISTS (SELECT 1 FROM landlord_expense_payments p
+                     WHERE p.expense_id = e.id AND p.voided_at IS NULL) AS paid_otherwise
+       FROM landlord_expenses e
+      WHERE e.landlord_id = $1 AND (e.id = $2::uuid OR e.bank_transaction_id = $3)
+      ORDER BY e.created_at, e.id
+      FOR UPDATE OF e`, [t.landlord_id, t.expense_id, t.id])).rows
+  const live = exps.filter(e => e.status === 'active')
+  if (!live.length) return { voided: 0, released: false }
+  const kept = live.filter(e => e.system_link || e.paid_otherwise)
+  if (kept.length) {
+    const { logger } = await import('../lib/logger')
+    logger.warn({ transactionId: t.id, kept: kept.map(e => ({ id: e.id, systemLink: e.system_link, paidOtherwise: e.paid_otherwise })) },
+      '[bank-feed] the bank voided a line filed as an expense another record keeps — left filed for the owner to change')
+    return { voided: 0, released: false }
+  }
+  const ids = live.map(e => e.id)
+  const v = await client.query(
+    `UPDATE landlord_expenses
+        SET status = 'voided', voided_at = now(), bank_transaction_id = COALESCE(bank_transaction_id, $2), updated_at = now()
+      WHERE id = ANY($1::uuid[]) AND status = 'active'`, [ids, t.id])
+  const mark = { at: new Date().toISOString(), by: null, was: t.expense_id ? 'one_category' : 'split', expenseIds: ids }
+  await client.query(
+    `UPDATE bank_transactions
+        SET status = 'ignored', ignored_reason = 'bank_void', expense_id = NULL, categorized_at = NULL,
+            auto_settle_undo = COALESCE(auto_settle_undo, '{}'::jsonb) || jsonb_build_object('${BANK_VOIDED_FILING_MARK}', $2::jsonb),
+            updated_at = now()
+      WHERE id = $1`, [t.id, JSON.stringify(mark)])
+  return { voided: v.rowCount ?? 0, released: true }
+}
+
+/**
+ * 10/13 review: the owner is told when the bank voids a line they filed as a
+ * new expense. It used to stay filed and flagged on the Bank page ("Your bank
+ * voided this transaction after it was filed"); set aside as the bank's void
+ * now, it is hidden there and its expense voided, so without this nobody would
+ * know the expense went. Once, after the sync that voided it commits (the
+ * caller), in the portal's notices — the same place as a voided rent deposit
+ * (bankDepositConfirm alertMatchedDepositVoided). Never throws.
+ */
+export async function tellOwnerBankVoidedFiling(lineId: string): Promise<boolean> {
+  try {
+    const t = await queryOne<{
+      landlord_id: string; owner_user_id: string | null; amount: string; day: string; description: string | null; mark: any
+    }>(
+      `SELECT bt.landlord_id, l.user_id AS owner_user_id, bt.amount::text AS amount,
+              to_char(bt.posted_date, 'FMMon FMDD, YYYY') AS day, bt.description,
+              bt.auto_settle_undo->'${BANK_VOIDED_FILING_MARK}' AS mark
+         FROM bank_transactions bt JOIN landlords l ON l.id = bt.landlord_id
+        WHERE bt.id = $1 AND bt.status = 'ignored' AND bt.ignored_reason = 'bank_void'
+          AND bt.auto_settle_undo ? '${BANK_VOIDED_FILING_MARK}'`, [lineId])
+    if (!t?.owner_user_id || !t.mark) return false
+    const n = Array.isArray(t.mark.expenseIds) ? t.mark.expenseIds.length : 1
+    const amount = `$${(Math.abs(booksCents(t.amount)) / 100).toFixed(2)}`
+    const what = t.description ? ` (${t.description})` : ''
+    const { createNotification } = await import('./notifications')
+    await createNotification({
+      userId: t.owner_user_id,
+      landlordId: t.landlord_id,
+      type: 'bank_line_voided',
+      title: n === 1 ? 'Your bank voided a transaction you filed as an expense' : 'Your bank voided a transaction you split into expenses',
+      body: `Your bank voided the ${amount} transaction of ${t.day}${what} — the money never left. `
+        + (n === 1
+          ? 'The expense you filed it as was voided too; it stays on record as voided.'
+          : `The ${n} expenses you split it into were voided too; they stay on record as voided.`),
+      actionUrl: '/expenses',
+      data: { bank_transaction_id: lineId, expense_ids: t.mark.expenseIds ?? [] },
+    })
+    return true
+  } catch (err) {
+    const { logger } = await import('../lib/logger')
+    logger.error({ err, lineId }, '[bank-feed] could not tell the owner the bank voided a line they filed')
+    return false
+  }
+}
+
 // ── Nic L19: what a bookkeeper may file of the money coming in ──────────────
 
 /** The owner's choice for this bookkeeper (DEFAULT_BOOKKEEPER_MONEY_IN_FILING when none). */
@@ -591,10 +710,10 @@ export async function bookkeeperMoneyInFiling(userId: string, landlordId: string
 /**
  * Refuses (403) a bookkeeper filing, splitting, ignoring or undoing a line of
  * money COMING in unless the owner's choice for them allows it: 'any', or
- * 'after_not_rent' with the line marked "Not rent" by someone who takes
- * payments. A deposit filed or ignored leaves the rent queue, and a tenant's
- * rent filed as other income stays open on the tenant's account with late
- * fees following (design §11). Money going out passes.
+ * 'after_not_rent' with the line marked "Not rent" first. A deposit filed or
+ * ignored leaves the rent queue, and a tenant's rent filed as other income
+ * stays open on the tenant's account with late fees following (design §11).
+ * Money going out passes.
  */
 export async function assertBookkeeperMayFileLine(user: { role?: string; userId?: string }, landlordId: string, lineId: string): Promise<void> {
   if (user.role !== 'bookkeeper') return
@@ -606,11 +725,29 @@ export async function assertBookkeeperMayFileLine(user: { role?: string; userId?
   const choice = await bookkeeperMoneyInFiling(user.userId ?? '', landlordId)
   if (choice === 'any') return
   if (choice === 'after_not_rent' && t.marked) return
-  // 10/12 review: "Not rent" is the owner's to mark (POST /bank-feed/deposits/
-  // :id/not-rent is requireLandlord), so the bookkeeper is sent to the owner.
+  // 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk
+  // staff)" — the API takes the bookkeeper's mark too (POST /bank-feed/
+  // deposits/:id/not-rent, requireBankFiler), but the button is on the owner's
+  // Bank page only, so the words do not send them looking for it.
   throw new AppError(403, choice === 'never'
     ? 'The owner keeps money coming in to themselves. Money going out is yours to file.'
-    : 'This deposit may be a tenant\'s rent. The owner marks it "Not rent" first; then you can file it.')
+    : 'This deposit may be a tenant\'s rent. It has to be marked "Not rent" first; then you can file it.')
+}
+
+/**
+ * 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk
+ * staff)" — read with Nic L19 (10/12): a bookkeeper files money coming in only
+ * as the owner chose for them. Taking a deposit off the "Deposits that may be
+ * rent" list is a call about money coming in, and a tenant's rent taken off it
+ * stays owed on the tenant's account with late fees following (design §11). So
+ * a bookkeeper the owner keeps away from money coming in ('never') neither
+ * marks a deposit "Not rent" nor takes the mark back; 'any' and
+ * 'after_not_rent' do. Refuses (403); the owner and GAM pass.
+ */
+export async function assertBookkeeperMayMarkNotRent(user: { role?: string; userId?: string }, landlordId: string): Promise<void> {
+  if (user.role !== 'bookkeeper') return
+  if (await bookkeeperMoneyInFiling(user.userId ?? '', landlordId) !== 'never') return
+  throw new AppError(403, 'The owner keeps money coming in to themselves, so "Not rent" is theirs to mark.')
 }
 
 /**

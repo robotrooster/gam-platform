@@ -45,7 +45,13 @@ export interface CheckoutQuote {
   pastEndAttempted?: {
     words: string
     charges: Array<{ paymentId: string; dueDate: string; amount: number }>
-    choices: { void: string; keep: string }
+    /**
+     * 10/13 (Nic): "Take those charges off" (void) is the owner's and a
+     * manager's with the booking permission; anybody else gets "Keep them
+     * owed" only, and voidRefused says why.
+     */
+    choices: { void?: string; keep: string }
+    voidRefused?: string | null
   } | null
   waitsForRefund: string | null
   /** For staff without "Check guests out" on a guest who still owes. */
@@ -165,6 +171,38 @@ export function retryParts(q: Pick<CheckoutQuote, 'decision' | 'canRefund'> | nu
 export function windowTitle(q: Pick<CheckoutQuote, 'checkedOut' | 'decision'> | null): string {
   if (!q?.checkedOut) return 'Check out'
   return q.decision?.status === 'decided' ? 'Early check-out refund' : 'Decide the money'
+}
+
+/** The answers to rent a payment was tried on past the day they left. */
+export type PastEndChoice = 'void' | 'keep'
+/** The one answer everybody may give (the server's own words when it sends them). */
+export const KEEP_THEM_OWED = 'Keep them owed'
+
+/**
+ * 10/13 (Nic): "void the cancelled nights: owner + managers with booking
+ * permission." The answers to offer for rent a payment was tried on past the
+ * day they left — the schedule's shorter-stay question (SchedulePage) and the
+ * Check out window's (EarlyCheckOutModal) — exactly as the server sent them:
+ * "Take those charges off" only when it was offered (the owner's, and a
+ * booking manager's), "Keep them owed" always, since anybody who reaches the
+ * question may keep them owed. A reply that names neither (an older server, a
+ * reply cut short) still leaves "Keep them owed" — never a chooser with
+ * nothing to press, which saved nothing and said nothing.
+ */
+export function pastEndChoices(
+  offered: { void?: unknown; keep?: unknown } | null | undefined,
+): Array<{ value: PastEndChoice; label: string }> {
+  const words = (v: unknown) => (typeof v === 'string' && v.trim() ? v : null)
+  const out: Array<{ value: PastEndChoice; label: string }> = []
+  const off = words(offered?.void)
+  if (off) out.push({ value: 'void', label: off })
+  out.push({ value: 'keep', label: words(offered?.keep) ?? KEEP_THEM_OWED })
+  return out
+}
+
+/** The question, with why "Take those charges off" is not offered when the server says. */
+export function pastEndQuestion(words: string, voidRefused?: string | null): string {
+  return voidRefused ? `${words}\n\n${voidRefused}` : words
 }
 
 /** A new key for one press of the window (a double click, or two windows, decide once). */

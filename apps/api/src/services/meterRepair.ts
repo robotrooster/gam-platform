@@ -37,6 +37,13 @@
  * as they stand when the cycle is billed, so a read corrected before billing
  * is simply the read (10/12 review: a trigger that cleared it the moment a
  * differing read was saved lost it for good to a typo corrected minutes later).
+ *
+ * 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it': LANDLORD'S
+ * CHOICE, asked at the moment of marking ('Stop the flat charge too?')." On a
+ * flat-rate meter the choice carries the landlord's answer
+ * (utility_meters.zero_use_stops_flat_charge, written with the confirmation
+ * and cleared with it): yes, and the flat charge is not billed while the meter
+ * is marked unused (services/utilityBilling); no, and it keeps billing.
  */
 import type { PoolClient } from 'pg'
 import { meterWorksNoUseLabel } from '@gam/shared'
@@ -53,6 +60,8 @@ export async function markMeterRepaired(client: PoolClient, a: {
   userId: string
   /** The meter works and the household on it uses nothing: zero use bills $0 (10/12). */
   zeroUseConfirmed?: boolean
+  /** 10/13 (Nic): with zeroUseConfirmed on a flat-rate meter, "Stop the flat charge too?" answered yes. */
+  stopFlatCharge?: boolean
 }): Promise<void> {
   const meter = (await client.query<{ property_id: string }>(
     `UPDATE utility_meters
@@ -61,7 +70,7 @@ export async function markMeterRepaired(client: PoolClient, a: {
       RETURNING property_id`, [a.meterId])).rows[0]
   if (!meter) throw new Error(`markMeterRepaired: meter ${a.meterId} not found`)
   // Written only when confirmed, so the "Repaired" path never touches the column.
-  if (a.zeroUseConfirmed === true) await recordZeroUseConfirmation(client, a.meterId, a.userId)
+  if (a.zeroUseConfirmed === true) await recordZeroUseConfirmation(client, a.meterId, a.userId, a.stopFlatCharge === true)
   // The fresh starting point, dated today at the property.
   await client.query(`
     INSERT INTO utility_meter_readings
@@ -86,6 +95,13 @@ export async function markMeterWorksNoUse(client: PoolClient, a: {
   meterId: string
   /** Who confirmed it (the landlord or staff member). */
   userId: string
+  /**
+   * 10/13 (Nic): on a flat-rate meter, the answer to "Stop the flat charge
+   * too?" — true stops it while the meter is marked unused. Only a flat-rate
+   * meter carries it (routes/utility refuses it elsewhere); false or absent
+   * keeps it billing.
+   */
+  stopFlatCharge?: boolean
 }): Promise<void> {
   const meter = (await client.query(
     `UPDATE utility_meters
@@ -93,15 +109,38 @@ export async function markMeterWorksNoUse(client: PoolClient, a: {
       WHERE id = $1
       RETURNING id`, [a.meterId])).rows[0]
   if (!meter) throw new Error(`markMeterWorksNoUse: meter ${a.meterId} not found`)
-  await recordZeroUseConfirmation(client, a.meterId, a.userId)
+  await recordZeroUseConfirmation(client, a.meterId, a.userId, a.stopFlatCharge === true)
 }
 
-/** The confirmation and who made it, written together (cleared together too). */
-async function recordZeroUseConfirmation(client: PoolClient, meterId: string, userId: string): Promise<void> {
+/**
+ * The confirmation, who made it, and (10/13) whether it stops a flat charge —
+ * written together, and cleared together too (ZERO_USE_CLEARED_SET).
+ */
+async function recordZeroUseConfirmation(client: PoolClient, meterId: string, userId: string, stopsFlatCharge = false): Promise<void> {
   await client.query(
     `UPDATE utility_meters
-        SET zero_use_confirmed_at = NOW(), zero_use_confirmed_by_user_id = $2, updated_at = NOW()
-      WHERE id = $1`, [meterId, userId])
+        SET zero_use_confirmed_at = NOW(), zero_use_confirmed_by_user_id = $2,
+            zero_use_stops_flat_charge = ($3::boolean AND billing_method = 'flat_rate'), updated_at = NOW()
+      WHERE id = $1`, [meterId, userId, stopsFlatCharge])
+}
+
+/**
+ * 10/13: the SET list every place that clears "Works, nobody using it" uses,
+ * so the flat-charge answer always goes with the confirmation (a flat charge
+ * starts again the moment the meter is no longer marked unused).
+ */
+export const ZERO_USE_CLEARED_SET =
+  'zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL, zero_use_stops_flat_charge = FALSE'
+
+/**
+ * 10/13 (Nic): does this meter's flat charge stop this cycle? A flat-rate
+ * meter marked "Works, nobody using it" whose landlord answered yes to "Stop
+ * the flat charge too?" — and only while the mark stands.
+ */
+export function flatChargeStopped(m: {
+  billing_method?: string | null; zero_use_confirmed_at?: Date | string | null; zero_use_stops_flat_charge?: boolean | null
+}): boolean {
+  return m.billing_method === 'flat_rate' && !!m.zero_use_confirmed_at && m.zero_use_stops_flat_charge === true
 }
 
 // ── 10/12 (Nic), Q-f: THE ESTIMATES BILLED WHILE IT WAS FLAGGED ──────────────

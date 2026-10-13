@@ -33,7 +33,8 @@ import {
   syncLeaseWithBookingDates, pastEndAttemptedCharges, stayShortenedChoiceIn, recordStayShortenedChoice,
   type PastEndAttempted,
 } from '../services/bookingLeaseBilling'
-import { STAY_SHORTENED_CHARGE_CHOICE_LABEL, type StayShortenedChargeChoice } from '@gam/shared'
+import { type StayShortenedChargeChoice } from '@gam/shared'
+import { shortenedChoicesFor, assertMayAnswerShortened } from '../lib/stayShortenedVoid'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
 import { scheduleStayPrice, stayExtensionQuote, extendStayByMonth, SCREENING_LINE_NAME, type StayExtension } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
@@ -3606,12 +3607,18 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       shortenedAsk = await pastEndAttemptedCharges(booking.id, newCheckOut)
       if (shortenedAsk) {
         shortenedChoice = stayShortenedChoiceIn(req.body?.pastEndAttempted)
+        // 10/13 (Nic): "void the cancelled nights: owner + managers with
+        // booking permission" (lib/stayShortenedVoid). Anybody else is offered
+        // "Keep them owed" only, and a 'void' they send is refused here,
+        // before anything is written.
         if (!shortenedChoice) {
+          const offer = shortenedChoicesFor(req.user)
           return void res.status(409).json({
             success: false, code: 'stay_shortened_attempted', error: shortenedAsk.words,
-            charges: shortenedAsk.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL,
+            charges: shortenedAsk.lines, choices: offer.choices, voidRefused: offer.voidRefused,
           })
         }
+        assertMayAnswerShortened(req.user, shortenedChoice)
       }
     }
 

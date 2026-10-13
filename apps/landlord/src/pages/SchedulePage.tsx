@@ -7,6 +7,7 @@ import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
 import { toast, appConfirm, appPrompt, appChoose } from '../components/dialogs'
+import { pastEndChoices, pastEndQuestion } from '../lib/earlyCheckOut'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
 import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
@@ -966,16 +967,16 @@ export function SchedulePage() {
   // landlord chooses here, at the moment: take those charges off (anything
   // paid on them goes back to the guest as credit), or keep them owed. The
   // change is sent again with the answer; Cancel saves nothing.
+  // 10/13 (Nic): "Take those charges off" is the owner's and a manager's with
+  // the booking permission — the server sends only the answers this person may
+  // give (and says why when "Take those charges off" is not one of them).
   const askShortenedIf = (e: any, resend: (choice: string) => void): boolean => {
     const body = e?.response?.data
     if (e?.response?.status !== 409 || body?.code !== 'stay_shortened_attempted') return false
-    const labels = body?.choices ?? {}
-    appChoose(body.error, {
+    // Only the answers the server offered; "Keep them owed" always (lib/earlyCheckOut).
+    appChoose(pastEndQuestion(body.error, body.voidRefused), {
       title: 'Rent a payment was tried on',
-      choices: [
-        { value: 'void', label: labels.void ?? 'Take those charges off' },
-        { value: 'keep', label: labels.keep ?? 'Keep them owed' },
-      ],
+      choices: pastEndChoices(body?.choices),
     }).then(choice => { if (choice) resend(choice) })
     return true
   }

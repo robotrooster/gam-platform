@@ -164,7 +164,8 @@ describe('"Works, tenant uses no power" on a meter marked broken', () => {
     const landlordPays = await add('office water', 'master_bill_to_landlord', ', digits', ', 6')
     const flat = await add('flat water', 'flat_rate', ', rate_per_unit', ', 25')
     for (const id of [rubs, landlordPays, flat]) {
-      const res = await patch(p, id, { zeroUseConfirmed: true })
+      // 10/13 (Nic): a flat-rate meter's "Works" carries "Stop the flat charge too?" (no, here).
+      const res = await patch(p, id, { zeroUseConfirmed: true, ...(id === flat ? { stopFlatCharge: false } : {}) })
       expect(res.status, JSON.stringify(res.body)).toBe(200)
       expect(await meterRow(id)).toMatchObject({ out_of_service: false, zero_use_confirmed_by_user_id: p.userId })
       expect(await confirmed(id)).toBe(true)
@@ -758,7 +759,7 @@ describe('a meter that is not a submeter, and taking it back (10/12 review)', ()
     const trash = await addMeter(p, 'trash', 'flat_rate')
     const s = await space(p, 'RV 30', 100, 150)
     await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [trash, s.unitId])
-    expect((await patch(p, trash, { zeroUseConfirmed: true })).status).toBe(200)
+    expect((await patch(p, trash, { zeroUseConfirmed: true, stopFlatCharge: false })).status).toBe(200)
     await confirmedOnOct5(trash)
     // Nobody new yet: it stands through October's charge.
     await run(trash, '2026-10-01')
@@ -797,7 +798,7 @@ describe('a meter that is not a submeter, and taking it back (10/12 review)', ()
     const trash = await addMeter(p, 'trash', 'flat_rate')
     const s = await space(p, 'RV 31', 100, 150)
     for (const id of [office, trash, s.meterId]) {
-      expect((await patch(p, id, { zeroUseConfirmed: true })).status).toBe(200)
+      expect((await patch(p, id, { zeroUseConfirmed: true, ...(id === trash ? { stopFlatCharge: false } : {}) })).status).toBe(200)
       // A rename, or an explicit false, leaves it.
       expect((await patch(p, id, { label: 'renamed', zeroUseWithdrawn: false })).status).toBe(200)
       expect(await confirmed(id)).toBe(true)
@@ -826,5 +827,112 @@ describe('a meter that is not a submeter, and taking it back (10/12 review)', ()
     await patch(other, office, { zeroUseConfirmed: true })
     expect((await patch(p, office, { zeroUseWithdrawn: true })).status).toBe(403)
     expect(await confirmed(office)).toBe(true)
+  })
+})
+
+
+// ── 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it': LANDLORD'S
+// CHOICE, asked at the moment of marking ('Stop the flat charge too?')." Yes:
+// the flat charge stops while the meter is marked unused and starts again when
+// it is not. No: it keeps billing (as it always did).
+describe('"Stop the flat charge too?" on a flat-rate meter (10/13, Nic)', () => {
+  /** A $25 trash charge on an occupied space (rate set at the property, as the flat branch reads it). */
+  async function trashOnSpace() {
+    const p = await park({ estimates: false })
+    const s = await space(p, 'RV 12', 100, 150)
+    await db.query(`INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit) VALUES ($1, 'trash', 25)
+                    ON CONFLICT DO NOTHING`, [p.propertyId])
+    const trash = (await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, rate_per_unit)
+       VALUES ($1, 'trash', 'RV 12 trash', 'flat_rate', 25) RETURNING id`, [p.propertyId])).rows[0].id
+    await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [trash, s.unitId])
+    return { p, s, trash }
+  }
+  const stops = (meterId: string) => db.query<{ s: boolean }>(
+    `SELECT zero_use_stops_flat_charge AS s FROM utility_meters WHERE id = $1`, [meterId]).then(r => r.rows[0].s)
+
+  it('is asked when the meter is marked: without an answer nothing is saved', async () => {
+    const { p, trash } = await trashOnSpace()
+    const res = await patch(p, trash, { zeroUseConfirmed: true })
+    expect(res.status).toBe(409)
+    expect(res.body).toMatchObject({ code: 'flat_charge_question', spaces: 1 })
+    expect(res.body.error).toBe('Stop the flat charge too? Yes: RV 12 trash bills nothing to the 1 space on it while it is marked unused, '
+      + 'and starts again once it is not. No: it keeps billing.')
+    expect(await confirmed(trash)).toBe(false)
+  })
+
+  it('yes: nothing is billed while it is marked unused; taken back, the flat charge starts again', async () => {
+    const { p, trash } = await trashOnSpace()
+    expect((await patch(p, trash, { zeroUseConfirmed: true, stopFlatCharge: true })).status).toBe(200)
+    expect(await stops(trash)).toBe(true)
+    await confirmedOnOct5(trash)
+    const oct = await run(trash, '2026-10-01')
+    expect(oct).toMatchObject({ billsCreated: 0 })
+    expect(oct.reason).toMatch(/stopped the flat charge/)
+    expect(await billsFor(trash, '2026-10-01')).toEqual([])
+
+    const back = await patch(p, trash, { zeroUseWithdrawn: true })
+    expect(back.status).toBe(200)
+    expect(back.body.data).toMatchObject({ zero_use_confirmed_at: null, zero_use_stops_flat_charge: false })
+    const nov = await run(trash, '2026-11-01')
+    expect(nov.reason).toBeUndefined()
+    expect(await billsFor(trash, '2026-11-01')).toEqual([expect.objectContaining({ charge: 25, allocation_method: 'flat_rate' })])
+  })
+
+  it('no: it keeps billing, as it always did', async () => {
+    const { p, trash } = await trashOnSpace()
+    expect((await patch(p, trash, { zeroUseConfirmed: true, stopFlatCharge: false })).status).toBe(200)
+    expect(await confirmed(trash)).toBe(true)
+    expect(await stops(trash)).toBe(false)
+    await confirmedOnOct5(trash)
+    await run(trash, '2026-10-01')
+    expect(await billsFor(trash, '2026-10-01')).toEqual([expect.objectContaining({ charge: 25 })])
+  })
+
+  it('starts again on its own once the household it was confirmed for is gone (a new one arrives)', async () => {
+    const { p, trash } = await trashOnSpace()
+    await patch(p, trash, { zeroUseConfirmed: true, stopFlatCharge: true })
+    await confirmedOnOct5(trash)
+    await run(trash, '2026-10-01')
+    expect(await billsFor(trash, '2026-10-01')).toEqual([])
+    // A new household on another space the meter serves, from 11/3.
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: p.propertyId, landlordId: p.landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId: p.landlordId, startDate: '2026-11-03' })
+      await seedLeaseTenant(c, { leaseId, tenantId: await seedTenant(c) })
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [trash, unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    await run(trash, '2026-11-01')
+    expect(await confirmed(trash)).toBe(false)
+    expect(await stops(trash)).toBe(false)
+    expect((await billsFor(trash, '2026-11-01')).length).toBeGreaterThan(0)
+  })
+
+  it('is a flat-rate question only, answered only with "Works", and never by the assistant', async () => {
+    const { p, s, trash } = await trashOnSpace()
+    // On a submeter there is nothing flat to stop.
+    expect((await patch(p, s.meterId, { zeroUseConfirmed: true, stopFlatCharge: true })).status).toBe(400)
+    expect(await confirmed(s.meterId)).toBe(false)
+    // Without "Works" it answers nothing (false, like zeroUseConfirmed: false, changes nothing).
+    expect((await patch(p, trash, { stopFlatCharge: true })).status).toBe(400)
+    expect((await patch(p, trash, { label: 'RV 12 can', stopFlatCharge: false })).status).toBe(200)
+    expect(await confirmed(trash)).toBe(false)
+    // The assistant makes no money decision: the landlord answers on the Utilities page.
+    const agent = await request(app()).patch(`/api/utility/meters/${trash}`).set('Authorization', `Bearer ${p.token}`)
+      .set('X-GAM-Actor', 'agent').send({ zeroUseConfirmed: true, stopFlatCharge: false })
+    expect(agent.status).toBe(403)
+    expect(agent.body.error).toMatch(/landlord's own choice/)
+    expect(await confirmed(trash)).toBe(false)
+  })
+
+  it('marking it broken by hand ends the mark and the stop with it', async () => {
+    const { p, trash } = await trashOnSpace()
+    await patch(p, trash, { zeroUseConfirmed: true, stopFlatCharge: true })
+    expect((await patch(p, trash, { outOfService: true })).status).toBe(200)
+    expect(await stops(trash)).toBe(false)
+    expect(await confirmed(trash)).toBe(false)
   })
 })

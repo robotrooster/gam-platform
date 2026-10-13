@@ -7,7 +7,8 @@
  *   - a money-out line that fits a record to the cent is matched first
  *     (409 MATCH_FIRST), filed as a new expense only on "none of these"
  *   - a transfer files the money arriving too, under the owner's L19 choice
- *   - a bank void of a line filed as a new expense voids its payment
+ *   - a bank void of a line filed as a new expense voids its payment, and
+ *     (10/13, Nic) the expense itself, kept on record as voided
  *   - a bill GAM keeps for something else (a fixed asset here) keeps its
  *     amount and is removed where it came from; archiving a starting category
  *     never stops the bills GAM makes there
@@ -175,8 +176,20 @@ describe('L19: a transfer files the money arriving too', () => {
   })
 })
 
-describe('a bank void of a line filed as a new expense (design §12)', () => {
-  it('voids the payment the filing made: the expense is owed again, the line stays filed and flagged', async () => {
+describe('a bank void of a line filed as a new expense (design §12; 10/13, Nic)', () => {
+  // 10/13 (Nic): "Bank voids a line filed as a new expense: VOID the expense
+  // too (kept on record as voided)."
+  const expenseRow = async (id: string) => (await db.query(
+    `SELECT status, voided_at IS NOT NULL AS voided, bank_transaction_id FROM landlord_expenses WHERE id = $1`, [id])).rows[0]
+  const lineRow = async (id: string) => (await db.query(
+    `SELECT status, ignored_reason, bank_status, expense_id, auto_settle_undo FROM bank_transactions WHERE id = $1`, [id])).rows[0]
+  // 10/13 review: the owner is told — the line is hidden as the bank's void now.
+  const toldOwner = async (co: Co) => (await db.query(
+    `SELECT n.user_id = l.user_id AS to_owner, n.title, n.body, n.action_url, n.email_sent
+       FROM notifications n JOIN landlords l ON l.id = n.landlord_id
+      WHERE n.landlord_id = $1 AND n.type = 'bank_line_voided' ORDER BY n.created_at`, [co.landlordId])).rows
+
+  it('voids the payment the filing made and the expense itself (kept), and sets the line aside as the bank\'s void', async () => {
     const co = await company()
     const t = await line(co, -64, '2026-10-02')
     const filed = await request(app()).post(`/api/bank-feed/transactions/${t.id}/categorize`).set(as(co.owner))
@@ -184,10 +197,74 @@ describe('a bank void of a line filed as a new expense (design §12)', () => {
     expect(filed.status).toBe(200)
     const expenseId = filed.body.data.expenseId
     expect((await paidOn(expenseId)).map(p => p.voided)).toEqual([false])
+    expect(await landlordExpensesTotal(co.landlordId, '2026-10-01', '2026-10-31')).toBe(64)
     await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: -64, status: 'void' }])
     expect((await paidOn(expenseId)).map(p => p.voided)).toEqual([true])
-    expect((await db.query(`SELECT status, bank_status FROM bank_transactions WHERE id = $1`, [t.id])).rows[0])
-      .toEqual({ status: 'categorized', bank_status: 'void' })
+    // Kept on record, voided, stamped with the line it came from — never deleted.
+    expect(await expenseRow(expenseId)).toEqual({ status: 'voided', voided: true, bank_transaction_id: t.id })
+    expect(await landlordExpensesTotal(co.landlordId, '2026-10-01', '2026-10-31')).toBe(0)
+    const after = await lineRow(t.id)
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void', expense_id: null })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({ was: 'one_category', expenseIds: [expenseId], by: null })
+    // Nothing is owed on it: it is not an open bill.
+    expect((await request(app()).get('/api/expenses?state=open').set(as(co.owner))).body.data).toEqual([])
+    // The owner is told, once, in the portal's notices (no email).
+    expect(await toldOwner(co)).toEqual([{
+      to_owner: true, title: 'Your bank voided a transaction you filed as an expense',
+      body: 'Your bank voided the $64.00 transaction of Oct 2, 2026 (ACME SUPPLY) — the money never left. The expense you filed it as was voided too; it stays on record as voided.',
+      action_url: '/expenses', email_sent: false,
+    }])
+    // The bank saying it again changes nothing and tells nobody again.
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: -64, status: 'void' }])
+    expect(await toldOwner(co)).toHaveLength(1)
+  })
+
+  it('a split line: every part is voided (kept), and the line is set aside', async () => {
+    const co = await company()
+    const t = await line(co, -100, '2026-10-02')
+    const split = await request(app()).post(`/api/bank-feed/transactions/${t.id}/split`).set(as(co.owner)).send({ parts: [
+      { category: 'supplies', amount: 60, scopeKind: 'property_common', propertyId: co.propertyId },
+      { category: 'repairs', amount: 40, scopeKind: 'unit', unitId: co.unitId },
+    ] })
+    expect(split.status, JSON.stringify(split.body)).toBe(200)
+    const parts: string[] = split.body.data.expenseIds
+    expect(parts).toHaveLength(2)
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: -100, status: 'void' }])
+    for (const id of parts) expect(await expenseRow(id)).toEqual({ status: 'voided', voided: true, bank_transaction_id: t.id })
+    const after = await lineRow(t.id)
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void' })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({ was: 'split' })
+    expect([...after.auto_settle_undo.bankVoidedFiling.expenseIds].sort()).toEqual([...parts].sort())
+    expect((await toldOwner(co)).map(n => [n.to_owner, n.title, n.body])).toEqual([[true,
+      'Your bank voided a transaction you split into expenses',
+      'Your bank voided the $100.00 transaction of Oct 2, 2026 (ACME SUPPLY) — the money never left. The 2 expenses you split it into were voided too; they stay on record as voided.']])
+  })
+
+  it('an expense another record keeps (it became a fixed asset) is left filed and flagged for the owner, as before', async () => {
+    const co = await company()
+    const t = await line(co, -4000, '2026-10-02')
+    const filed = await request(app()).post(`/api/bank-feed/transactions/${t.id}/categorize`).set(as(co.owner))
+      .send({ category: 'supplies', scopeKind: 'property_common', propertyId: co.propertyId })
+    const expenseId = filed.body.data.expenseId
+    await db.query(
+      `INSERT INTO books_fixed_assets (landlord_id, property_id, name, asset_class, cost, salvage_value, acquired_on, in_service_date,
+                                       life_years, method, source_expense_id)
+       VALUES ($1, $2, 'Mower', 'equipment', 4000, 0, '2026-10-02', '2026-10-02', 5, 'straight_line', $3)`, [co.landlordId, co.propertyId, expenseId])
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: -4000, status: 'void' }])
+    expect((await expenseRow(expenseId)).status).toBe('active')
+    expect(await lineRow(t.id)).toMatchObject({ status: 'categorized', bank_status: 'void', expense_id: expenseId })
+    // Left on the Bank page with its flag: no notice of an expense voided.
+    expect(await toldOwner(co)).toEqual([])
+  })
+
+  it('money coming in filed as income is not an expense, and stays filed and flagged', async () => {
+    const co = await company()
+    const t = await line(co, 75, '2026-10-02')
+    const filed = await request(app()).post(`/api/bank-feed/transactions/${t.id}/categorize`).set(as(co.owner))
+      .send({ category: 'laundry', scopeKind: 'property_common', propertyId: co.propertyId })
+    expect(filed.status, JSON.stringify(filed.body)).toBe(200)
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: 75, status: 'void' }])
+    expect(await lineRow(t.id)).toMatchObject({ status: 'categorized', bank_status: 'void' })
   })
 })
 

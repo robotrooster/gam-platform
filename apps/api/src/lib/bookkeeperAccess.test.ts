@@ -96,6 +96,9 @@ const EXPECTED_ALLOWED = new Set([
   'POST /api/bank-feed/transactions/:id/ignore',
   'POST /api/bank-feed/transactions/:id/match-expenses',
   'POST /api/bank-feed/transactions/:id/match-record',
+  // 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk staff)".
+  'POST /api/bank-feed/deposits/:id/not-rent',
+  'POST /api/bank-feed/deposits/:id/not-rent/undo',
   'GET /api/reports/summary',
   'GET /api/reports/monthly-pl',
   'GET /api/reports/property-pl',
@@ -146,9 +149,10 @@ describe('the bookkeeper gate, against every route the API declares', () => {
       // 10/12 (Nic, L19): the bank lines' filing routes are opened on purpose (above).
       .filter(k => !EXPECTED_ALLOWED.has(k))
     expect(leaks).toEqual([])
-    // Never a tenant's payment: confirming a deposit, a recorded deposit, "Not rent".
+    // Never a tenant's payment: confirming a deposit, a recorded deposit. (10/13,
+    // Nic: "Not rent" is the owner's and the bookkeeper's — EXPECTED_ALLOWED.)
     for (const k of ['POST /api/bank-feed/deposits/:id/confirm', 'POST /api/bank-feed/deposits/:id/recorded-deposit',
-                     'POST /api/bank-feed/deposits/:id/not-rent', 'POST /api/bank-feed/link-session']) {
+                     'GET /api/bank-feed/deposits/unmatched', 'POST /api/bank-feed/link-session']) {
       const [m, t] = k.split(' ')
       expect(isBookkeeperRequestAllowed(m, t.replace(':id', UUID)), k).toBe(false)
     }

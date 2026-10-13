@@ -9,6 +9,7 @@ import { MERCHANT_RULE_SCOPES, BANK_TXN_STATUSES, BANK_OUT_MATCH_KINDS, BANK_IN_
 import { companyWideRefusal, bookkeeperMayWrite, READ_ONLY_REFUSAL } from '../lib/bookkeeperScope'
 import {
   moneyOutMatchesFor, matchLineToExpenses, matchLineToRecord, assertBookkeeperMayFileLine, assertBookkeeperMayFileTransfer,
+  assertBookkeeperMayMarkNotRent,
 } from '../services/bankMoneyOut'
 import { queryOne } from '../db'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
@@ -28,8 +29,11 @@ bankFeedRouter.use(requireAuth)
  * bookkeeper's with the bank — the company-wide box (10/12, ledger decision 2:
  * one level, so every such bookkeeper files). Money going out is open to them; money coming in only as the
  * owner chose for them (assertBookkeeperMayFileLine on each filing route).
- * Never a tenant's payment: confirming a deposit, a recorded deposit and "Not
- * rent" stay the owner's (requireLandlord, and off the bookkeeper allowlist).
+ * Never a tenant's payment: confirming a deposit and a recorded deposit stay
+ * the owner's (requireLandlord, and off the bookkeeper allowlist). 10/13 (Nic):
+ * "Not rent" is the owner's and the bookkeeper's ("owner + bookkeeper (not
+ * front-desk staff)") — requireBankFiler, on the bookkeeper allowlist; never a
+ * bookkeeper the owner keeps away from money coming in (assertBookkeeperMayMarkNotRent).
  */
 function bankGate(write: boolean) {
   return (req: any, res: any, next: any) => {
@@ -482,9 +486,18 @@ bankFeedRouter.post('/deposits/:id/recorded-deposit', requireLandlord, async (re
 //     between their own accounts and income are different things, and which
 //     one it is, is theirs to say there (file it, or ignore it).
 // Pressing it twice is harmless (the first mark stands).
-bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, res, next) => {
+//
+// WHO — 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not
+// front-desk staff)." The owner, and a bookkeeper with the bank (the
+// company-wide box, requireBankFiler — the same door as filing a bank line).
+// Never staff who take payments: the front desk makes the deposit slip, it
+// does not say what a bank line was. The mark keeps who pressed it ('by').
+// Nic L19: a bookkeeper the owner keeps away from money coming in ('never')
+// does not make this call either (assertBookkeeperMayMarkNotRent).
+bankFeedRouter.post('/deposits/:id/not-rent', requireBankFiler, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayMarkNotRent(req.user, landlordId)
     const row = await queryOne<{ id: string; amount: string; posted_date: string }>(
       `UPDATE bank_transactions
           SET auto_settle_undo = CASE
@@ -506,10 +519,12 @@ bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, 
 
 // POST /api/bank-feed/deposits/:id/not-rent/undo — the one-button back-out:
 // the deposit comes back on the rent-matching list exactly as it was (the
-// mark is removed; anything else the column held stays).
-bankFeedRouter.post('/deposits/:id/not-rent/undo', requireLandlord, async (req: any, res, next) => {
+// mark is removed; anything else the column held stays). 10/13 (Nic): the
+// owner's and a bookkeeper's with the bank, like the mark itself.
+bankFeedRouter.post('/deposits/:id/not-rent/undo', requireBankFiler, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayMarkNotRent(req.user, landlordId)
     const row = await queryOne<{ id: string }>(
       `UPDATE bank_transactions
           SET auto_settle_undo = NULLIF(auto_settle_undo - '${NOT_RENT_MARK}', '{}'::jsonb),

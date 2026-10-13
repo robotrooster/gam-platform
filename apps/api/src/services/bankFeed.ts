@@ -328,6 +328,9 @@ export async function upsertTransactions(
   // S655 (Step 12): deposits already matched to a tenant's bills that the bank
   // has now voided — both sides are told once this sync commits.
   const voidedMatched: string[] = []
+  // 10/13 (Nic): lines filed as a new expense that the bank voided — their
+  // expenses were voided with them; the owner is told once this sync commits.
+  const voidedFiled: string[] = []
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -386,7 +389,7 @@ export async function upsertTransactions(
     const fresh: FeedRow[] = []
     for (const r of rows) {
       const s = stored.get(r.externalId)
-      if (s) { if (await followTheBank(client, s, r, reviewState, voidedMatched)) followed++; continue }
+      if (s) { if (await followTheBank(client, s, r, reviewState, voidedMatched, voidedFiled)) followed++; continue }
       if ((r.status ?? 'posted') !== 'posted') { notPostedYet++; continue }
       fresh.push(r)
     }
@@ -475,6 +478,13 @@ export async function upsertTransactions(
     const { releaseVoidedMoneyOutMatches } = await import('./bankMoneyOut')
     await releaseVoidedMoneyOutMatches(voidedMatched)
   }
+  if (voidedFiled.length) {
+    // 10/13 review: the line used to stay filed and flagged on the Bank page;
+    // set aside as the bank's void now, it is hidden there — so the owner is
+    // told what changed (services/bankMoneyOut).
+    const { tellOwnerBankVoidedFiling } = await import('./bankMoneyOut')
+    for (const id of voidedFiled) await tellOwnerBankVoidedFiling(id)
+  }
   if (replacedOldCopy || keptOldCopy || followed || notPostedYet) {
     logger.info({ connectionId, inserted, replacedOldCopy, keptOldCopy, followed, notPostedYet },
       '[bank-feed] sync: copies from an earlier link paired, bank changes followed, pending left for later')
@@ -490,6 +500,7 @@ async function followTheBank(
   client: PoolClient, s: StoredRow, r: FeedRow,
   reviewState: (postedDate: string) => { status: string; reason: string | null },
   voidedMatched: string[] = [],
+  voidedFiled: string[] = [],
 ): Promise<boolean> {
   const incoming = r.status ?? 'posted'
   if (s.bank_status === 'void') return false            // a void never comes back
@@ -507,11 +518,14 @@ async function followTheBank(
     if (!hidden) {
       // Filed, a copy, or the landlord's own call: keep it, flag it. The page
       // tells the landlord the bank voided something they already filed.
+      // 10/13 (Nic): a line filed as a new expense is the exception — its
+      // expense is voided too and the line set aside (voidFiledLinePayments),
+      // and the owner is told once the sync commits (voidedFiled).
       await client.query(`UPDATE bank_transactions SET bank_status = 'void', updated_at = now() WHERE id = $1`, [s.id])
       if (s.status === 'categorized' || s.status === 'matched') {
         logger.warn({ transactionId: s.id, status: s.status }, '[bank-feed] the bank voided a transaction that was already filed')
       }
-      if (s.status === 'categorized') await voidFiledLinePayments(client, s.id)
+      if (s.status === 'categorized' && await voidFiledLinePayments(client, s.id)) voidedFiled.push(s.id)
       if (s.status === 'matched') voidedMatched.push(s.id)
     }
     // S655 review: a copy voided means the transaction it copies was voided.
@@ -519,7 +533,7 @@ async function followTheBank(
     // stays on the retired link, which is never synced again — only its hidden
     // copy on the live link still hears from the bank. Carry the void over, or
     // the landlord is never told the money they filed never moved.
-    if (s.ignored_reason === 'duplicate' && s.duplicate_of_id) await voidTheOriginal(client, s.duplicate_of_id, voidedMatched)
+    if (s.ignored_reason === 'duplicate' && s.duplicate_of_id) await voidTheOriginal(client, s.duplicate_of_id, voidedMatched, voidedFiled)
     return true
   }
 
@@ -549,12 +563,14 @@ async function followTheBank(
  * money-out line filed as a new expense (one category, or split into parts)
  * that the bank then voided never paid anything. The payments the filing made
  * from the line are voided (kept on record) in the sync's own transaction, so
- * the books stop crediting the bank for money that never left; the expense
- * stays, owed again, and the line stays filed and flagged until the owner
- * undoes it on the Bank page. A payment recorded by hand that the line had
+ * the books stop crediting the bank for money that never left. 10/13 (Nic):
+ * and the expense the filing made is voided too (kept on record), the line set
+ * aside as the bank's void (bankMoneyOut voidExpensesOfBankVoidedLine) — it
+ * used to stay, owed again, with the line filed and flagged until the owner
+ * undid it on the Bank page. A payment recorded by hand that the line had
  * cleared (a check) goes back to waiting for its bank line.
  */
-async function voidFiledLinePayments(client: PoolClient, lineId: string): Promise<void> {
+async function voidFiledLinePayments(client: PoolClient, lineId: string): Promise<boolean> {
   await client.query(
     `UPDATE landlord_expense_payments
         SET voided_at = now(), void_reason = 'The bank voided this transaction', updated_at = now()
@@ -562,6 +578,11 @@ async function voidFiledLinePayments(client: PoolClient, lineId: string): Promis
   await client.query(
     `UPDATE landlord_expense_payments SET bank_transaction_id = NULL, updated_at = now()
       WHERE bank_transaction_id = $1 AND voided_at IS NULL AND source = 'payment'`, [lineId])
+  // 10/13 (Nic): "Bank voids a line filed as a new expense: VOID the expense
+  // too (kept on record as voided)." The expenses the filing made are voided
+  // and the line is set aside as the bank's void (services/bankMoneyOut).
+  const { voidExpensesOfBankVoidedLine } = await import('./bankMoneyOut')
+  return (await voidExpensesOfBankVoidedLine(client, lineId)).released
 }
 
 /**
@@ -571,7 +592,7 @@ async function voidFiledLinePayments(client: PoolClient, lineId: string): Promis
  * flagged, so the page warns the landlord. The row is already locked by
  * upsertTransactions.
  */
-async function voidTheOriginal(client: PoolClient, id: string, voidedMatched: string[] = []): Promise<void> {
+async function voidTheOriginal(client: PoolClient, id: string, voidedMatched: string[] = [], voidedFiled: string[] = []): Promise<void> {
   const hidden = (await client.query(
     `UPDATE bank_transactions t
         SET status = 'ignored', ignored_reason = 'bank_void', bank_status = 'void', updated_at = now()
@@ -583,7 +604,7 @@ async function voidTheOriginal(client: PoolClient, id: string, voidedMatched: st
   if (flagged && (flagged.status === 'categorized' || flagged.status === 'matched')) {
     logger.warn({ transactionId: id, status: flagged.status }, '[bank-feed] the bank voided a transaction that was already filed (seen on its copy)')
   }
-  if (flagged?.status === 'categorized') await voidFiledLinePayments(client, id)
+  if (flagged?.status === 'categorized' && await voidFiledLinePayments(client, id)) voidedFiled.push(id)
   if (flagged?.status === 'matched') voidedMatched.push(id)
 }
 

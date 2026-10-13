@@ -42,6 +42,8 @@
  *   - 10/12 (Nic, L19): with the company-wide box, the bank lines: file, match
  *     and undo money going out; money coming in only as the owner chose for
  *     them (any, only after "Not rent", or never). Never a tenant's payment.
+ *     10/13 (Nic): marking a deposit "Not rent" (and taking the mark back) is
+ *     theirs too: "owner + bookkeeper (not front-desk staff)".
  *   - the P&L reports the shared Reports page reads (overview, by property,
  *     a property's detail, a month's P&L). Never the owner statement, the tax
  *     summary or the 1099 work-trade summary (they carry the company's own
@@ -102,6 +104,10 @@ const RULES: Rule[] = [
   { method: 'GET',    test: /^\/api\/bank-feed\/(connections|transactions)\/?$/ },
   { method: 'GET',    test: /^\/api\/bank-feed\/transactions\/[0-9a-f-]{36}\/matches\/?$/i },
   { method: 'POST',   test: /^\/api\/bank-feed\/transactions\/[0-9a-f-]{36}\/(categorize|split|split\/undo|undo-filing|ignore|match-expenses|match-record)\/?$/i },
+  // 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not front-desk
+  // staff)" — marking a deposit "Not rent", and its Undo. routes/bankFeed
+  // holds them to the company-wide box (requireBankFiler) and the row's company.
+  { method: 'POST',   test: /^\/api\/bank-feed\/deposits\/[0-9a-f-]{36}\/not-rent(\/undo)?\/?$/i },
   // The P&L reports.
   { method: 'GET',    test: /^\/api\/reports\/(summary|monthly-pl|property-pl|site-downtime|property-detail)\/?$/ },
   // 10/12 (Nic): the monthly property report, with the owner's box (see the header).

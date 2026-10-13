@@ -347,12 +347,13 @@ export const BANK_MATCH_FIRST_CODE = 'MATCH_FIRST'
  * filed or ignored leaves the rent queue, so a tenant's rent filed as "other
  * income" stays open on the tenant's account and late fees follow:
  *   any             file any deposit
- *   after_not_rent  only a deposit the owner marked "Not rent" (the default —
- *                   design §11; "Not rent" is the owner's to mark)
+ *   after_not_rent  only a deposit marked "Not rent" (the default — design
+ *                   §11; 10/13 Nic: the owner AND the bookkeeper may mark it,
+ *                   not front-desk staff; 'never' may not)
  *   never           never file money coming in
  * Money going out is always open to a bookkeeper with the bank (the
- * company-wide box). A bookkeeper never records a tenant's payment, matches a
- * deposit to a tenant's bill or marks one "Not rent".
+ * company-wide box). A bookkeeper never records a tenant's payment or matches a
+ * deposit to a tenant's bill.
  */
 export const BOOKKEEPER_MONEY_IN_FILING = ['any', 'after_not_rent', 'never'] as const
 export type BookkeeperMoneyInFiling = typeof BOOKKEEPER_MONEY_IN_FILING[number]

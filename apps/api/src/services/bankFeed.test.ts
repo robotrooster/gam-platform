@@ -346,18 +346,21 @@ describe('the bank’s own state is followed', () => {
     expect(await listTransactions(f.landlordId)).toHaveLength(0)
   })
 
-  it('a voided transaction already filed stays in the books, flagged for the landlord', async () => {
+  // 10/13 (Nic): "Bank voids a line filed as a new expense: VOID the expense
+  // too (kept on record as voided)." It used to stay in the books, flagged.
+  it('a voided transaction already filed as an expense voids that expense (kept) and is set aside as the bank\'s void', async () => {
     const f = await seed()
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'v2', postedDate: '2026-09-09', amount: -75, description: 'HOTEL HOLD' },
     ])
-    await categorizeTransaction(f.landlordId, (await row('v2')).id, { category: 'repairs', scopeKind: 'unit', unitId: f.unitA })
+    const { expenseId } = await categorizeTransaction(f.landlordId, (await row('v2')).id, { category: 'repairs', scopeKind: 'unit', unitId: f.unitA })
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'v2', postedDate: '2026-09-09', amount: -75, description: 'HOTEL HOLD', status: 'void' },
     ])
-    expect(await row('v2')).toMatchObject({ status: 'categorized', bank_status: 'void' })
-    const [listed] = await listTransactions(f.landlordId)
-    expect(listed.bank_status).toBe('void')
+    expect(await row('v2')).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void' })
+    expect((await db.query(`SELECT expense_id FROM bank_transactions WHERE external_id = 'v2'`)).rows[0].expense_id).toBeNull()
+    expect((await db.query(`SELECT status FROM landlord_expenses WHERE id = $1`, [expenseId])).rows[0].status).toBe('voided')
+    expect(await landlordExpensesTotal(f.landlordId, '2026-09-01', '2026-09-30')).toBe(0)
   })
 })
 
@@ -993,7 +996,9 @@ describe('an auto-match never overwrites a row someone acted on while it ran', (
  * filed" warning shows.
  */
 describe('a void on a hidden copy reaches the original it copies', () => {
-  it('a filed original is flagged voided and still listed, so the landlord is warned', async () => {
+  // 10/13 (Nic): a filed expense the bank voids is voided with it (kept), and
+  // the original set aside as the bank's void — through its copy too.
+  it('a filed original is voided with its expense (kept) and set aside as the bank\'s void', async () => {
     const f = await seed()
     const relink = await relinkSameBank(f)
     const r = { postedDate: '2026-09-03', amount: -310, description: 'HOME DEPOT #9 AZ' }
@@ -1005,10 +1010,10 @@ describe('a void on a hidden copy reaches the original it copies', () => {
 
     await upsertTransactions(relink, f.landlordId, [{ externalId: 'n_v', ...r, status: 'void' }])
 
-    expect(await row('o_v')).toMatchObject({ status: 'categorized', bank_status: 'void' })
-    const listed = (await listTransactions(f.landlordId)).find((t: any) => t.id === original)
-    expect(listed).toMatchObject({ status: 'categorized', bank_status: 'void' })
-    expect(await landlordExpensesTotal(f.landlordId, '2026-09-01', '2026-09-30')).toBe(310)   // still in the books
+    expect(await row('o_v')).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void' })
+    expect((await db.query(`SELECT expense_id FROM bank_transactions WHERE id = $1`, [original])).rows[0].expense_id).toBeNull()
+    expect(await landlordExpensesTotal(f.landlordId, '2026-09-01', '2026-09-30')).toBe(0)   // voided, kept on record
+    expect((await db.query(`SELECT count(*)::int AS n FROM landlord_expenses WHERE landlord_id = $1 AND status = 'voided'`, [f.landlordId])).rows[0].n).toBe(1)
   })
 
   it('an original nobody filed is hidden as voided, like any voided row', async () => {

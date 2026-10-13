@@ -1992,6 +1992,9 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
     `Take back "${meterWorksNoUseLabel(m.utilityType)}" on ${m.label}? `
       + (m.billingMethod === 'submeter'
         ? 'From now on, a read that does not move while somebody lives there is treated as a stuck meter again.'
+        // 10/13 (Nic): a flat charge stopped with it starts again.
+        : m.billingMethod === 'flat_rate' && m.zeroUseStopsFlatCharge
+        ? 'Its flat charge starts again with the next bill.'
         : 'How this meter bills does not change.'),
     { confirmLabel: 'Take it back' }).then(ok => { if (ok) withdrawNoUse.mutate(m.id) })
   // S648 (Nic): a repaired or replaced meter starts from what it reads NOW —
@@ -2464,8 +2467,11 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
  * alone); on a master or a flat-rate meter it is recorded and nothing about
  * how the meter bills changes.
  */
-function worksNoUseEffect(m: { billingMethod?: string }): string {
-  return m.billingMethod === 'submeter' ? 'zero use bills $0 until it moves' : 'confirmed working, nobody using it'
+function worksNoUseEffect(m: { billingMethod?: string; zeroUseStopsFlatCharge?: boolean }): string {
+  if (m.billingMethod === 'submeter') return 'zero use bills $0 until it moves'
+  // 10/13 (Nic): "Stop the flat charge too?" answered yes.
+  if (m.billingMethod === 'flat_rate' && m.zeroUseStopsFlatCharge) return 'flat charge stopped while nobody uses it'
+  return 'confirmed working, nobody using it'
 }
 
 function MeterBackInServiceModal({ meter, onClose, onSaved }: {
@@ -2474,6 +2480,13 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
   const [reading, setReading] = useState('')
   // 10/12 (Q-f): the "also void the estimates?" question, open once "Works" is pressed.
   const [askVoid, setAskVoid] = useState(false)
+  // 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it': LANDLORD'S
+  // CHOICE, asked at the moment of marking ('Stop the flat charge too?')." Asked
+  // first on a flat-rate meter; the answer rides the save (and the estimates
+  // question after it, when there is one).
+  const flatRate = meter.billingMethod === 'flat_rate'
+  const [askStop, setAskStop] = useState(false)
+  const [stopAnswer, setStopAnswer] = useState<boolean | undefined>(undefined)
   const digits = Number(meter.digits) || METER_READING_DEFAULT_DIGITS
   const readingOk = new RegExp(`^\\d{1,${digits}}$`).test(reading)
   const worksLabel = meterWorksNoUseLabel(meter.utilityType)
@@ -2490,7 +2503,7 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
   const waiting = estimates?.count ?? 0
   const save = useMutation((body: {
     outOfService: false; repairedStartingReading?: number; zeroUseConfirmed?: true; voidFlaggedEstimates?: boolean
-    voidEstimateIds?: string[]
+    voidEstimateIds?: string[]; stopFlatCharge?: boolean
   }) => apiPatch(`/utility/meters/${meter.id}`, body), {
     onSuccess: (r: any, body) => {
       const v = r?.flaggedEstimatesVoided
@@ -2506,10 +2519,11 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
         k.changed?.count ? ` ${plural(k.changed.count)} (${fmt(k.changed.amount)}) had already changed (taken off or moved onto a bill).` : '',
         k.failed?.count ? ` ${plural(k.failed.count)} (${fmt(k.failed.amount)}) could not be voided just now — nothing about ${k.failed.count === 1 ? 'it' : 'them'} changed; try again from the meter.` : '',
       ].join('')
+      const effect = worksNoUseEffect({ ...meter, zeroUseStopsFlatCharge: body.stopFlatCharge === true })
       toast(body.zeroUseConfirmed
         ? (flagged
-          ? `${meter.label} is back in service — ${worksNoUseEffect(meter)}.${voidedWords}${keptWords}`
-          : `${meter.label} confirmed working — ${worksNoUseEffect(meter)}.`)
+          ? `${meter.label} is back in service — ${effect}.${voidedWords}${keptWords}`
+          : `${meter.label} confirmed working — ${effect}.`)
         : `${meter.label} marked repaired — its next bill is measured from ${body.repairedStartingReading}`)
       onSaved()
       onClose()
@@ -2517,11 +2531,18 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
     onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter'),
   })
   // "Yes, void them" sends the charges this window showed — only those come off.
-  const works = (voidFlaggedEstimates?: boolean) => save.mutate({
+  const works = (voidFlaggedEstimates?: boolean, stopFlatCharge?: boolean) => save.mutate({
     outOfService: false, zeroUseConfirmed: true,
     ...(voidFlaggedEstimates !== undefined ? { voidFlaggedEstimates } : {}),
     ...(voidFlaggedEstimates ? { voidEstimateIds: (estimates?.charges ?? []).map(c => c.id) } : {}),
+    ...(stopFlatCharge !== undefined ? { stopFlatCharge } : {}),
   })
+  // 10/13: the flat-charge answer, then the estimates question when one waits.
+  const answerStop = (stop: boolean) => {
+    if (waiting > 0) { setStopAnswer(stop); setAskStop(false); setAskVoid(true) }
+    else works(undefined, stop)
+  }
+  const spaces = (meter.assignedUnitIds || []).length
   const choice: CSSProperties = { border: '1px solid var(--border-1)', borderRadius: 'var(--r-md)', padding: 12, marginBottom: 10 }
   const why: CSSProperties = { fontSize: '.76rem', color: 'var(--text-3)', margin: '4px 0 10px', lineHeight: 1.45 }
   return (
@@ -2553,7 +2574,10 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
         <div style={choice}>
           <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{worksLabel}</div>
           <div style={why}>
-            {meter.billingMethod !== 'submeter'
+            {flatRate
+              ? <>The meter works — nobody on it uses any {noun}. {flagged ? 'No new reading: it goes back in service. ' : ''}It
+                is recorded on the meter, and you choose next whether its flat charge stops too.</>
+              : meter.billingMethod !== 'submeter'
               ? <>The meter works — nobody on it uses any {noun}. {flagged ? 'No new reading: it goes back in service. ' : ''}It
                 is recorded on the meter; how this meter bills does not change.</>
               : flagged
@@ -2571,11 +2595,30 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
               <button className="btn btn-primary btn-sm" onClick={() => refetchEstimates()}>Try again</button>
             </div>
           )}
-          {!askVoid && (
+          {!askVoid && !askStop && (
             <button className="btn btn-primary" disabled={save.isLoading || (flagged && (estimatesLoading || estimatesFailed))}
-              onClick={() => waiting > 0 ? setAskVoid(true) : works()}>
+              onClick={() => flatRate ? setAskStop(true) : waiting > 0 ? setAskVoid(true) : works()}>
               {worksLabel}
             </button>
+          )}
+          {askStop && (
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45 }}>
+                Stop the flat charge too?
+              </div>
+              <div style={{ ...why, margin: '6px 0 8px' }}>
+                Yes: {meter.label} bills nothing to the {spaces} space{spaces === 1 ? '' : 's'} on it while it is marked
+                unused, and starts again once it is not. No: it keeps billing as it does now.
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => answerStop(true)}>
+                  Yes, stop it
+                </button>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => answerStop(false)}>
+                  No, keep billing it
+                </button>
+              </div>
+            </div>
           )}
           {askVoid && estimates && (
             <div>
@@ -2596,10 +2639,10 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(true)}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(true, stopAnswer)}>
                   Yes, void {waiting === 1 ? 'it' : 'them'}
                 </button>
-                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(false)}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(false, stopAnswer)}>
                   No, leave {waiting === 1 ? 'it' : 'them'}
                 </button>
               </div>

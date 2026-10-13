@@ -815,6 +815,8 @@ export async function runGamDebitSweep(): Promise<{ considered: number; debited:
   // 10/12 (G1): failed pulls whose cost could not be read when they failed —
   // billed now, before anyone's balance is weighed against the threshold.
   await readFailedPullCosts().catch((err) => logger.error({ err }, '[gam-debit-sweep] reading failed pulls\' costs failed'))
+  // 10/13 (G1): and disputed pulls whose cost was not read when the dispute came.
+  await readDisputedPullCosts().catch((err) => logger.error({ err }, '[gam-debit-sweep] reading disputed pulls\' costs failed'))
   const rows = await query<{ id: string }>(
     `SELECT l.id FROM landlords l
       WHERE l.is_demo = FALSE
@@ -899,4 +901,490 @@ export async function uncollectableLandlords(): Promise<UncollectableLandlord[]>
     })
   }
   return out
+}
+
+// ── 10/13 (Nic): A PULL THE LANDLORD'S BANK DISPUTES ─────────────────────────
+//
+//   "GAM fee pull disputed by landlord's bank: AUTOMATIC — the disputed fees
+//    reopen as owed by the landlord, collected on the next pull, admin told."
+//
+// A pull that went through and that the landlord's bank later disputes (an ACH
+// "unauthorized" return) comes to the dispute webhook as a dispute on the
+// pull's own PaymentIntent. It used to be a charge nobody could place: one
+// admin notice (dispute_charge_unplaced), and the fees the bank took back read
+// as collected. Now, once Stripe has taken the money (DISPUTE_STATUSES_MONEY_TAKEN):
+//   - every fee the pull collected is owed again — its collected_amount comes
+//     back down by what this pull took for it (its
+//     landlord_gam_charge_collections rows; kept as written). Owed again, the
+//     fees are collected the usual way: netted from the landlord's next payout,
+//     or on the next pull (runGamDebitSweep, once over the threshold — a pull
+//     happened, so they were);
+//   - a pull that came back is a failed pull for Nic G1 ("gam eats no fees of
+//     failed pulls ever", on a later return alike — billFailedPullCost): the
+//     pull's own $6 cost line, GAM's price for a transfer that collects, is
+//     voided (reason 'bank_debit_failed', kept on record) and the $6 GAM wrote
+//     down as earned when the pull landed is taken back off GAM's book (an
+//     adjustment, as a disputed tenant payment's spread is); what the pull
+//     actually cost GAM — Stripe's fee on the pull and Stripe's dispute fee —
+//     is billed to the landlord at cost (billDisputedPullCost: kind
+//     bank_debit_failed_cost, source 'gam_bank_debit_disputed'), read from
+//     Stripe. Not readable yet, the nightly sweep asks again
+//     (readDisputedPullCosts) and an admin is told once it has waited
+//     FAILED_PULL_COST_UNREAD_DAYS — a cost nobody reads is a cost GAM absorbs;
+//   - the pull is marked disputed (disputed_at, stripe_dispute_id,
+//     dispute_reopened_amount) and stays 'succeeded': it did go through;
+//   - an admin is told, once per dispute.
+// An inquiry takes no money and reopens nothing (an admin is told, once). A
+// dispute arriving before the pull's own success is recorded is put off
+// ('not_settled': the webhook answers 503 and Stripe sends it again). A WON
+// dispute is not undone by itself (decisions #55-AMENDED, as for a tenant's
+// payment): one critical notice lists what to undo by hand.
+
+/** Admin notice categories for a disputed pull. */
+export const GAM_DEBIT_DISPUTED_CATEGORY = 'gam_debit_disputed'
+export const GAM_DEBIT_DISPUTE_INQUIRY_CATEGORY = 'gam_debit_dispute_inquiry'
+export const GAM_DEBIT_DISPUTE_UNPLACED_CATEGORY = 'gam_debit_dispute_unplaced'
+export const GAM_DEBIT_DISPUTE_WON_CATEGORY = 'gam_debit_dispute_won'
+export const GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY = 'gam_debit_dispute_cost_unread'
+/** The source of the GAM charge that bills what a disputed pull cost GAM. */
+export const GAM_DEBIT_DISPUTE_COST_SOURCE = 'gam_bank_debit_disputed'
+
+/**
+ * The pull's own $6 cost line: written in the pull's own transaction, so it
+ * shares the pull's created_at (NOW() is the transaction's clock) — the rule
+ * billFailedPullCost and resumeUnconfirmedDebit use. An older cost line the
+ * pull also carried was never this pull's. $1 = the pull.
+ */
+const PULL_OWN_COST_LINE_SQL =
+  `SELECT c.id FROM landlord_gam_charges c
+    WHERE c.id = ANY ((SELECT charge_ids FROM landlord_gam_debits WHERE id = $1)::uuid[])
+      AND c.kind = 'bank_debit_cost'
+      AND c.created_at = (SELECT created_at FROM landlord_gam_debits WHERE id = $1)
+    LIMIT 1`
+
+export interface GamDebitDisputeInput {
+  paymentIntentId: string
+  stripeDisputeId: string
+  /** The status the event acts on: the furthest Stripe has told GAM (webhooks, disputeStatusRank). */
+  disputeStatus: string
+  /** The event's own status ('won' only on the event that carries the win). */
+  eventStatus: string
+  disputedCents: number
+  /** Stripe's dispute fee, from this event's balance transactions. */
+  feeCents: number
+  /**
+   * Whether this event carried the dispute's balance transactions at all — so
+   * feeCents is Stripe's word on its fee (0 included). False: Stripe has not
+   * said it on this event, and it is read from Stripe instead.
+   */
+  feeStated?: boolean
+  /** On a win: the part of the fee Stripe gave back. */
+  feeReturnedCents?: number
+}
+
+export type GamDebitDisputeOutcome =
+  | { handled: false }
+  | {
+      handled: true
+      action: 'reopened' | 'already_reopened' | 'inquiry' | 'not_settled' | 'unplaced' | 'won'
+      debitId: string
+      reopened?: number
+      /** What the pull cost GAM, billed at cost (null: not read from Stripe yet). */
+      costBilled?: number | null
+    }
+
+const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`
+
+/** One admin notice per (category, dispute) — the live list and the archive both count. */
+async function noticeOncePerDispute(category: string, stripeDisputeId: string,
+  n: { severity: 'info' | 'warn' | 'critical'; title: string; body: string; context: Record<string, unknown> }): Promise<boolean> {
+  const seen = await queryOne(
+    `SELECT 1 FROM admin_notifications WHERE category = $1 AND context->>'stripe_dispute_id' = $2
+     UNION ALL
+     SELECT 1 FROM admin_notifications_archive WHERE category = $1 AND context->>'stripe_dispute_id' = $2
+     LIMIT 1`, [category, stripeDisputeId])
+  if (seen) return false
+  const { createAdminNotification } = await import('./adminNotifications')
+  await createAdminNotification({ ...n, category, context: { ...n.context, stripe_dispute_id: stripeDisputeId } })
+  return true
+}
+
+/**
+ * Handle a dispute on a GAM fee pull. `handled: false` when the disputed
+ * charge is not a pull (the caller carries on with a tenant's payment or a held
+ * charge). Throws only on a database failure (the webhook answers 500 and
+ * Stripe sends the event again; nothing half-done stays — one transaction).
+ */
+export async function handleGamDebitDispute(d: GamDebitDisputeInput): Promise<GamDebitDisputeOutcome> {
+  type Pull = {
+    id: string; landlord_id: string; status: string; total_amount: string; created_at: Date
+    disputed_at: Date | null; business_name: string | null
+  }
+  const pull = await queryOne<Pull>(
+    `SELECT d.id, d.landlord_id, d.status, d.total_amount::text AS total_amount, d.created_at,
+            d.disputed_at, l.business_name
+       FROM landlord_gam_debits d LEFT JOIN landlords l ON l.id = d.landlord_id
+      WHERE d.stripe_payment_intent_id = $1`, [d.paymentIntentId])
+  if (!pull) return { handled: false }
+  const { DISPUTE_STATUSES_MONEY_TAKEN, DISPUTE_STATUS_WON } = await import('./creditUse')
+  const day = new Date(pull.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Phoenix' })
+  const who = pull.business_name ?? 'the landlord'
+  const ctx = { debit_id: pull.id, landlord_id: pull.landlord_id, stripe_payment_intent_id: d.paymentIntentId,
+                disputed: d.disputedCents / 100 }
+
+  // WON — decisions #55-AMENDED: not undone by itself. Told once, by the event
+  // that carries the win (it alone knows the fee Stripe gave back).
+  if (d.disputeStatus === DISPUTE_STATUS_WON) {
+    if (d.eventStatus === DISPUTE_STATUS_WON) await raiseWonGamDebitDisputeNotice(pull, d, day, who)
+    return { handled: true, action: 'won', debitId: pull.id }
+  }
+
+  // An inquiry takes no money: nothing reopens. An admin is told, once.
+  if (!(DISPUTE_STATUSES_MONEY_TAKEN as readonly string[]).includes(d.disputeStatus)) {
+    await noticeOncePerDispute(GAM_DEBIT_DISPUTE_INQUIRY_CATEGORY, d.stripeDisputeId, {
+      severity: 'warn',
+      title: `${who}'s bank is asking about GAM's fee pull of ${day} (${usd(d.disputedCents)})`,
+      body: `Stripe opened inquiry ${d.stripeDisputeId} on pull ${pull.id}. No money has moved, so nothing was reopened. `
+        + 'If it becomes a dispute, the fees the pull collected are owed again and go on the next pull.',
+      context: ctx,
+    })
+    return { handled: true, action: 'inquiry', debitId: pull.id }
+  }
+
+  // The pull's own success is not recorded yet (events arrive in any order):
+  // its charges are not marked collected, so there is nothing to reopen yet.
+  if (pull.status === 'pending') return { handled: true, action: 'not_settled', debitId: pull.id }
+
+  // A dispute on a pull GAM recorded as failed, or for part of it, cannot be
+  // placed by rule — a person looks (once per dispute). ACH disputes are for
+  // the whole payment.
+  const totalCents = Math.round(parseFloat(pull.total_amount) * 100)
+  if (pull.status !== 'succeeded' || d.disputedCents !== totalCents) {
+    await noticeOncePerDispute(GAM_DEBIT_DISPUTE_UNPLACED_CATEGORY, d.stripeDisputeId, {
+      severity: 'critical',
+      title: `A dispute on GAM's fee pull of ${day} from ${who} could not be placed by itself (${d.paymentIntentId})`,
+      body: pull.status !== 'succeeded'
+        ? `Stripe opened dispute ${d.stripeDisputeId} for ${usd(d.disputedCents)} on pull ${pull.id}, which is recorded as ${pull.status}. Nothing was reopened. Check the pull and its charges by hand.`
+        : `Stripe opened dispute ${d.stripeDisputeId} for ${usd(d.disputedCents)} on pull ${pull.id}, which took ${usd(totalCents)}. A dispute for part of a pull is not reopened by itself: decide by hand which charges are owed again.`,
+      context: { ...ctx, pull_status: pull.status, pulled: totalCents / 100 },
+    })
+    return { handled: true, action: 'unplaced', debitId: pull.id }
+  }
+
+  let action: 'reopened' | 'already_reopened' = 'already_reopened'
+  let reopenedCents = 0
+  let charges = 0
+  let costLineCents = 0
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    // The account's lock first (a payout batch netting, or a pull claiming,
+    // takes it before its row locks), then the pull.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [gamAccountLockKey(pull.landlord_id)])
+    const now = (await client.query<{ disputed_at: Date | null; status: string; stripe_dispute_id: string | null }>(
+      `SELECT disputed_at, status, stripe_dispute_id FROM landlord_gam_debits WHERE id = $1 FOR UPDATE`,
+      [pull.id])).rows[0]
+    if (!now.disputed_at) {
+      action = 'reopened'
+      const ownCostLine = (await client.query<{ id: string }>(PULL_OWN_COST_LINE_SQL, [pull.id])).rows[0]?.id ?? null
+      // What this pull collected on each charge (its collection records, kept as written).
+      const took = (await client.query<{ charge_id: string; amount: string }>(
+        `SELECT col.charge_id, SUM(col.amount)::text AS amount
+           FROM landlord_gam_charge_collections col
+          WHERE col.landlord_gam_debit_id = $1
+          GROUP BY col.charge_id
+          ORDER BY col.charge_id`, [pull.id])).rows
+      for (const t of took) {
+        const cents = Math.round(parseFloat(t.amount) * 100)
+        if (cents <= 0) continue
+        const r = await client.query<{ back: string }>(
+          `WITH old AS (SELECT id, collected_amount FROM landlord_gam_charges WHERE id = $1 FOR UPDATE)
+           UPDATE landlord_gam_charges c
+              SET collected_amount = GREATEST(old.collected_amount - $2::numeric, 0),
+                  collected_at = NULL, updated_at = NOW()
+             FROM old WHERE c.id = old.id
+           RETURNING (old.collected_amount - GREATEST(old.collected_amount - $2::numeric, 0))::text AS back`,
+          [t.charge_id, (cents / 100).toFixed(2)])
+        const back = Math.round(parseFloat(r.rows[0]?.back ?? '0') * 100)
+        if (back <= 0) continue
+        // Nic G1: the pull's own $6 is GAM's price for a transfer that
+        // collects, and this one came back — voided, as on a failed pull
+        // (kept on record). One that cannot be voided stays owed with the fees.
+        if (t.charge_id === ownCostLine && await voidGamCharge(client, t.charge_id, 'bank_debit_failed')) {
+          costLineCents += back
+          continue
+        }
+        reopenedCents += back
+        charges++
+      }
+      // The $6 GAM wrote down as earned when the pull landed (settleGamDebit,
+      // banking_spread) is taken back off GAM's book — once per pull, as a
+      // disputed tenant payment's spread is (paymentReversal reverseChargeSpread).
+      if (costLineCents > 0) {
+        const booked = (await client.query<{ s: string; done: boolean }>(
+          `SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'banking_spread' AND reference_type = 'gam_bank_debit'), 0)::text AS s,
+                  bool_or(reference_type = 'dispute_spread_reversal') AS done
+             FROM platform_revenue_ledger WHERE reference_id = $1`, [pull.id])).rows[0]
+        const bookedCents = Math.round(parseFloat(booked?.s ?? '0') * 100)
+        if (bookedCents > 0 && !booked?.done) {
+          await recordPlatformRevenue({
+            type: 'adjustment',
+            amount: -bookedCents / 100,
+            referenceId: pull.id,
+            referenceType: 'dispute_spread_reversal',
+            notes: `Bank transfer cost taken back: the landlord's bank disputed GAM's fee pull ${pull.id} (dispute ${d.stripeDisputeId})`,
+          }, client)
+        }
+      }
+      await client.query(
+        `UPDATE landlord_gam_debits
+            SET disputed_at = NOW(), stripe_dispute_id = $2, dispute_reopened_amount = $3, updated_at = NOW()
+          WHERE id = $1`, [pull.id, d.stripeDisputeId, (reopenedCents / 100).toFixed(2)])
+    } else if (now.stripe_dispute_id !== d.stripeDisputeId) {
+      // A second dispute on one pull cannot take the money twice: told, never reopened again.
+      await client.query('COMMIT')
+      await noticeOncePerDispute(GAM_DEBIT_DISPUTE_UNPLACED_CATEGORY, d.stripeDisputeId, {
+        severity: 'critical',
+        title: `A second dispute on GAM's fee pull of ${day} from ${who} (${d.paymentIntentId})`,
+        body: `Stripe opened dispute ${d.stripeDisputeId} on pull ${pull.id}, already reopened for dispute ${now.stripe_dispute_id}. Nothing was reopened again. Check it in Stripe by hand.`,
+        context: { ...ctx, first_dispute: now.stripe_dispute_id },
+      })
+      return { handled: true, action: 'unplaced', debitId: pull.id }
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+
+  // What the pull cost GAM, at cost — once, when Stripe says it (this event's
+  // word on the dispute fee, else read from Stripe). Never throws.
+  const cost = await billDisputedPullCost(pull.id, d.feeStated ? Math.max(0, Math.round(d.feeCents)) : null)
+  const costBilled = cost.read && cost.costCents != null ? cost.costCents / 100 : null
+
+  if (action === 'reopened') {
+    logger.warn({ debitId: pull.id, landlordId: pull.landlord_id, reopened: reopenedCents / 100, costLine: costLineCents / 100, stripeDisputeId: d.stripeDisputeId },
+      '[gam-debit] the landlord\'s bank disputed a pull — its fees are owed again')
+    await noticeOncePerDispute(GAM_DEBIT_DISPUTED_CATEGORY, d.stripeDisputeId, {
+      severity: 'warn',
+      title: `${who}'s bank disputed GAM's fee pull of ${day} (${usd(totalCents)}): the fees are owed again`,
+      body: `Stripe opened dispute ${d.stripeDisputeId} on pull ${pull.id} and took back ${usd(d.disputedCents)}. `
+        + `The ${charges} charge${charges === 1 ? '' : 's'} it paid (${usd(reopenedCents)}) ${charges === 1 ? 'is' : 'are'} owed by ${who} again and `
+        + `${charges === 1 ? 'is' : 'are'} collected from their next payout, or on the next pull. `
+        + (costLineCents > 0
+          ? `The pull's own ${usd(costLineCents)} bank transfer cost was taken off: GAM's price is for a transfer that collects. `
+          : '')
+        + (costBilled == null
+          ? 'What the pull cost GAM at Stripe could not be read yet; it is billed to them at cost when it is (the nightly sweep asks again).'
+          : costBilled > 0
+            ? `What the pull cost GAM at Stripe (${usd(Math.round(costBilled * 100))}: its fee on the transfer and the dispute fee) is billed to them at cost.`
+            : 'Stripe charged nothing for it.'),
+      context: { ...ctx, reopened: reopenedCents / 100, charges, cost_line_voided: costLineCents / 100, cost_billed: costBilled },
+    }).catch((err) => logger.error({ err, debitId: pull.id }, '[gam-debit] could not tell an admin about the disputed pull'))
+  }
+  return { handled: true, action, debitId: pull.id, reopened: reopenedCents / 100, costBilled }
+}
+
+/**
+ * Stripe's fee for a dispute, read from Stripe: the fees on its balance
+ * transactions (the same sum the webhook reads off an event). null when the
+ * dispute has no balance transaction yet — Stripe has not said it.
+ */
+export async function disputeFeeCentsFromStripe(
+  stripe: { disputes: { retrieve: (id: string) => Promise<any> } },
+  stripeDisputeId: string,
+): Promise<number | null> {
+  const dp = await stripe.disputes.retrieve(stripeDisputeId)
+  const bts: any[] = Array.isArray(dp?.balance_transactions) ? dp.balance_transactions : []
+  if (!bts.length) return null
+  return bts.reduce((s, bt) => {
+    if (typeof bt === 'string') throw new Error(`Stripe did not include balance transaction ${bt} on dispute ${stripeDisputeId}`)
+    return s + Math.max(0, Math.round(Number(bt?.fee) || 0))
+  }, 0)
+}
+
+/**
+ * 10/13 (Nic G1, "gam eats no fees of failed pulls ever", on a later return
+ * alike): what a disputed pull actually cost GAM is the landlord's, at cost —
+ * Stripe's fee on the pull itself (the $6 that paid for it was voided with the
+ * dispute) and Stripe's dispute fee. Billed as its own GAM charge, kind
+ * 'bank_debit_failed_cost', source 'gam_bank_debit_disputed', collected like
+ * every other GAM charge; idempotent per pull (its source is the pull) and
+ * recorded on the pull (dispute_cost_*).
+ *
+ * `disputeFeeCents`: the dispute fee an event stated (null: read the dispute
+ * from Stripe). Stripe unreadable, or the dispute fee not said yet: nothing is
+ * billed and the cost stays unread; the nightly sweep (readDisputedPullCosts)
+ * asks again. Never throws.
+ */
+export async function billDisputedPullCost(
+  debitId: string, disputeFeeCents: number | null = null,
+): Promise<{ read: boolean; costCents: number | null; chargeId: string | null }> {
+  try {
+    const d = await queryOne<{
+      landlord_id: string; created_at: Date; pi: string | null; dispute_id: string | null
+      disputed: boolean; read: boolean; cost_cents: number | null; charge_id: string | null
+    }>(
+      `SELECT landlord_id, created_at, stripe_payment_intent_id AS pi, stripe_dispute_id AS dispute_id,
+              disputed_at IS NOT NULL AS disputed, dispute_cost_read_at IS NOT NULL AS read,
+              ROUND(dispute_cost_amount * 100)::int AS cost_cents, dispute_cost_charge_id AS charge_id
+         FROM landlord_gam_debits WHERE id = $1`, [debitId])
+    if (!d || !d.disputed || !d.dispute_id) return { read: false, costCents: null, chargeId: null }
+    if (d.read) return { read: true, costCents: d.cost_cents, chargeId: d.charge_id }
+
+    let costCents: number
+    try {
+      const stripe = getStripe() as any
+      // A pull that went through has no failure fee: this reads its own fee.
+      const pullFee = d.pi ? await failedPullCostCents(stripe, d.pi) : 0
+      const disputeFee = disputeFeeCents ?? await disputeFeeCentsFromStripe(stripe, d.dispute_id)
+      if (disputeFee == null) {
+        logger.warn({ debitId, stripeDisputeId: d.dispute_id }, '[gam-debit] Stripe has not said the dispute fee on a disputed pull yet — asked again next sweep')
+        return { read: false, costCents: null, chargeId: null }
+      }
+      costCents = Math.max(0, pullFee) + Math.max(0, disputeFee)
+    } catch (err) {
+      logger.warn({ err, debitId }, '[gam-debit] what the disputed pull cost could not be read from Stripe — asked again next sweep')
+      return { read: false, costCents: null, chargeId: null }
+    }
+
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [gamAccountLockKey(d.landlord_id)])
+      const still = await client.query(
+        `SELECT 1 FROM landlord_gam_debits WHERE id = $1 AND dispute_cost_read_at IS NULL FOR UPDATE`, [debitId])
+      if (!still.rows.length) {
+        // Read meanwhile (a redelivered event, or the sweep): what it said.
+        await client.query('ROLLBACK')
+        const was = await queryOne<{ cost_cents: number | null; charge_id: string | null }>(
+          `SELECT ROUND(dispute_cost_amount * 100)::int AS cost_cents, dispute_cost_charge_id AS charge_id
+             FROM landlord_gam_debits WHERE id = $1`, [debitId])
+        return { read: true, costCents: was?.cost_cents ?? null, chargeId: was?.charge_id ?? null }
+      }
+      let chargeId: string | null = null
+      if (costCents > 0) {
+        const day = new Date(d.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'America/Phoenix' })
+        chargeId = await chargeLandlord(client, {
+          landlordId: d.landlord_id,
+          kind: 'bank_debit_failed_cost',
+          amount: costCents / 100,
+          sourceType: GAM_DEBIT_DISPUTE_COST_SOURCE,
+          sourceId: debitId,
+          notes: `What Stripe charged for the ${day} bank transfer of GAM's fees that your bank disputed (its fee on the transfer and its dispute fee), passed on at cost`,
+        })
+        chargeId ??= (await client.query<{ id: string }>(
+          `SELECT id FROM landlord_gam_charges WHERE source_type = $1 AND source_id = $2`,
+          [GAM_DEBIT_DISPUTE_COST_SOURCE, debitId])).rows[0]?.id ?? null
+      }
+      await client.query(
+        `UPDATE landlord_gam_debits
+            SET dispute_cost_amount = $2, dispute_cost_charge_id = $3, dispute_cost_read_at = NOW(), updated_at = NOW()
+          WHERE id = $1`,
+        [debitId, (costCents / 100).toFixed(2), chargeId])
+      await client.query('COMMIT')
+      if (costCents > 0) {
+        logger.warn({ debitId, landlordId: d.landlord_id, cost: costCents / 100 },
+          '[gam-debit] a disputed pull cost GAM fees — billed to the landlord at cost')
+      }
+      return { read: true, costCents, chargeId }
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (err) {
+    logger.error({ err, debitId }, '[gam-debit] the cost of a disputed pull could not be billed — asked again next sweep')
+    return { read: false, costCents: null, chargeId: null }
+  }
+}
+
+/**
+ * 10/13 (G1): the nightly sweep's pass over disputed pulls whose cost was
+ * never read (Stripe could not be reached, or had not said its dispute fee):
+ * read and bill it now. Pulls disputed in the last 60 days; one still unread
+ * after FAILED_PULL_COST_UNREAD_DAYS tells an admin (once per dispute) — a
+ * cost nobody reads is a cost GAM absorbs.
+ */
+export async function readDisputedPullCosts(): Promise<{ considered: number; read: number }> {
+  const rows = await query<{ id: string; landlord_id: string; stripe_payment_intent_id: string | null; stripe_dispute_id: string; disputed_at: Date; total_amount: string }>(
+    `SELECT id, landlord_id, stripe_payment_intent_id, stripe_dispute_id, disputed_at, total_amount::text AS total_amount
+       FROM landlord_gam_debits
+      WHERE disputed_at IS NOT NULL AND dispute_cost_read_at IS NULL
+        AND disputed_at > NOW() - INTERVAL '60 days'
+      ORDER BY disputed_at`)
+  let read = 0
+  for (const r of rows) {
+    const out = await billDisputedPullCost(r.id, null)
+    if (out.read) { read++; continue }
+    if (Date.now() - new Date(r.disputed_at).getTime() < FAILED_PULL_COST_UNREAD_DAYS * 86_400_000) continue
+    await noticeOncePerDispute(GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY, r.stripe_dispute_id, {
+      severity: 'warn',
+      title: `What a disputed $${Number(r.total_amount).toFixed(2)} bank pull of GAM's fees cost has not been read from Stripe`,
+      body: `Pull ${r.id} (payment ${r.stripe_payment_intent_id ?? 'unknown'}) was disputed (${r.stripe_dispute_id}), and Stripe's fees on it — its fee on the transfer and its dispute fee — could not be read, so the landlord has not been billed for them. `
+        + 'Check the dispute in Stripe; the nightly sweep keeps asking.',
+      context: { debit_id: r.id, landlord_id: r.landlord_id, payment_intent_id: r.stripe_payment_intent_id },
+    }).catch(() => {})
+  }
+  return { considered: rows.length, read }
+}
+
+/**
+ * decisions #55-AMENDED, for a pull: Stripe decided the landlord's bank's
+ * dispute for GAM and put the money back. Not undone by itself — one critical
+ * notice says what to undo by hand: the fees reopened (still owed: mark them
+ * collected again; collected again since: give the landlord that back), the
+ * pull's $6 cost line voided with the dispute (the transfer collected after
+ * all), and the part of the dispute fee Stripe returned. Never throws.
+ */
+async function raiseWonGamDebitDisputeNotice(
+  pull: { id: string; landlord_id: string; disputed_at: Date | null },
+  d: GamDebitDisputeInput, day: string, who: string,
+): Promise<void> {
+  try {
+    const now = await queryOne<{ disputed: boolean; cost: string | null }>(
+      `SELECT disputed_at IS NOT NULL AS disputed, dispute_cost_amount::text AS cost
+         FROM landlord_gam_debits WHERE id = $1`, [pull.id])
+    // The fees the dispute reopened (the pull's collections on charges still
+    // live), and the pull's own cost line it voided.
+    const state = await queryOne<{ owed: string; again: string; voided: string }>(
+      `SELECT COALESCE(SUM(LEAST(x.took, c.amount - c.collected_amount)) FILTER (WHERE c.voided_at IS NULL), 0)::text AS owed,
+              COALESCE(SUM(x.took - LEAST(x.took, c.amount - c.collected_amount)) FILTER (WHERE c.voided_at IS NULL), 0)::text AS again,
+              COALESCE(SUM(x.took) FILTER (WHERE c.voided_at IS NOT NULL AND c.void_reason = 'bank_debit_failed'
+                                             AND c.kind = 'bank_debit_cost'), 0)::text AS voided
+         FROM (SELECT charge_id, SUM(amount) AS took FROM landlord_gam_charge_collections
+                WHERE landlord_gam_debit_id = $1 GROUP BY charge_id) x
+         JOIN landlord_gam_charges c ON c.id = x.charge_id`, [pull.id])
+    const owedCents = Math.round(parseFloat(state?.owed ?? '0') * 100)
+    const againCents = Math.round(parseFloat(state?.again ?? '0') * 100)
+    const voidedCents = Math.round(parseFloat(state?.voided ?? '0') * 100)
+    const costCents = Math.round(parseFloat(now?.cost ?? '0') * 100)
+    const returned = Math.min(costCents, Math.max(0, d.feeReturnedCents ?? 0))
+    const steps: string[] = []
+    if (now?.disputed) {
+      if (owedCents > 0) steps.push(`Mark ${usd(owedCents)} of the reopened charges collected again (pull ${pull.id}): the money is back.`)
+      if (againCents > 0) steps.push(`Give ${who} back ${usd(againCents)}: the reopened charges were collected again since (a payout or a later pull).`)
+      if (voidedCents > 0) steps.push(`The pull's ${usd(voidedCents)} bank transfer cost was voided when the dispute opened, and taken back off GAM's book; the transfer collected after all, so bill it to ${who} again and put it back on GAM's book.`)
+      if (returned > 0) steps.push(`Take ${usd(returned)} off what the dispute cost was billed to ${who} (${usd(costCents)}): Stripe gave its dispute fee back with the win.`)
+    }
+    const head = `Stripe decided dispute ${d.stripeDisputeId} on GAM's fee pull of ${day} from ${who} for GAM and put back `
+      + `${usd(Math.max(0, d.disputedCents))}. GAM does not undo a won dispute by itself yet: nothing was changed.`
+    await noticeOncePerDispute(GAM_DEBIT_DISPUTE_WON_CATEGORY, d.stripeDisputeId, {
+      severity: 'critical',
+      title: steps.length === 0
+        ? `A dispute on GAM's fee pull was won: nothing to undo (${d.paymentIntentId})`
+        : `A dispute on GAM's fee pull was won: undo ${steps.length} thing${steps.length === 1 ? '' : 's'} by hand (${d.paymentIntentId})`,
+      body: steps.length === 0
+        ? `${head} Nothing was reopened for it, so there is nothing to undo.`
+        : `${head} Undo these by hand:\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`,
+      context: { debit_id: pull.id, landlord_id: pull.landlord_id, stripe_payment_intent_id: d.paymentIntentId,
+                 still_owed: owedCents / 100, collected_again: againCents / 100, cost_line_voided: voidedCents / 100,
+                 fee_returned: returned / 100, steps },
+    })
+  } catch (err) {
+    logger.error({ err, debitId: pull.id }, '[gam-debit] could not raise the won-dispute notice')
+  }
 }

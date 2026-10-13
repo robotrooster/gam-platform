@@ -9,12 +9,12 @@ import fs from 'fs'
 import crypto from 'crypto'
 import multer from 'multer'
 import { streamStoredFile } from '../lib/fileServe'
-import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
+import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
-import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates } from '../services/meterRepair'
+import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
@@ -534,6 +534,12 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // from GET /meters/:id/flagged-estimates). Only those come off — one
       // written between the question and the answer is never voided unseen.
       voidEstimateIds: z.array(z.string().uuid()).max(1000).optional(),
+      // 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it':
+      // LANDLORD'S CHOICE, asked at the moment of marking ('Stop the flat
+      // charge too?')." Sent with zeroUseConfirmed on a flat-rate meter, and
+      // required there: true stops the flat charge while the meter is marked
+      // unused (it starts again once it is not), false keeps it billing.
+      stopFlatCharge: z.boolean().optional(),
     }).parse(req.body)
     // S648: marking a broken meter repaired REQUIRES what the new meter reads
     // now. Without it, the first bill after the repair would be measured from
@@ -563,6 +569,36 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
     }
     if (voidingEstimates && body.voidEstimateIds === undefined) {
       throw new AppError(400, 'Send the estimated charges the window showed (voidEstimateIds) — only those are taken off.')
+    }
+    // 10/13 (Nic): "Stop the flat charge too?" — a flat-rate meter's question,
+    // asked when it is marked "Works, nobody using it", and only then.
+    // (Only true acts, like zeroUseConfirmed: false, or leaving it out, changes nothing.)
+    const flatRate = meter.billing_method === 'flat_rate'
+    if (body.stopFlatCharge === true && !confirmingNoUse) {
+      throw new AppError(400,
+        `Stopping the flat charge is answered only with "${meterWorksNoUseLabel(meter.utility_type)}".`)
+    }
+    if (body.stopFlatCharge === true && !flatRate) {
+      throw new AppError(400, 'Only a flat-rate charge can be stopped this way — this meter bills what it measures.')
+    }
+    // ...and it is the landlord's own choice: the assistant makes no money
+    // decision (decisions #38 Q6), so it neither stops a charge nor keeps one
+    // billing on the landlord's behalf.
+    if (confirmingNoUse && flatRate && req.get('X-GAM-Actor') === 'agent') {
+      throw new AppError(403,
+        `Whether ${meter.label}'s flat charge stops too is the landlord's own choice, made with `
+        + `"${meterWorksNoUseLabel(meter.utility_type)}" on the Utilities page — nothing was changed.`)
+    }
+    if (confirmingNoUse && flatRate && body.stopFlatCharge === undefined) {
+      const served = await queryOne<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM utility_meter_units WHERE meter_id = $1`, [meter.id])
+      const n = served?.n ?? 0
+      return void res.status(409).json({
+        success: false, code: 'flat_charge_question',
+        error: `Stop the flat charge too? Yes: ${meter.label} bills nothing to the ${n} space${n === 1 ? '' : 's'} on it `
+          + 'while it is marked unused, and starts again once it is not. No: it keeps billing.',
+        spaces: n,
+      })
     }
     // The flagged period this meter is in (services/meterRepair
     // flaggedPeriodStart: since it last came back into service), read BEFORE
@@ -737,9 +773,11 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // zero_use_confirmed_at, services/meterRepair): from here a flat read is
       // a stuck meter again. Only written when one is on record.
       // 10/12 (Nic, review): ...and the landlord taking it back (zeroUseWithdrawn).
+      // 10/13 (Nic): and a flat charge stopped with it starts again
+      // (ZERO_USE_CLEARED_SET clears the answer with the mark).
       if ((body.outOfService === true || withdrawingNoUse) && meter.zero_use_confirmed_at) {
         await tx.query(
-          `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL WHERE id = $1`,
+          `UPDATE utility_meters SET ${ZERO_USE_CLEARED_SET} WHERE id = $1`,
           [req.params.id])
         updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       }
@@ -751,12 +789,12 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         // nobody using it too, when that is said with it.
         await markMeterRepaired(tx, {
           meterId: req.params.id, startingReading: body.repairedStartingReading, userId: req.user!.userId,
-          zeroUseConfirmed: confirmingNoUse,
+          zeroUseConfirmed: confirmingNoUse, stopFlatCharge: body.stopFlatCharge === true,
         })
         updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       } else if (confirmingNoUse) {
         // 10/12 (Nic), M1: "Works, tenant uses no power".
-        await markMeterWorksNoUse(tx, { meterId: req.params.id, userId: req.user!.userId })
+        await markMeterWorksNoUse(tx, { meterId: req.params.id, userId: req.user!.userId, stopFlatCharge: body.stopFlatCharge === true })
         updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       }
       await tx.query('COMMIT')

@@ -838,7 +838,7 @@ function BookkeeperPropertiesEditor({ boxesLive, moreBoxes, member, properties, 
               {BOOKKEEPER_MONEY_IN_FILING.map(v => <option key={v} value={v}>{BOOKKEEPER_MONEY_IN_FILING_LABEL[v]}</option>)}
             </select>
             <span style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
-              A deposit they file leaves the rent queue, so a tenant's rent filed as other income stays owed on the tenant's account. "Not rent" is yours to mark. Money going out is always theirs to file.
+              A deposit they file leaves the rent queue, so a tenant's rent filed as other income stays owed on the tenant's account. You and they can mark a deposit "Not rent" (not if they never file money coming in). Money going out is always theirs to file.
             </span>
           </label>
         )}

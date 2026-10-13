@@ -30,6 +30,7 @@ import { X, LogOut } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
 import {
   summaryLines, canConfirm, confirmLabel, refundAmountFor, waitLine, doneLines, failedPart, retryParts, windowTitle, newKey, money,
+  pastEndChoices, KEEP_THEM_OWED,
   type CheckoutQuote, type CheckoutChoice,
 } from '../lib/earlyCheckOut'
 
@@ -112,7 +113,10 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
       // 10/12 (G6): rent past the day they left that a payment was tried on
       // turned up since the window opened — asked here, with the charges.
       if (data?.code === 'stay_shortened_attempted') {
-        setQuote((q) => q ? { ...q, pastEndAttempted: { words: data.error, charges: data.charges ?? [], choices: data.choices ?? { void: 'Take those charges off', keep: 'Keep them owed' } } } : q)
+        setQuote((q) => q ? { ...q, pastEndAttempted: {
+          words: data.error, charges: data.charges ?? [],
+          choices: data.choices ?? { keep: KEEP_THEM_OWED }, voidRefused: data.voidRefused ?? null,
+        } } : q)
         setPastEnd(null)
       }
       if (data?.code === 'checkout_changed' && data?.data) {
@@ -278,12 +282,17 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
             {askPastEnd && quote.pastEndAttempted && (
               <div style={{ display: 'grid', gap: 8 }}>
                 <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-1)', lineHeight: 1.5 }}>{quote.pastEndAttempted.words}</div>
-                {(['void', 'keep'] as const).map((c) => (
+                {/* 10/13 (Nic): only the answers this person may give — "Take those
+                    charges off" is the owner's and a booking manager's. */}
+                {quote.pastEndAttempted.voidRefused && (
+                  <div style={{ fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{quote.pastEndAttempted.voidRefused}</div>
+                )}
+                {pastEndChoices(quote.pastEndAttempted.choices).map(({ value: c, label }) => (
                   <button key={c} type="button" disabled={busy} onClick={() => setPastEnd(c)}
                     style={{ textAlign: 'left', padding: '10px 14px', borderRadius: 10, cursor: 'pointer',
                              background: pastEnd === c ? 'var(--bg-3)' : 'var(--bg-2)',
                              border: `2px solid ${pastEnd === c ? 'var(--gold)' : 'var(--border-1)'}` }}>
-                    <div style={{ fontSize: '.86rem', fontWeight: 700, color: 'var(--text-0)' }}>{quote.pastEndAttempted!.choices[c]}</div>
+                    <div style={{ fontSize: '.86rem', fontWeight: 700, color: 'var(--text-0)' }}>{label}</div>
                   </button>
                 ))}
               </div>

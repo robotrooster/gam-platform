@@ -35,7 +35,7 @@ import {
   CheckoutChanged, poolQ, checkOutForLeftDay,
 } from '../services/earlyCheckOut'
 import { pastEndAttemptedCharges, stayShortenedChoiceIn, recordStayShortenedChoice } from '../services/bookingLeaseBilling'
-import { STAY_SHORTENED_CHARGE_CHOICE_LABEL } from '@gam/shared'
+import { shortenedChoicesFor, assertMayAnswerShortened } from '../lib/stayShortenedVoid'
 import { todayIn } from '../lib/timezone'
 
 export const stayCheckOutRouter = Router()
@@ -85,10 +85,13 @@ stayCheckOutRouter.get('/:unitId/bookings/:bookingId/check-out', requirePerm(...
     // they left. Rent for the nights after it that a payment was tried on is
     // the landlord's choice — take it off or keep it owed — asked here, before
     // the check-out, and answered with it (pastEndAttempted on the POST).
+    // 10/13 (Nic): "Take those charges off" is offered to the owner and a
+    // manager with the booking permission only (lib/stayShortenedVoid).
     const ask = !quote.checkedOut && quote.leftOn
       ? await pastEndAttemptedCharges(b.id, checkOutForLeftDay(quote.checkIn, quote.leftOn)) : null
+    const offer = shortenedChoicesFor(req.user)
     res.json({ success: true, data: { ...quote,
-      pastEndAttempted: ask ? { words: ask.words, charges: ask.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL } : null } })
+      pastEndAttempted: ask ? { words: ask.words, charges: ask.lines, choices: offer.choices, voidRefused: offer.voidRefused } : null } })
   } catch (e) { next(e) }
 })
 
@@ -121,11 +124,14 @@ stayCheckOutRouter.post('/:unitId/bookings/:bookingId/check-out', requirePerm(..
         if (ask) {
           const choice = stayShortenedChoiceIn(body.pastEndAttempted)
           if (!choice) {
+            const offer = shortenedChoicesFor(req.user)
             return res.status(409).json({
               success: false, code: 'stay_shortened_attempted', error: ask.words,
-              charges: ask.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL,
+              charges: ask.lines, choices: offer.choices, voidRefused: offer.voidRefused,
             })
           }
+          // 10/13 (Nic): 'void' is the owner's and a booking manager's — refused before anything is written.
+          assertMayAnswerShortened(req.user, choice)
           await recordStayShortenedChoice({ bookingId: b.id, asked: ask, choice, chosenBy: req.user!.userId })
         }
       }

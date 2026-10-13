@@ -318,6 +318,37 @@ webhooksRouter.post('/stripe', async (req, res) => {
           `SELECT id FROM connect_disputes WHERE stripe_dispute_id = $1`, [dispute.id])
         const { recordChargeback } = await import('../services/heldPayouts')
 
+        // 10/13 (Nic): "GAM fee pull disputed by landlord's bank: AUTOMATIC —
+        // the disputed fees reopen as owed by the landlord, collected on the
+        // next pull, admin told." A dispute on GAM's own pull of its fees from
+        // a landlord's bank (landlord_gam_debits) is not a tenant's payment or
+        // a held charge: services/landlordGamDebit handles all of it (the
+        // inquiry, the reopening, the pull's $6 voided and what the pull cost
+        // GAM at Stripe billed at cost (Nic G1), a win's hand list)
+        // and nothing below runs. It used to fall through to the
+        // "charge GAM cannot place" notice and nothing else.
+        if (piId) {
+          const { handleGamDebitDispute } = await import('../services/landlordGamDebit')
+          const { disputeFeeReturnedOnWinCents } = await import('../services/stripeCosts')
+          const pulled = await handleGamDebitDispute({
+            paymentIntentId: piId, stripeDisputeId: dispute.id, disputeStatus: status, eventStatus: dispute.status,
+            disputedCents: dispute.amount ?? 0, feeCents,
+            // Stripe's word on its dispute fee only when the event carries the
+            // dispute's balance transactions; else it is read from Stripe.
+            feeStated: (dispute.balance_transactions ?? []).length > 0,
+            feeReturnedCents: dispute.status === DISPUTE_STATUS_WON ? disputeFeeReturnedOnWinCents(dispute as any) : 0,
+          })
+          if (pulled.handled) {
+            // The pull's own success is not recorded yet: Stripe sends this again.
+            if (pulled.action === 'not_settled') {
+              logger.warn({ event_type: event.type, stripe_dispute_id: dispute.id, debit_id: pulled.debitId },
+                'dispute on a GAM fee pull that has not settled yet — Stripe will deliver it again')
+              return res.status(503).json({ error: 'the pull has not settled yet — try again in a moment' })
+            }
+            break
+          }
+        }
+
         if (status === DISPUTE_STATUS_WON) {
           // Decisions #55-AMENDED: a won dispute is NOT undone automatically
           // in this deploy — no bill voided, no landlord line, no credit, no
