@@ -100,7 +100,7 @@ function renderAdminEmailHtml(opts: CreateAdminNotificationOpts): string {
       <div style="font-size:1.1rem;font-weight:600;color:#1a202c">${escapeHtml(opts.title)}</div>
       <div style="color:#4a5568;font-size:.85rem;margin-top:4px">${escapeHtml(opts.category)}</div>
     </div>
-    ${opts.body ? `<p style="color:#2d3748;line-height:1.5">${escapeHtml(opts.body)}</p>` : ''}
+    ${opts.body ? `<p style="color:#2d3748;line-height:1.5;white-space:pre-line">${escapeHtml(opts.body)}</p>` : ''}
     ${actionBlock}
     ${ctxBlock}
   </div>`

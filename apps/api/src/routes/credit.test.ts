@@ -35,7 +35,7 @@ import {
   cleanupAllSchema, seedTenant, seedLandlord, seedProperty, seedUnit,
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
-import { appendEvent } from '../services/creditLedger'
+import { appendEvent, computeEventHash, restartChain } from '../services/creditLedger'
 import { creditRouter } from './credit'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -576,5 +576,103 @@ describe('Integrity', () => {
     expect(res.body.data).toHaveProperty('ok')
     expect(res.body.data).toHaveProperty('eventCount')
     expect(res.body.data.ok).toBe(true)  // freshly seeded chain is valid
+  })
+})
+
+// 10/13 (Nic): "Restart note: ADMIN ONLY." A forked chain restarted (the 12 of
+// 10/13) carries a note explaining the break. GET /integrity/verify/:subjectId
+// returns it to an admin or super_admin only — never to a tenant or a landlord,
+// the tenant whose record it is included; everyone the route lets in still gets
+// the proof (whole since the restart, the break it explains).
+describe('Integrity — a restarted chain\'s note is admin only (10/13)', () => {
+  const NOTE = 'Restarted 10/13/2026: this record\'s chain split in two (a fork).'
+
+  /** Tenant A's chain a → b, with c also after a (the old bug's fork), restarted with NOTE. */
+  async function restartedChain(tenantId: string) {
+    const a = await seedTenantEvent(tenantId)
+    const b = await seedTenantEvent(tenantId)
+    const c = await seedTenantEvent(tenantId)
+    const aHash = (await db.query(`SELECT this_hash FROM credit_events WHERE id = $1`, [a.eventId])).rows[0].this_hash as Buffer
+    const row = (await db.query<any>(
+      `SELECT event_data, occurred_at, attestation_source, attestation_evidence FROM credit_events WHERE id = $1`, [c.eventId])).rows[0]
+    const forged = computeEventHash({ prevHash: aHash, eventData: row.event_data, occurredAt: new Date(row.occurred_at),
+      attestationSource: row.attestation_source, attestationEvidence: row.attestation_evidence })
+    await db.query(`UPDATE credit_events SET prev_hash = $1, this_hash = $2 WHERE id = $3`, [aHash, forged, c.eventId])
+    const r = await restartChain({ subjectId: a.subjectId, note: NOTE })
+    return { subjectId: a.subjectId, restartId: r.eventId, firstBad: c.eventId, b: b.eventId }
+  }
+
+  async function superAdminToken(): Promise<string> {
+    const u = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'S', 'A', TRUE) RETURNING id`, [`super-${randomUUID()}@test.dev`])
+    return jwt.sign({ userId: u.rows[0].id, role: 'super_admin', email: 's@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+  }
+
+  const verify = (subjectId: string, token: string) => request(buildApp())
+    .get(`/api/credit/integrity/verify/${subjectId}`)
+    .set('Authorization', `Bearer ${token}`)
+
+  it('admin and super_admin read the note with the proof', async () => {
+    const f = await seed()
+    const c = await restartedChain(f.tenantAId)
+    for (const token of [f.adminToken, await superAdminToken()]) {
+      const res = await verify(c.subjectId, token)
+      expect(res.status).toBe(200)
+      expect(res.body.data).toMatchObject({ ok: true, eventCount: 4 })
+      expect(res.body.data.restarts).toHaveLength(1)
+      expect(res.body.data.restarts[0]).toMatchObject({
+        eventId: c.restartId, note: NOTE, sealedEventCount: 3, brokenEventId: c.firstBad,
+      })
+    }
+  })
+
+  it('the tenant whose record it is, their current landlord and a network landlord get the proof, never the note', async () => {
+    const f = await seed()
+    const c = await restartedChain(f.tenantAId)
+    for (const token of [f.tenantAToken, f.landlordAToken, f.landlordBToken]) {
+      const res = await verify(c.subjectId, token)
+      expect(res.status).toBe(200)
+      expect(res.body.data).toMatchObject({ ok: true, eventCount: 4 })
+      expect(res.body.data.restarts).toHaveLength(1)
+      expect(res.body.data.restarts[0]).toMatchObject({ eventId: c.restartId, sealedEventCount: 3, brokenEventId: c.firstBad })
+      expect(res.body.data.restarts[0]).not.toHaveProperty('note')
+      expect(JSON.stringify(res.body)).not.toContain(NOTE)
+    }
+  })
+
+  it('another tenant with no tie to the record is still refused (403)', async () => {
+    const f = await seed()
+    const c = await restartedChain(f.tenantAId)
+    const res = await verify(c.subjectId, f.tenantBToken)
+    expect(res.status).toBe(403)
+  })
+
+  // The proof names the restart's id; a dispute on it would echo its contents
+  // (the note) back through /disputes/mine. A restart is not a mark: refused.
+  it('the tenant cannot open a dispute on the restart entry — 400, nothing opened, the note never echoed', async () => {
+    const f = await seed()
+    const c = await restartedChain(f.tenantAId)
+    const res = await request(buildApp())
+      .post('/api/credit/dispute')
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+      .send({ disputedEventId: c.restartId, reason: 'factual_inaccuracy', notes: 'what is this?' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/not part of the credit history/)
+    expect((await db.query(`SELECT 1 FROM credit_disputes WHERE disputed_event_id = $1`, [c.restartId])).rowCount).toBe(0)
+    expect((await db.query(`SELECT 1 FROM credit_events WHERE subject_id = $1 AND event_type = 'dispute_opened'`, [c.subjectId])).rowCount).toBe(0)
+    const mine = await request(buildApp())
+      .get('/api/credit/disputes/mine')
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+    expect(mine.status).toBe(200)
+    expect(JSON.stringify(mine.body)).not.toContain(NOTE)
+
+    // A real mark on the same record can still be disputed.
+    const ok = await request(buildApp())
+      .post('/api/credit/dispute')
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+      .send({ disputedEventId: c.b, reason: 'factual_inaccuracy' })
+    expect(ok.status).toBe(200)
   })
 })

@@ -1,5 +1,5 @@
 import { getClient } from '../db'
-import { appendEvent, supersedeEvent } from './creditLedger'
+import { appendEvent, supersedeEvent, CHAIN_RESTART_EVENT } from './creditLedger'
 import { recomputeAndSnapshot } from './creditScore'
 import type {
   CreditDisputeReason,
@@ -48,8 +48,8 @@ export async function openDispute(args: {
     // on the stranger's chain via supersede — cross-subject credit
     // manipulation. Now: 403 if the event's subject_id !=
     // disputingSubjectId.
-    const ownership = await client.query<{ subject_id: string }>(
-      `SELECT subject_id FROM credit_events WHERE id = $1`,
+    const ownership = await client.query<{ subject_id: string; event_type: string }>(
+      `SELECT subject_id, event_type FROM credit_events WHERE id = $1`,
       [args.disputedEventId],
     )
     if (ownership.rows.length === 0) {
@@ -57,6 +57,14 @@ export async function openDispute(args: {
     }
     if (ownership.rows[0].subject_id !== args.disputingSubjectId) {
       throw new Error('disputed event does not belong to disputing subject')
+    }
+    // 10/13 (Nic): "Restart note: ADMIN ONLY." A chain restart is the ledger's
+    // own record, not a mark — nothing in the credit history to dispute — and
+    // a dispute would hand its note back to the subject (/disputes/mine
+    // returns the disputed entry's contents). The integrity proof names the
+    // restart's id to anyone who may verify the chain, so it is refused here.
+    if (ownership.rows[0].event_type === CHAIN_RESTART_EVENT) {
+      throw new AppError(400, 'That entry is not part of the credit history, so it cannot be disputed.')
     }
 
     const evidence = {

@@ -3350,10 +3350,11 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // Credit ledger nightly recompute. 3am Phoenix — sits between
-  // lease-ends (2am) and background-check expiry (3am same minute on
-  // a different table set, no contention). Recomputes scores for
-  // every subject with active events and refreshes the stats panel.
+  // Credit ledger nightly. 3am Phoenix — sits between lease-ends (2am) and
+  // background-check expiry (3am same minute on a different table set, no
+  // contention). Writes tonight's bill marks, runs the credit chain check
+  // (10/13 Nic: one admin email for broken chains, or a did-not-run email),
+  // then recomputes scores and refreshes the stats panel.
   cron.schedule('0 3 * * *', async () => {
     try {
       const { processCreditNightly } = await import('./creditNightly')

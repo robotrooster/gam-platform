@@ -332,6 +332,23 @@ export const CHAIN_BREAKS = [
 ] as const
 export type ChainBreak = typeof CHAIN_BREAKS[number]
 
+/** A break in plain words — the nightly chain check's admin email (10/13). */
+export const CHAIN_BREAK_LABEL: Record<ChainBreak, string> = {
+  tampered: 'an entry was changed after it was written',
+  no_first_event: 'no entry starts the chain',
+  two_first_events: 'two entries each start the chain',
+  fork: 'the chain splits: two entries follow the same entry',
+  loop: 'the chain loops back on itself',
+  unlinked: 'an entry follows no entry of the chain',
+  restart_mismatch: 'a restart does not match the chain it sealed',
+}
+
+/**
+ * Who may read a restart's note (10/13, Nic: "Restart note: ADMIN ONLY") — the
+ * GAM staff roles, never a tenant or a landlord (verifyChain).
+ */
+export const CHAIN_RESTART_NOTE_ROLES: readonly string[] = ['admin', 'super_admin']
+
 /** A point where a chain split (10/13): an entry more than one entry attaches to. */
 export interface ChainSplit {
   /** The entry the branches attach to. */
@@ -345,12 +362,13 @@ export interface ChainRestart {
   /** The restart event: the first event of the chain after it. */
   eventId: string
   restartedAt: Date
-  /** Who may read the note: the restart event's own tier. */
+  /** The restart event's own tier (private_to_subject). */
   visibility: CreditNetworkVisibility
   /**
-   * The note recorded with it, explaining the break — only for a reader whose
-   * tiers include `visibility` (verifyChain). The rest is the integrity proof,
-   * which the integrity route shows anyone who may verify the chain.
+   * The note recorded with it, explaining the break — ADMIN ONLY (10/13, Nic):
+   * verifyChain returns it to an admin or super_admin reader alone. The rest
+   * is the integrity proof, which the integrity route shows anyone who may
+   * verify the chain.
    */
   note?: string
   /** The chain it sealed — its events, kept exactly as they were — and where that chain broke. */
@@ -559,20 +577,22 @@ export function verifyEvents(events: readonly ChainEventRow[]): VerifyChainResul
  * when it was restarted (10/13; `restarts` then lists each restart and the
  * break it explains).
  *
- * 10/13 (review): a restart's note is the words of a 'private_to_subject'
- * event, so it is returned only to a reader whose tiers (`visibleTo`, the
- * route's canViewSubject) include the restart's. The default is no tiers: no
- * note. The rest of a restart — its id, what it sealed, where the chain broke
- * and split — is the integrity proof, shown to anyone who may verify the chain.
+ * 10/13 (Nic): "Restart note: ADMIN ONLY." The note ("chain restarted on
+ * 10/13 …") is returned only when `readerRole` is admin or super_admin
+ * (CHAIN_RESTART_NOTE_ROLES) — never to a tenant or a landlord, the subject
+ * itself included, although the restart event is 'private_to_subject'. No
+ * role: no note. The rest of a restart — its id, what it sealed, where the
+ * chain broke and split — is the integrity proof, shown to anyone who may
+ * verify the chain.
  */
 export async function verifyChain(
   subjectId: string,
-  opts: { visibleTo?: readonly CreditNetworkVisibility[] } = {},
+  opts: { readerRole?: string | null } = {},
 ): Promise<VerifyChainResult> {
   const v = verifyEvents(await readChain(db, subjectId))
   if (!v.restarts) return v
-  const may = new Set(opts.visibleTo ?? [])
-  return { ...v, restarts: v.restarts.map(({ note, ...r }) => (may.has(r.visibility) ? { ...r, note } : r)) }
+  if (opts.readerRole && CHAIN_RESTART_NOTE_ROLES.includes(opts.readerRole)) return v
+  return { ...v, restarts: v.restarts.map(({ note: _note, ...r }) => r) }
 }
 
 export interface ChainsReport {

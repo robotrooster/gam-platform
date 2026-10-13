@@ -12,7 +12,7 @@
  *   - verifyChain           replay determinism + tamper detection
  *   - restartChain          10/13: a forked chain restarted from today, the
  *                           break — every split — sealed and still reported
- *                           (verifyAllChains); the note only to its tier;
+ *                           (verifyAllChains); the note to admins only;
  *                           the nightly score and stats skip a restart
  *   - computeMerkleRoot     weekly-anchor cron tree builder
  *   - supersedeEvent        dispute correction stamping
@@ -650,7 +650,7 @@ describe('chain restart (10/13)', () => {
     const meta = (await db.query(`SELECT attestation_source, network_visibility, dimension_tags FROM credit_events WHERE id = $1`, [r.eventId])).rows[0]
     expect(meta).toEqual({ attestation_source: 'system_derived', network_visibility: 'private_to_subject', dimension_tags: [] })
 
-    const v = await verifyChain(f.sid, { visibleTo: ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network'] })
+    const v = await verifyChain(f.sid, { readerRole: 'admin' })
     expect(v).toMatchObject({ ok: true, eventCount: 4 })
     expect(v.restarts).toHaveLength(1)
     expect(v.restarts![0]).toMatchObject({
@@ -712,20 +712,24 @@ describe('chain restart (10/13)', () => {
     expect(await snapshot(f.sid)).toHaveLength(3)
   })
 
-  // 10/13 review: the restart event is 'private_to_subject', and the integrity
-  // route returns verifyChain to every reader canViewSubject lets in — network
-  // landlords included. The note goes only to a reader with the restart's tier.
-  it('the note is returned only to a reader whose tiers include the restart\'s; the proof to anyone', async () => {
+  // 10/13 (Nic): "Restart note: ADMIN ONLY." The integrity route returns
+  // verifyChain to every reader canViewSubject lets in — the subject itself,
+  // its landlords, network landlords. The note goes to an admin or super_admin
+  // alone (the restart's 'private_to_subject' tier is not enough); the proof
+  // to anyone.
+  it('the note is returned to an admin or super_admin only — never a tenant or a landlord, the subject included; the proof to anyone', async () => {
     const f = await forked()
     const r = await restartChain({ subjectId: f.sid, note: NOTE })
     const proof = { eventId: r.eventId, sealedEventCount: 3, brokenEventId: f.c.eventId, splits: r.splits }
-    for (const visibleTo of [undefined, ['visible_to_gam_network'], ['visible_to_current_landlord', 'visible_to_gam_network']] as const) {
-      const v = await verifyChain(f.sid, visibleTo ? { visibleTo } : {})
+    for (const readerRole of [undefined, null, '', 'tenant', 'landlord', 'property_manager', 'onsite_manager', 'bookkeeper', 'Admin']) {
+      const v = await verifyChain(f.sid, readerRole === undefined ? {} : { readerRole })
       expect(v).toMatchObject({ ok: true, restarts: [proof] })
       expect(v.restarts![0]).not.toHaveProperty('note')
     }
-    const own = await verifyChain(f.sid, { visibleTo: ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network'] })
-    expect(own.restarts![0]).toMatchObject({ ...proof, note: NOTE })
+    for (const readerRole of ['admin', 'super_admin']) {
+      const v = await verifyChain(f.sid, { readerRole })
+      expect(v.restarts![0]).toMatchObject({ ...proof, note: NOTE })
+    }
   })
 
   it('later marks link from the restart; the restart is never part of the credit history', async () => {
