@@ -20,7 +20,7 @@ interface GamCharge {
   amount: number; collected: number; collectedAt: string | null
 }
 interface PayoutData {
-  payouts: Payout[]; totalSettled: number; totalOnTheWay: number
+  payouts: Payout[]; totalSettled: number; totalOnTheWay: number; payoutCount?: number
   gamCharges: GamCharge[]; gamChargesOutstanding: number
 }
 
@@ -42,7 +42,7 @@ export function PayoutsPage() {
             <div className="fin-kpi">
               <div className="fin-kpi-label">Paid out</div>
               <div className="fin-kpi-value fin-in">{isLoading && !data ? '…' : money(data?.totalSettled ?? 0)}</div>
-              <div className="fin-kpi-sub">Landed in the bank (last 200 payouts)</div>
+              <div className="fin-kpi-sub">Landed in the bank, all time</div>
             </div>
             <div className="fin-kpi">
               <div className="fin-kpi-label">On its way</div>
@@ -57,6 +57,14 @@ export function PayoutsPage() {
 
           <div className="card fin-card">
             <div className="fin-card-head"><span className="fin-card-title">Payouts</span></div>
+            {/* 10/11: the totals above count every payout; the list stops at the newest ones. */}
+            {(data?.payoutCount ?? 0) > payouts.length && (
+              <div className="fin-card-head">
+                <span className="fin-muted">
+                  {`Showing the newest ${payouts.length.toLocaleString('en-US')} of ${(data?.payoutCount ?? 0).toLocaleString('en-US')} payouts. The totals count all of them.`}
+                </span>
+              </div>
+            )}
             {payouts.length === 0 ? <div className="fin-empty">{isLoading ? 'Loading…' : 'No payouts yet.'}</div> : (
               <table className="data-table">
                 <thead><tr>

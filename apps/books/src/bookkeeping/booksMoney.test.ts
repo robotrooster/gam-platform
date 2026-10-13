@@ -39,36 +39,26 @@ describe('rent roll: only spaces that owe rent carry a variance', () => {
   })
 })
 
-describe('GAM P&L figures: what became of the bills vs beside the total', () => {
+describe('GAM P&L figures beside the total (no switch: one way only, 10/12)', () => {
   const beside = [
-    { key: 'collectedSoFar', label: 'Collected so far', amount: 900 },
     { key: 'clearing', label: 'Still clearing', amount: 50 },
-    { key: 'stillOwed', label: 'Still owed', amount: 50 },
     { key: 'workTrade', label: 'Covered by work trade', amount: 300 },
     { key: 'depositsHeld', label: 'Deposits received (held)', amount: 500 },
   ]
 
-  it('Money billed: collected so far, clearing and still owed are the bills\' outcome, in that order — never beside', () => {
-    const { outcome, aside } = splitBeside(beside, 'billed')
-    expect(outcome.map(o => o.key)).toEqual(['collectedSoFar', 'clearing', 'stillOwed'])
-    expect(aside.map(a => a.key)).toEqual(['workTrade', 'depositsHeld'])
-    expect(outcome.reduce((s, o) => s + o.amount, 0)).toBe(1000)
-  })
-
-  it('Money received: every figure is beside the total; there is no bills\' outcome', () => {
-    const { outcome, aside, onHand } = splitBeside(beside, 'received')
-    expect(outcome).toEqual([])
+  it('every figure is beside the total', () => {
+    const { aside, onHand } = splitBeside(beside)
     expect(aside).toHaveLength(beside.length)
     expect(onHand).toBeNull()
   })
 
-  it('nothing to split is nothing either way', () => {
-    expect(splitBeside(null, 'billed')).toEqual({ outcome: [], aside: [], onHand: null })
-    expect(splitBeside(undefined, 'received')).toEqual({ outcome: [], aside: [], onHand: null })
+  it('nothing to split is nothing', () => {
+    expect(splitBeside(null)).toEqual({ aside: [], onHand: null })
+    expect(splitBeside(undefined)).toEqual({ aside: [], onHand: null })
   })
 })
 
-describe('GAM P&L: paid-ahead money is never "beside the total" under Money received (§0.0, Todd)', () => {
+describe('GAM P&L: paid-ahead money is never "beside the total" (§0.0, Todd)', () => {
   // Todd's September: Rent $460 + Paid ahead for later bills $460 = $920; the
   // $460 for October is still on hand at Sep 30.
   const toddBeside = [
@@ -77,20 +67,14 @@ describe('GAM P&L: paid-ahead money is never "beside the total" under Money rece
   ]
 
   it('Todd\'s September: the $460 paid ahead, not used yet, is not listed beside the $920 total — it is shown as counted', () => {
-    const { aside, onHand } = splitBeside(toddBeside, 'received')
+    const { aside, onHand } = splitBeside(toddBeside)
     expect(aside.map(a => a.key)).toEqual(['clearing'])
     expect(onHand).toEqual({ key: 'paidAheadUnused', label: 'Paid ahead, not used yet', amount: 460 })
     expect(PAID_AHEAD_COUNTED_NOTE).toBe('counted on the day it arrived; $0 again when it pays a bill')
   })
 
-  it('Money billed: paid-ahead money on hand stays beside the total (no bill it pays is in it yet)', () => {
-    const { aside, onHand } = splitBeside(toddBeside, 'billed')
-    expect(aside.map(a => a.key)).toEqual(['paidAheadUnused'])
-    expect(onHand).toBeNull()
-  })
-
   it('a zero paid-ahead figure shows no counted line', () => {
-    expect(splitBeside([{ key: 'paidAheadUnused', label: 'Paid ahead, not used yet', amount: 0 }], 'received').onHand).toBeNull()
+    expect(splitBeside([{ key: 'paidAheadUnused', label: 'Paid ahead, not used yet', amount: 0 }]).onHand).toBeNull()
   })
 })
 

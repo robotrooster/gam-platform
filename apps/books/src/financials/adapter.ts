@@ -14,6 +14,7 @@
  * open, sent as X-Client-Id — the same header every Books page sends).
  */
 import { createContext, useContext } from 'react'
+import { useQuery } from 'react-query'
 import axios from 'axios'
 import { applyCamelizeInterceptor } from '@gam/shared'
 import { toast as appToast, appConfirm as appAsk } from '../components/dialogs'
@@ -91,6 +92,15 @@ export function appConfirm(message: string, opts: { title?: string; confirmLabel
 
 /** The report tabs a bookkeeper sees (the API serves them nothing else). */
 const BOOKKEEPER_CAN = new Set(['reports.tab.overview', 'reports.tab.property', 'reports.export'])
+/**
+ * 10/12 (Nic): the report tabs a bookkeeper sees only with the owner's box —
+ * the monthly property report ("Sees the monthly property report on screen").
+ * Read off GET /financials/scope (the menu reads the same query); the server
+ * refuses the report without the box either way.
+ */
+const BOOKKEEPER_BOX_CAN: Record<string, (scope: { seesMonthlyReport?: boolean }) => boolean> = {
+  'reports.tab.monthly': scope => scope.seesMonthlyReport === true,
+}
 
 export interface Viewer {
   role: string
@@ -112,10 +122,13 @@ export function useIsBookkeeper(): boolean {
 export function useViewer(): Viewer {
   const { role } = useContext(FinancialsViewerContext)
   const isBookkeeper = role === 'bookkeeper'
+  const { data: scope } = useQuery<{ seesMonthlyReport?: boolean }>('financials-scope',
+    () => finGet('/financials/scope'), { enabled: isBookkeeper, staleTime: 60_000 })
+  const bookkeeperCan = (perm: string) => BOOKKEEPER_CAN.has(perm) || (!!scope && !!BOOKKEEPER_BOX_CAN[perm]?.(scope))
   return {
     role,
     isBookkeeper,
-    can: (perm: string) => isBookkeeper ? BOOKKEEPER_CAN.has(perm) : true,
+    can: (perm: string) => isBookkeeper ? bookkeeperCan(perm) : true,
     // Balances, Payments and the rest are the landlord portal's, not Books'.
     openOwnerPage: null,
   }

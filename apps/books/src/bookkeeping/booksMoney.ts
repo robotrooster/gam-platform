@@ -1,9 +1,11 @@
 /**
  * S655 (money plan, Step 15): the small rules GAM Books' money screens share,
  * kept out of main.tsx (which renders on import) so each one is tested.
+ *
+ * 10/12 (Nic): the Books pages also show inside the landlord portal's
+ * Bookkeeping menu, so this file is the same bytes in apps/books and
+ * apps/landlord (src/bookkeeping, bookkeeping-parity.test.ts).
  */
-import type { IncomeBasis } from '@gam/shared'
-
 // ─── Rent roll ───────────────────────────────────────────────────────────────
 
 export interface RentRollUnit {
@@ -43,10 +45,10 @@ export function expectedRent(units: readonly RentRollUnit[]): number {
 export interface BesideFigure { key: string; label: string; amount: number }
 
 /**
- * Money billed: collected so far, still clearing and still owed are what became
- * of the bills — they add up to the total, and still owed is INSIDE it — so
- * they are listed as that, never as "beside the total". Everything else is
- * beside the total.
+ * 10/12 (Nic): "NO Money received / Money billed toggle anywhere" — the P&L
+ * reads Received, Charged and Owed side by side, so its figures beside the
+ * total are split one way only (the old Money billed branch, and its basis
+ * argument, are gone).
  *
  * Money received (§0.0, Todd): paid-ahead money counted in full on the day it
  * arrived ("Paid ahead for later bills", inside the total) and $0 again when it
@@ -55,29 +57,17 @@ export interface BesideFigure { key: string; label: string; amount: number }
  * than the report counted — and comes back as `onHand`, to be shown on its own
  * line with PAID_AHEAD_COUNTED_NOTE. Every other figure is beside the total.
  */
-export const BILLED_OUTCOME_KEYS = ['collectedSoFar', 'clearing', 'stillOwed'] as const
 export const PAID_AHEAD_ON_HAND_KEY = 'paidAheadUnused'
 export const PAID_AHEAD_COUNTED_NOTE = 'counted on the day it arrived; $0 again when it pays a bill'
 
 export function splitBeside(
-  items: readonly BesideFigure[] | null | undefined, basis: IncomeBasis,
-): { outcome: BesideFigure[]; aside: BesideFigure[]; onHand: BesideFigure | null } {
+  items: readonly BesideFigure[] | null | undefined,
+): { aside: BesideFigure[]; onHand: BesideFigure | null } {
   const list = [...(items ?? [])]
-  if (basis !== 'billed') {
-    const found = list.find(i => i.key === PAID_AHEAD_ON_HAND_KEY)
-    return {
-      outcome: [],
-      aside: list.filter(i => i.key !== PAID_AHEAD_ON_HAND_KEY),
-      onHand: found && Number(found.amount) ? found : null,
-    }
-  }
-  const keys = BILLED_OUTCOME_KEYS as readonly string[]
+  const found = list.find(i => i.key === PAID_AHEAD_ON_HAND_KEY)
   return {
-    outcome: BILLED_OUTCOME_KEYS
-      .map(k => list.find(i => i.key === k))
-      .filter((i): i is BesideFigure => !!i),
-    aside: list.filter(i => !keys.includes(i.key)),
-    onHand: null,
+    aside: list.filter(i => i.key !== PAID_AHEAD_ON_HAND_KEY),
+    onHand: found && Number(found.amount) ? found : null,
   }
 }
 
