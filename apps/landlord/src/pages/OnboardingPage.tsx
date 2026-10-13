@@ -3,14 +3,14 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
+import { useEntities } from '../components/EntityPicker'
+import { companiesMissingPayouts, payoutsReadyFor, type PayoutCompany } from '../lib/payoutReadiness'
 import {
   Check, Building2, CreditCard, FileText, User,
   ChevronRight, ChevronLeft, AlertTriangle,
-  Landmark, Plus, X, LayoutGrid
+  Landmark, Plus, LayoutGrid
 } from 'lucide-react'
 import {
-  ACCOUNT_TYPE_VALUES, ACCOUNT_HOLDER_TYPE_VALUES,
-  AccountType, AccountHolderType,
   PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT,
   UNIT_TYPES, UNIT_TYPE_LABEL,
 } from '@gam/shared'
@@ -59,7 +59,6 @@ export function OnboardingPage() {
   const [agreed, setAgreed] = useState(false)
   const agreementRef = useRef<HTMLDivElement>(null)
   const [scrolledAgreement, setScrolledAgreement] = useState(false)
-  const [showAddBank, setShowAddBank] = useState(false)
   // S513 (#2): landlord's onboarding ACH fee election. Default false = tenant
   // pays ACH (the launch default). Card is always the tenant's — not a choice.
   const [coverFees, setCoverFees] = useState(false)
@@ -70,10 +69,9 @@ export function OnboardingPage() {
   const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential', firstBillingCycle: (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` })() })
   const [errors, setErrors] = useState<Record<string, string>>({})
 
-  // S637: the bank-account CATALOG no longer gates onboarding. It stays
-  // available on the Banking page (PM-company payouts and owner distributions
-  // read it), but "Get Paid" is answered by the Stripe Connect account — see
-  // payoutsReady below.
+  // S637: the bank-account CATALOG no longer gates onboarding — "Get Paid" is
+  // answered by the Stripe Connect account (payoutsReady below). 10/12 (Nic):
+  // and the catalog's add form is gone from this page and the Banking page.
   // S605: the operating-bank feed. Polls while the landlord is on that step so
   // the screen flips to "connected" the moment Stripe's window closes.
   const { data: feedConnections = [], refetch: refetchFeed } = useQuery<any[]>(
@@ -81,7 +79,11 @@ export function OnboardingPage() {
     { refetchInterval: step === 4 ? 4000 : false },
   )
   const feedLinked = feedConnections.some((c: any) => c.status === 'active')
-  useEffect(() => { if (feedLinked) setCompleted(prev => new Set([...prev, 3])) }, [feedLinked])
+  // 10/12 (Nic): the feed is step 4. This marked 3 — Get Paid — so linking the
+  // read-only feed put a green check and "Complete" on Get Paid with no Stripe
+  // payouts behind it: the same feed-for-payouts mix-up S637 describes. Left
+  // over from S649 inserting Add Your Units at index 2.
+  useEffect(() => { if (feedLinked) setCompleted(prev => new Set([...prev, 4])) }, [feedLinked])
   const [feedErr, setFeedErr] = useState<string | null>(null)
   const [feedBusy, setFeedBusy] = useState(false)
 
@@ -121,15 +123,38 @@ export function OnboardingPage() {
   //
   // Nic: "Both places where they connect an account... should just take them to
   // the connect account. The feed can come after."
+  //
+  // 10/12: and the COMPANY's Connect account. This asked about entity=user —
+  // the account's own user-level Connect id — but since S554 an owner verifies
+  // the landlord company (the Banking page this step sends them to onboards
+  // entity=landlord), so a landlord who finished Stripe there was still told
+  // "Set up payouts" here. Ask about the company this account owns. With one
+  // owned company (every fresh signup) that is its live Stripe status; with
+  // several, the same rule as the owner to-do list (/landlords/me/todos).
+  // 10/12 (Nic): that rule is now "every company with a property can be paid"
+  // (lib/payoutReadiness.ts) — "any of them can be paid" let a paid company
+  // answer for one that holds a property and has no Stripe account.
+  const { data: entities = [] } = useEntities()
+  const ownedEntities = (entities as Array<PayoutCompany & { isOwner?: boolean }>)
+    .filter(e => e.isOwner)
+  const payoutEntityId = ownedEntities.length === 1 ? ownedEntities[0].id : ''
   const connectStatusQ = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
-    'onboarding-connect-status',
-    () => apiGet('/stripe/connect/status?entity=user'),
-    { refetchInterval: 15000 },
+    ['onboarding-connect-status', payoutEntityId],
+    () => apiGet(`/stripe/connect/status?entity=landlord&entityId=${payoutEntityId}`),
+    { enabled: !!payoutEntityId, refetchInterval: 15000 },
   )
-  const payoutsReady = !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+  const payoutsReady = payoutEntityId
+    ? !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+    : payoutsReadyFor(ownedEntities)
+  // Where "Set up payouts" goes: straight to the one company that needs it.
+  const unpaidOwned = companiesMissingPayouts(ownedEntities)
+  const payoutSetupHref = !payoutEntityId && unpaidOwned.length === 1
+    ? `/banking?entity=${unpaidOwned[0].id}` : '/banking'
   const bankReady = payoutsReady
+  // 10/12 (Nic): Get Paid is step 3. This marked 2 (Add Your Units), the same
+  // S649 off-by-one as the feed marker above.
   useEffect(() => {
-    if (bankReady) setCompleted(prev => new Set([...prev, 2]))
+    if (bankReady) setCompleted(prev => new Set([...prev, 3]))
   }, [bankReady])
 
   // S629: the entity gets its NAME here, at the first moment the landlord
@@ -227,7 +252,10 @@ export function OnboardingPage() {
       if (!property.city.trim()) errs.city = 'City required'
       if (!property.zip.trim()) errs.zip = 'ZIP required'
     }
-    if (stepIdx === 4) {
+    // 10/12: the agreement is step 5. At 4 this demanded a signature on the
+    // bank-feed step — Next there silently did nothing — and never checked
+    // the agreement itself (another S649 off-by-one).
+    if (stepIdx === 5) {
       if (!agreed) errs.agreed = 'You must agree to continue'
       if (!signature.trim()) errs.signature = 'Signature required'
       if (!scrolledAgreement) errs.scroll = 'Please read the full agreement'
@@ -288,7 +316,7 @@ export function OnboardingPage() {
         {/* Left sidebar — steps */}
         <div style={{ width: 280, flexShrink: 0, background: 'var(--bg-1)', borderRight: '1px solid var(--border-0)', padding: '32px 24px', overflowY: 'auto' }}>
           <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 20, lineHeight: 1.6 }}>
-            Complete all 4 steps to activate your portfolio.
+            Complete all {STEPS.length} steps to activate your portfolio.
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {STEPS.map((s, i) => {
@@ -560,8 +588,11 @@ export function OnboardingPage() {
                         Payouts are live
                       </div>
                       <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-                        Rent collected through GAM is deposited to your bank each week. You can route each
-                        property to a different account from the Properties page.
+                        {/* 10/12 (Nic): this also said each property could be
+                            routed to a different account from the Properties
+                            page — that routing never moved a payout and is
+                            removed. Rent lands in the bank verified with Stripe. */}
+                        Rent collected through GAM is deposited to the bank you verified with Stripe.
                       </div>
                     </div>
                   </div>
@@ -596,7 +627,7 @@ export function OnboardingPage() {
                         </div>
                       )}
                       <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }}
-                        onClick={() => navigate('/banking')}>
+                        onClick={() => navigate(payoutSetupHref)}>
                         {connectStatusQ.data?.exists ? 'Continue payout setup' : 'Set up payouts'}
                       </button>
                     </div>
@@ -641,7 +672,7 @@ export function OnboardingPage() {
               </div>
             )}
 
-            {/* ── STEP 3: AGREEMENT ── */}
+            {/* ── STEP 4: CONNECT YOUR BANK (read-only feed) ── */}
             {/* S605: required step — a landlord without this has no expense side
                 to their P&L. Read-only; it cannot move money. */}
             {step === 4 && (
@@ -795,159 +826,6 @@ export function OnboardingPage() {
             </div>
 
           </div>
-        </div>
-      </div>
-
-      {showAddBank && (
-        <AddBankAccountInlineModal
-          onClose={() => setShowAddBank(false)}
-          onAdded={() => { qc.invalidateQueries('bank-accounts'); setShowAddBank(false) }}
-        />
-      )}
-    </div>
-  )
-}
-
-function AddBankAccountInlineModal({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
-  const [form, setForm] = useState({
-    nickname: '', accountHolderName: '',
-    accountHolderType: 'individual' as AccountHolderType,
-    accountType: 'checking' as AccountType,
-    routingNumber: '', accountNumber: '', confirm_accountNumber: '',
-  })
-  const [errors, setErrors] = useState<Record<string, string>>({})
-  const lbl: React.CSSProperties = {
-    fontSize: '.7rem', fontWeight: 600, color: 'var(--text-3)',
-    textTransform: 'uppercase', letterSpacing: '.06em',
-    display: 'block', marginBottom: 5,
-  }
-
-  const mut = useMutation(
-    (data: any) => apiPost('/bank-accounts', data),
-    {
-      onSuccess: () => onAdded(),
-      onError: (e: any) => setErrors({ submit: e?.response?.data?.error || 'Failed to add account' }),
-    }
-  )
-
-  const submit = () => {
-    const errs: Record<string, string> = {}
-    // S637: nickname is OPTIONAL here too — the server derives one from the
-    // account details. This is a SECOND copy of the add-account form (the other
-    // is BankingPage) and it kept the required check after that one dropped it,
-    // so the trap that stopped Dusty Rhoades was still live on this path.
-    if (!form.accountHolderName.trim()) errs.accountHolderName = 'Required'
-    if (!/^\d{9}$/.test(form.routingNumber.replace(/\D/g, ''))) errs.routingNumber = 'Must be 9 digits'
-    const acct = form.accountNumber.replace(/\D/g, '')
-    if (acct.length < 4 || acct.length > 17) errs.accountNumber = 'Must be 4–17 digits'
-    if (form.accountNumber !== form.confirm_accountNumber) errs.confirm_accountNumber = "Account numbers don't match"
-    setErrors(errs)
-    if (Object.keys(errs).length > 0) return
-    mut.mutate({
-      nickname: form.nickname.trim(),
-      accountHolderName: form.accountHolderName.trim(),
-      accountHolderType: form.accountHolderType,
-      accountType: form.accountType,
-      routingNumber: form.routingNumber.replace(/\D/g, ''),
-      accountNumber: acct,
-    })
-  }
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 520, width: '95vw' }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div className="modal-title" style={{ marginBottom: 0 }}>Add Bank Account</div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Nickname <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--text-3)' }}>(optional)</span></label>
-          <input className="input" style={{ width: '100%' }} value={form.nickname}
-            placeholder='e.g. "Acme Holdings LLC"'
-            onChange={e => setForm(f => ({ ...f, nickname: e.target.value }))} />
-          {errors.nickname && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.nickname}</div>}
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-          <div>
-            <label style={lbl}>Holder Type</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              {ACCOUNT_HOLDER_TYPE_VALUES.map(v => (
-                <button key={v} type="button"
-                  onClick={() => setForm(f => ({ ...f, accountHolderType: v }))}
-                  style={{
-                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                    fontSize: '.76rem', textTransform: 'capitalize',
-                    border: `1px solid ${form.accountHolderType === v ? 'var(--gold)' : 'var(--border-0)'}`,
-                    background: form.accountHolderType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                    color: 'var(--text-0)',
-                  }}>{v}</button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label style={lbl}>Account Type</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              {ACCOUNT_TYPE_VALUES.map(v => (
-                <button key={v} type="button"
-                  onClick={() => setForm(f => ({ ...f, accountType: v }))}
-                  style={{
-                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                    fontSize: '.76rem', textTransform: 'capitalize',
-                    border: `1px solid ${form.accountType === v ? 'var(--gold)' : 'var(--border-0)'}`,
-                    background: form.accountType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                    color: 'var(--text-0)',
-                  }}>{v}</button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Account Holder Name</label>
-          <input className="input" style={{ width: '100%' }} value={form.accountHolderName}
-            placeholder={form.accountHolderType === 'business' ? 'Legal entity name' : 'Full name on account'}
-            onChange={e => setForm(f => ({ ...f, accountHolderName: e.target.value }))} />
-          {errors.accountHolderName && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountHolderName}</div>}
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 12, marginBottom: 12 }}>
-          <div>
-            <label style={lbl}>Routing #</label>
-            <input className="input" style={{ width: '100%' }} value={form.routingNumber}
-              inputMode="numeric" maxLength={9}
-              onChange={e => setForm(f => ({ ...f, routingNumber: e.target.value }))} />
-            {errors.routingNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.routingNumber}</div>}
-          </div>
-          <div>
-            <label style={lbl}>Account #</label>
-            <input className="input" style={{ width: '100%' }} value={form.accountNumber}
-              inputMode="numeric"
-              onChange={e => setForm(f => ({ ...f, accountNumber: e.target.value }))} />
-            {errors.accountNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountNumber}</div>}
-          </div>
-        </div>
-
-        <div style={{ marginBottom: 14 }}>
-          <label style={lbl}>Confirm Account #</label>
-          <input className="input" style={{ width: '100%' }} value={form.confirm_accountNumber}
-            inputMode="numeric"
-            onChange={e => setForm(f => ({ ...f, confirm_accountNumber: e.target.value }))} />
-          {errors.confirm_accountNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.confirm_accountNumber}</div>}
-        </div>
-
-        {errors.submit && (
-          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-            {errors.submit}
-          </div>
-        )}
-
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={mut.isLoading}>
-            {mut.isLoading ? <span className="spinner" /> : <><Check size={14} /> Add Account</>}
-          </button>
         </div>
       </div>
     </div>

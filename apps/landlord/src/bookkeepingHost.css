@@ -1,0 +1,125 @@
+/* 10/12 (Nic): "Bookkeeping" in the landlord menu shows GAM Books' own pages
+   (src/bookkeeping — the same files as apps/books, bookkeeping-parity.test.ts).
+   Those pages are written in GAM Books' look: its card, button, table, badge
+   and form classes. This sheet brings that look to them inside the portal,
+   scoped to .bk-host so the portal's own screens are untouched. Rules are
+   Books' (apps/books/src/main.tsx); its color and font tokens map onto the
+   portal's, so the light theme and a landlord's accent color carry through.
+   The mirror of apps/books/src/financialsHost.css. Landlord portal only — not
+   one of the shared files. */
+.bk-host {
+  --bg0: var(--bg-0); --bg1: var(--bg-1); --bg2: var(--bg-2); --bg3: var(--bg-3); --bg4: var(--bg-4);
+  --b0: var(--border-0); --b1: var(--border-1); --b2: var(--border-2);
+  --t0: var(--text-0); --t1: var(--text-1); --t2: var(--text-2); --t3: var(--text-3);
+  --purple: #a855f7; --teal: #14b8a6;
+  --font-d: var(--font-display); --font-b: var(--font-body); --font-m: var(--font-mono);
+  font-family: var(--font-b);
+  color: var(--t1);
+  line-height: 1.6;
+}
+.bk-host h1, .bk-host h2, .bk-host h3 { font-family: var(--font-d); color: var(--t0); line-height: 1.2; letter-spacing: normal; }
+.bk-host button { cursor: pointer; font-family: var(--font-b); }
+.bk-host input, .bk-host select, .bk-host textarea { font-family: var(--font-b); }
+.bk-host .card { background: var(--bg2); border: 1px solid var(--b1); border-radius: 10px; padding: 18px; }
+/* A phone: a wide table scrolls inside its card, never the page. */
+.bk-host .card { overflow-x: auto; }
+.bk-host .ct { font-size: .72rem; font-weight: 700; color: var(--t3); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 14px; }
+.bk-host .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.bk-host .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+.bk-host .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .bk-host .grid4 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 800px) { .bk-host .grid2, .bk-host .grid3, .bk-host .grid4 { grid-template-columns: 1fr; } }
+.bk-host .ph { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--b0); flex-wrap: wrap; gap: 10px; }
+.bk-host .pt { font-family: var(--font-d); font-size: 1.4rem; font-weight: 800; color: var(--t0); }
+.bk-host .ps { font-size: .78rem; color: var(--t3); margin-top: 2px; }
+.bk-host .kpi { background: var(--bg2); border: 1px solid var(--b1); border-radius: 10px; padding: 16px; position: relative; overflow: hidden; }
+.bk-host .kpi::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, var(--gold), transparent); opacity: .4; }
+.bk-host .kl { font-size: .65rem; color: var(--t3); text-transform: uppercase; letter-spacing: .09em; font-weight: 600; margin-bottom: 6px; }
+.bk-host .kv { font-family: var(--font-d); font-size: 1.6rem; font-weight: 800; color: var(--t0); line-height: 1; margin-bottom: 4px; }
+.bk-host .ks { font-size: .7rem; color: var(--t3); }
+.bk-host .kv.g { color: var(--green); } .bk-host .kv.r { color: var(--red); } .bk-host .kv.a { color: var(--amber); }
+.bk-host .kv.gold { color: var(--gold); } .bk-host .kv.b { color: var(--blue); } .bk-host .kv.t { color: var(--teal); }
+.bk-host .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 7px; font-size: .78rem; font-weight: 600; border: none; cursor: pointer; transition: all .12s; font-family: var(--font-b); text-decoration: none; white-space: normal; }
+.bk-host .bp { background: var(--gold); color: #080a0c; } .bk-host .bp:hover { background: #d9af3a; color: #080a0c; }
+.bk-host .bg-btn { background: var(--bg4); color: var(--t1); border: 1px solid var(--b2); } .bk-host .bg-btn:hover { background: var(--bg3); color: var(--t1); }
+.bk-host .bd { background: rgba(239,68,68,.08); color: var(--red); border: 1px solid rgba(239,68,68,.2); } .bk-host .bd:hover { background: rgba(239,68,68,.14); }
+.bk-host .bt { background: rgba(20,184,166,.08); color: var(--teal); border: 1px solid rgba(20,184,166,.2); }
+.bk-host .bsm { padding: 4px 9px; font-size: .72rem; }
+.bk-host .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 20px; font-size: .65rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.bk-host .bg2 { background: rgba(34,197,94,.08); color: var(--green); border: 1px solid rgba(34,197,94,.18); }
+.bk-host .ba { background: rgba(245,158,11,.08); color: var(--amber); border: 1px solid rgba(245,158,11,.18); }
+.bk-host .br { background: rgba(239,68,68,.08); color: var(--red); border: 1px solid rgba(239,68,68,.18); }
+.bk-host .bgold { background: rgba(201,162,39,.08); color: var(--gold); border: 1px solid rgba(201,162,39,.18); }
+.bk-host .bmu { background: var(--bg4); color: var(--t3); border: 1px solid var(--b1); }
+.bk-host .bb { background: rgba(59,130,246,.08); color: var(--blue); border: 1px solid rgba(59,130,246,.18); }
+.bk-host .bteal { background: rgba(20,184,166,.08); color: var(--teal); border: 1px solid rgba(20,184,166,.18); }
+.bk-host .tbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.bk-host .tbl th { background: var(--bg3); color: var(--t3); font-size: .64rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--b1); }
+.bk-host .tbl td { padding: 9px 12px; border-bottom: 1px solid var(--b0); color: var(--t1); }
+.bk-host .tbl tr:last-child td { border-bottom: none; }
+.bk-host .tbl tr:hover td { background: rgba(255,255,255,.012); }
+.bk-host .mono { font-family: var(--font-m); font-size: .8rem; }
+.bk-host .alert { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border-radius: 8px; font-size: .78rem; margin-bottom: 14px; }
+.bk-host .ae { background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.18); color: #fca5a5; }
+.bk-host .aw { background: rgba(245,158,11,.08); border: 1px solid rgba(245,158,11,.18); color: #fcd34d; }
+.bk-host .ag { background: rgba(34,197,94,.08); border: 1px solid rgba(34,197,94,.18); color: #86efac; }
+.bk-host .agold { background: rgba(201,162,39,.08); border: 1px solid rgba(201,162,39,.18); color: var(--gold); }
+.bk-host .empty { text-align: center; padding: 48px 20px; color: var(--t3); }
+.bk-host .spinner { width: 16px; height: 16px; border: 2px solid var(--b2); border-top-color: var(--gold); border-radius: 50%; animation: bk-spin .6s linear infinite; flex-shrink: 0; }
+@keyframes bk-spin { to { transform: rotate(360deg); } }
+.bk-host .dr { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--b0); font-size: .78rem; gap: 10px; }
+.bk-host .dr:last-child { border-bottom: none; }
+.bk-host .dk { color: var(--t3); } .bk-host .dv { color: var(--t0); font-weight: 500; }
+.bk-host .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--b0); margin-bottom: 20px; flex-wrap: wrap; }
+.bk-host .tab { padding: 9px 14px; background: none; border: none; color: var(--t3); font-size: .78rem; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all .12s; font-family: var(--font-b); }
+.bk-host .tab:hover { color: var(--t1); } .bk-host .tab.on { color: var(--gold); border-bottom-color: var(--gold); }
+/* The form window. Above the portal's sticky top bar (100). */
+.bk-host .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.bk-host .modal { background: var(--bg2); border: 1px solid var(--b1); border-radius: 12px; padding: 24px; width: 100%; max-width: 520px; max-height: 90vh; overflow-y: auto; }
+.bk-host .modal-h { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--b0); }
+.bk-host .modal-t { font-family: var(--font-d); font-size: 1.1rem; font-weight: 700; color: var(--t0); margin-bottom: 0; }
+.bk-host .frow { margin-bottom: 14px; }
+.bk-host .frow2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+.bk-host label { display: block; font-size: .72rem; font-weight: 600; color: var(--t3); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .06em; }
+.bk-host input[type=text], .bk-host input[type=email], .bk-host input[type=tel], .bk-host input[type=number], .bk-host input[type=date], .bk-host input[type=password], .bk-host select, .bk-host textarea {
+  width: 100%; background: var(--bg3); border: 1px solid var(--b1); border-radius: 7px; color: var(--t0); padding: 8px 11px; font-size: .875rem; outline: none; transition: border .12s;
+}
+.bk-host input:focus, .bk-host select:focus, .bk-host textarea:focus { border-color: var(--gold); }
+.bk-host .factions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--b0); flex-wrap: wrap; }
+/* Sub-lines under a figure */
+.bk-host .dr-sub .dk { padding-left: 14px; }
+.bk-host .bnote { margin-top: 10px; font-size: .72rem; color: var(--t3); line-height: 1.5; }
+/* S655: which company's books (an account with several) */
+.bk-host .company-pick { max-width: 560px; }
+.bk-host .company-pick-list { display: grid; gap: 8px; margin-top: 16px; }
+.bk-host .company-pick-list .btn { justify-content: space-between; padding: 11px 14px; font-size: .84rem; text-align: left; flex-wrap: wrap; }
+.bk-host .company-pick-sub { font-weight: 500; font-size: .72rem; opacity: .75; }
+.bk-host .bk-company { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.bk-host .bk-company label { margin-bottom: 0; }
+.bk-host .bk-company select { width: auto; max-width: 100%; padding: 6px 10px; font-size: .8rem; }
+.bk-host .bk-loading { padding: 32px; color: var(--t3); text-align: center; }
+.bk-host .bk-loading .spinner { display: inline-block; }
+
+/* A phone: two boxes side by side stack, and a page heading's controls wrap under it. */
+@media (max-width: 600px) {
+  .bk-host .frow2 { grid-template-columns: 1fr; }
+  .bk-host .ph { align-items: flex-start; }
+  .bk-host .modal { padding: 18px; }
+}
+
+/* The light theme: Books' alert text is pale for a dark page, and gold as text
+   needs the portal's darker ink on white (globals.css does the same). */
+:root[data-theme="light"] .bk-host .ae { color: #b91c1c; }
+:root[data-theme="light"] .bk-host .aw { color: #92400e; }
+:root[data-theme="light"] .bk-host .ag { color: #15803d; }
+:root[data-theme="light"] .bk-host .agold,
+:root[data-theme="light"] .bk-host .bgold,
+:root[data-theme="light"] .bk-host .kv.gold,
+:root[data-theme="light"] .bk-host .tab.on { color: var(--gold-ink); }
+:root[data-theme="light"] .bk-host .tab.on { border-bottom-color: var(--gold-ink); }
+:root[data-theme="light"] .bk-host .tbl tr:hover td { background: rgba(0,0,0,.025); }
+/* A link drawn as a button keeps its button's text color (the portal's light
+   theme colors every link gold). */
+:root[data-theme="light"] .bk-host .bp { color: #080a0c; }
+:root[data-theme="light"] .bk-host .bg-btn { color: var(--t1); }
+:root[data-theme="light"] .bk-host .overlay { background: rgba(20,30,60,.45); }

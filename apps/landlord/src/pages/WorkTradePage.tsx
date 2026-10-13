@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { WorkTradePanel } from '../../../../packages/shared-ui/WorkTradePanel'
+import { ExtraHoursPayables } from '../../../../packages/shared-ui/WorkTradeExtraHours'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 const panelApi = { get: apiGet, post: apiPost, patch: apiPatch }
@@ -9,6 +10,8 @@ import { toast } from '../components/dialogs'
 import { WORK_TRADE_COVERABLE, WORK_TRADE_COVERABLE_LABEL } from '@gam/shared'
 
 const STATUS_MAP: Record<string, string> = { active: 'badge-green', paused: 'badge-amber', ended: 'badge-muted' }
+// 10/12: the status in words, never the raw value.
+const STATUS_LABEL: Record<string, string> = { active: 'Active', paused: 'Paused', ended: 'Ended' }
 const DOC_STATUS_LABEL: Record<string, string> = { pending: 'Draft', draft: 'Draft', sent: 'Awaiting signature', in_progress: 'Awaiting signature', completed: 'On file', voided: 'Voided', execution_failed: 'Needs attention' }
 
 // W-56 (Nic): targets are PER PERSON (edited inline on each agreement row
@@ -51,6 +54,10 @@ export function WorkTradePage() {
   // S576 (B-8): the landlord's own work-trade addendum forms (Form Type =
   // Work-Trade Addendum). Fetched once, passed to each row's addendum cell.
   const { data: addendumTemplates = [] } = useQuery<any[]>('wt-addendum-templates', () => apiGet('/esign/templates?purpose=work_trade_addendum'))
+  // 10/12 (Nic): paid extra hours not yet paid, across everyone — "Both" ways to
+  // pay each: by hand (Mark paid), or Send to GAM Books.
+  const qc = useQueryClient()
+  const { data: extraOwed = [] } = useQuery<any[]>('wt-extra-hours-open', () => apiGet('/work-trade/extra-hours'))
 
   // Distinct properties for the new-agreement DEFAULT editor. a.target is
   // now the per-agreement value, so fetch nothing extra — the default
@@ -76,6 +83,18 @@ export function WorkTradePage() {
             <WorkTradePanel agreementId={openId} side="landlord" api={panelApi} onClose={() => setOpenId(null)}
               notify={(m, kind) => kind === 'error' ? toast.error(m) : toast(m)} />
           </div>
+        </div>
+      )}
+
+      {(extraOwed as any[]).length > 0 && (
+        <div className="card" style={{ marginBottom: 16, padding: 16 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Extra hours to pay</div>
+          <div style={{ color: 'var(--text-3)', fontSize: '.82rem', marginBottom: 6 }}>
+            Hours worked beyond what a work trade needed, on agreements you set to pay them. Pay by hand and mark them paid, or send them to GAM Books.
+          </div>
+          <ExtraHoursPayables rows={extraOwed as any[]} api={panelApi} showWho
+            onChanged={() => { qc.invalidateQueries('wt-extra-hours-open'); qc.invalidateQueries('wt-extra-hours') }}
+            notify={(m, kind) => kind === 'error' ? toast.error(m) : toast(m)} />
         </div>
       )}
 
@@ -113,7 +132,7 @@ export function WorkTradePage() {
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
                     : <span style={{ color: 'var(--text-3)' }}>0</span>}</td>
                   <td className="mono">{a.startDate ? new Date(a.startDate).toLocaleDateString() : '—'}</td>
-                  <td><span className={`badge ${STATUS_MAP[a.status] || 'badge-muted'}`}>{a.status || '—'}</span></td>
+                  <td><span className={`badge ${STATUS_MAP[a.status] || 'badge-muted'}`}>{STATUS_LABEL[a.status] ?? '—'}</span></td>
                   <td onClick={e => e.stopPropagation()}><AddendumCell agreement={a} templates={addendumTemplates as any[]} /></td>
                 </tr>
               )) : (
@@ -227,22 +246,47 @@ function AddendumCell({ agreement, templates }: { agreement: any; templates: any
 const COVERABLE: { key: string; label: string }[] =
   WORK_TRADE_COVERABLE.map(k => ({ key: k, label: WORK_TRADE_COVERABLE_LABEL[k] }))
 
+/** "1 open charge ($110.55)" — what a coverage change did to the bills already out. */
+function coverageWords(c: any): string | null {
+  if (!c) return null
+  const n = (k: number) => `${k} open ${k === 1 ? 'charge' : 'charges'}`
+  const m = (v: number) => `$${Number(v || 0).toFixed(2)}`
+  const parts: string[] = []
+  if (c.parked) parts.push(`${n(c.parked)} (${m(c.parkedAmount)}) now covered by the work trade until the month closes`)
+  if (c.covered) parts.push(`${n(c.covered)} covered by hours already worked (${m(c.coveredAmount)})`)
+  if (c.putBack) parts.push(`${n(c.putBack)} (${m(c.putBackAmount)}) back on the tenant's balance`)
+  if (c.notReached) parts.push(`${n(c.notReached)} (${m(c.notReachedAmount)}) on bills the work trade can't reach stay owed`)
+  return parts.length ? parts.join('; ') : null
+}
+
 function AgreementCoversCell({ agreement }: { agreement: any }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
+  // 10/12 (Nic): unticking a type with open charges parked under the trade is
+  // the landlord's choice at that moment.
+  const [asking, setAsking] = useState<{ key: string; next: string[]; count: number; amount: number } | null>(null)
   const covered: string[] = agreement.coveredCharges ?? []
   const save = useMutation(
-    (next: string[]) => apiPatch(`/work-trade/${agreement.id}`, { coveredCharges: next }),
-    { onSuccess: () => { qc.invalidateQueries('work-trade'); // S634: it no longer waits for the next invoice. A covered charge on the
-      // CURRENT month is suspended — worked off, not owed — and settles at
-      // month close.
-      toast('Saved — covered charges are worked off, not billed, from this month on.') },
+    (v: { next: string[]; openCoveredCharges?: 'keep_covered' | 'put_back' }) =>
+      apiPatch(`/work-trade/${agreement.id}`, { coveredCharges: v.next, openCoveredCharges: v.openCoveredCharges }),
+    { onSuccess: (data: any) => {
+        qc.invalidateQueries('work-trade'); setAsking(null)
+        // 10/12: a change now reaches the bills already out, not only the next one.
+        const words = coverageWords(data?.coverage)
+        toast(words ? `Saved — ${words}.` : 'Saved — covered charges are worked off, not billed.')
+      },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that') },
   )
-  const toggle = (key: string) => {
-    const next = covered.includes(key) ? covered.filter(k => k !== key) : [...covered, key]
-    save.mutate(next)
+  const checking = useMutation(() => apiGet<Record<string, { count: number; amount: number }>>(`/work-trade/${agreement.id}/covered-open`))
+  const toggle = async (key: string) => {
+    if (!covered.includes(key)) { save.mutate({ next: [...covered, key] }); return }
+    const next = covered.filter(k => k !== key)
+    let parked: { count: number; amount: number } | undefined
+    try { parked = (await checking.mutateAsync())?.[key] } catch { parked = undefined }
+    if (parked && parked.count > 0) setAsking({ key, next, count: parked.count, amount: parked.amount })
+    else save.mutate({ next })
   }
+  const askLabel = asking ? (WORK_TRADE_COVERABLE_LABEL as any)[asking.key] ?? 'these' : ''
   // S613 (Nic): the label states what IS covered, and never editorialises.
   //
   //   "Why would a selectable list be titled 'all but propane' if other things
@@ -274,16 +318,38 @@ function AgreementCoversCell({ agreement }: { agreement: any }) {
           <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 6, lineHeight: 1.5 }}>
             Choose what the hours trade for. Anything unticked is billed in full.
           </div>
-          {COVERABLE.map(c => (
-            <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '3px 2px',
-                                        fontSize: '.76rem', cursor: 'pointer' }}>
-              <input type="checkbox" checked={covered.includes(c.key)}
-                disabled={save.isLoading} onChange={() => toggle(c.key)} />
-              {c.label}
-            </label>
-          ))}
-          <button className="btn btn-ghost btn-sm" style={{ marginTop: 6, width: '100%', fontSize: '.7rem' }}
-            onClick={() => setOpen(false)}>Done</button>
+          {asking ? (
+            <div style={{ fontSize: '.74rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
+              {asking.count === 1 ? 'There is 1 open' : `There are ${asking.count} open`} {askLabel} {asking.count === 1 ? 'charge' : 'charges'}
+              {' '}(${Number(asking.amount).toFixed(2)}) covered by this work trade right now.
+              <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+                <button className="btn btn-primary btn-sm" disabled={save.isLoading}
+                  onClick={() => save.mutate({ next: asking.next, openCoveredCharges: 'keep_covered' })}>
+                  Keep the open {askLabel} charges covered</button>
+                <button className="btn btn-primary btn-sm" disabled={save.isLoading}
+                  onClick={() => save.mutate({ next: asking.next, openCoveredCharges: 'put_back' })}>
+                  Put them back on the tenant's balance</button>
+                <button className="btn btn-ghost btn-sm" disabled={save.isLoading} onClick={() => setAsking(null)}>Cancel</button>
+              </div>
+            </div>
+          ) : COVERABLE.map(c => {
+            // 10/12: never nothing — an empty list reads as "covers everything"
+            // to the billing runs. To stop a trade, end it.
+            const last = covered.length === 1 && covered.includes(c.key)
+            return (
+              <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '3px 2px',
+                                          fontSize: '.76rem', cursor: last ? 'default' : 'pointer' }}
+                title={last ? 'A work trade covers at least one charge. To stop it, end the agreement.' : undefined}>
+                <input type="checkbox" checked={covered.includes(c.key)}
+                  disabled={save.isLoading || checking.isLoading || last} onChange={() => toggle(c.key)} />
+                {c.label}
+              </label>
+            )
+          })}
+          {!asking && (
+            <button className="btn btn-ghost btn-sm" style={{ marginTop: 6, width: '100%', fontSize: '.7rem' }}
+              onClick={() => setOpen(false)}>Done</button>
+          )}
         </div>
       )}
     </div>

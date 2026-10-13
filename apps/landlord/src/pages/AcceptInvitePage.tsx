@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { BOOKKEEPER_ACCESS_SUMMARY } from '@gam/shared'
+import { bookkeeperAccessSummary, type BookkeeperAccessChoice } from '@gam/shared'
 
 // 10/11 (Nic): a bookkeeper's portal is GAM Books, so their invite ends there.
 const ENV = (import.meta as any).env || {}
@@ -21,6 +21,9 @@ interface InviteInfo {
   firstName: string | null
   lastName: string | null
   phone: string | null
+  // 10/12 (Nic): a bookkeeper invitation's boxes, so the summary below says
+  // what they give — the bank account and payroll only when Company-wide is.
+  bookkeeperAccess?: BookkeeperAccessChoice
 }
 
 const wrap: React.CSSProperties = { minHeight: '100vh', background: '#060809', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: 'system-ui' }
@@ -145,7 +148,7 @@ export function AcceptInvitePage() {
           </div>
           {isBookkeeper && (
             <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 20, lineHeight: 1.6, background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 8, padding: '10px 12px' }}>
-              <strong style={{ color: 'var(--text-0)' }}>Bookkeeper.</strong> {BOOKKEEPER_ACCESS_SUMMARY}
+              <strong style={{ color: 'var(--text-0)' }}>Bookkeeper.</strong> {bookkeeperAccessSummary(info?.bookkeeperAccess ?? { propertyCount: 0, companyWide: false }, 'invitee')}
             </div>
           )}
 

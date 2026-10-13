@@ -21,6 +21,10 @@
   --border-0:   #1e2435;
   --border-1:   #252d42;
   --border-2:   #2f3a55;
+  /* 10/12 review: several pages ask for a plain --border, which was never
+     defined, so their boxes drew no edge. It is the standard edge (follows
+     the theme through --border-1). */
+  --border:     var(--border-1);
 
   /* Text */
   --text-0:     #f0f2f7;
@@ -862,3 +866,12 @@ fieldset:disabled { opacity: 1; }
 }
 .lock-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0 14px; }
 .lock-foot   { font-size: .74rem; color: var(--text-3); line-height: 1.55; margin: 0; }
+
+/* S575 hub sub-tabs (Financials, Screening, Bookkeeping). 10/12 review: one
+   sideways-scrolling row on a phone instead of five wrapped rows. */
+.hub-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border-0); margin-bottom: 20px; flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .hub-tabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .hub-tabs::-webkit-scrollbar { display: none; }
+  .hub-tabs > a { flex: 0 0 auto; white-space: nowrap; }
+}

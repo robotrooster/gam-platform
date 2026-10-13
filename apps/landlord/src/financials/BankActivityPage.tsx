@@ -4,10 +4,12 @@
  * transaction and matching deposits stay on the owner's Bank page.
  *
  * One of the shared financial pages: the same bytes in the landlord portal and
- * GAM Books (financials-parity.test.ts). A bookkeeper sees what money in WAS
- * (a GAM payout, a bank deposit, laundry income) and what money out was filed
- * as (its vendor and kind), never the bank's memo, which can name the person
- * who paid or was paid (GET /financials/bank-activity).
+ * GAM Books (financials-parity.test.ts). The owner and the bookkeeper read the
+ * same line: the bank's own description (who paid or was paid — how a bank
+ * line is reconciled) and, in its own column, what it was filed as. A
+ * bookkeeper's description has any email or phone number on it taken out by
+ * the server (GET /financials/bank-activity). Money in and money out count
+ * every line in the days picked; the list shows the newest of them.
  */
 import { useQuery } from 'react-query'
 import { finGet } from './adapter'
@@ -18,7 +20,7 @@ interface Txn {
   description: string; filedAs: string | null; statusLabel: string
   accountName: string | null; companyName: string | null
 }
-interface BankData { transactions: Txn[]; moneyIn: number; moneyOut: number }
+interface BankData { transactions: Txn[]; transactionCount: number; moneyIn: number; moneyOut: number }
 
 export function BankActivityPage() {
   const { data: scope } = useFinancialsScope()
@@ -30,6 +32,9 @@ export function BankActivityPage() {
   )
   const txns = data?.transactions ?? []
   const severalCompanies = (scope?.companies.length ?? 0) > 1
+  // The totals count every line in the days picked; the list stops at the newest.
+  const allLines = Number(data?.transactionCount ?? txns.length)
+  const listCut = allLines > txns.length
 
   return (
     <div className="fin">
@@ -49,6 +54,13 @@ export function BankActivityPage() {
             </div>
           </div>
           <div className="card fin-card">
+            {listCut && (
+              <div className="fin-card-head">
+                <span className="fin-muted">
+                  {`Showing the newest ${txns.length.toLocaleString('en-US')} of ${allLines.toLocaleString('en-US')} lines. Money in and money out count all of them. Pick fewer days to see the rest.`}
+                </span>
+              </div>
+            )}
             {txns.length === 0 ? (
               <div className="fin-empty">{isLoading ? 'Loading…' : 'No bank activity in these days, or no bank is linked yet.'}</div>
             ) : (

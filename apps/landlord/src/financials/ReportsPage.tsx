@@ -1,28 +1,39 @@
 // 10/11 (Nic): one of the shared financial pages — the same bytes in the
 // landlord portal and GAM Books (financials-parity.test.ts). The owner sees
 // every tab; a bookkeeper sees the P&L tabs (Overview, By Property), and the
-// API refuses them the rest and takes every tenant name out of what it sends.
+// API refuses them the rest. 10/11 (Nic): tenant names show to a bookkeeper
+// too (who paid is half of keeping the books); the API sends them no tenant
+// email, phone or address, and no maintenance request's words.
+//
+// 10/12 (Nic): "NO Money received / Money billed toggle anywhere — show
+// Charged, Received and Owed side by side as columns, with a short line
+// showing how they tie." The switch above the tabs is gone; every report shows
+// the three columns, the tie line under them, and the net on each money
+// column. The monthly P&L's "money by the day it arrived" is ONE line per day
+// with that day's total and the expenses logged that day under it; a day opens
+// to who paid on screen, and the printout keeps the daily totals only.
+// 10/12 (Nic, L2): "Received leads" — every table reads Received, Charged,
+// Owed (the shared MONEY_COLUMNS order, ThreeCells) and every net leads with
+// Received less expenses. And the Monthly report tab: the monthly property report (all four groups) as a
+// printable page and a PDF, with the owner's list of who it is emailed to.
 import { useState, useEffect, useRef } from 'react'
-import { useQuery } from 'react-query'
+import { useQuery, useQueryClient } from 'react-query'
 import {
   humanize, UNIT_TYPE_LABEL, UNIT_STATUS_LABEL, MAINTENANCE_STATUS_LABEL, PAYMENT_STATUS_LABEL,
-  type IncomeBasis, type PaymentStatus,
+  PAYMENT_STAMP_LETTER, MONEY_COLUMN_LABEL,
+  type PaymentStatus, type PaymentStamp, type MoneyColumn,
 } from '@gam/shared'
-import { finGet as apiGet, useViewer } from './adapter'
+import { finGet as apiGet, finPost, openProtectedFile, useViewer, toast, toastError } from './adapter'
 // S633: tax + statement documents belong to ONE company; the picker renders
 // nothing for an account that owns a single one.
 import { EntityPicker, useEntities } from './EntityPicker'
-// S655 (money plan, Step 15): ONE "Money received" / "Money billed" switch
-// above the tabs; every query on this page carries it.
-import { IncomeBasisToggle, BasisPrintNote } from './IncomeBasisToggle'
 import {
-  useIncomeBasis, withBasis, basisLabel, perMonthTitle, incomeCardView,
-  activeCategories, categoryColumns, categoryLabel, expenseLines, expenseCategoryLabel,
-  groupCharges, partsText, noChargeRemainder, sumAmounts, INCOME_LINES_ORDER, incomeLineLabel,
-  billedOutcome, besideNotInTotal, usDay, chargeDay, chargeKey, reportErrorText, latestOnly,
-  showsBillOutcome, resultIsStale, paidAheadOnHand, PAID_AHEAD_COUNTED_NOTE, arrivalDay, lastTwelveMonths,
-  taxYearBeside,
-  type CategoryRow, type ChargeRow, type BesideItem,
+  moneyColumns, moneyCardView, sumThree, netsOf,
+  activeCategories, categoryLabel, categoryThree, expenseLines, expenseCategoryLabel,
+  noChargeRemainder, sumAmounts, INCOME_LINES_ORDER, incomeLineLabel, type ExpenseLine,
+  usDay, chargeDay, chargeKey, reportErrorText, latestOnly, PAID_AHEAD_COUNTED_NOTE, PAID_AHEAD_ON_HAND_KEY,
+  lastTwelveMonths, lastMonthKey, dayRows, expensesLoggedText,
+  type CategoryRow, type ChargeRow, type BesideItem, type MoneyView, type MoneyThree, type DayLine,
 } from './incomeBasis'
 import './reports-basis.css'
 
@@ -46,11 +57,15 @@ function monthLabel(ym: string): string {
 }
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December']
 const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+const COLS = moneyColumns()
 
 // ── Export helpers ────────────────────────────────────────────
 function downloadCsv(filename: string, header: string[], rows: (string | number | null | undefined)[][]) {
+  // 10/12: a field that starts like a formula is opened as one by a
+  // spreadsheet (a resident named "=HYPERLINK(…)"), so it reads as text.
   const esc = (v: any) => {
-    const s = v == null ? '' : String(v)
+    const raw = v == null ? '' : String(v)
+    const s = typeof v === 'string' && /^[=+\-@\t\r]/.test(v) ? `'${raw}` : raw
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
   }
   const csv = [header, ...rows].map(r => r.map(esc).join(',')).join('\r\n')
@@ -64,7 +79,9 @@ function downloadCsv(filename: string, header: string[], rows: (string | number 
 }
 
 // Hide the app chrome + interactive controls when the browser prints / saves
-// to PDF, so a landlord gets a clean statement for their accountant.
+// to PDF, so a landlord gets a clean statement for their accountant. 10/12:
+// the three-column tables, the daily lines and the monthly report's stamps
+// live here too (the shared stylesheet stays as it was).
 function PrintStyles() {
   return (
     <style>{`
@@ -85,6 +102,14 @@ function PrintStyles() {
           print-color-adjust: exact !important;
           color: rgba(160, 132, 60, 0.13) !important;
         }
+        /* 10/12: a modal printed on its own (the monthly P&L), without the page under it. */
+        .rb-print-hide { display: none !important; }
+        .modal-overlay.rb-printable { position: static !important; background: none !important; display: block !important; padding: 0 !important; }
+        .modal-overlay.rb-printable .modal { width: auto !important; max-width: none !important; max-height: none !important; overflow: visible !important; box-shadow: none !important; border: none !important; }
+        .modal-overlay.rb-printable .rb-modal-body { overflow: visible !important; }
+        .rb-stamp-chip { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+        .rb-mr-property { break-before: page; }
+        .rb-mr-property:first-of-type { break-before: auto; }
       }
       .t12-watermark {
         position: absolute;
@@ -103,6 +128,54 @@ function PrintStyles() {
         color: rgba(160, 132, 60, 0.10);
         user-select: none;
       }
+      /* 10/12 (Nic): the three columns. */
+      .rb-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: -6px 0 16px; font-size: .74rem; color: var(--text-3); line-height: 1.45; }
+      .rb-legend strong { color: var(--text-1); font-weight: 700; }
+      .rb-three th.rb-num, .rb-three td.rb-num { min-width: 92px; }
+      .rb-three tfoot td, .rb-three tr.rb-total td { border-top: 2px solid var(--border-1); font-weight: 700; color: var(--text-0); }
+      .rb-three tr.rb-net td { font-weight: 700; color: var(--gold); border-top: 1px solid var(--border-0); }
+      .rb-three tr.rb-sub td:first-child { padding-left: 22px; color: var(--text-2); }
+      .rb-three td.rb-blank { color: var(--text-3); }
+      .rb-tie { margin: 8px 6px 2px; font-size: .74rem; color: var(--text-2); line-height: 1.55; }
+      .rb-tie p { margin: 0 0 3px; }
+      .rb-pos { color: var(--green); }
+      .rb-neg { color: var(--red); }
+      .rb-owed { color: var(--amber); }
+      /* One line per day (the monthly P&L). */
+      .rb-day { border-bottom: 1px solid var(--border-0); }
+      .rb-day:last-child { border-bottom: none; }
+      .rb-day-line { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 6px; background: none; border: none; color: var(--text-1); font: inherit; cursor: pointer; text-align: left; }
+      .rb-day-line:hover { background: var(--bg-3); }
+      .rb-day-line[aria-expanded="true"] .rb-day-caret { transform: rotate(90deg); }
+      .rb-day-caret { color: var(--text-3); font-size: .7rem; width: 12px; transition: transform .12s; }
+      .rb-day-date { font-size: .8rem; font-weight: 700; color: var(--text-0); flex: 1 1 auto; min-width: 0; }
+      .rb-day-count { font-size: .7rem; color: var(--text-3); white-space: nowrap; }
+      .rb-day-total { font-family: var(--font-mono); font-size: .8rem; color: var(--green); white-space: nowrap; }
+      .rb-day-expense { padding: 0 6px 8px 28px; font-size: .74rem; color: var(--red); }
+      .rb-day-detail { padding: 0 6px 8px 28px; }
+      /* The monthly report. */
+      .rb-mr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; padding: 4px 4px 10px; }
+      .rb-mr-fig { background: var(--bg-2); border: 1px solid var(--border-0); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+      .rb-mr-fig-label { font-size: .66rem; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); font-weight: 600; }
+      .rb-mr-fig-value { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; color: var(--text-0); margin-top: 2px; }
+      .rb-mr-fig-sub { font-size: .68rem; color: var(--text-3); margin-top: 2px; }
+      .rb-mr-section-title { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--gold); font-weight: 700; margin: 14px 4px 8px; }
+      .rb-stamps { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 2px 4px 10px; }
+      .rb-stamp-count { display: inline-flex; align-items: center; gap: 6px; font-size: .8rem; color: var(--text-1); font-weight: 600; }
+      .rb-stamp-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 22px; padding: 0 5px; border-radius: 6px; font-family: var(--font-mono); font-size: .7rem; font-weight: 700; color: #fff; }
+      .rb-stamp-chip.paid_on_time { background: var(--green); } /* wire-ok: a stamp's enum value as a class name */
+      .rb-stamp-chip.partial { background: var(--rb-yellow, #eab308); color: #1a1a1a; }
+      .rb-stamp-chip.paid_late { background: var(--rb-orange, #f97316); } /* wire-ok: a stamp's enum value as a class name */
+      .rb-stamp-chip.outstanding { background: var(--red); }
+      .rb-stamp-chip.due { background: var(--text-3); }
+      .rb-recip { display: flex; flex-direction: column; gap: 6px; padding: 4px 4px 8px; }
+      .rb-recip-row { display: flex; align-items: center; gap: 10px; font-size: .82rem; color: var(--text-1); flex-wrap: wrap; }
+      .rb-recip-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--gold); }
+      .rb-recip-meta { font-size: .72rem; color: var(--text-3); }
+      .rb-recip-add { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .rb-recip-add .input { flex: 1 1 220px; min-width: 0; }
+      .rb-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border-1); font-size: .76rem; color: var(--text-1); }
+      .rb-chip button { background: none; border: none; color: var(--text-3); cursor: pointer; font-size: .9rem; line-height: 1; padding: 0; }
     `}</style>
   )
 }
@@ -129,7 +202,7 @@ function PeriodPicker({ year, setYear, month, setMonth, allowAll }: {
   const isFutureMonth = (m: number) => year === thisYear && m > curMonth
 
   return (
-    <div className="no-print" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+    <div className="no-print" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
       <select className="input" value={year} onChange={e => {
         const y = parseInt(e.target.value)
         setYear(y)
@@ -150,77 +223,115 @@ function PeriodPicker({ year, setYear, month, setMonth, allowAll }: {
   )
 }
 
-// ── OVERVIEW CHARTS (MTD bar + YTD cumulative area) ───────────
+/**
+ * 10/12 (Nic): what each column counts, once, under the page title (prints
+ * too). 10/12 (ledger P8): once the reports read the company's books, Owed is
+ * what tenants still owed at the end of the period, and the line under each
+ * table shows how it got there.
+ */
+function MoneyLegend() {
+  const { data } = useQuery<any>(['reports-ledger-status'], () => apiGet('/reports/ledger-status'))
+  const cols = data?.live ? moneyColumns(true) : COLS
+  return (
+    <div className="rb-legend">
+      {cols.map(c => <span key={c.key}><strong>{c.label}</strong> — {c.note}</span>)}
+    </div>
+  )
+}
+
+/** How the columns tie, in the server's own words. */
+function TieLines({ lines }: { lines: string[] | null | undefined }) {
+  if (!lines?.length) return null
+  return <div className="rb-tie">{lines.map(l => <p key={l}>{l}</p>)}</div>
+}
+
+// ── OVERVIEW CHARTS (charged vs received by month + YTD) ──────
 // Hand-rolled SVG so there's no charting dependency and it inherits the
 // gold/dark theme. Both render inline — no download or print needed.
-function CollectionsCharts({ ytdMonthly, mtd, ytd, basis }: {
-  ytdMonthly: { month: string; collected: number }[]
-  mtd: number; ytd: number; basis: IncomeBasis
+interface MonthPoint { m: number; label: string; charged: number; received: number; cumCharged: number; cumReceived: number }
+
+function seriesFor(year: number, upto: number, rows: Array<{ month: string; collected: number; charged?: number }>): MonthPoint[] {
+  const byMonth = new Map(rows.map(m => [m.month, m]))
+  const out: MonthPoint[] = []
+  let cc = 0, cr = 0
+  for (let m = 1; m <= upto; m++) {
+    const r = byMonth.get(`${year}-${String(m).padStart(2, '0')}`)
+    const charged = Number(r?.charged ?? 0), received = Number(r?.collected ?? 0)
+    cc += charged; cr += received
+    out.push({ m, label: MONTHS_SHORT[m - 1], charged, received, cumCharged: cc, cumReceived: cr })
+  }
+  return out
+}
+
+function CollectionsCharts({ ytdMonthly, ytd }: {
+  ytdMonthly: Array<{ month: string; collected: number; charged?: number }>
+  ytd: MoneyThree
 }) {
   const now = new Date()
   const year = now.getFullYear()
   const upto = now.getMonth() + 1 // 1..12, current month
-  const byMonth = new Map(ytdMonthly.map(m => [m.month, m.collected]))
-  const series: { m: number; label: string; collected: number; cumulative: number }[] = []
-  let cum = 0
-  for (let m = 1; m <= upto; m++) {
-    const v = byMonth.get(`${year}-${String(m).padStart(2, '0')}`) ?? 0
-    cum += v
-    series.push({ m, label: MONTHS_SHORT[m - 1], collected: v, cumulative: cum })
-  }
-  const hasData = series.some(s => s.collected !== 0)
-
+  const series = seriesFor(year, upto, ytdMonthly)
+  const hasData = series.some(s => s.charged !== 0 || s.received !== 0)
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(300px, 100%), 1fr))', gap: 16 }}>
       <div className="card">
         <div className="card-header">
-          <span className="card-title">{perMonthTitle(basis)} — {year}</span>
-          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>This month {fmt(mtd)}</span>
+          <span className="card-title">{MONEY_COLUMN_LABEL.received} and {MONEY_COLUMN_LABEL.charged.toLowerCase()} by month — {year}</span>
+          <ChartKey />
         </div>
         <div style={{ padding: '12px 12px 6px' }}>
-          {hasData ? <BarChart series={series} current={upto} /> : <EmptyChart basis={basis} />}
+          {hasData ? <BarChart series={series} current={upto} /> : <EmptyChart />}
         </div>
       </div>
       <div className="card">
         <div className="card-header">
           <span className="card-title">Year to date, added up — {year}</span>
-          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>This year {fmt(ytd)}</span>
+          <span style={{ fontSize: '.7rem', color: 'var(--gold)' }}>{MONEY_COLUMN_LABEL.received} {fmt0(ytd.received)} · {MONEY_COLUMN_LABEL.charged} {fmt0(ytd.charged)}</span>
         </div>
         <div style={{ padding: '12px 12px 6px' }}>
-          {hasData ? <AreaChart series={series} /> : <EmptyChart basis={basis} />}
+          {hasData ? <AreaChart series={series} /> : <EmptyChart />}
         </div>
       </div>
     </div>
   )
 }
 
-const EmptyChart = ({ basis }: { basis: IncomeBasis }) => (
+const ChartKey = () => (
+  <span style={{ display: 'flex', gap: 10, fontSize: '.68rem', color: 'var(--text-3)' }}>
+    <span><span style={{ display: 'inline-block', width: 9, height: 9, background: 'var(--gold)', marginRight: 4 }} />{MONEY_COLUMN_LABEL.received}</span>
+    <span><span style={{ display: 'inline-block', width: 9, height: 9, background: 'var(--text-3)', opacity: .5, marginRight: 4 }} />{MONEY_COLUMN_LABEL.charged}</span>
+  </span>
+)
+
+const EmptyChart = () => (
   <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-3)', fontSize: '.8rem' }}>
-    {basis === 'billed' ? 'Nothing billed yet this year.' : 'No money received yet this year.'}
+    Nothing received or charged yet this year.
   </div>
 )
 
-// Vertical bars; current (MTD) month highlighted gold.
-function BarChart({ series, current }: { series: { label: string; collected: number; m: number }[]; current: number }) {
+// Paired bars: received (gold) first, then charged (muted) — 10/12 (Nic, L2):
+// Received leads; the current month brightest.
+function BarChart({ series, current }: { series: Array<{ label: string; charged: number; received: number; m: number }>; current: number }) {
   const W = 520, H = 200, padL = 8, padR = 8, padT = 14, padB = 22
   const chartW = W - padL - padR, chartH = H - padT - padB
-  const max = Math.max(...series.map(s => s.collected), 1)
-  const slot = chartW / series.length
-  const bw = Math.min(slot * 0.6, 46)
+  const max = Math.max(...series.map(s => Math.max(s.charged, s.received)), 1)
+  const slot = chartW / Math.max(series.length, 1)
+  const bw = Math.min(slot * 0.32, 22)
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label="Collected by month">
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label="Received and charged by month">
       <line x1={padL} y1={padT + chartH} x2={W - padR} y2={padT + chartH} stroke="var(--border-1)" strokeWidth={1} />
       {series.map((s, i) => {
-        const h = (s.collected / max) * chartH
-        const x = padL + i * slot + (slot - bw) / 2
-        const y = padT + chartH - h
+        const x0 = padL + i * slot + (slot - bw * 2 - 3) / 2
+        const hc = (Math.max(s.charged, 0) / max) * chartH
+        const hr = (Math.max(s.received, 0) / max) * chartH
         const isCurrent = s.m === current
         return (
           <g key={s.m}>
-            <title>{`${s.label}: ${fmt(s.collected)}`}</title>
-            <rect x={x} y={y} width={bw} height={Math.max(h, 1)} rx={2}
-              fill={isCurrent ? 'var(--gold)' : 'var(--gold-dim)'} opacity={isCurrent ? 1 : 0.65} />
-            <text x={x + bw / 2} y={H - 7} textAnchor="middle" fontSize={9} fill="var(--text-3)">{s.label}</text>
+            <title>{`${s.label}: received ${fmt(s.received)}, charged ${fmt(s.charged)}`}</title>
+            <rect x={x0} y={padT + chartH - hr} width={bw} height={Math.max(hr, 1)} rx={2}
+              fill={isCurrent ? 'var(--gold)' : 'var(--gold-dim)'} opacity={isCurrent ? 1 : 0.75} />
+            <rect x={x0 + bw + 3} y={padT + chartH - hc} width={bw} height={Math.max(hc, 1)} rx={2} fill="var(--text-3)" opacity={0.45} />
+            <text x={x0 + bw + 1.5} y={H - 7} textAnchor="middle" fontSize={9} fill="var(--text-3)">{s.label}</text>
           </g>
         )
       })}
@@ -228,31 +339,33 @@ function BarChart({ series, current }: { series: { label: string; collected: num
   )
 }
 
-// Cumulative line + filled area, ending dot at the YTD total.
-function AreaChart({ series }: { series: { label: string; cumulative: number; m: number }[] }) {
+// Cumulative received (gold, filled) and charged (muted line), ending dot at the YTD received total.
+function AreaChart({ series }: { series: MonthPoint[] }) {
   const W = 520, H = 200, padL = 8, padR = 8, padT = 14, padB = 22
   const chartW = W - padL - padR, chartH = H - padT - padB
-  const max = Math.max(...series.map(s => s.cumulative), 1)
+  const max = Math.max(...series.map(s => Math.max(s.cumReceived, s.cumCharged)), 1)
   const xAt = (i: number) => series.length <= 1 ? padL + chartW / 2 : padL + (i / (series.length - 1)) * chartW
   const yAt = (v: number) => padT + chartH - (v / max) * chartH
-  const pts = series.map((s, i) => `${xAt(i)},${yAt(s.cumulative)}`).join(' ')
-  const area = `${padL},${padT + chartH} ${pts} ${xAt(series.length - 1)},${padT + chartH}`
+  const ptsR = series.map((s, i) => `${xAt(i)},${yAt(s.cumReceived)}`).join(' ')
+  const ptsC = series.map((s, i) => `${xAt(i)},${yAt(s.cumCharged)}`).join(' ')
+  const area = `${padL},${padT + chartH} ${ptsR} ${xAt(series.length - 1)},${padT + chartH}`
   const last = series[series.length - 1]
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label="Cumulative collections year to date">
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label="Received and charged, added up, year to date">
       <line x1={padL} y1={padT + chartH} x2={W - padR} y2={padT + chartH} stroke="var(--border-1)" strokeWidth={1} />
       <polygon points={area} fill="var(--gold)" opacity={0.12} />
-      <polyline points={pts} fill="none" stroke="var(--gold)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      <polyline points={ptsC} fill="none" stroke="var(--text-3)" strokeWidth={1.5} strokeDasharray="4 3" />
+      <polyline points={ptsR} fill="none" stroke="var(--gold)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
       {series.map((s, i) => (
-        <g key={s.m}><title>{`${s.label}: ${fmt(s.cumulative)}`}</title>
-          <circle cx={xAt(i)} cy={yAt(s.cumulative)} r={i === series.length - 1 ? 3.5 : 2}
+        <g key={s.m}><title>{`${s.label}: received ${fmt(s.cumReceived)}, charged ${fmt(s.cumCharged)}`}</title>
+          <circle cx={xAt(i)} cy={yAt(s.cumReceived)} r={i === series.length - 1 ? 3.5 : 2}
             fill={i === series.length - 1 ? 'var(--gold)' : 'var(--gold-dim)'} />
         </g>
       ))}
       {series.map((s, i) => (
         <text key={'l' + s.m} x={xAt(i)} y={H - 7} textAnchor="middle" fontSize={9} fill="var(--text-3)">{s.label}</text>
       ))}
-      {last && <text x={xAt(series.length - 1)} y={Math.max(yAt(last.cumulative) - 7, 10)} textAnchor="end" fontSize={9} fill="var(--gold)">{fmt(last.cumulative)}</text>}
+      {last && <text x={xAt(series.length - 1)} y={Math.max(yAt(last.cumReceived) - 7, 10)} textAnchor="end" fontSize={9} fill="var(--gold)">{fmt(last.cumReceived)}</text>}
     </svg>
   )
 }
@@ -260,21 +373,34 @@ function AreaChart({ series }: { series: { label: string; cumulative: number; m:
 // ══════════════════════════════════════════════════════════════
 // REPORTS PAGE — tabbed
 // ══════════════════════════════════════════════════════════════
-type Tab = 'overview' | 'property' | 'annual' | 'statement' | 'custom'
+type Tab = 'overview' | 'property' | 'monthly' | 'annual' | 'statement' | 'custom'
 const TABS: { key: Tab; label: string; perm: string }[] = [
   { key: 'overview',  label: 'Overview',        perm: 'reports.tab.overview' },
   { key: 'property',  label: 'By Property',     perm: 'reports.tab.property' },
+  { key: 'monthly',   label: 'Monthly report',  perm: 'reports.tab.monthly' },
   { key: 'annual',    label: 'Annual & Tax',    perm: 'reports.tab.annual' },
   { key: 'statement', label: 'Owner Statement', perm: 'reports.tab.statement' },
   { key: 'custom',    label: 'Custom & T-12',   perm: 'reports.tab.custom' },
 ]
 
+/** ?tab= and ?month= from the address (the monthly report email links straight to its tab). */
+function linkParams(): { tab: Tab | null; month: string | null } {
+  try {
+    const q = new URLSearchParams(window.location.search)
+    const t = q.get('tab')
+    const m = q.get('month')
+    return {
+      tab: TABS.some(x => x.key === t) ? t as Tab : null,
+      month: m && /^\d{4}-(0[1-9]|1[0-2])$/.test(m) ? m : null,
+    }
+  } catch {
+    return { tab: null, month: null }
+  }
+}
+
 export function ReportsPage() {
-  const [tab, setTab] = useState<Tab>('overview')
+  const [tab, setTab] = useState<Tab>(() => linkParams().tab ?? 'overview')
   const { can } = useViewer()
-  // S655: "Money received" (the default) or "Money billed" — one switch above
-  // the tabs, remembered in this browser, carried by every query below.
-  const [basis, setBasis] = useIncomeBasis()
 
   // Staff see only report tabs they're granted; owners see all. Snap the
   // active tab to the first visible one if the current tab is hidden.
@@ -291,18 +417,18 @@ export function ReportsPage() {
       <div className="page-header">
         <div><h1 className="page-title">Reports</h1><p className="page-subtitle">Financial, tax, and occupancy summaries</p></div>
       </div>
-      <IncomeBasisToggle basis={basis} onChange={setBasis} />
-      <BasisPrintNote basis={basis} />
+      <MoneyLegend />
       <div className="no-print" style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 18, overflowX: 'auto' }}>
         {visibleTabs.map(t => (
           <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>
         ))}
       </div>
-      {tab === 'overview'  && can('reports.tab.overview')  && <OverviewTab basis={basis} />}
-      {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab basis={basis} />}
-      {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab basis={basis} />}
-      {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab basis={basis} />}
-      {tab === 'custom'    && can('reports.tab.custom')    && <CustomReportTab basis={basis} />}
+      {tab === 'overview'  && can('reports.tab.overview')  && <OverviewTab />}
+      {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab />}
+      {tab === 'monthly'   && can('reports.tab.monthly')   && <MonthlyReportTab />}
+      {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab />}
+      {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab />}
+      {tab === 'custom'    && can('reports.tab.custom')    && <CustomReportTab />}
     </div>
   )
 }
@@ -337,48 +463,75 @@ function ReportError({ error, what }: { error: unknown; what: string }) {
   return <div className="alert alert-warn" style={{ margin: 12, fontSize: '.82rem' }}>{reportErrorText(error, what)}</div>
 }
 
+/** A money cell: green when money in, red when it takes money off. */
+function Cell({ v, kind }: { v: number | null | undefined; kind?: 'owed' | 'net' | 'plain' }) {
+  const n = Number(v ?? 0)
+  const cls = kind === 'owed' ? (n ? 'rb-owed' : '') : kind === 'net' ? (n < 0 ? 'rb-neg' : '') : n < 0 ? 'rb-neg' : ''
+  return <td className={`rb-num ${cls}`}>{v == null ? '—' : fmt(n)}</td>
+}
+
+/**
+ * 10/12 (Nic, L2): a row's three money cells in the columns' own order
+ * (COLS, the shared MONEY_COLUMNS: Received leads, then Charged, then Owed),
+ * so a row can never sit under the wrong header. An absent figure prints "—".
+ */
+function ThreeCells({ v }: { v: Partial<Record<MoneyColumn, number | null | undefined>> }) {
+  return <>{COLS.map(c => <Cell key={c.key} v={v[c.key]} kind={c.key === 'owed' ? 'owed' : undefined} />)}</>
+}
+
 // ── OVERVIEW (S69 + S512 #20 drill-in) ────────────────────────
-function OverviewTab({ basis }: { basis: IncomeBasis }) {
-  const { data: report, isLoading, error } = useQuery<any>(['reports', basis], () => apiGet(withBasis('/reports/summary', basis)))
+function OverviewTab() {
+  const { data: report, isLoading, error } = useQuery<any>(['reports-summary'], () => apiGet('/reports/summary'))
   const [openMonth, setOpenMonth] = useState<string | null>(null)
   // 10/11: the card opens the owner's Balances page where there is one to open.
   const { openOwnerPage } = useViewer()
-  // S655 (§2): the income card, the same one the dashboard shows. Money
-  // received: what arrived this month, money paid ahead inside it, money still
-  // clearing beside it. Money billed: this month's bills and what became of them.
-  const card = incomeCardView(report?.incomeCard, basis, 'this month', fmt)
-  const word = basisLabel(basis)
+  // 10/12 (Nic): this month's Charged, Received and Owed side by side — the
+  // same card the dashboard shows — and how they tie.
+  const card = moneyCardView(report?.incomeCard, fmt)
+  const ytd: MoneyThree = report?.ytd ?? { charged: 0, received: Number(report?.ytdCollected || 0), owed: 0 }
 
   return (
     <>
+      <div className={openMonth ? 'rb-print-hide' : undefined}>
       {error ? <ReportError error={error} what="the summary" /> : isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
         <div className="rb-stack" style={{gap:16}}>
           <div className="rb-kpis">
-            <div className="kpi-card">
-              <div className="kpi-label">{card.label}</div>
-              <div className="kpi-value green">{fmt0(card.amount)}</div>
-              <div className="kpi-sub rb-kpi-notes">{card.notes.map(n => <span key={n}>{n}</span>)}</div>
-            </div>
-            <div className="kpi-card"><div className="kpi-label">{word} this year</div><div className="kpi-value" style={{color:'var(--gold)'}}>{fmt0(report?.ytdCollected)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.received} this month</div><div className="kpi-value green">{fmt0(card.received)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.charged} this month</div><div className="kpi-value">{fmt0(card.charged)}</div></div>
+            {/* Decision #25: Owed is a grand total of what everyone owes; the server
+                leaves it out for a viewer who sees no grand totals, and so does the card. */}
+            {report?.thisMonth?.owed != null && (
+              <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.owed} of this month's bills</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(card.owed)}</div></div>
+            )}
+            <div className="kpi-card"><div className="kpi-label">This year</div><div className="kpi-value" style={{color:'var(--gold)'}}>{fmt0(ytd.received)}</div><div className="kpi-sub">received · {fmt0(ytd.charged)} charged</div></div>
             {/* S527 W-38: click through to the who-owes-what list (same target as the dashboard KPI). */}
             {/* Decision #25: a grand total of what everyone owes is for owners and
                 property managers only; when the server leaves it out, so does the card. */}
             {report?.outstanding != null && (
-              <div className="kpi-card" style={{cursor: openOwnerPage ? 'pointer' : 'default'}} onClick={()=>openOwnerPage?.('/balances')}><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report.outstanding)}</div></div>
+              <div className="kpi-card" style={{cursor: openOwnerPage ? 'pointer' : 'default'}} onClick={()=>openOwnerPage?.('/balances')}><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report.outstanding)}</div><div className="kpi-sub">every month still owed</div></div>
             )}
             <div className="kpi-card"><div className="kpi-label">Occupancy Rate</div><div className="kpi-value">{report?.occupancyRate != null ? `${report.occupancyRate}%` : '—'}</div></div>
           </div>
-          <CollectionsCharts basis={basis} ytdMonthly={report?.ytdMonthly ?? []} mtd={Number(card.amount || 0)} ytd={Number(report?.ytdCollected || 0)} />
+          <TieLines lines={report?.thisMonth?.tieText ?? card.notes} />
+          <CollectionsCharts ytdMonthly={report?.ytdMonthly ?? []} ytd={ytd} />
           <div className="card">
             <div className="card-header"><span className="card-title">Monthly Breakdown</span></div>
             <div style={{padding:'4px 0 16px'}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)',padding:'0 0 10px'}}>Click a month to open its profit &amp; loss and the money behind it.</div>
               <div className="data-table-wrap">
-                <table className="data-table">
-                  {/* "Net" IS the net of the P&L the row opens (the month's income less
-                      GAM's platform fee, maintenance, lot rent and entered expenses).
-                      "Payout fees" are the payout run's own fees, shown for reference. */}
-                  <thead><tr><th>Month</th><th>{word}</th><th>Disbursed</th><th>Payout fees</th><th>Net</th><th></th></tr></thead>
+                <table className="data-table rb-three">
+                  {/* "Net" IS the net of the P&L the row opens: each money column less
+                      GAM's platform fee, maintenance, lot rent, your expenses and the
+                      payment processing fees you cover. */}
+                  <thead><tr>
+                    <th>Month</th>
+                    {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+                    <th className="rb-num">Expenses</th>
+                    <th className="rb-num">Net on received</th>
+                    <th className="rb-num">Net on charged</th>
+                    <th className="rb-num" title="Paid out to your bank; the payout run's own fees on hover">Paid out</th>
+                    <th></th>
+                  </tr></thead>
                   <tbody>
                     {report?.monthly?.length ? report.monthly.map((m: any) => (
                       <tr key={m.month}
@@ -386,14 +539,15 @@ function OverviewTab({ basis }: { basis: IncomeBasis }) {
                           style={{cursor:'pointer'}}
                           title={`Open ${monthLabel(m.month)} P&L`}>
                         <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{monthLabel(m.month)}</td>
-                        <td className="mono" style={{color:'var(--green)'}}>{fmt(m.collected)}</td>
-                        <td className="mono">{fmt(m.disbursed)}</td>
-                        <td className="mono" style={{color:'var(--text-3)'}}>{fmt(m.fees)}</td>
-                        <td className="mono" style={{color: m.net != null && m.net < 0 ? 'var(--red, #e06666)' : 'var(--text-0)',fontWeight:600}}>{fmt(m.net)}</td>
+                        <ThreeCells v={{ received: m.received ?? m.collected, charged: m.charged, owed: m.owed }} />
+                        <Cell v={m.expenses} />
+                        <Cell v={m.netReceived ?? m.net} kind="net" />
+                        <Cell v={m.netCharged} kind="net" />
+                        <td className="rb-num" title={`Payout fees ${fmt(m.fees)}`}>{fmt(m.disbursed)}</td>
                         <td style={{color:'var(--text-3)',textAlign:'right'}}>›</td>
                       </tr>
                     )) : (
-                      <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No report data yet.</td></tr>
+                      <tr><td colSpan={9} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No report data yet.</td></tr>
                     )}
                   </tbody>
                 </table>
@@ -402,13 +556,14 @@ function OverviewTab({ basis }: { basis: IncomeBasis }) {
           </div>
         </div>
       )}
-      {openMonth && <MonthlyPLModal month={openMonth} basis={basis} onClose={() => setOpenMonth(null)} />}
+      </div>
+      {openMonth && <MonthlyPLModal month={openMonth} onClose={() => setOpenMonth(null)} />}
     </>
   )
 }
 
 // ── BY PROPERTY (per-property P&L) ────────────────────────────
-function ByPropertyTab({ basis }: { basis: IncomeBasis }) {
+function ByPropertyTab() {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
   // ── S637: DEFAULT TO THIS MONTH, LIKE EVERY OTHER REPORT ────────────
@@ -430,34 +585,47 @@ function ByPropertyTab({ basis }: { basis: IncomeBasis }) {
   const [openProp, setOpenProp] = useState<{ id: string; name: string } | null>(null)
   const { can } = useViewer()
   const qs = `year=${year}${month ? `&month=${month}` : ''}`
-  const { data, isLoading, error } = useQuery<any>(['property-pl', year, month, basis],
-    () => apiGet(withBasis(`/reports/property-pl?${qs}`, basis)))
+  const { data, isLoading, error } = useQuery<any>(['property-pl', year, month],
+    () => apiGet(`/reports/property-pl?${qs}`))
   const props: any[] = data?.properties ?? []
-  const word = basisLabel(basis)
 
-  // S655: each row is income − platform fee − maintenance − lot rent − your
-  // expenses = net (the drill-in's net, line for line). Lot rent and entered
-  // expenses had no column, so a row with either did not add up on screen.
+  // S655: each row's net is its money column less platform fee − maintenance −
+  // processing fees − lot rent − your expenses (the drill-in's nets, line for
+  // line). 10/12 (Nic): the payment processing fees the landlord covers have
+  // their own column, like every other place expenses are listed.
   const otherCosts = (p: any) => Number(p.lotRent || 0) + Number(p.enteredExpenses || 0)
-  const income = (p: any) => Number(p.incomeTotal ?? p.rentCollected ?? 0)
+  // 10/12 (Nic, G10): card fees guests got back with refunds sit with the
+  // processing fees (both are card and bank fees the landlord pays).
+  const procCosts = (p: any) => Number(p.processingFees || 0) + Number(p.cardFeesRefunded || 0)
+  const three = (p: any): MoneyThree => ({
+    charged: Number(p.charged ?? 0), received: Number(p.received ?? p.incomeTotal ?? p.rentCollected ?? 0), owed: Number(p.owed ?? 0),
+  })
+  // Decision #25: the server leaves Owed out for a viewer who sees no grand totals ("—").
+  const hasOwed = props.some(p => p.owed != null)
   const totals = props.reduce((t, p) => ({
-    income: t.income + income(p),
+    ...sumThree([t, three(p)]),
     maint: t.maint + Number(p.maintCost || 0),
     plat: t.plat + Number(p.platformFees || 0),
+    proc: t.proc + procCosts(p),
     other: t.other + otherCosts(p),
-    net: t.net + Number(p.netIncome || 0),
-  }), { income: 0, maint: 0, plat: 0, other: 0, net: 0 })
+    netCharged: t.netCharged + Number(p.netCharged || 0),
+    netReceived: t.netReceived + Number(p.netReceived ?? p.netIncome ?? 0),
+  }), { charged: 0, received: 0, owed: 0, maint: 0, plat: 0, proc: 0, other: 0, netCharged: 0, netReceived: 0 })
 
   const periodLabel = month ? `${MONTHS[month - 1]} ${year}` : `Full year ${year}`
 
   const exportCsv = () => downloadCsv(
-    `property-pl-${basis}-${year}${month ? `-${String(month).padStart(2,'0')}` : ''}.csv`,
-    ['Property', 'Occupied', 'Total units', 'Occupancy %', word, 'Maintenance', 'Platform fee', 'Lot rent and your expenses', 'Net income'],
-    props.map(p => [p.name, p.occupiedUnits, p.totalUnits, p.occupancyRate,
-      income(p).toFixed(2), Number(p.maintCost||0).toFixed(2),
-      Number(p.platformFees||0).toFixed(2), otherCosts(p).toFixed(2), Number(p.netIncome||0).toFixed(2)]),
+    `property-pl-${year}${month ? `-${String(month).padStart(2,'0')}` : ''}.csv`,
+    ['Property', 'Occupied', 'Total units', 'Occupancy %', ...COLS.map(c => c.label), 'Maintenance', 'Platform fee',
+     'Payment processing fees', 'Card fees refunded', 'Lot rent and your expenses', 'Net on received', 'Net on charged'],
+    props.map(p => [p.leftOn ? `${p.name} (left ${usDay(p.leftOn)}, history only)` : p.name,
+      p.leftOn ? '' : p.occupiedUnits, p.leftOn ? '' : p.totalUnits, p.leftOn ? '' : p.occupancyRate,
+      ...COLS.map(c => c.key === 'owed' && !hasOwed ? '' : three(p)[c.key].toFixed(2)), Number(p.maintCost||0).toFixed(2),
+      Number(p.platformFees||0).toFixed(2), Number(p.processingFees||0).toFixed(2), Number(p.cardFeesRefunded||0).toFixed(2), otherCosts(p).toFixed(2),
+      Number(p.netReceived ?? p.netIncome ?? 0).toFixed(2), Number(p.netCharged||0).toFixed(2)]),
   )
   const minus = (n: number) => n > 0 ? `−${fmt(n)}` : fmt(n)
+  const costCell = (n: number) => <td className="rb-num" style={{ color: n > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(n)}</td>
 
   return (
     <div className="rb-stack">
@@ -478,40 +646,52 @@ function ByPropertyTab({ basis }: { basis: IncomeBasis }) {
         <div style={{ padding: '4px 0 12px' }}>
           {error ? <ReportError error={error} what="the property report" /> : isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
             <div className="data-table-wrap">
-              <table className="data-table">
+              <table className="data-table rb-three">
                 <thead><tr>
-                  <th>Property</th><th style={{textAlign:'center'}}>Occ / Total</th><th style={{textAlign:'center'}}>Occ %</th>
-                  <th className="rb-num">{word}</th><th className="rb-num">Maint.</th><th className="rb-num">Platform Fee</th>
-                  <th className="rb-num">Lot rent &amp; your expenses</th><th className="rb-num">Net</th><th></th>
+                  <th>Property</th><th style={{textAlign:'center'}}>Occupancy</th>
+                  {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+                  <th className="rb-num">Maint.</th><th className="rb-num">Platform fee</th>
+                  <th className="rb-num" title="Payment processing fees you cover for tenants, and card fees given back with refunds">Processing fees</th>
+                  <th className="rb-num" title="Lot rent and your expenses">Lot rent &amp; expenses</th>
+                  <th className="rb-num">Net on received</th><th className="rb-num">Net on charged</th><th></th>
                 </tr></thead>
                 <tbody>
                   {props.length ? props.map((p: any) => (
                     <tr key={p.id} onClick={() => setOpenProp({ id: p.id, name: p.name })}
                         style={{ cursor: 'pointer' }} title={`Open ${p.name} detail`}>
-                      <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{p.name}</td>
-                      <td className="mono" style={{ textAlign: 'center' }}>{p.occupiedUnits}/{p.totalUnits}</td>
-                      <td className="mono" style={{ textAlign: 'center' }}>{p.occupancyRate}%</td>
-                      <td className="rb-num" style={{ color: 'var(--green)' }}>{fmt(income(p))}</td>
-                      <td className="rb-num" style={{ color: Number(p.maintCost) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(Number(p.maintCost || 0))}</td>
-                      <td className="rb-num" style={{ color: Number(p.platformFees) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(Number(p.platformFees || 0))}</td>
-                      <td className="rb-num" style={{ color: otherCosts(p) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{minus(otherCosts(p))}</td>
-                      <td className="rb-num" style={{ color: Number(p.netIncome) >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 600 }}>{fmt(p.netIncome)}</td>
+                      {/* 10/12: a bookkeeper's former property (sold or moved out while
+                          they kept it) is its history: no units or occupancy today
+                          (the new owner's), and the last day it was the company's. */}
+                      <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>
+                        {p.name}
+                        {p.leftOn && <div style={{ fontSize: '.7rem', fontWeight: 400, color: 'var(--text-3)' }}>Left {usDay(p.leftOn)} · history only</div>}
+                      </td>
+                      <td className="mono" style={{ textAlign: 'center' }}>{p.leftOn ? '—' : `${p.occupiedUnits}/${p.totalUnits} (${p.occupancyRate}%)`}</td>
+                      <ThreeCells v={{ ...three(p), owed: hasOwed ? three(p).owed : null }} />
+                      {costCell(Number(p.maintCost || 0))}
+                      {costCell(Number(p.platformFees || 0))}
+                      {costCell(procCosts(p))}
+                      {costCell(otherCosts(p))}
+                      <Cell v={p.netReceived ?? p.netIncome} kind="net" />
+                      <Cell v={p.netCharged} kind="net" />
                       <td style={{ color: 'var(--text-3)', textAlign: 'right' }}>›</td>
                     </tr>
                   )) : (
-                    <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No properties yet.</td></tr>
+                    <tr><td colSpan={12} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No properties yet.</td></tr>
                   )}
                 </tbody>
                 {props.length > 0 && (
                   <tfoot>
-                    <tr style={{ borderTop: '2px solid var(--border-1)' }}>
-                      <td style={{ fontWeight: 700, color: 'var(--text-0)' }}>Total</td>
-                      <td></td><td></td>
-                      <td className="rb-num" style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(totals.income)}</td>
-                      <td className="rb-num" style={{ color: totals.maint > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.maint)}</td>
-                      <td className="rb-num" style={{ color: totals.plat > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.plat)}</td>
-                      <td className="rb-num" style={{ color: totals.other > 0 ? 'var(--red)' : 'var(--text-3)', fontWeight: 700 }}>{minus(totals.other)}</td>
-                      <td className="rb-num" style={{ color: totals.net >= 0 ? 'var(--gold)' : 'var(--red)', fontWeight: 700 }}>{fmt(totals.net)}</td>
+                    <tr>
+                      <td>Total</td>
+                      <td></td>
+                      <ThreeCells v={{ received: totals.received, charged: totals.charged, owed: hasOwed ? totals.owed : null }} />
+                      {costCell(totals.maint)}
+                      {costCell(totals.plat)}
+                      {costCell(totals.proc)}
+                      {costCell(totals.other)}
+                      <Cell v={totals.netReceived} kind="net" />
+                      <Cell v={totals.netCharged} kind="net" />
                       <td></td>
                     </tr>
                   </tfoot>
@@ -522,7 +702,7 @@ function ByPropertyTab({ basis }: { basis: IncomeBasis }) {
         </div>
       </div>
       <SiteDowntimeCard year={year} month={month} periodLabel={periodLabel} />
-      {openProp && <PropertyDetailModal propertyId={openProp.id} name={openProp.name} year={year} month={month} basis={basis} onClose={() => setOpenProp(null)} />}
+      {openProp && <PropertyDetailModal propertyId={openProp.id} name={openProp.name} year={year} month={month} onClose={() => setOpenProp(null)} />}
     </div>
   )
 }
@@ -576,33 +756,33 @@ function SiteDowntimeCard({ year, month, periodLabel }: { year: number; month: n
 // S655, decision #4 (Nic): "here's the total collected... I want to see how
 // much electric was billed back, property-wide... the distinction between lot
 // rent collected, late fees, trailer payments, etc." The drill-in LEADS with
-// the breakdown: income by category (billed vs collected, under the switch),
-// then expenses as line items, then net. The rent roll, payments and
-// maintenance lists come after, collapsed ("way too long").
-function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: {
-  propertyId: string; name: string; year: number; month: number | null; basis: IncomeBasis; onClose: () => void
+// the breakdown: income by category (10/12: Charged, Received and Owed side by
+// side), then expenses as line items, then the nets. The rent roll, payments
+// and maintenance lists come after, collapsed ("way too long").
+function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
+  propertyId: string; name: string; year: number; month: number | null; onClose: () => void
 }) {
   const qs = `propertyId=${propertyId}&year=${year}${month ? `&month=${month}` : ''}`
-  const { data, isLoading, error } = useQuery<any>(['property-detail', propertyId, year, month, basis],
-    () => apiGet(withBasis(`/reports/property-detail?${qs}`, basis)))
+  const { data, isLoading, error } = useQuery<any>(['property-detail', propertyId, year, month],
+    () => apiGet(`/reports/property-detail?${qs}`))
   const periodLabel = month ? `${MONTHS[month - 1]} ${year}` : `Full year ${year}`
-  const word = basisLabel(basis)
-  // 10/11 (Nic): a bookkeeper never sees who lives where, so the property's
-  // rent roll is the owner's alone.
+  // 10/11 (Nic): a bookkeeper reads the rent roll with names, but a repair as
+  // its cost and kind — never the request's own words (the API sends none).
   const { isBookkeeper } = useViewer()
 
   // Zero-filled 12-month trend for the mini bar chart; highlight selected month.
-  const byMonth = new Map<string, number>((data?.monthlyTrend ?? []).map((t: any) => [t.month, t.collected]))
-  const trend = Array.from({ length: 12 }, (_, i) => ({
-    m: i + 1, label: MONTHS_SHORT[i],
-    collected: byMonth.get(`${year}-${String(i + 1).padStart(2, '0')}`) ?? 0,
-  }))
-  const hasTrend = trend.some(t => t.collected !== 0)
+  const byMonth = new Map<string, any>((data?.monthlyTrend ?? []).map((t: any) => [t.month, t]))
+  const trend = Array.from({ length: 12 }, (_, i) => {
+    const t = byMonth.get(`${year}-${String(i + 1).padStart(2, '0')}`)
+    return { m: i + 1, label: MONTHS_SHORT[i], charged: Number(t?.charged ?? 0), received: Number(t?.collected ?? 0) }
+  })
+  const hasTrend = trend.some(t => t.charged !== 0 || t.received !== 0)
   const units: any[] = data?.units ?? []
   const payments: any[] = data?.payments ?? []
   const maintenance: any[] = data?.maintenance ?? []
   const expenses = data?.expenses
-  const breakdown = data?.breakdown
+  const view: MoneyView | undefined = data?.view
+  const nets = data?.nets ?? netsOf(view, Number(expenses?.total || 0))
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -612,7 +792,8 @@ function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: 
             <div className="modal-title" style={{ marginBottom: 2 }}>{name}</div>
             <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
               {periodLabel}
-              {data?.property ? ` · ${data.property.city}, ${data.property.state} · ${data.property.occupiedUnits}/${data.property.totalUnits} occupied (${data.property.occupancyRate}%)` : ''}
+              {data?.property && !data.property.leftOn ? ` · ${data.property.city}, ${data.property.state} · ${data.property.occupiedUnits}/${data.property.totalUnits} occupied (${data.property.occupancyRate}%)` : ''}
+              {data?.property?.leftOn ? ` · Left the company ${usDay(data.property.leftOn)}: its history up to that day, nothing after` : ''}
             </div>
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }} aria-label="Close">×</button>
@@ -623,13 +804,11 @@ function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: 
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
             <>
-              {/* 1. Income by category, billed vs collected, under the switch. */}
+              {/* 1. Income by category: Charged, Received and Owed side by side. */}
               <CategoryBreakdownCard
-                basis={basis}
                 title={`Income by category — ${periodLabel}`}
-                categories={breakdown?.categories ?? []}
-                lines={breakdown?.lines ?? []}
-                total={Number(breakdown?.total ?? 0)}
+                categories={data?.breakdown?.categories ?? []}
+                view={view}
               />
 
               {/* 2. Expenses as line items. */}
@@ -637,29 +816,26 @@ function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: 
                 <div className="card-header"><span className="card-title">Expenses — {periodLabel}</span></div>
                 {expenseLines(expenses).map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
                 <PnLLine label="Total expenses" value={Number(expenses?.total || 0)} kind="total-out" />
+                {/* 10/12 (Nic, ledger P8): on the books, what of them was paid in the period (the Received net takes it). */}
+                {expenses?.paid != null && <PnLLine label="Of which paid in this period" value={Number(expenses.paid)} kind="expense" />}
               </div>
 
-              {/* 3. Net. */}
+              {/* 3. The nets. */}
               <div className="card" style={{ marginBottom: 14 }}>
-                <PnLLine label={`${word} (income)`} value={Number(breakdown?.total || 0)} kind="total-in" />
-                <PnLLine label="Expenses" value={Number(expenses?.total || 0)} kind="total-out" />
-                <PnLLine label="Net" value={Number(data.net || 0)} kind="net" />
-                {Number(data.summary?.depositsHeld) > 0 && (
-                  <div className="rb-small-note">
-                    Deposits received in this period (held for tenants, never income): {fmt(data.summary.depositsHeld)}
-                  </div>
-                )}
+                <PnLLine label={`Net on ${MONEY_COLUMN_LABEL.received.toLowerCase()}`} value={Number(nets.received ?? data.net ?? 0)} kind="net" />
+                <PnLLine label={`Net on ${MONEY_COLUMN_LABEL.charged.toLowerCase()}`} value={Number(nets.charged || 0)} kind="net" />
+                <BesideFigures items={view?.beside} />
               </div>
 
               {hasTrend && (
                 <div className="card" style={{ marginBottom: 14 }}>
-                  <div className="card-header"><span className="card-title">{perMonthTitle(basis)} — {year}</span></div>
+                  <div className="card-header"><span className="card-title">{MONEY_COLUMN_LABEL.received} and {MONEY_COLUMN_LABEL.charged.toLowerCase()} by month — {year}</span><ChartKey /></div>
                   <div style={{ padding: '10px 12px 4px' }}><BarChart series={trend} current={month ?? -1} /></div>
                 </div>
               )}
 
               {/* The lists, after the breakdown and collapsed. */}
-              {!isBookkeeper && <details className="rb-collapse">
+              <details className="rb-collapse">
                 <summary>Rent roll ({units.length} {units.length === 1 ? 'unit' : 'units'})</summary>
                 <div className="rb-collapse-body data-table-wrap">
                   <table className="data-table">
@@ -677,12 +853,12 @@ function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: 
                     </tbody>
                   </table>
                 </div>
-              </details>}
+              </details>
 
               <details className="rb-collapse">
-                <summary>{basis === 'billed' ? 'Bills' : 'Payments'} behind the total ({payments.length})</summary>
+                <summary>Payments behind {MONEY_COLUMN_LABEL.received} ({payments.length})</summary>
                 <div className="rb-collapse-body data-table-wrap">
-                  <ChargesTable rows={payments} basis={basis} emptyText={`Nothing in ${periodLabel}.`} />
+                  <ChargesTable rows={payments} emptyText={`No money arrived in ${periodLabel}.`} />
                 </div>
               </details>
 
@@ -718,51 +894,42 @@ function PropertyDetailModal({ propertyId, name, year, month, basis, onClose }: 
 }
 
 /**
- * Decision #4: income by category, billed vs collected. Money received: what
- * was billed in the period and what arrived in it; the total is what arrived,
- * plus money with no category (money paid ahead, deposit deductions, ...).
- * Money billed: each bill and what became of it; the total is what was billed.
+ * Decision #4, 10/12 (Nic): income by category with Charged, Received and
+ * Owed side by side, the money with no category under its line, the totals,
+ * and how the columns tie.
  */
-function CategoryBreakdownCard({ basis, title, categories, lines, total }: {
-  basis: IncomeBasis; title: string
-  categories: CategoryRow[]; lines: Array<{ line: string; label: string; amount: number }>; total: number
+function CategoryBreakdownCard({ title, view, categories }: {
+  title: string; view: MoneyView | undefined
+  /** An older reply's breakdown (billed / collected / still owed), read when there is no view. */
+  categories?: CategoryRow[]
 }) {
-  const rows = activeCategories(categories)
-  const cols = categoryColumns(basis)
-  // The column that adds up to the total under the switch.
-  const totalKey = basis === 'billed' ? 'billed' : 'collected'
-  const colSum = (k: string) => sumAmounts(rows.map(r => ({ amount: Number((r as any)[k] || 0) })))
+  const rows = view
+    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed }))
+    : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r) }))
+  const lines = (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed }))
+  const all = [...rows, ...lines]
+  const total = view ? { charged: view.charged, received: view.received, owed: view.owed } : sumThree(all)
   return (
     <div className="card" style={{ marginBottom: 14 }}>
       <div className="card-header"><span className="card-title">{title}</span></div>
-      {rows.length === 0 && lines.length === 0 ? (
+      {all.length === 0 ? (
         <div style={{ padding: 16, color: 'var(--text-3)', fontSize: '.82rem', textAlign: 'center' }}>
-          {basis === 'billed' ? 'Nothing was billed in this period.' : 'No money arrived in this period.'}
+          Nothing was received or charged in this period.
         </div>
       ) : (
         <div className="data-table-wrap">
-          <table className="data-table rb-cat-table">
+          <table className="data-table rb-cat-table rb-three">
             <thead><tr>
               <th>Category</th>
-              {cols.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+              {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
             </tr></thead>
             <tbody>
               {/* data-label: on a phone each row stacks, every figure named. */}
-              {rows.map(r => (
-                <tr key={r.category}>
-                  <td className="rb-cat-name">{categoryLabel(r)}</td>
-                  {cols.map(c => (
-                    <td key={c.key} data-label={c.label} className="rb-num" style={c.key === totalKey ? { color: 'var(--text-0)', fontWeight: 600 } : undefined}>
-                      {fmt((r as any)[c.key])}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-              {lines.map(l => (
-                <tr key={l.line} className="rb-cat-lines">
-                  <td>{l.label}</td>
-                  {cols.map(c => (
-                    <td key={c.key} data-label={c.label} className={`rb-num${c.key === totalKey ? '' : ' rb-cat-blank'}`}>{c.key === totalKey ? fmt(l.amount) : '—'}</td>
+              {all.map(r => (
+                <tr key={r.key}>
+                  <td className="rb-cat-name">{r.label}</td>
+                  {COLS.map(c => (
+                    <td key={c.key} data-label={c.label} className={`rb-num${c.key === 'owed' && r.owed ? ' rb-owed' : ''}`}>{fmt(r[c.key])}</td>
                   ))}
                 </tr>
               ))}
@@ -770,33 +937,25 @@ function CategoryBreakdownCard({ basis, title, categories, lines, total }: {
             <tfoot>
               <tr>
                 <td>Total</td>
-                {cols.map(c => (
-                  <td key={c.key} data-label={c.label} className="rb-num">
-                    {c.key === totalKey ? fmt(total) : fmt(colSum(c.key))}
-                  </td>
-                ))}
+                {COLS.map(c => <td key={c.key} data-label={c.label} className="rb-num">{fmt(total[c.key])}</td>)}
               </tr>
             </tfoot>
           </table>
         </div>
       )}
+      <TieLines lines={view?.tieText} />
     </div>
   )
 }
 
-/**
- * The charges behind a total. Money received: each charge's own new money on
- * the day it arrived. Money billed: each bill due in the period, with what
- * became of it.
- */
-function ChargesTable({ rows, basis, emptyText }: { rows: any[]; basis: IncomeBasis; emptyText: string }) {
-  // 10/11: no names for a bookkeeper (the API sends none either).
-  const { isBookkeeper } = useViewer()
+/** The payments behind Received: each charge's own new money on the day it arrived. */
+function ChargesTable({ rows, emptyText }: { rows: any[]; emptyText: string }) {
+  // 10/11 (Nic): who paid shows to everyone who reads this, a bookkeeper included.
   return (
     <table className="data-table">
       <thead><tr>
-        <th>{basis === 'billed' ? 'Due' : 'Day'}</th><th>Unit</th>{!isBookkeeper && <th>Tenant</th>}<th>For</th><th>Status</th>
-        <th className="rb-num">{basis === 'billed' ? 'Billed' : 'Received'}</th>
+        <th>Day</th><th>Unit</th><th>Tenant</th><th>For</th><th>Status</th>
+        <th className="rb-num">{MONEY_COLUMN_LABEL.received}</th>
       </tr></thead>
       <tbody>
         {rows.length ? rows.map(p => (
@@ -804,20 +963,16 @@ function ChargesTable({ rows, basis, emptyText }: { rows: any[]; basis: IncomeBa
             {/* The day the entry counted (the property's calendar): a dispute of
                 an earlier payment sits on the day the money was taken back. */}
             <td className="mono rb-nowrap" style={{ color: 'var(--text-3)' }}>
-              {usDay(chargeDay(p, basis))}
-              {basis === 'received' && Number(p.amount) < 0 && (
-                <div className="rb-taken-back">money taken back</div>
-              )}
+              {usDay(chargeDay(p))}
+              {Number(p.amount) < 0 && <div className="rb-taken-back">money taken back</div>}
             </td>
             <td className="mono">{p.unitNumber ? `#${p.unitNumber}` : '—'}</td>
-            {!isBookkeeper && <td style={{ color: 'var(--text-2)' }}>{p.tenantName || '—'}</td>}
-            <td style={{ color: 'var(--text-3)' }}>{p.categoryLabel || humanize(p.type)}</td>
-            <td>
-              <StatusPill status={p.status} />
-              {basis === 'billed' && partsText(p.parts, fmt) && (
-                <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{partsText(p.parts, fmt)}</div>
-              )}
+            <td style={{ color: 'var(--text-2)' }}>{p.tenantName || '—'}</td>
+            <td style={{ color: 'var(--text-3)' }}>
+              {p.categoryLabel || humanize(p.type)}
+              {p.dueDate && <div style={{ fontSize: '.66rem' }}>bill due {usDay(p.dueDate)}</div>}
             </td>
+            <td><StatusPill status={p.status} /></td>
             <td className="rb-num" style={{ color: 'var(--text-0)' }}>
               {fmt(p.amount)}
               {Number(p.creditGiven) > 0 && (
@@ -825,21 +980,18 @@ function ChargesTable({ rows, basis, emptyText }: { rows: any[]; basis: IncomeBa
               )}
             </td>
           </tr>
-        )) : <tr><td colSpan={isBookkeeper ? 5 : 6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>{emptyText}</td></tr>}
+        )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 20 }}>{emptyText}</td></tr>}
       </tbody>
     </table>
   )
 }
 
 // ── ANNUAL & TAX (tax-summary + work-trade 1099) ──────────────
-// S655: the total IS the year's P&L under the switch, the deductions are the
-// P&L's expenses line for line, and the net is its net. The money paid ahead
-// and not used is shown next to the total, named by the server: "Paid ahead
-// for next year's bills" once the year is over, "Paid ahead, not used yet"
-// while the year is still running. Under Money received it counted on the day
-// it arrived ($0 again when it pays them), so it is never called "not in" the
-// total; under Money billed it is outside the total.
-function AnnualTaxTab({ basis }: { basis: IncomeBasis }) {
+// S655 → 10/12 (Nic): the year's Charged and Received side by side, line for
+// line, the deductions are the P&L's expenses line for line (the payment
+// processing fees included), and the net is shown on each money column. Money
+// paid ahead and not used yet at Dec 31 counted in Received the day it arrived.
+function AnnualTaxTab() {
   const now = new Date()
   const [year, setYear] = useState(now.getFullYear())
   const { can } = useViewer()
@@ -849,25 +1001,29 @@ function AnnualTaxTab({ basis }: { basis: IncomeBasis }) {
   const [companyId, setCompanyId] = useState<string>('')
   const q = companyId ? `&landlordId=${companyId}` : ''
   const { ready, mustChoose } = useCompanyReady(companyId)
-  const { data: tax, isLoading, error } = useQuery<any>(['tax-summary', year, companyId, basis],
-    () => apiGet(withBasis(`/reports/tax-summary?year=${year}${q}`, basis)), { enabled: ready })
+  const { data: tax, isLoading, error } = useQuery<any>(['tax-summary', year, companyId],
+    () => apiGet(`/reports/tax-summary?year=${year}${q}`), { enabled: ready })
   const { data: wt } = useQuery<any>(['wt-1099', year, companyId],
     () => apiGet(`/reports/work-trade-1099?year=${year}${q}`), { enabled: ready })
 
   const monthly: any[] = tax?.monthlyBreakdown ?? []
   const eligible: any[] = wt?.eligible ?? []
-  const word = basisLabel(basis)
-  const incomeLines: Array<{ line: string; label: string; amount: number }> = tax?.income?.lines ?? []
   const d = tax?.deductions
   const deductions = expenseLines(d ? {
     platformFee: Number(d.platformFees || 0), maintenance: Number(d.maintExpenses || 0),
     lotRent: Number(d.lotRent || 0), enteredExpenses: Number(d.enteredExpenses || 0),
+    processingFees: Number(d.processingFees || 0), cardFeesRefunded: Number(d.cardFeesRefunded || 0),
   } : null)
+  const view: MoneyView | undefined = tax?.view
+  const nets = tax?.nets ?? netsOf(view, sumAmounts(deductions))
+  // 10/12 (Nic, review): on the books a month's Owed is a balance at its end
+  // (a bill unpaid since January is in every month's), so the Year row's Owed
+  // is the year's own (the balance at its end), never the months added up.
+  const monthSum = sumThree(monthly.map((m: any) => ({ charged: m.charged, received: m.received ?? m.collected, owed: m.owed })))
+  const yearRow = view?.source === 'ledger' && typeof view.owed === 'number' ? { ...monthSum, owed: view.owed } : monthSum
   const paidAheadNext = Number(tax?.paidAheadNextYear?.amount || 0)
-  // Money received: the paid-ahead money on hand at year end counted on the
-  // day it arrived, so it sits on its own line — never in the "not in them"
-  // box (§0.0, Todd). Money billed: it and work trade are both outside.
-  const yearBeside = taxYearBeside(tax?.paidAheadNextYear, d?.workTradeValue, basis)
+  const extraBeside: BesideItem[] = Number(d?.workTradeValue || 0) > 0
+    ? [{ key: 'workTrade1099', label: 'Covered by work trade (bartered, never money)', amount: Number(d.workTradeValue) }] : []
 
   return (
     <div className="rb-stack">
@@ -886,65 +1042,52 @@ function AnnualTaxTab({ basis }: { basis: IncomeBasis }) {
         <>
           <div className="rb-kpis">
             <div className="kpi-card">
-              <div className="kpi-label">{word} {year}</div>
-              <div className="kpi-value green">{fmt0(tax?.income?.totalRent)}</div>
+              <div className="kpi-label">{MONEY_COLUMN_LABEL.received} {year}</div>
+              <div className="kpi-value green">{fmt0(view?.received ?? tax?.income?.totalRent)}</div>
               {paidAheadNext > 0 && (
-                <div className="kpi-sub">
-                  {tax?.paidAheadNextYear?.label || 'Paid ahead, not used yet'} {fmt0(paidAheadNext)}
-                  {basis === 'billed' ? ' — not in this total' : ' — counted when it arrived'}
-                </div>
+                <div className="kpi-sub">{tax?.paidAheadNextYear?.label || 'Paid ahead, not used yet'} {fmt0(paidAheadNext)} — counted when it arrived</div>
               )}
             </div>
-            <div className="kpi-card"><div className="kpi-label">Net Income</div><div className="kpi-value" style={{ color: 'var(--gold)' }}>{fmt0(tax?.netIncome)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.charged} {year}</div><div className="kpi-value">{fmt0(view?.charged)}</div>{view?.owed != null && <div className="kpi-sub">{MONEY_COLUMN_LABEL.owed} {fmt0(view.owed)}</div>}</div>
+            <div className="kpi-card"><div className="kpi-label">Net on received</div><div className="kpi-value" style={{ color: 'var(--gold)' }}>{fmt0(nets.received)}</div><div className="kpi-sub">Net on charged {fmt0(nets.charged)}</div></div>
             <div className="kpi-card"><div className="kpi-label">Deposits Held</div><div className="kpi-value">{fmt0(tax?.deposits?.totalHeld)}</div><div className="kpi-sub">tenants' money, never income</div></div>
-            <div className="kpi-card"><div className="kpi-label">{basis === 'billed' ? 'Bills counted' : 'Payments counted'}</div><div className="kpi-value">{tax?.income?.paymentCount ?? 0}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Payments counted</div><div className="kpi-value">{tax?.income?.paymentCount ?? 0}</div></div>
           </div>
 
-          <div className="card">
-            <div className="card-header"><span className="card-title">Income, deductions and net — {year}</span></div>
-            <div style={{ padding: '2px 6px 12px' }}>
-              <div className="rb-heading">Income ({word})</div>
-              {incomeLines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
-              <PnLLine label="Total income" value={Number(tax?.income?.totalRent || 0)} kind="total-in" />
-              <PaidAheadOnHand item={yearBeside.onHand} />
-              <div className="rb-heading">Deductions (estimated)</div>
-              {deductions.map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
-              <PnLLine label="Total deductions" value={sumAmounts(deductions)} kind="total-out" />
-              <PnLLine label="Net income" value={Number(tax?.netIncome || 0)} kind="net" />
-              {yearBeside.notIn.length > 0 && (
-                <div className="rb-beside">
-                  <div className="rb-beside-title">Beside the totals, not in them</div>
-                  {yearBeside.notIn.map(i => (
-                    <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
-                  ))}
-                </div>
-              )}
-              <div className="rb-small-note">
-                Estimates for planning only — not tax advice. GAM does not file on your behalf. Confirm with your tax professional.
-              </div>
-            </div>
-          </div>
+          <ThreeColumnPnL
+            title={`Income, deductions and net — ${year}`}
+            view={view}
+            expenses={deductions}
+            expensesHeading="Deductions (estimated)"
+            nets={nets}
+            extraBeside={extraBeside}
+            note="Estimates for planning only — not tax advice. GAM does not file on your behalf. Confirm with your tax professional."
+          />
 
           <div className="card">
-            <div className="card-header"><span className="card-title">{perMonthTitle(basis)} — {year}</span></div>
+            <div className="card-header"><span className="card-title">By month — {year}</span></div>
             <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
-              <table className="data-table">
-                <thead><tr><th>Month</th><th className="rb-num">{word}</th><th style={{textAlign:'center'}}>{basis === 'billed' ? 'Bills' : 'Payments'}</th><th style={{textAlign:'center'}}>Failed</th></tr></thead>
+              <table className="data-table rb-three">
+                <thead><tr>
+                  <th>Month</th>
+                  {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+                  <th style={{textAlign:'center'}}>Payments</th><th style={{textAlign:'center'}}>Failed</th>
+                </tr></thead>
                 <tbody>
                   {monthly.length ? monthly.map((m: any) => (
                     <tr key={m.month}>
                       <td style={{ color: 'var(--text-1)' }}>{MONTHS[(Number(m.month) || 1) - 1]}</td>
-                      <td className="rb-num" style={{ color: 'var(--green)' }}>{fmt(m.collected)}</td>
+                      <ThreeCells v={{ received: m.received ?? m.collected, charged: m.charged, owed: m.owed }} />
                       <td className="mono" style={{ textAlign: 'center' }}>{m.paid}</td>
                       <td className="mono" style={{ textAlign: 'center', color: Number(m.failed) > 0 ? 'var(--red)' : 'var(--text-3)' }}>{m.failed}</td>
                     </tr>
-                  )) : <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>Nothing in {year}.</td></tr>}
+                  )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24 }}>Nothing in {year}.</td></tr>}
                 </tbody>
                 {monthly.length > 0 && (
                   <tfoot>
-                    <tr style={{ borderTop: '2px solid var(--border-1)' }}>
-                      <td style={{ fontWeight: 700, color: 'var(--text-0)' }}>Year</td>
-                      <td className="rb-num" style={{ fontWeight: 700, color: 'var(--green)' }}>{fmt(sumAmounts(monthly.map((m: any) => ({ amount: Number(m.collected || 0) }))))}</td>
+                    <tr>
+                      <td>Year</td>
+                      {COLS.map(c => <td key={c.key} className="rb-num">{fmt(yearRow[c.key])}</td>)}
                       <td></td><td></td>
                     </tr>
                   </tfoot>
@@ -986,7 +1129,7 @@ function AnnualTaxTab({ basis }: { basis: IncomeBasis }) {
 }
 
 // ── OWNER STATEMENT (monthly-statement) ───────────────────────
-function OwnerStatementTab({ basis }: { basis: IncomeBasis }) {
+function OwnerStatementTab() {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
   const [month, setMonth] = useState<number | null>(now.getMonth() + 1)
@@ -995,8 +1138,8 @@ function OwnerStatementTab({ basis }: { basis: IncomeBasis }) {
   // company's name at the top.
   const [companyId, setCompanyId] = useState<string>('')
   const { ready, mustChoose } = useCompanyReady(companyId)
-  const { data, isLoading, error } = useQuery<any>(['monthly-statement', year, month, companyId, basis],
-    () => apiGet(withBasis(`/reports/monthly-statement?year=${year}&month=${month}` + (companyId ? `&landlordId=${companyId}` : ''), basis)),
+  const { data, isLoading, error } = useQuery<any>(['monthly-statement', year, month, companyId],
+    () => apiGet(`/reports/monthly-statement?year=${year}&month=${month}` + (companyId ? `&landlordId=${companyId}` : '')),
     { enabled: ready })
 
   const s = data?.summary
@@ -1004,17 +1147,23 @@ function OwnerStatementTab({ basis }: { basis: IncomeBasis }) {
   const maintenance: any[] = data?.maintenance ?? []
   const landlord = data?.landlord
   const ym = `${year}-${String(month).padStart(2, '0')}`
-  const remainder = noChargeRemainder(Number(s?.totalIncome || 0), Number(data?.rowsTotal || 0))
+  const view: MoneyView | undefined = data?.view
+  const remainder = noChargeRemainder(Number(view?.received ?? s?.totalIncome ?? 0), Number(data?.rowsTotal || 0))
+  const hh = s?.households
+  const expenses = expenseLines(s ? {
+    platformFee: Number(s.totalPlatformFees || 0), maintenance: Number(s.totalMaintCost || 0),
+    lotRent: Number(s.lotRent || 0), enteredExpenses: Number(s.enteredExpenses || 0),
+    processingFees: Number(s.processingFees || 0), cardFeesRefunded: Number(s.cardFeesRefunded || 0),
+  } : null)
+  if (s && Number(s.pmFee)) expenses.push({ key: 'pmFee', label: 'Management fee', amount: Number(s.pmFee) })
 
   const exportPaymentsCsv = () => downloadCsv(
-    `owner-statement-${basis}-${ym}.csv`,
-    ['Counted on', 'Date due', 'Money arrived', 'Property', 'Unit', 'Tenant', 'For', 'Status',
-     basis === 'billed' ? 'Billed' : 'Received', ...(basis === 'billed' ? ['What became of it'] : [])],
+    `owner-statement-${ym}.csv`,
+    ['Day it arrived', 'Date due', 'Property', 'Unit', 'Tenant', 'For', 'Status', MONEY_COLUMN_LABEL.received],
     payments.map(p => [
-      chargeDay(p, basis), (p.dueDate || '').slice(0, 10), arrivalDay(p, basis), p.propertyName, p.unitNumber,
+      chargeDay(p), (p.dueDate || '').slice(0, 10), p.propertyName, p.unitNumber,
       [p.tenantFirst, p.tenantLast].filter(Boolean).join(' '),
       p.categoryLabel || humanize(p.type), statusWords(p.status), Number(p.amount || 0).toFixed(2),
-      ...(basis === 'billed' ? [partsText(p.parts, fmt)] : []),
     ]),
   )
 
@@ -1047,26 +1196,31 @@ function OwnerStatementTab({ basis }: { basis: IncomeBasis }) {
               <div style={{ textAlign: 'right' }}>
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>Period</div>
                 <div style={{ fontSize: '.9rem', color: 'var(--gold)', fontWeight: 600 }}>{monthLabel(ym)}</div>
-                <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{basisLabel(basis)}</div>
               </div>
             </div>
           </div>
 
-          <PnLStatement s={s} lines={data?.lines ?? []} beside={data?.beside ?? []} periodLabel={monthLabel(ym)} basis={basis} />
+          <ThreeColumnPnL
+            title={`Profit & Loss — ${monthLabel(ym)}`}
+            view={view}
+            expenses={expenses}
+            nets={data?.nets ?? netsOf(view, Number(s?.totalExpenses || 0))}
+          />
 
           <div className="card">
             <div className="card-header">
-              <span className="card-title">{basis === 'billed' ? 'Bills behind the total' : 'Payments behind the total'}</span>
+              <span className="card-title">Payments behind {MONEY_COLUMN_LABEL.received}</span>
+              {/* 10/12 (Nic): households past grace, not lines (a $5 daily late fee is not five late bills). */}
               <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                {s?.settledPayments ?? 0} paid · {s?.latePayments ?? 0} late · {s?.failedPayments ?? 0} failed
+                Households, bills due in {monthLabel(ym)}: {hh?.paidOnTime ?? 0} on time · {s?.latePayments ?? 0} past grace · {s?.failedPayments ?? 0} with a failed payment
               </span>
             </div>
             <div style={{ padding: '4px 0 12px' }} className="data-table-wrap">
-              <ChargesTable rows={payments} basis={basis} emptyText={`Nothing in ${monthLabel(ym)}.`} />
+              <ChargesTable rows={payments} emptyText={`No money arrived in ${monthLabel(ym)}.`} />
               {payments.length > 0 && (
                 <div className="rb-small-note">
                   These add up to {fmt(data?.rowsTotal)}.
-                  {Math.abs(remainder) >= 0.01 && ` The other ${fmt(remainder)} of the total has no single charge behind it (money paid ahead, register sales and stays, other income, move-out lines).`}
+                  {Math.abs(remainder) >= 0.01 && ` The other ${fmt(remainder)} of ${MONEY_COLUMN_LABEL.received} has no single charge behind it (money paid ahead, register sales and stays, other income, move-out lines).`}
                 </div>
               )}
             </div>
@@ -1105,7 +1259,7 @@ function StatusPill({ status }: { status: string }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// MONTHLY P&L DRILL-IN MODAL (S512 #20; S655 under the switch)
+// MONTHLY P&L DRILL-IN MODAL (S512 #20; 10/12 three columns, one line per day)
 // ══════════════════════════════════════════════════════════════
 interface PaymentRow extends ChargeRow {
   type: string
@@ -1120,18 +1274,14 @@ interface PaymentRow extends ChargeRow {
 interface MonthlyPL {
   period: { year: number; month: number; start: string; end: string }
   gross: { rent: number; other: number; total: number }
-  /** Every income line, labeled; they add up to gross.total. */
-  lines: Array<{ line: string; label: string; amount: number }>
-  /** Shown beside the total, never in it. */
-  beside: Array<{ key: string; label: string; amount: number }>
-  /** Money billed: what became of the bills (adds up to the total). */
-  parts: Array<{ part: string; label: string; amount: number }>
-  depositsHeld?: number
-  expenses: { platformFee: number; maintenance: number; lotRent?: number; enteredExpenses?: number; total: number }
+  expenses: { platformFee: number; maintenance: number; lotRent?: number; enteredExpenses?: number; processingFees?: number; cardFeesRefunded?: number; total: number }
   net: number
   paymentCount: number
   payments: PaymentRow[]
   rowsTotal: number
+  view: MoneyView
+  nets: { charged: number; received: number }
+  days: DayLine[]
 }
 
 const dayLabel = (iso: string) =>
@@ -1139,7 +1289,7 @@ const dayLabel = (iso: string) =>
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
 
-function MonthlyPLModal({ month, basis, onClose }: { month: string; basis: IncomeBasis; onClose: () => void }) {
+function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void }) {
   const [year, mo] = month.split('-').map(Number)
   // ── S637: A P&L BELONGS TO ONE COMPANY ──────────────────────────────
   //
@@ -1153,36 +1303,39 @@ function MonthlyPLModal({ month, basis, onClose }: { month: string; basis: Incom
   // multi-company account it 400'd on open. Every other report tab already
   // carries the picker; this one was missed.
   const [companyId, setCompanyId] = useState<string>('')
-  const { isBookkeeper } = useViewer()
   const { data, isLoading, error } = useQuery<MonthlyPL>(
-    ['monthly-pl', month, companyId, basis],
-    () => apiGet(withBasis(`/reports/monthly-pl?year=${year}&month=${mo}`
-      + (companyId ? `&landlordId=${companyId}` : ''), basis)),
+    ['monthly-pl', month, companyId],
+    () => apiGet(`/reports/monthly-pl?year=${year}&month=${mo}` + (companyId ? `&landlordId=${companyId}` : '')),
   )
-
-  // Money received: grouped by the day the money arrived. Money billed: by the
-  // day each bill was due.
-  const groups = data?.payments ? groupCharges(data.payments, basis) : []
-  const remainder = data ? noChargeRemainder(data.gross.total, data.rowsTotal) : 0
-  // Money billed with its parts listed (paid / clearing / covered by money paid
-  // ahead / still owed — inside the total): "collected so far" is made of those
-  // parts, so it is not listed again as "beside the total, not in it".
-  const outcomeShown = !!data && showsBillOutcome(basis, data.parts.length)
+  // 10/12 (Nic): a day opens to who paid on screen; the printout keeps the daily totals only.
+  const [open, setOpen] = useState<Set<string>>(new Set())
+  const toggle = (day: string) => setOpen(prev => {
+    const next = new Set(prev)
+    if (next.has(day)) next.delete(day); else next.add(day)
+    return next
+  })
+  const view = data?.view
+  const days = data?.days ?? []
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal rb-modal" style={{ width: 720 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+    <div className="modal-overlay rb-printable" onClick={onClose}>
+      <div className="modal rb-modal" style={{ width: 760 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
           <div>
             <div className="modal-title" style={{ marginBottom: 2 }}>{monthLabel(month)} — Profit &amp; Loss</div>
-            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{basisLabel(basis)}</div>
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{COLS.map(c => c.label).join(', ')} side by side</div>
           </div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }} aria-label="Close">×</button>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {data && <ToolbarBtn onClick={() => window.print()} label="Print" />}
+            <button className="btn btn-ghost btn-sm no-print" onClick={onClose} style={{ padding: 6 }} aria-label="Close">×</button>
+          </div>
         </div>
 
         <div className="rb-modal-body">
-          <EntityPicker value={companyId} onChange={setCompanyId}
-            note="A profit and loss statement belongs to one company." />
+          <div className="no-print">
+            <EntityPicker value={companyId} onChange={setCompanyId}
+              note="A profit and loss statement belongs to one company." />
+          </div>
           {/* S637: a failure used to render as "Loading…" forever, because this
               branch tested `!data` and an errored query has no data. That hid
               the actual reason — here, a 400 naming exactly what was wrong. */}
@@ -1194,94 +1347,86 @@ function MonthlyPLModal({ month, basis, onClose }: { month: string; basis: Incom
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
             <>
-              {/* P&L summary */}
               <div className="rb-stats">
-                <PLStat label={`${basisLabel(basis)}`} value={data.gross.total} color="var(--green)" />
+                <PLStat label={MONEY_COLUMN_LABEL.received} value={view?.received ?? data.gross.total} color="var(--green)" />
+                <PLStat label={MONEY_COLUMN_LABEL.charged} value={view?.charged ?? 0} color="var(--text-0)" />
+                {(!view || view.owed != null) && <PLStat label={MONEY_COLUMN_LABEL.owed} value={view?.owed ?? 0} color="var(--amber)" />}
                 <PLStat label="Expenses" value={data.expenses.total} color="var(--text-2)" negative />
-                <PLStat label="Net" value={data.net} color={data.net >= 0 ? 'var(--gold)' : 'var(--red, #e06666)'} bold />
+                <PLStat label="Net on received" value={data.nets?.received ?? data.net} color={(data.nets?.received ?? data.net) >= 0 ? 'var(--gold)' : 'var(--red, #e06666)'} bold />
               </div>
 
-              <div className="card" style={{ marginBottom: 16 }}>
-                <div className="card-header"><span className="card-title">Breakdown</span></div>
-                <div style={{ padding: '0 0 6px' }}>
-                  <PnLHeading>Income</PnLHeading>
-                  {data.lines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
-                  <PnLLine label="Total income" value={data.gross.total} kind="total-in" />
-                  <PaidAheadOnHand item={paidAheadOnHand(data.beside, basis)} />
-                  {outcomeShown && (
-                    <div className="rb-beside">
-                      <div className="rb-beside-title">What became of the bills</div>
-                      {data.parts.map(p => (
-                        <div key={p.part} className="rb-beside-row"><span>{p.label}</span><span className="rb-line-amount">{fmt(p.amount)}</span></div>
-                      ))}
-                    </div>
-                  )}
-                  <PnLHeading>Expenses</PnLHeading>
-                  {expenseLines(data.expenses).map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
-                  <PnLLine label="Total expenses" value={data.expenses.total} kind="total-out" />
-                  <PnLLine label="Net to owner" value={data.net} kind="net" />
-                  {/* Money billed: still clearing and still owed are inside the total
-                      (listed above under what became of the bills), never beside it —
-                      and nor is collected so far once those parts are listed. Money
-                      received: paid-ahead money on hand already counted (above). */}
-                  <BesideFigures items={besideNotInTotal(data.beside, basis, { outcomeShown })} />
-                </div>
-              </div>
+              <ThreeColumnPnL
+                title="Breakdown"
+                view={view}
+                expenses={expenseLines(data.expenses)}
+                nets={data.nets ?? netsOf(view, data.expenses.total)}
+              />
 
-              {/* The charges behind the total. */}
-              <div className="card">
+              {/* 10/12 (Nic): one line per day with the day's total, and the
+                  expenses logged that day under it. A day opens to who paid. */}
+              <div className="card" style={{ marginTop: 16 }}>
                 <div className="card-header">
-                  <span className="card-title">
-                    {basis === 'billed' ? `Bills by due date (${data.paymentCount})` : `Payments by the day the money arrived (${data.paymentCount})`}
-                  </span>
+                  <span className="card-title">Money by the day it arrived</span>
+                  <span className="no-print" style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Click a day to see who paid.</span>
                 </div>
-                <div style={{ padding: '6px 0' }}>
-                  {groups.length === 0 ? (
+                <div style={{ padding: '2px 0 6px' }}>
+                  {days.length === 0 ? (
                     <div style={{ textAlign: 'center', color: 'var(--text-3)', padding: 24, fontSize: '.8rem' }}>
-                      {basis === 'billed' ? `No bills due in ${monthLabel(month)}.` : `No payments arrived in ${monthLabel(month)}.`}
+                      No money arrived and no expenses were logged in {monthLabel(month)}.
                     </div>
-                  ) : groups.map(group => (
-                    <div key={group.date || 'none'} style={{ marginBottom: 8 }}>
-                      <div className="rb-group-head">
-                        <span style={{ fontSize: '.74rem', fontWeight: 700, color: 'var(--text-1)' }}>
-                          {group.date ? dayLabel(group.date + 'T12:00:00') : 'No date'}
-                        </span>
-                        <span className="mono" style={{ fontSize: '.74rem', color: 'var(--green)' }}>{fmt(group.total)}</span>
+                  ) : days.map(d => {
+                    const isOpen = open.has(d.day)
+                    const rows = dayRows(d, data.payments)
+                    const canOpen = rows.length > 0 || Math.abs(d.noCharge) >= 0.01
+                    return (
+                      <div key={d.day} className="rb-day">
+                        <button type="button" className="rb-day-line" aria-expanded={isOpen}
+                          onClick={() => canOpen && toggle(d.day)} disabled={!canOpen} style={{ cursor: canOpen ? 'pointer' : 'default' }}>
+                          <span className="rb-day-caret no-print">{canOpen ? '▸' : ''}</span>
+                          <span className="rb-day-date">{dayLabel(d.day + 'T12:00:00')}</span>
+                          {d.paymentCount > 0 && <span className="rb-day-count">{d.paymentCount} {d.paymentCount === 1 ? 'payment' : 'payments'}</span>}
+                          <span className="rb-day-total">{fmt(d.received)}</span>
+                        </button>
+                        {d.expensesLogged !== 0 && (
+                          <div className="rb-day-expense">{expensesLoggedText(d.expensesLogged, d.expenseCount, fmt)}</div>
+                        )}
+                        {isOpen && (
+                          <div className="rb-day-detail no-print">
+                            {rows.map(r => (
+                              <div key={chargeKey(r)} className="rb-group-row">
+                                <span className="rb-group-who">
+                                  {r.tenantName || 'Tenant'}
+                                  <span className="rb-group-detail">
+                                    {r.unitNumber ? ` · ${r.propertyName ? r.propertyName + ' ' : ''}#${r.unitNumber}` : ''}
+                                    {` · ${r.categoryLabel || humanize(r.type)}`}
+                                    {Number(r.amount) < 0
+                                      ? ' · money taken back (a dispute or bank return)'
+                                      : `${r.method && r.method !== '—' ? ` · ${r.method}` : ''}${r.settledAt ? ` · ${timeLabel(r.settledAt)}` : ''}`}
+                                    {r.dueDate ? ` · bill due ${usDay(r.dueDate)}` : ''}
+                                    {Number(r.creditGiven) > 0 ? ` · credit you gave ${fmt(r.creditGiven)}` : ''}
+                                  </span>
+                                </span>
+                                <span className="mono" style={{ color: 'var(--text-0)', whiteSpace: 'nowrap' }}>{fmt(r.amount)}</span>
+                              </div>
+                            ))}
+                            {Math.abs(d.noCharge) >= 0.01 && (
+                              <div className="rb-group-row">
+                                <span className="rb-group-who"><span className="rb-group-detail">Money with no single charge behind it (paid ahead, register sales, stays, other income)</span></span>
+                                <span className="mono" style={{ color: 'var(--text-0)', whiteSpace: 'nowrap' }}>{fmt(d.noCharge)}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      {group.rows.map(r => (
-                        <div key={chargeKey(r)} className="rb-group-row">
-                          <span className="rb-group-who">
-                            {isBookkeeper ? (r.categoryLabel || humanize(r.type)) : (r.tenantName || 'Tenant')}
-                            <span className="rb-group-detail">
-                              {r.unitNumber ? ` · ${r.propertyName ? r.propertyName + ' ' : ''}#${r.unitNumber}` : ''}
-                              {/* A bookkeeper's row already leads with the category. */}
-                              {isBookkeeper ? '' : ` · ${r.categoryLabel || humanize(r.type)}`}
-                              {basis === 'received'
-                                ? (Number(r.amount) < 0
-                                    ? ' · money taken back (a dispute or bank return)'
-                                    : `${r.method && r.method !== '—' ? ` · ${r.method}` : ''}${r.settledAt ? ` · ${timeLabel(r.settledAt)}` : ''}`)
-                                : (partsText(r.parts, fmt) ? ` · ${partsText(r.parts, fmt)}` : '')}
-                              {Number(r.creditGiven) > 0 ? ` · credit you gave ${fmt(r.creditGiven)}` : ''}
-                            </span>
-                          </span>
-                          <span className="mono" style={{ color: 'var(--text-0)', whiteSpace: 'nowrap' }}>{fmt(r.amount)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                  {groups.length > 0 && Math.abs(remainder) >= 0.01 && (
-                    <div className="rb-small-note">
-                      These add up to {fmt(data.rowsTotal)}. The other {fmt(remainder)} of the total has no single charge
-                      behind it (money paid ahead, register sales and stays, other income, move-out lines) — see the breakdown above.
-                    </div>
-                  )}
+                    )
+                  })}
                 </div>
               </div>
             </>
           )}
         </div>
 
-        <div className="modal-footer" style={{ marginTop: 12, flexShrink: 0 }}>
+        <div className="modal-footer no-print" style={{ marginTop: 12, flexShrink: 0 }}>
           <button className="btn btn-ghost" onClick={onClose}>Close</button>
         </div>
       </div>
@@ -1301,38 +1446,36 @@ function PLStat({ label, value, color, negative, bold }: { label: string; value:
 }
 
 /**
- * Money received: the paid-ahead money not used yet. It counted on the day it
- * arrived ("Paid ahead for later bills"), so it is shown apart from the "not
- * in it" box, with words that say so (§0.0, Todd).
+ * Figures in no column (work trade, deposits held, owner money in, chargeback
+ * costs) — and the paid-ahead money not used yet, which already counted in
+ * Received the day it arrived (§0.0, Todd).
  */
-function PaidAheadOnHand({ item }: { item: BesideItem | null }) {
-  if (!item) return null
+function BesideFigures({ items }: { items: BesideItem[] | null | undefined }) {
+  const list = items ?? []
+  const onHand = list.find(i => i.key === PAID_AHEAD_ON_HAND_KEY && Number(i.amount))
+  const rest = list.filter(i => i.key !== PAID_AHEAD_ON_HAND_KEY)
+  if (!onHand && !rest.length) return null
   return (
-    <div className="rb-counted">
-      <div className="rb-beside-row"><span>{item.label}</span><span className="rb-line-amount">{fmt(item.amount)}</span></div>
-      <div className="rb-counted-note">{PAID_AHEAD_COUNTED_NOTE}</div>
-    </div>
-  )
-}
-
-/** Figures shown BESIDE a total, never inside it (still clearing, credits you gave, ...). */
-function BesideFigures({ items }: { items: Array<{ key: string; label: string; amount: number }> | null | undefined }) {
-  if (!items?.length) return null
-  return (
-    <div className="rb-beside">
-      <div className="rb-beside-title">Beside the total, not in it</div>
-      {items.map(i => (
-        <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
-      ))}
-    </div>
+    <>
+      {onHand && (
+        <div className="rb-counted">
+          <div className="rb-beside-row"><span>{onHand.label}</span><span className="rb-line-amount">{fmt(onHand.amount)}</span></div>
+          <div className="rb-counted-note">{PAID_AHEAD_COUNTED_NOTE}</div>
+        </div>
+      )}
+      {rest.length > 0 && (
+        <div className="rb-beside">
+          <div className="rb-beside-title">In no column</div>
+          {rest.map(i => (
+            <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
+          ))}
+        </div>
+      )}
+    </>
   )
 }
 
 // ── P&L statement block (income green, expenses RED, net gold) ─
-function PnLHeading({ children }: { children: string }) {
-  return <div className="rb-heading">{children}</div>
-}
-
 type PnLKind = 'income' | 'expense' | 'total-in' | 'total-out' | 'net'
 function PnLLine({ label, value, kind }: { label: string; value: number; kind: PnLKind }) {
   const isExpense = kind === 'expense' || kind === 'total-out'
@@ -1353,46 +1496,487 @@ function PnLLine({ label, value, kind }: { label: string; value: number; kind: P
 }
 
 /**
- * The owner statement's P&L. Every income line (rent, fees, utilities, paid
- * ahead, register sales, credits given, returned, ...) is listed, so the lines
- * add up to the total income; every expense (platform fee, maintenance, lot
- * rent, your expenses) is listed, so they add up to the total expenses.
+ * 10/12 (Nic): a P&L with Received, Charged and Owed side by side. Every
+ * income line is listed in each column (they add up to the column's total),
+ * the tie line says how the columns relate, every expense is listed once
+ * (the payment processing fees always), and the net is shown on each money
+ * column. Figures in no column follow.
  */
-function PnLStatement({ s, lines, beside, periodLabel, basis }: {
-  s: any; lines: Array<{ line: string; label: string; amount: number }>
-  beside: BesideItem[]; periodLabel: string; basis: IncomeBasis
+function ThreeColumnPnL({ title, view, expenses, expensesHeading = 'Expenses', nets, extraBeside, note }: {
+  title: string
+  view: MoneyView | undefined
+  /** 10/12 (ledger P8): a line's `paid` (on the books) is the Received column's; else the same amount. */
+  expenses: ExpenseLine[]
+  expensesHeading?: string
+  nets: { charged: number; received: number }
+  extraBeside?: BesideItem[]
+  note?: string
 }) {
-  const outcome = billedOutcome(beside, basis)
-  const expenses = expenseLines(s ? {
-    platformFee: Number(s.totalPlatformFees || 0), maintenance: Number(s.totalMaintCost || 0),
-    lotRent: Number(s.lotRent || 0), enteredExpenses: Number(s.enteredExpenses || 0),
-  } : null)
-  if (s && Number(s.pmFee)) expenses.push({ key: 'pmFee', label: 'Management fee', amount: Number(s.pmFee) })
+  const lines = view?.lines ?? []
+  const expTotal = sumAmounts(expenses)
+  const paidTotal = sumAmounts(expenses.map(e => ({ amount: e.paid ?? e.amount })))
   return (
     <div className="card">
-      <div className="card-header"><span className="card-title">Profit &amp; Loss — {periodLabel}</span></div>
-      <div style={{ padding: '2px 8px 14px' }}>
-        <PnLHeading>{`Income (${basisLabel(basis)})`}</PnLHeading>
-        {lines.map(l => <PnLLine key={l.line} label={l.label} value={l.amount} kind="income" />)}
-        <PnLLine label="Total income" value={Number(s?.totalIncome || 0)} kind="total-in" />
-        <PaidAheadOnHand item={paidAheadOnHand(beside, basis)} />
-        {/* Money billed: what became of the bills — collected so far, still
-            clearing, still owed — adds up to the total income above. */}
-        {outcome.length > 0 && (
-          <div className="rb-beside">
-            <div className="rb-beside-title">What became of the bills</div>
-            {outcome.map(i => (
-              <div key={i.key} className="rb-beside-row"><span>{i.label}</span><span className="rb-line-amount">{fmt(i.amount)}</span></div>
-            ))}
+      <div className="card-header"><span className="card-title">{title}</span></div>
+      <div className="data-table-wrap">
+        <table className="data-table rb-three">
+          <thead><tr>
+            <th>Income</th>
+            {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+          </tr></thead>
+          <tbody>
+            {lines.length ? lines.map(l => (
+              <tr key={l.line} className="rb-sub">
+                <td>{l.label || incomeLineLabel(l.line)}</td>
+                <ThreeCells v={l} />
+              </tr>
+            )) : (
+              <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 16 }}>Nothing received or charged.</td></tr>
+            )}
+            <tr className="rb-total">
+              <td>Total income</td>
+              <ThreeCells v={{ received: view?.received ?? 0, charged: view?.charged ?? 0, owed: view ? view.owed : 0 }} />
+            </tr>
+            <tr><td colSpan={4} style={{ paddingTop: 14, fontSize: '.7rem', textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--text-3)', fontWeight: 700 }}>{expensesHeading}</td></tr>
+            {expenses.map(e => {
+              const rec = e.paid ?? e.amount
+              return (
+                <tr key={e.key} className="rb-sub">
+                  <td>{e.label}</td>
+                  <td className="rb-num rb-neg">{rec ? `−${fmt(Math.abs(rec))}` : fmt(0)}</td>
+                  <td className="rb-num rb-neg">{e.amount ? `−${fmt(Math.abs(e.amount))}` : fmt(0)}</td>
+                  <td className="rb-blank"></td>
+                </tr>
+              )
+            })}
+            <tr className="rb-total">
+              <td>Total {expensesHeading.toLowerCase().replace(/ \(.*\)$/, '')}</td>
+              <td className="rb-num rb-neg">−{fmt(paidTotal)}</td>
+              <td className="rb-num rb-neg">−{fmt(expTotal)}</td>
+              <td className="rb-blank"></td>
+            </tr>
+            <tr className="rb-net">
+              <td>Net</td>
+              <Cell v={nets.received} kind="net" />
+              <Cell v={nets.charged} kind="net" />
+              <td className="rb-blank"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <TieLines lines={view?.tieText} />
+      <div style={{ padding: '0 6px 12px' }}>
+        <BesideFigures items={[...(view?.beside ?? []), ...(extraBeside ?? [])]} />
+        {note && <div className="rb-small-note">{note}</div>}
+      </div>
+    </div>
+  )
+}
+
+// ══════════════════════════════════════════════════════════════
+// 10/12 (Nic) — THE MONTHLY PROPERTY REPORT
+//
+// All four groups — tenants & leases, payments (the colored stamps, who is
+// late and by how many days past grace), money (Charged / Received / Owed by
+// category, expenses by category, net, work trade, deposits), operations
+// (utility billed back vs the utility's own bill, maintenance, stays) — for
+// each property, printable, and as the PDF the email attaches. The owner picks
+// who it is emailed to on the 2nd (the card at the bottom).
+// ══════════════════════════════════════════════════════════════
+interface ReportProperty {
+  property: { id: string; name: string; city: string | null; state: string | null }
+  tenants: {
+    leasesStarted: number; leasesRenewed: number; existingOnboarded: number; leasesEnded: number
+    moveIns: number; moveOuts: number; spaces: number; occupied: number; vacant: number
+    occupancyPercent: number | null; occupancyAsOf: string; occupancyFrom: 'monthEndSnapshot' | 'today' | string
+  }
+  payments: {
+    counts: Array<{ stamp: PaymentStamp; label: string; households: number }>
+    households: number
+    late: Array<{ householdId: string; name: string; units: string[]; stamp: PaymentStamp; stampLabel: string; daysPastGrace: number; owed: number }>
+  }
+  money: {
+    view: MoneyView
+    expenses: { lines: Array<{ key: string; label: string; amount: number }>; total: number }
+    net: { received: number; charged: number }
+    workTradeCovered: number; depositsReceived: number; depositsReturned: number
+  }
+  operations: {
+    utilityCycle: string
+    utilities: Array<{ utility: string; label: string; billedBack: number; utilityBill: number | null }>
+    utilityExpensesLogged: number
+    maintenance: { opened: number; closed: number; cost: number }
+    stays: { stays: number; nights: number; bookedThisMonth: number }
+  }
+}
+interface MonthlyReport {
+  company: { id: string; name: string }
+  month: string
+  monthLabel: string
+  properties: ReportProperty[]
+  /** 10/12 review: the whole company's money no property here holds (beside the totals); null when none. */
+  notInTotals?: { received: number; charged: number; expenses: number } | null
+  totals: {
+    tenants: ReportProperty['tenants']
+    payments: { counts: ReportProperty['payments']['counts']; households: number; late: number }
+    money: ReportProperty['money']
+  }
+}
+
+const Fig = ({ label, value, sub }: { label: string; value: string | number; sub?: string }) => (
+  <div className="rb-mr-fig">
+    <div className="rb-mr-fig-label">{label}</div>
+    <div className="rb-mr-fig-value">{value}</div>
+    {sub && <div className="rb-mr-fig-sub">{sub}</div>}
+  </div>
+)
+
+function StampCounts({ counts }: { counts: ReportProperty['payments']['counts'] }) {
+  return (
+    <div className="rb-stamps">
+      {counts.map(c => (
+        <span key={c.stamp} className="rb-stamp-count" title={`${c.label}: ${c.households} ${c.households === 1 ? 'household' : 'households'}`}>
+          <span className={`rb-stamp-chip ${c.stamp}`}>{PAYMENT_STAMP_LETTER[c.stamp]}</span>
+          {c.label}: {c.households}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function MonthlyReportTab() {
+  const { role, isBookkeeper } = useViewer()
+  const [companyId, setCompanyId] = useState<string>('')
+  const { ready, mustChoose } = useCompanyReady(companyId)
+  const [month, setMonth] = useState<string>(() => linkParams().month ?? lastMonthKey())
+  const [propertyId, setPropertyId] = useState('')
+  const [y, m] = month.split('-').map(Number)
+  const q = `month=${month}${companyId ? `&landlordId=${companyId}` : ''}`
+  const { data, isLoading, error } = useQuery<MonthlyReport>(['monthly-report', month, companyId],
+    () => apiGet(`/reports/monthly-report?${q}`), { enabled: ready })
+  const [pdfBusy, setPdfBusy] = useState(false)
+  const shown = (data?.properties ?? []).filter(p => !propertyId || p.property.id === propertyId)
+  // 10/12 review: year and month live in one string, so each picker change
+  // updates it from its CURRENT value. Two setters reading this render's year
+  // and month lost the year when the picker moved both at once (a later month
+  // clamped to this month when switching to this year).
+  const setYear = (yy: number) => setMonth(cur => `${yy}-${cur.slice(5, 7)}`)
+  const setMonthOnly = (mm: number | null) => setMonth(cur => `${cur.slice(0, 4)}-${String(mm ?? 1).padStart(2, '0')}`)
+
+  const openPdf = async () => {
+    setPdfBusy(true)
+    try {
+      await openProtectedFile(`/api/reports/monthly-report/pdf?${q}${propertyId ? `&propertyId=${propertyId}` : ''}`)
+    } catch {
+      toastError('Could not open the PDF. Try again in a moment.')
+    } finally {
+      setPdfBusy(false)
+    }
+  }
+
+  return (
+    <div className="rb-stack rb-report">
+      <div className="no-print">
+        <EntityPicker value={companyId} onChange={setCompanyId}
+          note="The monthly report is one company's report — it prints that company's name." />
+      </div>
+      <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <PeriodPicker year={y} setYear={setYear} month={m} setMonth={setMonthOnly} />
+          {(data?.properties?.length ?? 0) > 1 && (
+            <select className="input" value={propertyId} onChange={e => setPropertyId(e.target.value)} style={{ minWidth: 180 }}>
+              <option value="">All properties</option>
+              {data!.properties.map(p => <option key={p.property.id} value={p.property.id}>{p.property.name}</option>)}
+            </select>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <ToolbarBtn onClick={() => window.print()} label="Print" disabled={!data} />
+          <ToolbarBtn onClick={openPdf} label={pdfBusy ? 'Opening…' : 'PDF'} disabled={!data || pdfBusy} />
+        </div>
+      </div>
+
+      {mustChoose ? <ChooseCompany what="monthly report" /> : error ? <ReportError error={error} what="the monthly report" /> : (isLoading || !data) ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
+        <>
+          <div className="card">
+            <div style={{ padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', color: 'var(--text-0)', fontWeight: 700 }}>Monthly property report</div>
+                <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginTop: 2 }}>{data.company.name}</div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>Month</div>
+                <div style={{ fontSize: '.9rem', color: 'var(--gold)', fontWeight: 600 }}>{data.monthLabel}</div>
+              </div>
+            </div>
           </div>
+
+          {!propertyId && data.properties.length > 1 && <AllPropertiesCard report={data} />}
+          {data.properties.length === 0 && (
+            <div className="card" style={{ padding: 18, color: 'var(--text-2)', fontSize: '.84rem' }}>No properties to report on for this month.</div>
+          )}
+          {shown.map(p => <PropertyMonthCard key={p.property.id} p={p} monthLabel={data.monthLabel} />)}
+        </>
+      )}
+
+      {/* 10/12 (Nic): who gets it — owner/admin only to edit. */}
+      {role === 'landlord' && !isBookkeeper && ready && !mustChoose && <RecipientsCard companyId={companyId} />}
+    </div>
+  )
+}
+
+function AllPropertiesCard({ report }: { report: MonthlyReport }) {
+  const T = report.totals
+  return (
+    <div className="card">
+      <div className="card-header"><span className="card-title">All properties — {report.monthLabel}</span></div>
+      <div className="data-table-wrap">
+        <table className="data-table rb-three">
+          <thead><tr>
+            <th>Property</th><th className="rb-num">Occupancy</th>
+            {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
+            <th className="rb-num">Expenses</th><th className="rb-num">Net on received</th><th className="rb-num">Net on charged</th>
+            <th className="rb-num">Past grace</th>
+          </tr></thead>
+          <tbody>
+            {report.properties.map(p => (
+              <tr key={p.property.id}>
+                <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{p.property.name}</td>
+                <td className="rb-num">{p.tenants.occupancyPercent == null ? '—' : `${p.tenants.occupancyPercent}%`}</td>
+                <ThreeCells v={p.money.view} />
+                <Cell v={p.money.expenses.total} />
+                <Cell v={p.money.net.received} kind="net" /><Cell v={p.money.net.charged} kind="net" />
+                <td className="rb-num">{p.payments.late.length}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td>Total</td>
+              <td className="rb-num">{T.tenants.occupancyPercent == null ? '—' : `${T.tenants.occupancyPercent}%`}</td>
+              <ThreeCells v={T.money.view} />
+              <Cell v={T.money.expenses.total} />
+              <Cell v={T.money.net.received} kind="net" /><Cell v={T.money.net.charged} kind="net" />
+              <td className="rb-num">{T.payments.late}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      <TieLines lines={T.money.view.tieText} />
+      {/* 10/12 review: the whole company's money no property here holds — beside the totals, so they add up to the P&L. */}
+      {report.notInTotals && (
+        <div className="rb-tie"><p>
+          Booked to the company, not to a property in this report, so in none of its property figures: {MONEY_COLUMN_LABEL.received.toLowerCase()} {fmt(report.notInTotals.received)}, {MONEY_COLUMN_LABEL.charged.toLowerCase()} {fmt(report.notInTotals.charged)}, expenses {fmt(report.notInTotals.expenses)}. With these, the figures add up to the month&apos;s profit and loss.
+        </p></div>
+      )}
+      <div className="rb-mr-section-title">Payments — every property</div>
+      <StampCounts counts={T.payments.counts} />
+    </div>
+  )
+}
+
+function PropertyMonthCard({ p, monthLabel: ml }: { p: ReportProperty; monthLabel: string }) {
+  const t = p.tenants
+  const money = p.money
+  const ops = p.operations
+  return (
+    <div className="card rb-mr-property">
+      <div className="card-header">
+        <span className="card-title">{p.property.name}</span>
+        <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{[p.property.city, p.property.state].filter(Boolean).join(', ')}</span>
+      </div>
+
+      <div className="rb-mr-section-title">Tenants and leases</div>
+      <div className="rb-mr-grid">
+        <Fig label="Leases started" value={t.leasesStarted} sub={`${t.leasesRenewed} renewed · ${t.existingOnboarded} existing moved onto GAM`} />
+        <Fig label="Leases ended" value={t.leasesEnded} />
+        <Fig label="Move-ins" value={t.moveIns} />
+        <Fig label="Move-outs" value={t.moveOuts} />
+        {/* 10/12 (Nic) review: say what each number is — occupied is the
+            spaces GAM billed for the month (held at any point in it), the
+            spaces are counted on the day named. */}
+        <Fig label="Occupied spaces" value={`${t.occupied} of ${t.spaces}`}
+          sub={`${t.occupancyPercent == null ? '—' : `${t.occupancyPercent}%`} · occupied = spaces GAM billed for ${ml} · spaces counted ${t.occupancyFrom === 'today' ? `today, ${usDay(t.occupancyAsOf)}` : usDay(t.occupancyAsOf)}`} />
+        <Fig label="Vacant spaces" value={t.vacant} />
+      </div>
+
+      <div className="rb-mr-section-title">Payments — bills due in {ml}, one stamp per household</div>
+      <StampCounts counts={p.payments.counts} />
+      {p.payments.late.length > 0 ? (
+        <div className="data-table-wrap">
+          <table className="data-table">
+            <thead><tr><th>Who is late</th><th>Space</th><th>Status</th><th className="rb-num">Days past grace</th><th className="rb-num">Still owed</th></tr></thead>
+            <tbody>
+              {p.payments.late.map(h => (
+                <tr key={h.householdId}>
+                  <td style={{ color: 'var(--text-0)', fontWeight: 600 }}>{h.name}</td>
+                  <td className="mono">{h.units.join(', ') || '—'}</td>
+                  <td><span className={`rb-stamp-chip ${h.stamp}`} style={{ marginRight: 6 }}>{PAYMENT_STAMP_LETTER[h.stamp]}</span>{h.stampLabel}</td>
+                  <td className="rb-num">{h.daysPastGrace}</td>
+                  <Cell v={h.owed} kind="owed" />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="rb-small-note" style={{ padding: '0 6px 8px' }}>Nobody is past the grace period for this month.</div>
+      )}
+
+      <div className="rb-mr-section-title">Money — {COLS.map(c => c.label.toLowerCase()).join(', ')}</div>
+      <CategoryBreakdownCard title={`Income by category — ${ml}`} view={money.view} />
+      <div className="data-table-wrap">
+        <table className="data-table rb-three">
+          <thead><tr><th>Expenses</th><th className="rb-num">Amount</th></tr></thead>
+          <tbody>
+            {money.expenses.lines.map(l => (
+              <tr key={l.key} className="rb-sub"><td>{l.label}</td><td className="rb-num rb-neg">{l.amount ? `−${fmt(Math.abs(l.amount))}` : fmt(0)}</td></tr>
+            ))}
+            <tr className="rb-total"><td>Total expenses</td><td className="rb-num rb-neg">−{fmt(money.expenses.total)}</td></tr>
+            <tr className="rb-net"><td>Net on received</td><Cell v={money.net.received} kind="net" /></tr>
+            <tr className="rb-net"><td>Net on charged</td><Cell v={money.net.charged} kind="net" /></tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="rb-mr-grid" style={{ marginTop: 10 }}>
+        <Fig label="Covered by work trade" value={fmt(money.workTradeCovered)} sub="hours, never money" />
+        <Fig label="Deposits received" value={fmt(money.depositsReceived)} sub="held for tenants, never income" />
+        <Fig label="Deposits returned" value={fmt(money.depositsReturned)} />
+      </div>
+
+      <div className="rb-mr-section-title">Operations</div>
+      {ops.utilities.length > 0 ? (
+        <div className="data-table-wrap">
+          <table className="data-table rb-three">
+            <thead><tr><th>Utility ({ops.utilityCycle} cycle)</th><th className="rb-num">Billed back to tenants</th><th className="rb-num">The utility's own bill</th><th className="rb-num">Difference</th></tr></thead>
+            <tbody>
+              {ops.utilities.map(u => (
+                <tr key={u.utility}>
+                  <td>{u.label}</td>
+                  <Cell v={u.billedBack} />
+                  <td className="rb-num">{u.utilityBill == null ? 'Not entered' : fmt(u.utilityBill)}</td>
+                  {u.utilityBill == null ? <td className="rb-num rb-blank">—</td> : <Cell v={u.billedBack - u.utilityBill} kind="net" />}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="rb-small-note" style={{ padding: '0 6px 8px' }}>No utilities were billed back this cycle.</div>
+      )}
+      <div className="rb-mr-grid" style={{ marginTop: 10 }}>
+        <Fig label="Utility bills you logged" value={fmt(ops.utilityExpensesLogged)} sub="as expenses" />
+        <Fig label="Maintenance opened" value={ops.maintenance.opened} />
+        <Fig label="Maintenance closed" value={ops.maintenance.closed} sub={`cost ${fmt(ops.maintenance.cost)}`} />
+        <Fig label="Stays" value={ops.stays.stays} sub={`${ops.stays.nights} nights · ${ops.stays.bookedThisMonth} booked this month`} />
+      </div>
+    </div>
+  )
+}
+
+interface RecipientsData {
+  canEdit: boolean
+  isDefault: boolean
+  recipients: Array<{ kind: string; userId: string | null; email: string; name: string | null; roleLabel: string | null }>
+  leftTeam: Array<{ userId: string; name: string }>
+  team: Array<{ userId: string; name: string; email: string; roleLabel: string; allProperties: boolean; propertyCount: number | null }>
+  lastSends: Array<{ month: string; email: string; status: string; statusLabel: string; sentAt: string | null }>
+  maxExtraEmails: number
+}
+
+/**
+ * 10/12 (Nic): "EMAILED at month close WITH THE PDF ATTACHED to the
+ * recipients the OWNER picks — themselves, property managers, bookkeepers,
+ * other team members, plus extra email addresses — owner/admin only to edit;
+ * default = the owner only." Each person gets the properties their own
+ * access covers; another address gets every property.
+ */
+function RecipientsCard({ companyId }: { companyId: string }) {
+  const qc = useQueryClient()
+  const q = companyId ? `?landlordId=${companyId}` : ''
+  const { data, error, isLoading } = useQuery<RecipientsData>(['monthly-report-recipients', companyId],
+    () => apiGet(`/reports/monthly-report/recipients${q}`), { retry: false })
+  const [picked, setPicked] = useState<Set<string> | null>(null)
+  const [emails, setEmails] = useState<string[] | null>(null)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const seeded = useRef<string>('')
+  useEffect(() => {
+    if (!data) return
+    const key = `${companyId}:${JSON.stringify(data.recipients)}`
+    if (seeded.current === key) return
+    seeded.current = key
+    setPicked(new Set(data.recipients.filter(r => r.kind === 'team_member' && r.userId).map(r => r.userId!)))
+    setEmails(data.recipients.filter(r => r.kind === 'email').map(r => r.email))
+  }, [data, companyId])
+
+  // Only the owner edits the list: anyone else is refused, and the card is not shown.
+  if (error || isLoading || !data || !picked || !emails) return null
+  const sendOf = (email: string) => data.lastSends.find(s => s.email === email)
+  const addEmail = () => {
+    const e = draft.trim().toLowerCase()
+    if (!e) return
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) { toastError('That is not an email address.'); return }
+    if (emails.includes(e)) { setDraft(''); return }
+    if (emails.length >= data.maxExtraEmails) { toastError(`Add at most ${data.maxExtraEmails} other addresses.`); return }
+    setEmails([...emails, e]); setDraft('')
+  }
+  const save = async () => {
+    setSaving(true)
+    try {
+      await finPost('/reports/monthly-report/recipients', {
+        ...(companyId ? { landlordId: companyId } : {}), teamMemberIds: [...picked], emails,
+      })
+      seeded.current = ''
+      await qc.invalidateQueries(['monthly-report-recipients', companyId])
+      toast('Saved. The next monthly report goes to this list.')
+    } catch (e: any) {
+      toastError(reportErrorText(e, 'the list').replace(/^Could not load/, 'Could not save'))
+    } finally {
+      setSaving(false)
+    }
+  }
+  const status = (email: string) => {
+    const s = sendOf(email)
+    return s ? `${monthLabel(s.month)}: ${s.statusLabel}${s.sentAt ? ` ${usDay(s.sentAt.slice(0, 10))}` : ''}` : null
+  }
+
+  return (
+    <div className="card no-print">
+      <div className="card-header">
+        <span className="card-title">Who gets this report by email</span>
+        <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Sent on the 2nd of each month for the month before, with the PDF attached.</span>
+      </div>
+      {data.isDefault && <div className="rb-small-note" style={{ padding: '0 6px 8px' }}>Right now only you get it. Pick anyone else below.</div>}
+      <div className="rb-recip">
+        {data.team.map(m => (
+          <label key={m.userId} className="rb-recip-row">
+            <input type="checkbox" checked={picked.has(m.userId)} onChange={e => {
+              const next = new Set(picked)
+              if (e.target.checked) next.add(m.userId); else next.delete(m.userId)
+              setPicked(next)
+            }} />
+            <span style={{ fontWeight: 600 }}>{m.name}</span>
+            <span className="rb-recip-meta">{m.roleLabel} · {m.allProperties ? 'every property' : `${m.propertyCount ?? 0} ${(m.propertyCount ?? 0) === 1 ? 'property' : 'properties'}`}{status(m.email) ? ` · ${status(m.email)}` : ''}</span>
+          </label>
+        ))}
+        {data.leftTeam.length > 0 && (
+          <div className="rb-recip-meta">No longer on your team (they get nothing): {data.leftTeam.map(l => l.name).join(', ')}</div>
         )}
-
-        <PnLHeading>Expenses</PnLHeading>
-        {expenses.map(l => <PnLLine key={l.key} label={l.label} value={l.amount} kind="expense" />)}
-        <PnLLine label="Total expenses" value={Number(s?.totalExpenses || 0)} kind="total-out" />
-
-        <PnLLine label="Net to Owner" value={Number(s?.netToOwner || 0)} kind="net" />
-        <BesideFigures items={besideNotInTotal(beside, basis, { outcomeShown: outcome.length > 0 })} />
+      </div>
+      <div style={{ padding: '4px 4px 6px', fontSize: '.78rem', color: 'var(--text-2)', fontWeight: 600 }}>Other email addresses (they get every property)</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '0 4px 8px' }}>
+        {emails.map(e => (
+          <span key={e} className="rb-chip">{e}{status(e) ? <span className="rb-recip-meta">{status(e)}</span> : null}
+            <button type="button" aria-label={`Remove ${e}`} onClick={() => setEmails(emails.filter(x => x !== e))}>×</button>
+          </span>
+        ))}
+      </div>
+      <div className="rb-recip-add" style={{ padding: '0 4px 12px' }}>
+        <input className="input" type="email" placeholder="name@example.com" value={draft}
+          onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addEmail() } }} />
+        <button type="button" className="btn btn-primary btn-sm" onClick={addEmail}>Add address</button>
+        <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save list'}</button>
       </div>
     </div>
   )
@@ -1405,6 +1989,7 @@ function PnLStatement({ s, lines, beside, periodLabel, basis }: {
 // engine (GET /reports/query) so any combination of range × level × time bucket
 // is one screen instead of one endpoint each. T-12 is the same engine with the
 // knobs preset — which is why it can never disagree with the numbers here.
+// 10/12 (Nic): Charged, Received and Owed side by side on every row.
 // ══════════════════════════════════════════════════════════════
 type RLevel  = 'portfolio' | 'property' | 'unit'
 type RBucket = 'total' | 'monthly' | 'daily'
@@ -1413,11 +1998,14 @@ interface EngineRow {
   period: string | null
   propertyName: string | null
   unitNumber: string | null
-  /** S655: `lines` has every income line on its own (they add up to total). */
+  /** S655: `lines` has every income line on its own (they add up to total). Income is money received. */
   income:   { rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number; lines?: Record<string, number> }
   /** S655: lotRent — what an investor-operator owes the park, by billing month (the P&L's own). */
-  expenses: { maintenance: number; entered: number; platformFee: number; lotRent?: number; total: number; byCategory: Record<string, number> }
+  expenses: { maintenance: number; entered: number; platformFee: number; lotRent?: number; processingFees?: number; cardFeesRefunded?: number; total: number; byCategory: Record<string, number> }
   net: number
+  /** 10/12: the three columns, and the net on Charged. */
+  money?: MoneyThree
+  netCharged?: number
   occupiedUnits: number
   derived: { netPerUnit: number | null; costPerUnit: number | null; incomePerUnit: number | null; costPerDay: number; netPerDay: number }
 }
@@ -1426,13 +2014,14 @@ interface EngineResult {
   totals: EngineRow
   meta: {
     start: string; end: string; level: RLevel; bucket: RBucket; platformFeeIncluded: boolean; lotRentIncluded?: boolean; report?: string; note?: string
-    /** S655: the switch the figures were counted under. */
-    basis?: { basis: IncomeBasis; label: string; note: string }
+    /** 10/12 (ledger P8): 'ledger' when the report read the company's books. */
+    source?: 'ledger'
   }
 }
 
 const money = (n: number | null | undefined) =>
   n == null ? '—' : n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+const threeOf = (r: EngineRow): MoneyThree => r.money ?? { charged: 0, received: r.income.total, owed: 0 }
 
 /** Default range: the last 12 complete months, matching the T-12 convention
  *  (a half-finished current month makes income look worse than it is). */
@@ -1442,7 +2031,7 @@ function defaultRange(): { start: string; end: string } {
   return lastTwelveMonths()
 }
 
-function CustomReportTab({ basis }: { basis: IncomeBasis }) {
+function CustomReportTab() {
   const dflt = defaultRange()
   const [start, setStart]   = useState(dflt.start)
   const [end, setEnd]       = useState(dflt.end)
@@ -1452,20 +2041,15 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
   const [error, setError]   = useState<string | null>(null)
   const [result, setResult] = useState<EngineResult | null>(null)
   const [title, setTitle]   = useState('Custom report')
-  // S655: the last report run, so flipping the switch re-runs it in place
-  // under the new basis instead of leaving figures counted the other way —
-  // after a failed run too (the flip is a fresh try). Each run is numbered and
-  // only the newest may land: an older run under the other basis answering
-  // last would otherwise sit under a switch that says the opposite.
-  const lastRun = useRef<{ path: string; label: string } | null>(null)
+  // Each run is numbered and only the newest may land: an older, slower run
+  // answering last would otherwise sit under the newer settings.
   const [runs] = useState(latestOnly)
 
-  const run = async (path: string, label: string, b: IncomeBasis = basis) => {
-    lastRun.current = { path, label }
+  const run = async (path: string, label: string) => {
     const me = runs.start()
     setRunning(true); setError(null)
     try {
-      const answer = await apiGet<EngineResult>(withBasis(path, b))
+      const answer = await apiGet<EngineResult>(path)
       if (!runs.isLatest(me)) return
       setResult(answer)
       setTitle(label)
@@ -1477,21 +2061,13 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
       if (runs.isLatest(me)) setRunning(false)
     }
   }
-  useEffect(() => {
-    if (lastRun.current) run(lastRun.current.path, lastRun.current.label, basis)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [basis])
 
   const runCustom = () => {
     if (start > end) { setError('Start date must be on or before the end date.'); return }
     run(`/reports/query?start=${start}&end=${end}&level=${level}&bucket=${bucket}`, 'Custom report')
   }
   const runT12 = () => run('/reports/t12', 'Trailing 12 months (T-12)')
-  // S655: a result on screen that was counted under the other basis (the
-  // switch flipped and its re-run is still out), or any run in flight, is
-  // dimmed with a plain line saying what is coming — never left at full
-  // strength under a switch that says the opposite.
-  const stale = !!result && resultIsStale(result.meta.basis?.basis, basis, running)
+  const stale = running && !!result
   // S655: lot rent is a P&L expense; its column shows whenever there is any.
   const hasLotRent = !!result && (Number(result.totals.expenses.lotRent ?? 0) !== 0
     || result.rows.some(r => Number(r.expenses.lotRent ?? 0) !== 0))
@@ -1499,26 +2075,21 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
   const exportCsv = () => {
     if (!result) return
     const header = [
-      'Period', 'Property', 'Unit',
-      'Rent', 'Fees', 'Utilities', 'Home sale', 'Other income', 'Total income',
-      'Maintenance', 'Expenses', 'Platform fee', 'Lot rent', 'Total expenses',
-      'Net', 'Occupied units', 'Net / unit', 'Cost / unit',
+      'Period', 'Property', 'Unit', ...COLS.map(c => c.label),
+      'Rent', 'Fees', 'Utilities', 'Home sale', 'Other income',
+      'Maintenance', 'Expenses', 'Platform fee', 'Lot rent', 'Payment processing fees', 'Card fees refunded', 'Total expenses',
+      'Net on received', 'Net on charged', 'Occupied units', 'Net / unit', 'Cost / unit',
     ]
-    const body = result.rows.map(r => [
-      r.period ?? 'Total', r.propertyName ?? '', r.unitNumber ?? '',
-      r.income.rent, r.income.fees, r.income.utilities, r.income.homeSale, r.income.other, r.income.total,
-      r.expenses.maintenance, r.expenses.entered, r.expenses.platformFee, r.expenses.lotRent ?? 0, r.expenses.total,
-      r.net, r.occupiedUnits, r.derived.netPerUnit ?? '', r.derived.costPerUnit ?? '',
-    ])
-    const t = result.totals
-    body.push([
-      'TOTAL', '', '',
-      t.income.rent, t.income.fees, t.income.utilities, t.income.homeSale, t.income.other, t.income.total,
-      t.expenses.maintenance, t.expenses.entered, t.expenses.platformFee, t.expenses.lotRent ?? 0, t.expenses.total,
-      t.net, t.occupiedUnits, t.derived.netPerUnit ?? '', t.derived.costPerUnit ?? '',
-    ])
+    const line = (r: EngineRow, period: string) => [
+      period, r.propertyName ?? '', r.unitNumber ?? '', ...COLS.map(c => threeOf(r)[c.key]),
+      r.income.rent, r.income.fees, r.income.utilities, r.income.homeSale, r.income.other,
+      r.expenses.maintenance, r.expenses.entered, r.expenses.platformFee, r.expenses.lotRent ?? 0, r.expenses.processingFees ?? 0, r.expenses.cardFeesRefunded ?? 0, r.expenses.total,
+      r.net, r.netCharged ?? '', r.occupiedUnits, r.derived.netPerUnit ?? '', r.derived.costPerUnit ?? '',
+    ]
+    const body = result.rows.map(r => line(r, r.period ?? 'Total'))
+    body.push(line(result.totals, 'TOTAL').map((v, i) => i === 1 || i === 2 ? '' : v))
     const name = (result.meta.report === 'T-12' ? 't12' : 'report')
-      + `_${result.meta.basis?.basis ?? basis}_${result.meta.start}_to_${result.meta.end}.csv`
+      + `_${result.meta.start}_to_${result.meta.end}.csv`
     downloadCsv(name, header, body)
   }
 
@@ -1580,9 +2151,7 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
 
       {stale && (
         <div className="no-print" role="status" style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
-          {result?.meta.basis && result.meta.basis.basis !== basis
-            ? `Recounting under ${basisLabel(basis)}… The figures below are still ${result.meta.basis.label} until it finishes.`
-            : 'Running the report… The figures below are the last run until it finishes.'}
+          Running the report… The figures below are the last run until it finishes.
         </div>
       )}
 
@@ -1599,10 +2168,8 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
               {result.meta.start} → {result.meta.end}
             </div>
           </div>
-          {(result.meta.note || result.meta.basis) && (
-            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 6 }}>
-              {result.meta.note || `${result.meta.basis!.label}: ${result.meta.basis!.note}`}
-            </div>
+          {result.meta.note && (
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 6 }}>{result.meta.note}</div>
           )}
           {!result.meta.platformFeeIncluded && (
             <div className="alert alert-warn" style={{ marginTop: 10, fontSize: '.75rem' }}>
@@ -1617,50 +2184,54 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
             </div>
           ) : (
             <div style={{ overflowX: 'auto', marginTop: 12 }}>
-              <table className="data-table">
+              <table className="data-table rb-three">
                 <thead>
                   <tr>
                     {result.meta.bucket !== 'total' && <th>Period</th>}
                     {result.meta.level !== 'portfolio' && <th>Property</th>}
                     {result.meta.level === 'unit' && <th>Unit</th>}
-                    <th style={{ textAlign: 'right' }}>{result.meta.basis?.label ?? basisLabel(basis)}</th>
+                    {COLS.map(c => <th key={c.key} className="rb-num">{c.label}</th>)}
                     <th style={{ textAlign: 'right' }}>Repairs</th>
                     <th style={{ textAlign: 'right' }}>Expenses</th>
                     <th style={{ textAlign: 'right' }}>Platform fee</th>
                     {hasLotRent && <th style={{ textAlign: 'right' }}>Lot rent</th>}
-                    <th style={{ textAlign: 'right' }}>Net</th>
+                    <th style={{ textAlign: 'right' }}>Processing fees</th>
+                    <th style={{ textAlign: 'right' }}>Net on received</th>
+                    <th style={{ textAlign: 'right' }}>Net on charged</th>
                     <th style={{ textAlign: 'right' }}>Net / unit</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {result.rows.map((r, i) => (
-                    <tr key={i}>
-                      {result.meta.bucket !== 'total' && <td>{r.period}</td>}
-                      {result.meta.level !== 'portfolio' && <td>{r.propertyName ?? '—'}</td>}
-                      {result.meta.level === 'unit' && <td>{r.unitNumber ?? '—'}</td>}
-                      <td style={{ textAlign: 'right' }}>{money(r.income.total)}</td>
-                      <td style={{ textAlign: 'right' }}>{money(r.expenses.maintenance)}</td>
-                      <td style={{ textAlign: 'right' }}>{money(r.expenses.entered)}</td>
-                      <td style={{ textAlign: 'right' }}>{money(r.expenses.platformFee)}</td>
-                      {hasLotRent && <td style={{ textAlign: 'right' }}>{money(r.expenses.lotRent ?? 0)}</td>}
-                      <td style={{ textAlign: 'right', color: r.net < 0 ? 'var(--red)' : undefined }}>{money(r.net)}</td>
-                      <td style={{ textAlign: 'right' }}>{money(r.derived.netPerUnit)}</td>
-                    </tr>
-                  ))}
-                  <tr style={{ fontWeight: 600, borderTop: '2px solid var(--border-0)' }}>
-                    <td colSpan={
-                      (result.meta.bucket !== 'total' ? 1 : 0)
-                      + (result.meta.level !== 'portfolio' ? 1 : 0)
-                      + (result.meta.level === 'unit' ? 1 : 0) || 1
-                    }>Total</td>
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.income.total)}</td>
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.maintenance)}</td>
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.entered)}</td>
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.platformFee)}</td>
-                    {hasLotRent && <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.lotRent ?? 0)}</td>}
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.net)}</td>
-                    <td style={{ textAlign: 'right' }}>{money(result.totals.derived.netPerUnit)}</td>
-                  </tr>
+                  {[...result.rows, null].map((r, i) => {
+                    const row = r ?? result.totals
+                    const t = threeOf(row)
+                    return (
+                      <tr key={i} style={r ? undefined : { fontWeight: 600, borderTop: '2px solid var(--border-0)' }}>
+                        {r ? (
+                          <>
+                            {result.meta.bucket !== 'total' && <td>{r.period}</td>}
+                            {result.meta.level !== 'portfolio' && <td>{r.propertyName ?? '—'}</td>}
+                            {result.meta.level === 'unit' && <td>{r.unitNumber ?? '—'}</td>}
+                          </>
+                        ) : (
+                          <td colSpan={
+                            (result.meta.bucket !== 'total' ? 1 : 0)
+                            + (result.meta.level !== 'portfolio' ? 1 : 0)
+                            + (result.meta.level === 'unit' ? 1 : 0) || 1
+                          }>Total</td>
+                        )}
+                        {COLS.map(c => <td key={c.key} style={{ textAlign: 'right' }}>{money(t[c.key])}</td>)}
+                        <td style={{ textAlign: 'right' }}>{money(row.expenses.maintenance)}</td>
+                        <td style={{ textAlign: 'right' }}>{money(row.expenses.entered)}</td>
+                        <td style={{ textAlign: 'right' }}>{money(row.expenses.platformFee)}</td>
+                        {hasLotRent && <td style={{ textAlign: 'right' }}>{money(row.expenses.lotRent ?? 0)}</td>}
+                        <td style={{ textAlign: 'right' }} title="Payment processing fees you cover for tenants, and card fees given back with refunds">{money(Number(row.expenses.processingFees ?? 0) + Number(row.expenses.cardFeesRefunded ?? 0))}</td>
+                        <td style={{ textAlign: 'right', color: row.net < 0 ? 'var(--red)' : undefined }}>{money(row.net)}</td>
+                        <td style={{ textAlign: 'right', color: (row.netCharged ?? 0) < 0 ? 'var(--red)' : undefined }}>{money(row.netCharged ?? null)}</td>
+                        <td style={{ textAlign: 'right' }}>{money(row.derived.netPerUnit)}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1677,6 +2248,8 @@ function CustomReportTab({ basis }: { basis: IncomeBasis }) {
 // shape an agent, buyer, appraiser, or lender expects. The engine returns one
 // row per (month × property), so this transposes it and lets the existing print
 // styling (PrintStyles strips the app chrome) produce a clean PDF via print.
+// 10/12 (Nic): the income lines are money received; Charged and Owed sit under
+// them for each month, with the net on each.
 function T12Statement({ result, propertyName, stale }: { result: EngineResult; propertyName: string | null; stale?: boolean }) {
   const months = [...new Set(result.rows.map(r => r.period).filter(Boolean))].sort() as string[]
 
@@ -1707,7 +2280,14 @@ function T12Statement({ result, propertyName, stale }: { result: EngineResult; p
           indent: true,
         }))
       : [{ label: 'Other income', get: (m: string) => at(m, r => r.income.homeSale + r.income.other), indent: true }]),
-    { label: 'Total income',         get: m => at(m, r => r.income.total), strong: true },
+    { label: `Total income (${MONEY_COLUMN_LABEL.received.toLowerCase()})`, get: m => at(m, r => r.income.total), strong: true },
+    { label: `${MONEY_COLUMN_LABEL.charged} (bills due that month)`, get: m => at(m, r => threeOf(r).charged), indent: true },
+    // Decision #25: left out when the server leaves Owed out (a viewer who sees no grand totals).
+    ...(result.rows.every(r => r.money == null || r.money.owed != null)
+      // 10/12 (ledger P8): on the books, Owed is what tenants still owed at each month's end.
+      ? [{ label: result.meta?.source === 'ledger' ? `${MONEY_COLUMN_LABEL.owed} at the month's end` : `${MONEY_COLUMN_LABEL.owed} of those bills today`,
+           get: (m: string) => at(m, r => threeOf(r).owed), indent: true }]
+      : []),
     { label: 'Repairs & maintenance', get: m => at(m, r => r.expenses.maintenance), indent: true },
     ...categories.map(c => ({
       // The API camelizes this breakdown's keys ('property_tax' arrives as
@@ -1721,8 +2301,15 @@ function T12Statement({ result, propertyName, stale }: { result: EngineResult; p
     ...(result.rows.some(r => Number(r.expenses.lotRent ?? 0) !== 0)
       ? [{ label: 'Lot rent', get: (m: string) => at(m, r => Number(r.expenses.lotRent ?? 0)), indent: true }]
       : []),
+    // 10/11 → 10/12 (Nic): the payment processing fees the landlord covers, listed wherever expenses are.
+    { label: 'Payment processing fees', get: (m: string) => at(m, r => Number(r.expenses.processingFees ?? 0)), indent: true },
+    // 10/12 (Nic, G10): card fees guests got back with refunds — printed only when there are any.
+    ...(result.rows.some(r => Number(r.expenses.cardFeesRefunded ?? 0) !== 0)
+      ? [{ label: 'Card fees refunded', get: (m: string) => at(m, r => Number(r.expenses.cardFeesRefunded ?? 0)), indent: true }]
+      : []),
     { label: 'Total expenses', get: m => at(m, r => r.expenses.total), strong: true },
-    { label: 'Net operating income', get: m => at(m, r => r.net), strong: true },
+    { label: 'Net operating income (on received)', get: m => at(m, r => r.net), strong: true },
+    { label: 'Net operating income (on charged)', get: m => at(m, r => Number(r.netCharged ?? 0)), strong: true },
   ]
 
   const rowTotal = (get: (m: string) => number) => months.reduce((s, m) => s + get(m), 0)
@@ -1770,7 +2357,7 @@ function T12Statement({ result, propertyName, stale }: { result: EngineResult; p
             </div>
           </div>
         </div>
-        {/* Not while a re-run under the other basis is out: the PDF would carry the old figures. */}
+        {/* Not while a newer run is out: the PDF would carry the old figures. */}
         <ToolbarBtn onClick={() => window.print()} label="Print / Save PDF" disabled={stale} />
       </div>
 
@@ -1808,8 +2395,7 @@ function T12Statement({ result, propertyName, stale }: { result: EngineResult; p
           what is in it and what is not, or the reader assumes the worst. */}
       <div style={{ marginTop: 14, fontSize: '.72rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
         <strong>Basis of preparation.</strong>{' '}
-        {result.meta.note
-          || `Twelve complete months; the current partial month is excluded.${result.meta.basis ? ` ${result.meta.basis.label}: ${result.meta.basis.note}` : ''}`}
+        {result.meta.note || 'Twelve complete months; the current partial month is excluded.'}
         {' '}Security deposits are excluded —
         they are tenant funds held, not income. Repairs are included only where an actual cost was
         recorded; estimates are excluded. Costs not tied to a specific unit are shown at the

@@ -13,12 +13,45 @@
 //
 // The backends are untouched — this composes the two existing page bodies in
 // `embedded` mode, so all the working logic stays where it was.
-import { BankReconciliationPage } from './BankReconciliationPage'
 import { useUrlTab } from '../lib/useUrlTab'
 import { BankFeedPage } from './BankFeedPage'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { QueryClient, QueryClientProvider } from 'react-query'
 import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
+import { BankReconcilePage } from '../bookkeeping/BankReconcilePage'
+import { setBooksCompany } from '../bookkeeping/adapter'
+import '../bookkeepingHost.css'
+
+/**
+ * 10/12 (Nic, ledger P9): the month check is the bank reconciliation on the
+ * books now — GAM Books' own page (src/bookkeeping, the same bytes as GAM
+ * Books and the Bookkeeping menu), on the company chosen above. It replaces
+ * the S568 statement-total check (a statement figure against what GAM paid
+ * out, with bank charges logged beside it): a bank account is reconciled line
+ * by line against its statement, and a bank charge is an expense paid from
+ * that bank. Its own cache and Books' look (.bk-host), like the Bookkeeping
+ * host (bookkeepingHost.tsx).
+ */
+function LedgerReconciliation({ entityId }: { entityId: string }) {
+  const { data: entities = [] } = useEntities()
+  // S654 (Nic, DIRECTIVE): no default company — a two-company account chooses first.
+  const ready = !!entityId || entities.length === 1
+  setBooksCompany(entityId || null)
+  const qc = useMemo(() => new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 15_000 } } }), [entityId])
+  if (!ready) {
+    return (
+      <div className="card" style={{ padding: 14, fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 20 }}>
+        {entities.length >= 2 ? 'Choose a company above to reconcile its bank.' : 'Loading…'}
+      </div>
+    )
+  }
+  return (
+    <div className="bk-host">
+      <QueryClientProvider client={qc}><BankReconcilePage embedded /></QueryClientProvider>
+    </div>
+  )
+}
 
 // S652 (Nic): "the bank feed and reconciliation need to be on a separate page
 // because this layout is retarded." Two tabs. The feed is the bank: linked
@@ -36,7 +69,7 @@ export function BankPage() {
           <p className="page-subtitle">
             {tab === 'feed'
               ? 'Your linked bank, its balance, and the transactions to turn into expenses.'
-              : 'Check that GAM\'s payouts landed, and match branch deposits to rent.'}
+              : 'Reconcile each bank account against its statement, and match branch deposits to rent.'}
           </p>
         </div>
       </div>
@@ -54,7 +87,7 @@ export function BankPage() {
           <EntityPicker value={entityId} onChange={setEntityId} label="Company"
             note="Each company has its own bank, so its month is checked and its deposits matched on their own." />
           {/* S654 (review): keyed by company, so typed figures never carry over to another company's books. */}
-          <BankReconciliationPage key={entityId || 'none'} embedded entityId={entityId} />
+          <LedgerReconciliation key={entityId || 'none'} entityId={entityId} />
           <div style={{ marginTop: 28 }}>
             <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
             <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>

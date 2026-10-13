@@ -13,7 +13,8 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe, Headphones, Camera, Gauge } from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen } from 'lucide-react'
+import { BOOKS_PATHS } from '../../bookkeeping/adapter'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -30,18 +31,29 @@ import {
 // S575: `hub` folds a cluster of items into ONE sidebar entry whose page
 // (HubTabLayout) renders the cluster's members as sub-tabs. Order within a hub
 // IS the tab order, and the first ACCESSIBLE member is that hub's landing page.
+type Hub = 'financials' | 'screening' | 'bookkeeping'
 const NAV_ITEMS: Array<{
   to: string
   icon: any
   label: string
   section: string | null
   category?: string
-  hub?: 'financials' | 'screening'
+  hub?: Hub
   // 10/11 (Nic): the shared financial pages a bookkeeper sees — and the only
   // ones. 'only' = the bookkeeper's read-only view of something the owner
   // already has a fuller page for (Bank, Disbursements), so the owner's hub
   // does not carry it twice.
   bookkeeper?: true | 'only'
+  // 10/12 (Nic): the company-wide box's — the bank account, payouts, payroll
+  // and the company's own books. A bookkeeper sees it only with that box
+  // ticked (the server refuses it otherwise).
+  companyWide?: true
+  // 10/12 (Nic, BK1): the whole-company Books ledger's — a bookkeeper sees it
+  // with the company-wide box OR "May use the whole-company ledger"
+  // (routes/books BOOKS_LEDGER, the server's own list).
+  ledger?: true
+  // 10/12 (Nic): every bookkeeper, whatever is ticked for them (Categories).
+  everyBookkeeper?: true
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
@@ -78,10 +90,14 @@ const NAV_ITEMS: Array<{
   // Financials — S575: one "Financials" sidebar item, these render as sub-tabs.
   // Items without a `category` stay owner-only (staff can't see them). Tab order
   // is display order; the first the user can access is the landing tab.
+  // 10/12 (Nic): the Rent Roll leads the Financials hub, and staff with "View
+  // all payments" reach it — the page reads what that key opens
+  // (GET /balances/rent-roll, payments.view_all), so that key, not any key in
+  // the Payments category, shows it (see visibleNavItemsFor).
+  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments' },
+  // 10/12 (Nic): kept — "we still need the place to see payments mid month."
   { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null, hub: 'financials', category: 'payments' },
   { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null, hub: 'financials', category: 'balances' },
-  // W-2 (S531): owner-only — matches the API canViewLandlordFinances gate.
-  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials' },
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
   // 10/11 (Nic): money in by type — by month and by day, no names.
   { to: '/income',        icon: BarChart2,        label: 'Money In',         section: null, hub: 'financials', bookkeeper: true },
@@ -90,8 +106,8 @@ const NAV_ITEMS: Array<{
   { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials', bookkeeper: true },
   // 10/11 (Nic): "maintenance... the maintenance costs." Cost lines only.
   { to: '/maintenance-costs', icon: Wrench,       label: 'Maintenance Costs', section: null, hub: 'financials', bookkeeper: true },
-  { to: '/bank-activity', icon: Landmark,         label: 'Bank Activity',    section: null, hub: 'financials', bookkeeper: 'only' },
-  { to: '/payouts',       icon: ArrowDownToLine,  label: 'Payouts',          section: null, hub: 'financials', bookkeeper: 'only' },
+  { to: '/bank-activity', icon: Landmark,         label: 'Bank Activity',    section: null, hub: 'financials', bookkeeper: 'only', companyWide: true },
+  { to: '/payouts',       icon: ArrowDownToLine,  label: 'Payouts',          section: null, hub: 'financials', bookkeeper: 'only', companyWide: true },
   // S645 (Nic): an owner whose book is split between managers reads it here,
   // in one place, with the managers side by side. Owner-level like the rest of
   // the financials hub — it is a judgment about the people they hired.
@@ -114,6 +130,51 @@ const NAV_ITEMS: Array<{
   // S568/S575: investor-operator net + lot rent (homes-only parks). Owner-level;
   // the sub-tab is further gated on the landlord actually having a mobile-home unit.
   { to: '/lot-rent',      icon: Landmark,         label: 'Lot Rent & Net',   section: null, hub: 'financials' },
+  // 10/12 (Nic): "Bookkeeping" is the GAM Books pages INSIDE the portal, not a
+  // link out — the same files as GAM Books (src/bookkeeping,
+  // bookkeeping-parity.test.ts), as sub-tabs like Financials, in Books' own
+  // order. The company's own books: the owner, and a bookkeeper with the
+  // company-wide box (the server's rule — routes/books.ts). Never staff.
+  { to: BOOKS_PATHS.dashboard,       icon: BookOpen, label: 'Dashboard',           section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.employees,       icon: BookOpen, label: 'Employees (W-2)',     section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic): one list of everyone the company pays — contractors are
+  // vendors (the old Contractors address opens Vendors on its Contractors tab).
+  { to: BOOKS_PATHS.vendors,         icon: BookOpen, label: 'Vendors & Contractors', section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.runPayroll,      icon: BookOpen, label: 'Run Payroll',         section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.payHistory,      icon: BookOpen, label: 'Pay History',         section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.taxForms,        icon: BookOpen, label: 'Tax Forms',           section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.accounts,        icon: BookOpen, label: 'Chart of Accounts',   section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.journal,         icon: BookOpen, label: 'Journal Entries',     section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic, L5): Transactions and Bills & AP retired for a landlord
+  // company — money out is one record (Expenses) and bank lines are filed on
+  // the Bank page; their routes stay (each page points to Expenses).
+  { to: BOOKS_PATHS.reconcile,       icon: BookOpen, label: 'Bank Reconciliation', section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic, L3, ledger P9): close a month — the company-wide box's; who may
+  // close and reopen is the owner's Books Settings choice (the server decides).
+  { to: BOOKS_PATHS.closeMonth,      icon: BookOpen, label: 'Close Month',         section: null, hub: 'bookkeeping', bookkeeper: true, companyWide: true },
+  // 10/12 (Nic): loans (principal / interest / escrow) and fixed assets.
+  { to: BOOKS_PATHS.loans,           icon: BookOpen, label: 'Loans',               section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.fixedAssets,     icon: BookOpen, label: 'Fixed Assets',        section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.profitLoss,      icon: BookOpen, label: 'P&L',                 section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.balanceSheet,    icon: BookOpen, label: 'Balance Sheet',       section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic, ledger P8): the trial balance and the general ledger — the whole-company ledger's.
+  { to: BOOKS_PATHS.trialBalance,    icon: BookOpen, label: 'Trial Balance',       section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.generalLedger,   icon: BookOpen, label: 'General Ledger',      section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.cashFlow,        icon: BookOpen, label: 'Cash Flow',           section: null, hub: 'bookkeeping', bookkeeper: true, companyWide: true },
+  { to: BOOKS_PATHS.ownerStatements, icon: BookOpen, label: 'Owner Statements',    section: null, hub: 'bookkeeping', bookkeeper: true, companyWide: true },
+  { to: BOOKS_PATHS.taxCenter,       icon: BookOpen, label: 'Tax Center',          section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic): the company's own choices for how its books count money, and
+  // what its books start with — GAM Books' pages, shown in the Bookkeeping
+  // menu (BooksSettingsPage.tsx / OpeningBalancesPage.tsx). The owner changes
+  // them; a bookkeeper with the ledger box (or company-wide) reads them; the
+  // server decides what each may do (routes/booksSettings.ts).
+  { to: BOOKS_PATHS.booksSettings,   icon: BookOpen, label: 'Books Settings',      section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  { to: BOOKS_PATHS.openingBalances, icon: BookOpen, label: 'Opening Balances',    section: null, hub: 'bookkeeping', bookkeeper: true, ledger: true },
+  // 10/12 (Nic, L5): the company's own categories (a bookkeeper adds them too).
+  // 10/12 (Nic): shown to EVERY bookkeeper, not only one with the ledger — the
+  // server lets each keep the categories (routes/expenses); pointing one at an
+  // account is what needs the ledger, and the page says so.
+  { to: BOOKS_PATHS.categories,      icon: BookOpen, label: 'Categories',          section: null, hub: 'bookkeeping', bookkeeper: true, everyBookkeeper: true },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
@@ -142,13 +203,15 @@ const NAV_ITEMS: Array<{
 ]
 
 // S575: hub display metadata + the set of child paths (for sidebar active-state).
-const HUB_META: Record<'financials' | 'screening', { label: string; icon: any }> = {
-  financials: { label: 'Financials', icon: Landmark },
-  screening:  { label: 'Screening',  icon: UserSearch },
+const HUB_META: Record<Hub, { label: string; icon: any }> = {
+  financials:  { label: 'Financials',  icon: Landmark },
+  screening:   { label: 'Screening',   icon: UserSearch },
+  bookkeeping: { label: 'Bookkeeping', icon: BookOpen },
 }
-const HUB_CHILD_PATHS: Record<string, Set<string>> = {
-  financials: new Set(NAV_ITEMS.filter(i => i.hub === 'financials').map(i => i.to)),
-  screening:  new Set(NAV_ITEMS.filter(i => i.hub === 'screening').map(i => i.to)),
+const HUB_CHILD_PATHS: Record<Hub, Set<string>> = {
+  financials:  new Set(NAV_ITEMS.filter(i => i.hub === 'financials').map(i => i.to)),
+  screening:   new Set(NAV_ITEMS.filter(i => i.hub === 'screening').map(i => i.to)),
+  bookkeeping: new Set(NAV_ITEMS.filter(i => i.hub === 'bookkeeping').map(i => i.to)),
 }
 
 // category → its catalog permission keys (built once from the shared catalog).
@@ -162,7 +225,17 @@ const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 // (main.tsx) so staff always LAND on a page they can actually see. Owners see
 // everything; staff see an item iff they hold ANY catalog key in its category
 // (plus the S168 banking special case). Items with no category are owner-only.
-export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean; allProperties?: boolean } | null | undefined) {
+export type NavUser = {
+  role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean
+  /** 10/12: a bookkeeper's company-wide box (GET /financials/scope); unknown = not shown. */
+  companyWide?: boolean
+  /** 10/12 (Nic, BK1): the whole-company Books ledger (company-wide or the ledger box); unknown = not shown. */
+  ledger?: boolean
+  /** 10/12: false when a bookkeeper keeps no property's money (no property ticked); unknown = shown. */
+  propertyMoney?: boolean
+} | null | undefined
+
+export function visibleNavItemsFor(user: NavUser) {
   const role = user?.role || 'landlord'
   const perms = (user?.permissions || {}) as Record<string, boolean | string>
   const isOwner = OWNER_ROLES.has(role)
@@ -173,13 +246,29 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // 10/11 (Nic): a bookkeeper sees the shared financial pages and nothing
     // else — "money coming in, money going out... the maintenance costs".
     // The API refuses them everything else too (lib/bookkeeperAccess).
-    // The bank account and payouts are company-wide: a bookkeeper kept to some
-    // of the company's properties is refused both, so they are not offered.
+    // 10/12 (Nic): the bank account, payouts and (Bookkeeping) the company's
+    // own books follow the company-wide box alone — the server's rule
+    // (lib/financialsScope refuseWithoutCompanyWide, routes/books.ts), never
+    // the property boxes; it used to read "every property ticked" here, so a
+    // bookkeeper with the box but some properties lost Bank Activity and one
+    // with every property but no box was offered pages that refused them. A
+    // bookkeeper with no property ticked keeps no property's money, so those
+    // pages go, as in GAM Books.
     if (role === 'bookkeeper') {
-      if (item.bookkeeper === 'only' && user?.allProperties === false) return false
-      return !!item.bookkeeper
+      if (!item.bookkeeper) return false
+      // 10/12 (Nic): Categories, for every bookkeeper.
+      if (item.everyBookkeeper) return true
+      if (item.companyWide) return user?.companyWide === true
+      // 10/12 (Nic, BK1): the ledger pages, with either box.
+      if (item.ledger) return user?.companyWide === true || user?.ledger === true
+      return user?.propertyMoney !== false
     }
     if (item.bookkeeper === 'only') return false
+    // 10/12 (Nic): the company's own books are the owner's (and a company-wide
+    // bookkeeper's, above) — never staff's. Not an admin's either: GAM Books
+    // keeps admins out (S568), and its API would hand an admin every
+    // company's books at once.
+    if (item.hub === 'bookkeeping') return role === 'landlord'
     // S575: Lot Rent & Net is a mobile-home concept (lot rent + investor-operator
     // net for homes-only parks). Landlords see it only once they have a
     // mobile-home unit; admin/super_admin (platform oversight) always see it;
@@ -197,6 +286,10 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // --- staff: driven purely by catalog permissions ---
     // S168: /banking for property_manager — only when direct-deposit is on.
     if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
+    // 10/12 (Nic): the Rent Roll is for staff with "View all payments" — the
+    // key its page reads (GET /balances/rent-roll); "View payments" alone shows
+    // only unpaid bills, and the rent roll would refuse it.
+    if (item.to === '/rent-roll') return perms['payments.view_all'] === true
     if (!item.category) return false               // owner-only items (Team, Work Trade)
     // S640: Front Desk moved to its own category; onboarding staff who already
     // had it keep it rather than silently losing a page they use daily.
@@ -214,8 +307,8 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
 // members collapse into ONE entry (icon/label from HUB_META, landing = the first
 // accessible member). RoleRedirect keeps using the flat visibleNavItemsFor so
 // staff still land on a concrete page.
-export function sidebarNavItemsFor(user: Parameters<typeof visibleNavItemsFor>[0]) {
-  const out: Array<{ to: string; icon: any; label: string; section: string | null; hub?: 'financials' | 'screening' }> = []
+export function sidebarNavItemsFor(user: NavUser) {
+  const out: Array<{ to: string; icon: any; label: string; section: string | null; hub?: Hub }> = []
   const seen = new Set<string>()
   for (const item of visibleNavItemsFor(user)) {
     const hub = item.hub
@@ -230,15 +323,41 @@ export function sidebarNavItemsFor(user: Parameters<typeof visibleNavItemsFor>[0
   return out
 }
 
+/**
+ * 10/12 (Nic): the signed-in user as the menu reads them. A bookkeeper's
+ * company-wide box and whether they keep any property's money are not on the
+ * sign-in; they are on GET /financials/scope (the shared financial pages read
+ * the same query). `scopeLoading` is true until it answers.
+ */
+export function useNavUser(): { navUser: NavUser; scopeLoading: boolean } {
+  const { user } = useAuth()
+  const isBookkeeper = user?.role === 'bookkeeper'
+  const { data: scope, isLoading } = useQuery<{ companyWide?: boolean; ledger?: boolean; properties?: unknown[] }>(
+    'financials-scope', () => apiGet('/financials/scope'), { enabled: isBookkeeper, staleTime: 60_000 })
+  if (!isBookkeeper || !user) return { navUser: user, scopeLoading: false }
+  return {
+    navUser: {
+      ...user,
+      companyWide: scope?.companyWide === true,
+      ledger: scope?.ledger === true,
+      propertyMoney: scope ? (scope.properties?.length ?? 0) > 0 : undefined,
+    },
+    scopeLoading: isLoading,
+  }
+}
+
 // S575: the page rendered for a hub route (/payments, /pool, …). Renders the
 // cluster's accessible members as a sub-tab bar over the active child page.
-export function HubTabLayout({ hub }: { hub: 'financials' | 'screening' }) {
-  const { user } = useAuth()
-  const tabs = visibleNavItemsFor(user).filter(i => i.hub === hub)
+export function HubTabLayout({ hub }: { hub: Hub }) {
+  const { navUser } = useNavUser()
+  const tabs = visibleNavItemsFor(navUser).filter(i => i.hub === hub)
   return (
     <div>
       {tabs.length > 1 && (
-        <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 20, flexWrap: 'wrap' }}>
+        // 10/12 review: on a phone the bar is one row that scrolls sideways
+        // (globals.css .hub-tabs) — Bookkeeping's 17 tabs wrapped into about
+        // five rows and pushed the page below the fold.
+        <div className="hub-tabs">
           {tabs.map(t => (
             <NavLink key={t.to} to={t.to} end
               style={({ isActive }) => ({
@@ -418,13 +537,24 @@ export function Layout() {
   const isBookkeeper = role === 'bookkeeper'
 
   // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect); the
-  // sidebar collapses the Financials/Screening clusters into one item each (S575).
-  const visibleItems = sidebarNavItemsFor(user)
+  // sidebar collapses the Financials/Screening/Bookkeeping clusters into one
+  // item each (S575).
+  const { navUser, scopeLoading } = useNavUser()
+  const visibleItems = sidebarNavItemsFor(navUser)
 
   // 10/11: a bookkeeper who follows an old link or types a path lands back on
   // their pages rather than on a screen the API will refuse piece by piece.
+  // 10/12: until their scope has answered, the company-wide pages (Bank
+  // Activity, Payouts, Bookkeeping) are let through — a link to one is not
+  // bounced before it is known whether it is theirs; the server still refuses
+  // it if not, and the redirect runs again once the scope is in.
   if (isBookkeeper) {
-    const theirs = visibleNavItemsFor(user).map(i => i.to)
+    const theirs = visibleNavItemsFor(scopeLoading ? { ...navUser, companyWide: true } : navUser).map(i => i.to)
+    // 10/12 review: the bare /bookkeeping address opens the Books dashboard
+    // (main.tsx's own redirect), never their first page, when it is theirs.
+    if (layoutLocation.pathname === '/bookkeeping' && theirs.includes(BOOKS_PATHS.dashboard)) {
+      return <Navigate to={BOOKS_PATHS.dashboard} replace />
+    }
     if (!theirs.includes(layoutLocation.pathname)) return <Navigate to={theirs[0] ?? '/income'} replace />
   }
 
@@ -445,8 +575,8 @@ export function Layout() {
             const Icon = item.icon
             const showSection = !!item.section && !renderedSections.has(item.section)
             if (showSection) renderedSections.add(item.section!)
-            // Hub items (Financials/Screening) are active for any of their child
-            // routes, not just the landing path a plain NavLink would match.
+            // Hub items (Financials/Screening/Bookkeeping) are active for any of
+            // their child routes, not just the landing path a plain NavLink would match.
             const hubActive = !!item.hub && HUB_CHILD_PATHS[item.hub].has(layoutLocation.pathname)
             return (
               <div key={item.to}>

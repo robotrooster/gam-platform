@@ -6,14 +6,14 @@ import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus, LogOut } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
 import { PropertySelect } from '../components/ListControls'
-// S655 (money plan, Step 15): the "Money received" / "Money billed" switch
-// drives the income card, the trend and the property-health card.
-import { IncomeBasisToggle } from '../components/IncomeBasisToggle'
+// 10/12 (Nic): no "Money received" / "Money billed" switch — the income card
+// and the property-health card show Charged, Received and Owed side by side.
 import {
-  useIncomeBasis, withBasis, incomeCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
-  activeCategories, categoryLabel, figuresBasis, reportErrorText, monthToDate,
-  type IncomeBasis, type IncomeCardData, type CategoryRow,
+  moneyCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
+  activeCategories, categoryLabel, categoryThree, sumThree, reportErrorText, monthToDate,
+  type IncomeCardData, type CategoryRow,
 } from '../lib/incomeBasis'
+import { MONEY_COLUMN_LABEL } from '@gam/shared'
 import '../styles/reports-basis.css'
 // KPI cards show full dollars without cents (fmtWhole). Tables below keep this
 // exact, with-cents `fmt` — precise figures belong in the tables.
@@ -58,7 +58,7 @@ interface DashStats {
   projectedOtpDisbursement?: number
   platformFee?: number
   platformFeeByProperty?: { propertyId: string; name: string; fee: number }[]
-  /** S655: the income card, both ways; the switch picks which one leads. */
+  /** S655: the income card, both ways. 10/12: shown side by side (Charged / Received / Owed). */
   incomeCard?: IncomeCardData
   /** S655: the rent card, both ways (rent only). */
   rentCard?: {
@@ -73,11 +73,9 @@ interface DashStats {
     total: number
   }
   trend?: TrendMonth[]
-  /** S655: the basis these figures were counted under (the API echoes the switch). */
-  basis?: { basis: IncomeBasis; label: string; note: string }
 }
 
-/** One month of the trend: its total under the switch, split rent / everything else, by category. */
+/** One month of the trend: money received that month, split rent / everything else, by category. */
 interface TrendMonth {
   month: string
   period: string
@@ -104,15 +102,13 @@ export function DashboardPage() {
   // they see without impersonating anybody. Empty string is the blended view,
   // which stays the default.
   const [propertyId, setPropertyId] = useState('')
-  // S655: "Money received" (default) or "Money billed", remembered per browser.
-  const [basis, setBasis] = useIncomeBasis()
 
   const { data: properties = [] } = useQuery<any[]>(
     'properties', () => apiGet<any[]>('/properties'), { staleTime: 60_000 })
 
   const { data: stats, isLoading, isPreviousData, isError, error } = useQuery<DashStats>(
-    ['dashboard', propertyId, basis],
-    () => apiGet(withBasis(`/landlords/me/dashboard${propertyId ? `?propertyId=${propertyId}` : ''}`, basis)),
+    ['dashboard', propertyId],
+    () => apiGet(`/landlords/me/dashboard${propertyId ? `?propertyId=${propertyId}` : ''}`),
     { staleTime: Infinity, keepPreviousData: true }
   )
 
@@ -123,9 +119,9 @@ export function DashboardPage() {
   )
 
 
-  // Pad trend to always show 6 months. S655: each month is that month's total
-  // under the switch — the same figure as its row on Reports and, for this
-  // month, the income card — matched by its 'YYYY-MM' period.
+  // Pad trend to always show 6 months. Each month is the money received that
+  // month — the Received figure of its row on Reports and, for this month, the
+  // income card — matched by its 'YYYY-MM' period.
   const trendData = (() => {
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     const now = new Date()
@@ -146,16 +142,11 @@ export function DashboardPage() {
       }
     })
   })()
-  // S655: while a flip loads, the last answer stays up (dimmed) — labeled by
-  // the basis it was COUNTED under (the API echoes it), never the switch's new
-  // one, so an old figure never sits under the other basis's name.
-  const shownBasis = figuresBasis(stats?.basis?.basis, basis)
   // Nothing to show and the load failed: say so rather than a page of $0.
   const loadFailed = isError && !stats
-  // S655 (§0.0, Nic): "Money received this month $A", incl. $X paid ahead for
-  // later bills, + $Y still clearing beside it — or "Money billed this month
-  // $B" with collected so far · clearing · still owed (adding up to $B).
-  const incomeCard = incomeCardView(stats?.incomeCard, shownBasis)
+  // 10/12 (Nic): this month's Charged, Received and Owed side by side — the
+  // same card the Reports overview shows — with how they tie under it.
+  const incomeCard = moneyCardView(stats?.incomeCard)
 
   // Platform fee: authoritative per-property number from the API — $2/billable
   // unit floored at the $10 property minimum (full stop), summed across every
@@ -174,7 +165,11 @@ export function DashboardPage() {
   // so the landlord can still see what the trades are worth.
   const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
   // S650: hibernating leases are asleep — occupied, never payable.
-  const payableUnits   = Math.max(rentRollUnits - workTradeUnits - Number((stats as any)?.hibernatingUnits ?? 0), 0)
+  // 10/12: the spaces summed into Expected Monthly Rent — every space an active
+  // lease holds, less work trade and hibernating leases (the API counts them
+  // beside the sum, so the two can never disagree).
+  const payableUnits   = Number((stats as any)?.payableRentUnits
+    ?? Math.max(rentRollUnits - workTradeUnits - Number((stats as any)?.hibernatingUnits ?? 0), 0))
   const platformFee = stats?.platformFee ?? 0
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
@@ -287,9 +282,9 @@ export function DashboardPage() {
 
       {/* S637: one property at a time. PropertySelect hides itself for a
           single-property landlord, so this costs nothing for most accounts.
-          S655: the Money received / Money billed switch sits beside it. */}
+          10/12 (Nic): the Money received / Money billed switch is gone. */}
+      {properties.length > 1 && (
       <div className="dash-basis-bar">
-        <IncomeBasisToggle basis={basis} onChange={setBasis} />
         {properties.length > 1 && (
           <div className="dash-prop-filter">
             <PropertySelect
@@ -306,6 +301,7 @@ export function DashboardPage() {
           </div>
         )}
       </div>
+      )}
 
       {/* S655: a dashboard that could not load says so once, in plain words —
           it used to fall through to a grid of $0 cards that read as real. */}
@@ -317,14 +313,17 @@ export function DashboardPage() {
       )}
 
       {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
-      {/* While a new switch or property loads, the last figures stay up dimmed
+      {/* While a new property loads, the last figures stay up dimmed
           rather than reading as the new choice's numbers. */}
       {!loadFailed && (
       <div className="kpi-grid dash-kpis" style={{gridTemplateColumns:"repeat(12, 1fr)", opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}}
            aria-busy={isPreviousData || undefined}>
         {/* Row 1 (span 4): rent money trio */}
-        {/* W-2 (S531): clicks through to the rent-roll page, whose total is
-            the same formula as monthlyRentVolume. */}
+        {/* W-2 (S531): clicks through to the Rent Roll. 10/12 (Nic): both read
+            the rent the active LEASES bill (never a unit's listed rent; a space
+            marked occupied with no active lease adds nothing), with work trade
+            and hibernating leases left out — the Rent Roll's lease_rent.expected
+            is this figure. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
@@ -339,18 +338,18 @@ export function DashboardPage() {
           </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
-          <div className="kpi-label">{incomeCard.label}</div>
-          <div className="kpi-value green">{fmtWhole(incomeCard.amount)}</div>
-          {/* S642 (Nic): "Collected this month needs to show any in-flight
-              stuff… those two cards need to match up." S655 (§0.0): the card
-              is the income card, from the same facts as Reports. Money received
-              counts the day money ARRIVED — money paid ahead inside it, money
-              still clearing beside it, never in it. Money billed shows this
-              month's bills with collected so far · clearing · still owed. */}
+          <div className="kpi-label">This month</div>
+          {/* 10/12 (Nic): Charged, Received and Owed side by side, from the same
+              facts as Reports. S642 (Nic): money in flight is shown — still
+              clearing, never inside Received. */}
+          <div className="dash-three">
+            {/* 10/12 (Nic, L2): Received leads. */}
+            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.received}</span><span className="dash-three-value green">{fmtWhole(incomeCard.received)}</span></div>
+            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.charged}</span><span className="dash-three-value">{fmtWhole(incomeCard.charged)}</span></div>
+            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.owed}</span><span className="dash-three-value" style={{ color: incomeCard.owed > 0 ? 'var(--amber)' : undefined }}>{fmtWhole(incomeCard.owed)}</span></div>
+          </div>
           <div className="kpi-sub" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {incomeCard.notes.length
-              ? incomeCard.notes.map(n => <span key={n}>{n}</span>)
-              : <span>{shownBasis === 'billed' ? 'bills due this month' : 'money that arrived this month'}</span>}
+            {incomeCard.notes.map(n => <span key={n}>{n}</span>)}
           </div>
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
@@ -453,7 +452,6 @@ export function DashboardPage() {
             months of rent collected (taller beat = stronger month). */}
         {!loadFailed && <PropertyHealthMonitor
           months={trendData}
-          basis={shownBasis}
           rentBilled={stats?.rentCard?.billed}
           thisMonth={stats?.propertyHealth}
           stale={isPreviousData}
@@ -730,20 +728,19 @@ function PmCutThisMonthCard() {
   )
 }
 // Property Health — an animated ECG/"heartbeat monitor". Each of the last 6
-// months is one PQRST beat; the R-spike height scales with that month's total
-// under the switch relative to the strongest month (0 → flatline). A sweeping
+// months is one PQRST beat; the R-spike height scales with the money received
+// that month relative to the strongest month (0 → flatline). A sweeping
 // scan bar + glow give the live-monitor feel. Falls back to a static trace
 // when the viewer prefers reduced motion.
 //
 // S655 (decision #4): under the trace, this month's income by category — the
-// SAME totals the property report shows for the same month and switch.
-function PropertyHealthMonitor({ months, basis, rentBilled, thisMonth, stale }: {
+// SAME totals the property report shows for the same month. 10/12 (Nic):
+// Charged, Received and Owed side by side.
+function PropertyHealthMonitor({ months, rentBilled, thisMonth, stale }: {
   months: { month: string; revenue: number; rentRevenue?: number; otherRevenue?: number }[]
-  /** The basis the figures were counted under (the API's echo), not the switch mid-flip. */
-  basis: IncomeBasis
   rentBilled?: { amount: number; collected: number; clearing: number; stillOwed: number }
   thisMonth?: DashStats['propertyHealth']
-  /** The last answer, still up while a new switch or property loads: dimmed, like the KPI grid. */
+  /** The last answer, still up while a new property loads: dimmed, like the KPI grid. */
   stale?: boolean
 }) {
   const W = 640, H = 190
@@ -790,9 +787,8 @@ function PropertyHealthMonitor({ months, basis, rentBilled, thisMonth, stale }: 
   }
   const cats = activeCategories(thisMonth?.categories)
   const otherLines = thisMonth?.lines ?? []
-  // The figure that adds up to the total under the switch.
-  const pick = (c: CategoryRow) => basis === 'billed' ? c.billed : c.collected
-  const second = (c: CategoryRow) => basis === 'billed' ? c.collected : c.billed
+  const three = (c: CategoryRow) => categoryThree(c)
+  const catTotals = sumThree(cats.map(three))
 
   // Hover: map the cursor to a month and surface that beat's details.
   const peaks = data.map((_, i) => ({ x: (i + 0.53) * bw, y: baseY - spk * (vals[i] / max) }))
@@ -836,7 +832,7 @@ function PropertyHealthMonitor({ months, basis, rentBilled, thisMonth, stale }: 
                 {' + '}{fmt((data[hoverIdx] as any).otherRevenue)} everything else
               </div>
             ) : (
-              <div className="phm-tip-sub">{basis === 'billed' ? 'money billed' : 'money received'} · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+              <div className="phm-tip-sub">money received · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
             )}
           </div>
         )}
@@ -878,32 +874,43 @@ function PropertyHealthMonitor({ months, basis, rentBilled, thisMonth, stale }: 
       )}
       {(cats.length > 0 || otherLines.length > 0) && (
         <div className="phm-cats">
-          <div className="phm-cats-head">
+          <div className="phm-cats-head phm-cats-three">
             <span>This month by category</span>
-            <span>{basis === 'billed' ? 'Billed · collected so far' : 'Received · billed'}</span>
+            <span>{MONEY_COLUMN_LABEL.received}</span>
+            <span>{MONEY_COLUMN_LABEL.charged}</span>
+            <span>{MONEY_COLUMN_LABEL.owed}</span>
           </div>
           {cats.map(c => (
-            <div key={c.category} className="phm-cat-row">
+            <div key={c.category} className="phm-cat-row phm-cats-three">
               <span>{categoryLabel(c)}</span>
-              <span>{fmt(pick(c))}</span>
-              <span style={{ color: 'var(--text-3)' }}>{fmt(second(c))}</span>
+              <span>{fmt(three(c).received)}</span>
+              <span style={{ color: 'var(--text-3)' }}>{fmt(three(c).charged)}</span>
+              <span style={{ color: three(c).owed ? 'var(--amber)' : 'var(--text-3)' }}>{fmt(three(c).owed)}</span>
             </div>
           ))}
           {otherLines.map(l => (
-            <div key={l.line} className="phm-cat-row">
+            <div key={l.line} className="phm-cat-row phm-cats-three">
               <span>{l.label}</span>
               <span>{fmt(l.amount)}</span>
               <span style={{ color: 'var(--text-3)' }}>—</span>
+              <span style={{ color: 'var(--text-3)' }}>—</span>
             </div>
           ))}
-          <div className="phm-cat-row total">
-            <span>{basis === 'billed' ? 'Money billed' : 'Money received'}</span>
+          <div className="phm-cat-row total phm-cats-three">
+            <span>Total</span>
             <span>{fmt(thisMonth?.total ?? 0)}</span>
-            <span></span>
+            <span>{fmt(catTotals.charged)}</span>
+            <span>{fmt(catTotals.owed)}</span>
           </div>
         </div>
       )}
       <style>{`
+        .phm-cats-three { display: grid !important; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 6px; }
+        .dash-three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 4px 0 2px; }
+        .dash-three > div { display: flex; flex-direction: column; min-width: 0; }
+        .dash-three-label { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; }
+        .dash-three-value { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 700; color: var(--text-0); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dash-three-value.green { color: var(--green); }
         .phm-screen { position: relative; background: radial-gradient(120% 90% at 50% 30%, rgba(20,26,22,.55), var(--bg-2)); border: 1px solid var(--border-0); border-radius: 10px; padding: 8px; overflow: hidden; cursor: crosshair; }
         .phm-hoverline { stroke: currentColor; stroke-width: 1; opacity: .55; stroke-dasharray: 3 3; }
         .phm-hoverdot { fill: currentColor; filter: drop-shadow(0 0 5px currentColor); }

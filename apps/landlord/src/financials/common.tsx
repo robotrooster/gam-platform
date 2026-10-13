@@ -9,13 +9,24 @@ import { useQuery } from 'react-query'
 import { finGet } from './adapter'
 import './financials.css'
 
-export interface FinProperty { id: string; name: string; landlordId: string }
+export interface FinProperty {
+  id: string; name: string; landlordId: string
+  /** 10/12 (Nic): a property sold or moved out while a bookkeeper kept it — the
+   *  last day its history is theirs (read only). null on a current property. */
+  leftOn?: string | null
+}
 export interface FinScope {
   viewer: 'owner' | 'bookkeeper'
   canRemoveExpenses: boolean
-  wholeCompany: boolean
+  /** 10/12 (Nic): the company-wide box — the bank account, payouts and payroll. */
+  companyWide: boolean
   companies: Array<{ id: string; name: string }>
   properties: FinProperty[]
+}
+
+/** 10/12: a property's name, and for a former one the last day its history is shown. */
+export function propertyLabel(p: FinProperty): string {
+  return p.leftOn ? `${p.name} (left ${dayName(p.leftOn)}, history only)` : p.name
 }
 
 /** Who is looking and which properties they keep (GET /financials/scope). */
@@ -92,7 +103,7 @@ export function PropertyPicker({ value, onChange, properties }: {
       <span className="fin-field-label">Property</span>
       <select className="form-input fin-select" value={value} onChange={e => onChange(e.target.value)}>
         <option value="">All properties</option>
-        {properties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        {properties.map(p => <option key={p.id} value={p.id}>{propertyLabel(p)}</option>)}
       </select>
     </label>
   )

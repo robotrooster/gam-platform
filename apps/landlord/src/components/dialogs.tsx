@@ -39,11 +39,20 @@ type PromptReq = {
   defaultValue: string
   resolve: (value: string | null) => void
 }
+// 10/12 (G6): a question with more than one answer, each its own button.
+type ChooseReq = {
+  id: number
+  message: string
+  title: string
+  choices: Array<{ value: string; label: string }>
+  resolve: (value: string | null) => void
+}
 
 let nextId = 1
 let pushToast: ((t: ToastMsg) => void) | null = null
 let pushConfirm: ((c: ConfirmReq) => void) | null = null
 let pushPrompt: ((c: PromptReq) => void) | null = null
+let pushChoose: ((c: ChooseReq) => void) | null = null
 
 export function toast(text: string) {
   pushToast?.({ id: nextId++, text, kind: 'info' })
@@ -87,11 +96,33 @@ export function appPrompt(
   })
 }
 
+/**
+ * 10/12 (Nic, G6): a question with two or more answers — "Take those charges
+ * off" / "Keep them owed". Resolves the chosen value, or null on Cancel. Each
+ * answer is its own gold button (an action); Cancel backs out.
+ */
+export function appChoose(
+  message: string,
+  opts: { title?: string; choices: Array<{ value: string; label: string }> },
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (!pushChoose || opts.choices.length === 0) { resolve(null); return }
+    pushChoose({
+      id: nextId++,
+      message,
+      title: opts.title ?? 'Please choose',
+      choices: opts.choices,
+      resolve,
+    })
+  })
+}
+
 export function DialogHost() {
   const [toasts, setToasts] = useState<ToastMsg[]>([])
   const [confirmReq, setConfirmReq] = useState<ConfirmReq | null>(null)
   const [promptReq, setPromptReq] = useState<PromptReq | null>(null)
   const [promptValue, setPromptValue] = useState('')
+  const [chooseReq, setChooseReq] = useState<ChooseReq | null>(null)
 
   useEffect(() => {
     pushToast = (t) => {
@@ -115,7 +146,11 @@ export function DialogHost() {
       setPromptValue(c.defaultValue)
       return c
     })
-    return () => { pushToast = null; pushConfirm = null; pushPrompt = null }
+    pushChoose = (c) => setChooseReq((prev) => {
+      if (prev) { c.resolve(null); return prev }
+      return c
+    })
+    return () => { pushToast = null; pushConfirm = null; pushPrompt = null; pushChoose = null }
   }, [])
 
   const settle = (ok: boolean) => {
@@ -161,6 +196,24 @@ export function DialogHost() {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <button className="btn btn-ghost" onClick={() => { promptReq.resolve(null); setPromptReq(null) }}>Cancel</button>
               <button className="btn btn-primary" onClick={() => { promptReq.resolve(promptValue); setPromptReq(null) }}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* choose modal (10/12, G6) */}
+      {chooseReq && (
+        <div onClick={() => { chooseReq.resolve(null); setChooseReq(null) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>{chooseReq.title}</div>
+            <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 14, whiteSpace: 'pre-wrap' }}>{chooseReq.message}</div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-ghost" onClick={() => { chooseReq.resolve(null); setChooseReq(null) }}>Cancel</button>
+              {chooseReq.choices.map((c) => (
+                <button key={c.value} className="btn btn-primary" onClick={() => { chooseReq.resolve(c.value); setChooseReq(null) }}>
+                  {c.label}
+                </button>
+              ))}
             </div>
           </div>
         </div>

@@ -18,7 +18,7 @@ import {
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
   readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
   deskFigures, sameFigures, figuresMovedMessage, payerHits, matchPayerHits, returnDetail, chargeMonthsRange,
-  readChargesById, plainRefusal, localToday, calendarDay, localDayOf, chargeTimeliness, awaitingOpensAtWord,
+  readChargesById, plainRefusal, localToday, calendarDay, localDayOf, awaitingOpensAtWord,
   type DeskQuote, type DeskQuoteRow, type TenderInput, type OutstandingRow, type LedgerPayment, type PickerLease,
 } from './creditDesk'
 import { PAYMENT_STATUSES, PAYMENT_STATUS_LABEL } from '@gam/shared'
@@ -103,8 +103,8 @@ describe('Outstanding Balances (decisions #29)', () => {
   })
   it('says how late in days (the server counts it, grace honored), and nothing when not late', () => {
     expect(daysLateText(0)).toBeNull()
-    expect(daysLateText(1)).toBe('1 day late')
-    expect(daysLateText(12)).toBe('12 days late')
+    expect(daysLateText(1)).toBe('1 day past grace')
+    expect(daysLateText(12)).toBe('12 days past grace')
   })
 
   const twoParks: OutstandingRow = {
@@ -545,7 +545,7 @@ describe('the tenant page shows total credit and usable credit', () => {
 describe('the Payments ledger (decisions #26, #29)', () => {
   const p: LedgerPayment = {
     id: 'x', name: 'Jane Doe', unitNumber: 'RV 14', propertyName: 'Mountain View', paidOn: '2026-10-01',
-    owed: 925, amount: 925, creditApplied: 0, returned: 0, creditReturned: 0, methodLabel: 'Card', status: 'settled',
+    applied: 925, amount: 925, creditApplied: 0, returned: 0, creditReturned: 0, methodLabel: 'Card', status: 'settled',
     statusLabel: 'Paid', paidFor: 'October rent', daysLate: 0, timingLabel: 'On time',
   }
   it('searches who, where and what it paid for', () => {
@@ -645,36 +645,16 @@ describe('days on the tenant page are calendar days, never shifted by time zone'
   })
 })
 
-describe('how on time each charge was (the tenant page’s timeliness window)', () => {
-  const today = '2026-10-10'
-  it('paid on the due day in the evening is on time; days after are late', () => {
-    const evening = new Date(2026, 9, 1, 18, 0).toISOString()
-    expect(chargeTimeliness({ status: 'settled', dueDate: '2026-10-01', settledAt: evening }, today))
-      .toMatchObject({ late: 0, label: 'On time', tone: 'good' })
-    const later = new Date(2026, 9, 4, 9, 0).toISOString()
-    expect(chargeTimeliness({ status: 'settled', dueDate: '2026-10-01', settledAt: later }, today))
-      .toMatchObject({ late: 3, label: '3 days late', tone: 'warn' })
-  })
-  it('an open charge past due is overdue by the days since', () => {
-    expect(chargeTimeliness({ status: 'pending', dueDate: '2026-10-01' }, today)).toMatchObject({ late: 9, label: '9 days overdue', tone: 'bad' })
-    expect(chargeTimeliness({ status: 'pending', dueDate: '2026-10-15' }, today)).toMatchObject({ late: 0, label: 'Not paid yet' })
-  })
-  it('a payment clearing or a charge paid from the deposit is never overdue, and every status is said in words', () => {
-    expect(chargeTimeliness({ status: 'processing', dueDate: '2026-10-01' }, today)).toMatchObject({ late: 0, label: 'Clearing', tone: 'info' })
-    expect(chargeTimeliness({ status: 'paid_via_deposit', dueDate: '2026-09-01' }, today)).toMatchObject({ late: 0, label: 'Paid from deposit' })
-    expect(chargeTimeliness({ status: 'failed', dueDate: '2026-10-01' }, today)).toMatchObject({ label: 'Failed', tone: 'bad' })
-    expect(chargeTimeliness({ status: 'returned', dueDate: '2026-10-01' }, today)).toMatchObject({ label: 'Returned', tone: 'bad' })
-  })
-  it('a voided charge (decisions #48.5) reads "Voided" — never "Unknown", never overdue, never late', () => {
-    expect(chargeTimeliness({ status: 'voided', dueDate: '2026-09-01' }, today))
-      .toEqual({ due: '2026-09-01', settled: null, late: 0, label: 'Voided', tone: 'muted' })
+// 10/12 (Nic): the tenant page's per-charge timeliness window (which counted
+// days late from the due date, with no grace) is gone — the Payment Health
+// card opens the household's payment report, where how late is days past the
+// grace period (the server's one rule).
+describe('the desk says every charge status in words', () => {
+  it('a voided charge reads as voided in a refusal', () => {
     expect(plainRefusal('This charge is not open (status: voided)')).toBe('This charge is no longer open — it is voided now.')
   })
-  it('every payment status in the shared list has its own words on the desk', () => {
-    for (const st of PAYMENT_STATUSES) {
-      expect(chargeTimeliness({ status: st, dueDate: '2026-10-20' }, today).label).not.toBe('Unknown')
-      expect(PAYMENT_STATUS_LABEL[st]).toBeTruthy()
-    }
+  it('every payment status in the shared list has its own words', () => {
+    for (const st of PAYMENT_STATUSES) expect(PAYMENT_STATUS_LABEL[st]).toBeTruthy()
   })
 })
 

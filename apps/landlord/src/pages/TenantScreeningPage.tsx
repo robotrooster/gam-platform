@@ -30,15 +30,20 @@ type ScreeningEvent = {
   thisHash: string | null
 }
 
+// 10/12 (Nic): "the payment history should be a health percentage. one mark
+// per invoice." Each bill carries ONE mark, and the percent shown is that
+// payment health: bills on time ÷ bills judged (credit stats
+// paymentStats.health). The grace-period and failed-payment labels are kept
+// for marks written before. (Duplicated in apps/tenant main.tsx — keep both in step.)
 const EVENT_LABEL: Record<string, string> = {
-  payment_received_on_time:           'Rent paid on time',
+  payment_received_on_time:           'Bill paid on time',
   payment_received_late_grace:        'Paid within grace period',
-  payment_received_late_minor:        'Paid late (minor)',
-  payment_received_late_major:        'Paid late (major)',
-  payment_received_late_severe:       'Paid late (severe)',
-  payment_partial:                    'Partial payment',
+  payment_received_late_minor:        'Bill paid late (1–3 days past grace)',
+  payment_received_late_major:        'Bill paid late (4–15 days past grace)',
+  payment_received_late_severe:       'Bill paid late (16+ days past grace)',
+  payment_partial:                    'Bill partly paid past grace',
   payment_failed_nsf:                 'Payment failed (NSF)',
-  payment_skipped:                    'Payment skipped',
+  payment_skipped:                    'Bill unpaid past grace',
   payment_refunded:                   'Payment refunded',
   lease_signed:                       'Lease signed',
   lease_renewed:                      'Lease renewed',
@@ -84,8 +89,9 @@ const EVENT_LABEL: Record<string, string> = {
   multi_landlord_history_clean:       'Clean history across landlords',
 }
 
+// 10/12: a bill paid late is not good news (payment health counts it not on time).
 const POSITIVE_EVENT_TYPES = new Set([
-  'payment_received_on_time','payment_received_late_grace','payment_received_late_minor',
+  'payment_received_on_time','payment_received_late_grace',
   'lease_signed','lease_renewed','lease_terminated_natural','lease_anniversary',
   'proper_notice_given_for_move_out','move_in_inspection_completed','move_out_inspection_completed',
   'move_out_condition_matches_move_in','move_in_photos_submitted','move_out_photos_submitted',
@@ -171,7 +177,9 @@ export function TenantScreeningPage() {
             You see events the tenant has consented to share with the GAM network.
             With an active tenancy you also see current-landlord-only events.
             Score is internal-only and not exposed here. Make screening decisions
-            based on the events themselves, not a single number.
+            based on the events themselves, not a single number. Payment health
+            counts each bill once: on time when paid in full by the last day of
+            its grace period.
           </div>
         </div>
       </div>
@@ -223,9 +231,11 @@ function ScreeningResult({ tenantId, onClear }: { tenantId: string; onClear: () 
 
   const events = data.events || []
   const activeEvents = events.filter(e => !e.superseded)
-  const payment = data.stats?.paymentStats?.lifetime || {}
-  const totalPayments = payment.totalEvents ?? 0
-  const onTimePct = payment.onTimePct
+  // 10/12 (Nic): the payment health — bills on time ÷ bills judged, one mark per bill.
+  const health = data.stats?.paymentStats?.health || {}
+  const healthPct: number | null = typeof health.percent === 'number' ? health.percent : null
+  const billsJudged: number = health.counted ?? 0
+  const billsOnTime: number = health.onTime ?? 0
   const longestStreak = data.stats?.paymentStats?.longestOnTimeStreakCount ?? 0
   const currentStreak = data.stats?.paymentStats?.currentOnTimeStreakCount ?? 0
 
@@ -250,8 +260,9 @@ function ScreeningResult({ tenantId, onClear }: { tenantId: string; onClear: () 
 
       <div className="grid3" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 }}>
         <Kpi label="Visible events" value={String(activeEvents.length)} sub="network + your relationship" />
-        <Kpi label="On-time payments" value={totalPayments > 0 ? `${onTimePct}%` : '—'} sub={`${totalPayments} payments tracked`} />
-        <Kpi label="On-time streak" value={String(currentStreak)} sub={`longest: ${longestStreak}`} />
+        <Kpi label="Payment health" value={healthPct !== null ? `${healthPct}%` : '—'}
+          sub={billsJudged > 0 ? `${billsOnTime} of ${billsJudged} bill${billsJudged === 1 ? '' : 's'} paid on time` : 'No bills judged yet'} />
+        <Kpi label="On-time streak" value={String(currentStreak)} sub={`bills in a row · longest: ${longestStreak}`} />
       </div>
 
       {activeEvents.length === 0 ? (
@@ -280,7 +291,8 @@ function ScreeningResult({ tenantId, onClear }: { tenantId: string; onClear: () 
 function ScreeningEventRow({ ev }: { ev: ScreeningEvent }) {
   const tone = eventTone(ev.eventType)
   const dotColor = tone === 'positive' ? 'var(--green)' : tone === 'negative' ? 'var(--red)' : 'var(--text-3)'
-  const label = EVENT_LABEL[ev.eventType] || ev.eventType
+  // 10/12: never the raw event type on screen (an unlabeled one reads in words).
+  const label = EVENT_LABEL[ev.eventType] || humanize(ev.eventType)
   const visBadge = ev.networkVisibility === 'visible_to_gam_network' ? 'badge-blue' : 'badge-muted'
   const visLabel = ev.networkVisibility === 'visible_to_gam_network' ? 'network' : 'current relationship'
 

@@ -89,41 +89,14 @@ export function localDayOf(v: string | null | undefined): string | null {
 }
 
 /**
- * How on time one charge was, for the tenant page's timeliness window (W-25):
- * a paid charge by the day it settled against its due day; a charge still
- * open and past due by how long it has been overdue. Every other status says
- * what it is in words (a payment clearing is not late; a charge paid from the
- * deposit is paid) — never the raw status.
+ * decisions #29: how late, honoring the grace period (the server counts it).
+ * 10/12 (Nic): "'Days late' = days past the grace period everywhere", and the
+ * words say so. 0 → null: nothing to say.
  */
-export function chargeTimeliness(
-  p: { status: string; dueDate?: string | null; settledAt?: string | null },
-  today: string = localToday(),
-): { due: string | null; settled: string | null; late: number; label: string; tone: 'good' | 'warn' | 'bad' | 'info' | 'muted' } {
-  const due = calendarDay(p.dueDate)
-  const settled = p.status === 'settled' ? localDayOf(p.settledAt) : null
-  const days = (a: string, b: string) => Math.round((Date.UTC(+b.slice(0, 4), +b.slice(5, 7) - 1, +b.slice(8, 10))
-    - Date.UTC(+a.slice(0, 4), +a.slice(5, 7) - 1, +a.slice(8, 10))) / 86400000)
-  const word = PAYMENT_STATUS_LABEL[p.status as PaymentStatus] ?? 'Unknown'
-  if (p.status === 'settled' && due && settled) {
-    const late = Math.max(0, days(due, settled))
-    return late === 0
-      ? { due, settled, late, label: 'On time', tone: 'good' }
-      : { due, settled, late, label: `${late} day${late === 1 ? '' : 's'} late`, tone: late <= 7 ? 'warn' : 'bad' }
-  }
-  if (p.status === 'failed' || p.status === 'returned') return { due, settled, late: 0, label: word, tone: 'bad' }
-  if (p.status === 'processing') return { due, settled, late: 0, label: word, tone: 'info' }
-  if (p.status === 'pending' && due && due < today) {
-    const late = days(due, today)
-    return { due, settled, late, label: `${late} day${late === 1 ? '' : 's'} overdue`, tone: 'bad' }
-  }
-  return { due, settled, late: 0, label: word, tone: p.status === 'pending' ? 'warn' : 'muted' }
-}
-
-/** decisions #29: "N days late" honoring the grace period (the server counts it). 0 → null: nothing to say. */
 export function daysLateText(days: number | null | undefined): string | null {
   const n = Math.max(0, Math.floor(Number(days ?? 0)))
   if (n === 0) return null
-  return `${n} day${n === 1 ? '' : 's'} late`
+  return `${n} day${n === 1 ? '' : 's'} past grace`
 }
 
 // ─── The credit beside a balance ─────────────────────────────────────────────
@@ -1325,7 +1298,8 @@ export interface LedgerPayment {
   unitNumber: string | null
   propertyName: string | null
   paidOn: string
-  owed: number
+  /** 10/12: what this payment put toward the month's bills (money plus credit) — never "owed". */
+  applied: number
   amount: number
   creditApplied: number
   returned: number

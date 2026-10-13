@@ -76,6 +76,7 @@ import { UnitsPage }       from './pages/UnitsPage'
 import { UnitDetailPage }  from './pages/UnitDetailPage'
 import { TenantsPage }     from './pages/TenantsPage'
 import { TenantDetailPage } from './pages/TenantDetailPage'
+import { TenantPaymentReportPage } from './pages/TenantPaymentReportPage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
 import { BalancesPage }    from './pages/BalancesPage'
@@ -136,6 +137,40 @@ import { PaidAheadChoicePage } from './pages/PaidAheadChoicePage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
 import { FrontDeskPage } from './pages/FrontDeskPage'
+// 10/12 (Nic): "Bookkeeping" — GAM Books' own pages inside the portal, the
+// same files as GAM Books (src/bookkeeping, bookkeeping-parity.test.ts).
+import { BooksDashboardPage } from './bookkeeping/BooksDashboardPage'
+import { ChartOfAccountsPage } from './bookkeeping/ChartOfAccountsPage'
+import { EmployeesPage } from './bookkeeping/EmployeesPage'
+import { ContractorsPage } from './bookkeeping/ContractorsPage'
+import { VendorsPage } from './bookkeeping/VendorsPage'
+// 10/12 (Nic): loans and fixed assets (GAM Books' pages, the same bytes in apps/books).
+import { LoansPage } from './bookkeeping/LoansPage'
+import { FixedAssetsPage } from './bookkeeping/FixedAssetsPage'
+import { RunPayrollPage } from './bookkeeping/RunPayrollPage'
+import { PayHistoryPage } from './bookkeeping/PayHistoryPage'
+import { TaxFormsPage } from './bookkeeping/TaxFormsPage'
+import { JournalEntriesPage } from './bookkeeping/JournalEntriesPage'
+import { TransactionsPage } from './bookkeeping/TransactionsPage'
+import { BankReconcilePage } from './bookkeeping/BankReconcilePage'
+// 10/12 (Nic, ledger P9): close a month — GAM Books' page, in the Bookkeeping menu.
+import { CloseMonthPage } from './bookkeeping/CloseMonthPage'
+import { BillsPage } from './bookkeeping/BillsPage'
+import { CashFlowPage } from './bookkeeping/CashFlowPage'
+import { OwnerStatementsPage } from './bookkeeping/OwnerStatementsPage'
+import { TaxCenterPage } from './bookkeeping/TaxCenterPage'
+import { ProfitLossPage } from './bookkeeping/ProfitLossPage'
+import { BalanceSheetPage } from './bookkeeping/BalanceSheetPage'
+// 10/12 (Nic, ledger P8): the trial balance and the general ledger.
+import { TrialBalancePage } from './bookkeeping/TrialBalancePage'
+import { GeneralLedgerPage } from './bookkeeping/GeneralLedgerPage'
+import { BooksSettingsPage } from './bookkeeping/BooksSettingsPage'
+import { OpeningBalancesPage } from './bookkeeping/OpeningBalancesPage'
+// 10/12 (Nic, L5): the company's own categories for money out and in.
+import { CategoriesPage } from './bookkeeping/CategoriesPage'
+import { BOOKS_PATHS } from './bookkeeping/adapter'
+// Which company's books, a cache of their own, and Books' look.
+import { BookkeepingHost } from './bookkeepingHost'
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: Error | null}> {
   constructor(props: any) { super(props); this.state = { error: null } }
@@ -283,6 +318,9 @@ function App() {
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
+              {/* 10/12 (Nic): the household's payment report, printable — opened
+                  from a name on the Rent Roll or from the tenant profile. */}
+              <Route path="tenants/:id/report" element={<TenantPaymentReportPage />} />
               <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
               {/* S639: the front counter's call list — same people as the
                   pending pool, shaped as "who do I ring and what do I say". */}
@@ -321,6 +359,40 @@ function App() {
                 <Route path="bank-reconciliation" element={<Navigate to="/bank" replace />} />
                 <Route path="banking"        element={<BankingPage />} />
                 <Route path="lot-rent"       element={<LotRentPage />} />
+              </Route>
+              {/* 10/12 (Nic): Bookkeeping — GAM Books' pages inside the portal,
+                  as sub-tabs like Financials (Layout.tsx). The host names the
+                  company whose books are open (bookkeepingHost.tsx). */}
+              <Route path="bookkeeping" element={<Navigate to={BOOKS_PATHS.dashboard} replace />} />
+              <Route element={<HubTabLayout hub="bookkeeping" />}>
+                <Route element={<BookkeepingHost />}>
+                  <Route path={BOOKS_PATHS.dashboard}       element={<BooksDashboardPage />} />
+                  <Route path={BOOKS_PATHS.employees}       element={<EmployeesPage />} />
+                  <Route path={BOOKS_PATHS.contractors}     element={<ContractorsPage />} />
+                  <Route path={BOOKS_PATHS.vendors}         element={<VendorsPage />} />
+                  <Route path={BOOKS_PATHS.loans}           element={<LoansPage />} />
+                  <Route path={BOOKS_PATHS.fixedAssets}     element={<FixedAssetsPage />} />
+                  <Route path={BOOKS_PATHS.runPayroll}      element={<RunPayrollPage />} />
+                  <Route path={BOOKS_PATHS.payHistory}      element={<PayHistoryPage />} />
+                  <Route path={BOOKS_PATHS.taxForms}        element={<TaxFormsPage />} />
+                  <Route path={BOOKS_PATHS.accounts}        element={<ChartOfAccountsPage />} />
+                  <Route path={BOOKS_PATHS.journal}         element={<JournalEntriesPage />} />
+                  <Route path={BOOKS_PATHS.transactions}    element={<TransactionsPage />} />
+                  <Route path={BOOKS_PATHS.reconcile}       element={<BankReconcilePage />} />
+                  <Route path={BOOKS_PATHS.closeMonth}      element={<CloseMonthPage />} />
+                  <Route path={BOOKS_PATHS.bills}           element={<BillsPage />} />
+                  <Route path={BOOKS_PATHS.profitLoss}      element={<ProfitLossPage />} />
+                  <Route path={BOOKS_PATHS.balanceSheet}    element={<BalanceSheetPage />} />
+                  <Route path={BOOKS_PATHS.trialBalance}    element={<TrialBalancePage />} />
+                  <Route path={BOOKS_PATHS.generalLedger}   element={<GeneralLedgerPage />} />
+                  <Route path={BOOKS_PATHS.cashFlow}        element={<CashFlowPage />} />
+                  <Route path={BOOKS_PATHS.ownerStatements} element={<OwnerStatementsPage />} />
+                  <Route path={BOOKS_PATHS.taxCenter}       element={<TaxCenterPage />} />
+                  {/* 10/12 (Nic): Books Settings and Opening Balances, in the Bookkeeping menu (Layout.tsx). */}
+                  <Route path={BOOKS_PATHS.booksSettings}   element={<BooksSettingsPage />} />
+                  <Route path={BOOKS_PATHS.openingBalances} element={<OpeningBalancesPage />} />
+                  <Route path={BOOKS_PATHS.categories}      element={<CategoriesPage />} />
+                </Route>
               </Route>
               {/* S575: Screening hub — Applicant Pool / Background Checks / Rental History. */}
               <Route element={<HubTabLayout hub="screening" />}>
