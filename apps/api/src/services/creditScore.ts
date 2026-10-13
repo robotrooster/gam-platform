@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
-import { computeMerkleRoot, getSubjectChain } from './creditLedger'
+import { computeMerkleRoot, getSubjectChain, CHAIN_RESTART_EVENT } from './creditLedger'
 import type { CreditScoreDimension } from '@gam/shared'
 
 // ============================================================
@@ -250,6 +250,8 @@ export async function recomputeAndSnapshot(
 /**
  * Recompute scores for every subject that has any non-superseded
  * events. Used by the nightly cron. Failure-isolates per subject.
+ * 10/13: a chain restart is not history (getSubjectChain leaves it
+ * out), so a subject whose only live event is a restart is not scored.
  */
 export async function recomputeAllSubjects(): Promise<{
   processed: number
@@ -259,7 +261,9 @@ export async function recomputeAllSubjects(): Promise<{
     `SELECT DISTINCT s.id
        FROM credit_subjects s
        JOIN credit_events e ON e.subject_id = s.id
-      WHERE e.superseded_by IS NULL`,
+      WHERE e.superseded_by IS NULL
+        AND e.event_type <> $1`,
+    [CHAIN_RESTART_EVENT],
   )
 
   const errors: { subjectId: string; error: string }[] = []

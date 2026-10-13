@@ -10,6 +10,10 @@
  *                           compute → insert
  *   - getSubjectChain       chain readback (recorded_at ASC, id ASC)
  *   - verifyChain           replay determinism + tamper detection
+ *   - restartChain          10/13: a forked chain restarted from today, the
+ *                           break — every split — sealed and still reported
+ *                           (verifyAllChains); the note only to its tier;
+ *                           the nightly score and stats skip a restart
  *   - computeMerkleRoot     weekly-anchor cron tree builder
  *   - supersedeEvent        dispute correction stamping
  *   - findSubjectId         convenience lookup
@@ -34,7 +38,14 @@ import {
   computeMerkleRoot,
   supersedeEvent,
   findSubjectId,
+  restartChain,
+  checkRestart,
+  readChain,
+  verifyAllChains,
+  CHAIN_RESTART_EVENT,
 } from './creditLedger'
+import { refreshAllSubjectStats } from './creditStats'
+import { recomputeAllSubjects } from './creditScore'
 
 beforeEach(cleanupAllSchema)
 
@@ -571,6 +582,350 @@ describe('one transaction, many events: one path, in append order (10/12)', () =
     expect(v.ok).toBe(false)
     expect(v.reason).toMatch(/prev_hash does not match prior event this_hash \(two events follow the same event: a fork\)/)
     expect([b.eventId, c.eventId]).toContain(v.firstBadEventId)
+  })
+})
+
+// 10/13 (Nic, the 12 chains a pre-10/12 bug forked): "restart the chain from
+// today for each, with a recorded note explaining the break (old entries
+// untouched)". A restart is the first event of a new chain; it seals the old
+// one, and verifyChain reads the chain as whole since the restart while
+// reporting the old break as explained history.
+describe('chain restart (10/13)', () => {
+  const ev = (refId: string, i: number) => ({
+    subjectType: 'tenant' as const, subjectRefId: refId,
+    eventType: 'payment_received_on_time' as const, eventData: { i },
+    occurredAt: new Date('2026-10-12T12:00:00Z'),
+    attestationSource: 'gam_workflow_auto' as const,
+    networkVisibility: 'visible_to_current_landlord' as const,
+  })
+  const NOTE = 'Restarted 10/13/2026: this record\'s chain split in two (a fork).'
+  const TODAY = new Date('2026-10-13T16:00:00Z')
+
+  /** Re-link an event to follow another, its hash recomputed so only the link is wrong. */
+  async function relink(id: string, prevHash: Buffer) {
+    const row = (await db.query<any>(`SELECT event_data, occurred_at, attestation_source, attestation_evidence FROM credit_events WHERE id = $1`, [id])).rows[0]
+    const forged = computeEventHash({ prevHash, eventData: row.event_data, occurredAt: new Date(row.occurred_at),
+      attestationSource: row.attestation_source, attestationEvidence: row.attestation_evidence })
+    await db.query(`UPDATE credit_events SET prev_hash = $1, this_hash = $2 WHERE id = $3`, [prevHash, forged, id])
+  }
+
+  /** a → b, and c also after a: the old bug's fork; c is its first bad event. */
+  async function forked() {
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    const b = await appendEvent(ev(refId, 2))
+    const c = await appendEvent(ev(refId, 3))
+    await relink(c.eventId, a.thisHash)
+    return { refId, sid: a.subjectId, a, b, c }
+  }
+
+  const snapshot = async (sid: string) => (await db.query(
+    `SELECT id, event_type, event_data, occurred_at, recorded_at, prev_hash, this_hash, superseded_by, superseded_reason
+       FROM credit_events WHERE subject_id = $1 ORDER BY recorded_at, id`, [sid])).rows
+
+  it('a forked chain restarted from today: one new first event with the note; every old entry untouched; whole since the restart, the fork reported', async () => {
+    const f = await forked()
+    expect(await verifyChain(f.sid)).toMatchObject({ ok: false, firstBadEventId: f.c.eventId, break: 'fork' })
+    const before = await snapshot(f.sid)
+
+    const r = await restartChain({ subjectId: f.sid, note: NOTE, occurredAt: TODAY })
+    expect(r).toMatchObject({ subjectId: f.sid, prevHash: null, sealedEventCount: 3, brokenEventId: f.c.eventId })
+    expect(r.splits).toEqual([{ eventId: f.a.eventId, followedBy: [f.b.eventId, f.c.eventId] }])
+    expect(r.brokenReason).toMatch(/a fork/)
+
+    // Old entries exactly as they were.
+    const after = await snapshot(f.sid)
+    expect(after.slice(0, 3)).toEqual(before)
+    const restart = after[3]
+    expect(restart).toMatchObject({ id: r.eventId, event_type: CHAIN_RESTART_EVENT, prev_hash: null, superseded_by: null })
+    expect(new Date(restart.occurred_at).toISOString()).toBe(TODAY.toISOString())
+    expect(restart.event_data).toEqual({
+      note: NOTE,
+      sealed_event_count: 3,
+      sealed_end_hashes: [f.b.thisHash.toString('hex'), (before[2].this_hash as Buffer).toString('hex')].sort(),
+      broken_event_id: f.c.eventId,
+      broken_reason: r.brokenReason,
+      splits: [{ event_id: f.a.eventId, followed_by: [f.b.eventId, f.c.eventId] }],
+    })
+    const meta = (await db.query(`SELECT attestation_source, network_visibility, dimension_tags FROM credit_events WHERE id = $1`, [r.eventId])).rows[0]
+    expect(meta).toEqual({ attestation_source: 'system_derived', network_visibility: 'private_to_subject', dimension_tags: [] })
+
+    const v = await verifyChain(f.sid, { visibleTo: ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network'] })
+    expect(v).toMatchObject({ ok: true, eventCount: 4 })
+    expect(v.restarts).toHaveLength(1)
+    expect(v.restarts![0]).toMatchObject({
+      eventId: r.eventId, visibility: 'private_to_subject', note: NOTE, sealedEventCount: 3, brokenEventId: f.c.eventId,
+      splits: [{ eventId: f.a.eventId, followedBy: [f.b.eventId, f.c.eventId] }],
+    })
+    expect(v.restarts![0].brokenReason).toMatch(/two events follow the same event: a fork/)
+  })
+
+  // 10/13 review: production's forks split up to seven ways at one entry, and
+  // one chain (Jonathan Covey's) at two entries. The seal, the report and the
+  // hashed note have to carry every split, not the first the walk meets.
+  it('a chain split three ways, and again further on: the restart seals and reports every split', async () => {
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    const b = await appendEvent(ev(refId, 2))
+    const c = await appendEvent(ev(refId, 3))
+    await relink(c.eventId, a.thisHash)            // a: b, c
+    const d = await appendEvent(ev(refId, 4))
+    await relink(d.eventId, a.thisHash)            // a: b, c, d
+    const dHash = (await readChain(db, a.subjectId)).find(x => x.id === d.eventId)!.this_hash
+    const e = await appendEvent(ev(refId, 5))      // after d (the newest end)
+    expect(e.prevHash!.equals(dHash)).toBe(true)
+    const g = await appendEvent(ev(refId, 6))
+    await relink(g.eventId, dHash)                 // d: e, g
+    const splits = [
+      { eventId: a.eventId, followedBy: [b.eventId, c.eventId, d.eventId] },
+      { eventId: d.eventId, followedBy: [e.eventId, g.eventId] },
+    ]
+    // The walk stops at the first split; the restart check sees both.
+    expect(await verifyChain(a.subjectId)).toMatchObject({ ok: false, firstBadEventId: c.eventId, break: 'fork' })
+    expect(checkRestart(await readChain(db, a.subjectId))).toMatchObject({ ok: true, brokenEventId: c.eventId, liveEventCount: 6, splits })
+
+    const r = await restartChain({ subjectId: a.subjectId, note: NOTE, expectBrokenEventId: c.eventId, expectSplits: splits })
+    expect(r).toMatchObject({ sealedEventCount: 6, brokenEventId: c.eventId, splits })
+    const data = (await db.query(`SELECT event_data FROM credit_events WHERE id = $1`, [r.eventId])).rows[0].event_data
+    expect(data.splits).toEqual([
+      { event_id: a.eventId, followed_by: [b.eventId, c.eventId, d.eventId] },
+      { event_id: d.eventId, followed_by: [e.eventId, g.eventId] },
+    ])
+    expect(data.sealed_end_hashes).toHaveLength(4)   // b, c, e, g: one end per branch
+    const v = await verifyChain(a.subjectId)
+    expect(v).toMatchObject({ ok: true, eventCount: 7, restarts: [{ eventId: r.eventId, brokenEventId: c.eventId, splits }] })
+
+    // A seal naming only the first split no longer matches what it sealed.
+    await db.query(`UPDATE credit_events SET event_data = jsonb_set(event_data, '{splits}', $2::jsonb) WHERE id = $1`,
+      [r.eventId, JSON.stringify(data.splits.slice(0, 1))])
+    const row = (await readChain(db, a.subjectId)).find(x => x.id === r.eventId)!
+    await db.query(`UPDATE credit_events SET this_hash = $2 WHERE id = $1`, [r.eventId, computeEventHash({
+      prevHash: null, eventData: row.event_data, occurredAt: new Date(row.occurred_at),
+      attestationSource: row.attestation_source, attestationEvidence: row.attestation_evidence })])
+    expect(await verifyChain(a.subjectId)).toMatchObject({ ok: false, firstBadEventId: r.eventId, break: 'restart_mismatch' })
+  })
+
+  it('refused: splits other than the ones the note was written from — nothing written', async () => {
+    const f = await forked()
+    await expect(restartChain({ subjectId: f.sid, note: NOTE, expectSplits: [{ eventId: f.a.eventId, followedBy: [f.b.eventId] }] }))
+      .rejects.toThrow(/does not split where expected/)
+    expect(await snapshot(f.sid)).toHaveLength(3)
+  })
+
+  // 10/13 review: the restart event is 'private_to_subject', and the integrity
+  // route returns verifyChain to every reader canViewSubject lets in — network
+  // landlords included. The note goes only to a reader with the restart's tier.
+  it('the note is returned only to a reader whose tiers include the restart\'s; the proof to anyone', async () => {
+    const f = await forked()
+    const r = await restartChain({ subjectId: f.sid, note: NOTE })
+    const proof = { eventId: r.eventId, sealedEventCount: 3, brokenEventId: f.c.eventId, splits: r.splits }
+    for (const visibleTo of [undefined, ['visible_to_gam_network'], ['visible_to_current_landlord', 'visible_to_gam_network']] as const) {
+      const v = await verifyChain(f.sid, visibleTo ? { visibleTo } : {})
+      expect(v).toMatchObject({ ok: true, restarts: [proof] })
+      expect(v.restarts![0]).not.toHaveProperty('note')
+    }
+    const own = await verifyChain(f.sid, { visibleTo: ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network'] })
+    expect(own.restarts![0]).toMatchObject({ ...proof, note: NOTE })
+  })
+
+  it('later marks link from the restart; the restart is never part of the credit history', async () => {
+    const f = await forked()
+    const r = await restartChain({ subjectId: f.sid, note: NOTE })
+    const d = await appendEvent(ev(f.refId, 4))
+    const e = await appendEvent(ev(f.refId, 5))
+    expect(d.prevHash!.equals(r.thisHash)).toBe(true)
+    expect(e.prevHash!.equals(d.thisHash)).toBe(true)
+    expect(await verifyChain(f.sid)).toMatchObject({ ok: true, eventCount: 6, restarts: [{ eventId: r.eventId }] })
+    // History (the credit screens, the score, the stats): the marks, not the restart.
+    expect((await getSubjectChain(f.sid)).map(x => x.id)).toEqual([f.a.eventId, f.b.eventId, f.c.eventId, d.eventId, e.eventId])
+    // The chain itself: everything, in append order.
+    expect((await readChain(db, f.sid)).map(x => x.id)).toEqual([f.a.eventId, f.b.eventId, f.c.eventId, r.eventId, d.eventId, e.eventId])
+  })
+
+  it('a whole chain is never restarted, and a restarted one is whole: a second run finds nothing to do', async () => {
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    await appendEvent(ev(refId, 2))
+    await expect(restartChain({ subjectId: a.subjectId, note: NOTE })).rejects.toThrow(/whole: nothing to restart/)
+    expect(await verifyChain(a.subjectId)).toEqual({ ok: true, eventCount: 2 })
+
+    const f = await forked()
+    await restartChain({ subjectId: f.sid, note: NOTE })
+    expect(checkRestart(await readChain(db, f.sid))).toMatchObject({ ok: false, why: 'the chain is whole: nothing to restart', liveEventCount: 1 })
+    await expect(restartChain({ subjectId: f.sid, note: NOTE })).rejects.toThrow(/whole: nothing to restart/)
+    expect((await snapshot(f.sid))).toHaveLength(4)
+  })
+
+  it('refused: a note-less restart, a break other than a fork, altered contents, a break somewhere else than named — nothing written', async () => {
+    const f = await forked()
+    await expect(restartChain({ subjectId: f.sid, note: '   ' })).rejects.toThrow(/needs a note/)
+    await expect(restartChain({ subjectId: f.sid, note: NOTE, expectBrokenEventId: f.b.eventId }))
+      .rejects.toThrow(`breaks at ${f.c.eventId}, not ${f.b.eventId}`)
+
+    // Altered contents on one branch: a restart would hide it.
+    const g = await forked()
+    await db.query(`UPDATE credit_events SET event_data = '{"i": 99}' WHERE id = $1`, [g.b.eventId])
+    await expect(restartChain({ subjectId: g.sid, note: NOTE })).rejects.toThrow(`event ${g.b.eventId} no longer matches its hash`)
+
+    // An entry that follows nothing (not a fork).
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    const b = await appendEvent(ev(refId, 2))
+    await relink(b.eventId, Buffer.alloc(32, 0x11))
+    expect(await verifyChain(a.subjectId)).toMatchObject({ ok: false, break: 'unlinked' })
+    await expect(restartChain({ subjectId: a.subjectId, note: NOTE })).rejects.toThrow(/broken by unlinked .* not a fork/)
+
+    // A fork AND an entry that follows nothing (10/13 review): the walk meets
+    // the fork first, but a restart would explain only the fork.
+    const h = await forked()
+    const stray = await appendEvent(ev(h.refId, 4))
+    await relink(stray.eventId, Buffer.alloc(32, 0x22))
+    expect(await verifyChain(h.sid)).toMatchObject({ ok: false, firstBadEventId: h.c.eventId, break: 'fork' })
+    await expect(restartChain({ subjectId: h.sid, note: NOTE }))
+      .rejects.toThrow(`event ${stray.eventId} attaches to no entry of the chain, not a fork`)
+
+    for (const sid of [f.sid, g.sid]) expect(await snapshot(sid)).toHaveLength(3)
+    expect(await snapshot(a.subjectId)).toHaveLength(2)
+    expect(await snapshot(h.sid)).toHaveLength(4)
+  })
+
+  it('the old entries stay checked after a restart: altered contents, a removed entry, an edited note or a forged restart all read as broken', async () => {
+    // Altered contents of an entry before the restart.
+    const f1 = await forked()
+    await restartChain({ subjectId: f1.sid, note: NOTE })
+    await db.query(`UPDATE credit_events SET event_data = '{"i": 42}' WHERE id = $1`, [f1.a.eventId])
+    expect(await verifyChain(f1.sid)).toMatchObject({ ok: false, firstBadEventId: f1.a.eventId, break: 'tampered' })
+
+    // An entry before the restart removed: the restart no longer matches what it sealed.
+    const f2 = await forked()
+    const r2 = await restartChain({ subjectId: f2.sid, note: NOTE })
+    await db.query(`DELETE FROM credit_events WHERE id = $1`, [f2.b.eventId])
+    expect(await verifyChain(f2.sid)).toMatchObject({ ok: false, firstBadEventId: r2.eventId, break: 'restart_mismatch' })
+
+    // The note edited after the fact: the restart's own hash no longer holds.
+    const f3 = await forked()
+    const r3 = await restartChain({ subjectId: f3.sid, note: NOTE })
+    await db.query(`UPDATE credit_events SET event_data = jsonb_set(event_data, '{note}', '"something else"') WHERE id = $1`, [r3.eventId])
+    expect(await verifyChain(f3.sid)).toMatchObject({ ok: false, firstBadEventId: r3.eventId, break: 'tampered' })
+
+    // A restart written by hand that does not seal the chain before it.
+    const f4 = await forked()
+    const c = await db.connect()
+    let forgedId = ''
+    try {
+      const data = { note: NOTE, sealed_event_count: 1, sealed_end_hashes: [], broken_event_id: null, broken_reason: null }
+      const at = new Date('2026-10-13T16:00:00Z')
+      const h = computeEventHash({ prevHash: null, eventData: data, occurredAt: at, attestationSource: 'system_derived', attestationEvidence: {} })
+      forgedId = (await c.query(
+        `INSERT INTO credit_events (subject_id, event_type, event_data, occurred_at, attestation_source, attestation_evidence,
+                                    dimension_tags, network_visibility, prev_hash, this_hash, recorded_at)
+         VALUES ($1, 'chain_restarted', $2, $3, 'system_derived', '{}', '{}', 'private_to_subject', NULL, $4, clock_timestamp() + interval '1 second')
+         RETURNING id`, [f4.sid, JSON.stringify(data), at, h])).rows[0].id
+    } finally { c.release() }
+    expect(await verifyChain(f4.sid)).toMatchObject({ ok: false, firstBadEventId: forgedId, break: 'restart_mismatch' })
+
+    // A restart written by hand whose seal matches a chain broken some other
+    // way (an entry that follows nothing): a restart explains only a fork, so
+    // the break before it stays a break.
+    const refId = newRefId()
+    const a5 = await appendEvent(ev(refId, 1))
+    const b5 = await appendEvent(ev(refId, 2))
+    await relink(b5.eventId, Buffer.alloc(32, 0x11))
+    const sealed = await readChain(db, a5.subjectId)
+    const c5 = await db.connect()
+    try {
+      const data = {
+        note: NOTE, sealed_event_count: 2, sealed_end_hashes: sealed.map(x => x.this_hash.toString('hex')).sort(),
+        broken_event_id: b5.eventId, broken_reason: 'prev_hash does not match prior event this_hash', splits: [],
+      }
+      const at = new Date('2026-10-13T16:00:00Z')
+      const h = computeEventHash({ prevHash: null, eventData: data, occurredAt: at, attestationSource: 'system_derived', attestationEvidence: {} })
+      await c5.query(
+        `INSERT INTO credit_events (subject_id, event_type, event_data, occurred_at, attestation_source, attestation_evidence,
+                                    dimension_tags, network_visibility, prev_hash, this_hash, recorded_at)
+         VALUES ($1, 'chain_restarted', $2, $3, 'system_derived', '{}', '{}', 'private_to_subject', NULL, $4, clock_timestamp() + interval '1 second')`,
+        [a5.subjectId, JSON.stringify(data), at, h])
+    } finally { c5.release() }
+    const v5 = await verifyChain(a5.subjectId)
+    expect(v5).toMatchObject({ ok: false, firstBadEventId: b5.eventId, break: 'unlinked' })
+    expect(v5.reason).toMatch(/the restart after it explains only a fork/)
+  })
+
+  it('the chain since the restart must be whole: a fork after it is a break, the earlier restart still listed', async () => {
+    const f = await forked()
+    const r = await restartChain({ subjectId: f.sid, note: NOTE })
+    const d = await appendEvent(ev(f.refId, 4))
+    const e = await appendEvent(ev(f.refId, 5))
+    await relink(e.eventId, r.thisHash)
+    const v = await verifyChain(f.sid)
+    expect(v).toMatchObject({ ok: false, firstBadEventId: e.eventId, break: 'fork', restarts: [{ eventId: r.eventId }] })
+    // ...and that fork is restarted in turn: two restarts, each explaining its own break.
+    const r2 = await restartChain({ subjectId: f.sid, note: 'second', expectBrokenEventId: e.eventId })
+    const w = await verifyChain(f.sid)
+    expect(w).toMatchObject({ ok: true, eventCount: 7 })
+    expect(w.restarts!.map(x => [x.eventId, x.sealedEventCount, x.brokenEventId])).toEqual([
+      [r.eventId, 3, f.c.eventId],
+      [r2.eventId, 3, e.eventId],
+    ])
+    expect(d.prevHash!.equals(r.thisHash)).toBe(true)
+  })
+
+  it('verifyAllChains tells whole, whole since a restart, and broken apart', async () => {
+    const refId = newRefId()
+    await appendEvent(ev(refId, 1))
+    const restarted = await forked()
+    const r = await restartChain({ subjectId: restarted.sid, note: NOTE })
+    const broken = await forked()
+    const all = await verifyAllChains()
+    expect(all).toMatchObject({ subjects: 3, ok: 1, okAfterRestart: 1 })
+    expect(all.bad).toEqual([{ subjectId: broken.sid, firstBadEventId: broken.c.eventId, reason: expect.stringMatching(/a fork/), break: 'fork' }])
+    expect(all.restarted).toEqual([{ subjectId: restarted.sid, restarts: [expect.objectContaining({ eventId: r.eventId, note: NOTE })] }])
+  })
+
+  it('a subject whose only live entry is its restart is not counted by the nightly stats', async () => {
+    const f = await forked()
+    const c = await db.connect()
+    try {
+      for (const id of [f.a.eventId, f.b.eventId, f.c.eventId]) await supersedeEvent(c, id, id, 'withdrawn_no_bill')
+    } finally { c.release() }
+    await restartChain({ subjectId: f.sid, note: NOTE })
+    expect((await refreshAllSubjectStats()).processed).toBe(0)
+    expect(await verifyChain(f.sid)).toMatchObject({ ok: true, eventCount: 4 })
+  })
+
+  // creditScore.recomputeAllSubjects (the 03:00 nightly): a restart is not a
+  // mark, so a subject whose only live event is its restart is never scored;
+  // one with a live mark beside its restart still is.
+  it('a subject whose only live entry is its restart is not scored by the nightly recompute', async () => {
+    const VERSION = 'test-10.13-restart'
+    await db.query(
+      `INSERT INTO credit_score_formulas (version, definition, description, effective_from)
+       VALUES ($1, $2, 'test formula', NOW() - interval '1 day')`,
+      [VERSION, JSON.stringify({
+        model: 'unbounded_multiplicative', starting_score: 100, floor: 0,
+        positives: { payment_received_on_time: 1 }, negatives: {},
+        attestation_weight: { gam_workflow_auto: 1 }, spam_caps: {},
+      })])
+    try {
+      const onlyRestart = await forked()
+      const c = await db.connect()
+      try {
+        for (const id of [onlyRestart.a.eventId, onlyRestart.b.eventId, onlyRestart.c.eventId]) {
+          await supersedeEvent(c, id, id, 'withdrawn_no_bill')
+        }
+      } finally { c.release() }
+      await restartChain({ subjectId: onlyRestart.sid, note: NOTE })
+      const withMark = await forked()
+      await restartChain({ subjectId: withMark.sid, note: NOTE })
+
+      expect(await recomputeAllSubjects()).toEqual({ processed: 1, errors: [] })
+      const scored = (await db.query<{ subject_id: string; event_count: number }>(
+        `SELECT subject_id, event_count FROM credit_scores`)).rows
+      expect(scored).toEqual([{ subject_id: withMark.sid, event_count: 3 }])
+    } finally {
+      await db.query(`DELETE FROM credit_scores WHERE formula_version = $1`, [VERSION])
+      await db.query(`DELETE FROM credit_score_formulas WHERE version = $1`, [VERSION])
+    }
   })
 })
 

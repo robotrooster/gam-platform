@@ -216,7 +216,11 @@ describe('oct12_rerate_late_marks — every history rebuilt as one mark per bill
     const done = await tx(c => applyRebuild(c, { asOf: AS_OF }), true)
     expect(done.orphansWithdrawn.map(o => o.id)).toEqual([orphan])
     const all = await marksOf(w.tenantId)
-    for (const id of [rentMark, orphan]) expect(all.find(m => m.id === id)).toMatchObject({ superseded_by: id, superseded_reason: 'attestation_invalidated' })
+    // The onboarding bill no longer earns its mark: withdrawn. The mark with no
+    // bill: 10/13 (Nic) "withdrawn: no bill" — kept, its reason saying so.
+    expect(all.find(m => m.id === rentMark)).toMatchObject({ superseded_by: rentMark, superseded_reason: 'attestation_invalidated' })
+    expect(all.find(m => m.id === orphan)).toMatchObject({ superseded_by: orphan, superseded_reason: 'withdrawn_no_bill' })
+    expect(formatRebuild(report, 'DRY RUN')).toContain(`mark ${orphan} (late, 1–3 days past grace) withdrawn: no bill — its payment row no longer exists · BETTER`)
     expect(all.filter(m => !m.superseded_by).map(m => [m.event_data.invoice_id, m.event_type, m.event_data.stamp]))
       .toEqual([[octInv, 'payment_skipped', 'outstanding']])
     const again = await tx(c => applyRebuild(c, { asOf: AS_OF }), true)

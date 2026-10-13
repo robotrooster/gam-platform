@@ -24,7 +24,10 @@
  *     withdrawn (each points at itself, 'attestation_invalidated');
  *   - a bill unpaid or partly paid past its grace period gets its mark;
  *   - a per-line mark no bill stands behind (its row is gone, or on no
- *     invoice) is withdrawn.
+ *     invoice) is withdrawn: "withdrawn: no bill" (10/13, Nic — the 18 marks
+ *     of three deleted demo tenants and "Nic Test": withdraw them, record
+ *     kept). It points at itself, 'withdrawn_no_bill', so it stops counting
+ *     anywhere (every reader skips a superseded mark) and stays on record.
  * A bill an admin corrected after a dispute is left alone; a bill with money
  * still clearing waits for it to settle (the nightly run marks it then).
  *
@@ -155,8 +158,9 @@ export async function applyRebuild(client: PoolClient, opts: { asOf?: string | n
     changes.push(c)
     c.subjectIds.forEach(s => subjects.add(s))
   }
+  // 10/13 (Nic): "withdrawn: no bill" — the record kept, its reason saying so.
   for (const o of plan.orphans) {
-    await supersedeEvent(client, o.id, o.id, 'attestation_invalidated')
+    await supersedeEvent(client, o.id, o.id, 'withdrawn_no_bill')
     subjects.add(o.subjectId)
   }
   return { changes, orphansWithdrawn: plan.orphans, subjects: [...subjects] }
@@ -277,7 +281,7 @@ export function formatRebuild(changes: readonly TenantHistoryChange[], header: s
     lines.push('')
     lines.push(`${t.name} — before: ${t.before.marks} mark(s), ${t.before.onTime} on time (${p(t.before.percent)}) → after: ${t.after.bills} bill(s), ${t.after.onTime} on time (${p(t.after.percent)})`)
     for (const b of t.bills) lines.push(`   ${b.label}: ${b.before} → ${b.after} · ${b.direction.toUpperCase()}`)
-    for (const o of t.orphans) lines.push(`   mark ${o.eventId} (${o.mark}) withdrawn — ${o.why} · ${o.direction.toUpperCase()}`)
+    for (const o of t.orphans) lines.push(`   mark ${o.eventId} (${o.mark}) withdrawn: no bill — ${o.why} · ${o.direction.toUpperCase()}`)
   }
   return lines.join('\n')
 }

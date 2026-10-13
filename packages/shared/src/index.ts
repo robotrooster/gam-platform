@@ -7005,6 +7005,13 @@ export const CREDIT_EVENT_TYPES = [
   'dispute_resolved_corrected',
   'dispute_resolved_no_change',
 
+  // Ledger integrity (system-recorded, 10/13). Nic: restart a forked chain
+  // "from today, with a recorded note explaining the break" — the restart is
+  // the new chain's first event and seals the old one (apps/api
+  // services/creditLedger restartChain). Not a mark: never scored, never in a
+  // credit history (getSubjectChain leaves it out); verifyChain reports it.
+  'chain_restarted',
+
   // External life events — utility (v1.5+ Plaid/aggregator)
   'utility_payment_on_time',
   'utility_payment_late_grace',
@@ -7153,6 +7160,10 @@ export const CREDIT_SUPERSEDE_REASONS = [
   // TEXT with no CHECK: no migration.
   'bill_status_changed',
   'replaced_by_bill_mark',
+  // 10/13 (Nic, the marks whose payment row is gone — deleted demo tenants,
+  // "Nic Test"): "withdrawn: no bill" — the mark points at itself, stops
+  // counting anywhere, and the record stays (scripts/oct12_rerate_late_marks).
+  'withdrawn_no_bill',
 ] as const
 export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
 

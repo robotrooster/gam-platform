@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 import { query, getClient } from '../db'
-import { getSubjectChain } from './creditLedger'
+import { getSubjectChain, CHAIN_RESTART_EVENT } from './creditLedger'
 
 // ============================================================
 // Credit stats service — Session B.
@@ -259,11 +259,15 @@ export async function refreshAllSubjectStats(): Promise<{
   processed: number
   errors: { subjectId: string; error: string }[]
 }> {
+  // 10/13: a chain restart is not history (getSubjectChain leaves it out):
+  // a subject whose only live event is a restart has nothing to count.
   const subjects = await query<{ id: string }>(
     `SELECT DISTINCT s.id
        FROM credit_subjects s
        JOIN credit_events e ON e.subject_id = s.id
-      WHERE e.superseded_by IS NULL`,
+      WHERE e.superseded_by IS NULL
+        AND e.event_type <> $1`,
+    [CHAIN_RESTART_EVENT],
   )
 
   const errors: { subjectId: string; error: string }[] = []
