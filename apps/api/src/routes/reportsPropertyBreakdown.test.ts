@@ -121,15 +121,17 @@ describe('GET /reports/property-detail — the breakdown (decision #4)', () => {
               SUM(ub.charge_amount) FILTER (WHERE pay.status = 'settled')::text AS paid
          FROM utility_bills ub JOIN payments pay ON pay.id = ub.payment_id
         WHERE ub.utility_type = 'electric' AND ub.landlord_id = $1`, [p.landlordId])).rows[0]
-    for (const basis of ['received', 'billed']) {
-      const d = (await get(p, `/api/reports/property-detail?propertyId=${p.propertyId}&year=2026&month=9&basis=${basis}`)).body.data
-      const e = cat(d, 'electric')
-      expect(e.label).toBe('Electric')
-      expect(e.billed).toBe(Number(bills.billed))     // 182.01
-      expect(e.collected).toBe(Number(bills.paid))    // 151.01
-    }
-    const billed = (await get(p, `/api/reports/property-detail?propertyId=${p.propertyId}&year=2026&month=9&basis=billed`)).body.data
-    expect(cat(billed, 'electric').stillOwed).toBe(31)
+    // 10/12 (Nic): Charged, Received and Owed side by side — no switch.
+    const d = (await get(p, `/api/reports/property-detail?propertyId=${p.propertyId}&year=2026&month=9`)).body.data
+    const e = cat(d, 'electric')
+    expect(e.label).toBe('Electric')
+    expect(e.billed).toBe(Number(bills.billed))     // 182.01
+    expect(e.collected).toBe(Number(bills.paid))    // 151.01
+    expect(e.charged).toBe(Number(bills.billed))
+    expect(e.received).toBe(Number(bills.paid))
+    expect(e.owed).toBe(31)
+    const viewElectric = d.view.categories.find((c: any) => c.category === 'electric')
+    expect(viewElectric).toMatchObject({ charged: 182.01, received: 151.01, owed: 31 })
   })
 
   it('trash fee resolves to trash, propane to propane, HOMEPMT to home payments', async () => {
@@ -228,16 +230,16 @@ describe('the dashboard property card and the agent read the same totals', () =>
     const p = await park()
     const today = await thisMonth(p)
     const [y, m] = [Number(today.slice(0, 4)), Number(today.slice(5, 7))]
-    for (const basis of ['received', 'billed']) {
-      const dash = (await get(p, `/api/landlords/me/dashboard?propertyId=${p.propertyId}&basis=${basis}`)).body.data
-      const detail = (await get(p, `/api/reports/property-detail?propertyId=${p.propertyId}&year=${y}&month=${m}&basis=${basis}`)).body.data
-      expect(dash.property_health.total).toBe(detail.breakdown.total)
-      expect(dash.trend[dash.trend.length - 1].revenue).toBe(detail.breakdown.total)
-      for (const c of detail.breakdown.categories) {
-        const mine = dash.property_health.categories.find((x: any) => x.category === c.category)
-        expect(mine.amount).toBe(c.amount)
-      }
-      expect(dash.basis.basis).toBe(basis)
+    // 10/12 (Nic): the dashboard (no switch now: Money received, its
+    // default) and the report carry the same Charged / Received / Owed.
+    const dash = (await get(p, `/api/landlords/me/dashboard?propertyId=${p.propertyId}`)).body.data
+    const detail = (await get(p, `/api/reports/property-detail?propertyId=${p.propertyId}&year=${y}&month=${m}`)).body.data
+    expect(dash.property_health.total).toBe(detail.breakdown.total)
+    expect(dash.trend[dash.trend.length - 1].revenue).toBe(detail.breakdown.total)
+    for (const c of detail.breakdown.categories) {
+      const mine = dash.property_health.categories.find((x: any) => x.category === c.category)
+      expect(mine.amount).toBe(c.amount)
+      expect([mine.charged, mine.received, mine.owed]).toEqual([c.charged, c.received, c.owed])
     }
     const rx = (await get(p, `/api/landlords/me/dashboard?basis=received`)).body.data
     // Money received this month $A, incl. $460 paid ahead for later bills.
@@ -259,13 +261,14 @@ describe('the dashboard property card and the agent read the same totals', () =>
     const [y, m] = [Number(today.slice(0, 4)), Number(today.slice(5, 7))]
     const actor = { userId: p.userId, role: 'landlord', profileId: '', landlordIds: [p.landlordId] } as any
     for (const [yr, mo] of [[2026, 9], [y, m]] as const) {
-      for (const basis of ['received', 'billed']) {
-        const tool: any = await getProfitAndLoss.execute({ year: yr, month: mo, basis }, actor)
-        const report = (await get(p, `/api/reports/monthly-pl?year=${yr}&month=${mo}&basis=${basis}`)).body.data
-        expect(tool.income.total).toBe(report.gross.total)
-        expect(tool.net).toBe(report.net)
-        expect(tool.basis).toBe(report.meta.basis.label)
-      }
+      // 10/12: the report carries the three columns; so does the tool (no
+      // basis any more, ledger P8), Received first, the same on each.
+      const report = (await get(p, `/api/reports/monthly-pl?year=${yr}&month=${mo}`)).body.data
+      const tool: any = await getProfitAndLoss.execute({ year: yr, month: mo }, actor)
+      expect([tool.income.received, tool.income.charged, tool.income.owed]).toEqual([report.view.received, report.view.charged, report.view.owed])
+      expect(tool.net).toEqual({ received: report.nets.received, charged: report.nets.charged })
+      expect(report.gross.total).toBe(report.view.received)
+      expect(report.net).toBe(report.nets.received)
     }
     const stats: any = await getPortfolioStats.execute({ topic: 'money' }, actor)
     const dash = (await get(p, '/api/landlords/me/dashboard')).body.data

@@ -1161,7 +1161,9 @@ describe('a long stay on a lease', () => {
     expect(out.body.data.next).toBe('decide')
     const lease = await query<any>(`SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date FROM leases WHERE id = $1`, [leaseId])
     expect(lease[0].end_date).toBe(TODAY)
-    expect(await query(`SELECT 1 FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId])).toHaveLength(0)
+    // 10/12 (Nic): November's rent is voided as a record, never deleted.
+    expect(await query(`SELECT status FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId]))
+      .toEqual([{ status: 'voided' }])
     const fresh = out.body.data.quote
     expect(fresh).toMatchObject({ checkedOut: true, question: 'overpaid', unused: 1451.61 })
     // The newest rent payment first: October's card.

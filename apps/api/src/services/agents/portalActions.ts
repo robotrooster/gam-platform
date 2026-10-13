@@ -289,10 +289,16 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     description:
       'File a transaction from the bank feed under a category so it lands on the P&L. Use when they ' +
       'are going through the feed: "that one was insurance". Money OUT is an expense; money IN that ' +
-      'is not a GAM payout is other income — never categorize a matched GAM payout, that double-counts it.',
+      'is not a GAM payout is other income — never categorize a matched GAM payout, that double-counts it. ' +
+      // 10/12 review (Nic L5, match first): money out that fits a bill, a check
+      // written, GAM's fees, a refund, a transfer or a loan payment to the cent
+      // is refused with what it fits — matched on the Bank page, never filed twice.
+      'Money out that fits a bill or record to the cent is refused with what it fits: send them to "What did this pay?" ' +
+      'on the Bank page; notAMatch only once they say it is none of those.',
     params: {
       transactionId: { type: 'string', description: 'The transaction id from the bank feed.' },
       category: { type: 'string', description: 'The expense or income category it belongs to.' },
+      notAMatch: { type: 'boolean', description: 'True only once the landlord says it is none of the records it fits.' },
     },
     required: ['transactionId', 'category'],
   },
@@ -1163,15 +1169,19 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     id: 'set_fee_payers',
     audience: 'landlord', method: 'PATCH', path: '/api/properties/:propertyId/allocation-rule',
     pathParams: ['propertyId'],
+    // 10/12 (Nic): this also offered "which bank account a property pays out
+    // to" — a pick from the legacy bank catalog that never moved a payout
+    // (rent pays out to the bank the company verified with Stripe). Removed
+    // with the Properties-page dropdown it mirrored.
     description:
-      'Set which bank account a property pays out to, or whether its card and bank fees are passed ' +
-      'on or covered. Use for "we will eat the fees at Oak Street". The fees are ONE choice for card ' +
-      'and bank alike (achFeePayer sets both). The platform fee is always the landlord\u2019s; if they ' +
-      'ask to move it, say so plainly. Cash, check and money order carry no fee.',
+      'Set whether a property\u2019s card and bank fees are passed on or covered. Use for "we will eat ' +
+      'the fees at Oak Street". The fees are ONE choice for card and bank alike (achFeePayer sets ' +
+      'both). The platform fee is always the landlord\u2019s; if they ask to move it, say so plainly. ' +
+      'Cash, check and money order carry no fee. Rent pays out to the bank the company verified with ' +
+      'Stripe on the Disbursement Account page; there is no per-property payout account to set.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       achFeePayer: { type: 'string', description: 'landlord (cover the card and bank fees) or tenant (pass them on).' },
-      ownerBankAccountId: { type: 'string', description: 'The bank account this property pays out to, from a lookup. It must belong to the owner and be active.' },
     },
     required: ['propertyId'],
     confirmFirst: true,
@@ -1219,25 +1229,38 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     id: 'add_vendor',
     audience: 'landlord', method: 'POST', path: '/api/books/vendors',
     description:
-      'Add a vendor to their books — a plumber, a landscaper, a supplier. Use for "set up Desert ' +
-      'Plumbing so I can start putting their invoices in".\n' +
+      'Add someone the company pays to their books — one list of everyone they pay: a contractor (the ' +
+      'plumber, the yard man), a utility company (power, water, garbage), a supplier, or anyone else. ' +
+      'Use for "set up Desert Plumbing so I can start putting their invoices in" or "add Jose, he does ' +
+      'the yards, 1099".\n' +
+      'vendorType says which kind. Only a contractor can carry the 1099 box (is1099) — whether somebody ' +
+      'is a contractor or an employee is a tax question that is theirs or their accountant\u2019s to ' +
+      'answer, not yours: record what they tell you.\n' +
       'Everything here has to come from the landlord or from the vendor\u2019s own paperwork. NEVER ' +
       'invent an email, a phone number or a tax id to get the record to save — ask for what is ' +
-      'missing. The tax id is an EIN (XX-XXXXXXX) or an SSN (XXX-XX-XXXX) and the system checks the ' +
-      'shape, so read it back digit by digit if they said it out loud.',
+      'missing. The taxpayer id is optional; when given it is an EIN (XX-XXXXXXX) or an SSN ' +
+      '(XXX-XX-XXXX — only its last four digits are kept), and the system checks the shape, so read it ' +
+      'back digit by digit if they said it out loud.',
     params: {
-      name: { type: 'string', description: 'The business name.' },
+      vendorType: { type: 'string', description: 'contractor, utility, supplier, or other.' },
+      name: { type: 'string', description: 'The business name, or the person\u2019s name for an individual contractor.' },
       contactName: { type: 'string', description: 'The person they deal with there.' },
       email: { type: 'string', description: 'Their email.' },
       phone: { type: 'string', description: 'Their phone number.' },
       address: { type: 'string', description: 'Their address.' },
       category: { type: 'string', description: 'What they do — plumbing, landscaping, supplies.' },
       paymentTerms: { type: 'string', description: 'net15, net30, net45, net60, due_on_receipt, or cod.' },
-      taxId: { type: 'string', description: 'EIN as XX-XXXXXXX or SSN as XXX-XX-XXXX.' },
+      taxId: { type: 'string', description: 'Optional. EIN as XX-XXXXXXX or SSN as XXX-XX-XXXX.' },
       accountNumber: { type: 'string', description: 'The landlord\u2019s account number with that vendor, if there is one.' },
       notes: { type: 'string', description: 'Anything else worth keeping on the record.' },
+      is1099: { type: 'boolean', description: 'A contractor only: true when their payments go on a 1099.' },
+      taxClassification: { type: 'string', description: 'A contractor only, from their W-9: individual, c_corp, s_corp, partnership, llc, or other.' },
+      w9OnFile: { type: 'boolean', description: 'True when the landlord has their W-9.' },
+      trade: { type: 'string', description: 'A contractor only: their trade.' },
+      payRate: { type: 'number', description: 'A contractor only: their usual rate in dollars.' },
+      payUnit: { type: 'string', description: 'What the rate is per: project, hour, day, or sqft.' },
     },
-    required: ['name', 'contactName', 'email', 'phone', 'address', 'category', 'paymentTerms', 'taxId'],
+    required: ['vendorType', 'name', 'contactName', 'email', 'phone', 'address'],
     confirmFirst: true,
   },
   {
@@ -1245,19 +1268,25 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/books/vendors/:vendorId',
     pathParams: ['vendorId'],
     description:
-      'Update a vendor on their books — new contact, new number, different terms, or mark them ' +
-      'inactive when they stop using them. Use for "Desert Plumbing changed hands, new email is...". ' +
-      'Only send what changed.',
+      'Update someone on their vendor list — new contact, new number, different terms, the 1099 box, ' +
+      'or mark them inactive when they stop using them. Use for "Desert Plumbing changed hands, new ' +
+      'email is..." or "we do not use that landscaper any more". Only send what changed.\n' +
+      'Marking somebody inactive does not remove them: what they were paid stays on the books, which ' +
+      'is what their 1099 is built from.',
     params: {
       vendorId: { type: 'string', description: 'The vendor id, from a lookup.' },
+      vendorType: { type: 'string', description: 'contractor, utility, supplier, or other.' },
       name: { type: 'string', description: 'Business name.' },
       contactName: { type: 'string', description: 'Contact person.' },
       email: { type: 'string', description: 'Email.' },
       phone: { type: 'string', description: 'Phone.' },
+      address: { type: 'string', description: 'Address.' },
       category: { type: 'string', description: 'What they do.' },
       paymentTerms: { type: 'string', description: 'net15, net30, net45, net60, due_on_receipt, or cod.' },
       status: { type: 'string', description: 'active or inactive.' },
       notes: { type: 'string', description: 'Notes on the record.' },
+      is1099: { type: 'boolean', description: 'A contractor only: true when their payments go on a 1099.' },
+      w9OnFile: { type: 'boolean', description: 'True when the landlord has their W-9.' },
     },
     required: ['vendorId'],
     confirmFirst: true,
@@ -1436,7 +1465,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     params: {
       date: { type: 'string', description: 'The entry date, YYYY-MM-DD.' },
       description: { type: 'string', description: 'What the entry is for.' },
-      lines: { type: 'array', description: 'The lines. Each is an object with accountId, an optional description, and debit and credit amounts. Total debits must equal total credits.' },
+      lines: { type: 'array', description: 'The lines. Each is an object with accountId, an optional description, debit and credit amounts, and optionally the propertyId (or unitId) it belongs to — none is company-wide. Total debits must equal total credits. Accounts GAM keeps from the money records (tenant balances, money GAM holds, deposits owed, bills owed) are refused.' },
       reference: { type: 'string', description: 'A reference for the entry.' },
     },
     required: ['date', 'description', 'lines'],
@@ -1511,49 +1540,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: ['employeeId'],
     confirmFirst: true,
   },
-  {
-    id: 'add_contractor',
-    audience: 'landlord', method: 'POST', path: '/api/books/contractors',
-    description:
-      'Add a 1099 contractor to their books — somebody they pay for work who is not an employee. Use ' +
-      'for "add Jose, he does the yards, 1099".\n' +
-      'The difference between a contractor and an employee is a tax question with real consequences, ' +
-      'and it is theirs or their accountant\u2019s to answer, not yours. Record what they tell you; do ' +
-      'not advise them on which one somebody is.\n' +
-      'A name is required. If they have not given one, ask.',
-    params: {
-      name: { type: 'string', description: 'Their name or business name.' },
-      email: { type: 'string', description: 'Email.' },
-      phone: { type: 'string', description: 'Phone.' },
-      taxId: { type: 'string', description: 'EIN or SSN, as it appears on their W-9.' },
-      address: { type: 'string', description: 'Address.' },
-      category: { type: 'string', description: 'What they do.' },
-    },
-    required: ['name'],
-    confirmFirst: true,
-  },
-  {
-    id: 'update_contractor',
-    audience: 'landlord', method: 'PATCH', path: '/api/books/contractors/:contractorId',
-    pathParams: ['contractorId'],
-    description:
-      'Update a 1099 contractor on their books — a new phone number, a new address, a different ' +
-      'category of work, or marking them inactive when they stop using them. Use for "Jose has a ' +
-      'new number" or "we do not use that landscaper any more".\n' +
-      'Only send what changed. Marking somebody inactive does not remove them: what they were paid ' +
-      'stays on the books, which is what their 1099 is built from.',
-    params: {
-      contractorId: { type: 'string', description: 'The contractor id, from a lookup.' },
-      name: { type: 'string', description: 'Name.' },
-      email: { type: 'string', description: 'Email.' },
-      phone: { type: 'string', description: 'Phone.' },
-      address: { type: 'string', description: 'Address.' },
-      category: { type: 'string', description: 'What they do.' },
-      status: { type: 'string', description: 'active or inactive.' },
-    },
-    required: ['contractorId'],
-    confirmFirst: true,
-  },
+  // 10/12 (Nic): add_contractor / update_contractor are gone with the Contractors
+  // routes — a contractor is a vendor of type contractor (add_vendor, update_vendor).
   {
     id: 'approve_payroll_run',
     audience: 'landlord', method: 'POST', path: '/api/books/payroll/runs/:runId/approve',
@@ -1562,7 +1550,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Approve a payroll run that is sitting in draft. Use for "yes, approve the run for the period ' +
       'ending the 15th".\n' +
       'Approving posts the run to each employee\u2019s year-to-date figures — gross, withholding, net — ' +
-      'which is what their W-2s are built from. It does NOT pay anybody: GAM does not send wages, and ' +
+      'which is what their W-2s are built from, and books it on the pay date. Each paycheck\u2019s take-home ' +
+      'pay and each payroll tax it leaves owed become unpaid bills on their Expenses, which the bank ' +
+      'lines that pay them clear. It does NOT pay anybody: GAM does not send wages, and ' +
       'they still pay their people however they normally do. Read back the period, the pay date and ' +
       'the number of people on it before approving, and never approve a run you have not read.',
     params: { runId: { type: 'string', description: 'The payroll run id, from a lookup.' } },
@@ -1959,18 +1949,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
   {
     id: 'record_bank_reconciliation',
     audience: 'landlord', method: 'POST', path: '/api/bank-reconciliations',
+    // 10/12 (Nic, ledger P9): reconciliation is on the books now — this STARTS a
+    // statement; ticking its lines off and finishing it are the person's own
+    // presses on the Bank Reconciliation page.
     description:
-      'Save a bank reconciliation for a period — the statement balance they are reconciling to, and ' +
-      'the dates it covers. Use for "reconcile March, the statement says $18,402.11".\n' +
+      'Start reconciling a bank account to a statement — the statement\'s last day and the ending ' +
+      'balance printed on it. Use for "reconcile March, the statement says $18,402.11". Say that they ' +
+      'then tick off what is on the statement and finish on the Bank Reconciliation page (Bank → ' +
+      'Reconciliation); you do not tick or finish it.\n' +
       'The statement balance is the figure ON THEIR BANK STATEMENT. Never work it out for them and ' +
       'never round it: reconciling to a number nobody checked is worse than not reconciling.',
     params: {
-      periodStart: { type: 'string', description: 'First day of the period, YYYY-MM-DD.' },
-      periodEnd: { type: 'string', description: 'Last day of the period, YYYY-MM-DD.' },
-      statementBalance: { type: 'number', description: 'The closing balance printed on their bank statement.' },
-      accountId: { type: 'string', description: 'Which bank account, from a lookup, when they have more than one.' },
+      periodStart: { type: 'string', description: 'First day the statement covers, YYYY-MM-DD (optional; not needed).' },
+      periodEnd: { type: 'string', description: 'The statement\'s last day, YYYY-MM-DD.' },
+      statementBalance: { type: 'number', description: 'The ending balance printed on their bank statement.' },
+      accountId: { type: 'string', description: 'Which bank account, when the company has more than one: the account\'s number or name as they say it, or its last four digits — e.g. 1011, PNC Bank, or PNC ••9677. Leave it out when it has one linked bank.' },
     },
-    required: ['periodStart', 'periodEnd', 'statementBalance'],
+    required: ['periodEnd', 'statementBalance'],
     confirmFirst: true,
   },
   {
@@ -1978,9 +1973,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/bank-accounts/:accountId',
     pathParams: ['accountId'],
     description:
-      'Rename one of their own bank accounts, so they can tell them apart. Use for "call that one ' +
-      'Operating". This changes the LABEL only — nothing about the account itself. You cannot add a ' +
-      'bank account or change its numbers; that is entered by them directly and never through you.',
+      'Rename one of the bank accounts already on their old GAM bank list, so they can tell them ' +
+      'apart. Use for "call that one Operating". This changes the LABEL only — nothing about the ' +
+      'account itself. That list does not receive payouts and takes no new accounts: rent pays out ' +
+      'to the bank they verify with Stripe on the Disbursement Account page, which they enter ' +
+      'themselves inside Stripe\u2019s form, never through you.',
     params: {
       accountId: { type: 'string', description: 'The bank account id, from a lookup.' },
       nickname: { type: 'string', description: 'What to call it.' },
@@ -1992,10 +1989,10 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'POST', path: '/api/bank-accounts/:accountId/archive',
     pathParams: ['accountId'],
     description:
-      'Archive one of their own bank accounts so it stops being offered. Use for "we closed that ' +
+      'Archive one of the bank accounts on their old GAM bank list. Use for "we closed that ' +
       'account".\n' +
-      'Check first whether any property pays out to it — archiving the account a property pays into ' +
-      'leaves that payout with nowhere to land. Say which properties use it before you archive it.',
+      'That list never received payouts — rent pays out to the bank verified with Stripe on the ' +
+      'Disbursement Account page — so archiving one changes no payout.',
     params: { accountId: { type: 'string', description: 'The bank account id, from a lookup.' } },
     required: ['accountId'],
     confirmFirst: true,
@@ -3001,7 +2998,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     pathParams: ['meterId'],
     description:
       'Change a meter — its label, its rate, its base fee, its face digits, or mark it broken or ' +
-      'repaired. Use for "water went to $0.006 a gallon" or "the meter on 12 is dead".\n' +
+      'repaired, or working with nobody on it using any. Use for "water went to $0.006 a gallon", ' +
+      '"the meter on 12 is dead" or "that meter is fine, they just aren\u2019t plugged in".\n' +
       'How a reading is INTERPRETED and how a bill is CALCULATED — the utility type, the billing ' +
       'method, the digits, the multiplier — can be changed freely until the meter has actually ' +
       'measured or billed something, and are frozen after that. That is deliberate: changing them ' +
@@ -3020,6 +3018,15 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       rubsBasis: { type: 'string', description: 'How the pool is priced.' },
       outOfService: { type: 'boolean', description: 'true = mark it broken, false = mark it repaired.' },
       repairedStartingReading: { type: 'number', description: 'Required when marking it repaired: what the repaired or replaced meter reads now (0 for a brand-new meter). Ask for it — never assume 0.' },
+      // 10/12 (Nic), M1: the "Works, tenant uses no power" choice beside "Repaired";
+      // Q-d: on any meter, any time. Q-f: voiding the estimates billed while it
+      // was flagged is the landlord's own choice on the Utilities page — a money
+      // decision, which the assistant never makes (decisions #38 Q6); the route
+      // refuses it from the assistant.
+      zeroUseConfirmed: { type: 'boolean', description: 'true = the meter works and the household on it uses none (away, not plugged in): back in service with no new reading, and on a submeter zero use bills $0 until it moves (a master or flat-rate meter bills as before). Works on any meter, flagged or not; on a broken one send it with outOfService false. Only when the landlord says so. You never take off estimates billed while a meter was flagged: on a flagged meter that has unpaid ones, this is refused with how many and how much — tell them, and that whether to void them is their choice with "Works, tenant uses no power" on the Utilities page (the wrench on the meter).' },
+      // 10/12 (Nic, review): taking "Works, tenant uses no power" back — a
+      // mis-click on a master or flat-rate meter could not be undone.
+      zeroUseWithdrawn: { type: 'boolean', description: 'true = take back an earlier "works, the household uses none" on this meter (it was a mistake, or somebody is using it now): from then on a submeter that reads the same number on an occupied space is treated as stuck again. Only when the landlord says so.' },
     },
     required: ['meterId'],
     confirmFirst: true,
@@ -3469,7 +3476,18 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       endDate: { type: 'string', description: 'When it ends, YYYY-MM-DD.' },
       monthlyHoursTarget: { type: 'integer', description: 'Hours a month the work is worth.' },
       coveredCharges: { type: 'array', description: 'Which kinds of charge the work offsets.' },
+      // 10/12 (Nic): taking a type off is the landlord's choice for its open charges.
+      openCoveredCharges: { type: 'string', description:
+        'Only when taking a charge type OFF: keep_covered (the default) leaves open charges of it covered by ' +
+        'the trade; put_back puts them back on the tenant’s balance. Ask the landlord which — never ' +
+        'choose put_back for them.' },
       carryForwardMonths: { type: 'integer', description: 'How many months unused hours carry forward, 0 to 24.' },
+      // 10/12 (Nic): hours beyond what the trade needs — banked, or paid.
+      extraHours: { type: 'string', description:
+        'Hours worked beyond what the trade needs: bank (kept for later months, the default) or pay.' },
+      extraHoursRate: { type: 'number', description:
+        'Only with pay: dollars per EXTRA hour, beyond the trade. Never what a trade hour is worth. Read it back before saving.' },
+      extraHoursPayMethod: { type: 'string', description: 'Only with pay: payroll_w2 or contractor_1099.' },
     },
     required: ['agreementId'],
     confirmFirst: true,

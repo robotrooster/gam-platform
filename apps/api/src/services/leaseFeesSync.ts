@@ -121,7 +121,7 @@ export async function syncSecurityDepositRow(
   }>(
     `SELECT id, flex_deposit_enabled, collected_amount::text, status
        FROM security_deposits
-      WHERE lease_id = $1
+      WHERE lease_id = $1 AND status <> 'voided'
       ORDER BY created_at DESC
       LIMIT 1`,
     [leaseId],
@@ -129,9 +129,16 @@ export async function syncSecurityDepositRow(
   const touched = !!existing && (existing.flex_deposit_enabled || Number(existing.collected_amount) > 0)
 
   if (!amount || amount <= 0) {
-    // Remove only an untouched row; never delete a funded / enrolled deposit.
+    // Remove only an untouched row; never a funded / enrolled deposit.
+    // 10/12 (Nic, G8 — keep everything): voided and kept, never deleted. Every
+    // reader of a lease's deposit leaves a voided record out, and a deposit
+    // added back later gets a record of its own.
     if (existing && !touched) {
-      await exec(`DELETE FROM security_deposits WHERE id = $1`, [existing.id])
+      await exec(
+        `UPDATE security_deposits
+            SET status = 'voided', voided_at = NOW(), updated_at = NOW(),
+                void_reason = 'Voided: the security deposit was taken off the lease before anything was collected on it'
+          WHERE id = $1 AND status <> 'voided' AND COALESCE(collected_amount, 0) = 0`, [existing.id])
     }
     return
   }
@@ -282,6 +289,31 @@ export function depositCollectedBySql(a = 'p'): string {
 }
 
 /**
+ * 10/12 (Nic, ledger P1) — payments.deposit_collected_by, stored once when a
+ * deposit payment settles: depositCollectedBySql above, evaluated NOW, while
+ * platform_held and released_by_deposit_return_id still say how the money
+ * came in (a finalized move-out clears platform_held afterwards). The ledger
+ * posts the deposit from this fact, never from what the row says later.
+ * Written at each settle, and never changed while that settle stands; cleared
+ * when the settle is undone (bankDepositConfirm undo match reopens the row),
+ * so the next settle writes its own. A row none of the facts describes stays
+ * NULL.
+ * Called by every settle of a deposit payment: reconcileSettledDepositPayment
+ * (the Stripe webhook) and manualPaymentSettle (the desk, a posted receipt,
+ * the bank-deposit match, the landlord assistant).
+ */
+export async function stampDepositCollectedBy(
+  runner: Pick<PoolClient, 'query'>, paymentIds: readonly string[],
+): Promise<void> {
+  if (paymentIds.length === 0) return
+  await runner.query(
+    `UPDATE payments p SET deposit_collected_by = ${depositCollectedBySql('p')}
+      WHERE p.id = ANY($1::uuid[]) AND p.type = 'deposit' AND p.status = 'settled'
+        AND p.deposit_collected_by IS NULL AND ${depositCollectedBySql('p')} IS NOT NULL`,
+    [[...paymentIds]])
+}
+
+/**
  * The S604 custody gate for one lease: may GAM hold deposits in this
  * property's state (state_deposit_custody_rules, fail-closed — a state nobody
  * has researched reads as "no")? The same rule syncSecurityDepositRow plans
@@ -357,7 +389,12 @@ export async function reconcileSettledDepositPayment(
        FROM payments p WHERE p.id = $1`,
     [paymentId],
   )
-  if (!p || p.type !== 'deposit' || !p.lease_id) return null
+  if (!p || p.type !== 'deposit') return null
+  // 10/12 (Nic, ledger P1): who collected it is stored now, once, from the
+  // same one definition — before finalize can change what it reads (every
+  // deposit payment, pet / key / cleaning ones included).
+  await stampDepositCollectedBy(client ?? db, [paymentId])
+  if (!p.lease_id) return null
   // S653: a pet / key / cleaning deposit is its own held deposit (it carries
   // its lease_fees row). It is returned by depositReturn alongside the security
   // deposit but it does not fund THIS pool, or a pet deposit settling first
@@ -368,7 +405,7 @@ export async function reconcileSettledDepositPayment(
   const dep = await one<{ id: string; flex_deposit_enabled: boolean; status: string; held_by: string; collected: string }>(
     `SELECT id, flex_deposit_enabled, status, held_by, collected_amount::text AS collected
        FROM security_deposits
-      WHERE lease_id = $1
+      WHERE lease_id = $1 AND status <> 'voided'
       ORDER BY created_at DESC
       LIMIT 1
       ${client ? 'FOR UPDATE' : ''}`,

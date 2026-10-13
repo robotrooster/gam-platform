@@ -303,16 +303,12 @@ describe('GET /api/payments', () => {
 
 describe('POST /api/payments/initiate-rent-collection', () => {
   async function setupEligibleUnit(f: Fixture) {
-    // Activate the unit, verify the tenant's ACH, give landlord A an
-    // active bank account row so the eligibility query matches.
+    // Activate the unit, verify the tenant's ACH, and make landlord A payable:
+    // 10/12 (Nic) that means live Stripe Connect payouts, not a row in the
+    // legacy bank catalog (the removed Add Bank Account form).
     await db.query(`UPDATE units SET status='active' WHERE id=$1`, [f.aUnitId])
     await db.query(`UPDATE tenants SET ach_verified=TRUE WHERE id=$1`, [f.tenant1Id])
-    const c = await db.connect()
-    try {
-      await c.query('BEGIN')
-      await seedUserBankAccount(c, { userId: f.aUid })
-      await c.query('COMMIT')
-    } finally { c.release() }
+    await db.query(`UPDATE landlords SET connect_payouts_enabled=TRUE WHERE id=$1`, [f.aLid])
   }
 
   it('non-admin → 403', async () => {
@@ -399,6 +395,19 @@ describe('POST /api/payments/initiate-rent-collection', () => {
     const res = await request(buildApp()).post('/api/payments/initiate-rent-collection')
       .set('Authorization', `Bearer ${f.tokenAdmin}`)
       .send({ targetMonth: '2026-07' })
+    expect(res.body.data.initiated).toBe(0)
+  })
+
+  it('10/12: a landlord with only a legacy bank row (no Connect payouts) is not collected for', async () => {
+    const f = await seed()
+    await setupEligibleUnit(f)
+    await db.query(`UPDATE landlords SET connect_payouts_enabled=FALSE WHERE id=$1`, [f.aLid])
+    const c = await db.connect()
+    try { await seedUserBankAccount(c, { userId: f.aUid }) } finally { c.release() }
+    const res = await request(buildApp()).post('/api/payments/initiate-rent-collection')
+      .set('Authorization', `Bearer ${f.tokenAdmin}`)
+      .send({ targetMonth: '2026-07' })
+    expect(res.status).toBe(200)
     expect(res.body.data.initiated).toBe(0)
   })
 })
@@ -1432,7 +1441,8 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(rows[0].event_type).toBe('payment_received_late_severe')
     expect(rows[0].attestation_source).toBe('landlord_self_reported_with_evidence')
     expect(rows[0].attestation_evidence).toMatchObject({ manual_method: 'check', reference: 'CHK-77' })
-    expect(rows[0].event_data.payment_id).toBe(pid)
+    // 10/12 (Nic): "one mark per invoice" — the bill's mark, its lines listed.
+    expect(rows[0].event_data.payment_ids).toContain(pid)
   })
 
   it('a check is recorded settled (no disbursement) and the response carries no fee fields', async () => {

@@ -32,7 +32,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedManager } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedManager, seedProperty } from '../test/dbHelpers'
 
 const { emailInvitationMock, createNotificationMock } = vi.hoisted(() => ({
   emailInvitationMock:    vi.fn(async (..._args: any[]) => 'msg_invitation_mock'),
@@ -93,6 +93,14 @@ async function seedScopesFixture(): Promise<ScopesFixture> {
     return { landlordUserId, landlordId, landlordToken }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
+}
+
+/** 10/11: a property of the fixture's company — a bookkeeper ticks at least one. */
+async function seedCompanyProperty(f: ScopesFixture): Promise<string> {
+  const c = await db.connect()
+  try {
+    return await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+  } finally { c.release() }
 }
 
 // Seed a property_manager user + scope row under the landlord, return
@@ -295,14 +303,14 @@ describe('POST /:roleType/invite', () => {
 })
 
 describe('PATCH /:roleType/:userId/permissions — bookkeeper rejection', () => {
-  it('bookkeeper rejected → 400 (uses accessLevel, not permissions toggles)', async () => {
+  it('bookkeeper rejected → 400 (no permission toggles; 10/12: no access level either — one level)', async () => {
     const f = await seedScopesFixture()
     const res = await request(buildApp())
       .patch(`/api/scopes/bookkeeper/${randomUUID()}/permissions`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ permissions: { 'books.edit': true } })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/accessLevel/)
+    expect(res.body.error).toMatch(/no permission toggles/)
   })
 })
 
@@ -349,10 +357,12 @@ describe('POST /invitations/:token/accept', () => {
   // S592 (Nic): landlords invite their own bookkeeper via this same email-link
   // flow; the bookkeeper sets their OWN password on accept. Replaces the removed
   // admin direct-create (/api/books/bookkeeper/invite).
-  it('S592: bookkeeper invite → accept creates a bookkeeper + bookkeeper_scopes with the chosen access level', async () => {
+  it('S592: bookkeeper invite → accept creates a bookkeeper + bookkeeper_scopes (10/12: at the one level, whatever the payload says)', async () => {
     const f = await seedScopesFixture()
+    const park = await seedCompanyProperty(f)
     const email = `bk-${randomUUID()}@test.dev`
-    const token = await createPendingInvite(f, 'bookkeeper', email, { accessLevel: 'read_write' })
+    // 10/12 (Nic, ledger decision 2): an older invitation's read_only is not kept.
+    const token = await createPendingInvite(f, 'bookkeeper', email, { accessLevel: 'read_only', propertyIds: [park] })
 
     const res = await request(buildApp())
       .post(`/api/invitations/${token}/accept`)
@@ -363,10 +373,11 @@ describe('POST /invitations/:token/accept', () => {
     const u = await db.query<{ role: string }>(
       `SELECT role FROM users WHERE lower(email)=lower($1)`, [email])
     expect(u.rows[0].role).toBe('bookkeeper')
-    const s = await db.query<{ access_level: string }>(
-      `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1`, [res.body.data.userId])
+    const s = await db.query<{ access_level: string; property_ids: string[] }>(
+      `SELECT access_level, property_ids FROM bookkeeper_scopes WHERE user_id=$1`, [res.body.data.userId])
     expect(s.rows.length).toBe(1)
     expect(s.rows[0].access_level).toBe('read_write')
+    expect(s.rows[0].property_ids).toEqual([park])
   })
 
   it('expired invitation → 400 (no user / scope created)', async () => {
@@ -654,11 +665,12 @@ describe('S654: an invitation token never leaves by response; an existing accoun
 
   it('a new address: the account is made only by whoever holds the emailed link', async () => {
     const f = await seedScopesFixture()
+    const park = await seedCompanyProperty(f)
     const email = `fresh-${randomUUID()}@test.dev`
     const inv = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ email, scope: { accessLevel: 'read_only' } })
+      .send({ email, scope: { accessLevel: 'read_only', propertyIds: [park] } })
     expect(inv.status).toBe(201)
     expect(JSON.stringify(inv.body)).not.toContain(tokenFromEmail())
     expect(emailInvitationMock.mock.calls[0]![0]).toBe(email)

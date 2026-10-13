@@ -3,7 +3,13 @@ import { ZodError } from 'zod'
 import { logger } from '../lib/logger'
 
 export class AppError extends Error {
-  constructor(public statusCode: number, message: string) {
+  /**
+   * 10/12 review: `details` — optional plain fields a client can act on
+   * beside the sentence (e.g. { code: 'MATCH_FIRST', matches: [...] } when a
+   * bank line going out fits a record GAM already has). Sent as top-level
+   * keys of the error reply; never `success` or `error`.
+   */
+  constructor(public statusCode: number, message: string, public details?: Record<string, unknown>) {
     super(message)
   }
 }
@@ -40,5 +46,6 @@ export function errorHandler(err: any, req: Request, res: Response, _next: NextF
     const log = ((req as any).log ?? logger) as typeof logger
     log.error({ err, status }, 'request failed (5xx)')
   }
-  res.status(status).json({ success: false, error: message })
+  const extra = err instanceof AppError && err.details && status < 500 ? err.details : {}
+  res.status(status).json({ ...extra, success: false, error: message })
 }

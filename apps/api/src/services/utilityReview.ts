@@ -57,7 +57,9 @@ export async function billReview(runId: string) {
       FROM utility_meters m
       LEFT JOIN utility_meter_readings cur
              ON cur.meter_id = m.id AND cur.billing_cycle_month = $2::date AND cur.reason = 'monthly_cycle'
-      LEFT JOIN utility_bills ub ON ub.meter_id = m.id AND ub.billing_cycle_month = $2::date
+      -- 10/12 (G8): a bill voided out of its slot (a tenancy that never
+      -- happened; its usage went back on hold) is not the cycle's bill.
+      LEFT JOIN utility_bills ub ON ub.meter_id = m.id AND ub.billing_cycle_month = $2::date AND ub.voided_at IS NULL
       LEFT JOIN units u ON u.id = COALESCE(ub.unit_id,
              (SELECT mu.unit_id FROM utility_meter_units mu WHERE mu.meter_id = m.id LIMIT 1))
       LEFT JOIN tenants tt ON tt.id = ub.tenant_id
@@ -117,7 +119,9 @@ export async function dropUnissuedBillsFrom(meterId: string, cycleMonth: any): P
     `SELECT COUNT(*)::int AS n FROM utility_bills ub
       WHERE ub.meter_id = $1 AND ub.billing_cycle_month >= $2::date
         AND (ub.status <> 'unbilled' OR ub.payment_id IS NOT NULL)
-        AND NOT ${PAUSED_CYCLE_MARKER_SQL}`, [meterId, cycle])
+        AND NOT ${PAUSED_CYCLE_MARKER_SQL}
+        -- 10/12 (G8): a bill voided out of its slot was taken back, not issued.
+        AND ub.voided_at IS NULL`, [meterId, cycle])
   if ((issued?.n ?? 0) > 0) return false
   await query(
     `DELETE FROM utility_bills ub USING utility_meters m, utility_meters me

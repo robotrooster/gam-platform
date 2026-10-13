@@ -186,11 +186,15 @@ describe('the charges behind a total are filed under the day they counted', () =
     expect(statement.rowsTotal).toBe(0)
   })
 
-  it('Money billed files each bill on its due day', async () => {
+  it('10/12: a bill is Charged in its due month and its money is filed under the day it arrived (one line per day)', async () => {
     const f = await seed()
     const p = await settledRent(f, 500, '2026-08-05', '2026-08-07T10:00:00-07:00')
     const aug = (await get(f.owner, '/api/reports/monthly-pl?year=2026&month=8&basis=billed')).body.data
-    expect(aug.payments.find((r: any) => r.id === p)).toMatchObject({ day: '2026-08-05', dueDate: '2026-08-05' })
+    expect(aug.payments.find((r: any) => r.id === p)).toMatchObject({ day: '2026-08-07', dueDate: '2026-08-05' })
+    expect(aug.view).toMatchObject({ charged: 500, received: 500, owed: 0 })
+    const day = aug.days.find((d: any) => d.day === '2026-08-07')
+    expect(day).toMatchObject({ received: 500, chargesTotal: 500, noCharge: 0, paymentCount: 1 })
+    expect(day.paymentKeys).toEqual([`${p}:2026-08-07`])
   })
 })
 

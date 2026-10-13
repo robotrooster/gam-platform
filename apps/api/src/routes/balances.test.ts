@@ -63,14 +63,15 @@ async function seedOwedTenant() {
     const invoiceId = inv.rows[0].id
 
     await c.query(
+      // 10/12: written on its due date (lateness counts from the later of the two).
       `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                             type, amount, status, due_date, entry_description, notes)
-       VALUES ($1,$2,$3,$4,$5,'rent',440,'pending','2026-09-01','RENT',NULL)`,
+                             type, amount, status, due_date, entry_description, notes, created_at)
+       VALUES ($1,$2,$3,$4,$5,'rent',440,'pending','2026-09-01','RENT',NULL,'2026-09-01')`,
       [invoiceId, unitId, leaseId, tenantId, ll.landlordId])
     await c.query(
       `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                             type, amount, status, due_date, entry_description, notes)
-       VALUES ($1,$2,$3,$4,$5,'utility',176.40,'pending','2026-09-01','UTILITY',$6)`,
+                             type, amount, status, due_date, entry_description, notes, created_at)
+       VALUES ($1,$2,$3,$4,$5,'utility',176.40,'pending','2026-09-01','UTILITY',$6,'2026-09-01')`,
       [invoiceId, unitId, leaseId, tenantId, ll.landlordId,
        'Electric — Aug 2026 (used before the lease was signed)'])
     await c.query('COMMIT')

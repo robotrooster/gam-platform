@@ -525,7 +525,7 @@ describe('the payout nets it', () => {
     const c = await getClient()
     try {
       await c.query('BEGIN')
-      const taken = await netAgainstDisbursement(c, p.landlordId, 500)
+      const taken = await netAgainstDisbursement(c, p.landlordId, 500, [])
       await c.query('COMMIT')
       expect(taken).toBe(14)                            // October's $12 and tonight's $2
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }

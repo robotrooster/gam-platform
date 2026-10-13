@@ -195,9 +195,12 @@ describe('utility-service invoices (S615)', () => {
     const { rows: [inv] } = await db.query<any>(
       `SELECT id FROM invoices WHERE service_agreement_id = $1
         ORDER BY due_date DESC LIMIT 1`, [ctx.agreementId])
-    // Push the due date well past the 5-day grace.
+    // Push the due date well past the 5-day grace (10/12: and the bill's
+    // written day with it — a bill written after its due date counts from the
+    // day it was written).
     await db.query(
-      `UPDATE invoices SET due_date = (NOW() - INTERVAL '20 days')::date WHERE id = $1`, [inv.id])
+      `UPDATE invoices SET due_date = (NOW() - INTERVAL '20 days')::date,
+                           created_at = NOW() - INTERVAL '23 days' WHERE id = $1`, [inv.id])
     await db.query(
       `UPDATE payments SET due_date = (NOW() - INTERVAL '20 days')::date WHERE invoice_id = $1`, [inv.id])
 
@@ -227,7 +230,8 @@ describe('utility-service invoices (S615)', () => {
       `SELECT id FROM invoices WHERE service_agreement_id = $1
         ORDER BY due_date DESC LIMIT 1`, [ctx.agreementId])
     await db.query(
-      `UPDATE invoices SET due_date = (NOW() - INTERVAL '20 days')::date WHERE id = $1`, [inv.id])
+      `UPDATE invoices SET due_date = (NOW() - INTERVAL '20 days')::date,
+                           created_at = NOW() - INTERVAL '23 days' WHERE id = $1`, [inv.id])
     await db.query(
       `UPDATE payments SET due_date = (NOW() - INTERVAL '20 days')::date WHERE invoice_id = $1`, [inv.id])
 

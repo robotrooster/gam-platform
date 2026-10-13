@@ -71,8 +71,11 @@ async function leaseWithOverdueInvoice(f: any, opts: {
               late_fee_initial_type='flat', late_fee_grace_days=$4 WHERE id=$1`,
       [leaseId, opts.leaseFee.enabled ?? true, opts.leaseFee.amount, opts.leaseFee.grace ?? 0])
     const inv = await client.query<{ id: string }>(
-      `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-       VALUES ($1, $2, $3, $4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending') RETURNING id`,
+      // 10/12 (Nic): written before it came due, as the monthly run writes it
+      // (a bill written after its due date counts from the day it was written).
+      `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending',
+               NOW() - make_interval(days => $6::int + 3)) RETURNING id`,
       [f.landlordId, leaseId, opts.unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, opts.daysOverdue ?? 10, rent])
     await client.query(
       `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)
@@ -504,8 +507,9 @@ describe('S655 FlexPay: a covered bill gets no late fee', () => {
                 late_fee_initial_type = 'flat', late_fee_grace_days = 5 WHERE id = $1`, [leaseId])
       // Due four days ago: today is the last of five grace days (due + 5 − 1).
       const inv = await client.query<{ id: string }>(
-        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-         VALUES ($1, $2, $3, $4, $5, ($7::timestamptz AT TIME ZONE $6)::date - 4, 1000, 1000, 'pending') RETURNING id`,
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, ($7::timestamptz AT TIME ZONE $6)::date - 4, 1000, 1000, 'pending',
+                 $7::timestamptz - interval '7 days') RETURNING id`,
         [f.landlordId, tenantId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, NOW_AT])
       await client.query(
         `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)

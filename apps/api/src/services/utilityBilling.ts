@@ -1,9 +1,9 @@
 import { meterReadingModulus } from '@gam/shared'
-import { query, queryOne, getClient } from '../db'
+import { db, query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
-import { UTILITY_TYPE_LABEL, UTILITY_UNIT_LABEL, type UtilityType } from '@gam/shared'
+import { UTILITY_TYPE_LABEL, UTILITY_UNIT_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel, type UtilityType } from '@gam/shared'
 import { PAUSED_CYCLE_NOTE, PAUSED_CYCLE_MARKER_SQL } from './utilityPausedCycle'
 
 // S90: utility bill generation engine.
@@ -240,9 +240,22 @@ export async function flagBrokenMeter(
             out_of_service_since = COALESCE(out_of_service_since, CURRENT_DATE),
             updated_at = NOW()
       WHERE id = $1 AND out_of_service = FALSE
-      RETURNING property_id, utility_type, label`, [meterId])
+      RETURNING *`, [meterId])
   if (!flipped.length) return
   const m = flipped[0]
+  // 10/12 (review): an automatic flag also clears a "works, the household uses
+  // nothing" confirmation (utility_meters.zero_use_confirmed_at). It only fires
+  // once that confirmation no longer stands (the household left, or a new one
+  // arrived — zeroUseConfirmedStands), and left set, the Utilities page went on
+  // showing "uses no power · zero use bills $0 until it moves" beside a meter
+  // that was flagged and estimated again — and after "Repaired", a meter that
+  // still did not move kept that word on it. Written only when one is on
+  // record, on the same connection as the flag (the change journal keeps it).
+  if (m.zero_use_confirmed_at) {
+    await run(
+      `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL
+        WHERE id = $1`, [meterId])
+  }
   const who = await run(
     `SELECT l.user_id, l.id AS landlord_id, p.name AS property_name,
             (SELECT string_agg(u.unit_number, ', ') FROM utility_meter_units mu
@@ -265,11 +278,17 @@ export async function flagBrokenMeter(
     : `so it has been marked broken. This property bills an estimate while a meter is broken, but no similar occupied `
       + `space had a reading to estimate from, so nothing is billed for it this month. `
       + `Replace or repair it, then mark it repaired on the Utilities page with its new reading so it bills again.`
+  // 10/12 (Nic), M1: the other way back into service, beside "Repaired" — the
+  // meter works and the household on it uses nothing (Gerald at Mountain View:
+  // gone, not plugged in, paying for occupancy).
+  const worksNoUse = ` If the meter works and the household on it simply uses no `
+    + `${UTILITY_USAGE_NOUN[m.utility_type as UtilityType] ?? what.toLowerCase()}, `
+    + `choose "${meterWorksNoUseLabel(m.utility_type)}" there instead: zero use then bills $0 until the meter moves.`
   const notice = {
     userId: w.user_id as string, landlordId: w.landlord_id as string, type: 'utility_meter_broken',
     title: `${what} meter not reading — ${where}`,
     body: `The ${what.toLowerCase()} meter for ${where} read the same number twice while the space was occupied, `
-      + billedInstead,
+      + billedInstead + worksNoUse,
     data: { meterId, propertyId: m.property_id },
     actionUrl: '/utilities',
   }
@@ -422,6 +441,175 @@ const LEASE_LAST_DAY_ON_SPACE_SQL =
  * either, so the two agree.
  */
 const CLOSING_READ_REASONS = new Set(['move_out_final', 'stay_turnover'])
+
+/**
+ * ── 10/12 (Nic): A METER CONFIRMED WORKING ON A HOUSEHOLD THAT USES NOTHING ──
+ *
+ *   "Gerald Logue (Mountain View RV 48): void his $22.47 estimated electric
+ *    and mark his meter working (zero use then bills $0). Mountain View's
+ *    estimate setting stays on."
+ *
+ * utility_meters.zero_use_confirmed_at (services/meterRepair) says somebody
+ * confirmed the meter works and the household on it uses nothing — the
+ * landlord's "Works, tenant uses no power" choice beside "Repaired" (M1), or
+ * the one-time repair of Gerald's meter. While it
+ * stands, a flat read on an occupied space is taken at its word — zero use,
+ * billed $0 — instead of being marked stuck, estimated and the landlord told
+ * (both stuck tests: the monthly run and a lease being signed). It stands until
+ * the household it was confirmed for leaves — a move-out or stay-turnover read
+ * DATED after the day it was confirmed — and is cleared outright when the
+ * meter moves (a billed cycle shows use: clearZeroUseConfirmation here, read
+ * from the reads as they stand at billing — 10/12 review: never on a read
+ * being saved, which a correction could not undo), is marked broken by hand
+ * (routes/utility), or is flagged broken automatically once it no longer
+ * stands (flagBrokenMeter). 10/12 (review): a meter that is not a submeter is
+ * never flagged, so there it is cleared at billing once it no longer stands
+ * (generateBillsForMeter, before its early returns), and the landlord can
+ * withdraw it on any meter (routes/utility: zeroUseWithdrawn).
+ *
+ * 10/12 (review): BY THE READING'S DATE, NOT WHEN IT WAS TYPED IN. A move-out
+ * read of the household BEFORE (dated before the confirmation, entered after
+ * it) used to end the confirmation of the household it was made for — and at
+ * Mountain View the next flat read billed another estimate, the $22.47 kind M1
+ * exists to stop. A read dated on or before the day it was confirmed (the
+ * property's calendar) says nothing about the household since. A departure dated after the cycle being billed (`asOf`) says
+ * nothing about that cycle either: the household was still there.
+ *
+ * Reads the meter row as a whole (SELECT *), so the check costs nothing on a
+ * meter that never had it.
+ *
+ * A NEW HOUSEHOLD ON THE SPACE. This rule is the M1 build's reading of what
+ * "tenant" in "Works, tenant uses no power" covers — not Nic's words (his M1
+ * answer: "ADD 'Works, tenant uses no power' choice next to 'Repaired'
+ * (Gerald specifically is gone, not plugged in, paying for occupancy)"). The
+ * confirmation is about the household that was there, not the space forever.
+ * A move-out read is how a departure is normally seen, but a household can
+ * follow another without one. So it also stops standing once a lease has
+ * moved onto the space after the day it was confirmed (on or before `asOf`,
+ * the cycle read's day) whose residents were not on the space then — not a
+ * renewal or a later lease for the same people, and not an existing
+ * resident's onboarding lease (they lived there already). "On the space then"
+ * means under a lease still in force on the confirmation day (10/12 review):
+ * a former resident who comes back after it is a new household, not the one
+ * the confirmation was made for.
+ */
+async function zeroUseConfirmedStands(
+  meter: { id: string; zero_use_confirmed_at?: Date | string | null } | string,
+  one: (sql: string, params: any[]) => Promise<any | null> = queryOne,
+  /** The cycle read's day (YYYY-MM-DD); today when not given. */
+  asOf?: string | null,
+): Promise<boolean> {
+  const m = typeof meter === 'string' ? await one(`SELECT * FROM utility_meters WHERE id = $1`, [meter]) : meter
+  if (!m?.zero_use_confirmed_at) return false
+  // The household left: a closing read DATED after the confirmation day, and
+  // on or before the cycle being billed (today when not given).
+  const left = await one(
+    `SELECT 1 AS left
+       FROM utility_meter_readings r
+       JOIN utility_meters um ON um.id = r.meter_id
+       JOIN properties pp ON pp.id = um.property_id
+      WHERE r.meter_id = $1 AND r.reason = ANY($2::text[])
+        AND r.reading_date > timezone(COALESCE(pp.timezone, 'America/Phoenix'), $3::timestamptz)::date
+        AND r.reading_date <= COALESCE($4::date, timezone(COALESCE(pp.timezone, 'America/Phoenix'), now())::date)
+      LIMIT 1`,
+    [m.id, [...CLOSING_READ_REASONS], m.zero_use_confirmed_at, asOf ?? null])
+  if (left) return false
+  // The meter moved since it was confirmed (zeroUseMeterMoved): the
+  // confirmation has done its job.
+  if (await zeroUseMeterMoved(m, one, asOf)) return false
+  const arrived = await one(`
+    SELECT 1 AS arrived
+      FROM utility_meter_units mu
+      JOIN lease_unit_history h ON h.unit_id = mu.unit_id
+      JOIN leases l ON l.id = h.lease_id
+      JOIN units u ON u.id = h.unit_id
+      JOIN properties p ON p.id = u.property_id
+     WHERE mu.meter_id = $1
+       AND h.effective_from > timezone(p.timezone, $2::timestamptz)::date
+       AND h.effective_from <= COALESCE($3::date, timezone(p.timezone, now())::date)
+       AND l.status IN ('active', 'expired', 'terminated')
+       AND NOT ${LEASE_NEVER_IN_FORCE_SQL}
+       AND NOT COALESCE(l.is_existing_tenancy, FALSE)
+       AND NOT EXISTS (
+         SELECT 1 FROM lease_tenants lt
+           JOIN lease_tenants was ON was.tenant_id = lt.tenant_id AND was.lease_id <> l.id
+           JOIN leases wl ON wl.id = was.lease_id
+           JOIN lease_unit_history wh ON wh.lease_id = was.lease_id
+           JOIN utility_meter_units wmu ON wmu.unit_id = wh.unit_id AND wmu.meter_id = $1
+          WHERE lt.lease_id = l.id
+            -- 10/12 (review): on the space ON the confirmation day — started on
+            -- or before it, a lease that took effect (or an existing resident's
+            -- lease still being signed), and its last day on the space not
+            -- before it. A lease that had ended is a former household.
+            AND wh.effective_from <= timezone(p.timezone, $2::timestamptz)::date
+            AND (wl.status IN ('active', 'expired', 'terminated')
+                 OR (wl.status = 'pending' AND COALESCE(wl.is_existing_tenancy, FALSE)))
+            AND NOT ${leaseNeverInForceSql('wl')}
+            AND LEAST(COALESCE(wl.end_date, 'infinity'::date),
+                      COALESCE(timezone(p.timezone, wl.terminated_at)::date, 'infinity'::date),
+                      COALESCE(wh.effective_to - 1, 'infinity'::date))
+                >= timezone(p.timezone, $2::timestamptz)::date)
+     LIMIT 1`, [m.id, m.zero_use_confirmed_at, asOf ?? null])
+  return !arrived
+}
+
+/**
+ * 10/12 (review): has the meter moved since it was confirmed working with
+ * nobody using it? A read dated after the confirmation day (the property's
+ * calendar), on or before `asOf` (today when not given), that differs from the
+ * read before it — read from the reads AS THEY STAND NOW. Reads that start a
+ * measurement (opening read, meter replaced, billed outside GAM) and reads
+ * still waiting on their double-check count for nothing, as either side.
+ *
+ * This was a trigger that cleared the confirmation the moment such a read was
+ * SAVED (trg_meter_read_clears_zero_use); nothing restored it when that read
+ * was corrected — a typo of 49093 for 49083 fixed minutes later still lost it,
+ * and the next flat cycle flagged the meter and, at Mountain View, billed the
+ * estimate M1 exists to stop. Decided here, when it matters (the stuck tests),
+ * a corrected read is simply the read.
+ */
+async function zeroUseMeterMoved(
+  m: { id: string; zero_use_confirmed_at?: Date | string | null },
+  one: (sql: string, params: any[]) => Promise<any | null> = queryOne,
+  asOf?: string | null,
+): Promise<boolean> {
+  if (!m?.zero_use_confirmed_at) return false
+  const moved = await one(
+    `SELECT 1 AS moved
+       FROM utility_meter_readings r
+       JOIN utility_meters um ON um.id = r.meter_id
+       JOIN properties pp ON pp.id = um.property_id
+       CROSS JOIN LATERAL (
+         SELECT q.reading_value FROM utility_meter_readings q
+          WHERE q.meter_id = r.meter_id AND q.id <> r.id AND NOT COALESCE(q.needs_review, FALSE)
+            AND (q.reading_date, q.created_at) < (r.reading_date, r.created_at)
+          ORDER BY q.reading_date DESC, q.created_at DESC LIMIT 1) prev
+      WHERE r.meter_id = $1
+        AND r.reason NOT IN ('baseline', 'meter_replaced', 'billed_off_platform')
+        AND NOT COALESCE(r.needs_review, FALSE)
+        AND r.reading_date > timezone(COALESCE(pp.timezone, 'America/Phoenix'), $2::timestamptz)::date
+        AND r.reading_date <= COALESCE($3::date, timezone(COALESCE(pp.timezone, 'America/Phoenix'), now())::date)
+        AND prev.reading_value <> r.reading_value
+      LIMIT 1`,
+    [m.id, m.zero_use_confirmed_at, asOf ?? null])
+  return !!moved
+}
+
+/**
+ * 10/12: the meter moved — a read after the confirmation shows usage
+ * (zeroUseMeterMoved, or the cycle's own read) — so "it works and nobody uses
+ * it" has done its job. Cleared when the cycle is billed, so a meter that
+ * stops later is caught by the stuck test again. A re-run of a cycle read
+ * before the confirmation leaves it.
+ */
+async function clearZeroUseConfirmation(meterId: string, cycleReadDate: string): Promise<boolean> {
+  const cleared = await query<{ id: string }>(
+    `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL, updated_at = NOW()
+      WHERE id = $1 AND zero_use_confirmed_at IS NOT NULL
+        AND zero_use_confirmed_at < $2::date
+      RETURNING id`, [meterId, cycleReadDate])
+  return cleared.length > 0
+}
 
 async function occupiedAcrossReadSpan(
   units: Array<{ unit_id: string; status: string }>,
@@ -881,6 +1069,25 @@ export async function generateBillsForMeter(
   if (!property) throw new AppError(404, 'Property not found for meter')
   const landlordId = property.landlord_id
 
+  // 10/12 (Nic, review): "Works, tenant uses no power" is on ANY meter (Q-d),
+  // but the check below that ends it is reached only by a submeter or a RUBS
+  // master serving units — a master the landlord pays, a flat-rate meter and
+  // a meter serving no unit all return first. One press (or a mis-click) on the office water master, or on a
+  // flat trash charge across 27 spaces, left "uses no water · confirmed
+  // working, nobody using it" on the Utilities page for good: through months
+  // of the master reading usage, and new households arriving. On a meter that
+  // is not a submeter it ends here, before any of those returns, once it no
+  // longer stands (zeroUseConfirmedStands: the meter moved since, the
+  // household it was confirmed for left, or a new one arrived). It bills
+  // nothing on these meters either way; the landlord can also withdraw it on
+  // the page (routes/utility: zeroUseWithdrawn).
+  if (meter.zero_use_confirmed_at && meter.billing_method !== 'submeter'
+      && !(await zeroUseConfirmedStands(meter, queryOne, lastDayOfCycle(cycleIso)))
+      && await clearZeroUseConfirmation(meterId, lastDayOfCycle(cycleIso))) {
+    meter.zero_use_confirmed_at = null
+    meter.zero_use_confirmed_by_user_id = null
+  }
+
   if (meter.billing_method === 'master_bill_to_landlord') {
     return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: 0,
       reason: 'master_bill_to_landlord — landlord absorbs, no tenant bills' }
@@ -1158,8 +1365,21 @@ export async function generateBillsForMeter(
     : null
   const pausedCycle = !!paused || !!pausedMarker
 
+  // 10/12 (Nic): "mark his meter working (zero use then bills $0)" — a meter
+  // confirmed working on a household that uses nothing is not stuck
+  // (zeroUseConfirmedStands). Once it moves, the confirmation is cleared —
+  // this cycle's read shows use, or any read since the confirmation does, from
+  // the reads as they stand now (zeroUseMeterMoved; 10/12 review).
+  if (meter.zero_use_confirmed_at
+      && ((move?.usage != null && Number(move.usage) > 0)
+          || await zeroUseMeterMoved(meter, queryOne, move?.cycle_date ?? lastDayOfCycle(cycleIso)))) {
+    await clearZeroUseConfirmation(meterId, move?.cycle_date ?? lastDayOfCycle(cycleIso))
+  }
+  const zeroUseConfirmed = meter.billing_method === 'submeter'
+    && await zeroUseConfirmedStands(meter, queryOne, move?.cycle_date ?? lastDayOfCycle(cycleIso))
+
   let stuckOnOccupied = false
-  if (meter.billing_method === 'submeter' && !meter.out_of_service && !pausedCycle) {
+  if (meter.billing_method === 'submeter' && !meter.out_of_service && !pausedCycle && !zeroUseConfirmed) {
     // IDENTICAL, not merely non-positive. A NEGATIVE delta is a meter that
     // rolled back — a misread or a replaced head — and has its own handling
     // below. Swallowing it here would bill an estimate for what is really a
@@ -2943,6 +3163,7 @@ export async function releaseSuspendedChargesForLease(args: {
                COALESCE(m.rate_per_unit, pur.rate_per_unit, 0) AS rate,
                to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle,
                cyc.reading_value AS end_val, cyc.reading_date AS end_date,
+               to_char(cyc.reading_date, 'YYYY-MM-DD') AS end_day,
                base.reading_value AS start_val, base.reading_date AS start_date,
                un.unit_type, un.rv_amp_service, pp.estimates_stuck_meters AS estimates
           FROM utility_meters m
@@ -2984,6 +3205,9 @@ export async function releaseSuspendedChargesForLease(args: {
                                        AND COALESCE(sc.usage_amount, 0) = 0))`,
         [args.unitId])
       for (const st of stuck) {
+        // 10/12 (Nic): a meter confirmed working on a household that uses
+        // nothing is not stuck here either (zeroUseConfirmedStands).
+        if (await zeroUseConfirmedStands(st.meter_id, q1, st.end_day)) continue
         await q(`
           UPDATE suspended_utility_charges
              SET cancelled_at = now(), updated_at = now(),
@@ -3136,7 +3360,7 @@ export async function releaseSuspendedChargesForLease(args: {
       // strand anyone whose meter read is corrected, or whose bill-back
       // is switched on, after their invoice was cut. This lands it on
       // the open invoice instead, so the tenant sees it when they log in.
-      if (bill?.id) await attachBillToOpenInvoice(bill.id, h, args, q, q1)
+      if (bill?.id) await attachBillToOpenInvoice(bill.id, h, args, q, q1, c ?? db)
       if (bill?.id) { released++; amount += Number(h.charge_amount) }
     } catch (e) {
       logger.error({ err: e, suspendedId: h.id, unitId: args.unitId },
@@ -3170,15 +3394,24 @@ async function attachBillToOpenInvoice(
   args: { unitId: string; leaseId: string; tenantId: string; landlordId: string },
   q: ManyFn,
   q1: OneFn,
+  /** The same connection as q/q1, whole (the work-trade step needs its query results). */
+  run: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
 ): Promise<void> {
   const amount = Number(held.charge_amount)
-  if (!(amount > 0)) return
+  if (!(amount > 0)) {
+    // 10/12 (Nic): "$0 lines are ignored." A share that bills nothing is
+    // billed as nothing — read, charged nothing, no line — so the monthly run
+    // never turns it into a $0 line later (Gerald Logue's August electric).
+    await q(`UPDATE utility_bills SET status = 'billed', billed_at = COALESCE(billed_at, NOW()), updated_at = NOW()
+              WHERE id = $1 AND payment_id IS NULL AND status = 'unbilled'`, [billId])
+    return
+  }
   try {
     // The earliest still-open invoice on this lease whose period already
     // covers this cycle. 'settled' and 'void' are left alone — a paid
     // invoice must never grow a new line after the fact.
     const inv = await q1<{ id: string; due_date: string }>(
-      `SELECT id, due_date FROM invoices
+      `SELECT id, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM invoices
         WHERE lease_id = $1
           AND status IN ('pending','partial')
           AND date_trunc('month', due_date)::date >= date_trunc('month', $2::date)::date
@@ -3186,8 +3419,8 @@ async function attachBillToOpenInvoice(
       [args.leaseId, held.billing_cycle_month])
     if (!inv) return
 
-    const wt = await q1<{ covered_charges: string[] | null }>(
-      `SELECT covered_charges FROM work_trade_agreements
+    const wt = await q1<{ id: string; covered_charges: string[] | null }>(
+      `SELECT id, covered_charges FROM work_trade_agreements
         WHERE unit_id = $1 AND tenant_id = $2 AND status = 'active'
           AND start_date <= $3::date AND (end_date IS NULL OR end_date >= $3::date)
         LIMIT 1`,
@@ -3208,28 +3441,52 @@ async function attachBillToOpenInvoice(
     const pay = await q1<{ id: string }>(
       `INSERT INTO payments (
          invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-         type, amount, status, due_date, entry_description, notes,
-         work_trade_suspended_at
-       ) VALUES ($1,$2,$3,$4,$5,'utility',$6,'pending',$7,'UTILITY',$8,$9)
+         type, amount, status, due_date, entry_description, notes
+       ) VALUES ($1,$2,$3,$4,$5,'utility',$6,'pending',$7,'UTILITY',$8)
        RETURNING id`,
       [inv.id, args.unitId, args.leaseId, args.tenantId, args.landlordId,
-       amount.toFixed(2), inv.due_date,
-       covered ? `${label} — work trade, suspended until month close` : label,
-       covered ? new Date().toISOString() : null])
+       amount.toFixed(2), inv.due_date, label])
     if (!pay) return
 
     await q(`UPDATE utility_bills
                 SET payment_id = $1, status = 'billed', billed_at = NOW(), updated_at = NOW()
               WHERE id = $2`, [pay.id, billId])
 
+    // 10/12 (Nic, Curtis Clabough): a covered share is brought under its
+    // month the way a coverage change brings a line (services/workTradeCoverage
+    // bringLinesUnderTrade). It used to be parked with the month's covered
+    // amount left as it was; the close credits only that amount and then lifts
+    // every suspension on the bill, so the covered water came back as money
+    // owed at every close. Not yet credited: parked, and the month re-priced
+    // over everything parked. Already credited: the hours applied pay it down.
+    // A bill with no work-trade month to settle it (or one billed in cash) parks
+    // it as before.
+    let owed = amount
+    if (covered && wt) {
+      const { bringLinesUnderTrade } = await import('./workTradeCoverage')
+      const r = await bringLinesUnderTrade(run as any, wt.id, inv.id, [{
+        id: pay.id, invoice_id: inv.id, amount, type: 'utility', tenant_id: args.tenantId, due_date: inv.due_date,
+      }])
+      if (r.outcome === 'not_reached') {
+        await q(`UPDATE payments SET work_trade_suspended_at = NOW(), notes = $2 WHERE id = $1`,
+          [pay.id, `${label} — work trade, suspended until month close`])
+        owed = 0
+      } else {
+        const line = await q1<{ amount: string; suspended: boolean }>(
+          `SELECT amount::text AS amount, work_trade_suspended_at IS NOT NULL AS suspended FROM payments WHERE id = $1`, [pay.id])
+        owed = !line || line.suspended ? 0 : Number(line.amount)
+      }
+    }
+
     // A suspended line was never money owed, so it moves the utilities
     // subtotal but not the total — the same split the move-in bundle uses.
+    // What the hours already applied paid off is not owed either.
     await q(`UPDATE invoices
                 SET subtotal_utilities = subtotal_utilities + $2,
                     total_amount = total_amount + $3,
                     updated_at = NOW()
               WHERE id = $1`,
-      [inv.id, amount.toFixed(2), covered ? '0.00' : amount.toFixed(2)])
+      [inv.id, amount.toFixed(2), owed.toFixed(2)])
 
     logger.info({ billId, invoiceId: inv.id, amount, covered },
       'utility billing: released share attached to the open invoice')
@@ -3270,7 +3527,7 @@ export async function attachStrandedUtilityBill(billId: string): Promise<boolean
   await attachBillToOpenInvoice(billId, bill, {
     unitId: bill.unit_id, leaseId: bill.lease_id,
     tenantId: bill.tenant_id, landlordId: bill.landlord_id,
-  }, query, queryOne)
+  }, query, queryOne, db)
   const after = await queryOne<{ payment_id: string | null }>(
     `SELECT payment_id FROM utility_bills WHERE id = $1`, [billId])
   return !before?.payment_id && !!after?.payment_id

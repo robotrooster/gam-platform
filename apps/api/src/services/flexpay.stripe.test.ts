@@ -764,6 +764,28 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect((await advanceOf(b.tenantId))).toHaveLength(1)
   })
 
+  // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." The
+  // late-fee engine fines a lease with no grace of its own on the park's
+  // grace, so the cover has to land by that grace's last day — lease-else-5
+  // paid a 3-day park's bill two days after its late fee.
+  it('a lease with no grace is covered on the property\'s last grace day; a lease grace still wins', async () => {
+    await enablePlatform()
+    const a = await seedHousehold({ graceDays: null })
+    const b = await seedHousehold({ graceDays: 5 })
+    await db.query(`UPDATE properties SET late_fee_grace_days = 3 WHERE id = ANY($1::uuid[])`,
+      [[a.propertyId, b.propertyId]])
+    // Oct 2, 3 am Phoenix: inside the park's 3 days (the 1st to the 3rd).
+    expect((await coverFlexPayCycle(new Date('2026-10-02T10:00:00Z'))).candidates_scanned).toBe(0)
+    // Oct 3, 3 am Phoenix: the park's last grace day — a is paid, on time; b's
+    // own 5 days run to the 5th, so it waits.
+    const r = await coverFlexPayCycle(new Date('2026-10-03T10:00:00Z'))
+    expect(r).toMatchObject({ candidates_scanned: 1, bills_covered: 1 })
+    expect((await payment(a.rentId)).notes).toBe('Paid on time')
+    expect(await advanceOf(b.tenantId)).toHaveLength(0)
+    expect((await coverFlexPayCycle(COVER_NOW)).bills_covered).toBe(1)
+    expect(await advanceOf(b.tenantId)).toHaveLength(1)
+  })
+
   it('a re-run the same day is a no-op', async () => {
     await enablePlatform()
     const h = await seedHousehold()

@@ -1337,6 +1337,21 @@ async function seedCompletedTransaction(
 }
 
 describe('POST /api/pos/transactions/:id/refund', () => {
+  // 10/12 (Nic, ledger P1): the refund row keeps the tax it gave back.
+  it('a refund of half a taxed sale stores the tax it gave back', async () => {
+    const f = await seedPosFixture()
+    const txId = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status)
+       VALUES ($1, $2, 'cash', 100, 8, 108, 'completed') RETURNING id`, [f.landlordId, f.landlordUserId])).rows[0].id
+    const res = await request(buildApp())
+      .post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 54, refundMethod: 'cash' })
+    expect(res.status).toBe(200)
+    const ref = await db.query<{ tax_refunded: string }>(`SELECT tax_refunded FROM pos_refunds WHERE transaction_id = $1`, [txId])
+    expect(Number(ref.rows[0].tax_refunded)).toBe(4)
+  })
+
   it('cash sale refund (no method passed): defaults to cash, status → refunded', async () => {
     const f = await seedPosFixture()
     const txId = await seedCompletedTransaction(f, { paymentMethod: 'cash', total: 25 })
@@ -1623,10 +1638,12 @@ describe('POST /api/pos/transactions/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ reason: 'rung up wrong' })
     expect(res.status).toBe(200)
-    const tx = await db.query<{ status: string; void_reason: string }>(
-      `SELECT status, void_reason FROM pos_transactions WHERE id = $1`, [txId])
+    const tx = await db.query<{ status: string; void_reason: string; voided: boolean }>(
+      `SELECT status, void_reason, voided_at IS NOT NULL AS voided FROM pos_transactions WHERE id = $1`, [txId])
     expect(tx.rows[0].status).toBe('voided')
     expect(tx.rows[0].void_reason).toBe('rung up wrong')
+    // 10/12 (Nic, ledger P1): the moment, not only the reason.
+    expect(tx.rows[0].voided).toBe(true)
   })
 
   it('cannot void an already-refunded transaction → 400', async () => {

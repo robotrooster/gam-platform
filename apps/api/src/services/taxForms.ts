@@ -15,6 +15,7 @@
  */
 
 import { query } from '../db'
+import { form1099NecThreshold, FORM_1099_NOT_REPORTED_PAYMENT_METHODS } from '@gam/shared'
 
 export interface TaxFormDeadline {
   state_code:     string
@@ -40,7 +41,7 @@ interface LandlordContext {
  * Pull the landlord's context — employees, 1099 contractors, and
  * property states — to determine which catalog rows apply.
  */
-async function getLandlordContext(landlordId: string): Promise<LandlordContext> {
+async function getLandlordContext(landlordId: string, year: number): Promise<LandlordContext> {
   const ctx = await query<{
     has_employees:        boolean
     has_contractors:      boolean
@@ -51,9 +52,18 @@ async function getLandlordContext(landlordId: string): Promise<LandlordContext> 
          SELECT 1 FROM books_employees
           WHERE landlord_id = $1 AND status = 'active'
        ) AS has_employees,
+       -- 10/12 (Nic): a vendor with the 1099 box paid at least the year's
+       -- 1099-NEC threshold in the tax year (its payments, card payments left
+       -- out — the card company reports those; services/booksVendorsLoans).
+       -- It read books_contractors.ytd_paid, a running number nothing added to.
        EXISTS (
-         SELECT 1 FROM books_contractors
-          WHERE landlord_id = $1 AND ytd_paid >= 600
+         SELECT 1 FROM books_vendors v
+          WHERE v.landlord_id = $1 AND v.is_1099
+            AND (SELECT COALESCE(sum(p.amount), 0)
+                   FROM landlord_expense_payments p JOIN landlord_expenses e ON e.id = p.expense_id
+                  WHERE e.vendor_id = v.id AND e.status = 'active' AND p.voided_at IS NULL
+                    AND NOT (p.method = ANY($4::text[]))
+                    AND p.paid_on >= make_date($2::int, 1, 1) AND p.paid_on < make_date($2::int + 1, 1, 1)) >= $3::numeric
        ) AS has_contractors,
        (
          SELECT ARRAY_AGG(DISTINCT state)
@@ -61,7 +71,7 @@ async function getLandlordContext(landlordId: string): Promise<LandlordContext> 
           WHERE landlord_id = $1
             AND state IS NOT NULL
        ) AS property_states`,
-    [landlordId],
+    [landlordId, year, form1099NecThreshold(year), [...FORM_1099_NOT_REPORTED_PAYMENT_METHODS]],
   )
 
   const row = ctx[0]
@@ -81,7 +91,7 @@ export async function getApplicableTaxForms(
   landlordId: string,
   year: number,
 ): Promise<TaxFormDeadline[]> {
-  const ctx = await getLandlordContext(landlordId)
+  const ctx = await getLandlordContext(landlordId, year)
 
   // Build the applies_to filter list based on landlord context.
   const appliesFilters: string[] = ['all_landlords']

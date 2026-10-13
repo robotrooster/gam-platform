@@ -382,6 +382,9 @@ export async function sendPendingInvoiceNotices(
             AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
             -- a disputed original: its reopened row is the line that is owed
             AND p.status <> 'returned'
+            -- 10/12: a voided line (decisions #48.5) is owed by nobody — a
+            -- record kept on the bill, never a line the tenant is sent
+            AND p.status <> 'voided'
           ORDER BY CASE p.type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, p.created_at`,
         [inv.id])
       // S654 (Nic): "Work trade people are on work trade. There's no bills going

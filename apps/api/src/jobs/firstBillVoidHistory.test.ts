@@ -67,9 +67,11 @@ describe('late-fee job: a voided earlier invoice is not a prior bill', () => {
   /** A pending rent invoice 10 days past due, well beyond the 3-day grace. */
   async function overdueBill(r: Resident): Promise<string> {
     const { rows: [inv] } = await db.query<{ id: string }>(
+      // 10/12 (Nic): written before it came due, as the monthly run writes it
+      // (a bill written after its due date counts from the day it was written).
       `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date,
-                             subtotal_rent, total_amount, status)
-       VALUES ($1,$2,$3,$4,(NOW() AT TIME ZONE $5)::date - 10,$6,$6,'pending')
+                             subtotal_rent, total_amount, status, created_at)
+       VALUES ($1,$2,$3,$4,(NOW() AT TIME ZONE $5)::date - 10,$6,$6,'pending', NOW() - interval '13 days')
        RETURNING id`,
       [r.landlordId, r.leaseId, r.unitId, `INV-${Math.random().toString(36).slice(2, 10)}`, TZ, r.rent])
     await db.query(

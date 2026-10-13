@@ -159,11 +159,26 @@ export async function appendEvent(
       `credit_subject:${subjectId}`,
     ])
 
+    // 10/12 (Nic: "one mark per invoice" — corrections must keep the chain
+    // whole): the tip is the chain's END — the newest event no other event of
+    // the subject follows. recorded_at used to default to now(), the
+    // TRANSACTION's start, so every event one transaction appended for a
+    // subject (a settle's rent and utility marks, a correction's new mark and
+    // its withdrawal) shared one recorded_at, and "newest" fell to the random
+    // id: a third append could link to the first instead of the second (a
+    // fork), and verifyChain, walking by (recorded_at, id), read correct
+    // chains as tampered. Production carried both on 10/12 (27 of 114
+    // subjects failed verifyChain, 12 had a fork). New events now get a
+    // recorded_at strictly after the subject's newest (below); a tail of
+    // equal times written before is resolved by the links.
     const tip = await client.query<{ this_hash: Buffer }>(
-      `SELECT this_hash
-         FROM credit_events
-        WHERE subject_id = $1
-        ORDER BY recorded_at DESC, id DESC
+      `SELECT e.this_hash
+         FROM credit_events e
+        WHERE e.subject_id = $1
+          AND e.recorded_at = (SELECT MAX(m.recorded_at) FROM credit_events m WHERE m.subject_id = $1)
+        ORDER BY (NOT EXISTS (SELECT 1 FROM credit_events n
+                               WHERE n.subject_id = $1 AND n.prev_hash = e.this_hash)) DESC,
+                 e.id DESC
         LIMIT 1`,
       [subjectId],
     )
@@ -180,13 +195,19 @@ export async function appendEvent(
       attestationEvidence: evidence,
     })
 
+    // recorded_at: the clock now, and always after the subject's newest event
+    // (10/12, above) — append order IS (recorded_at, id) order, for
+    // verifyChain, the score replay and the Merkle anchor alike. Not hashed.
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO credit_events (
          subject_id, event_type, event_data, occurred_at,
          attestation_source, attestation_evidence,
          dimension_tags, network_visibility,
-         prev_hash, this_hash
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         prev_hash, this_hash, recorded_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                 GREATEST(clock_timestamp(),
+                          COALESCE((SELECT MAX(m.recorded_at) FROM credit_events m WHERE m.subject_id = $1)
+                                   + interval '1 microsecond', clock_timestamp())))
        RETURNING id`,
       [
         subjectId,
@@ -258,56 +279,52 @@ export interface VerifyChainResult {
 }
 
 /**
- * Walk a subject's chain in recorded_at order, recomputing each hash
- * from its persisted prev_hash + payload, and comparing to the
- * persisted this_hash. Returns ok=true only if every event verifies
- * AND the chain is unbroken (event N's prev_hash equals event N-1's
- * this_hash).
+ * Walk a subject's chain in append order (by its links, 10/12), recomputing
+ * each hash from its persisted prev_hash + payload, and comparing to the
+ * persisted this_hash. Returns ok=true only if every event verifies AND the
+ * chain is unbroken: one first event, each later event's prev_hash equal to
+ * the this_hash of the event before it, no event left off the path, no fork.
  */
 export async function verifyChain(subjectId: string): Promise<VerifyChainResult> {
   const events = await getSubjectChain(subjectId)
   if (events.length === 0) return { ok: true, eventCount: 0 }
+  const bad = (id: string, reason: string): VerifyChainResult =>
+    ({ ok: false, eventCount: events.length, firstBadEventId: id, reason })
 
-  let expectedPrev: Buffer | null = null
-  for (const ev of events) {
-    if (expectedPrev === null && ev.prev_hash !== null) {
-      return {
-        ok: false,
-        eventCount: events.length,
-        firstBadEventId: ev.id,
-        reason: 'first event has non-null prev_hash',
-      }
-    }
-    if (expectedPrev !== null) {
-      if (ev.prev_hash === null || !ev.prev_hash.equals(expectedPrev)) {
-        return {
-          ok: false,
-          eventCount: events.length,
-          firstBadEventId: ev.id,
-          reason: 'prev_hash does not match prior event this_hash',
-        }
-      }
-    }
-
-    const recomputed = computeEventHash({
-      prevHash: ev.prev_hash,
-      eventData: ev.event_data,
-      occurredAt: new Date(ev.occurred_at),
-      attestationSource: ev.attestation_source,
-      attestationEvidence: ev.attestation_evidence,
-    })
-    if (!recomputed.equals(ev.this_hash)) {
-      return {
-        ok: false,
-        eventCount: events.length,
-        firstBadEventId: ev.id,
-        reason: 'this_hash does not match recomputed digest',
-      }
-    }
-
-    expectedPrev = ev.this_hash
+  // 10/12: walked by the LINKS (each event's prev_hash names the one before
+  // it), from the one event with no predecessor. Events one transaction
+  // appended before 10/12 share a recorded_at, so (recorded_at, id) order is
+  // not append order for them (appendEvent); the links are. Every event must
+  // be on the one path: an event no path reaches has a prev_hash that matches
+  // no event before it; two events after the same one are a fork.
+  const roots = events.filter((e) => e.prev_hash === null)
+  if (roots.length === 0) return bad(events[0].id, 'first event has non-null prev_hash')
+  if (roots.length > 1) return bad(roots[1].id, 'prev_hash does not match prior event this_hash')
+  const after = new Map<string, ChainEventRow[]>()
+  for (const e of events) {
+    if (!e.prev_hash) continue
+    const k = e.prev_hash.toString('hex')
+    after.set(k, [...(after.get(k) ?? []), e])
   }
-
+  const seen = new Set<string>()
+  let cur: ChainEventRow | undefined = roots[0]
+  while (cur) {
+    const recomputed = computeEventHash({
+      prevHash: cur.prev_hash,
+      eventData: cur.event_data,
+      occurredAt: new Date(cur.occurred_at),
+      attestationSource: cur.attestation_source,
+      attestationEvidence: cur.attestation_evidence,
+    })
+    if (!recomputed.equals(cur.this_hash)) return bad(cur.id, 'this_hash does not match recomputed digest')
+    seen.add(cur.id)
+    const next: ChainEventRow[] = after.get(cur.this_hash.toString('hex')) ?? []
+    if (next.length > 1) return bad(next[1].id, 'prev_hash does not match prior event this_hash (two events follow the same event: a fork)')
+    cur = next[0]
+    if (cur && seen.has(cur.id)) return bad(cur.id, 'prev_hash does not match prior event this_hash (a loop)')
+  }
+  const stray = events.find((e) => !seen.has(e.id))
+  if (stray) return bad(stray.id, 'prev_hash does not match prior event this_hash')
   return { ok: true, eventCount: events.length }
 }
 
@@ -369,20 +386,29 @@ export async function computeMerkleRoot(): Promise<MerkleRootResult> {
  *
  * The chain hash invariant is preserved — superseded_by is metadata,
  * not part of the hashed payload.
+ *
+ * 10/12 (review): only a LIVE event is superseded. An event already
+ * superseded keeps the link it has — overwriting it rewrote which mark
+ * replaced it (a dispute resolved after the bill was re-judged turned a
+ * 'bill_status_changed' link into a dispute correction and left the bill with
+ * two live marks). Returns whether the event was superseded now; false: it
+ * was not live (or does not exist) and nothing changed — the caller decides
+ * whether that is an error.
  */
 export async function supersedeEvent(
   client: PoolClient,
   originalEventId: string,
   correctedEventId: string,
   reason: CreditSupersedeReason,
-): Promise<void> {
-  await client.query(
+): Promise<boolean> {
+  const r = await client.query(
     `UPDATE credit_events
         SET superseded_by = $2,
             superseded_reason = $3
-      WHERE id = $1`,
+      WHERE id = $1 AND superseded_by IS NULL`,
     [originalEventId, correctedEventId, reason],
   )
+  return (r.rowCount ?? 0) > 0
 }
 
 /**

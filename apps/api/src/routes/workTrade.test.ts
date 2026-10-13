@@ -56,6 +56,7 @@ function buildApp() {
   return app
 }
 
+// 10/12: the work-trade extra-hours columns/table, until they reach schema.sql.
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_workTrade'

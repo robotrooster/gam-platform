@@ -46,6 +46,7 @@ import { generateMoveInInvoice } from '../jobs/moveInBundle'
 import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { PM_PAYOUT_USER_SQL, noPmRecipientMessage } from '../services/pmPayoutRecipient'
 import { stampPdf } from '../services/pdfStamp'
 import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../services/lateFeePolicy'
 import { suggestUnitPrefill } from '../services/leasePrefill'
@@ -1328,7 +1329,7 @@ async function postLeasingFeeIfApplicable(client: any, leaseId: string, unitId: 
     SELECT p.id AS property_id,
            p.pm_company_id, p.pm_fee_plan_id,
            c.bank_account_id AS pm_bank_account_id,
-           ba.user_id AS pm_payout_user_id,
+           ${PM_PAYOUT_USER_SQL} AS pm_payout_user_id,
            fp.leasing_fee_amount
       FROM units u
       JOIN properties p ON p.id = u.property_id
@@ -1340,9 +1341,12 @@ async function postLeasingFeeIfApplicable(client: any, leaseId: string, unitId: 
   const row = r.rows[0]
   if (!row.pm_company_id || !row.pm_fee_plan_id) return
   if (row.leasing_fee_amount === null || parseFloat(row.leasing_fee_amount) <= 0) return
+  // 10/12 (Nic): a legacy catalog bank is no longer required — the fee is
+  // booked to the company's active owner and paid to its Stripe Connect
+  // account (services/pmPayoutRecipient.ts). Only a company with neither
+  // has nobody to book it to.
   if (!row.pm_payout_user_id) {
-    throw new AppError(409,
-      `PM company ${row.pm_company_id} has no bank routing — cannot post leasing fee.`)
+    throw new AppError(409, noPmRecipientMessage(row.pm_company_id))
   }
 
   const amount = round2Esign(parseFloat(row.leasing_fee_amount))
@@ -1866,7 +1870,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
               SET total_amount = total_amount + $2::numeric,
                   status = CASE WHEN status = 'funded' THEN 'partial' ELSE status END,
                   updated_at = NOW()
-            WHERE lease_id = $1 AND flex_deposit_enabled = FALSE`,
+            WHERE lease_id = $1 AND flex_deposit_enabled = FALSE AND status <> 'voided'`,
           [doc.renews_lease_id, delta.toFixed(2)],
         )
       }
@@ -2042,7 +2046,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       // check-then-act rather than an upsert. Safe: buildLeaseFromDocument runs
       // inside one transaction holding an advisory lock on this document.
       const existingDep = await client.query(
-        `SELECT id FROM security_deposits WHERE lease_id = $1 LIMIT 1`, [lease.id])
+        `SELECT id FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1`, [lease.id])
       if (existingDep.rows[0]) {
         await client.query(
           `UPDATE security_deposits

@@ -1157,6 +1157,38 @@ describe('what is never income', () => {
     expect(t.total).toBe(0)
     expect(t.beside.depositsHeld).toBe(500)
   })
+
+  // 10/11 (Nic): an owner putting their own money in is not income, and the
+  // proceeds of selling an asset are not operating income. Filed off the bank
+  // like laundry money, but beside the total, each on its own line.
+  it('a bank deposit filed as an owner contribution or sale proceeds is beside the total, never income', async () => {
+    const w = await world()
+    await db.query(
+      `INSERT INTO landlord_other_income (landlord_id, property_id, category, amount, income_date)
+       VALUES ($1,$2,'laundry',25,'2026-09-07'), ($1,$2,'owner_contribution',5000,'2026-09-08'),
+              ($1,$2,'sale_proceeds',12000,'2026-09-09')`,
+      [w.landlordId, w.propertyId])
+    for (const basis of ['received', 'billed'] as const) {
+      const t = await tot(w, basis, '2026-09-01', '2026-09-30')
+      expect(t.total).toBe(25)
+      expect(t.lines.otherIncome).toBe(25)
+      expect(t.beside.ownerContributions).toBe(5000)
+      expect(t.beside.saleProceeds).toBe(12000)
+      const cats = await categoryTotals({ landlordIds: [w.landlordId], start: '2026-09-01', end: '2026-09-30', basis })
+      expect(cats.total).toBe(25)
+      expect(cats.categories.find(c => c.category === 'other_income')?.amount).toBe(25)
+      const pl = await computeLandlordPL(w.landlordId, '2026-09-01', '2026-09-30', ['2026-09-01'], basis)
+      expect(pl.gross.total).toBe(25)
+      expect(pl.gross.otherIncome).toBe(25)
+      expect(pl.besideItems).toEqual(expect.arrayContaining([
+        { key: 'ownerContributions', label: 'Owner contributions', amount: 5000 },
+        { key: 'saleProceeds', label: 'Sale proceeds', amount: 12000 },
+      ]))
+    }
+    // A voided filing is gone from both.
+    await db.query(`UPDATE landlord_other_income SET status = 'voided', voided_at = now() WHERE category = 'owner_contribution'`)
+    expect((await tot(w, 'received', '2026-09-01', '2026-09-30')).beside.ownerContributions).toBe(0)
+  })
 })
 
 describe('still clearing is one figure under both bases', () => {

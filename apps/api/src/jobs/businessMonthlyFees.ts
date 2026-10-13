@@ -88,6 +88,7 @@ export async function processBusinessMonthlyFees(now: Date = new Date()): Promis
       if (await heldForBusiness(p.business_id) >= Number(p.amount)) {
         const netted = await recordHeldItem({
           businessId: p.business_id, sourceType: 'platform_fee', sourceId: `accrual:${p.id}`,
+          property: { propertyId: null },  // 10/12 (Nic, ledger P1): a business's line is company-level
           amount: -Number(p.amount), description: 'GAM invoicing fee',
         })
         if (netted) {

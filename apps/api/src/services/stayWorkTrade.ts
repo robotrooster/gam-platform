@@ -261,6 +261,17 @@ export async function syncStayWorkTrade(bookingId: string, opts: {
       [existing.id, b.unit_id, b.check_in, b.check_out,
        t ? [...t.coveredCharges] : null, t ? t.tracksHours : null, t ? t.trusted : null,
        t?.hoursTarget ?? null, !!t, t?.duties ?? null])
+    // 10/12 (Nic): a change of what the trade covers reaches the stay's bills
+    // already out, as it does from the Work Trade page — a type ticked brings
+    // its open charges under the trade. A type unticked keeps its parked
+    // charges covered: the reservation form asks no question, and putting
+    // charges back on someone's balance is a choice made on the Work Trade page.
+    if (t) {
+      const { applyCoverageChange } = await import('./workTradeCoverage')
+      await applyCoverageChange(run, {
+        agreementId: existing.id, from: existing.covered_charges, to: t.coveredCharges, removal: 'keep_covered',
+      })
+    }
     return { action: 'updated', agreementId: existing.id }
   }
   if (!opts.terms || over) return { action: 'none' }

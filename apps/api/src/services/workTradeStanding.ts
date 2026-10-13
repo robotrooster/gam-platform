@@ -58,6 +58,56 @@ export interface WorkTradeStanding {
   nextBillingMonth: string | null
   /** One sentence for the invoice. Never a raw enum, never bare numbers. */
   summary: string
+  /**
+   * 10/12 (Nic): hours worked beyond what a month and any carried shortfall
+   * needed — banked or paid, per the agreement. Filled by loadWorkTradeStanding.
+   */
+  extraHours?: ExtraHoursStanding
+}
+
+/** One month's extra hours, as a close recorded them. */
+export interface ExtraHoursEntry {
+  periodMonth: string
+  hours: number
+  /** banked — toward future months; paid — paid separately by the landlord. */
+  how: 'banked' | 'paid'
+  /**
+   * PAID extra hours only. Nic, 10/12: the tenant sees the rate and amount for
+   * paid EXTRA hours ("6 extra hours × $15 = $90"). Banked hours never carry a
+   * dollar figure, and neither do the trade hours (S643).
+   */
+  rate: number | null
+  amount: number | null
+  /** PAID extra hours only: unpaid, sent_to_books or paid. */
+  status: string | null
+}
+
+export interface ExtraHoursStanding {
+  /** What this agreement does with extra hours now. */
+  mode: 'bank' | 'pay'
+  /** Newest first — the last six closes that recorded any. */
+  recent: ExtraHoursEntry[]
+  /** The newest entry as one sentence, or null when there is none. */
+  summary: string | null
+}
+
+function monthName(periodMonth: string): string {
+  return DateTime.fromISO(periodMonth).toFormat('LLLL')
+}
+
+const money = (n: number) => `$${n.toFixed(2)}`
+
+/**
+ * "6 extra hours in September — banked" / "6 extra hours in September × $15.00
+ * = $90.00 — paid separately by your landlord". The PAID wording names a rate
+ * because those hours are wages; it is the only place a work-trade hour is
+ * ever priced for the tenant, and it prices only hours beyond the trade.
+ */
+export function extraHoursSentence(e: ExtraHoursEntry): string {
+  const n = Number.isInteger(e.hours) ? String(e.hours) : e.hours.toFixed(2).replace(/0$/, '')
+  const h = `${n} extra ${e.hours === 1 ? 'hour' : 'hours'} in ${monthName(e.periodMonth)}`
+  if (e.how === 'banked' || e.rate == null || e.amount == null) return `${h} — banked toward future months`
+  return `${h} × ${money(e.rate)} = ${money(e.amount)} — paid separately by your landlord`
 }
 
 /** Days in the month a period-month string names. */
@@ -192,7 +242,7 @@ export async function loadWorkTradeStanding(
     }))
     .filter(c => c.hoursOutstanding > 0)
 
-  return workTradeStanding({
+  const standing = workTradeStanding({
     currentMonth: month,
     currentMonthTarget: current ? Number(current.target_hours) : 0,
     currentMonthApplied: current ? Number(current.hours_applied) : 0,
@@ -200,4 +250,67 @@ export async function loadWorkTradeStanding(
     bankedHours: Number(ag.banked_hours),
     audience,
   })
+  return { ...standing, extraHours: await loadExtraHours(agreementId) }
+}
+
+/**
+ * 10/12: the extra hours the month closes recorded for this agreement — banked
+ * (hours only) and paid (hours, rate, amount). The same for both audiences: the
+ * rate shown is the one the landlord pays for EXTRA hours, never what a trade
+ * hour is worth, and banked entries carry no money at all.
+ */
+export async function loadExtraHours(agreementId: string): Promise<ExtraHoursStanding> {
+  // A database without the extra-hours migrations has never banked or paid an
+  // extra hour: say so, rather than fail the standing (the /standing route and
+  // both agents' tools read this).
+  if (!(await extraHoursSchemaReady())) return { mode: 'bank', recent: [], summary: null }
+  const ag = await queryOne<{ mode: string | null; tracks_hours: boolean }>(
+    `SELECT extra_hours_mode AS mode, tracks_hours FROM work_trade_agreements WHERE id = $1`, [agreementId])
+  const banked = await query<{ period_month: string; hours: number }>(
+    `SELECT to_char(period_month,'YYYY-MM-DD') AS period_month, extra_hours_banked::float AS hours
+       FROM work_trade_settlements
+      WHERE agreement_id = $1 AND extra_hours_banked > 0
+      ORDER BY period_start DESC LIMIT 6`, [agreementId])
+  const paid = await query<{ period_month: string; hours: number; rate: number; amount: number; status: string }>(
+    `SELECT to_char(period_month,'YYYY-MM-DD') AS period_month, hours::float AS hours,
+            rate::float AS rate, amount::float AS amount, status
+       FROM work_trade_extra_hours
+      WHERE agreement_id = $1
+      ORDER BY period_start DESC, created_at DESC LIMIT 6`, [agreementId])
+  const recent: ExtraHoursEntry[] = [
+    ...banked.map(b => ({ periodMonth: b.period_month, hours: round2h(Number(b.hours)), how: 'banked' as const,
+                          rate: null, amount: null, status: null })),
+    ...paid.map(p => ({ periodMonth: p.period_month, hours: round2h(Number(p.hours)), how: 'paid' as const,
+                        rate: round2(Number(p.rate)), amount: round2(Number(p.amount)), status: p.status })),
+  ].sort((a, b) => b.periodMonth.localeCompare(a.periodMonth)).slice(0, 6)
+  return {
+    mode: ag?.mode === 'pay' && ag.tracks_hours !== false ? 'pay' : 'bank',
+    recent,
+    summary: recent.length ? extraHoursSentence(recent[0]) : null,
+  }
+}
+
+let extraHoursSchemaSeen = false
+
+/**
+ * 10/12: are the three extra-hours migrations (20261012180000–180200) applied?
+ * Migrations reach the live database before the code that needs them
+ * (expand, then contract), but a month close and the standing must never stop
+ * over a setting if they have not: the close then banks as it always did and
+ * writes no extra-hours record, and the standing reports none. Read from the
+ * catalog; a yes is remembered (a schema does not lose them), a no is asked
+ * again next time.
+ */
+export async function extraHoursSchemaReady(q: { query: Function } = { query }): Promise<boolean> {
+  if (extraHoursSchemaSeen) return true
+  const out = await q.query(
+    `SELECT (SELECT COUNT(*) FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND ((table_name = 'work_trade_agreements'
+                      AND column_name IN ('extra_hours_mode', 'extra_hours_rate', 'extra_hours_pay_method'))
+                  OR (table_name = 'work_trade_settlements' AND column_name = 'extra_hours_banked'))) = 4
+            AND to_regclass('public.work_trade_extra_hours') IS NOT NULL AS ready`, [])
+  const rows = Array.isArray(out) ? out : out?.rows ?? []
+  extraHoursSchemaSeen = rows[0]?.ready === true
+  return extraHoursSchemaSeen
 }

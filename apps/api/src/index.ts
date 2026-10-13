@@ -111,6 +111,10 @@ import { tenantCreditsRouter }  from './routes/tenantCredits'
 import { propertyTaxRouter } from './routes/propertyTax'
 import { realEstateLawRouter } from './routes/realEstateLaw'
 import { booksRouter } from './routes/books'
+// 10/12 (Nic): the company's books settings and opening balances (landlord's choice each).
+import { booksSettingsRouter } from './routes/booksSettings'
+// 10/12 (Nic, ledger P9): close a month, reconcile a bank account on the ledger.
+import { booksCloseRouter, booksReconcileRouter } from './routes/booksClose'
 import { scopesRouter, invitationsRouter } from './routes/scopes'
 import { pmRouter } from './routes/pm'
 import { creditRouter }       from './routes/credit'
@@ -123,6 +127,8 @@ import { entryRequestsRouter } from './routes/entryRequests'
 import { notificationsRouter } from './routes/notifications'
 import { bankAccountsRouter } from './routes/bankAccounts'
 import { adminBankAccountsRouter } from './routes/admin/bankAccounts'
+// 10/12 (Nic): GAM Books ledger, the admin's read-only view (the ledger is dark).
+import { adminLedgerRouter } from './routes/admin/ledger'
 import { financesRouter }      from './routes/finances'
 import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
@@ -457,8 +463,12 @@ app.use('/api/real-estate-law', realEstateLawRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/bank-accounts',  bankAccountsRouter)
+app.use('/api/admin',          adminLedgerRouter)
 app.use('/api/admin',          adminBankAccountsRouter)
 app.use('/api/users',          financesRouter)
+app.use('/api/books/setup',    booksSettingsRouter)   // ahead of the Books router: it answers /setup itself
+app.use('/api/books/close',    booksCloseRouter)      // ahead of the Books router: 10/12 (Nic, P9) close a month
+app.use('/api/books/reconcile', booksReconcileRouter) // ahead of the Books router: 10/12 (Nic, P9) reconcile on the ledger
 app.use('/api/books',          booksRouter)
 app.use('/api/renter-pool',    renterPoolRouter)
 app.use('/api/scopes',         scopesRouter)

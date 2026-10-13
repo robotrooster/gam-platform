@@ -203,6 +203,78 @@ describe('GET /master-bills', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(res.status).toBe(403)
   })
+
+  // 10/12: a voided bill recovered nothing. One voided out of its slot (a
+  // tenancy that never happened — its usage goes back on hold and is billed
+  // to whoever is next) used to count beside the next tenant's bill for the
+  // same usage, and a voided estimate counted as recovered.
+  it('counts only bills that stand — never a voided-out bill or a void marker', async () => {
+    const f = await seed()
+    const master = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const c = await db.connect()
+    try {
+      const unit2 = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
+      await c.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, bill_amount)
+         VALUES ($1, '2026-08-31', 3990, '2026-08-01', $2, 74.79)`,
+        [master, f.landlordAUserId])
+      const bill = (unitId: string, amount: number, status: string, voided: boolean) => c.query(
+        `INSERT INTO utility_bills (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+                                    charge_amount, status, utility_type, voided_at, void_reason)
+         VALUES ($1, $2, $3, $4, $5, '2026-08-01', $6, $7, 'water', $8, $9)`,
+        [master, unitId, f.tenantAId, f.leaseAId, f.landlordAId, amount, status,
+         voided ? new Date() : null, voided ? 'The lease was voided before it was signed' : null])
+      await bill(f.unitAId, 30, 'void', true)        // voided out of its slot
+      await bill(f.unitAId, 40, 'billed', false)     // the next bill for the same usage
+      await bill(unit2, 25, 'void', false)           // a voided estimate (keeps its slot)
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .get(`/api/utility/master-bills?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data[0].recovered_amount)).toBe(40)
+    expect(Number(res.body.data[0].recovered_count)).toBe(1)
+  })
+})
+
+// 10/12 (keep everything): correcting a flagged read drops the stale draft
+// bills built on the old value — never a voided bill, which is kept on record
+// (one voided out of its slot, and a void marker that holds its cycle).
+describe('POST /readings/:id/resolve-review — voided bills are kept', () => {
+  it('a corrected read deletes the stale unbilled bill and leaves every voided one', async () => {
+    const f = await seed()
+    const meter = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    const c = await db.connect()
+    let readingId = '', stale = '', voidedOut = '', marker = ''
+    try {
+      const unit2 = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
+      readingId = (await c.query<{ id: string }>(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, needs_review)
+         VALUES ($1, '2026-08-31', 100, '2026-08-01', $2, TRUE) RETURNING id`,
+        [meter, f.landlordAUserId])).rows[0].id
+      const bill = (unitId: string, status: string, voided: boolean) => c.query<{ id: string }>(
+        `INSERT INTO utility_bills (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+                                    charge_amount, status, utility_type, voided_at, void_reason)
+         VALUES ($1, $2, $3, $4, $5, '2026-08-01', 12.5, $6, 'water', $7, $8) RETURNING id`,
+        [meter, unitId, f.tenantAId, f.leaseAId, f.landlordAId, status,
+         voided ? new Date() : null, voided ? 'The tenant never moved in' : null]).then(r => r.rows[0].id)
+      voidedOut = await bill(f.unitAId, 'void', true)
+      stale = await bill(f.unitAId, 'unbilled', false)
+      marker = await bill(unit2, 'void', false)
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .post(`/api/utility/readings/${readingId}/resolve-review`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ correctedValue: 120 })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const left = (await db.query<{ id: string }>(`SELECT id FROM utility_bills WHERE meter_id = $1`, [meter])).rows.map(r => r.id)
+    expect(left.sort()).toEqual([voidedOut, marker].sort())
+    expect(left).not.toContain(stale)
+  })
 })
 
 describe('GET /bills', () => {

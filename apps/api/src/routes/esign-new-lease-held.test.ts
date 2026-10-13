@@ -80,7 +80,7 @@ import { tenantsRouter } from './tenants'
 import { leasesRouter } from './leases'
 import { errorHandler } from '../middleware/errorHandler'
 import { processNewLeaseSignings } from '../jobs/scheduler'
-import { NEW_LEASE_AFTER_EARLY_END_CANNOT_SIGN, clearNeverOwedOnHeldNewLease } from '../services/renewalSuccessor'
+import { NEW_LEASE_AFTER_EARLY_END_CANNOT_SIGN, NEW_LEASE_NEVER_STARTS_CHARGE_REASON, clearNeverOwedOnHeldNewLease } from '../services/renewalSuccessor'
 import { isoToDocumentDate } from '@gam/shared'
 
 const TZ = 'America/Phoenix'
@@ -245,7 +245,12 @@ describe('a held new lease (money paid on it) takes off what was never owed', ()
     const mine = await api().get('/api/tenants/payments').set('Authorization', `Bearer ${h.tenantToken}`)
     expect(mine.status).toBe(200)
     const onNew = mine.body.data.filter((p: any) => p.lease_id === newLeaseId)
+    // 10/12 (Nic): what was taken off is kept as a voided record (owed by
+    // nobody), never deleted — nothing on the new lease is due. 10/12 (Nic, G9):
+    // the tenant's payments list leaves a voided line out; it stays in the records.
     expect(onNew.map((p: any) => p.status)).toEqual(['settled'])
+    expect((await db.query<any>(`SELECT status FROM payments WHERE lease_id=$1 ORDER BY status`, [newLeaseId])).rows.map((r: any) => r.status))
+      .toEqual(['settled', 'voided'])
     // The landlord is told, in plain words, that nothing unpaid is billed.
     const notes = await heldNotices(h.landlordUserId)
     expect(notes).toHaveLength(1)
@@ -296,7 +301,9 @@ describe('a held new lease (money paid on it) takes off what was never owed', ()
     const billRow = async (id: string) => (await db.query<any>(
       `SELECT lease_id, status, payment_id FROM utility_bills WHERE id=$1`, [id])).rows[0]
     expect(await billRow(unpaidBill)).toEqual({ lease_id: h.leaseId, status: 'unbilled', payment_id: null })
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [unpaidCharge])).rows).toHaveLength(0)
+    // 10/12 (Nic): its charge is voided as a record, never deleted.
+    expect((await db.query(`SELECT status, void_reason FROM payments WHERE id=$1`, [unpaidCharge])).rows)
+      .toEqual([{ status: 'voided', void_reason: NEW_LEASE_NEVER_STARTS_CHARGE_REASON }])
     expect(await billRow(paidBill)).toEqual({ lease_id: newLeaseId, status: 'billed', payment_id: paidCharge })
     // Idempotent.
     expect(await inTxn()).toEqual({ charges: 0, bills: 0, retotaled: 0, utilityBills: 0, kept: 0, keptCharges: [] })

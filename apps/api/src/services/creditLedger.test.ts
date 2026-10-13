@@ -512,6 +512,68 @@ describe('verifyChain', () => {
   })
 })
 
+// 10/12 (Nic: "one mark per invoice" — a correction appends a new mark and
+// supersedes the old in ONE transaction, and the rebuild appends many): events
+// one transaction appended for a subject used to share recorded_at (now(), the
+// transaction's start), so the tip fell to the random id — a third append
+// could fork the chain — and verifyChain, walking by (recorded_at, id), read a
+// correct chain as tampered. Production carried both on 10/12.
+describe('one transaction, many events: one path, in append order (10/12)', () => {
+  const ev = (refId: string, i: number) => ({
+    subjectType: 'tenant' as const, subjectRefId: refId,
+    eventType: 'payment_received_on_time' as const, eventData: { i },
+    occurredAt: new Date('2026-10-12T12:00:00Z'),
+    attestationSource: 'gam_workflow_auto' as const,
+    networkVisibility: 'visible_to_current_landlord' as const,
+  })
+
+  it('each event links to the one before it, recorded strictly later; the chain verifies', async () => {
+    const refId = newRefId()
+    const c = await db.connect()
+    const ids: string[] = []
+    try {
+      await c.query('BEGIN')
+      for (let i = 0; i < 6; i++) ids.push((await appendEvent(ev(refId, i), c)).eventId)
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const sid = (await findSubjectId('tenant', refId))!
+    const chain = await getSubjectChain(sid)
+    expect(chain.map(e => e.id)).toEqual(ids)
+    for (let i = 1; i < chain.length; i++) {
+      expect(chain[i].prev_hash!.equals(chain[i - 1].this_hash)).toBe(true)
+      expect(new Date(chain[i].recorded_at).getTime()).toBeGreaterThanOrEqual(new Date(chain[i - 1].recorded_at).getTime())
+    }
+    expect(await verifyChain(sid)).toEqual({ ok: true, eventCount: 6 })
+  })
+
+  it('a tail of equal times written before 10/12: the next event links to the true end, and the links verify it', async () => {
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    const b = await appendEvent(ev(refId, 2))
+    // As the old default wrote them: one recorded_at for both (id order now decides nothing).
+    await db.query(`UPDATE credit_events SET recorded_at = '2026-10-01T12:00:00Z' WHERE id = ANY($1::uuid[])`, [[a.eventId, b.eventId]])
+    const c = await appendEvent(ev(refId, 3))
+    expect(c.prevHash!.equals(b.thisHash)).toBe(true)
+    expect(await verifyChain(a.subjectId)).toEqual({ ok: true, eventCount: 3 })
+  })
+
+  it('a fork (two events after one) is reported, not read as a path', async () => {
+    const refId = newRefId()
+    const a = await appendEvent(ev(refId, 1))
+    const b = await appendEvent(ev(refId, 2))
+    const c = await appendEvent(ev(refId, 3))
+    // Plant the old bug's fork: c also follows a (its hash recomputed so only the link is wrong).
+    const row = (await db.query<any>(`SELECT event_data, occurred_at, attestation_source, attestation_evidence FROM credit_events WHERE id = $1`, [c.eventId])).rows[0]
+    const forged = computeEventHash({ prevHash: a.thisHash, eventData: row.event_data, occurredAt: new Date(row.occurred_at),
+      attestationSource: row.attestation_source, attestationEvidence: row.attestation_evidence })
+    await db.query(`UPDATE credit_events SET prev_hash = $1, this_hash = $2 WHERE id = $3`, [a.thisHash, forged, c.eventId])
+    const v = await verifyChain(a.subjectId)
+    expect(v.ok).toBe(false)
+    expect(v.reason).toMatch(/prev_hash does not match prior event this_hash \(two events follow the same event: a fork\)/)
+    expect([b.eventId, c.eventId]).toContain(v.firstBadEventId)
+  })
+})
+
 // ─── computeMerkleRoot ─────────────────────────────────────────
 
 describe('computeMerkleRoot', () => {

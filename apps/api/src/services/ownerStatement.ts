@@ -99,12 +99,14 @@
  * is still processing has not paid anybody yet.
  */
 
+// 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
+import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
 import { query } from '../db'
 import { round2 } from './workTradeCredit'
 import { landlordIncomeSql } from './landlordPL'
 import {
   incomeEvents, summarize, moveOutSweepSql, moveOutDeductionsKeptSql, gapChainSql,
-  stayShortenedCtes, reservationPartOfUseSql, disputeFeePropertySql,
+  stayShortenedCtes, reservationPartOfUseSql, disputeFeePropertySql, ledgerOwedDay,
 } from './incomeBasis'
 import { disputeFeeLineSql } from './paymentReversal'
 
@@ -301,7 +303,7 @@ export async function ownerStatement(opts: {
          JOIN properties pr ON pr.id = u.property_id
          LEFT JOIN LATERAL ${moveOutSweepSql('pay')} mo ON TRUE
          LEFT JOIN LATERAL (SELECT sd0.held_by FROM security_deposits sd0
-                             WHERE sd0.lease_id = COALESCE(mo.move_out_lease_id, pay.lease_id)
+                             WHERE sd0.lease_id = COALESCE(mo.move_out_lease_id, pay.lease_id) AND sd0.status <> 'voided'
                              ORDER BY sd0.created_at DESC LIMIT 1) sd ON TRUE
         WHERE pay.status IN ('settled','paid_via_deposit','returned')
           AND (${landlordIncomeSql('pay')}
@@ -383,7 +385,7 @@ export async function ownerStatement(opts: {
                  FROM v_credit_uses v
                 WHERE v.deposit_return_id = dr.id AND v.status = 'applied' AND v.kind = 'paid_ahead') pa
              LEFT JOIN LATERAL (SELECT sd0.held_by FROM security_deposits sd0
-                                 WHERE sd0.lease_id = dr.lease_id
+                                 WHERE sd0.lease_id = dr.lease_id AND sd0.status <> 'voided'
                                  ORDER BY sd0.created_at DESC LIMIT 1) sd ON TRUE
             WHERE dr.landlord_id = $1
               AND dr.finalized_at IS NOT NULL AND dr.status NOT IN ('draft','awaiting_approval')
@@ -601,7 +603,7 @@ export async function ownerStatement(opts: {
        SELECT e.property_id, SUM(e.amount) AS expenses
          FROM landlord_expenses e
          JOIN scope s ON s.id = e.property_id
-        WHERE e.status = 'active' AND e.voided_at IS NULL
+        WHERE ${liveExpenseSql('e')} AND e.voided_at IS NULL
           AND e.expense_date >= $2::date
           AND e.expense_date <  ($2::date + INTERVAL '1 month')
         GROUP BY e.property_id
@@ -641,7 +643,7 @@ export async function ownerStatement(opts: {
        JOIN properties p ON p.id = e.property_id
       WHERE p.landlord_id = $1
         AND ($3::uuid IS NULL OR p.pm_company_id = $3::uuid)
-        AND e.status = 'active' AND e.voided_at IS NULL
+        AND ${liveExpenseSql('e')} AND e.voided_at IS NULL
         AND e.expense_date >= $2::date
         AND e.expense_date <  ($2::date + INTERVAL '1 month')
       ORDER BY e.expense_date, e.created_at`,
@@ -720,6 +722,20 @@ export async function ownerStatement(opts: {
   }
   const billedOf = (events: typeof billedEvents, cover: number): OwnerStatementBilled => {
     const t = summarize(events, 'billed')
+    // 10/12 (Nic, ledger P8): once the books are live — the month's bills
+    // (Charged), what tenants paid against bills in the month, and what they
+    // still owed at the month's end (every bill, design §10). Reservation
+    // money is the books' own posting there, so nothing is taken off.
+    if (events.some(e => e.ledger)) {
+      const owedDay = ledgerOwedDay(events)
+      const sum = (f: (e: (typeof events)[number]) => boolean) => round2(events.filter(f).reduce((x, e) => x + e.amount, 0))
+      return {
+        billed: t.total,
+        collectedSoFar: round2(-sum(e => e.ledger === 'proof' && e.proofTerm === 'received')),
+        clearing: 0,
+        stillOwed: sum(e => e.ledger === 'owed' && e.day === owedDay),
+      }
+    }
     return {
       billed: round2(t.total - cover),
       collectedSoFar: round2(t.beside.collectedSoFar - cover),

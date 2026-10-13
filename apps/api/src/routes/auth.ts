@@ -7,6 +7,7 @@ import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_V
 import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
 import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
 import { requireAuth, forgetSessionCutoff } from '../middleware/auth'
+import { bookkeeperScopesOf } from '../lib/bookkeeperScope'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
          sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
@@ -80,18 +81,17 @@ async function getScopeForUser(userId: string, role: string):
     return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
   }
   if (role === 'bookkeeper') {
-    const r = await queryOne<any>(
-      // 10/11: oldest assignment first, so the company on the pass is the same
-      // one requireAuth falls back to (middleware/auth bookkeeperScopeFor).
-      `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
-        WHERE user_id = $1 ORDER BY created_at, id LIMIT 1`,
-      [userId])
-    // property_ids NULL = the whole company (allProperties); else only these.
+    // 10/11: oldest assignment first, so the company on the pass is the same
+    // one requireAuth falls back to (middleware/auth bookkeeperScopeFor). Their
+    // properties are worked out against what the company owns right now
+    // (lib/bookkeeperScope): allProperties only while every property the
+    // company owns today is ticked; propertyIds = the ticked ones still its own.
+    const [r] = await bookkeeperScopesOf(userId)
     return r ? {
       landlordId: r.landlord_id,
       permissions: { access_level: r.access_level },
-      propertyIds: r.property_ids ?? [],
-      allProperties: r.property_ids == null,
+      propertyIds: r.kept_ids,
+      allProperties: r.covers_all,
     } : null
   }
   return null
@@ -761,9 +761,8 @@ authRouter.post('/login', async (req, res, next) => {
 })
 
 // GET /api/auth/me
-// S67: bank_account_ready is derived from active user_bank_accounts rows
-// (the 16a per-user catalog) rather than landlords.stripe_bank_verified
-// (the pre-16a Stripe Connect flag, slated for deletion).
+// bank_account_ready = the landlord's Stripe Connect payouts are live
+// (10/12 — see the column below; the S67 legacy-catalog derivation is gone).
 // S82: includes landlordId + permissions for worker roles so the
 // landlord-portal nav can perm-filter on page load. Source of truth is
 // the scope table (re-fetched, not cached on the JWT) so toggle changes
@@ -793,15 +792,13 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- GAM can pay you.
          --
          -- The same fix landed on /me/todos in S605 and this endpoint was
-         -- missed. The legacy catalog still counts, for the multi-owner
-         -- allocation-split case that genuinely uses it.
-         (
-           COALESCE(l.connect_payouts_enabled, FALSE)
-           OR EXISTS (
-             SELECT 1 FROM user_bank_accounts ba
-              WHERE ba.user_id = u.id AND ba.status = 'active'
-           )
-         ) AS bank_account_ready,
+         -- missed.
+         --
+         -- 10/12 (Nic): ONLY Connect. A row in the legacy bank catalog used to
+         -- count as ready too — the old Add Bank Account form, which never set
+         -- up payouts (Country Acres typed a bank in on 10/5 and waited for
+         -- microdeposits that could never come). That form is removed.
+         COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready,
          -- Gates the "Lot Rent & Net" nav item. Owner landlords only; l.id is
          -- NULL for non-landlord roles so the flag is false for them.
          --

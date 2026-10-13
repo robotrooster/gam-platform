@@ -51,6 +51,37 @@ export async function cleanupAllSchema(): Promise<void> {
   // The deposit-slip tables FK remittances, register sales and bank rows; the
   // items reference the slips, so both go in one TRUNCATE.
   await db.query(`TRUNCATE credit_uses`)
+  // 10/12 (Nic, ledger P9): a bank reconciliation's cleared lines name the
+  // ledger lines (RESTRICT) and are never deleted (a trigger refuses it), and a
+  // ledger reconciliation is never deleted either — TRUNCATE fires no row
+  // trigger, and both go before the bank lines and the ledger they name. Guarded: migration 20261014230000.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.bank_reconciliation_items') IS NOT NULL THEN
+      TRUNCATE bank_reconciliation_items, bank_reconciliations;
+    END IF;
+  END $$`)
+  // 10/12 (Nic, ledger P6): the loan register and the fixed assets point at
+  // bank lines, expenses, vendors and properties, and refuse a row DELETE
+  // (never removed) — TRUNCATE fires no row trigger. Nothing references them.
+  // 10/12 review: first — a loan payment matched to a bank line names it, so
+  // the bank lines below could not be removed while it stood.
+  // Guarded: the tables arrive with migrations 20261014190200 / 190300.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.books_loans') IS NOT NULL THEN TRUNCATE books_loan_payments, books_loans; END IF;
+    IF to_regclass('public.books_fixed_assets') IS NOT NULL THEN TRUNCATE books_fixed_assets; END IF;
+  END $$`)
+  // 10/12 (Nic, ledger P6): an expense's payments name the bank lines that
+  // paid them and are never deleted (a trigger refuses it) — TRUNCATE fires no
+  // row trigger; and a money-out bank line matched to a refund check, a
+  // register refund or GAM's debit names that record, so those lines clear
+  // before the records do. Guarded: migrations 20261014180100 / 180200.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.landlord_expense_payments') IS NOT NULL THEN TRUNCATE landlord_expense_payments; END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'bank_transactions' AND column_name = 'matched_kind') THEN
+      DELETE FROM bank_transactions WHERE matched_kind IS NOT NULL;
+    END IF;
+  END $$`)
   // 10/4 (decisions #38): an early check-out's refund parts point at the
   // payments they went back to (RESTRICT — never erased from under them), so
   // they clear before those payments, with their decisions and the stay ledger.
@@ -61,6 +92,28 @@ export async function cleanupAllSchema(): Promise<void> {
   // S553: call slots FK sales_leads — clear child first. Availability has
   // no FKs but tests seed their own windows.
   // S652: card-reader orders FK to properties/landlords; clear first.
+  // 10/12 (ledger P0): a reader installment charge names its order (RESTRICT),
+  // and GAM charge collections name the payout batch or bank pull that
+  // collected them (RESTRICT) — both clear before their parents. Guarded: the
+  // columns and the table arrive with migrations 20261013090000-090200, and a
+  // test database built before they are dumped into schema.sql has neither.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.landlord_gam_charge_collections') IS NOT NULL THEN
+      DELETE FROM landlord_gam_charge_collections;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'landlord_gam_charges' AND column_name = 'reader_order_id') THEN
+      DELETE FROM landlord_gam_charges WHERE reader_order_id IS NOT NULL;
+    END IF;
+  END $$`)
+  // 10/12 (review): a reader order's cost entries are never deleted (a row
+  // trigger refuses it) and hold their order (RESTRICT) — TRUNCATE fires no row
+  // trigger. Guarded: the table arrives with migration 20261013160100.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.pos_reader_order_costs') IS NOT NULL THEN
+      TRUNCATE pos_reader_order_costs;
+    END IF;
+  END $$`)
   await db.query(`DELETE FROM pos_reader_orders`)
   await db.query(`DELETE FROM sales_call_slots`)
   await db.query(`DELETE FROM sales_leads`)
@@ -121,6 +174,14 @@ export async function cleanupAllSchema(): Promise<void> {
   // the application, and the directive is about what a super_admin can do
   // in the product.
   await db.query(`TRUNCATE email_send_log`)
+  // 10/12 (Nic): the monthly property report's recipients and sends FK
+  // landlords and users (never cascaded: keep everything), so they clear
+  // before them. Guarded: the tables arrive with migrations 20261013150000/
+  // 150100, and a test database built before they are dumped has neither.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.monthly_report_sends') IS NOT NULL THEN DELETE FROM monthly_report_sends; END IF;
+    IF to_regclass('public.monthly_report_recipients') IS NOT NULL THEN DELETE FROM monthly_report_recipients; END IF;
+  END $$`)
   // S631: admin_invitations FKs users three ways (inviter, acceptor, revoker)
   // with NO ACTION — that reference IS the audit trail for who granted console
   // access, so it restricts rather than cascades. Clear it before users.
@@ -173,6 +234,14 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM propane_fills`)
   await db.query(`DELETE FROM property_utility_tax_rates`)
   await db.query(`DELETE FROM utility_meters`)
+  // 10/12 (ledger P0): a move-out's deposit-share transfer record names its
+  // deposit return (RESTRICT). Guarded like the block above (20261013090100).
+  await db.query(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'platform_transfer_intents' AND column_name = 'deposit_return_id') THEN
+      DELETE FROM platform_transfer_intents WHERE deposit_return_id IS NOT NULL;
+    END IF;
+  END $$`)
   await db.query(`DELETE FROM deposit_returns`)
   // S331: FlexSuite acceptance audit + FlexDeposit installment plan
   // tables — both FK to tenants / security_deposits; clear before the
@@ -314,11 +383,26 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM home_sale_installments`)
   await db.query(`DELETE FROM home_sale_contracts`)
   await db.query(`DELETE FROM lease_documents`)
+  // 10/12 (G6): the landlord's answer when a stay was shortened names its
+  // lease, booking and company (no cascade), so it clears first. Guarded: the
+  // table arrives with migration 20261013235150, and a test database built
+  // before it is dumped into schema.sql has no such table.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.stay_shortened_charge_choices') IS NOT NULL THEN DELETE FROM stay_shortened_charge_choices; END IF;
+  END $$`)
   await db.query(`DELETE FROM leases`)
   // Maintenance comments + media FK to maintenance_requests, which FKs units.
   // (assigned_to -> users is ON DELETE SET NULL, so no ordering constraint there.)
   await db.query(`DELETE FROM maintenance_comments`)
   await db.query(`DELETE FROM maintenance_media`)
+  // 10/12 (Nic, L6): a repair's bill names the repair; it lets go first (the
+  // expense itself clears below). Guarded: migration 20261014180100.
+  await db.query(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'landlord_expenses' AND column_name = 'maintenance_request_id') THEN
+      UPDATE landlord_expenses SET maintenance_request_id = NULL WHERE maintenance_request_id IS NOT NULL;
+    END IF;
+  END $$`)
   await db.query(`DELETE FROM maintenance_requests`)
   await db.query(`DELETE FROM tenant_walkthrough_media`)
   await db.query(`DELETE FROM contractors`)
@@ -335,6 +419,25 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`UPDATE pos_transactions SET open_ticket_id = NULL`)
   await db.query(`DELETE FROM pos_open_tickets`)
   await db.query(`DELETE FROM unit_bookings`)
+  // 10/12: paid extra hours FK their agreement RESTRICT (money owed for work
+  // done is never erased from under it), so they clear first. Guarded: the
+  // table arrives with migration 20261012180200, and a test database built
+  // before it is dumped into schema.sql has no such table.
+  // 10/12 (Nic, ledger P6/P7): a paycheck line and a contractor expense name
+  // the extra hours they pay; they let go first (their own rows clear below).
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.work_trade_extra_hours') IS NOT NULL THEN
+      IF EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'payroll_run_lines' AND column_name = 'work_trade_extra_hours_id') THEN
+        UPDATE payroll_run_lines SET work_trade_extra_hours_id = NULL WHERE work_trade_extra_hours_id IS NOT NULL;
+      END IF;
+      IF EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'landlord_expenses' AND column_name = 'work_trade_extra_hours_id') THEN
+        UPDATE landlord_expenses SET work_trade_extra_hours_id = NULL WHERE work_trade_extra_hours_id IS NOT NULL;
+      END IF;
+      DELETE FROM work_trade_extra_hours;
+    END IF;
+  END $$`)
   // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
   // for work_trade_logs (CASCADE on agreement delete). Clear before units.
   await db.query(`DELETE FROM work_trade_agreements`)
@@ -343,6 +446,32 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM home_sale_contracts`)
   // S568: home_ownerships FK units + users (RESTRICT). Clear before units/users.
   await db.query(`DELETE FROM home_ownerships`)
+  // 10/12 (ledger P3): the GAM Books ledger tables are append-only (triggers
+  // refuse UPDATE and DELETE) and RESTRICT to landlords, books accounts, bank
+  // connections and journal entries, so they go first, by TRUNCATE — which
+  // fires no row trigger, so no bypass ever goes into the production guards.
+  // Journal lines now RESTRICT to their entry (an entry is voided, never
+  // erased), so both clear here too. Guarded: the ledger tables arrive with
+  // migrations 20261013200000-200600, and a test database built before they
+  // are dumped into schema.sql has none of them.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.bank_reconciliation_items') IS NOT NULL THEN
+      -- 10/12 (Nic, ledger P9): a cleared bank line names its ledger line, so
+      -- it is truncated in the same statement (already empty — cleared above).
+      TRUNCATE bank_reconciliation_items, ledger_close_balances, books_period_closes, ledger_posting_lines, ledger_postings,
+               ledger_rebuild_runs, ledger_outbox, ledger_source_errors, books_account_map, books_opening_items;
+    ELSIF to_regclass('public.ledger_postings') IS NOT NULL THEN
+      TRUNCATE ledger_close_balances, books_period_closes, ledger_posting_lines, ledger_postings,
+               ledger_rebuild_runs, ledger_outbox, ledger_source_errors, books_account_map, books_opening_items;
+    END IF;
+    -- 10/12 (Nic, ledger review): every register-stock choice is kept
+    -- (append-only, names its company) — TRUNCATE fires no row trigger.
+    -- Guarded: the table arrives with migration 20261014170100.
+    IF to_regclass('public.books_register_stock_changes') IS NOT NULL THEN
+      TRUNCATE books_register_stock_changes;
+    END IF;
+  END $$`)
+  await db.query(`TRUNCATE journal_entry_lines, journal_entries`)
   // S570: bank feed. bank_transactions FK bank_connections + landlord_expenses;
   // bank_connections + landlord_merchant_rules FK landlords/properties/units.
   // Clear before landlord_expenses / units / properties / landlords below.
@@ -351,6 +480,25 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM landlord_merchant_rules`)
   // S568: lot_rent_charges FK units/properties/landlords. Clear before units.
   await db.query(`DELETE FROM lot_rent_charges`)
+  // 10/12 (Nic, ledger P7): what a payroll run left owed names its expenses,
+  // and an expense's payments are never deleted (a trigger refuses it) —
+  // TRUNCATE fires no row trigger. Guarded: the tables arrive with migrations
+  // 20261014200300 and 20261014180100.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.payroll_run_expenses') IS NOT NULL THEN TRUNCATE payroll_run_expenses; END IF;
+    IF to_regclass('public.landlord_expense_payments') IS NOT NULL THEN TRUNCATE landlord_expense_payments CASCADE; END IF;
+  END $$`)
+  // 10/12 (Nic, ledger P6 integrate): a GAM Books bill or transaction moved
+  // onto the Expenses record names the expense it became
+  // (migrated_expense_id / migrated_other_income_id, 20261014180300); the
+  // books rows themselves clear further down, so drop the pointers first.
+  await db.query(`DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'books_bills' AND column_name = 'migrated_expense_id') THEN
+      UPDATE books_bills SET migrated_expense_id = NULL WHERE migrated_expense_id IS NOT NULL;
+      UPDATE books_transactions SET migrated_expense_id = NULL, migrated_other_income_id = NULL
+       WHERE migrated_expense_id IS NOT NULL OR migrated_other_income_id IS NOT NULL;
+    END IF;
+  END $$`)
   // S568: landlord_expenses FK units/properties/landlords/users. Clear before units.
   await db.query(`DELETE FROM landlord_expenses`)
   await db.query(`DELETE FROM unit_out_of_order`)
@@ -430,8 +578,10 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM books_transactions`)
   await db.query(`DELETE FROM books_accounts`)
   await db.query(`DELETE FROM books_employees`)
-  await db.query(`DELETE FROM books_contractors`)
+  // 10/12 (Nic, ledger P6): a vendor folded in from a contractor names the
+  // contractor row it came from, so the vendors clear first.
   await db.query(`DELETE FROM books_vendors`)
+  await db.query(`DELETE FROM books_contractors`)
   await db.query(`DELETE FROM invitations`)
   // S352: PM company chain — pm_invitations / pm_staff / pm_fee_plans /
   // pm_property_invitations all FK pm_companies CASCADE, so wiping
@@ -479,6 +629,12 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM depots`)
   await db.query(`DELETE FROM dump_locations`)
   await db.query(`DELETE FROM business_platform_fee_accruals`)
+  // 10/12 (Nic, ledger P6): each company's own expense and income categories
+  // name it. A trigger refuses deleting one (they are kept); TRUNCATE fires no
+  // row trigger. Guarded: the table arrives with migration 20261014180000.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.books_categories') IS NOT NULL THEN TRUNCATE books_categories CASCADE; END IF;
+  END $$`)
   await db.query(`DELETE FROM businesses`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
@@ -488,6 +644,11 @@ export async function cleanupAllSchema(): Promise<void> {
   // surface in the NEXT test's beforeEach, not the one that wrote the row.
   await db.query(`DELETE FROM audit_log`)
   await db.query(`DELETE FROM users`)
+  // 10/12 (ledger P3): every DELETE above that touched a money table marked its
+  // source in the ledger outbox; a test starts with none waiting.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.ledger_outbox') IS NOT NULL THEN TRUNCATE ledger_outbox; END IF;
+  END $$`)
 }
 
 export async function withRollback<T>(

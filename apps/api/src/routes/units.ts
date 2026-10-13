@@ -5,6 +5,7 @@ import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope, userHasPerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { healthByHousehold, householdsOf } from '../services/householdMonths'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
 import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
@@ -28,7 +29,11 @@ import {
   type StayWorkTradeTerms,
 } from '../services/stayWorkTrade'
 import { unitPendingReads } from '../services/utilityReadingRuns'
-import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
+import {
+  syncLeaseWithBookingDates, pastEndAttemptedCharges, stayShortenedChoiceIn, recordStayShortenedChoice,
+  type PastEndAttempted,
+} from '../services/bookingLeaseBilling'
+import { STAY_SHORTENED_CHARGE_CHOICE_LABEL, type StayShortenedChargeChoice } from '@gam/shared'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
 import { scheduleStayPrice, stayExtensionQuote, extendStayByMonth, SCREENING_LINE_NAME, type StayExtension } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
@@ -102,18 +107,11 @@ unitsRouter.get('/', async (req, res, next) => {
         vuo.primary_last_name AS tenant_last,
         vuo.primary_email AS tenant_email,
         vuo.tenant_count,
-        -- S652 (Nic): payment health on the list, not two clicks deep. Charges
-        -- due before today; paid = settled, or covered by work trade (hours
-        -- paid it, "there was no payment to be made, so how could they be at
-        -- zero percent"). NULL until there is a bill to judge by.
-        (SELECT CASE WHEN COUNT(*) = 0 THEN NULL
-                     ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit') OR p.work_trade_suspended_at IS NOT NULL) / COUNT(*))
-                END
-           FROM payments p
-          WHERE p.tenant_id = vuo.primary_tenant_id
-            AND p.type IN ('rent','utility','fee','home_payment')
-            AND p.due_date < CURRENT_DATE
-            AND p.status IN ('pending','failed','settled','paid_via_deposit','returned')) AS payment_health,
+        -- 10/12 (Nic): "lease rent (from the LEASE, not the unit listing)".
+        -- The rent the active lease bills — the Tenants list shows it beside
+        -- the Rent Roll, which reads the same lease (RV 33 lists at $589; its
+        -- lease bills $495). rent_amount stays the space's listed price.
+        (SELECT al.rent_amount FROM leases al WHERE al.id = vuo.active_lease_id) AS lease_rent_amount,
         -- S554 (button-sweep bug #10): the admin-ops Units panel reads
         -- achVerified for the primary tenant's ACH badge; without this the
         -- field was always undefined and the badge stuck on "Pending".
@@ -197,6 +195,34 @@ unitsRouter.get('/', async (req, res, next) => {
       WHERE 1=1 ${landlordFilter} ${propertyFilter} ${staffScopeFilter} ${retiredFilter}
       ORDER BY p.name, u.unit_number
     `, params)
+    // S652 (Nic): payment health on the list, not two clicks deep. 10/12 (Nic):
+    // "Payment health = ONE definition everywhere, per HOUSEHOLD per BILL
+    // MONTH" — the household's months paid on time since it joined GAM (all
+    // time, services/householdMonths), the figure the profile, the Rent Roll and
+    // the tenant's own screen show. It used to be paid rows ÷ rows due, which
+    // never checked a date (Gerald Logue: 25% here, 6% on his profile, 0% on
+    // his own screen; 1 of 2 months, 50%, under the one definition). NULL
+    // until a month is judged. Scoped to the viewer's companies and properties.
+    //
+    // 10/12: only to a viewer who may see payment histories — the owner, GAM
+    // admin, or staff with "View all payments" or the books — the same rule
+    // the profile keeps (routes/tenants seesPayments; S641: "I don't want her
+    // to see ... the payment histories"). Anyone else reads "—".
+    const seesHealth = isAdmin || userHasPerm(req.user, 'payments.view_all', 'books.view')
+    const primaries = [...new Set(units.map((u: any) => u.tenant_id).filter(Boolean))] as string[]
+    if (primaries.length && seesHealth) {
+      const healthLandlords = isAdmin ? [...new Set(units.map((u: any) => u.landlord_id))] as string[] : callerScope
+      const households = await householdsOf(primaries, healthLandlords, scopedPropertyIds)
+      const health = await healthByHousehold({
+        landlordIds: healthLandlords, propertyIds: scopedPropertyIds,
+        householdIds: [...new Set(households.values())],
+      })
+      for (const u of units as any[]) {
+        u.payment_health = u.tenant_id ? (health.get(households.get(u.tenant_id) ?? u.tenant_id)?.percent ?? null) : null
+      }
+    } else {
+      for (const u of units as any[]) u.payment_health = null
+    }
     res.json({ success: true, data: units })
   } catch (e) { next(e) }
 })
@@ -1772,6 +1798,16 @@ unitsRouter.patch('/:id/status', requirePerm('units.set_status'), async (req, re
     }
     if (unit.status === 'suspended') {
       throw new AppError(400, 'This unit is in eviction mode. Turn eviction mode off to change its status')
+    }
+    // 10/12 (Nic): 'utility_service' is in the shared status list now (it
+    // matches the database). A service point is made by setting up a utility
+    // service agreement (routes/utilityServiceAgreements), never by hand, and
+    // it can never hold a lease — so neither direction is a status change here.
+    if (status === 'utility_service') {
+      throw new AppError(400, 'A utility service space is created by setting up a utility service agreement, not by changing its status')
+    }
+    if (unit.status === 'utility_service') {
+      throw new AppError(400, 'This space is a utility service point. Manage it from its utility service agreement')
     }
     // S604: 'owner_use' means the OWNER occupies it — no lease, no rent. A unit
     // with a live lease has a tenant in it, so the two states are mutually
@@ -3551,6 +3587,34 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       throw new AppError(400, 'Check-out has to be at least one day after check-in.')
     }
 
+    // ── 10/12 (Nic, G6): A SHORTER STAY PAST RENT A PAYMENT WAS TRIED ON ──────
+    //
+    // Unpaid rent on nights the new end takes away is taken off — but rent a
+    // payment was tried on (a declined card, a returned bank pull), or that
+    // another record points at, used to stay owed with GAM told to "decide
+    // with the landlord". Nic: the LANDLORD CHOOSES, at this moment — take
+    // those charges off (anything already paid on them goes back to the guest
+    // as credit), or keep them owed. Asked before anything is saved
+    // ('stay_shortened_attempted', the charges and the two choices in the
+    // body), and sent again with `pastEndAttempted`; the answer is written with
+    // the save and the lease sync after it carries it out. The assistant never
+    // answers it (it makes no money decision about a stay): it passes the
+    // words on, and the desk answers on the schedule.
+    let shortenedAsk: PastEndAttempted | null = null
+    let shortenedChoice: StayShortenedChargeChoice | null = null
+    if (!keepsEarlyCheckOut && (checkOutChanged || checkOutMoved) && newCheckOut < booking.check_out_day) {
+      shortenedAsk = await pastEndAttemptedCharges(booking.id, newCheckOut)
+      if (shortenedAsk) {
+        shortenedChoice = stayShortenedChoiceIn(req.body?.pastEndAttempted)
+        if (!shortenedChoice) {
+          return void res.status(409).json({
+            success: false, code: 'stay_shortened_attempted', error: shortenedAsk.words,
+            charges: shortenedAsk.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL,
+          })
+        }
+      }
+    }
+
     // 10/5 (Nic, R2/R6): what a longer stay needs is asked below, once the
     // new nights are known to be free (stayAsk).
     const stayTermsGiven = stayTermsIn(req.body?.stayTerms)
@@ -4327,6 +4391,12 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // puts back a reservation an extension moved for this save.)
     if (isDeadlock(failure)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
     if (failure) throw failure
+
+    // 10/12 (G6): the landlord's answer for rent a payment was tried on, for
+    // the lease sync below (and an early check-out's lease end) to carry out.
+    if (shortenedAsk && shortenedChoice) {
+      await recordStayShortenedChoice({ bookingId: booking.id, asked: shortenedAsk, choice: shortenedChoice, chosenBy: req.user!.userId })
+    }
 
     // The save is final, so a reservation the extension moved for it stays
     // moved — unless the extending guest went to another site after all (the

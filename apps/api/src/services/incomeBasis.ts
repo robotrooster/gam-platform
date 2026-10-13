@@ -37,10 +37,11 @@
 import {
   INCOME_BASES, DEFAULT_INCOME_BASIS, INCOME_BASIS_LABEL, INCOME_BASIS_NOTE,
   INCOME_LINES, INCOME_LINE_LABEL, BILLED_PARTS, BILLED_PART_LABEL,
-  INCOME_CATEGORIES, INCOME_CATEGORY_LABEL, INCOME_UTILITY_CATEGORIES,
-  type IncomeBasis, type IncomeLine, type BilledPart, type IncomeCategory,
+  INCOME_CATEGORIES, INCOME_CATEGORY_LABEL, INCOME_UTILITY_CATEGORIES, OTHER_INCOME_NOT_INCOME_CATEGORIES,
+  type IncomeBasis, type IncomeLine, type BilledPart, type IncomeCategory, type OtherIncomeNotIncomeCategory,
 } from '@gam/shared'
 import { query } from '../db'
+import { pastCutoff, type PropertyCutoff } from '../lib/bookkeeperScope'
 import { AppError } from '../middleware/errorHandler'
 import { depositOrMoveOutRowSql } from './moneyPredicates'
 import { STAY_SHORTENED_CREDIT_NOTE } from './bookingLeaseBilling'
@@ -66,7 +67,11 @@ const round2 = (n: number) => Math.round(n * 100) / 100
  *     billed twice and the stay nets to what it was worth. Rent moved to credit
  *     when a stay is shortened is "Stay shortened" (stayShortenedCreditSql).
  */
-const EXTRA_LINES = ['movedToCredit'] as const
+// 10/12 (Nic, ledger P8): two lines only the ledger's reports use — the
+// work-trade discount (a minus line in Charged when the owner books work trade
+// as a rent discount, Nic L12) and deposits billed and still owed (in Owed:
+// the receivables balance holds every bill, deposits included).
+const EXTRA_LINES = ['movedToCredit', 'workTradeDiscount', 'depositsOwed'] as const
 export type ReportLine = IncomeLine | typeof EXTRA_LINES[number]
 export const REPORT_LINES: readonly ReportLine[] = [
   ...INCOME_LINES,
@@ -74,6 +79,8 @@ export const REPORT_LINES: readonly ReportLine[] = [
 ]
 export const REPORT_LINE_LABEL: Record<ReportLine, string> = {
   movedToCredit: 'Moved to credit',
+  workTradeDiscount: 'Work-trade discount',
+  depositsOwed: 'Deposits',
   ...INCOME_LINE_LABEL,
 }
 
@@ -239,8 +246,18 @@ export function basisMeta(basis: IncomeBasis): BasisMeta {
  *                   check-out refund — given back with the refund, netted from
  *                   the landlord's next payout (Stripe keeps its fee; GAM
  *                   absorbs nothing). The landlord's cost, on the refund day.
+ *   ownerContributions  10/11 (Nic): a bank deposit filed as the owner putting
+ *                   their own money in. Money in, but not income.
+ *   saleProceeds    10/11 (Nic): a bank deposit filed as the proceeds of
+ *                   selling an asset. Money in, but not operating income.
+ *   taxCollected    10/12 (Nic, ledger P8): sales, lodging and utility tax
+ *                   that arrived with a payment — owed to the government,
+ *                   never income (the ledger's reports list it).
  */
-export const ASIDE_LINES = ['clearing', 'creditsYouGave', 'workTrade', 'depositsHeld', 'chargebackFees', 'refundCardFees'] as const
+export const ASIDE_LINES = [
+  'clearing', 'creditsYouGave', 'workTrade', 'depositsHeld', 'chargebackFees', 'refundCardFees',
+  'ownerContributions', 'saleProceeds', 'taxCollected',
+] as const
 export type AsideLine = typeof ASIDE_LINES[number]
 export const ASIDE_LINE_LABEL: Record<AsideLine | 'paidAheadUnused' | 'collectedSoFar' | 'stillOwed', string> = {
   clearing:        'Still clearing',
@@ -248,10 +265,23 @@ export const ASIDE_LINE_LABEL: Record<AsideLine | 'paidAheadUnused' | 'collected
   workTrade:       'Covered by work trade',
   depositsHeld:    'Deposits received (held)',
   chargebackFees:  'Chargeback fees',
-  refundCardFees:  'Card fees given back with refunds',
+  refundCardFees:  'Card fees refunded',
+  ownerContributions: 'Owner contributions',
+  saleProceeds:    'Sale proceeds',
+  taxCollected:    'Tax collected (owed to the government)',
   paidAheadUnused: 'Paid ahead, not used yet',
   collectedSoFar:  'Collected so far',
   stillOwed:       'Still owed',
+}
+
+/**
+ * 10/11 (Nic): the beside line each not-income bank filing lands on
+ * (OTHER_INCOME_NOT_INCOME_CATEGORIES). One entry per category, so a category
+ * added to that list cannot land nowhere.
+ */
+const NOT_INCOME_ASIDE: Record<OtherIncomeNotIncomeCategory, AsideLine> = {
+  owner_contribution: 'ownerContributions',
+  sale_proceeds:      'saleProceeds',
 }
 
 // ─── SQL building blocks ──────────────────────────────────────────────────────
@@ -260,6 +290,38 @@ const IDENT = /^[a-z_][a-z0-9_]*$/i
 function a(alias: string): string {
   if (!IDENT.test(alias)) throw new Error(`incomeBasis: "${alias}" is not a table alias`)
   return alias
+}
+
+/** 10/11: a literal from a shared list, quoted for SQL (letters and underscores only). */
+function lit(v: string): string {
+  if (!IDENT.test(v)) throw new Error(`incomeBasis: "${v}" is not a plain word`)
+  return `'${v}'`
+}
+
+/**
+ * 10/11 (Nic): TRUE when a landlord_other_income row's category is money in that is not income.
+ * 10/12 (Nic, ledger P6, L5): or a category the company made (or pointed)
+ * at an account that is not income — an owner putting money in, a loan —
+ * which stays off the P&L by itself (books_category_on_pl_on — 10/12 review:
+ * as its account stood on the row's own date, the ledger's rule).
+ */
+function otherIncomeNotIncomeSql(oi: string): string {
+  return `(${a(oi)}.category IN (${OTHER_INCOME_NOT_INCOME_CATEGORIES.map(lit).join(', ')})
+           OR NOT books_category_on_pl_on(${a(oi)}.category_id, ${a(oi)}.income_date))`
+}
+
+/** 10/11 (Nic): the line a landlord_other_income row lands on: its own beside line, else "Other income". */
+function otherIncomeLineSql(oi: string): string {
+  const whens = OTHER_INCOME_NOT_INCOME_CATEGORIES
+    .map(c => `WHEN ${a(oi)}.category = ${lit(c)} THEN ${lit(NOT_INCOME_ASIDE[c])}`).join(' ')
+  // 10/12 (Nic, ledger P6, L5): a category of the company's own off the P&L —
+  // on equity, the owner's money put in; anywhere else, beside the total with
+  // the sale proceeds (money in that is not income).
+  return `(CASE ${whens}
+            WHEN NOT books_category_on_pl_on(${a(oi)}.category_id, ${a(oi)}.income_date)
+              THEN CASE WHEN books_category_account_type_on(${a(oi)}.category_id, ${a(oi)}.income_date) = 'equity' THEN ${lit(NOT_INCOME_ASIDE.owner_contribution)}
+                        ELSE ${lit(NOT_INCOME_ASIDE.sale_proceeds)} END
+            ELSE 'otherIncome' END)`
 }
 
 /**
@@ -1746,15 +1808,107 @@ function siteDepositSql(b: string): string {
         0))))`
 }
 
+/**
+ * The card fee a guest got back with a refund — NEVER income: the landlord's
+ * cost, on the refund day ('refundCardFees', a positive cost), and taken off
+ * again on the day Stripe sent a card refund back (reversed_at).
+ *
+ *   1. 10/4 (decisions #38 Q4): an early check-out refund part (every card or
+ *      bank part that went out, a register sale's included — its sale refund
+ *      row leaves the fee out of income; and a card refund given back in cash
+ *      instead, fix round 2, which carries the same fee). Review fix
+ *      (choice46b): a refund from the landlord's paid-ahead money screen too —
+ *      at that lease's unit, as rent ('space_rent'); pass 2: money carried from
+ *      an earlier lease, at the lease it arrived on (received_lease_id).
+ *   2. 10/12 (Nic, G10): the register's own Refund of a CARD sale. "The
+ *      customer gets the card fee back too; the landlord eats that fee." The
+ *      card fee is the surcharge the guest paid on top of the sale; its share
+ *      of the refund is stored on the refund (pos_refunds.card_fee_refunded,
+ *      earlyCheckOut.saleRefundCardFeeShare) and was counted nowhere — the
+ *      sale's income leaves it out, and no cost line had it. A cash sale has
+ *      no card fee, so it has none. A refund row written for an early
+ *      check-out part (stay_refund_part_id) is the part's, counted in (1).
+ *
+ * The P&L subtracts these as the "Card fees refunded" expense
+ * (services/landlordPL cardFeesRefundedByProperty reads the same branches).
+ */
+function refundCardFeeBranches(stayCategory: string, saleRows: string): string[] {
+  return [
+    `SELECT rp.landlord_id, u.property_id, u.id, COALESCE(sd.lease_id, pcl.id), NULL::uuid, NULL::date,
+            ${localDay('ev.at', TZ('pr'))},
+            'refundCardFees', CASE WHEN sd.lease_id IS NULL AND pc.id IS NULL THEN 'stays_and_pay_links' ELSE 'space_rent' END,
+            NULL::text, -ev.sign * rp.card_fee_back, FALSE, NULL::uuid
+       FROM stay_refund_parts rp
+       LEFT JOIN stay_checkout_decisions sd ON sd.id = rp.decision_id
+       LEFT JOIN paid_ahead_choices pc ON pc.id = rp.paid_ahead_choice_id
+       LEFT JOIN lease_prepaid_credits rc ON rc.id = rp.prepaid_credit_id AND pc.id IS NOT NULL
+       LEFT JOIN leases pcl ON pcl.id = COALESCE(rc.received_lease_id, pc.lease_id)
+       LEFT JOIN unit_bookings b ON b.id = rp.booking_id
+       JOIN units u ON u.id = CASE WHEN pc.id IS NOT NULL THEN pcl.unit_id ELSE b.unit_id END
+       LEFT JOIN properties pr ON pr.id = u.property_id
+       CROSS JOIN LATERAL (VALUES (rp.refunded_at, -1), (rp.reversed_at, 1)) AS ev(at, sign)
+      WHERE ${LL('rp.landlord_id')} AND (sd.id IS NOT NULL OR pc.id IS NOT NULL) AND rp.status IN ('refunded', 'handed_back')
+        AND rp.card_fee_back > 0
+        AND ev.at IS NOT NULL AND ${NEAR('ev.at')}`,
+    `SELECT t.landlord_id, t.property_id, NULL::uuid, NULL::uuid, NULL::uuid, NULL::date,
+            ${localDay('ev.at', TZ('pr'))},
+            'refundCardFees', ${stayCategory}, NULL::text, -ev.sign * r.card_fee_refunded, FALSE, NULL::uuid
+       FROM pos_refunds r
+       JOIN pos_transactions t ON t.id = r.transaction_id
+       LEFT JOIN properties pr ON pr.id = t.property_id
+       CROSS JOIN LATERAL (VALUES (r.created_at, -1), (r.reversed_at, 1)) AS ev(at, sign)
+      WHERE ${saleRows} AND r.card_fee_refunded > 0 AND r.stay_refund_part_id IS NULL
+        AND ev.at IS NOT NULL AND ${NEAR('ev.at')}`,
+  ]
+}
+
+/** The register-sale facts' category and rows (sharedBranches), for refundCardFeeBranches read on its own. */
+const SALE_STAY_CATEGORY_SQL = `CASE WHEN t.pay_link_id IS NOT NULL
+            OR EXISTS (SELECT 1 FROM unit_bookings sb WHERE sb.pos_transaction_id = t.id)
+            OR EXISTS (SELECT 1 FROM pos_open_tickets ot WHERE ot.id = t.open_ticket_id AND ot.booking_id IS NOT NULL)
+          THEN 'stays_and_pay_links' ELSE 'register_sales' END`
+const SALE_ROWS_SQL = `t.status <> 'voided' AND t.payment_method <> 'charge' AND ${LL('t.landlord_id')}`
+
+/**
+ * 10/12 (Nic, G10) — "Card fees refunded": the card fee guests got back with
+ * refunds (refundCardFeeBranches), by property (key '' = no property), for the
+ * days asked (`start`/`end`, the property's calendar), the companies asked,
+ * the properties asked (null = all) and with a sold property's days after it
+ * left cut (`cutoffs`). The P&L's expense line (services/landlordPL).
+ */
+export async function cardFeesRefundedByProperty(
+  landlordIds: string[] | null, start: string, end: string,
+  propertyIds: string[] | null = null, cutoffs: readonly PropertyCutoff[] = [],
+  /** 10/12 (ledger P8): 'records' reads the money records whatever the company (the nightly parity check). */
+  source: ReportSource = 'auto',
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>()
+  if ((landlordIds && landlordIds.length === 0) || (propertyIds && propertyIds.length === 0)) return out
+  // 10/12 (Nic, ledger P8): on the ledger, the card fees refunded account (5117).
+  if (landlordIds && await readsLedger({ landlordIds, source })) {
+    const { ledgerRoleByProperty } = await import('./ledgerReports')
+    return ledgerRoleByProperty({ landlordIds, propertyIds, cutoffs }, 'card_fees_refunded', start, end)
+  }
+  const rows = await query<{ property_id: string | null; day: string; amount: string }>(
+    `SELECT ev.property_id, ev.day::text AS day, ROUND(ev.amount::numeric, 2)::text AS amount
+       FROM (${refundCardFeeBranches(SALE_STAY_CATEGORY_SQL, SALE_ROWS_SQL).join('\n UNION ALL \n')}) AS ev(${COLS})
+      WHERE ev.day BETWEEN $2::date AND $3::date AND ev.amount <> 0
+        AND ($4::uuid[] IS NULL OR ev.property_id = ANY($4::uuid[]))`,
+    [landlordIds, ymd(start), ymd(end), propertyIds])
+  for (const r of rows) {
+    if (cutoffs.length && pastCutoff(cutoffs, r.property_id, r.day)) continue
+    const k = r.property_id ?? ''
+    out.set(k, Math.round(((out.get(k) ?? 0) + Number(r.amount)) * 100) / 100)
+  }
+  return out
+}
+
 function sharedBranches(basis: IncomeBasis): string[] {
   // A register sale paid through a one-time link is billed on the day the link was sent.
   const saleTs = basis === 'billed'
     ? `CASE WHEN lk.kind = 'one_time' THEN lk.created_at ELSE t.created_at END`
     : 't.created_at'
-  const stayCategory = `CASE WHEN t.pay_link_id IS NOT NULL
-            OR EXISTS (SELECT 1 FROM unit_bookings sb WHERE sb.pos_transaction_id = t.id)
-            OR EXISTS (SELECT 1 FROM pos_open_tickets ot WHERE ot.id = t.open_ticket_id AND ot.booking_id IS NOT NULL)
-          THEN 'stays_and_pay_links' ELSE 'register_sales' END`
+  const stayCategory = SALE_STAY_CATEGORY_SQL
   // Pre-tax share of a refund: the refund times (net sale) / (net sale + tax).
   // 10/5 (M10): the background check is never refunded and never the sale's income — left out of the share.
   const preTax = (amt: string) =>
@@ -1765,7 +1919,7 @@ function sharedBranches(basis: IncomeBasis): string[] {
   const siteDeposit = siteDepositSql('b')
   // A store charge (FlexCharge, payment_method 'charge') is not money: the
   // account's paydown row (FCPAYDOWN) is, and counts when it settles.
-  const saleRows = `t.status <> 'voided' AND t.payment_method <> 'charge' AND ${LL('t.landlord_id')}`
+  const saleRows = SALE_ROWS_SQL
   const moveOutFrom = `
        FROM deposit_returns dr
        JOIN leases l ON l.id = dr.lease_id
@@ -1908,37 +2062,18 @@ function sharedBranches(basis: IncomeBasis): string[] {
       WHERE ${LL('rp.landlord_id')} AND sd.lease_id IS NULL AND rp.pos_refund_id IS NULL
         AND rp.stay_payment_id IS NOT NULL AND rp.status IN ('refunded', 'handed_back')
         AND ev.at IS NOT NULL AND ${NEAR('ev.at')}`,
-    // 10/4 (decisions #38 Q4): the card fee a guest got back with an early
-    // check-out refund (every card or bank part that went out, a register
-    // sale's included — its sale refund row leaves the fee out of income; and
-    // a card refund given back in cash instead, fix round 2, which carries the
-    // same fee). Not income: the landlord's cost, beside the total (a positive
-    // cost, like chargebackFees), on the refund day — and taken off again on
-    // the day Stripe sent a refund back (rp.reversed_at).
-    // Review fix (choice46b): the card fee given back with a refund from the
-    // landlord's paid-ahead money screen too (a card or bank refund, or one
-    // given back in cash instead) — at that lease's unit, as rent ('space_rent').
-    // Pass 2: for money carried from an earlier lease, at the lease it arrived
-    // on (received_lease_id), beside its refund line.
-    `SELECT rp.landlord_id, u.property_id, u.id, COALESCE(sd.lease_id, pcl.id), NULL::uuid, NULL::date,
-            ${localDay('ev.at', TZ('pr'))},
-            'refundCardFees', CASE WHEN sd.lease_id IS NULL AND pc.id IS NULL THEN 'stays_and_pay_links' ELSE 'space_rent' END,
-            NULL::text, -ev.sign * rp.card_fee_back, FALSE, NULL::uuid
-       FROM stay_refund_parts rp
-       LEFT JOIN stay_checkout_decisions sd ON sd.id = rp.decision_id
-       LEFT JOIN paid_ahead_choices pc ON pc.id = rp.paid_ahead_choice_id
-       LEFT JOIN lease_prepaid_credits rc ON rc.id = rp.prepaid_credit_id AND pc.id IS NOT NULL
-       LEFT JOIN leases pcl ON pcl.id = COALESCE(rc.received_lease_id, pc.lease_id)
-       LEFT JOIN unit_bookings b ON b.id = rp.booking_id
-       JOIN units u ON u.id = CASE WHEN pc.id IS NOT NULL THEN pcl.unit_id ELSE b.unit_id END
-       LEFT JOIN properties pr ON pr.id = u.property_id
-       CROSS JOIN LATERAL (VALUES (rp.refunded_at, -1), (rp.reversed_at, 1)) AS ev(at, sign)
-      WHERE ${LL('rp.landlord_id')} AND (sd.id IS NOT NULL OR pc.id IS NOT NULL) AND rp.status IN ('refunded', 'handed_back')
-        AND rp.card_fee_back > 0
-        AND ev.at IS NOT NULL AND ${NEAR('ev.at')}`,
+    // 10/4 (decisions #38 Q4) / 10/12 (Nic, G10): the card fee a guest got
+    // back with a refund — the landlord's cost (refundCardFeeBranches).
+    ...refundCardFeeBranches(stayCategory, saleRows),
     // Money GAM never handled, filed by the landlord (laundry, interest, Square payouts...).
+    // 10/11 (Nic): an owner's own money put in, and the proceeds of selling an
+    // asset, are filed the same way but are NOT income: beside the total, each
+    // on its own line (NOT_INCOME_ASIDE), with no category and no billed part.
     `SELECT oi.landlord_id, oi.property_id, oi.unit_id, NULL::uuid, NULL::uuid, NULL::date, oi.income_date,
-            'otherIncome', 'other_income', 'paid', oi.amount, TRUE, NULL::uuid
+            ${otherIncomeLineSql('oi')},
+            CASE WHEN ${otherIncomeNotIncomeSql('oi')} THEN NULL ELSE 'other_income' END,
+            CASE WHEN ${otherIncomeNotIncomeSql('oi')} THEN NULL ELSE 'paid' END,
+            oi.amount, NOT ${otherIncomeNotIncomeSql('oi')}, NULL::uuid
        FROM landlord_other_income oi
       WHERE ${LL('oi.landlord_id')} AND oi.status = 'active' AND oi.voided_at IS NULL
         AND oi.income_date BETWEEN $2::date AND $3::date`,
@@ -2090,6 +2225,66 @@ export interface IncomeEvent {
    * sit on the previous lease of a renewal chain.
    */
   moveOutId: string | null
+  /**
+   * 10/12 (Nic, ledger P8): set on facts read from the ledger
+   * (services/ledgerReports ledgerIncomeEvents):
+   *   'line'   a ledger line — a Received or Charged fact like any other
+   *   'owed'   the receivables still open at the end of `day` (a month's end,
+   *            or the period's last day), for the Owed column — never in a
+   *            total (inTotal false); moneyViewFrom takes the last one in
+   *            its period
+   *   'proof'  one movement of the receivables in the period (proofTerm says
+   *            which), for the proof strip under the three columns
+   *   'owedStart' 10/12 (Nic, review): the receivables open at the START of
+   *            `day` (the end of the day before) — the proof strip's owed at
+   *            the start of a period beginning that day; never the Owed
+   *            column, never in a total
+   */
+  ledger?: 'line' | 'owed' | 'owedStart' | 'proof'
+  proofTerm?: LedgerProofTerm
+  /**
+   * 10/12 (Nic, review): on 'owed' / 'owedStart' facts, every day the query
+   * read the receivables on (sorted). Only days with something owed have
+   * facts, so the Owed column's day comes from this list (ledgerOwedDay): a
+   * day on which nothing was owed reads $0, never an earlier day's balance.
+   */
+  owedDays?: readonly string[]
+}
+
+/**
+ * 10/12 (Nic, ledger P8): the proof strip's terms — what moved the tenants'
+ * receivables (1100) in the period (services/ledgerReports RECEIVABLE_TERM_SQL).
+ */
+export type LedgerProofTerm =
+  | 'billed' | 'received' | 'creditsGiven' | 'workTrade' | 'paidAhead' | 'deposits' | 'opening' | 'writtenOff' | 'other'
+
+/**
+ * 10/12 (Nic, ledger P8): "Owed at start + Charged − Received against bills −
+ * Credits given − Work trade − Paid from paid-ahead − Paid from deposits ±
+ * Opening and corrections = Owed at end" (design §10). Each term is the
+ * receivables movement grouped by what posted it, so it always adds up.
+ * `billed` is everything billed to tenants (deposits and tax included), not
+ * the Charged column (income only).
+ */
+export interface LedgerProof {
+  startDay: string
+  endDay: string
+  owedAtStart: number
+  billed: number
+  received: number
+  creditsGiven: number
+  workTrade: number
+  paidAhead: number
+  deposits: number
+  /** Opening balances, write-offs and every other correction (signed: + adds to what is owed). */
+  corrections: number
+  owedAtEnd: number
+  /**
+   * 10/12 (Nic, review): owed at the start is read from the books (the day
+   * before the period), not worked back from the end; this is how far the
+   * terms miss adding up to owed at the end (0 when the strip ties out).
+   */
+  offBy: number
 }
 
 export interface IncomeQuery {
@@ -2101,16 +2296,57 @@ export interface IncomeQuery {
   basis: IncomeBasis
   /** null/undefined = every property; an empty list sees nothing. */
   propertyIds?: string[] | null
+  /**
+   * 10/12 (Nic): the clean cut at a sale. A former property's facts dated
+   * after its last day are left out (a bookkeeper keeps a sold property's
+   * history for the days it was the company's, and sees nothing after it —
+   * lib/bookkeeperScope). Omitted / [] = no cut (owners).
+   */
+  cutoffs?: readonly PropertyCutoff[] | null
+  /**
+   * 10/12 (Nic, ledger P8): where the facts come from. 'auto' (the default):
+   * the ledger when every company of the query reads it
+   * (services/ledgerReports ledgerReportsLive), else the money records.
+   * 'records': the money records whatever the company (the nightly parity
+   * check compares the two). 10/12 (Nic, review): 'ledger' — the ledger,
+   * decided once by a screen covering several companies
+   * (ledgerReportsLive over all of them) so every reader it calls agrees.
+   */
+  source?: ReportSource
 }
 
+/**
+ * 10/12 (Nic, review): where a reader's money comes from. 'auto': the ledger
+ * when every company it covers reads it; 'records' / 'ledger': decided by the
+ * caller, once per request, so a screen never mixes the two for one company.
+ */
+export type ReportSource = 'auto' | 'records' | 'ledger'
+
 const ymd = (d: string) => String(d).slice(0, 10)
+
+/**
+ * 10/12 (Nic, ledger P8): does this query read the ledger? Every company it
+ * covers must read the ledger, so no screen mixes the two for one company.
+ */
+async function readsLedger(q: Pick<IncomeQuery, 'landlordIds' | 'source'>): Promise<boolean> {
+  if (q.source === 'records' || !q.landlordIds || q.landlordIds.length === 0) return false
+  if (q.source === 'ledger') return true
+  const { ledgerReportsLive } = await import('./ledgerReports')
+  return ledgerReportsLive(q.landlordIds)
+}
 
 export async function incomeEvents(q: IncomeQuery): Promise<IncomeEvent[]> {
   if (q.landlordIds && q.landlordIds.length === 0) return []
   if (q.propertyIds && q.propertyIds.length === 0) return []
+  // 10/12 (Nic, ledger P8): every report reads the ledger once the company's
+  // books are live — Charged, Received and Owed from the same lines.
+  if (await readsLedger(q)) {
+    const { ledgerIncomeEvents } = await import('./ledgerReports')
+    return ledgerIncomeEvents(q)
+  }
   const rows = await query<any>(incomeEventsSql(q.basis),
     [q.landlordIds ?? null, ymd(q.start), ymd(q.end), q.propertyIds ?? null])
-  return rows.map(r => ({
+  const facts: IncomeEvent[] = rows.map(r => ({
     landlordId: r.landlord_id,
     propertyId: r.property_id ?? null,
     unitId: r.unit_id ?? null,
@@ -2125,6 +2361,7 @@ export async function incomeEvents(q: IncomeQuery): Promise<IncomeEvent[]> {
     inTotal: r.in_total === true,
     moveOutId: r.move_out_id ?? null,
   }))
+  return q.cutoffs?.length ? facts.filter(e => !pastCutoff(q.cutoffs, e.propertyId, e.day)) : facts
 }
 
 // ─── Totals ───────────────────────────────────────────────────────────────────
@@ -2136,8 +2373,19 @@ export interface IncomeBeside {
   depositsHeld: number
   /** What chargebacks cost beyond the sale and its tax (Stripe's fee, the buyer's card fee). */
   chargebackFees: number
-  /** The card fee guests got back with early check-out refunds (the landlord's cost, #38 Q4). */
+  /**
+   * The card fee guests got back with refunds — early check-out parts and
+   * (10/12, G10) the register's Refund of a card sale. The landlord's cost: the
+   * P&L subtracts it as "Card fees refunded" (landlordPL); kept here for the
+   * cash-flow statement, which reads it as money out.
+   */
   refundCardFees: number
+  /** 10/11: bank deposits filed as the owner's own money put in (money in, never income). */
+  ownerContributions: number
+  /** 10/11: bank deposits filed as the proceeds of selling an asset (money in, never income). */
+  saleProceeds: number
+  /** 10/12 (ledger P8): tax that arrived with a payment (owed to the government, never income). */
+  taxCollected: number
   /** Money billed: the parts already collected (paid, covered, kept). */
   collectedSoFar: number
   /** Money billed: the part still owed. */
@@ -2167,7 +2415,8 @@ export function summarize(events: readonly IncomeEvent[], basis: IncomeBasis): I
   const lines = zeroLines()
   const parts = zeroParts()
   const beside: IncomeBeside = {
-    clearing: 0, creditsYouGave: 0, workTrade: 0, depositsHeld: 0, chargebackFees: 0, refundCardFees: 0, collectedSoFar: 0, stillOwed: 0,
+    clearing: 0, creditsYouGave: 0, workTrade: 0, depositsHeld: 0, chargebackFees: 0, refundCardFees: 0,
+    ownerContributions: 0, saleProceeds: 0, taxCollected: 0, collectedSoFar: 0, stillOwed: 0,
   }
   let total = 0
   for (const e of events) {
@@ -2206,6 +2455,12 @@ export interface IncomeTotals extends IncomeSummary {
 export async function paidAheadUnusedAt(q: Omit<IncomeQuery, 'start' | 'basis'>): Promise<number> {
   if (q.landlordIds && q.landlordIds.length === 0) return 0
   if (q.propertyIds && q.propertyIds.length === 0) return 0
+  // 10/12 (Nic, ledger P8): on the ledger, the paid-ahead money the company
+  // holds (2050) — paid-ahead money GAM holds is not on its books (Nic L13).
+  if (await readsLedger(q)) {
+    const { ledgerPaidAheadUnusedAt } = await import('./ledgerReports')
+    return ledgerPaidAheadUnusedAt(q)
+  }
   const row = await query<{ s: string }>(`
     SELECT COALESCE(SUM(GREATEST(c.amount_original - COALESCE(used.amt, 0), 0)), 0)::text AS s
       FROM lease_prepaid_credits c
@@ -2260,8 +2515,13 @@ export function besideList(
   beside: IncomeBeside, paidAheadUnused: number | null, basis: IncomeBasis,
 ): Array<{ key: string; label: string; amount: number }> {
   const keys: Array<keyof typeof ASIDE_LINE_LABEL> = basis === 'received'
-    ? ['clearing', 'creditsYouGave', 'workTrade', 'depositsHeld', 'chargebackFees', 'refundCardFees', 'paidAheadUnused']
-    : ['collectedSoFar', 'clearing', 'stillOwed', 'workTrade', 'depositsHeld', 'chargebackFees', 'refundCardFees', 'paidAheadUnused']
+    // 10/12 (Nic, G10): card fees given back with refunds are the P&L's
+    // "Card fees refunded" expense line now (services/landlordPL), so they are
+    // no longer shown beside the total as well.
+    ? ['clearing', 'creditsYouGave', 'workTrade', 'depositsHeld', 'ownerContributions', 'saleProceeds',
+       'chargebackFees', 'paidAheadUnused']
+    : ['collectedSoFar', 'clearing', 'stillOwed', 'workTrade', 'depositsHeld', 'ownerContributions', 'saleProceeds',
+       'chargebackFees', 'paidAheadUnused']
   const value = (k: keyof typeof ASIDE_LINE_LABEL): number =>
     k === 'paidAheadUnused' ? (paidAheadUnused ?? 0) : (beside as any)[k] ?? 0
   return keys.filter(k => value(k) !== 0).map(k => ({ key: k, label: ASIDE_LINE_LABEL[k], amount: value(k) }))
@@ -2285,6 +2545,15 @@ export interface CategoryRow {
   stillOwed: number
   /** What counts toward the total under the chosen basis. */
   amount: number
+  /**
+   * 10/12 (Nic): the three columns every report shows side by side, whatever
+   * the old switch said — Charged (= billed), Received (money that arrived in
+   * the period; 0 when no received facts were read) and Owed (of what was
+   * charged, still owed today).
+   */
+  charged: number
+  received: number
+  owed: number
 }
 
 export interface CategoryBreakdown {
@@ -2297,15 +2566,61 @@ export interface CategoryBreakdown {
 }
 
 /** Pure: the breakdown from already-read facts (billed facts always; received facts under Money received). */
+/**
+ * 10/12 (Nic, ledger P8): the day the Owed column reads — the last day the
+ * ledger read the receivables on, between `start` and `end` when given (a
+ * month read out of a year takes that month's own end). null when the facts
+ * are not the ledger's (or nothing is owed on any day read).
+ * 10/12 (Nic, review): from the days each 'owed' fact says were read
+ * (owedDays), not from the days that happen to have rows — otherwise a scope
+ * that owes $0 at the end would read an earlier month's balance.
+ */
+export function ledgerOwedDay(events: readonly IncomeEvent[], start?: string, end?: string): string | null {
+  let best: string | null = null
+  const consider = (d: string) => {
+    if (start && d < start) return
+    if (end && d > end) return
+    if (!best || d > best) best = d
+  }
+  const seen = new Set<readonly string[]>()
+  for (const e of events) {
+    if (e.ledger !== 'owed' && e.ledger !== 'owedStart') continue
+    if (e.owedDays) {
+      if (seen.has(e.owedDays)) continue
+      seen.add(e.owedDays)
+      // The list's first day is the day before the period (the strip's start);
+      // the last is the period's end, so an unbounded read lands on the end.
+      for (const d of e.owedDays) consider(d)
+    } else if (e.ledger === 'owed') consider(e.day)
+  }
+  return best
+}
+
 export function breakdownFrom(
   basis: IncomeBasis, billedEvents: readonly IncomeEvent[], receivedEvents: readonly IncomeEvent[] | null,
+  /**
+   * 10/12 (Nic, review): the period these facts are the breakdown of, when it
+   * is shorter than the period they were read for (a month out of six): Owed
+   * is then read at the end of this period, never the longer one's.
+   */
+  period?: { start: string; end: string },
 ): CategoryBreakdown {
   const rows = new Map<IncomeCategory, CategoryRow>()
   for (const c of INCOME_CATEGORIES) {
-    rows.set(c, { category: c, label: INCOME_CATEGORY_LABEL[c], billed: 0, collected: 0, clearing: 0, stillOwed: 0, amount: 0 })
+    rows.set(c, {
+      category: c, label: INCOME_CATEGORY_LABEL[c], billed: 0, collected: 0, clearing: 0, stillOwed: 0, amount: 0,
+      charged: 0, received: 0, owed: 0,
+    })
   }
   const lineTotals = zeroLines()
+  // 10/12 (Nic, ledger P8): on the ledger, Owed is the receivables still open
+  // at the end of the last day read (design §10), by the bill's category.
+  const owedDay = ledgerOwedDay(billedEvents, period ? ymd(period.start) : undefined, period ? ymd(period.end) : undefined)
   for (const e of billedEvents) {
+    if (e.ledger === 'owed') {
+      if (e.day === owedDay && e.category) rows.get(e.category)!.owed += e.amount
+      continue
+    }
     if (!e.inTotal) continue
     if (!e.category) {
       if (basis === 'billed') lineTotals[e.line as ReportLine] += e.amount
@@ -2313,6 +2628,8 @@ export function breakdownFrom(
     }
     const r = rows.get(e.category)!
     r.billed += e.amount
+    // 10/12: Owed is read off the bills under either basis.
+    if (e.part === 'stillOwed') r.owed += e.amount
     if (basis === 'billed') {
       if (e.part && COLLECTED_PARTS.includes(e.part)) r.collected += e.amount
       if (e.part === 'clearing') r.clearing += e.amount
@@ -2326,11 +2643,17 @@ export function breakdownFrom(
       rows.get(e.category)!.collected += e.amount
     }
   }
+  // 10/12: Received beside Charged, from the received facts when they were read.
+  for (const e of receivedEvents ?? []) {
+    if (!e.inTotal || !e.category) continue
+    rows.get(e.category)!.received += e.amount
+  }
   const categories = [...rows.values()].map(r => {
     const out = {
       ...r,
       billed: round2(r.billed), collected: round2(r.collected),
       clearing: round2(r.clearing), stillOwed: round2(r.stillOwed),
+      charged: round2(r.billed), received: round2(r.received), owed: round2(r.owed),
     }
     out.amount = basis === 'received' ? out.collected : out.billed
     return out
@@ -2348,7 +2671,347 @@ export function breakdownFrom(
  * The property report and the dashboard property-health card both read this.
  */
 export async function categoryTotals(q: IncomeQuery): Promise<CategoryBreakdown> {
-  const billed = await incomeEvents({ ...q, basis: 'billed' })
-  const received = q.basis === 'received' ? await incomeEvents({ ...q, basis: 'received' }) : null
+  // 10/12 (Nic): both kinds of facts always, so every category carries
+  // Charged, Received and Owed side by side.
+  const [billed, received] = await Promise.all([
+    incomeEvents({ ...q, basis: 'billed' }),
+    incomeEvents({ ...q, basis: 'received' }),
+  ])
   return breakdownFrom(q.basis, billed, received)
+}
+
+// ─── 10/12 (Nic): Charged / Received / Owed, side by side ───────────────────
+//
+//   "NO 'Money received / Money billed' toggle anywhere — show Charged,
+//    Received and Owed side by side as columns, with a short line showing how
+//    they tie."
+//
+// The switch is retired from every screen. Underneath, the two kinds of facts
+// above are unchanged and both are read for every report: the Money billed
+// facts are the Charged column (each bill in the month it was due, less
+// credits given) and, through what became of each bill, the Owed column (the
+// part still owed today); the Money received facts are the Received column
+// (the day money arrived). Nothing is counted twice: each column adds up its
+// own facts, and the tie line splits each column's total into parts that add
+// back to it exactly.
+
+/** One line (or category) in the three columns. */
+export interface MoneyColumns { charged: number; received: number; owed: number }
+
+export interface MoneyViewLine extends MoneyColumns { line: ReportLine; label: string }
+export interface MoneyViewCategory extends MoneyColumns { category: IncomeCategory; label: string }
+
+/**
+ * How the columns tie. Every figure is a split of a column's own total, so
+ * each side adds back to it to the cent:
+ *   charged = collected + clearing + owed + other
+ *     collected  paid, covered by money paid ahead or deposit interest, kept
+ *                from a deposit (BILLED_PARTS' collected parts)
+ *     clearing   paid with money still on its way
+ *     owed       still owed today
+ *     other      Charged money with no outcome on it (0 in practice)
+ *   received = forPeriodBills + forEarlierBills + paidAhead + noBill
+ *     forPeriodBills   for bills due in the period
+ *     forEarlierBills  for bills due before it (a late payment)
+ *     paidAhead        paid ahead for later bills (and a later bill paid early)
+ *     noBill           money with no bill behind it (register sales, stays,
+ *                      other income, deposit deductions kept)
+ *   stillClearing — paid in the period and not arrived yet: in no column.
+ */
+export interface MoneyTie {
+  charged: { collected: number; clearing: number; owed: number; other: number }
+  received: { forPeriodBills: number; forEarlierBills: number; paidAhead: number; noBill: number }
+  stillClearing: number
+}
+
+export interface MoneyView extends MoneyColumns {
+  /** Of Charged: collected so far (tie.charged.collected). */
+  collected: number
+  /** Of Charged: paid with money still clearing. */
+  clearing: number
+  /** Every non-zero income line, in report order (they add up to each column). */
+  lines: MoneyViewLine[]
+  /** Income by category (non-zero), and the money with no category under its line. */
+  categories: MoneyViewCategory[]
+  uncategorized: MoneyViewLine[]
+  tie: MoneyTie
+  /** The tie in plain words — one short line per column (screens, the PDF and the email print it as is). */
+  tieText: string[]
+  /**
+   * Figures in no column: covered by work trade (never money), deposits
+   * received (held for the tenant), owner contributions and sale proceeds
+   * (money in, never income), chargeback fees and card fees given back with
+   * refunds (costs netted from payouts), and paid-ahead money not used yet by
+   * the period's last day (it counted in Received the day it arrived).
+   */
+  beside: Array<{ key: string; label: string; amount: number }>
+  /**
+   * 10/12 (Nic, ledger P8): 'ledger' when the facts came from the ledger. Owed
+   * is then what tenants still owed at the END of the period (the receivables
+   * balance, every bill), and `proof` is the strip that ties it: owed at the
+   * start + billed − received against bills − credits − work trade − paid
+   * from paid-ahead money − paid from deposits ± opening balances and
+   * corrections = owed at the end. tieText's second line says it in words.
+   */
+  source?: 'ledger'
+  proof?: LedgerProof
+}
+
+/**
+ * The beside keys a three-column report lists (clearing and credits are in the
+ * columns and the tie). 10/12 (G10): card fees given back with refunds are the
+ * P&L's "Card fees refunded" expense, not a figure beside it.
+ */
+const VIEW_BESIDE_KEYS = [
+  'workTrade', 'depositsHeld', 'ownerContributions', 'saleProceeds', 'chargebackFees',
+  // 10/12 (ledger P8): tax that arrived with a payment (the ledger's reports).
+  'taxCollected',
+] as const
+
+/** Dollars in report words: $1,234.56, −$12.00. */
+export function sayDollars(n: number): string {
+  const v = round2(n)
+  return `${v < 0 ? '−' : ''}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+/** "a, b and c" */
+function joinWords(parts: string[]): string {
+  if (parts.length <= 1) return parts.join('')
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
+}
+
+/**
+ * The tie in two short lines: what became of what was charged, and what the
+ * money received was for. `periodLabel` names the period ("September 2026",
+ * "2026"). Zero parts are left out (the first part of each line always shows).
+ */
+export function moneyTieText(v: Pick<MoneyView, 'charged' | 'received'> & { tie: MoneyTie }, periodLabel: string): string[] {
+  const c = v.tie.charged, r = v.tie.received
+  const chargedParts = [`${sayDollars(c.collected)} is collected`]
+  if (c.clearing) chargedParts.push(`${sayDollars(c.clearing)} is still clearing`)
+  chargedParts.push(`${sayDollars(c.owed)} is still owed`)
+  if (c.other) chargedParts.push(`${sayDollars(c.other)} has no outcome yet`)
+  const receivedParts = [`${sayDollars(r.forPeriodBills)} was for bills due in ${periodLabel}`]
+  if (r.forEarlierBills) receivedParts.push(`${sayDollars(r.forEarlierBills)} for bills due earlier`)
+  if (r.paidAhead) receivedParts.push(`${sayDollars(r.paidAhead)} was paid ahead for later bills`)
+  if (r.noBill) receivedParts.push(`${sayDollars(r.noBill)} had no bill behind it (register sales, stays, other income)`)
+  // 10/12 (Nic, L2): Received leads — what arrived first, then what became
+  // of what was charged. routes/reports viewForViewer drops the second
+  // sentence (it names what is still owed) for a viewer who sees no totals.
+  const out = [
+    `Of ${sayDollars(v.received)} received, ${joinWords(receivedParts)}.`,
+    `Of ${sayDollars(v.charged)} charged, ${joinWords(chargedParts)}.`,
+  ]
+  if (v.tie.stillClearing) out.push(`${sayDollars(v.tie.stillClearing)} more was paid and is still clearing; it counts in Received the day it arrives.`)
+  return out
+}
+
+/**
+ * Pure: the three columns from already-read facts — the Money billed facts
+ * and the Money received facts for the SAME scope and days — with the tie.
+ * `period` is the report's first and last day ('YYYY-MM-DD'); a received
+ * fact's bill is "for the period" when its due date falls inside it.
+ */
+export function moneyViewFrom(
+  billed: readonly IncomeEvent[],
+  received: readonly IncomeEvent[],
+  period: { start: string; end: string; label: string },
+  paidAheadUnused: number | null = null,
+): MoneyView {
+  const start = ymd(period.start), end = ymd(period.end)
+  const byLine = new Map<ReportLine, MoneyColumns>()
+  const byCat = new Map<IncomeCategory, MoneyColumns>()
+  const noCat = new Map<ReportLine, MoneyColumns>()
+  const cell = <K>(m: Map<K, MoneyColumns>, k: K): MoneyColumns => {
+    let x = m.get(k)
+    if (!x) { x = { charged: 0, received: 0, owed: 0 }; m.set(k, x) }
+    return x
+  }
+  const tie: MoneyTie = {
+    charged: { collected: 0, clearing: 0, owed: 0, other: 0 },
+    received: { forPeriodBills: 0, forEarlierBills: 0, paidAhead: 0, noBill: 0 },
+    stillClearing: 0,
+  }
+  let charged = 0, rec = 0, owed = 0
+  const isLine = (l: string): l is ReportLine => (REPORT_LINES as readonly string[]).includes(l)
+  // 10/12 (Nic, ledger P8): facts from the ledger carry the receivables still
+  // open at each month's end ('owed' — the Owed column reads the last one in
+  // this period) and the period's receivables movements ('proof').
+  const fromLedger = billed.some(e => !!e.ledger) || received.some(e => !!e.ledger)
+  const owedDay = fromLedger ? ledgerOwedDay(billed, start, end) : null
+  const flow: Record<LedgerProofTerm, number> = {
+    billed: 0, received: 0, creditsGiven: 0, workTrade: 0, paidAhead: 0, deposits: 0, opening: 0, writtenOff: 0, other: 0,
+  }
+  // 10/12 (Nic, review): owed at the start of the strip, read from the books
+  // (the 'owedStart' facts dated the period's first day) when the day before
+  // the period was read.
+  const dayBefore = addDaysYmd(start, -1)
+  let startWasRead = false
+  let owedBefore = 0
+  // Every fact in a total counts toward its column's total, as summarize
+  // counts it; the lines and categories are its groupings.
+  for (const e of billed) {
+    if (e.ledger === 'owed' || e.ledger === 'owedStart') {
+      if (!startWasRead && e.owedDays?.includes(dayBefore)) startWasRead = true
+      if (e.ledger === 'owedStart') {
+        if (e.day === start) owedBefore += e.amount
+        continue
+      }
+      if (e.day !== owedDay) continue
+      owed += e.amount
+      const line = isLine(e.line) ? e.line : null
+      if (line) cell(byLine, line).owed += e.amount
+      const g = e.category ? cell(byCat, e.category) : line ? cell(noCat, line) : null
+      if (g) g.owed += e.amount
+      continue
+    }
+    if (e.ledger === 'proof') {
+      if (e.proofTerm && e.day >= start && e.day <= end) flow[e.proofTerm] += e.amount
+      continue
+    }
+    if (!e.inTotal) continue
+    const isOwed = e.part === 'stillOwed'
+    const line = isLine(e.line) ? e.line : null
+    charged += e.amount
+    if (line) cell(byLine, line).charged += e.amount
+    const g = e.category ? cell(byCat, e.category) : line ? cell(noCat, line) : null
+    if (g) g.charged += e.amount
+    if (isOwed) {
+      owed += e.amount
+      if (line) cell(byLine, line).owed += e.amount
+      if (g) g.owed += e.amount
+      tie.charged.owed += e.amount
+    } else if (e.part === 'clearing') tie.charged.clearing += e.amount
+    else if (e.part && COLLECTED_PARTS.includes(e.part)) tie.charged.collected += e.amount
+    else tie.charged.other += e.amount
+  }
+  const beside = new Map<string, number>()
+  for (const e of received) {
+    if (!e.inTotal) {
+      if (e.line === 'clearing') tie.stillClearing += e.amount
+      else beside.set(e.line, (beside.get(e.line) ?? 0) + e.amount)
+      continue
+    }
+    rec += e.amount
+    if (isLine(e.line)) {
+      cell(byLine, e.line).received += e.amount
+      ;(e.category ? cell(byCat, e.category) : cell(noCat, e.line)).received += e.amount
+    } else if (e.category) {
+      cell(byCat, e.category).received += e.amount
+    }
+    const due = e.dueDate ? ymd(e.dueDate) : null
+    if (e.line === 'paidAhead') tie.received.paidAhead += e.amount
+    else if (!due) tie.received.noBill += e.amount
+    else if (due < start) tie.received.forEarlierBills += e.amount
+    else if (due > end) tie.received.paidAhead += e.amount
+    else tie.received.forPeriodBills += e.amount
+  }
+  const tidy = (x: MoneyColumns): MoneyColumns => ({ charged: round2(x.charged), received: round2(x.received), owed: round2(x.owed) })
+  const nonZero = (x: MoneyColumns) => x.charged !== 0 || x.received !== 0 || x.owed !== 0
+  const lines = REPORT_LINES
+    .filter(l => byLine.has(l))
+    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(byLine.get(l)!) }))
+    .filter(nonZero)
+  const categories = INCOME_CATEGORIES
+    .filter(c => byCat.has(c))
+    .map(c => ({ category: c, label: INCOME_CATEGORY_LABEL[c], ...tidy(byCat.get(c)!) }))
+    .filter(nonZero)
+  const uncategorized = REPORT_LINES
+    .filter(l => noCat.has(l))
+    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(noCat.get(l)!) }))
+    .filter(nonZero)
+  for (const k of ['collected', 'clearing', 'owed', 'other'] as const) tie.charged[k] = round2(tie.charged[k])
+  for (const k of ['forPeriodBills', 'forEarlierBills', 'paidAhead', 'noBill'] as const) tie.received[k] = round2(tie.received[k])
+  tie.stillClearing = round2(tie.stillClearing)
+  const view: MoneyView = {
+    charged: round2(charged), received: round2(rec), owed: round2(owed),
+    collected: tie.charged.collected, clearing: tie.charged.clearing,
+    lines, categories, uncategorized, tie, tieText: [],
+    beside: [
+      ...VIEW_BESIDE_KEYS
+        .map(k => ({ key: k as string, label: ASIDE_LINE_LABEL[k], amount: round2(beside.get(k) ?? 0) }))
+        .filter(b => b.amount !== 0),
+      ...(paidAheadUnused ? [{ key: 'paidAheadUnused', label: ASIDE_LINE_LABEL.paidAheadUnused, amount: round2(paidAheadUnused) }] : []),
+    ],
+  }
+  if (fromLedger) {
+    // 10/12 (Nic, ledger P8): the strip that ties Owed (design §10). The
+    // movements are debits − credits on the receivables, so money in and
+    // credits are negative; each is shown as what it took off.
+    const r = (n: number) => round2(n) || 0   // never −0
+    const corrections = r(flow.opening + flow.writtenOff + flow.other)
+    const moved = flow.billed + flow.received + flow.creditsGiven + flow.workTrade + flow.paidAhead + flow.deposits + corrections
+    // 10/12 (Nic, review): a real tie-out — owed at the start is the books'
+    // own balance the day before (when it was read), checked against the
+    // end less what moved; offBy is any amount the terms miss by.
+    const owedAtStart = startWasRead ? r(owedBefore) : r(owed - moved)
+    const proof: LedgerProof = {
+      startDay: start, endDay: end,
+      owedAtStart,
+      billed: r(flow.billed), received: r(-flow.received), creditsGiven: r(-flow.creditsGiven),
+      workTrade: r(-flow.workTrade), paidAhead: r(-flow.paidAhead), deposits: r(-flow.deposits),
+      corrections, owedAtEnd: r(owed), offBy: r(owedAtStart + moved - owed),
+    }
+    view.source = 'ledger'
+    view.proof = proof
+    view.tieText = [moneyTieText(view, period.label)[0], ledgerProofText(proof)]
+    return view
+  }
+  view.tieText = moneyTieText(view, period.label)
+  return view
+}
+
+/** 'YYYY-MM-DD' → "Sep 30, 2026" (the proof strip's days). */
+function dayWords(day: string): string {
+  const [y, m, d] = day.split('-').map(Number)
+  return new Date(Date.UTC(y, (m || 1) - 1, d || 1)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+
+/**
+ * 10/12 (Nic, ledger P8): the proof strip in words — owed at the start, what
+ * was billed, received and otherwise settled, and owed at the end. Zero terms
+ * between billed and the end are left out.
+ */
+export function ledgerProofText(p: LedgerProof): string {
+  const startWords = dayWords(addDaysYmd(p.startDay, -1))
+  const parts = [`Owed ${sayDollars(p.owedAtStart)} at the end of ${startWords}`, `+ billed ${sayDollars(p.billed)}`,
+    `− received against bills ${sayDollars(p.received)}`]
+  if (p.creditsGiven) parts.push(`− credits given ${sayDollars(p.creditsGiven)}`)
+  if (p.workTrade) parts.push(`− work trade ${sayDollars(p.workTrade)}`)
+  if (p.paidAhead) parts.push(`− paid from money paid ahead ${sayDollars(p.paidAhead)}`)
+  if (p.deposits) parts.push(`− paid from deposits ${sayDollars(p.deposits)}`)
+  if (p.corrections) parts.push(`${p.corrections > 0 ? '+' : '−'} opening balances and corrections ${sayDollars(Math.abs(p.corrections))}`)
+  const text = `${parts.join(' ')} = owed ${sayDollars(p.owedAtEnd)} at the end of ${dayWords(p.endDay)}.`
+  // 10/12 (Nic, review): never hide a strip that does not tie out.
+  return p.offBy ? `${text} These do not add up: they are off by ${sayDollars(Math.abs(p.offBy))}.` : text
+}
+
+/** 'YYYY-MM-DD' plus n days. */
+function addDaysYmd(day: string, n: number): string {
+  const [y, m, d] = day.split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10)
+}
+
+/** Both kinds of facts for one scope and period, read once (and paid-ahead money on hand at its last day). */
+export async function incomeBoth(q: Omit<IncomeQuery, 'basis'>): Promise<{
+  billed: IncomeEvent[]; received: IncomeEvent[]; paidAheadUnused: number
+}> {
+  const [billed, received, paidAheadUnused] = await Promise.all([
+    incomeEvents({ ...q, basis: 'billed' }),
+    incomeEvents({ ...q, basis: 'received' }),
+    paidAheadUnusedAt(q),
+  ])
+  return { billed, received, paidAheadUnused }
+}
+
+/** The three columns for one scope and period. `label` names the period in the tie line. */
+export async function moneyView(q: Omit<IncomeQuery, 'basis'> & { label: string }): Promise<MoneyView> {
+  const { billed, received, paidAheadUnused } = await incomeBoth(q)
+  return moneyViewFrom(billed, received, { start: q.start, end: q.end, label: q.label }, paidAheadUnused)
+}
+
+/** 'YYYY-MM' → "September 2026" (the tie line's period name). */
+export function monthWords(ym: string): string {
+  const [y, m] = ym.split('-').map(Number)
+  return new Date(Date.UTC(y, (m || 1) - 1, 1)).toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
 }

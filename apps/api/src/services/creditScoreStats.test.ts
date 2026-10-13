@@ -42,11 +42,12 @@ function mkEvent(opts: {
   dimension_tags?: string[]
   superseded_by?: string | null
   id?: string
+  event_data?: Record<string, unknown>
 }): any {
   return {
     id:                 opts.id ?? nextId(),
     event_type:         opts.event_type,
-    event_data:         {},
+    event_data:         opts.event_data ?? {},
     occurred_at:        opts.occurred_at ?? opts.recorded_at ?? new Date('2026-01-01'),
     recorded_at:        opts.recorded_at ?? new Date('2026-01-01'),
     attestation_source: opts.attestation_source ?? 'gam_system_witnessed',
@@ -242,43 +243,65 @@ describe('computeStats', () => {
     expect((r.payment_stats as any).rolling_12mo.total_events).toBe(0)
   })
 
-  it('payment events bucketed by tier in lifetime slice', () => {
-    const events = [
-      mkEvent({ event_type: 'payment_received_on_time',     occurred_at: new Date('2026-01-01') }),
-      mkEvent({ event_type: 'payment_received_on_time',     occurred_at: new Date('2026-02-01') }),
-      mkEvent({ event_type: 'payment_received_late_grace',  occurred_at: new Date('2026-03-01') }),
-      mkEvent({ event_type: 'payment_failed_nsf',           occurred_at: new Date('2026-04-01') }),
-    ]
-    const r = computeStats(events) as any
-    expect(r.payment_stats.lifetime.total_events).toBe(4)
-    expect(r.payment_stats.lifetime.on_time_count).toBe(2)
-    expect(r.payment_stats.lifetime.within_grace_count).toBe(3)  // on_time + grace
-    expect(r.payment_stats.lifetime.nsf_count).toBe(1)
-    expect(r.payment_stats.lifetime.on_time_pct).toBe(50)
-    expect(r.payment_stats.lifetime.within_grace_pct).toBe(75)
+  // 10/12 (Nic): "the payment history should be a health percentage. one
+  // mark per invoice." The payment figures are the BILL marks
+  // (event_data.mark_basis 'invoice'); a per-line mark from before 10/12 is
+  // only counted as not yet replaced.
+  const billMark = (event_type: string, due: string, occurred_at?: Date) =>
+    mkEvent({ event_type, occurred_at: occurred_at ?? new Date(`${due}T12:00:00Z`), event_data: { mark_basis: 'invoice', due_date: due } })
+
+  it('the payment health: bills on time ÷ bills judged, as a whole percent, with its words', () => {
+    const r = computeStats([
+      billMark('payment_received_on_time',     '2026-01-01'),
+      billMark('payment_received_on_time',     '2026-02-01'),
+      billMark('payment_received_late_minor',  '2026-03-01'),
+      billMark('payment_skipped',              '2026-04-01'),
+      billMark('payment_partial',              '2026-05-01'),
+      billMark('payment_received_on_time',     '2026-06-01'),
+    ]) as any
+    expect(r.payment_stats.basis).toBe('bill')
+    expect(r.payment_stats.health).toEqual({
+      percent: 50, on_time: 3, counted: 6, paid_late: 1, partial: 1, outstanding: 1,
+      label: '50%, 3 of 6 bills on time',
+    })
+    expect(r.payment_stats.lifetime).toMatchObject({ total_events: 6, on_time_count: 3, on_time_pct: 50, skipped_count: 1, partial_count: 1 })
   })
 
-  it('rolling_90d window excludes events older than 90 days', () => {
-    const recent = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-    const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000)
-    const events = [
-      mkEvent({ event_type: 'payment_received_on_time', occurred_at: recent }),
-      mkEvent({ event_type: 'payment_received_on_time', occurred_at: old }),
-    ]
-    const r = computeStats(events) as any
+  it('per-line marks written before 10/12 are not the payment history (counted only)', () => {
+    const r = computeStats([
+      billMark('payment_received_on_time', '2026-01-01'),
+      mkEvent({ event_type: 'payment_received_on_time', event_data: { payment_id: 'p1' } }),
+      mkEvent({ event_type: 'payment_received_late_major', event_data: { payment_id: 'p2' } }),
+    ]) as any
+    expect(r.payment_stats.health).toMatchObject({ percent: 100, counted: 1 })
+    expect(r.payment_stats.line_marks_not_replaced).toBe(2)
+  })
+
+  it('no bills yet: no percent, and the words say so', () => {
+    const r = computeStats([mkEvent({ event_type: 'lease_signed' })]) as any
+    expect(r.payment_stats.health).toMatchObject({ percent: null, counted: 0, label: 'No bills to judge yet' })
+  })
+
+  it('rolling_90d window excludes bills older than 90 days', () => {
+    const recent = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const r = computeStats([
+      billMark('payment_received_on_time', recent),
+      billMark('payment_received_on_time', old),
+    ]) as any
     expect(r.payment_stats.lifetime.total_events).toBe(2)
     expect(r.payment_stats.rolling_90d.total_events).toBe(1)
   })
 
-  it('on-time streak: counts consecutive on_time + grace, resets on miss', () => {
-    const events = [
-      mkEvent({ event_type: 'payment_received_on_time',     occurred_at: new Date('2026-01-01') }),
-      mkEvent({ event_type: 'payment_received_on_time',     occurred_at: new Date('2026-02-01') }),
-      mkEvent({ event_type: 'payment_received_late_grace',  occurred_at: new Date('2026-03-01') }),
-      mkEvent({ event_type: 'payment_failed_nsf',           occurred_at: new Date('2026-04-01') }),
-      mkEvent({ event_type: 'payment_received_on_time',     occurred_at: new Date('2026-05-01') }),
-    ]
-    const r = computeStats(events) as any
+  it('on-time streak runs by bill (due date), resets on a bill not paid on time', () => {
+    const r = computeStats([
+      // Recorded out of order: the streak follows the bills' months.
+      billMark('payment_received_on_time',     '2026-05-01'),
+      billMark('payment_received_on_time',     '2026-01-01'),
+      billMark('payment_received_on_time',     '2026-02-01'),
+      billMark('payment_received_on_time',     '2026-03-01'),
+      billMark('payment_received_late_major',  '2026-04-01'),
+    ]) as any
     expect(r.payment_stats.longest_on_time_streak_count).toBe(3)
     expect(r.payment_stats.current_on_time_streak_count).toBe(1)
   })
@@ -325,20 +348,23 @@ describe('computeStats', () => {
     const supersedingId = nextId()
     const events = [
       mkEvent({
-        event_type: 'payment_received_on_time',
-        occurred_at: new Date('2026-01-01'),
+        event_type: 'payment_skipped',
+        occurred_at: new Date('2026-01-07'),
         superseded_by: supersedingId,
+        event_data: { mark_basis: 'invoice', due_date: '2026-01-01' },
       }),
       mkEvent({
         id: supersedingId,
-        event_type: 'payment_failed_nsf',
-        occurred_at: new Date('2026-01-02'),
+        event_type: 'payment_received_late_major',
+        occurred_at: new Date('2026-01-12'),
+        event_data: { mark_basis: 'invoice', due_date: '2026-01-01' },
       }),
     ]
     const r = computeStats(events) as any
     expect(r.event_count).toBe(1)
-    expect(r.payment_stats.lifetime.on_time_count).toBe(0)
-    expect(r.payment_stats.lifetime.nsf_count).toBe(1)
+    expect(r.payment_stats.lifetime.skipped_count).toBe(0)
+    expect(r.payment_stats.lifetime.late_major_count).toBe(1)
+    expect(r.payment_stats.health).toMatchObject({ counted: 1, outstanding: 0, paid_late: 1, percent: 0 })
   })
 
   it('pct computation handles zero denominator (no payments → 0)', () => {

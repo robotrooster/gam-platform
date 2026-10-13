@@ -15,6 +15,11 @@ import { AppError } from '../middleware/errorHandler'
 import { cascadeLeaseTenantsOnVoid } from './leaseDocCascade'
 import { lockLeaseHousehold, unwindIssuedLease, paymentTriedSql } from './unwindIssuedLease'
 import { lockHousehold } from '../services/moneyPredicates'
+import { voidUnowedChargesOrRefuse } from '../services/chargeVoids'
+
+/** Why a home payment of a sale whose agreement was voided is not owed (payments.void_reason). */
+export const HOME_SALE_VOIDED_CHARGE_REASON =
+  'The installment contract it was billed under was voided, so the sale was cancelled and it is not owed.'
 
 type Q = (sql: string, params?: any[]) => Promise<{ rows: any[] }>
 
@@ -104,9 +109,14 @@ export async function voidDocument(q: Q, doc: any, reason: string | null) {
  *     refund, not a void. The landlord cancels the financing on the unit
  *     instead, and what was paid stays on record.
  *   - Otherwise each home payment still owed comes off the bill it is on
- *     (removed — nothing was ever tried on it, the precedent unwindIssuedLease
- *     follows; the bill's totals come down by the same amount and its status
- *     follows what is left on it), and the sale is cancelled.
+ *     (nothing was ever tried on it, the precedent unwindIssuedLease follows;
+ *     the bill's totals come down by the same amount and its status follows
+ *     what is left on it), and the sale is cancelled. 10/12 (Nic): the home
+ *     payment is VOIDED as a record (status 'voided' with when and why,
+ *     decisions #48.5 — services/chargeVoids), never deleted, and in no
+ *     balance or total. Its installment lets go of it, as the delete's
+ *     ON DELETE SET NULL did, so every reader of the schedule sees what it
+ *     saw before; the payment still names its installment.
  *   - REFUSED when the sale is already recorded as paid off: the home has
  *     passed to the buyer, and a void cannot hand it back.
  * A sale still waiting for a signature is left to the void trigger, which
@@ -138,18 +148,26 @@ export async function unwindHomeSaleOnVoid(q: Q, contractId: string): Promise<vo
       'so the contract can\'t be voided. Cancel the financed sale on the unit instead — what was paid stays on record.')
   }
   const owed = lines.filter(l => l.status === 'pending' || l.status === 'failed')
-  for (const l of owed) {
-    if (l.invoice_id) {
+  // The sale is cancelled below, so its installments never bill again: each
+  // voided home payment keeps naming the installment it billed.
+  const voided = await voidUnowedChargesOrRefuse(q, owed.map(l => l.id), HOME_SALE_VOIDED_CHARGE_REASON,
+    'A record still points at a home payment from this installment contract, so the contract can\'t be voided. ' +
+    'Cancel the financed sale on the unit instead — what was paid stays on record.',
+    { keepInstallmentLink: true })
+  for (const v of voided) {
+    if (v.invoiceId) {
       await q(
         `UPDATE invoices
             SET subtotal_home_payments = GREATEST(COALESCE(subtotal_home_payments, 0) - $2, 0),
                 total_amount = total_amount - $2,
                 updated_at = NOW()
-          WHERE id = $1`, [l.invoice_id, l.amount])
+          WHERE id = $1`, [v.invoiceId, v.amount.toFixed(2)])
     }
-    // The installment's payment_id clears itself (ON DELETE SET NULL); the
-    // bill's status follows what is left on it (trg_payments_invoice_status_rollup).
-    await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending', 'failed')`, [l.id])
+    // The installment has let go of it already, as the delete's ON DELETE SET
+    // NULL did (10/12 review: voidUnowedCharges releases every voided home
+    // payment's installment, for every path); the bill's status follows what
+    // is left on it (trg_payments_invoice_status_rollup, which leaves voided
+    // lines out).
   }
   await q(
     `UPDATE home_sale_contracts SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()

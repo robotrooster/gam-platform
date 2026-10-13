@@ -25,6 +25,7 @@ import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } 
 import { replyToProperty } from '../services/replyRouting'
 import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
+import { graceDaysSql } from '../services/lateness'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -63,8 +64,6 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
                   OR l.id IN (SELECT m.landlord_id FROM landlord_members m WHERE m.user_id = u.id))
         ) AS landlords_without_property,
         (SELECT COUNT(*)::int FROM users WHERE role='tenant')   AS total_tenants,
-        (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
-        (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
         (SELECT COUNT(*)::int FROM units WHERE payment_block=TRUE) AS eviction_mode_units,
         -- ── S639: THE ADMIN LENS IS MONEY THAT MOVED ───────────────────────
         --
@@ -225,7 +224,23 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
              AND COALESCE(p.mapping_status, 'unverified') = 'unverified'
         ) AS csv_imports_pending_review
     `)
-    res.json({ success: true, data: platform })
+    // 10/12 (Nic, A5): "Active units card: MATCH BILLING (occupied = billable
+    // evidence; vacant = rest; retired excluded)." This counted unit STATUS
+    // ('active' / 'vacant') across every unit on the platform — retired ones,
+    // demo accounts and signups that never went live included — so it could
+    // not agree with what GAM bills. It now reads the platform fee's own count
+    // of occupied spaces this month (services/platformMetrics spacesOccupied →
+    // billableUnits.occupiedSpacesSql), out of the spaces under management,
+    // and the rest are vacant.
+    const { spacesOccupied } = await import('../services/platformMetrics')
+    const spaces = await spacesOccupied()
+    res.json({ success: true, data: {
+      ...platform,
+      active_units: spaces.occupied,
+      vacant_units: spaces.vacant,
+      total_spaces: spaces.spaces,
+      spaces_month: spaces.month,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -985,11 +1000,13 @@ export const onboardingOverviewHandler = async (req: any, res: any, next: any) =
       SELECT
         (SELECT COUNT(*)::int FROM landlords l WHERE l.onboarding_complete=FALSE
            AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)) AS landlords_incomplete,
+        -- 10/12 (Nic): "no bank" = Stripe cannot pay them yet. This counted
+        -- rows in the legacy bank catalog (the old Add Bank Account form, now
+        -- removed), which never set up payouts — so a landlord with live
+        -- Connect payouts counted as missing a bank, and one who only typed a
+        -- routing number in (Country Acres, 10/5) counted as done.
         (SELECT COUNT(*)::int FROM landlords l
-          WHERE NOT EXISTS (
-            SELECT 1 FROM user_bank_accounts ba
-             WHERE ba.user_id = l.user_id AND ba.status = 'active'
-          )
+          WHERE NOT COALESCE(l.connect_payouts_enabled, FALSE)
           AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)
         ) AS landlords_no_bank,
         (SELECT COUNT(*)::int FROM tenants t WHERE t.ach_verified=FALSE
@@ -1008,16 +1025,21 @@ export const onboardingOverviewHandler = async (req: any, res: any, next: any) =
                JOIN units un ON un.id=le.unit_id
                JOIN landlords ld ON ld.id=un.landlord_id
                WHERE vlat.tenant_id=t.id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS tenants_no_flex,
-        (SELECT COUNT(*)::int FROM units un WHERE un.status='vacant'
-           AND ($1::uuid IS NULL OR EXISTS (
-             SELECT 1 FROM landlords ld WHERE ld.id=un.landlord_id
-              AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS vacant_units,
         (SELECT COUNT(*)::int FROM v_unit_occupancy vuo WHERE NOT vuo.is_occupied
            AND ($1::uuid IS NULL OR EXISTS (
              SELECT 1 FROM units un JOIN landlords ld ON ld.id=un.landlord_id
               WHERE un.id=vuo.unit_id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS units_no_tenant
     `, [scopeId])
-    res.json({ success: true, data: stats })
+    // 10/12 (Nic, A5: "MATCH BILLING (occupied = billable evidence; vacant =
+    // rest; retired excluded)"). This tile counted unit STATUS = 'vacant' — a
+    // label somebody typed — while the Overview's vacant count follows the
+    // platform fee, so the admin showed two different "vacant" numbers. Now
+    // the same count as the Overview (services/platformMetrics spacesOccupied:
+    // open spaces on live properties of real landlords, less those occupied
+    // this month the way the bill counts them), in this admin's portfolio.
+    const { spacesOccupied } = await import('../services/platformMetrics')
+    const spaces = await spacesOccupied(undefined, { portfolioUserId: scopeId })
+    res.json({ success: true, data: { ...stats, vacant_units: spaces.vacant } })
   } catch (e) { next(e) }
 }
 adminRouter.get('/onboarding/overview', onboardingOverviewHandler)
@@ -1030,10 +1052,9 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
   try {
     const landlord = await queryOne<any>(
       `SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
-        EXISTS (
-          SELECT 1 FROM user_bank_accounts ba
-           WHERE ba.user_id = l.user_id AND ba.status = 'active'
-        ) AS bank_account_ready
+        -- 10/12 (Nic): ready = Stripe Connect payouts are live, nothing else
+        -- (see landlords_no_bank above).
+        COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready
        FROM landlords l JOIN users u ON u.id = l.user_id
        WHERE l.id = $1`, [req.params.id]
     )
@@ -1052,11 +1073,7 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
          COUNT(DISTINCT p.id)::int AS property_count,
          COUNT(DISTINCT u.id)::int AS unit_count,
          COUNT(DISTINCT u.id) FILTER (WHERE vuo.is_occupied)::int AS units_with_tenants,
-         COUNT(DISTINCT l.id) FILTER (WHERE l.status='active')::int AS active_leases,
-         (
-           SELECT COUNT(*)::int FROM user_bank_accounts ba
-            WHERE ba.user_id = ld.user_id AND ba.status = 'active'
-         ) AS active_bank_accounts
+         COUNT(DISTINCT l.id) FILTER (WHERE l.status='active')::int AS active_leases
        FROM landlords ld
        LEFT JOIN properties p ON p.landlord_id = ld.id
        LEFT JOIN units u ON u.landlord_id = ld.id
@@ -1068,7 +1085,10 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
 
     const checklist = [
       { key: 'account_created',   label: 'Account created',         done: true },
-      { key: 'bank_account_added', label: 'Bank account added',     done: counts.active_bank_accounts > 0 },
+      // 10/12 (Nic): done when Stripe can pay them — not when a routing number
+      // sat in the legacy catalog (the removed Add Bank Account form). Key kept
+      // so existing readers of the checklist do not break.
+      { key: 'bank_account_added', label: 'Payouts set up with Stripe', done: !!landlord.bank_account_ready },
       { key: 'property_added',    label: 'Property added',           done: counts.property_count > 0 },
       { key: 'unit_added',        label: 'Units added',              done: counts.unit_count > 0 },
       { key: 'tenant_invited',    label: 'Tenant invited',           done: counts.units_with_tenants > 0 },
@@ -1765,6 +1785,28 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
         book: r.book,
         on_balance: r.onBalance,
         gap: r.gap,
+        // 10/12 (Nic, A3): "SHOW THE BRIDGE" — from what the earnings ledger
+        // says GAM has earned to GAM's own on the balance, line by line; the
+        // leftover must read $0.00 (services/stripeCosts platformBalanceBridge).
+        bridge: r.bridge ? {
+          earned: r.bridge.earned,
+          platform_fees_not_collected: r.bridge.platformFeesNotCollected,
+          // 10/12 (G5 review): the part of a processing fee a landlord covers
+          // that the payment could not hold, billed to them and not collected yet.
+          processing_fees_not_collected: r.bridge.processingFeesNotCollected,
+          reader_payments_collected: r.bridge.readerPaymentsCollected,
+          // 10/12 (Nic, Q-g): cost first — the cost part of the reader
+          // payments is its own line; the markup is inside `earned`.
+          reader_cost_recovered: r.bridge.readerCostRecovered,
+          reader_markup_collected: r.bridge.readerMarkupCollected,
+          reader_markup_not_collected: r.bridge.readerMarkupNotCollected,
+          paid_out_to_gam_bank: r.bridge.paidOutToGamBank,
+          // Not "items": the camelizer passes an `items` value through untouched.
+          timing: r.bridge.timing.map(t => ({ key: t.key, label: t.label, amount: t.amount })),
+          gams_own: r.bridge.gamsOwn,
+          on_balance: r.bridge.onBalance,
+          leftover: r.bridge.leftover,
+        } : null,
       } : null,
       owed_by_landlords_uncollected: split.owedByLandlordsUncollected,
       // 10/12 (Nic) review: the same figure kind by kind, so the card can say
@@ -1955,6 +1997,9 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
   { key: 'flexpay',            label: 'FlexPay',             types: ['flexpay_subscription'],      recurring: false },
   { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
   { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },
+  // 10/12 (Nic, Q-g): a card reader's markup — only the markup is earnings;
+  // GAM's cost of the reader coming back never reaches the ledger.
+  { key: 'card_reader_markup', label: 'Card Reader Markup',  types: ['device_markup'],             recurring: false },
   { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
 ]
 
@@ -2632,13 +2677,20 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
     const countedDefault = flexPayCountedDefaultSql('fa')
     // S542c (Nic): queue ordered by FLOAT NEED — shortest float first,
     // FIFO created_at as tiebreak. Float = days between GAM's front
-    // (lease grace-period end, default 5) and the tenant's benefit-
+    // (grace-period end: lease, else property, else 5) and the tenant's benefit-
     // arrival day; a benefit day at/before grace-end is ~zero float.
     // Shorter float recycles bankroll faster (3 tenants × 1 week beats
     // 1 tenant × 3 weeks) and longer floats earn less per dollar-day.
     // Unknown day (questionnaire-funneled) sorts LAST until captured.
     // Position numbers are ADMIN-SIDE ONLY — tenants never see one.
     // state_hold rows keep their place but cannot be approved (422).
+    //
+    // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain."
+    // The front is the late-fee engine's grace (services/lateness, one
+    // definition). Lease-else-5 measured a park with a 2-day grace as if
+    // FlexPay fronted on the 5th, understating the float by 3 days and
+    // queueing that tenant ahead of shorter ones.
+    const grace = graceDaysSql('l', 'pr')
     const rows = await query<any>(
       `SELECT fi.id, fi.status, fi.claimed_income_source, fi.tenant_note,
               fi.admin_notes, fi.created_at, fi.reviewed_at,
@@ -2646,7 +2698,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
               -- NB: CASE guard required — GREATEST(0, NULL) is 0 in
               -- Postgres, which would sort unknown-day rows FIRST.
               CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                   ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                   ELSE GREATEST(0, fi.desired_pull_day - ${grace})
               END AS est_float_days,
               -- S545: lease context the reviewer needs — the terms the
               -- float rides on: due day, remaining term.
@@ -2695,7 +2747,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
                    AND NOT COALESCE(t.flexpay_returner_cleared, false)) ASC,
                   (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                   CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                       ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                       ELSE GREATEST(0, fi.desired_pull_day - ${grace})
                   END ASC NULLS LAST,
                   fi.created_at ASC))::int
               END AS queue_position,
@@ -2720,7 +2772,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
                  is_flexpay_returner ASC,
                  (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                  CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                      ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                      ELSE GREATEST(0, fi.desired_pull_day - ${grace})
                  END ASC NULLS LAST,
                  fi.created_at ASC`,
       [status, otherIncomeOpen],
@@ -4269,6 +4321,37 @@ adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next
     }).parse(req.body)
     const { adminUpdateReaderOrder } = await import('../services/readerOrders')
     res.json({ success: true, data: await adminUpdateReaderOrder(req.params.id, body) })
+  } catch (e) { next(e) }
+})
+/**
+ * 10/12 (Nic): "those orders are going to need to be tracked because shipping
+ * will vary." GAM's actual cost of the reader, typed from the shop receipt:
+ * base price, tax and shipping — or tax and shipping as one figure when the
+ * receipt does not split them. Each save is a new entry (the old ones are
+ * kept); fixed once markup figured from it is booked as GAM's earnings (10/12
+ * review — then only the same total may be split differently). Returns the
+ * order as the desk shows it.
+ */
+adminRouter.post('/reader-orders/:id/cost', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const amt = z.number().finite().nonnegative().max(100000)
+    const body = z.object({
+      basePrice: amt,
+      tax: amt.nullable().optional(),
+      shipping: amt.nullable().optional(),
+      taxAndShipping: amt.nullable().optional(),
+      note: z.string().trim().max(500).nullable().optional(),
+    }).refine(b => b.taxAndShipping == null || (b.tax == null && b.shipping == null),
+      { message: 'Enter tax and shipping separately, or as one combined amount — not both.' })
+      .parse(req.body)
+    const { recordReaderOrderCost } = await import('../services/readerOrders')
+    const data = await recordReaderOrderCost(req.params.id, body, req.user!.userId)
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'reader_order_cost_recorded',
+      targetId: req.params.id, targetType: 'pos_reader_order',
+      metadata: { ...body, total: data?.cost_total ?? null }, ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 

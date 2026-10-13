@@ -56,6 +56,7 @@ import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
 import {
   costLineAmount, splitCents, computeMarginMonths, syncStripeCosts, marginForMonth, marginByMonth, screeningFeeInside,
   splitPlatformBalance, loadPlatformBalanceBook, type MarginInputs, type MarginPaymentInput, type PlatformBalanceBook,
+  BRIDGE_TIMING_LABEL,
 } from './stripeCosts'
 import { trueUpProcessingMargin } from './platformRevenue'
 
@@ -497,6 +498,125 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
     expect(s.reconciliation).toBeNull()
     expect(s.checkrHeld).toBe(75.88)
   })
+
+  // 10/12 (Nic, A3): "SHOW THE BRIDGE (earned − billed-not-collected + reader
+  // payments − payouts to GAM bank = money in Stripe)".
+  describe('the bridge from the earnings ledger to GAM\'s own (10/12, A3)', () => {
+    // The same book, with the earnings ledger and the collected figures cut
+    // the way the bridge needs them: $136 collected from landlords = $130 of
+    // platform fees + a $6 bank-pull cost; $24 more billed and still owed;
+    // the screenings' $14.10 = $10 of GAM's $5s + $4.10 of card fees.
+    const bridged = (over: Partial<PlatformBalanceBook> = {}): PlatformBalanceBook => ({
+      ...book(),
+      bridge: {
+        earned: { processing: 80, platform_fees: 154, screening: 10, flexpay: 0, test_sweep: 10.33, reader_markup: 0, other: 0 },
+        platformFeesNotCollected: 24,
+        chargesCollected: { subscription: 130, deviceInstallment: 0, bankDebitCost: 6, other: 0 },
+        screeningMargin: 10, screeningFee: 4.10,
+      },
+      ...over,
+    })
+
+    it('earned, less fees not collected, less what went to GAM\'s bank, with Stripe\'s catch-up named, lands on GAM\'s own: $0.00 left over', () => {
+      const s = splitPlatformBalance(bridged(), live())
+      expect(s.reconciliation!.bridge).toEqual({
+        earned: 254.33, platformFeesNotCollected: 24, processingFeesNotCollected: 0, readerPaymentsCollected: 0,
+        readerCostRecovered: 0, readerMarkupCollected: 0, readerMarkupNotCollected: 0, paidOutToGamBank: 1.21,
+        // Fees collected $341.51 + $2.83 + $4.10 + $6 less Stripe's $267.53 = $86.91 against the ledger's $80.
+        timing: [{ key: 'processing', label: BRIDGE_TIMING_LABEL.processing, amount: 6.91 }],
+        gamsOwn: 236.03, onBalance: 236.03, leftover: 0,
+      })
+    })
+
+    it('a card-reader installment collected is added — the earnings ledger has none of it', () => {
+      const b = bridged()
+      b.collected = { ...b.collected, landlordChargesCollected: 136 + 87.5 }
+      b.bridge = { ...b.bridge!, chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 87.5 } }
+      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 87.5 })
+      expect(s.gamsOwn).toBe(323.53)
+      expect(s.reconciliation!.bridge).toMatchObject({
+        readerPaymentsCollected: 87.5, readerCostRecovered: 87.5, readerMarkupCollected: 0, gamsOwn: 323.53, leftover: 0,
+      })
+      expect(s.reconciliation!.gap).toBe(0)
+    })
+
+    // 10/12 (Nic, Q-g): "COST FIRST — pieces repay GAM's cost first; the
+    // markup lands in the last piece(s)." Mountain View: 4 × $87.50 against
+    // $331.73 → piece 4 is $69.23 cost + $18.27 markup. Only the markup is
+    // earnings; the bridge shows the cost on its own line and still ties.
+    it('a reader paid off: the cost comes back on its own line, the $18.27 markup is inside earned, $0.00 left over', () => {
+      const b = bridged()
+      b.collected = { ...b.collected, landlordChargesCollected: 136 + 350 }
+      b.bridge = {
+        ...b.bridge!,
+        earned: { ...b.bridge!.earned, reader_markup: 18.27 },
+        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 350 },
+        readerMarkupBilled: 18.27, readerMarkupCollected: 18.27,
+      }
+      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 350 })
+      expect(s.reconciliation!.gap).toBe(0)
+      expect(s.reconciliation!.bridge).toMatchObject({
+        earned: 272.60, readerPaymentsCollected: 350, readerCostRecovered: 331.73,
+        readerMarkupCollected: 18.27, readerMarkupNotCollected: 0, gamsOwn: 586.03, leftover: 0,
+      })
+      expect(s.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('reader_markup')
+    })
+
+    it('the last piece billed but not collected yet: its markup is taken off like a platform fee owed, still $0.00', () => {
+      const b = bridged()
+      b.collected = { ...b.collected, landlordChargesCollected: 136 + 262.5 }
+      b.bridge = {
+        ...b.bridge!,
+        earned: { ...b.bridge!.earned, reader_markup: 18.27 },
+        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 262.5 },
+        readerMarkupBilled: 18.27, readerMarkupCollected: 0,
+      }
+      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 262.5 })
+      expect(s.reconciliation!.bridge).toMatchObject({
+        readerCostRecovered: 262.5, readerMarkupCollected: 0, readerMarkupNotCollected: 18.27, leftover: 0,
+      })
+    })
+
+    it('a markup row the earnings ledger is missing is named, not lost', () => {
+      const b = bridged()
+      b.collected = { ...b.collected, landlordChargesCollected: 136 + 350 }
+      b.bridge = {
+        ...b.bridge!,
+        chargesCollected: { ...b.bridge!.chargesCollected, deviceInstallment: 350 },
+        readerMarkupBilled: 18.27, readerMarkupCollected: 18.27,
+      }
+      const s = splitPlatformBalance(b, { ...live(), pending: 4003.60 + 350 })
+      const br = s.reconciliation!.bridge!
+      expect(br.timing.find(t => t.key === 'reader_markup')).toEqual(
+        { key: 'reader_markup', label: BRIDGE_TIMING_LABEL.reader_markup, amount: 18.27 })
+      expect(br.leftover).toBe(0)
+    })
+
+    it('every other kind of money is its own named line, and the leftover is always the check\'s difference', () => {
+      const b = bridged({
+        flexpayFronted: 460,
+        takenBack: { ...NOTHING_TAKEN_BACK, rentNotRepaid: 300, gamLinesTakenBack: 4 },
+        stripeCostsRecorded: 267.53 - 2.46,   // Stripe sales tax nobody recorded: a real gap
+      })
+      b.collected = { ...b.collected, gamOwnedBillLines: 8, businessInvoicingFees: 15, landlordChargesCollected: 136 + 5 }
+      b.bridge = { ...b.bridge!, chargesCollected: { ...b.bridge!.chargesCollected, other: 5 },
+                   earned: { ...b.bridge!.earned, other: 12 } }
+      const s = splitPlatformBalance(b, live())
+      const br = s.reconciliation!.bridge!
+      expect(Object.fromEntries(br.timing.map(t => [t.key, t.amount]))).toEqual({
+        processing: 9.37, flexpay_fronted: -460, dispute_rent_not_repaid: -300, dispute_gam_lines: -4,
+        gam_bill_lines: 8, business_invoicing_fees: 15, other_charges: 5, ledger_other: -12,
+      })
+      for (const t of br.timing) expect(t.label).toBe(BRIDGE_TIMING_LABEL[t.key])
+      expect(br.leftover).toBe(s.reconciliation!.gap)
+      expect(br.leftover).not.toBe(0)
+    })
+
+    it('no bridge without its facts or without Stripe', () => {
+      expect(splitPlatformBalance(book(), live()).reconciliation!.bridge).toBeNull()
+      expect(splitPlatformBalance(bridged(), null).reconciliation).toBeNull()
+    })
+  })
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -783,7 +903,7 @@ describe('a card sale refunded at the register (10/3 review)', () => {
     expect(book.collected.registerCardFees).toBe(2.17)
     const s = splitPlatformBalance(book, liveOf(52.17 - 1.00))
     expect(s.gamsOwn).toBe(1.17)
-    expect(s.reconciliation).toMatchObject({ book: 1.17, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 1.17, gap: 0, bridge: { leftover: 0 } })
   })
 })
 
@@ -831,7 +951,7 @@ describe('stay deposits paid online and the business portal\'s payments (10/3 re
     const s = splitPlatformBalance(book, liveOf(104.05 - 2.00))
     expect(s.owedToLandlords).toBe(100)
     expect(s.gamsOwn).toBe(2.05)
-    expect(s.reconciliation).toMatchObject({ book: 2.05, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 2.05, gap: 0, bridge: { leftover: 0 } })
   })
 
   it('a business invoice paid by card and a business register card sale are on the margin card with GAM\'s cut, and the check ties with the invoicing fee', async () => {
@@ -876,7 +996,7 @@ describe('stay deposits paid online and the business portal\'s payments (10/3 re
     const s = splitPlatformBalance(book, liveOf(250 - 5))
     expect(s.owedToLandlords).toBe(230.15)                    // 192.45 + 47.70 − the $10 fee netted
     expect(s.gamsOwn).toBe(14.85)
-    expect(s.reconciliation).toMatchObject({ book: 14.85, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 14.85, gap: 0, bridge: { leftover: 0 } })
   })
 
   it('a business invoice paid by bank is the business\'s while it clears, and a bank payment GAM\'s records do not show is never GAM\'s', async () => {
@@ -1029,7 +1149,7 @@ describe('a platform fee a property passes to its tenants (10/3 review)', () => 
     expect(book.collected).toMatchObject({ processingFees: 33.30, tenantPaidPlatformFees: 10 })
     const s = splitPlatformBalance(book, liveOf(486.65 + 476.65))
     expect(s.gamsOwn).toBe(43.30)
-    expect(s.reconciliation).toMatchObject({ book: 43.30, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 43.30, gap: 0, bridge: { leftover: 0 } })
 
     const r = await trueUpProcessingMargin('2026-08-01')
     expect(r.feesCharged).toBe(33.30)
@@ -1115,7 +1235,7 @@ describe('a bank fee the landlord covers (10/3 review)', () => {
     const s = splitPlatformBalance(book, liveOf(500 - 2.50))
     expect(s.owedToLandlords).toBe(494)
     expect(s.gamsOwn).toBe(3.5)
-    expect(s.reconciliation).toMatchObject({ book: 3.5, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 3.5, gap: 0, bridge: { leftover: 0 } })
   })
 
   it('while it clears, the $6 the landlord covers is GAM\'s money still clearing, never the landlord\'s', async () => {
@@ -1133,7 +1253,7 @@ describe('a bank fee the landlord covers (10/3 review)', () => {
     const s = splitPlatformBalance(book, liveOf(0, { pending: 497.5, clearingOnBalance: { pi_cover_clearing: { net: 497.5, fee: 2.5 } } }))
     expect(s.clearing).toMatchObject({ landlordsOnBalance: 494, gamTotal: 6, gamOnBalance: 3.5, stripeTook: 2.5 })
     expect(s.gamsOwn).toBe(0)
-    expect(s.reconciliation).toMatchObject({ book: 0, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 0, gap: 0, bridge: { leftover: 0 } })
   })
 
   it('reads the payer\'s fee first; the landlord\'s only when the payer paid none', () => {
@@ -1203,7 +1323,7 @@ describe('a stay deposit followed by a paid balance link (10/3 review)', () => {
     const s = splitPlatformBalance(book, liveOf(73 + 652.60 - 11))
     expect(s.owedToLandlords).toBe(700)
     expect(s.gamsOwn).toBe(14.6)
-    expect(s.reconciliation).toMatchObject({ book: 14.6, gap: 0 })
+    expect(s.reconciliation).toMatchObject({ book: 14.6, gap: 0, bridge: { leftover: 0 } })
   })
 
   it('reads the fee from the payout line — on top or covered by the property — whatever later payments did to the deposit on record', () => {
@@ -1481,5 +1601,86 @@ describe('Stripe\'s fee on a business invoice paid by bank, while it clears (10/
     const m = await marginForMonth(month)
     expect(m).toMatchObject({ stripeCost: 1, otherClearing: { count: 0, stripeCost: 0 } })
     expect(m.notTiedToAPayment).toEqual([{ category: 'bank_debit_fee', label: COST_LABELS.bank_debit_fee, amount: 1 }])
+  })
+})
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10/12 (Nic, G5) review — "BILL THE LANDLORD" for a processing fee they cover
+// that is more than the payment: the $6 bank fee on a $4 payment takes $4 from
+// the payment and bills the other $2 as a GAM charge. GAM earned the whole $6
+// (the earnings ledger, the margin card); its own money is the $4 now and the
+// $2 when collected. The check and the bridge counted the $6 at settle AND the
+// $2 again when collected (as "other charges"), so GAM's own read $2 high.
+// ═══════════════════════════════════════════════════════════════════════════
+import { gamFeeHeldOnRemittance } from './stripeCosts'
+
+describe('a covered processing fee bigger than the payment (10/12, G5 review)', () => {
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    await db.query(`DELETE FROM stripe_processing_costs`)
+    await db.query(`DELETE FROM platform_revenue_ledger`)
+  })
+
+  it('earned in full; on GAM\'s balance only up to the payment (settled), or the landlord\'s part (still clearing)', () => {
+    const settled = { tenantFee: 0, allocFee: 6, allocUncovered: 2, feePayer: 'landlord', amount: 4, method: 'ach' as const }
+    expect(gamFeeOnRemittance(settled).total).toBe(6)
+    expect(gamFeeHeldOnRemittance(settled)).toEqual({ tenantBorne: 0, landlordBorne: 4, total: 4 })
+    const clearing = { tenantFee: 0, allocFee: null, allocUncovered: 0, feePayer: 'landlord', amount: 4, method: 'ach' as const }
+    expect(gamFeeOnRemittance(clearing).landlordBorne).toBe(6)
+    expect(gamFeeHeldOnRemittance(clearing, 4).landlordBorne).toBe(4)
+    // A fee the payment covers is untouched.
+    expect(gamFeeHeldOnRemittance({ ...settled, amount: 500, allocUncovered: 0 }).total).toBe(6)
+  })
+
+  it('the check and the bridge tie at $0.00 while the $2 is owed and after it is collected — counted once, as processing', async () => {
+    const c = await db.connect()
+    let landlordId = '', tenantId = '', propertyId = ''
+    try {
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId
+      tenantId = await seedTenant(c)
+      propertyId = await seedProperty(c, { landlordId, ownerUserId: l.userId, managedByUserId: l.userId })
+    } finally { c.release() }
+    const { rows: [pay] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, tenant_id, type, amount, status, entry_description, due_date, stripe_payment_intent_id, settled_at)
+       VALUES ($1, $2, 'rent', 4, 'settled', 'RENT', '2026-10-01', 'pi_small', NOW()) RETURNING id`, [landlordId, tenantId])
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, landlord_id, amount, applied_amount, status, payment_method,
+                                       gross_amount, processing_fee_amount, stripe_payment_intent_id, created_at, settled_at)
+       VALUES ($1, $2, 4, 4, 'settled', 'ach', 4, 0, 'pi_small', NOW(), NOW())`, [tenantId, landlordId])
+    // Allocation: the $6 earned (less Stripe's $0.02), $4 withheld, $2 uncovered and billed.
+    await db.query(
+      `INSERT INTO platform_revenue_ledger (type, amount, balance_after, reference_id, reference_type, property_id, customer_fee_charged)
+       VALUES ('banking_spread', 5.98, 5.98, $1, 'payment', $2, 6)`, [pay.id, propertyId])
+    await db.query(
+      `INSERT INTO allocation_splits (payment_id, landlord_id, property_id, gross_held, landlord_fee_withheld, landlord_fee_uncovered, owner_share)
+       VALUES ($1, $2, $3, 4, 4, 2, 0)`, [pay.id, landlordId, propertyId])
+    const { rows: [charge] } = await db.query<{ id: string }>(
+      `INSERT INTO landlord_gam_charges (landlord_id, property_id, kind, amount, source_type, source_id)
+       VALUES ($1, $2, 'uncovered_processing_fee', 2, 'allocation_uncovered_fee', $3) RETURNING id`, [landlordId, propertyId, pay.id])
+    await db.query(
+      `INSERT INTO stripe_processing_costs (stripe_txn_id, txn_type, category, amount, posted_at, stripe_payment_intent_id)
+       VALUES ('txn_small:fee', 'payment', 'bank_debit_fee', 0.02, NOW(), 'pi_small')`)
+
+    // Owed: $4 − $0.02 is GAM's on the balance.
+    const owed = await loadPlatformBalanceBook()
+    expect(owed.collected.processingFees).toBe(4)
+    expect(owed.bridge!.processingFeesNotCollected).toBe(2)
+    const s1 = splitPlatformBalance(owed, liveOf(4 - 0.02))
+    expect(s1.gamsOwn).toBe(3.98)
+    expect(s1.reconciliation).toMatchObject({ gap: 0, bridge: { processingFeesNotCollected: 2, leftover: 0 } })
+    expect(s1.reconciliation!.bridge!.timing).toEqual([])
+
+    // Collected from the next payout: the $2 is GAM's now, as processing — never "other charges".
+    await db.query(`UPDATE landlord_gam_charges SET collected_amount = 2, collected_at = NOW() WHERE id = $1`, [charge.id])
+    const paid = await loadPlatformBalanceBook()
+    expect(paid.collected.processingFees).toBe(4)
+    expect(paid.bridge!.chargesCollected).toMatchObject({ uncoveredFee: 2, other: 0 })
+    expect(paid.bridge!.processingFeesNotCollected).toBe(0)
+    const s2 = splitPlatformBalance(paid, liveOf(4 - 0.02 + 2))
+    expect(s2.gamsOwn).toBe(5.98)
+    expect(s2.reconciliation).toMatchObject({ gap: 0, bridge: { processingFeesNotCollected: 0, leftover: 0 } })
+    expect(s2.reconciliation!.bridge!.timing.map(t => t.key)).not.toContain('other_charges')
   })
 })

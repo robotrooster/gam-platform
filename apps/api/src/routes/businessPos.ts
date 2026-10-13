@@ -296,6 +296,7 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
         const { recordHeldItem } = await import('../services/heldPayouts')
         await recordHeldItem({
           businessId, sourceType: 'business_pos_sale', sourceId: txn.id,
+          property: { propertyId: null },  // 10/12 (Nic, ledger P1): a business's line is company-level
           amount: heldCents / 100, description: `Register sale ${receiptNumber}`,
         }, client)
       }

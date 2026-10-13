@@ -468,9 +468,12 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
       targetMonth: z.string().regex(/^\d{4}-\d{2}$/) // YYYY-MM
     }).parse(req.body)
 
-    // Get all active units with verified ACH whose landlord has at least one
-    // active bank account in the user_bank_accounts catalog. Pre-S67 the
-    // gate was l.stripe_account_id (Connect-flavored, deleted in S67).
+    // Get all active units with verified ACH whose landlord can be paid.
+    // 10/12 (Nic): "can be paid" = the landlord company's Stripe Connect
+    // payouts are live. This gate used to read the legacy user_bank_accounts
+    // catalog (the removed Add Bank Account form), which never set up a
+    // payout — so it pulled rent for a landlord Stripe could not pay and
+    // skipped one whose Connect payouts were live.
     const units = await query<any>(`
       SELECT u.*, t.stripe_customer_id, t.ach_verified, t.on_time_pay_enrolled,
         t.float_fee_active, t.income_arrival_day, t.id AS tenant_profile_id
@@ -494,10 +497,7 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         AND t.ach_verified = TRUE
         -- S655: a NACHA zero-tolerance suspension blocks bank pulls.
         AND t.ach_suspended_at IS NULL
-        AND EXISTS (
-          SELECT 1 FROM user_bank_accounts ba
-           WHERE ba.user_id = l.user_id AND ba.status = 'active'
-        )
+        AND l.connect_payouts_enabled
     `)
 
     // S654: the 1st as a plain calendar string, so the due date never depends
@@ -527,12 +527,14 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         // S414 status filter: only skip when an ACTIVE (non-failed,
         // non-returned) row exists. Failed/returned rows are retry-
         // eligible — the system should be able to re-bill that month.
+        // 10/12: a voided row (owed by nobody) leaves the month too — the
+        // same rows ux_payments_unit_rent_due_date_active leaves out.
         const existing = await queryOne<{ id: string }>(
           `SELECT id FROM payments
             WHERE unit_id = $1
               AND type = 'rent'
               AND due_date = $2
-              AND status NOT IN ('failed', 'returned')
+              AND status NOT IN ('failed', 'returned', 'voided')
             LIMIT 1`,
           [unit.id, dueDate]
         )

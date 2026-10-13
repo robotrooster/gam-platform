@@ -59,10 +59,10 @@ describe('payees who owe GAM back', () => {
       oldL = (await seedLandlord(c)).landlordId
       newL = (await seedLandlord(c)).landlordId
     } finally { c.release() }
-    await recordHeldItem({ landlordId: oldL, sourceType: 'dispute', sourceId: 'dp_old', amount: -40 })
+    await recordHeldItem({ landlordId: oldL, sourceType: 'dispute', sourceId: 'dp_old', amount: -40, property: { propertyId: null } })
     await db.query(`UPDATE held_payout_items SET created_at = NOW() - INTERVAL '20 days' WHERE source_id = 'dp_old'`)
-    await recordHeldItem({ landlordId: oldL, sourceType: 'pos_sale', sourceId: 'tx_small', amount: 10 })
-    await recordHeldItem({ landlordId: newL, sourceType: 'dispute', sourceId: 'dp_new', amount: -40 })
+    await recordHeldItem({ landlordId: oldL, sourceType: 'pos_sale', sourceId: 'tx_small', amount: 10, property: { propertyId: null } })
+    await recordHeldItem({ landlordId: newL, sourceType: 'dispute', sourceId: 'dp_new', amount: -40, property: { propertyId: null } })
     const out = await findFloatedBalances()
     expect(out).toEqual([{ landlordId: oldL, businessId: null, owedBack: 30 }])
     await findFloatedBalances()

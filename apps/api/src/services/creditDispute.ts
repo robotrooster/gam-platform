@@ -7,6 +7,7 @@ import type {
   CreditSupersedeReason,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { AppError } from '../middleware/errorHandler'
 
 // ============================================================
 // Credit dispute service — Session B.
@@ -247,14 +248,37 @@ export async function resolveDispute(args: {
       if (!args.correctedEvent) {
         throw new Error('correctedEvent is required for outcome=corrected')
       }
+      // 10/12 (review): only a mark still live can be corrected. A mark the
+      // ledger has replaced since the dispute was opened (a later payment
+      // re-judged its bill — creditBillMarks — or it was withdrawn) already
+      // points at what replaced it; correcting it anyway overwrote that link
+      // and left two live marks. The admin resolves this one as upheld or no
+      // change and corrects the live mark if it is wrong.
+      // The mark's subject is locked first, the lock every mark writer takes
+      // (appendEvent, creditBillMarks.syncBillMarks), so nothing replaces the
+      // mark between this check and the correction.
+      const target = (await client.query<{ subject_id: string }>(
+        `SELECT subject_id FROM credit_events WHERE id = $1`, [d.disputed_event_id])).rows[0]
+      if (!target) throw new AppError(404, 'The disputed mark no longer exists')
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`credit_subject:${target.subject_id}`])
+      const live = (await client.query<{ superseded_by: string | null }>(
+        `SELECT superseded_by FROM credit_events WHERE id = $1`, [d.disputed_event_id])).rows[0]
+      if (live?.superseded_by) {
+        throw new AppError(409,
+          'This mark was already replaced on the ledger after the dispute was opened (a later payment or correction). ' +
+          'Resolve this dispute as upheld or no change; if the mark that replaced it is wrong, correct that one.')
+      }
       const corrected = await appendEvent(args.correctedEvent, client)
       correctedEventId = corrected.eventId
-      await supersedeEvent(
+      const superseded = await supersedeEvent(
         client,
         d.disputed_event_id,
         correctedEventId,
         args.supersedeReason ?? 'correction_after_dispute',
       )
+      if (!superseded) {
+        throw new AppError(409, 'The disputed mark was replaced while this was being resolved. Reload and try again.')
+      }
     }
 
     const resolveEventType = (

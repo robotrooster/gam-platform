@@ -27,14 +27,17 @@ vi.mock('./adminNotifications', () => ({
 }))
 // S650: GAM's own available balance at Stripe — what the batch may claim.
 const balanceMock = vi.hoisted(() => vi.fn(async () => ({ available: [{ currency: 'usd', amount: 100_000_00 }] })))
+// 10/12 (ledger P0): a direct transfer (a move-out's deposit share) is made
+// with the Stripe client itself, under its own key, as its callers always did.
+const directTransferMock = vi.hoisted(() => vi.fn(async (..._a: any[]): Promise<any> => ({ id: 'tr_direct_default' })))
 vi.mock('../lib/stripe', () => ({
-  getStripe: () => ({ balance: { retrieve: balanceMock } }),
+  getStripe: () => ({ balance: { retrieve: balanceMock }, transfers: { create: directTransferMock } }),
 }))
 
 import { db } from '../db'
 import { BUSINESS_TYPES } from '@gam/shared'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser, executePlatformTransferIntent } from './landlordPassthrough'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedDepositReturnDraft } from '../test/dbHelpers'
+import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser, executePlatformTransferIntent, fireRecordedDirectTransfer } from './landlordPassthrough'
 import { takePayoutCut, payoutCutLockKey, cutUnderLock } from './payoutCut'
 import { stampPayoutTransfers } from './payoutComposition'
 
@@ -45,6 +48,8 @@ beforeEach(async () => {
   transferMock.mockResolvedValue({ id: 'tr_mock_default' } as any)
   balanceMock.mockClear()
   balanceMock.mockResolvedValue({ available: [{ currency: 'usd', amount: 100_000_00 }] } as any)
+  directTransferMock.mockReset()
+  directTransferMock.mockResolvedValue({ id: 'tr_direct_default' })
 })
 
 interface Ctx {
@@ -596,7 +601,7 @@ describe('heldOwnerShareForUser (S639 — display twin of the RESERVE sum)', () 
 describe('S648 held items in the landlord payout batch', () => {
   async function hold(ctx: Ctx, amount: number, sourceType: any = 'pos_sale', sourceId?: string): Promise<void> {
     const { recordHeldItem } = await import('./heldPayouts')
-    await recordHeldItem({ landlordId: ctx.landlordId, sourceType, sourceId: sourceId ?? Math.random().toString(36).slice(2), amount })
+    await recordHeldItem({ landlordId: ctx.landlordId, sourceType, sourceId: sourceId ?? Math.random().toString(36).slice(2), amount, property: { propertyId: null } })
   }
 
   it('pays rent, register sales and stay deposits in one transfer, and marks each item carried', async () => {
@@ -680,9 +685,9 @@ describe('S648 business payout batch', () => {
   it('pays what GAM holds for the business in one transfer, then nothing twice', async () => {
     const { businessId } = await seedBusiness()
     const { recordHeldItem, reconcileBusinessHeldFunds, heldForBusiness } = await import('./heldPayouts')
-    await recordHeldItem({ businessId, sourceType: 'business_invoice_payment', sourceId: 'cs_1', amount: 193.2 })
-    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_1', amount: 9.61 })
-    await recordHeldItem({ businessId, sourceType: 'refund', sourceId: 're_1', amount: -20 })
+    await recordHeldItem({ businessId, sourceType: 'business_invoice_payment', sourceId: 'cs_1', amount: 193.2, property: { propertyId: null } })
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_1', amount: 9.61, property: { propertyId: null } })
+    await recordHeldItem({ businessId, sourceType: 'refund', sourceId: 're_1', amount: -20, property: { propertyId: null } })
     expect(await heldForBusiness(businessId)).toBe(182.81)
     transferMock.mockResolvedValueOnce({ id: 'tr_biz' } as any)
     const r = await reconcileBusinessHeldFunds(businessId)
@@ -700,14 +705,14 @@ describe('S648 business payout batch', () => {
   it('no payout account → nothing moves', async () => {
     const { businessId } = await seedBusiness(null)
     const { recordHeldItem, reconcileBusinessHeldFunds } = await import('./heldPayouts')
-    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_2', amount: 10 })
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_2', amount: 10, property: { propertyId: null } })
     expect((await reconcileBusinessHeldFunds(businessId)).intentId).toBeNull()
     expect(transferMock).not.toHaveBeenCalled()
   })
 
   it('an item names exactly one payee', async () => {
     const { recordHeldItem } = await import('./heldPayouts')
-    await expect(recordHeldItem({ sourceType: 'refund', sourceId: 'x', amount: -1 })).rejects.toThrow(/one payee/)
+    await expect(recordHeldItem({ sourceType: 'refund', sourceId: 'x', amount: -1, property: { propertyId: null } })).rejects.toThrow(/one payee/)
   })
 })
 
@@ -936,5 +941,218 @@ describe('a transfer confirmed while a payout takes its cut', () => {
       expect(await inside(before, cut), `dated ${before}, before a cut at ${cut.toISOString()}`).toBe(true)
       expect(await inside(after, cut), `dated ${after}, after a cut at ${cut.toISOString()}`).toBe(false)
     }
+  })
+})
+
+// ── 10/12 (Nic, ledger P0) ──────────────────────────────────────────────────
+// What collected each GAM charge, and a record for every transfer to a
+// landlord's Stripe account (gam-ledger-design-2026-10-12 §16.1, §16.5, M0b).
+describe('10/12 ledger P0: GAM charges a batch nets, and transfers that are not the batch', () => {
+  it('a batch records what it kept from each GAM charge, against itself, and skips one a bank pull is collecting', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    const charge = async (amount: number, notes: string) => (await db.query<{ id: string }>(
+      `INSERT INTO landlord_gam_charges (landlord_id, kind, amount, source_type, source_id, notes, created_at)
+       VALUES ($1, 'subscription', $2, 'platform_fee_accrual', gen_random_uuid(), $3, NOW() - INTERVAL '1 day')
+       RETURNING id`, [ctx.landlordId, amount, notes])).rows[0].id
+    const oct = await charge(88, 'October fee')
+    const piece = await charge(87.5, 'Card reader piece')
+    const inPull = await charge(48, 'September fee, in a pull')
+    await db.query(
+      `INSERT INTO landlord_gam_debits (landlord_id, charges_amount, bank_cost_amount, total_amount, status, charge_ids)
+       VALUES ($1, 48, 6, 54, 'pending', $2)`, [ctx.landlordId, [inPull]])
+    transferMock.mockResolvedValueOnce({ id: 'tr_p0_net' } as any)
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.amount).toBe(774.5)                                  // 950 − 88 − 87.50; the $48 is the pull's
+
+    const { rows: [intent] } = await db.query<any>(
+      `SELECT id, gam_fees_kept_amount::text AS kept, purpose FROM platform_transfer_intents`)
+    expect(intent).toMatchObject({ kept: '175.50', purpose: 'payout' })
+    const { rows } = await db.query<any>(
+      `SELECT charge_id, amount::text AS amount, platform_transfer_intent_id, landlord_gam_debit_id, derived
+         FROM landlord_gam_charge_collections c ORDER BY c.amount DESC`)
+    expect(rows).toEqual([
+      { charge_id: oct, amount: '88.00', platform_transfer_intent_id: intent.id, landlord_gam_debit_id: null, derived: false },
+      { charge_id: piece, amount: '87.50', platform_transfer_intent_id: intent.id, landlord_gam_debit_id: null, derived: false },
+    ])
+    // Every charge's records add up to what it says was collected.
+    const { rows: tie } = await db.query<any>(
+      `SELECT c.id FROM landlord_gam_charges c
+         LEFT JOIN (SELECT charge_id, SUM(amount) AS s FROM landlord_gam_charge_collections GROUP BY 1) x ON x.charge_id = c.id
+        WHERE COALESCE(x.s, 0) <> c.collected_amount`)
+    expect(tie).toEqual([])
+  })
+
+  async function moveOut(ctx: Ctx): Promise<string> {
+    const c = await db.connect()
+    try {
+      const leaseId = await seedLease(c, { unitId: ctx.unitId, landlordId: ctx.landlordId })
+      return await seedDepositReturnDraft(c, { leaseId, tenantId: ctx.tenantId, landlordId: ctx.landlordId, totalDeposit: 500 })
+    } finally { c.release() }
+  }
+  const settlement = (ctx: Ctx, draftId: string) => ({
+    purpose: 'deposit_settlement' as const,
+    landlordId: ctx.landlordId,
+    destinationConnectAccountId: 'acct_test_s428',
+    amount: 120,
+    depositReturnId: draftId,
+    idempotencyKey: `deposit_disb_${draftId}`,
+    description: 'Deposit disbursement — lease x',
+    metadata: { gam_purpose: 'deposit_return_landlord_disbursement', gam_deposit_return_id: draftId },
+  })
+
+  it('a move-out deposit share is recorded BEFORE Stripe is asked, then confirmed — and never sent twice', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    let seenAtCall: any = null
+    directTransferMock.mockImplementationOnce(async () => {
+      seenAtCall = (await db.query(`SELECT status, purpose FROM platform_transfer_intents WHERE deposit_return_id = $1`, [draftId])).rows[0]
+      return { id: 'tr_p0_dep' }
+    })
+
+    const r = await fireRecordedDirectTransfer(settlement(ctx, draftId))
+    expect(r.transferId).toBe('tr_p0_dep')
+    expect(seenAtCall).toEqual({ status: 'pending', purpose: 'deposit_settlement' })
+    expect(directTransferMock).toHaveBeenCalledWith(
+      { amount: 12000, currency: 'usd', destination: 'acct_test_s428', description: 'Deposit disbursement — lease x',
+        metadata: { gam_purpose: 'deposit_return_landlord_disbursement', gam_deposit_return_id: draftId } },
+      { idempotencyKey: `deposit_disb_${draftId}` })
+    expect(transferMock).not.toHaveBeenCalled()             // never the batch's transfer
+    const { rows: [i] } = await db.query<any>(
+      `SELECT status, stripe_transfer_id, transferred_at, amount::text AS amount, gross_owed::text AS gross,
+              gam_fees_kept_amount::text AS kept, landlord_user_id
+         FROM platform_transfer_intents WHERE id = $1`, [r.intentId])
+    expect(i).toMatchObject({ status: 'transferred', stripe_transfer_id: 'tr_p0_dep', amount: '120.00', gross: '120.00',
+                              kept: '0.00', landlord_user_id: ctx.landlordUserId })
+    expect(i.transferred_at).toBeTruthy()
+
+    // Called again for the same move-out: the same record, no second transfer.
+    const again = await fireRecordedDirectTransfer(settlement(ctx, draftId))
+    expect(again).toEqual(r)
+    expect(directTransferMock).toHaveBeenCalledTimes(1)
+
+    // The payout that sweeps it lists it like any other transfer.
+    const { rows: [d] } = await db.query<{ id: string }>(
+      `INSERT INTO disbursements (user_id, landlord_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, stripe_account_id)
+       VALUES ($1, $2, 'auto_friday', 120, 'processing', 'po_p0_dep', clock_timestamp(), 0, 'acct_test_s428') RETURNING id`,
+      [ctx.landlordUserId, ctx.landlordId])
+    const stamped = await stampPayoutTransfers({
+      disbursementId: d.id, connectAccountId: 'acct_test_s428', payoutAmount: 120, payoutAt: new Date(Date.now() + 1000),
+    })
+    expect(stamped).toMatchObject({ intentIds: [r.intentId], residual: 0 })
+  })
+
+  /** What Stripe throws when it answers and refuses (lib/stripeRefusal). */
+  const stripeError = (type: string, message: string, statusCode?: number) =>
+    Object.assign(new Error(message), { type, ...(statusCode ? { statusCode } : {}) })
+
+  it('a refusal marks the record failed, says so the way the move-out always did, and the batch recovery leaves it to a person', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    directTransferMock.mockRejectedValueOnce(stripeError('StripeInvalidRequestError', 'destination account closed', 400))
+    await expect(fireRecordedDirectTransfer(settlement(ctx, draftId))).rejects.toThrow(/closed/)
+    const { rows: [i] } = await db.query<any>(
+      `SELECT status, attempts, last_error FROM platform_transfer_intents WHERE deposit_return_id = $1`, [draftId])
+    expect(i).toMatchObject({ status: 'failed', attempts: 1 })
+    expect(i.last_error).toMatch(/closed/)
+    expect(adminNotifyMock).toHaveBeenCalledWith(expect.objectContaining({
+      category: 'deposit_disbursement_transfer_failed',
+      context: expect.objectContaining({ deposit_return_id: draftId, amount: 120 }),
+    }))
+    directTransferMock.mockClear()
+    await recoverPendingPlatformTransfers(0)
+    expect(directTransferMock).not.toHaveBeenCalled()
+    expect(transferMock).not.toHaveBeenCalled()
+  })
+
+  it('10/12 review: two callers under one key — Stripe makes it once, the record ends transferred, nobody is told it failed', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    // The first is slow and Stripe makes the transfer; the second, while the
+    // first is in flight, gets the 409 Stripe gives a key already in use.
+    directTransferMock.mockImplementationOnce(async () => { await new Promise(r => setTimeout(r, 600)); return { id: 'tr_real' } })
+    directTransferMock.mockImplementationOnce(async () => {
+      throw stripeError('StripeIdempotencyError', 'There is currently another in-progress request using this Stripe-Idempotency-Key', 409)
+    })
+    const first = fireRecordedDirectTransfer(settlement(ctx, draftId))
+    await new Promise(r => setTimeout(r, 200))
+    const second = await fireRecordedDirectTransfer(settlement(ctx, draftId))
+    expect(second.transferId).toBeNull()                    // not known yet — and not a failure
+    expect((await first).transferId).toBe('tr_real')
+    const { rows: [i] } = await db.query<any>(
+      `SELECT status, stripe_transfer_id, attempts FROM platform_transfer_intents WHERE deposit_return_id = $1`, [draftId])
+    expect(i).toMatchObject({ status: 'transferred', stripe_transfer_id: 'tr_real', attempts: 1 })
+    expect(adminNotifyMock).not.toHaveBeenCalledWith(expect.objectContaining({ category: 'deposit_disbursement_transfer_failed' }))
+  })
+
+  it('10/12 review: a timeout leaves the record pending (never failed), and recovery asks again under the same key', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    directTransferMock.mockRejectedValueOnce(stripeError('StripeConnectionError', 'Request timed out'))
+    const r = await fireRecordedDirectTransfer(settlement(ctx, draftId))
+    expect(r.transferId).toBeNull()
+    const { rows: [i] } = await db.query<any>(
+      `SELECT status, attempts, last_error FROM platform_transfer_intents WHERE id = $1`, [r.intentId])
+    expect(i).toMatchObject({ status: 'pending', attempts: 1, last_error: 'Request timed out' })
+    expect(adminNotifyMock).not.toHaveBeenCalled()
+    // Stripe had made it: recovery's ask under the same key hands it back.
+    directTransferMock.mockResolvedValueOnce({ id: 'tr_made_before_timeout' })
+    expect((await recoverPendingPlatformTransfers(0)).recovered).toBe(1)
+    expect(directTransferMock).toHaveBeenLastCalledWith(expect.anything(), { idempotencyKey: `deposit_disb_${draftId}` })
+    expect((await db.query(`SELECT status, stripe_transfer_id FROM platform_transfer_intents WHERE id = $1`, [r.intentId])).rows[0])
+      .toEqual({ status: 'transferred', stripe_transfer_id: 'tr_made_before_timeout' })
+  })
+
+  it('10/12 review: Stripe\'s answer wins — a direct transfer marked failed while it was in flight is confirmed when Stripe made it', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    directTransferMock.mockImplementationOnce(async () => {
+      // Another caller marked the record failed while this request was at Stripe.
+      await db.query(`UPDATE platform_transfer_intents SET status = 'failed' WHERE deposit_return_id = $1`, [draftId])
+      return { id: 'tr_wins' }
+    })
+    const r = await fireRecordedDirectTransfer(settlement(ctx, draftId))
+    expect(r.transferId).toBe('tr_wins')
+    expect((await db.query(`SELECT status, stripe_transfer_id FROM platform_transfer_intents WHERE id = $1`, [r.intentId])).rows[0])
+      .toEqual({ status: 'transferred', stripe_transfer_id: 'tr_wins' })
+  })
+
+  it('a record left pending (the process stopped mid-way) is finished by recovery under ITS key and request, never the batch\'s', async () => {
+    const ctx = await seedCtx()
+    const draftId = await moveOut(ctx)
+    const { rows: [i] } = await db.query<{ id: string }>(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          purpose, deposit_return_id, stripe_idempotency_key, stripe_request, created_at)
+       VALUES ($1, $2, 'acct_test_s428', 120, 120, 'pending', 'deposit_settlement', $3, $4, $5::jsonb, NOW() - INTERVAL '1 hour')
+       RETURNING id`,
+      [ctx.landlordId, ctx.landlordUserId, draftId, `deposit_disb_${draftId}`,
+       JSON.stringify({ description: 'Deposit disbursement — lease y', metadata: { gam_deposit_return_id: draftId } })])
+    directTransferMock.mockResolvedValueOnce({ id: 'tr_p0_recovered' })
+    const out = await recoverPendingPlatformTransfers(5)
+    expect(out.recovered).toBe(1)
+    expect(directTransferMock).toHaveBeenCalledWith(
+      { amount: 12000, currency: 'usd', destination: 'acct_test_s428',
+        description: 'Deposit disbursement — lease y', metadata: { gam_deposit_return_id: draftId } },
+      { idempotencyKey: `deposit_disb_${draftId}` })
+    expect(transferMock).not.toHaveBeenCalled()
+    expect((await db.query(`SELECT status, stripe_transfer_id FROM platform_transfer_intents WHERE id = $1`, [i.id])).rows[0])
+      .toEqual({ status: 'transferred', stripe_transfer_id: 'tr_p0_recovered' })
+    expect(await executePlatformTransferIntent(i.id)).toBe('already')
+  })
+
+  it('the database refuses a direct transfer with nothing to say what it pays, or with no key', async () => {
+    const ctx = await seedCtx()
+    await expect(db.query(
+      `INSERT INTO platform_transfer_intents (landlord_id, destination_connect_account_id, amount, gross_owed, purpose, stripe_idempotency_key, stripe_request)
+       VALUES ($1, 'acct_x', 10, 10, 'deposit_settlement', 'k1', '{}'::jsonb)`, [ctx.landlordId])).rejects.toThrow()
+    const draftId = await moveOut(ctx)
+    await expect(db.query(
+      `INSERT INTO platform_transfer_intents (landlord_id, destination_connect_account_id, amount, gross_owed, purpose, deposit_return_id, stripe_request)
+       VALUES ($1, 'acct_x', 10, 10, 'deposit_settlement', $2, '{}'::jsonb)`, [ctx.landlordId, draftId])).rejects.toThrow()
+    await expect(db.query(
+      `INSERT INTO platform_transfer_intents (landlord_id, destination_connect_account_id, amount, gross_owed, purpose, deposit_return_id)
+       VALUES ($1, 'acct_x', 10, 10, 'payout', $2)`, [ctx.landlordId, draftId])).rejects.toThrow()
   })
 })

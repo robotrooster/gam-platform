@@ -12,6 +12,7 @@ import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { replyToProperty } from '../services/replyRouting'
 import { portalLink } from '../lib/portalUrls'
 import { query, queryOne, getClient } from '../db'
+import { graceDaysSql, pastGraceSql, propertyDaySql, lateCountsFromSql, writtenAtSql } from '../services/openBalances'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine, unbilledDueDates, CATCHUP_DAYS } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
@@ -2248,6 +2249,12 @@ async function processBackgroundCheckExpiry() {
 export function schedulerInit() {
   logger.info('⏰ Scheduler initialized')
 
+  // 10/12 (Nic): GAM Books ledger — the outbox drain every minute and the
+  // nightly tie-out at 04:40 (services/ledgerJobs). Dark until the projector
+  // phases register their source types; until then both find nothing to do.
+  import('../services/ledgerJobs').then(m => m.registerLedgerJobs())
+    .catch(e => logger.error({ err: e }, '[ledger] could not register its jobs'))
+
   // S654: daily crons run on Phoenix time, so each fires at the same local hour
   // on any host (the API is moving to a UTC host, S641). Two exceptions, pinned
   // to UTC on purpose: payout sync (4:10 UTC) and auto-payouts (1:00 UTC), because
@@ -3744,26 +3751,50 @@ export function schedulerInit() {
   // to Phoenix; unpinned it ran at the host's 7am (midnight Phoenix on UTC).
   cron.schedule('0 7 * * *', async () => {
     try {
-      // Rent due 5+ days ago that hasn't settled. S654: these rows only mark
-      // units delinquent now; the morning email reads the Outstanding list.
+      // Rent past its grace period that hasn't settled. S654: these rows only
+      // mark units delinquent now; the morning email reads the Outstanding list.
+      //
+      // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain."
+      // This used a fixed 5 days on the server's clock, so a lease with a
+      // 10-day grace was marked delinquent here and cleared again by the
+      // database trigger (sync_unit_delinquency), which honors the lease and
+      // the property. Now it reads the same chain on the property's calendar,
+      // and the first late day is the late fees' (the 6th for the 1st with 5
+      // days: services/openBalances.pastGraceSql).
+      //
+      // 10/12 (Nic, LF2): a bill written after its due date is late counted
+      // "from the DAY IT WAS WRITTEN (grace starts then)" — "delinquency
+      // trigger too". So lateness starts on the later of the due date and the
+      // day GAM wrote the bill (lateCountsFromSql / writtenAtSql: a reopened
+      // row or the rest of a part-paid row counts from its bill, a released
+      // work-trade hold from its release), the same start as Outstanding, the
+      // Rent Roll and the digest. The trigger asks the identical question
+      // (20261013120000_delinquency_first_late_day.sql), so the two never flip
+      // a space back and forth. The rows are unpaid, so "the day it was paid"
+      // is today. A $0 rent line is never owed (10/12): the trigger leaves it
+      // out, so this does too.
+      const today = propertyDaySql('NOW()', 'pr')
+      const lateStart = lateCountsFromSql('p.due_date', propertyDaySql(writtenAtSql('p'), 'pr'), today)
+      const pastGrace = `p.amount > 0 AND ${pastGraceSql(today, lateStart, graceDaysSql('l', 'pr'))}`
       const overdue = await query<any>(`
         SELECT p.*, u.unit_number, u.id AS unit_id,
           t.id AS tenant_id, t.ssi_ssdi,
           tu.email AS tenant_email, tu.first_name AS tenant_first,
           tu.last_name AS tenant_last,
           ul.email AS landlord_email,
-          COALESCE(l.business_name, ul.first_name || ' ' || ul.last_name) AS landlord_name,
+          COALESCE(ll.business_name, ul.first_name || ' ' || ul.last_name) AS landlord_name,
           pr.name AS property_name
         FROM payments p
         JOIN units u ON u.id = p.unit_id
         JOIN properties pr ON pr.id = u.property_id
         JOIN tenants t ON t.id = p.tenant_id
         JOIN users tu ON tu.id = t.user_id
-        JOIN landlords l ON l.id = p.landlord_id
-        JOIN users ul ON ul.id = l.user_id
+        JOIN landlords ll ON ll.id = p.landlord_id
+        JOIN users ul ON ul.id = ll.user_id
+        LEFT JOIN leases l ON l.id = p.lease_id
         WHERE p.type = 'rent'
           AND p.status IN ('pending','failed')
-          AND p.due_date <= NOW() - INTERVAL '5 days'
+          AND ${pastGrace}
           AND u.payment_block = FALSE
           -- ── S638 (Nic): WORK TRADE IS NOT LATE ────────────────────────────
           --
@@ -3821,11 +3852,14 @@ export function schedulerInit() {
          WHERE u.status = 'delinquent'
            AND NOT EXISTS (
              SELECT 1 FROM payments p
+               JOIN units pu ON pu.id = p.unit_id
+               JOIN properties pr ON pr.id = pu.property_id
+               LEFT JOIN leases l ON l.id = p.lease_id
               WHERE p.unit_id = u.id
                 AND p.type = 'rent'
                 AND p.status IN ('pending','failed')
                 AND p.work_trade_suspended_at IS NULL
-                AND p.due_date <= NOW() - INTERVAL '5 days')
+                AND ${pastGrace})
         RETURNING u.id`)
       if (cleared.length > 0) {
         logger.info(`[Scheduler] ${cleared.length} unit(s) no longer delinquent`)
@@ -3918,6 +3952,7 @@ export function schedulerInit() {
   registerServiceAgreementInvoiceEngine()
   registerLateFeeEngine()
   registerAutopayEngine()
+  void import('./monthlyPropertyReportEmail').then(m => m.registerMonthlyPropertyReportEmail()).catch((e: unknown) => logger.error({ err: e }, '[Scheduler] monthly property report email')) // 10/12 (Nic): the monthly property report, emailed the 2nd
   registerRefreshCron()
   // initial population — async, will populate per-tz crons on next tick
   refreshTimezoneCrons().then(({ added }) => {

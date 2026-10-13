@@ -85,7 +85,7 @@ export async function detectPortabilityEligible(args: {
   }>(
     `SELECT id, total_amount::text, held_by
        FROM security_deposits
-      WHERE lease_id = $1
+      WHERE lease_id = $1 AND status <> 'voided'
       ORDER BY created_at DESC
       LIMIT 1`,
     [args.leaseId],
@@ -191,8 +191,10 @@ export async function authorizeDepositPortability(args: {
     id: string; tenant_id: string; lease_id: string;
     portability_status: string; portability_target_lease_id: string | null;
   }>(
+    // 10/12 (Nic) review, G8: a voided deposit record (only ever a pending
+    // line, nothing collected, kept as a record) is not a deposit to carry.
     `SELECT id, tenant_id, lease_id, portability_status, portability_target_lease_id
-       FROM security_deposits WHERE id = $1`,
+       FROM security_deposits WHERE id = $1 AND status <> 'voided'`,
     [args.depositId],
   )
   if (!dep) throw new AppError(404, 'Deposit not found')
@@ -307,10 +309,11 @@ export async function executeDepositPortability(args: {
               held_by, total_amount::text, collected_amount::text,
               flex_deposit_enabled
          FROM security_deposits
-        WHERE id = $1
+        WHERE id = $1 AND status <> 'voided'
         FOR UPDATE`,
       [args.depositId],
     ).then(r => r.rows[0])
+    // 10/12 (Nic) review, G8: never a voided record (it is kept, and refuses to move).
     if (!dep) throw new AppError(404, 'Deposit not found')
     if (dep.portability_status === 'carried_forward') {
       await client.query('ROLLBACK')
@@ -338,7 +341,7 @@ export async function executeDepositPortability(args: {
          LEFT JOIN LATERAL (
            SELECT id, total_amount, flex_deposit_enabled, collected_amount
              FROM security_deposits
-            WHERE lease_id = l.id
+            WHERE lease_id = l.id AND status <> 'voided'
             ORDER BY created_at DESC LIMIT 1
          ) td ON TRUE
         WHERE l.id = $1
@@ -368,8 +371,13 @@ export async function executeDepositPortability(args: {
     // Remove the target lease's own untouched deposit row so the carried
     // (funded) row becomes the canonical deposit for the target lease — no
     // duplicate, no double-charge. Never delete a touched target row.
+    // 10/12 (Nic, G8 — keep everything): voided and kept, never deleted.
     if (target.target_dep_id && target.target_dep_id !== dep.id && !target.target_touched) {
-      await client.query(`DELETE FROM security_deposits WHERE id = $1`, [target.target_dep_id])
+      await client.query(
+        `UPDATE security_deposits
+            SET status = 'voided', voided_at = NOW(), updated_at = NOW(),
+                void_reason = 'Voided: the deposit carried from the tenant''s previous lease took its place'
+          WHERE id = $1 AND status <> 'voided' AND COALESCE(collected_amount, 0) = 0`, [target.target_dep_id])
     }
 
     // Re-point the carried row onto the target lease, set its required amount.

@@ -58,8 +58,9 @@ import { query } from '../db'
 import { todayIn } from '../lib/timezone'
 import { chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
 import {
-  daysLate, graceDaysSql, propertyDaySql, listOpenTenantBalances, WORK_TRADE_MARKER_LABEL,
+  daysLate, graceDaysSql, propertyDaySql, writtenAtSql, listOpenTenantBalances, WORK_TRADE_MARKER_LABEL,
 } from './openBalances'
+import { lateCountsFrom } from './creditLedgerEmitters'
 
 // ─── Which month (the one rule) ──────────────────────────────────────────────
 
@@ -251,8 +252,13 @@ export interface LedgerPayment {
    * which can be before the bill's due date that `paid_on` reads.
    */
   arrived_on: string | null
-  /** What this month's bills it paid came to (money plus account credit). */
-  owed: number
+  /**
+   * What this payment put toward this month's bills: its money plus the
+   * account credit it used. 10/12: it was sent as `owed` and the Payments page
+   * headed the column "Owed" — but nothing here is still owed (that is the
+   * Rent Roll's and Outstanding's figure); it is what the payment applied.
+   */
+  applied: number
   /** The money that went to this month's bills. $0 for a bill paid from account credit. */
   amount: number
   /** Account credit that went to this month's bills. */
@@ -291,7 +297,7 @@ export interface LedgerPayment {
   status_label: string
   /** "September rent, September water". */
   paid_for: string
-  /** 0 = on time. Days since the oldest bill it paid was due, once past its grace period, on the day they paid. */
+  /** 0 = on time. Days past the grace period of the oldest bill it paid, on the day they paid (10/12). */
   days_late: number
   timing_label: string
   lines: LedgerLine[]
@@ -576,6 +582,8 @@ interface RowFacts {
   id: string; tenant_id: string | null; type: string; amount: string; status: string; notes: string | null
   entry_description: string | null; utility_type: string | null; fee_type: string | null; fee_description: string | null
   due_date: string; grace_days: number; unit_number: string | null; property_id: string | null; property_name: string | null
+  /** 10/12: the day GAM wrote the charge, property calendar (lateness counts from it when later than the due date). */
+  written_day: string | null
   revenue_owner: string; manual_method: string | null; payment_channel: string | null
   /** Paid by a card or bank payment, or covered by GAM: "Online payment" when nothing names the method. */
   online: boolean
@@ -591,6 +599,7 @@ async function rowFacts(ids: string[], landlordIds: string[], propertyIds: strin
             ${chargeLabelColumnsSql('p')},
             to_char(COALESCE(inv.due_date, p.due_date), 'YYYY-MM-DD') AS due_date,
             ${graceDaysSql('l', 'pr')}::int AS grace_days,
+            to_char(${propertyDaySql(writtenAtSql('p'), 'pr')}, 'YYYY-MM-DD') AS written_day,
             u.unit_number, pr.id AS property_id, pr.name AS property_name,
             p.revenue_owner, p.manual_method, p.payment_channel,
             (p.stripe_payment_intent_id IS NOT NULL OR p.flexpay_advance_id IS NOT NULL) AS online,
@@ -920,9 +929,13 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
       nothingStands: paidC === 0 && creditC > 0 && creditReturnedC >= creditC,
     })
     // On time or late: from the oldest bill it paid, honoring that bill's
-    // grace, on the day they paid (the postmark).
+    // grace, on the day they paid (the postmark). 10/12 (Nic): days past the
+    // grace period, counted from the later of the due date and the day GAM
+    // wrote the bill (lateCountsFrom — a bill written 9/16 for 9/1 and paid
+    // 9/17 is on time, not 16 days late).
     const oldest = lines[0]
-    const late = daysLate(oldest.due_date, paidOn, Number(facts.get(oldest.payment_id)!.grace_days))
+    const oldestFacts = facts.get(oldest.payment_id)!
+    const late = daysLate(lateCountsFrom(oldest.due_date, oldestFacts.written_day, paidOn), paidOn, Number(oldestFacts.grace_days))
     const where = lines.map(l => facts.get(l.payment_id)!)
     const uniq = (xs: Array<string | null | undefined>) => [...new Set(xs.filter((x): x is string => !!x))]
     const id = publicId(d, kind)
@@ -944,7 +957,7 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
         : status === 'clearing' ? null
         : kind === 'credit' ? (paidC > 0 ? d.paid_day : null)
         : paidOn,
-      owed: dollars(paidC + creditC),
+      applied: dollars(paidC + creditC),
       amount: dollars(paidC),
       credit_applied: dollars(creditC),
       returned: dollars(returnedC),
@@ -960,7 +973,7 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
       status_label: LEDGER_PAYMENT_STATUS_LABEL[status],
       paid_for: uniq(lines.map(l => `${monthLabel(l.due_date)} ${lowerFirst(l.label)}`)).join(', '),
       days_late: late,
-      timing_label: late > 0 ? `${late} ${late === 1 ? 'day' : 'days'} late` : 'On time',
+      timing_label: late > 0 ? `${late} ${late === 1 ? 'day' : 'days'} past grace` : 'On time',
       lines,
     })
   }

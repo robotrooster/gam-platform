@@ -195,25 +195,57 @@ async function adminWasToldAbout(disbursementId: string): Promise<boolean> {
     [PAYOUT_GAP_NOTICE, disbursementId]))
 }
 
-/** The GAM owner of a Connect account: the user, and the company it is stamped on. */
+/**
+ * SQL, one uuid or NULL: the company a payout from Connect account `acct` (a
+ * SQL expression) belongs to — the ONE company whose money lands in that
+ * account (its own account, or its owner's when it has none, the same rule
+ * reconcilePlatformHeldForAccount pays by), and NULL when two or more share it.
+ *
+ * 10/12 (Nic, ledger P0, design §16.2; no first company wins): a payout was
+ * stamped with the account's FIRST company (oldest, or lowest id), so on an
+ * account two companies share, the whole payout — both companies' money —
+ * landed on one company's books. A payout from a shared account carries both;
+ * it names neither, and every page that lists payouts already treats a payout
+ * with no company as belonging to the account's owner only when that owner has
+ * one company (routes/financials payoutWhere). The books hold it in suspense
+ * until it can be split (design §6 G3).
+ */
+export const SOLE_COMPANY_ON_ACCOUNT_SQL = (acct: string) => `(
+  SELECT CASE WHEN COUNT(*) = 1 THEN (array_agg(l.id))[1] END
+    FROM landlords l JOIN users u ON u.id = l.user_id
+   WHERE COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) = ${acct})`
+
+/**
+ * The GAM owner of a Connect account: the login that holds it, and the company
+ * it is stamped on — only when exactly one company's money lands there
+ * (SOLE_COMPANY_ON_ACCOUNT_SQL), never the first of several.
+ */
 export async function connectPayoutOwner(account: string): Promise<PayoutOwner | null> {
   return queryOne<PayoutOwner>(
-    `SELECT $1::text AS account, user_id, landlord_id FROM (
-       SELECT l.user_id, l.id AS landlord_id, l.created_at FROM landlords l
-        WHERE l.stripe_connect_account_id = $1 AND l.user_id IS NOT NULL
-       UNION ALL
-       SELECT u.id, NULL, u.created_at FROM users u WHERE u.stripe_connect_account_id = $1
-     ) x ORDER BY landlord_id NULLS LAST, created_at LIMIT 1`, [account])
+    `SELECT $1::text AS account, x.user_id, ${SOLE_COMPANY_ON_ACCOUNT_SQL('$1::text')} AS landlord_id
+       FROM (
+         SELECT l.user_id, l.created_at FROM landlords l JOIN users u ON u.id = l.user_id
+          WHERE COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) = $1
+         UNION ALL
+         SELECT u.id, u.created_at FROM users u WHERE u.stripe_connect_account_id = $1
+       ) x
+      ORDER BY x.created_at, x.user_id LIMIT 1`, [account])
 }
 
 export async function syncConnectPayouts(stripe: PayoutLister = getStripe() as any, opts: { limit?: number } = {}) {
-  const accounts = await query<PayoutOwner>(
-    `SELECT DISTINCT ON (account) account, user_id, landlord_id FROM (
-       SELECT l.stripe_connect_account_id AS account, l.user_id, l.id AS landlord_id
+  const accountIds = await query<{ account: string }>(
+    `SELECT DISTINCT account FROM (
+       SELECT l.stripe_connect_account_id AS account
          FROM landlords l WHERE l.stripe_connect_account_id IS NOT NULL AND l.user_id IS NOT NULL
-       UNION ALL
-       SELECT u.stripe_connect_account_id, u.id, NULL FROM users u WHERE u.stripe_connect_account_id IS NOT NULL
-     ) x ORDER BY account, landlord_id NULLS LAST`)
+       UNION
+       SELECT u.stripe_connect_account_id FROM users u WHERE u.stripe_connect_account_id IS NOT NULL
+     ) x ORDER BY account`)
+  // 10/12: each account's owner by the one rule the webhook uses too.
+  const accounts: PayoutOwner[] = []
+  for (const { account } of accountIds) {
+    const owner = await connectPayoutOwner(account)
+    if (owner) accounts.push(owner)
+  }
   const banks = new Map<string, { name: string | null; last4: string | null }>()
   let seen = 0, created = 0, updated = 0
   for (const a of accounts) {

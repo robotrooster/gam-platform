@@ -282,7 +282,14 @@ describe('reservation fee charging (#4)', () => {
     const cancel = await request(app).post(`/api/common-areas/reservations/${r.id}/cancel`)
       .set('Authorization', `Bearer ${f.t1Token}`).send({})
     expect(cancel.body.data.feeOutcome).toBe('voided')
-    expect((await feePayments(f.t1)).rows).toHaveLength(0) // unpaid fee removed
+    // 10/12 (Nic): the unpaid fee is voided as a record, never deleted — kept
+    // at its amount, owed by nobody, and the reservation still names it.
+    const kept = (await db.query(
+      `SELECT p.id, p.amount::float AS amount, p.status, p.void_reason, car.fee_payment_id, car.fee_voided
+         FROM payments p JOIN common_area_reservations car ON car.id = $2
+        WHERE p.tenant_id = $1 AND p.type = 'fee'`, [f.t1, r.id])).rows
+    expect(kept).toEqual([{ id: kept[0]?.id, amount: 40, status: 'voided', void_reason: RESERVATION_FEE_VOID_REASON,
+      fee_payment_id: kept[0]?.id, fee_voided: true }])
   })
 
   /** The tenant's fee, bounced: a bank payment was tried on it and turned down. */
@@ -1058,7 +1065,10 @@ describe('W-44 private events', () => {
       [res.body.data.id])
     expect(r.rows[0].status).toBe('cancelled')
     expect(r.rows[0].fee_voided).toBe(true)
-    expect(r.rows[0].fee_payment_id).toBeNull()
+    // 10/12 (Nic): the unpaid deposit is voided as a record, not deleted — the
+    // reservation still points at it.
+    expect(r.rows[0].fee_payment_id).toBeTruthy()
+    expect((await db.query(`SELECT status FROM payments WHERE id = $1`, [r.rows[0].fee_payment_id])).rows[0].status).toBe('voided')
     expect(r.rows[0].decision_note).toMatch(/deposit unpaid/i)
   })
 

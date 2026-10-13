@@ -768,6 +768,72 @@ export async function writeCheckOut(client: PoolClient, s: StayRow, leftOn: stri
 // ─── Register refund rows (one shape for every way a sale's money goes back) ─
 
 /**
+ * 10/12 (Nic, ledger P1) — the part of a register refund that is the sale's
+ * tax (pos_refunds.tax_refunded), from the sale's stored totals as they are
+ * when the refund is written. What the refund gives back of the SALE is its
+ * amount less the card fee given back with it (card_fee_refunded — never part
+ * of the sale); of that, the share that is tax is the sale's tax over its net
+ * plus tax: given − ROUND(given × net ÷ (net + tax), 2), net = subtotal −
+ * discount − the sale's background-check money (GAM's, never refunded, never
+ * the sale's income). The same proportion the reports took every time they
+ * ran; now taken once and kept. Every refund writer uses it: recordSaleRefund
+ * and the register's Refund (routes/pos). Also the backfill's rule.
+ */
+export async function saleRefundTax(
+  q: Pick<PoolClient, 'query'>, saleId: string, amount: number, cardFeeRefunded: number,
+): Promise<number> {
+  const given = round2(Math.max(0, Number(amount) - Math.max(0, Number(cardFeeRefunded) || 0)))
+  if (!(given > 0)) return 0
+  // 10/12 (ledger P1 review): never more than the sale's tax not already
+  // given back by its other refunds (a Stripe refund sent back, reversed_at,
+  // gave nothing back) — the books can never return more tax than was taken.
+  const r = (await q.query<{ tax: string | null }>(
+    `SELECT CASE WHEN t.tax_amount > 0 THEN
+              GREATEST(0, LEAST($2::numeric, $2::numeric - ROUND($2::numeric * (t.subtotal - t.discount_amount - s.screening)
+                / NULLIF(t.subtotal - t.discount_amount - s.screening + t.tax_amount, 0), 2),
+                t.tax_amount - COALESCE((SELECT SUM(pr.tax_refunded) FROM pos_refunds pr
+                                          WHERE pr.transaction_id = t.id AND pr.reversed_at IS NULL), 0)))
+            ELSE 0 END::text AS tax
+       FROM pos_transactions t
+       CROSS JOIN LATERAL (SELECT COALESCE((SELECT SUM(ssp.amount) FROM screening_prepayments ssp
+                                             WHERE ssp.status <> 'void' AND ssp.source_id IN (t.id, t.pay_link_id)), 0) AS screening) s
+      WHERE t.id = $1`, [saleId, given.toFixed(2)])).rows[0]
+  return round2(Number(r?.tax ?? 0) || 0)
+}
+
+/**
+ * 10/12 (Nic, ledger P1 review) — the part of a register refund that is the
+ * card fee the guest paid on top of a card sale (pos_transactions.surcharge),
+ * for a refund that does not say (the register's Refund, routes/pos). A card
+ * sale's total carries its surcharge, and the register lets a clerk hand the
+ * whole total back in cash: that surcharge is never the sale's income and
+ * never its tax. Its share of the refund is by proportion — amount ×
+ * surcharge ÷ what the sale can give back (its total less the background
+ * check GAM keeps) — and never more of the surcharge than earlier refunds
+ * left. Stored as the refund's card_fee_refunded, so every reader that takes
+ * the sale's part of a refund as amount − card_fee_refunded (saleRefundTax,
+ * incomeBasis, the stay's refundable money) reads it the same way.
+ */
+export async function saleRefundCardFeeShare(
+  q: Pick<PoolClient, 'query'>, saleId: string, amount: number,
+): Promise<number> {
+  const amt = round2(Math.max(0, Number(amount) || 0))
+  if (!(amt > 0)) return 0
+  const r = (await q.query<{ fee: string | null }>(
+    `SELECT CASE WHEN t.surcharge > 0 AND t.total - s.screening > 0 THEN
+              GREATEST(0, LEAST(ROUND($2::numeric * t.surcharge / (t.total - s.screening), 2),
+                t.surcharge - COALESCE((SELECT SUM(pr.card_fee_refunded) FROM pos_refunds pr
+                                         WHERE pr.transaction_id = t.id AND pr.reversed_at IS NULL), 0),
+                $2::numeric))
+            ELSE 0 END::text AS fee
+       FROM pos_transactions t
+       CROSS JOIN LATERAL (SELECT COALESCE((SELECT SUM(ssp.amount) FROM screening_prepayments ssp
+                                             WHERE ssp.status <> 'void' AND ssp.source_id IN (t.id, t.pay_link_id)), 0) AS screening) s
+      WHERE t.id = $1`, [saleId, amt.toFixed(2)])).rows[0]
+  return round2(Number(r?.fee ?? 0) || 0)
+}
+
+/**
  * A register refund row on a sale, with the sale's refunded total and status
  * moved — locked so two refunds never pass the sale's total.
  */
@@ -784,12 +850,14 @@ export async function recordSaleRefund(client: PoolClient, o: {
   if (cumulative > t.total + 0.005) {
     throw new AppError(409, `That is more than is left to refund on the sale (${money(round2(t.total - prior))} at most) — nothing was changed.`)
   }
+  // 10/12 (Nic, ledger P1): the tax this refund gives back, stored with it.
+  const taxRefunded = await saleRefundTax(client, o.saleId, o.amount, o.cardFeeRefunded ?? 0)
   const r = await client.query<{ id: string }>(
     `INSERT INTO pos_refunds (transaction_id, landlord_id, amount, reason, refund_method, stripe_refund_id,
-                              card_fee_refunded, stay_refund_part_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                              card_fee_refunded, stay_refund_part_id, tax_refunded)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
     [o.saleId, o.landlordId, round2(o.amount).toFixed(2), o.reason, o.method, o.stripeRefundId ?? null,
-     round2(o.cardFeeRefunded ?? 0).toFixed(2), o.stayRefundPartId ?? null])
+     round2(o.cardFeeRefunded ?? 0).toFixed(2), o.stayRefundPartId ?? null, taxRefunded.toFixed(2)])
   await client.query(
     `UPDATE pos_transactions SET status = $2, refund_amount = $3, refunded_at = NOW() WHERE id = $1`,
     [o.saleId, cumulative >= t.total - 0.005 ? 'refunded' : 'partial_refund', cumulative])
@@ -1708,6 +1776,7 @@ async function sendCardPart(partId: string): Promise<void> {
     if (part.drop > 0 && !reverse) {
       await recordHeldItem({
         landlordId: part.landlord_id, sourceType: 'refund', sourceId: refund.id, amount: -part.drop,
+        property: { refundPartId: partId },  // 10/12 (Nic, ledger P1): the stay's or lease's space
         description: part.paid_ahead_choice_id
           ? `Refund of ${paidAheadWords(part.choice_unit)} (card fee included)`
           : `Refund to ${part.guest_name || 'a guest'} who left early (card fee included)`,
@@ -2080,6 +2149,7 @@ export async function stripeRefundFailed(refund: { id: string; status?: string |
       if (took && part.drop > 0) {
         await recordHeldItem({
           landlordId: part.landlord_id, sourceType: 'refund', sourceId: `${refund.id}:failed`, amount: part.drop,
+          property: { refundPartId: part.id },  // 10/12 (Nic, ledger P1): the stay's or lease's space
           description: part.paid_ahead_choice_id
             ? `A refund of ${paidAheadWords(part.choice_unit)} came back — put back on your payout until it is sent again`
             : `A refund to ${part.guest_name || 'a guest'} came back — the money is yours again until it is sent`,

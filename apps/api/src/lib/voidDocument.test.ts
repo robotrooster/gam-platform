@@ -9,9 +9,10 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
-import { voidDocument } from './voidDocument'
+import { voidDocument, HOME_SALE_VOIDED_CHARGE_REASON } from './voidDocument'
 import { lockLeaseHousehold } from './unwindIssuedLease'
 import { householdLockKey } from '../services/moneyPredicates'
+import { voidedKeptVsDeleted } from '../test/voidedChargeTotals'
 
 let f: { landlordId: string; unitId: string; tenantId: string }
 
@@ -243,9 +244,14 @@ describe('voiding an installment contract only the landlord signed', () => {
       return { doc, saleId: k.id as string, invoiceId }
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
   }
+  // 10/12 (Nic): a home payment the void takes off is VOIDED as a record,
+  // never deleted — a live line is one not voided.
   const billOf = async (id: string) => (await query<any>(
     `SELECT status, total_amount::float AS total, subtotal_home_payments::float AS home,
-            (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment') AS home_lines
+            (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment'
+                                                    AND p.status <> 'voided') AS home_lines,
+            (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment'
+                                                    AND p.status = 'voided') AS voided_home_lines
        FROM invoices i WHERE id = $1`, [id]))[0]
 
   it('takes the home payment off the bill and cancels the sale', async () => {
@@ -258,10 +264,22 @@ describe('voiding an installment contract only the landlord signed', () => {
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
     expect(await saleStatus(saleId)).toBe('cancelled')
-    expect(await billOf(invoiceId)).toMatchObject({ status: 'pending', total: 450, home: 0, home_lines: 0 })
+    expect(await billOf(invoiceId)).toMatchObject({ status: 'pending', total: 450, home: 0, home_lines: 0, voided_home_lines: 1 })
     const unbilled = await query<any>(
       `SELECT 1 FROM home_sale_installments WHERE contract_id = $1 AND payment_id IS NOT NULL`, [saleId])
     expect(unbilled).toHaveLength(0)
+    // The home payment is kept, at its amount, stamped with why it is not owed,
+    // and still names its installment.
+    const kept = await query<any>(
+      `SELECT p.amount::float AS amount, p.void_reason, p.voided_at IS NOT NULL AS stamped,
+              (SELECT i.contract_id FROM home_sale_installments i WHERE i.id = p.home_sale_installment_id) AS contract_id
+         FROM payments p WHERE p.invoice_id = $1 AND p.type = 'home_payment'`, [invoiceId])
+    expect(kept).toEqual([{ amount: 150, void_reason: HOME_SALE_VOIDED_CHARGE_REASON, stamped: true, contract_id: saleId }])
+    // Every figure reads as it did when the home payment was deleted.
+    const who = (await query<any>(`SELECT landlord_id, tenant_id FROM invoices WHERE id = $1`, [invoiceId]))[0]
+    const r = await voidedKeptVsDeleted(who.landlord_id, who.tenant_id)
+    expect(r.voidedRows).toBe(1)
+    expect(r.kept).toEqual(r.deleted)
   })
 
   it('refuses once a home payment from it was paid — nothing changes', async () => {
@@ -329,7 +347,7 @@ describe('voiding an installment contract only the landlord signed', () => {
       expect((await attaching).attached).toEqual([])
     } catch (e) { await voiding.query('ROLLBACK').catch(() => {}); throw e } finally { voiding.release() }
     expect(await saleStatus(saleId)).toBe('cancelled')
-    expect(await billOf(invoiceId)).toMatchObject({ total: 450, home: 0, home_lines: 0 })
+    expect(await billOf(invoiceId)).toMatchObject({ total: 450, home: 0, home_lines: 0, voided_home_lines: 1 })
   })
 
   it('a void outside voidDocument that races the start sees the lines the start wrote, and stops', async () => {

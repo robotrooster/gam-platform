@@ -78,4 +78,29 @@ describe('captureGrowthSnapshot', () => {
         WHERE snapshot_date=CURRENT_DATE`)).rows[0]
     expect(pcount.n).toBe(1)
   })
+
+  it('10/12 review: a property\'s snapshot counts its spaces — never a retired unit or a utility service point', async () => {
+    const c = await db.connect()
+    let p1 = ''
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      p1 = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const live = await seedUnit(c, { propertyId: p1, landlordId })
+      const retired = await seedUnit(c, { propertyId: p1, landlordId })
+      const service = await seedUnit(c, { propertyId: p1, landlordId })
+      await c.query(`UPDATE units SET status='vacant' WHERE id = ANY($1::uuid[])`, [[live, retired]])
+      // Retire-and-replace keeps the old row, status 'vacant', beside its replacement.
+      await c.query(`UPDATE units SET retired_at = now() - interval '1 day' WHERE id=$1`, [retired])
+      await c.query(`UPDATE units SET status='utility_service' WHERE id=$1`, [service])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    await captureGrowthSnapshot()
+    const prop = (await db.query<any>(
+      `SELECT * FROM property_growth_snapshots WHERE snapshot_date=CURRENT_DATE AND property_id=$1`, [p1])).rows[0]
+    expect(prop.units).toBe(1)
+    expect(prop.vacant_units).toBe(1)
+    expect(prop.occupied_units).toBe(0)
+  })
 })

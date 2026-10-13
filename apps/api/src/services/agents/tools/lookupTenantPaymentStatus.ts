@@ -294,11 +294,14 @@ export const lookupTenantPaymentStatus: AgentTool = {
     const credit = await creditBeside({ tenantId: m.tenant_id, landlordIds })
     // GAM's FlexPay pull is the tenant's arrangement with GAM and never reaches
     // a landlord (CLAUDE.md: FlexPay must never surface in the landlord portal).
+    // 10/12 (Nic, G9): a voided charge is not a recent payment — it was taken
+    // off, owed by nobody (kept on file and in the full history).
     const recent = await query<{ type: string; amount: string; status: string; due_date: string | null }>(
       `SELECT p.type, p.amount, p.status, p.due_date
          FROM payments p
         WHERE ${householdRowSql('p', '$1')} AND p.landlord_id = ANY($2::uuid[])
           AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+          AND p.status <> 'voided'
         ORDER BY COALESCE(p.due_date, p.created_at) DESC, p.created_at DESC, p.id
         LIMIT 5`,
       [m.tenant_id, landlordIds]

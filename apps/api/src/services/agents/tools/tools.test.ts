@@ -638,16 +638,31 @@ describe('read tools scope to the actor', () => {
       expect(res.bookings[0]).toMatchObject({ nights: 3, total: 300, status: 'confirmed' })
     })
 
-    it('get_setup_progress scopes Connect by userId, counts by landlord id, and finds the next step', async () => {
+    // 10/12 (Nic): payouts are the COMPANY's (landlords), not the user's, and
+    // only live payouts count. The SQL itself runs in getSetupProgress.db.test.ts.
+    it('get_setup_progress reads payouts and counts by the account’s companies, and finds the next step', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: true, has_property: true }]) // companies
       ;(mockQueryOne as any)
-        .mockResolvedValueOnce({ connect_details_submitted: true, connect_charges_enabled: true, connect_payouts_enabled: false }) // users (by userId)
-        .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0', onboarding_complete: false }) // counts (by landlord_id)
+        .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0' }) // counts (by landlord_id)
       const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
-      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['u2']) // connect by actor.userId
-      expect((mockQueryOne as any).mock.calls[1][1]).toEqual([['L1']]) // counts by the account's companies
+      expect((mockQuery as any).mock.calls[0][0]).toMatch(/FROM landlords l/)
+      expect((mockQuery as any).mock.calls[0][1]).toEqual([['L1']]) // payouts by the account's companies
+      expect((mockQueryOne as any).mock.calls[0][1]).toEqual([['L1']]) // counts by the account's companies
       expect(res.complete).toBe(false)
-      expect(res.completedSteps).toBe(2) // bank (details submitted) + property
+      expect(res.completedSteps).toBe(2) // payouts + property
       expect(res.nextStep).toMatch(/units/i) // next incomplete step
+    })
+
+    it('get_setup_progress: details submitted without live payouts is not "can get paid"', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: false, has_property: true }])
+      ;(mockQueryOne as any)
+        .mockResolvedValueOnce({ properties: '1', units: '2', active_leases: '1' })
+      const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
+      expect(res.canGetPaid).toBe(false)
+      expect(res.companiesThatCannotBePaid).toEqual(['TruBlu'])
+      expect(res.nextStep).toMatch(/payouts/i)
     })
 
     it('get_property_rent_roll binds units to the landlord id, supports a property filter', async () => {
@@ -911,6 +926,7 @@ describe('get_books_summary (landlord, ledger-scoped)', () => {
 
   it('binds both income and expense queries to the landlord id and computes net', async () => {
     ;(query as any)
+      .mockResolvedValueOnce([]) // 10/12 (ledger P8): the books are not live yet — the journal path
       .mockResolvedValueOnce([
         { code: '4010', name: 'Rental Income', period_amount: '5000' },
         { code: '4020', name: 'Late Fee Income', period_amount: '150' },
@@ -920,18 +936,48 @@ describe('get_books_summary (landlord, ledger-scoped)', () => {
         { code: '5050', name: 'Utilities', period_amount: '300' },
       ]) // expenses
     const res: any = await getBooksSummary.execute({ period: 'last_month' }, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1][0]).toEqual(['L1']) // income scoped to landlord
-    expect((query as any).mock.calls[1][1][0]).toEqual(['L1']) // expenses scoped to landlord
+    expect((query as any).mock.calls[1][1][0]).toEqual(['L1']) // income scoped to landlord
+    expect((query as any).mock.calls[2][1][0]).toEqual(['L1']) // expenses scoped to landlord
     expect(res).toMatchObject({ totalIncome: 5150, totalExpenses: 1500, netIncome: 3650, period: 'last month' })
     expect(res.topExpenses[0]).toMatchObject({ category: 'Repairs & Maintenance', amount: 1200 })
+    // 10/11: the Books P&L's join shape — the period, posted and owner tests
+    // bind the lines summed (not a LEFT JOIN beside them), and a deactivated
+    // account with activity in the period still counts.
+    for (const call of (query as any).mock.calls.slice(1, 3)) {
+      const sql = String(call[0]).replace(/\s+/g, ' ')
+      expect(sql).toContain('LEFT JOIN (journal_entry_lines jel JOIN journal_entries je ON je.id = jel.entry_id AND je.date BETWEEN $2 AND $3')
+      expect(sql).toContain('HAVING ba.active OR')
+      expect(sql).not.toContain('ba.active = TRUE')
+    }
   })
 
   it('reports cleanly when no bookkeeping accounts exist', async () => {
-    ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([])
+    ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([])
     const res: any = await getBooksSummary.execute({}, LANDLORD_ACTOR)
     expect(res.ok).toBe(true)
     expect(res.netIncome).toBe(0)
     expect(res.note).toMatch(/no bookkeeping accounts/i)
+  })
+
+  // 10/12 (Nic, ledger P8): once the books are live, the summary is the
+  // ledger's P&L — Received leads (L2), Charged beside it.
+  it('reads the books once they are live: received and paid lead, charged and incurred beside', async () => {
+    const lr = await import('../../ledgerReports')
+    ;(query as any).mockResolvedValueOnce([{ id: 'L1' }]) // the books are live
+    const spy = vi.spyOn(lr, 'ledgerProfitAndLoss').mockResolvedValue({
+      source: 'ledger', period: { start: '2026-09-01', end: '2026-09-30', label: 'last month' }, lead: 'received',
+      view: { received: 900, charged: 1000, owed: 100 } as any, chargedBeside: [], corrections: [],
+      incomeAccounts: [{ accountId: 'a', code: '4010', name: 'Space and lot rent', charged: 1000 }],
+      expenses: { rows: [{ accountId: 'b', code: '5040', name: 'Repairs and maintenance', paid: 50, incurred: 80 }], paid: 50, incurred: 80 },
+      nets: { received: 850, charged: 920 },
+    })
+    try {
+      const res: any = await getBooksSummary.execute({ period: 'last_month' }, LANDLORD_ACTOR)
+      expect(spy.mock.calls[0][0]).toEqual({ landlordIds: ['L1'] })
+      expect(res).toMatchObject({ totalIncome: 900, totalExpenses: 50, netIncome: 850, owedAtEnd: 100 })
+      expect(res.charged).toEqual({ income: 1000, expensesIncurred: 80, net: 920 })
+      expect(res.topExpenses).toEqual([{ category: 'Repairs and maintenance', amount: 80 }])
+    } finally { spy.mockRestore() }
   })
 })
 
@@ -1036,16 +1082,26 @@ describe('get_team (landlord, all-role roster)', () => {
     ;(query as any)
       .mockResolvedValueOnce([
         { role: 'maintenance', first_name: 'Mike', last_name: 'Diaz', all_properties: false, prop_count: 2 },
-        { role: 'bookkeeper', first_name: 'Bea', last_name: 'Cook', all_properties: null, prop_count: null },
+        // 10/11: a bookkeeper's coverage is their property boxes — every
+        // property the company owns today ticked, or how many are. 10/12: the
+        // company-wide box is its own (bank and payroll named only when it is
+        // ticked), with the lease-dates box and any sold property's history.
+        { role: 'bookkeeper', first_name: 'Bea', last_name: 'Cook', all_properties: true, prop_count: 3, company_wide: true, lease_dates: false, former_count: 0 },
+        { role: 'bookkeeper', first_name: 'Nora', last_name: 'Park', all_properties: false, prop_count: 1, company_wide: false, lease_dates: true, former_count: 1 },
+        { role: 'bookkeeper', first_name: 'Cy', last_name: 'Wide', all_properties: false, prop_count: 0, company_wide: true, lease_dates: false, former_count: 0 },
       ]) // members
       .mockResolvedValueOnce([{ email: 'new@x.dev', role: 'onsite_manager' }]) // invites
     const res: any = await getTeam.execute({}, LANDLORD_ACTOR)
     expect((query as any).mock.calls[0][1]).toEqual([['L1']]) // members scoped to landlord
     expect((query as any).mock.calls[1][1]).toEqual([['L1']]) // invites scoped to landlord
+    expect(String((query as any).mock.calls[0][0])).toMatch(/FROM bookkeeper_scopes bs/)
     expect(res.members).toEqual([
       { name: 'Mike Diaz', role: 'Maintenance', coverage: '2 properties' },
-      { name: 'Bea Cook', role: 'Bookkeeper', coverage: 'books access' },
+      { name: 'Bea Cook', role: 'Bookkeeper', coverage: 'all properties; company-wide books (bank account, payouts, payroll)' },
+      { name: 'Nora Park', role: 'Bookkeeper', coverage: '1 property; lease start and end dates; history of 1 sold property up to the sale' },
+      { name: 'Cy Wide', role: 'Bookkeeper', coverage: 'company-wide books (bank account, payouts, payroll)' },
     ])
+    expect(res.members[2].coverage).not.toMatch(/payroll|bank/)   // Nora: no company-wide box
     expect(res.pendingInvites[0]).toMatchObject({ email: 'new@x.dev', role: 'On-site Manager' })
   })
 })
@@ -1568,28 +1624,37 @@ describe('get_portfolio_stats never tells a landlord who is on SSI/SSDI', () => 
   })
 })
 
-// S655 (money plan, Step 3): the agent's P&L is the reports page's P&L under
-// the same "Money received" / "Money billed" switch. The figures themselves are
-// held equal to the report and the dashboard card against a real database in
-// routes/reportsPropertyBreakdown.test.ts; here, that the switch reaches the
-// shared computation and the answer says which way it counted.
-describe('get_profit_and_loss follows the basis switch', () => {
+// 10/12 (Nic): "NO Money received / Money billed toggle anywhere — show
+// Charged, Received and Owed side by side." (L2) "Received leads." The agent's
+// P&L is the reports page's P&L (computeLandlordPL): the three columns, the tie
+// in words and the net on each money column. The old basis switch is gone; a
+// stale one passed in is ignored. The figures themselves are held equal to the
+// report against a real database in routes/reportsPropertyBreakdown.test.ts.
+describe('get_profit_and_loss: Received, Charged and Owed, no switch', () => {
   beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset() })
 
-  async function run(args: Record<string, unknown>) {
+  async function run(args: Record<string, unknown>, source?: 'ledger') {
     const pl = await import('../../landlordPL')
     const { getProfitAndLoss } = await import('./getProfitAndLoss')
     mockQuery.mockResolvedValue([{ id: 'L1', business_name: 'Oak Park' }])
-    const spy = vi.spyOn(pl, 'computeLandlordPL').mockImplementation(async (_l, _s, _e, _m, basis = 'received') => ({
+    const spy = vi.spyOn(pl, 'computeLandlordPL').mockImplementation(async () => ({
       gross: { rent: 460, fees: 0, utilities: 0, homeSale: 0, balances: 0, otherIncome: 0, other: 0, total: 460 },
       lines: {} as any,
       lineItems: [{ line: 'rent', label: 'Rent', amount: 460 }],
       beside: { clearing: 0, creditsYouGave: 0, workTrade: 0, depositsHeld: 0, collectedSoFar: 0, stillOwed: 0, paidAheadUnused: 0 },
       besideItems: [],
       depositsHeld: 0,
-      expenses: { platformFee: 10, maintenance: 0, lotRent: 0, enteredExpenses: 5, total: 15 },
+      expenses: { platformFee: 10, maintenance: 0, lotRent: 0, enteredExpenses: 5, total: 15, ...(source ? { cashTotal: 12 } : {}) },
       net: 445,
-      basis: { basis, label: basis === 'billed' ? 'Money billed' : 'Money received', note: 'n' },
+      basis: { basis: 'received', label: 'Money received', note: 'n' },
+      view: {
+        received: 460, charged: 920, owed: 460, collected: 0, clearing: 0,
+        lines: [{ line: 'rent', label: 'Rent', received: 460, charged: 920, owed: 460 }],
+        categories: [], uncategorized: [], tie: {} as any,
+        tieText: ['Of $460.00 received, $460.00 was for bills due in September 2026.', 'Owed $0.00 … = owed $460.00 at the end of Sep 30, 2026.'],
+        beside: [], ...(source ? { source } : {}),
+      },
+      nets: { charged: 905, received: source ? 448 : 445 },
     }) as any)
     try {
       const out: any = await getProfitAndLoss.execute(args, LANDLORD_ACTOR)
@@ -1597,22 +1662,28 @@ describe('get_profit_and_loss follows the basis switch', () => {
     } finally { spy.mockRestore() }
   }
 
-  it('passes Money billed to the shared P&L and says so in the answer', async () => {
-    const { out, call } = await run({ year: 2026, month: 9, basis: 'billed' })
-    expect(call[4]).toBe('billed')
-    expect(out.basis).toBe('Money billed')
-    expect(out.income.lines).toEqual([{ line: 'rent', label: 'Rent', amount: 460 }])
+  it('answers with the three columns, Received first, the tie, and the net on each', async () => {
+    const { out } = await run({ year: 2026, month: 9 })
+    expect(out.income).toMatchObject({ received: 460, charged: 920, owed: 460 })
+    expect(Object.keys(out.income).slice(0, 3)).toEqual(['received', 'charged', 'owed'])
+    expect(out.income.lines).toEqual([{ label: 'Rent', received: 460, charged: 920, owed: 460 }])
+    expect(out.net).toEqual({ received: 445, charged: 905 })
+    expect(out.howTheyTie).toHaveLength(2)
+    expect(out.basis).toBeUndefined()
+    expect(out.columns).toMatch(/still unpaid of those bills today/)
   })
 
-  it('defaults to Money received, and an unknown basis falls back to it', async () => {
-    expect((await run({ year: 2026, month: 9 })).call[4]).toBe('received')
-    expect((await run({ year: 2026, month: 9, basis: 'accrual' })).call[4]).toBe('received')
+  it('on the books, says Owed is at the period\'s end and gives the expenses paid', async () => {
+    const { out } = await run({ year: 2026, month: 9 }, 'ledger')
+    expect(out.columns).toMatch(/still owed at the end of the period/)
+    expect(out.expenses.paidInPeriod).toBe(12)
+    expect(out.net).toEqual({ received: 448, charged: 905 })
   })
 
-  it('offers the basis as a one-sentence parameter', async () => {
+  it('offers no basis parameter, and a stale one changes nothing', async () => {
     const { getProfitAndLoss } = await import('./getProfitAndLoss')
-    const p: any = (getProfitAndLoss.parameters as any).properties.basis
-    expect(p.enum).toEqual(['received', 'billed'])
-    expect(p.description.split('. ').length).toBeLessThanOrEqual(2)
+    expect((getProfitAndLoss.parameters as any).properties.basis).toBeUndefined()
+    const { call } = await run({ year: 2026, month: 9, basis: 'billed' })
+    expect(call).toHaveLength(4)
   })
 })

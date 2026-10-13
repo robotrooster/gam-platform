@@ -397,9 +397,14 @@ describe('voiding a lease the landlord already signed', () => {
     expect(inv.length).toBeGreaterThan(0)                  // kept, as a record
     expect(inv.every((i: any) => i.status === 'void')).toBe(true)
 
+    // 10/12 (Nic): the charges are voided as records, never deleted — none
+    // is owed, and every one is kept with why.
     const charges = await db.query(
-      `SELECT COUNT(*)::int AS n FROM payments WHERE lease_id=$1`, [lease.id])
-    expect(charges.rows[0].n).toBe(0)
+      `SELECT COUNT(*) FILTER (WHERE status <> 'voided')::int AS live,
+              COUNT(*) FILTER (WHERE status = 'voided' AND void_reason IS NOT NULL)::int AS voided
+         FROM payments WHERE lease_id=$1`, [lease.id])
+    expect(charges.rows[0].live).toBe(0)
+    expect(charges.rows[0].voided).toBeGreaterThan(0)
 
     const lt = await db.query(`SELECT status FROM lease_tenants WHERE lease_id=$1`, [lease.id])
     expect(lt.rows.every((r: any) => r.status === 'void')).toBe(true)
@@ -483,15 +488,19 @@ describe('voiding a lease the landlord already signed', () => {
     const held = (await db.query(
       `SELECT released_at FROM suspended_utility_charges WHERE unit_id=$1`, [f.unitId])).rows[0]
     expect(held.released_at).toBeNull()
+    // 10/12 (Nic, G8 — keep everything): the bill is voided and kept, out of
+    // its cycle slot, never deleted.
     const gone = await db.query(
-      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1 AND voided_at IS NULL`, [f.unitId])
     expect(gone.rows[0].n).toBe(0)
+    expect((await db.query(`SELECT status FROM utility_bills WHERE unit_id=$1 AND voided_at IS NOT NULL`, [f.unitId])).rows)
+      .toEqual([{ status: 'void' }])
 
     // Re-draft at the right terms and sign again: the $21 comes back, once.
     const second = await unsignedDoc(f)
     await signAs(second, f.landlordToken)
     const again = await db.query(
-      `SELECT charge_amount::float AS amt FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+      `SELECT charge_amount::float AS amt FROM utility_bills WHERE unit_id=$1 AND voided_at IS NULL`, [f.unitId])
     expect(again.rows).toHaveLength(1)
     expect(again.rows[0].amt).toBe(21)
   })

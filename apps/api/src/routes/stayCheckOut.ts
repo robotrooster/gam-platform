@@ -32,8 +32,11 @@ import { logger } from '../lib/logger'
 import { syncStayUtilityAgreement } from '../services/stayTerms'
 import {
   quoteEarlyCheckOut, decideEarlyCheckOut, retryRefundPart, givePartBackInCash, previewRefund, resumeStaleParts, healLeaseEnd,
-  CheckoutChanged, poolQ,
+  CheckoutChanged, poolQ, checkOutForLeftDay,
 } from '../services/earlyCheckOut'
+import { pastEndAttemptedCharges, stayShortenedChoiceIn, recordStayShortenedChoice } from '../services/bookingLeaseBilling'
+import { STAY_SHORTENED_CHARGE_CHOICE_LABEL } from '@gam/shared'
+import { todayIn } from '../lib/timezone'
 
 export const stayCheckOutRouter = Router()
 stayCheckOutRouter.use(requireAuth)
@@ -78,7 +81,14 @@ stayCheckOutRouter.get('/:unitId/bookings/:bookingId/check-out', requirePerm(...
     }
     const quote = await quoteEarlyCheckOut(poolQ, b.id, {
       leftOn: day(req.query.leftOn), canRefund: userHasPerm(req.user, 'pos.refund'), canCheckOut: userHasPerm(req.user, 'guests.check_out') })
-    res.json({ success: true, data: quote })
+    // 10/12 (Nic, G6): checking out early ends a long stay's lease on the day
+    // they left. Rent for the nights after it that a payment was tried on is
+    // the landlord's choice — take it off or keep it owed — asked here, before
+    // the check-out, and answered with it (pastEndAttempted on the POST).
+    const ask = !quote.checkedOut && quote.leftOn
+      ? await pastEndAttemptedCharges(b.id, checkOutForLeftDay(quote.checkIn, quote.leftOn)) : null
+    res.json({ success: true, data: { ...quote,
+      pastEndAttempted: ask ? { words: ask.words, charges: ask.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL } : null } })
   } catch (e) { next(e) }
 })
 
@@ -96,6 +106,30 @@ stayCheckOutRouter.post('/:unitId/bookings/:bookingId/check-out', requirePerm(..
   try {
     const b = await stayFor(req)
     const body = req.body ?? {}
+    // 10/12 (Nic, G6): the landlord's answer for rent past the day they left
+    // that a payment was tried on (see the GET). Asked again, with the
+    // charges, when it is missing; written before the check-out ends the
+    // lease, which carries it out.
+    const leftOn = day(body.leftOn)
+    if (leftOn) {
+      const stay = await queryOne<{ check_in: string; status: string; tz: string }>(
+        `SELECT to_char(b.check_in, 'YYYY-MM-DD') AS check_in, b.status, COALESCE(pr.timezone, 'America/Phoenix') AS tz
+           FROM unit_bookings b JOIN units u ON u.id = b.unit_id LEFT JOIN properties pr ON pr.id = u.property_id
+          WHERE b.id = $1`, [b.id])
+      if (stay && stay.status !== 'checked_out' && leftOn <= todayIn(stay.tz)) {
+        const ask = await pastEndAttemptedCharges(b.id, checkOutForLeftDay(stay.check_in, leftOn))
+        if (ask) {
+          const choice = stayShortenedChoiceIn(body.pastEndAttempted)
+          if (!choice) {
+            return res.status(409).json({
+              success: false, code: 'stay_shortened_attempted', error: ask.words,
+              charges: ask.lines, choices: STAY_SHORTENED_CHARGE_CHOICE_LABEL,
+            })
+          }
+          await recordStayShortenedChoice({ bookingId: b.id, asked: ask, choice, chosenBy: req.user!.userId })
+        }
+      }
+    }
     const result = await decideEarlyCheckOut({
       bookingId: b.id,
       actor: {

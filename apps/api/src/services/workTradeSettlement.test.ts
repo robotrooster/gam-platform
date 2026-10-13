@@ -338,3 +338,97 @@ describe('an agreement that does not track hours', () => {
     expect(r.periods.every(p => p.creditTotal === 500)).toBe(true)
   })
 })
+
+// 10/12 (Nic): "instead of giving him credit ahead for his rent, it may be
+// compensation on top of the rent." The landlord picks per agreement what hours
+// beyond what a month and any carried shortfall needed do: bank or pay.
+describe('extra hours — banked or paid', () => {
+  it('banking (the default) is unchanged, and says how many hours this close added', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 86, bankedHours: 5, carryForwardMonths: 1,
+    })
+    expect(r.bankedHours).toBe(11)
+    expect(r.extraHours).toBe(6)
+    expect(r.payableHours).toBe(0)
+  })
+
+  it('paying leaves the bank alone and returns the extra hours as payable', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 86, bankedHours: 5, carryForwardMonths: 1, extraHours: 'pay',
+    })
+    expect(r.periods[0].status).toBe('settled')
+    expect(r.payableHours).toBe(6)
+    expect(r.extraHours).toBe(6)
+    expect(r.bankedHours).toBe(5)   // banked credit never turns into wages
+  })
+
+  it('a carried shortfall is paid down with the new work before anything is extra', () => {
+    const r = settleMonth({
+      periods: [
+        period({ periodMonth: '2026-08-01', hoursApplied: 70, agedCloses: 0 }),   // 10 short
+        period({ periodMonth: '2026-09-01' }),
+      ],
+      hoursWorked: 96, bankedHours: 0, carryForwardMonths: 2, extraHours: 'pay',
+    })
+    expect(r.periods[0]).toMatchObject({ status: 'settled', hoursAppliedNow: 10 })
+    expect(r.periods[1]).toMatchObject({ status: 'settled', hoursAppliedNow: 80 })
+    expect(r.payableHours).toBe(6)
+  })
+
+  it('this month needs its hours first: a short month has nothing extra to pay', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 70, bankedHours: 0, carryForwardMonths: 1, extraHours: 'pay',
+    })
+    expect(r.payableHours).toBe(0)
+    expect(r.periods[0].hoursOutstanding).toBe(10)
+  })
+
+  it('new work fills the month before banked credit, so the bank is kept', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 90, bankedHours: 12, carryForwardMonths: 1, extraHours: 'pay',
+    })
+    expect(r.bankedHours).toBe(12)
+    expect(r.payableHours).toBe(10)
+  })
+
+  it('late approvals from an older month are new work: they fill this month, then the rest is extra', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 75, lateSurplusHours: 8, bankedHours: 0, carryForwardMonths: 1, extraHours: 'pay',
+    })
+    expect(r.periods[0].status).toBe('settled')
+    expect(r.payableHours).toBe(3)
+  })
+
+  it('banking a late approval is the same hours as before it was split out', () => {
+    const viaBank = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 75, bankedHours: 8, carryForwardMonths: 1,
+    })
+    const viaLate = settleMonth({
+      periods: [period({ periodMonth: '2026-09-01' })],
+      hoursWorked: 75, lateSurplusHours: 8, bankedHours: 0, carryForwardMonths: 1,
+    })
+    expect(viaLate.bankedHours).toBe(viaBank.bankedHours)
+    expect(viaLate.periods).toEqual(viaBank.periods)
+  })
+
+  it('ending an agreement that pays extra hours pays the new work left over, never the bank', () => {
+    const r = settleOnEnd([
+      period({ periodMonth: '2026-09-01', hoursApplied: 80 }),
+      period({ periodMonth: '2026-10-01', hoursApplied: 0 }),
+    ], 40, { '2026-10-01': 85 }, { extraHours: 'pay' })
+    expect(r.payableHours).toBe(5)
+    expect(r.bankedHours).toBe(0)
+  })
+
+  it('ending an agreement that banks pays nothing out', () => {
+    const r = settleOnEnd([period({ periodMonth: '2026-10-01', hoursApplied: 0 })], 0, { '2026-10-01': 85 })
+    expect(r.payableHours).toBe(0)
+    expect(r.bankedHours).toBe(0)
+  })
+})

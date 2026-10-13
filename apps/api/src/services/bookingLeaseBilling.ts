@@ -23,12 +23,16 @@
 // and full-month cycle keep the long-standing behavior.
 // ============================================================
 import type { PoolClient } from 'pg'
-import { computeMonthlyStaySchedule, UTILITY_TYPE_LABEL, type UtilityType, type CreditUseSource } from '@gam/shared'
+import {
+  computeMonthlyStaySchedule, UTILITY_TYPE_LABEL, STAY_SHORTENED_CHARGE_CHOICES,
+  type UtilityType, type CreditUseSource, type StayShortenedChargeChoice,
+} from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
 import { createAdminNotification } from './adminNotifications'
 import { lockHousehold } from './moneyPredicates'
+import { voidUnowedCharges } from './chargeVoids'
 import {
   createPaidAhead, voidPaidAhead, supersedeScheduledRetry, cancelSupersededIntents, runWholeBillCheckAfterCommit,
   rentPastStayEndSql, applyCredit,
@@ -91,6 +95,10 @@ function rowCarriesHistorySql(a: string): string {
       OR EXISTS (SELECT 1 FROM lease_prepaid_credit_draws x WHERE x.payment_id = ${a}.id)
       OR EXISTS (SELECT 1 FROM lease_prepaid_credits x WHERE x.source_payment_id = ${a}.id))`
 }
+
+/** Why rent the stay's new dates no longer owe is not owed (payments.void_reason). */
+export const STAY_SHORTENED_RENT_VOID_REASON =
+  'The stay\'s dates changed and no rent is owed for this date any more.'
 
 /** Unpaid rent past a shortened stay's new end that had to stay on the account; `amount` is what is still unpaid on it. */
 interface KeptRent { id: string; dueDate: string; amount: number; status: string; reason: 'history' | 'could_not_remove' }
@@ -208,6 +216,232 @@ async function adjustInvoiceRent(client: PoolClient, invoiceId: string | null, d
     [invoiceId, delta.toFixed(2)])
 }
 
+// ─── 10/12 (Nic, G6): the landlord's choice on rent a payment was tried on ───
+
+/**
+ * Unpaid rent on nights a shortening takes away that a payment was tried on —
+ * a declined card, a returned bank pull — or that another record points at
+ * (rowCarriesHistorySql). The plain unpaid rows there are simply voided; these
+ * were kept owed, and GAM was told to "decide with the landlord". Nic (10/12):
+ * the LANDLORD CHOOSES, at the moment they shorten the stay — void those
+ * charges (any money paid on them comes back to the guest as credit), or keep
+ * them owed. Money still on its way (a pending row with a payment in flight)
+ * is not asked about: it settles and is banked as money paid ahead.
+ */
+export interface PastEndAttemptedLine {
+  paymentId: string
+  dueDate: string
+  /** What is still unpaid on it. */
+  amount: number
+  status: string
+  /** A card or bank payment was tried on it (else another record points at it). */
+  paymentTried: boolean
+}
+
+export interface PastEndAttempted {
+  leaseId: string
+  landlordId: string
+  newCheckOut: string
+  lines: PastEndAttemptedLine[]
+  /** Plain words for the question, naming the months and the amount. */
+  words: string
+}
+
+/** The words the schedule and the Check out window ask the question with. */
+export function pastEndAttemptedWords(lines: readonly PastEndAttemptedLine[], newCheckOut: string): string {
+  const total = round2(lines.reduce((s, l) => s + l.amount, 0))
+  const months = [...new Set(lines.map(l => monthName(l.dueDate)))].join(', ')
+  const tried = lines.some(l => l.paymentTried)
+  return `The stay now ends ${longDate(newCheckOut)}. ${money2(total)} of rent for nights after that (${months}) ` +
+    (tried ? 'had a payment tried on it that did not go through' : 'has other records tied to it') +
+    ', so it is not simply taken off. Take those charges off (anything already paid on them goes back to the guest as credit), or keep them owed?'
+}
+
+/**
+ * The rent a shortening of booking `bookingId` to end `newCheckOut` would ask
+ * the landlord about (see PastEndAttemptedLine), or null when there is none —
+ * no active booking-schedule lease, an end that is not earlier, or nothing
+ * tried on. Read-only.
+ */
+export async function pastEndAttemptedCharges(bookingId: string, newCheckOut: string): Promise<PastEndAttempted | null> {
+  const end = String(newCheckOut).slice(0, 10)
+  const lease = await queryOne<{ id: string; landlord_id: string; lease_source: string | null; end_date: string | null; status: string }>(
+    `SELECT l.id, l.landlord_id, l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date, l.status
+       FROM leases l WHERE l.source_booking_id = $1`, [bookingId])
+  if (!lease || lease.status !== 'active') return null
+  if (!isBookingScheduleLease({ lease_source: lease.lease_source, end_date: end })) return null
+  if (lease.end_date && end >= lease.end_date) return null
+  const rows = await query<{ id: string; due_date: string; owed: string; status: string; tried: boolean }>(
+    `SELECT p.id, to_char(p.due_date, 'YYYY-MM-DD') AS due_date, p.status,
+            (p.amount - COALESCE((SELECT SUM(u.amount) FROM credit_uses u
+                                   WHERE u.payment_id = p.id AND u.status = 'applied'), 0))::text AS owed,
+            (p.stripe_payment_intent_id IS NOT NULL) AS tried
+       FROM payments p
+      WHERE p.lease_id = $1 AND p.type = 'rent' AND p.status IN ('pending','failed')
+        AND p.due_date >= $2::date
+        AND ${rowCarriesHistorySql('p')}
+        AND NOT (p.status = 'pending' AND p.stripe_payment_intent_id IS NOT NULL)
+      ORDER BY p.due_date, p.id`, [lease.id, end])
+  if (rows.length === 0) return null
+  const lines = rows.map(r => ({
+    paymentId: r.id, dueDate: r.due_date, amount: round2(Number(r.owed)), status: r.status, paymentTried: r.tried === true,
+  }))
+  return { leaseId: lease.id, landlordId: lease.landlord_id, newCheckOut: end, lines, words: pastEndAttemptedWords(lines, end) }
+}
+
+/** A choice given in a request body ('void' / 'keep'), or null. */
+export function stayShortenedChoiceIn(v: unknown): StayShortenedChargeChoice | null {
+  return (STAY_SHORTENED_CHARGE_CHOICES as readonly string[]).includes(String(v)) ? v as StayShortenedChargeChoice : null
+}
+
+/**
+ * Write the landlord's answer for a shortening (stay_shortened_charge_choices),
+ * for the lease sync that follows to carry out. `paymentIds` are the charges
+ * they were shown — only those follow it.
+ */
+export async function recordStayShortenedChoice(a: {
+  bookingId: string; asked: PastEndAttempted; choice: StayShortenedChargeChoice; chosenBy: string | null
+}): Promise<string> {
+  const r = await queryOne<{ id: string }>(
+    `INSERT INTO stay_shortened_charge_choices
+       (booking_id, lease_id, landlord_id, new_check_out, choice, payment_ids, chosen_by)
+     VALUES ($1, $2, $3, $4::date, $5, $6::uuid[], $7)
+     RETURNING id`,
+    [a.bookingId, a.asked.leaseId, a.asked.landlordId, a.asked.newCheckOut, a.choice,
+     a.asked.lines.map(l => l.paymentId), a.chosenBy])
+  return r!.id
+}
+
+/** Why rent past a shortened stay the landlord chose to take off is not owed (payments.void_reason). */
+export const STAY_SHORTENED_CHOSEN_VOID_REASON =
+  'The stay\'s dates changed, and the landlord chose to take this charge off: no rent is owed for this date any more.'
+
+/**
+ * 10/12 (Nic, G6): carry out "take it off" on one charge the landlord was asked
+ * about. Nothing paid on it → voided as a record (even though a payment was
+ * tried on it or a record points at it: the landlord said so). Money already
+ * on it (the guest's credit spent on it, or a bank deposit matched to it) →
+ * the charge closes at what was paid, the rest is taken off, and the paid part
+ * is banked back to the guest as money paid ahead by the shortening's own
+ * banking (bankOverpayment counts it as rent paid past the new end) — "refund
+ * or credit any money paid". Inside the caller's transaction (household lock).
+ */
+async function takeOffChosenRow(
+  client: PoolClient, paymentId: string, endsOn: string,
+): Promise<{ outcome: 'voided' | 'closed' | 'gone'; takenOff: number; paid: number; invoiceId: string | null }> {
+  const r = (await client.query<{ amount: string; invoice_id: string | null; credit_paid: string; bank_paid: string }>(
+    `SELECT p.amount::text AS amount, p.invoice_id,
+            COALESCE((SELECT SUM(u.amount) FROM credit_uses u WHERE u.payment_id = p.id AND u.status = 'applied'), 0)::text AS credit_paid,
+            COALESCE((SELECT SUM(a.amount) FROM bank_deposit_allocations a WHERE a.payment_id = p.id AND a.reversed_at IS NULL), 0)::text AS bank_paid
+       FROM payments p WHERE p.id = $1 AND p.status IN ('pending','failed')
+        FOR UPDATE OF p`, [paymentId])).rows[0]
+  if (!r) return { outcome: 'gone', takenOff: 0, paid: 0, invoiceId: null }
+  const amount = round2(Number(r.amount))
+  const paid = round2(Math.min(amount, Number(r.credit_paid) + Number(r.bank_paid)))
+  if (paid <= 0.005) {
+    const v = await client.query(
+      `UPDATE payments
+          SET status = 'voided', voided_at = NOW(), void_reason = $2,
+              next_retry_at = NULL, work_trade_suspended_at = NULL
+        WHERE id = $1 AND status IN ('pending','failed')`, [paymentId, STAY_SHORTENED_CHOSEN_VOID_REASON])
+    if (!v.rowCount) return { outcome: 'gone', takenOff: 0, paid: 0, invoiceId: null }
+    await adjustInvoiceRent(client, r.invoice_id, -amount)
+    return { outcome: 'voided', takenOff: amount, paid: 0, invoiceId: r.invoice_id }
+  }
+  const takenOff = round2(amount - paid)
+  await client.query(
+    `UPDATE payments p
+        SET amount = $2::numeric, status = 'settled', settled_at = NOW(), next_retry_at = NULL,
+            notes = CONCAT_WS(' · ', NULLIF(p.notes, ''), $3::text)
+      WHERE p.id = $1 AND p.status IN ('pending','failed')`,
+    [paymentId, paid.toFixed(2),
+     `Stay now ends ${longDate(endsOn)}: the landlord chose to take this charge off; the ${money2(paid)} already paid on it went back to the guest as money paid ahead`])
+  if (takenOff > 0) await adjustInvoiceRent(client, r.invoice_id, -takenOff)
+  // 10/12 (Nic) review, G6: the row closes as paid by what was on it, and the
+  // shortening banks that much back to the guest as money paid ahead
+  // (bankOverpayment, funded_by 'reclassified' — rent that "went out with the
+  // original rent", so never GAM's to hold or pay out again). For that to be
+  // true, the closing settles the row the way any settle does:
+  //   - platform_held says whether GAM holds any of it (the success path's
+  //     rule, v_payment_money.gam_held_part): a card or bank pull TRIED on it
+  //     set it, and a failure never cleared it; a bank deposit matched to it
+  //     went to the landlord's own bank, and credit the landlord holds is
+  //     theirs.
+  //   - GAM-held money spent on it (paid-ahead money that came through
+  //     Stripe) is the landlord's share now and is booked like any settle from
+  //     credit (settleFromCredit), so it rides the ordinary payout — else GAM
+  //     would keep it while the guest's credit reads as the landlord's.
+  const held = (await client.query<{ held: string; type: string; revenue_owner: string; unit_id: string | null }>(
+    `SELECT vm.gam_held_part::text AS held, p.type, p.revenue_owner, p.unit_id
+       FROM v_payment_money vm JOIN payments p ON p.id = vm.payment_id
+      WHERE vm.payment_id = $1`, [paymentId])).rows[0]
+  const gamHolds = !!held && Number(held.held) > 0.005
+  await client.query(`UPDATE payments SET platform_held = $2 WHERE id = $1`, [paymentId, gamHolds])
+  if (gamHolds) {
+    const { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } = await import('./allocation')
+    if ((ALLOCATABLE_PAYMENT_TYPES as readonly string[]).includes(held.type) && held.revenue_owner === 'landlord' && held.unit_id) {
+      // No second processing fee: GAM-held paid-ahead money paid its fee when it arrived.
+      await executeRentAllocation(client, paymentId, 'ach', { feeAlreadyCollected: true })
+    }
+  }
+  return { outcome: 'closed', takenOff, paid, invoiceId: r.invoice_id }
+}
+
+/** Why a bill a shortened stay emptied was voided (invoices.notes). */
+export const STAY_SHORTENED_BILL_VOID_NOTE = (endsOn: string) =>
+  `Voided: the stay now ends ${longDate(endsOn)}, and nothing on this bill is owed any more`
+
+/** 10/12 (Nic, G7/G8): why the open work-trade period on that bill was voided (kept, never deleted). */
+export const WORK_TRADE_PERIOD_STAY_SHORTENED_VOID = (endsOn: string) =>
+  `Voided: the stay now ends ${longDate(endsOn)}, and the bill this period would credit was voided, so it has nothing left to credit`
+
+/**
+ * 10/12 (Nic, G7) — A BILL A SHORTENED STAY EMPTIED IS VOIDED, NEVER DELETED.
+ *
+ * An invoice left with nothing live on it — only voided lines — used to be
+ * deleted (its voided lines first let go of it, so the delete went through).
+ * Keep-everything: it is now marked void (status 'void', total $0, the reason
+ * in its notes) and keeps its lines, so the bill and what was on it stay on
+ * record. Every reader of what a tenant owes already leaves a void bill out.
+ *
+ * It gives the lease's date back, as the delete did: a lease has one bill per
+ * due date (ux_invoices_lease_due_date, which the bill run inserts against),
+ * and a bill keeping the date would stop the run from ever billing that month
+ * again if the stay grows back. So the void bill lets go of its lease — the
+ * lease moves to voided_from_lease_id and lease_id is NULL (migration
+ * 20261013235115) — and every per-lease reader sees exactly what it saw after
+ * the delete. A bill something else still carries (a live line) is left as it
+ * is. In its own savepoint: nothing here undoes the date move.
+ */
+async function voidEmptyStayBill(client: PoolClient, leaseId: string, invoiceId: string, endsOn: string): Promise<void> {
+  await client.query('SAVEPOINT stay_shortened_invoice')
+  try {
+    const voided = await client.query(
+      `UPDATE invoices i
+          SET status = 'void', total_amount = 0, updated_at = NOW(),
+              voided_from_lease_id = i.lease_id, lease_id = NULL,
+              notes = LEFT(CONCAT_WS(E'\n', NULLIF(i.notes, ''), $2::text), 2000)
+        WHERE i.id = $1 AND i.status <> 'void' AND i.lease_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = i.id AND p.status <> 'voided')`,
+      [invoiceId, STAY_SHORTENED_BILL_VOID_NOTE(endsOn)])
+    // 10/12 (Nic) review, G7: a work-trade period on a void bill has nothing
+    // left to credit (as unwindIssuedLease and renewalSuccessor say). Left
+    // open, the month close would credit hours onto the void bill and count
+    // its voided lines as the shortfall already billed. Voided and kept
+    // (G8), never deleted.
+    if (voided.rowCount) {
+      await client.query(
+        `UPDATE work_trade_settlements
+            SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+          WHERE invoice_id = $1 AND status = 'open'`, [invoiceId, WORK_TRADE_PERIOD_STAY_SHORTENED_VOID(endsOn)])
+    }
+    await client.query('RELEASE SAVEPOINT stay_shortened_invoice')
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT stay_shortened_invoice')
+    logger.warn({ err: e, leaseId, invoiceId }, '[booking-lease-sync] an emptied bill could not be voided — left as it is')
+  }
+}
+
 /**
  * Master Schedule → lease sync (S548). Called after a booking's dates
  * change. Best-effort by design — the caller .catch()es and logs; a sync
@@ -216,14 +450,15 @@ async function adjustInvoiceRent(client: PoolClient, invoiceId: string | null, d
  *
  * pending lease  → dates simply follow the booking (still unsigned).
  * active lease   → end_date follows; unpaid rent falling past the new end is
- *                  deleted only when it carries no history (a plain pending
+ *                  voided as a record (10/12 — never deleted; it was deleted
+ *                  before) only when it carries no history (a plain pending
  *                  bill nobody tried to pay). A scheduled bank retry on such
  *                  rent is canceled and its held credit given back first. Rent
  *                  with history — a bounced card or bank payment, a receipt
  *                  applied to it — is kept (GAM never erases a record), its
  *                  retry still superseded so nobody pulls rent for a month the
  *                  guest is not staying, and the landlord and GAM are told by
- *                  name. Each delete runs in its own savepoint, so no row can
+ *                  name. Each void runs in its own savepoint, so no row can
  *                  undo the date move or the banking. Unpaid rent INSIDE the
  *                  stay whose month the new dates change (the old final month,
  *                  or the new one) is re-priced to the schedule, so the guest
@@ -293,6 +528,11 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
   let givenFailed = false
   // Unpaid rent past the new end that was removed.
   let removedPastEnd = 0
+  // 10/12 (Nic, G6): the landlord's answer for rent a payment was tried on,
+  // given when they shortened the stay — what it took off, and what it kept.
+  let chosenAnswer: StayShortenedChargeChoice | null = null
+  const chosenTakenOff: Array<{ id: string; dueDate: string; takenOff: number; paid: number }> = []
+  const chosenKept: KeptRent[] = []
   // The stay now ends later than the lease did.
   const lengthened = endMoved && !!lease.end_date && !!lease.check_out && lease.check_out > lease.end_date
   if (endMoved) {
@@ -313,42 +553,33 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
       await client.query(`UPDATE leases SET end_date = $2, updated_at = now() WHERE id = $1`, [lease.id, lease.check_out])
 
       if (isBookingScheduleLease({ lease_source: lease.lease_source, end_date: lease.check_out })) {
-        // Removes a plain unpaid rent row (one that carries no history) and
-        // takes it off its invoice. Its own savepoint: a record pointing at the
-        // row that rowCarriesHistorySql does not know about keeps the row
-        // instead of rolling back the date move and the banking with it.
+        // Takes a plain unpaid rent row (one that carries no history) off the
+        // guest's account and off its invoice. 10/12 (Nic): the row is VOIDED
+        // as a record (status 'voided' with when and why, decisions #48.5 —
+        // services/chargeVoids), never deleted; it keeps its amount, date and
+        // lease and is in no balance or total. A row another record points at
+        // that rowCarriesHistorySql does not know about is left alone (the
+        // rows the database refused to delete) and kept. Its own savepoint, so
+        // nothing here can roll back the date move and the banking.
         const removeRow = async (id: string, amount: number): Promise<boolean> => {
           await client.query('SAVEPOINT stay_shortened_row')
           let invoiceId: string | null
           try {
-            const d = await client.query<{ invoice_id: string | null }>(
-              `DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed') RETURNING invoice_id`,
-              [id])
+            const { voided } = await voidUnowedCharges(
+              (t, p) => client.query(t, p), [id], STAY_SHORTENED_RENT_VOID_REASON)
             await client.query('RELEASE SAVEPOINT stay_shortened_row')
-            if (d.rowCount === 0) return false
-            invoiceId = d.rows[0]?.invoice_id ?? null
+            if (voided.length === 0) return false
+            invoiceId = voided[0].invoiceId
           } catch (e) {
             await client.query('ROLLBACK TO SAVEPOINT stay_shortened_row')
-            logger.warn({ err: e, leaseId: lease.id, paymentId: id }, '[booking-lease-sync] unpaid rent the new dates no longer owe could not be removed — kept')
+            logger.warn({ err: e, leaseId: lease.id, paymentId: id }, '[booking-lease-sync] unpaid rent the new dates no longer owe could not be voided — kept')
             return false
           }
           if (!invoiceId) return true
           // The bill keeps its other lines (the final meter reads ride the
           // last one), so its rent and total drop by the rent that went.
           await adjustInvoiceRent(client, invoiceId, -amount)
-          // An invoice left with no payments is an empty shell — remove it,
-          // unless something still points at it (then it stays, harmless).
-          await client.query('SAVEPOINT stay_shortened_invoice')
-          try {
-            await client.query(
-              `DELETE FROM invoices i WHERE i.id = $1
-                 AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = i.id)`,
-              [invoiceId])
-            await client.query('RELEASE SAVEPOINT stay_shortened_invoice')
-          } catch (e) {
-            await client.query('ROLLBACK TO SAVEPOINT stay_shortened_invoice')
-            logger.warn({ err: e, leaseId: lease.id, invoiceId }, '[booking-lease-sync] empty invoice left in place — a record still points at it')
-          }
+          await voidEmptyStayBill(client, lease.id, invoiceId, lease.check_out)
           return true
         }
 
@@ -547,6 +778,18 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
              FROM payments p WHERE p.id = ANY($1::uuid[])`,
           [ids])).rows).map(r => [r.id, { amount: Number(r.amount), unpaid: Number(r.unpaid) }]))
 
+        // 10/12 (Nic, G6): the landlord's answer, given when they shortened
+        // the stay to this end (the schedule's Edit or drag, or the Check out
+        // window), for the rent they were shown. Only those charges follow it;
+        // anything else kept is kept as before and GAM is told.
+        const answer = (await client.query<{ id: string; choice: StayShortenedChargeChoice; payment_ids: string[] }>(
+          `SELECT id, choice, payment_ids FROM stay_shortened_charge_choices
+            WHERE booking_id = $1 AND new_check_out = $2::date AND applied_at IS NULL
+            ORDER BY chosen_at DESC, id DESC LIMIT 1
+              FOR UPDATE`, [bookingId, lease.check_out])).rows[0] ?? null
+        const answered = new Set(answer?.payment_ids ?? [])
+        chosenAnswer = answer?.choice ?? null
+
         for (const r of unpaid) {
           const on = nowOn.get(r.id) ?? { amount: Number(r.amount), unpaid: Number(r.amount) }
           const row = { id: r.id, dueDate: r.due_date, amount: on.unpaid, status: r.status }
@@ -554,7 +797,17 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
             // Money in flight is not "kept": it either settles (and is banked)
             // or fails (a failed row past the end — the bank's failure handler
             // must not schedule a retry on it).
-            if (!(r.status === 'pending' && r.intent)) kept.push({ ...row, reason: 'history' })
+            if (r.status === 'pending' && r.intent) continue
+            if (answer && answered.has(r.id)) {
+              if (answer.choice === 'keep') { chosenKept.push({ ...row, reason: 'history' }); continue }
+              const out = await takeOffChosenRow(client, r.id, lease.check_out)
+              if (out.outcome !== 'gone') {
+                chosenTakenOff.push({ id: r.id, dueDate: r.due_date, takenOff: out.takenOff, paid: out.paid })
+                if (out.outcome === 'voided' && out.invoiceId) await voidEmptyStayBill(client, lease.id, out.invoiceId, lease.check_out)
+                continue
+              }
+            }
+            kept.push({ ...row, reason: 'history' })
             continue
           }
           if (await removeRow(r.id, on.amount)) removedPastEnd++
@@ -572,6 +825,13 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
         }
         // The give-back already ran above (leaving GAM's unpaid bills alone).
         banked = await bankOverpayment(client, lease.id, { giveBackFirst: false })
+        // 10/12 (G6): the answer is carried out — it, and any older one for
+        // this same end, never applies again.
+        if (answer) {
+          await client.query(
+            `UPDATE stay_shortened_charge_choices SET applied_at = NOW()
+              WHERE booking_id = $1 AND new_check_out = $2::date AND applied_at IS NULL`, [bookingId, lease.check_out])
+        }
       }
       await client.query('COMMIT')
     } catch (e) {
@@ -633,7 +893,7 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
       category: 'stay_shortened_rent_kept',
       title: `Rent past a shortened stay is still on the account — ${who}`,
       body: `The stay now ends ${lease.check_out}. ${money2(keptTotal)} of unpaid rent due after that (${keptMonths}) could not be removed: ` +
-        kept.map(k => `${monthName(k.dueDate)} ${money2(k.amount)} (${k.status === 'failed' ? 'a card or bank payment on it failed' : 'other records point at it'}${k.reason === 'could_not_remove' ? '; the delete was refused' : ''})`).join('; ') +
+        kept.map(k => `${monthName(k.dueDate)} ${money2(k.amount)} (${k.status === 'failed' ? 'a card or bank payment on it failed' : 'other records point at it'}${k.reason === 'could_not_remove' ? '; it could not be voided' : ''})`).join('; ') +
         `. Any bank retry on it was canceled` +
         (besidePastEnd.length > 0
           ? `; that bank pull also carried ${money2(stillOwedTotal)} still owed inside the stay (${stillOwedLines}), whose retry went with it — the tenant has been asked to pay that now`
@@ -697,7 +957,7 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
   // already holds — a stay that is ending has no next bill run to settle it,
   // and a late fee could land meanwhile), or new rent was billed. A bill still
   // carrying kept rent past the new end never settles from credit.
-  const billCameDown = repriced.some(r => r.to < r.from) || removedPastEnd > 0
+  const billCameDown = repriced.some(r => r.to < r.from) || removedPastEnd > 0 || chosenTakenOff.length > 0
   const wholeBillTenant = banked.tenantId ?? hhTenantId
   if (wholeBillTenant && (banked.amount > 0 || billCameDown || longer.billed.length > 0 || given.total > 0)) {
     await runWholeBillCheckAfterCommit({ tenantId: wholeBillTenant, landlordId: lease.landlord_id, onlyLeaseIds: [lease.id] })
@@ -714,6 +974,16 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
       if (given.total > 0) bits.push(`${money2(given.total)} of credit you gave them had paid rent for nights no longer in the stay (${[...new Set(given.given.map(x => monthName(x.dueDate)))].join(', ')}); it went back to them as credit they can use on a later bill, and that rent bill came down by the same amount`)
       if (repriced.length > 0) bits.push(`unpaid rent changed to match the new dates (${repricedList}); they are asked only for the new amount`)
       if (kept.length > 0) bits.push(`${money2(keptTotal)} of unpaid rent due after the new end (${keptMonths}) stays on their account for now, because a payment or another record is tied to it and GAM never erases a record; their account credit is not used on it, and GAM has been told and will clear it with you`)
+      // 10/12 (Nic, G6): what the landlord chose for rent a payment was tried on.
+      if (chosenTakenOff.length > 0) {
+        const off = round2(chosenTakenOff.reduce((s2, c) => s2 + c.takenOff, 0))
+        const back = round2(chosenTakenOff.reduce((s2, c) => s2 + c.paid, 0))
+        bits.push(`as you chose, ${money2(off)} of rent due after the new end (${[...new Set(chosenTakenOff.map(c => monthName(c.dueDate)))].join(', ')}) that a payment was tried on was taken off` +
+          (back > 0 ? `, and the ${money2(back)} already paid on it went back to them as money paid ahead` : ''))
+      }
+      if (chosenKept.length > 0) {
+        bits.push(`as you chose, ${money2(round2(chosenKept.reduce((s2, k) => s2 + k.amount, 0)))} of rent due after the new end (${[...new Set(chosenKept.map(k => monthName(k.dueDate)))].join(', ')}) that a payment was tried on stays owed`)
+      }
       if (ownBesidePastEnd.length > 0) bits.push(`the bank payment GAM was going to try again also carried ${money2(sumOwed(ownBesidePastEnd))} they still owe for the stay (${owedLines(ownBesidePastEnd)}); that retry was canceled with the rest of the pull because the stay changed, and they have been asked to pay it now`)
       if (ownRepricedPull.length > 0) bits.push(`the bank payment GAM was going to try again for that rent was canceled, because it would have pulled the old amount; they have been asked to pay ${money2(sumOwed(ownRepricedPull))} now (${owedLines(ownRepricedPull)})`)
       if (longer.creditTakenBack > 0) bits.push(`${money2(longer.creditTakenBack)} of money paid ahead from when the stay was shortened was taken back, because those days are part of the stay again`)
@@ -730,6 +1000,10 @@ export async function syncLeaseWithBookingDates(bookingId: string): Promise<void
         data: {
           leaseId: lease.id, bookingId, creditAmount: banked.amount, creditGivenBack: given.total,
           keptRent: keptTotal, retryCanceledOwed: sumOwed(ownRetryCanceled),
+          // 10/12 (G6): the landlord's answer, carried out.
+          shortenedChoice: chosenAnswer,
+          chosenTakenOff: chosenTakenOff.map(c => ({ paymentId: c.id, dueDate: c.dueDate, takenOff: c.takenOff, paidBack: c.paid })),
+          chosenKept: chosenKept.map(k => ({ paymentId: k.id, dueDate: k.dueDate, amount: k.amount })),
           repricedRent: repriced.map(r => ({ paymentId: r.id, dueDate: r.dueDate, from: r.from, to: r.to })),
           longerStayRent: longer.billed.map(b => ({ paymentId: b.id, dueDate: b.dueDate, amount: b.amount, kind: b.kind })),
           creditTakenBack: longer.creditTakenBack,

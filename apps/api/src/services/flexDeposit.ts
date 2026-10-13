@@ -510,6 +510,7 @@ export async function cancelFlexDeposit(tenantId: string): Promise<{ ok: true } 
         WHERE sd.tenant_id = $1
           AND sd.flex_deposit_enabled = TRUE
           AND sd.flex_deposit_plan_status = 'active'
+          AND sd.status <> 'voided'
         ORDER BY sd.created_at DESC
         LIMIT 1`,
       [tenantId],
@@ -861,6 +862,7 @@ export async function processFlexDepositCustodyFee(now: Date = new Date()): Prom
       WHERE sd.flex_deposit_enabled = TRUE
         AND sd.flex_deposit_plan_status IN ('active', 'completed')
         AND sd.custody_fee_active = TRUE
+        AND sd.status <> 'voided'
         AND l.status IN ('active', 'pending')`,
   )
   out.candidates_scanned = rows.length
@@ -1131,6 +1133,7 @@ export async function payAheadFlexDeposit(args: {
       WHERE sd.tenant_id = $1
         AND sd.flex_deposit_enabled = TRUE
         AND sd.flex_deposit_plan_status = 'active'
+        AND sd.status <> 'voided'
       ORDER BY sd.created_at DESC
       LIMIT 1`,
     [args.tenantId],

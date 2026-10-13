@@ -20,7 +20,85 @@ import {
   type SettlementPeriod, type SettlementResult,
 } from '../services/workTradeSettlement'
 import { round2 } from '../services/workTradeCredit'
-import { emitPaymentSettledEvent } from '../services/creditLedgerEmitters'
+import { syncBillMarksAfterSettle } from '../services/creditLedgerEmitters'
+import { BILL_TOTAL_SQL } from '../services/workTradeCoverage'
+import { extraHoursSchemaReady } from '../services/workTradeStanding'
+import type { WorkTradeSettlementStatus } from '@gam/shared'
+
+/**
+ * 10/12 (Nic): what an agreement does with hours beyond what a month needs —
+ * bank them (default) or pay them. Read through to_jsonb so a database that has
+ * not had migration 20261012180000 yet still closes its months, as 'bank' (the
+ * only behavior before it): a month close must never stop over a setting. The
+ * writes are guarded the same way (recordExtraHours, extraHoursSchemaReady):
+ * without the migrations the close banks and records nothing extra.
+ */
+const EXTRA_HOURS_COLS = `
+  to_jsonb(wta)->>'extra_hours_mode' AS extra_hours_mode,
+  (to_jsonb(wta)->>'extra_hours_rate')::numeric::float AS extra_hours_rate,
+  to_jsonb(wta)->>'extra_hours_pay_method' AS extra_hours_pay_method,
+  wta.tracks_hours`
+
+interface ExtraHoursTerms {
+  extra_hours_mode?: string | null
+  extra_hours_rate?: number | null
+  extra_hours_pay_method?: string | null
+  tracks_hours?: boolean | null
+}
+
+/**
+ * 'pay' only when the landlord set it AND gave a rate and a pay method, and the
+ * agreement tracks hours: "when they work more hours than the agreement needs"
+ * means nothing on a trade that asks for no hours.
+ */
+function extraHoursMode(a: ExtraHoursTerms): 'bank' | 'pay' {
+  return a.extra_hours_mode === 'pay' && a.tracks_hours !== false
+    && Number(a.extra_hours_rate) > 0 && !!a.extra_hours_pay_method ? 'pay' : 'bank'
+}
+
+/**
+ * 10/12: write down what this run's extra hours became, on the period it
+ * closed (`periodId`).
+ *   bank — the hours it added to the bank, so the tenant can be told "6 extra
+ *          hours in September — banked" (hours only, S643).
+ *   pay  — a payable record: hours × the agreement's rate, by its pay method.
+ *          A later run that counts more of this period's hours (an approval
+ *          that landed after the close) adds them to the same unpaid record;
+ *          the close counts each approved hour once (S654), so a re-run with
+ *          nothing new writes nothing.
+ * `banking` false: the hours were not banked (an agreement ending forfeits its
+ * bank), so only a payable is written.
+ */
+async function recordExtraHours(
+  client: PoolClient, a: ExtraHoursTerms & { id: string; landlord_id: string; tenant_id: string },
+  periodId: string | null, result: SettlementResult, banking = true,
+): Promise<void> {
+  if (!periodId || !(result.extraHours > 0)) return
+  // Without the extra-hours migrations there is nowhere to write either record
+  // (and no agreement can be in pay mode: its columns read NULL above).
+  if (!(await extraHoursSchemaReady(client))) return
+  if (result.payableHours > 0) {
+    const rate = Number(a.extra_hours_rate)
+    await client.query(
+      `INSERT INTO work_trade_extra_hours
+         (agreement_id, landlord_id, tenant_id, settlement_id, period_month, period_start,
+          hours, rate, amount, pay_method)
+       SELECT $1, $2, $3, ws.id, ws.period_month, ws.period_start, $5, $6, $7, $8
+         FROM work_trade_settlements ws WHERE ws.id = $4
+       ON CONFLICT (agreement_id, period_start, rate, pay_method) WHERE status = 'unpaid'
+       DO UPDATE SET hours  = work_trade_extra_hours.hours + EXCLUDED.hours,
+                     amount = ROUND((work_trade_extra_hours.hours + EXCLUDED.hours) * work_trade_extra_hours.rate, 2),
+                     updated_at = NOW()`,
+      [a.id, a.landlord_id, a.tenant_id, periodId, result.payableHours.toFixed(2),
+       rate.toFixed(2), round2(result.payableHours * rate).toFixed(2), a.extra_hours_pay_method])
+    return
+  }
+  if (!banking) return
+  await client.query(
+    `UPDATE work_trade_settlements
+        SET extra_hours_banked = extra_hours_banked + $2, updated_at = NOW()
+      WHERE id = $1`, [periodId, result.extraHours.toFixed(2)])
+}
 
 export interface SettlementRunResult {
   agreementsProcessed: number
@@ -162,7 +240,9 @@ async function countLateApprovals(
  * with 160 hours approved or banked against the 160 asked.
  *
  * A settled month wants nothing more, so those hours are surplus and join the
- * bank, like any hour worked past a target: approved hours inside the period's
+ * bank, like any hour worked past a target (10/12: or are paid, on an agreement
+ * set to pay extra hours — the caller passes them to settleMonth as new work,
+ * which meets any remaining need first): approved hours inside the period's
  * own dates minus its hours_worked, the same counted-once rule as
  * countLateApprovals. hours_worked then records the approved total, so no
  * later close, re-run or ending counts them again. The record only rises:
@@ -243,25 +323,26 @@ async function creditInvoice(
     const net = round2(Number(r.amount) - take)
     remaining = round2(remaining - take)
     if (net === 0) {
+      // 10/12 (Nic, ledger P1): the credit is stored on the row
+      // (work_trade_credit) as it lowers the amount — the row's gross is
+      // amount + work_trade_credit; until now it was rewritten and kept nowhere.
       await client.query(
         `UPDATE payments
             SET amount = 0, status = 'settled', settled_at = NOW(),
+                work_trade_credit = work_trade_credit + $2::numeric,
                 notes = COALESCE(notes || ' — ', '') || 'Covered by work-trade credit'
-          WHERE id = $1`, [r.id])
-      // S652 (Nic): "let's count work trade as on time." Hours worked paid this
-      // line; the resident's credit history says so — settled on its due date,
-      // whatever day the month actually closed.
-      if (r.tenant_id && (r.type === 'rent' || r.type === 'utility') && r.due_date) {
-        await emitPaymentSettledEvent(client, {
-          tenantId: r.tenant_id, paymentId: r.id, paymentType: r.type, amount: take,
-          dueDate: new Date(r.due_date), settledAt: new Date(r.due_date), graceDays: null,
-          stripePaymentIntentId: null, attestationSource: 'gam_workflow_auto',
-          attestationEvidence: { covered_by: 'work_trade_credit', hours, invoice_id: invoiceId },
-        })
-      }
+          WHERE id = $1`, [r.id, take.toFixed(2)])
+      // S652 (Nic): "let's count work trade as on time." The bill's one mark is
+      // judged once, below, after the hours' value is on the invoice. 10/12
+      // (review): judging it here, per line, read the bill before
+      // work_trade_credit_amount was written — $0 charged — so the on-time mark
+      // the nightly had written was withdrawn ('attestation_invalidated') and
+      // the final judgement wrote the same mark again: every covered month left
+      // a withdrawn mark and a duplicate in the chain.
     } else {
-      await client.query(`UPDATE payments SET amount = $2 WHERE id = $1`,
-        [r.id, net.toFixed(2)])
+      await client.query(
+        `UPDATE payments SET amount = $2, work_trade_credit = work_trade_credit + $3::numeric WHERE id = $1`,
+        [r.id, net.toFixed(2), take.toFixed(2)])
     }
   }
 
@@ -288,14 +369,12 @@ async function creditInvoice(
     // Rebuild from what is actually owed now the credit has landed: zero when
     // the hours were met, the lapse when they were not. Subtracting the credit
     // instead would take money off a total that never had it.
+    // 10/12: one rule for this and a change of coverage (services/
+    // workTradeCoverage BILL_TOTAL_SQL) — it also leaves out a late fee, which
+    // invoices.subtotal_late_fees holds, and a voided line.
     await client.query(
       `UPDATE invoices i
-          SET total_amount = COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                 WHERE p.invoice_id = i.id
-                   AND p.work_trade_suspended_at IS NULL
-                   AND p.status <> 'failed'
-              ), 0),
+          SET total_amount = ${BILL_TOTAL_SQL},
               work_trade_credit_amount = i.work_trade_credit_amount + $2,
               work_trade_credit_hours  = i.work_trade_credit_hours + $3,
               updated_at = NOW()
@@ -313,6 +392,13 @@ async function creditInvoice(
         WHERE id = $1`,
       [invoiceId, round2(credit - remaining).toFixed(2), round2h(hours).toFixed(2)])
   }
+
+  // 10/12 (Nic): "one mark per invoice." The bill's one payment-history mark is
+  // judged now the hours' value sits on the invoice (work_trade_credit_amount)
+  // and the lapse, if any, is billed — the per-line calls above ran before it
+  // did. A bill the hours covered in full is on time (S652).
+  await syncBillMarksAfterSettle(client, (await client.query<{ id: string }>(
+    `SELECT id FROM payments WHERE invoice_id = $1 ORDER BY id LIMIT 1`, [invoiceId])).rows.map(r => r.id))
 }
 
 /**
@@ -370,14 +456,16 @@ async function billDeficit(
   if (separate > 0) {
     // No bill holds it, so it joins the carried-balance track: outside FIFO and
     // payable in part (S622).
+    // 10/12 (Nic, ledger P1): the row names the period whose hours it bills
+    // (work_trade_settlement_id) — until now only its note said so.
     await client.query(
       `INSERT INTO payments
          (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-          entry_description, due_date, notes)
+          entry_description, due_date, notes, work_trade_settlement_id)
        VALUES ($1, $2, $3, $4, 'carried_balance', $5, 'pending', 'BALANCE',
-               CURRENT_DATE, $6)`,
+               CURRENT_DATE, $6, $7)`,
       [agreement.unit_id, agreement.lease_id, agreement.tenant_id, agreement.landlord_id,
-       separate.toFixed(2), note])
+       separate.toFixed(2), note, period.id])
   }
   await client.query(
     `UPDATE work_trade_settlements
@@ -499,6 +587,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
       `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
               wta.banked_hours::float AS banked_hours,
               wta.carry_forward_months, wta.carry_forward_indefinite,
+              ${EXTRA_HOURS_COLS},
               -- A lease has no tenant_id: tenancy lives in lease_tenants, which
               -- is what makes co-tenants and mid-term changes expressible. The
               -- agreement's tenant must be an ACTIVE party to the lease for it
@@ -554,9 +643,11 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         const { rows: ownRows } = await client.query(
           `SELECT id, status, hours_worked::float AS counted
              FROM work_trade_settlements
-            WHERE agreement_id = $1 AND period_month = $2::date`,
+            WHERE agreement_id = $1 AND period_month = $2::date
+              -- 10/12 (G8): a voided period (its bill will never be owed) is no month's own.
+              AND status <> 'voided'`,
           [a.id, periodMonth])
-        const own = ownRows[0] as { id: string; status: string; counted: number } | undefined
+        const own = ownRows[0] as { id: string; status: WorkTradeSettlementStatus; counted: number } | undefined
         const counted = own ? round2h(Number(own.counted)) : 0
         const uncounted = own ? Math.max(0, round2h(approved - counted)) : approved
         // What the month's own period has counted after this run.
@@ -569,17 +660,32 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         for (const [k, v] of late.hoursWorked) if (!hoursWorkedByMonth.has(k)) hoursWorkedByMonth.set(k, v)
         // S654: settled months' late approvals go to the bank. The month being
         // closed is skipped: its own new hours are `uncounted` above.
+        // 10/12: they are new work, not banked credit — settleMonth spends them
+        // on needs first, then banks or pays what is left.
         const settledLate = await bankSettledLateApprovals(client, a.id, own ? own.id : null)
 
         const result = withLateHours(settleMonth({
           periods: late.periods,
           hoursWorked: uncounted,
-          bankedHours: round2h(Number(a.banked_hours) + late.banked + settledLate),
+          lateSurplusHours: round2h(late.banked + settledLate),
+          bankedHours: round2h(Number(a.banked_hours)),
           // S652: a landlord floating the shortfall indefinitely never has it billed.
           carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
+          // 10/12: only hours the month's own record counted (once) are ever
+          // paid. A month with no period of its own (no bill that month) has
+          // nothing recording what was counted — `uncounted` is all its
+          // approved hours, every run — so a re-run, or a bill that arrives
+          // later (countLateApprovals), would count the same hours again; in
+          // pay mode that recount became a second wage. Its extra hours bank,
+          // as they did before pay mode existed.
+          extraHours: own ? extraHoursMode(a) : 'bank',
         }), late.appliedNow)
 
         await persist(client, a, late.periods, hoursWorkedByMonth, result, run)
+        // 10/12: what the extra hours became, on the month this run closed (its
+        // own period even when a re-run finds it already settled; else the
+        // newest open period standing in for it, as above).
+        await recordExtraHours(client, a, own?.id ?? ordered[ordered.length - 1]?.id ?? null, result)
         // S654: a month whose own period already closed is not in `ordered`, so
         // persist does not record its late approvals; record them here, or the
         // next run would count them again.
@@ -590,7 +696,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         }
         await client.query(
           `UPDATE work_trade_settlements SET close_run_at = COALESCE(close_run_at, NOW())
-            WHERE agreement_id = $1 AND period_month = $2::date`, [a.id, periodMonth])
+            WHERE agreement_id = $1 AND period_month = $2::date AND status <> 'voided'`, [a.id, periodMonth])
         await client.query('COMMIT')
         run.agreementsProcessed++
       } catch (e: unknown) {
@@ -635,6 +741,8 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         WHERE ws.close_run_at IS NULL
           AND ws.period_start <> ws.period_month
           AND ws.period_end < $1::date
+          -- 10/12 (G8): a voided period is never closed: it credits nothing.
+          AND ws.status <> 'voided'
         ORDER BY ws.agreement_id, ws.period_start`, [todayIso])
 
     for (const c of closing) {
@@ -643,6 +751,7 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         const { rows } = await client.query(
           `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
                   wta.banked_hours::float AS banked_hours, wta.carry_forward_months, wta.carry_forward_indefinite,
+                  ${EXTRA_HOURS_COLS},
                   (SELECT l.id FROM leases l
                      JOIN lease_tenants lt ON lt.lease_id = l.id
                     WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
@@ -680,16 +789,20 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         // The record only rises: hours un-approved after a close are not taken back.
         const hoursWorkedByMonth = new Map<string, number>([[c.period_start, round2h(counted + uncounted)]])
         for (const [k, v] of late.hoursWorked) if (!hoursWorkedByMonth.has(k)) hoursWorkedByMonth.set(k, v)
-        // S654: settled periods' late approvals go to the bank.
+        // S654: settled periods' late approvals go to the bank. 10/12: as new
+        // work — needs first, then banked or paid (see the calendar close).
         const settledLate = await bankSettledLateApprovals(client, a.id, c.id)
         const result = withLateHours(settleMonth({
           periods: late.periods,
           hoursWorked: uncounted,
-          bankedHours: round2h(Number(a.banked_hours) + late.banked + settledLate),
+          lateSurplusHours: round2h(late.banked + settledLate),
+          bankedHours: round2h(Number(a.banked_hours)),
           // S652: a landlord floating the shortfall indefinitely never has it billed.
           carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
+          extraHours: extraHoursMode(a),
         }), late.appliedNow)
         await persist(client, a, late.periods, hoursWorkedByMonth, result, run)
+        await recordExtraHours(client, a, c.id, result)
         await client.query(`UPDATE work_trade_settlements SET close_run_at = NOW() WHERE id = $1`, [c.id])
         await client.query('COMMIT')
         run.agreementsProcessed++
@@ -723,6 +836,7 @@ export async function settleAgreementOnEnd(agreementId: string): Promise<Settlem
     const { rows } = await client.query(
       `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
               wta.banked_hours::float AS banked_hours,
+              ${EXTRA_HOURS_COLS},
               -- A lease has no tenant_id: tenancy lives in lease_tenants, which
               -- is what makes co-tenants and mid-term changes expressible. The
               -- agreement's tenant must be an ACTIVE party to the lease for it
@@ -760,10 +874,20 @@ export async function settleAgreementOnEnd(agreementId: string): Promise<Settlem
       }
     }
     // S654: a settled month's late approvals are banked hours too, so they are
-    // spent before anything is billed.
+    // spent before anything is billed. 10/12: as new work — before the bank,
+    // and on an agreement that pays extra hours, what is left is paid.
     const settledLate = await bankSettledLateApprovals(client, agreementId, null)
-    const result = settleOnEnd(periods, round2h(Number(a.banked_hours) + settledLate), uncounted)
+    const result = settleOnEnd(periods, round2h(Number(a.banked_hours)), uncounted,
+      { lateSurplusHours: settledLate, extraHours: extraHoursMode(a) })
     await persist(client, a, periods, hoursWorked, result, run)
+    // 10/12: paid extra hours land on the agreement's newest month. (On a
+    // banking agreement they went with the bank — an ending forfeits it.)
+    if (result.payableHours > 0) {
+      const newest = (await client.query<{ id: string }>(
+        `SELECT id FROM work_trade_settlements WHERE agreement_id = $1 AND status <> 'voided'
+          ORDER BY period_start DESC LIMIT 1`, [agreementId])).rows[0]
+      await recordExtraHours(client, a, newest?.id ?? null, result, false)
+    }
     await client.query('COMMIT')
     run.agreementsProcessed++
   } catch (e: unknown) {

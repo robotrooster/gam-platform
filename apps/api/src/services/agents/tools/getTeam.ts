@@ -9,6 +9,7 @@
  */
 
 import { query } from '../../../db'
+import { keptIdsSql, coversAllSql, companyWideSql, formerSql } from '../../../lib/bookkeeperScope'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface MemberRow {
@@ -17,6 +18,14 @@ interface MemberRow {
   last_name: string | null
   all_properties: boolean | null
   prop_count: number | null
+  /** 10/12: bookkeepers only — the company-wide box, the lease-dates box, former properties. */
+  company_wide: boolean | null
+  lease_dates: boolean | null
+  former_count: number | null
+  /** 10/12 (Nic): bookkeepers only — the ledger, whole-company reports and monthly report boxes. */
+  company_ledger: boolean | null
+  whole_reports: boolean | null
+  monthly_report: boolean | null
 }
 
 const ROLE_LABEL: Record<string, string> = {
@@ -38,22 +47,38 @@ export const getTeam: AgentTool = {
   async execute(_args, actor: AgentActor) {
     // One row per (member, role), scoped to this landlord on every table.
     const members = await query<MemberRow>(
-      `SELECT s.role, u.first_name, u.last_name, s.all_properties, s.prop_count
+      `SELECT s.role, u.first_name, u.last_name, s.all_properties, s.prop_count,
+              s.company_wide, s.lease_dates, s.former_count, s.company_ledger, s.whole_reports, s.monthly_report
          FROM (
            SELECT 'property_manager' AS role, user_id, landlord_id, all_properties,
-                  COALESCE(array_length(property_ids, 1), 0) AS prop_count
+                  COALESCE(array_length(property_ids, 1), 0) AS prop_count,
+                  NULL::boolean AS company_wide, NULL::boolean AS lease_dates, NULL::int AS former_count,
+                  NULL::boolean AS company_ledger, NULL::boolean AS whole_reports, NULL::boolean AS monthly_report
              FROM property_manager_scopes
            UNION ALL
            SELECT 'onsite_manager', user_id, landlord_id, all_properties,
-                  COALESCE(array_length(property_ids, 1), 0)
+                  COALESCE(array_length(property_ids, 1), 0), NULL, NULL, NULL, NULL, NULL, NULL
              FROM onsite_manager_scopes
            UNION ALL
            SELECT 'maintenance', user_id, landlord_id, all_properties,
-                  COALESCE(array_length(property_ids, 1), 0)
+                  COALESCE(array_length(property_ids, 1), 0), NULL, NULL, NULL, NULL, NULL, NULL
              FROM maintenance_worker_scopes
            UNION ALL
-           SELECT 'bookkeeper', user_id, landlord_id, NULL::boolean, NULL::integer
-             FROM bookkeeper_scopes
+           -- 10/11: a bookkeeper keeps the properties ticked for them; "all"
+           -- only while every property the company owns today is ticked
+           -- (lib/bookkeeperScope). 10/12: the company-wide box (bank account,
+           -- payouts, payroll) is its own; lease dates are the owner's box; a
+           -- sold property stays readable up to the day it left.
+           SELECT 'bookkeeper', bs.user_id, bs.landlord_id, ${coversAllSql('bs')},
+                  cardinality(${keptIdsSql('bs')}), ${companyWideSql('bs')}, bs.show_lease_dates,
+                  jsonb_array_length(${formerSql('bs')}),
+                  -- 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+                  -- 10/12 review: the ledger and whole-company reports boxes end
+                  -- with the last property they kept (lib/bookkeeperScope).
+                  (bs.company_ledger AND cardinality(${keptIdsSql('bs')}) > 0),
+                  (bs.whole_company_reports AND (${companyWideSql('bs')} OR cardinality(${keptIdsSql('bs')}) > 0)),
+                  bs.sees_monthly_report
+             FROM bookkeeper_scopes bs
          ) s
          JOIN users u ON u.id = s.user_id
         WHERE s.landlord_id = ANY($1::uuid[])
@@ -67,10 +92,21 @@ export const getTeam: AgentTool = {
     )
 
     const coverage = (m: MemberRow): string => {
-      if (m.role === 'bookkeeper') return 'books access'
-      if (m.all_properties) return 'all properties'
       const n = m.prop_count ?? 0
-      return `${n} propert${n === 1 ? 'y' : 'ies'}`
+      const props = m.all_properties ? 'all properties' : `${n} propert${n === 1 ? 'y' : 'ies'}`
+      if (m.role !== 'bookkeeper') return props
+      // 10/12 (Nic): the company-wide box, and nothing about payroll or the
+      // bank when it is not ticked.
+      const parts = [
+        n > 0 || !m.company_wide ? props : null,
+        m.company_wide ? 'company-wide books (bank account, payouts, payroll)' : null,
+        m.company_ledger && !m.company_wide ? 'the whole-company Books ledger (no bank account or payouts)' : null,
+        m.whole_reports ? "company reports showing the whole company" : null,
+        m.monthly_report ? 'the monthly property report on screen' : null,
+        m.lease_dates ? 'lease start and end dates' : null,
+        m.former_count ? `history of ${m.former_count} sold propert${m.former_count === 1 ? 'y' : 'ies'} up to the sale` : null,
+      ].filter(Boolean)
+      return parts.join('; ')
     }
 
     return {

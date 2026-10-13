@@ -369,7 +369,10 @@ describe('recordScreeningPrepayment / voidScreeningPrepayment (R8)', () => {
     const { rows: [sp] } = await db.query(`SELECT status, voided_at, landlord_charge_id FROM screening_prepayments WHERE id = $1`, [r1.prepaymentId])
     expect(sp.status).toBe('void')
     expect(sp.voided_at).toBeTruthy()
-    expect((await db.query(`SELECT 1 FROM landlord_gam_charges WHERE id = $1`, [sp.landlord_charge_id])).rows).toHaveLength(0)
+    // 10/12 (Nic, ledger P0): voided and KEPT, never deleted — owed by nobody.
+    expect((await db.query(`SELECT void_reason, voided_at IS NOT NULL AS voided, collected_amount::text AS collected
+                              FROM landlord_gam_charges WHERE id = $1`, [sp.landlord_charge_id])).rows)
+      .toEqual([{ void_reason: 'screening_payment_taken_back', voided: true, collected: '0.00' }])
     // a voided stay can be sold again
     const again = await recordScreeningPrepayment(null, { landlordId: w.landlordId, propertyId: w.propertyId, bookingId: b1, amount: 42.94, source: 'booking_site', collectedBy: 'landlord' })
     expect(again.created).toBe(true)
@@ -378,6 +381,17 @@ describe('recordScreeningPrepayment / voidScreeningPrepayment (R8)', () => {
     const r2 = await recordScreeningPrepayment(null, { landlordId: w.landlordId, propertyId: w.propertyId, bookingId: b2, amount: 42.94, source: 'register', collectedBy: 'landlord' })
     await db.query(`UPDATE landlord_gam_charges SET collected_amount = 10 WHERE id = $1`, [r2.landlordChargeId])
     expect(await voidScreeningPrepayment(null, { prepaymentId: r2.prepaymentId })).toEqual({ voided: false, reason: 'collected' })
+
+    // 10/12: a fee a bank pull is still collecting is on its way — it stands,
+    // and so does its screening.
+    const b3 = await booking(w, w.unitId, { from: 30, to: 55, email: email('v3') })
+    const r3 = await recordScreeningPrepayment(null, { landlordId: w.landlordId, propertyId: w.propertyId, bookingId: b3, amount: 42.94, source: 'register', collectedBy: 'landlord' })
+    await db.query(
+      `INSERT INTO landlord_gam_debits (landlord_id, charges_amount, bank_cost_amount, total_amount, status, charge_ids)
+       VALUES ($1, 42.94, 6, 48.94, 'pending', $2)`, [w.landlordId, [r3.landlordChargeId]])
+    expect(await voidScreeningPrepayment(null, { prepaymentId: r3.prepaymentId })).toEqual({ voided: false, reason: 'collected' })
+    expect((await db.query(`SELECT status FROM screening_prepayments WHERE id = $1`, [r3.prepaymentId])).rows[0].status).toBe('unused')
+    expect((await db.query(`SELECT voided_at FROM landlord_gam_charges WHERE id = $1`, [r3.landlordChargeId])).rows[0].voided_at).toBeNull()
 
     await db.query(`UPDATE screening_prepayments SET status = 'used' WHERE id = $1`, [again.prepaymentId])
     expect(await voidScreeningPrepayment(null, { bookingId: b1 })).toEqual({ voided: false, reason: 'used' })

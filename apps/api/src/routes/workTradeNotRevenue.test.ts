@@ -22,14 +22,16 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
 import { landlordsRouter } from './landlords'
+import { balancesRouter } from './balances'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
   const app = express()
   app.use(express.json())
   app.use('/api/landlords', landlordsRouter)
+  app.use('/api/balances', balancesRouter)
   app.use(errorHandler)
   return app
 }
@@ -135,15 +137,17 @@ describe('S640 work trade is out of the money totals', () => {
     expect(Number(res.body.data.work_trade_rent)).toBe(0)
   })
 
+  // 10/12 (Nic): the Rent Roll the card opens is the combined page
+  // (GET /api/balances/rent-roll); it totals the leases' rent the same way.
   it('the rent roll splits the same way the card does, and still lists the space', async () => {
     const f = await seed()
     const res = await request(buildApp())
-      .get('/api/landlords/me/rent-roll').set('Authorization', `Bearer ${f.token}`)
+      .get('/api/balances/rent-roll').set('Authorization', `Bearer ${f.token}`)
     expect(res.status).toBe(200)
-    expect(Number(res.body.data.total)).toBe(500)
-    expect(Number(res.body.data.work_trade_total)).toBe(460)
-    expect(res.body.data.rows).toHaveLength(2)
-    expect(res.body.data.rows.filter((r: any) => r.work_trade)).toHaveLength(1)
+    expect(res.body.data.lease_rent).toEqual({ expected: 500, traded_for_work: 460 })
+    const rows = res.body.data.properties.flatMap((p: any) => p.rows)
+    expect(rows).toHaveLength(2)
+    expect(rows.filter((r: any) => r.work_trade)).toHaveLength(1)
   })
 
   // The regression this protects against: a NULL from the work-trade lateral
@@ -159,6 +163,7 @@ describe('S640 work trade is out of the money totals', () => {
       const propertyId = await seedProperty(c, { landlordId, ownerUserId: seeded.userId, managedByUserId: seeded.userId })
       const u = await seedUnit(c, { propertyId, landlordId, rentAmount: 725 })
       await c.query(`UPDATE units SET status='active' WHERE id=$1`, [u])
+      await seedLease(c, { unitId: u, landlordId, rentAmount: 725 })
       await c.query('COMMIT')
       token = jwt.sign(
         { userId: seeded.userId, role: 'landlord', email: 'l2@t.dev', landlordIds: [landlordId], permissions: {} },

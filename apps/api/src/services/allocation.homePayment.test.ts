@@ -150,17 +150,26 @@ describe('a home payment the tenant pays is split like rent', () => {
     expect(Number(fee)).toBeCloseTo(Math.round(whole * 100) / 100, 2)
   })
 
-  it('a home payment paid by bank writes no on-time mark of its own; the rent beside it does', async () => {
+  // 10/12 (Nic): "one mark per invoice" — the home payment rides the rent's
+  // bill (S654), so the bill carries ONE mark for both; it is never its own.
+  it('a home payment paid by bank writes no mark of its own; the bill it rides with the rent carries one', async () => {
     const p = await park()
     const rent = await charge(p, { type: 'rent', amount: 450 })
     const home = await charge(p, { type: 'home_payment', amount: 200 })
+    const inv = (await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+       VALUES ($1,$2,$3,$4,'INV-HOME-1','2026-10-01',650,'pending','2026-09-25T17:00:00Z') RETURNING id`,
+      [p.landlordId, p.tenantId, p.leaseId, p.unitId])).rows[0].id
+    await db.query(`UPDATE payments SET invoice_id = $2 WHERE id = ANY($1::uuid[])`, [[rent, home], inv])
     await inFlight([rent, home], 'pi_home_bank_2')
     await cleared('pi_home_bank_2')
-    const marks = (await db.query<{ payment_id: string }>(
-      `SELECT ce.event_data->>'payment_id' AS payment_id FROM credit_events ce
+    const marks = (await db.query<{ bill_key: string; payment_ids: string[] }>(
+      `SELECT ce.event_data->>'bill_key' AS bill_key, ce.event_data->'payment_ids' AS payment_ids FROM credit_events ce
          JOIN credit_subjects cs ON cs.id = ce.subject_id
-        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1`, [p.tenantId])).rows.map(r => r.payment_id)
-    expect(marks).toEqual([rent])
+        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1 AND ce.superseded_by IS NULL`, [p.tenantId])).rows
+    expect(marks).toHaveLength(1)
+    expect(marks[0].bill_key).toBe(inv)
+    expect([...marks[0].payment_ids].sort()).toEqual([rent, home].sort())
   })
 
   it('a home payment paid at the desk never pays out', async () => {

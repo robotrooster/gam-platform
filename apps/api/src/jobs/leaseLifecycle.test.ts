@@ -908,10 +908,12 @@ async function seedPastDueInvoice(args: {
   const client = await getClient()
   try {
     const inv = await client.query<{ id: string }>(
+      // 10/12 (Nic): written before it came due, as the monthly run writes it
+      // (a bill written after its due date counts from the day it was written).
       `INSERT INTO invoices
          (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
-          due_date, subtotal_rent, total_amount, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'pending')
+          due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'pending', $6::date - 3)
        RETURNING id`,
       [
         args.stack.landlordId, args.stack.tenantId, args.stack.leaseId,

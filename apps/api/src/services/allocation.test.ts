@@ -717,11 +717,14 @@ describe('executeRentAllocation — PM company cut', () => {
     })
   })
 
-  it('PM contracted with bank routing missing: 409', async () => {
+  // 10/12 (Nic): the legacy catalog bank no longer takes new rows, so a PM
+  // company has none. Its cut is booked to its active owner and paid to the
+  // company's Stripe Connect account. Only a company with neither throws.
+  it('PM contracted with no catalog bank AND no active owner: 409', async () => {
     await withRollback(async (client) => {
       const { userId: ownerUserId, landlordId } = await seedLandlord(client)
       const tenantId = await seedTenant(client)
-      // PM company with NO bank_account_id — leave it null
+      // PM company with NO bank_account_id and no pm_staff owner
       const res = await client.query<{ id: string }>(
         `INSERT INTO pm_companies (name) VALUES ('no-bank PM') RETURNING id`
       )
@@ -740,7 +743,49 @@ describe('executeRentAllocation — PM company cut', () => {
       })
 
       await expect(executeRentAllocation(client, paymentId, 'ach'))
-        .rejects.toThrow(/no bank routing/i)
+        .rejects.toThrow(/no active owner/i)
+    })
+  })
+
+  it('PM contracted with no catalog bank: the cut is booked to the company’s active owner', async () => {
+    await withRollback(async (client) => {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const { userId: pmOwnerUserId } = await seedLandlord(
+        client, { email: `pm-owner-${randomUUID()}@test.dev` }
+      )
+      const res = await client.query<{ id: string }>(
+        `INSERT INTO pm_companies (name, stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted)
+         VALUES ('Connect-only PM', 'acct_pm_test', TRUE, TRUE) RETURNING id`
+      )
+      const pmCompanyId = res.rows[0].id
+      await client.query(
+        `INSERT INTO pm_staff (pm_company_id, user_id, role, status, joined_at)
+         VALUES ($1, $2, 'owner', 'active', NOW())`, [pmCompanyId, pmOwnerUserId])
+      const pmFeePlanId = await seedPmFeePlan(client, {
+        pmCompanyId, feeType: 'percent_of_rent', percent: 10,
+      })
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+      await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      const paymentId = await seedPaidRent(client, {
+        unitId, tenantId, landlordId, amount: 1000,
+      })
+
+      await executeRentAllocation(client, paymentId, 'ach')
+
+      const pm = await client.query(
+        `SELECT user_id, amount::text AS amount, bank_account_id FROM user_balance_ledger
+          WHERE reference_id=$1 AND type='allocation_pm_company_fee'`,
+        [paymentId]
+      )
+      expect(pm.rows).toHaveLength(1)
+      expect(pm.rows[0].user_id).toBe(pmOwnerUserId)
+      expect(pm.rows[0].amount).toBe('100.00')
+      expect(pm.rows[0].bank_account_id).toBeNull()
     })
   })
 })
@@ -1027,9 +1072,18 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
       const alert = await client.query(`SELECT body FROM admin_notifications WHERE category = 'allocation_fees_exceed_held'`)
       expect(alert.rowCount).toBe(1)
       expect(alert.rows[0].body).toMatch(/\$65\.00 was not covered/)
+      // 10/12 (Nic, L18): the $65 GAM could not pay the manager is a real
+      // unpaid bill on the landlord's Expenses, under Management, tied to the split.
+      const billOf = () => client.query(
+        `SELECT e.amount::text AS amount, c.system_key, (b.unpaid)::text AS unpaid
+           FROM landlord_expenses e JOIN allocation_splits s ON s.id = e.allocation_split_id
+           JOIN books_categories c ON c.id = e.category_id JOIN v_expense_balance b ON b.expense_id = e.id
+          WHERE s.payment_id = $1 AND e.status = 'active'`, [pay])
+      expect((await billOf()).rows).toEqual([{ amount: '65.00', system_key: 'management', unpaid: '65.00' }])
       // Re-running is a no-op (the $0 owner share marks it allocated).
       await executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })
       expect((await ledger(client, pay, 'allocation_manager_fee')).n).toBe(1)
+      expect((await billOf()).rowCount).toBe(1)
     })
   })
 

@@ -306,7 +306,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
     'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
-    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    'approve_payroll_run', 'void_payroll_run',   // 10/12: contractors are vendors (add_vendor)
     // S628: charging and forgiving, and the maintenance side of the business.
     // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
     // ACT. "The assistant cannot waive the late fee. The landlord has to waive
@@ -424,7 +424,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
     'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
-    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    'approve_payroll_run', 'void_payroll_run',   // 10/12: contractors are vendors (add_vendor)
     // S628: charging and forgiving, and the maintenance side of the business.
     // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
     // ACT. "The assistant cannot waive the late fee. The landlord has to waive

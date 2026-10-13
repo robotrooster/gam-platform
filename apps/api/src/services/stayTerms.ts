@@ -36,7 +36,7 @@ import { AppError } from '../middleware/errorHandler'
 import { todayIn } from '../lib/timezone'
 import { portalLink } from '../lib/portalUrls'
 import { createNotification } from './notifications'
-import { chargeLandlord } from './landlordGamAccount'
+import { chargeLandlord, voidGamCharge } from './landlordGamAccount'
 import { replyToProperty } from './replyRouting'
 import {
   guestScreeningContext, screeningHistorySentence, RESERVATION_PAID_SQL,
@@ -830,9 +830,10 @@ export async function emailPrepaidScreeningLink(prepaymentId: string): Promise<{
  * The payment that carried a screening was taken back (a chargeback on the
  * card charge — services/heldPayouts): the screening was never really paid, so
  * it is voided and, if the landlord held it, their uncollected charge line is
- * removed (as landlordGamDebit does for a pull that never happened). A
- * screening the guest already used, or whose charge GAM has already taken from
- * a payout, is left as it is.
+ * voided too (as landlordGamDebit does for a pull that never happened; 10/12,
+ * ledger P0: voided and kept, never deleted). A screening the guest already
+ * used, or whose charge GAM has already taken from a payout — or is taking in
+ * a bank pull still settling — is left as it is.
  *
  * 10/5 (Nic): never on a cancel or a no-show — "a paid screening fee is not
  * refunded on denial or no-show"; the paid check keeps waiting for the guest.
@@ -849,15 +850,23 @@ export async function voidScreeningPrepayment(client: PoolClient | null, by: { b
   if (!sp) return { voided: false, reason: 'none' }
   if (sp.status !== 'unused') return { voided: false, reason: 'used' }
   if (sp.landlord_charge_id) {
-    const [charge] = await run<{ collected: string }>(
-      `SELECT collected_amount::text AS collected FROM landlord_gam_charges WHERE id = $1 FOR UPDATE`,
+    const [charge] = await run<{ collected: string; voided: boolean }>(
+      `SELECT collected_amount::text AS collected, voided_at IS NOT NULL AS voided
+         FROM landlord_gam_charges WHERE id = $1 FOR UPDATE`,
       [sp.landlord_charge_id])
     if (charge && Number(charge.collected) > 0) {
       logger.error({ prepaymentId: sp.id, chargeId: sp.landlord_charge_id },
         '[stay-terms] screening fee already netted from a payout — prepayment left in place')
       return { voided: false, reason: 'collected' }
     }
-    await run(`DELETE FROM landlord_gam_charges WHERE id = $1 AND collected_amount = 0`, [sp.landlord_charge_id])
+    if (charge && !charge.voided
+        && !(await voidGamCharge(client, sp.landlord_charge_id, 'screening_payment_taken_back'))) {
+      // Not collected, not voided, and still not voidable: a bank pull that has
+      // not settled is carrying it, so the money is already on its way.
+      logger.error({ prepaymentId: sp.id, chargeId: sp.landlord_charge_id },
+        '[stay-terms] screening fee is inside a bank pull still settling — prepayment left in place')
+      return { voided: false, reason: 'collected' }
+    }
   }
   await run(
     `UPDATE screening_prepayments SET status = 'void', voided_at = NOW() WHERE id = $1`, [sp.id])

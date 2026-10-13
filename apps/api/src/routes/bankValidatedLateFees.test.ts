@@ -162,10 +162,14 @@ const liveLateFeeCredits = async (feeId: string) => (await db.query<any>(
   `SELECT u.id AS use_id, tc.id AS credit_id, tc.status AS credit_status, u.status AS use_status
      FROM credit_uses u JOIN tenant_credits tc ON tc.id = u.tenant_credit_id
     WHERE u.payment_id = $1 AND u.source = 'late_fee_credit' ORDER BY tc.created_at, u.id`, [feeId])).rows
+/**
+ * 10/12 (Nic): "one mark per invoice" — the live mark of the BILL a row is on,
+ * and the day the bill was paid in full (the day the mark counts from).
+ */
 const marksOn = async (id: string) => (await db.query<{ id: string; event_type: string; paid_on: string; data: any }>(
-  `SELECT id, event_type, to_char((event_data->>'paid_at')::timestamptz AT TIME ZONE $2, 'YYYY-MM-DD') AS paid_on, event_data AS data
-     FROM credit_events WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1
-      AND superseded_by IS NULL`, [id, TZ])).rows
+  `SELECT e.id, e.event_type, e.event_data->>'paid_in_full_on' AS paid_on, e.event_data AS data
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [id])).rows
 const LATE = /^payment_received_late_(minor|major|severe)$/
 const todayAtProperty = async () => (await db.query<{ d: string }>(`SELECT (NOW() AT TIME ZONE $1)::date::text AS d`, [TZ])).rows[0].d
 const txn = async (id: string) => (await db.query<any>(
@@ -210,7 +214,7 @@ describe('1. a deposit logged by hand, then the bank shows it — the bank\'s da
     expect(now.data).toMatchObject({ bank_validated: true, corrects_event_id: lateMark.id })
     expect(now.data.late_fee_on_bill).toBeUndefined()
     expect((await db.query<any>(`SELECT superseded_by, superseded_reason FROM credit_events WHERE id = $1`, [lateMark.id])).rows[0])
-      .toEqual({ superseded_by: now.id, superseded_reason: 'data_entry_error_corrected' })
+      .toEqual({ superseded_by: now.id, superseded_reason: 'bill_status_changed' })
     // The bank line is tied to the receipt — no money moved again.
     const tr = await txn(t)
     expect(tr.status).toBe('matched')

@@ -17,7 +17,7 @@ import { db, getClient } from '../db'
 import {
   createSlip, voidSlip, listSlips, cashProposalFor, findCashCombination, slipLastBankDay, matchSlipByHand,
 } from './depositSlips'
-import { reconcileDeposits, normalizeMerchant, upsertTransactions } from './bankFeed'
+import { reconcileDeposits, normalizeMerchant, upsertTransactions, ignoreTransaction, undoFiling, categorizeTransaction } from './bankFeed'
 import { undoDepositMatch } from './bankDepositConfirm'
 import { bankFeedRouter } from '../routes/bankFeed'
 import { errorHandler } from '../middleware/errorHandler'
@@ -360,6 +360,31 @@ describe('flags and undo', () => {
     // A matched slip cannot be voided; an open one can.
     await voidSlip(ctx.landlordId, slip.id, ctx.userId)
     expect((await slipOf(slip.id)).status).toBe('void')
+  })
+
+  it('10/12 (Nic) review: a slip-matched deposit the owner ignored comes back MATCHED when the Ignore is undone — never filed or confirmed a second time', async () => {
+    const ctx = await build()
+    const a = await receipt(ctx, 460, '2026-09-25')
+    const slip = await createSlip({ landlordId: ctx.landlordId, depositDate: '2026-09-28', receiptIds: [a.id], createdBy: ctx.userId })
+    const t = await bankRow(ctx, 460, '2026-09-29')
+    await reconcileDeposits(ctx.landlordId)
+    expect((await txnOf(t)).status).toBe('matched')
+    await ignoreTransaction(ctx.landlordId, t)
+    expect((await txnOf(t)).status).toBe('ignored')
+    const back = await undoFiling(ctx.landlordId, t, { undoneBy: ctx.userId })
+    expect(back).toMatchObject({ kind: 'ignored', status: 'matched' })
+    const row = await txnOf(t)
+    expect(row.status).toBe('matched')
+    expect(row.auto_settle_undo.kind).toBe('deposit_slip')
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    // Filing it as income would count the deposit a second time: refused.
+    await expect(categorizeTransaction(ctx.landlordId, t, { category: 'other', scopeKind: 'property_common', propertyId: ctx.propertyId } as any))
+      .rejects.toMatchObject({ statusCode: 409 })
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id = $1 AND status = 'active'`,
+      [ctx.landlordId])).rows[0].n).toBe(0)
+    // The slip's own Undo still works on it.
+    const undone = await undoDepositMatch({ bankTransactionId: t, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect(undone).toMatchObject({ kind: 'deposit_slip', slipReopened: true })
   })
 
   it('a matched slip cannot be voided — the match is undone first', async () => {

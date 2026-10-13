@@ -140,6 +140,14 @@ export async function finishJob(userId: string, jobId: string, opts: { hours?: n
   await query(`INSERT INTO maintenance_comments (request_id, user_id, role, message, is_internal)
                VALUES ($1,$2,'maintenance',$3,FALSE)`,
     [jobId, userId, `Work completed${note ? ` — ${note}` : ''}${needsCheck ? ' (waiting for a check)' : ''}`])
+  // 10/12 review (Nic L6): a repair a work trader closes is completed like
+  // one closed on the Maintenance page — with the company's 'automatic'
+  // choice and a cost already on it, its unpaid bill is made now (never
+  // throws; the job is done either way).
+  {
+    const { syncRepairBill } = await import('./repairBills')
+    await syncRepairBill(jobId, userId)
+  }
   let log = null
   if (opts.hours && opts.hours > 0 && tr.tracks_hours !== false) {
     log = await queryOne<any>(

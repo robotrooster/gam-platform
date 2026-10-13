@@ -779,6 +779,11 @@ async function runGeneration(
             AND ub.payment_id IS NULL
             AND ub.status IN ('unbilled','billed')
             AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
+            -- 10/12 (Nic): "$0 lines are ignored." A reading that bills
+            -- nothing never becomes a line (marked billed below, in the run's
+            -- transaction) — the same rule the held-share release already
+            -- followed (utilityBilling.attachBillToOpenInvoice).
+            AND (ub.charge_amount + ub.tax_amount) > 0
           ORDER BY ub.billing_cycle_month ASC, ub.id ASC`,
         [lease.id, dueDate, crossLink?.service_agreement_id ?? null]
       )
@@ -1289,6 +1294,29 @@ async function runGeneration(
         const spotsThisCycle = new Set(
           utilityBills.map(b => (b as any).bill_unit_id).filter(Boolean))
         const movedMidCycle = spotsThisCycle.size > 1
+
+        // ── 10/12 (Nic): A $0 READING IS BILLED, AS NOTHING ──────────────────
+        //
+        //   "Payment health = ONE definition … $0 lines are ignored."
+        //
+        // Gerald Logue's October bill carried a $0.00 electric line: his August
+        // reading (49083 → 49083, 0 kWh), held from before his lease and
+        // released when he signed. The release path skips a $0 share
+        // (utilityBilling.attachBillToOpenInvoice); this run did not, so it
+        // wrote a $0 line that read like rent on his profile, counted against
+        // his payment health and kept his late fees running. A reading that
+        // bills nothing is marked billed — it was read and charged nothing —
+        // with no line and no payment link, so no later run picks it up again
+        // (the read above takes only readings that bill money).
+        await client.query(
+          `UPDATE utility_bills ub
+              SET status = 'billed', billed_at = COALESCE(ub.billed_at, NOW()), updated_at = NOW()
+            WHERE (ub.lease_id = $1 OR ub.service_agreement_id = $3)
+              AND ub.payment_id IS NULL
+              AND ub.status = 'unbilled'
+              AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
+              AND (ub.charge_amount + ub.tax_amount) = 0`,
+          [lease.id, dueDate, crossLink?.service_agreement_id ?? null])
 
         for (let i = 0; i < utilityBills.length; i++) {
           const ub = utilityBills[i]

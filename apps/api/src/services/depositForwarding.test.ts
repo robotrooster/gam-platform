@@ -77,7 +77,7 @@ async function getRow(id: string) {
 }
 
 describe('executeDepositPortability — custody forwarding (S516)', () => {
-  it('same-size deposit: merges into target, deletes the duplicate, dissolves the custody fee', async () => {
+  it('same-size deposit: merges into target, voids the duplicate (kept), dissolves the custody fee', async () => {
     const s = await seedForwardScenario(1000)
     const elig = await detectPortabilityEligible({ leaseId: s.leaseA })
     expect(elig.eligible).toBe(true)
@@ -97,8 +97,23 @@ describe('executeDepositPortability — custody forwarding (S516)', () => {
     expect(carried.status).toBe('funded')
     expect(carried.custody_fee_active).toBe(false)
 
-    // The target lease's own (untouched) S515 row was deleted — no duplicate.
-    expect(await getRow(s.targetDepId)).toBeNull()
+    // The target lease's own (untouched) S515 row is no longer its deposit — no
+    // duplicate. 10/12 (Nic, G8 — keep everything): voided and kept, not deleted.
+    expect(await getRow(s.targetDepId)).toMatchObject({ lease_id: s.leaseB, status: 'voided' })
+    const live = await db.query(`SELECT id FROM security_deposits WHERE lease_id = $1 AND status <> 'voided'`, [s.leaseB])
+    expect(live.rows.map(r => r.id)).toEqual([s.depositId])
+  })
+
+  it('10/12 (Nic) review, G8: a voided deposit record is never carried — authorize and execute say it is not found', async () => {
+    const s = await seedForwardScenario(1000)
+    await authorizeDepositPortability({ tenantId: s.tenantId, depositId: s.depositId, targetLeaseId: s.leaseB, signature: 'tenant-signed' })
+    await executeDepositPortability({ depositId: s.depositId })
+    expect(await getRow(s.targetDepId)).toMatchObject({ status: 'voided' })
+    // The tenant's own voided record, pointed at their old lease: refused, never a 500 from the record's own guard.
+    await expect(authorizeDepositPortability({ tenantId: s.tenantId, depositId: s.targetDepId, targetLeaseId: s.leaseA, signature: 'tenant-signed' }))
+      .rejects.toMatchObject({ statusCode: 404 })
+    await expect(executeDepositPortability({ depositId: s.targetDepId })).rejects.toMatchObject({ statusCode: 404 })
+    expect(await getRow(s.targetDepId)).toMatchObject({ lease_id: s.leaseB, status: 'voided' })
   })
 
   it('larger deposit at the new property: stays partial, custody fee stays active', async () => {

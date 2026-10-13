@@ -480,7 +480,7 @@ export async function generateMoveInInvoice(
                 (SELECT amount::text FROM flex_deposit_installments
                   WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount
            FROM security_deposits sd
-          WHERE sd.tenant_id = $1 AND sd.lease_id = $2
+          WHERE sd.tenant_id = $1 AND sd.lease_id = $2 AND sd.status <> 'voided'
           LIMIT 1`,
         [inputs.tenant_id, inputs.lease_id],
       )

@@ -64,6 +64,9 @@
  * each the SAME definition as its tile so the map adds up to the tile: units =
  * "Spaces under management" (open spaces on a live property), money = "Rent
  * logged through GAM" (RENT_LINES, all time). See PlatformMap / buildPlatformMap.
+ * 10/12 (Nic, H1): "TOGGLE BOTH (occupied/billed vs all spaces)" — each place
+ * also carries how many of its spaces are occupied this month as GAM bills them
+ * (OCCUPIED_SPACES), which adds up to the tile's occupied figure the same way.
  * Properties have no county column; the county comes from the property's own
  * map location (properties.latitude/longitude) inside the Census county shapes
  * checked in beside this file (us-atlas, offline — no outside lookup). Anything
@@ -79,6 +82,9 @@ import { logger } from '../lib/logger'
 import { realLandlordSql } from './platformRevenue'
 import { platformFeeBill } from './platformFeeBill'
 import { liveReversalSql, reversedUseOfWonDisputeSql } from './creditUse'
+import { occupiedSpacesSql } from './billableUnits'
+import { utilityBillSentSql, stayHeldSql } from './moneyPredicates'
+import { todayIn, monthStartOf } from '../lib/timezone'
 
 export interface RentByMethod {
   method: string
@@ -124,6 +130,16 @@ export interface PlatformMetrics {
     rentRollMonthly: number
     spacesBilled: number
     spacesBilledMonth: string | null
+    /**
+     * 10/12 (Nic, A5/H1): of `units`, occupied this month as GAM bills them
+     * (OCCUPIED_SPACES), and the rest. The heat map's "Occupied (billed)"
+     * view adds up to occupiedSpaces; the admin Overview's Active Units card
+     * reads the same count (spacesOccupied).
+     */
+    occupiedSpaces: number
+    vacantSpaces: number
+    /** 'YYYY-MM-01': the month occupiedSpaces counts. */
+    occupiedMonth: string
   }
   paperwork: { leasesSigned: number; documentsSigned: number; signatures: number }
   operations: {
@@ -150,6 +166,11 @@ export interface MapArea {
   name: string
   /** The "Spaces under management" tile, in this place: open spaces on a live property. */
   units: number
+  /**
+   * 10/12 (Nic, H1): of those spaces, the ones occupied this month as GAM bills
+   * them — the tile's "occupied" figure, in this place (OCCUPIED_SPACES).
+   */
+  occupied: number
   /** The "Rent logged through GAM" tile, in this place: all time, every way it was paid. */
   money: number
   /** Properties counted here: live ones, and any other a rent dollar was logged on. */
@@ -169,7 +190,7 @@ export interface PlatformMap {
    * silently". `offStateMap` true: missing from both maps; false: on the state
    * map, missing from the county map only.
    */
-  missing: Array<{ reason: MapGap; label: string; offStateMap: boolean; properties: number; units: number; money: number }>
+  missing: Array<{ reason: MapGap; label: string; offStateMap: boolean; properties: number; units: number; occupied: number; money: number }>
 }
 
 const ELECTRONIC = ['card', 'ach'] as const
@@ -327,10 +348,10 @@ const TENANT_MONEY_LINES = (): string => `
     JOIN tenant_remittances r ON r.id = rp.remittance_id
    WHERE ${REFUND_WENT_BACK('rp')} AND r.status = 'settled' AND ${realLandlordSql('r.landlord_id')}`
 
-/** Utility bills that went out to a resident — not drafts, not voided. */
-const UTILITY_BILL_SENT = `b.status IN ('billed', 'paid', 'disputed')`
-/** A stay that happened or is booked to happen. */
-const STAY_HELD = `k.status IN ('confirmed', 'checked_in', 'checked_out')`
+/** Utility bills that went out to a resident — not drafts, not voided (services/moneyPredicates, shared with the monthly report). */
+const UTILITY_BILL_SENT = utilityBillSentSql('b')
+/** A stay that happened or is booked to happen (services/moneyPredicates). */
+const STAY_HELD = stayHeldSql('k')
 /** A background check that went to the screening company. */
 const CHECK_RAN = `bc.status IN ('submitted', 'processing', 'complete', 'approved', 'denied', 'expired')`
 /** Paid online by the applicant and not refunded (services/stripeCosts reads the same). */
@@ -346,6 +367,76 @@ const LIVE_PROPERTY = (p: string) => `(
   OR EXISTS (SELECT 1 FROM platform_fee_accruals a WHERE a.property_id = ${p}.id)
   OR EXISTS (SELECT 1 FROM unit_bookings k JOIN units ku ON ku.id = k.unit_id
               WHERE ku.property_id = ${p}.id AND ${STAY_HELD}))`
+
+// ── Spaces, and which are occupied (10/12, Nic: A5 and H1) ───────────────────
+
+/** Open spaces on a property (a properties id expression). A retired space is gone for good (S652). */
+const OPEN_SPACES = (p: string) => `(SELECT COUNT(*)::int FROM units os_open
+   WHERE os_open.property_id = ${p} AND os_open.retired_at IS NULL)`
+
+/**
+ * 10/12 (Nic, A5): "MATCH BILLING (occupied = billable evidence; vacant = rest;
+ * retired excluded)". The open spaces on a property (an id expression) that are
+ * OCCUPIED in `month` (a SQL date expression, the month's first day) exactly as
+ * the platform fee counts them — billableUnits.occupiedSpacesSql, the query the
+ * monthly bill and its nightly top-up run: a lease, a month stay, owner use or
+ * a utility arrangement, each space once, and a space held at any point in the
+ * month counts for the month (someone leaving mid-month does not refund it).
+ * Not a unit's status: a status is a label somebody typed (S652).
+ *
+ * Nightly and weekly stays are billed by their nights after the month (nights
+ * ÷ 30), never as spaces, so a site holding only those is not an occupied
+ * space here either — the same as the bill.
+ */
+const OCCUPIED_SPACES = (p: string, month: string) => `(SELECT COUNT(*)::int
+    FROM (${occupiedSpacesSql(p, month)}) occ_s
+    JOIN units occ_u ON occ_u.id = occ_s.unit_id
+   WHERE occ_u.retired_at IS NULL)`
+
+/** The month the platform fee is billing now, by the Phoenix calendar the bill runs on ('YYYY-MM-01'). */
+export function billingMonthNow(): string {
+  return monthStartOf(todayIn(null))
+}
+
+export interface SpacesOccupied {
+  /** 'YYYY-MM-01': the month counted. */
+  month: string
+  /** Open spaces on GAM: on a live property of a real landlord ("Spaces under management"). */
+  spaces: number
+  /** Of those, occupied this month as GAM bills them (OCCUPIED_SPACES). */
+  occupied: number
+  /** The rest. */
+  vacant: number
+}
+
+/**
+ * 10/12 (Nic, A5): the admin Overview's Active Units card — the spaces under
+ * management (the Metrics tile's own set: live properties of real landlords),
+ * how many are occupied the way GAM bills them, and the rest vacant.
+ *
+ * 10/12 (A5 review): the Onboarding page's Vacant Units tile reads the same
+ * count ("match billing"), narrowed to a regular admin's portfolio
+ * (`portfolioUserId`: landlords they closed or service, S567); without it,
+ * every landlord — the Overview's figure. Two "vacant" numbers on one admin
+ * was the defect.
+ */
+export async function spacesOccupied(
+  month: string = billingMonthNow(),
+  opts: { portfolioUserId?: string | null } = {},
+): Promise<SpacesOccupied> {
+  const [row] = await query<{ spaces: number; occupied: number }>(`
+    SELECT COALESCE(SUM(${OPEN_SPACES('p.id')}), 0)::int AS spaces,
+           COALESCE(SUM(${OCCUPIED_SPACES('p.id', '$1::date')}), 0)::int AS occupied
+      FROM properties p
+     WHERE ${realLandlordSql('p.landlord_id')} AND ${LIVE_PROPERTY('p')}
+       AND ($2::uuid IS NULL OR EXISTS (
+             SELECT 1 FROM landlords ld WHERE ld.id = p.landlord_id
+                AND (ld.portfolio_manager_id = $2::uuid OR ld.service_manager_id = $2::uuid)))`,
+    [month, opts.portfolioUserId ?? null])
+  const spaces = n0(row?.spaces)
+  const occupied = n0(row?.occupied)
+  return { month, spaces, occupied, vacant: Math.max(0, spaces - occupied) }
+}
 
 // ── The heat map (10/12, Nic) ─────────────────────────────────────────────────
 
@@ -376,8 +467,9 @@ const MAP_ROWS = (): string => `
     ) x GROUP BY x.entity_id
   )
   SELECT pl.id AS property_id, pl.state, pl.latitude::float8 AS lat, pl.longitude::float8 AS lng,
-         CASE WHEN pl.live THEN (SELECT COUNT(*)::int FROM units u
-                                  WHERE u.property_id = pl.id AND u.retired_at IS NULL) ELSE 0 END AS units,
+         CASE WHEN pl.live THEN ${OPEN_SPACES('pl.id')} ELSE 0 END AS units,
+         -- 10/12 (Nic, H1): the same spaces, occupied this month as GAM bills them.
+         CASE WHEN pl.live THEN ${OCCUPIED_SPACES('pl.id', '$1::date')} ELSE 0 END AS occupied,
          COALESCE(rent.amount, 0)::text AS money,
          -- 10/12 (Nic) review: a map location is only trusted for the address
          -- it was found for. An address edit does not look the location up
@@ -394,7 +486,7 @@ const MAP_ROWS = (): string => `
     LEFT JOIN moved mv ON mv.property_id = pl.id
    WHERE pl.live OR rent.property_id IS NOT NULL
   UNION ALL
-  SELECT NULL, NULL, NULL, NULL, 0, rent.amount::text, FALSE FROM rent WHERE rent.property_id IS NULL`
+  SELECT NULL, NULL, NULL, NULL, 0, 0, rent.amount::text, FALSE FROM rent WHERE rent.property_id IS NULL`
 
 interface MapRow {
   property_id: string | null
@@ -402,6 +494,8 @@ interface MapRow {
   lat: number | null
   lng: number | null
   units: number
+  /** 10/12 (Nic, H1): of `units`, occupied this month as GAM bills them (OCCUPIED_SPACES). */
+  occupied: number
   money: string
   /** 10/12 (Nic) review: the address was edited after its map location was found (MAP_ROWS). */
   location_stale: boolean
@@ -537,19 +631,24 @@ async function buildPlatformMap(rows: MapRow[]): Promise<PlatformMap> {
   const states = new Map<string, MapArea & { abbr: string }>()
   const counties = new Map<string, MapArea & { state: string }>()
   const missing = new Map<MapGap, PlatformMap['missing'][number]>()
-  const miss = (reason: MapGap, units: number, money: number, isProperty: boolean) => {
+  // 10/12 (Nic, H1): what one property adds — its spaces, how many of them are
+  // occupied as GAM bills them, and the rent logged on it.
+  type Counts = { units: number; occupied: number; money: number }
+  const miss = (reason: MapGap, n: Counts, isProperty: boolean) => {
     const m = missing.get(reason)
-      ?? { reason, label: MAP_GAP_LABEL[reason], offStateMap: OFF_STATE_MAP.has(reason), properties: 0, units: 0, money: 0 }
+      ?? { reason, label: MAP_GAP_LABEL[reason], offStateMap: OFF_STATE_MAP.has(reason), properties: 0, units: 0, occupied: 0, money: 0 }
     m.properties += isProperty ? 1 : 0
-    m.units += units
-    m.money += money
+    m.units += n.units
+    m.occupied += n.occupied
+    m.money += n.money
     missing.set(reason, m)
   }
-  const add = <T extends MapArea>(areas: Map<string, T>, fips: string, blank: () => T, units: number, money: number) => {
+  const add = <T extends MapArea>(areas: Map<string, T>, fips: string, blank: () => T, n: Counts) => {
     const a = areas.get(fips) ?? blank()
     a.properties += 1
-    a.units += units
-    a.money += money
+    a.units += n.units
+    a.occupied += n.occupied
+    a.money += n.money
     areas.set(fips, a)
   }
 
@@ -560,25 +659,24 @@ async function buildPlatformMap(rows: MapRow[]): Promise<PlatformMap> {
   }
 
   for (const row of rows) {
-    const units = n0(row.units)
-    const money = Number(row.money ?? 0)
-    if (!row.property_id) { miss('no_property', 0, money, false); continue }
+    const n: Counts = { units: n0(row.units), occupied: n0(row.occupied), money: Number(row.money ?? 0) }
+    if (!row.property_id) { miss('no_property', { units: 0, occupied: 0, money: n.money }, false); continue }
     const abbr = formatState(row.state ?? '')
     const fips = STATE_FIPS[abbr]
-    if (!fips) { miss('unknown_state', units, money, true); continue }
+    if (!fips) { miss('unknown_state', n, true); continue }
     add(states, fips, () => ({ fips, abbr, name: US_STATE_NAME[abbr] ?? TERRITORY_NAME[abbr] ?? abbr,
-                               units: 0, money: 0, properties: 0 }), units, money)
+                               units: 0, occupied: 0, money: 0, properties: 0 }), n)
 
-    if (!shapesReadable) { miss('no_county_shapes', units, money, true); continue }
-    if (row.lat == null || row.lng == null) { miss('no_location', units, money, true); continue }
+    if (!shapesReadable) { miss('no_county_shapes', n, true); continue }
+    if (row.lat == null || row.lng == null) { miss('no_location', n, true); continue }
     // 10/12 (Nic) review: a point found for the old address would put the
     // property in the old county with no warning — named, never placed.
-    if (row.location_stale) { miss('stale_location', units, money, true); continue }
+    if (row.location_stale) { miss('stale_location', n, true); continue }
     const county = await countyAt(Number(row.lat), Number(row.lng))
-    if (!county) { miss('outside_map', units, money, true); continue }
-    if (county.fips.slice(0, 2) !== fips) { miss('wrong_state', units, money, true); continue }
+    if (!county) { miss('outside_map', n, true); continue }
+    if (county.fips.slice(0, 2) !== fips) { miss('wrong_state', n, true); continue }
     add(counties, county.fips, () => ({ fips: county.fips, name: county.name, state: abbr,
-                                        units: 0, money: 0, properties: 0 }), units, money)
+                                        units: 0, occupied: 0, money: 0, properties: 0 }), n)
   }
 
   const done = <T extends MapArea>(a: T): T => ({ ...a, money: r2(a.money) })
@@ -592,6 +690,8 @@ async function buildPlatformMap(rows: MapRow[]): Promise<PlatformMap> {
 
 export async function computePlatformMetrics(): Promise<PlatformMetrics> {
   const realR = realLandlordSql('r.landlord_id')
+  // 10/12 (Nic, H1): the month whose occupied spaces the map and the tile count.
+  const month = billingMonthNow()
   const [
     rentRows, monthRows, tenantMoney, paid, busiest, register, stayDeposits, checks, payouts,
     footprint, paperwork, operations, growth, bill, mapRows,
@@ -728,7 +828,7 @@ export async function computePlatformMetrics(): Promise<PlatformMetrics> {
        ORDER BY snapshot_date`),
     platformFeeBill(),
     // 10/12 (Nic): the heat map's rows, one per property (MAP_ROWS).
-    query<MapRow>(MAP_ROWS()),
+    query<MapRow>(MAP_ROWS(), [month]),
   ])
 
   const byMethod: RentByMethod[] = rentRows
@@ -755,6 +855,7 @@ export async function computePlatformMetrics(): Promise<PlatformMetrics> {
     backgroundChecks: { amount: r2(checks[0]?.paid), count: n0(checks[0]?.paid_n) },
   }
   const f = footprint[0] ?? {}
+  const occupiedTotal = mapRows.reduce((sum, r) => sum + n0(r.occupied), 0)
   const d = paperwork[0] ?? {}
   const o = operations[0] ?? {}
   const b = busiest[0]
@@ -800,6 +901,11 @@ export async function computePlatformMetrics(): Promise<PlatformMetrics> {
       rentRollMonthly: r2(f.rent_roll),
       spacesBilled: bill.spaces,
       spacesBilledMonth: bill.month,
+      // Live properties only carry units and occupied spaces in MAP_ROWS, so
+      // these are the tile's own set, and the map adds up to them.
+      occupiedSpaces: occupiedTotal,
+      vacantSpaces: Math.max(0, n0(f.units) - occupiedTotal),
+      occupiedMonth: month,
     },
     paperwork: {
       leasesSigned: n0(d.leases_signed),

@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db } from '../db'
 import { logger } from '../lib/logger'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
-import { syncConnectPayouts } from './connectPayoutSync'
+import { syncConnectPayouts, connectPayoutOwner } from './connectPayoutSync'
 import { PAYOUT_GAP_NOTICE } from './payoutComposition'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -337,5 +337,61 @@ describe('one payout, one row', () => {
     expect(await sync!).toMatchObject({ created: 0, updated: 1 })
     const rows = (await db.query(`SELECT trigger_type, status, bank_last4 FROM disbursements WHERE stripe_payout_id='po_both'`)).rows
     expect(rows).toEqual([{ trigger_type: 'auto_friday', status: 'settled', bank_last4: '8739' }])
+  })
+})
+
+// 10/12 (Nic, ledger P0, design §16.2): no first company wins. A payout from a
+// Connect account two companies share carries both companies' money, so it is
+// stamped with neither; one company alone on an account is stamped with it,
+// whether the account is the company's own or its owner's.
+describe('which company a payout belongs to', () => {
+  const now = Math.floor(Date.now() / 1000)
+  async function owner() {
+    const c = await db.connect()
+    try { await c.query('BEGIN'); const ll = await seedLandlord(c); await c.query('COMMIT'); return ll } finally { c.release() }
+  }
+
+  // A company has at most one account of its own (landlords_stripe_connect_account_id_uniq);
+  // two companies share one through the account kept on the login, which a
+  // company with none of its own pays into.
+  it('an account two companies share: the payout names neither, never the first one', async () => {
+    const ll = await owner()
+    await db.query(`UPDATE users SET stripe_connect_account_id = 'acct_shared' WHERE id = $1`, [ll.userId])
+    await db.query(`INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Second Company')`, [ll.userId])
+    expect(await connectPayoutOwner('acct_shared')).toEqual({ account: 'acct_shared', user_id: ll.userId, landlord_id: null })
+    await syncConnectPayouts(fakeStripe([
+      { id: 'po_shared', amount: 50000, status: 'paid', created: now - 3600, arrival_date: now, destination: 'ba_1' },
+    ]) as any)
+    const [row] = (await db.query(`SELECT landlord_id, user_id, stripe_account_id FROM disbursements WHERE stripe_payout_id = 'po_shared'`)).rows
+    expect(row).toEqual({ landlord_id: null, user_id: ll.userId, stripe_account_id: 'acct_shared' })
+  })
+
+  it('a company with the account as its own, beside one paying into it from the login: neither — it carries both', async () => {
+    // Before 10/12 the company whose own row named the account won, though the
+    // other company's money was in the same payout.
+    const ll = await owner()
+    await db.query(`UPDATE users SET stripe_connect_account_id = 'acct_mixed' WHERE id = $1`, [ll.userId])
+    await db.query(`UPDATE landlords SET stripe_connect_account_id = 'acct_mixed' WHERE id = $1`, [ll.landlordId])
+    await db.query(`INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Pays through the login')`, [ll.userId])
+    expect((await connectPayoutOwner('acct_mixed'))?.landlord_id).toBeNull()
+  })
+
+  it('one company on its owner\'s account (no account of its own): the payout is that company\'s', async () => {
+    const ll = await owner()
+    await db.query(`UPDATE users SET stripe_connect_account_id = 'acct_owner' WHERE id = $1`, [ll.userId])
+    expect(await connectPayoutOwner('acct_owner')).toEqual({ account: 'acct_owner', user_id: ll.userId, landlord_id: ll.landlordId })
+  })
+
+  it('two companies, each with its own account: each payout is its own company\'s', async () => {
+    const ll = await owner()
+    await db.query(`UPDATE landlords SET stripe_connect_account_id = 'acct_a' WHERE id = $1`, [ll.landlordId])
+    const { rows: [b] } = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, business_name, stripe_connect_account_id) VALUES ($1, 'B', 'acct_b') RETURNING id`, [ll.userId])
+    expect((await connectPayoutOwner('acct_a'))?.landlord_id).toBe(ll.landlordId)
+    expect((await connectPayoutOwner('acct_b'))?.landlord_id).toBe(b.id)
+  })
+
+  it('an account nobody holds has no owner', async () => {
+    expect(await connectPayoutOwner('acct_nobody')).toBeNull()
   })
 })

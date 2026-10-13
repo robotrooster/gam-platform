@@ -36,8 +36,10 @@ export const getWorkTradeStanding: AgentTool = {
   description:
     'Where the tenant stands on their work-trade agreement: hours their current month asks for, ' +
     'hours carried over from earlier months, the total that would get them completely straight, ' +
-    'and hours they have banked by working ahead. ' +
-    'Answer in hours — never quote a dollar value or a per-hour rate for work-trade labor. ' +
+    'and hours they have banked by working ahead; and any extra hours beyond the trade (banked, or ' +
+    'paid separately by the landlord). ' +
+    'Answer in hours — never quote a dollar value or a per-hour rate for work-trade labor. The one ' +
+    'exception is PAID extra hours, whose rate and amount the tenant may be told. ' +
     'Use for "how many hours do I still owe?", "what happens if I only work 60 of my 80 hours?", ' +
     '"am I behind on my work trade?". Read-only.',
   parameters: { type: 'object', properties: {} },
@@ -82,6 +84,23 @@ export const getWorkTradeStanding: AgentTool = {
         'Work trade is measured in hours, not wages. Do not state or estimate a ' +
         'dollar value per hour, and do not compute one from the bill. If asked, ' +
         'say the hours cover the month\'s charges and point them to their invoice.',
+      // 10/12 (Nic): hours worked BEYOND the trade. Banked ones are hours only.
+      // Paid ones carry the rate and amount the landlord pays for extra hours —
+      // Nic: the tenant may see those — and nothing else here does.
+      extraHours: (standing.extraHours?.recent ?? []).map(e => ({
+        month: e.periodMonth,
+        hours: e.hours,
+        ...(e.how === 'paid'
+          ? { paidSeparatelyByLandlord: true, extraHoursRate: e.rate, amount: e.amount,
+              paid: e.status === 'paid' }
+          : { banked: true }),
+      })),
+      extraHoursSummary: standing.extraHours?.summary ?? null,
+      extraHoursNote:
+        'Extra hours are hours worked beyond what the work trade needed. Banked extra hours are ' +
+        'hours only. Paid extra hours are paid separately by the landlord at the rate shown — you may ' +
+        'state that rate and amount for EXTRA hours only. It is not what a work-trade hour is worth; ' +
+        'never apply it to the trade hours.',
     }
   },
 }

@@ -19,6 +19,7 @@ import {
   seedLeaseTenant,
 } from '../test/dbHelpers'
 
+// 10/12: the extra-hours columns/table, until they reach schema.sql.
 beforeEach(cleanupAllSchema)
 
 interface Stack {
@@ -146,12 +147,15 @@ describe('month close, against the database', () => {
     expect(rent.amount).toBe(0)
     expect(rent.notes).toContain('work-trade')
     // S652 (Nic): "let's count work trade as on time" — the credit history says so.
+    // 10/12 (Nic): "one mark per invoice" — the bill's one mark, derived from its records.
     const ev = (await db.query(
-      `SELECT ce.event_type, ce.attestation_source FROM credit_events ce
-        WHERE ce.event_data->>'payment_id' = (SELECT id::text FROM payments WHERE invoice_id=$1 AND type='rent')`, [s.invoiceId])).rows
+      `SELECT ce.event_type, ce.attestation_source, ce.event_data FROM credit_events ce
+        WHERE ce.event_data->>'mark_basis' = 'invoice' AND ce.event_data->>'bill_key' = $1::text
+          AND ce.superseded_by IS NULL`, [s.invoiceId])).rows
     expect(ev).toHaveLength(1)
     expect(ev[0].event_type).toBe('payment_received_on_time')
-    expect(ev[0].attestation_source).toBe('gam_workflow_auto')
+    expect(ev[0].attestation_source).toBe('system_derived')
+    expect(ev[0].event_data).toMatchObject({ work_trade: '500.00', stamp: 'paid_on_time' })
   })
 
   // Nic's example: 80-hour agreement, 60 worked, 20 hours carry forward.
@@ -1118,5 +1122,174 @@ describe('carried periods keep their hours', () => {
       `SELECT hours_worked::float AS worked FROM work_trade_settlements
         WHERE agreement_id=$1 AND period_month='2026-09-01'`, [s.agreementId])).rows[0]
     expect(st.worked).toBe(60)
+  })
+})
+
+// ── 10/12 (Nic): extra hours — banked or paid, per agreement ─────────────────
+async function setExtraHours(s: Stack, mode: 'bank' | 'pay', rate = 15, method = 'payroll_w2') {
+  await db.query(
+    `UPDATE work_trade_agreements
+        SET extra_hours_mode = $2, extra_hours_rate = $3, extra_hours_pay_method = $4
+      WHERE id = $1`, [s.agreementId, mode, rate, method])
+}
+const payablesOf = async (s: Stack) => (await db.query(
+  `SELECT to_char(period_month,'YYYY-MM-DD') AS month, hours::float AS hours, rate::float AS rate,
+          amount::float AS amount, pay_method, status
+     FROM work_trade_extra_hours WHERE agreement_id = $1 ORDER BY period_start`, [s.agreementId])).rows
+const bankedOn = async (s: Stack, periodMonth: string) => Number((await db.query(
+  `SELECT extra_hours_banked::float AS h FROM work_trade_settlements
+    WHERE agreement_id = $1 AND period_month = $2::date`, [s.agreementId, periodMonth])).rows[0]?.h ?? 0)
+const bankOf = async (s: Stack) => Number((await db.query(
+  `SELECT banked_hours::float AS h FROM work_trade_agreements WHERE id = $1`, [s.agreementId])).rows[0].h)
+
+describe('extra hours at month close', () => {
+  it('bank (the default): extra hours bank, and the close records them on the month', async () => {
+    const s = await buildStack()
+    await logHours(s, '2026-09-12', 86)
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect(await bankOf(s)).toBe(6)
+    expect(await bankedOn(s, '2026-09-01')).toBe(6)
+    expect(await payablesOf(s)).toEqual([])
+  })
+
+  it('pay: extra hours become a payable record at the rate and pay method, and do not bank', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay', 15, 'contractor_1099')
+    await logHours(s, '2026-09-12', 86)
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect(await payablesOf(s)).toEqual([
+      { month: '2026-09-01', hours: 6, rate: 15, amount: 90, pay_method: 'contractor_1099', status: 'unpaid' },
+    ])
+    expect(await bankOf(s)).toBe(0)
+    expect(await bankedOn(s, '2026-09-01')).toBe(0)
+    // The month itself is covered in full, as on any agreement.
+    expect((await invoiceOf(s.invoiceId)).total).toBe(0)
+  })
+
+  it('pay, with a carried shortfall: the shortfall is worked off first, only the rest is paid', async () => {
+    const s = await buildStack({ carryForwardMonths: 3 })
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-10', 70)                       // September 10 short
+    await runWorkTradeSettlement('2026-09-01')
+    await addPeriod(s, '2026-10-01')
+    await logHours(s, '2026-10-10', 96)                       // 80 + 10 owed + 6 extra
+    const r = await runWorkTradeSettlement('2026-10-01')
+    expect(r.errors).toEqual([])
+    expect((await periodOf(s, '2026-09-01')).status).toBe('settled')
+    expect((await periodOf(s, '2026-10-01')).status).toBe('settled')
+    const p = await payablesOf(s)
+    expect(p).toHaveLength(1)
+    expect(p[0]).toMatchObject({ month: '2026-10-01', hours: 6, amount: 90 })
+  })
+
+  it('bank, with a carried shortfall: the same hours bank instead', async () => {
+    const s = await buildStack({ carryForwardMonths: 3 })
+    await logHours(s, '2026-09-10', 70)
+    await runWorkTradeSettlement('2026-09-01')
+    await addPeriod(s, '2026-10-01')
+    await logHours(s, '2026-10-10', 96)
+    await runWorkTradeSettlement('2026-10-01')
+    expect(await bankOf(s)).toBe(6)
+    expect(await bankedOn(s, '2026-10-01')).toBe(6)
+    expect(await payablesOf(s)).toEqual([])
+  })
+
+  it('a re-run of the same close writes no second record and no more hours', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 86)
+    await runWorkTradeSettlement('2026-09-01')
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await payablesOf(s)).toEqual([
+      { month: '2026-09-01', hours: 6, rate: 15, amount: 90, pay_method: 'payroll_w2', status: 'unpaid' },
+    ])
+  })
+
+  it('hours approved after a settled close are paid at the next close, counted once', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 86)
+    await runWorkTradeSettlement('2026-09-01')
+    await logHours(s, '2026-09-30', 4)                        // approved after September closed
+    await addPeriod(s, '2026-10-01')
+    await logHours(s, '2026-10-12', 80)
+    await runWorkTradeSettlement('2026-10-01')
+    await runWorkTradeSettlement('2026-10-01')                // a re-run adds nothing
+    expect(await payablesOf(s)).toEqual([
+      { month: '2026-09-01', hours: 6, rate: 15, amount: 90, pay_method: 'payroll_w2', status: 'unpaid' },
+      { month: '2026-10-01', hours: 4, rate: 15, amount: 60, pay_method: 'payroll_w2', status: 'unpaid' },
+    ])
+  })
+
+  it('pay: a month with no bill of its own banks its extra hours — a re-run never pays them as wages', async () => {
+    // 10/12 review: nothing records what such a month counted, so a re-run
+    // counts its approved hours again. Before pay mode that only double-banked;
+    // in pay mode the recount became a second wage.
+    const s = await buildStack({ carryForwardMonths: 3 })
+    await setExtraHours(s, 'pay')
+    await runWorkTradeSettlement('2026-09-01')                // September: 80 short
+    await logHours(s, '2026-10-10', 50)                       // October: no bill, 50 hours
+    await runWorkTradeSettlement('2026-10-01')
+    await runWorkTradeSettlement('2026-10-01')                // a manual re-run
+    expect(await payablesOf(s)).toEqual([])
+  })
+
+  it('a record already paid is never reopened', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 86)
+    await runWorkTradeSettlement('2026-09-01')
+    await db.query(`UPDATE work_trade_extra_hours SET status='paid', paid_at=NOW(), paid_on=CURRENT_DATE WHERE agreement_id=$1`,
+      [s.agreementId])
+    await logHours(s, '2026-09-30', 4)
+    await addPeriod(s, '2026-10-01')
+    await logHours(s, '2026-10-12', 80)
+    await runWorkTradeSettlement('2026-10-01')
+    const p = await payablesOf(s)
+    expect(p.map((x: any) => [x.month, x.hours, x.status])).toEqual([['2026-09-01', 6, 'paid'], ['2026-10-01', 4, 'unpaid']])
+  })
+
+  it('an agreement that does not track hours never pays extra hours', async () => {
+    const s = await buildStack({ target: 0, tracksHours: false })
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 10)
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect(await payablesOf(s)).toEqual([])
+  })
+
+  it('ending an agreement that pays extra hours pays the month\'s extra hours', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 85)
+    const r = await settleAgreementOnEnd(s.agreementId)
+    expect(r.errors).toEqual([])
+    expect(await payablesOf(s)).toEqual([
+      { month: '2026-09-01', hours: 5, rate: 15, amount: 75, pay_method: 'payroll_w2', status: 'unpaid' },
+    ])
+  })
+
+  it('the standing shows banked extra hours as hours, and paid ones with rate and amount', async () => {
+    const s = await buildStack()
+    await setExtraHours(s, 'pay')
+    await logHours(s, '2026-09-12', 86)
+    await runWorkTradeSettlement('2026-09-01')
+    const tenant = await loadWorkTradeStanding(s.agreementId, '2026-10-01', 'tenant')
+    expect(tenant!.extraHours).toMatchObject({
+      mode: 'pay',
+      recent: [{ periodMonth: '2026-09-01', hours: 6, how: 'paid', rate: 15, amount: 90, status: 'unpaid' }],
+      summary: '6 extra hours in September × $15.00 = $90.00 — paid separately by your landlord',
+    })
+
+    const b = await buildStack()
+    await logHours(b, '2026-09-12', 86)
+    await runWorkTradeSettlement('2026-09-01')
+    const banked = await loadWorkTradeStanding(b.agreementId, '2026-10-01', 'tenant')
+    expect(banked!.extraHours!.recent).toEqual([
+      { periodMonth: '2026-09-01', hours: 6, how: 'banked', rate: null, amount: null, status: null }])
+    expect(banked!.extraHours!.summary).toBe('6 extra hours in September — banked toward future months')
+    expect(banked!.extraHours!.summary).not.toMatch(/\$/)
   })
 })

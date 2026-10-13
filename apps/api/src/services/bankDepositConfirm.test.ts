@@ -168,14 +168,12 @@ describe('confirming a deposit', () => {
     expect((await db.query(`SELECT status FROM invoices WHERE id=$1`, [s.invoiceId])).rows[0].status).toBe('settled')
     // No late fee left on the bill: the rent counts from the bank-validated day
     // (the 4th, three days after it was due — inside the grace days), a good mark.
-    const mark = (await db.query(
-      `SELECT event_type, event_data FROM credit_events
-        WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [s.rentId])).rows
+    // 10/12 ("one mark per invoice"): the BILL's one mark.
+    const mark = await billMarks(s.rentId)
     expect(mark).toHaveLength(1)
-    expect(mark[0].event_type).toMatch(/^payment_received_(on_time|late_grace)$/)
-    expect(mark[0].event_data).toMatchObject({ bank_validated: true })
+    expect(mark[0].event_type).toBe('payment_received_on_time')
+    expect(mark[0].event_data).toMatchObject({ bank_validated: true, paid_in_full_on: '2026-09-04' })
     expect(mark[0].event_data.late_fee_on_bill).toBeUndefined()
-    expect(String(mark[0].event_data.paid_at).slice(0, 10)).toBe('2026-09-04')
   })
 
   it('a late fee charged on or before the bank\'s day stands, and then the payment is late — counted from the bank\'s day, not the day it was matched', async () => {
@@ -188,13 +186,10 @@ describe('confirming a deposit', () => {
     expect(await lateFees(s.invoiceId)).toEqual([
       { tick: '2026-09-05', amount: 5, credited: 0 }, { tick: '2026-09-21', amount: 0, credited: 0 },
     ])
-    const mark = (await db.query(
-      `SELECT event_type, event_data FROM credit_events
-        WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [s.rentId])).rows
+    const mark = await billMarks(s.rentId)
     expect(mark).toHaveLength(1)
     expect(mark[0].event_type).toMatch(/^payment_received_late_(minor|major|severe)$/)
-    expect(String(mark[0].event_data.paid_at).slice(0, 10)).toBe('2026-09-20')
-    expect(mark[0].event_data).toMatchObject({ bank_validated: true, late_fee_on_bill: true })
+    expect(mark[0].event_data).toMatchObject({ bank_validated: true, late_fee_on_bill: true, paid_in_full_on: '2026-09-20' })
   })
 
   it('keeps a late fee that was genuinely earned before payment', async () => {
@@ -587,11 +582,18 @@ describe('S655: a deposit is new money for one household, never more than it pay
       declarationId: s.declarationId,
     })
     expect(r.paidAhead).toBe(10)
-    expect(undo.creditEventIds.length).toBeGreaterThan(0)
+    // 10/12 ("one mark per invoice"): the bill's mark, named by its first line.
+    expect(undo.creditEventIds).toEqual((await billMarks(s.rentId)).map(m => m.id))
   })
 })
 
 // ── Step 9 review fixes ──────────────────────────────────────────────────────
+
+/** 10/12 (Nic): "one mark per invoice" — the live payment mark of the BILL a row is on. */
+const billMarks = async (paymentId: string) => (await db.query<{ id: string; event_type: string; event_data: any }>(
+  `SELECT e.id, e.event_type, e.event_data
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [paymentId])).rows
 
 /** Each late fee on the bill: its day, what was charged, and how much of it a late-fee credit nets out (10/6). */
 const lateFees = async (invoiceId: string) => (await db.query(
@@ -810,12 +812,19 @@ describe('Step 12: undoing a deposit match', () => {
     const alloc = (await db.query(`SELECT reversed_at IS NOT NULL AS reversed, reversed_by FROM bank_deposit_allocations WHERE bank_transaction_id=$1`, [s.txnId])).rows
     expect(alloc).toEqual([{ reversed: true, reversed_by: owner }])
     expect((await db.query(`SELECT status FROM tenant_remittances WHERE id=$1`, [r.receiptId])).rows[0].status).toBe('failed')
+    // 10/12 (Nic, ledger P1): the receipt itself keeps when it was undone, and by whom.
+    expect((await db.query(`SELECT undone_at IS NOT NULL AS undone, undone_by FROM tenant_remittances WHERE id=$1`, [r.receiptId])).rows[0])
+      .toEqual({ undone: true, undone_by: owner })
     expect((await db.query(`SELECT status, bank_transaction_id FROM tenant_declared_deposits WHERE id=$1`, [s.declarationId])).rows[0])
       .toEqual({ status: 'pending', bank_transaction_id: null })
     const marks = (await db.query(`SELECT id, superseded_by, superseded_reason FROM credit_events WHERE id = ANY($1::uuid[])`,
       [r.undo.creditEventIds])).rows
     expect(marks.length).toBeGreaterThan(0)
     for (const m of marks) expect(m).toMatchObject({ superseded_by: m.id, superseded_reason: 'attestation_invalidated' })
+    // 10/12: and the bill is judged again — owed again, and (this fixture's rent
+    // row was written today, so lateness counts from today) inside its grace
+    // period: not judged yet, so no mark replaces the withdrawn one.
+    expect(await billMarks(s.rentId)).toEqual([])
     const txn = (await db.query(`SELECT status, matched_payment_id, auto_settled_at, auto_settle_undo FROM bank_transactions WHERE id=$1`, [s.txnId])).rows[0]
     expect(txn).toMatchObject({ status: 'needs_review', matched_payment_id: null, auto_settled_at: null })
     expect(txn.auto_settle_undo).toMatchObject({ undone: true, undoneBy: owner, was: { receiptId: r.receiptId } })
@@ -893,6 +902,23 @@ describe('Step 9 review: a security deposit paid by bank deposit is on the depos
     await undoDepositMatch({ bankTransactionId: s.txnId, landlordId: s.landlordId, undoneBy: null })
     expect(await record(depositId)).toEqual({ collected: 0, status: 'pending' })
     expect((await rentRow(chargeId)).status).toBe('pending')
+  })
+
+  it('10/12 review: Undo clears who collected the deposit, so the tenant paying it online afterwards reads as GAM\'s', async () => {
+    const { s, chargeId } = await securityOwed()
+    await confirmDepositMatch({ bankTransactionId: s.txnId, chargeIds: [chargeId], method: 'check' })
+    const collectedBy = async () => (await db.query(
+      `SELECT deposit_collected_by FROM payments WHERE id = $1`, [chargeId])).rows[0].deposit_collected_by
+    expect(await collectedBy()).toBe('landlord')
+    await undoDepositMatch({ bankTransactionId: s.txnId, landlordId: s.landlordId, undoneBy: null })
+    expect(await collectedBy()).toBeNull()
+    // The tenant then pays the same row online, onto GAM's balance.
+    await db.query(
+      `UPDATE payments SET status = 'settled', settled_at = NOW(), platform_held = TRUE, stripe_payment_intent_id = 'pi_dep_after_undo'
+        WHERE id = $1`, [chargeId])
+    const { reconcileSettledDepositPayment } = await import('./leaseFeesSync')
+    await reconcileSettledDepositPayment(chargeId)
+    expect(await collectedBy()).toBe('gam')
   })
 
   // 10/4 (decisions #46.3, Nic, FINAL) — replaces "GAM escrow: a bank-matched

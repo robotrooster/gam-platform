@@ -96,6 +96,7 @@ function app() {
   return a
 }
 
+// 10/12: the work-trade extra-hours columns/table, until they reach schema.sql.
 beforeEach(async () => {
   await cleanupAllSchema()
   for (const m of Object.values(h)) m.mockClear()

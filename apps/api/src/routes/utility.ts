@@ -1,4 +1,8 @@
 import { Router } from 'express'
+// 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
+import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
+// 10/12 (Nic, ledger P8): the recovery report's spend reads the books once they are live.
+import { ledgerReportsLive } from '../services/ledgerReports'
 import { z } from 'zod'
 import path from 'path'
 import fs from 'fs'
@@ -10,6 +14,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
+import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
@@ -326,6 +331,8 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, property.id)
 
     // S605: the double-billing guard is checked BEFORE the meter exists, so a
     // refused assignment can no longer leave a half-created meter behind.
@@ -441,13 +448,20 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
 utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const meter = await queryOne<any>(
-      `SELECT m.*, p.landlord_id FROM utility_meters m
+      `SELECT m.*, p.landlord_id
+         FROM utility_meters m
          JOIN properties p ON p.id = m.property_id
         WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties edits only
+    // those properties' meters, as every other meter write path already
+    // required (reads-due, /meters/:id/reads, master bills). Without it, a
+    // manager scoped to one park could re-rate, retire or confirm "uses no
+    // power" (bills $0) on a meter at another park of the same company.
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const body = z.object({
       label:          z.string().min(1).optional(),
@@ -489,18 +503,103 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // one somewhere, it may have some number on it. And we need to set that
       // as the starting point for the next billing cycle."
       repairedStartingReading: z.number().nonnegative().optional(),
+      // 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
+      // 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+      // occupancy)." The meter works and the household on it uses nothing:
+      // back in service with no new reading (nothing was replaced), and a flat
+      // read bills $0 instead of being flagged until the meter moves
+      // (services/meterRepair → markMeterWorksNoUse).
+      // 10/12 (Nic): "usable on ANY meter, any time" — broken or not.
+      // 10/12 (review): a boolean, not only `true`. The assistant passes every
+      // parameter it was given, so a "mark it repaired" call carrying
+      // zeroUseConfirmed: false was refused outright. Only true is the choice;
+      // false (or leaving it out) means not this choice.
+      zeroUseConfirmed: z.boolean().optional(),
+      // 10/12 (Nic, review): take "Works, tenant uses no power" back. On a
+      // master or a flat-rate meter nothing else could: "Mark broken" (which
+      // also ends it) is offered on submeters only, and those meters never
+      // reach the stuck-meter test that ends it on a submeter — a mis-click
+      // stayed on the meter for good. Its own field, not zeroUseConfirmed:
+      // false, which stays "not this choice" (the assistant sends every
+      // parameter it was given, so false on a rename must change nothing).
+      // Only true acts; on a meter with no confirmation it changes nothing.
+      zeroUseWithdrawn: z.boolean().optional(),
+      // 10/12 (Nic), Q-f: "past estimates when picking 'Works': LANDLORD'S
+      // CHOICE at that moment (void unpaid estimated charges from the flagged
+      // period, or leave them)." Asked in the same window: true voids them
+      // (soft — kept on record), false or absent leaves them. Paid ones are
+      // never touched (services/meterRepair voidFlaggedPeriodEstimates).
+      voidFlaggedEstimates: z.boolean().optional(),
+      // 10/12 (review): the estimated charges the window SHOWED (their ids,
+      // from GET /meters/:id/flagged-estimates). Only those come off — one
+      // written between the question and the answer is never voided unseen.
+      voidEstimateIds: z.array(z.string().uuid()).max(1000).optional(),
     }).parse(req.body)
     // S648: marking a broken meter repaired REQUIRES what the new meter reads
     // now. Without it, the first bill after the repair would be measured from
     // the old meter's last number — a meaningless difference between two
     // different devices.
     const repairing = body.outOfService === false && meter.out_of_service === true
-    if (repairing && body.repairedStartingReading == null) {
+    const confirmingNoUse = body.zeroUseConfirmed === true
+    if (confirmingNoUse && body.outOfService === true) {
+      throw new AppError(400, 'A meter cannot be marked broken and confirmed working at the same time.')
+    }
+    const withdrawingNoUse = body.zeroUseWithdrawn === true
+    if (withdrawingNoUse && confirmingNoUse) {
+      throw new AppError(400, '"Works, tenant uses no power" cannot be chosen and taken back at the same time.')
+    }
+    const voidingEstimates = body.voidFlaggedEstimates === true
+    if (voidingEstimates && !confirmingNoUse) {
+      throw new AppError(400,
+        'Estimated charges come off only with "Works, tenant uses no power" — the meter was working while it was flagged.')
+    }
+    // 10/12 (Nic), Q-f: the LANDLORD's choice. Voiding charges is a money
+    // decision, and the assistant makes none (decisions #38 Q6): it can put
+    // the meter back with "Works", and the landlord voids the estimates
+    // themselves on the Utilities page.
+    if (voidingEstimates && req.get('X-GAM-Actor') === 'agent') {
+      throw new AppError(403,
+        'Voiding the estimated charges is the landlord\'s own choice on the Utilities page — the assistant does not void charges.')
+    }
+    if (voidingEstimates && body.voidEstimateIds === undefined) {
+      throw new AppError(400, 'Send the estimated charges the window showed (voidEstimateIds) — only those are taken off.')
+    }
+    // The flagged period this meter is in (services/meterRepair
+    // flaggedPeriodStart: since it last came back into service), read BEFORE
+    // the meter goes back in service below — that write is the next "came back".
+    const flaggedFrom = meter.out_of_service
+      ? await flaggedPeriodStart((t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id)
+      : null
+    // ...and the assistant never takes that choice away by putting a flagged
+    // meter back first: once it is back in service there is no flagged period
+    // left to ask about. With estimates waiting on the answer, it is the
+    // landlord's press, where the window shows how many and how much.
+    if (confirmingNoUse && meter.out_of_service && req.get('X-GAM-Actor') === 'agent') {
+      const waiting = await flaggedPeriodEstimates(
+        (t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id, flaggedFrom)
+      if (waiting.length > 0) {
+        const total = Math.round(waiting.reduce((s, e) => s + Math.round(e.amount * 100), 0)) / 100
+        throw new AppError(409,
+          `${meter.label} has ${waiting.length} unpaid estimated charge${waiting.length === 1 ? '' : 's'} from while it was flagged `
+          + `($${total.toFixed(2)}). Whether to void them is the landlord's choice, made with "Works, tenant uses no power" `
+          + `on the Utilities page (the wrench on the meter) — nothing was changed.`)
+      }
+    }
+    // 10/12 (Nic): "Works, tenant uses no power" — "Any meter". It used to be
+    // refused on anything but a submeter (only a submeter is ever flagged for
+    // not moving, services/utilityBilling), which left a RUBS master, a
+    // master the landlord pays and a flat-rate meter with no way to say it.
+    // On those it records the confirmation and puts the meter back in service
+    // when it was marked broken; what it bills is unchanged (the stuck-meter
+    // test it quiets runs on submeters only).
+    // "Works, tenant uses no power" needs no reading: the meter was never
+    // broken, so the reads it already has stand and the next is measured from them.
+    if (repairing && body.repairedStartingReading == null && !confirmingNoUse) {
       throw new AppError(400,
         'Enter what the repaired or replaced meter reads right now (0 for a brand-new meter). Its next bill is measured from that number.')
     }
-    if (repairing && meter.digits != null
-        && body.repairedStartingReading! >= meterReadingModulus(Number(meter.digits))) {
+    if (repairing && meter.digits != null && body.repairedStartingReading != null
+        && body.repairedStartingReading >= meterReadingModulus(Number(meter.digits))) {
       throw new AppError(400,
         `${body.repairedStartingReading} does not fit on a ${meter.digits}-digit meter — check the number, or change the meter's digits first.`)
     }
@@ -633,24 +732,82 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
           nextMethod,
           body.readingMultiplier ?? null,
         ])).rows[0]
-      if (repairing) {
+      // 10/12 (Nic): somebody marking the meter broken by hand overrides an
+      // earlier "it works, the household uses nothing" (utility_meters.
+      // zero_use_confirmed_at, services/meterRepair): from here a flat read is
+      // a stuck meter again. Only written when one is on record.
+      // 10/12 (Nic, review): ...and the landlord taking it back (zeroUseWithdrawn).
+      if ((body.outOfService === true || withdrawingNoUse) && meter.zero_use_confirmed_at) {
+        await tx.query(
+          `UPDATE utility_meters SET zero_use_confirmed_at = NULL, zero_use_confirmed_by_user_id = NULL WHERE id = $1`,
+          [req.params.id])
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
+      }
+      if (repairing && body.repairedStartingReading != null) {
         // The fresh starting point, dated today at the property. Recorded as a
         // replacement read: it starts the next measurement and bills nothing.
-        await tx.query(`
-          INSERT INTO utility_meter_readings
-            (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
-          SELECT $1, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, $2,
-                 date_trunc('month', NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date,
-                 'meter_replaced', $3
-            FROM properties p WHERE p.id = $4`,
-          [req.params.id, body.repairedStartingReading, req.user!.userId, meter.property_id])
+        // 10/12: the one repair path (services/meterRepair), shared with the
+        // one-time repair of Gerald Logue's meter — confirmed working with
+        // nobody using it too, when that is said with it.
+        await markMeterRepaired(tx, {
+          meterId: req.params.id, startingReading: body.repairedStartingReading, userId: req.user!.userId,
+          zeroUseConfirmed: confirmingNoUse,
+        })
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
+      } else if (confirmingNoUse) {
+        // 10/12 (Nic), M1: "Works, tenant uses no power".
+        await markMeterWorksNoUse(tx, { meterId: req.params.id, userId: req.user!.userId })
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       }
       await tx.query('COMMIT')
     } catch (e) {
       await tx.query('ROLLBACK').catch(() => {})
       throw e
     } finally { tx.release() }
+    // 10/12 (Nic), Q-f: the landlord chose to void the unpaid estimates billed
+    // while the meter was flagged. The flagged period is the one it was in
+    // when the choice was made (read above, before it went back in service);
+    // a meter that was not flagged has none. Each household is voided under
+    // its own lock after the meter is back (services/meterRepair), and only
+    // the charges the window showed.
+    if (voidingEstimates && flaggedFrom) {
+      const result = await voidFlaggedPeriodEstimates({
+        meterId: req.params.id, from: flaggedFrom, utilityType: meter.utility_type,
+        shownIds: body.voidEstimateIds ?? [],
+      })
+      return res.json({ success: true, data: { ...updated, flagged_estimates_voided: result } })
+    }
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/12 (Nic), Q-f — the numbers for the question in the "Works, tenant uses no
+ * power" window: "Also void the N unpaid estimated charges from while it was
+ * flagged ($X)?" The same list PATCH voids when the landlord says yes
+ * (services/meterRepair flaggedPeriodEstimates). Empty for a meter that is not
+ * flagged — nothing to ask. Read-only.
+ */
+utilityRouter.get('/meters/:id/flagged-estimates', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const meter = await queryOne<any>(
+      `SELECT m.id, m.property_id, p.landlord_id FROM utility_meters m
+         JOIN properties p ON p.id = m.property_id
+        WHERE m.id = $1`, [req.params.id])
+    if (!meter) throw new AppError(404, 'Meter not found')
+    if (!canAccessLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, meter.property_id)
+    const list = await flaggedPeriodEstimates((t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id)
+    const amount = Math.round(list.reduce((s, e) => s + Math.round(e.amount * 100), 0)) / 100
+    res.json({ success: true, data: {
+      count: list.length,
+      amount,
+      // 10/12 (review): each charge's id, sent back with "Yes, void them"
+      // (PATCH voidEstimateIds) so only what was shown comes off.
+      charges: list.map(e => ({
+        id: e.id, state: e.state, cycleMonth: e.cycleMonth, amount: e.amount, invoiceNumber: e.invoiceNumber,
+      })),
+    } })
   } catch (e) { next(e) }
 })
 
@@ -664,6 +821,8 @@ utilityRouter.delete('/meters/:id', requirePerm('properties.edit'), async (req, 
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH).
+    await assertPropertyInScope(req.user, meter.property_id)
     // Retention guard (data-retention rule — reading history is permanent).
     // The utility_meter_readings FK is ON DELETE CASCADE, so hard-deleting a
     // meter would silently WIPE its whole reading history (point-in-time reads,
@@ -725,6 +884,8 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     // A submeter measures exactly ONE unit, so a multi-select against one is a
     // mistake worth naming rather than half-applying.
     if (meter.billing_method === 'submeter' && requested.length > 1) {
@@ -825,6 +986,8 @@ utilityRouter.post('/meters/:id/bill-back', requirePerm('properties.edit'), asyn
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const rows = await query<{ lease_id: string; unit_id: string }>(
       `INSERT INTO lease_utility_responsibilities
@@ -899,6 +1062,8 @@ utilityRouter.patch('/meters/:id/units/:unitId', requirePerm('properties.edit'),
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     if (meter.billing_method !== 'flat_rate') {
       throw new AppError(400,
         'A count only applies to a flat charge. On a meter, usage already reflects how much this unit used.')
@@ -922,6 +1087,8 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     await query(`DELETE FROM utility_meter_units WHERE meter_id = $1 AND unit_id = $2`,
       [req.params.id, req.params.unitId])
     res.json({ success: true })
@@ -968,15 +1135,32 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
 
+    // 10/12 (Nic, ledger P8): once the company's books are live, what the
+    // property SPENT is its utility expenses as the books hold them — the
+    // property's share of each (a company-wide bill split by units included),
+    // on its accounting day; the expense still says which utility.
+    const onBooks = await ledgerReportsLive([property.landlord_id])
+    const spentSql = onBooks
+      ? `SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
+                SUM(l.debit - l.credit)::numeric AS amount
+           FROM ledger_posting_lines l
+           JOIN ledger_postings ps ON ps.id = l.posting_id AND ps.source_type = 'expense'
+           JOIN landlord_expenses e ON e.id::text = ps.source_id
+           JOIN books_accounts a ON a.id = l.account_id AND a.type = 'expense'
+          WHERE l.landlord_id = $4::uuid AND l.property_id = $1 AND e.category = 'utilities'
+            AND l.accounting_date BETWEEN $2::date AND $3::date
+          GROUP BY 1`
+      : `SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
+                SUM(e.amount)::numeric AS amount
+           FROM landlord_expenses e
+          WHERE e.property_id = $1 AND e.category = 'utilities'
+            AND ${liveExpenseSql('e')}
+            AND e.expense_date BETWEEN $2::date AND $3::date
+            AND $4::uuid IS NOT NULL
+          GROUP BY 1`
     const rows = await query<any>(`
       WITH spent AS (
-        SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
-               SUM(e.amount)::numeric AS amount
-          FROM landlord_expenses e
-         WHERE e.property_id = $1 AND e.category = 'utilities'
-           AND e.status = 'active'
-           AND e.expense_date BETWEEN $2::date AND $3::date
-         GROUP BY 1
+        ${spentSql}
       ),
       -- S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
       -- $1,588.65. Those are an exact match and I don't know why it's saying
@@ -1077,7 +1261,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
         LEFT JOIN recovered r ON r.utility_type = t.utility_type
         LEFT JOIN owner_use o ON o.utility_type = t.utility_type
        ORDER BY 2 DESC
-    `, [propertyId, from, to])
+    `, [propertyId, from, to, property.landlord_id])
 
     const lines = rows.map((r: any) => ({
       utilityType: r.utility_type,
@@ -1188,6 +1372,8 @@ utilityRouter.get('/meters/:id/readings', requirePerm('properties.edit'), async 
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     const readings = await query<any>(`
       SELECT * FROM utility_meter_readings
        WHERE meter_id = $1
@@ -1219,6 +1405,8 @@ utilityRouter.post('/meters/:id/readings', requirePerm('properties.edit'), async
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     const reading = await queryOne<any>(`
       INSERT INTO utility_meter_readings
         (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
@@ -1265,6 +1453,9 @@ utilityRouter.post('/tax-rates', requirePerm('properties.edit'), async (req, res
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
     const row = await queryOne<any>(
       `INSERT INTO property_utility_tax_rates (property_id, utility_type, tax_rate_pct, label)
        VALUES ($1, $2, $3, $4)
@@ -1316,6 +1507,8 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const reading = await queryOne<any>(
       `SELECT * FROM utility_meter_readings WHERE id = $1 AND meter_id = $2`,
@@ -1721,12 +1914,18 @@ utilityRouter.get('/master-bills', requirePerm('properties.edit'), async (req, r
              m.id AS meter_id, m.label AS meter_label, m.utility_type,
              m.billing_method, m.rubs_basis, m.rate_per_unit, m.base_fee,
              (SELECT COUNT(*) FROM utility_meter_units mu WHERE mu.meter_id = m.id) AS unit_count,
+             -- 10/12: a voided bill recovered nothing — a tenancy that never
+             -- happened (kept, voided_at set, its usage back on hold and billed
+             -- to whoever is next) or a voided estimate / paused-cycle marker.
+             -- Counting it counted the same usage twice.
              COALESCE((SELECT SUM(ub.charge_amount) FROM utility_bills ub
                         WHERE ub.meter_id = m.id
-                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_amount,
+                          AND ub.billing_cycle_month = r.billing_cycle_month
+                          AND ub.voided_at IS NULL AND ub.status <> 'void'), 0) AS recovered_amount,
              COALESCE((SELECT COUNT(*) FROM utility_bills ub
                         WHERE ub.meter_id = m.id
-                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_count
+                          AND ub.billing_cycle_month = r.billing_cycle_month
+                          AND ub.voided_at IS NULL AND ub.status <> 'void'), 0) AS recovered_count
         FROM utility_meter_readings r
         JOIN utility_meters m ON m.id = r.meter_id
        WHERE m.property_id = $1
@@ -1865,6 +2064,9 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
     if (!canAccessLandlordResource(req.user, reading.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, reading.property_id)
     if (!reading.needs_review) throw new AppError(409, 'Reading is not flagged for review')
     if (body.correctedValue != null && body.correctedValue >= meterReadingModulus(reading.digits)) {
       throw new AppError(400, `Reading exceeds this meter's ${reading.digits}-digit capacity`)
@@ -1887,9 +2089,14 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
     // window. A bill built on the superseded value and not yet on an invoice
     // is stale; and if this was the last flagged read on a waiting run, the
     // run completes here.
+    // 10/12: never a voided bill — it is kept on record (keep everything): one
+    // voided out of its slot (voided_at, a tenancy that never happened) and
+    // the older void markers (a voided estimate, a paused cycle), which hold
+    // their cycle so it is never billed again.
     if (body.correctedValue != null && Number(reading.reading_value) !== body.correctedValue) {
       await query(
-        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
+        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL
+            AND voided_at IS NULL AND status <> 'void'`,
         [reading.meter_id, reading.billing_cycle_month])
     }
     const cycleIso = reading.billing_cycle_month instanceof Date
@@ -1935,6 +2142,9 @@ utilityRouter.post('/reading-runs/:id/complete', requirePerm('properties.edit'),
     if (!canAccessLandlordResource(req.user, run.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, run.property_id)
     if (run.status === 'completed') throw new AppError(409, 'Reading run is already completed')
     // S652: the landlord completing the run IS the approval of its bills.
     const completed = await completeReadingRun(run.id, req.user!.userId, { approve: true })
@@ -1960,6 +2170,9 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
     const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
     if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, run.property_id)
     if (run.status === 'completed') throw new AppError(409, 'These bills already went out')
     // A reading still flagged as a possible typo bills nothing and holds only
     // its own unit's invoice (S534) — it never holds the park (Nic).
@@ -2043,6 +2256,9 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
         throw new AppError(403, 'Forbidden')
       }
+      // 10/12 (review): a team member held to some properties acts only on those
+      // properties, as every other meter write path requires (assertPropertyInScope).
+      await assertPropertyInScope(req.user, meter.property_id)
       const result = await generateBillsForMeter(body.meterId, cycleDate)
       return res.json({ success: true, data: [result] })
     }
@@ -2054,6 +2270,7 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       if (!canAccessLandlordResource(req.user, property.landlord_id)) {
         throw new AppError(403, 'Forbidden')
       }
+      await assertPropertyInScope(req.user, property.id)
       const results = await generateBillsForProperty(body.propertyId, cycleDate)
       return res.json({ success: true, data: results })
     }
@@ -2064,6 +2281,11 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       : req.user!.landlordId
     if (!landlordId) {
       throw new AppError(400, 'meterId or propertyId required for admin/super_admin calls')
+    }
+    // 10/12 (review): every property of the company is more than a team member
+    // held to some of them may bill — they choose one of theirs.
+    if ((await getScopedPropertyIds(req.user)) !== null) {
+      throw new AppError(400, 'Choose one of your properties to generate its utility bills.')
     }
     const results = await generateBillsForLandlord(landlordId, cycleDate)
     res.json({ success: true, data: results })
@@ -2079,13 +2301,20 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
 // finalization is a property-level admin action.
 utilityRouter.post('/bills/:id/finalize', requirePerm('properties.edit'), async (req: any, res, next) => {
   try {
-    const bill = await queryOne<{ id: string; landlord_id: string; status: string }>(
-      `SELECT id, landlord_id, status FROM utility_bills WHERE id=$1`, [req.params.id]
+    const bill = await queryOne<{ id: string; landlord_id: string; status: string; property_id: string | null }>(
+      `SELECT ub.id, ub.landlord_id, ub.status, COALESCE(m.property_id, u.property_id) AS property_id
+         FROM utility_bills ub
+         LEFT JOIN utility_meters m ON m.id = ub.meter_id
+         LEFT JOIN units u ON u.id = ub.unit_id
+        WHERE ub.id=$1`, [req.params.id]
     )
     if (!bill) throw new AppError(404, 'Utility bill not found')
     if (!canAccessLandlordResource(req.user, bill.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, bill.property_id)
     if (bill.status !== 'unbilled') {
       throw new AppError(409, `Bill is ${bill.status}; only 'unbilled' can be finalized`)
     }
@@ -2188,6 +2417,9 @@ utilityRouter.post('/property-rates', requirePerm('properties.edit'), async (req
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
 
     const row = await queryOne<any>(
       `INSERT INTO property_utility_rates
@@ -2277,6 +2509,9 @@ utilityRouter.post('/opening-reads', requirePerm('properties.edit'), async (req,
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
 
     const cycleMonth = body.readingDate.slice(0, 7) + '-01'
     const results: { meterId: string; label: string; status: string; message?: string }[] = []

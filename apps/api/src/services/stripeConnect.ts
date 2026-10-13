@@ -431,9 +431,10 @@ export async function firePmTransfersForReference(
     user_id: string
     amount: string
     bank_account_id: string | null
+    property_id: string | null
     notes: string | null
   }>(
-    `SELECT id, user_id, amount, bank_account_id, notes
+    `SELECT id, user_id, amount, bank_account_id, property_id, notes
        FROM user_balance_ledger
       WHERE type = 'allocation_pm_company_fee'
         AND reference_type = $1
@@ -460,11 +461,26 @@ export async function firePmTransfersForReference(
   let failed = 0
   for (const row of rows) {
     try {
-      // Resolve the destination Connect account for this user. The PM
-      // company's payout user owns a bank account (snapshotted at allocation
-      // time); their stripe_connect_account_id is what we transfer to.
+      // Resolve the destination Connect account for this row.
+      // 10/12 (Nic): the PM COMPANY's Connect account first — that is the one
+      // its owner verifies in the PM portal (pm_companies.stripe_connect_
+      // account_id) and the one PM acceptance checks. Only when the recipient
+      // is an active owner of the company managing the row's property, so a
+      // cut never lands in a company the recipient does not own. The old
+      // user-level account stays as the fallback for a legacy catalog-bank
+      // recipient (services/pmPayoutRecipient.ts).
       const destRow = await queryOne<{ stripe_connect_account_id: string | null }>(
-        `SELECT stripe_connect_account_id FROM users WHERE id=$1`, [row.user_id]
+        `SELECT COALESCE(
+           (SELECT c.stripe_connect_account_id
+              FROM properties p
+              JOIN pm_companies c ON c.id = p.pm_company_id
+             WHERE p.id = $2
+               AND c.stripe_connect_account_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM pm_staff s
+                            WHERE s.pm_company_id = c.id AND s.user_id = $1
+                              AND s.role = 'owner' AND s.status = 'active')),
+           (SELECT u.stripe_connect_account_id FROM users u WHERE u.id = $1)
+         ) AS stripe_connect_account_id`, [row.user_id, row.property_id]
       )
       if (!destRow?.stripe_connect_account_id) {
         logger.warn(`[pm_transfer] user ${row.user_id} has no Connect account; ledger ${row.id} skipped`)
