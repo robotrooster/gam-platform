@@ -9,7 +9,7 @@ You can add four kinds of team members:
 - Property Manager — your right hand for day-to-day operations: properties, units, tenants, leases, and team management when you grant it.
 - On-Site Manager — someone stationed at a property handling on-the-ground tasks.
 - Maintenance — a worker who receives and works repair requests.
-- Bookkeeper — read-only or read-write access to your books.
+- Bookkeeper — sees the money for the properties you tick for them (money in, money out, receipts and maintenance costs) and does the full bookkeeping on it: adding, correcting, removing and paying expenses and bills. Every bookkeeper works at the same level; there is no read-only setting. They never work a tenant's account (no rent payments, credits, late fees or refunds). The company's bank account, payouts and payroll are a separate "Company-wide" box you tick only if they should see them.
 
 To add someone, open your Team page and send an invitation to their email address. They'll get a link to set up (or sign in to) their account and join your team. Invitation links expire after 24 hours for security — if one lapses, just resend it from the same page, which issues a fresh link. You can also revoke a pending invitation any time before it's accepted.
 
@@ -17,6 +17,7 @@ A few things worth knowing:
 
 - One email, one role. If an address is already registered under a different role, that person can't accept a worker invite with it.
 - An on-site manager can only work for one landlord across the whole platform, so that invite won't go through if they're already on-site for someone else.
-- You're always in control. Team members can't widen their own access or change their own permissions — only you (or someone you've trusted with team management) can adjust their scope.
+- You're always in control. Team members can't widen their own access or change their own permissions — only you (or someone you've trusted with team management) can adjust their scope. A manager you've trusted with team management can only give a bookkeeper properties that manager looks after themselves, and can give the Company-wide box, the whole-company ledger or whole-company reports only if they have company-wide access themselves, and the monthly report only if they see it themselves.
+- A bookkeeper keeps one company's books: the properties ticked for them, the Company-wide box, or both. Tick at least one property or Company-wide when you invite them. A company with no property yet can have a company-wide bookkeeper. A property you add later starts unticked; tick it on their row on the Team page if they should see it. Lease start and end dates on their rent roll are a box of their own, off unless you tick it, and so are the whole-company ledger, whole-company reports and the monthly report on screen.
 
 When you remove a team member, their access ends immediately. Start small, grant only what each person needs, and expand as you build trust.
