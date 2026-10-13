@@ -106,3 +106,48 @@ Runbook and logs: `~/gam-backups/deploy-1013/` (backups `gam-predeploy-0521.dump
 - `GET /api/esign/landlord-pending` answers 403 about 900 times a day (644
   before the deploy on 10/13 alone): some signed-in client polls a page it
   is not allowed to see.
+
+## 10/13 afternoon: second deploy (live 12:16 Phoenix)
+
+Nic answered every open question from the morning (all of them in
+`~/gam-nic-answers-2026-10-13.md`), rejected the first combined-page mockup and
+described the pages again; his words are in the commit `bf91965` message.
+Deploy go-ahead was his ("When it's done, just deploy it too").
+
+Shipped (`8504d2e`..`2cedcb9`):
+- **Payments = the open month's Rent Roll; Rent Roll = history; tenant report
+  = full history** (`bf91965`). New endpoints GET /api/balances/rent-roll/
+  {properties, open-month, history}; the moved-out setting and its routes are
+  gone (column `landlords.rent_roll_moved_out` left for a later contract
+  migration). Household = lease. The 10/6 hand-logged rule is shared with
+  credit history (services/lateness).
+- **Credit** (`8b6b91e`): 12 forked chains restarted with a recorded note
+  (applied: 114 subjects, 102 whole, 12 whole since a restart, 0 broken); the
+  rebuild applied (128 bills changed, 18 marks with no bill withdrawn).
+- **Money rules** (`1cb9d98`): disputed GAM pulls reopen as owed
+  automatically; "Not rent" for owner + bookkeeper (API only, no bookkeeper
+  button yet); bank void voids the filed expense; flat-meter "Stop the flat
+  charge too?"; shortened-stay void for booking managers.
+- **Readers, GAM side** (`cd42cf2`): dated cost corrections, missing cost in
+  the morning email; nothing new booked in GAM's book (open question).
+- **Ledger** (`858c1d7`): late closed-month record → replacement account
+  (`books_accounts.replaced_from`); disputed pull posts a 'cancellation'.
+- Tests: `TEST_APPLY_MIGRATIONS_AFTER=<newest production migration>` makes
+  globalSetup apply unapplied migration files on top of schema.sql
+  (`8504d2e`); this replaced the per-feature test shims.
+
+Record: `~/gam-backups/deploy-1013b/` (backups `gam-predeploy-1212.dump`,
+`gam_demo-predeploy-1212.dump`, previous `api-dist-live/`, logs). Full API
+suite 13,581 passed (702 files) on the pending migrations; frontends 1,068
+passed; deploy.sh run with --skip-tests on that same commit. Books after:
+integrity 0, drift 0; Oak Park $45,701.39, Mountain View $121,571.36.
+
+Open questions for Nic (28, sent by email): `~/gam-backups/deploy-1013b/
+questions_for_nic.txt`. Not built (waiting on them): readers in GAM's own
+book, the landlord-books equipment expense for readers, Company-column
+default, hand-typed asset funding question, day-made for automatic changes,
+bank-feed match for a disputed pull's return line.
+
+First bookkeeper invited by Nic 10/13 (Mountain View, full bookkeeping;
+invitation aec4a847, pending). When she accepts, set her money-in filing to
+"May file any deposit" (Nic chose full bookkeeping).
