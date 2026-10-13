@@ -220,6 +220,10 @@ export const INCOME_UTILITY_CATEGORIES = ['electric', 'water', 'sewer', 'gas', '
 export const PLATFORM_REVENUE_TYPES = [
   'banking_spread', 'manual_withdrawal_fee', 'placement_fee_share',
   'platform_fee_subscription', 'screening_margin', 'adjustment', 'flexpay_subscription',
+  // 10/12 (Nic): a card reader's markup — what GAM charged the landlord less
+  // GAM's actual cost of the reader. Only the markup is earnings; the cost
+  // part of the payments is GAM's money coming back (readerOrderMoney).
+  'device_markup',
 ] as const
 export type PlatformRevenueTypeValue = typeof PLATFORM_REVENUE_TYPES[number]
 

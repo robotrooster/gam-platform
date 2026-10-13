@@ -58,12 +58,38 @@ function roundHalfEvenCents(amount: number): number {
 }
 
 /**
- * Date the initial late fee should fire (exclusive grace).
+ * Date the initial late fee should fire: the first late day.
  * Late fee fires when CURRENT_DATE >= dueDate + graceDays.
  * Example: dueDate '2026-05-01', graceDays 5 → '2026-05-06'.
+ *
+ * 10/12 (Nic): with a grace of 0 the NEXT day is late — paying on the due date
+ * is on time — so the first late day is never the due date itself:
+ * dueDate + max(grace, 1), the same day as the lateness rule every screen uses
+ * (apps/api services/lateness firstLateDay). `dueDate` is the day lateness
+ * starts: the due date, or the day GAM wrote the bill when that is later.
  */
 export function lateFeeStartDate(dueDate: string, graceDays: number): string {
-  return addDaysISO(dueDate, graceDays);
+  return addDaysISO(dueDate, Math.max(Math.trunc(graceDays), 1));
+}
+
+/**
+ * `n` accrual periods after `anchor`: n days, n weeks, or the same day of the
+ * month n months on (clamped to the month's last day, counted from the anchor
+ * so a 31st stays a 31st where the month has one).
+ */
+export function addAccrualPeriods(anchor: string, period: LateFeeAccrualPeriod, n: number): string {
+  if (period === 'daily') {
+    return addDaysISO(anchor, n);
+  }
+  if (period === 'weekly') {
+    return addDaysISO(anchor, n * 7);
+  }
+  const { y, m, d } = parseISODate(anchor);
+  const totalMonths = (m - 1) + n;
+  const targetY = y + Math.floor(totalMonths / 12);
+  const targetM = (totalMonths % 12) + 1;
+  const targetD = Math.min(d, daysInMonth(targetY, targetM));
+  return formatISODate(targetY, targetM, targetD);
 }
 
 /**
@@ -94,19 +120,7 @@ export function nextAccrualDate(
   const anchor = accrualFrom === 'grace_end' ? lateFeeStartDate(dueDate, graceDays) : dueDate;
   // due_date_inclusive counts the anchor day itself as occurrence 1.
   const n = accrualFrom === 'due_date_inclusive' ? occurrenceIndex - 1 : occurrenceIndex;
-  if (period === 'daily') {
-    return addDaysISO(anchor, n);
-  }
-  if (period === 'weekly') {
-    return addDaysISO(anchor, n * 7);
-  }
-  // monthly — calendar-exact with last-day clamp on anchor day
-  const { y, m, d } = parseISODate(anchor);
-  const totalMonths = (m - 1) + n;
-  const targetY = y + Math.floor(totalMonths / 12);
-  const targetM = (totalMonths % 12) + 1;
-  const targetD = Math.min(d, daysInMonth(targetY, targetM));
-  return formatISODate(targetY, targetM, targetD);
+  return addAccrualPeriods(anchor, period, n);
 }
 
 /**
