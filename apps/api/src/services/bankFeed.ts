@@ -328,8 +328,9 @@ export async function upsertTransactions(
   // S655 (Step 12): deposits already matched to a tenant's bills that the bank
   // has now voided — both sides are told once this sync commits.
   const voidedMatched: string[] = []
-  // 10/13 (Nic): lines filed as a new expense that the bank voided — their
-  // expenses were voided with them; the owner is told once this sync commits.
+  // 10/13 (Nic): lines filed as a new expense (or, a deposit, as other
+  // income) that the bank voided — their expenses or income were voided with
+  // them; the owner is told once this sync commits.
   const voidedFiled: string[] = []
   const client = await getClient()
   try {
@@ -520,7 +521,8 @@ async function followTheBank(
       // tells the landlord the bank voided something they already filed.
       // 10/13 (Nic): a line filed as a new expense is the exception — its
       // expense is voided too and the line set aside (voidFiledLinePayments),
-      // and the owner is told once the sync commits (voidedFiled).
+      // and the owner is told once the sync commits (voidedFiled). So is a
+      // deposit filed as other income: its income is voided too.
       await client.query(`UPDATE bank_transactions SET bank_status = 'void', updated_at = now() WHERE id = $1`, [s.id])
       if (s.status === 'categorized' || s.status === 'matched') {
         logger.warn({ transactionId: s.id, status: s.status }, '[bank-feed] the bank voided a transaction that was already filed')
@@ -568,7 +570,8 @@ async function followTheBank(
  * aside as the bank's void (bankMoneyOut voidExpensesOfBankVoidedLine) — it
  * used to stay, owed again, with the line filed and flagged until the owner
  * undid it on the Bank page. A payment recorded by hand that the line had
- * cleared (a check) goes back to waiting for its bank line.
+ * cleared (a check) goes back to waiting for its bank line. 10/13 (Nic): a
+ * DEPOSIT filed as other income is voided the same way (voidIncomeOfBankVoidedLine).
  */
 async function voidFiledLinePayments(client: PoolClient, lineId: string): Promise<boolean> {
   await client.query(
@@ -582,7 +585,67 @@ async function voidFiledLinePayments(client: PoolClient, lineId: string): Promis
   // too (kept on record as voided)." The expenses the filing made are voided
   // and the line is set aside as the bank's void (services/bankMoneyOut).
   const { voidExpensesOfBankVoidedLine } = await import('./bankMoneyOut')
-  return (await voidExpensesOfBankVoidedLine(client, lineId)).released
+  if ((await voidExpensesOfBankVoidedLine(client, lineId)).released) return true
+  // 10/13 (Nic): "Bank void of a deposit filed as other income → VOID the
+  // income record too" — same as expenses.
+  return (await voidIncomeOfBankVoidedLine(client, lineId)).released
+}
+
+/**
+ * 10/13 (Nic): "Bank void of a deposit filed as other income → VOID the income
+ * record too" (kept on record as voided), the way a line filed as a new
+ * expense is (bankMoneyOut voidExpensesOfBankVoidedLine). A deposit the bank
+ * voided never came in, so the income the Bank page filed it as — one
+ * category by the owner, one the feed filed by itself (an auto-file rule), or
+ * the parts of a split — is voided in the sync's own transaction: status
+ * 'voided' with the day, never deleted, each stamped with the line it came
+ * from (bank_transaction_id). The line is set aside as the bank's void
+ * ('ignored', 'bank_void'), where undoing a bank-voided filing puts it
+ * (undoFiling, undoAutoFile, undoSplit), with what was voided on the line
+ * (BANK_VOIDED_FILING_MARK: was, incomeIds, and the rule of a filing the feed
+ * made by itself). The owner is told once the sync commits
+ * (bankMoneyOut tellOwnerBankVoidedFiling). It used to stay filed and flagged
+ * on the Bank page, the income still counted.
+ *
+ * Only a line FILED on the Bank page: a deposit matched to money GAM has on
+ * record (a tenant's rent, a deposit slip) has its own void handling. Runs in
+ * the caller's transaction with the line locked (the sync).
+ */
+export async function voidIncomeOfBankVoidedLine(client: Pick<PoolClient, 'query'>, lineId: string):
+  Promise<{ voided: number; released: boolean }> {
+  const t = (await client.query<{
+    id: string; landlord_id: string; status: string; bank_status: string | null; expense_id: string | null
+    landlord_other_income_id: string | null; auto_filed_rule_id: string | null
+  }>(
+    `SELECT id, landlord_id, status, bank_status, expense_id, landlord_other_income_id, auto_filed_rule_id
+       FROM bank_transactions WHERE id = $1`, [lineId])).rows[0]
+  if (!t || t.status !== 'categorized' || t.bank_status !== 'void' || t.expense_id) return { voided: 0, released: false }
+  // The one-category filing's income (by the owner or by itself), and a split's parts (they name the line).
+  const live = (await client.query<{ id: string }>(
+    `SELECT id FROM landlord_other_income
+      WHERE landlord_id = $1 AND (id = $2::uuid OR bank_transaction_id = $3) AND status = 'active'
+      ORDER BY created_at, id
+      FOR UPDATE`, [t.landlord_id, t.landlord_other_income_id, t.id])).rows.map(r => r.id)
+  if (!live.length) return { voided: 0, released: false }
+  const v = await client.query(
+    `UPDATE landlord_other_income
+        SET status = 'voided', voided_at = now(), bank_transaction_id = COALESCE(bank_transaction_id, $2), updated_at = now()
+      WHERE id = ANY($1::uuid[]) AND status = 'active'`, [live, t.id])
+  const { BANK_VOIDED_FILING_MARK } = await import('./bankMoneyOut')
+  const mark = {
+    at: new Date().toISOString(), by: null,
+    was: t.auto_filed_rule_id ? 'auto_filed' : t.landlord_other_income_id ? 'one_category' : 'split',
+    incomeIds: live,
+    ...(t.auto_filed_rule_id ? { ruleId: t.auto_filed_rule_id } : {}),
+  }
+  await client.query(
+    `UPDATE bank_transactions
+        SET status = 'ignored', ignored_reason = 'bank_void', landlord_other_income_id = NULL, categorized_at = NULL,
+            auto_filed_rule_id = NULL, auto_filed_at = NULL,
+            auto_settle_undo = COALESCE(auto_settle_undo, '{}'::jsonb) || jsonb_build_object('${BANK_VOIDED_FILING_MARK}', $2::jsonb),
+            updated_at = now()
+      WHERE id = $1`, [t.id, JSON.stringify(mark)])
+  return { voided: v.rowCount ?? 0, released: true }
 }
 
 /**

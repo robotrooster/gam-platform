@@ -86,7 +86,8 @@ stayCheckOutRouter.get('/:unitId/bookings/:bookingId/check-out', requirePerm(...
     // the landlord's choice — take it off or keep it owed — asked here, before
     // the check-out, and answered with it (pastEndAttempted on the POST).
     // 10/13 (Nic): "Take those charges off" is offered to the owner and a
-    // manager with the booking permission only (lib/stayShortenedVoid).
+    // property manager with the booking permission only — "not on-site staff"
+    // (lib/stayShortenedVoid).
     const ask = !quote.checkedOut && quote.leftOn
       ? await pastEndAttemptedCharges(b.id, checkOutForLeftDay(quote.checkIn, quote.leftOn)) : null
     const offer = shortenedChoicesFor(req.user)
@@ -130,7 +131,8 @@ stayCheckOutRouter.post('/:unitId/bookings/:bookingId/check-out', requirePerm(..
               charges: ask.lines, choices: offer.choices, voidRefused: offer.voidRefused,
             })
           }
-          // 10/13 (Nic): 'void' is the owner's and a booking manager's — refused before anything is written.
+          // 10/13 (Nic): 'void' is the owner's and a property manager's with the
+          // booking permission (never on-site staff) — refused before anything is written.
           assertMayAnswerShortened(req.user, choice)
           await recordStayShortenedChoice({ bookingId: b.id, asked: ask, choice, chosenBy: req.user!.userId })
         }

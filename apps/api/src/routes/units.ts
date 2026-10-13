@@ -3608,7 +3608,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       if (shortenedAsk) {
         shortenedChoice = stayShortenedChoiceIn(req.body?.pastEndAttempted)
         // 10/13 (Nic): "void the cancelled nights: owner + managers with
-        // booking permission" (lib/stayShortenedVoid). Anybody else is offered
+        // booking permission" — "OWNER + PROPERTY MANAGERS only (not on-site
+        // staff)" (lib/stayShortenedVoid). Anybody else is offered
         // "Keep them owed" only, and a 'void' they send is refused here,
         // before anything is written.
         if (!shortenedChoice) {

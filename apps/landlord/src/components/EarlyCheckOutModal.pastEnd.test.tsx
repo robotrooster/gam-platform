@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 /**
  * 10/13 (Nic): "void the cancelled nights: owner + managers with booking
- * permission." The Check out window asks about rent a payment was tried on
+ * permission" — "OWNER + PROPERTY MANAGERS only (not on-site staff)." The
+ * Check out window asks about rent a payment was tried on
  * past the day they left with only the answers the server offered: somebody
  * who may not take the charges off sees "Keep them owed" alone, with the
  * server's reason why; the owner sees both. A quote that names no answers
@@ -32,7 +33,7 @@ vi.mock('../lib/api', () => ({
 
 import { EarlyCheckOutModal } from './EarlyCheckOutModal'
 
-const REFUSED = 'Only the owner, or a manager who can edit reservations, can take those charges off.'
+const REFUSED = 'Only the owner, or a property manager who can edit reservations, can take those charges off.'
 
 function quote(pastEnd: any) {
   return {

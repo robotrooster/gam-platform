@@ -12,6 +12,9 @@
  * failed pull — its own $6 is voided (GAM's price is for a transfer that
  * collects) and what it cost GAM at Stripe (its fee on the pull and the
  * dispute fee) is billed to the landlord at cost.
+ *
+ * 10/13 (Nic, afternoon): "Won GAM pull dispute: AUTOMATIC (back to collected;
+ * anything collected twice credited back). Dispute fee unknown → bill $15."
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -47,10 +50,14 @@ vi.mock('../lib/stripe', async (orig) => ({
 import { webhooksRouter } from './webhooks'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
-import { chargeLandlord, outstandingForLandlord } from '../services/landlordGamAccount'
 import {
-  debitLandlordForCharges, handleGamDebitDispute, readDisputedPullCosts, runGamDebitSweep,
-  GAM_DEBIT_DISPUTE_COST_SOURCE, GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY,
+  chargeLandlord, outstandingForLandlord, voidGamCharge, netAgainstDisbursement, recordGamChargeCollections, type GamChargeTake,
+} from '../services/landlordGamAccount'
+import {
+  debitLandlordForCharges, handleGamDebitDispute, readDisputedPullCosts, runGamDebitSweep, applyWonGamDebitDisputes,
+  disputeCostRebillSourceId, gamDebitWonGiveBackSourceId, gamChargeVoidedGiveBackSourceId, gamChargeVoidedTakeBackSourceId,
+  GAM_DEBIT_DISPUTE_COST_SOURCE, GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY, GAM_DEBIT_DISPUTE_FEE_ASSUMED_CATEGORY,
+  GAM_DEBIT_DISPUTE_FEE_CORRECTED_CATEGORY, GAM_DEBIT_DISPUTE_WON_CATEGORY, STRIPE_USUAL_DISPUTE_FEE_CENTS,
 } from '../services/landlordGamDebit'
 
 function buildApp() {
@@ -64,6 +71,9 @@ const post = (body: unknown) => request(buildApp()).post('/webhooks/stripe')
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  // 10/13: a won dispute reads what Stripe gave back of its fee from the
+  // dispute's stored webhooks too; every test here reuses one dispute id.
+  await db.query(`TRUNCATE stripe_webhook_events`)
   stripeCreate.mockClear()
   stripeRetrieve.mockClear()
   disputeRetrieve.mockReset()
@@ -126,6 +136,96 @@ const revenue = async (debitId: string) => (await db.query<any>(
   [debitId])).rows
 const notices = async (category: string) => (await db.query<any>(
   `SELECT severity, title, body, context FROM admin_notifications WHERE category = $1 ORDER BY created_at`, [category])).rows
+/** 10/13: the dispute fee inside the bill, and whether it is Stripe's word or the $15 in its place. */
+const feeRow = async (id: string) => (await db.query<any>(
+  `SELECT dispute_fee_amount::float AS fee, dispute_fee_assumed_at IS NOT NULL AS assumed, dispute_fee_stated_at IS NOT NULL AS stated,
+          dispute_cost_amount::float AS cost, dispute_cost_charge_id
+     FROM landlord_gam_debits WHERE id = $1`, [id])).rows[0]
+/** 10/13: what a win did. */
+const wonRow = async (id: string) => (await db.query<any>(
+  `SELECT status, disputed_at IS NOT NULL AS disputed, dispute_won_at IS NOT NULL AS won,
+          dispute_won_restored_amount::float AS restored, dispute_won_given_back_amount::float AS given_back,
+          dispute_cost_amount::float AS cost, dispute_cost_charge_id
+     FROM landlord_gam_debits WHERE id = $1`, [id])).rows[0]
+/** What GAM holds to pay the landlord on their next payout. */
+const held = async (landlordId: string) => (await db.query<any>(
+  `SELECT source_type, source_id, amount::float AS amount, payout_intent_id FROM held_payout_items WHERE landlord_id = $1 ORDER BY source_id`,
+  [landlordId])).rows
+/** Payout lines in a fixed order (byte order, not the database's collation). */
+const sortedBySource = <T extends { source_id: string }>(xs: T[]): T[] =>
+  [...xs].sort((a, b) => (a.source_id < b.source_id ? -1 : a.source_id > b.source_id ? 1 : 0))
+/** The live charges billing what a dispute cost (one at a time). */
+const liveCostCharges = async (landlordId: string) => (await db.query<any>(
+  `SELECT id, amount::float AS amount, source_id FROM landlord_gam_charges
+    WHERE landlord_id = $1 AND source_type = $2 AND voided_at IS NULL`, [landlordId, GAM_DEBIT_DISPUTE_COST_SOURCE])).rows
+/** The event that carries the win; Stripe gives back `returnedFee` of its $15 with it. */
+const wonEvent = (o: { id?: string; returnedFee?: number; pi?: string; cents?: number } = {}) => {
+  const pi = o.pi ?? 'pi_gam_pull_sep'
+  const cents = o.cents ?? 5400
+  return {
+    id: o.id ?? (pi === 'pi_gam_pull_sep' ? 'evt_won' : `evt_won_${pi}`), type: 'charge.dispute.closed',
+    data: { object: { id: `du_${pi}`, object: 'dispute', charge: `ch_${pi}`, payment_intent: pi,
+      amount: cents, currency: 'usd', status: 'won', reason: 'fraudulent',
+      balance_transactions: [{ amount: -cents, fee: 1500 }, { amount: cents, fee: -(o.returnedFee ?? 1500) }] } },
+  }
+}
+/** The next pull (pi_next_pull) settles. */
+async function settleNextPull(): Promise<string> {
+  const nextId = (await db.query<{ id: string }>(`SELECT id FROM landlord_gam_debits WHERE stripe_payment_intent_id = 'pi_next_pull'`)).rows[0].id
+  const ok = await post({
+    id: 'evt_ok_next', type: 'payment_intent.succeeded',
+    data: { object: { id: 'pi_next_pull', metadata: { gam_debit_id: nextId }, payment_method_types: ['us_bank_account'] } },
+  })
+  expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+  return nextId
+}
+/**
+ * 10/13 (migration 20261015180000): per charge, the collections of pulls not
+ * disputed (or whose dispute GAM won) and of payouts, less what a win gave back
+ * for it as collected twice, = what it has collected.
+ */
+async function expectCollectionsTie(landlordId: string) {
+  const tie = (await db.query<any>(
+    `SELECT c.id, c.collected_amount::float AS collected,
+            (COALESCE((SELECT SUM(col.amount) FROM landlord_gam_charge_collections col
+                         LEFT JOIN landlord_gam_debits d ON d.id = col.landlord_gam_debit_id
+                        WHERE col.charge_id = c.id AND (d.id IS NULL OR d.disputed_at IS NULL OR d.dispute_won_at IS NOT NULL)), 0)
+             - COALESCE((SELECT SUM(h.amount) FROM held_payout_items h
+                          WHERE h.source_type = 'refund' AND h.source_id LIKE 'gam_debit_dispute_won:%:' || c.id::text), 0))::float AS live
+       FROM landlord_gam_charges c WHERE c.landlord_id = $1`, [landlordId])).rows
+  for (const r of tie) expect(r.collected, r.id).toBe(r.live)
+  // 10/13 review: a voided charge's collected_amount is given back whole, net
+  // of what a later dispute of the pull that collected it took back.
+  const voided = (await db.query<any>(
+    `SELECT c.id, c.collected_amount::float AS collected,
+            COALESCE((SELECT SUM(h.amount) FROM held_payout_items h
+                       WHERE h.source_type = 'refund'
+                         AND (h.source_id = 'gam_charge_voided:' || c.id::text
+                              OR (split_part(h.source_id, ':', 1) = 'gam_charge_voided_taken_back'
+                                  AND split_part(h.source_id, ':', 3) = c.id::text))), 0)::float AS given_back
+       FROM landlord_gam_charges c WHERE c.landlord_id = $1 AND c.voided_at IS NOT NULL`, [landlordId])).rows
+  for (const r of voided) expect(Math.round(r.given_back * 100), r.id).toBe(Math.round(r.collected * 100))
+}
+
+/**
+ * 10/13 review ("every dollar counted once"): what the landlord has paid GAM —
+ * every pull that stands (not disputed, or won back) and what payouts kept —
+ * less every payout line GAM holds for them (given back, or taken back), plus
+ * what they still owe, = every live charge. Nothing paid twice, nothing lost.
+ */
+async function expectEveryDollarOnce(landlordId: string) {
+  const r = (await db.query<any>(
+    `SELECT (SELECT COALESCE(SUM(total_amount), 0) FROM landlord_gam_debits
+              WHERE landlord_id = $1 AND status = 'succeeded' AND (disputed_at IS NULL OR dispute_won_at IS NOT NULL))::float AS pulled,
+            (SELECT COALESCE(SUM(col.amount), 0) FROM landlord_gam_charge_collections col
+               JOIN landlord_gam_charges c ON c.id = col.charge_id
+              WHERE c.landlord_id = $1 AND col.platform_transfer_intent_id IS NOT NULL)::float AS netted,
+            (SELECT COALESCE(SUM(amount), 0) FROM held_payout_items WHERE landlord_id = $1)::float AS held,
+            (SELECT COALESCE(SUM(amount), 0) FROM landlord_gam_charges WHERE landlord_id = $1 AND voided_at IS NULL)::float AS live`,
+    [landlordId])).rows[0]
+  const owed = await outstandingForLandlord(landlordId)
+  expect(Math.round((r.pulled + r.netted - r.held + owed) * 100)).toBe(Math.round(r.live * 100))
+}
 
 describe('the landlord\'s bank disputes a pull of GAM\'s fees', () => {
   it('the fees are owed again, the pull\'s own $6 is voided, what it cost GAM at Stripe is billed at cost, and an admin is told — never "a charge GAM cannot place"', async () => {
@@ -220,31 +320,143 @@ describe('the landlord\'s bank disputes a pull of GAM\'s fees', () => {
     expect(await pullRow(p.debitId)).toMatchObject({ reopened: 48, cost: 15.27, cost_read: true })
   })
 
-  it('a cost Stripe has not said is read by the nightly sweep; still unread after three days, an admin is told once', async () => {
+  it('a cost Stripe has not said is read by the nightly sweep once Stripe says it', async () => {
     const p = await settledPull()
     expect((await post(dispute('pi_gam_pull_sep', 5400, { fee: 0 }))).status).toBe(200)
     expect(await outstandingForLandlord(p.landlordId)).toBe(48)
 
-    // The first night: still nothing from Stripe, and too soon to tell anyone.
+    // The first night: still nothing from Stripe, and too soon to bill anything in its place.
     expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
     expect(await notices(GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY)).toEqual([])
-
-    // Three days on, Stripe still silent: an admin is told — once.
-    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
-    await readDisputedPullCosts()
-    await readDisputedPullCosts()
-    const told = await notices(GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY)
-    expect(told).toHaveLength(1)
-    expect(told[0].context).toMatchObject({ debit_id: p.debitId, stripe_dispute_id: 'du_pi_gam_pull_sep' })
+    expect(await notices(GAM_DEBIT_DISPUTE_FEE_ASSUMED_CATEGORY)).toEqual([])
 
     // Stripe says its fee: the nightly sweep (runGamDebitSweep) bills it at cost.
     disputeRetrieve.mockImplementation(async (id: string) => ({ id, balance_transactions: [{ amount: -5400, fee: 1500 }] }))
     await runGamDebitSweep()
     expect(await pullRow(p.debitId)).toMatchObject({ cost: 15.27, cost_read: true })
+    expect(await feeRow(p.debitId)).toMatchObject({ fee: 15, assumed: false, stated: true })
     const owed = (await db.query<any>(
       `SELECT amount::float AS amount FROM landlord_gam_charges WHERE source_type = $1 AND source_id = $2`,
       [GAM_DEBIT_DISPUTE_COST_SOURCE, p.debitId])).rows
     expect(owed).toEqual([{ amount: 15.27 }])
+  })
+
+  // 10/13 (Nic, afternoon): "Dispute fee unknown → bill $15."
+  it('Stripe never states its dispute fee: three days on, $15 (its usual fee) is billed with its fee on the pull, once, and an admin is told', async () => {
+    expect(STRIPE_USUAL_DISPUTE_FEE_CENTS).toBe(1500)
+    const p = await settledPull()
+    expect((await post(dispute('pi_gam_pull_sep', 5400, { fee: 0 }))).status).toBe(200)
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(48)
+
+    // Three days on, Stripe still silent: $15 in its place, with Stripe's $0.27 on the pull.
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 1 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(63.27)
+    expect(await feeRow(p.debitId)).toMatchObject({ fee: 15, assumed: true, stated: false, cost: 15.27 })
+    const billed = (await db.query<any>(
+      `SELECT kind, amount::float AS amount, source_id, notes FROM landlord_gam_charges WHERE id = $1`,
+      [(await feeRow(p.debitId)).dispute_cost_charge_id])).rows[0]
+    expect(billed).toMatchObject({ kind: 'bank_debit_failed_cost', amount: 15.27, source_id: p.debitId })
+    expect(billed.notes).toContain('$15 — Stripe\'s usual dispute fee, as Stripe has not stated its own')
+    // Told once — and it was billed, so the "could not be read" notice is not raised.
+    const told = await notices(GAM_DEBIT_DISPUTE_FEE_ASSUMED_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].severity).toBe('info')
+    expect(told[0].context).toMatchObject({ debit_id: p.debitId, stripe_dispute_id: 'du_pi_gam_pull_sep', cost_billed: 15.27 })
+    expect(await notices(GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY)).toEqual([])
+
+    // The next nights, Stripe still silent: asked again, never billed twice, told once.
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(63.27)
+    expect(await liveCostCharges(p.landlordId)).toHaveLength(1)
+    expect(await notices(GAM_DEBIT_DISPUTE_FEE_ASSUMED_CATEGORY)).toHaveLength(1)
+
+    // Stripe states $15 after all: nothing to correct, and it stops asking.
+    disputeRetrieve.mockImplementation(async (id: string) => ({ id, balance_transactions: [{ amount: -5400, fee: 1500 }] }))
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    expect(await feeRow(p.debitId)).toMatchObject({ fee: 15, assumed: true, stated: true, cost: 15.27, dispute_cost_charge_id: expect.any(String) })
+    expect(await liveCostCharges(p.landlordId)).toEqual([expect.objectContaining({ amount: 15.27, source_id: p.debitId })])
+    expect((await db.query(`SELECT 1 FROM landlord_gam_charges WHERE landlord_id = $1 AND voided_at IS NOT NULL AND void_reason <> 'bank_debit_failed'`, [p.landlordId])).rowCount).toBe(0)
+    expect(await notices(GAM_DEBIT_DISPUTE_FEE_CORRECTED_CATEGORY)).toEqual([])
+    expect(await readDisputedPullCosts()).toEqual({ considered: 0, read: 0 })
+  })
+
+  it('Stripe later states a different fee: the $15 bill is voided and replaced by one at Stripe\'s fee — never both owed', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400, { fee: 0 }))
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
+    await readDisputedPullCosts()
+    const first = (await feeRow(p.debitId)).dispute_cost_charge_id
+    expect(await outstandingForLandlord(p.landlordId)).toBe(63.27)
+
+    disputeRetrieve.mockImplementation(async (id: string) => ({ id, balance_transactions: [{ amount: -5400, fee: 2000 }] }))
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    // The $15 bill, voided (kept on record); Stripe's $20 with its $0.27 on the pull, billed instead.
+    const old = await charge(first)
+    expect(old).toMatchObject({ amount: 15.27, collected: 0, void_reason: 'dispute_cost_rebilled' })
+    expect(old.voided_at).not.toBeNull()
+    const now = await feeRow(p.debitId)
+    expect(now).toMatchObject({ fee: 20, assumed: true, stated: true, cost: 20.27 })
+    expect(now.dispute_cost_charge_id).not.toBe(first)
+    expect(await liveCostCharges(p.landlordId)).toEqual([
+      { id: now.dispute_cost_charge_id, amount: 20.27, source_id: disputeCostRebillSourceId(p.debitId, 'stated') }])
+    expect(await outstandingForLandlord(p.landlordId)).toBe(68.27)
+    expect(await held(p.landlordId)).toEqual([])
+    const told = await notices(GAM_DEBIT_DISPUTE_FEE_CORRECTED_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].context).toMatchObject({ was: 15.27, now: 20.27, stated_fee: 20 })
+
+    // Asked again (a sweep, a redelivered event): nothing more.
+    expect(await readDisputedPullCosts()).toEqual({ considered: 0, read: 0 })
+    expect((await post(dispute('pi_gam_pull_sep', 5400, { type: 'charge.dispute.updated', eventId: 'evt_upd20', fee: 2000 }))).status).toBe(200)
+    expect(await liveCostCharges(p.landlordId)).toHaveLength(1)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(68.27)
+  })
+
+  it('the $15 already collected when an event states $10: given back on the next payout, and $10.27 billed — Stripe\'s fee paid once', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400, { fee: 0 }))
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
+    await readDisputedPullCosts()
+    const first = (await feeRow(p.debitId)).dispute_cost_charge_id
+    // The next pull collects the reopened $48 and the $15.27.
+    expect(await debitLandlordForCharges(p.landlordId)).toMatchObject({ status: 'debited', chargesAmount: 63.27, total: 69.27 })
+    await settleNextPull()
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+
+    // A later event states Stripe's fee: $10.
+    expect((await post(dispute('pi_gam_pull_sep', 5400, { type: 'charge.dispute.funds_withdrawn', eventId: 'evt_fw10', fee: 1000 }))).status).toBe(200)
+    const old = await charge(first)
+    expect(old).toMatchObject({ amount: 15.27, collected: 15.27, void_reason: 'dispute_cost_rebilled' })
+    expect(await held(p.landlordId)).toEqual([
+      { source_type: 'refund', source_id: gamChargeVoidedGiveBackSourceId(first), amount: 15.27, payout_intent_id: null }])
+    expect(await feeRow(p.debitId)).toMatchObject({ fee: 10, stated: true, cost: 10.27 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(10.27)
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+  })
+
+  it('Stripe that cannot be read at all for three days: nothing is assumed, an admin is told once', async () => {
+    const p = await settledPull()
+    stripeRetrieve.mockRejectedValueOnce(new Error('Stripe is down'))
+      .mockRejectedValueOnce(new Error('Stripe is down'))
+      .mockRejectedValueOnce(new Error('Stripe is down'))
+    disputeRetrieve.mockImplementation(async (id: string) => ({ id, balance_transactions: [{ amount: -5400, fee: 1500 }] }))
+    expect((await post(dispute('pi_gam_pull_sep', 5400))).status).toBe(200)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(48)
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 0 })
+    const told = await notices(GAM_DEBIT_DISPUTE_COST_UNREAD_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].context).toMatchObject({ debit_id: p.debitId, stripe_dispute_id: 'du_pi_gam_pull_sep' })
+    expect(await notices(GAM_DEBIT_DISPUTE_FEE_ASSUMED_CATEGORY)).toEqual([])
+    expect(await feeRow(p.debitId)).toMatchObject({ fee: null, assumed: false, cost: null })
+    // Readable again: Stripe's own fee is billed, at cost.
+    expect(await readDisputedPullCosts()).toEqual({ considered: 1, read: 1 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(63.27)
   })
 
   it('Stripe unreachable when the dispute comes: the fees still reopen, and what it cost is billed once Stripe can be read', async () => {
@@ -293,29 +505,296 @@ describe('the landlord\'s bank disputes a pull of GAM\'s fees', () => {
     expect(told[0].severity).toBe('critical')
   })
 
-  it('a won dispute is not undone by itself: one critical notice lists what to undo by hand', async () => {
+  // 10/13 (Nic, afternoon): "Won GAM pull dispute: AUTOMATIC (back to
+  // collected; anything collected twice credited back)."
+  it('a won dispute undoes itself: the fees back to collected, the pull\'s $6 too (and back on GAM\'s book), the dispute\'s cost voided; an admin is told, once', async () => {
     const p = await settledPull()
     await post(dispute('pi_gam_pull_sep', 5400))
-    const won = {
-      id: 'evt_won', type: 'charge.dispute.closed',
-      data: { object: { id: 'du_pi_gam_pull_sep', object: 'dispute', charge: 'ch_pi_gam_pull_sep', payment_intent: 'pi_gam_pull_sep',
-        amount: 5400, currency: 'usd', status: 'won', reason: 'fraudulent',
-        balance_transactions: [{ amount: -5400, fee: 1500 }, { amount: 5400, fee: -1500 }] } },
-    }
-    expect((await post(won)).status).toBe(200)
-    // Nothing changed by itself.
     expect(await outstandingForLandlord(p.landlordId)).toBe(63.27)
-    expect(await charge(p.cost)).toMatchObject({ void_reason: 'bank_debit_failed' })
-    const told = await notices('gam_debit_dispute_won')
+    const costCharge = (await pullRow(p.debitId)).dispute_cost_charge_id
+
+    expect((await post(wonEvent())).status).toBe(200)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    expect(await charge(p.fee)).toMatchObject({ amount: 48, collected: 48, voided_at: null })
+    // The transfer collected after all: GAM's $6 price for it stands again.
+    expect(await charge(p.cost)).toMatchObject({ amount: 6, collected: 6, voided_at: null, void_reason: null })
+    // Stripe gave its $15 back with the win: what the dispute cost is taken off (kept on record).
+    const voided = await charge(costCharge)
+    expect(voided).toMatchObject({ amount: 15.27, collected: 0, void_reason: 'dispute_won' })
+    expect(voided.voided_at).not.toBeNull()
+    expect(await wonRow(p.debitId)).toMatchObject({
+      status: 'succeeded', disputed: true, won: true, restored: 54, given_back: 0, cost: 0, dispute_cost_charge_id: null })
+    expect(await liveCostCharges(p.landlordId)).toEqual([])
+    expect(await held(p.landlordId)).toEqual([])
+    // GAM's book: the $6 taken back with the dispute is put back.
+    expect(await revenue(p.debitId)).toEqual([
+      { type: 'banking_spread', reference_type: 'gam_bank_debit', amount: 6 },
+      { type: 'adjustment', reference_type: 'dispute_spread_reversal', amount: -6 },
+      { type: 'banking_spread', reference_type: 'gam_bank_debit_dispute_won', amount: 6 },
+    ])
+    await expectCollectionsTie(p.landlordId)
+
+    const told = await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)
     expect(told).toHaveLength(1)
-    expect(told[0].severity).toBe('critical')
-    expect(told[0].body).toContain('1. Mark $48.00 of the reopened charges collected again')
-    expect(told[0].body).toContain('2. The pull\'s $6.00 bank transfer cost was voided when the dispute opened')
-    expect(told[0].body).toContain('3. Take $15.00 off what the dispute cost was billed to')
-    expect(told[0].body).toContain('($15.27)')
-    // A redelivery tells nobody again.
-    expect((await post({ ...won, id: 'evt_won_again' })).status).toBe(200)
-    expect(await notices('gam_debit_dispute_won')).toHaveLength(1)
+    expect(told[0].severity).toBe('info')
+    expect(told[0].body).toContain('GAM undid the dispute by itself')
+    expect(told[0].body).toContain('1. The 1 charge it had paid went back to collected ($48.00).')
+    expect(told[0].body).toContain('2. The pull\'s own $6.00 bank transfer cost is collected again')
+    expect(told[0].body).toContain('3. What the dispute cost ($15.27) was taken off.')
+    expect(told[0].context).toMatchObject({ debit_id: p.debitId, restored: 54, collected_twice: 0, cost_was: 15.27, cost_now: 0, fee_returned: 15 })
+
+    // A redelivery, an older event read as won, and the nightly sweep change nothing.
+    expect((await post(wonEvent({ id: 'evt_won_again' }))).status).toBe(200)
+    expect((await post(dispute('pi_gam_pull_sep', 5400, { type: 'charge.dispute.updated', eventId: 'evt_late_upd' }))).status).toBe(200)
+    expect(await applyWonGamDebitDisputes()).toEqual({ considered: 0, applied: 0 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    expect(await revenue(p.debitId)).toHaveLength(3)
+    expect(await held(p.landlordId)).toEqual([])
+    expect(await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)).toHaveLength(1)
+    expect(await handleGamDebitDispute({
+      paymentIntentId: 'pi_gam_pull_sep', stripeDisputeId: 'du_pi_gam_pull_sep', disputeStatus: 'won', eventStatus: 'won',
+      disputedCents: 5400, feeCents: 1500, feeStated: true, feeReturnedCents: 1500,
+    })).toMatchObject({ handled: true, action: 'won', restored: 54, givenBack: 0, costBilled: 0 })
+  })
+
+  it('collected again meanwhile by the next pull: what was collected twice is given back on the landlord\'s next payout, with what was collected on the dispute\'s cost', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    const costCharge = (await pullRow(p.debitId)).dispute_cost_charge_id
+    expect(await debitLandlordForCharges(p.landlordId)).toMatchObject({ status: 'debited', chargesAmount: 63.27, total: 69.27 })
+    await settleNextPull()
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+
+    expect((await post(wonEvent())).status).toBe(200)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    // The $48 was collected by both pulls: given back once.
+    expect(await charge(p.fee)).toMatchObject({ amount: 48, collected: 48 })
+    expect(await charge(p.cost)).toMatchObject({ collected: 6, voided_at: null })
+    expect(await charge(costCharge)).toMatchObject({ collected: 15.27, void_reason: 'dispute_won' })
+    expect(await held(p.landlordId)).toEqual([
+      { source_type: 'refund', source_id: gamChargeVoidedGiveBackSourceId(costCharge), amount: 15.27, payout_intent_id: null },
+      { source_type: 'refund', source_id: gamDebitWonGiveBackSourceId(p.debitId, p.fee), amount: 48, payout_intent_id: null },
+    ].sort((a, b) => a.source_id.localeCompare(b.source_id)))
+    expect(await wonRow(p.debitId)).toMatchObject({ won: true, restored: 6, given_back: 63.27 })
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+    const told = await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].body).toContain('$48.00 had been collected again meanwhile (collected twice); it is given back to')
+    expect(told[0].body).toContain('the $15.27 already collected on it is given back on their next payout')
+
+    // Retried: given back once.
+    expect((await post(wonEvent({ id: 'evt_won_again' }))).status).toBe(200)
+    expect(await held(p.landlordId)).toHaveLength(2)
+  })
+
+  it('a later pull still settling holds the win back (that money is on its way); the nightly sweep undoes it once that pull settles', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    expect(await debitLandlordForCharges(p.landlordId)).toMatchObject({ status: 'debited', total: 69.27 })
+
+    const res = await post(wonEvent())
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(await wonRow(p.debitId)).toMatchObject({ won: false, restored: null, given_back: null })
+    expect(await charge(p.fee)).toMatchObject({ collected: 0 })
+    expect(await charge(p.cost)).toMatchObject({ void_reason: 'bank_debit_failed' })
+    expect(await held(p.landlordId)).toEqual([])
+    expect(await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)).toEqual([])
+    // Still settling the next night: still waiting.
+    expect(await applyWonGamDebitDisputes()).toEqual({ considered: 1, applied: 0 })
+
+    await settleNextPull()
+    expect(await applyWonGamDebitDisputes()).toEqual({ considered: 1, applied: 1 })
+    expect(await wonRow(p.debitId)).toMatchObject({ won: true, restored: 6, given_back: 63.27 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    await expectCollectionsTie(p.landlordId)
+    expect(await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)).toHaveLength(1)
+    expect(await applyWonGamDebitDisputes()).toEqual({ considered: 0, applied: 0 })
+  })
+
+  it('Stripe kept its dispute fee with the win: only that stays the landlord\'s, billed at cost on its own (Nic G1)', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    const costCharge = (await pullRow(p.debitId)).dispute_cost_charge_id
+    expect((await post(wonEvent({ returnedFee: 0 }))).status).toBe(200)
+    expect(await charge(costCharge)).toMatchObject({ void_reason: 'dispute_won' })
+    const now = await wonRow(p.debitId)
+    expect(now).toMatchObject({ won: true, restored: 54, cost: 15 })
+    expect(await liveCostCharges(p.landlordId)).toEqual([
+      { id: now.dispute_cost_charge_id, amount: 15, source_id: disputeCostRebillSourceId(p.debitId, 'won_stated') }])
+    expect(await outstandingForLandlord(p.landlordId)).toBe(15)
+    await expectEveryDollarOnce(p.landlordId)
+    expect((await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY))[0].body).toContain('Stripe kept $15.00 of its dispute fee, which stays theirs at cost.')
+  })
+
+  // 10/13 review ("every dollar counted once"): a landlord whose bank disputes
+  // two pulls in a row — the second one paid the first dispute's cost.
+  it('the next pull, which paid the first dispute\'s cost, disputed after GAM won the first: that cost (voided, given back) is never owed again — the bank\'s return of it is taken back from the next payout, once; won too, given back again', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    const costCharge = (await pullRow(p.debitId)).dispute_cost_charge_id
+    expect(await debitLandlordForCharges(p.landlordId)).toMatchObject({ status: 'debited', chargesAmount: 63.27, total: 69.27 })
+    const next = await settleNextPull()
+    expect((await post(wonEvent())).status).toBe(200)
+    // GAM won the first: the $48 collected twice and the $15.27 dispute cost are given back.
+    const afterFirstWin = [
+      { source_type: 'refund', source_id: gamChargeVoidedGiveBackSourceId(costCharge), amount: 15.27, payout_intent_id: null },
+      { source_type: 'refund', source_id: gamDebitWonGiveBackSourceId(p.debitId, p.fee), amount: 48, payout_intent_id: null },
+    ]
+    expect(sortedBySource(await held(p.landlordId))).toEqual(sortedBySource(afterFirstWin))
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+
+    // Then the landlord's bank disputes the next pull ($69.27).
+    const res = await post(dispute('pi_next_pull', 6927))
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    // The $48 is owed again. The voided $15.27 is not — but the bank returned
+    // what the pull paid on it, which was already given back: taken back.
+    expect(await charge(p.fee)).toMatchObject({ collected: 0, voided_at: null })
+    expect(await charge(costCharge)).toMatchObject({ collected: 0, void_reason: 'dispute_won' })
+    expect(await pullRow(next)).toMatchObject({ disputed: true, reopened: 48, cost: 15 })
+    const takenBack = { source_type: 'refund', source_id: gamChargeVoidedTakeBackSourceId(next, costCharge), amount: -15.27, payout_intent_id: null }
+    expect(sortedBySource(await held(p.landlordId))).toEqual(sortedBySource([...afterFirstWin, takenBack]))
+    // Owed: the $48 again, and what the second dispute cost ($15; Stripe's fee on this pull reads $0 here).
+    expect(await outstandingForLandlord(p.landlordId)).toBe(63)
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+    const told = (await notices('gam_debit_disputed')).filter((n: any) => n.context.stripe_dispute_id === 'du_pi_next_pull')
+    expect(told).toHaveLength(1)
+    expect(told[0].body).toContain('The 1 charge it paid ($48.00) is owed by')
+    expect(told[0].body).toContain('$15.27 it paid on a fee GAM has since taken off had already been given back')
+    expect(told[0].body).toContain('so it is taken back from their next payout')
+    expect(told[0].context).toMatchObject({ reopened: 48, charges: 1, taken_back: 15.27 })
+
+    // Redelivered, or a later update: taken back once.
+    expect((await post(dispute('pi_next_pull', 6927, { type: 'charge.dispute.updated', eventId: 'evt_next_upd' }))).status).toBe(200)
+    expect(await held(p.landlordId)).toHaveLength(3)
+    await expectEveryDollarOnce(p.landlordId)
+
+    // GAM wins that one too: the pull stands again, so what it paid on the
+    // voided cost is given back again — once in all.
+    expect((await post(wonEvent({ pi: 'pi_next_pull', cents: 6927 }))).status).toBe(200)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    expect(await charge(p.fee)).toMatchObject({ collected: 48 })
+    expect(sortedBySource(await held(p.landlordId))).toEqual(sortedBySource([...afterFirstWin, takenBack,
+      { source_type: 'refund', source_id: gamDebitWonGiveBackSourceId(next, costCharge), amount: 15.27, payout_intent_id: null }]))
+    expect(await wonRow(next)).toMatchObject({ won: true, restored: 54, given_back: 15.27 })
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+    const won = (await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)).filter((n: any) => n.context.stripe_dispute_id === 'du_pi_next_pull')
+    expect(won).toHaveLength(1)
+    expect(won[0].body).toContain('$15.27 it had paid on fees taken off since is given back')
+    expect(won[0].body).not.toContain('collected twice')
+    expect(won[0].context).toMatchObject({ collected_twice: 0, voided_given_back: 15.27 })
+  })
+
+  it('the next pull paid the $15 that Stripe\'s stated fee later replaced, then was disputed: the replaced bill (voided, given back) is never owed again — its give-back is taken back', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400, { fee: 0 }))
+    await db.query(`UPDATE landlord_gam_debits SET disputed_at = NOW() - INTERVAL '4 days' WHERE id = $1`, [p.debitId])
+    await readDisputedPullCosts()
+    const first = (await feeRow(p.debitId)).dispute_cost_charge_id
+    expect(await debitLandlordForCharges(p.landlordId)).toMatchObject({ status: 'debited', chargesAmount: 63.27, total: 69.27 })
+    const next = await settleNextPull()
+    // Stripe states $10: the $15.27 bill is voided and given back; $10.27 billed in its place.
+    expect((await post(dispute('pi_gam_pull_sep', 5400, { type: 'charge.dispute.funds_withdrawn', eventId: 'evt_fw10', fee: 1000 }))).status).toBe(200)
+    expect(await charge(first)).toMatchObject({ collected: 15.27, void_reason: 'dispute_cost_rebilled' })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(10.27)
+    await expectEveryDollarOnce(p.landlordId)
+
+    // The landlord's bank disputes the next pull.
+    expect((await post(dispute('pi_next_pull', 6927))).status).toBe(200)
+    expect(await charge(first)).toMatchObject({ collected: 0, void_reason: 'dispute_cost_rebilled' })
+    expect(await pullRow(next)).toMatchObject({ disputed: true, reopened: 48 })
+    expect(sortedBySource(await held(p.landlordId))).toEqual(sortedBySource([
+      { source_type: 'refund', source_id: gamChargeVoidedGiveBackSourceId(first), amount: 15.27, payout_intent_id: null },
+      { source_type: 'refund', source_id: gamChargeVoidedTakeBackSourceId(next, first), amount: -15.27, payout_intent_id: null },
+    ]))
+    // Owed: the $48 again, Stripe's stated $10.27 on the first dispute, and $15 on the second.
+    expect(await outstandingForLandlord(p.landlordId)).toBe(73.27)
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+  })
+
+  it('a fee taken off while the dispute is open: the win gives back what the pull paid on it — nobody owes it, and it is not "collected twice"', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    // The reopened $48 is taken off (nothing is collected on it now; any reason a GAM charge is voided).
+    expect(await voidGamCharge(null, p.fee, 'screening_payment_taken_back')).toBe(true)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(15.27)
+
+    expect((await post(wonEvent())).status).toBe(200)
+    expect(await charge(p.fee)).toMatchObject({ collected: 0, void_reason: 'screening_payment_taken_back' })
+    expect(await held(p.landlordId)).toEqual([
+      { source_type: 'refund', source_id: gamDebitWonGiveBackSourceId(p.debitId, p.fee), amount: 48, payout_intent_id: null }])
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    expect(await wonRow(p.debitId)).toMatchObject({ won: true, restored: 6, given_back: 48 })
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+    const told = await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].body).toContain('$48.00 it had paid on fees taken off since is given back')
+    expect(told[0].body).not.toContain('collected twice')
+    expect(told[0].context).toMatchObject({ collected_twice: 0, voided_given_back: 48 })
+  })
+
+  it('collected again meanwhile by a payout, not a pull: what was collected twice is given back the same way', async () => {
+    const p = await settledPull()
+    await post(dispute('pi_gam_pull_sep', 5400))
+    const costCharge = (await pullRow(p.debitId)).dispute_cost_charge_id
+    // The next payout nets what is owed: the $48 and the $15.27.
+    const intent = (await db.query<{ id: string }>(
+      `INSERT INTO platform_transfer_intents (landlord_id, destination_connect_account_id, amount, gross_owed, netted_amount)
+       VALUES ($1, 'acct_test', 36.73, 100, 63.27) RETURNING id`, [p.landlordId])).rows[0].id
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const takes: GamChargeTake[] = []
+      expect(await netAgainstDisbursement(c, p.landlordId, 100, takes)).toBe(63.27)
+      await recordGamChargeCollections(c, takes, { platformTransferIntentId: intent })
+      await c.query('COMMIT')
+    } catch (e) {
+      await c.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { c.release() }
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+
+    expect((await post(wonEvent())).status).toBe(200)
+    expect(await charge(p.fee)).toMatchObject({ collected: 48, voided_at: null })
+    expect(await charge(costCharge)).toMatchObject({ collected: 15.27, void_reason: 'dispute_won' })
+    expect(sortedBySource(await held(p.landlordId))).toEqual(sortedBySource([
+      { source_type: 'refund', source_id: gamChargeVoidedGiveBackSourceId(costCharge), amount: 15.27, payout_intent_id: null },
+      { source_type: 'refund', source_id: gamDebitWonGiveBackSourceId(p.debitId, p.fee), amount: 48, payout_intent_id: null },
+    ]))
+    expect(await wonRow(p.debitId)).toMatchObject({ won: true, restored: 6, given_back: 63.27 })
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    await expectCollectionsTie(p.landlordId)
+    await expectEveryDollarOnce(p.landlordId)
+    expect((await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY))[0].context).toMatchObject({ collected_twice: 48, voided_given_back: 0 })
+  })
+
+  it('a won dispute that never reopened the pull has nothing to undo: an admin is told so, once', async () => {
+    const p = await settledPull()
+    expect((await post(wonEvent())).status).toBe(200)
+    expect((await post(wonEvent({ id: 'evt_won_again' }))).status).toBe(200)
+    expect(await outstandingForLandlord(p.landlordId)).toBe(0)
+    expect(await wonRow(p.debitId)).toMatchObject({ disputed: false, won: false })
+    expect(await held(p.landlordId)).toEqual([])
+    const told = await notices(GAM_DEBIT_DISPUTE_WON_CATEGORY)
+    expect(told).toHaveLength(1)
+    expect(told[0].severity).toBe('info')
+    expect(told[0].title).toContain('nothing to undo')
+  })
+
+  it('a re-bill\'s source is one per pull and basis, so a retry can never bill one twice', () => {
+    const a = disputeCostRebillSourceId('11111111-1111-4111-8111-111111111111', 'stated')
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+    expect(disputeCostRebillSourceId('11111111-1111-4111-8111-111111111111', 'stated')).toBe(a)
+    expect(new Set([a,
+      disputeCostRebillSourceId('11111111-1111-4111-8111-111111111111', 'won_stated'),
+      disputeCostRebillSourceId('11111111-1111-4111-8111-111111111111', 'won_assumed'),
+      disputeCostRebillSourceId('22222222-2222-4222-8222-222222222222', 'stated'),
+    ]).size).toBe(4)
   })
 
   it('a charge that is not a pull is left to the rest of the dispute path', async () => {

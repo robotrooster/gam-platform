@@ -51,6 +51,17 @@ export type PlatformTransferPurpose = typeof PLATFORM_TRANSFER_PURPOSES[number]
  *                                   back; what the failure actually cost is
  *                                   billed instead, at cost (kind
  *                                   'bank_debit_failed_cost', services/landlordGamDebit)
+ *   dispute_won                   — 10/13 (Nic, "Won GAM pull dispute:
+ *                                   AUTOMATIC"): what a disputed pull cost,
+ *                                   taken back when Stripe decided the dispute
+ *                                   for GAM (what Stripe kept of its fee, if
+ *                                   anything, is billed again on its own)
+ *   dispute_cost_rebilled         — 10/13 (Nic, "Dispute fee unknown → bill
+ *                                   $15"): what a disputed pull cost, replaced
+ *                                   by a new charge once Stripe stated its
+ *                                   dispute fee in place of the $15
  */
-export const LANDLORD_GAM_CHARGE_VOID_REASONS = ['bank_debit_not_made', 'screening_payment_taken_back', 'bank_debit_failed'] as const
+export const LANDLORD_GAM_CHARGE_VOID_REASONS = [
+  'bank_debit_not_made', 'screening_payment_taken_back', 'bank_debit_failed', 'dispute_won', 'dispute_cost_rebilled',
+] as const
 export type LandlordGamChargeVoidReason = typeof LANDLORD_GAM_CHARGE_VOID_REASONS[number]

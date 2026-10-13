@@ -324,9 +324,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
         // a landlord's bank (landlord_gam_debits) is not a tenant's payment or
         // a held charge: services/landlordGamDebit handles all of it (the
         // inquiry, the reopening, the pull's $6 voided and what the pull cost
-        // GAM at Stripe billed at cost (Nic G1), a win's hand list)
-        // and nothing below runs. It used to fall through to the
-        // "charge GAM cannot place" notice and nothing else.
+        // GAM at Stripe billed at cost (Nic G1), a $15 dispute fee corrected
+        // once an event states Stripe's own, and — 10/13 afternoon, "Won GAM
+        // pull dispute: AUTOMATIC" — a win undone by itself: fees back to
+        // collected, anything collected twice given back, admin told; a win
+        // waiting on a later pull still settling ('won_waiting') is answered
+        // 200 and undone by the nightly sweep) and nothing below runs. It used
+        // to fall through to the "charge GAM cannot place" notice and nothing
+        // else.
         if (piId) {
           const { handleGamDebitDispute } = await import('../services/landlordGamDebit')
           const { disputeFeeReturnedOnWinCents } = await import('../services/stripeCosts')

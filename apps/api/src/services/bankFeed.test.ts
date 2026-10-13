@@ -1246,6 +1246,38 @@ describe('Step 12: money GAM never handled files itself after the first', () => 
     expect(listed.match_kind).toBe('auto_filed')
   })
 
+  // 10/13 (Nic, afternoon): "Bank void of a deposit filed as other income →
+  // VOID the income record too" — a deposit that filed itself included.
+  it('a deposit that filed itself as income, then voided by the bank: its income is voided (kept) and the line set aside', async () => {
+    const f = await seed()
+    await fileFirst(f, 'sqv1', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
+    const sq = { postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' }
+    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'sqv2', ...sq }])
+    const r = (await db.query(
+      `SELECT id, status, auto_filed_rule_id, landlord_other_income_id FROM bank_transactions WHERE external_id='sqv2'`)).rows[0]
+    expect(r.status).toBe('categorized')
+    expect(r.auto_filed_rule_id).toBeTruthy()
+    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'sqv2', ...sq, status: 'void' }])
+    const inc = (await db.query(`SELECT status, voided_at IS NOT NULL AS voided, bank_transaction_id FROM landlord_other_income WHERE id=$1`,
+      [r.landlord_other_income_id])).rows[0]
+    expect(inc).toEqual({ status: 'voided', voided: true, bank_transaction_id: r.id })
+    const after = (await db.query(
+      `SELECT status, ignored_reason, bank_status, landlord_other_income_id, auto_filed_rule_id, auto_filed_at, auto_settle_undo
+         FROM bank_transactions WHERE id=$1`, [r.id])).rows[0]
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void',
+      landlord_other_income_id: null, auto_filed_rule_id: null, auto_filed_at: null })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({
+      was: 'auto_filed', incomeIds: [r.landlord_other_income_id], ruleId: r.auto_filed_rule_id })
+    // The payer still files itself: the bank's void says nothing about them.
+    expect((await ruleFor(f, 'SQUARE INC')).auto_file_income).toBe(true)
+    // 10/13 review: the owner never filed it — the feed did — and the notice says so.
+    const owner = (await db.query(`SELECT user_id FROM landlords WHERE id=$1`, [f.landlordId])).rows[0].user_id
+    const told = (await db.query(`SELECT title, body FROM notifications WHERE user_id=$1 AND type='bank_line_voided'`, [owner])).rows
+    expect(told.map((n: any) => n.title)).toEqual(['Your bank voided a deposit that was filed as income by itself'])
+    expect(told[0].body).toContain('The income it was filed as by itself, like the last deposit from that payer, was voided too')
+    expect(told[0].body).not.toContain('you filed')
+  })
+
   it('DoorLoop is never auto-filed', async () => {
     const f = await seed()
     await fileFirst(f, 'dl1', 'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH', 904.7)

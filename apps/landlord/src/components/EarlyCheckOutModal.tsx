@@ -283,7 +283,8 @@ export function EarlyCheckOutModal({ unitId, bookingId, onClose }: {
               <div style={{ display: 'grid', gap: 8 }}>
                 <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-1)', lineHeight: 1.5 }}>{quote.pastEndAttempted.words}</div>
                 {/* 10/13 (Nic): only the answers this person may give — "Take those
-                    charges off" is the owner's and a booking manager's. */}
+                    charges off" is the owner's and a property manager's with the
+                    booking permission, never on-site staff's. */}
                 {quote.pastEndAttempted.voidRefused && (
                   <div style={{ fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{quote.pastEndAttempted.voidRefused}</div>
                 )}

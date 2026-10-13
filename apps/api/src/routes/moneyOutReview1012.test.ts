@@ -8,7 +8,8 @@
  *     (409 MATCH_FIRST), filed as a new expense only on "none of these"
  *   - a transfer files the money arriving too, under the owner's L19 choice
  *   - a bank void of a line filed as a new expense voids its payment, and
- *     (10/13, Nic) the expense itself, kept on record as voided
+ *     (10/13, Nic) the expense itself, kept on record as voided — and of a
+ *     deposit filed as other income, the income (10/13 afternoon, Nic)
  *   - a bill GAM keeps for something else (a fixed asset here) keeps its
  *     amount and is removed where it came from; archiving a starting category
  *     never stops the bills GAM makes there
@@ -257,14 +258,62 @@ describe('a bank void of a line filed as a new expense (design §12; 10/13, Nic)
     expect(await toldOwner(co)).toEqual([])
   })
 
-  it('money coming in filed as income is not an expense, and stays filed and flagged', async () => {
+  // 10/13 (Nic, afternoon): "Bank void of a deposit filed as other income →
+  // VOID the income record too" (kept on record as voided), same as expenses.
+  const incomeRow = async (id: string) => (await db.query(
+    `SELECT status, voided_at IS NOT NULL AS voided, bank_transaction_id FROM landlord_other_income WHERE id = $1`, [id])).rows[0]
+  const activeIncome = async (co: Co) => (await db.query<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id = $1 AND status = 'active'`, [co.landlordId])).rows[0].n
+
+  it('a deposit filed as other income: the income is voided too (kept), the line set aside, the owner told once', async () => {
     const co = await company()
     const t = await line(co, 75, '2026-10-02')
     const filed = await request(app()).post(`/api/bank-feed/transactions/${t.id}/categorize`).set(as(co.owner))
       .send({ category: 'laundry', scopeKind: 'property_common', propertyId: co.propertyId })
     expect(filed.status, JSON.stringify(filed.body)).toBe(200)
+    const incomeId = (await db.query<{ id: string }>(`SELECT landlord_other_income_id AS id FROM bank_transactions WHERE id = $1`, [t.id])).rows[0].id
+    expect(incomeId).toBeTruthy()
+    expect(await activeIncome(co)).toBe(1)
     await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: 75, status: 'void' }])
-    expect(await lineRow(t.id)).toMatchObject({ status: 'categorized', bank_status: 'void' })
+    // Kept on record, voided, stamped with the line it came from — never deleted.
+    expect(await incomeRow(incomeId)).toEqual({ status: 'voided', voided: true, bank_transaction_id: t.id })
+    expect(await activeIncome(co)).toBe(0)
+    const after = (await db.query(
+      `SELECT status, ignored_reason, bank_status, landlord_other_income_id, auto_settle_undo FROM bank_transactions WHERE id = $1`, [t.id])).rows[0]
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void', landlord_other_income_id: null })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({ was: 'one_category', incomeIds: [incomeId], by: null })
+    expect(await toldOwner(co)).toEqual([{
+      to_owner: true, title: 'Your bank voided a deposit you filed as income',
+      body: 'Your bank voided the $75.00 deposit of Oct 2, 2026 (ACME SUPPLY) — the money never came in. The income it was filed as was voided too; it stays on record as voided.',
+      action_url: '/income', email_sent: false,
+    }])
+    // The bank saying it again changes nothing and tells nobody again.
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: 75, status: 'void' }])
+    expect(await toldOwner(co)).toHaveLength(1)
+    expect(await incomeRow(incomeId)).toEqual({ status: 'voided', voided: true, bank_transaction_id: t.id })
+  })
+
+  it('a deposit split into income: every part is voided (kept), and the line is set aside', async () => {
+    const co = await company()
+    const t = await line(co, 120, '2026-10-02')
+    const split = await request(app()).post(`/api/bank-feed/transactions/${t.id}/split`).set(as(co.owner)).send({ parts: [
+      { category: 'laundry', amount: 70, scopeKind: 'property_common', propertyId: co.propertyId },
+      { category: 'propane_fuel', amount: 50, scopeKind: 'unit', unitId: co.unitId },
+    ] })
+    expect(split.status, JSON.stringify(split.body)).toBe(200)
+    const parts: string[] = split.body.data.incomeIds
+    expect(parts).toHaveLength(2)
+    await upsertTransactions(co.connectionId, co.landlordId, [{ externalId: t.externalId, postedDate: '2026-10-02', amount: 120, status: 'void' }])
+    for (const id of parts) expect(await incomeRow(id)).toEqual({ status: 'voided', voided: true, bank_transaction_id: t.id })
+    expect(await activeIncome(co)).toBe(0)
+    const after = await lineRow(t.id)
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void' })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({ was: 'split' })
+    expect([...after.auto_settle_undo.bankVoidedFiling.incomeIds].sort()).toEqual([...parts].sort())
+    expect((await toldOwner(co)).map(n => [n.title, n.body, n.action_url])).toEqual([[
+      'Your bank voided a deposit you split into income',
+      'Your bank voided the $120.00 deposit of Oct 2, 2026 (ACME SUPPLY) — the money never came in. The 2 income records you split it into were voided too; they stay on record as voided.',
+      '/income']])
   })
 })
 

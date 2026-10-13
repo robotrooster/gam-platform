@@ -47,8 +47,8 @@ export interface CheckoutQuote {
     charges: Array<{ paymentId: string; dueDate: string; amount: number }>
     /**
      * 10/13 (Nic): "Take those charges off" (void) is the owner's and a
-     * manager's with the booking permission; anybody else gets "Keep them
-     * owed" only, and voidRefused says why.
+     * property manager's with the booking permission — "not on-site staff";
+     * anybody else gets "Keep them owed" only, and voidRefused says why.
      */
     choices: { void?: string; keep: string }
     voidRefused?: string | null
@@ -180,11 +180,13 @@ export const KEEP_THEM_OWED = 'Keep them owed'
 
 /**
  * 10/13 (Nic): "void the cancelled nights: owner + managers with booking
- * permission." The answers to offer for rent a payment was tried on past the
+ * permission" — "OWNER + PROPERTY MANAGERS only (not on-site staff)." The
+ * answers to offer for rent a payment was tried on past the
  * day they left — the schedule's shorter-stay question (SchedulePage) and the
  * Check out window's (EarlyCheckOutModal) — exactly as the server sent them:
  * "Take those charges off" only when it was offered (the owner's, and a
- * booking manager's), "Keep them owed" always, since anybody who reaches the
+ * property manager's with the booking permission), "Keep them owed" always,
+ * since anybody who reaches the
  * question may keep them owed. A reply that names neither (an older server, a
  * reply cut short) still leaves "Keep them owed" — never a chooser with
  * nothing to press, which saved nothing and said nothing.

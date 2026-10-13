@@ -599,7 +599,8 @@ export async function releaseVoidedMoneyOutMatches(lineIds: string[]): Promise<n
 // page): an expense another feature keeps (a fixed asset made from it — the
 // asset's void comes first, as on the Expenses page), and one that still has a
 // payment on it that the line did not make. A line filed as income is not an
-// expense, and stays as it was.
+// expense: 10/13 (Nic) its income is voided the same way (services/bankFeed
+// voidIncomeOfBankVoidedLine), with the same mark and the same notice.
 
 /** The key in bank_transactions.auto_settle_undo that records the expenses voided with the bank's void. */
 export const BANK_VOIDED_FILING_MARK = 'bankVoidedFiling'
@@ -659,6 +660,10 @@ export async function voidExpensesOfBankVoidedLine(client: Runner, lineId: strin
  * know the expense went. Once, after the sync that voided it commits (the
  * caller), in the portal's notices — the same place as a voided rent deposit
  * (bankDepositConfirm alertMatchedDepositVoided). Never throws.
+ *
+ * 10/13 (Nic): "Bank void of a deposit filed as other income → VOID the income
+ * record too." A deposit filed as income (by hand, by itself, or split) is
+ * told the same way, in income words (the mark names incomeIds).
  */
 export async function tellOwnerBankVoidedFiling(lineId: string): Promise<boolean> {
   try {
@@ -672,10 +677,34 @@ export async function tellOwnerBankVoidedFiling(lineId: string): Promise<boolean
         WHERE bt.id = $1 AND bt.status = 'ignored' AND bt.ignored_reason = 'bank_void'
           AND bt.auto_settle_undo ? '${BANK_VOIDED_FILING_MARK}'`, [lineId])
     if (!t?.owner_user_id || !t.mark) return false
-    const n = Array.isArray(t.mark.expenseIds) ? t.mark.expenseIds.length : 1
     const amount = `$${(Math.abs(booksCents(t.amount)) / 100).toFixed(2)}`
     const what = t.description ? ` (${t.description})` : ''
     const { createNotification } = await import('./notifications')
+    if (Array.isArray(t.mark.incomeIds)) {
+      const parts = t.mark.incomeIds.length
+      const split = t.mark.was === 'split'
+      // 10/13 review: a deposit the feed filed by itself (an auto-file rule,
+      // "Filed by itself" on the Bank page) was never filed by the owner — said so.
+      const byItself = t.mark.was === 'auto_filed'
+      await createNotification({
+        userId: t.owner_user_id,
+        landlordId: t.landlord_id,
+        type: 'bank_line_voided',
+        title: split ? 'Your bank voided a deposit you split into income'
+          : byItself ? 'Your bank voided a deposit that was filed as income by itself'
+          : 'Your bank voided a deposit you filed as income',
+        body: `Your bank voided the ${amount} deposit of ${t.day}${what} — the money never came in. `
+          + (split
+            ? `The ${parts} income records you split it into were voided too; they stay on record as voided.`
+            : byItself
+              ? 'The income it was filed as by itself, like the last deposit from that payer, was voided too; it stays on record as voided.'
+              : 'The income it was filed as was voided too; it stays on record as voided.'),
+        actionUrl: '/income',
+        data: { bank_transaction_id: lineId, income_ids: t.mark.incomeIds },
+      })
+      return true
+    }
+    const n = Array.isArray(t.mark.expenseIds) ? t.mark.expenseIds.length : 1
     await createNotification({
       userId: t.owner_user_id,
       landlordId: t.landlord_id,
