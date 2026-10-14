@@ -2,9 +2,12 @@
  * 10/12 (Nic) — GAM BOOKS: BOOKS SETTINGS AND OPENING BALANCES
  *
  *   "history start = landlord's choice (since joining GAM, or a start date +
- *    opening balances)"; home sales, work trade, register stock, company-level
- *   costs, who may close and reopen a month, where an open month's fixes show,
- *   who may write off — each the LANDLORD'S CHOICE (Nic's 10/12 answers).
+ *    opening balances)"; home sales, work trade, register stock, who may
+ *   close and reopen a month, where an open month's fixes show, who may write
+ *   off — each the LANDLORD'S CHOICE (Nic's 10/12 answers). 10/13 (Nic): where
+ *   company-level costs go is no setting — "there should never be a default
+ *   setting to apply expenses"; each record says where its cost goes when it
+ *   is logged.
  *
  * The door to services/booksSettings.ts (what each setting means and how it is
  * saved is there). Mounted at /api/books/setup, AHEAD of the Books router in
@@ -35,7 +38,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import { z } from 'zod'
 import {
   BOOKS_HISTORY_STARTS, BOOKS_HOME_SALE_METHODS, BOOKS_WORK_TRADE_METHODS, LEDGER_REGISTER_STOCK_METHODS,
-  BOOKS_COMPANY_COST_METHODS, LEDGER_WRITE_OFF_PERMISSIONS, LEDGER_CLOSE_PERMISSIONS, LEDGER_OPEN_MONTH_FIX_MODES,
+  LEDGER_WRITE_OFF_PERMISSIONS, LEDGER_CLOSE_PERMISSIONS, LEDGER_OPEN_MONTH_FIX_MODES,
   LEDGER_OPENING_ITEM_KINDS_ENTERED, BOOKS_REPAIR_BILL_MODES,
 } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
@@ -106,6 +109,10 @@ function parse<T>(schema: z.ZodType<T, any, any>, body: unknown): T {
   return r.data
 }
 
+/** 10/13 (Nic): what a request for the retired company-costs setting is told. */
+export const COMPANY_COSTS_RETIRED = 'Where a cost goes is chosen on each expense, bill, payroll run, loan and fixed asset when it is logged — '
+  + 'split across your properties by units, one property, or one unit. There is no setting for it.'
+
 const choice = <T extends readonly [string, ...string[]]>(values: T, message: string) =>
   z.enum(values, { errorMap: () => ({ message }) }).optional()
 
@@ -118,7 +125,9 @@ const settingsPatchSchema = z.object({
   homeSaleMethod:      choice(BOOKS_HOME_SALE_METHODS, 'Choose how home sales count.'),
   workTradeMethod:     choice(BOOKS_WORK_TRADE_METHODS, 'Choose how work trade that covers rent counts.'),
   registerStockMethod: choice(LEDGER_REGISTER_STOCK_METHODS, 'Choose how register stock counts.'),
-  companyCostsMethod:  choice(BOOKS_COMPANY_COST_METHODS, 'Choose where company-level costs go.'),
+  // 10/13 (Nic): "there should never be a default setting to apply expenses" —
+  // the retired company-costs choice is refused in words, never saved.
+  companyCostsMethod:  z.undefined({ errorMap: () => ({ message: COMPANY_COSTS_RETIRED }) }),
   writeOffBy:          choice(LEDGER_WRITE_OFF_PERMISSIONS, 'Choose who may write off a balance.'),
   // 10/12 (Nic, L6): a repair closed with a cost — an unpaid bill by itself, or "Record as bill".
   repairBills:         choice(BOOKS_REPAIR_BILL_MODES, 'Choose what a repair closed with a cost does.'),

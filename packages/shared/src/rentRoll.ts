@@ -72,8 +72,11 @@ export const RENT_ROLL_STATUS_COLOR: Record<RentRollRowStatus, RentRollStatusCol
 
 /**
  * A row that is a space, not a household (the open month): an empty space
- * (Vacant) or one in use with nobody on a lease (occupied). No money, nothing
- * to open, nobody to report on or take a payment from.
+ * (Vacant) or one in use with nobody on a lease (occupied). No bill, nobody to
+ * report on or take a payment from. 10/13 (Nic): "just make them all clickable
+ * even if they're vacant and just show you know an expanded box with nothing"
+ * — it opens like every other row, to say nothing is billed on it (and to any
+ * register sale or pay link that names it).
  */
 export function isSpaceOnlyRow(row: { status: RentRollRowStatus }): boolean {
   return row.status === 'vacant' || row.status === 'occupied'
@@ -217,6 +220,24 @@ export interface OpenMonthStay {
   nights: number
   /** The booking's own words: "Checked in", "Checked out", "Confirmed", … (BOOKING_STATUS_LABEL). */
   statusLabel: string
+  /**
+   * 10/13 (Nic): "Stay rows SHOW what's still owed" (e.g. a $360 balance link
+   * still open) — what is still owed on the stay, all of it, by the one rule
+   * the register and the pay links read (apps/api services/registerStay
+   * reservationDue): its price less what was paid toward it; a stay its lease
+   * bills, what is left of its deposit. 0 when paid up, canceled or a no-show.
+   * The row's Owed (OpenMonthRow.owed) is what of it is owed NOW — billed on
+   * its pay link, or the rest from arrival day (S649, Nic: "the other 90%
+   * needs to generate on the day they're due to arrive"); before then the
+   * row's Owed is 0 and the opened row says when it comes due (checkIn).
+   */
+  owed: number
+  /**
+   * 'YYYY-MM-DD': the day the stay's balance was billed on its pay link
+   * (services/stayBalance — arrival day), while that balance is still unpaid;
+   * null otherwise.
+   */
+  balanceBilledOn: string | null
   /** Of this month's stay money, what has gone back to the guest this month. */
   refunded: number
   refunds: Array<{
@@ -304,7 +325,14 @@ export interface OpenMonthRow {
   credit: number
   /** Covered by work trade (hours, never money). */
   workTrade: number
-  /** Still owed on the month's bills = invoiced − paid − work trade (the difference after a partial). */
+  /**
+   * Still owed on the month's bills = invoiced − paid − work trade (the
+   * difference after a partial). On a stay row (10/13, Nic: "Stay rows SHOW
+   * what's still owed"): what is owed on the stay now — its balance billed on
+   * its pay link, or the rest of it from arrival day; all that is still owed
+   * on it is OpenMonthStay.owed. A stay is paid, not billed by the month, so it
+   * is never in Invoiced.
+   */
   owed: number
   /**
    * What the household still owes on EARLIER months' bills here (not in
@@ -355,6 +383,20 @@ export interface OpenMonthRow {
   charges: RentRollCharge[]
   /** A stay row's stay (status 'stay'); null on every other row. */
   stay: OpenMonthStay | null
+  /**
+   * 10/13 (Nic): "Pay links / register sales that name a space go ON that
+   * space's row" (Andres Razo's $752.17 electric pay link for RV 27 is RV 27's).
+   * Every register sale and pay link this month whose items or label name this
+   * row's space — and what went back on one at the register this month — oldest
+   * first, in the same lines the folder uses (OpenMonthRoll.otherMoney keeps
+   * only money that names no space). Never in Invoiced, Paid or Owed: it is no
+   * bill. [] when none.
+   */
+  otherMoney: OpenMonthOtherMoney[]
+  /** Of `otherMoney`, the money that came in (its sales). */
+  otherIn: number
+  /** Of `otherMoney`, what went back at the register this month (its refunds). */
+  otherRefunded: number
 }
 
 /**
@@ -383,13 +425,26 @@ export interface OpenMonthTotals extends RentRollTotals {
   stays: number
   staysRefunded: number
   /**
+   * 10/13 (Nic): "Stay rows SHOW what's still owed" — what is owed now on the
+   * stays shown (the stay rows' Owed), apart from the bills' Owed.
+   */
+  staysOwed: number
+  /**
    * 10/13 (Nic): "show ALL money coming in" — the register sales and pay links
-   * this month that are no household's bill and no stay's (OpenMonthRoll
-   * .otherMoney), and of them what went back at the register this month. Apart
-   * from the bills and the stays, so each adds up on its own.
+   * this month that are no household's bill and no stay's, wherever they show
+   * (on the row of the space they name, or in the folder), and of them what
+   * went back at the register this month. Apart from the bills and the stays,
+   * so each adds up on its own.
    */
   otherIn: number
   otherRefunded: number
+  /**
+   * Of `otherIn` / `otherRefunded`, the folder's (OpenMonthRoll.otherMoney —
+   * 10/13, Nic: "only money with no space stays in the folder"); the rest is on
+   * the rows of the spaces it names (OpenMonthRow.otherIn).
+   */
+  folderIn: number
+  folderRefunded: number
 }
 
 /**
@@ -419,6 +474,53 @@ export interface OpenMonthOtherMoney {
   forLabel: string
   /** Who paid: the resident's or the customer's name; null — nobody named (a walk-in). */
   who: string | null
+  /**
+   * 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it
+   * looks like that charge is just for electric ... It's not got a good
+   * breakdown between what's a billback on the electricity and what is not."
+   * A sale's breakdown, from its own line items: each part with its own amount
+   * and what it is — "Electric (per kWh) — September, RV 27" an electric
+   * bill-back, 390 kWh × $0.21, $81.90; "RV site — monthly" site rent,
+   * $589.00 — then its tax, and what comes off: a discount, the background
+   * check (the screening's), the part toward a stay (on the stay's row). The
+   * parts add up to `amount`. [] on a refund. Absent from an older server.
+   */
+  parts?: OpenMonthSalePart[]
+  /**
+   * The card fee the payer paid on top of the sale (pos_transactions.surcharge)
+   * — never in `amount`, never the landlord's money; 0 when none (cash, or the
+   * landlord absorbs it). Only on a sale.
+   */
+  cardFee?: number
+}
+
+/** One part of a register sale or pay link (OpenMonthOtherMoney.parts). */
+export interface OpenMonthSalePart {
+  /**
+   * item     one line the sale sold (pos_transaction_items);
+   * tax      a tax on it (the sale's own named taxes, else "Tax");
+   * discount what the register took off (negative);
+   * screening the background check in it — the screening's, not the landlord's (negative);
+   * stay     its part toward a stay — shown on the stay's row (negative);
+   * rest     what is left of the sale's total that its lines do not show.
+   */
+  kind: 'item' | 'tax' | 'discount' | 'screening' | 'stay' | 'rest'
+  /** In words: the item's name as sold ("Electric (per kWh) — September, RV 27"), the tax's name, "Discount" … */
+  label: string
+  /**
+   * What an item IS, in words, when the register says: "Electric bill-back"
+   * (a utility sold off a meter — the utility recovery report's own rule,
+   * routes/utility registerUtilityType), "Site rent" (a stay item: a night, a
+   * week or a month on a site); null for anything else (propane, a fee …).
+   */
+  what: string | null
+  /** How many (an item's quantity), and the price of one; null when it is not an item. */
+  qty: number | null
+  unitPrice: number | null
+  /** What one is, from the item's name ("kWh" in "Electric (per kWh)"); null when the name does not say. */
+  unit: string | null
+  /** Dollars: what it adds to the sale (an item, a tax), or takes off it (negative). */
+  amount: number
 }
 
 /** GET /api/balances/rent-roll/open-month?propertyId= — the Payments page. */
@@ -429,16 +531,20 @@ export interface OpenMonthRoll {
   month: string
   /**
    * Every space, one row per household (lease), a Vacant row for an empty
-   * space and an occupied row for a space in use with nobody on a lease; and
-   * any household here still owing on an earlier lease. Ordered: rows still
-   * owing (owed + owedEarlier > 0) first, then the rest; each group in space
-   * order (compareSpaces).
+   * space and an occupied row for a space in use with nobody on a lease; a
+   * stay guest's row for a stay checked in, paid toward this month, or — its
+   * guest still coming or here — owing on its billed balance; and any
+   * household here still owing on an earlier lease. Ordered: rows still owing
+   * (owed + owedEarlier > 0) first, then the rest; each group in space order
+   * (compareSpaces).
    */
   rows: OpenMonthRow[]
   /**
    * 10/13 (Nic): "show ALL money coming in" — the register sales and pay links
    * of the month that are no household's bill and no stay's, and what went
-   * back on them at the register this month, oldest first.
+   * back on them at the register this month, oldest first. 10/13 (Nic): "only
+   * money with no space stays in the folder" — one that names a space is on
+   * that space's row (OpenMonthRow.otherMoney), never here as well.
    */
   otherMoney: OpenMonthOtherMoney[]
   totals?: OpenMonthTotals
@@ -458,9 +564,26 @@ export interface RentRollHealth {
   /** 'YYYY-MM': first billed month … the month judged to. */
   from: string
   through: string
-  /** "50%, 1 of 2 months" / "No months to judge yet". */
+  /**
+   * "50%, 1 of 2 months"; nothing counted yet: "Onboarding month — not
+   * counted" (the onboarding month was left out, 10/13, Nic: "Keep it out, but
+   * say so") or "No months to judge yet".
+   */
   label: string
+  /**
+   * The onboarding month was judged and left out (paid late on moving onto
+   * GAM, no late fee on the bill — good news only). Absent from an older server.
+   */
+  onboardingLeftOut?: boolean
 }
+
+/**
+ * 10/13 (Nic), the onboarding month at Mountain View (September): "Keep it
+ * out, but say so." What payment health says when nothing is counted yet —
+ * never a bare dash (services/householdMonths paymentHealth's label).
+ */
+export const HEALTH_ONBOARDING_NOT_COUNTED = 'Onboarding month — not counted'
+export const HEALTH_NOTHING_JUDGED = 'No months to judge yet'
 
 /** One month's stamp on a history row. */
 export interface RentRollStamp {
@@ -507,7 +630,11 @@ export interface RentRollHistoryRow {
   stamps: RentRollStamp[]
 }
 
-/** How many households earned each status in a month ("Oct: 3 late"). */
+/**
+ * How many households earned each status in a month ("Oct: 3 late") — the
+ * rows' and (10/13, Nic: "Rent Roll month counts INCLUDE the moved-out
+ * folder") the "Moved out, still owes" households' bills that month.
+ */
 export interface RentRollMonthCount {
   month: string
   counts: Array<{ status: RentRollMonthStatus; label: string; households: number }>
@@ -539,6 +666,73 @@ export interface RentRollMovedOutOwing {
   inRange: RentRollTotals
 }
 
+// ─── Stays on the Rent Roll (10/13, Nic) ─────────────────────────────────────
+//
+//   "show stays as an aggregate by line items. eg 22 nights paid for via pos
+//    and 1 week paid for via pos. otherwise when people use the same sites
+//    over again in a month it will look funny on the report. dont put these
+//    stays in the spot put them below with expandable notes. 4 nights in 15
+//    and 8 nights in 18 etc."
+
+/**
+ * What one of a stay's line items buys — the register's stay items
+ * (pos_items.stay_unit, whose CHECK lists the same three) and a stay booked
+ * online, by its length.
+ */
+export const RENT_ROLL_STAY_UNITS = ['night', 'week', 'month'] as const
+export type RentRollStayUnit = typeof RENT_ROLL_STAY_UNITS[number]
+export const RENT_ROLL_STAY_UNIT_LABEL: Record<RentRollStayUnit, { one: string; many: string }> = {
+  night: { one: 'night', many: 'nights' },
+  week:  { one: 'week', many: 'weeks' },
+  month: { one: 'month', many: 'months' },
+}
+
+/**
+ * How a stay's line items were paid for: rung at the register or on a pay link
+ * (POS — the stay item's line on the sale), or booked and paid on the booking
+ * site (its deposit, and the balance link after it).
+ */
+export const RENT_ROLL_STAY_VIAS = ['pos', 'booking_site'] as const
+export type RentRollStayVia = typeof RENT_ROLL_STAY_VIAS[number]
+export const RENT_ROLL_STAY_VIA_LABEL: Record<RentRollStayVia, string> = {
+  pos:          'POS',
+  booking_site: 'the booking site',
+}
+
+/** "22 nights", "1 week", "2.5 months" (a register quantity can carry decimals). */
+export function stayQuantityText(quantity: number, unit: RentRollStayUnit): string {
+  const q = Math.round(Number(quantity) * 1000) / 1000
+  const words = RENT_ROLL_STAY_UNIT_LABEL[unit] ?? RENT_ROLL_STAY_UNIT_LABEL.night
+  return `${q.toLocaleString('en-US', { maximumFractionDigits: 3 })} ${q === 1 ? words.one : words.many}`
+}
+
+/** One aggregate line of the range's stays: "22 nights paid for via POS", opened for its notes per site. */
+export interface RentRollStayLine {
+  /** '<unit>:<via>' */
+  key: string
+  unit: RentRollStayUnit
+  via: RentRollStayVia
+  /** Every line item of the kind in the range added up: 22 (nights). */
+  quantity: number
+  /** "22 nights paid for via POS" */
+  label: string
+  /** How many stays (or sales of a stay item with no stay on the schedule) it adds up. */
+  stays: number
+  /**
+   * The money that came in for them in the range (what was paid toward the
+   * stays; a stay item sold with no stay on the schedule, its line). Sent only
+   * with the range totals (decisions #25: a sum across guests).
+   */
+  paid?: number
+  /**
+   * The expandable notes, per site in space order: "4 nights in RV 15", "8
+   * nights in RV 18" — a site used twice in the range is one note with both
+   * stays' nights. A line item that names no site: space null, "2 nights, no
+   * site named".
+   */
+  sites: Array<{ space: string | null; quantity: number; stays: number; label: string }>
+}
+
 /** GET /api/balances/rent-roll/history?propertyId=&from=&to= | &range=all — the Rent Roll page. */
 export interface RentRollHistory {
   propertyId: string
@@ -554,11 +748,23 @@ export interface RentRollHistory {
    * Every household billed in the range, in space order — except anyone who
    * moved out and still owes: they are in `movedOutOwing` alone (10/13, Nic:
    * "Moved-out people who still owe sit in a collapsed 'Moved out, still owes'
-   * folder until paid"), never twice. `monthCounts` are these rows'.
+   * folder until paid"), never twice. `monthCounts` are these rows' and the
+   * folder households' (10/13, Nic: "month counts INCLUDE the moved-out
+   * folder").
    */
   rows: RentRollHistoryRow[]
   /** Not limited to the range: everyone no longer living here who still owes. */
   movedOutOwing: RentRollMovedOutOwing[]
+  /**
+   * 10/13 (Nic): the range's stays BELOW the lease rows, never in the spaces'
+   * spots — an aggregate by line item ("22 nights paid for via POS", "1 week
+   * paid for via POS"), each with its notes per site ("4 nights in RV 15").
+   * A stay is the range's when money came in for it in the range (the month
+   * paid, as on the Payments page); a stay that became a lease is that
+   * lease's row. Nights, weeks, then months; POS before the booking site. []
+   * when none.
+   */
+  stays: RentRollStayLine[]
   /**
    * The rows' money for the range AND the "Moved out, still owes" households'
    * bills in the range (10/13, Nic: "Range totals INCLUDE moved-out folder

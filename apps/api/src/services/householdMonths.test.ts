@@ -137,6 +137,43 @@ describe('judgeMonth (the stamp rule)', () => {
   it('work trade covering every base charge is green', () => {
     expect(judgeMonth({ ...base, workTradeBaseC: 50000, baseInC: 0 })).toMatchObject({ stamp: 'paid_on_time', workTradeOnly: true, onTime: true })
   })
+  // 10/13 (Nic): "Keep it out, but say so" — the rule says when it left the month out.
+  it('says when the onboarding rule left a month out — only then', () => {
+    expect(judgeMonth({ ...base, onboarding: true, daysPastGracePaid: 9 })).toMatchObject({ counted: false, leftOutOnboarding: true })
+    expect(judgeMonth({ ...base, onboarding: true })).toMatchObject({ counted: true, leftOutOnboarding: false })
+    expect(judgeMonth({ ...base, onboarding: true, daysPastGracePaid: 9, lateFeeOnBill: true })).toMatchObject({ counted: true, leftOutOnboarding: false })
+    // Still inside grace (a partial, or due): not judged yet, so not left out by the rule.
+    expect(judgeMonth({ ...base, onboarding: true, owedBaseC: 30000, baseInC: 20000 })).toMatchObject({ counted: false, leftOutOnboarding: false })
+    expect(judgeMonth({ ...base, onboarding: true, owedBaseC: 50000, baseInC: 0 })).toMatchObject({ stamp: 'due', leftOutOnboarding: false })
+    expect(judgeMonth({ ...base, daysPastGracePaid: 9 })).toMatchObject({ counted: true, leftOutOnboarding: false })
+  })
+})
+
+// 10/13 (Nic), September at Mountain View — the onboarding month paid late:
+// "Keep it out, but say so."
+describe('householdMonths — the onboarding month left out, and said', () => {
+  it('September paid 6 days past grace is left out; alone, health says "Onboarding month — not counted"; with October on time, 100%', async () => {
+    const w = await world({ existingTenancy: true })
+    await bill(w, '2026-09-01', '2026-09-01 05:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'cash', paidAt: '2026-09-11 10:00' }])
+    await bill(w, '2026-10-01', '2026-09-30 05:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'cash', paidAt: '2026-10-03 10:00' }])
+    const ms = await months(w)
+    expect(monthOf(ms, '2026-09')).toMatchObject({ stamp: 'paid_late', onboarding: true, counted: false, onboarding_left_out: true })
+    expect(monthOf(ms, '2026-10')).toMatchObject({ stamp: 'paid_on_time', onboarding: false, counted: true, onboarding_left_out: false })
+    expect(paymentHealth(ms, '2026-09')).toMatchObject({
+      percent: null, counted: 0, not_counted: 1, onboarding_left_out: true, label: 'Onboarding month — not counted',
+    })
+    expect(paymentHealth(ms, '2026-10')).toMatchObject({
+      percent: 100, on_time: 1, counted: 1, not_counted: 1, onboarding_left_out: true, label: '100%, 1 of 1 month',
+    })
+  })
+
+  it('nothing judged yet and no onboarding month left out still reads "No months to judge yet"', async () => {
+    const w = await world({ existingTenancy: true })
+    // Due Oct 15: inside grace on Oct 12.
+    await bill(w, '2026-10-15', '2026-10-01 05:00', [{ type: 'rent', amount: 495 }])
+    const h = paymentHealth(await months(w), '2026-10')
+    expect(h).toMatchObject({ percent: null, onboarding_left_out: false, label: 'No months to judge yet' })
+  })
 })
 
 describe('householdMonths — Gerald Logue (Mountain View RV 48)', () => {

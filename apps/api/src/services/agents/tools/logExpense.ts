@@ -59,9 +59,12 @@ export const logExpense: AgentTool = {
     'Use when they TELL you about a cost: "paid the plumber $340 for Apt 101", "insurance was $1,200 ' +
     'this month".\\n' +
     'CONFIRM FIRST. Read back the amount, the category, what it was for and which property or unit it ' +
-    'belongs to, and get an explicit yes before calling. This writes to their books.\\n' +
+    'belongs to (or that it is split across all their properties), and get an explicit yes before calling. ' +
+    'This writes to their books.\\n' +
     '`place` takes a property or unit in their own words ("Oak Street", "Apt 101") — never ask for an ' +
-    'id. Leave it out only for a cost that belongs to the whole portfolio. If the date is not given, ' +
+    'id. Where a cost goes is theirs to say, every time: one unit, one property, or split across all their ' +
+    'properties by units. If they did not say, ASK — never pick it for them. splitAcrossProperties: true ' +
+    'only when they said it is shared by all their properties (no place then). If the date is not given, ' +
     'today is correct; do not invent a different one.\\n' +
     `category must be one of: ${EXPENSE_CATEGORIES.join(', ')}. Pick the closest and say which you used; ` +
     'use "other" only when nothing fits. There is no receipt upload from chat — if they have one, tell ' +
@@ -74,7 +77,9 @@ export const logExpense: AgentTool = {
       category: { type: 'string', description: `One of: ${EXPENSE_CATEGORIES.join(', ')}` },
       description: { type: 'string', description: 'What it was for, in their words. e.g. "replaced the water heater"' },
       vendor: { type: 'string', description: 'Who was paid, if they said.' },
-      place: { type: 'string', description: 'Property or unit in their words — "Oak Street", "Apt 101". Omit for a portfolio-wide cost.' },
+      place: { type: 'string', description: 'Property or unit in their words — "Oak Street", "Apt 101".' },
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or property at the time of logging."
+      splitAcrossProperties: { type: 'boolean', description: 'True only when they said the cost is shared by all their properties (split by units). Never true unless they said so.' },
       expenseDate: { type: 'string', description: 'YYYY-MM-DD. Today if they did not say.' },
     },
     required: ['amount', 'category', 'expenseDate'],
@@ -100,6 +105,24 @@ export const logExpense: AgentTool = {
       return { ok: false, error: 'expenseDate must be YYYY-MM-DD. Use today unless they gave a date.' }
     }
 
+    // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+    // property at the time of logging. there should never be a default
+    // setting to apply expenses." A place they named, or a split they asked
+    // for — nothing chosen for them.
+    const named = args.place != null && String(args.place).trim() !== ''
+    const split = args.splitAcrossProperties === true
+    if (!named && !split) {
+      return {
+        ok: false, needsPlace: true, error: 'Where this cost goes was not said.',
+        tellThem: 'Ask where it goes: one unit, one property, or split across all their properties by units. Do not choose for them.',
+      }
+    }
+    if (named && split) {
+      return {
+        ok: false, needsPlace: true, error: 'A cost goes on one place or is split across all their properties, not both.',
+        tellThem: 'Ask which they meant: that one place, or split across all their properties by units.',
+      }
+    }
     let propertyId: string | null = null
     let unitId: string | null = null
     let matched: string | null = null
@@ -108,7 +131,7 @@ export const logExpense: AgentTool = {
     // only company, and asks when it owns several — an expense in the wrong
     // company's books is a wrong P&L and a wrong tax return.
     let expenseLandlordId: string | null = null
-    if (args.place != null && String(args.place).trim()) {
+    if (named) {
       const r: any = await resolvePlace(actorLandlordIds(actor), String(args.place))
       if (r.ambiguous) {
         return {
@@ -119,7 +142,7 @@ export const logExpense: AgentTool = {
       if (r.notFound) {
         return {
           ok: false, error: `Nothing in their portfolio matches "${args.place}".`,
-          tellThem: 'Ask which property or unit it belongs to — do not guess, and do not file it against the portfolio instead without saying so.',
+          tellThem: 'Ask which property or unit it belongs to — do not guess, and do not split it across their properties instead unless they say so.',
         }
       }
       propertyId = r.propertyId; unitId = r.unitId; matched = r.matched
@@ -141,6 +164,10 @@ export const logExpense: AgentTool = {
       vendor: args.vendor != null ? String(args.vendor).slice(0, 160) : null,
       expenseDate,
       isCommon: !unitId && !!propertyId,
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+      // property at the time of logging" — the place they named, or the
+      // split they asked for (read back before this call).
+      costPlace: unitId ? 'unit' : propertyId ? 'property' : 'split_by_units',
       utilityType: null,
     } as any)
 
@@ -149,7 +176,7 @@ export const logExpense: AgentTool = {
       logged: true,
       expenseId: row?.id,
       amount, category, expenseDate,
-      appliedTo: matched ?? 'the whole portfolio',
+      appliedTo: matched ?? 'split across all their properties by units, as they asked',
       note:
         'Recorded. Tell them it is on their books and will show on the profit-and-loss under ' +
         `"${category}". If they have a receipt, it attaches on the Expenses page — not from here.`,

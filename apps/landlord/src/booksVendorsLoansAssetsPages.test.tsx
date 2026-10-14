@@ -88,6 +88,8 @@ beforeEach(() => {
     '/books/loans/l1/suggest': { principal: 398, interest: 602, escrow: 200, balanceBefore: 119600 },
     '/books/loans/form-options': { booksStartDate: '2026-01-01', today: '2026-10-12', bankAccounts: [{ id: 'b1', name: 'First Bank', accountLast4: '4321' }] },
     '/books/properties': [{ id: 'p1', name: 'Oak Park' }],
+    // 10/13 (Nic): the Loans and Fixed assets forms ask where each cost goes.
+    '/books/cost-places': { asked: true, properties: [{ id: 'p1', name: 'Oak Park', units: [] }] },
     '/books/fixed-assets': [ASSET],
     '/books/fixed-assets/capital-expenses': [{ id: 'e1', description: 'New roof', categoryName: 'Capital improvements', propertyName: 'Oak Park', expenseDate: '2026-02-10', amount: 12000 }],
   }
@@ -153,6 +155,15 @@ describe('Loans', () => {
     expect(text()).toContain('Bank line')
     expect(button('Record payment')!.disabled).toBe(true)
     await act(async () => { button('Use this split')!.click() })
+    // 10/13 (Nic): "they don't pick as a setting, they pick as the expense
+    // happens" — what the payment came from starts blank and is asked.
+    const from = [...host!.querySelectorAll('select')].find(s => s.options[0]?.textContent === 'Choose where it came from') as HTMLSelectElement
+    expect(from.value).toBe('')
+    expect(button('Record payment')!.disabled).toBe(true)
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(from, 'bank')
+      from.dispatchEvent(new Event('change', { bubbles: true }))
+    })
     expect(button('Record payment')!.disabled).toBe(false)
     await act(async () => { button('Record payment')!.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
     await flush()
@@ -160,6 +171,28 @@ describe('Loans', () => {
       paidOn: '2026-10-12', amount: 1200, principal: 398, interest: 602, escrow: 200, method: 'bank' }) }])
     // A payment that is a bank line is changed on the Bank page: no Void beside it.
     expect(button('Void')).toBeUndefined()
+  })
+})
+
+describe('Loans: where the money went is asked, never preselected (10/13, Nic)', () => {
+  it('a new loan starts with no place and no destination for its money; Add Loan waits for both', async () => {
+    await render(<LoansPage />)
+    await act(async () => { button('+ Add Loan')!.click() })
+    await flush()
+    const went = [...host!.querySelectorAll('select')].find(s => s.options[0]?.textContent === 'Choose where the money went') as HTMLSelectElement
+    expect(went.value).toBe('')
+    expect([...host!.querySelectorAll('input[name="costPlace"]')].some(r => (r as HTMLInputElement).checked)).toBe(false)
+    expect(button('Add Loan')!.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="costPlace"][value="split_by_units"]') as HTMLInputElement).click() })
+    await flush()
+    // Where its interest goes is answered; where its money went is not.
+    expect(button('Add Loan')!.disabled).toBe(true)
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(went, 'equipment')
+      went.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    await flush()
+    expect(button('Add Loan')!.disabled).toBe(false)
   })
 })
 

@@ -5,12 +5,12 @@ import { ArrowLeft, ChevronDown, ChevronRight, Download, Printer, ScrollText } f
 import {
   RENT_ROLL_STATUS_COLOR,
   type RentRollHistory, type RentRollHistoryRow, type RentRollMonthCount, type RentRollMonthStatus, type RentRollResident,
-  type RentRollStatusColor,
+  type RentRollStatusColor, type RentRollStayLine,
 } from '@gam/shared'
 import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { money, monthTitle, localToday, dayWord } from '../lib/creditDesk'
-import { shortMonth, stripYear, healthColor, healthText, csvLine, downloadText } from '../lib/paymentStamps'
+import { shortMonth, stripYear, healthColor, healthText, healthTitle, csvLine, downloadText } from '../lib/paymentStamps'
 import {
   RANGE_PICKS, RANGE_PICK_LABEL, viewFromParams, withViewParams, historyPath, rangeKey, monthChoices, customRange, type RangePick,
 } from '../components/rentroll/rentRollRange'
@@ -52,6 +52,15 @@ import '../components/rentroll/rentroll.css'
  * INCLUDE moved-out folder households" — the summary's Invoiced / Paid / Owed
  * count the "Moved out, still owes" households' bills in the range too (the
  * server's totals).
+ *
+ * 10/13 (Nic), round 3: "Rent Roll month counts INCLUDE the moved-out folder"
+ * (the server's counts). "show stays as an aggregate by line items. eg 22
+ * nights paid for via pos and 1 week paid for via pos … dont put these stays
+ * in the spot put them below with expandable notes. 4 nights in 15 and 8
+ * nights in 18 etc." — a Stays card below the households' rows, one line per
+ * kind of line item and how it was paid for (the money beside it only when the
+ * server sent the range totals), each opening to its notes per site; the
+ * spreadsheet carries the same lines.
  *
  * Every figure is the server's (GET /api/balances/rent-roll/history —
  * services/rentRoll, the one payment-health definition, the 10/6 hand-logged
@@ -98,7 +107,13 @@ export function movedOutInRangeWords(h: Pick<RentRollHistory, 'movedOutTotals' |
   return `Includes the moved-out households' bills in this range: invoiced ${money(mo.invoiced)} · paid ${money(mo.paid)} · owed ${money(mo.owed)}`
 }
 
-/** The rent roll as a spreadsheet: the rows as on screen, then the totals (when sent), then "Moved out, still owes". */
+/** The Stays card's head: "6 stays" — how many stays the lines add up. */
+export function staysMeta(stays: readonly Pick<RentRollStayLine, 'stays'>[]): string {
+  const n = stays.reduce((t, s) => t + s.stays, 0)
+  return `${n} stay${n === 1 ? '' : 's'}`
+}
+
+/** The rent roll as a spreadsheet: the rows as on screen, then the totals (when sent), then "Moved out, still owes", then the stays. */
 export function rentRollCsv(h: RentRollHistory): string {
   const months = newestFirst(h.months)
   const names = (rs: readonly RentRollResident[]) => householdNames(rs) || householdName(rs)
@@ -131,6 +146,15 @@ export function rentRollCsv(h: RentRollHistory): string {
       lines.push(csvLine([m.spaces.join(' '), names(m.residents), m.leaseEnded ?? '',
         m.inRange?.invoiced ?? 0, m.inRange?.paid ?? 0, m.inRange?.owed ?? 0, m.owed,
         m.months.map(x => `${monthTitle(x.month)} ${money(x.owed)}`).join('; ')]))
+    }
+  }
+  // 10/13 (Nic): the stays, an aggregate by line item, with the notes per site.
+  const stays = h.stays ?? []
+  if (stays.length) {
+    const withPaid = stays.some(s => s.paid !== undefined)
+    lines.push('', csvLine(['Stays']), csvLine(['Line item', 'Stays', ...(withPaid ? ['Paid'] : []), 'Sites']))
+    for (const s of stays) {
+      lines.push(csvLine([s.label, s.stays, ...(withPaid ? [s.paid ?? ''] : []), s.sites.map(x => x.label).join('; ')]))
     }
   }
   return lines.join('\n') + '\n'
@@ -173,12 +197,16 @@ function MonthStamp({ row, month }: { row: RentRollHistoryRow; month: string }) 
   return <StatusStamp status={s.status} label={s.statusLabel} color={s.statusColor} title={monthStampTitle(s)} onboarding={s.onboarding} />
 }
 
+/**
+ * The row's health: its percentage, or — nothing counted yet — why, in words
+ * (10/13, Nic, the onboarding month paid late: "Keep it out, but say so"):
+ * "Onboarding month — not counted", "No months to judge yet". Never a bare dash.
+ */
 function Health({ row }: { row: RentRollHistoryRow }) {
   const h = row.health
-  return (
-    <span title={`Pays on time: ${h.label} — all time through ${monthTitle(h.through)}`}
-      style={{ color: healthColor(h.percent), fontWeight: 700 }}>{healthText(h)}</span>
-  )
+  return h.percent === null
+    ? <span className="rr-health-words" title={healthTitle(h)}>{healthText(h)}</span>
+    : <span title={healthTitle(h)} style={{ color: healthColor(h.percent), fontWeight: 700 }}>{healthText(h)}</span>
 }
 
 const noRetryOn4xx = (count: number, e: any) => { const st = e?.response?.status; return !(st >= 400 && st < 500) && count < 2 }
@@ -194,6 +222,9 @@ export function RentRollPage() {
   // The view: the one the address names, else the default — the same for every property.
   const { pick: lit, range } = viewFromParams(params, today)
   const [movedOpen, setMovedOpen] = useState(false)
+  // 10/13 (Nic): "expandable notes" — which stay lines are open.
+  const [staysOpen, setStaysOpen] = useState<Set<string>>(() => new Set())
+  const toggleStay = (key: string) => setStaysOpen(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
 
   const history = useQuery(['rent-roll-history', propertyId, rangeKey(range)],
     () => api.get(historyPath(propertyId!, range)).then(r => r.data.data as RentRollHistory), {
@@ -210,12 +241,14 @@ export function RentRollPage() {
     next.set('property', id)
     setParams(next)
     setMovedOpen(false)
+    setStaysOpen(new Set())
   }
   const allProperties = () => {
     const next = new URLSearchParams(params)
     next.delete('property')
     setParams(next)
     setMovedOpen(false)
+    setStaysOpen(new Set())
   }
 
   // The custom boxes show the range on screen (All time: once its months are known).
@@ -420,6 +453,36 @@ export function RentRollPage() {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* 10/13 (Nic): "dont put these stays in the spot put them below
+                  with expandable notes" — below the households, never in a space's row. */}
+              {(data.stays ?? []).length > 0 && (
+                <div className="card rrh-stays" style={dim} data-section="stays">
+                  <div className="rrh-stays-head">
+                    Stays
+                    <span className="rrh-folder-meta">{staysMeta(data.stays)}</span>
+                  </div>
+                  <ul className="rrh-stays-list">
+                    {data.stays.map(s => {
+                      const open = staysOpen.has(s.key)
+                      return (
+                        <li key={s.key} className="rrh-stay" data-line={s.key}>
+                          <button type="button" className="rrh-stay-head" aria-expanded={open} onClick={() => toggleStay(s.key)}>
+                            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                            <span className="rrh-stay-label">{s.label}</span>
+                            {s.paid !== undefined && <span className="rrh-stay-paid">{money(s.paid)}</span>}
+                          </button>
+                          {open && (
+                            <ul className="rrh-stay-notes">
+                              {s.sites.map(x => <li key={x.space ?? ''}>{x.label}</li>)}
+                            </ul>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ul>
                 </div>
               )}
 

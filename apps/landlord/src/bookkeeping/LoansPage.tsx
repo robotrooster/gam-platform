@@ -6,6 +6,14 @@
  * property tax and insurance). A payment is typed here, or made from a bank
  * line on the Bank page.
  *
+ * 10/13 (Nic): "each expense is chosen on the split or specific unit or
+ * property at the time of logging. there should never be a default setting to
+ * apply expenses." A loan says where its interest goes when it is logged —
+ * split across the properties by units, one property, or one unit
+ * (CostPlaceField); the form does not save until that is answered. And
+ * "they don't pick as a setting, they pick as the expense happens": where the
+ * loan's money went and what each payment was paid from start blank too.
+ *
  * GAM Books' own page, shown in GAM Books and inside the landlord portal's
  * Bookkeeping menu — the same bytes in apps/books and apps/landlord
  * (bookkeeping-parity.test.ts). How it reaches the API, shows a toast and
@@ -15,20 +23,24 @@ import React, { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   formatCurrency, BOOKS_LOAN_FUNDED_TO, BOOKS_LOAN_FUNDED_TO_LABEL, BOOKS_LOAN_PAYMENT_METHODS, BOOKS_LOAN_PAYMENT_METHOD_LABEL,
-  BOOKS_LOAN_STATE_LABEL,
+  BOOKS_LOAN_STATE_LABEL, BOOKS_COST_PLACE_NONE_LABEL, BOOKS_COST_PLACE_LABEL,
 } from '@gam/shared'
 import { booksGet as get, booksPost as post, booksPatch as patch, toast } from './adapter'
 import { Modal } from './common'
 import { VoidReasonModal } from './VoidReasonModal'
+import { CostPlaceField, useCostPlaces, costPlaceOf, costPlaceChosen, costPlaceBody, type CostPlaceValue, type CostPlaceProperty } from './CostPlaceField'
 
 const day=(d:string|null|undefined)=>d?new Date(`${d.slice(0,10)}T12:00:00`).toLocaleDateString():'—'
 const stateLabel=(s:string)=>(BOOKS_LOAN_STATE_LABEL as Record<string,string>)[s]??'—'
 const methodLabel=(m:string)=>(BOOKS_LOAN_PAYMENT_METHOD_LABEL as Record<string,string>)[m]??'—'
 const fundedLabel=(f:string)=>(BOOKS_LOAN_FUNDED_TO_LABEL as Record<string,string>)[f]??'—'
 const money=(n:number)=>Math.round(n*100)/100
+// 10/13 (Nic): where a loan's interest goes, in words, for its row.
+const placeWords=(l:any)=>l.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units
+  :l.unitNumber?`${l.propertyName??''} · Unit ${l.unitNumber}`:(l.propertyName??BOOKS_COST_PLACE_NONE_LABEL)
 
-const blankLoan={name:'',lenderName:'',vendorId:'',propertyId:'',originalAmount:'',annualRate:'',startDate:'',termMonths:'',
-  paymentAmount:'',escrowAmount:'0',paymentDay:'',fundedTo:'bank',fundedBankConnectionId:'',openingBalance:'',openingEscrow:'',notes:''}
+const blankLoan={name:'',lenderName:'',vendorId:'',originalAmount:'',annualRate:'',startDate:'',termMonths:'',
+  paymentAmount:'',escrowAmount:'0',paymentDay:'',fundedTo:'',fundedBankConnectionId:'',openingBalance:'',openingEscrow:'',notes:''}
 type LoanForm=typeof blankLoan
 
 export function LoansPage(){
@@ -36,7 +48,7 @@ export function LoansPage(){
   const[showVoided,setShowVoided]=useState(false)
   const{data:loans=[],isLoading}=useQuery(['loans',showVoided],()=>get<any[]>(`/books/loans${showVoided?'?includeVoided=true':''}`))
   const{data:opts}=useQuery('loanOpts',()=>get<any>('/books/loans/form-options'))
-  const{data:properties=[]}=useQuery('booksProps',()=>get<any[]>('/books/properties').catch(()=>[]))
+  const{properties,asked}=useCostPlaces()
   const{data:vendors=[]}=useQuery(['ven',false],()=>get<any[]>('/books/vendors'))
   const[editing,setEditing]=useState<any|null|'new'>(null)
   const[openId,setOpenId]=useState<string|null>(null)
@@ -71,7 +83,7 @@ export function LoansPage(){
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
           <div style={{overflowX:'auto'}}>
             <table className="tbl" style={{minWidth:640}}>
-              <thead><tr><th>Loan</th><th>Property</th><th>Rate</th><th>Payment</th><th>Owed now</th><th>Escrow held</th><th>Last paid</th><th></th></tr></thead>
+              <thead><tr><th>Loan</th><th>Interest goes to</th><th>Rate</th><th>Payment</th><th>Owed now</th><th>Escrow held</th><th>Last paid</th><th></th></tr></thead>
               <tbody>
                 {(loans as any[]).length?(loans as any[]).map((l:any)=>(
                   <tr key={l.id} style={{opacity:l.state==='voided'?.5:1}}>
@@ -79,7 +91,7 @@ export function LoansPage(){
                       <div style={{fontWeight:600,color:'var(--t0)'}}>{l.name}</div>
                       <div style={{fontSize:'.68rem',color:'var(--t3)'}}>{l.lenderName} · <span className={`badge ${l.state==='active'?'bteal':l.state==='paid_off'?'bg2':'bmu'}`}>{stateLabel(l.state)}</span></div>
                     </td>
-                    <td style={{fontSize:'.75rem'}}>{l.propertyName??'Company'}</td>
+                    <td style={{fontSize:'.75rem'}}>{placeWords(l)}</td>
                     <td className="mono">{(+l.annualRate).toFixed(3).replace(/\.?0+$/,'')}%</td>
                     <td className="mono">{l.paymentAmount?formatCurrency(l.paymentAmount):'—'}{+l.escrowAmount>0&&<div style={{fontSize:'.62rem',color:'var(--t3)'}}>{formatCurrency(l.escrowAmount)} escrow</div>}</td>
                     <td className="mono" style={{color:'var(--red)'}}>{l.balance==null?<span className="badge ba">Enter what was owed</span>:formatCurrency(l.balance)}</td>
@@ -94,19 +106,21 @@ export function LoansPage(){
         )}
       </div>
 
-      {editing&&<LoanFormModal loan={editing==='new'?null:editing} opts={opts} properties={properties as any[]} vendors={vendors as any[]}
+      {editing&&<LoanFormModal loan={editing==='new'?null:editing} opts={opts} properties={properties} asked={asked} vendors={vendors as any[]}
         onClose={()=>setEditing(null)} onSaved={(id)=>{refresh();setEditing(null);setOpenId(id)}}/>}
       {openId&&!editing&&<LoanDetail id={openId} onClose={()=>setOpenId(null)} onEdit={(l)=>setEditing(l)} onChanged={refresh} opts={opts}/>}
     </div>
   )
 }
 
-function LoanFormModal({loan,opts,properties,vendors,onClose,onSaved}:{loan:any|null;opts:any;properties:any[];vendors:any[];onClose:()=>void;onSaved:(id:string)=>void}){
+function LoanFormModal({loan,opts,properties,asked,vendors,onClose,onSaved}:{loan:any|null;opts:any;properties:CostPlaceProperty[];asked:boolean;vendors:any[];onClose:()=>void;onSaved:(id:string)=>void}){
+  // 10/13 (Nic): where its interest goes — asked, never chosen for the person.
+  const[place,setPlace]=useState<CostPlaceValue>(()=>costPlaceOf(loan))
   const[form,setForm]=useState<LoanForm>(()=>loan?{
-    name:loan.name??'',lenderName:loan.lenderName??'',vendorId:loan.vendorId??'',propertyId:loan.propertyId??'',
+    name:loan.name??'',lenderName:loan.lenderName??'',vendorId:loan.vendorId??'',
     originalAmount:String(+loan.originalAmount),annualRate:String(+loan.annualRate),startDate:loan.startDate??'',
     termMonths:loan.termMonths?String(loan.termMonths):'',paymentAmount:loan.paymentAmount?String(+loan.paymentAmount):'',
-    escrowAmount:String(+loan.escrowAmount||0),paymentDay:loan.paymentDay?String(loan.paymentDay):'',fundedTo:loan.fundedTo??'bank',
+    escrowAmount:String(+loan.escrowAmount||0),paymentDay:loan.paymentDay?String(loan.paymentDay):'',fundedTo:loan.fundedTo??'',
     fundedBankConnectionId:loan.fundedBankConnectionId??'',openingBalance:loan.openingBalance!=null?String(+loan.openingBalance):'',
     openingEscrow:loan.openingEscrow!=null?String(+loan.openingEscrow):'',notes:loan.notes??''}:blankLoan)
   const[err,setErr]=useState('')
@@ -117,7 +131,7 @@ function LoanFormModal({loan,opts,properties,vendors,onClose,onSaved}:{loan:any|
   const save=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
     const body:any={...form,fundedTo:before?'':form.fundedTo,fundedBankConnectionId:!before&&form.fundedTo==='bank'?form.fundedBankConnectionId:'',
-      openingBalance:before?form.openingBalance:'',openingEscrow:before?form.openingEscrow:''}
+      openingBalance:before?form.openingBalance:'',openingEscrow:before?form.openingEscrow:'',...(asked?costPlaceBody(place):{})}
     try{
       const r=loan?await patch(`/books/loans/${loan.id}`,body):await post('/books/loans',body)
       toast(loan?'Loan saved.':`${form.name} added.`)
@@ -133,19 +147,12 @@ function LoanFormModal({loan,opts,properties,vendors,onClose,onSaved}:{loan:any|
           <div><label>Name of the loan</label><input type="text" value={form.name} onChange={set('name')} maxLength={120} required placeholder="e.g. Oak Street mortgage"/></div>
           <div><label>Lender</label><input type="text" value={form.lenderName} onChange={set('lenderName')} maxLength={200} required/></div>
         </div>
-        <div className="frow2">
-          <div><label>Property</label>
-            <select value={form.propertyId} onChange={set('propertyId')}>
-              <option value="">The company (no one property)</option>
-              {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
-          </div>
-          <div><label>Lender on your vendor list (optional)</label>
-            <select value={form.vendorId} onChange={set('vendorId')}>
-              <option value="">None</option>
-              {vendors.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
-            </select>
-          </div>
+        {asked&&<CostPlaceField value={place} onChange={setPlace} properties={properties} what="its interest"/>}
+        <div className="frow"><label>Lender on your vendor list (optional)</label>
+          <select value={form.vendorId} onChange={set('vendorId')}>
+            <option value="">None</option>
+            {vendors.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
+          </select>
         </div>
         <div className="frow2">
           <div><label>Amount borrowed</label><input type="number" min="0.01" step="0.01" value={form.originalAmount} onChange={set('originalAmount')} required/></div>
@@ -172,6 +179,7 @@ function LoanFormModal({loan,opts,properties,vendors,onClose,onSaved}:{loan:any|
           <div className="frow2">
             <div><label>Where the money went</label>
               <select value={form.fundedTo} onChange={set('fundedTo')} required>
+                <option value="">Choose where the money went</option>
                 {BOOKS_LOAN_FUNDED_TO.map(f=><option key={f} value={f}>{fundedLabel(f)}</option>)}
               </select>
             </div>
@@ -186,7 +194,7 @@ function LoanFormModal({loan,opts,properties,vendors,onClose,onSaved}:{loan:any|
         <div className="frow"><label>Notes (optional)</label><textarea rows={2} value={form.notes} onChange={set('notes')}/></div>
         <div className="factions">
           <button type="button" className="btn bg-btn" onClick={onClose}>Cancel</button>
-          <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:loan?'Save':'Add Loan'}</button>
+          <button type="submit" className="btn bp" disabled={saving||(asked&&!costPlaceChosen(place))||(!before&&!form.fundedTo)}>{saving?<><span className="spinner"/>Saving…</>:loan?'Save':'Add Loan'}</button>
         </div>
       </form>
     </Modal>
@@ -197,7 +205,8 @@ function LoanDetail({id,opts,onClose,onEdit,onChanged}:{id:string;opts:any;onClo
   const qc=useQueryClient()
   const{data:loan}=useQuery(['loan',id],()=>get<any>(`/books/loans/${id}`))
   const today:string=opts?.today??new Date().toISOString().slice(0,10)
-  const[pay,setPay]=useState({paidOn:today,amount:'',principal:'',interest:'',escrow:'',method:'bank',bankConnectionId:'',memo:''})
+  // 10/13 (Nic): what it was paid from is picked on each payment, never preselected.
+  const[pay,setPay]=useState({paidOn:today,amount:'',principal:'',interest:'',escrow:'',method:'',bankConnectionId:'',memo:''})
   const[hint,setHint]=useState<any>(null)
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
@@ -220,7 +229,7 @@ function LoanDetail({id,opts,onClose,onEdit,onChanged}:{id:string;opts:any;onClo
       await post(`/books/loans/${id}/payments`,{...pay,amount:+pay.amount,principal:+pay.principal||0,interest:+pay.interest||0,escrow:+pay.escrow||0,
         bankConnectionId:pay.method==='bank'?pay.bankConnectionId:''})
       toast('Payment recorded.')
-      setPay(p=>({...p,principal:'',interest:'',escrow:'',memo:''}))
+      setPay(p=>({...p,principal:'',interest:'',escrow:'',memo:'',method:'',bankConnectionId:''}))
       qc.invalidateQueries(['loan',id]);onChanged()
     }catch(ex:any){setErr(ex.response?.data?.error||'Could not record the payment.')}
     finally{setSaving(false)}
@@ -231,7 +240,7 @@ function LoanDetail({id,opts,onClose,onEdit,onChanged}:{id:string;opts:any;onClo
   return(
     <Modal title={loan.name} onClose={onClose}>
       <div className="dr"><span className="dk">Lender</span><span className="dv">{loan.lenderName}{loan.vendorName?` (${loan.vendorName})`:''}</span></div>
-      <div className="dr"><span className="dk">Property</span><span className="dv">{loan.propertyName??'The company'}</span></div>
+      <div className="dr"><span className="dk">Interest goes to</span><span className="dv">{placeWords(loan)}</span></div>
       <div className="dr"><span className="dk">Borrowed</span><span className="dv mono">{formatCurrency(loan.originalAmount)} on {day(loan.startDate)}</span></div>
       {loan.opensAtBooksStart?
         <div className="dr"><span className="dk">Owed on your books start</span><span className="dv mono">{loan.openingBalance!=null?formatCurrency(loan.openingBalance):'Not entered yet'}</span></div>:
@@ -261,7 +270,8 @@ function LoanDetail({id,opts,onClose,onEdit,onChanged}:{id:string;opts:any;onClo
           {+pay.amount>0&&parts!==money(+pay.amount)&&<div className="alert aw">The parts add up to {formatCurrency(parts)}; they must add up to the payment.</div>}
           <div className="frow2">
             <div><label>Paid from</label>
-              <select value={pay.method} onChange={setP('method')}>
+              <select value={pay.method} onChange={setP('method')} required>
+                <option value="">Choose where it came from</option>
                 {BOOKS_LOAN_PAYMENT_METHODS.map(m=><option key={m} value={m}>{methodLabel(m)}</option>)}
               </select>
             </div>
@@ -273,7 +283,7 @@ function LoanDetail({id,opts,onClose,onEdit,onChanged}:{id:string;opts:any;onClo
             </div>}
           </div>
           <div className="factions" style={{marginTop:0}}>
-            <button type="submit" className="btn bp" disabled={saving||parts!==money(+pay.amount)}>{saving?<><span className="spinner"/>Saving…</>:'Record payment'}</button>
+            <button type="submit" className="btn bp" disabled={saving||parts!==money(+pay.amount)||!pay.method}>{saving?<><span className="spinner"/>Saving…</>:'Record payment'}</button>
           </div>
           <p style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,marginBottom:0}}>Paid from a linked bank, it matches its bank line when the line arrives. A payment the Bank page made from a line is changed there.</p>
         </form>

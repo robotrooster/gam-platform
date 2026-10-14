@@ -294,13 +294,18 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       // written, GAM's fees, a refund, a transfer or a loan payment to the cent
       // is refused with what it fits — matched on the Bank page, never filed twice.
       'Money out that fits a bill or record to the cent is refused with what it fits: send them to "What did this pay?" ' +
-      'on the Bank page; notAMatch only once they say it is none of those.',
+      'on the Bank page; notAMatch only once they say it is none of those. ' +
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or property at the time of logging."
+      'Where it goes is theirs to say, every time — ask; never pick it for them.',
     params: {
       transactionId: { type: 'string', description: 'The transaction id from the bank feed.' },
       category: { type: 'string', description: 'The expense or income category it belongs to.' },
+      scopeKind: { type: 'string', description: 'Where it goes: unit, property_common (the whole property), or split_by_units (money out only: across all their properties by units). Ask them.' },
+      unitId: { type: 'string', description: 'For unit: which unit, from a lookup.' },
+      propertyId: { type: 'string', description: 'For property_common: which property, from a lookup.' },
       notAMatch: { type: 'boolean', description: 'True only once the landlord says it is none of the records it fits.' },
     },
-    required: ['transactionId', 'category'],
+    required: ['transactionId', 'category', 'scopeKind'],
   },
   {
     id: 'ignore_bank_transaction',
@@ -472,12 +477,13 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'POST', path: '/api/esign/documents/:documentId/void',
     pathParams: ['documentId'],
     description:
-      'Void a document that should not be signed — wrong terms, wrong tenant, superseded. It stays ' +
-      'on record as voided rather than vanishing. Signers can no longer sign it. Use for "kill the ' +
-      'lease I sent to 204, the rent was wrong".',
+      'End a document that should not be signed — wrong terms, wrong tenant, superseded. One that ' +
+      'never completed and that no money touched is deleted for good; anything else stays on record ' +
+      'as voided. The result says which (deleted: true or false). Signers can no longer sign it. Use ' +
+      'for "kill the lease I sent to 204, the rent was wrong".',
     params: {
       documentId: { type: 'string', description: 'The document id, from a lookup.' },
-      reason: { type: 'string', description: 'Why it is being voided, in their words — this is the audit trail.' },
+      reason: { type: 'string', description: 'Why, in their words — kept on the record when it is voided.' },
     },
     required: ['documentId'],
     confirmFirst: true,
@@ -1554,8 +1560,16 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'pay and each payroll tax it leaves owed become unpaid bills on their Expenses, which the bank ' +
       'lines that pay them clear. It does NOT pay anybody: GAM does not send wages, and ' +
       'they still pay their people however they normally do. Read back the period, the pay date and ' +
-      'the number of people on it before approving, and never approve a run you have not read.',
-    params: { runId: { type: 'string', description: 'The payroll run id, from a lookup.' } },
+      'the number of people on it before approving, and never approve a run you have not read. ' +
+      'A run that does not yet say where its wages go is not approved until they say: split across their ' +
+      'properties by units, one property, or one unit.',
+    params: {
+      runId: { type: 'string', description: 'The payroll run id, from a lookup.' },
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or property at the time of logging."
+      costPlace: { type: 'string', description: 'Where the wages and employer taxes go: split_by_units (across their properties by units), property, or unit. Ask them; never pick it for them.' },
+      propertyId: { type: 'string', description: 'For property: which property, from a lookup.' },
+      unitId: { type: 'string', description: 'For unit: which unit, from a lookup.' },
+    },
     required: ['runId'],
     confirmFirst: true,
   },
@@ -4091,6 +4105,10 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       employeeIds: { type: 'array', description: 'Which employees are on this run, from a lookup.' },
       hoursMap: { type: 'object', description: 'Hours worked, keyed by employee id. Their figures, never estimated.' },
       taxMap: { type: 'object', description: 'Federal and state withholding per employee, keyed by employee id. Their figures.' },
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or property at the time of logging."
+      costPlace: { type: 'string', description: 'Where the wages and employer taxes go: split_by_units (across their properties by units), property, or unit. Ask them; never pick it for them.' },
+      propertyId: { type: 'string', description: 'For property: which property, from a lookup.' },
+      unitId: { type: 'string', description: 'For unit: which unit, from a lookup.' },
     },
     required: ['periodStart', 'periodEnd', 'payDate', 'payFrequency', 'employeeIds'],
     confirmFirst: true,

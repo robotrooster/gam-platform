@@ -11,7 +11,7 @@
  * running balance stays a real running balance.
  */
 import type { PoolClient } from 'pg'
-import type { PlatformRevenueTypeValue } from '@gam/shared'
+import { READER_BOOK_REFERENCE, type PlatformRevenueTypeValue } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { logger } from '../lib/logger'
 
@@ -63,8 +63,9 @@ export interface PlatformRevenueEntry {
  * carries on exactly as it would without one.
  *
  * Amounts are positive, except an 'adjustment', which may be negative (money
- * taken back off the book: a FlexPay $25 whose pull the bank took back). A $0
- * row is never written.
+ * taken back off the book: a FlexPay $25 whose pull the bank took back), and
+ * (10/13 evening) a card reader's markup split again under a corrected cost
+ * (reference 'reader_resplit'). A $0 row is never written.
  *
  * Inside a transaction, pass its client — unless that transaction goes on to
  * wait on something slow (a card capture) before it commits: then book after
@@ -238,8 +239,11 @@ const OWN_TRANSACTION_LOCK_TIMEOUT = '10s'
 async function writeRevenueRow(e: PlatformRevenueEntry, exec: RevenueExec, inTransaction = false): Promise<void> {
   // Earnings are always money in. Only an 'adjustment' may take money back off
   // the book (S655: a FlexPay $25 whose pull the bank took back), and never by
-  // $0.
-  if (e.type === 'adjustment' ? !(Number.isFinite(e.amount) && e.amount !== 0) : !(e.amount > 0)) return
+  // $0. 10/13 evening (Nic: "Redo the split"): so may a card reader's markup
+  // split again under a corrected cost (reference 'reader_resplit',
+  // @gam/shared READER_BOOK_REFERENCE) — more shipping takes markup back.
+  const signed = e.type === 'adjustment' || (e.type === 'device_markup' && e.referenceType === READER_BOOK_REFERENCE.resplit)
+  if (signed ? !(Number.isFinite(e.amount) && e.amount !== 0) : !(e.amount > 0)) return
   // S653 (Nic): "any demo money should not be billed. It should not exist in
   // the system at all." A row tied to a demo or GAM-internal account is not
   // revenue and never reaches the book — no charge, and therefore never a

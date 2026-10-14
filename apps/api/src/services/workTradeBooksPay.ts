@@ -30,7 +30,7 @@ import type { PoolClient } from 'pg'
 import { AppError } from '../middleware/errorHandler'
 import { todayIn } from '../lib/timezone'
 import { createMoneyOutExpense, createLandlordExpense } from './landlordExpenses'
-import { getOrCreateContractorVendorForTenant } from './booksVendorsLoans'
+import { getOrCreateContractorVendorForTenant, type CostPlaceChoice } from './booksVendorsLoans'
 import { ensureCategories } from './booksCategories'
 
 /**
@@ -47,6 +47,9 @@ export const EXTRA_HOURS_ON_LIVE_RUN_SQL = `EXISTS (
   SELECT 1 FROM payroll_run_lines l JOIN payroll_runs r ON r.id = l.run_id
    WHERE l.work_trade_extra_hours_id = x.id AND r.status IN ('draft', 'approved'))`
 
+/** 10/13 (Nic): what a contractor bill confirmed with no place is told. */
+export const CONTRACTOR_BILL_NO_PLACE = 'Choose where this contractor bill goes: one unit, one property, or split across your properties by units.'
+
 export interface WorkTradeContractorPayment {
   expenseId: string
   vendorId: string
@@ -60,9 +63,14 @@ export interface WorkTradeContractorPayment {
  * record is locked while it is checked: it must be this company's, sent as a
  * contractor payment, and still waiting for Books (not paid, not already an
  * expense that is live).
+ *
+ * 10/13 (Nic): "each expense is chosen on the split or specific unit or
+ * property at the time of logging" — `place` is where the person confirming
+ * the bill said its cost goes (routes/books.ts resolves it); the bill keeps it.
  */
 export async function recordWorkTradeContractorPayment(client: PoolClient, args: {
   landlordId: string; extraHoursId: string; vendorId?: string | null; createdBy: string | null
+  place: CostPlaceChoice | null
 }): Promise<WorkTradeContractorPayment> {
   const { rows: [x] } = await client.query<any>(
     `SELECT x.*, to_char(x.period_month, 'YYYY-MM') AS period_ym,
@@ -80,6 +88,7 @@ export async function recordWorkTradeContractorPayment(client: PoolClient, args:
   const { rows: [v] } = await client.query<{ id: string; name: string }>(
     `SELECT id, name FROM books_vendors WHERE id = $1 AND landlord_id = $2 AND status = 'active'`, [vendorId, args.landlordId])
   if (!v) throw new AppError(404, 'That vendor is not one of this company\'s.')
+  if (!args.place?.costPlace) throw new AppError(400, CONTRACTOR_BILL_NO_PLACE)
 
   const today = todayIn(null)
   const amount = +(+x.amount).toFixed(2)
@@ -89,6 +98,8 @@ export async function recordWorkTradeContractorPayment(client: PoolClient, args:
     landlordId: args.landlordId, categoryKey: 'contractor_payments', amount, expenseDate: today, dueDate: today,
     description: `Work-trade extra hours, ${x.period_ym}: ${v.name}`, createdBy: args.createdBy,
     vendorId: v.id, workTradeExtraHoursId: x.id,
+    // 10/13 (Nic): where the person confirming it said the cost goes.
+    costPlace: args.place.costPlace, propertyId: args.place.propertyId, unitId: args.place.unitId,
   })
   await client.query(
     `UPDATE work_trade_extra_hours SET books_reference_id = $2, updated_at = NOW() WHERE id = $1`, [x.id, expenseId])
@@ -190,6 +201,9 @@ export async function recordWorkTradeHoursPaidByHand(client: PoolClient, args: {
       + (contractor ? ' (contractor, 1099)' : ' (wages paid outside payroll)'),
     vendorId: vendor?.id ?? null,
     propertyId: x.property_id, isCommon: !!x.property_id,
+    // 10/13: GAM's record of hours marked paid by hand — on the work trader's
+    // property (company level if that property has left the company).
+    systemBill: true,
     workTradeExtraHoursId: x.id,
     payment: { method: x.paid_how, paidOn: x.paid_on, memo: x.paid_note },
   }, client)

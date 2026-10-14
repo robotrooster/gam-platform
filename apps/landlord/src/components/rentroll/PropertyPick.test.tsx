@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { chosenProperty, householdName, householdNames, reportPath } from './PropertyPick'
-import { StatusStamp, monthStampTitle } from './StatusStamp'
+import { StatusStamp, monthStampTitle, ONBOARDING_STAMP_WORDS } from './StatusStamp'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -70,5 +70,53 @@ describe('the stamp', () => {
     expect(monthStampTitle({ month: '2026-09', statusLabel: 'Paid', invoiced: 495, paid: 0, workTrade: 495, owed: 0, onboarding: true }))
       .toBe('September 2026: Paid · invoiced $495.00 · paid $0.00 · work trade $495.00 · first month on GAM')
     expect(monthStampTitle({ month: '2026-08', statusLabel: 'No bill', invoiced: 0, paid: 0, workTrade: 0, owed: 0 })).toBe('August 2026: No bill')
+  })
+
+  // 10/13 (Nic): the gold underline on the onboarding month — "KEEP it, and
+  // give it a label": hover or tap says "First month on GAM".
+  it('the onboarding month keeps its gold underline and says "First month on GAM" on hover and on a tap', async () => {
+    const title = monthStampTitle({ month: '2026-09', statusLabel: 'Paid late +4', invoiced: 495, paid: 495, workTrade: 0, owed: 0, onboarding: true })
+    act(() => root.render(<StatusStamp status="paid_late" label="Paid late +4" color="orange" title={title} onboarding />))
+    expect(ONBOARDING_STAMP_WORDS).toBe('First month on GAM')
+    const stamp = host.querySelector('.rrs') as HTMLButtonElement
+    expect(stamp.tagName).toBe('BUTTON')
+    expect(stamp.className).toBe('rrs orange onboarding')
+    expect(stamp.textContent).toBe('Paid late +4')
+    // Said to a screen reader too; never the browser's own hover box beside the label.
+    expect(stamp.getAttribute('aria-label')).toBe('September 2026: Paid late +4 · invoiced $495.00 · paid $495.00 · first month on GAM')
+    expect(stamp.getAttribute('title')).toBeNull()
+    const tip = () => host.querySelector('[role="tooltip"]')
+    expect(tip()).toBeNull()
+    // A mouse on it.
+    const pointer = (type: string, pointerType: string) => {
+      const ev = new MouseEvent(type, { bubbles: true, relatedTarget: type === 'pointerover' ? document.body : null })
+      Object.defineProperty(ev, 'pointerType', { value: pointerType })
+      return ev
+    }
+    act(() => { stamp.dispatchEvent(pointer('pointerover', 'mouse')) })
+    expect(tip()!.querySelector('strong')!.textContent).toBe('First month on GAM')
+    expect(tip()!.textContent).toBe('First month on GAMSeptember 2026: Paid late +4 · invoiced $495.00 · paid $495.00')
+    expect(stamp.getAttribute('aria-describedby')).toBe(tip()!.id)
+    act(() => { stamp.dispatchEvent(new MouseEvent('pointerout', { bubbles: true, relatedTarget: document.body })) })
+    expect(tip()).toBeNull()
+    // A finger: a tap says it, a tap again (or Escape) closes it.
+    act(() => { stamp.dispatchEvent(pointer('pointerover', 'touch')) })
+    expect(tip()).toBeNull()
+    await act(async () => { stamp.click() })
+    expect(tip()!.querySelector('strong')!.textContent).toBe('First month on GAM')
+    expect(stamp.getAttribute('aria-expanded')).toBe('true')
+    await act(async () => { stamp.click() })
+    expect(tip()).toBeNull()
+    await act(async () => { stamp.click() })
+    act(() => { stamp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
+    expect(tip()).toBeNull()
+  })
+
+  it('a stamp that is not the onboarding month stays a plain pill with its words on hover', () => {
+    act(() => root.render(<StatusStamp status="paid" label="Paid" color="green" title="October 2026: Paid" />))
+    const stamp = host.querySelector('.rrs')!
+    expect(stamp.tagName).toBe('SPAN')
+    expect(stamp.getAttribute('title')).toBe('October 2026: Paid')
+    expect(host.querySelector('button')).toBeNull()
   })
 })

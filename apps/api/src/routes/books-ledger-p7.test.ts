@@ -92,10 +92,6 @@ async function waitingReason(sourceType: string, sourceId: string): Promise<stri
   return r.rows[0]?.reason_code ?? null
 }
 
-async function costsMethod(co: LedgerCompany, m: 'company_bucket' | 'split_by_units'): Promise<void> {
-  await db.query(`UPDATE landlords SET books_company_costs_method = $2 WHERE id = $1`, [co.landlordId, m])
-}
-
 async function employee(co: LedgerCompany, o: { first: string; payType?: 'salary' | 'hourly'; rate: number }): Promise<string> {
   const r = await db.query<{ id: string }>(
     `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, filing_status,
@@ -107,7 +103,9 @@ async function employee(co: LedgerCompany, o: { first: string; payType?: 'salary
 
 /** A run calculated and approved through the routes; returns its id. */
 async function approvedRun(co: LedgerCompany, body: object): Promise<string> {
-  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly', ...body })
+  // 10/13 (Nic): a run says where its wages go when it is logged (here: the company's first property, unless the test says).
+  const place = 'costPlace' in body ? {} : { costPlace: 'property', propertyId: co.propertyId }
+  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly', ...place, ...body })
   expect(calc.status, JSON.stringify(calc.body)).toBe(201)
   const ok = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
   expect(ok.status, JSON.stringify(ok.body)).toBe(200)
@@ -131,7 +129,6 @@ async function chart(co: LedgerCompany): Promise<(role: string) => Promise<strin
 describe('a payroll run posts on its pay date (J3)', () => {
   it('wages and the employer\'s taxes as expenses; withholding, the employer\'s taxes and take-home pay as liabilities', async () => {
     const co = await ledgerCompany()
-    await costsMethod(co, 'company_bucket')
     const a = await employee(co, { first: 'Ann', rate: 52000 })     // 2,000 every two weeks
     const b = await employee(co, { first: 'Bo', rate: 26000 })      // 1,000
     const runId = await approvedRun(co, {
@@ -152,7 +149,10 @@ describe('a payroll run posts on its pay date (J3)', () => {
     // Take-home: 3,000 − 200 − 40 − 186 − 43.50
     expect(by('net_pay_payable')).toBeCloseTo(-2530.5, 2)
     expect(new Set(ls.map(l => l.day))).toEqual(new Set(['2026-03-20']))
-    expect(ls.every(l => l.property === null)).toBe(true)
+    // 10/13 (Nic): the wages and the employer's taxes where the run said (its property); what is owed at company level.
+    const costs = new Set(['payroll_expense', 'employer_payroll_taxes'])
+    expect(ls.filter(l => costs.has(l.role ?? '')).every(l => l.property === co.propertyId)).toBe(true)
+    expect(ls.filter(l => !costs.has(l.role ?? '') && l.role !== 'interproperty_clearing').every(l => l.property === null)).toBe(true)
     // The run's own totals carry the employer's taxes.
     const run = (await db.query<any>(`SELECT * FROM payroll_runs WHERE id = $1`, [runId])).rows[0]
     expect([+run.total_employer_ss, +run.total_employer_medicare, +run.total_futa, +run.total_suta]).toEqual([186, 43.5, 18, 30])
@@ -165,39 +165,35 @@ describe('a payroll run posts on its pay date (J3)', () => {
     expect(await roleBalance(co.landlordId, 'accounts_payable')).toBeCloseTo(-(2530.5 + 200 + 40 + 459 + 18 + 30), 2)
   })
 
-  // 10/13 (Nic): "Company-level costs before the owner picks: post to the
-  // COMPANY column by default"; "a later 'split by units' splits only NEW costs".
-  it('goes to the Company column until the owner picks (L7); a later split by units splits only runs approved after it', async () => {
+  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+  // property at the time of logging. there should never be a default setting
+  // to apply expenses" — payroll is logged by a person, so the run says where
+  // its wages go; nothing approves without it.
+  it('goes where the run says when it is logged: split by units, one unit; a run approved before 10/13 stays in the Company column', async () => {
     const co = await ledgerCompany()
     const a = await employee(co, { first: 'Ann', rate: 26000 })     // 1,000
-    const runId = await approvedRun(co, { employeeIds: [a] })
-    expect(await settle()).toEqual({ failed: 0 })
-    expect(await waitingReason('payroll_run', runId)).toBeNull()
-    const companyOnly = (ls: Line[]) => ls.filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr])
-    expect(companyOnly(await activeLines('payroll_run', runId))).toEqual([[null, 1000]])
-    // Three units on the first property, one on the second (the fixture's unit plus three).
+    // Three units on the first property, one on the second (the fixture's unit plus three), there on the pay dates.
     await inTx(async c => {
       for (const [p, n] of [[co.propertyId, 2], [co.propertyId2, 1]] as const) {
         for (let i = 0; i < n; i++) await seedUnit(c, { propertyId: p, landlordId: co.landlordId })
       }
-      // Every unit was there on the pay dates.
       await c.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
     })
-    // The owner picks "split by units" after the books posted (services/booksSettings stamps the moment).
-    await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units', books_company_costs_from = now() WHERE id = $1`,
-      [co.landlordId])
-    // What is already in the Company column stays there — re-posted, or rebuilt.
-    await db.query(`INSERT INTO ledger_outbox (source_type, source_id, owner_id) VALUES ('payroll_run', $1, $2)`, [runId, co.landlordId])
-    expect(await settle()).toEqual({ failed: 0 })
-    expect(companyOnly(await activeLines('payroll_run', runId))).toEqual([[null, 1000]])
-    // A run approved after the pick splits.
-    const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-15', periodEnd: '2026-03-28', payDate: '2026-04-03',
+    // The retired setting decides nothing.
+    await db.query(`UPDATE landlords SET books_company_costs_method = 'company_bucket' WHERE id = $1`, [co.landlordId])
+    // Nothing chosen: calculated, but never approved.
+    const bare = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20',
       payFrequency: 'biweekly', employeeIds: [a] })
-    expect(calc.status, JSON.stringify(calc.body)).toBe(201)
-    expect((await post(co, `/payroll/runs/${calc.body.data.id}/approve`)).status).toBe(200)
-    const later = calc.body.data.id as string
+    expect(bare.status, JSON.stringify(bare.body)).toBe(201)
+    const refused = await post(co, `/payroll/runs/${bare.body.data.id}/approve`)
+    expect([refused.status, refused.body.error]).toEqual([400,
+      'Choose where this payroll\'s wages and employer taxes go: one unit, one property, or split across your properties by units.'])
+    // Said at approval instead: split across the properties by units.
+    const ok = await post(co, `/payroll/runs/${bare.body.data.id}/approve`, { costPlace: 'split_by_units' })
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    expect(ok.body.data).toMatchObject({ cost_place: 'split_by_units', property_id: null, unit_id: null })
     expect(await settle()).toEqual({ failed: 0 })
-    const ls = await activeLines('payroll_run', later)
+    const ls = await activeLines('payroll_run', bare.body.data.id)
     const wages = ls.filter(l => l.role === 'payroll_expense')
     expect(wages.map(l => [l.property, l.dr]).sort()).toEqual([[co.propertyId, 750], [co.propertyId2, 250]].sort())
     // What is owed stays company level; the clearing lines balance each property.
@@ -209,11 +205,33 @@ describe('a payroll run posts on its pay date (J3)', () => {
       const net = ls.filter(l => l.property === p).reduce((s, l) => s + l.dr - l.cr, 0)
       expect(Math.round(net * 100)).toBe(0)
     }
+
+    // One unit: on its property, tagged with the unit.
+    const onUnit = await approvedRun(co, { employeeIds: [a], costPlace: 'unit', unitId: co.unitId, payDate: '2026-04-03',
+      periodStart: '2026-03-15', periodEnd: '2026-03-28' })
+    expect(await settle()).toEqual({ failed: 0 })
+    const unitLines = (await db.query<{ property_id: string | null; unit_id: string | null }>(
+      `SELECT l.property_id, l.unit_id FROM ledger_posting_lines l JOIN ledger_postings p ON p.id = l.posting_id
+        WHERE p.source_type = 'payroll_run' AND p.source_id = $1 AND p.superseded_at IS NULL AND l.account_role = 'payroll_expense'`,
+      [onUnit])).rows
+    expect(unitLines).toEqual([{ property_id: co.propertyId, unit_id: co.unitId }])
+    // A unit that is not the company's is refused.
+    const other = await ledgerCompany()
+    const theirs = await post(co, '/payroll/runs', { periodStart: '2026-04-01', periodEnd: '2026-04-14', payDate: '2026-04-17',
+      payFrequency: 'biweekly', employeeIds: [a], costPlace: 'unit', unitId: other.unitId })
+    expect([theirs.status, theirs.body.error]).toEqual([404, 'That unit is not this company\'s.'])
+
+    // Approved before 10/13 (no place): the Company column, as it posted.
+    const legacy = await approvedRun(co, { employeeIds: [a], costPlace: 'split_by_units', payDate: '2026-04-17',
+      periodStart: '2026-04-01', periodEnd: '2026-04-14' })
+    await db.query(`UPDATE payroll_runs SET cost_place = NULL WHERE id = $1`, [legacy])
+    expect(await settle()).toEqual({ failed: 0 })
+    expect((await activeLines('payroll_run', legacy)).filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr]))
+      .toEqual([[null, 1000]])
   })
 
   it('voiding an approved run takes its posting back; a draft never posts', async () => {
     const co = await ledgerCompany()
-    await costsMethod(co, 'company_bucket')
     const a = await employee(co, { first: 'Ann', rate: 26000 })
     const runId = await approvedRun(co, { employeeIds: [a] })
     await settle()
@@ -234,7 +252,6 @@ describe('a payroll run posts on its pay date (J3)', () => {
 
   it('a paycheck that does not add up is refused by name instead of posting crooked', async () => {
     const co = await ledgerCompany()
-    await costsMethod(co, 'company_bucket')
     const a = await employee(co, { first: 'Ann', rate: 26000 })
     const runId = await approvedRun(co, { employeeIds: [a] })
     await db.query(`UPDATE payroll_run_lines SET net_pay = net_pay + 5 WHERE run_id = $1`, [runId])
@@ -380,7 +397,6 @@ describe('a journal entry mirrors into the ledger as entered (J4)', () => {
 
   it('an adjusting entry names an automatic record the company\'s ledger posted; anything else is refused', async () => {
     const co = await ledgerCompany()
-    await costsMethod(co, 'company_bucket')
     const a = await employee(co, { first: 'Ann', rate: 26000 })
     const runId = await approvedRun(co, { employeeIds: [a] })
     await settle()

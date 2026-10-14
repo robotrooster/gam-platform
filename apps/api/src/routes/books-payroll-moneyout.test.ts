@@ -22,6 +22,8 @@ import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, see
 import { inTx } from '../test/ledgerFixtures'
 import { payrollLiabilityRolesOfExpenses, createPayrollMoneyOut } from '../services/payrollMoneyOut'
 import { WORK_TRADE_EXTRA_PAID_HOW_RECORDED } from '@gam/shared'
+import { CONTRACTOR_BILL_NO_PLACE } from '../services/workTradeBooksPay'
+import { listLandlordExpenses, updateLandlordExpense } from '../services/landlordExpenses'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_books_p7_moneyout'
 const app = express()
@@ -30,7 +32,7 @@ app.use('/api/books', booksRouter)
 app.use('/api/work-trade', workTradeRouter)
 app.use(errorHandler)
 
-interface Co { landlordId: string; ownerUserId: string; tenantId: string; unitId: string; token: string }
+interface Co { landlordId: string; ownerUserId: string; tenantId: string; unitId: string; propertyId: string; token: string }
 async function company(): Promise<Co> {
   return inTx(async c => {
     const { userId, landlordId } = await seedLandlord(c)
@@ -40,7 +42,7 @@ async function company(): Promise<Co> {
     await seedLease(c, { unitId, landlordId })
     const token = jwt.sign({ userId, role: 'landlord', email: 'o@t.dev', profileId: null, landlordIds: [landlordId], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
-    return { landlordId, ownerUserId: userId, tenantId, unitId, token }
+    return { landlordId, ownerUserId: userId, tenantId, unitId, propertyId, token }
   })
 }
 const post = (co: Co, url: string, body: object = {}) =>
@@ -61,7 +63,9 @@ async function employee(co: Co, first: string, rate: number): Promise<string> {
 }
 
 async function approved(co: Co, body: object): Promise<string> {
-  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly', ...body })
+  // 10/13 (Nic): a run says where its wages go when it is logged (here: split across the properties by units).
+  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly',
+    costPlace: 'split_by_units', ...body })
   expect(calc.status, JSON.stringify(calc.body)).toBe(201)
   const ok = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
   expect(ok.status, JSON.stringify(ok.body)).toBe(200)
@@ -165,13 +169,28 @@ describe('work-trade extra hours sent to GAM Books (I6)', () => {
     const x = await extraHours(co, 'contractor_1099')
     const v = await vendor(co)
     expect((await get(co, '/work-trade-pay')).body.data.map((r: any) => r.id)).toEqual([x])
-    const made = await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v })
+    // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+    // property at the time of logging" — confirmed with no place, nothing records.
+    const noPlace = await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v })
+    expect([noPlace.status, noPlace.body.error]).toEqual([400, CONTRACTOR_BILL_NO_PLACE])
+    expect((await get(co, '/work-trade-pay')).body.data.map((r: any) => r.id)).toEqual([x])
+    const made = await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v, costPlace: 'unit', unitId: co.unitId })
     expect(made.status, JSON.stringify(made.body)).toBe(201)
     const e = (await db.query<any>(
-      `SELECT c.system_key AS category, e.amount::float AS amount, e.vendor_id, e.work_trade_extra_hours_id
+      `SELECT c.system_key AS category, e.amount::float AS amount, e.vendor_id, e.work_trade_extra_hours_id, e.cost_place, e.unit_id
          FROM landlord_expenses e LEFT JOIN books_categories c ON c.id = e.category_id WHERE e.id = $1`,
       [made.body.data.expenseId])).rows[0]
     expect([e.category, e.amount, e.vendor_id, e.work_trade_extra_hours_id]).toEqual(['contractor_payments', 90, v, x])
+    // Where the person confirming it said it goes.
+    expect([e.cost_place, e.unit_id]).toEqual(['unit', co.unitId])
+    // 10/13 review: that place is the bill's own — the Expenses form does not
+    // ask it again (place_fixed), and its words are still corrected there.
+    const listed = (await listLandlordExpenses(co.landlordId)).find((r: any) => r.id === made.body.data.expenseId)
+    expect([listed.place_fixed, listed.system_linked]).toEqual([true, false])
+    const words = await updateLandlordExpense(made.body.data.expenseId, co.landlordId, { description: 'Pat, September extra hours' })
+    expect(words.description).toBe('Pat, September extra hours')
+    await expect(updateLandlordExpense(made.body.data.expenseId, co.landlordId, { costPlace: 'split_by_units' }))
+      .rejects.toThrow(/pays a work trader's extra hours as a contractor/)
     const rec = (await db.query<any>(`SELECT status, books_reference_id FROM work_trade_extra_hours WHERE id = $1`, [x])).rows[0]
     expect([rec.status, rec.books_reference_id]).toEqual(['sent_to_books', made.body.data.expenseId])
     expect((await get(co, '/work-trade-pay')).body.data).toEqual([])
@@ -183,14 +202,14 @@ describe('work-trade extra hours sent to GAM Books (I6)', () => {
     // The expense voided on the Expenses page: the hours are waiting for Books again.
     await db.query(`UPDATE landlord_expenses SET status = 'voided', voided_at = NOW() WHERE id = $1`, [made.body.data.expenseId])
     expect((await get(co, '/work-trade-pay')).body.data.map((r: any) => r.id)).toEqual([x])
-    expect((await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v })).status).toBe(201)
+    expect((await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v, costPlace: 'property', propertyId: co.propertyId })).status).toBe(201)
   })
 
   it('paying the contractor bill pays the hours; taking the payment back puts them back to waiting', async () => {
     const co = await company()
     const x = await extraHours(co, 'contractor_1099')
     // No vendor picked: the vendor list's own record of this person, made once.
-    const made = await post(co, `/work-trade-pay/${x}/contractor-payment`, {})
+    const made = await post(co, `/work-trade-pay/${x}/contractor-payment`, { costPlace: 'split_by_units' })
     expect(made.status, JSON.stringify(made.body)).toBe(201)
     const vendorRow = (await db.query<any>(`SELECT tenant_id, vendor_type, is_1099 FROM books_vendors WHERE id = $1`, [made.body.data.vendorId])).rows[0]
     expect(vendorRow).toEqual({ tenant_id: co.tenantId, vendor_type: 'contractor', is_1099: true })

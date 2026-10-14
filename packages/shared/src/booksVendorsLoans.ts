@@ -270,6 +270,28 @@ export const BOOKS_FIXED_ASSET_FUNDED_BY_LABEL: Record<BooksFixedAssetFundedBy, 
   expense: 'Already an expense',
 }
 /**
+ * 10/13 (Nic): "Funding: ALLOW A MIX (several funding lines adding up to the
+ * cost; a loan may spread over several assets)" — e.g. an $8,000 mower =
+ * $6,000 from a loan + $2,000 cash on hand. Each line of
+ * books_fixed_asset_funding is one of BOOKS_FIXED_ASSET_FUNDED_BY with its
+ * amount (a loan line names the loan; an "already an expense" line names the
+ * expense and is that whole expense); the live lines add up to the asset's
+ * cost, and the loan lines naming one loan, across every live asset, never
+ * add up to more than was borrowed. And "they don't pick as a setting, they
+ * pick as the expense happens": the form lists where the money can have come
+ * from on each asset — nothing is remembered from one asset to the next.
+ * Mirrors books_fixed_asset_funding_kind_check (migration 20261015230100).
+ */
+export interface BooksFixedAssetFundingLine {
+  kind: BooksFixedAssetFundedBy
+  amount: number
+  /** For 'loan': the loan whose money went straight to the seller. */
+  loanId?: string | null
+  /** For 'expense': the expense it already was (its whole amount). */
+  expenseId?: string | null
+}
+
+/**
  * The loans that can have paid for an asset of each posting role: a loan whose
  * money went straight to the seller of a property puts its cost on Rental
  * property, one to the seller of equipment or a vehicle on Equipment

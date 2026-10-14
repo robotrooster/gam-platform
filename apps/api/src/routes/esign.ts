@@ -3260,8 +3260,15 @@ esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('e
 
 esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
+    const { documentKeptReasonSql, documentEnd } = await import('../lib/eraseUnfinishedDocument')
     const docs = await query<any>(`
       SELECT d.*, u.unit_number, p.name as property_name,
+        -- 10/13 (Nic): what the row's end button does — 'delete' (it never
+        -- completed and no money touched it, so it is erased), 'void' (it
+        -- stays on record, and why), or null (no button): documentEnd below,
+        -- from the very test the void route runs (lib/eraseUnfinishedDocument),
+        -- so the label never lies.
+        ${documentKeptReasonSql('d')} AS kept_reason,
         COUNT(DISTINCT s.id)::int as signer_count,
         COUNT(DISTINCT s.id) FILTER (WHERE s.status='signed')::int as signed_count,
         -- S632 (Nic): "Where as the landlord can I sign the lease inside the
@@ -3305,12 +3312,13 @@ esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (
         -- for history of tenancy. We don't want to keep voided ones that never
         -- were fully executed. It's just clutter." A voided document never
         -- became an agreement (a completed one cannot be voided), so it has no
-        -- place in the landlord's list. The row itself is kept — GAM never
-        -- erases — it just is not shown.
+        -- place in the landlord's list. One money touched is kept, just not
+        -- shown; since 10/13 one nothing touched no longer exists at all
+        -- (lib/eraseUnfinishedDocument).
         AND d.status <> 'voided'
       GROUP BY d.id, u.unit_number, p.name
       ORDER BY d.created_at DESC`, [landlordScopeIds(req.user!)])
-    res.json({ success: true, data: docs })
+    res.json({ success: true, data: docs.map(({ kept_reason, ...d }: any) => ({ ...d, ...documentEnd(d.status, kept_reason) })) })
   } catch (e) { next(e) }
 })
 
@@ -3892,6 +3900,7 @@ esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm(
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
     await assertWorksAtProperty(req.user, lease.property_id, 'That household is at a property you do not work at.')
 
+    const { documentKeptReasonSql, documentEnd } = await import('../lib/eraseUnfinishedDocument')
     const openDraft = await queryOne<any>(`
       SELECT d.id, d.status, d.title, d.lease_id,
              (SELECT s.status FROM lease_document_signers s
@@ -3907,7 +3916,11 @@ esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm(
              -- The start-date test newLeaseCancelRefusal uses: once its start
              -- date has come it is the household's lease (the window says so).
              (nl.signed_by_landlord IS TRUE AND nl.status IN ('pending','active')
-               AND (nl.status = 'active' OR nl.start_date <= GREATEST(CURRENT_DATE, $2::date))) AS started
+               AND (nl.status = 'active' OR nl.start_date <= GREATEST(CURRENT_DATE, $2::date))) AS started,
+             -- 10/13 (Nic): whether canceling erases it or voids it — the
+             -- void route's own test (lib/eraseUnfinishedDocument), so the
+             -- window says "Delete" only when the press deletes.
+             ${documentKeptReasonSql('d')} AS kept_reason
         FROM lease_documents d
         LEFT JOIN leases nl ON nl.id = d.lease_id
        WHERE d.renews_lease_id = $1 AND d.status NOT IN ('completed','voided')
@@ -3924,6 +3937,8 @@ esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm(
             { id: openDraft.id, status: openDraft.status, lease_id: openDraft.lease_id, renews_lease_id: lease.id })
       openDraft.can_cancel = refusal === null
       openDraft.cancel_refusal = refusal
+      Object.assign(openDraft, documentEnd(openDraft.status, openDraft.kept_reason))
+      delete openDraft.kept_reason
     }
     // S655: a new lease everyone has signed, waiting to start (or started).
     // Nothing to decide — the window just says so.
@@ -5804,14 +5819,31 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
       if (refusal) throw new AppError(409, refusal)
     }
 
-    // S29 item 6 / S558 / S581 / S647 / S652: every step of a void lives in
-    // lib/voidDocument, so a script clearing a packet runs the same ones. Read
-    // that file for why each exists — including the one that was missing.
-    const { voidDocument } = await import('../lib/voidDocument')
-    await voidDocument(client.query.bind(client), doc, reason || null)
-
+    // 10/13 (Nic): "If it never completed, it doesn't exist." A document that
+    // never completed and that no money touched is ERASED — with its packet's
+    // other unfinished documents when it is the packet's lease — not voided.
+    // Anything the test in lib/eraseUnfinishedDocument keeps (issued and
+    // billed, a resident's signature, a sale started, an open invite waiting
+    // on it) is voided, unchanged: S29 item 6 / S558 / S581 / S647 / S652,
+    // every step of a void lives in lib/voidDocument. One call decides
+    // (endDocument); the GoldSign list and the new-lease window read the same
+    // test (end_action) so the button says which one happens. A completed or
+    // already voided document is refused, as before.
+    const { endDocument } = await import('../lib/voidDocument')
+    const { removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
+    const q = client.query.bind(client)
+    const ended = await endDocument(q, doc, reason || null)
     await client.query('COMMIT')
-    res.json({ success: true })
+    if (ended.deleted) {
+      // Files only these documents used — after COMMIT, best-effort.
+      await removeOrphanedDocumentFiles(q, ended.files).catch(() => {})
+      res.json({ success: true, data: {
+        deleted: true,
+        documents: ended.documents.map(d => ({ id: d.id, title: d.title })),
+      } })
+      return
+    }
+    res.json({ success: true, data: { deleted: false } })
   } catch (e) {
     await client.query('ROLLBACK')
     next(e)
@@ -6997,6 +7029,21 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         } catch (e) {
           logger.error({ err: e, leaseId: leaseResult.leaseId },
             '[utility] releasing held shares failed — they stay held')
+        }
+      }
+
+      // 10/13 (Nic): "we have birthdays from leases ... Customer profiles should
+      // mostly have birthdays." The birthdates typed on this lease ("Birthdate
+      // 1/2/3") go onto the people they belong to — matched by the name beside
+      // each, never guessed, never overwriting one on file
+      // (services/leaseBirthdates). Best-effort and post-commit like the
+      // neighbors here: the signature is recorded either way.
+      if (leaseResult?.leaseId) {
+        try {
+          const { copyLeaseBirthdates } = await import('../services/leaseBirthdates')
+          await copyLeaseBirthdates({ documentId: doc.id, apply: true })
+        } catch (e) {
+          logger.error({ err: e, documentId: doc.id }, '[birthdates] copying the lease birthdates failed')
         }
       }
 

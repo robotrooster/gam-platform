@@ -53,7 +53,7 @@ vi.mock('../lib/api', () => ({
 const auth = vi.hoisted(() => ({ user: { role: 'landlord', permissions: {} } as any }))
 vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: auth.user }) }))
 
-import { RentRollPage, newestFirst, rangeTitle, monthCountWords, rentRollCsv, csvFileName, movedOutInRangeWords } from './RentRollPage'
+import { RentRollPage, newestFirst, rangeTitle, monthCountWords, rentRollCsv, csvFileName, movedOutInRangeWords, staysMeta } from './RentRollPage'
 import { rangeOfPick, historyPath } from '../components/rentroll/rentRollRange'
 import { localToday } from '../lib/creditDesk'
 import { csvField, csvLine } from '../lib/paymentStamps'
@@ -283,6 +283,32 @@ describe('the Rent Roll: one property at a time', () => {
     expect(foot[0].querySelector('.rrs-count.red')?.textContent).toBe('1 owes')
   })
 
+  // 10/13 (Nic), the onboarding month (September at Mountain View) paid late:
+  // "Keep it out, but say so." Nothing counted yet is said in words, never a
+  // bare dash; beside a percentage, the hover says the onboarding month is out.
+  it('health with nothing counted yet says why in words — never a bare dash; the onboarding month left out is said', async () => {
+    server.history = q => {
+      const h = history(q)
+      const [a, g] = h.rows
+      return { ...h, rows: [
+        { ...a, health: { ...health(null, 'Onboarding month — not counted'), onTime: 0, counted: 0, outstanding: 0, notCounted: 2, onboardingLeftOut: true } },
+        { ...g, health: { ...health(100, '100%, 1 of 1 month'), onboardingLeftOut: true } },
+        { ...g, key: 'lease:l9', leaseId: 'l9', householdId: 'n1', residents: [resident('n1', 'Nell New')], spaces: ['RV 12'],
+          health: { ...health(null, 'No months to judge yet'), onTime: 0, counted: 0, outstanding: 0 } },
+      ] }
+    }
+    await render(undefined, '?range=this_year')
+    const healthCells = [...host.querySelectorAll('.rr-split .rr-scroll tbody tr')].map(tr => tr.querySelectorAll('td')[3])
+    expect(healthCells.map(td => td.textContent)).toEqual(['Onboarding month — not counted', '100%', 'No months to judge yet'])
+    expect(healthCells[0].querySelector('.rr-health-words')).not.toBeNull()
+    expect(healthCells[0].querySelector('span')!.getAttribute('title')).toMatch(/^Pays on time: Onboarding month — not counted — all time through /)
+    expect(healthCells[1].querySelector('span')!.getAttribute('title')).toMatch(/^Pays on time: 100%, 1 of 1 month · the onboarding month is not counted — all time through /)
+    expect(healthCells.some(td => td.textContent === '—')).toBe(false)
+    // The phone cards say the same.
+    expect([...host.querySelectorAll('.rr-cards .rr-card')].map(c => c.querySelector('.rr-card-top > div:last-child')!.textContent))
+      .toEqual(['Health Onboarding month — not counted', 'Health 100%', 'Health No months to judge yet'])
+  })
+
   it('a month in another year than the range’s end carries its year', async () => {
     await render(undefined, '?from=2025-11&to=2026-01')
     const heads = [...host.querySelectorAll('.rr-scroll thead th.rrh-stampcol')].map(th => th.textContent)
@@ -469,5 +495,70 @@ describe('the spreadsheet and the helpers', () => {
     expect(monthCountWords(undefined)).toEqual([])
     expect(newestFirst(['2026-08', '2026-09', '2026-10'])).toEqual(['2026-10', '2026-09', '2026-08'])
     expect(newestFirst(undefined)).toEqual([])
+  })
+})
+
+// 10/13 (Nic), round 3: "show stays as an aggregate by line items. eg 22 nights
+// paid for via pos and 1 week paid for via pos … dont put these stays in the
+// spot put them below with expandable notes. 4 nights in 15 and 8 nights in 18 etc."
+describe('10/13 (Nic), round 3: the stays below the rows, by line item, with expandable notes', () => {
+  const stays = (paid: boolean) => [
+    { key: 'night:pos', unit: 'night', via: 'pos', quantity: 22, label: '22 nights paid for via POS', stays: 4,
+      ...(paid ? { paid: 880 } : {}),
+      sites: [
+        { space: 'RV 15', quantity: 4, stays: 1, label: '4 nights in RV 15' },
+        { space: 'RV 18', quantity: 8, stays: 2, label: '8 nights in RV 18' },
+        { space: 'RV 20', quantity: 10, stays: 1, label: '10 nights in RV 20' },
+      ] },
+    { key: 'week:pos', unit: 'week', via: 'pos', quantity: 1, label: '1 week paid for via POS', stays: 1,
+      ...(paid ? { paid: 280 } : {}), sites: [{ space: 'RV 12', quantity: 1, stays: 1, label: '1 week in RV 12' }] },
+  ]
+
+  it('a Stays card below the households, never in a space\'s row; each line opens to its notes per site', async () => {
+    server.history = q => history(q, { stays: stays(true), totals: { invoiced: 1567.47, lateFees: 60, paid: 990, credit: 0, workTrade: 0, owed: 577.47 } })
+    await render()
+    const card = host.querySelector('[data-section="stays"]')!
+    expect(card).not.toBeNull()
+    // Below the households' table.
+    const tableCard = host.querySelector('.rrh-card')!
+    expect(tableCard.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // No stay in any space's row.
+    expect(tableCard.textContent).not.toContain('nights')
+    expect(card.querySelector('.rrh-stays-head')!.textContent).toBe('Stays5 stays')
+    const heads = [...card.querySelectorAll('button.rrh-stay-head')]
+    expect(heads.map(b => b.textContent)).toEqual(['22 nights paid for via POS$880.00', '1 week paid for via POS$280.00'])
+    expect(heads.map(b => b.getAttribute('aria-expanded'))).toEqual(['false', 'false'])
+    expect(card.querySelector('.rrh-stay-notes')).toBeNull()
+    await click(heads[0] as HTMLElement)
+    expect([...card.querySelectorAll('li[data-line="night:pos"] .rrh-stay-notes li')].map(li => li.textContent))
+      .toEqual(['4 nights in RV 15', '8 nights in RV 18', '10 nights in RV 20'])
+    expect(card.querySelector('li[data-line="week:pos"] .rrh-stay-notes')).toBeNull()
+    await click(heads[0] as HTMLElement)
+    expect(card.querySelector('.rrh-stay-notes')).toBeNull()
+  })
+
+  it('without the range totals, the lines and notes but never their money; none at all, no card', async () => {
+    server.history = q => history(q, { stays: stays(false) })
+    await render()
+    expect([...host.querySelectorAll('button.rrh-stay-head')].map(b => b.textContent))
+      .toEqual(['22 nights paid for via POS', '1 week paid for via POS'])
+    act(() => root.unmount())
+    root = createRoot(host)
+    server.history = q => history(q, { stays: [] })
+    await render()
+    expect(host.querySelector('[data-section="stays"]')).toBeNull()
+  })
+
+  it('the spreadsheet carries the same lines, with their notes, after the rest', () => {
+    const h = history(new URLSearchParams('propertyId=mv&from=2026-09&to=2026-09'), { stays: stays(true) })
+    const lines = rentRollCsv(h).trimEnd().split('\n')
+    expect(lines.slice(-5)).toEqual([
+      '', 'Stays', 'Line item,Stays,Paid,Sites',
+      '22 nights paid for via POS,4,880,4 nights in RV 15; 8 nights in RV 18; 10 nights in RV 20',
+      '1 week paid for via POS,1,280,1 week in RV 12',
+    ])
+    const noMoney = rentRollCsv(history(new URLSearchParams('propertyId=mv&from=2026-09&to=2026-09'), { stays: stays(false) })).trimEnd().split('\n')
+    expect(noMoney.slice(-3)).toEqual(['Line item,Stays,Sites', '22 nights paid for via POS,4,4 nights in RV 15; 8 nights in RV 18; 10 nights in RV 20', '1 week paid for via POS,1,1 week in RV 12'])
+    expect(staysMeta([{ stays: 1 }])).toBe('1 stay')
   })
 })

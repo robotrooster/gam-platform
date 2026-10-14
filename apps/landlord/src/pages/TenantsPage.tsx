@@ -78,6 +78,17 @@ interface LeaseHealth { unitId: string; leaseId: string; percent: number | null;
 /** Said on hover when the lease-by-lease health could not be read (the column shows a dash). */
 export const HEALTH_NOT_LOADED = 'Payment health could not be loaded — refresh the page to try again.'
 
+/**
+ * 10/13 (Nic): a space whose lease has nothing counted yet says why — the
+ * server's words ("Onboarding month — not counted", "No months to judge yet");
+ * the list's own column (GAM admin) has none to give, so "Nothing counted yet".
+ * Null — a dash — only while the figures load or when they could not be read.
+ */
+export function healthNoneText(h: { percent: number | null; label: string | null }, loading: boolean): string | null {
+  if (loading || h.label === HEALTH_NOT_LOADED) return null
+  return h.label ?? 'Nothing counted yet'
+}
+
 export function TenantsPage() {
   const [showInvite, setShowInvite] = useState(false)
   const [search, setSearch] = useState('')
@@ -159,10 +170,16 @@ export function TenantsPage() {
                       time since the household joined GAM (all time, per bill month).
                       10/13 (Nic): the lease on this space's own figure. */}
                   <td className="mono" title={healthOf(u).label ?? undefined}>{(() => {
-                    const pct = healthOf(u).percent
-                    return pct == null
-                      ? <span style={{color:'var(--text-3)'}}>—</span>
-                      : <span style={{fontWeight:700,color:healthColor(pct)}}>{pct}%</span>
+                    const h = healthOf(u)
+                    if (h.percent != null) return <span style={{fontWeight:700,color:healthColor(h.percent)}}>{h.percent}%</span>
+                    // 10/13 (Nic): "Keep it out, but say so" — nothing counted yet is
+                    // said in words ("Onboarding month — not counted"), never a bare
+                    // dash. A dash only while the figures load, or when they could
+                    // not be read (why on hover).
+                    const words = healthNoneText(h, leaseHealth.isLoading)
+                    return words
+                      ? <span style={{color:'var(--text-3)',fontFamily:'var(--font-body)',fontSize:'.72rem',fontWeight:600}}>{words}</span>
+                      : <span style={{color:'var(--text-3)'}}>—</span>
                   })()}</td>
                   {/* 10/12 (Nic): the lease's rent, not the space's listed price (the Rent Roll's figure). */}
                   <td className="mono">{(u.leaseRentAmount ?? u.rentAmount) ? `$${Number(u.leaseRentAmount ?? u.rentAmount).toLocaleString()}` : '—'}

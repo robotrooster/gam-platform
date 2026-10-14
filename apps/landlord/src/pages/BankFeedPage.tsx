@@ -4,6 +4,12 @@
 // a 2-click categorize into the P&L. The landlord ALWAYS confirms and ALWAYS
 // picks scope (a unit, or the property split/common across units); auto-suggest
 // only pre-fills from what this landlord chose for the same merchant before.
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging. there should never be a default setting to
+// apply expenses." Money going out is never pre-filled with where it goes —
+// the line asks (one unit, the whole property, or split across all the
+// company's properties by units), and so does each part of a split; the
+// remembered category still pre-fills.
 import { useMemo, useState, useEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
@@ -14,7 +20,7 @@ import { apiGet, apiPost , apiPut } from '../lib/api'
 import {
   EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL,
   BANK_TXN_IGNORED_REASON_LABEL, BANK_TXN_MATCH_KIND_LABEL, DEPOSIT_SLIP_SOURCE_LABEL,
-  BANK_LINE_MATCH_KIND_LABEL, BANK_MATCH_FIRST_CODE,
+  BANK_LINE_MATCH_KIND_LABEL, BANK_MATCH_FIRST_CODE, BOOKS_COST_PLACE_LABEL,
   type BankTxnIgnoredReason, type DepositSlipSource, type BankLineMatchKind,
 } from '@gam/shared'
 import '../styles/bank-reconciliation.css'
@@ -53,6 +59,17 @@ const SCOPE_CHOICES: [string, string][] = [
   ['unit', SCOPE_LABEL.unit],
   ['property_common', SCOPE_LABEL.property_common], // wire-ok: local constant map, not an API response
 ]
+// 10/13 (Nic): money going out may also be split across all the company's
+// properties by units (BOOKS_COST_PLACES); money coming in sits on a unit or a property.
+const scopeChoices = (moneyOut: boolean): [string, string][] => moneyOut
+  ? [...SCOPE_CHOICES, ['split_by_units', BOOKS_COST_PLACE_LABEL.split_by_units]]
+  : SCOPE_CHOICES
+/** 10/13: a filing's place is fully said — a unit, a property, or a split (naming neither). */
+const scopePlaced = (p: { scopeKind: string; propertyId: string; unitId: string }) =>
+  p.scopeKind === 'split_by_units' ? true : p.scopeKind === 'unit' ? !!p.unitId : p.scopeKind ? !!p.propertyId : false
+/** The ids a filing sends for its place (a split names none). */
+const scopeIds = (p: { scopeKind: string; propertyId: string; unitId: string }) =>
+  p.scopeKind === 'split_by_units' ? {} : p.scopeKind === 'unit' ? { unitId: p.unitId } : { propertyId: p.propertyId }
 
 type Draft = {
   category: string; scopeKind: string; propertyId: string; unitId: string
@@ -146,7 +163,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     // Income rows must not default to an expense category — confirming without
     // touching the dropdown would file a deposit as 'repairs'.
     category: t.suggestedCategory || (Number(t.amount) > 0 ? 'other' : 'repairs'),
-    scopeKind: t.suggestedScopeKind || 'unit',
+    // 10/13 (Nic): money going out starts with no place (the API never suggests one for it).
+    scopeKind: t.suggestedScopeKind || (Number(t.amount) > 0 ? 'unit' : ''),
     propertyId: t.suggestedPropertyId || '',
     unitId: t.suggestedUnitId || '',
   }
@@ -287,23 +305,29 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const closeSplit = (id: string) => setSplits(s => { const n = { ...s }; delete n[id]; return n })
   const openSplit = (t: any) => {
     const moneyIn = Number(t.amount) > 0
+    // 10/13 (Nic): a part going out starts with no place; it is asked on each part.
     const blank = (from: Partial<SplitPart> = {}): SplitPart => ({
-      category: moneyIn ? 'other' : 'repairs', amount: '', scopeKind: 'property_common', propertyId: '', unitId: '', ...from,
+      category: moneyIn ? 'other' : 'repairs', amount: '', scopeKind: moneyIn ? 'property_common' : '', propertyId: '', unitId: '', ...from,
     })
     const parts: SplitPart[] = Array.isArray(t.splitParts) && t.splitParts.length
       ? t.splitParts.map((p: any) => ({
           category: p.category, categoryId: p.categoryId || undefined, amount: Number(p.amount).toFixed(2),
-          scopeKind: p.unitId ? 'unit' : 'property_common', propertyId: p.propertyId || '', unitId: p.unitId || '',
+          scopeKind: p.costPlace === 'split_by_units' ? 'split_by_units' : p.unitId ? 'unit' : 'property_common',
+          propertyId: p.propertyId || '', unitId: p.unitId || '',
           description: p.description ?? null,
         }))
       : (() => {
           // Start from where it is filed now (or the review row's choice), so
-          // the owner only says how the money divides.
+          // the owner only says how the money divides. 10/13 (Nic): money going
+          // out carries that choice to its first part only; each other part asks.
           const d = draftFor(t)
           const place = t.filedCategory
-            ? { scopeKind: t.filedUnitId ? 'unit' : 'property_common', propertyId: t.filedPropertyId || '', unitId: t.filedUnitId || '' }
-            : { scopeKind: d.scopeKind === 'unit' ? 'unit' : 'property_common', propertyId: d.propertyId, unitId: d.unitId }
-          return [blank({ category: t.filedCategory || d.category, categoryId: t.filedCategoryId || d.categoryId, ...place }), blank(place)]
+            ? { scopeKind: t.filedCostPlace === 'split_by_units' ? 'split_by_units' : t.filedUnitId ? 'unit' : 'property_common',
+                propertyId: t.filedPropertyId || '', unitId: t.filedUnitId || '' }
+            : { scopeKind: d.scopeKind === 'unit' || d.scopeKind === 'split_by_units' || !d.scopeKind ? d.scopeKind : 'property_common',
+                propertyId: d.propertyId, unitId: d.unitId }
+          return [blank({ category: t.filedCategory || d.category, categoryId: t.filedCategoryId || d.categoryId, ...place }),
+            moneyIn ? blank(place) : blank()]
         })()
     setSplits(s => ({ ...s, [t.id]: parts }))
   }
@@ -397,7 +421,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       const categoryId = p.categoryId || cats.find(c => c.systemKey === p.category)?.id
       return {
       category: p.category, ...(categoryId ? { categoryId } : {}), amount: (partCents(p.amount) ?? 0) / 100, scopeKind: p.scopeKind,
-      ...(p.scopeKind === 'unit' ? { unitId: p.unitId } : { propertyId: p.propertyId }),
+      ...scopeIds(p),
       ...(p.description ? { description: p.description } : {}),
     } }) })
   }
@@ -434,12 +458,13 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
 
   const submit = (t: any, notAMatch = false) => {
     const d = draftFor(t)
+    if (!d.scopeKind) { toast('Choose where it goes: one unit, the whole property, or split across your properties.'); return }
     if (d.scopeKind === 'unit' && !d.unitId) { toast('Pick a unit.'); return }
-    if (d.scopeKind !== 'unit' && !d.propertyId) { toast('Pick a property.'); return }
+    if (d.scopeKind !== 'unit' && d.scopeKind !== 'split_by_units' && !d.propertyId) { toast('Pick a property.'); return }
     const categoryId = draftCategoryId(t, d)
     categorize.mutate({ id: t.id, body: {
       category: d.category, ...(categoryId ? { categoryId } : {}), scopeKind: d.scopeKind,
-      ...(d.scopeKind === 'unit' ? { unitId: d.unitId } : { propertyId: d.propertyId }),
+      ...scopeIds(d),
       ...(notAMatch ? { notAMatch: true } : {}),
     } })
   }
@@ -710,10 +735,12 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                               : OTHER_INCOME_CATEGORIES.map(c => <option key={c} value={c}>{OTHER_INCOME_CATEGORY_LABEL[c]}</option>)}
                           </select>
                         )}
-                        <select className="input input-sm" value={d.scopeKind} onChange={e => setDraft(t.id, { scopeKind: e.target.value })}>
-                          {SCOPE_CHOICES.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                        <select className="input input-sm" value={d.scopeKind} aria-label="Where it goes"
+                          onChange={e => setDraft(t.id, { scopeKind: e.target.value, ...(e.target.value === 'split_by_units' ? { propertyId: '', unitId: '' } : {}) })}>
+                          {!d.scopeKind && <option value="">Where does it go?</option>}
+                          {scopeChoices(isExpense).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                         </select>
-                        {d.scopeKind === 'unit' ? (
+                        {!d.scopeKind || d.scopeKind === 'split_by_units' ? null : d.scopeKind === 'unit' ? (
                           <>
                             <select className="input input-sm" value={d.propertyId} onChange={e => setDraft(t.id, { propertyId: e.target.value, unitId: '' })}>
                               <option value="">Property…</option>
@@ -777,7 +804,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                             <span style={{ fontWeight: 600, color: 'var(--text-1)' }}>{fmt(p.amount)}</span>
                             <span>{p.categoryName ?? categoryLabel(isExpense, p.category)}</span>
                             <span style={{ color: 'var(--text-3)' }}>
-                              {[p.propertyName, p.unitNumber].filter(Boolean).join(' · ')}
+                              {p.costPlace === 'split_by_units' ? BOOKS_COST_PLACE_LABEL.split_by_units
+                                : [p.propertyName, p.unitNumber].filter(Boolean).join(' · ')}
                             </span>
                           </div>
                         ))}
@@ -806,8 +834,9 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                         onPart={(i, patch) => setPart(t.id, i, patch)}
                         onAdd={() => setSplits(s => ({ ...s, [t.id]: [...(s[t.id] || []), {
                           category: isExpense ? 'repairs' : 'other', amount: '',
-                          scopeKind: (s[t.id]?.[0]?.scopeKind) || 'property_common',
-                          propertyId: (s[t.id]?.[0]?.propertyId) || '', unitId: '',
+                          // 10/13 (Nic): a new part going out asks where it goes.
+                          scopeKind: isExpense ? '' : (s[t.id]?.[0]?.scopeKind) || 'property_common',
+                          propertyId: isExpense ? '' : (s[t.id]?.[0]?.propertyId) || '', unitId: '',
                         }] }))}
                         onRemove={i => setSplits(s => ({ ...s, [t.id]: (s[t.id] || []).filter((_, j) => j !== i) }))}
                         onCancel={() => closeSplit(t.id)}
@@ -924,7 +953,7 @@ function SplitEditor({ total, parts, categories, properties, unitsForProp, repla
   const totalCents = Math.round(Math.abs(total) * 100)
   const sumCents = parts.reduce((s, p) => s + (partCents(p.amount) ?? 0), 0)
   const left = totalCents - sumCents
-  const placed = (p: SplitPart) => (p.scopeKind === 'unit' ? !!p.unitId : !!p.propertyId)
+  const placed = scopePlaced
   const ready = parts.length >= 2 && left === 0
     && parts.every(p => partCents(p.amount) !== null && placed(p))
   const money = (c: number) => fmt(c / 100)
@@ -967,14 +996,17 @@ function SplitEditor({ total, parts, categories, properties, unitsForProp, repla
               </select>
             )}
             <select className="input input-sm" value={p.scopeKind} aria-label={`Part ${i + 1} placement`}
-              onChange={e => onPart(i, { scopeKind: e.target.value, unitId: '' })}>
-              {SCOPE_CHOICES.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+              onChange={e => onPart(i, { scopeKind: e.target.value, unitId: '', ...(e.target.value === 'split_by_units' ? { propertyId: '' } : {}) })}>
+              {!p.scopeKind && <option value="">Where does it go?</option>}
+              {scopeChoices(isExpense).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
             </select>
-            <select className="input input-sm" value={p.propertyId} aria-label={`Part ${i + 1} property`}
-              onChange={e => onPart(i, { propertyId: e.target.value, unitId: '' })}>
-              <option value="">Property…</option>
-              {properties.map((pr: any) => <option key={pr.id} value={pr.id}>{pr.name}</option>)}
-            </select>
+            {p.scopeKind && p.scopeKind !== 'split_by_units' && (
+              <select className="input input-sm" value={p.propertyId} aria-label={`Part ${i + 1} property`}
+                onChange={e => onPart(i, { propertyId: e.target.value, unitId: '' })}>
+                <option value="">Property…</option>
+                {properties.map((pr: any) => <option key={pr.id} value={pr.id}>{pr.name}</option>)}
+              </select>
+            )}
             {p.scopeKind === 'unit' && (
               <select className="input input-sm" value={p.unitId} disabled={!p.propertyId} aria-label={`Part ${i + 1} unit`}
                 onChange={e => onPart(i, { unitId: e.target.value })}>

@@ -69,6 +69,8 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DO $$ BEGIN
     IF to_regclass('public.books_loans') IS NOT NULL THEN TRUNCATE books_loan_payments, books_loans; END IF;
     IF to_regclass('public.books_fixed_assets') IS NOT NULL THEN TRUNCATE books_fixed_assets; END IF;
+    -- 10/13 (Nic): an asset's funding lines are never removed either (no keys; migration 20261015230100).
+    IF to_regclass('public.books_fixed_asset_funding') IS NOT NULL THEN TRUNCATE books_fixed_asset_funding; END IF;
   END $$`)
   // 10/12 (Nic, ledger P6): an expense's payments name the bank lines that
   // paid them and are never deleted (a trigger refuses it) — TRUNCATE fires no
@@ -97,6 +99,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // collected them (RESTRICT) — both clear before their parents. Guarded: the
   // columns and the table arrive with migrations 20261013090000-090200, and a
   // test database built before they are dumped into schema.sql has neither.
+  // 10/13 evening (Nic: "Redo the split"): a reader piece split again under a
+  // later cost names the piece, the cost entry and the order (RESTRICT) — it
+  // clears before all three. Guarded: the table arrives with migration 20261015220000.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.pos_reader_order_resplits') IS NOT NULL THEN TRUNCATE pos_reader_order_resplits; END IF;
+  END $$`)
   await db.query(`DO $$ BEGIN
     IF to_regclass('public.landlord_gam_charge_collections') IS NOT NULL THEN
       DELETE FROM landlord_gam_charge_collections;
@@ -109,8 +117,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // 10/12 (review): a reader order's cost entries are never deleted (a row
   // trigger refuses it) and hold their order (RESTRICT) — TRUNCATE fires no row
   // trigger. Guarded: the table arrives with migration 20261013160100.
+  // 10/13 evening: with the re-splits that name the entries (emptied above, but
+  // a TRUNCATE must name every table that references the one it empties).
   await db.query(`DO $$ BEGIN
-    IF to_regclass('public.pos_reader_order_costs') IS NOT NULL THEN
+    IF to_regclass('public.pos_reader_order_resplits') IS NOT NULL THEN
+      TRUNCATE pos_reader_order_resplits, pos_reader_order_costs;
+    ELSIF to_regclass('public.pos_reader_order_costs') IS NOT NULL THEN
       TRUNCATE pos_reader_order_costs;
     END IF;
   END $$`)
@@ -129,6 +141,11 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM credit_merkle_anchors`)
   await db.query(`DELETE FROM credit_events`)
   await db.query(`DELETE FROM credit_subjects`)
+  // 10/13 evening (Nic): the nightly chain check's record, read by the 8:05
+  // morning admin email. Guarded: the table arrives with migration 20261015220100.
+  await db.query(`DO $$ BEGIN
+    IF to_regclass('public.credit_chain_check_runs') IS NOT NULL THEN DELETE FROM credit_chain_check_runs; END IF;
+  END $$`)
   await db.query(`DELETE FROM admin_notifications`)
   // S362: admin_action_log + system_features FK users with NO ACTION
   // (default). Wipe both before users delete. system_features rows

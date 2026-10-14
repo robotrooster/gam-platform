@@ -87,6 +87,9 @@
 .tr-v { color: var(--text-0); text-align: right; }
 .tr-health { display: flex; align-items: center; gap: 14px; }
 .tr-health-pct { font-family: var(--font-mono); font-size: 1.6rem; font-weight: 800; }
+/* 10/13 (Nic): "Keep it out, but say so" — nothing counted yet, in words; the onboarding month left out, said. */
+.tr-health-none { font-size: .95rem; font-weight: 700; color: var(--text-1); }
+.tr-health-note { color: var(--text-3); font-size: .72rem; }
 .tr-pattern { font-size: .95rem; font-weight: 700; color: var(--text-0); margin-bottom: 6px; }
 .tr-bars { display: flex; flex-direction: column; gap: 4px; }
 .tr-bar { display: grid; grid-template-columns: 150px 1fr 28px; gap: 8px; align-items: center; font-size: .74rem; color: var(--text-2); }

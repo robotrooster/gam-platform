@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { RefreshCw, CalendarX2, FileSignature, Send } from 'lucide-react'
 import { appConfirm } from '../components/dialogs'
+import { newLeaseCancelButton } from '../lib/documentEnd'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 // The calendar day as written ('YYYY-MM-DD…'), never shifted by the browser's
@@ -139,13 +140,14 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
   const cancelRefusal: string | null = openDraft && !openDraft.canCancel ? (openDraft.cancelRefusal ?? null) : null
   // What canceling does to the lease in force, said in the confirm: a
   // month-to-month just carries on; a lease with an end date ends on it unless
-  // another new lease is sent before then.
-  const cancelConfirmText = !landlordSigned
-    ? 'Throw away this draft? Anything typed into it is discarded. The current lease carries on as it is.'
-    : lease?.endDate
-      ? `Cancel the new lease? The current lease carries on as it is through ${longDate(lease.endDate)} and ends then — ` +
-        'unless you send them another new lease before that day, it is treated as a move-out. Any deposit change on the new one is taken back.'
-      : 'Cancel the new lease? The current lease carries on exactly as it is, and any deposit change on the new one is taken back.'
+  // another new lease is sent before then. 10/13 (Nic): "If it never
+  // completed, it doesn't exist" — whether the press deletes the new lease or
+  // voids it is the server's answer (openDraft.endAction, the void route's own
+  // test), never guessed from who has signed (lib/documentEnd).
+  const cancelButton = newLeaseCancelButton({
+    endAction: openDraft?.endAction ?? null, landlordSigned,
+    currentLeaseEnd: lease?.endDate ? longDate(lease.endDate) : null,
+  })
   const openExistingDraft = async () => {
     // A draft that was never sent has no live signing session — send it
     // on the way in (only 'pending' / 'draft' status docs take this branch).
@@ -256,9 +258,9 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                   <button className="btn btn-ghost" onClick={onClose}>Close</button>
                   {canCancel && (
                     <button className="btn btn-primary" disabled={voidMut.isLoading || working}
-                      onClick={()=>{ appConfirm(cancelConfirmText,
-                        { danger: true, confirmLabel: landlordSigned ? 'Cancel the new lease' : 'Throw away draft' }).then(ok => { if (ok) voidMut.mutate() }) }}>
-                      {voidMut.isLoading ? 'Canceling…' : landlordSigned ? 'Cancel the new lease' : 'Throw away draft'}
+                      onClick={()=>{ appConfirm(cancelButton.confirm,
+                        { danger: true, confirmLabel: cancelButton.label }).then(ok => { if (ok) voidMut.mutate() }) }}>
+                      {voidMut.isLoading ? cancelButton.working : cancelButton.label}
                     </button>
                   )}
                   {!landlordSigned && (

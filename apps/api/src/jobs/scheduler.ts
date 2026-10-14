@@ -2308,6 +2308,9 @@ export function schedulerInit() {
   // S652 (Nic): a card-reader request must never sit unseen. Every morning,
   // one email while anything is waiting on GAM; silent otherwise. 10/13 (Nic):
   // it also flags every reader GAM bought whose cost is not entered yet.
+  // 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+  // email (not its own 3 am email)" — this is that email: it also names any
+  // credit chain last night's check found broken, or says the check did not run.
   cron.schedule('5 8 * * *', async () => {
     try {
       const { chaseReaderOrders } = await import('../services/readerOrders')
@@ -2967,6 +2970,20 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // 10/13 (Nic): "emailing tenants on their birthday and saying, Hey, happy
+  // birthday from GAM ... Thank you for using GAM." Current tenants and
+  // landlords whose birthday is today, once a person a year
+  // (jobs/birthdayEmails.ts). A morning hour, so it lands on the day itself.
+  cron.schedule('15 9 * * *', async () => {
+    try {
+      const { runBirthdayEmails } = await import('./birthdayEmails')
+      const r = await runBirthdayEmails()
+      if (r.birthdays) logger.info(r, '[birthday-emails] run')
+    } catch (e) {
+      logger.error({ err: e }, '[birthday-emails] run failed')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S652 (Nic): "immediately reach out to people when there's a problem."
   // A landlord GAM cannot collect from is a silent problem — the fee accrues,
   // the sweep finds no bank, and nothing reaches the one person who can fix it.
@@ -3353,8 +3370,8 @@ export function schedulerInit() {
   // Credit ledger nightly. 3am Phoenix — sits between lease-ends (2am) and
   // background-check expiry (3am same minute on a different table set, no
   // contention). Writes tonight's bill marks, runs the credit chain check
-  // (10/13 Nic: one admin email for broken chains, or a did-not-run email),
-  // then recomputes scores and refreshes the stats panel.
+  // (10/13 Nic; evening: written down for the 8:05 morning admin email, no
+  // 3 am email), then recomputes scores and refreshes the stats panel.
   cron.schedule('0 3 * * *', async () => {
     try {
       const { processCreditNightly } = await import('./creditNightly')

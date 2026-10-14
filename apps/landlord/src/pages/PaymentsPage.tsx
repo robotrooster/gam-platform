@@ -9,14 +9,14 @@ import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
 import { X, CheckCircle, Gift, ChevronRight } from 'lucide-react'
-import { money, toCents, monthTitle, serverStatus, serverMessage, CREDIT_USE_RULE } from '../lib/creditDesk'
+import { money, toCents, monthTitle, serverStatus, serverMessage, dayWord, CREDIT_USE_RULE } from '../lib/creditDesk'
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
-import { OpenMonthDetail, StayDetail } from '../components/payments/OpenMonthDetail'
+import { OpenMonthDetail, StayDetail, SpaceDetail } from '../components/payments/OpenMonthDetail'
 import { OtherMoneyFolder } from '../components/payments/OtherMoney'
 import { RecordPaymentPicker } from '../components/payments/RecordPaymentPicker'
 import {
   propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords,
-  rowName, rowOpens, stayRefundWords,
+  rowName, hasRegisterMoney, stayRefundWords, registerWords, rowMethods, stayOwedWords,
 } from '../components/payments/openMonth'
 import { usePhone } from '../components/payments/usePhone'
 import { BalancesPage } from './BalancesPage'
@@ -86,6 +86,27 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // "Delinquent" tag beside the name of a household past its grace period with
 // money still owed. "phones = one card per household" — under 640px the rows
 // are cards, never a table that scrolls sideways. No search box.
+//
+// 10/13 (Nic), round 3: "Stay rows SHOW what's still owed" — a stay row's Owed
+// is what is still owed on the stay (the day its balance link went out under
+// it), and a stay still owing sits at the top with everyone else owing; its
+// sum rides beside the stays' ("Owed on stays"). "Pay links / register sales
+// that name a space go ON that space's row … only money with no space stays
+// in the folder" — that money is under the row's Paid ("+ $752.17 register &
+// pay links", never in Paid itself), its way of paying in the method column,
+// and its lines when the row is opened.
+//
+// 10/13 (Nic), round 4: "can we have it where the vacant units are still like
+// the unit number is still directly in line with the ones that are occupied?
+// It's weird that they're tabbed over to the left because the vacant units are
+// not clickable ... just make them all clickable even if they're vacant and
+// just show you know an expanded box with nothing ... I want the layout to be
+// nice and smooth." Every row opens, with the same caret before its space
+// number, so every space number lines up; a space nobody holds on a lease opens
+// to "Vacant — nothing billed this month." (and any register money naming
+// it). Phones the same. And a register sale or pay link opens to its breakdown
+// ("it looks like that charge is just for electric. It's not ... not clickable
+// to show an expanded breakdown") — each part, what it is, its own amount.
 
 // S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
 // overcharge, goodwill). Funded by the landlord (they receive less rent) and
@@ -346,37 +367,51 @@ export function PaymentsPage() {
       </>
     )
   }
-  /** The Paid cell: what came in, work trade beside it, clearing, a stay's refund. */
+  /** The Paid cell: what came in, work trade beside it, clearing, a stay's refund, the register's money on the space. */
   const paidCell = (r: OpenMonthRow) => {
     const paid = paidWords(r)
     const refundedWords = stayRefundWords(r)
+    const register = registerWords(r)
     return (
       <>
-        {paid.amount ?? <span className="pay-muted">—</span>}
+        {paid.amount ?? (register?.amount ? null : <span className="pay-muted">—</span>)}
         {/* As on the Rent Roll: work trade's value beside Paid. */}
         {paid.workTrade && <span className="pay-sub">{paid.workTrade}</span>}
         {toCents(r.clearing) > 0 && <span className="pay-sub">{money(r.clearing)} still clearing</span>}
         {refundedWords && <span className="pay-sub">{refundedWords}</span>}
+        {/* 10/13 (Nic, round 3): register sales and pay links naming this space. */}
+        {register?.amount && <span className="pay-sub pay-register">{register.amount}</span>}
+        {register?.refunded && <span className="pay-sub">{register.refunded}</span>}
       </>
     )
   }
-  /** The Owed cell: this month's, and what is still owed from earlier months. */
+  /** The Owed cell: this month's, and what is still owed from earlier months (a stay: what is owed on it now, and when the rest comes due). */
   const owedCell = (r: OpenMonthRow) => {
     const earlier = earlierWords(r)
+    const sent = stayOwedWords(r, d => dayWord(d, roll?.month.slice(0, 4) ?? ''))
     return (
       <>
         {toCents(r.owed) > 0 ? <span className="pay-owed">{money(r.owed)}</span> : <span className="pay-muted">—</span>}
         {/* 10/13 (Nic): "outstanding balances are always at the top" — earlier months too. */}
         {earlier && <span className="pay-sub pay-earlier">{earlier}</span>}
+        {sent && <span className="pay-sub">{sent}</span>}
       </>
     )
   }
-  const methodsText = (r: OpenMonthRow) => r.methods.length > 0 ? r.methods.join(', ') : <span className="pay-muted">—</span>
-  /** A stay is paid, never billed by the month: no Invoiced, no Owed. */
+  const methodsText = (r: OpenMonthRow) => {
+    const ways = rowMethods(r)
+    return ways.length > 0 ? ways.join(', ') : <span className="pay-muted">—</span>
+  }
+  /** A stay is paid, never billed by the month: no Invoiced (its Owed is what is still owed on it). */
   const billed = (r: OpenMonthRow) => !isSpaceOnlyRow(r) && !isStayRow(r)
+  /** Owed: a household's bills, or what is still owed on a stay (10/13, Nic, round 3). */
+  const owes = (r: OpenMonthRow) => !isSpaceOnlyRow(r)
+  /** Paid and the method: a household, a stay, or a space a register sale names. */
+  const takesMoney = (r: OpenMonthRow) => !isSpaceOnlyRow(r) || hasRegisterMoney(r)
   const detail = (r: OpenMonthRow, month: string) => isStayRow(r)
     ? <StayDetail row={r} month={month} />
-    : <OpenMonthDetail row={r} month={month} canAddPhoto={canTake} ledgerFacts={!readOnly} />
+    : isSpaceOnlyRow(r) ? <SpaceDetail row={r} month={month} />
+      : <OpenMonthDetail row={r} month={month} canAddPhoto={canTake} ledgerFacts={!readOnly} />
   const recordButton = (r: OpenMonthRow) => rowTakesPayment(r, canTake) && (
     <button className="btn btn-primary btn-sm" onClick={e => { e.stopPropagation(); openRecord(r) }}>
       Record payment
@@ -448,6 +483,8 @@ export function PaymentsPage() {
                 <span>Stays <strong>{money(t.stays)}</strong>
                   {toCents(t.staysRefunded) > 0 && <> ({money(t.staysRefunded)} refunded)</>}</span>
               )}
+              {/* 10/13 (Nic, round 3): "Stay rows SHOW what's still owed". */}
+              {toCents(t.staysOwed) > 0 && <span>Owed on stays <strong>{money(t.staysOwed)}</strong></span>}
               {/* "ALL money coming in" — the register's and pay links' other money, its own sum. */}
               {toCents(t.otherIn) > 0 && (
                 <span>Register &amp; pay links <strong>{money(t.otherIn)}</strong>
@@ -462,29 +499,29 @@ export function PaymentsPage() {
           // 10/13 (Nic): "phones = one card per household" — no sideways scrolling.
           <div className="pay-cards">
             {roll.rows.map(r => {
-              const opens = rowOpens(r)
-              const open = opens && openKeys.has(r.key)
+              // 10/13 (Nic): every card opens, an empty space's too.
+              const open = openKeys.has(r.key)
               const record = recordButton(r)
               return (
-                <div key={r.key} className={`pay-card${opens ? ' pay-click' : ''}${open ? ' pay-open' : ''}`} data-card-key={r.key}>
-                  <div className="pay-card-head" onClick={opens ? () => toggle(r.key) : undefined}
-                    role={opens ? 'button' : undefined} tabIndex={opens ? 0 : undefined} aria-expanded={opens ? open : undefined}
-                    onKeyDown={opens ? e => {
+                <div key={r.key} className={`pay-card pay-click${open ? ' pay-open' : ''}`} data-card-key={r.key}>
+                  <div className="pay-card-head" onClick={() => toggle(r.key)}
+                    role="button" tabIndex={0} aria-expanded={open}
+                    onKeyDown={e => {
                       if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r.key) }
-                    } : undefined}>
+                    }}>
                     <div className="pay-card-top">
-                      <span className="pay-space">{opens && <span className="pay-caret">{open ? '▾' : '▸'}</span>}{r.space ?? '—'}</span>
+                      <span className="pay-space"><span className="pay-caret">{open ? '▾' : '▸'}</span>{r.space ?? '—'}</span>
                       <span className={`pay-pill ${r.statusColor}`}>{r.statusLabel}</span>
                     </div>
                     <div className="pay-card-who">{who(r)}</div>
-                    {!isSpaceOnlyRow(r) && (
-                      <div className={`pay-card-figs${billed(r) ? '' : ' one'}`}>
+                    {takesMoney(r) && (
+                      <div className={`pay-card-figs${billed(r) ? '' : owes(r) ? ' two' : ' one'}`}>
                         {billed(r) && <div>Invoiced<strong>{toCents(r.invoiced) > 0 ? money(r.invoiced) : '—'}</strong></div>}
                         <div>Paid<strong>{paidCell(r)}</strong></div>
-                        {billed(r) && <div>Owed<strong>{owedCell(r)}</strong></div>}
+                        {owes(r) && <div>Owed<strong>{owedCell(r)}</strong></div>}
                       </div>
                     )}
-                    {!isSpaceOnlyRow(r) && <div className="pay-card-method">Payment method: {methodsText(r)}</div>}
+                    {takesMoney(r) && <div className="pay-card-method">Payment method: {methodsText(r)}</div>}
                   </div>
                   {record && <div className="pay-card-record">{record}</div>}
                   {open && <div className="pay-card-detail">{detail(r, roll.month)}</div>}
@@ -505,29 +542,30 @@ export function PaymentsPage() {
             <tbody>
               {/* The server's order: still owing first, then space order (10/13). */}
               {roll.rows.map(r => {
-                // A space nobody holds on a lease (Vacant, or in use): no money, nothing to open.
-                const opens = rowOpens(r)
-                const open = opens && openKeys.has(r.key)
+                // 10/13 (Nic): "just make them all clickable even if they're vacant" —
+                // every row opens, so every space number sits after the same caret.
+                const open = openKeys.has(r.key)
+                const what = isSpaceOnlyRow(r) ? 'this space’s month' : 'the payments and charges'
                 return (
                   <Fragment key={r.key}>
-                    <tr className={`pay-row${opens ? ' pay-click' : ''}${open ? ' pay-open' : ''}`} data-key={r.key}
-                      onClick={opens ? () => toggle(r.key) : undefined}
-                      tabIndex={opens ? 0 : undefined} aria-expanded={opens ? open : undefined}
-                      onKeyDown={opens ? e => {
+                    <tr className={`pay-row pay-click${open ? ' pay-open' : ''}`} data-key={r.key}
+                      onClick={() => toggle(r.key)}
+                      tabIndex={0} aria-expanded={open}
+                      onKeyDown={e => {
                         if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r.key) }
-                      } : undefined}
-                      title={opens ? (open ? 'Hide the payments and charges' : 'Show the payments and charges') : undefined}>
+                      }}
+                      title={open ? `Hide ${what}` : `Show ${what}`}>
                       <td className="pay-space">
-                        {opens && <span className="pay-caret">{open ? '▾' : '▸'}</span>}
+                        <span className="pay-caret">{open ? '▾' : '▸'}</span>
                         {r.space ?? '—'}
                       </td>
                       <td>{who(r)}</td>
                       <td className="num mono">
                         {!billed(r) ? null : toCents(r.invoiced) > 0 ? money(r.invoiced) : <span className="pay-muted">—</span>}
                       </td>
-                      <td className="num mono">{isSpaceOnlyRow(r) ? null : paidCell(r)}</td>
-                      <td className="num mono">{billed(r) ? owedCell(r) : null}</td>
-                      <td>{isSpaceOnlyRow(r) ? null : methodsText(r)}</td>
+                      <td className="num mono">{takesMoney(r) ? paidCell(r) : null}</td>
+                      <td className="num mono">{owes(r) ? owedCell(r) : null}</td>
+                      <td>{takesMoney(r) ? methodsText(r) : null}</td>
                       <td><span className={`pay-pill ${r.statusColor}`}>{r.statusLabel}</span></td>
                       {canTake && <td className="pay-record">{recordButton(r)}</td>}
                     </tr>

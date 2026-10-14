@@ -11,9 +11,9 @@ import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordTarget, landlordScopeIds, landlordForRequest, ownsLandlord } from '../lib/landlordScope'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { query, queryOne } from '../db'
-import { LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED, BOOKS_CATEGORY_DIRECTIONS } from '@gam/shared'
+import { LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED, BOOKS_CATEGORY_DIRECTIONS, BOOKS_COST_PLACES } from '@gam/shared'
 import {
-  createLandlordExpense, listLandlordExpenses, voidLandlordExpense, attachExpenseReceipt, updateLandlordExpense,
+  createLandlordExpense, listLandlordExpenses, voidLandlordExpense, attachExpenseReceipt, updateLandlordExpense, EXPENSE_NO_PLACE,
   recordExpensePayment, voidExpensePayment,
 } from '../services/landlordExpenses'
 import { listCategories, createCategory, updateCategory, categoryAccountChoices } from '../services/booksCategories'
@@ -87,6 +87,9 @@ async function bookkeepersExpense(req: any): Promise<{ landlordId: string; scope
   }
   return { landlordId: row.landlord_id, scope }
 }
+
+/** 10/13 (Nic): a split reaches every property of the company — a bookkeeper kept to some of them files on those. */
+const SPLIT_NEEDS_WHOLE_COMPANY = 'Splitting a cost across all of the company\'s properties takes the whole company\'s books. Choose a property or unit you keep.'
 
 /**
  * 10/11: where a bookkeeper's new or moved expense is filed must be inside
@@ -231,6 +234,10 @@ expensesRouter.post('/', requireExpenseViewer, async (req: any, res, next) => {
       dueDate:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
       expenseDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       isCommon:        z.boolean().optional(),
+      // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+      // property at the time of logging" — required (a unit or a property
+      // named says it; 'split_by_units' names neither).
+      costPlace:       z.enum(BOOKS_COST_PLACES, { errorMap: () => ({ message: EXPENSE_NO_PLACE }) }).nullable().optional(),
       // S613: which utility this bill was for. Drives the recovery report —
       // what came in for water vs what was billed back out for water.
       utilityType:     z.enum(['water','gas','electric','sewer','trash','propane']).nullable().optional(),
@@ -249,6 +256,7 @@ expensesRouter.post('/', requireExpenseViewer, async (req: any, res, next) => {
     let landlordId: string
     if (isBookkeeper(req)) {
       const scope = await financialsScope({ user: req.user, headers: req.headers, query: {} })
+      if (body.costPlace === 'split_by_units' && scope.narrowed) throw new AppError(403, SPLIT_NEEDS_WHOLE_COMPANY)
       await assertBookkeeperPlacement(scope, body.unitId, body.propertyId)
       landlordId = scope.landlordIds[0]
     } else {
@@ -266,6 +274,7 @@ expensesRouter.post('/', requireExpenseViewer, async (req: any, res, next) => {
       billNumber: body.billNumber ?? null, dueDate: body.dueDate ?? null,
       expenseDate: body.expenseDate,
       isCommon: body.isCommon, utilityType: body.utilityType ?? null,
+      costPlace: body.costPlace ?? null,
       payment: body.unpaid ? null
         : body.paid ? { method: body.paid.method, paidOn: body.paid.paidOn ?? null, bankConnectionId: body.paid.bankConnectionId ?? null }
         : undefined,
@@ -360,11 +369,14 @@ expensesRouter.patch('/:id', requireExpenseViewer, async (req: any, res, next) =
       utilityType: z.enum(['water','gas','electric','sewer','trash','propane']).nullable().optional(),
       unitId:      z.string().uuid().nullable().optional(),
       propertyId:  z.string().uuid().nullable().optional(),
+      // 10/13 (Nic): where the cost goes, when it is re-filed.
+      costPlace:   z.enum(BOOKS_COST_PLACES, { errorMap: () => ({ message: EXPENSE_NO_PLACE }) }).nullable().optional(),
     }).parse(req.body)
     let company: string
     if (isBookkeeper(req)) {
       const own = await bookkeepersExpense(req)
-      if (body.unitId !== undefined || body.propertyId !== undefined) {
+      if (body.costPlace === 'split_by_units' && own.scope.narrowed) throw new AppError(403, SPLIT_NEEDS_WHOLE_COMPANY)
+      if (body.unitId !== undefined || body.propertyId !== undefined || body.costPlace !== undefined) {
         await assertBookkeeperPlacement(own.scope, body.unitId, body.propertyId)
       }
       company = own.landlordId
@@ -477,7 +489,11 @@ expensesRouter.get('/options', requireExpenseViewer, async (req: any, res, next)
     // 10/12 review: canWrite — the money-out writes (payments, categories, a
     // repair's bill). 10/12 (Nic, ledger decision 2): one level, so every
     // bookkeeper the company keeps is offered them.
-    res.json({ success: true, data: { categories, vendors, banks, canPointAccounts: scope.ledger && mayWrite(req), canWrite: mayWrite(req) } })
+    // 10/13 review: canSplit — "split across your properties by units"
+    // reaches every property, so a bookkeeper kept to some of them is not
+    // offered it (POST/PATCH refuse it: SPLIT_NEEDS_WHOLE_COMPANY).
+    res.json({ success: true, data: { categories, vendors, banks, canPointAccounts: scope.ledger && mayWrite(req), canWrite: mayWrite(req),
+      canSplit: !scope.narrowed } })
   } catch (e) { next(e) }
 })
 

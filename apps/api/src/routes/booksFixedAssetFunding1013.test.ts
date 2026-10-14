@@ -129,13 +129,17 @@ describe('where the money for a hand-typed asset came from', () => {
     expect(missing.body.error).toBe('Choose the expense it was.')
     const theirs = await post(w.otherTok, '/fixed-assets', { name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: roof })
     expect(theirs.status).toBe(404)
+    // 10/13 (Nic): where its depreciation goes is asked (it sits where the expense was filed).
+    const unsaid = await post(w.tok, '/fixed-assets', { name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: roof })
+    expect([unsaid.status, unsaid.body.error]).toEqual([400,
+      'Choose where this asset and its depreciation goes: the property the expense was filed on, or one of its units.'])
     const r = await post(w.tok, '/fixed-assets', {
-      name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: roof,
+      name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: roof, costPlace: 'property',
       cost: 1, acquiredOn: '2026-09-01', propertyId: w.co.propertyId,   // ignored: the expense's are the asset's
     })
     expect(r.status, JSON.stringify(r.body)).toBe(201)
     expect(r.body.data).toMatchObject({ cost: '12000.00', acquired_on: '2026-02-10', property_id: w.co.propertyId2,
-      source_expense_id: roof, funded_by: 'expense', monthly: 100 })
+      source_expense_id: roof, funded_by: 'expense', cost_place: 'property', monthly: 100 })
     expect((await get(w.tok, '/fixed-assets/linkable-expenses')).body.data).toEqual([])
     const again = await post(w.tok, '/fixed-assets', { name: 'Roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: roof })
     expect(again.status).toBe(409)
@@ -280,7 +284,8 @@ describe('a repair\'s bill that can still change with its repair (10/13 review)'
       `INSERT INTO landlord_expense_payments (expense_id, landlord_id, paid_on, amount, method, source) VALUES ($1, $2, '2026-02-20', 2000, 'cash', 'payment')`,
       [bill, w.co.landlordId])
     expect((await get(w.tok, '/fixed-assets/linkable-expenses')).body.data.map((e: any) => [e.id, e.amount])).toEqual([[bill, 12000]])
-    const r = await post(w.tok, '/fixed-assets', { name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: bill })
+    const r = await post(w.tok, '/fixed-assets', { name: 'New roof', assetClass: 'improvement', lifeYears: 10, fundedBy: 'expense', expenseId: bill,
+      costPlace: 'property' })
     expect(r.status, JSON.stringify(r.body)).toBe(201)
     expect(r.body.data).toMatchObject({ cost: '12000.00', acquired_on: '2026-02-10', source_expense_id: bill })
     // The repair's cost corrected afterwards: the bill (and so the asset) stays as it was.

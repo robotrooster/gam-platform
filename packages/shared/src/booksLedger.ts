@@ -710,7 +710,9 @@ export const LEDGER_CAPTURE_COLUMNS = {
     // 10/12 (Nic, ledger P6): the category it charges to and who was paid
     // (its payments' cash lines carry both, so a change marks them too), and
     // the manager's-cut bill of a split (Nic L18: the split posts its cost).
-    'category_id', 'vendor_id', 'allocation_split_id'],
+    'category_id', 'vendor_id', 'allocation_split_id',
+    // 10/13 (Nic): where the cost goes, picked when it is logged (migration 20261015230000).
+    'cost_place'],
   landlord_expense_payments: ['expense_id', 'landlord_id', 'paid_on', 'amount', 'method',
     'bank_connection_id', 'bank_transaction_id', 'voided_at'],
   landlord_other_income: ['landlord_id', 'property_id', 'unit_id', 'category', 'amount', 'income_date', 'is_common',
@@ -721,7 +723,9 @@ export const LEDGER_CAPTURE_COLUMNS = {
   payroll_runs: ['landlord_id', 'business_id', 'pay_date', 'status', 'total_gross', 'total_federal_tax',
     'total_state_tax', 'total_ss', 'total_medicare', 'total_net', 'approved_at', 'voided_at',
     // 10/12 (Nic, ledger P7): the employer's own taxes, recorded per run (design J3).
-    'total_employer_ss', 'total_employer_medicare', 'total_futa', 'total_suta'],
+    'total_employer_ss', 'total_employer_medicare', 'total_futa', 'total_suta',
+    // 10/13 (Nic): where the wages and the employer's taxes go, picked when the run is logged (20261015230000).
+    'cost_place', 'property_id', 'unit_id'],
   payroll_run_lines: ['run_id', 'employee_id', 'gross_pay', 'federal_tax', 'state_tax', 'ss_tax', 'medicare_tax',
     'other_deductions', 'net_pay',
     // 10/12 (Nic, ledger P7): the employer's taxes on each paycheck (design J3).
@@ -742,7 +746,9 @@ export const LEDGER_CAPTURE_COLUMNS = {
   books_loans: ['landlord_id', 'business_id', 'property_id', 'name', 'original_amount', 'start_date',
     'funded_to', 'funded_bank_connection_id', 'opening_balance', 'opening_escrow', 'voided_at',
     // 10/12 (Nic, integrate): the bank line the loan's money arrived as dates it (20261014210100).
-    'funded_bank_transaction_id'],
+    'funded_bank_transaction_id',
+    // 10/13 (Nic): where each payment's interest goes, picked when the loan is logged (20261015230000).
+    'cost_place', 'unit_id'],
   books_loan_payments: ['loan_id', 'landlord_id', 'business_id', 'paid_on', 'amount', 'principal', 'interest', 'escrow',
     'method', 'bank_connection_id', 'voided_at',
     // 10/12 (Nic, integrate): the bank line that paid it clears it on the bank's day (20261014210100).
@@ -751,7 +757,13 @@ export const LEDGER_CAPTURE_COLUMNS = {
     'acquired_on', 'in_service_date', 'life_years', 'method', 'prior_depreciation', 'source_expense_id', 'voided_at',
     // 10/13 (Nic): where a hand-typed asset's money came from posts its cost
     // (migration 20261015190100; the capture also marks the expense it names).
-    'funded_by', 'funded_loan_id'],
+    'funded_by', 'funded_loan_id',
+    // 10/13 (Nic): where each month's depreciation goes, picked when the asset is logged (20261015230000).
+    'cost_place', 'unit_id'],
+  // 10/13 (Nic): "Funding: ALLOW A MIX" — an asset's funding lines (migration
+  // 20261015230100). A line's change marks its asset's purchase posting, and
+  // the expense an "already an expense" line names and that expense's payments.
+  books_fixed_asset_funding: ['asset_id', 'landlord_id', 'kind', 'loan_id', 'expense_id', 'amount', 'replaced_at'],
   // Dependent tables: a projector reads them, so they mark the key that reads them.
   utility_bills: ['payment_id', 'meter_id', 'landlord_id', 'charge_amount', 'tax_amount', 'utility_type'],
   home_sale_installments: ['contract_id', 'payment_id', 'billing_month', 'amount', 'principal_portion',
@@ -966,22 +978,63 @@ export const BOOKS_WORK_TRADE_METHOD_LABEL: Record<BooksWorkTradeMethod, string>
 }
 
 /**
- * landlords.books_company_costs_method (Nic L7): costs that belong to no one
- * property (payroll, company-wide bills)
- *   company_bucket  stay in a Company column of their own
- *   split_by_units  are split across the properties by how many units each has
- * 10/13 (Nic): "Company-level costs before the owner picks: post to the
- * COMPANY column by default" (NULL reads as company_bucket), and "a later
- * 'split by units' splits only NEW costs" — a pick made after the books posted
- * applies from landlords.books_company_costs_from on.
+ * landlords.books_company_costs_method (Nic L7) — RETIRED 10/13 (Nic): "each
+ * expense is chosen on the split or specific unit or property at the time of
+ * logging. there should never be a default setting to apply expenses." The
+ * column (and landlords.books_company_costs_from) stays on the table (expand
+ * then contract), nothing reads it, and the Books settings page no longer asks
+ * it: where a cost goes is BOOKS_COST_PLACES, picked on each record. These
+ * values mirror landlords_books_company_costs_method_check only.
  */
 export const BOOKS_COMPANY_COST_METHODS = ['company_bucket', 'split_by_units'] as const
 export type BooksCompanyCostMethod = typeof BOOKS_COMPANY_COST_METHODS[number]
-/** 10/13 (Nic): where company-level costs go while the owner has not picked. */
-export const DEFAULT_BOOKS_COMPANY_COST_METHOD: BooksCompanyCostMethod = 'company_bucket'
-export const BOOKS_COMPANY_COST_METHOD_LABEL: Record<BooksCompanyCostMethod, string> = {
-  company_bucket: 'A Company column of their own',
+
+/**
+ * 10/13 (Nic): where a cost a person logs goes — picked on the record when it
+ * is logged, never a setting or a default: "each expense is chosen on the
+ * split or specific unit or property at the time of logging." Payroll, loan
+ * interest and depreciation are logged by a person too, so they get the same
+ * choice ("except gams charge all those costs get logged by a person"):
+ *   split_by_units  split across the company's properties by how many units
+ *                   each had on the cost's day — counting a unit already in
+ *                   GAM when the cost was logged (units are typed in after
+ *                   the books start); company level only when it had none.
+ *                   Only a cost is split: money out that is not one (an
+ *                   owner's draw) is refused it
+ *   property        one property (the record's property_id)
+ *   unit            one unit (the record's unit_id; its property is the unit's)
+ * The `cost_place` column of landlord_expenses, payroll_runs (the wages and
+ * the employer's taxes), books_loans (each payment's interest) and
+ * books_fixed_assets (each month's depreciation) — required when a person
+ * logs one (the forms ask; the routes refuse without it). NULL only on a
+ * record logged before 10/13 (it stays as it posted: its property, else the
+ * Company column), on a bill GAM makes for another record (a payroll run's
+ * take-home pay or taxes, a payout split's manager's cut), which moves money
+ * owed and places no cost, and on money out that is not a cost (an owner's
+ * draw) the person put on the company. GAM's own company-wide charges, the only costs
+ * nobody logs (a $6 transfer cost), go to the Company column (property NULL).
+ * Mirrors the four *_cost_place_check constraints (migration 20261015230000).
+ */
+export const BOOKS_COST_PLACES = ['split_by_units', 'property', 'unit'] as const
+export type BooksCostPlace = typeof BOOKS_COST_PLACES[number]
+export const BOOKS_COST_PLACE_LABEL: Record<BooksCostPlace, string> = {
   split_by_units: 'Split across your properties by units',
+  property:       'One property',
+  unit:           'One unit',
+}
+/** What "where it goes" says on a list row, for a cost logged before 10/13 with no place (the Company column). */
+export const BOOKS_COST_PLACE_NONE_LABEL = 'The company'
+
+/**
+ * 10/13 (Nic): the place a form sends, worked out from what it names — a unit
+ * is 'unit', a property 'property'; 'split_by_units' only when said. Null:
+ * nothing chosen (the form asks again).
+ */
+export function booksCostPlaceOf(v: { costPlace?: string | null; propertyId?: string | null; unitId?: string | null }): BooksCostPlace | null {
+  if (v.costPlace === 'split_by_units') return 'split_by_units'
+  if (v.unitId) return 'unit'
+  if (v.propertyId) return 'property'
+  return null
 }
 
 /**

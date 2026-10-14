@@ -33,7 +33,7 @@ import { recordPlatformRevenue, realLandlordSql } from './platformRevenue'
 import { dateIn, todayIn } from '../lib/timezone'
 import {
   SUPPORTED_CARD_READER, installmentSplit, readerCostTotal, readerOrderMoney,
-  READER_BOOK_REFERENCE, readerBookRows, readerBookTotals,
+  READER_BOOK_REFERENCE, readerBookRows, readerBookTotals, readerEntryInForce,
   type ReaderCostParts, type ReaderPieceBilled, type ReaderBookRowKind,
 } from '@gam/shared'
 
@@ -113,19 +113,81 @@ const READER_BOUGHT_AT_SQL = (o: string) => `COALESCE(${o}.ordered_at, ${o}.ship
 const READER_BOUGHT_SQL = (o: string) => `(${o}.status IN ('ordered','shipped','delivered','registered')
   OR (${o}.status = 'cancelled' AND ${READER_BOUGHT_AT_SQL(o)} IS NOT NULL))`
 
+/** The one 8:05 morning admin email's category (10/13 evening: card readers and the credit chain check). */
+export const MORNING_ADMIN_EMAIL_CATEGORY = 'morning_admin_email'
+
 /**
- * The morning chase: ONE email while anything is waiting on GAM.
+ * The 8:05 morning admin email (the scheduler's '5 8 * * *'): ONE email while
+ * anything is waiting on GAM.
  *
  *   requested            → nobody has ordered it yet (every day until they do)
  *   ordered, no reader   → after 3 days: has Stripe shipped it?
  *   shipped, never online→ after 10 days: did it arrive, is it plugged in?
  *   bought, no cost      → (10/13) every day until GAM's cost is on the desk
+ *   credit chains        → (10/13 evening, Nic: "Broken credit chain: fold into
+ *                          the 8:05 MORNING admin email (not its own 3 am
+ *                          email)") each chain last night's check found broken,
+ *                          or that the check did not run
+ *                          (creditChainCheck.creditChainMorningSection)
  *
  * One digest, not one email per order (S652: one email per thing), counting
  * orders — one order can be on two lines (not in use yet, and no cost). Silent
- * when nothing waits.
+ * when nothing waits and every chain was checked whole. `waiting` counts the
+ * reader orders; `sent` says whether the email went out.
+ *
+ * 10/13 (review): the two parts never wait on each other. Last night's chain
+ * check is read first (it never throws), and the card reader part is guarded:
+ * a reader query, Stripe or a reader's order that cannot be checked no longer
+ * stops the email — the chains still go out, and the email says the card
+ * reader check could not run (with why). One property Stripe cannot be asked
+ * about never hides the others.
  */
 export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiting: number; sent: boolean }> {
+  // 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+  // email (not its own 3 am email)." What last night's check found, first: a
+  // broken chain is the more serious news, and it is read before anything of
+  // the readers can go wrong.
+  const { creditChainMorningSection } = await import('./creditChainCheck')
+  const chains = await creditChainMorningSection()
+  let readers: { lines: string[]; waitingOrders: Set<string>; failed: string | null }
+  try {
+    readers = { ...(await readerMorningLines(now)), failed: null }
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e)
+    logger.error({ err: e }, '[reader-order] the card reader part of the morning admin email could not run')
+    readers = {
+      lines: [`CARD READERS NOT CHECKED — this morning's card reader check stopped before it finished: ${why}. `
+        + 'Open Reader Orders to see what is waiting. The check runs again tomorrow morning.'],
+      waitingOrders: new Set(), failed: why,
+    }
+  }
+  const { lines, waitingOrders } = readers
+  if (!lines.length && !chains.lines.length) return { waiting: 0, sent: false }
+  const n = waitingOrders.size
+  await createAdminNotification({
+    severity: chains.outcome === 'broken' ? 'critical' : 'warn', category: MORNING_ADMIN_EMAIL_CATEGORY, emailSuperAdmins: true,
+    title: [
+      chains.title,
+      n ? `${n} card reader order${n === 1 ? '' : 's'} waiting on GAM` : null,
+      readers.failed ? 'The card reader check did not run this morning' : null,
+    ].filter(Boolean).join(' · '),
+    body: [...chains.lines, ...lines].join('\n'),
+    context: {
+      ...(n ? { count: n } : {}),
+      ...(chains.context ? { creditChains: chains.context } : {}),
+      ...(readers.failed ? { readerCheck: { failed: readers.failed } } : {}),
+    },
+    ...(n || readers.failed ? { action: { label: 'Open Reader Orders', url: `${portalUrl('admin')}/reader-orders` } } : {}),
+  })
+  return { waiting: n, sent: true }
+}
+
+/**
+ * The card reader part of the 8:05 morning admin email (chaseReaderOrders):
+ * one line per thing waiting on GAM, and the orders they are about. Throws when
+ * it cannot finish (the caller says so in the email).
+ */
+async function readerMorningLines(now: Date): Promise<{ lines: string[]; waitingOrders: Set<string> }> {
   // 10/12 (review): every morning, not only on the 1st, a piece the code before
   // 10/12 raised with no order named is tied to its order (linkUnlinkedReaderPieces),
   // so the desk and the GAM-money bridge never miss it for a month.
@@ -146,10 +208,16 @@ export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiti
   // active and in use." Ask the readers before asking a person: every property
   // with an order GAM has placed is checked at Stripe first (and against the
   // readers already on file if Stripe can't be reached), so an order whose
-  // reader is plugged in and working never makes this list.
+  // reader is plugged in and working never makes this list. (10/13 review) A
+  // property that cannot be checked is skipped, not the whole email: its order
+  // may be asked about a day early.
   const placed = await query<{ landlord_id: string; property_id: string }>(
     `SELECT DISTINCT landlord_id, property_id FROM pos_reader_orders WHERE status IN ('ordered','shipped','delivered')`)
-  for (const o of placed) await syncReadersFromStripe(o.landlord_id, o.property_id)
+  for (const o of placed) {
+    try { await syncReadersFromStripe(o.landlord_id, o.property_id) } catch (e) {
+      logger.warn({ err: e, propertyId: o.property_id }, "[reader-order] could not check a property's readers for the morning email — its orders are listed as they stand")
+    }
+  }
   const rows = await query<any>(
     `SELECT o.id, o.status, o.created_at, o.ordered_at, o.shipped_at, o.serial,
             p.name AS property_name, l.business_name
@@ -192,16 +260,7 @@ export async function chaseReaderOrders(now: Date = new Date()): Promise<{ waiti
       + `type the Stripe shop receipt (base price, tax, shipping) on Reader Orders`)
     waitingOrders.add(o.id)
   }
-  if (!lines.length) return { waiting: 0, sent: false }
-  const n = waitingOrders.size
-  await createAdminNotification({
-    severity: 'warn', category: 'reader_orders_waiting', emailSuperAdmins: true,
-    title: `${n} card reader order${n === 1 ? '' : 's'} waiting on GAM`,
-    body: lines.join('\n'),
-    context: { count: n },
-    action: { label: 'Open Reader Orders', url: `${portalUrl('admin')}/reader-orders` },
-  })
-  return { waiting: n, sent: true }
+  return { lines, waitingOrders }
 }
 
 export function listReaderOrders(landlordId: string, propertyId?: string) {
@@ -271,18 +330,29 @@ const num = (n: unknown) => (n == null ? null : Number(n))
  * Nic: full purchase) the purchase and each correction of it, and each piece's
  * cost repaid and markup. `kind` is a READER_BOOK_ROW_KINDS value. `voided`
  * names a row whose piece was voided after it was booked: the row is still in
- * the book.
+ * the book. `resplit` (10/13 evening, Nic: "Redo the split"): the difference
+ * booked when the piece was split again under a corrected cost.
  */
 const ORDER_BOOK_ROWS_SQL = (orderRef: string) => `
   SELECT r.id, r.amount, r.created_at, r.notes, g.installment_number AS n, (g.voided_at IS NOT NULL) AS voided,
-         CASE WHEN r.type = 'device_markup' THEN 'markup' ELSE 'cost_repaid' END AS kind
+         CASE WHEN r.type = 'device_markup' THEN 'markup' ELSE 'cost_repaid' END AS kind, FALSE AS resplit
     FROM platform_revenue_ledger r
     JOIN landlord_gam_charges g ON g.id = r.reference_id
    WHERE ((r.type = 'device_markup' AND r.reference_type = 'reader_order_installment')
        OR (r.type = 'adjustment' AND r.reference_type = '${READER_BOOK_REFERENCE.costRepaid}'))
      AND g.reader_order_id = ${orderRef}
   UNION ALL
-  SELECT r.id, r.amount, r.created_at, r.notes, NULL::smallint AS n, FALSE AS voided, 'purchase' AS kind
+  -- 10/13 evening (Nic: "Redo the split"): a piece split again under a later cost.
+  SELECT r.id, r.amount, r.created_at, r.notes, g.installment_number AS n, (g.voided_at IS NOT NULL) AS voided,
+         CASE WHEN r.type = 'device_markup' THEN 'markup' ELSE 'cost_repaid' END AS kind, TRUE AS resplit
+    FROM platform_revenue_ledger r
+    JOIN pos_reader_order_resplits s ON s.id = r.reference_id
+    JOIN landlord_gam_charges g ON g.id = s.charge_id
+   WHERE ((r.type = 'device_markup' AND r.reference_type = '${READER_BOOK_REFERENCE.resplit}')
+       OR (r.type = 'adjustment' AND r.reference_type = '${READER_BOOK_REFERENCE.costRepaid}'))
+     AND s.reader_order_id = ${orderRef}
+  UNION ALL
+  SELECT r.id, r.amount, r.created_at, r.notes, NULL::smallint AS n, FALSE AS voided, 'purchase' AS kind, FALSE AS resplit
     FROM platform_revenue_ledger r
     JOIN pos_reader_order_costs c ON c.id = r.reference_id
    WHERE r.type = 'adjustment' AND r.reference_type = '${READER_BOOK_REFERENCE.purchase}'
@@ -353,7 +423,7 @@ export async function adminListReaderOrders(orderId?: string) {
                         FROM landlord_gam_charges g WHERE g.reader_order_id = o.id), '[]'::json) AS pieces_billed,
             COALESCE((SELECT json_agg(json_build_object(
                         'id', b.id, 'kind', b.kind, 'amount', b.amount, 'at', b.created_at, 'notes', b.notes,
-                        'n', b.n, 'voided', b.voided)
+                        'n', b.n, 'voided', b.voided, 'resplit', b.resplit)
                         -- Pieces billed together in their order; a piece's cost repaid
                         -- before its markup (they share a moment).
                         ORDER BY b.created_at, b.n NULLS FIRST, CASE b.kind WHEN 'purchase' THEN 0 WHEN 'cost_repaid' THEN 1 ELSE 2 END, b.id)
@@ -375,10 +445,10 @@ export async function adminListReaderOrders(orderId?: string) {
     const money = readerOrderMoney({
       price: Number(r.price), installments: Number(r.installments), totalCost: num(r.cost_total), pieces: billed,
     })
-    const book: Array<{ id: string; kind: ReaderBookRowKind; at: string; amount: number; notes: string | null; n: number | null; voided: boolean }> =
+    const book: Array<{ id: string; kind: ReaderBookRowKind; at: string; amount: number; notes: string | null; n: number | null; voided: boolean; resplit: boolean }> =
       (r.book_rows ?? []).map((b: any) => ({
         id: b.id, kind: b.kind, at: b.at, amount: Number(b.amount), notes: b.notes ?? null,
-        n: b.n == null ? null : Number(b.n), voided: !!b.voided,
+        n: b.n == null ? null : Number(b.n), voided: !!b.voided, resplit: !!b.resplit,
       }))
     const all = readerBookTotals(book)
     const live = readerBookTotals(book.filter(b => !b.voided))
@@ -394,6 +464,7 @@ export async function adminListReaderOrders(orderId?: string) {
       : null
     const rowsFor = (n: number, kind: ReaderBookRowKind) =>
       book.filter(b => b.n === n && b.kind === kind).reduce((a, b) => a + centsOf(b.amount), 0) / 100
+    const notBookedCents = expected ? centsOf(expected.net) - centsOf(live.net) : 0
     // What of GAM's cost the pieces billed have not repaid yet (a reader GAM bought).
     const unrepaid = r.bought && money.totalCost != null
       ? Math.max(0, centsOf(money.totalCost) - centsOf(live.costRepaid)) / 100 : null
@@ -433,7 +504,14 @@ export async function adminListReaderOrders(orderId?: string) {
       still_to_repay: unrepaid == null ? null : cancelled ? 0 : unrepaid,
       // GAM's records against the book: $0.00 unless a row is missing (the
       // ledger writes best-effort; the next run of bookReaderBook writes it).
-      not_booked: expected ? (centsOf(expected.net) - centsOf(live.net)) / 100 : 0,
+      not_booked: notBookedCents / 100,
+      // 10/13 (review): the book's split against GAM's records — what of the
+      // cost repaid the book holds as markup (below zero: the other way) while
+      // nothing is missing. A split again under a figure it was already split
+      // under is never booked twice (bookReaderResplits), so the morning run
+      // leaves this for a person; it nets to $0.00, so `not_booked` never shows it.
+      split_not_booked: expected && notBookedCents === 0
+        ? (centsOf(expected.costRepaid) - centsOf(live.costRepaid)) / 100 : 0,
       book,
       // Every piece of the plan, cost first under the current cost, and where
       // each stands — with what GAM's book holds for it.
@@ -634,9 +712,9 @@ export async function bookReaderBook(client: PoolClient, orderId?: string): Prom
       }, client)
       booked++
     }
-    // Each piece, as a whole (see above).
+    // Each piece, as a whole (see above), under the cost in force the day it was billed.
     for (const g of pieces) {
-      const split = rows.filter(x => x.ref === g.id)
+      const split = rows.filter(x => x.ref === g.id && !x.resplit)
       const amountC = centsOf(g.amount)
       const repaidC = g.cost_repaid_booked == null ? null : centsOf(g.cost_repaid_booked)
       const markupC = g.markup_booked == null ? null : centsOf(g.markup_booked)
@@ -666,9 +744,146 @@ export async function bookReaderBook(client: PoolClient, orderId?: string): Prom
         booked++
       }
     }
+    // 10/13 evening (Nic: "Redo the split"): each piece split again under every
+    // correction dated after it was billed — and, for a correction dated back
+    // over a piece already booked under the figure before it, under the figure
+    // it should have been booked under.
+    if (pieces.length) booked += await bookReaderResplits(client, { o, entries, pieces, rows, installments })
   }
   if (booked) logger.info({ booked, orderId: orderId ?? null }, "[reader-order] booked in GAM's book")
   return booked
+}
+
+/**
+ * 10/13 evening (Nic): "Redo the split" — a cost correction after pieces are
+ * booked REDOES the split, as a dated correction. For one order (inside
+ * bookReaderBook, its row locked), after its pieces' own rows are booked:
+ *
+ *   - each re-split readerBookRows lists (`resplitUnder`: a correction dated
+ *     after the piece was billed) is booked once, ON THE CORRECTION'S DAY (the
+ *     moment its purchase row is booked at, READER_COST_BOOKED_AT_SQL): the
+ *     cost-repaid difference ('adjustment', 'reader_cost_repaid') and the
+ *     markup difference ('device_markup', 'reader_resplit'), both referenced to
+ *     the re-split (pos_reader_order_resplits: the piece and the correction);
+ *   - then whatever still differs between what the book holds for the piece
+ *     and its split under the order's latest cost — a piece booked under the
+ *     figure before a correction dated back over the day it was billed (one
+ *     typed later, with an earlier date) — is booked as the re-split under the
+ *     figure in force the day it was billed, dated that correction's day, or
+ *     the day the piece was billed when that is later (never before the piece).
+ *
+ * The rows booked before stay as they were, and a piece's own rows stay dated
+ * the day it was billed. Each kind of each re-split is booked once (the ledger
+ * refuses a second); a row a run could not write is written by the next.
+ * Returns how many rows it wrote.
+ */
+async function bookReaderResplits(client: PoolClient, a: {
+  o: { id: string; property_id: string; property_name: string }
+  entries: Array<{ id: string; effective_on: string; booked_at: Date; total_cost: unknown }>
+  pieces: Array<{ id: string; n: unknown; billed_on: string; billed_at: Date }>
+  rows: ReturnType<typeof readerBookRows>
+  installments: number
+}): Promise<number> {
+  const { o, entries, pieces, rows, installments } = a
+  const dollars = (n: number) => `$${n.toFixed(2)}`
+  // What the book holds for each piece now: its own rows, and each re-split's (by the entry it is under).
+  const held = new Map((await client.query<{ id: string; own_repaid: string | null; own_markup: string | null }>(
+    `SELECT g.id,
+            (SELECT SUM(r.amount) FROM platform_revenue_ledger r
+              WHERE r.type = 'adjustment' AND r.reference_type = '${READER_BOOK_REFERENCE.costRepaid}' AND r.reference_id = g.id) AS own_repaid,
+            (SELECT SUM(r.amount) FROM platform_revenue_ledger r
+              WHERE r.type = 'device_markup' AND r.reference_type = 'reader_order_installment' AND r.reference_id = g.id) AS own_markup
+       FROM landlord_gam_charges g WHERE g.id = ANY($1::uuid[])`, [pieces.map(g => g.id)])).rows.map(r => [r.id, r]))
+  const resplits = (await client.query<{ id: string; charge_id: string; cost_id: string; repaid: string | null; markup: string | null }>(
+    `SELECT s.id, s.charge_id, s.cost_id,
+            (SELECT SUM(r.amount) FROM platform_revenue_ledger r
+              WHERE r.type = 'adjustment' AND r.reference_type = '${READER_BOOK_REFERENCE.costRepaid}' AND r.reference_id = s.id) AS repaid,
+            (SELECT SUM(r.amount) FROM platform_revenue_ledger r
+              WHERE r.type = 'device_markup' AND r.reference_type = '${READER_BOOK_REFERENCE.resplit}' AND r.reference_id = s.id) AS markup
+       FROM pos_reader_order_resplits s WHERE s.reader_order_id = $1`, [o.id])).rows
+  let wrote = 0
+
+  /** The re-split row for this piece and entry (made the first time it is needed). */
+  const resplitId = async (chargeId: string, costId: string): Promise<string> => {
+    const have = resplits.find(s => s.charge_id === chargeId && s.cost_id === costId)
+    if (have) return have.id
+    const id = (await client.query<{ id: string }>(
+      `WITH ins AS (
+         INSERT INTO pos_reader_order_resplits (reader_order_id, charge_id, cost_id) VALUES ($1, $2, $3)
+         ON CONFLICT (charge_id, cost_id) DO NOTHING RETURNING id)
+       SELECT id FROM ins UNION ALL SELECT id FROM pos_reader_order_resplits WHERE charge_id = $2 AND cost_id = $3 LIMIT 1`,
+      [o.id, chargeId, costId])).rows[0].id
+    resplits.push({ id, charge_id: chargeId, cost_id: costId, repaid: null, markup: null })
+    return id
+  }
+
+  /** Book one re-split's two differences (cents, signed), each only if that kind is not booked for it yet. */
+  const book = async (g: typeof pieces[number], e: typeof entries[number], d: { repaid: number; markup: number },
+    words: { cost: number; previousCost: number | null }, at: Date) => {
+    if (d.repaid === 0 && d.markup === 0) return
+    const id = await resplitId(g.id, e.id)
+    const s = resplits.find(x => x.id === id)!
+    const n = Number(g.n)
+    const head = `Card reader cost corrected — ${o.property_name}: payment ${n} of ${installments} split again under GAM's `
+      + `${dollars(words.cost)} cost${words.previousCost != null ? ` (was ${dollars(words.previousCost)})` : ''} from ${e.effective_on}`
+    if (d.repaid !== 0 && s.repaid == null) {
+      await recordPlatformRevenue({
+        type: 'adjustment', amount: d.repaid / 100,
+        referenceId: id, referenceType: READER_BOOK_REFERENCE.costRepaid, propertyId: o.property_id,
+        notes: `${head} — ${dollars(Math.abs(d.repaid) / 100)} ${d.repaid > 0 ? 'more' : 'less'} cost repaid`,
+        at,
+      }, client)
+      s.repaid = (d.repaid / 100).toFixed(2)
+      wrote++
+    }
+    if (d.markup !== 0 && s.markup == null) {
+      await recordPlatformRevenue({
+        type: 'device_markup', amount: d.markup / 100,
+        referenceId: id, referenceType: READER_BOOK_REFERENCE.resplit, propertyId: o.property_id,
+        notes: `${head} — ${dollars(Math.abs(d.markup) / 100)} ${d.markup > 0 ? 'more' : 'less'} markup`,
+        at,
+      }, client)
+      s.markup = (d.markup / 100).toFixed(2)
+      wrote++
+    }
+  }
+
+  for (const g of pieces) {
+    const mine = rows.filter(x => x.ref === g.id)
+    // Every correction dated after the piece was billed, on its own day.
+    for (const e of entries) {
+      const redo = mine.filter(x => x.resplitUnder === e.id)
+      if (!redo.length) continue
+      const of = (kind: ReaderBookRowKind) => centsOf(redo.find(x => x.kind === kind)?.amount ?? 0)
+      await book(g, e, { repaid: of('cost_repaid'), markup: of('markup') },
+        { cost: redo[0].cost, previousCost: redo[0].previousCost ?? null }, e.booked_at)
+    }
+    // What still differs from the split under the order's latest cost: the
+    // piece's own rows were booked under a figure a correction dated back over
+    // its day replaced. Booked as the re-split under the figure in force that
+    // day — never one already booked under it.
+    const want = (kind: ReaderBookRowKind) => mine.filter(x => x.kind === kind).reduce((t, x) => t + centsOf(x.amount), 0)
+    const h = held.get(g.id)
+    const has = (kind: 'repaid' | 'markup') =>
+      centsOf(kind === 'repaid' ? h?.own_repaid : h?.own_markup)
+      + resplits.filter(s => s.charge_id === g.id).reduce((t, s) => t + centsOf(kind === 'repaid' ? s.repaid : s.markup), 0)
+    const d = { repaid: want('cost_repaid') - has('repaid'), markup: want('markup') - has('markup') }
+    if (d.repaid === 0 && d.markup === 0) continue
+    // Nothing of the piece's own in the book (a write that failed): the next run books it whole.
+    if (h?.own_repaid == null && h?.own_markup == null) continue
+    const e = entries[readerEntryInForce(entries.map(x => ({ effectiveOn: x.effective_on })), g.billed_on)]
+    // A kind already booked under that figure is never booked twice (book()
+    // skips it): what is left of it is for a person. It nets to $0.00, so the
+    // desk shows it as the split not in GAM's book (adminListReaderOrders
+    // split_not_booked), not as a row missing (not_booked).
+    const taken = resplits.find(s => s.charge_id === g.id && s.cost_id === e.id)
+    if (taken && ((d.repaid !== 0 && taken.repaid != null) || (d.markup !== 0 && taken.markup != null))) {
+      logger.warn({ orderId: o.id, pieceId: g.id, costId: e.id, d }, "[reader-order] a piece's split differs from its cost and the re-split under it is booked already — left for a person")
+    }
+    const at = new Date(Math.max(new Date(e.booked_at).getTime(), new Date(g.billed_at).getTime()))
+    await book(g, e, d, { cost: Number(e.total_cost), previousCost: null }, at)
+  }
+  return wrote
 }
 
 /** What the GAM-money bridge needs about readers (readerBookFacts). */

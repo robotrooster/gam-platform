@@ -27,11 +27,24 @@
 // (or part of one) is recorded on the row. Cash that never touched the bank is
 // logged here and never has to match a bank line; a bill the bank paid is
 // matched on the Bank page.
+//
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging. there should never be a default setting to
+// apply expenses." The form asks where each cost goes — one unit, one
+// property, or split across the company's properties by units — with nothing
+// chosen ahead of time and nothing carried over from the last expense; it does
+// not save until that is answered (the API refuses it too). And on cash on
+// hand: "they don't pick as a setting, they pick as the expense happens" —
+// how it was paid (cash from the office, a check, a card, the owner, the
+// bank) is chosen on each expense and each payment, never preselected.
+// 10/13 review: money out that is not a cost (an owner's draw) is not split
+// across the properties; it goes on a unit, a property, or the company.
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   EXPENSE_PAY_STATE_LABEL, LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED, LANDLORD_EXPENSE_PAYMENT_METHOD_LABEL, humanize,
-  type ExpensePayState, type LandlordExpensePaymentMethod,
+  BOOKS_COST_PLACE_LABEL, BOOKS_COST_PLACE_NONE_LABEL,
+  type ExpensePayState, type LandlordExpensePaymentMethod, type BooksCostPlace,
 } from '@gam/shared'
 import { finGet, finPost, finPatch, finUpload, openProtectedFile, toast, appConfirm, useViewer } from './adapter'
 import { useFinancialsScope, money, dayName, errorWords, PropertyPicker, PageHead, Notice } from './common'
@@ -49,6 +62,12 @@ interface Payment {
 interface Expense {
   id: string; category: string; amount: number; description: string | null; vendor: string | null
   expenseDay: string; isCommon: boolean; unitId: string | null; propertyId: string | null
+  /** 10/13 (Nic): where its cost goes, as picked when it was logged (null: logged before 10/13). */
+  costPlace: BooksCostPlace | null
+  /** A bill GAM keeps for another record (a payroll run's, a manager's cut, a fixed asset's): not removed here. */
+  systemLinked?: boolean
+  /** 10/13 review: any bill GAM keeps for another record (those, and a work trader's hours): its place is that record's. */
+  placeFixed?: boolean
   unitNumber: string | null; propertyName: string | null; utilityType: string | null
   receiptUrl: string | null; receiptName: string | null; fromBank: boolean
   canEdit: boolean; canRemove: boolean
@@ -71,22 +90,41 @@ interface Options {
   categories: Category[]
   vendors: Array<{ id: string; name: string; landlordId: string }>
   banks: Array<{ id: string; name: string; landlordId: string }>
+  /** 10/13 review: false for a bookkeeper kept to some properties (a split reaches every property). */
+  canSplit?: boolean
 }
 interface Unit { id: string; unitNumber: string; propertyId: string }
 
 type View = 'all' | 'open' | 'paid'
+/** 10/13 review: where money out goes on the form — a cost's places, and the company for money out that is not a cost. */
+type FormPlace = BooksCostPlace | 'company'
+/** 10/13 (Nic): the places a cost can go, in the order the form offers them. */
+const PLACE_ORDER: readonly BooksCostPlace[] = ['unit', 'property', 'split_by_units']
+/** 10/13 review: money out that is not a cost (an owner's draw) is never split; it may sit on the company. */
+const NOT_A_COST_PLACES: readonly FormPlace[] = ['unit', 'property', 'company']
+const placeLabel = (s: FormPlace) => (s === 'company' ? BOOKS_COST_PLACE_NONE_LABEL : BOOKS_COST_PLACE_LABEL[s])
+/** 10/13 (Nic): where an expense's cost goes, in words, for its row. */
+function placeWords(e: Pick<Expense, 'unitNumber' | 'propertyName' | 'costPlace' | 'isCommon'>): string {
+  if (e.unitNumber) return `${e.propertyName ? e.propertyName + ' · ' : ''}Unit ${e.unitNumber}`
+  if (e.costPlace === 'split_by_units') return BOOKS_COST_PLACE_LABEL.split_by_units
+  if (e.propertyName) return e.isCommon ? `${e.propertyName} · common (split per unit)` : e.propertyName
+  return BOOKS_COST_PLACE_NONE_LABEL
+}
 const VIEW_LABEL: Record<View, string> = { all: 'All expenses', open: 'Bills to pay', paid: 'Paid' }
 
 const blankForm = () => ({
-  propertyId: '', unitId: '', scope: 'unit' as 'unit' | 'common',
+  // 10/13 (Nic): where the cost goes — nothing chosen until the person chooses.
+  propertyId: '', unitId: '', scope: '' as FormPlace | '', companyId: '',
   categoryId: '', amount: '', description: '', vendorId: '', vendor: '', expenseDate: today(),
   // S613: which utility, when the category is utilities. Feeds the recovery report.
   utilityType: null as string | null,
-  // 10/12 (Nic, L5): paid now (and how), or a bill to pay.
-  paidNow: true, method: 'cash' as LandlordExpensePaymentMethod, paidOn: '', bankConnectionId: '',
+  // 10/12 (Nic, L5): paid now (and how), or a bill to pay. 10/13 (Nic): "they
+  // don't pick as a setting, they pick as the expense happens" — how it was
+  // paid starts blank.
+  paidNow: true, method: '' as LandlordExpensePaymentMethod | '', paidOn: '', bankConnectionId: '',
   dueDate: '', billNumber: '',
 })
-const blankPay = () => ({ method: 'cash' as LandlordExpensePaymentMethod, amount: '', paidOn: today(), bankConnectionId: '' })
+const blankPay = () => ({ method: '' as LandlordExpensePaymentMethod | '', amount: '', paidOn: today(), bankConnectionId: '' })
 
 export function ExpensesPage() {
   const qc = useQueryClient()
@@ -112,10 +150,16 @@ export function ExpensesPage() {
   const set = (patch: Partial<ReturnType<typeof blankForm>>) => setForm(f => ({ ...f, ...patch }))
   const propUnits = units.filter(u => u.propertyId === form.propertyId)
 
-  // The company the form files under: the chosen property's, else the only one.
-  const companyId = properties.find(p => p.id === form.propertyId)?.landlordId
-    ?? (scope?.companies?.length === 1 ? scope.companies[0].id : null)
+  // The company the form files under: the chosen property's, else the one
+  // chosen for a split or the company itself (several companies), else the only one.
+  const companies = scope?.companies ?? []
+  const onNoProperty = form.scope === 'split_by_units' || form.scope === 'company'
+  const companyId = (!onNoProperty ? properties.find(p => p.id === form.propertyId)?.landlordId : null)
+    ?? (form.companyId || null)
+    ?? (companies.length === 1 ? companies[0].id : null)
   const editingRow = editingId ? expenses.find(e => e.id === editingId) : null
+  // 10/13: a bill GAM keeps for another record keeps that record's place.
+  const placeFixed = !!(editingRow?.placeFixed ?? editingRow?.systemLinked)
   const formCompany = editingRow?.landlordId ?? companyId
   const categories = useMemo(() => (options?.categories ?? [])
     .filter(c => c.direction === 'expense' && (c.inPicker || c.id === form.categoryId) && (!formCompany || c.landlordId === formCompany)),
@@ -124,6 +168,19 @@ export function ExpensesPage() {
   const banks = (options?.banks ?? []).filter(b => !formCompany || b.landlordId === formCompany)
   const chosenCategory = categories.find(c => c.id === form.categoryId) ?? null
   const isUtilities = chosenCategory?.systemKey === 'utilities'
+  // 10/13 review: the places offered — a cost's, or, for money out that is
+  // not a cost, a unit, a property or the company. A split and the company
+  // reach the whole company, so only to someone who keeps all of it.
+  const notACost = !!chosenCategory && !chosenCategory.onProfitAndLoss
+  const wholeCompany = options?.canSplit !== false
+  const places: readonly FormPlace[] = (notACost ? NOT_A_COST_PLACES : PLACE_ORDER)
+    .filter(s => (s !== 'split_by_units' && s !== 'company') || wholeCompany)
+  const setCategory = (categoryId: string) => {
+    const c = categories.find(x => x.id === categoryId)
+    const offered: readonly FormPlace[] = c && !c.onProfitAndLoss ? NOT_A_COST_PLACES : PLACE_ORDER
+    // A place the new category does not offer is asked again.
+    set({ categoryId, ...(form.scope && !offered.includes(form.scope) ? { scope: '' as const } : {}) })
+  }
 
   // S637 (Nic, DIRECTIVE): "expenses, selected property." Options come from the
   // PROPERTIES the viewer keeps, not from the expense rows, so a park with
@@ -134,7 +191,8 @@ export function ExpensesPage() {
 
   const resetForm = () => {
     setEditingId(null); setReceipt(null); setFileKey(k => k + 1)
-    setForm(f => ({ ...blankForm(), propertyId: f.propertyId, scope: f.scope }))
+    // 10/13 (Nic): the next expense asks again — nothing carried over.
+    setForm(blankForm())
   }
   const refresh = () => {
     qc.invalidateQueries('landlord-expenses')
@@ -149,11 +207,15 @@ export function ExpensesPage() {
         utilityType: isUtilities ? form.utilityType : null,
         description: form.description.trim() || null,
         vendorId: form.vendorId || null, vendor: form.vendorId ? null : (form.vendor.trim() || null),
-        // A company-wide expense (no property, e.g. filed from the bank feed)
-        // keeps its place unless a property is chosen for it.
-        ...(form.scope === 'unit'
-          ? { unitId: form.unitId, propertyId: null }
-          : form.propertyId ? { propertyId: form.propertyId, unitId: null } : {}),
+        // 10/13 (Nic): where the cost goes, as chosen (a bill another record
+        // keeps stays where that record put it).
+        ...(placeFixed ? {} : form.scope === 'unit'
+          ? { costPlace: 'unit', unitId: form.unitId, propertyId: null }
+          : form.scope === 'property'
+            ? { costPlace: 'property', propertyId: form.propertyId, unitId: null }
+            : form.scope === 'company'
+              ? { costPlace: null, propertyId: null, unitId: null }
+              : { costPlace: 'split_by_units', propertyId: null, unitId: null }),
         billNumber: form.billNumber.trim() || null,
         dueDate: form.dueDate || null,
       }
@@ -162,7 +224,9 @@ export function ExpensesPage() {
         await finPatch(`/expenses/${id}`, body)
       } else {
         const res = await finPost<Expense>('/expenses', {
-          ...body, isCommon: form.scope === 'common',
+          ...body, isCommon: form.scope === 'property',
+          // A split, or money out on the company, names no property: the company it is for.
+          ...(onNoProperty && companyId ? { landlordId: companyId } : {}),
           ...(form.paidNow
             ? { paid: { method: form.method, paidOn: form.paidOn || form.expenseDate,
                         bankConnectionId: (form.method === 'bank' || form.method === 'check') && form.bankConnectionId ? form.bankConnectionId : null } }
@@ -223,7 +287,10 @@ export function ExpensesPage() {
     setEditingId(e.id); setErr(null); setReceipt(null); setFileKey(k => k + 1)
     setForm({
       ...blankForm(),
-      propertyId: e.propertyId || '', unitId: e.unitId || '', scope: e.unitId ? 'unit' : 'common',
+      propertyId: e.propertyId || '', unitId: e.unitId || '', companyId: e.landlordId,
+      // One logged before 10/13 on no property asks again; money out that is
+      // not a cost on no property is on the company.
+      scope: e.costPlace ?? (e.unitId ? 'unit' : e.propertyId ? 'property' : !e.onProfitAndLoss ? 'company' : ''),
       categoryId: e.categoryId || '', amount: String(e.amount), description: e.description || '',
       vendorId: e.vendorId || '', vendor: e.vendorId ? '' : (e.vendor || ''),
       expenseDate: e.expenseDay, utilityType: e.utilityType,
@@ -236,7 +303,10 @@ export function ExpensesPage() {
   }
 
   const canSubmit = form.amount && Number(form.amount) > 0 && form.expenseDate && form.categoryId &&
-    (form.scope === 'unit' ? form.unitId : (form.propertyId || (editingRow && !editingRow.propertyId)))
+    (placeFixed || (form.scope === 'unit' ? form.unitId : form.scope === 'property' ? form.propertyId
+      : onNoProperty && places.includes(form.scope as FormPlace) ? !!companyId : false)) &&
+    // 10/13 (Nic): how it was paid is picked on each expense.
+    (editingId || !form.paidNow || !!form.method)
 
   const statusOf = (e: Expense) => e.payState === 'paid'
     ? EXPENSE_PAY_STATE_LABEL.paid
@@ -253,32 +323,41 @@ export function ExpensesPage() {
       <div className="card" style={{ marginBottom: 20, maxWidth: 720 }}>
         <div className="card-title" style={{ marginBottom: 14 }}>{editingId ? 'Edit this expense' : 'Log an expense or a bill'}</div>
         <div className="fin-form">
-          <label>Property
-            <select className="form-input" value={form.propertyId}
-              onChange={e => set({ propertyId: e.target.value, unitId: '' })}>
-              <option value="">Select a property…</option>
-              {/* 10/12: a property that left the company is read only — nothing is filed on it. */}
-              {properties.filter(p => !p.leftOn).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
-          </label>
-
+          {/* 10/13 (Nic): "each expense is chosen on the split or specific unit
+              or property at the time of logging" — asked first, nothing chosen. */}
+          {placeFixed && editingRow ? (
+            <div className="fin-muted" style={{ padding: '2px 0' }}>Goes to {placeWords(editingRow)}, where the record it is for put it.</div>
+          ) : <>
+          <div className="fin-muted" style={{ padding: '2px 0' }}>{notACost ? 'Where does this go?' : 'Where does this cost go?'}</div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {(['unit', 'common'] as const).map(s => (
+            {places.map(s => (
               <button key={s} type="button" className={`btn btn-sm ${form.scope === s ? 'btn-primary' : 'btn-ghost'}`}
-                onClick={() => set({ scope: s })} disabled={!form.propertyId}>
-                {s === 'unit' ? 'For a specific unit' : 'Common (whole property)'}
+                onClick={() => set({ scope: s, unitId: s === 'unit' ? form.unitId : '' })}>
+                {placeLabel(s)}
               </button>
             ))}
           </div>
 
-          {form.scope === 'unit' ? (
+          {(form.scope === 'unit' || form.scope === 'property') && (
+            <label>Property
+              <select className="form-input" value={form.propertyId}
+                onChange={e => set({ propertyId: e.target.value, unitId: '' })}>
+                <option value="">Select a property…</option>
+                {/* 10/12: a property that left the company is read only — nothing is filed on it. */}
+                {properties.filter(p => !p.leftOn).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </label>
+          )}
+
+          {form.scope === 'unit' && (
             <label>Unit
               <select className="form-input" value={form.unitId} onChange={e => set({ unitId: e.target.value })} disabled={!form.propertyId}>
                 <option value="">Select a unit…</option>
                 {propUnits.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
               </select>
             </label>
-          ) : (
+          )}
+          {form.scope === 'property' && (
             // S603 (Nic): any expense not tied to a specific unit is divided
             // evenly across that property's units, so per-unit cost reflects reality.
             <div className="fin-muted" style={{ padding: '4px 0' }}>
@@ -286,10 +365,28 @@ export function ExpensesPage() {
               including vacant ones, so per-unit numbers stay accurate.
             </div>
           )}
+          {onNoProperty && places.includes(form.scope as FormPlace) && (
+            <>
+              {companies.length > 1 && !editingRow && (
+                <label>Company
+                  <select className="form-input" value={form.companyId} onChange={e => set({ companyId: e.target.value })}>
+                    <option value="">Select a company…</option>
+                    {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                </label>
+              )}
+              <div className="fin-muted" style={{ padding: '4px 0' }}>
+                {form.scope === 'company'
+                  ? `${chosenCategory?.name ?? 'This'} is not a cost, so it is not split; it goes on the company.`
+                  : 'This cost is split across all of the company\'s properties by how many units each has on its date.'}
+              </div>
+            </>
+          )}
+          </>}
 
           <div className="fin-form-row">
             <label>Category
-              <select className="form-input" value={form.categoryId} onChange={e => set({ categoryId: e.target.value })}>
+              <select className="form-input" value={form.categoryId} onChange={e => setCategory(e.target.value)}>
                 <option value="">Choose a category…</option>
                 {categories.map(c => <option key={c.id} value={c.id}>{c.name}{c.onProfitAndLoss ? '' : ' (not a business cost)'}</option>)}
               </select>
@@ -343,7 +440,8 @@ export function ExpensesPage() {
           {!editingId && form.paidNow ? (
             <div className="fin-form-row">
               <label>Paid how
-                <select className="form-input" value={form.method} onChange={e => set({ method: e.target.value as LandlordExpensePaymentMethod })}>
+                <select className="form-input" value={form.method} onChange={e => set({ method: e.target.value as LandlordExpensePaymentMethod | '' })}>
+                  <option value="">Choose how it was paid…</option>
                   {LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED.map(m => <option key={m} value={m}>{LANDLORD_EXPENSE_PAYMENT_METHOD_LABEL[m]}</option>)}
                 </select>
               </label>
@@ -451,8 +549,7 @@ function ExpenseRow({ e, status, bookkeeper, paying, banks, pay, setPay, payErr,
           {!e.onProfitAndLoss && <div className="fin-muted">Not a business cost</div>}
         </td>
         <td className="fin-muted">
-          {e.unitNumber ? `${e.propertyName ? e.propertyName + ' · ' : ''}Unit ${e.unitNumber}`
-            : e.isCommon ? `${e.propertyName} · common (split per unit)` : (e.propertyName || 'Whole company')}
+          {placeWords(e)}
         </td>
         <td className="fin-muted">{e.vendorName || '—'}{e.billNumber ? <div>#{e.billNumber}</div> : null}</td>
         <td className="fin-muted">{e.description || '—'}</td>
@@ -497,7 +594,8 @@ function ExpenseRow({ e, status, bookkeeper, paying, banks, pay, setPay, payErr,
           <td colSpan={9}>
             <div className="fin-form-row" style={{ alignItems: 'end' }}>
               <label className="fin-field">Paid how
-                <select className="form-input" value={pay.method} onChange={ev => setPay({ method: ev.target.value as LandlordExpensePaymentMethod })}>
+                <select className="form-input" value={pay.method} onChange={ev => setPay({ method: ev.target.value as LandlordExpensePaymentMethod | '' })}>
+                  <option value="">Choose how it was paid…</option>
                   {LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED.map(m => <option key={m} value={m}>{LANDLORD_EXPENSE_PAYMENT_METHOD_LABEL[m]}</option>)}
                 </select>
               </label>
@@ -516,7 +614,7 @@ function ExpenseRow({ e, status, bookkeeper, paying, banks, pay, setPay, payErr,
                 </label>
               )}
               <div style={{ display: 'flex', gap: 8 }}>
-                <button className="btn btn-primary btn-sm" disabled={paySaving || !(Number(pay.amount) > 0)} onClick={onSavePay}>
+                <button className="btn btn-primary btn-sm" disabled={paySaving || !(Number(pay.amount) > 0) || !pay.method} onClick={onSavePay}>
                   {paySaving ? 'Saving…' : 'Save payment'}
                 </button>
                 <button className="btn btn-ghost btn-sm" onClick={onCancelPay}>Cancel</button>

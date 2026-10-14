@@ -109,8 +109,10 @@ describe('I1/I2: an expense and how it was paid', () => {
 
   it('an owner draw is real money out but never a cost: its category is on equity, the P&L leaves it out, its cash line is kind equity', async () => {
     const co = await company()
+    // 10/13 review: an owner draw is not a cost — never split; put on the company (no place), it posts at company level.
     const draw = await createLandlordExpense({
-      landlordId: co.landlordId, category: 'owner_draw', amount: 1000, expenseDate: '2026-10-02', payment: { method: 'bank', bankConnectionId: co.connectionId },
+      landlordId: co.landlordId, category: 'owner_draw', amount: 1000, expenseDate: '2026-10-02',
+      payment: { method: 'bank', bankConnectionId: co.connectionId },
     })
     const repair = await createLandlordExpense({
       landlordId: co.landlordId, propertyId: co.propertyId, category: 'repairs', amount: 40, expenseDate: '2026-10-02',
@@ -130,25 +132,31 @@ describe('I1/I2: an expense and how it was paid', () => {
     expect(repair.category_id).toBeTruthy()
   })
 
-  // 10/13 (Nic): "Company-level costs before the owner picks: post to the
-  // COMPANY column by default"; "a later 'split by units' splits only NEW costs".
-  it('a cost on no property goes to the Company column until the owner picks (Nic L7); a later split takes only expenses entered after it', async () => {
+  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+  // property at the time of logging. there should never be a default setting
+  // to apply expenses."
+  it('a cost on no property: split by units when the person logging it said so; one logged before 10/13 stays in the Company column', async () => {
     const co = await company({ costs: null })
-    const e = await createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04' })
+    // Logged before 10/13 with no place (as an expense was then): the Company column.
+    const e = await createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04', systemBill: true })
+    expect(e.cost_place).toBeNull()
     expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
     expect(await waiting('expense', e.id)).toBeNull()
     expect((await active('expense', e.id)).map(l => [l.role, l.property, l.dr, l.cr]))
       .toEqual([['software_subscriptions', null, 49, 0], ['accounts_payable', null, 0, 49]])
     await db.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
+    // The retired setting decides nothing: it stays there, re-posted or rebuilt.
     await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units', books_company_costs_from = now() WHERE id = $1`, [co.landlordId])
-    // Already in the Company column: it stays there, re-posted or rebuilt.
     await db.query(`UPDATE landlord_expenses SET amount = 50 WHERE id = $1`, [e.id])
     expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
     expect((await active('expense', e.id)).map(l => [l.role, l.property, l.dr, l.cr]))
       .toEqual([['software_subscriptions', null, 50, 0], ['accounts_payable', null, 0, 50]])
     expect((await rebuildOwner(co.owner, { mode: 'dry_run' })).counts.drift).toBe(0)
-    // Entered after the pick: split across the properties by units.
-    const later = await createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04' })
+    // Nothing chosen is refused; said "split": split across the properties by units.
+    await expect(createLandlordExpense({ landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04' }))
+      .rejects.toThrow(/Choose where this cost goes/)
+    const later = await createLandlordExpense({
+      landlordId: co.landlordId, category: 'software', amount: 49, expenseDate: '2026-10-04', costPlace: 'split_by_units' })
     expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
     const cost = (await active('expense', later.id)).filter(l => l.role === 'software_subscriptions')
     expect(cost.every(l => l.property !== null)).toBe(true)

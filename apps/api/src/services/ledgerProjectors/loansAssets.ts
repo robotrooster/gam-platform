@@ -23,12 +23,13 @@
  *
  * 'loan_payment' — one books_loan_payments row, on the day it was paid:
  *     Dr the loan's own account          principal (what is owed goes down)
- *     Dr Mortgage and loan interest (5010) interest — on the loan's property,
- *                                        or, for a company loan, where the
- *                                        owner puts company-level costs (L7;
- *                                        10/13: the Company column until they
- *                                        choose, a later split only for
- *                                        payments entered after it)
+ *     Dr Mortgage and loan interest (5010) interest — 10/13 (Nic): where the
+ *                                        loan said when it was logged
+ *                                        (books_loans.cost_place: split across
+ *                                        the properties by units on the day
+ *                                        paid, its property, or its unit); a
+ *                                        loan logged before 10/13: its
+ *                                        property, else the Company column
  *     Dr Escrow held by your lender (1250) escrow
  *     Cr where the money came from: the bank (that bank's sub-account), a
  *        credit card (2110), or the owner personally (3010)
@@ -49,8 +50,11 @@
  *     Cr Opening balance equity (3900)   the rest
  *     An asset bought on or after the start: 10/13 (Nic) "the form ASKS where
  *     the money came from (cash on hand / owner put money in / loan / already
- *     an expense) and posts to that" (books_fixed_assets.funded_by), on the day
- *     it was bought:
+ *     an expense) and posts to that", and "ALLOW A MIX (several funding lines
+ *     adding up to the cost)": each live line of books_fixed_asset_funding
+ *     (or, said once for the whole cost, books_fixed_assets.funded_by), on the
+ *     day it was bought — one posting, a debit of the asset's account for the
+ *     cash and owner lines together:
  *       cash     Dr its account / Cr Undeposited funds (1040, the office drawer)
  *       owner    Dr its account / Cr Owner equity and contributions (3010)
  *       loan     nothing: the loan's own posting (above, funded straight to the
@@ -60,16 +64,18 @@
  *                the same side of the start)
  *       expense  nothing: the expense posts its cost to the asset's account
  *                ("LINK that expense (cost moves to the asset)", moneyOut)
- *     — never twice. Not said (an asset entered before 10/13): nothing, as
- *     before; the page asks.
+ *     — never twice. A loan's money may pay for several assets, each line its
+ *     part (the database holds the parts to what was borrowed). Not said (an
+ *     asset entered before 10/13): nothing, as before; the page asks.
  *     10/12 review: an asset made from an expense dated before the start
  *     (its cost opens through the expense) opens the depreciation already
  *     taken: Dr Opening balance equity / Cr Accumulated depreciation.
  *   '<asset>|YYYY-MM' that month's straight-line depreciation, on the month's
- *     last day: Dr Depreciation (5170) — on the asset's property, or where
- *     company-level costs go (L7; 10/13: the Company column until the owner
- *     chooses, a later split only for months that end — for an asset entered —
- *     after it) — / Cr Accumulated depreciation (1510).
+ *     last day: Dr Depreciation (5170) — 10/13 (Nic): where the asset said
+ *     when it was logged (books_fixed_assets.cost_place: split across the
+ *     properties by units on the month's last day, its property, or its unit;
+ *     one logged before 10/13: its property, else the Company column) — / Cr
+ *     Accumulated depreciation (1510), on the asset's property.
  *     A month that ended before the books start posts nothing (the opening
  *     carries it). Land never depreciates. An asset made from an expense that
  *     is no longer active posts nothing (the database refuses that void while
@@ -79,26 +85,30 @@
  * posting's walk of every projector (tenantOpening J1 a) finds nothing of
  * these to carry — loans and assets open through their own postings above.
  *
- * Facts only (ledgerProjectorPurity): the rows as saved, the books start date,
- * the owner's company-cost choice (fixed once the books post, applying from a
- * stored moment). A business's
+ * Facts only (ledgerProjectorPurity): the rows as saved (where each cost goes
+ * is stored on its loan or asset), the funding lines, the books start date.
+ * A business's
  * loans and assets wait for the business portal's own books (a later phase).
  */
 import type { PoolClient } from 'pg'
 import {
   BOOKS_FIXED_ASSET_CLASS_ROLE, depreciationBefore, depreciationSchedule, fixedAssetDepreciates, fixedAssetLifeMonths,
   type BooksFixedAssetClass, type BooksFixedAssetFundedBy, type DepreciationMonth, type LedgerAccountRole,
+  type BooksCostPlace,
 } from '@gam/shared'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
 import { LedgerSourceError } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import { dr, cr, companyTzSql } from './registerBookingPayoutKit'
 import { cSql, centsOf, isUuid } from './tenantShared'
-import { companyCostSpread, drSpread } from './companyCosts'
+import { costPlaceSpread, drSpread } from './companyCosts'
 
 // 10/13 (Nic): 2 — a hand-typed asset posts its cost against where the money
 // came from; company-level costs go to the Company column until the owner picks.
-export const LOANS_ASSETS_RULE_VERSION = 2
+// 10/13 (Nic): 3 — interest and depreciation go where the loan or asset said
+// when it was logged (cost_place), never a setting; an asset's money may come
+// from several funding lines.
+export const LOANS_ASSETS_RULE_VERSION = 3
 
 /** A loan's own account: its sub-account under Mortgage payable. */
 function loanSub(loanId: string, name: string): DesiredLine['sub'] {
@@ -229,7 +239,11 @@ interface LoanPaymentRow {
   bank_transaction_id: string | null
   line_day: string | null
   line_connection: string | null
-  created_at: string
+  /** 10/13 (Nic): where the loan said its interest goes (null: logged before 10/13). */
+  cost_place: BooksCostPlace | null
+  unit_id: string | null
+  /** 10/13 review: when the loan was logged (a split reads the units in GAM by then too). */
+  logged_at: string
 }
 
 export async function projectLoanPayment(client: PoolClient, paymentId: string): Promise<DesiredPosting[]> {
@@ -241,7 +255,7 @@ export async function projectLoanPayment(client: PoolClient, paymentId: string):
             l.name AS loan_name, l.property_id, l.vendor_id, l.voided_at::text AS loan_voided_at,
             (SELECT x.books_start_date::text FROM landlords x WHERE x.id = p.landlord_id) AS books_start,
             p.bank_transaction_id, bt.posted_date::text AS line_day, bt.bank_connection_id AS line_connection,
-            p.created_at::text AS created_at
+            l.cost_place, l.unit_id, l.created_at::text AS logged_at
        FROM books_loan_payments p JOIN books_loans l ON l.id = p.loan_id
        LEFT JOIN bank_transactions bt ON bt.id = p.bank_transaction_id
       WHERE p.id = $1`, [paymentId])).rows[0]
@@ -267,15 +281,12 @@ export async function projectLoanPayment(client: PoolClient, paymentId: string):
     ...dr('mortgage_payable', principal, { ...d, sub: loanSub(p.loan_id, p.loan_name), cashEffect: 'out', expenseKind: 'liability', memo: 'Principal' }),
   ]
   const interestTags = { cashEffect: 'out' as const, expenseKind: 'expense', reportCategory: 'mortgage_interest' as const }
-  if (p.property_id) {
-    lines.push(...dr('mortgage_interest', interest, { ...d, ...interestTags, memo: `Interest: ${p.loan_name}` }))
-  } else {
-    // A company loan's interest belongs to no one property (Nic L7; 10/13:
-    // the Company column until the owner picks, a split only for payments
-    // entered after it).
-    const spread = await companyCostSpread(client, p.landlord_id, p.paid_on, { at: p.created_at })
-    lines.push(...drSpread('mortgage_interest', interest, spread, { vendorId: p.vendor_id, ...interestTags, memo: `Interest: ${p.loan_name}` }))
-  }
+  // 10/13 (Nic): where the loan said its interest goes when it was logged —
+  // split across the properties by units on the day paid, its property, or
+  // its unit (a loan logged before 10/13: its property, else the Company column).
+  const spread = await costPlaceSpread(client, p.landlord_id, p.paid_on,
+    { costPlace: p.cost_place, propertyId: p.property_id, unitId: p.unit_id, loggedAt: p.logged_at })
+  lines.push(...drSpread('mortgage_interest', interest, spread, { vendorId: p.vendor_id, ...interestTags, memo: `Interest: ${p.loan_name}` }))
   lines.push(...dr('loan_escrow', escrow, { ...d, cashEffect: 'out', expenseKind: 'asset', memo: 'Escrow' }))
 
   // 10/12 (Nic, integrate): a payment typed on one day whose bank line posted
@@ -346,9 +357,15 @@ interface AssetRow {
   source_expense_active: boolean | null
   voided_at: string | null
   books_start: string | null
-  /** 10/13 (Nic): where the money for an asset typed in by hand came from (BOOKS_FIXED_ASSET_FUNDED_BY). */
+  /** 10/13 (Nic): where the money for an asset typed in by hand came from, said once (BOOKS_FIXED_ASSET_FUNDED_BY). */
   funded_by: BooksFixedAssetFundedBy | null
-  created_at: string
+  /** 10/13 (Nic, "ALLOW A MIX"): its live funding lines, cents by kind (null: none — funded_by, or not said). */
+  funding: Partial<Record<BooksFixedAssetFundedBy, string>> | null
+  /** 10/13 (Nic): where its depreciation goes (null: logged before 10/13). */
+  cost_place: BooksCostPlace | null
+  unit_id: string | null
+  /** 10/13 review: when the asset was logged (a split reads the units in GAM by then too). */
+  logged_at: string
 }
 
 const ASSET_SQL = `
@@ -359,7 +376,10 @@ const ASSET_SQL = `
          (SELECT e.status = 'active' AND e.voided_at IS NULL FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_active,
          a.voided_at::text AS voided_at,
          (SELECT x.books_start_date::text FROM landlords x WHERE x.id = a.landlord_id) AS books_start,
-         a.funded_by, a.created_at::text AS created_at
+         a.funded_by, a.cost_place, a.unit_id, a.created_at::text AS logged_at,
+         (SELECT jsonb_object_agg(x.kind, x.c) FROM (
+            SELECT y.kind, ${cSql('sum(y.amount)')} AS c FROM books_fixed_asset_funding y
+             WHERE y.asset_id = a.id AND y.replaced_at IS NULL GROUP BY y.kind) x) AS funding
     FROM books_fixed_assets a`
 
 /**
@@ -373,6 +393,8 @@ const ASSET_FUNDED_FROM: Record<BooksFixedAssetFundedBy, { role: LedgerAccountRo
   loan:    null,
   expense: null,
 }
+/** The order a purchase posting lists its credits in (stable, so a rebuild matches). */
+const BOOKS_FIXED_ASSET_FUNDING_ORDER: readonly BooksFixedAssetFundedBy[] = ['cash', 'owner', 'loan', 'expense']
 
 /** Bought before the books start, and not made from an expense: its cost opens on the books start date. */
 function opensAtStart(a: AssetRow, start: string): boolean {
@@ -426,16 +448,32 @@ export async function projectFixedAsset(client: PoolClient, sourceId: string): P
   if (!key.month) {
     if (!opensAtStart(a, start) && !a.source_expense_id) {
       // 10/13 (Nic): typed in by hand, bought on or after the books start —
-      // "the form ASKS where the money came from … and posts to that". Cash on
-      // hand and the owner's own money post the cost here; a loan's posting
-      // and a linked expense carry it themselves (never twice).
-      const from = a.funded_by ? ASSET_FUNDED_FROM[a.funded_by] : null
-      if (!from) return []
+      // "the form ASKS where the money came from … and posts to that", and
+      // "ALLOW A MIX": each funding line its part (or funded_by, said once for
+      // the whole cost). Cash on hand and the owner's own money post their
+      // parts here; a loan's posting and a linked expense carry theirs
+      // themselves (never twice).
       const cost = centsOf(a.cost_c)
-      const memo = `${a.name}: bought with ${from.what}`
+      const parts = new Map<BooksFixedAssetFundedBy, number>(a.funding
+        ? (Object.entries(a.funding) as [BooksFixedAssetFundedBy, string][]).map(([k, c]) => [k, centsOf(c)])
+        : a.funded_by ? [[a.funded_by, cost]] : [])
+      if (a.funding && [...parts.values()].reduce((t, c) => t + c, 0) !== cost) {
+        throw new LedgerSourceError('projector_error',
+          `Fixed asset "${a.name}": where its money came from does not add up to what it cost.`)
+      }
+      const credits: DesiredLine[] = []
+      let carried = 0
+      for (const kind of BOOKS_FIXED_ASSET_FUNDING_ORDER) {
+        const from = ASSET_FUNDED_FROM[kind]
+        const c = parts.get(kind) ?? 0
+        if (!from || !c) continue
+        carried += c
+        credits.push(...cr(from.role, c, { propertyId: a.property_id, memo: `${a.name}: bought with ${from.what}` }))
+      }
+      if (!carried) return []
       return [{ owner, intendedDate: a.acquired_on, memo: `Fixed asset ${a.name}: bought`, lines: [
-        ...dr(role, cost, { propertyId: a.property_id, cashEffect: 'out', expenseKind: 'asset', memo: `${a.name}: cost` }),
-        ...cr(from.role, cost, { propertyId: a.property_id, memo }),
+        ...dr(role, carried, { propertyId: a.property_id, cashEffect: 'out', expenseKind: 'asset', memo: `${a.name}: cost` }),
+        ...credits,
       ] }]
     }
     if (!opensAtStart(a, start)) {
@@ -470,12 +508,13 @@ export async function projectFixedAsset(client: PoolClient, sourceId: string): P
   // A month that ended before the books start: the opening carries it.
   if (m.endDay < start) return []
   const memo = `Depreciation ${m.month}: ${a.name}`
-  // 10/13 (Nic): a month of a company asset's depreciation is recorded when
-  // the month is over (and the asset entered) — a later split takes only newer months.
-  const lines: DesiredLine[] = a.property_id
-    ? dr('depreciation_expense', m.cents, { propertyId: a.property_id, memo })
-    : drSpread('depreciation_expense', m.cents,
-      await companyCostSpread(client, a.landlord_id, m.endDay, { at: a.created_at, monthEnded: m.endDay }), { memo })
+  // 10/13 (Nic): where the asset said its depreciation goes when it was
+  // logged — split across the properties by units on the month's last day,
+  // its property, or its unit (one logged before 10/13: its property, else
+  // the Company column).
+  const lines: DesiredLine[] = drSpread('depreciation_expense', m.cents,
+    await costPlaceSpread(client, a.landlord_id, m.endDay,
+      { costPlace: a.cost_place, propertyId: a.property_id, unitId: a.unit_id, loggedAt: a.logged_at }), { memo })
   lines.push(...cr('accumulated_depreciation', m.cents, { propertyId: a.property_id, memo }))
   return [{ owner, intendedDate: m.endDay, memo, lines }]
 }

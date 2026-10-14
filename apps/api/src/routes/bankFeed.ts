@@ -5,7 +5,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { MERCHANT_RULE_SCOPES, BANK_TXN_STATUSES, BANK_OUT_MATCH_KINDS, BANK_IN_MATCH_KINDS, EXPENSE_MATCH_MAX } from '@gam/shared'
+import { BANK_FILING_SCOPES, BANK_TXN_STATUSES, BANK_OUT_MATCH_KINDS, BANK_IN_MATCH_KINDS, EXPENSE_MATCH_MAX } from '@gam/shared'
 import { companyWideRefusal, bookkeeperMayWrite, READ_ONLY_REFUSAL } from '../lib/bookkeeperScope'
 import {
   moneyOutMatchesFor, matchLineToExpenses, matchLineToRecord, assertBookkeeperMayFileLine, assertBookkeeperMayFileTransfer,
@@ -213,7 +213,8 @@ bankFeedRouter.post('/transactions/:id/categorize', requireBankFiler, async (req
       // of the line's direction.
       category: z.string().max(60).default('other'),
       categoryId: z.string().uuid().nullable().optional(),
-      scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
+      // 10/13 (Nic): money going out may also be split across the properties by units.
+      scopeKind: z.enum(BANK_FILING_SCOPES as unknown as [string, ...string[]]),
       unitId: z.string().uuid().nullable().optional(),
       propertyId: z.string().uuid().nullable().optional(),
       vendor: z.string().max(200).nullable().optional(),
@@ -249,7 +250,7 @@ bankFeedRouter.post('/transactions/:id/split', requireBankFiler, async (req: any
         category: z.string().max(60).default('other'),
         categoryId: z.string().uuid().nullable().optional(),
         amount: z.number().positive().max(100_000_000),
-        scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
+        scopeKind: z.enum(BANK_FILING_SCOPES as unknown as [string, ...string[]]),
         unitId: z.string().uuid().nullable().optional(),
         propertyId: z.string().uuid().nullable().optional(),
         description: z.string().max(500).nullable().optional(),

@@ -5,7 +5,7 @@ import { ArrowLeft, Printer } from 'lucide-react'
 import { PAYMENT_STAMP_LABEL, type RentRollMonthStatus, type RentRollStatusColor } from '@gam/shared'
 import { api } from '../lib/api'
 import { money, monthTitle, dayWord, monthWord } from '../lib/creditDesk'
-import { shortMonth, stripYear, healthColor, lineLateness, type StampMonth, type HealthFigure, type ChargeLine } from '../lib/paymentStamps'
+import { shortMonth, stripYear, healthColor, healthText, lineLateness, type StampMonth, type HealthFigure, type ChargeLine } from '../lib/paymentStamps'
 import { StatusStamp, monthStampTitle } from '../components/rentroll/StatusStamp'
 import '../styles/rent-roll.css'
 import '../components/rentroll/rentroll.css'
@@ -77,6 +77,12 @@ interface Report {
   onGamSince: string | null
   onboardingMonth: string | null
   balanceOwedNow: number
+  /**
+   * 10/13 (Nic): "Tenant report 'Delinquent' uses the money rule (same as
+   * Payments)" — the report's own money past its grace period with money still
+   * owed (the one lease, or the whole household), as the Payments page's tag.
+   */
+  delinquent?: boolean
   health: HealthFigure
   stamps: Array<StampMonth & { counted: boolean } & MonthPill>
   howLate: {
@@ -180,8 +186,15 @@ export function TenantPaymentReportPage() {
         <div className="card">
           <div className="card-title" style={{ marginBottom: 10 }}>Pays on time</div>
           <div className="tr-health">
-            <span className="tr-health-pct" style={{ color: healthColor(h.percent) }}>{h.percent === null ? '—' : `${h.percent}%`}</span>
-            <span style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>{h.label}<br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>All time: {monthTitle(h.from)} – {monthTitle(h.through)}</span></span>
+            {/* 10/13 (Nic), the onboarding month paid late: "Keep it out, but say
+                so." Nothing counted yet: the words alone ("Onboarding month — not
+                counted"), never a bare dash; beside a percentage, a line saying it. */}
+            {h.percent !== null && <span className="tr-health-pct" style={{ color: healthColor(h.percent) }}>{h.percent}%</span>}
+            <span style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>
+              {h.percent === null ? <strong className="tr-health-none">{healthText(h)}</strong> : h.label}
+              {h.percent !== null && h.onboardingLeftOut && <><br /><span className="tr-health-note">The onboarding month is not counted</span></>}
+              <br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>All time: {monthTitle(h.from)} – {monthTitle(h.through)}</span>
+            </span>
           </div>
           {/* 10/13: every month since the household's first bill, newest first,
               in the Rent Roll's colored stamps and words. */}
@@ -211,8 +224,10 @@ export function TenantPaymentReportPage() {
           <KV k="Account credit applied (all time)" v={money(r.creditApplied)} />
           <KV k="Late fees charged" v={`${money(r.lateFees.charged)}${r.lateFees.months ? ` · ${r.lateFees.months} month${r.lateFees.months === 1 ? '' : 's'}` : ''}`} />
           <KV k="Late fees still owed" v={money(r.lateFees.owed)} />
-          {r.leases.some(l => l.evictionMode) ? <KV k="Space" v={<span className="rr-flag">Eviction mode</span>} />
-            : r.leases.some(l => l.delinquent) ? <KV k="Space" v={<span className="rr-flag">Delinquent</span>} /> : null}
+          {/* 10/13 (Nic): "Delinquent" by the Payments page's money rule — beside
+              eviction mode, as the Payments page shows both. */}
+          {(r.delinquent ?? r.leases.some(l => l.delinquent)) && <KV k="Payments" v={<span className="rr-flag">Delinquent</span>} />}
+          {r.leases.some(l => l.evictionMode) && <KV k="Space" v={<span className="rr-flag">Eviction mode</span>} />}
         </div>
       </div>
 

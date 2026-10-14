@@ -136,10 +136,13 @@ describe('the Check out window', () => {
   })
 })
 
-// ── 10/13 (Nic): "Shortened stay 'void the cancelled nights': owner + managers
-// with booking permission" — and in the afternoon: "OWNER + PROPERTY MANAGERS
-// only (not on-site staff)." Anybody else who reaches the question is offered
-// "Keep them owed" only, and a 'void' they send is refused with nothing saved.
+// ── 10/13 (Nic) — who may take the charges off. Evening: "anyone who can
+// schedule reservations and take payments can cancel. refund is separate
+// permission." (replacing the afternoon's "OWNER + PROPERTY MANAGERS only (not
+// on-site staff)"). The owner always; anybody with "Create reservations" or
+// "Edit / move / cancel reservations" AND "Record a cash / check payment",
+// whatever their role. Anybody else who reaches the question is offered "Keep
+// them owed" only, and a 'void' they send is refused with nothing saved.
 async function staff(f: { landlordId: string }, role: 'onsite_manager' | 'property_manager', permissions: Record<string, boolean>) {
   const u = (await db.query<{ id: string }>(
     `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
@@ -154,23 +157,24 @@ async function staff(f: { landlordId: string }, role: 'onsite_manager' | 'proper
   }
 }
 
+const REFUSED = 'Taking those charges off needs "Create reservations" or "Edit / move / cancel reservations", '
+  + 'together with "Record a cash / check payment". You can keep them owed, or ask someone who has both to change the stay.'
+
 describe('10/13 (Nic): who may take the charges off', () => {
-  it('a desk person who checks guests out without the booking permission is offered "Keep them owed" only, and "take it off" is refused with nothing saved', async () => {
+  it('a desk person who checks guests out without the reservation and payment permissions is offered "Keep them owed" only, and "take it off" is refused with nothing saved', async () => {
     const f = await seed()
     const desk = await staff(f, 'onsite_manager', { 'guests.check_out': true })
     const q = await request(app()).get(`/api/units/${f.unitId}/bookings/${f.stay}/check-out?leftOn=2026-10-02`)
       .set('Authorization', `Bearer ${desk.token}`)
     expect(q.status, JSON.stringify(q.body)).toBe(200)
     expect(q.body.data.pastEndAttempted.choices).toEqual({ keep: 'Keep them owed' })
-    expect(q.body.data.pastEndAttempted.voidRefused).toBe(
-      'Taking those charges off is the owner\'s choice, or a property manager\'s with "Edit / move / cancel reservations". '
-      + 'You can keep them owed, or ask one of them to change the stay.')
+    expect(q.body.data.pastEndAttempted.voidRefused).toBe(REFUSED)
 
     const asked = await request(app()).post(`/api/units/${f.unitId}/bookings/${f.stay}/check-out`)
       .set('Authorization', `Bearer ${desk.token}`).send({ leftOn: '2026-10-02', choice: null, quoteToken: q.body.data.quoteToken, idempotencyKey: 'd1' })
     expect(asked.status).toBe(409)
     expect(asked.body.choices).toEqual({ keep: 'Keep them owed' })
-    expect(asked.body.voidRefused).toContain('owner\'s choice')
+    expect(asked.body.voidRefused).toBe(REFUSED)
 
     const refused = await request(app()).post(`/api/units/${f.unitId}/bookings/${f.stay}/check-out`)
       .set('Authorization', `Bearer ${desk.token}`)
@@ -189,47 +193,59 @@ describe('10/13 (Nic): who may take the charges off', () => {
       .toEqual([{ choice: 'keep', chosen_by: desk.userId }])
   })
 
-  it('10/13 afternoon: an on-site manager is offered "Keep them owed" only, even with "Edit / move / cancel reservations", and "take it off" is refused with nothing saved', async () => {
+  it('a reservation permission alone is not enough — "Edit / move / cancel reservations" without "Record a cash / check payment" is offered "Keep them owed" only, and "take it off" is refused with nothing saved', async () => {
     const f = await seed()
-    const onsite = await staff(f, 'onsite_manager', { 'schedule.edit_reservation': true, 'guests.check_out': true })
-    const first = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
-      .set('Authorization', `Bearer ${onsite.token}`).send({ checkOut: '2026-10-20' })
-    expect(first.status, JSON.stringify(first.body)).toBe(409)
-    expect(first.body.choices).toEqual({ keep: 'Keep them owed' })
-    expect(first.body.voidRefused).toContain('a property manager\'s with "Edit / move / cancel reservations"')
-    const refused = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
-      .set('Authorization', `Bearer ${onsite.token}`).send({ checkOut: '2026-10-20', pastEndAttempted: 'void' })
-    expect(refused.status).toBe(403)
-    expect(refused.body.error).toContain('Nothing was changed.')
+    for (const role of ['onsite_manager', 'property_manager'] as const) {
+      const who = await staff(f, role, { 'schedule.edit_reservation': true, 'guests.check_out': true })
+      const first = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+        .set('Authorization', `Bearer ${who.token}`).send({ checkOut: '2026-10-20' })
+      expect(first.status, JSON.stringify(first.body)).toBe(409)
+      expect(first.body.choices).toEqual({ keep: 'Keep them owed' })
+      expect(first.body.voidRefused).toBe(REFUSED)
+      const refused = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+        .set('Authorization', `Bearer ${who.token}`).send({ checkOut: '2026-10-20', pastEndAttempted: 'void' })
+      expect(refused.status, role).toBe(403)
+      expect(refused.body.error).toContain('Nothing was changed.')
+    }
     expect((await db.query<any>(`SELECT to_char(check_out, 'YYYY-MM-DD') AS d FROM unit_bookings WHERE id = $1`, [f.stay])).rows[0].d).toBe('2026-12-01')
     expect((await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [f.nov])).rows[0].status).toBe('failed')
     expect((await db.query(`SELECT 1 FROM stay_shortened_charge_choices`)).rowCount).toBe(0)
-
-    // The Check out window says the same to them.
-    const q = await request(app()).get(`/api/units/${f.unitId}/bookings/${f.stay}/check-out?leftOn=2026-10-02`)
-      .set('Authorization', `Bearer ${onsite.token}`)
-    expect(q.status, JSON.stringify(q.body)).toBe(200)
-    expect(q.body.data.pastEndAttempted.choices).toEqual({ keep: 'Keep them owed' })
-    const out = await request(app()).post(`/api/units/${f.unitId}/bookings/${f.stay}/check-out`)
-      .set('Authorization', `Bearer ${onsite.token}`)
-      .send({ leftOn: '2026-10-02', choice: null, quoteToken: q.body.data.quoteToken, idempotencyKey: 'o1', pastEndAttempted: 'void' })
-    expect(out.status).toBe(403)
-    expect((await db.query(`SELECT 1 FROM stay_shortened_charge_choices`)).rowCount).toBe(0)
   })
 
-  it('a property manager without "Edit / move / cancel reservations" is offered "Keep them owed" only', async () => {
+  it('10/13 evening: an on-site manager who can edit reservations and take payments is offered both and may take them off', async () => {
     const f = await seed()
-    const pm = await staff(f, 'property_manager', { 'guests.check_out': true })
-    const q = await request(app()).get(`/api/units/${f.unitId}/bookings/${f.stay}/check-out?leftOn=2026-10-02`)
-      .set('Authorization', `Bearer ${pm.token}`)
-    expect(q.status, JSON.stringify(q.body)).toBe(200)
-    expect(q.body.data.pastEndAttempted.choices).toEqual({ keep: 'Keep them owed' })
-    expect(q.body.data.pastEndAttempted.voidRefused).toContain('owner\'s choice')
+    const onsite = await staff(f, 'onsite_manager', { 'schedule.edit_reservation': true, take_payment: true })
+    const first = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+      .set('Authorization', `Bearer ${onsite.token}`).send({ checkOut: '2026-10-20' })
+    expect(first.status, JSON.stringify(first.body)).toBe(409)
+    expect(first.body.choices).toEqual({ void: 'Take those charges off', keep: 'Keep them owed' })
+    expect(first.body.voidRefused).toBeNull()
+    const second = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+      .set('Authorization', `Bearer ${onsite.token}`).send({ checkOut: '2026-10-20', pastEndAttempted: 'void' })
+    expect(second.status, JSON.stringify(second.body)).toBe(200)
+    await settle()
+    expect((await db.query<any>(`SELECT status, void_reason FROM payments WHERE id = $1`, [f.nov])).rows[0])
+      .toEqual({ status: 'voided', void_reason: STAY_SHORTENED_CHOSEN_VOID_REASON })
+    expect((await db.query<any>(`SELECT choice, chosen_by FROM stay_shortened_charge_choices`)).rows)
+      .toEqual([{ choice: 'void', chosen_by: onsite.userId }])
   })
 
-  it('a property manager with "Edit / move / cancel reservations" is offered both and may take them off', async () => {
+  it('"Create reservations" with "Record a cash / check payment" counts too: the Check out window offers both', async () => {
     const f = await seed()
-    const mgr = await staff(f, 'property_manager', { 'schedule.edit_reservation': true })
+    const desk = await staff(f, 'onsite_manager', { 'schedule.create_reservation': true, take_payment: true, 'guests.check_out': true })
+    const q = await request(app()).get(`/api/units/${f.unitId}/bookings/${f.stay}/check-out?leftOn=2026-10-02`)
+      .set('Authorization', `Bearer ${desk.token}`)
+    expect(q.status, JSON.stringify(q.body)).toBe(200)
+    expect(q.body.data.pastEndAttempted).toMatchObject({
+      choices: { void: 'Take those charges off', keep: 'Keep them owed' }, voidRefused: null,
+    })
+    // Giving money back is still its own permission: without "Issue refunds" the window cannot refund.
+    expect(q.body.data.canRefund).toBe(false)
+  })
+
+  it('a property manager who can edit reservations and take payments is offered both and may take them off', async () => {
+    const f = await seed()
+    const mgr = await staff(f, 'property_manager', { 'schedule.edit_reservation': true, take_payment: true })
     const first = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
       .set('Authorization', `Bearer ${mgr.token}`).send({ checkOut: '2026-10-20' })
     expect(first.status, JSON.stringify(first.body)).toBe(409)

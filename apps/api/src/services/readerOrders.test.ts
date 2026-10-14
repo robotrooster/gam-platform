@@ -21,6 +21,9 @@ import { READER_ORDER_COST_SOURCES } from '@gam/shared'
 beforeEach(async () => {
   await cleanupAllSchema(); adminNote.mockClear()
   stripeReaders.mockReset(); stripeReaders.mockImplementation(async () => ({ data: [] }))
+  // 10/13 evening (Nic): the 8:05 morning email also carries last night's credit chain check
+  // (services/creditChainCheck.test.ts) — every chain whole here, so these mornings are the readers' alone.
+  await db.query(`INSERT INTO credit_chain_check_runs (outcome, finished_at, subjects, whole, broken) VALUES ('whole', now(), 0, 0, 0)`)
 })
 
 async function world() {
@@ -371,7 +374,9 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     `SELECT r.type, r.amount::text AS amount, r.reference_type, to_char(r.created_at AT TIME ZONE 'America/Phoenix', 'YYYY-MM-DD') AS day, r.notes
        FROM platform_revenue_ledger r
       WHERE r.reference_id IN (SELECT id FROM landlord_gam_charges WHERE reader_order_id = $1
-                               UNION ALL SELECT id FROM pos_reader_order_costs WHERE reader_order_id = $1)
+                               UNION ALL SELECT id FROM pos_reader_order_costs WHERE reader_order_id = $1
+                               -- 10/13 evening (Nic: "Redo the split"): a piece split again under a correction.
+                               UNION ALL SELECT id FROM pos_reader_order_resplits WHERE reader_order_id = $1)
       ORDER BY r.created_at, (r.type = 'device_markup'), r.id`, [orderId])).rows
 
   // 10/13 (Nic, afternoon): FULL PURCHASE — "Book the $331.73 as an expense the day we buy it, and
@@ -408,56 +413,81 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     expect(await bookRows(o.id)).toHaveLength(6)
   })
 
-  it('a dated correction books the difference on its own date; the figure before it and every booked row stay', async () => {
+  // 10/13 evening (Nic): "Redo the split" — the pieces already booked are split again under the
+  // correction, on its date; every row booked before stays as it was.
+  it('a dated correction books the difference on its own date, and splits the pieces already booked again on that date; the figure before it and every booked row stay', async () => {
     const w = await world()
     const o = await pastOrder(w)
     let row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
     expect(row).toMatchObject({ cost_total: 331.73, cost_effective_on: '2026-05-11', markup: 18.27, loss: 0, booked_total: 18.27, not_booked: 0, cost_booked: true })
-    // October 1st: $5.00 more shipping turns up — $5.00 more expense on October 1st. September's
-    // pieces stay as booked.
+    // October 1st: $5.00 more shipping turns up — $5.00 more expense on October 1st, and piece 4
+    // (billed September 1st) split again under $336.73 on October 1st: $5.00 from markup to cost
+    // repaid. September's rows stay as booked.
     row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 15.95, effectiveOn: '2026-10-01', note: 'extra shipping' }, w.userId)
-    expect(row).toMatchObject({ cost_total: 336.73, cost_effective_on: '2026-10-01', markup: 13.27, booked_total: 13.27, not_booked: 0, still_to_repay: 5 })
+    expect(row).toMatchObject({ cost_total: 336.73, cost_effective_on: '2026-10-01', markup: 13.27, booked_total: 13.27, not_booked: 0, still_to_repay: 0,
+      purchase_booked: -336.73, cost_repaid_booked: 336.73, markup_booked: 13.27, split_not_booked: 0 })
     expect(row.cost_history.map((h: any) => [Number(h.total), h.effective_on])).toEqual([[336.73, '2026-10-01'], [331.73, '2026-05-11']])
     const after = await bookRows(o.id)
     expect(kinds(after).filter(k => k[0] === 'purchase')).toEqual([['purchase', '-331.73', '2026-05-11'], ['purchase', '-5.00', '2026-10-01']])
-    expect(after.find((r: any) => r.amount === '-5.00').notes)
+    expect(after.find((r: any) => r.amount === '-5.00' && r.reference_type === 'reader_purchase').notes)
       .toMatch(/Card reader cost corrected — .*: \$331\.73 → \$336\.73 \(base \$299\.00, tax \$21\.78, shipping \$15\.95\) from 2026-10-01 \(extra shipping\) — \$5\.00 more/)
     expect(kinds(after).filter(k => k[0] !== 'purchase')).toEqual([
       ['cost_repaid', '87.50', '2026-06-01'], ['cost_repaid', '87.50', '2026-07-01'], ['cost_repaid', '87.50', '2026-08-01'],
       ['cost_repaid', '69.23', '2026-09-01'], ['markup', '18.27', '2026-09-01'],
+      ['cost_repaid', '5.00', '2026-10-01'], ['markup', '-5.00', '2026-10-01'],
     ])
+    expect(after.find((r: any) => r.amount === '-5.00' && r.type === 'device_markup').notes)
+      .toMatch(/Card reader cost corrected — .*: payment 4 of 4 split again under GAM's \$336\.73 cost \(was \$331\.73\) from 2026-10-01 — \$5\.00 less markup/)
+    // The desk lists them as the split redone, under payment 4.
+    expect(row.book.filter((b: any) => b.resplit).map((b: any) => [b.kind, b.amount, b.n])).toEqual([['cost_repaid', 5, 4], ['markup', -5, 4]])
+    expect(row.pieces.find((p: any) => p.n === 4)).toMatchObject({ cost: 74.23, markup: 13.27, cost_repaid_booked: 74.23, markup_booked: 13.27 })
     // Never reaching back before the figure it corrects — on the desk, and at the table.
     await expect(recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 30, effectiveOn: '2026-09-30' }, w.userId))
       .rejects.toThrow(/on or after 2026-10-01/)
     await expect(db.query(`INSERT INTO pos_reader_order_costs (reader_order_id, base_price, effective_on) VALUES ($1, 250, '2026-09-30')`, [o.id]))
       .rejects.toThrow(/applies from its own date/)
-    // A refund of $10.00 today: $10.00 back to GAM, today.
+    // A refund of $10.00 today: $10.00 back to GAM, today — and piece 4 split again today: $10.00
+    // from cost repaid to markup.
     row = await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 5.95 }, w.userId)
-    expect(row).toMatchObject({ cost_total: 326.73, markup: 23.27, purchase_booked: -326.73, booked_total: 23.27, not_booked: 0, still_to_repay: 0 })
+    expect(row).toMatchObject({ cost_total: 326.73, markup: 23.27, purchase_booked: -326.73, booked_total: 23.27, not_booked: 0, still_to_repay: 0,
+      cost_repaid_booked: 326.73, markup_booked: 23.27, split_not_booked: 0 })
     expect((await bookRows(o.id)).filter((r: any) => r.reference_type === 'reader_purchase').map((r: any) => r.amount))
       .toEqual(['-331.73', '-5.00', '10.00'])
-    // The same figure again changes nothing; the monthly run changes nothing.
+    expect(kinds(await bookRows(o.id)).filter(k => k[0] !== 'purchase').slice(-2).map(k => [k[0], k[1]]))
+      .toEqual([['cost_repaid', '-10.00'], ['markup', '10.00']])
+    // The same figure again changes nothing; the monthly run changes nothing; the book is written once.
     await recordReaderOrderCost(o.id, { basePrice: 299, tax: 21.78, shipping: 5.95 }, w.userId)
     await raiseDueInstallments(new Date('2027-02-01T12:00:00Z'))
-    expect(await bookRows(o.id)).toHaveLength(8)
+    expect(await bookRows(o.id)).toHaveLength(12)
+    const c = await db.connect()
+    try { await c.query('BEGIN'); expect(await bookReaderBook(c)).toBe(0); await c.query('COMMIT') } finally { c.release() }
     // GAM's records for the bridge: what GAM paid now, and the pieces billed.
     expect(await readerBookFacts()).toEqual({ bought: 326.73, billed: 350, collected: 0, costRepaidCollected: 0, markupCollected: 0 })
   })
 
-  it('a typo fixed with the date of the figure it fixes: the book comes to what the reader earns, and no piece is booked twice', async () => {
+  // 10/13 evening (Nic: "Redo the split"): a fix dated back over the pieces already booked splits
+  // them again too — dated the day each was billed (never before it), as they should have been split.
+  it('a typo fixed with the date of the figure it fixes: the book comes to what the reader earns, the pieces are split again, and no piece is booked twice', async () => {
     const w = await world()
     const o = await pastOrder(w)
     // The typo ($361.20, a loss): every piece is cost repaid, $11.20 short.
     let row = await recordReaderOrderCost(o.id, { basePrice: 330, tax: 24, shipping: 7.2 }, w.userId)
     expect(row).toMatchObject({ booked_total: -11.2, markup_booked: 0, still_to_repay: 11.2 })
-    // Fixed with the typo's own date (May 11th): $29.47 back on May 11th; the pieces stay as booked.
+    // Fixed with the typo's own date (May 11th): $29.47 back on May 11th; the pieces' own rows stay
+    // as booked, and piece 4 is split again under $331.73 on the day it was billed (September 1st).
     row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2026-05-11' }, w.userId)
-    expect(row).toMatchObject({ markup: 18.27, loss: 0, booked_total: 18.27, purchase_booked: -331.73, cost_repaid_booked: 350, not_booked: 0, still_to_repay: 0 })
-    expect(kinds(await bookRows(o.id))).toEqual([
+    expect(row).toMatchObject({ markup: 18.27, loss: 0, booked_total: 18.27, purchase_booked: -331.73, cost_repaid_booked: 331.73, markup_booked: 18.27,
+      not_booked: 0, split_not_booked: 0, still_to_repay: 0 })
+    // Piece 4's rows share a moment: compared in a fixed order.
+    const sorted = (xs: any[][]) => xs.map(x => JSON.stringify(x)).sort()
+    expect(sorted(kinds(await bookRows(o.id)))).toEqual(sorted([
       ['purchase', '-361.20', '2026-05-11'], ['purchase', '29.47', '2026-05-11'],
       ['cost_repaid', '87.50', '2026-06-01'], ['cost_repaid', '87.50', '2026-07-01'], ['cost_repaid', '87.50', '2026-08-01'],
-      ['cost_repaid', '87.50', '2026-09-01'],
-    ])
+      ['cost_repaid', '87.50', '2026-09-01'], ['cost_repaid', '-18.27', '2026-09-01'], ['markup', '18.27', '2026-09-01'],
+    ]))
+    // Run again: nothing more.
+    const c = await db.connect()
+    try { await c.query('BEGIN'); expect(await bookReaderBook(c)).toBe(0); await c.query('COMMIT') } finally { c.release() }
   })
 
   it('a correction before the markup piece is billed: the piece is split under the new figure the day it is billed', async () => {
@@ -474,6 +504,46 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     expect(rows.filter((r: any) => r.reference_type !== 'reader_purchase').map((r: any) => [r.type, r.amount])).toEqual([
       ['adjustment', '87.50'], ['adjustment', '87.50'], ['adjustment', '87.50'], ['adjustment', '74.23'], ['device_markup', '13.27'],
     ])
+  })
+
+  // 10/13 evening (Nic): "Redo the split" — a correction typed later but dated before a piece was
+  // billed: that piece should have been split under it, so it is split again on the day it was
+  // billed (never before the piece); a correction dated after it, on the correction's own day.
+  it('a correction dated back over a piece already booked splits it again on the day it was billed; a later one on its own day', async () => {
+    const w = await world()
+    const o = await pastOrder(w)
+    // $300.00: pieces 1-3 all cost, piece 4 $37.50 cost + $50.00 markup.
+    await recordReaderOrderCost(o.id, { basePrice: 300 }, w.userId)
+    // $340.00 from August 15th, typed today: piece 4 (billed September 1st) moves $40.00 to cost repaid, on September 1st.
+    let row = await recordReaderOrderCost(o.id, { basePrice: 340, effectiveOn: '2026-08-15' }, w.userId)
+    expect(row).toMatchObject({ purchase_booked: -340, cost_repaid_booked: 340, markup_booked: 10, booked_total: 10, not_booked: 0, split_not_booked: 0, still_to_repay: 0 })
+    expect(kinds(await bookRows(o.id)).filter(k => k[2] === '2026-09-01').map(k => `${k[0]} ${k[1]}`).sort())
+      .toEqual(['cost_repaid 37.50', 'cost_repaid 40.00', 'markup -40.00', 'markup 50.00'])
+    // $320.00 from today: $20.00 back from cost repaid to markup, today.
+    row = await recordReaderOrderCost(o.id, { basePrice: 320 }, w.userId)
+    expect(row).toMatchObject({ purchase_booked: -320, cost_repaid_booked: 320, markup_booked: 30, booked_total: 30, not_booked: 0, split_not_booked: 0 })
+    expect(row.book.filter((b: any) => b.resplit).map((b: any) => [b.kind, b.amount, b.n]))
+      .toEqual([['cost_repaid', 40, 4], ['markup', -40, 4], ['cost_repaid', -20, 4], ['markup', 20, 4]])
+    expect((await db.query(`SELECT count(*)::int AS n FROM pos_reader_order_resplits WHERE reader_order_id = $1`, [o.id])).rows[0].n).toBe(2)
+    // GAM's records and its book agree; nothing more to write.
+    expect(await readerBookFacts()).toEqual({ bought: 320, billed: 350, collected: 0, costRepaidCollected: 0, markupCollected: 0 })
+    const c = await db.connect()
+    try { await c.query('BEGIN'); expect(await bookReaderBook(c)).toBe(0); await c.query('COMMIT') } finally { c.release() }
+    await chaseReaderOrders(new Date('2027-02-01T15:00:00Z'))
+    expect(await bookRows(o.id)).toHaveLength(12)
+    // 10/13 (review): a split the morning run cannot put right — piece 4 split again under a figure it
+    // was already split under (here: $1.00 of its markup booked as cost repaid instead) — nets to
+    // $0.00, so it is never "not in GAM's book yet"; the desk names it as the split, and it stays.
+    await db.query(
+      `UPDATE platform_revenue_ledger SET amount = amount + CASE type WHEN 'device_markup' THEN -1 ELSE 1 END
+        WHERE reference_id = (SELECT s.id FROM pos_reader_order_resplits s
+                                JOIN pos_reader_order_costs c ON c.id = s.cost_id
+                               WHERE s.reader_order_id = $1 AND c.effective_on = '2026-08-15')`, [o.id])
+    const c2 = await db.connect()
+    try { await c2.query('BEGIN'); expect(await bookReaderBook(c2)).toBe(0); await c2.query('COMMIT') } finally { c2.release() }
+    expect((await adminListReaderOrders(o.id))[0]).toMatchObject({
+      booked_total: 30, not_booked: 0, cost_repaid_booked: 321, markup_booked: 29, split_not_booked: -1,
+    })
   })
 
   it("the date: the day GAM ordered it unless typed; never a day to come, never before the landlord asked", async () => {
@@ -551,13 +621,18 @@ describe("GAM's cost of each reader, and the markup it earns", () => {
     expect(kinds(await bookRows(o.id)).filter(k => k[0] === 'purchase')).toEqual([['purchase', '-361.20', '2026-05-11'], ['purchase', '20.00', '2026-10-01']])
   })
 
-  it('a correction that pushes a reader over its price: the rows already booked stay, the $28.27 more is GAM\'s expense today, and the book comes to the $10.00 loss', async () => {
+  // 10/13 evening (Nic: "Redo the split"): the markup booked on piece 4 goes back today, so GAM's
+  // book shows no markup on a reader that earns none.
+  it('a correction that pushes a reader over its price: the rows already booked stay, the $28.27 more is GAM\'s expense today, the $18.27 markup goes back today, and the book comes to the $10.00 loss', async () => {
     const w = await world()
     const o = await pastOrder(w)
     await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 32.73 }, w.userId)
     const row = await recordReaderOrderCost(o.id, { basePrice: 299, taxAndShipping: 61 }, w.userId)   // $360.00
-    expect(row).toMatchObject({ markup: -10, loss: 10, markup_booked: 18.27, booked_total: -10, not_booked: 0 })
+    expect(row).toMatchObject({ markup: -10, loss: 10, markup_booked: 0, cost_repaid_booked: 350, booked_total: -10, not_booked: 0 })
     expect((await bookRows(o.id)).filter((r: any) => r.reference_type === 'reader_purchase').map((r: any) => r.amount)).toEqual(['-331.73', '-28.27'])
+    // The markup taken back is a markup row below zero (the 10/12 one stays as it was).
+    const today = (await db.query(`SELECT to_char(now() AT TIME ZONE 'America/Phoenix', 'YYYY-MM-DD') AS d`)).rows[0].d
+    expect(kinds(await bookRows(o.id)).filter(k => k[0] === 'markup')).toEqual([['markup', '18.27', '2026-09-01'], ['markup', '-18.27', today]])
   })
 
   // 10/13 (review): what the desk says GAM's book holds is what the book holds — a voided

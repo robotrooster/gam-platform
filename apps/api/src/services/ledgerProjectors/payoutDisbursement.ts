@@ -48,7 +48,7 @@ import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } fr
 import type { LedgerOwner } from '../ledgerOwner'
 import { cr, dr, toCents, splitCents, missingFact, localDaySql, companyTzSql } from './registerBookingPayoutKit'
 import { batchByProperty, loadIntent } from './payoutTransfer'
-import { companyCostSpread, drSpread } from './companyCosts'
+import { COMPANY_COLUMN, drSpread } from './companyCosts'
 
 export const payoutDisbursementProjector: LedgerProjector = {
   sourceType: 'disbursement',
@@ -157,7 +157,8 @@ export const payoutConnectPayoutProjector: LedgerProjector = {
 export const payoutInstantMarginProjector: LedgerProjector = {
   sourceType: 'instant_margin',
   // 10/12 (Nic, review): 2 — a company-level cost, placed as the owner chose (Nic L7).
-  ruleVersion: 2,
+  // 10/13 (Nic): 3 — GAM's own company-wide charge: the Company column, never a setting.
+  ruleVersion: 3,
 
   async project(client: PoolClient, marginId: string): Promise<DesiredPosting[]> {
     const m = (await client.query<{ landlord_id: string | null; amount: string; status: string; day: string | null; collected_at: string | null }>(
@@ -168,12 +169,11 @@ export const payoutInstantMarginProjector: LedgerProjector = {
     if (!m || !m.landlord_id || m.status !== 'collected' || !m.day) return []
     const amt = toCents(m.amount)
     const memo = 'GAM\'s fee on an instant payout'
-    // 10/12 (Nic, review; Nic L7): GAM's fee on a payout belongs to no one
-    // property — a Company column of its own, or split by units, as the owner
-    // chose (10/13: the Company column until they choose; a later split only
-    // for fees collected after it). The money left from company level.
+    // 10/13 (Nic): GAM's fee on a payout belongs to no one property and nobody
+    // logs it ("except gams charge all those costs get logged by a person") —
+    // the Company column. The money left from company level.
     return [{ owner: { landlordId: m.landlord_id }, intendedDate: m.day, memo, lines: [
-      ...drSpread('gam_platform_fees', amt, await companyCostSpread(client, m.landlord_id, m.day, { at: m.collected_at }), { memo }),
+      ...drSpread('gam_platform_fees', amt, COMPANY_COLUMN, { memo }),
       ...cr('stripe_in_transit', amt, { propertyId: null, memo }),
     ] }]
   },

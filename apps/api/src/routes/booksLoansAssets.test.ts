@@ -238,10 +238,17 @@ describe('fixed assets', () => {
     const no = await post(w.tok, `/fixed-assets/from-expense/${repair}`, { assetClass: 'improvement', lifeYears: 10 })
     expect(no.status).toBe(409)
     expect(no.body.error).toMatch(/not an asset account/)
-    const yes = await post(w.tok, `/fixed-assets/from-expense/${roof}`, { assetClass: 'improvement', lifeYears: 10 })
-    expect(yes.status).toBe(201)
+    // 10/13 (Nic): where its depreciation goes is asked — it sits where the expense was filed.
+    const unsaid = await post(w.tok, `/fixed-assets/from-expense/${roof}`, { assetClass: 'improvement', lifeYears: 10 })
+    expect([unsaid.status, unsaid.body.error]).toEqual([400,
+      'Choose where this asset and its depreciation goes: the property the expense was filed on, or one of its units.'])
+    const split = await post(w.tok, `/fixed-assets/from-expense/${roof}`, { assetClass: 'improvement', lifeYears: 10, costPlace: 'split_by_units' })
+    expect([split.status, split.body.error]).toEqual([409,
+      'This asset sits where its expense was filed, so its depreciation goes to that property or one of its units.'])
+    const yes = await post(w.tok, `/fixed-assets/from-expense/${roof}`, { assetClass: 'improvement', lifeYears: 10, costPlace: 'property' })
+    expect(yes.status, JSON.stringify(yes.body)).toBe(201)
     expect(yes.body.data).toMatchObject({ name: 'New roof', cost: '12000.00', acquired_on: '2026-02-10', source_expense_id: roof,
-      property_id: w.co.propertyId, opens_at_books_start: false, monthly: 100 })
+      property_id: w.co.propertyId, cost_place: 'property', unit_id: null, opens_at_books_start: false, monthly: 100 })
     expect((await post(w.tok, `/fixed-assets/from-expense/${roof}`, { assetClass: 'improvement', lifeYears: 10 })).status).toBe(409)
     const keep = await patch(w.tok, `/fixed-assets/${yes.body.data.id}`, { cost: 1 })
     expect(keep.status).toBe(409)

@@ -59,6 +59,8 @@
 .pay-owed { color: var(--gold); font-weight: 700; }
 /* 10/13 (Nic): what is still owed on earlier months, under this month's Owed. */
 .pay-sub.pay-earlier { color: var(--gold); font-weight: 600; }
+/* 10/13 (Nic, round 3): the register sales and pay links naming the space, under Paid (never in it). */
+.pay-sub.pay-register { color: var(--text-2); }
 .pay-tag {
   display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px;
   font-size: .64rem; font-weight: 700; white-space: nowrap;
@@ -114,6 +116,8 @@
 .pay-card-who { margin-top: 4px; font-size: .86rem; color: var(--text-0); overflow-wrap: anywhere; }
 .pay-card-figs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0 4px; font-size: .72rem; color: var(--text-2); }
 .pay-card-figs.one { grid-template-columns: 1fr; }
+/* 10/13 (Nic, round 3): a stay's card — Paid and what is still owed on it. */
+.pay-card-figs.two { grid-template-columns: repeat(2, 1fr); }
 .pay-card-figs strong { display: block; font-family: var(--font-mono); font-size: .86rem; color: var(--text-0); }
 .pay-card-figs .pay-sub { white-space: normal; }
 .pay-card-method { font-size: .74rem; color: var(--text-2); }
@@ -144,17 +148,33 @@
 .pay-other-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
 .pay-other-meta { margin-left: auto; font-weight: 400; font-size: .76rem; color: var(--text-3); }
 .pay-other-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--border-0); }
-.pay-other-line {
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline;
-  padding: 8px 16px; border-bottom: 1px solid var(--border-0); font-size: .78rem; color: var(--text-1);
-}
+.pay-other-line { border-bottom: 1px solid var(--border-0); }
 .pay-other-line:last-child { border-bottom: none; }
-.pay-other-line .day { font-family: var(--font-mono); white-space: nowrap; color: var(--text-2); }
-.pay-other-line .num { font-family: var(--font-mono); white-space: nowrap; text-align: right; color: var(--text-0); }
-.pay-other-line .num.cd-timing-late { color: var(--amber); }
+/* One grid line: the caret's place (kept on a refund, so every day lines up),
+   the day, what it was for, the amount. A sale is a button that opens its
+   breakdown (10/13, Nic: "not clickable to show an expanded breakdown"). */
+.pay-other-row {
+  width: 100%; display: grid; grid-template-columns: 12px auto minmax(0, 1fr) auto; gap: 4px 10px; align-items: baseline;
+  padding: 8px 16px; background: transparent; border: none; text-align: left;
+  font-family: var(--font-body); font-size: .78rem; color: var(--text-1);
+}
+.pay-other-row .pay-caret { margin-right: 0; }
+button.pay-other-row { cursor: pointer; }
+button.pay-other-row:hover { background: var(--bg-3); }
+button.pay-other-row:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.pay-other-row .day { font-family: var(--font-mono); white-space: nowrap; color: var(--text-2); }
+.pay-other-row .num { font-family: var(--font-mono); white-space: nowrap; text-align: right; color: var(--text-0); }
+.pay-other-row .num.cd-timing-late { color: var(--amber); }
 .pay-other-for { min-width: 0; overflow-wrap: anywhere; }
 .pay-other-for .pay-sub { white-space: normal; }
+/* A sale's breakdown, under its line: each part and its amount, what comes
+   off as −, the sum, and the card fee paid on top apart from it. */
+.pay-parts { padding: 0 16px 10px 38px; }
+.pay-parts .pay-lines .pay-sub { white-space: normal; }
+.pay-parts .pay-parts-total td { font-weight: 700; color: var(--text-0); border-top: 1px solid var(--border-1); }
+.pay-parts .pay-parts-fee td { color: var(--text-3); }
 @media (max-width: 640px) {
-  .pay-other-head, .pay-other-line { padding-left: 12px; padding-right: 12px; }
+  .pay-other-head, .pay-other-row { padding-left: 12px; padding-right: 12px; }
+  .pay-parts { padding: 0 12px 10px 34px; }
   .pay-other-meta { margin-left: 0; width: 100%; }
 }

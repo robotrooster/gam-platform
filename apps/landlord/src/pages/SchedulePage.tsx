@@ -967,8 +967,8 @@ export function SchedulePage() {
   // landlord chooses here, at the moment: take those charges off (anything
   // paid on them goes back to the guest as credit), or keep them owed. The
   // change is sent again with the answer; Cancel saves nothing.
-  // 10/13 (Nic): "Take those charges off" is the owner's and a property
-  // manager's with the booking permission, never on-site staff's — the server sends only the answers this person may
+  // 10/13 evening (Nic): "Take those charges off" is for "anyone who can schedule
+  // reservations and take payments" (and the owner) — the server sends only the answers this person may
   // give (and says why when "Take those charges off" is not one of them).
   const askShortenedIf = (e: any, resend: (choice: string) => void): boolean => {
     const body = e?.response?.data

@@ -334,3 +334,77 @@ describe('the shared words and colors', () => {
     expect(lineLateness({ isLateFee: true, daysPastGrace: 0, owed: 5, workTrade: 0 })).toBe('—')
   })
 })
+
+// 10/13 (Nic), round 3: "Tenant report 'Delinquent' uses the money rule (same as Payments)".
+describe('"Delinquent" on the report is the Payments page\'s money rule', () => {
+  const flags = () => [...host.querySelectorAll('.rr-flag')].map(f => f.textContent)
+  it('the server\'s word for the report\'s own money — a household with no lease included', async () => {
+    server.report = report({ delinquent: true, leases: [] })
+    await render()
+    expect(flags()).toEqual(['Delinquent'])
+  })
+  it('paid up, no tag — whatever a lease once said', async () => {
+    server.report = report({ delinquent: false })
+    await render()
+    expect(flags()).toEqual([])
+  })
+  it('beside eviction mode, as the Payments page shows both', async () => {
+    const r = report({ delinquent: true })
+    server.report = { ...r, leases: [{ ...r.leases[0], evictionMode: true }] }
+    await render()
+    expect(flags()).toEqual(['Delinquent', 'Eviction mode'])
+  })
+})
+
+// 10/13 (Nic), the onboarding month (September at Mountain View) paid late:
+// "Keep it out, but say so." And the gold underline on its stamp: "KEEP it,
+// and give it a label" — "First month on GAM".
+describe('the onboarding month on the report', () => {
+  const lateSeptember = (health: any) => report({
+    health,
+    stamps: [
+      stamp('2026-09', 'paid_late', { onboarding: true, daysPastGrace: 4, paid: 495, paidInFullOn: '2026-09-10', counted: false }),
+      stamp('2026-10', 'due', { owed: 495, counted: false }),
+    ],
+  })
+
+  it('the only judged month is the onboarding month: health says so in words, never a dash', async () => {
+    server.report = lateSeptember({ percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0, notCounted: 2,
+      workTrade: 0, from: '2026-09', through: '2026-10', label: 'Onboarding month — not counted', onboardingLeftOut: true })
+    await render()
+    const box = host.querySelector('.tr-health')!
+    expect(box.querySelector('.tr-health-pct')).toBeNull()
+    expect(box.querySelector('.tr-health-none')!.textContent).toBe('Onboarding month — not counted')
+    // No bare dash in the figure's place.
+    expect(box.textContent).not.toMatch(/^—/)
+  })
+
+  it('later months counted: the percentage from them, and a line saying the onboarding month is not counted', async () => {
+    server.report = lateSeptember({ percent: 100, onTime: 1, counted: 1, paidLate: 0, partial: 0, outstanding: 0, notCounted: 1,
+      workTrade: 0, from: '2026-09', through: '2026-11', label: '100%, 1 of 1 month', onboardingLeftOut: true })
+    await render()
+    const box = host.querySelector('.tr-health')!
+    expect(box.querySelector('.tr-health-pct')!.textContent).toBe('100%')
+    expect(box.querySelector('.tr-health-note')!.textContent).toBe('The onboarding month is not counted')
+  })
+
+  it('nothing judged yet at all says so in words', async () => {
+    server.report = report({ health: { percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0, notCounted: 1,
+      workTrade: 0, from: '2026-10', through: '2026-10', label: 'No months to judge yet' }, stamps: [stamp('2026-10', 'due', { owed: 495 })] })
+    await render()
+    expect(host.querySelector('.tr-health .tr-health-none')!.textContent).toBe('No months to judge yet')
+    expect(host.querySelector('.tr-health-note')).toBeNull()
+  })
+
+  it('the onboarding stamp keeps its gold underline and a tap says "First month on GAM"', async () => {
+    server.report = lateSeptember({ percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0, notCounted: 2,
+      workTrade: 0, from: '2026-09', through: '2026-10', label: 'Onboarding month — not counted', onboardingLeftOut: true })
+    await render()
+    const sept = [...host.querySelectorAll('.tr-months .rrs')].find(s => s.className.includes('onboarding')) as HTMLButtonElement
+    expect(sept.textContent).toBe('Paid late +4')
+    expect(sept.className).toContain('orange')
+    expect(host.querySelector('[role="tooltip"]')).toBeNull()
+    await act(async () => { sept.click() })
+    expect(host.querySelector('.tr-months [role="tooltip"] strong')!.textContent).toBe('First month on GAM')
+  })
+})

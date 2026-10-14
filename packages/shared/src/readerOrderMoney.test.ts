@@ -162,10 +162,72 @@ describe('readerBookRows — a reader in GAM\'s own book', () => {
       { id: 'c1', total: 331.73, effectiveOn: '2026-12-15' },   // typed late
       { id: 'c2', total: 250, effectiveOn: '2026-12-20' },      // a refund before piece 4
     ], pieces: [piece(3, '2026-12-01'), piece(4, '2027-01-01')] })
-    expect(rows.filter(r => r.kind !== 'purchase').map(r => [r.kind, r.n, r.amount, r.cost])).toEqual([
+    expect(rows.filter(r => r.kind !== 'purchase' && !r.resplit).map(r => [r.kind, r.n, r.amount, r.cost])).toEqual([
       ['cost_repaid', 3, 87.5, 331.73],
       ['markup', 4, 87.5, 250],
     ])
+    // 10/13 evening (Nic: "Redo the split"): piece 3, billed before the refund, is split again under
+    // it on the refund's day — $75.00 of cost and $12.50 of markup under $250.00.
+    expect(rows.filter(r => r.resplit).map(r => [r.kind, r.n, r.amount, r.on, r.cost, r.previousCost, r.resplitUnder])).toEqual([
+      ['cost_repaid', 3, -12.5, '2026-12-20', 250, 331.73, 'c2'],
+      ['markup', 3, 12.5, '2026-12-20', 250, 331.73, 'c2'],
+    ])
+  })
+
+  // 10/13 evening (Nic): "Redo the split" — a cost correction after pieces are booked redoes the
+  // split, as a dated correction, so the markup is only what is beyond the cost.
+  describe('a correction after pieces are booked redoes their split, dated the correction\'s day', () => {
+    const paid = [piece(1, '2026-10-05'), piece(2, '2026-11-01'), piece(3, '2026-12-01'), piece(4, '2027-01-01')]
+
+    it('$5.00 more shipping from 2/1: piece 4 moves $5.00 from markup to cost repaid on 2/1; its own rows stay dated the day billed', () => {
+      const rows = readerBookRows({ ...mv, entries: [...mv.entries, { id: 'c2', total: 336.73, effectiveOn: '2027-02-01' }], pieces: paid })
+      expect(rows.map(r => [r.kind, r.n ?? null, r.amount, r.on])).toEqual([
+        ['purchase', null, -331.73, '2026-09-28'],
+        ['purchase', null, -5, '2027-02-01'],
+        ['cost_repaid', 1, 87.5, '2026-10-05'],
+        ['cost_repaid', 2, 87.5, '2026-11-01'],
+        ['cost_repaid', 3, 87.5, '2026-12-01'],
+        ['cost_repaid', 4, 69.23, '2027-01-01'],
+        ['markup', 4, 18.27, '2027-01-01'],
+        ['cost_repaid', 4, 5, '2027-02-01'],
+        ['markup', 4, -5, '2027-02-01'],
+      ])
+      expect(rows.filter(r => r.resplit).every(r => r.resplitUnder === 'c2' && r.cost === 336.73 && r.previousCost === 331.73)).toBe(true)
+      // The slices: the cost repaid is the whole cost, the markup only what is beyond it.
+      expect(readerBookTotals(rows)).toEqual({ purchase: -336.73, costRepaid: 336.73, markup: 13.27, net: 13.27 })
+    })
+
+    it('a refund moves cost repaid to markup; each later correction redoes it again from the split before it', () => {
+      const rows = readerBookRows({ ...mv, pieces: paid, entries: [
+        ...mv.entries,
+        { id: 'c2', total: 300, effectiveOn: '2027-02-01' },      // a $31.73 refund
+        { id: 'c3', total: 340, effectiveOn: '2027-03-01' },      // and then $40.00 more after all
+      ] })
+      expect(rows.filter(r => r.resplit).map(r => [r.kind, r.n, r.amount, r.on, r.resplitUnder])).toEqual([
+        ['cost_repaid', 4, -31.73, '2027-02-01', 'c2'], ['markup', 4, 31.73, '2027-02-01', 'c2'],
+        ['cost_repaid', 4, 40, '2027-03-01', 'c3'], ['markup', 4, -40, '2027-03-01', 'c3'],
+      ])
+      expect(readerBookTotals(rows)).toEqual({ purchase: -340, costRepaid: 340, markup: 10, net: 10 })
+    })
+
+    it('a correction that pushes the cost past the price: the markup booked goes back, and the book holds the loss', () => {
+      const rows = readerBookRows({ ...mv, pieces: paid, entries: [...mv.entries, { id: 'c2', total: 360, effectiveOn: '2027-02-01' }] })
+      expect(rows.filter(r => r.resplit).map(r => [r.kind, r.n, r.amount])).toEqual([['cost_repaid', 4, 18.27], ['markup', 4, -18.27]])
+      expect(readerBookTotals(rows)).toEqual({ purchase: -360, costRepaid: 350, markup: 0, net: -10 })
+    })
+
+    it('a piece billed on or after the correction is split under it once — nothing to redo; one that never moves between cost and markup gets no row', () => {
+      const rows = readerBookRows({ ...mv, entries: [...mv.entries, { id: 'c2', total: 336.73, effectiveOn: '2026-12-01' }], pieces: paid })
+      // Pieces 1-2 stay all cost under either figure; 3 and 4 are billed under the correction.
+      expect(rows.filter(r => r.resplit)).toEqual([])
+      expect(rows.filter(r => r.n === 4).map(r => [r.kind, r.amount, r.cost])).toEqual([['cost_repaid', 74.23, 336.73], ['markup', 13.27, 336.73]])
+    })
+
+    it('a voided piece is never redone', () => {
+      const rows = readerBookRows({ ...mv, entries: [...mv.entries, { id: 'c2', total: 250, effectiveOn: '2027-02-01' }],
+        pieces: [...paid.slice(0, 3), piece(4, '2027-01-01', true)] })
+      expect(rows.filter(r => r.resplit).map(r => [r.kind, r.n, r.amount])).toEqual([['cost_repaid', 3, -12.5], ['markup', 3, 12.5]])
+    })
   })
 
   it('a reader that cost GAM more than it charges: every piece is cost repaid, and the loss stays below zero', () => {
@@ -181,8 +243,8 @@ describe('readerBookRows — a reader in GAM\'s own book', () => {
     expect(rows.map(r => r.kind)).toEqual(['purchase'])
   })
 
-  it('every kind has words for the desk, and the two references are distinct', () => {
+  it('every kind has words for the desk, and the references are distinct', () => {
     for (const k of READER_BOOK_ROW_KINDS) expect(READER_BOOK_ROW_KIND_LABEL[k]).toBeTruthy()
-    expect(READER_BOOK_REFERENCE.purchase).not.toBe(READER_BOOK_REFERENCE.costRepaid)
+    expect(new Set(Object.values(READER_BOOK_REFERENCE)).size).toBe(Object.keys(READER_BOOK_REFERENCE).length)
   })
 })

@@ -97,6 +97,11 @@ export const LANDLORD_ASSIGNABLE_ROLE_LABEL: Record<LandlordAssignableRole, stri
   bookkeeper:       'Bookkeeper',
 }
 
+// 10/13 (Nic): "team invites expire after 24 HOURS (fix the email that says 7
+// days)". How long a team invitation's link works, from when it is sent or
+// resent. One number for the invite route, the email and the Team page.
+export const TEAM_INVITATION_TTL_HOURS = 24
+
 // ---------- Service-business operator roles (S453) ----------
 // Distinct from landlord-side roles. Service businesses (trash hauling,
 // maintenance crews, mobile rentals, equipment rentals) live in the
@@ -743,6 +748,12 @@ export const BANK_TXN_MATCH_KIND_LABEL: Record<BankTxnMatchKind, string> = BANK_
 // property as a common cost, or to the property split across its units.
 export const MERCHANT_RULE_SCOPES = ['unit', 'property_common', 'property_allocate'] as const
 export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging" — a bank line going OUT may also be split
+// across the company's properties by units (BOOKS_COST_PLACES). Filing only:
+// never kept on a merchant rule, and never pre-filled on a money-out line.
+export const BANK_FILING_SCOPES = [...MERCHANT_RULE_SCOPES, 'split_by_units'] as const
+export type BankFilingScope = typeof BANK_FILING_SCOPES[number]
 
 // S570 (Nic): notification types that are too important to silence. Email is
 // FORCED on for these regardless of the user's preference (they can't toggle it
@@ -1915,14 +1926,19 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
           hint: 'The Master Schedule change log: who booked, moved, or canceled which stay, and when.' },
       ]},
       { label: 'Actions', items: [
+        // 10/13 evening (Nic): "anyone who can schedule reservations and take
+        // payments can cancel. refund is separate permission." (lib/stayShortenedVoid)
+        // 10/13 (review): creating alone never shortens a stay — that is an
+        // edit (the booking PATCH) or an early check-out (routes/stayCheckOut),
+        // so this hint names the check-out it also takes.
         { key: 'schedule.create_reservation', label: 'Create reservations',
-          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it.' },
+          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it. With "Record a cash / check payment" and "Check guests out" too, they may take off rent a payment was tried on when a guest leaves early.' },
         { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations',
-          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. A property manager with this may also take off rent a payment was tried on when a stay is shortened; on-site staff may not. Not checking guests in.' },
+          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. With "Record a cash / check payment" too, they may also take off rent a payment was tried on when a stay is shortened. Not checking guests in.' },
         { key: 'guests.check_in',             label: 'Check guests in',
           hint: 'Mark a guest as arrived on the schedule. Taking a closing meter read on the site first may also be needed.' },
         { key: 'guests.check_out',            label: 'Check guests out',
-          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding also needs "Issue refunds". Taking off rent a payment was tried on is for the owner and property managers with "Edit / move / cancel reservations".' },
+          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding also needs "Issue refunds". Taking off rent a payment was tried on needs a reservation permission and "Record a cash / check payment".' },
         { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)',
           hint: 'Set up a site: type, size, hookups, rent and nightly, weekly, and monthly rates, deposit, and whether guests can book it. Marking a site out of order stays owner-only.' },
         { key: 'guest_access',                label: 'Guest stay links',
@@ -2087,8 +2103,14 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
       //
       // Issuing credit needs no key of its own — that route admits owners and
       // property managers only, and an onsite manager is neither.
+      //
+      // 10/13 evening (Nic): "anyone who can schedule reservations and take
+      // payments can cancel. refund is separate permission." With a
+      // reservation permission this one may take a shortened stay's rent off,
+      // which puts what was paid on it to the guest's credit — so the hint no
+      // longer says "no credit"; the reservation hints say when.
       { key: 'take_payment',            label: 'Record a cash / check payment',
-        hint: 'Take a payment at the counter: cash, check, money order, or a card on the reader. Also sets how much paid-ahead money each bill uses and, while you are moving onto GAM, marks a first rent as paid in your old system. No credit or refunds.' },
+        hint: 'Take a payment at the counter: cash, check, money order, or a card on the reader. Sets how much paid-ahead money each bill uses and, while moving onto GAM, marks a first rent as paid in your old system. No refunds. For stays, see Master Schedule.' },
       { key: 'payments.import_history', label: 'Import payment history', sensitive: true,
         hint: 'Upload a spreadsheet of residents\' past payments from your old system.' },
     ]}],
@@ -7172,6 +7194,13 @@ export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
 export const CREDIT_NETWORK_TIERS = ['tier_2_full'] as const
 export type CreditNetworkTier = typeof CREDIT_NETWORK_TIERS[number]
 
+// 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+// email (not its own 3 am email)." What a night's credit chain check found
+// (credit_chain_check_runs.outcome; mirrors credit_chain_check_runs_outcome_check):
+// 'running' until it finishes; 'failed' is a check that could not finish.
+export const CREDIT_CHAIN_CHECK_OUTCOMES = ['running', 'whole', 'broken', 'failed'] as const
+export type CreditChainCheckOutcome = typeof CREDIT_CHAIN_CHECK_OUTCOMES[number]
+
 export const EXTERNAL_ACCOUNT_CATEGORIES = [
   'utility',
   'telecom',
@@ -8345,6 +8374,17 @@ export function readerOrderMoney(o: {
 // Mountain View: −$331.73 on 9/28, +$87.50 a month on pieces 1-3, and piece 4
 // +$69.23 repaid + $18.27 markup. A reader that cost more than it is charged
 // stays below zero by its loss once its last piece is billed.
+//
+// 10/13 evening (Nic): "Redo the split" — a cost correction after pieces are
+// booked REDOES the split, as a dated correction. Every piece already billed
+// is split again under the corrected cost, cost first: what moves between its
+// cost repaid and its markup is booked as the difference, ON THE CORRECTION'S
+// DATE (the rows booked before stay as they were; a piece's own rows stay
+// dated the day it was billed). So once every correction is in, the slices
+// say what Nic's rule says — the markup is only what is beyond the cost.
+// Mountain View with $5.00 more shipping from 10/1: piece 4 −$5.00 markup and
+// +$5.00 cost repaid on 10/1 ($74.23 + $13.27 in all), beside the −$5.00
+// purchase correction.
 
 /**
  * The reference_type of a reader's purchase and cost-repaid rows, which are
@@ -8352,8 +8392,14 @@ export function readerOrderMoney(o: {
  * 'device_markup', referenced 'reader_order_installment'). A purchase row
  * references its cost entry (pos_reader_order_costs), a cost-repaid row its
  * piece (landlord_gam_charges). Read by the money pies and the bridge.
+ *
+ * 10/13 evening (Nic: "Redo the split"): a piece split again under a later
+ * cost entry references the re-split (pos_reader_order_resplits: the piece and
+ * the entry) — its cost-repaid difference keeps the cost-repaid reference (so
+ * the pies and the bridge count it in "Cost repaid"), its markup difference is
+ * 'device_markup' referenced `resplit`. Either may be below zero.
  */
-export const READER_BOOK_REFERENCE = { purchase: 'reader_purchase', costRepaid: 'reader_cost_repaid' } as const
+export const READER_BOOK_REFERENCE = { purchase: 'reader_purchase', costRepaid: 'reader_cost_repaid', resplit: 'reader_resplit' } as const
 
 export const READER_BOOK_ROW_KINDS = ['purchase', 'cost_repaid', 'markup'] as const
 export type ReaderBookRowKind = typeof READER_BOOK_ROW_KINDS[number]
@@ -8382,6 +8428,13 @@ export interface ReaderBookRow {
   cost: number
   /** A correction: the figure it replaces. */
   previousCost?: number
+  /**
+   * 10/13 evening (Nic: "Redo the split"): a piece split again under a later
+   * cost entry. The row is the difference from the split before it (signed),
+   * dated the entry's day; `resplitUnder` is that entry's id (when ids are given).
+   */
+  resplit?: true
+  resplitUnder?: string
 }
 
 /**
@@ -8392,6 +8445,12 @@ export interface ReaderBookRow {
  * under the latest entry dated on or before the day it was billed (an order's
  * first entry covers every day before it, so a cost typed late still splits
  * the pieces billed before it).
+ *
+ * 10/13 evening (Nic: "Redo the split"): each later entry — a correction dated
+ * after the piece was billed — splits the piece again, and the difference from
+ * the split before it is a row of its own on that entry's day (`resplitUnder`):
+ * cost repaid one way, markup the other, the piece's total unchanged. Summed,
+ * every piece is split under the order's latest cost.
  */
 export function readerBookRows(o: {
   price: number; installments: number; bought: boolean
@@ -8414,13 +8473,38 @@ export function readerBookRows(o: {
     }
   }
   for (const p of [...o.pieces].filter(p => !p.voided).sort((a, b) => a.n - b.n)) {
-    const inForce = [...o.entries].reverse().find(e => e.effectiveOn <= p.billedOn) ?? o.entries[0]
+    const at = readerEntryInForce(o.entries, p.billedOn)
+    const inForce = o.entries[at]
     const s = readerPieceSplit(o.price, o.installments, inForce.total)[p.n - 1]
     if (!s) continue
     if (s.cost > 0) rows.push({ kind: 'cost_repaid', ref: p.id, n: p.n, amount: s.cost, on: p.billedOn, cost: rc(inForce.total) / 100 })
     if (s.markup > 0) rows.push({ kind: 'markup', ref: p.id, n: p.n, amount: s.markup, on: p.billedOn, cost: rc(inForce.total) / 100 })
+    // Every entry after it is dated after the day the piece was billed: the
+    // split redone under each, the difference on that entry's day.
+    let prev = s, prevCost = rc(inForce.total)
+    for (const e of o.entries.slice(at + 1)) {
+      const next = readerPieceSplit(o.price, o.installments, e.total)[p.n - 1]
+      const dCost = rc(next.cost) - rc(prev.cost)
+      const dMarkup = rc(next.markup) - rc(prev.markup)
+      const redo = { ref: p.id, n: p.n, on: e.effectiveOn, cost: rc(e.total) / 100, previousCost: prevCost / 100, resplit: true as const, resplitUnder: e.id }
+      if (dCost !== 0) rows.push({ kind: 'cost_repaid', amount: dCost / 100, ...redo })
+      if (dMarkup !== 0) rows.push({ kind: 'markup', amount: dMarkup / 100, ...redo })
+      prev = next; prevCost = rc(e.total)
+    }
   }
   return rows
+}
+
+/**
+ * Which of an order's cost entries (in the order typed) a piece billed on
+ * `billedOn` is split under when it is billed: the latest dated on or before
+ * that day, else the first (an order's first entry covers every day before
+ * it). Entries are never dated before the one they correct, so every entry
+ * after it is dated after the piece was billed.
+ */
+export function readerEntryInForce(entries: ReadonlyArray<Pick<ReaderCostEntryForBook, 'effectiveOn'>>, billedOn: string): number {
+  for (let i = entries.length - 1; i >= 0; i--) if (entries[i].effectiveOn <= billedOn) return i
+  return 0
 }
 
 /** What the rows come to, to the cent: purchase (below zero), cost repaid, markup, and the net. */
@@ -8446,3 +8530,4 @@ export * from './monthlyReport'
 
 // 10/12 (Nic): who stays on the Rent Roll after moving out (the landlord's choice, per company).
 export * from './rentRoll'
+

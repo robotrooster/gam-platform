@@ -164,11 +164,14 @@ describe('Run Payroll', () => {
         { id: 'x2', payMethod: 'contractor_1099', hours: 4, rate: 20, amount: 80, periodMonth: '2026-09-01', tenantFirst: 'Lee', tenantLast: 'Helper', employeeId: null, draftRunId: null },
       ],
       '/books/vendors': [{ id: 'v1', name: 'Acme Plumbing' }],
+      // 10/13 (Nic): where each run's wages go is asked on the run.
+      '/books/cost-places': { asked: true, properties: [{ id: 'p1', name: 'Oak Park', units: [{ id: 'u1', unitNumber: '7' }] }] },
     }
     server.replies['/books/payroll/runs'] = {
       id: 'r1', lines: [], employeeCount: 2, payFrequency: 'biweekly', payDate: '2026-03-20', periodStart: '2026-03-01', periodEnd: '2026-03-14',
       totalGross: '2090', totalFederalTax: '0', totalStateTax: '0', totalSs: '129.58', totalMedicare: '30.31', totalNet: '1930.11',
       totalEmployerSs: '129.58', totalEmployerMedicare: '30.31', totalFuta: '12', totalSuta: '0',
+      costPlace: 'split_by_units', propertyId: null, unitId: null,
     }
   })
 
@@ -188,29 +191,55 @@ describe('Run Payroll', () => {
     const annRow = (host!.querySelector('input[aria-label="Pay Ann Worker"]') as HTMLElement).closest('tr')!
     const annTaxes = annRow.querySelectorAll('input[type="number"]')
     await setValue(annTaxes[annTaxes.length - 2], '12')
+    // 10/13 (Nic): nothing is chosen for where the wages go; it is asked, and the run waits for it.
+    expect(text()).toContain('Where this payroll\'s cost (wages and employer taxes) goes')
+    const calc = [...form.querySelectorAll('button[type="submit"]')].pop() as HTMLButtonElement
+    expect(calc.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="payrollPlace"][value="split_by_units"]') as HTMLInputElement).click() })
+    await flush()
+    expect(calc.disabled).toBe(false)
     await submit(form)
     expect(server.posts).toEqual([{ url: '/books/payroll/runs', body: {
       periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly',
       employeeIds: ['e1'], hoursMap: {},
       taxMap: { e1: { federal: 0, state: 0, futa: 12, suta: 0 } },
       extraHours: [{ id: 'x1', employeeId: 'e1', federal: 0, state: 0, futa: 0, suta: 0 }],
+      costPlace: 'split_by_units', propertyId: null, unitId: null,
     } }])
-    // The review reads the employer's taxes the server recorded.
+    // The review reads the employer's taxes the server recorded, and where the wages go.
     expect(text()).toContain('Federal unemployment')
     expect(text()).toContain('$12.00')
+    expect(text()).toContain('Split across your properties by units')
   })
 
   it('records 1099 hours as a contractor bill — to the person themselves unless another vendor is picked', async () => {
     await render(<RunPayrollPage />)
     const select = host!.querySelector('select[aria-label="Vendor Lee Helper is paid as"]') as HTMLSelectElement
     expect([...select.options].map(o => o.textContent)).toEqual(['Lee Helper (contractor)', 'Acme Plumbing'])
+    // 10/13 (Nic): "except gams charge all those costs get logged by a person" —
+    // where the bill's cost goes is asked on it; nothing records until it is.
+    expect(text()).toContain('Where Lee Helper\'s contractor bill goes')
+    expect([...host!.querySelectorAll('input[name="contractorPlace-x2"]')].some(r => (r as HTMLInputElement).checked)).toBe(false)
+    expect(button('Record contractor bill')!.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="contractorPlace-x2"][value="split_by_units"]') as HTMLInputElement).click() })
+    await flush()
     await act(async () => { button('Record contractor bill')!.click() })
     await flush()
-    expect(server.posts).toEqual([{ url: '/books/work-trade-pay/x2/contractor-payment', body: {} }])
+    expect(server.posts).toEqual([{ url: '/books/work-trade-pay/x2/contractor-payment',
+      body: { costPlace: 'split_by_units', propertyId: null, unitId: null } }])
+    // Asked again on the next one: nothing carries over.
+    expect([...host!.querySelectorAll('input[name="contractorPlace-x2"]')].some(r => (r as HTMLInputElement).checked)).toBe(false)
     await setValue(select, 'v1')
+    await act(async () => { (host!.querySelector('input[name="contractorPlace-x2"][value="unit"]') as HTMLInputElement).click() })
+    await flush()
+    const property = [...host!.querySelectorAll('select')].find(s => s.options[0]?.textContent === 'Choose the property') as HTMLSelectElement
+    await setValue(property, 'p1')
+    const unit = [...host!.querySelectorAll('select')].find(s => s.options[0]?.textContent === 'Choose the unit') as HTMLSelectElement
+    await setValue(unit, 'u1')
     await act(async () => { button('Record contractor bill')!.click() })
     await flush()
-    expect(server.posts[1]).toEqual({ url: '/books/work-trade-pay/x2/contractor-payment', body: { vendorId: 'v1' } })
+    expect(server.posts[1]).toEqual({ url: '/books/work-trade-pay/x2/contractor-payment',
+      body: { vendorId: 'v1', costPlace: 'unit', propertyId: 'p1', unitId: 'u1' } })
   })
 })
 

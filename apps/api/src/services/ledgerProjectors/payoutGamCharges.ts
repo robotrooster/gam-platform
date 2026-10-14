@@ -26,9 +26,10 @@
  *                                      expense lands on the day GAM collected it, never when charged
  *
  * A voided charge posts nothing (taken back as a correction). 10/13 (Nic): a
- * charge on no property is a company-level cost — the Company column until
- * the owner picks; a later "split by units" splits only charges made after it
- * (companyCosts).
+ * charge on no property is GAM's own company-wide charge — the only kind of
+ * cost nobody logs ("except gams charge all those costs get logged by a
+ * person") — so it goes to the Company column (companyCosts COMPANY_COLUMN);
+ * no setting decides it.
  *
  * Source 'gam_debit' = one landlord_gam_debits row: a bank pull of GAM's fees,
  * posted when it succeeds (its settled day, the company's calendar):
@@ -36,8 +37,8 @@
  *   Dr Due to GAM (2080)                 each charge it collected, at the charge's property
  *                                        (landlord_gam_charge_collections, design P0)
  *   Dr Supplies (5140)                   10/13 (Nic): each card reader piece it collected, at the
- *                                        piece's property (one on no property: a company-level
- *                                        cost, companyCosts) — the piece is an expense in the
+ *                                        piece's property (one on no property: the Company
+ *                                        column, companyCosts) — the piece is an expense in the
  *                                        month GAM collected it
  *   Cr Outstanding checks and debits (2015)  the same — cleared when the "GAM FEES" bank line
  *                                        matches it (design H5; never an expense)
@@ -88,7 +89,7 @@ import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } fr
 import type { LedgerOwner } from '../ledgerOwner'
 import type { LedgerAccountRole } from '@gam/shared'
 import { cr, dr, toCents, waitsOnRule, localDaySql, propertyTzSql, companyTzSql } from './registerBookingPayoutKit'
-import { companyCostSpread, drSpread, crSpread, type CostRecorded } from './companyCosts'
+import { COMPANY_COLUMN, drSpread } from './companyCosts'
 
 /**
  * 10/13 (Nic): "Readers on the LANDLORD's books: each $87.50 → SUPPLIES, in
@@ -101,18 +102,13 @@ const READER_PIECE_MEMO = 'Card reader piece GAM collected'
 
 /**
  * 10/13 (Nic): the Supplies expense for reader pieces a batch or a pull
- * collected at one property (`propertyId`; null: the company's — a
- * company-level cost, spread as companyCosts says for a cost recorded when the
- * money was collected). `side` 'cr' takes it back exactly (a disputed pull).
+ * collected at one property (`propertyId`; null: the Company column — a piece
+ * is GAM's own charge, logged by nobody, companyCosts). `side` 'cr' takes it
+ * back exactly (a disputed pull).
  */
-export async function readerPieceLines(client: PoolClient, a: {
-  landlordId: string; propertyId: string | null; cents: number; day: string; recorded: CostRecorded; side: 'dr' | 'cr'
-}): Promise<DesiredLine[]> {
+export function readerPieceLines(a: { propertyId: string | null; cents: number; side: 'dr' | 'cr' }): DesiredLine[] {
   if (!a.cents) return []
-  const memo = READER_PIECE_MEMO
-  if (a.propertyId) return (a.side === 'dr' ? dr : cr)('supplies', a.cents, { propertyId: a.propertyId, memo })
-  const spread = await companyCostSpread(client, a.landlordId, a.day, a.recorded)
-  return (a.side === 'dr' ? drSpread : crSpread)('supplies', a.cents, spread, { memo })
+  return (a.side === 'dr' ? dr : cr)('supplies', a.cents, { propertyId: a.propertyId, memo: READER_PIECE_MEMO })
 }
 
 /** The expense each GAM charge kind is (null: posts nothing of its own). */
@@ -145,7 +141,9 @@ export const payoutGamChargeProjector: LedgerProjector = {
   // 10/12 (Nic, review): 2 — a charge on no property follows the company's
   // choice for company-level costs (Nic L7). 10/13 (Nic): 3 — a reader piece
   // posts nothing of its own (its collection does); the Company column by default.
-  ruleVersion: 3,
+  // 10/13 (Nic): 4 — a charge on no property is GAM's own company-wide charge:
+  // the Company column, never a setting.
+  ruleVersion: 4,
 
   async project(client: PoolClient, chargeId: string): Promise<DesiredPosting[]> {
     const c = (await client.query<{
@@ -167,15 +165,13 @@ export const payoutGamChargeProjector: LedgerProjector = {
       ? DISPUTED_PULL_COST_MEMO
       : CHARGE_MEMO[c.kind]
     const at = { propertyId: c.property_id }
-    // 10/12 (Nic, review; Nic L7): a charge on no property (the bank cost of a
-    // pull, a failed pull's cost) is a company-level cost — a Company column of
-    // its own, or split across the properties by units, as the owner chose for
-    // money out, loans and payroll (10/13: the Company column until they
-    // choose; a later split only for charges made after it). What is owed to
-    // GAM stays at company level.
+    // 10/13 (Nic): a charge on no property (the bank cost of a pull, a failed
+    // pull's cost) is GAM's own company-wide charge — nobody logs it, so no one
+    // picks where it goes: the Company column. What is owed to GAM stays at
+    // company level too.
     const cost = c.property_id
       ? dr(role, amt, { ...at, memo })
-      : drSpread(role, amt, await companyCostSpread(client, c.landlord_id, c.day, { at: c.created_at }), { memo })
+      : drSpread(role, amt, COMPANY_COLUMN, { memo })
     return [{ owner: { landlordId: c.landlord_id }, intendedDate: c.day, memo, lines: [
       ...cost, ...cr('due_to_gam', amt, { ...at, memo: 'Owed to GAM' }),
     ] }]
@@ -226,11 +222,11 @@ export const payoutGamDebitProjector: LedgerProjector = {
         // 10/13 (Nic): a card reader piece is a Supplies expense in the month
         // GAM collected it — this pull's day — and comes back off if the bank
         // takes the pull back. Each cost sits beside the line that paid it.
-        const piece = { landlordId: d.landlord_id, propertyId: r.property_id, cents: v, day: d.day, recorded: { at: d.settled_at } }
-        lines.push(...await readerPieceLines(client, { ...piece, side: 'dr' }))
+        const piece = { propertyId: r.property_id, cents: v }
+        lines.push(...readerPieceLines({ ...piece, side: 'dr' }))
         lines.push(...cr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees, until the bank line matches it' }))
         back.push(...dr('outstanding_checks', v, { propertyId: r.property_id, memo: 'Bank pull of GAM\'s fees your bank took back, until the bank line of the return matches it' }))
-        back.push(...await readerPieceLines(client, { ...piece, side: 'cr' }))
+        back.push(...readerPieceLines({ ...piece, side: 'cr' }))
         continue
       }
       lines.push(...dr('due_to_gam', v, { propertyId: r.property_id, memo: 'GAM charges paid by a bank pull' }))

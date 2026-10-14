@@ -31,7 +31,7 @@ import { createLandlordExpense, insertPayment } from './landlordExpenses'
 import { resolveCategory, type ResolvedCategory } from './booksCategories'
 import { payoutCompositions } from './payoutComposition'
 import type { PoolClient } from 'pg'
-import type { MerchantRuleScope, BankTxnBankStatus } from '@gam/shared'
+import type { MerchantRuleScope, BankTxnBankStatus, BankFilingScope } from '@gam/shared'
 import { OTHER_INCOME_CATEGORIES, BANK_TXN_HIDDEN_REASONS, isRentChannelPayer, BOOKS_LOAN_MATCH_WINDOW_DAYS } from '@gam/shared'
 import { payableRowSql, bankPayableRowSql } from './moneyPredicates'
 import { BANK_BOILERPLATE_WORDS, memoSaysTransfer } from './bankDepositMatch'
@@ -470,6 +470,10 @@ export async function upsertTransactions(
     const { alertMatchedDepositVoided } = await import('./bankDepositConfirm')
     const { alertSlipDepositVoided } = await import('./depositSlips')
     for (const r of voided) {
+      // 10/13 evening (Nic): "Bank takes back a bounced deposit that was
+      // MATCHED to income: void what bounced." Taken back by itself where GAM
+      // can (voidWhatBounced); otherwise told, as before.
+      if (r.kind && await voidWhatBounced(r.id)) continue
       if (r.kind === 'tenant') await alertMatchedDepositVoided(r.id)
       else if (r.kind === 'slip') await alertSlipDepositVoided(r.id)
     }
@@ -646,6 +650,121 @@ export async function voidIncomeOfBankVoidedLine(client: Pick<PoolClient, 'query
             updated_at = now()
       WHERE id = $1`, [t.id, JSON.stringify(mark)])
   return { voided: v.rowCount ?? 0, released: true }
+}
+
+/**
+ * 10/13 evening (Nic): "Bank takes back a bounced deposit that was MATCHED to
+ * income: void what bounced." The counterpart of a deposit FILED as income
+ * (voidIncomeOfBankVoidedLine): a deposit MATCHED to money on record that the
+ * bank then voids never came in, so what it was matched to is taken back — by
+ * itself now; it used to stay as paid, with the owner and GAM told to Undo it
+ * by hand. The exact Undo of the match runs (bankDepositConfirm undoDepositMatch,
+ * `bankVoided`), and the line is set aside as the bank's void:
+ *
+ *   - a deposit that paid a tenant's bills (a tenant's report, or one the
+ *     owner or the feed confirmed): its receipt is closed as taken back (kept
+ *     on record), every bill line it paid is owed again, and what the match
+ *     changed (late fees, credits, the report) goes back as it was; the tenant
+ *     is told;
+ *   - a deposit slip of other money alone (the question's own example: $200
+ *     of laundry cash): that money (filed as other income when it matched) is voided,
+ *     kept on record as voided, and the slip is open again for the bag.
+ *
+ * NOT TAKEN BACK — left for the owner, told as before (bankDepositConfirm
+ * alertMatchedDepositVoided, depositSlips alertSlipDepositVoided), because GAM
+ * has no way yet to take back a payment recorded at the desk (10/13 review;
+ * the open questions to Nic):
+ *   - a deposit tied to a payment the office logged by hand (a "Bank deposit"
+ *     receipt — kind 'recorded_deposit'): that payment stays paid;
+ *   - a deposit slip, or the office's cash GAM worked out, with payments or
+ *     register sales in it: the whole bag stays as it is, other money too —
+ *     voiding only the other money would treat money from one bag two ways;
+ *   - a check returned on a bank line of its own (part of a deposit bouncing)
+ *     is not handled at all: it arrives as money out, for review.
+ * Nor a GAM payout, or any match the Undo refuses because something changed
+ * since (a bill paid again, the paid-ahead money already used). Runs after the
+ * sync commits, each in its own transaction. Returns whether it was taken back;
+ * never throws.
+ */
+export async function voidWhatBounced(lineId: string): Promise<boolean> {
+  try {
+    const t = await queryOne<{ landlord_id: string; status: string; bank_status: string | null; kind: string | null; disbursement: string | null; matched_kind: string | null }>(
+      `SELECT landlord_id, status, bank_status, auto_settle_undo->>'kind' AS kind,
+              matched_disbursement_id AS disbursement, matched_kind
+         FROM bank_transactions WHERE id = $1`, [lineId])
+    if (!t || t.status !== 'matched' || t.bank_status !== 'void' || t.disbursement || t.matched_kind) return false
+    if (t.kind === 'recorded_deposit') return false
+    const { undoDepositMatch } = await import('./bankDepositConfirm')
+    const r = await undoDepositMatch({ bankTransactionId: lineId, landlordId: t.landlord_id, undoneBy: null, bankVoided: true })
+    await tellOwnerWhatBounced(lineId, r)
+    logger.info({ transactionId: lineId, kind: r.kind, reopened: r.reopenedChargeIds.length },
+      '[bank-feed] the bank voided a matched deposit — what it was matched to was taken back')
+    return true
+  } catch (err) {
+    // A refusal in words (desk payments in the bag, something changed since) is
+    // expected; anything else is worth a look.
+    const refused = err instanceof AppError
+    logger[refused ? 'info' : 'warn']({ err, transactionId: lineId },
+      '[bank-feed] the bank voided a matched deposit and its match could not be taken back by itself — the owner is told instead')
+    return false
+  }
+}
+
+/**
+ * The owner is told what a bank-voided matched deposit took back
+ * (voidWhatBounced), once, in the portal's notices. Never throws.
+ */
+async function tellOwnerWhatBounced(
+  lineId: string, r: { kind: string; reopenedChargeIds: string[] },
+): Promise<void> {
+  try {
+    const t = await queryOne<{ landlord_id: string; owner_user_id: string | null; amount: string; day: string; was: any }>(
+      `SELECT bt.landlord_id, l.user_id AS owner_user_id, bt.amount::text AS amount,
+              to_char(bt.posted_date, 'FMMon FMDD, YYYY') AS day, bt.auto_settle_undo->'was' AS was
+         FROM bank_transactions bt JOIN landlords l ON l.id = bt.landlord_id WHERE bt.id = $1`, [lineId])
+    if (!t?.owner_user_id) return
+    const amount = `$${(Math.abs(cents(t.amount)) / 100).toFixed(2)}`
+    const { createNotification } = await import('./notifications')
+    if (r.kind === 'deposit_slip') {
+      // Only a slip of other money alone is taken back by itself (bankDepositConfirm
+      // undoDepositMatch refuses a bag with payments or register sales in it).
+      const slip = t.was?.slipId ? await queryOne<{ day: string | null; status: string }>(
+        `SELECT to_char(s.deposit_date, 'FMMon FMDD, YYYY') AS day, s.status
+           FROM bank_deposit_slips s WHERE s.id = $1`, [t.was.slipId]) : null
+      const other = t.was?.otherIncomeId ? await queryOne<{ amount: string; note: string | null }>(
+        `SELECT amount::text AS amount, NULLIF(TRIM(description), '') AS note FROM landlord_other_income WHERE id = $1`,
+        [t.was.otherIncomeId]) : null
+      await createNotification({
+        userId: t.owner_user_id, landlordId: t.landlord_id, type: 'bank_deposit_voided',
+        title: 'Your bank took back an office deposit',
+        body: `Your bank voided the ${amount} deposit of ${t.day} that was matched to your deposit slip${slip?.day ? ` of ${slip.day}` : ''} — the money did not come in. `
+          + (other ? `GAM voided the $${(cents(other.amount) / 100).toFixed(2)}${other.note ? ` (${other.note})` : ''} it was filed as; it stays on record as voided. ` : 'GAM took the match off. ')
+          + (slip?.status === 'open' ? 'The slip is open again for the deposit when it reaches the bank. ' : '')
+          + 'Find out what happened to that deposit.',
+        actionUrl: '/bank',
+        data: { bank_transaction_id: lineId, slip_id: t.was?.slipId ?? null, other_income_id: t.was?.otherIncomeId ?? null },
+      })
+      return
+    }
+    const who = r.reopenedChargeIds.length ? await queryOne<{ name: string | null; spaces: string | null }>(
+      `SELECT (SELECT NULLIF(TRIM(COALESCE(usr.first_name,'') || ' ' || COALESCE(usr.last_name,'')), '')
+                 FROM payments p JOIN tenants tn ON tn.id = p.tenant_id JOIN users usr ON usr.id = tn.user_id
+                WHERE p.id = ANY($1::uuid[]) ORDER BY p.id LIMIT 1) AS name,
+              (SELECT string_agg(DISTINCT un.unit_number, ', ' ORDER BY un.unit_number)
+                 FROM payments p JOIN units un ON un.id = p.unit_id WHERE p.id = ANY($1::uuid[])) AS spaces`,
+      [r.reopenedChargeIds]) : null
+    const whose = who?.name ? `${who.name}${who.spaces ? ` (${who.spaces})` : ''}` : who?.spaces ? `the household at ${who.spaces}` : 'a tenant'
+    await createNotification({
+      userId: t.owner_user_id, landlordId: t.landlord_id, type: 'bank_deposit_voided',
+      title: 'Your bank took back a deposit that paid rent',
+      body: `Your bank voided the ${amount} deposit of ${t.day} that was matched to ${whose}'s bills — the money did not come in. `
+        + 'GAM took it back off those bills: they are owed again, and the payment stays on record as taken back. Your tenant was told.',
+      actionUrl: '/bank',
+      data: { bank_transaction_id: lineId, payment_ids: r.reopenedChargeIds },
+    })
+  } catch (err) {
+    logger.error({ err, lineId }, '[bank-feed] could not tell the owner what a bank-voided deposit took back')
+  }
 }
 
 /**
@@ -1472,7 +1591,8 @@ type CategorizeInput = {
   category: string
   /** 10/12 (Nic, L5): one of the company's own categories (wins over `category`). */
   categoryId?: string | null
-  scopeKind: MerchantRuleScope
+  /** 10/13 (Nic): money going out may also be split across the properties by units. */
+  scopeKind: BankFilingScope
   unitId?: string | null
   propertyId?: string | null
   vendor?: string | null
@@ -1579,7 +1699,12 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
       let unitId: string | null = null
       let propertyId: string | null = null
       let isCommon = false
-      if (input.scopeKind === 'unit') {
+      if (input.scopeKind === 'split_by_units') {
+        // 10/13 (Nic): "each expense is chosen on the split or specific unit
+        // or property at the time of logging" — split across the company's
+        // properties by units, naming none of them.
+        if (input.unitId || input.propertyId) throw new AppError(400, 'A cost split across your properties names no one property or unit.')
+      } else if (input.scopeKind === 'unit') {
         if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
         unitId = input.unitId
       } else {
@@ -1621,6 +1746,8 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
         vendor: input.vendor ?? (vendors.length === 1 ? vendors[0] : null) ?? txn.normalized_merchant ?? null,
         expenseDate: txn.posted_date_str,
         isCommon,
+        // 10/13 (Nic): where the person filing it said the cost goes.
+        costPlace: input.scopeKind === 'split_by_units' ? 'split_by_units' : null,
         utilityType: cat.legacyKey === 'utilities' && utilityTypes.length === 1 ? utilityTypes[0] : null,
         // 10/12 (Nic, L5): the bank line pays it (below), whole, on the bank's day.
         payment: null,
@@ -1656,7 +1783,11 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
   // Remember the merchant choice (outside the txn — a best-effort learning write).
   if (remembered) {
     await rememberMerchantChoice(landlordId, remembered.normalizedMerchant, {
-      category: remembered.category.legacyKey, categoryId: remembered.category.id, scopeKind: input.scopeKind,
+      // 10/13 (Nic): a split across the properties is never a rule's — the
+      // rule keeps "whole property" with no property (and a money-out line
+      // is never pre-filled with a place: listTransactions).
+      category: remembered.category.legacyKey, categoryId: remembered.category.id,
+      scopeKind: input.scopeKind === 'split_by_units' ? 'property_common' : input.scopeKind,
       propertyId: remembered.propertyId, unitId: remembered.unitId,
       direction: remembered.direction, description: remembered.description,
     })
@@ -1707,6 +1838,8 @@ async function fileAsIncome(client: PoolClient, landlordId: string, txn: any, in
 async function placeIncome(client: PoolClient, landlordId: string, input: {
   scopeKind: MerchantRuleScope | string; unitId?: string | null; propertyId?: string | null
 }): Promise<{ unitId: string | null; propertyId: string | null; rowPropertyId: string | null; isCommon: boolean }> {
+  // 10/13: a split across the properties is for a cost going out.
+  if (input.scopeKind === 'split_by_units') throw new AppError(400, 'Money coming in is filed on a unit or a property.')
   if (input.scopeKind === 'unit') {
     if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
     const u = (await client.query<{ property_id: string; landlord_id: string }>(
@@ -1759,7 +1892,8 @@ export type SplitPartInput = {
   /** 10/12 (Nic, L5): one of the company's own categories (wins over `category`). */
   categoryId?: string | null
   amount: number
-  scopeKind: MerchantRuleScope
+  /** 10/13 (Nic): a part going out may also be split across the properties by units. */
+  scopeKind: BankFilingScope
   unitId?: string | null
   propertyId?: string | null
   description?: string | null
@@ -1908,7 +2042,11 @@ export async function splitTransaction(landlordId: string, txnId: string, parts:
       const c = Math.round(Number(part.amount) * 100)
       if (!Number.isFinite(c) || c <= 0) throw new AppError(400, `Part ${n}: enter an amount above $0.00`)
       if (Math.abs(Number(part.amount) * 100 - c) > 1e-6) throw new AppError(400, `Part ${n}: an amount is dollars and cents`)
-      if (part.scopeKind === 'unit' ? !part.unitId : !part.propertyId) {
+      if (part.scopeKind === 'split_by_units') {
+        // 10/13 (Nic): a part going out may be split across the properties by units.
+        if (moneyIn) throw new AppError(400, `Part ${n}: money coming in is filed on a unit or a property`)
+        if (part.unitId || part.propertyId) throw new AppError(400, `Part ${n}: a part split across your properties names no one property or unit`)
+      } else if (part.scopeKind === 'unit' ? !part.unitId : !part.propertyId) {
         throw new AppError(400, part.scopeKind === 'unit' ? `Part ${n}: pick a unit` : `Part ${n}: pick a property`)
       }
       sumCents += c
@@ -1999,14 +2137,16 @@ export async function splitTransaction(landlordId: string, txnId: string, parts:
         // createLandlordExpense checks the unit/property belong to this landlord.
         const expense = await which(() => createLandlordExpense({
           landlordId, createdBy: opts.by ?? null,
-          propertyId: part.scopeKind === 'unit' ? null : part.propertyId ?? null,
+          propertyId: part.scopeKind === 'unit' || part.scopeKind === 'split_by_units' ? null : part.propertyId ?? null,
           unitId: part.scopeKind === 'unit' ? part.unitId ?? null : null,
+          // 10/13 (Nic): where the person splitting the line said this part goes.
+          costPlace: part.scopeKind === 'split_by_units' ? 'split_by_units' : null,
           categoryId: partCats[i].id, amount: partAmount,
           description: part.description ?? txn.description ?? null,
           // The vendor the owner put on what this replaces, when they all named one.
           vendor: vendors.length === 1 ? vendors[0] : txn.normalized_merchant ?? null,
           expenseDate: txn.posted_date_str,
-          isCommon: part.scopeKind !== 'unit',
+          isCommon: part.scopeKind === 'property_common' || part.scopeKind === 'property_allocate',
           utilityType: partCats[i].legacyKey === 'utilities' && utilityTypes.length === 1 ? utilityTypes[0] : null,
           bankTransactionId: txnId,
         }, client))
@@ -2529,8 +2669,14 @@ export async function listTransactions(landlordId: string, opts: {
             -- S655: why it is ignored, and what the bank says about it
             bt.ignored_reason, bt.bank_status,
             c.display_name AS connection_name,
-            r.category AS suggested_category, r.scope_kind AS suggested_scope_kind,
-            r.property_id AS suggested_property_id, r.unit_id AS suggested_unit_id,
+            r.category AS suggested_category,
+            -- 10/13 (Nic): "each expense is chosen on the split or specific
+            -- unit or property at the time of logging. there should never be a
+            -- default setting to apply expenses." A money-out line is never
+            -- pre-filled with where it goes (the category still is).
+            CASE WHEN bt.amount > 0 THEN r.scope_kind END AS suggested_scope_kind,
+            CASE WHEN bt.amount > 0 THEN r.property_id END AS suggested_property_id,
+            CASE WHEN bt.amount > 0 THEN r.unit_id END AS suggested_unit_id,
             -- S655: what a matched row was matched TO. The page called every
             -- matched row a GAM payout, including a tenant's own cash deposit.
             -- S655 (Step 12): a bank deposit slip, and a deposit that filed
@@ -2554,6 +2700,8 @@ export async function listTransactions(landlordId: string, opts: {
             COALESCE(foi.category, fe.category) AS filed_category,
             COALESCE(foi.property_id, fe.property_id) AS filed_property_id,
             COALESCE(foi.unit_id, fe.unit_id) AS filed_unit_id,
+            -- 10/13 (Nic): a money-out line split across the properties by units.
+            fe.cost_place AS filed_cost_place,
             parts.split_parts,
             -- 10/12 (Nic, L5): the company's own category it was filed under, and
             -- what a money-out line was matched to (expenses it paid, GAM's
@@ -2586,12 +2734,12 @@ export async function listTransactions(landlordId: string, opts: {
                   'id', x.id, 'category', x.category, 'amount', x.amount::float,
                   'property_id', x.property_id, 'unit_id', x.unit_id, 'description', x.description,
                   'property_name', pp.name, 'unit_number', pu.unit_number,
-                  'category_id', x.category_id, 'category_name', pc.name)
+                  'category_id', x.category_id, 'category_name', pc.name, 'cost_place', x.cost_place)
                 ORDER BY x.amount DESC, x.category, x.id) AS split_parts
-           FROM (SELECT id, category, category_id, amount, property_id, unit_id, description FROM landlord_other_income
+           FROM (SELECT id, category, category_id, amount, property_id, unit_id, description, NULL::text AS cost_place FROM landlord_other_income
                   WHERE bank_transaction_id = bt.id AND status = 'active'
                  UNION ALL
-                 SELECT id, category, category_id, amount, property_id, unit_id, description FROM landlord_expenses
+                 SELECT id, category, category_id, amount, property_id, unit_id, description, cost_place FROM landlord_expenses
                   WHERE bank_transaction_id = bt.id AND status = 'active') x
            LEFT JOIN properties pp ON pp.id = x.property_id
            LEFT JOIN units pu ON pu.id = x.unit_id

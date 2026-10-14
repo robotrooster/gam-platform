@@ -176,6 +176,7 @@ describe('cash flow: a check is read by what it paid for', () => {
     const connectionId = (await db.query<{ id: string }>(
       `INSERT INTO bank_connections (landlord_id, provider, status, display_name) VALUES ($1, 'stripe_fc', 'active', 'Operating') RETURNING id`,
       [co.landlordId])).rows[0].id
+    // 10/13 review: an owner draw is not a cost — never split; put on the company (no place), company level.
     const e = await createLandlordExpense({
       landlordId: co.landlordId, category: 'owner_draw', amount: 400, expenseDate: '2026-10-01',
       payment: { method: 'check', paidOn: '2026-10-01' },
@@ -210,8 +211,12 @@ describe('tax: given back to a customer comes off Collected, never "paid"', () =
   })
 })
 
-describe('GAM\'s company-level charges follow the company\'s choice (Nic L7)', () => {
-  it('split by units: the bank cost of a pull is spread across the properties; with no choice yet it goes to the Company column (10/13, Nic)', async () => {
+// 10/13 (Nic): "except gams charge all those costs get logged by a person" —
+// GAM's own company-wide charges are the costs nobody logs: the Company
+// column, never a setting ("there should never be a default setting to apply
+// expenses"; the old company-costs choice is retired and read by nothing).
+describe('GAM\'s company-level charges go to the Company column (10/13, Nic)', () => {
+  it('the bank cost of a pull stays in the Company column, whatever the retired setting says; nothing waits on a choice', async () => {
     const co = await tenantCo()
     await addLease(co)   // a unit on the second property
     await db.query(`UPDATE landlords SET books_company_costs_method = 'split_by_units' WHERE id = $1`, [co.landlordId])
@@ -226,12 +231,10 @@ describe('GAM\'s company-level charges follow the company\'s choice (Nic L7)', (
         WHERE p.source_type = 'gam_charge' AND p.source_id = $1 AND p.role = 'post' AND p.superseded_at IS NULL
           AND l.account_role <> 'interproperty_clearing'
         ORDER BY l.account_role, l.property_id`, [id])).rows
-    expect(ls.filter(l => l.role === 'bank_fees').map(l => [l.property_id, l.dr]).sort())
-      .toEqual([[co.propertyId, 3], [co.propertyId2, 3]].sort())
+    expect(ls.filter(l => l.role === 'bank_fees').map(l => [l.property_id, l.dr])).toEqual([[null, 6]])
     expect(ls.filter(l => l.role === 'due_to_gam')).toEqual([{ role: 'due_to_gam', property_id: null, dr: 0, cr: 6 }])
 
-    // 10/13 (Nic): "Company-level costs before the owner picks: post to the
-    // COMPANY column by default" — nothing waits on the choice.
+    // With the old column empty too: the Company column — nothing waits on a choice.
     const none = await tenantCo()
     await db.query(`UPDATE landlords SET books_company_costs_method = NULL WHERE id = $1`, [none.landlordId])
     const unpicked = await charge(none.landlordId)

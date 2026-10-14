@@ -28,7 +28,7 @@ import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
 import { currentBillMonth, addMonths } from '../services/householdMonths'
 import { lateFeeTermsText, latenessPattern, median, firstLateDayText } from '../services/tenantPaymentReport'
-import { splitRegisterMoney } from '../services/rentRoll'
+import { splitRegisterMoney, registerBillBackOf, unitInName, type RegisterSale } from '../services/rentRoll'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret'
 
@@ -629,6 +629,9 @@ async function sale(p: { landlordId: string; userId: string; propertyId: string 
   method: 'cash' | 'card' | 'check' | 'charge'; total: number; surcharge?: number; day: string; items: string[]
   customer?: string; tenantId?: string; payLink?: { label?: string; customerName?: string | null }; paidOnline?: boolean
   voided?: boolean; stays?: Array<{ bookingId: string; toward: number }>; screening?: number
+  /** The sale's line items as the register writes them (else each of `items` at $1). */
+  lines?: Array<{ name: string; category?: string; qty: number; price: number; itemId?: string }>
+  tax?: number; taxBreakdown?: Array<{ name: string; rate: number; amount: number }>
 }) {
   const at = `${o.day} 12:00:00-07`
   let linkId: string | null = null
@@ -650,12 +653,22 @@ async function sale(p: { landlordId: string; userId: string; propertyId: string 
   const pi = o.method === 'card' ? `pi_${randomUUID()}` : null
   const id = (await db.query<{ id: string }>(
     `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, surcharge, total, property_id, pay_link_id,
-                                   stripe_payment_intent_id, status, voided_at, created_at, paid_online, pos_customer_id, tenant_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15) RETURNING id`,
-    [p.landlordId, p.userId, o.method, o.total - (o.surcharge ?? 0), o.surcharge ?? 0, o.total, p.propertyId, linkId, pi,
-     o.voided ? 'voided' : 'completed', o.voided ? at : null, at, o.paidOnline === true, customerId, o.tenantId ?? null])).rows[0].id
-  for (const name of o.items) {
-    await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,1,1,1)`, [id, name])
+                                   stripe_payment_intent_id, status, voided_at, created_at, paid_online, pos_customer_id, tenant_id,
+                                   tax_amount, tax_breakdown)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15,$16,$17::jsonb) RETURNING id`,
+    [p.landlordId, p.userId, o.method, o.total - (o.surcharge ?? 0) - (o.tax ?? 0), o.surcharge ?? 0, o.total, p.propertyId, linkId, pi,
+     o.voided ? 'voided' : 'completed', o.voided ? at : null, at, o.paidOnline === true, customerId, o.tenantId ?? null,
+     o.tax ?? 0, o.taxBreakdown ? JSON.stringify(o.taxBreakdown) : null])).rows[0].id
+  if (o.lines) {
+    for (const l of o.lines) {
+      await db.query(
+        `INSERT INTO pos_transaction_items (transaction_id, item_id, item_name, item_category, qty, unit_price, subtotal)
+         VALUES ($1,$2,$3,$4,$5,$6,ROUND($5::numeric * $6::numeric, 2))`, [id, l.itemId ?? null, l.name, l.category ?? 'misc', l.qty, l.price])
+    }
+  } else {
+    for (const name of o.items) {
+      await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,1,1,1)`, [id, name])
+    }
   }
   for (const s of o.stays ?? []) {
     await db.query(
@@ -1043,8 +1056,9 @@ describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
     ])
     expect(d.movedOutOwing.map((m: any) => [m.spaces, m.residents[0].name, m.owed])).toEqual([[['RV 40'], 'Owen Owes', 495]])
     // 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — Owen's
-    // bill in the range is in the property's Invoiced and Owed; the month's
-    // counts are the rows'.
+    // bill in the range is in the property's Invoiced and Owed; and (round 3:
+    // "Rent Roll month counts INCLUDE the moved-out folder") in the month's
+    // counts too.
     expect(d.totals).toMatchObject({ invoiced: 1485, paid: 990, owed: 495 })
     // 10/13 review: and says which part is theirs, so the export's Total adds up.
     const zero = { invoiced: 0, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 0 }
@@ -1054,10 +1068,12 @@ describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
       expect(d.rows.reduce((s: number, r: any) => s + r[k], 0) + d.movedOutTotals[k], k).toBe(d.totals[k])
     }
     const counts = Object.fromEntries(d.monthCounts[0].counts.map((c: any) => [c.status, c.households]))
-    expect(counts).toMatchObject({ paid: 2, owes: 0, due: 0 })
+    expect(counts).toEqual({ paid: 2, paid_late: 0, partial: 0, owes: 1, due: 0 })
     // A folder household billed outside the range adds nothing to it.
     const before = (await history(owner(p), p.propertyId, `from=${addMonths(LAST, -1)}&to=${addMonths(LAST, -1)}`)).body.data
     expect(before.movedOutOwing.map((m: any) => m.residents[0].name)).toEqual(['Owen Owes'])
+    expect(Object.fromEntries(before.monthCounts[0].counts.map((c: any) => [c.status, c.households])))
+      .toEqual({ paid: 0, paid_late: 0, partial: 0, owes: 0, due: 0 })
     expect(before.totals).toMatchObject({ invoiced: 0, paid: 0, owed: 0 })
     expect(before.movedOutOwing[0].inRange).toEqual(zero)
     expect(before.movedOutTotals).toEqual(zero)
@@ -1533,5 +1549,574 @@ describe('the profile\'s Payment History: the household, a page at a time', () =
     const dues = [...one.payments, ...two.payments].map((x: any) => String(x.due_date).slice(0, 10))
     expect([...dues].sort().reverse()).toEqual(dues)
     expect((await page('?historyPage=0')).status).toBe(400)
+  })
+})
+
+// ─── 10/13 (Nic), round 3 ────────────────────────────────────────────────────
+
+describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
+  /** A one-time pay link for a stay's balance (services/stayBalance's), billed on `day` and unpaid. */
+  async function balanceLink(p: { landlordId: string; userId: string; propertyId: string }, bookingId: string, amount: number,
+                             day: string, status: 'open' | 'expired' | 'cancelled' = 'open') {
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email, booking_id, status)
+       VALUES ($1,$2,$3,$4,'one_time','Stay balance','[]'::jsonb,$5,$5,'guest@t.dev',$6,$7) RETURNING id`,
+      [randomUUID(), p.landlordId, p.propertyId, p.userId, amount, bookingId, status])).rows[0].id
+    await db.query(`UPDATE unit_bookings SET balance_billed_at = $2::timestamptz, balance_pay_link_id = $3 WHERE id = $1`,
+      [bookingId, `${day} 07:00:00-07`, id])
+    return id
+  }
+
+  it('a stay row says what is still owed on it; what is owed now — billed, or from arrival day — is its Owed, at the top, money this month or not', async () => {
+    const p = await park()
+    const lena = await household(p, 'RV 1', 'Lena Lease')
+    await rent(p, lena, THIS, 495, 1)
+    // RV 30: booked online last month ($120 deposit then); the $360 balance billed on its pay link on arrival this month, still open.
+    const rv30 = await space(p, 'RV 30')
+    const bea = await stayAt(p, rv30, { guest: 'Bea Balance', checkIn: `${THIS}-01`, nights: 7, status: 'confirmed', leaseType: 'weekly' })
+    await siteDepositOn(p, bea, 120, `${LAST}-20`)
+    await db.query(`UPDATE unit_bookings SET total_amount = 480, deposit_amount = 120, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [bea, `${LAST}-20 12:00:00-07`])
+    await balanceLink(p, bea, 360, `${THIS}-01`)
+    // RV 31: paid in full at the register this month — nothing owed.
+    const rv31 = await space(p, 'RV 31')
+    const paul = await stayAt(p, rv31, { guest: 'Paul Paidup', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    await registerSale(p, paul, { method: 'cash', toward: 300, day: `${THIS}-01` })
+    await db.query(`UPDATE unit_bookings SET total_amount = 300, balance_paid_at = $2::timestamptz WHERE id = $1`, [paul, `${THIS}-01 12:00:00-07`])
+    // RV 33: a deposit paid this month for a stay not here yet — the rest is still owed, but not until arrival
+    // (S649: the balance generates on arrival day).
+    const rv33 = await space(p, 'RV 33')
+    const dee = await stayAt(p, rv33, { guest: 'Dee Deposit', checkIn: `${addMonths(THIS, 1)}-03`, nights: 4, status: 'confirmed' })
+    await siteDepositOn(p, dee, 50, `${THIS}-01`)
+    await db.query(`UPDATE unit_bookings SET total_amount = 200, deposit_amount = 50, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [dee, `${THIS}-01 12:00:00-07`])
+    // RV 32: canceled with its balance link never paid — owed by nobody, not on the page.
+    const rv32 = await space(p, 'RV 32')
+    const cy = await stayAt(p, rv32, { guest: 'Cy Canceled', checkIn: `${THIS}-01`, nights: 7, status: 'cancelled', leaseType: 'weekly' })
+    await db.query(`UPDATE unit_bookings SET total_amount = 480, deposit_amount = 120, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [cy, `${LAST}-20 12:00:00-07`])
+    await balanceLink(p, cy, 360, `${THIS}-01`)
+    // RV 34: a billed balance whose link was canceled — not shown as owed here.
+    const rv34 = await space(p, 'RV 34')
+    const kit = await stayAt(p, rv34, { guest: 'Kit Linkcanceled', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    await db.query(`UPDATE unit_bookings SET total_amount = 480, deposit_amount = 120, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [kit, `${LAST}-20 12:00:00-07`])
+    await balanceLink(p, kit, 360, `${THIS}-01`, 'cancelled')
+    // RV 35: a stay that is over, its balance link unpaid, nothing paid this month — not on the open month,
+    // as a household that moved out is not.
+    const rv35 = await space(p, 'RV 35')
+    const olaf = await stayAt(p, rv35, { guest: 'Olaf Over', checkIn: `${LAST}-20`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    await db.query(`UPDATE unit_bookings SET total_amount = 480, deposit_amount = 120, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [olaf, `${LAST}-10 12:00:00-07`])
+    await balanceLink(p, olaf, 360, `${LAST}-20`)
+    // RV 36: here since the 1st, its deposit paid last month, its balance never billed (no email to send it to) — owed now.
+    const rv36 = await space(p, 'RV 36')
+    const hal = await stayAt(p, rv36, { guest: 'Hal Here', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    await siteDepositOn(p, hal, 100, `${LAST}-20`)
+    await db.query(`UPDATE unit_bookings SET total_amount = 300, deposit_amount = 100, deposit_paid_at = $2::timestamptz WHERE id = $1`,
+      [hal, `${LAST}-20 12:00:00-07`])
+
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    const row = (key: string) => d.rows.find((r: any) => r.key === key)
+    // Owing now first — the stays owing now, in space order — then every other row in its spot.
+    expect(d.rows.slice(0, 2).map((r: any) => [r.key, r.space, r.status, r.occupant, r.paid, r.owed, r.invoiced])).toEqual([
+      [`stay:${bea}`, 'RV 30', 'stay', 'Bea Balance', 0, 360, 0],
+      [`stay:${hal}`, 'RV 36', 'stay', 'Hal Here', 0, 200, 0],
+    ])
+    expect(row(`stay:${bea}`).stay).toMatchObject({ owed: 360, balanceBilledOn: `${THIS}-01`, statusLabel: 'Confirmed' })
+    expect(row(`stay:${hal}`).stay).toMatchObject({ owed: 200, balanceBilledOn: null, statusLabel: 'Checked in' })
+    // Dee: the rest of her stay is shown on the stay, owed from her arrival — nothing owed now, so in its spot.
+    expect(row(`stay:${dee}`)).toMatchObject({ paid: 50, owed: 0, stay: { owed: 150, balanceBilledOn: null, checkIn: `${addMonths(THIS, 1)}-03` } })
+    const keys = d.rows.map((r: any) => r.key)
+    expect(keys.indexOf(`stay:${dee}`)).toBeGreaterThan(keys.indexOf(`stay:${paul}`))
+    expect(row(`stay:${paul}`)).toMatchObject({ paid: 300, owed: 0, stay: { owed: 0, balanceBilledOn: null } })
+    expect(row(`stay:${cy}`)).toBeUndefined()
+    expect(row(`stay:${kit}`)).toBeUndefined()
+    expect(row(`stay:${olaf}`)).toBeUndefined()
+    // A stay is never a delinquent household, and the desk never takes its money.
+    expect(row(`stay:${bea}`)).toMatchObject({ delinquent: false, recordWith: null })
+    // The stays' Owed is its own sum; the bills still add up without it.
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 350, staysOwed: 560 })
+  })
+})
+
+describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go ON that space\'s row"', () => {
+  it('a sale whose words name one of the property\'s spaces is on that space\'s row; only money with no space stays in the folder', async () => {
+    const p = await park()
+    const lena = await household(p, 'RV 1', 'Lena Lease')
+    await rent(p, lena, THIS, 495, 1)
+    const rv2 = await space(p, 'RV 2')
+    const rv27 = await space(p, 'RV 27')
+    // Andres Razo's pay link — a month and September's electric at RV 27 (empty now), by card online.
+    const andres = await sale(p, {
+      method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true,
+      items: ['RV site — monthly', 'Electric (per kWh)', 'Electric (per kWh) — September, RV 27'], payLink: { customerName: 'Andres Razo' },
+    })
+    const back = await registerRefund(p, andres, 10, `${THIS}-02`)
+    // A sale naming Lena's space ("rv01" is RV 1): on her household's row, beside her bills.
+    const lenas = await sale(p, { method: 'cash', total: 20, day: `${THIS}-02`, items: ['Propane — rv01'] })
+    // A stay paid on a ticket naming its site, with propane: the propane is on the stay's row too.
+    const rv10 = await space(p, 'RV 10')
+    const rhea = await stayAt(p, rv10, { guest: 'Rhea Register', checkIn: `${THIS}-01`, nights: 7, status: 'checked_in', leaseType: 'weekly' })
+    const ticket = await sale(p, { method: 'cash', total: 320, day: `${THIS}-01`, items: ['RV site — weekly — 7 nights at site RV 10', 'Propane'],
+      stays: [{ bookingId: rhea, toward: 300 }] })
+    // The folder: propane to a walk-in (no space), a sale naming two spaces, a space that is not this property's.
+    const walkIn = await sale(p, { method: 'cash', total: 23.92, day: `${THIS}-01`, items: ['Propane'] })
+    const two = await sale(p, { method: 'cash', total: 40, day: `${THIS}-01`, items: ['Electric — RV 2 and RV 27'] })
+    const elsewhere = await sale(p, { method: 'cash', total: 15, day: `${THIS}-01`, items: ['Water — RV 99'] })
+
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    const row = (key: string) => d.rows.find((r: any) => r.key === key)
+    // RV 27 stays a gray Vacant row in its spot — its money is on it, never Invoiced, Paid or Owed.
+    expect(row(`vacant:${rv27}`)).toMatchObject({ status: 'vacant', invoiced: 0, paid: 0, owed: 0, otherIn: 752.17, otherRefunded: 10 })
+    expect(row(`vacant:${rv27}`).otherMoney.map((x: any) => [x.id, x.saleId, x.kind, x.amount, x.methodLabel, x.who])).toEqual([
+      [andres, andres, 'sale', 752.17, 'Card · online', 'Andres Razo'],
+      [back, andres, 'refund', 10, 'Cash', 'Andres Razo'],
+    ])
+    // RV 2 is not RV 27.
+    expect(row(`vacant:${rv2}`)).toMatchObject({ otherMoney: [], otherIn: 0, otherRefunded: 0 })
+    expect(row(`lease:${lena.leaseId}`)).toMatchObject({ invoiced: 495, paid: 495, owed: 0, otherIn: 20 })
+    expect(row(`lease:${lena.leaseId}`).otherMoney.map((x: any) => x.saleId)).toEqual([lenas])
+    expect(row(`stay:${rhea}`)).toMatchObject({ paid: 300, otherIn: 20 })
+    expect(row(`stay:${rhea}`).otherMoney.map((x: any) => x.saleId)).toEqual([ticket])
+    expect(d.otherMoney.map((x: any) => x.saleId).sort()).toEqual([walkIn, two, elsewhere].sort())
+    // All of it is the month's register money; of it, the folder's is apart.
+    expect(d.totals).toMatchObject({
+      invoiced: 495, paid: 495, owed: 0, stays: 300,
+      otherIn: 871.09, otherRefunded: 10, folderIn: 78.92, folderRefunded: 0,
+    })
+    // Staff without the sums still get every line where it belongs.
+    const staff = (await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }), p.propertyId)).body.data
+    expect(staff.rows.find((r: any) => r.key === `vacant:${rv27}`).otherMoney).toHaveLength(2)
+    expect(staff.otherMoney).toHaveLength(3)
+    expect(staff.totals).toBeUndefined()
+  })
+})
+
+// 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it looks
+// like that charge is just for electric. It's not ... not clickable to show an
+// expanded breakdown ... It's not got a good breakdown between what's a
+// billback on the electricity and what is not."
+describe('10/13 (Nic): a register sale or pay link carries its breakdown', () => {
+  // Andres Razo's pay link as production has it (read-only, 10/13): Oct 6, card
+  // online, $752.17 + a $26.88 card fee = $779.05; its three line items.
+  const ANDRES: RegisterSale = {
+    id: 'ff58520a', sold_on: '2026-10-06', sold_in_month: true, method: 'card', paid_online: true, via_link: true,
+    base: '752.17', screening: '0', who: 'Andres Razo',
+    items: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly', stays: [], refunds: [],
+    lines: [
+      { name: 'Electric (per kWh)', category: 'Utilities', qty: 387, unitPrice: 0.21, subtotal: 81.27, stayUnit: null },
+      { name: 'Electric (per kWh) — September, RV 27', category: 'Utilities', qty: 390, unitPrice: 0.21, subtotal: 81.9, stayUnit: null },
+      { name: 'RV site — monthly', category: 'Stays', qty: 1, unitPrice: 589, subtotal: 589, stayUnit: 'month' },
+    ],
+    tax: '0.00', taxes: null, discount: '0.00', discount_reason: null, card_fee: '26.88',
+  }
+  const sum = (parts: Array<{ amount: number }>) => Math.round(parts.reduce((t, x) => t + Math.round(x.amount * 100), 0)) / 100
+
+  it('Andres Razo\'s $752.17: two electric bill-backs apart from the month\'s site rent, each its own amount; the card fee apart', () => {
+    const [line] = splitRegisterMoney([ANDRES]).other
+    expect(line).toMatchObject({ kind: 'sale', amount: 752.17, cardFee: 26.88 })
+    expect(line.parts).toEqual([
+      { kind: 'item', label: 'Electric (per kWh)', what: 'Electric bill-back', qty: 387, unitPrice: 0.21, unit: 'kWh', amount: 81.27 },
+      { kind: 'item', label: 'Electric (per kWh) — September, RV 27', what: 'Electric bill-back', qty: 390, unitPrice: 0.21, unit: 'kWh', amount: 81.9 },
+      { kind: 'item', label: 'RV site — monthly', what: 'Site rent', qty: 1, unitPrice: 589, unit: null, amount: 589 },
+    ])
+    expect(sum(line.parts!)).toBe(752.17)
+  })
+
+  it('propane at the counter is no bill-back; its named tax is its own part; the parts add up to the line', () => {
+    // Production, Oct 6: 6.8 gal at $3.30 + $1.48 transaction privilege tax, cash.
+    const [line] = splitRegisterMoney([{
+      id: '37fe8a03', sold_on: '2026-10-06', sold_in_month: true, method: 'cash', paid_online: false, via_link: false,
+      base: '23.92', screening: '0', who: null, items: 'Propane', stays: [], refunds: [],
+      lines: [{ name: 'Propane', category: 'Utilities', qty: 6.8, unitPrice: 3.3, subtotal: 22.44, stayUnit: null }],
+      tax: '1.48', taxes: [{ name: 'Transaction privilege tax', amount: 1.48 }], discount: '0', card_fee: '0',
+    }]).other
+    expect(line.parts).toEqual([
+      { kind: 'item', label: 'Propane', what: null, qty: 6.8, unitPrice: 3.3, unit: null, amount: 22.44 },
+      { kind: 'tax', label: 'Transaction privilege tax', what: null, qty: null, unitPrice: null, unit: null, amount: 1.48 },
+    ])
+    expect(line).toMatchObject({ amount: 23.92, cardFee: 0 })
+  })
+
+  it('what comes off is said as its own part — a discount, the background check, the stay\'s part — so the parts still add up', () => {
+    const { other } = splitRegisterMoney([{
+      id: 's9', sold_on: '2026-10-02', sold_in_month: true, method: 'cash', paid_online: false, via_link: false,
+      base: '361.00', screening: '35', who: 'Sam', items: 'Background check, Propane, RV site — weekly',
+      stays: [{ bookingId: 'b1', toward: 300 }], refunds: [],
+      lines: [
+        { name: 'Background check', category: 'Fee', qty: 1, unitPrice: 35, subtotal: 35 },
+        { name: 'Propane', category: 'Utilities', qty: 10, unitPrice: 3.3, subtotal: 33 },
+        { name: 'RV site — weekly', category: 'Stays', qty: 1, unitPrice: 300, subtotal: 300, stayUnit: 'week' },
+      ],
+      tax: '0', taxes: null, discount: '7.00', discount_reason: 'Neighbor', card_fee: '0',
+    }])
+    const sale = other[0]
+    expect(sale.amount).toBe(26)
+    expect(sale.parts!.map(x => [x.kind, x.label, x.amount])).toEqual([
+      ['item', 'Background check', 35], ['item', 'Propane', 33], ['item', 'RV site — weekly', 300],
+      ['discount', 'Discount · Neighbor', -7],
+      ['screening', 'Background check — the screening’s, not yours', -35],
+      ['stay', 'Toward the stay — on the stay’s row', -300],
+    ])
+    expect(sum(sale.parts!)).toBe(26)
+  })
+
+  it('a sale whose lines do not show all of its total says the rest; a refund has no breakdown', () => {
+    const { other } = splitRegisterMoney([{
+      id: 's1', sold_on: '2026-10-02', sold_in_month: true, method: 'cash', paid_online: false, via_link: false,
+      base: '50', screening: '0', who: null, items: 'Laundry', stays: [],
+      refunds: [{ id: 'r1', day: '2026-10-03', inMonth: true, net: 5, method: 'cash' }],
+      lines: [{ name: 'Laundry', category: 'Laundry', qty: 2, unitPrice: 20, subtotal: 40 }],
+    }])
+    expect(other[0].parts!.map(x => [x.kind, x.label, x.amount])).toEqual([['item', 'Laundry', 40], ['rest', 'Rest of the sale', 10]])
+    expect(other[1]).toMatchObject({ kind: 'refund', parts: [], cardFee: 0 })
+  })
+
+  it('a bill-back is the utility recovery report\'s rule: a utilities item naming its utility', () => {
+    expect(registerBillBackOf('Utilities', 'Electric (per kWh) — September, RV 27')).toBe('electric')
+    expect(registerBillBackOf('utilities', 'Water — RV 4')).toBe('water')
+    expect(registerBillBackOf('Utilities', 'Sewer')).toBe('sewer')
+    expect(registerBillBackOf('Utilities', 'Garbage pickup')).toBe('trash')
+    expect(registerBillBackOf('Utilities', 'Gas meter')).toBe('gas')
+    expect(registerBillBackOf('Utilities', 'Propane')).toBeNull()
+    expect(registerBillBackOf('Utilities', 'Gasoline can')).toBeNull()
+    expect(registerBillBackOf('Fuel', 'Electric scooter charge')).toBeNull()
+    expect(registerBillBackOf(null, 'Electric')).toBeNull()
+    expect(unitInName('Electric (per kWh)')).toBe('kWh')
+    expect(unitInName('Propane (per gal)')).toBe('gal')
+    expect(unitInName('RV site — monthly')).toBeNull()
+  })
+
+  it('the open month sends each sale\'s parts and card fee, on the row of the space it names and in the folder', async () => {
+    const p = await park()
+    const rv27 = await space(p, 'RV 27')
+    const cat = (await db.query<{ id: string }>(
+      `INSERT INTO pos_categories (landlord_id, name, sort_order, is_active) VALUES ($1,'Stays',1,TRUE) RETURNING id`, [p.landlordId])).rows[0].id
+    const siteMonth = (await db.query<{ id: string }>(
+      `INSERT INTO pos_items (landlord_id, property_id, name, category_id, sell_price, cost_price, tax_rate, stock_qty, stock_min, stock_max, stay_unit)
+       VALUES ($1,$2,'RV site — monthly',$3,589,0,0,999,0,999,'month') RETURNING id`, [p.landlordId, p.propertyId, cat])).rows[0].id
+    const andres = await sale(p, {
+      method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true, items: [], payLink: { customerName: 'Andres Razo' },
+      lines: [
+        { name: 'RV site — monthly', category: 'Stays', qty: 1, price: 589, itemId: siteMonth },
+        { name: 'Electric (per kWh)', category: 'Utilities', qty: 387, price: 0.21 },
+        { name: 'Electric (per kWh) — September, RV 27', category: 'Utilities', qty: 390, price: 0.21 },
+      ],
+    })
+    const walkIn = await sale(p, {
+      method: 'cash', total: 23.92, day: `${THIS}-01`, items: [], tax: 1.48,
+      taxBreakdown: [{ name: 'Transaction privilege tax', rate: 0.066, amount: 1.48 }],
+      lines: [{ name: 'Propane', category: 'Utilities', qty: 6.8, price: 3.3 }],
+    })
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    const onRow = d.rows.find((r: any) => r.key === `vacant:${rv27}`).otherMoney
+    expect(onRow).toHaveLength(1)
+    expect(onRow[0]).toMatchObject({ saleId: andres, amount: 752.17, cardFee: 26.88 })
+    expect(onRow[0].parts.map((x: any) => [x.label, x.what, x.qty, x.unitPrice, x.unit, x.amount])).toEqual([
+      ['Electric (per kWh)', 'Electric bill-back', 387, 0.21, 'kWh', 81.27],
+      ['Electric (per kWh) — September, RV 27', 'Electric bill-back', 390, 0.21, 'kWh', 81.9],
+      ['RV site — monthly', 'Site rent', 1, 589, null, 589],
+    ])
+    expect(d.otherMoney).toHaveLength(1)
+    expect(d.otherMoney[0]).toMatchObject({ saleId: walkIn, amount: 23.92, cardFee: 0 })
+    expect(d.otherMoney[0].parts.map((x: any) => [x.kind, x.label, x.amount])).toEqual([
+      ['item', 'Propane', 22.44], ['tax', 'Transaction privilege tax', 1.48],
+    ])
+  })
+})
+
+describe('10/13 (Nic), round 3: the Rent Roll\'s stays — "an aggregate by line items … below with expandable notes"', () => {
+  /** The register's stay item: what one of it buys. */
+  async function stayItemOf(p: { landlordId: string; propertyId: string }, name: string, unit: 'night' | 'week' | 'month') {
+    const cat = (await db.query<{ id: string }>(
+      `INSERT INTO pos_categories (landlord_id, name, sort_order, is_active) VALUES ($1,$2,1,TRUE) RETURNING id`, [p.landlordId, `Stays by the ${unit}`])).rows[0].id
+    return (await db.query<{ id: string }>(
+      `INSERT INTO pos_items (landlord_id, property_id, name, category_id, sell_price, cost_price, tax_rate, stock_qty, stock_min, stock_max, stay_unit)
+       VALUES ($1,$2,$3,$4,0,0,0,999,0,999,$5) RETURNING id`, [p.landlordId, p.propertyId, name, cat, unit])).rows[0].id
+  }
+  /**
+   * A sale of a stay item, noon on `day`, recorded the way the register, a
+   * reservation ticket and a pay link record one (routes/pos-stays.test,
+   * decisions #9): a sale toward a stay on the schedule (`booking`, or
+   * `pays` for several) carries the stay as ONE line, quantity 1, at what it
+   * charged, whatever its length; a stay item sold with no stay on the
+   * schedule is its line at `qty`. `toward`: what the sale paid toward the
+   * stay (default qty × price). `stayLines`: more stay items' lines on it.
+   */
+  async function staySale(p: { landlordId: string; userId: string; propertyId: string }, o: {
+    item: string; qty: number; price: number; day: string; method?: 'cash' | 'card' | 'charge'; booking?: string; voided?: boolean
+    payLink?: boolean; also?: string[]; toward?: number; pays?: Array<{ booking: string; toward: number }>
+    stayLines?: Array<{ item: string; price: number }>
+  }) {
+    const at = `${o.day} 12:00:00-07`
+    const method = o.method ?? 'cash'
+    const pays = o.pays ?? (o.booking ? [{ booking: o.booking, toward: o.toward ?? o.qty * o.price }] : [])
+    const total = pays.length ? pays.reduce((t, x) => t + x.toward, 0) : o.qty * o.price
+    const linkId = o.payLink ? (await db.query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email, status, paid_at)
+       VALUES ($1,$2,$3,$4,'one_time','Stay','[]'::jsonb,$5,$5,'guest@t.dev','paid',$6::timestamptz) RETURNING id`,
+      [randomUUID(), p.landlordId, p.propertyId, p.userId, total, at])).rows[0].id : null
+    const pi = method === 'card' ? `pi_${randomUUID()}` : null
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total, property_id, pay_link_id,
+                                     stripe_payment_intent_id, status, voided_at, created_at)
+       VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10::timestamptz) RETURNING id`,
+      [p.landlordId, p.userId, method, total, p.propertyId, linkId, pi, o.voided ? 'voided' : 'completed', o.voided ? at : null, at])).rows[0].id
+    const nameOf = async (item: string) => (await db.query<{ name: string }>(`SELECT name FROM pos_items WHERE id = $1`, [item])).rows[0].name
+    const name = await nameOf(o.item)
+    if (pays.length) {
+      await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,$3,1,$4,$4)`,
+        [id, o.item, `${name} — the stay, one line at what it charged`, total])
+    } else {
+      await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [id, o.item, name, o.qty, o.price, total])
+    }
+    for (const l of o.stayLines ?? []) {
+      await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,$3,1,$4,$4)`,
+        [id, l.item, await nameOf(l.item), l.price])
+    }
+    for (const n of o.also ?? []) {
+      await db.query(`INSERT INTO pos_transaction_items (transaction_id, item_name, qty, unit_price, subtotal) VALUES ($1,$2,1,0,0)`, [id, n])
+    }
+    for (const x of pays) {
+      await db.query(
+        `INSERT INTO stay_payments (booking_id, landlord_id, kind, pos_transaction_id, stripe_payment_intent_id, method, toward_stay, paid_at)
+         VALUES ($1,$2,'pos_sale',$3,$4,$5,$6,$7::timestamptz)`, [x.booking, p.landlordId, id, pi, method, x.toward, at])
+    }
+    return id
+  }
+
+  it('the range\'s stays below the rows, by line item and how they were paid for, each with its notes per site; never in the spaces\' spots', async () => {
+    const p = await park()
+    const lena = await household(p, 'RV 1', 'Lena Lease')
+    await rent(p, lena, LAST, 495, 1)
+    const nightly = await stayItemOf(p, 'RV site — nightly', 'night')
+    const weekly = await stayItemOf(p, 'RV site — weekly', 'week')
+    const monthly = await stayItemOf(p, 'RV site — monthly', 'month')
+    const at = async (n: string) => space(p, n)
+    // At the register: 4 nights at RV 15; RV 18 used twice in the month (3 nights, then 5); 10 nights at RV 20 on a pay link.
+    const rv15 = await at('RV 15'), rv18 = await at('RV 18'), rv20 = await at('RV 20'), rv12 = await at('RV 12')
+    const a = await stayAt(p, rv15, { guest: 'Ann A', checkIn: `${LAST}-02`, nights: 4, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 4, price: 40, day: `${LAST}-02`, booking: a })
+    const b = await stayAt(p, rv18, { guest: 'Ben B', checkIn: `${LAST}-05`, nights: 3, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 3, price: 40, day: `${LAST}-05`, booking: b })
+    const c = await stayAt(p, rv18, { guest: 'Cal C', checkIn: `${LAST}-20`, nights: 5, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 5, price: 40, day: `${LAST}-20`, booking: c })
+    const dd = await stayAt(p, rv20, { guest: 'Dot D', checkIn: `${LAST}-10`, nights: 10, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 10, price: 40, day: `${LAST}-10`, booking: dd, payLink: true, method: 'card' })
+    // A week at RV 12.
+    const e = await stayAt(p, rv12, { guest: 'Eve E', checkIn: `${LAST}-12`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    await staySale(p, { item: weekly, qty: 1, price: 280, day: `${LAST}-12`, booking: e })
+    // Booked online: 2 nights at RV 30 (deposit, then its balance link — no stay item line), a month at RV 31.
+    const rv30 = await at('RV 30'), rv31 = await at('RV 31')
+    const f = await stayAt(p, rv30, { guest: 'Fay F', checkIn: `${LAST}-11`, nights: 2, status: 'checked_out' })
+    await siteDepositOn(p, f, 40, `${LAST}-10`)
+    await registerSale(p, f, { method: 'card', toward: 60, day: `${LAST}-11`, payLink: true, balanceLink: true })
+    const g = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, status, lease_type)
+       VALUES ($1,$2,'Gus G',$3::date,$4::date,'checked_in','month_to_month') RETURNING id`,
+      [rv31, p.landlordId, `${LAST}-01`, `${THIS}-01`])).rows[0].id
+    await siteDepositOn(p, g, 589, `${LAST}-01`)
+    // A month sold on a pay link with no stay on the schedule — its sale names RV 27 (Andres Razo's).
+    await at('RV 27')
+    await staySale(p, { item: monthly, qty: 1, price: 589, day: `${LAST}-06`, payLink: true, method: 'card',
+      also: ['Electric (per kWh) — September, RV 27'] })
+    // Never: a voided sale, a charge account, another month's, a stay that became a lease.
+    const rv40 = await at('RV 40'), rv41 = await at('RV 41'), rv42 = await at('RV 42'), rv43 = await at('RV 43')
+    await staySale(p, { item: nightly, qty: 2, price: 40, day: `${LAST}-03`, booking: await stayAt(p, rv40, { guest: 'Vo V', checkIn: `${LAST}-03`, nights: 2, status: 'checked_out' }), voided: true })
+    await staySale(p, { item: nightly, qty: 3, price: 40, day: `${LAST}-03`, method: 'charge', booking: await stayAt(p, rv41, { guest: 'Cha C', checkIn: `${LAST}-03`, nights: 3, status: 'checked_out' }) })
+    await staySale(p, { item: nightly, qty: 6, price: 40, day: `${addMonths(LAST, -1)}-03`, booking: await stayAt(p, rv42, { guest: 'Old O', checkIn: `${addMonths(LAST, -1)}-03`, nights: 6, status: 'checked_out' }) })
+    const leased = await stayAt(p, rv43, { guest: 'Lee L', checkIn: `${LAST}-03`, nights: 30, status: 'confirmed' })
+    await staySale(p, { item: nightly, qty: 30, price: 20, day: `${LAST}-03`, booking: leased })
+    const cl = await db.connect()
+    try {
+      await seedLease(cl, { unitId: rv43, landlordId: p.landlordId, rentAmount: 589, startDate: `${LAST}-03`, status: 'pending' })
+    } finally { cl.release() }
+    await db.query(`UPDATE leases SET source_booking_id = $2 WHERE unit_id = $1`, [rv43, leased])
+
+    const res = await history(owner(p), p.propertyId, `from=${LAST}&to=${LAST}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    // The rows are the households; no stay sits in a space's spot.
+    expect(d.rows.map((r: any) => r.residents[0].name)).toEqual(['Lena Lease'])
+    expect(d.stays.map((s: any) => [s.key, s.label, s.quantity, s.stays, s.paid])).toEqual([
+      ['night:pos', '22 nights paid for via POS', 22, 4, 880],
+      ['night:booking_site', '2 nights paid for via the booking site', 2, 1, 100],
+      ['week:pos', '1 week paid for via POS', 1, 1, 280],
+      ['month:pos', '1 month paid for via POS', 1, 1, 589],
+      ['month:booking_site', '1 month paid for via the booking site', 1, 1, 589],
+    ])
+    // The notes: per site, in space order — a site used twice is one note with both stays' nights.
+    expect(d.stays[0].sites).toEqual([
+      { space: 'RV 15', quantity: 4, stays: 1, label: '4 nights in RV 15' },
+      { space: 'RV 18', quantity: 8, stays: 2, label: '8 nights in RV 18' },
+      { space: 'RV 20', quantity: 10, stays: 1, label: '10 nights in RV 20' },
+    ])
+    expect(d.stays[2].sites).toEqual([{ space: 'RV 12', quantity: 1, stays: 1, label: '1 week in RV 12' }])
+    expect(d.stays[3].sites).toEqual([{ space: 'RV 27', quantity: 1, stays: 1, label: '1 month in RV 27' }])
+    expect(d.stays[4].sites.map((s: any) => s.label)).toEqual(['1 month in RV 31'])
+    // The bills' totals are the bills'.
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0 })
+    // Without the range totals, the lines and notes — never their money (decisions #25).
+    const staff = (await history(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }), p.propertyId, `from=${LAST}&to=${LAST}`)).body.data
+    expect(staff.stays.map((s: any) => s.label)).toEqual(d.stays.map((s: any) => s.label))
+    expect(staff.stays.every((s: any) => !('paid' in s))).toBe(true)
+    // Another range, its own stays: the month before has only the 6 nights at RV 42.
+    const before = (await history(owner(p), p.propertyId, `from=${addMonths(LAST, -1)}&to=${addMonths(LAST, -1)}`)).body.data
+    expect(before.stays.map((s: any) => s.label)).toEqual(['6 nights paid for via POS'])
+    // All time: every stay, whether or not a bill came first.
+    const all = (await history(owner(p), p.propertyId, 'range=all')).body.data
+    expect(all.stays[0]).toMatchObject({ key: 'night:pos', quantity: 28, stays: 5 })
+  })
+
+  it('a stay rung as one line counts its own length, once however many payments; a sale that paid two stays is two notes, each its own money', async () => {
+    const p = await park()
+    const nightly = await stayItemOf(p, 'RV site — nightly', 'night')
+    const weekly = await stayItemOf(p, 'RV site — weekly', 'week')
+    const at = async (n: string) => space(p, n)
+    const rv12 = await at('RV 12'), rv15 = await at('RV 15'), rv16 = await at('RV 16'), rv20 = await at('RV 20')
+    const rv21 = await at('RV 21'), rv22 = await at('RV 22')
+    // 4 nights rung at the counter: one line, quantity 1, $160.
+    const a = await stayAt(p, rv15, { guest: 'Ann A', checkIn: `${LAST}-02`, nights: 4, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 4, price: 40, day: `${LAST}-02`, booking: a })
+    // 5 nights reserved: a deposit ticket, then its balance on a pay link — each a stay line of quantity 1.
+    const b = await stayAt(p, rv16, { guest: 'Ben B', checkIn: `${LAST}-08`, nights: 5, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 5, price: 40, day: `${LAST}-02`, booking: b, toward: 80 })
+    await staySale(p, { item: nightly, qty: 5, price: 40, day: `${LAST}-08`, booking: b, toward: 120, payLink: true, method: 'card' })
+    // 2 weeks rung at the counter: one line, quantity 1, $560.
+    const c = await stayAt(p, rv12, { guest: 'Cal C', checkIn: `${LAST}-03`, nights: 14, status: 'checked_out', leaseType: 'weekly' })
+    await staySale(p, { item: weekly, qty: 2, price: 280, day: `${LAST}-03`, booking: c })
+    // One sale that paid two stays: 3 nights at RV 20 ($120) and 2 nights at RV 21 ($80).
+    const d = await stayAt(p, rv20, { guest: 'Dot D', checkIn: `${LAST}-10`, nights: 3, status: 'checked_out' })
+    const e = await stayAt(p, rv21, { guest: 'Eve E', checkIn: `${LAST}-10`, nights: 2, status: 'checked_out' })
+    await staySale(p, { item: nightly, qty: 5, price: 40, day: `${LAST}-10`, pays: [{ booking: d, toward: 120 }, { booking: e, toward: 80 }] })
+    // A sale with two stay items' lines toward one week at RV 22: its $280 once.
+    const f = await stayAt(p, rv22, { guest: 'Fay F', checkIn: `${LAST}-12`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
+    await staySale(p, { item: weekly, qty: 1, price: 280, day: `${LAST}-12`, booking: f, stayLines: [{ item: nightly, price: 0 }] })
+
+    const res = await history(owner(p), p.propertyId, `from=${LAST}&to=${LAST}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const s = res.body.data.stays
+    expect(s.map((l: any) => [l.key, l.label, l.quantity, l.stays, l.paid])).toEqual([
+      ['night:pos', '14 nights paid for via POS', 14, 4, 560],
+      ['week:pos', '3 weeks paid for via POS', 3, 2, 840],
+    ])
+    expect(s[0].sites.map((x: any) => [x.label, x.stays])).toEqual([
+      ['4 nights in RV 15', 1], ['5 nights in RV 16', 1], ['3 nights in RV 20', 1], ['2 nights in RV 21', 1],
+    ])
+    expect(s[1].sites.map((x: any) => [x.label, x.stays])).toEqual([['2 weeks in RV 12', 1], ['1 week in RV 22', 1]])
+  })
+})
+
+describe('10/13 (Nic), round 3: a bookkeeper\'s view of a sold property', () => {
+  it('a bill from before the sale, paid after it, reads PAID on their Rent Roll', async () => {
+    const p = await park('Alder')
+    const birch = await park('Birch', p)
+    const buyer = await park('Buyer Park')
+    const al = await household(p, 'RV 1', 'Al Alder')
+    const bill1 = await rent(p, al, LAST, 495)                  // unpaid on the day of the sale
+    const bea = await bookkeeperToken(p, [p.propertyId, birch.propertyId], { companyWide: true })
+    const { transferProperty } = await import('../services/propertyTransfer')
+    const t = await transferProperty({ propertyId: p.propertyId, fromLandlordId: p.landlordId, toLandlordId: buyer.landlordId, byUserId: p.userId })
+    await db.query(`UPDATE property_transfers SET transferred_at = $2::timestamptz WHERE id = $1`, [t.transferId, `${LAST}-20 12:00:00-07`])
+    await db.query(`UPDATE bookkeeper_former_properties SET left_at = $2::timestamptz WHERE property_transfer_id = $1`, [t.transferId, `${LAST}-20 12:00:00-07`])
+    const read = async () => (await history(bea.token, p.propertyId, `from=${LAST}&to=${THIS}`)).body.data
+    // Before he pays: owed, as of the sale.
+    const owing = await read()
+    expect(owing.rows.map((r: any) => [r.residents[0].name, r.invoiced, r.paid, r.owed])).toEqual([['Al Alder', 495, 0, 495]])
+    // He pays the old company's bill after the sale: paid.
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = $2::timestamptz WHERE id = $1`,
+      [bill1.paymentId, `${THIS}-01 12:00:00-07`])
+    const paid = await read()
+    expect(paid).toMatchObject({ from: LAST, to: LAST, months: [LAST] })
+    expect(paid.rows.map((r: any) => [r.residents[0].name, r.invoiced, r.paid, r.owed])).toEqual([['Al Alder', 495, 495, 0]])
+    expect(paid.rows[0].stamps[0]).toMatchObject({ month: LAST, status: 'paid_late', paid: 495, owed: 0 })
+    expect(paid.movedOutOwing).toEqual([])
+    expect(paid.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0 })
+  })
+})
+
+describe('10/13 (Nic), round 3: the tenant report\'s "Delinquent" is the Payments page\'s money rule', () => {
+  it('the report of a whole household says it too — a charge on no lease past grace included — and clears when paid', async () => {
+    const p = await park()
+    const unitId = await space(p, 'RV 9')
+    const c = await db.connect()
+    let tenantId: string
+    try {
+      tenantId = await seedTenant(c)
+    } finally { c.release() }
+    await db.query(`UPDATE users SET first_name = 'Nola', last_name = 'Nolease' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId])
+    const fee = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,'fee',40,'pending',$4::date,'OTHERFEE',$4::date) RETURNING id`,
+      [unitId, tenantId, p.landlordId, `${LAST}-01`])).rows[0].id
+    const rep = async () => (await report(owner(p), tenantId)).body.data
+    expect(await rep()).toMatchObject({ delinquent: true, leases: [] })
+    await db.query(`UPDATE payments SET status = 'settled', manual_method = 'cash', settled_at = NOW() WHERE id = $1`, [fee])
+    expect((await rep()).delinquent).toBe(false)
+  })
+})
+
+describe('the words of round 3', () => {
+  it('a space named in a sale\'s words: its number, however typed; a bare number only after a word for a space; never two', async () => {
+    const { spaceNamedIn } = await import('../services/rentRoll')
+    const spaces = [
+      { unitId: 'rv2', names: ['RV 2', null] }, { unitId: 'rv27', names: ['RV 27', null] },
+      { unitId: 'mh03', names: ['MH 03', 'Space 3'] }, { unitId: 'n20', names: ['20', null] }, { unitId: 'cabin', names: ['Cabin Moose', null] },
+      { unitId: 'lot7', names: ['Lot 7', null] },
+    ]
+    expect(spaceNamedIn(['Electric (per kWh) — September, RV 27'], spaces)).toBe('rv27')
+    expect(spaceNamedIn(['rv27'], spaces)).toBe('rv27')
+    expect(spaceNamedIn(['RV #027'], spaces)).toBe('rv27')
+    expect(spaceNamedIn(['RV 2'], spaces)).toBe('rv2')
+    expect(spaceNamedIn(['Lot rent — MH 3'], spaces)).toBe('mh03')
+    expect(spaceNamedIn(['Water for space 3'], spaces)).toBe('mh03')
+    expect(spaceNamedIn(['RV site — monthly'], spaces)).toBeNull()
+    expect(spaceNamedIn(['Propane 20 lb'], spaces)).toBeNull()
+    expect(spaceNamedIn(['Electric, site 20'], spaces)).toBe('n20')
+    expect(spaceNamedIn(['Firewood #20'], spaces)).toBe('n20')
+    expect(spaceNamedIn(['Firewood for cabin moose'], spaces)).toBe('cabin')
+    // A space numbered with a word for a space is named by any of them.
+    expect(spaceNamedIn(['Electric — lot 7'], spaces)).toBe('lot7')
+    expect(spaceNamedIn(['Electric — site 07'], spaces)).toBe('lot7')
+    expect(spaceNamedIn(['7 bundles of firewood'], spaces)).toBeNull()
+    expect(spaceNamedIn(['Electric — RV 2', 'and RV 27'], spaces)).toBeNull()
+    expect(spaceNamedIn([null, '', 'Propane'], spaces)).toBeNull()
+  })
+
+  it('a stay on the schedule, in line items: whole months, whole weeks, else nights', async () => {
+    const { bookingLineItems } = await import('../services/rentRoll')
+    expect(bookingLineItems({ lease_type: 'month_to_month', check_in: '2026-10-04', booked_check_out: '2026-11-04' })).toEqual({ unit: 'month', quantity: 1 })
+    expect(bookingLineItems({ lease_type: 'month_to_month', check_in: '2026-01-31', booked_check_out: '2026-02-28' })).toEqual({ unit: 'month', quantity: 1 })
+    expect(bookingLineItems({ lease_type: 'month_to_month', check_in: '2026-10-04', booked_check_out: '2026-12-04' })).toEqual({ unit: 'month', quantity: 2 })
+    expect(bookingLineItems({ lease_type: 'month_to_month', check_in: '2026-10-04', booked_check_out: '2026-11-18' })).toEqual({ unit: 'night', quantity: 45 })
+    expect(bookingLineItems({ lease_type: 'weekly', check_in: '2026-10-04', booked_check_out: '2026-10-18' })).toEqual({ unit: 'week', quantity: 2 })
+    expect(bookingLineItems({ lease_type: 'weekly', check_in: '2026-10-04', booked_check_out: '2026-10-14' })).toEqual({ unit: 'night', quantity: 10 })
+    expect(bookingLineItems({ lease_type: 'nightly', check_in: '2026-10-04', booked_check_out: '2026-10-07' })).toEqual({ unit: 'night', quantity: 3 })
+  })
+
+  it('the pieces add up into lines: nights, weeks, months; POS first; notes in space order; a site never named said so', async () => {
+    const { stayLinesOf } = await import('../services/rentRoll')
+    const lines = stayLinesOf([
+      { unit: 'week', via: 'pos', quantity: 1, paidCents: 28000, space: 'RV 12', stay: 'booking:e' },
+      { unit: 'night', via: 'booking_site', quantity: 2, paidCents: 10000, space: 'RV 30', stay: 'booking:f' },
+      { unit: 'night', via: 'pos', quantity: 0.5, paidCents: 2000, space: null, stay: 'sale:s1' },
+      { unit: 'night', via: 'pos', quantity: 3, paidCents: 12000, space: 'RV 18', stay: 'booking:b' },
+      { unit: 'night', via: 'pos', quantity: 5, paidCents: 20000, space: 'RV 18', stay: 'booking:c' },
+    ], true)
+    expect(lines.map(l => [l.label, l.paid, l.sites.map(s => s.label)])).toEqual([
+      ['8.5 nights paid for via POS', 340, ['8 nights in RV 18', '0.5 nights, no site named']],
+      ['2 nights paid for via the booking site', 100, ['2 nights in RV 30']],
+      ['1 week paid for via POS', 280, ['1 week in RV 12']],
+    ])
+    expect(stayLinesOf([{ unit: 'month', via: 'pos', quantity: 1, paidCents: 58900, space: 'RV 27', stay: 'sale:x' }], false)[0])
+      .not.toHaveProperty('paid')
   })
 })

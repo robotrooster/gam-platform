@@ -18,10 +18,25 @@
 // createMoneyOutExpense is how other GAM features leave money owed here (a
 // payroll run's take-home pay and taxes, a repair's bill, work-trade hours paid
 // as a contractor, the manager's cut GAM held too little to pay).
+//
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging. there should never be a default setting to
+// apply expenses." Every expense a person logs says where its cost goes —
+// `costPlace` (BOOKS_COST_PLACES, landlord_expenses.cost_place): one unit, one
+// property, or split across the company's properties by units. Naming a unit
+// or a property says it; nothing says it for them, and an expense with no
+// place is refused (EXPENSE_NO_PLACE). A bill another GAM feature makes takes
+// the place of what it is for (a repair's unit), or none when it places no
+// cost (a payroll run's take-home pay or taxes, a manager's cut).
+// 10/13 review: money out that is not a cost — filed under a category that
+// does not charge to an expense account, such as an owner's draw — is not
+// split across the properties (refused in words: the books would put it on
+// the company while the page said "split"); it goes on a unit, a property, or
+// the company (no place), as the person says.
 import type { PoolClient } from 'pg'
 import {
-  LANDLORD_EXPENSE_PAYMENT_METHODS, LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED, booksCents,
-  type LandlordExpensePaymentMethod, type LandlordExpensePaymentSource, type ExpensePayState,
+  LANDLORD_EXPENSE_PAYMENT_METHODS, LANDLORD_EXPENSE_PAYMENT_METHODS_ENTERED, booksCents, booksCostPlaceOf,
+  type LandlordExpensePaymentMethod, type LandlordExpensePaymentSource, type ExpensePayState, type BooksCostPlace,
 } from '@gam/shared'
 import { db, query, queryOne } from '../db'
 import { cutoffsParam, withinCutoffsSql, type PropertyCutoff } from '../lib/bookkeeperScope'
@@ -66,6 +81,17 @@ export interface CreateExpenseInput {
   dueDate?: string | null
   expenseDate: string          // YYYY-MM-DD
   isCommon?: boolean
+  /**
+   * 10/13 (Nic): where the cost goes, picked when it is logged. A unit or a
+   * property named says 'unit' / 'property'; 'split_by_units' names neither.
+   * Required for anything a person logs (EXPENSE_NO_PLACE).
+   */
+  costPlace?: BooksCostPlace | null
+  /**
+   * 10/13: a bill GAM makes for another record (createMoneyOutExpense) — it
+   * takes that record's place, or none when it places no cost.
+   */
+  systemBill?: boolean
   /** S613: which utility, when the category is utilities. Optional — an untyped
    *  utility bill still counts toward what the property spent. */
   utilityType?: string | null
@@ -136,6 +162,48 @@ function dollars(n: number): string {
   return (booksCents(n) / 100).toFixed(2)
 }
 
+/** 10/13 (Nic): what an expense logged with no place is told. */
+export const EXPENSE_NO_PLACE = 'Choose where this cost goes: one unit, one property, or split across your properties by units.'
+
+/** 10/13 review: what money out that is not a cost is told when it is split. */
+export const NOT_A_COST_SPLIT = (category: string) =>
+  `${category} is not a cost (it does not go on your profit and loss), so it is not split across your properties. `
+  + 'Choose the property or unit it is for, or put it on the company.'
+
+/**
+ * 10/13 (Nic): the place an expense is saved with — what the form chose,
+ * matched to the unit and property it names — or refused in words.
+ * 10/13 review: `notACost` names the category of money out that is not a
+ * cost (an owner's draw): never split, and on the company when it names no
+ * unit or property.
+ */
+export function expenseCostPlace(v: { costPlace?: BooksCostPlace | null; propertyId: string | null; unitId: string | null }, systemBill = false,
+  notACost: string | null = null): BooksCostPlace | null {
+  if (v.costPlace === 'split_by_units' && (v.propertyId || v.unitId)) {
+    throw new AppError(400, 'An expense split across your properties names no one property or unit.')
+  }
+  if (v.costPlace === 'split_by_units' && notACost) throw new AppError(400, NOT_A_COST_SPLIT(notACost))
+  if (v.costPlace === 'unit' && !v.unitId) throw new AppError(400, 'Choose the unit this cost is for.')
+  if (v.costPlace === 'property' && (!v.propertyId || v.unitId)) throw new AppError(400, 'Choose the property this cost is for.')
+  const place = booksCostPlaceOf(v)
+  if (!place && !systemBill && !notACost) throw new AppError(400, EXPENSE_NO_PLACE)
+  return place
+}
+
+/**
+ * 10/13 review: the category's name when, on `day`, it is not a cost (its
+ * account is not an expense account — an owner's draw, a capital improvement
+ * that charges to an asset account); null for a cost. The ledger's own rule
+ * (moneyOut: only an expense-type account is split).
+ */
+async function notACostCategory(run: Runner, categoryId: string | null, day: string): Promise<string | null> {
+  if (!categoryId) return null
+  const r = (await run.query<{ t: string | null; name: string }>(
+    `SELECT books_category_account_type_on(c.id, $2::date) AS t, c.name FROM books_categories c WHERE c.id = $1`,
+    [categoryId, day])).rows[0]
+  return r && (r.t ?? 'expense') !== 'expense' ? r.name : null
+}
+
 /**
  * 10/12 review — what else an expense stands for, as SQL on the expense
  * aliased `e` (NULL = nothing; an expense like any other):
@@ -144,7 +212,9 @@ function dollars(n: number): string {
  *   manager_cut  the manager's cut a payout split owes (Nic L18): its amount
  *                is the split's, which booked the debt to Accounts payable
  *   fixed_asset  it became a fixed asset (books_fixed_assets.source_expense_id):
- *                the asset copied its cost and day
+ *                the asset copied its cost and day — 10/13 (Nic, "ALLOW A
+ *                MIX"): or it paid for part of one (a live funding line names
+ *                it, its whole amount): books_expense_fixed_asset
  *   work_trade   work-trade extra hours paid as a contractor (1099): its
  *                amount is what marks those hours paid
  *   work_trade_by_hand  10/12 (Nic): work-trade extra hours marked paid by
@@ -158,7 +228,7 @@ function dollars(n: number): string {
 export function systemLinkSql(e = 'e'): string {
   return `(CASE WHEN EXISTS (SELECT 1 FROM payroll_run_expenses prx WHERE prx.expense_id = ${e}.id) THEN 'payroll'
               WHEN ${e}.allocation_split_id IS NOT NULL THEN 'manager_cut'
-              WHEN EXISTS (SELECT 1 FROM books_fixed_assets fxa WHERE fxa.source_expense_id = ${e}.id AND fxa.voided_at IS NULL) THEN 'fixed_asset'
+              WHEN books_expense_fixed_asset(${e}.id) IS NOT NULL THEN 'fixed_asset'
               WHEN ${e}.work_trade_extra_hours_id IS NOT NULL AND ${workTradePaidByHandSql(e)} THEN 'work_trade_by_hand'
               WHEN ${e}.work_trade_extra_hours_id IS NOT NULL THEN 'work_trade' END)`
 }
@@ -180,7 +250,7 @@ type SystemLink = 'payroll' | 'manager_cut' | 'fixed_asset' | 'work_trade' | 'wo
 const SYSTEM_LINK_EDIT_REFUSAL: Record<SystemLink, string> = {
   payroll: 'A payroll run left this to pay, so its amount, date and category are the run\'s. Void the run in Payroll and run it again to change them.',
   manager_cut: 'This is the manager\'s cut a payout could not pay (it is owed to the manager), so its amount and date are that payout\'s.',
-  fixed_asset: 'This expense became a fixed asset, which copied its cost and day. Void the asset on the Fixed assets page first, then change the expense.',
+  fixed_asset: 'This expense became a fixed asset, or paid for part of one, which counts its cost. Void the asset (or change where its money came from) on the Fixed assets page first, then change the expense.',
   work_trade: 'This pays a work trader\'s extra hours as a contractor, so its amount is those hours. To change it, remove this expense; the hours then wait on Run Payroll to be confirmed again.',
   work_trade_by_hand: 'This records a work trader\'s extra hours marked paid on the Work Trade page, so its amount, date and category are those hours\'. To change them, remove this expense; the hours then show as owed again on the Work Trade page.',
 }
@@ -216,6 +286,9 @@ export async function createLandlordExpense(input: CreateExpenseInput, client?: 
       const p = await one<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [propertyId])
       if (!p || p.landlord_id !== input.landlordId) throw new AppError(400, 'Property does not belong to you')
     }
+    // 10/13 (Nic): where the cost goes, picked when it is logged.
+    const costPlace = expenseCostPlace({ costPlace: input.costPlace, propertyId, unitId }, !!input.systemBill,
+      await notACostCategory(run, cat.id, input.expenseDate))
     const vendor = await assertVendor(run, input.landlordId, input.vendorId)
     // S603 (Nic): allocation is unconditional now — any non-unit-linked cost is
     // split across the property's units at report time. The column is retained
@@ -226,15 +299,15 @@ export async function createLandlordExpense(input: CreateExpenseInput, client?: 
       `INSERT INTO landlord_expenses
          (landlord_id, created_by, property_id, unit_id, category, category_id, amount, description, vendor, vendor_id,
           bill_number, due_date, expense_date, is_common, allocate_per_unit, utility_type, bank_transaction_id,
-          maintenance_request_id, work_trade_extra_hours_id, allocation_split_id, payments_tracked)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,TRUE) RETURNING *`,
+          maintenance_request_id, work_trade_extra_hours_id, allocation_split_id, payments_tracked, cost_place)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,TRUE,$21) RETURNING *`,
       [input.landlordId, input.createdBy ?? null, propertyId, unitId, cat.legacyKey, cat.id,
        dollars(input.amount), input.description ?? null, input.vendor ?? vendor?.name ?? null, vendor?.id ?? null,
        input.billNumber ? String(input.billNumber).slice(0, 100) : null, input.dueDate ?? null,
        input.expenseDate, isCommon, allocate,
        cat.legacyKey === 'utilities' ? (input.utilityType ?? null) : null,
        input.bankTransactionId ?? null, input.maintenanceRequestId ?? null, input.workTradeExtraHoursId ?? null,
-       input.allocationSplitId ?? null])
+       input.allocationSplitId ?? null, costPlace])
     if (input.bankTransactionId) {
       // One part of a split bank line: that line pays it, whole, on the bank's day.
       const bt = await one<{ bank_connection_id: string; posted_date: string; amount: string }>(
@@ -270,6 +343,8 @@ export async function createMoneyOutExpense(client: Runner, input: {
   description?: string | null; createdBy?: string | null
   vendorId?: string | null; vendor?: string | null; propertyId?: string | null; unitId?: string | null
   workTradeExtraHoursId?: string | null; maintenanceRequestId?: string | null; allocationSplitId?: string | null
+  /** 10/13 (Nic): where the cost goes, when the person confirming the bill chose it (a work trader's 1099 hours). */
+  costPlace?: BooksCostPlace | null
 }): Promise<{ id: string }> {
   const row = await createLandlordExpense({
     landlordId: input.landlordId, createdBy: input.createdBy ?? null, category: input.categoryKey,
@@ -277,8 +352,12 @@ export async function createMoneyOutExpense(client: Runner, input: {
     description: input.description ?? null, vendorId: input.vendorId ?? null, vendor: input.vendor ?? null,
     propertyId: input.propertyId ?? null, unitId: input.unitId ?? null,
     isCommon: !input.unitId && !!input.propertyId,
+    costPlace: input.costPlace ?? null,
     workTradeExtraHoursId: input.workTradeExtraHoursId ?? null, maintenanceRequestId: input.maintenanceRequestId ?? null,
     allocationSplitId: input.allocationSplitId ?? null,
+    // 10/13: the bill takes the place of what it is for (a repair's unit), or
+    // none when it places no cost (a payroll run's take-home pay or taxes).
+    systemBill: true,
     payment: null,
     // 10/12 review: archiving Repairs, Management or Contractor payments must
     // never silently stop the bills GAM makes there (L6, L18, 1099 hours).
@@ -430,6 +509,8 @@ export async function listLandlordExpenses(landlordId: string | string[], opts: 
   return query<any>(
     `SELECT e.id, e.category, e.amount::float AS amount, e.description, e.vendor, e.expense_date,
             e.is_common, e.allocate_per_unit, e.unit_id, e.property_id,
+            -- 10/13 (Nic): where its cost goes, as picked when it was logged.
+            e.cost_place,
             e.receipt_url, e.receipt_name, e.receipt_mime, e.receipt_size,
             e.utility_type, e.created_by, e.landlord_id, to_char(e.expense_date, 'YYYY-MM-DD') AS expense_day,
             -- 10/12 (Nic, L5): the company's own category, its vendor and the bill.
@@ -451,6 +532,10 @@ export async function listLandlordExpenses(landlordId: string | string[], opts: 
             -- (voidLandlordExpense): a payroll run's, a payout split's (L18),
             -- one that became a fixed asset.
             COALESCE(${systemLinkSql('e')} IN ('payroll', 'manager_cut', 'fixed_asset'), FALSE) AS system_linked,
+            -- 10/13 review: any bill GAM keeps for another record (those, and a
+            -- work trader's hours) keeps that record's place — the Expenses
+            -- form does not ask it again (updateLandlordExpense refuses a move).
+            (${systemLinkSql('e')} IS NOT NULL) AS place_fixed,
             -- 10/11: an expense the bank feed filed keeps the bank's amount and day.
             -- 10/12 (Nic): so does each part of a bank line the owner split.
             (e.bank_transaction_id IS NOT NULL
@@ -523,6 +608,8 @@ export interface UpdateExpenseInput {
   /** Re-file it: on a unit, or on the property (common). Omitted = where it is. */
   unitId?: string | null
   propertyId?: string | null
+  /** 10/13 (Nic): where the cost goes ('split_by_units' names neither). Omitted with no unit or property = where it is. */
+  costPlace?: BooksCostPlace | null
 }
 
 /**
@@ -567,9 +654,10 @@ export async function updateLandlordExpense(id: string, landlordId: string, patc
     }
     let unitId: string | null = cur.unit_id
     let propertyId: string | null = cur.property_id
-    if (patch.unitId !== undefined || patch.propertyId !== undefined) {
-      unitId = patch.unitId ?? null
-      propertyId = patch.propertyId ?? null
+    let costPlace: BooksCostPlace | null = cur.cost_place ?? null
+    if (patch.unitId !== undefined || patch.propertyId !== undefined || patch.costPlace !== undefined) {
+      unitId = patch.costPlace === 'split_by_units' ? null : patch.unitId ?? null
+      propertyId = patch.costPlace === 'split_by_units' ? null : patch.propertyId ?? null
       if (unitId) {
         const u = await one<any>('SELECT property_id, landlord_id FROM units WHERE id=$1', [unitId])
         if (!u || u.landlord_id !== landlordId) throw new AppError(400, 'Unit does not belong to you')
@@ -578,6 +666,15 @@ export async function updateLandlordExpense(id: string, landlordId: string, patc
         const p = await one<any>('SELECT landlord_id FROM properties WHERE id=$1', [propertyId])
         if (!p || p.landlord_id !== landlordId) throw new AppError(400, 'Property does not belong to you')
       }
+      // 10/13 (Nic): re-filed, it says where its cost goes — a bill another
+      // GAM feature keeps is refused below when its place moves.
+      costPlace = expenseCostPlace({ costPlace: patch.costPlace, propertyId, unitId: patch.costPlace === 'property' ? null : unitId },
+        !!cur.system_link, await notACostCategory(run, cat.id, expenseDate))
+      if (costPlace === 'property') unitId = null
+    } else if (cat.id !== cur.category_id) {
+      // 10/13 review: a new category — where it is still fits it (a cost
+      // names a place; money out that is not a cost is never split).
+      expenseCostPlace({ costPlace, propertyId, unitId }, !!cur.system_link, await notACostCategory(run, cat.id, expenseDate))
     }
     // 10/12 review: an expense another feature keeps (systemLinkSql) keeps
     // its amount, day, category and place — a payroll bill's amount clears the
@@ -587,6 +684,7 @@ export async function updateLandlordExpense(id: string, landlordId: string, patc
     if (cur.system_link) {
       const moved = booksCents(amount) !== booksCents(cur.amount) || expenseDate !== cur.expense_day
         || cat.id !== cur.category_id || (unitId ?? null) !== (cur.unit_id ?? null) || (propertyId ?? null) !== (cur.property_id ?? null)
+        || (costPlace === 'split_by_units') !== (cur.cost_place === 'split_by_units')
       if (moved) throw new AppError(409, SYSTEM_LINK_EDIT_REFUSAL[cur.system_link as SystemLink])
     }
     const vendor = patch.vendorId !== undefined ? await assertVendor(run, landlordId, patch.vendorId) : undefined
@@ -608,7 +706,7 @@ export async function updateLandlordExpense(id: string, landlordId: string, patc
       `UPDATE landlord_expenses
           SET category=$3, category_id=$4, amount=$5, description=$6, vendor=$7, vendor_id=$8, bill_number=$9,
               due_date=$10, expense_date=$11, unit_id=$12, property_id=$13, is_common=$14, allocate_per_unit=$14,
-              utility_type=$15, updated_at=NOW()
+              utility_type=$15, cost_place=$16, updated_at=NOW()
         WHERE id=$1 AND landlord_id=$2 AND status='active'
         RETURNING *`,
       [id, landlordId, cat.legacyKey, cat.id, dollars(amount),
@@ -617,7 +715,7 @@ export async function updateLandlordExpense(id: string, landlordId: string, patc
        vendor !== undefined ? (vendor?.id ?? null) : cur.vendor_id,
        patch.billNumber !== undefined ? (patch.billNumber ? String(patch.billNumber).slice(0, 100) : null) : cur.bill_number,
        patch.dueDate !== undefined ? (patch.dueDate || null) : cur.due_date,
-       expenseDate, unitId, propertyId, isCommon, utilityType])
+       expenseDate, unitId, propertyId, isCommon, utilityType, costPlace])
   })
 }
 
@@ -660,7 +758,7 @@ export async function voidLandlordExpense(id: string, landlordId: string, opts: 
       throw new AppError(409, 'This is the manager\'s cut a payout could not pay. It is owed to the manager, so it stays until it is paid.')
     }
     if (fromBank?.system_link === 'fixed_asset') {
-      throw new AppError(409, 'This expense became a fixed asset. Void the asset on the Fixed assets page first.')
+      throw new AppError(409, 'This expense became a fixed asset, or paid for part of one. Void the asset (or change where its money came from) on the Fixed assets page first.')
     }
     if (fromBank && (fromBank.split_part || fromBank.filed || fromBank.matched)) {
       throw new AppError(409, fromBank.split_part

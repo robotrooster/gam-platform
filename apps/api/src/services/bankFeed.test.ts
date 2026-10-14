@@ -844,21 +844,51 @@ describe('ignore + suggestion attach', () => {
     expect(queue.length).toBe(0)
   })
 
-  it('listTransactions attaches the remembered suggestion to a matching merchant row', async () => {
+  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+  // property at the time of logging. there should never be a default setting
+  // to apply expenses." The remembered category still pre-fills a money-out
+  // line; where it goes never does. A deposit still carries the payer's place.
+  it('listTransactions attaches the remembered category to a matching merchant row — never where money out goes', async () => {
     const f = await seed()
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'a', postedDate: '2026-08-10', amount: -40, description: 'HOME DEPOT #1 AZ' },
+      { externalId: 'in_a', postedDate: '2026-08-10', amount: 75, description: 'COINMACH LAUNDRY' },
     ])
-    let [txn] = await listTransactions(f.landlordId, { status: 'needs_review' })
-    await categorizeTransaction(f.landlordId, txn.id, { category: 'maintenance', scopeKind: 'unit', unitId: f.unitA })
-    // A second charge from the same merchant should carry the suggestion.
+    const first = await listTransactions(f.landlordId, { status: 'needs_review' })
+    await categorizeTransaction(f.landlordId, first.find((t: any) => t.amount < 0).id, { category: 'maintenance', scopeKind: 'unit', unitId: f.unitA })
+    await categorizeTransaction(f.landlordId, first.find((t: any) => t.amount > 0).id, { category: 'laundry', scopeKind: 'unit', unitId: f.unitB })
+    // A second charge from the same merchant carries its category, and no place.
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'b', postedDate: '2026-08-13', amount: -60, description: 'HOME DEPOT #7 AZ' },
+      { externalId: 'in_b', postedDate: '2026-08-13', amount: 80, description: 'COINMACH LAUNDRY' },
     ])
-    const [next] = await listTransactions(f.landlordId, { status: 'needs_review' })
+    const rows = await listTransactions(f.landlordId, { status: 'needs_review' })
+    const next = rows.find((t: any) => t.amount < 0)
     expect(next.suggested_category).toBe('maintenance')
-    expect(next.suggested_scope_kind).toBe('unit')
-    expect(next.suggested_unit_id).toBe(f.unitA)
+    expect([next.suggested_scope_kind, next.suggested_property_id, next.suggested_unit_id]).toEqual([null, null, null])
+    // (A payer whose deposit was filed as income may file its next one by itself — read it wherever it is.)
+    const deposit = (await listTransactions(f.landlordId, {})).find((t: any) => t.amount === 80)
+    expect([deposit.suggested_category, deposit.suggested_scope_kind, deposit.suggested_unit_id]).toEqual(['laundry', 'unit', f.unitB])
+  })
+
+  it('money going out may be split across the properties by units; money coming in never is', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'ins', postedDate: '2026-08-10', amount: -1200, description: 'STATE FARM INS' },
+      { externalId: 'dep', postedDate: '2026-08-10', amount: 90, description: 'COINMACH LAUNDRY' },
+    ])
+    const rows = await listTransactions(f.landlordId, { status: 'needs_review' })
+    const out = rows.find((t: any) => t.amount < 0)
+    const inn = rows.find((t: any) => t.amount > 0)
+    await expect(categorizeTransaction(f.landlordId, out.id, { category: 'insurance', scopeKind: 'split_by_units', propertyId: f.propertyId }))
+      .rejects.toThrow('A cost split across your properties names no one property or unit.')
+    const r = await categorizeTransaction(f.landlordId, out.id, { category: 'insurance', scopeKind: 'split_by_units' })
+    const e = (await db.query<any>(`SELECT cost_place, property_id, unit_id, amount::float AS amount FROM landlord_expenses WHERE id = $1`, [r.expenseId])).rows[0]
+    expect(e).toEqual({ cost_place: 'split_by_units', property_id: null, unit_id: null, amount: 1200 })
+    const [filed] = await listTransactions(f.landlordId, { lineId: out.id })
+    expect(filed.filed_cost_place).toBe('split_by_units')
+    await expect(categorizeTransaction(f.landlordId, inn.id, { category: 'laundry', scopeKind: 'split_by_units' }))
+      .rejects.toThrow('Money coming in is filed on a unit or a property.')
   })
 })
 

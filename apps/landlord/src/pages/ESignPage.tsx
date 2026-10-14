@@ -19,6 +19,7 @@ import { SearchBox } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
+import { documentEndButton } from '../lib/documentEnd'
 import { downloadAuthedFile, printAuthedFile } from '../lib/downloadFile'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -1916,9 +1917,25 @@ export function ESignPage() {
     }}
   )
 
+  // 10/13 (Nic): "If it never completed, it doesn't exist." The same button
+  // erases a document that never completed and that no money touched, and
+  // voids anything else; the server decides (lib/voidDocument.endDocument) and
+  // the row's endAction — with endReason when it can't delete — says which
+  // before it is pressed (lib/documentEnd). A refusal (a resident has signed)
+  // used to vanish without a word — it is shown now.
   const voidMut = useMutation(
-    (id: string) => apiPost(`/esign/documents/${id}/void`, { reason: 'Voided by landlord' }),
-    { onSuccess: () => qc.invalidateQueries('esign-documents') }
+    (id: string) => apiPost<any>(`/esign/documents/${id}/void`, { reason: 'Voided by landlord' }),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toast(d?.deleted ? 'Deleted' : 'Voided')
+        qc.invalidateQueries('esign-documents')
+        // A deleted lease drops off the household's onboarding row too.
+        qc.invalidateQueries('pending-tenants')
+      },
+      onError: (e: any) =>
+        toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not do that. Press the button again.'),
+    }
   )
 
   // S642: push a reminder by hand. Says WHO it reached — a landlord clicking
@@ -2151,9 +2168,20 @@ export function ESignPage() {
                             <Send size={12} />
                           </button>
                         )}
-                        {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
-                          <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>
-                        )}
+                        {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (() => {
+                          // 10/13: Delete or Void — and why not Delete — as the server
+                          // will do it (lib/documentEnd).
+                          const end = documentEndButton(d)
+                          return (
+                            <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }}
+                              title={end.title}
+                              disabled={voidMut.isLoading}
+                              onClick={e => { e.stopPropagation(); appConfirm(end.confirm, { danger: true, confirmLabel: end.confirmLabel })
+                                .then(ok => { if (ok) voidMut.mutate(d.id) }) }}>
+                              {end.action === 'delete' ? <Trash2 size={12} /> : <X size={12} />} {end.label}
+                            </button>
+                          )
+                        })()}
                       </div>
                     </td>
                   </tr>

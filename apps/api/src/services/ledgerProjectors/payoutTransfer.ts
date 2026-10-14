@@ -23,7 +23,7 @@
  *   Dr Due from GAM (1050)       the netted reversals, at their payments' property
  *   Dr Due to GAM (2080)         each kept GAM charge, at the charge's property
  *   Dr Supplies (5140)           each kept card reader piece, at its property (one
- *                                on no property: a company-level cost, companyCosts)
+ *                                on no property: the Company column, companyCosts)
  *   Dr Stripe in transit (1060)  amount, at the properties the money left
  *
  * A fully netted batch (amount 0) posts the same lines without the 1060 line.
@@ -206,8 +206,7 @@ export const payoutTransferProjector: LedgerProjector = {
     for (const [k, v] of b.kept) {
       const piece = Math.min(pieces.get(k) ?? 0, v)
       lines.push(...dr('due_to_gam', v - piece, { propertyId: prop(k), memo: 'GAM charges taken from this batch' }))
-      lines.push(...await readerPieceLines(client, {
-        landlordId: i.landlord_id, propertyId: prop(k), cents: piece, day: i.day, recorded: { at: i.transferred_at }, side: 'dr' }))
+      lines.push(...readerPieceLines({ propertyId: prop(k), cents: piece, side: 'dr' }))
     }
     for (const [k, v] of b.toStripe) lines.push(...dr('stripe_in_transit', v, { propertyId: prop(k), memo: 'Sent to your Stripe account' }))
     return [{ owner, intendedDate: i.day, memo: 'Weekly payout batch', lines }]

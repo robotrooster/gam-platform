@@ -145,6 +145,7 @@ describe('L5: bills and payments on the Expenses record', () => {
     expect(cash.status).toBe(200)
     const draw = await request(app()).post('/api/expenses').set(as(co.owner)).send({
       category: 'owner_draw', amount: 500, expenseDate: '2026-10-02', paid: { method: 'bank', bankConnectionId: co.connectionId },
+      // 10/13 review: an owner draw is not a cost — never split; put on the company it names no place.
     })
     expect(draw.status).toBe(200)
     const rows = (await request(app()).get('/api/expenses').set(as(co.owner))).body.data

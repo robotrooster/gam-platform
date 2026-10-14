@@ -186,9 +186,10 @@ describe('1. SECURITY + BK3: a sold property never theirs is hidden; it never de
     expect(books.body.data.gamRentIncome).toBe(500)
     const cf = await booksGet(bk.tok, '/api/books/reports/cash-flow?startDate=2026-09-01&endDate=2026-09-30', w.canyon)
     expect(cf.body.data.operating.inflows.rentCollected).toBe(500)
-    // And they file at company level (that is the whole company's).
+    // And they file at company level (that is the whole company's) — 10/13 (Nic): split across the
+    // properties by units, said when it is logged.
     const file = await request(app()).post('/api/expenses').set('Authorization', `Bearer ${bk.tok}`)
-      .send({ category: 'repairs', amount: 5, expenseDate: '2026-09-07' })
+      .send({ category: 'repairs', amount: 5, expenseDate: '2026-09-07', costPlace: 'split_by_units' })
     expect(file.status, JSON.stringify(file.body)).toBe(200)
     expect(file.body.data.property_id ?? file.body.data.propertyId ?? null).toBeNull()
     // The owner's books keep what the rows say.

@@ -7,7 +7,8 @@
 import { describe, it, expect } from 'vitest'
 import {
   rentRollStatusOf, rentRollStatusText, compareSpaces, isSpaceOnlyRow, isStayRow, RENT_ROLL_ROW_STATUSES, RENT_ROLL_STATUS_LABEL,
-  RENT_ROLL_STATUS_COLOR, STAY_PAYMENT_METHOD_LABEL,
+  RENT_ROLL_STATUS_COLOR, STAY_PAYMENT_METHOD_LABEL, RENT_ROLL_STAY_UNITS, RENT_ROLL_STAY_UNIT_LABEL, RENT_ROLL_STAY_VIAS,
+  RENT_ROLL_STAY_VIA_LABEL, stayQuantityText,
 } from './rentRoll'
 import { STAY_PAYMENT_METHODS } from './index'
 
@@ -69,5 +70,21 @@ describe('space-number order', () => {
   it('RV 2 before RV 10, MH 03 before MH 12; no space last', () => {
     const spaces = ['RV 10', null, 'RV 2', 'MH 12', 'RV 1', 'MH 03', 'rv 3']
     expect([...spaces].sort(compareSpaces)).toEqual(['MH 03', 'MH 12', 'RV 1', 'RV 2', 'rv 3', 'RV 10', null])
+  })
+})
+
+// 10/13 (Nic): "show stays as an aggregate by line items. eg 22 nights paid for
+// via pos and 1 week paid for via pos."
+describe('the Rent Roll\'s stays, by line item', () => {
+  it('says a quantity in words, one or many, decimals kept', () => {
+    expect(stayQuantityText(22, 'night')).toBe('22 nights')
+    expect(stayQuantityText(1, 'week')).toBe('1 week')
+    expect(stayQuantityText(2.5, 'month')).toBe('2.5 months')
+    expect(stayQuantityText(1000, 'night')).toBe('1,000 nights')
+  })
+  it('every kind of line item and every way it is paid for has its words', () => {
+    expect([...RENT_ROLL_STAY_UNITS]).toEqual(['night', 'week', 'month'])
+    for (const u of RENT_ROLL_STAY_UNITS) expect(RENT_ROLL_STAY_UNIT_LABEL[u].many).toBe(`${RENT_ROLL_STAY_UNIT_LABEL[u].one}s`)
+    expect(RENT_ROLL_STAY_VIAS.map(v => RENT_ROLL_STAY_VIA_LABEL[v])).toEqual(['POS', 'the booking site'])
   })
 })

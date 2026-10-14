@@ -999,7 +999,9 @@ describe('POST /documents/:id/send', () => {
 // ─── POST /documents/:id/void ──────────────────────────────────
 
 describe('POST /documents/:id/void', () => {
-  it('happy path: void unsent draft document', async () => {
+  // 10/13 (Nic): "If it never completed, it doesn't exist." An unsent draft
+  // nothing touched is erased (lib/eraseUnfinishedDocument), not voided.
+  it('happy path: an unsent draft is erased, with its signers', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'sent' })
     const res = await request(buildApp())
@@ -1007,6 +1009,23 @@ describe('POST /documents/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ reason: 'Typo in unit number' })
     expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(true)
+    const row = await db.query(`SELECT 1 FROM lease_documents WHERE id = $1`, [documentId])
+    expect(row.rows).toHaveLength(0)
+    const signers = await db.query(`SELECT 1 FROM lease_document_signers WHERE document_id = $1`, [documentId])
+    expect(signers.rows).toHaveLength(0)
+  })
+
+  it('happy path: a document that issued a lease is voided, with the reason given', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f, { status: 'sent' })
+    await db.query(`UPDATE lease_documents SET issued_at = NOW() WHERE id = $1`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/void`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ reason: 'Typo in unit number' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(false)
     const row = await db.query<{ status: string; void_reason: string }>(
       `SELECT status, void_reason FROM lease_documents WHERE id = $1`, [documentId],
     )
@@ -1037,8 +1056,10 @@ describe('POST /documents/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({})
     expect(res.status).toBe(200)
-    const doc = await db.query<{ status: string }>(`SELECT status FROM lease_documents WHERE id=$1`, [documentId])
-    expect(doc.rows[0].status).toBe('voided')
+    // 10/13: it never issued, so nothing touched it — erased, not voided.
+    expect(res.body.data.deleted).toBe(true)
+    const doc = await db.query(`SELECT 1 FROM lease_documents WHERE id=$1`, [documentId])
+    expect(doc.rows).toHaveLength(0)
   })
 
   it('S558: rejects voiding once a TENANT has signed (409 → supersede)', async () => {

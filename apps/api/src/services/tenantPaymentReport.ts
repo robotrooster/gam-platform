@@ -200,6 +200,14 @@ export interface TenantPaymentReport {
   on_gam_since: string | null
   onboarding_month: string | null
   balance_owed_now: number
+  /**
+   * 10/13 (Nic): "Tenant report 'Delinquent' uses the money rule (same as
+   * Payments)" — the report's own money (the one lease; or, from the profile,
+   * the person's whole household, a charge on no lease included) past its
+   * grace period with money still owed: householdMonths owesPastGrace, the
+   * Payments page's tag. Clears the moment it is paid.
+   */
+  delinquent: boolean
   health: PaymentHealth
   /**
    * Every month from the household's first bill on GAM through the month
@@ -519,6 +527,7 @@ export async function tenantPaymentReport(opts: {
     on_gam_since: onGamSince,
     onboarding_month: months.find(m => m.onboarding)?.month ?? null,
     balance_owed_now: dollars(months.reduce((s, m) => s + cents(m.owed), 0)),
+    delinquent: owesPastGrace(months),
     health,
     stamps,
     how_late: {

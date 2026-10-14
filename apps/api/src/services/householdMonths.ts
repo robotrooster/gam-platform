@@ -81,7 +81,10 @@
  * was charged on its bill (the credit history's 10/6 rule).
  */
 import { query } from '../db'
-import { FALLBACK_TIMEZONE, PAYMENT_STAMPS, PAYMENT_STAMP_LABEL, paidByLabel, rentRollStatusOf, type PaymentStamp } from '@gam/shared'
+import {
+  FALLBACK_TIMEZONE, PAYMENT_STAMPS, PAYMENT_STAMP_LABEL, paidByLabel, rentRollStatusOf, HEALTH_ONBOARDING_NOT_COUNTED, HEALTH_NOTHING_JUDGED,
+  type PaymentStamp,
+} from '@gam/shared'
 import {
   graceDaysSql, propertyDaySql, writtenAtSql, lateCountsFromSql, firstLateDaySql, daysPastGraceSql, pastGraceSql,
   openBalanceSql, inFlightRowSql, workTradeOpenRowSql, WORK_TRADE_MARKER_LABEL,
@@ -432,6 +435,8 @@ export interface HouseholdMonth {
   on_time: boolean
   /** The household's first rent month after moving onto GAM (good news only). */
   onboarding: boolean
+  /** The onboarding month, judged and left out of health by the good-news-only rule (paid late, no late fee on the bill). */
+  onboarding_left_out: boolean
   /** A late fee was charged on the month's bills. */
   late_fee_on_bill: boolean
   /** Work trade covers every base charge of the month. */
@@ -464,8 +469,8 @@ export function judgeMonth(a: {
   chargedBaseC: number; workTradeBaseC: number; owedBaseC: number; baseInC: number
   openPastGrace: boolean; daysPastGraceOpen: number; daysPastGracePaid: number
   onboarding: boolean; lateFeeOnBill: boolean
-}): { stamp: PaymentStamp | null; days: number; counted: boolean; onTime: boolean; workTradeOnly: boolean } {
-  if (a.chargedBaseC <= 0) return { stamp: null, days: 0, counted: false, onTime: false, workTradeOnly: false }
+}): { stamp: PaymentStamp | null; days: number; counted: boolean; onTime: boolean; workTradeOnly: boolean; leftOutOnboarding: boolean } {
+  if (a.chargedBaseC <= 0) return { stamp: null, days: 0, counted: false, onTime: false, workTradeOnly: false, leftOutOnboarding: false }
   const workTradeOnly = a.workTradeBaseC >= a.chargedBaseC
   let stamp: PaymentStamp
   let days = 0
@@ -484,8 +489,10 @@ export function judgeMonth(a: {
   const onTime = stamp === 'paid_on_time'
   let counted = stamp !== 'due' && !(stamp === 'partial' && !a.openPastGrace)
   // Onboarding: good news only, unless a late fee was charged on the bill.
-  if (counted && a.onboarding && !onTime && !a.lateFeeOnBill) counted = false
-  return { stamp, days, counted, onTime: counted && onTime, workTradeOnly }
+  // 10/13 (Nic): "Keep it out, but say so" — said as left out (paymentHealth).
+  const leftOutOnboarding = counted && a.onboarding && !onTime && !a.lateFeeOnBill
+  if (leftOutOnboarding) counted = false
+  return { stamp, days, counted, onTime: counted && onTime, workTradeOnly, leftOutOnboarding }
 }
 
 /**
@@ -673,6 +680,7 @@ function judgeAgg(r: MonthAgg): HouseholdMonth {
     counted: j.counted,
     on_time: j.onTime,
     onboarding: r.onboarding === true,
+    onboarding_left_out: j.leftOutOnboarding,
     late_fee_on_bill: r.late_fee_on_bill === true,
     work_trade_only: j.workTradeOnly,
     grace_days: Number(r.grace ?? 5),
@@ -696,8 +704,14 @@ export interface PaymentHealth {
   /** YYYY-MM through YYYY-MM: the household's first billed month on GAM (all time, 10/12) through the month judged to; `from` is `through` before anything is billed. */
   from: string
   through: string
-  /** "50%, 1 of 2 months". */
+  /**
+   * "50%, 1 of 2 months". Nothing counted yet: "Onboarding month — not
+   * counted" when the onboarding month was judged and left out (10/13, Nic:
+   * "Keep it out, but say so"), else "No months to judge yet".
+   */
   label: string
+  /** The onboarding month was judged and left out (paid late, good news only). */
+  onboarding_left_out: boolean
 }
 
 /**
@@ -720,6 +734,7 @@ export function paymentHealth(months: readonly HouseholdMonth[], through: string
   const onTime = counted.filter(m => m.on_time).length
   const percent = counted.length ? Math.round((onTime / counted.length) * 100) : null
   const first = billed.reduce<string | null>((f, m) => (f === null || m.month < f ? m.month : f), null)
+  const onboardingLeftOut = billed.some(m => m.onboarding_left_out)
   return {
     percent,
     on_time: onTime,
@@ -731,8 +746,9 @@ export function paymentHealth(months: readonly HouseholdMonth[], through: string
     work_trade: counted.filter(m => m.work_trade_only).length,
     from: first ?? through,
     through,
-    label: percent === null ? 'No months to judge yet'
+    label: percent === null ? (onboardingLeftOut ? HEALTH_ONBOARDING_NOT_COUNTED : HEALTH_NOTHING_JUDGED)
       : `${percent}%, ${onTime} of ${counted.length} month${counted.length === 1 ? '' : 's'}`,
+    onboarding_left_out: onboardingLeftOut,
   }
 }
 

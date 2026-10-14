@@ -56,7 +56,7 @@ beforeEach(() => {
   server.byUnit = [
     { unitId: 'u30', leaseId: 'L30', percent: 100, label: '100%, 1 of 1 month' },
     { unitId: 'u31', leaseId: 'L31', percent: 0, label: '0%, 0 of 1 month' },
-    { unitId: 'u40', leaseId: 'L40', percent: null, label: 'No months to judge yet' },
+    { unitId: 'u40', leaseId: 'L40', percent: null, label: 'Onboarding month — not counted' },
   ]
   server.byUnitFails = false
   server.hold = null
@@ -98,7 +98,8 @@ describe('the Tenants list: payment health by lease', () => {
   it('each space shows the health of its own lease — two leases, two numbers', async () => {
     await render()
     await until(() => healthCells()['RV 30'] === '100%', 'the lease figures')
-    expect(healthCells()).toEqual({ 'RV 30': '100%', 'RV 31': '0%', 'RV 40': '—' })
+    // 10/13 (Nic), the onboarding month paid late: "Keep it out, but say so" — words, never a bare dash.
+    expect(healthCells()).toEqual({ 'RV 30': '100%', 'RV 31': '0%', 'RV 40': 'Onboarding month — not counted' })
     const cell = [...host.querySelectorAll('tbody tr')][1].querySelectorAll('td')[3]
     expect(cell.getAttribute('title')).toBe('0%, 0 of 1 month')
   })
@@ -110,6 +111,24 @@ describe('the Tenants list: payment health by lease', () => {
     expect(healthCells()).toEqual({ 'RV 30': '—', 'RV 31': '—', 'RV 40': '—' })
     await act(async () => { release() })
     await until(() => healthCells()['RV 31'] === '0%', 'the lease figures')
+  })
+
+  it('nothing counted yet on a lease says the server\'s words; with no words to give (GAM admin), "Nothing counted yet"', async () => {
+    server.byUnit = [
+      { unitId: 'u30', leaseId: 'L30', percent: null, label: 'No months to judge yet' },
+      { unitId: 'u31', leaseId: 'L31', percent: 0, label: '0%, 0 of 1 month' },
+      { unitId: 'u40', leaseId: 'L40', percent: null, label: 'Onboarding month — not counted' },
+    ]
+    await render()
+    await until(() => healthCells()['RV 31'] === '0%', 'the lease figures')
+    expect(healthCells()).toEqual({ 'RV 30': 'No months to judge yet', 'RV 31': '0%', 'RV 40': 'Onboarding month — not counted' })
+    act(() => root.unmount())
+    root = createRoot(host)
+    server.byUnit = null
+    server.units = [unit('u30', 'RV 30', 'Hal', null), unit('u40', 'RV 40', 'Sol', 100)]
+    await render()
+    await until(() => healthCells()['RV 40'] === '100%', 'the list column')
+    expect(healthCells()).toEqual({ 'RV 30': 'Nothing counted yet', 'RV 40': '100%' })
   })
 
   it('GAM admin (no lease figures sent) reads the list\'s own column', async () => {

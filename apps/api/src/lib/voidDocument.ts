@@ -16,6 +16,7 @@ import { cascadeLeaseTenantsOnVoid } from './leaseDocCascade'
 import { lockLeaseHousehold, unwindIssuedLease, paymentTriedSql } from './unwindIssuedLease'
 import { lockHousehold } from '../services/moneyPredicates'
 import { voidUnowedChargesOrRefuse } from '../services/chargeVoids'
+import { eraseUnfinishedDocument, type ErasedDocument } from './eraseUnfinishedDocument'
 
 /** Why a home payment of a sale whose agreement was voided is not owed (payments.void_reason). */
 export const HOME_SALE_VOIDED_CHARGE_REASON =
@@ -31,6 +32,34 @@ async function refuseUnvoidable(q: Q, doc: any): Promise<void> {
     "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1",
     [doc.id]).then(r => r.rows[0])
   if (tenantSigned) throw new AppError(409, 'Cannot void after a tenant has signed — create a superseding document instead')
+}
+
+/** What ending a document did: erased (with what went with it), or voided. */
+export type DocumentEndOutcome =
+  | { deleted: true; documents: ErasedDocument[]; files: string[] }
+  | { deleted: false }
+
+/**
+ * 10/13 (Nic): "If it never completed, it doesn't exist." THE ONE WAY TO END
+ * A DOCUMENT that should not be signed: ERASED when it never completed and no
+ * money touched it (lib/eraseUnfinishedDocument — with its packet's other
+ * unfinished documents when it is the packet's lease), VOIDED below otherwise,
+ * exactly as before. "Going forward, the app deletes such documents instead of
+ * voiding them": anything that ends a document calls this, not voidDocument —
+ * voidDocument is for a caller that must keep the record whatever it is.
+ *
+ * Inside the caller's open transaction. A completed or already voided document
+ * is refused as the void always refused it, before anything is locked. Files
+ * only the erased documents used are the caller's to remove after COMMIT
+ * (removeOrphanedDocumentFiles). Sends nothing to anybody.
+ */
+export async function endDocument(q: Q, doc: any, reason: string | null): Promise<DocumentEndOutcome> {
+  if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
+  if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
+  const erased = await eraseUnfinishedDocument(q, doc)
+  if (erased.erased) return { deleted: true, documents: erased.documents, files: erased.files }
+  await voidDocument(q, doc, reason)
+  return { deleted: false }
 }
 
 export async function voidDocument(q: Q, doc: any, reason: string | null) {

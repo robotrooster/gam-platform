@@ -49,7 +49,7 @@ const SETTINGS = {
   booksStartDate: null, historyStart: null, joinedOn: '2026-08-28', joinMonthStart: '2026-08-01',
   closeBy: 'owner_or_bookkeeper', reopenBy: 'owner', openMonthFixes: 'restate',
   homeSaleMethod: null, workTradeMethod: null, registerStockMethod: 'expense_when_bought', registerStockFrom: null,
-  companyCostsMethod: null, writeOffBy: 'owner', closedThrough: null, today: '2026-10-12', hasPostings: false, openingItems: 0,
+  writeOffBy: 'owner', closedThrough: null, today: '2026-10-12', hasPostings: false, openingItems: 0,
 }
 const OPENING = {
   canEdit: true, seesBank: true, booksStartDate: '2026-10-01', closedThrough: null, homeSaleMethod: 'whole_sale_at_signing',
@@ -103,7 +103,10 @@ describe('Books Settings', () => {
     expect(t).toContain('Since joining GAM')
     expect(t).toContain('Your books start August 1, 2026, the first day of the month this company joined GAM.')
     expect(t).toContain('The whole sale when it is signed')
-    expect(t).toContain('A Company column of their own')
+    // 10/13 (Nic): "there should never be a default setting to apply expenses" —
+    // where a cost goes is asked on each record, never here.
+    expect(t).not.toContain('Costs that are no one property\'s')
+    expect(t).not.toContain('A Company column of their own')
     expect(t).toContain('Not chosen yet')
     // No raw stored value anywhere on the page.
     for (const raw of ['whole_sale_at_signing', 'income_as_paid', 'rent_and_labor', 'company_bucket', 'owner_or_bookkeeper', 'since_joining', 'expense_when_bought']) {

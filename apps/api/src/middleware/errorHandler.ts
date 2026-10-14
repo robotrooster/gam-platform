@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { ZodError } from 'zod'
-import { logger } from '../lib/logger'
+import { logger, redactLoggedUrl } from '../lib/logger'
 
 export class AppError extends Error {
   /**
@@ -37,7 +37,8 @@ export function errorHandler(err: any, req: Request, res: Response, _next: NextF
     // S652: a rejected write used to log only its status code. When a landlord
     // reports "it just reloads", the reason has to be in the log.
     const log = ((req as any).log ?? logger) as typeof logger
-    log.warn({ status, reason: message, path: req.originalUrl }, 'request rejected (4xx)')
+    // 10/13: never a live invitation token (lib/logger redactLoggedUrl).
+    log.warn({ status, reason: message, path: redactLoggedUrl(req.originalUrl) }, 'request rejected (4xx)')
   }
   if (status >= 500) {
     // Prefer the per-request child logger (carries request id) when

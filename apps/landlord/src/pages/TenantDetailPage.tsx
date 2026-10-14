@@ -11,7 +11,7 @@ import {
   money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay,
   CREDIT_USE_RULE, serverMessage, type TenantCredit,
 } from '../lib/creditDesk'
-import { healthColor, healthWord } from '../lib/paymentStamps'
+import { healthColor, healthWord, healthText } from '../lib/paymentStamps'
 import '../styles/credit-desk.css'
 
 /**
@@ -44,7 +44,7 @@ interface LeaseHealthRow {
   current: boolean
   /** The lease's own status (shared LEASE_STATUSES). */
   status?: LeaseStatus
-  health: { percent: number | null; onTime: number; counted: number; paidLate: number; partial: number; outstanding: number; label: string } | null
+  health: { percent: number | null; onTime: number; counted: number; paidLate: number; partial: number; outstanding: number; label: string; onboardingLeftOut?: boolean } | null
 }
 
 /**
@@ -147,7 +147,9 @@ export function TenantDetailPage() {
   const health = byLease.length === 1 ? (byLease[0].health ?? null) : (stats.health ?? null)
   const rate: number | null = byLease.length === 1 ? (byLease[0].health?.percent ?? null) : (stats.onTimeRate ?? null)
   const onTimeColor = healthColor(rate)
-  const onTimeLabel = healthWord(rate)
+  // 10/13 (Nic): "Keep it out, but say so" — nothing counted yet says why
+  // ("Onboarding month — not counted"), never a bare dash.
+  const onTimeLabel = healthWord(rate, health)
   const severalLeases = byLease.length > 1
   /** The report for one lease (that lease's household), or the person's whole one. */
   const reportFor = (leaseId?: string | null) => `/tenants/${id}/report${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ''}`
@@ -187,14 +189,19 @@ export function TenantDetailPage() {
               { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
               severalLeases
-                ? { label: 'Payment Health', val: byLease.map(l => `${l.unitNumber ?? '—'} ${l.health?.percent == null ? '—' : `${l.health.percent}%`}`).join(' · '),
+                ? { label: 'Payment Health', val: byLease.map(l => `${l.unitNumber ?? '—'} ${healthText(l.health)}`).join(' · '),
                     color: 'var(--text-0)', sub: 'by lease' }
-                : { label: 'Payment Health', val: rate === null ? '—' : rate + '%', color: onTimeColor, sub: onTimeLabel },
+                : rate === null
+                  // Nothing counted yet: the words in the figure's place (no dash, no repeat under it).
+                  ? { label: 'Payment Health', val: onTimeLabel, color: onTimeColor, small: true }
+                  : { label: 'Payment Health', val: rate + '%', color: onTimeColor, sub: onTimeLabel },
               { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ]).map(s => (
               <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
                 <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 6 }}>{s.label}</div>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1rem', fontWeight: 700, color: s.color }}>{s.val}</div>
+                <div style={(s as any).small
+                  ? { fontFamily: 'var(--font-body)', fontSize: '.8rem', fontWeight: 700, color: 'var(--text-2)' }
+                  : { fontFamily: 'var(--font-mono)', fontSize: '1rem', fontWeight: 700, color: s.color }}>{s.val}</div>
                 {(s as any).sub && <div style={{ fontSize: '.65rem', color: s.color, marginTop: 2 }}>{(s as any).sub}</div>}
               </div>
             ))}
@@ -229,7 +236,8 @@ export function TenantDetailPage() {
                   <div key={l.leaseId} data-lease={l.leaseId} style={{ padding: '10px 0', borderTop: '1px solid var(--border-0)' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                       <div style={{ width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-3)', border: '3px solid ' + color, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem', fontWeight: 800, color }}>{pct === null ? '—' : `${pct}%`}</span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem', fontWeight: 800, color }}
+                          title={pct === null ? healthText(l.health) : undefined}>{pct === null ? '—' : `${pct}%`}</span>
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontSize: '.84rem', fontWeight: 700, color: 'var(--text-0)' }}>
@@ -237,7 +245,9 @@ export function TenantDetailPage() {
                           <LeaseHealthBadge lease={l} />
                         </div>
                         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
-                          {l.health?.label ?? 'No months to judge yet'} · since joining GAM
+                          {/* Nothing counted yet: why, beside the ring's dash (healthText). */}
+                          {l.health?.percent == null ? healthText(l.health) : l.health.label} · since joining GAM
+                          {l.health?.percent != null && l.health.onboardingLeftOut && ' · onboarding month not counted'}
                           {l.health && ` · ${l.health.paidLate} late, ${l.health.partial} partial, ${l.health.outstanding} outstanding`}
                         </div>
                       </div>
@@ -264,7 +274,11 @@ export function TenantDetailPage() {
                 </div>
                 <div>
                   <div style={{ fontSize: '.85rem', fontWeight: 700, color: onTimeColor }}>{onTimeLabel}</div>
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>{health?.label ?? 'Months paid on time'} · since joining GAM</div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                    {/* Nothing counted yet: the words above say why; no repeat. */}
+                    {rate === null ? 'Since joining GAM' : `${health?.label ?? 'Months paid on time'} · since joining GAM`}
+                    {rate !== null && health?.onboardingLeftOut && ' · onboarding month not counted'}
+                  </div>
                 </div>
               </div>
               {[

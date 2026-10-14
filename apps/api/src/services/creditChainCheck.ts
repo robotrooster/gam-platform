@@ -1,10 +1,9 @@
 import type { PoolClient } from 'pg'
 import { db } from '../db'
-import { humanize } from '@gam/shared'
+import { humanize, type CreditChainCheckOutcome } from '@gam/shared'
 import { dateIn } from '../lib/timezone'
 import { logger } from '../lib/logger'
 import { verifyAllChains, CHAIN_BREAK_LABEL, type ChainBreak } from './creditLedger'
-import { createAdminNotification, type CreateAdminNotificationOpts } from './adminNotifications'
 
 // ============================================================
 // The nightly credit chain check (10/13, Nic: "ADD the nightly chain check
@@ -13,29 +12,30 @@ import { createAdminNotification, type CreateAdminNotificationOpts } from './adm
 // Every credit record's chain is verified each night (verifyAllChains, in the
 // 03:00 credit nightly, after tonight's marks are written). A chain whole —
 // never restarted, or whole since a restart that explains its old break — is
-// not news. Any chain broken is listed in ONE admin email to the super admins
-// (one email per thing): whose record it is (the tenant's name; a company's
-// record by its company name), and the first bad entry (what it is, its day,
-// its id) with the break in plain words. When every chain is whole, nothing is
-// sent. A broken chain is flagged every night it stays broken: nothing here
-// repairs one (a restart is a decision, 10/13), so it keeps showing until it
-// is dealt with.
+// not news. A chain broken is named in the morning admin email: whose record
+// it is (the tenant's name; a company's record by its company name), and the
+// first bad entry (what it is, its day, its id) with the break in plain words.
+// A broken chain is named every morning it stays broken: nothing here repairs
+// one (a restart is a decision, 10/13), so it keeps showing until it is dealt
+// with.
 //
-// 10/13 (review): a quiet morning has to mean every chain is whole. A night
-// the check could not finish sends its own admin email ("did not run"), and
-// "sent" is read back from admin_notifications, never assumed: the
-// notification helper swallows a failed write (it only logs it), so a flag
-// that is not on record is counted as an error in the nightly's log line.
+// 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+// email (not its own 3 am email)." The 03:00 check no longer emails anybody:
+// it writes down what it found (credit_chain_check_runs — recordCreditChainCheck),
+// and the one 8:05 morning admin email (services/readerOrders chaseReaderOrders,
+// which already goes out every morning anything waits on GAM) carries it
+// (creditChainMorningSection).
+//
+// 10/13 (review), kept: a quiet morning has to mean every chain is whole. The
+// morning email says the check did not run when last night's check could not
+// finish, has still not finished, or is not on record at all since the morning
+// before — so silence is never read as "every chain whole" when none was
+// checked.
 // ============================================================
 
 type Q = Pick<PoolClient, 'query'>
 
-/** The admin notification category for broken chains (one email a night, any number of chains). */
-export const CHAIN_BROKEN_CATEGORY = 'credit_chain_broken'
-/** The admin notification category for a night the check could not finish. */
-export const CHAIN_CHECK_FAILED_CATEGORY = 'credit_chain_check_failed'
-
-/** One broken chain, as the admin email names it. */
+/** One broken chain, as the morning email names it. */
 export interface BrokenChain {
   subjectId: string
   /** tenant / landlord / manager / property (null: the subject row is gone). */
@@ -117,7 +117,7 @@ function inWords(b: BrokenChain): { record: string; firstBadEntry: string; probl
   }
 }
 
-/** The admin email for broken chains: its title and one line per chain. */
+/** The broken chains in the morning email: their part of its title, and one line per chain. */
 export function brokenChainsEmail(broken: readonly BrokenChain[]): { title: string; body: string } {
   const n = broken.length
   const lines = broken.map((b) => {
@@ -131,11 +131,9 @@ export function brokenChainsEmail(broken: readonly BrokenChain[]): { title: stri
 }
 
 /**
- * The email's context block, one entry per broken chain. 10/13 (review): the
- * admin email prints its body as one paragraph (the line breaks between the
- * chains do not show), and the context under it line by line, so each chain is
- * repeated there in words — whose record, the first bad entry, the break — with
- * its ids and verifyChain's reason, word for word, for whoever repairs it.
+ * The email's context block for the broken chains, one entry per chain — whose
+ * record, the first bad entry, the break — with its ids and verifyChain's
+ * reason, word for word, for whoever repairs it.
  */
 export function brokenChainsContext(r: ChainCheckResult): Record<string, unknown> {
   return {
@@ -148,84 +146,154 @@ export function brokenChainsContext(r: ChainCheckResult): Record<string, unknown
 }
 
 /**
- * Raise an admin notification and say whether it is ON RECORD (10/13, review).
- * createAdminNotification never throws — a failed write is only logged — so
- * the row is looked for: one of this category written since just before the
- * call. Its email to the super admins goes out with the row (the helper logs
- * any address it could not reach). Never throws.
+ * The nightly record: chains checked, whole and broken. `recorded`: tonight's
+ * run is written down for the morning email (credit_chain_check_runs).
+ * `errors`: the check did not finish, or its run could not be written down.
  */
-async function raiseNotice(opts: CreateAdminNotificationOpts): Promise<boolean> {
+export interface ChainRecordResult {
+  subjects: number
+  whole: number
+  broken: number
+  recorded: boolean
+  errors: number
+}
+
+/** Write down a night's run (a new row, or the one started for it). Returns whether it is on record; never throws. */
+async function writeRun(id: string | null, run: {
+  outcome: Exclude<CreditChainCheckOutcome, 'running'>; subjects?: number; whole?: number; broken?: BrokenChain[]; error?: string
+}): Promise<boolean> {
+  const vals = [run.outcome, run.subjects ?? null, run.whole ?? null, run.broken?.length ?? null,
+    JSON.stringify(run.broken ?? []), run.error ?? null]
   try {
-    const { rows: [{ since }] } = await db.query<{ since: string }>(`SELECT now()::text AS since`)
-    await createAdminNotification(opts)
-    const { rows } = await db.query(
-      `SELECT 1 FROM admin_notifications WHERE category = $1 AND created_at >= $2::timestamptz LIMIT 1`,
-      [opts.category, since])
-    return rows.length > 0
+    const r = id
+      ? await db.query(
+        `UPDATE credit_chain_check_runs
+            SET outcome = $2, finished_at = now(), subjects = $3, whole = $4, broken = $5, broken_chains = $6::jsonb, error = $7
+          WHERE id = $1`, [id, ...vals])
+      : await db.query(
+        `INSERT INTO credit_chain_check_runs (outcome, finished_at, subjects, whole, broken, broken_chains, error)
+         VALUES ($1, now(), $2, $3, $4, $5::jsonb, $6)`, vals)
+    return (r.rowCount ?? 0) === 1
   } catch (err) {
-    logger.error({ err, category: opts.category }, '[credit-chains] the admin notice could not be raised')
+    logger.error({ err, outcome: run.outcome }, "[credit-chains] tonight's check could not be written down for the morning email")
     return false
   }
 }
 
 /**
- * The nightly flag: chains checked, whole and broken. `sent`: tonight's admin
- * email (broken chains, or the check not running) is on record. `errors`: the
- * check did not finish, or its broken-chain email is not on record.
+ * 10/13 evening (Nic): a night the check could not finish is written down as
+ * 'failed', with why — the morning email says it did not run. Returns whether
+ * it is on record; never throws.
  */
-export interface ChainFlagResult {
-  subjects: number
-  whole: number
-  broken: number
-  sent: boolean
-  errors: number
-}
-
-/**
- * 10/13 (review): the admin email for a night the check could not finish.
- * Without it, a morning with no broken-chain email would read as "every chain
- * whole" when no chain was checked. Returns whether it is on record; never throws.
- */
-export async function flagChainCheckFailed(err: unknown): Promise<boolean> {
+export async function recordChainCheckFailed(err: unknown, runId: string | null = null): Promise<boolean> {
   const why = err instanceof Error ? err.message : String(err)
-  return raiseNotice({
-    severity: 'warn',
-    category: CHAIN_CHECK_FAILED_CATEGORY,
-    emailSuperAdmins: true,
-    title: 'The credit chain check did not run tonight',
-    body: `Tonight's check of every credit history chain stopped before it finished: ${why}. No chain was checked, `
-      + 'so a morning without a broken-chain email does not mean every chain is whole. The check runs again tomorrow night.',
-    context: { error: why },
-  })
+  return writeRun(runId, { outcome: 'failed', error: why })
 }
 
 /**
- * The nightly check and its email: checks every chain, and when any is broken
- * sends one admin email (super admins) naming each. Nothing when all are whole.
- * A check that cannot finish sends the "did not run" email instead. Never throws.
+ * The 03:00 check: every chain checked, and what it found written down for the
+ * 8:05 morning admin email (credit_chain_check_runs) — the broken chains named,
+ * or that every chain is whole. Nobody is emailed from here (10/13 evening, Nic).
+ * The run is started before the check (a night that dies half way reads as
+ * unfinished in the morning) and finished with its outcome; a check that
+ * cannot finish is written down as 'failed'. `q` is what the check reads with;
+ * the run is written on the pool. Never throws.
  */
-export async function flagBrokenCreditChains(q: Q = db): Promise<ChainFlagResult> {
+export async function recordCreditChainCheck(q: Q = db): Promise<ChainRecordResult> {
+  let runId: string | null = null
+  try {
+    runId = (await db.query<{ id: string }>(`INSERT INTO credit_chain_check_runs DEFAULT VALUES RETURNING id`)).rows[0]?.id ?? null
+  } catch (err) {
+    // Written whole at the end instead.
+    logger.error({ err }, "[credit-chains] tonight's check could not be started on record")
+  }
   let r: ChainCheckResult
   try {
     r = await checkCreditChains(q)
   } catch (err) {
-    // Checked again tomorrow night; tonight the admins hear it did not run.
+    // Checked again tomorrow night; the morning email says it did not run.
     logger.error({ err }, '[credit-chains] the check did not finish')
-    return { subjects: 0, whole: 0, broken: 0, sent: await flagChainCheckFailed(err), errors: 1 }
+    return { subjects: 0, whole: 0, broken: 0, recorded: await recordChainCheckFailed(err, runId), errors: 1 }
   }
-  const out: ChainFlagResult = { subjects: r.subjects, whole: r.whole, broken: r.broken.length, sent: false, errors: 0 }
-  if (!r.broken.length) return out
-  const mail = brokenChainsEmail(r.broken)
-  const sent = await raiseNotice({
-    severity: 'critical',
-    category: CHAIN_BROKEN_CATEGORY,
-    emailSuperAdmins: true,
-    title: mail.title,
-    body: mail.body,
-    context: brokenChainsContext(r),
+  const recorded = await writeRun(runId, {
+    outcome: r.broken.length ? 'broken' : 'whole', subjects: r.subjects, whole: r.whole, broken: r.broken,
   })
-  // Not on record: nobody was told tonight. The chains are still broken
-  // tomorrow night, so the next run flags them again.
-  if (!sent) logger.error({ broken: r.broken.length }, '[credit-chains] the broken-chain email is not on record')
-  return { ...out, sent, errors: sent ? 0 : 1 }
+  // Not on record: the morning email says the check did not run, and the
+  // chains are checked again tomorrow night.
+  return { subjects: r.subjects, whole: r.whole, broken: r.broken.length, recorded, errors: recorded ? 0 : 1 }
+}
+
+/** What last night's check gives the morning admin email. */
+export interface ChainMorningSection {
+  /** 'whole': nothing to say. */
+  outcome: 'whole' | 'broken' | 'did_not_run'
+  /** Its part of the email's title (null when whole). */
+  title: string | null
+  /** Its lines of the email (none when whole). */
+  lines: string[]
+  /** Its part of the email's context block (null when whole). */
+  context: Record<string, unknown> | null
+}
+
+/** How long before the morning email a night's run may have started and still be last night's. */
+const LAST_NIGHT_HOURS = 24
+
+const NOT_CHECKED_TAIL = 'No chain was checked, so this email does not mean every chain is whole. The check runs again tonight.'
+
+/** "10/13/2026 3:00 AM" — a run's moment on GAM's (Arizona) calendar. */
+function arizonaMoment(at: Date): string {
+  return new Date(at).toLocaleString('en-US', {
+    timeZone: 'America/Phoenix', month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit',
+  }).replace(',', '')
+}
+
+/**
+ * 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+ * email." Last night's check — the newest run that started within the last
+ * LAST_NIGHT_HOURS (on the database's clock) — as the morning email says it:
+ *   - whole: nothing;
+ *   - broken: each broken chain named, one line each (brokenChainsEmail);
+ *   - did not run: it could not finish (with why), it has still not finished,
+ *     or no run is on record since the morning before (with the last one there
+ *     is) — a quiet morning means every chain is whole.
+ * Never throws: a run that cannot be read is said as not checked.
+ */
+export async function creditChainMorningSection(): Promise<ChainMorningSection> {
+  const notRun = (line: string, context: Record<string, unknown>): ChainMorningSection => ({
+    outcome: 'did_not_run', title: 'The credit chain check did not run last night', lines: [line], context,
+  })
+  try {
+    const { rows: [last] } = await db.query<{
+      started_at: Date; outcome: CreditChainCheckOutcome; subjects: number | null; whole: number | null
+      broken_chains: BrokenChain[]; error: string | null; last_night: boolean
+    }>(
+      `SELECT started_at, outcome, subjects, whole, broken_chains, error,
+              started_at > now() - make_interval(hours => $1) AS last_night
+         FROM credit_chain_check_runs ORDER BY started_at DESC, id DESC LIMIT 1`, [LAST_NIGHT_HOURS])
+    if (!last || !last.last_night) {
+      return notRun(`CREDIT CHAINS NOT CHECKED — the credit chain check did not run last night (${last
+        ? `the last check on record started ${arizonaMoment(last.started_at)}` : 'there is no check on record'}). ${NOT_CHECKED_TAIL}`,
+      { creditChainCheck: 'did_not_run', lastStartedAt: last?.started_at ?? null })
+    }
+    if (last.outcome === 'failed') {
+      return notRun(`CREDIT CHAINS NOT CHECKED — last night's credit chain check stopped before it finished: ${last.error ?? 'no reason on record'}. ${NOT_CHECKED_TAIL}`,
+        { creditChainCheck: 'failed', startedAt: last.started_at, error: last.error })
+    }
+    if (last.outcome === 'running') {
+      return notRun(`CREDIT CHAINS NOT CHECKED — last night's credit chain check started ${arizonaMoment(last.started_at)} and has not finished. ${NOT_CHECKED_TAIL}`,
+        { creditChainCheck: 'unfinished', startedAt: last.started_at })
+    }
+    const broken = last.broken_chains ?? []
+    if (last.outcome === 'whole' || !broken.length) return { outcome: 'whole', title: null, lines: [], context: null }
+    const mail = brokenChainsEmail(broken)
+    return {
+      outcome: 'broken', title: mail.title, lines: mail.body.split('\n'),
+      context: brokenChainsContext({ subjects: last.subjects ?? 0, whole: last.whole ?? 0, broken }),
+    }
+  } catch (err) {
+    logger.error({ err }, "[credit-chains] last night's check could not be read for the morning email")
+    const why = err instanceof Error ? err.message : String(err)
+    return notRun(`CREDIT CHAINS NOT CHECKED — last night's credit chain check could not be read: ${why}. ${NOT_CHECKED_TAIL}`,
+      { creditChainCheck: 'unreadable', error: why })
+  }
 }

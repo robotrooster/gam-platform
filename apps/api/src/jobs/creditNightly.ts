@@ -1,7 +1,7 @@
 import { recomputeAllSubjects } from '../services/creditScore'
 import { refreshAllSubjectStats } from '../services/creditStats'
 import { syncBillMarksNightly } from '../services/creditBillMarks'
-import { flagBrokenCreditChains, flagChainCheckFailed, type ChainFlagResult } from '../services/creditChainCheck'
+import { recordCreditChainCheck, recordChainCheckFailed, type ChainRecordResult } from '../services/creditChainCheck'
 import { logger } from '../lib/logger'
 
 // ============================================================
@@ -17,13 +17,15 @@ import { logger } from '../lib/logger'
 //      the database changes when a day passes), a bill paid in full gets its
 //      on-time or late mark if no settle wrote it. Runs first, so the scores
 //      and stats below read tonight's marks.
-//   0b. flagBrokenCreditChains (10/13, Nic: "ADD the nightly chain check
+//   0b. recordCreditChainCheck (10/13, Nic: "ADD the nightly chain check
 //      (break flagged in the morning admin email)"): every credit record's
-//      chain verified once tonight's marks are written; any chain broken is
-//      named in one admin email (whose record, the first bad entry), nothing
-//      when all are whole. A check that cannot finish sends a "did not run"
-//      email instead (10/13, review: a quiet morning means every chain is
-//      whole), and never stops the scores and stats.
+//      chain verified once tonight's marks are written. 10/13 evening (Nic:
+//      "fold into the 8:05 MORNING admin email (not its own 3 am email)"):
+//      nobody is emailed at 3 am — what it found is written down
+//      (credit_chain_check_runs) and the 8:05 morning admin email names any
+//      chain broken, or says the check did not run (a check that cannot
+//      finish is written down as failed; a quiet morning means every chain is
+//      whole). It never stops the scores and stats.
 //   1. recomputeAllSubjects: snapshots a credit_scores row per subject
 //      with active events.
 //   2. refreshAllSubjectStats: upserts credit_stats per subject (the
@@ -37,8 +39,8 @@ import { logger } from '../lib/logger'
 
 export interface NightlyResult {
   bills: { reviewed: number; changed: number; errors: number }
-  /** The chain check (10/13): chains checked, whole, broken; sent = tonight's admin email is on record. */
-  chains: ChainFlagResult
+  /** The chain check (10/13): chains checked, whole, broken; recorded = written down for the 8:05 morning email. */
+  chains: ChainRecordResult
   scores: { processed: number; errors: number }
   stats: { processed: number; errors: number }
 }
@@ -53,16 +55,16 @@ export async function processCreditNightly(): Promise<NightlyResult> {
     logger.error({ err }, '[credit-nightly][bill-marks]')
     bills = { ...bills, errors: bills.errors + 1 }
   }
-  let chains: ChainFlagResult
+  let chains: ChainRecordResult
   try {
-    // Never throws by itself (a check that cannot finish sends its own "did
-    // not run" email); this catch is the backstop for anything unforeseen.
-    chains = await flagBrokenCreditChains()
+    // Never throws by itself (a check that cannot finish is written down as
+    // failed); this catch is the backstop for anything unforeseen.
+    chains = await recordCreditChainCheck()
   } catch (err) {
     // Checked again tomorrow night; tonight's scores and stats still run, and
-    // the admins hear the check did not.
+    // the 8:05 morning email says the check did not run.
     logger.error({ err }, '[credit-nightly][chains]')
-    chains = { subjects: 0, whole: 0, broken: 0, sent: await flagChainCheckFailed(err), errors: 1 }
+    chains = { subjects: 0, whole: 0, broken: 0, recorded: await recordChainCheckFailed(err), errors: 1 }
   }
   const scoreResult = await recomputeAllSubjects()
   for (const e of scoreResult.errors) {

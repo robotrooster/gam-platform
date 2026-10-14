@@ -398,32 +398,80 @@ describe('flags and undo', () => {
 })
 
 describe('Step 12 review: the bank changes its mind, and two hands at once', () => {
-  it('when the bank voids a deposit matched to a slip, the owner is told the office’s deposit never came in', async () => {
+  // 10/13 evening (Nic): "Bank takes back a bounced deposit that was MATCHED to income: void what
+  // bounced." (10/13 review) GAM has no way yet to take back a payment recorded at the desk, so a bag
+  // with payments in it is left whole for the owner — its other money too (voiding only that would
+  // treat money from one bag two ways); the owner is told, as before, and Undo still works.
+  it('when the bank voids a deposit matched to a slip with payments in it, nothing is taken back by itself — the owner is told the office’s deposit never came in', async () => {
     const ctx = await build()
     const a = await receipt(ctx, 460, '2026-09-25')
     const b = await receipt(ctx, 75, '2026-09-26')
     const slip = await createSlip({
       landlordId: ctx.landlordId, depositDate: '2026-09-28', receiptIds: [a.id, b.id], createdBy: ctx.userId,
+      otherAmount: 20, otherNote: 'Laundry coins', otherIsNotRent: true,
     })
     await upsertTransactions(ctx.connectionId, ctx.landlordId, [
-      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 535, description: 'BRANCH DEPOSIT' },
+      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 555, description: 'BRANCH DEPOSIT' },
     ])
     expect((await slipOf(slip.id)).status).toBe('matched')
+    const income = (await db.query(`SELECT id, status FROM landlord_other_income WHERE landlord_id = $1`, [ctx.landlordId])).rows
+    expect(income.map((i: any) => i.status)).toEqual(['active'])
     await upsertTransactions(ctx.connectionId, ctx.landlordId, [
-      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 535, description: 'BRANCH DEPOSIT', status: 'void' },
+      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 555, description: 'BRANCH DEPOSIT', status: 'void' },
     ])
+    // Nothing taken back by itself: the slip stays matched, its other money and its payments as they were.
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    expect((await db.query(`SELECT status FROM landlord_other_income WHERE id = $1`, [income[0].id])).rows[0].status).toBe('active')
+    expect((await db.query(`SELECT status FROM tenant_remittances WHERE id = ANY($1::uuid[]) ORDER BY amount`, [[a.id, b.id]])).rows
+      .map((r: any) => r.status)).toEqual(['settled', 'settled'])
+    const t = (await db.query(`SELECT id, status, bank_status FROM bank_transactions WHERE external_id = 'bag_1'`)).rows[0]
+    expect({ status: t.status, bank_status: t.bank_status }).toEqual({ status: 'matched', bank_status: 'void' })
     const n = (await db.query(`SELECT title, body, action_url FROM notifications WHERE user_id = $1 AND type = 'bank_deposit_voided'`,
       [ctx.userId])).rows
     expect(n).toEqual([{
       title: 'Your bank voided an office deposit',
-      body: 'Your bank voided the $535.00 deposit of 2026-09-29 that was matched to your deposit slip of 2026-09-28 (2 payments) — the money did not come in. ' +
+      body: 'Your bank voided the $555.00 deposit of 2026-09-29 that was matched to your deposit slip of 2026-09-28 (2 payments) — the money did not come in. ' +
         'Find out what happened to that bag. Then open the deposit on the Bank page and press Undo, so those payments show as not banked again.',
       action_url: '/bank',
     }])
     // Undo still works on the voided row, and the payments are waiting to be banked again.
-    const t = (await db.query(`SELECT id FROM bank_transactions WHERE external_id = 'bag_1'`)).rows[0].id
-    await undoDepositMatch({ bankTransactionId: t, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    await undoDepositMatch({ bankTransactionId: t.id, landlordId: ctx.landlordId, undoneBy: ctx.userId })
     expect((await slipOf(slip.id)).status).toBe('open')
+  })
+
+  // The question's own example ("say $200 of laundry cash"): a bag of other money alone is taken back by
+  // itself — the income it was filed as is voided (kept on record), the slip is open again for the bag.
+  it('when the bank voids a deposit matched to a slip of other money alone, that money is voided by itself and the owner is told', async () => {
+    const ctx = await build()
+    const slip = await createSlip({
+      landlordId: ctx.landlordId, depositDate: '2026-09-28', createdBy: ctx.userId, propertyIds: [ctx.propertyId],
+      otherAmount: 200, otherNote: 'Laundry cash', otherIsNotRent: true,
+    })
+    await upsertTransactions(ctx.connectionId, ctx.landlordId, [
+      { externalId: 'bag_2', postedDate: '2026-09-29', amount: 200, description: 'BRANCH DEPOSIT' },
+    ])
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    const income = (await db.query(`SELECT id, status FROM landlord_other_income WHERE landlord_id = $1`, [ctx.landlordId])).rows
+    expect(income.map((i: any) => i.status)).toEqual(['active'])
+    await upsertTransactions(ctx.connectionId, ctx.landlordId, [
+      { externalId: 'bag_2', postedDate: '2026-09-29', amount: 200, description: 'BRANCH DEPOSIT', status: 'void' },
+    ])
+    // The income it was filed as is voided — kept on record.
+    expect((await db.query(`SELECT status, voided_at IS NOT NULL AS voided FROM landlord_other_income WHERE id = $1`, [income[0].id])).rows[0])
+      .toEqual({ status: 'voided', voided: true })
+    // The slip is open again for the bag; the line is set aside as the bank's void.
+    expect((await slipOf(slip.id)).status).toBe('open')
+    const line = (await db.query(`SELECT status, ignored_reason, landlord_other_income_id FROM bank_transactions WHERE external_id = 'bag_2'`)).rows[0]
+    expect(line).toEqual({ status: 'ignored', ignored_reason: 'bank_void', landlord_other_income_id: null })
+    const n = (await db.query(`SELECT title, body, action_url FROM notifications WHERE user_id = $1 AND type = 'bank_deposit_voided'`,
+      [ctx.userId])).rows
+    expect(n).toEqual([{
+      title: 'Your bank took back an office deposit',
+      body: 'Your bank voided the $200.00 deposit of Sep 29, 2026 that was matched to your deposit slip of Sep 28, 2026 — the money did not come in. ' +
+        'GAM voided the $200.00 (Laundry cash) it was filed as; it stays on record as voided. ' +
+        'The slip is open again for the deposit when it reaches the bank. Find out what happened to that deposit.',
+      action_url: '/bank',
+    }])
   })
 
   it('a person matching a slip while the sync holds the same deposit waits its turn — never a deadlock', async () => {

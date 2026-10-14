@@ -12,7 +12,7 @@ import { registerBooksLoansAssetsRoutes } from './booksLoansAssets'
 // 10/12 (Nic, ledger P8): the Books statements read the ledger.
 import { registerBooksLedgerReportRoutes, wholeLedgerScope } from './booksLedgerReports'
 import { ledgerReportsLive, ledgerTaxSummary, ledgerProfitAndLoss, ledgerAccountBalances } from '../services/ledgerReports'
-import { vendor1099List } from '../services/booksVendorsLoans'
+import { vendor1099List, resolveCostPlace, type CostPlaceChoice } from '../services/booksVendorsLoans'
 import { todayIn, monthStartOf } from '../lib/timezone'
 import { basisMeta, incomeEvents, incomeTotals, incomeBoth, moneyViewFrom, summarize, lineList, ledgerOwedDay, type IncomeEvent } from '../services/incomeBasis'
 import type { IncomeBasis } from '@gam/shared'
@@ -28,7 +28,7 @@ const BOOKS_BASIS: IncomeBasis = 'received'
 import {
   BOOKS_ACCOUNT_TYPES, BOOKS_TRANSACTION_TYPES, BOOKS_JOURNAL_ENTRY_TYPES,
   BOOKS_PAY_TYPES, BOOKS_PAY_FREQUENCIES, BOOKS_PAY_PERIODS_PER_YEAR, BOOKS_EMPLOYEE_FILING_STATUSES,
-  booksDefaultHours, booksNormalBalance, booksCents, socialSecurityWageBase, booksEmployerFica,
+  booksDefaultHours, booksNormalBalance, booksCents, socialSecurityWageBase, booksEmployerFica, BOOKS_COST_PLACES,
   type BooksPayFrequency,
 } from '@gam/shared'
 // 10/12 (Nic, ledger P7): payroll and journal entries post to the ledger
@@ -162,7 +162,11 @@ const BOOKS_WITHOUT_COMPANY_WIDE = /^\/(bookkeeper\/clients|companies|rent-roll)
 // 10/12 (Nic, ledger P8): the ledger's own statements — the trial balance,
 // the general ledger, money out and whether the books are live — are the
 // ledger's too (routes/booksLedgerReports).
-const BOOKS_LEDGER = /^\/(?:(?:accounts|employees|vendors|loans|fixed-assets|payroll|journal|transactions|bills|work-trade-pay)(?:\/.*)?|properties\/?|reconciliation\/?|reports\/(?:pl|balance-sheet|trial-balance|general-ledger|money-out|receivables|ledger-status)\/?|tax\/summary\/?)$/
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging" — the company's properties and units the
+// Loans, Fixed assets and Run Payroll forms ask that from (GET /cost-places)
+// are the ledger's, as the property list those forms read before was.
+const BOOKS_LEDGER = /^\/(?:(?:accounts|employees|vendors|loans|fixed-assets|payroll|journal|transactions|bills|work-trade-pay)(?:\/.*)?|properties\/?|cost-places\/?|reconciliation\/?|reports\/(?:pl|balance-sheet|trial-balance|general-ledger|money-out|receivables|ledger-status)\/?|tax\/summary\/?)$/
 
 // S383 fix — bookkeeper client-scope validation middleware. Pre-fix bug:
 // the middleware blindly accepted the X-Client-Id header without
@@ -897,7 +901,28 @@ function payrollTaxes(grossPay: number, ytdGross: number, federalTax: number, st
  * as 'YYYY-MM-DD' (node-postgres hands a date column over as a Date at the
  * server's midnight, which the pages' "date + T12:00:00" could not read).
  */
-const PAYROLL_RUN_COLUMNS = `pr.*, pr.pay_date::text AS pay_date, pr.period_start::text AS period_start, pr.period_end::text AS period_end`
+const PAYROLL_RUN_COLUMNS = `pr.*, pr.pay_date::text AS pay_date, pr.period_start::text AS period_start, pr.period_end::text AS period_end,
+  (SELECT p.name FROM properties p WHERE p.id = pr.property_id) AS property_name,
+  (SELECT u.unit_number FROM units u WHERE u.id = pr.unit_id) AS unit_number`
+
+/**
+ * 10/13 (Nic): "each expense is chosen on the split or specific unit or
+ * property at the time of logging" — payroll is logged by a person, so a
+ * landlord company's run says where its wages and the employer's taxes go
+ * (payroll_runs.cost_place): split across the properties by units, one
+ * property, or one unit. Sent when the run is calculated (kept on the draft)
+ * or when it is approved; a run is never approved without it.
+ */
+const PAYROLL_PLACE_WHAT = 'this payroll\'s wages and employer taxes'
+async function payrollPlaceSent(q: Pick<PoolClient, 'query'>, landlordId: string | null, body: any): Promise<CostPlaceChoice | null> {
+  const v = { costPlace: body?.costPlace ?? null, propertyId: body?.propertyId ?? null, unitId: body?.unitId ?? null }
+  if (!v.costPlace && !v.propertyId && !v.unitId) return null
+  if (v.costPlace !== null && !(BOOKS_COST_PLACES as readonly unknown[]).includes(v.costPlace)) {
+    throw new AppError(400, `Choose where ${PAYROLL_PLACE_WHAT} go: one unit, one property, or split across your properties by units.`)
+  }
+  if (!landlordId) throw new AppError(400, 'A business\'s books have no properties.')
+  return resolveCostPlace(q, { col: 'landlord_id', id: landlordId }, v, 'this payroll\'s cost')
+}
 
 /** A date column's value (a Date at the server's midnight, or text) as 'YYYY-MM-DD'. */
 function toIsoDay(v: unknown): string {
@@ -1048,13 +1073,16 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
     // the wage base once, not twice.
     const ytdSoFar = new Map<string, number>(everyone.map(id => [id, yearToDate.get(id)?.ytd_gross ?? 0]))
 
+    // 10/13 (Nic): where its wages go, when the form says it now (kept on the draft).
+    const place = await payrollPlaceSent(db, col === 'landlord_id' ? lid : null, req.body)
+
     const client = await db.connect()
     try {
       await client.query('BEGIN')
       const { rows: [run] } = await client.query(
-        `INSERT INTO payroll_runs (${col}, period_start, period_end, pay_date, pay_frequency, status)
-         VALUES ($1,$2,$3,$4,$5,'draft') RETURNING *`,
-        [lid, periodStart, periodEnd, payDate, payFrequency]
+        `INSERT INTO payroll_runs (${col}, period_start, period_end, pay_date, pay_frequency, status, cost_place, property_id, unit_id)
+         VALUES ($1,$2,$3,$4,$5,'draft',$6,$7,$8) RETURNING *`,
+        [lid, periodStart, periodEnd, payDate, payFrequency, place?.costPlace ?? null, place?.propertyId ?? null, place?.unitId ?? null]
       )
 
       let totalGross = 0, totalFed = 0, totalState = 0, totalSS = 0, totalMedicare = 0, totalNet = 0
@@ -1215,10 +1243,18 @@ booksRouter.post('/payroll/runs/:id/approve', requireBooksWrite, async (req, res
       )
       if (!run) throw new AppError(404, 'Run not found')
       if (run.status !== 'draft') throw new AppError(400, `This run is already ${PAYROLL_RUN_STATUS_WORD[run.status] ?? 'closed'}.`)
+      // 10/13 (Nic): a landlord company's run says where its wages go before
+      // it books — sent now, or kept from when it was calculated.
+      const place: CostPlaceChoice = (await payrollPlaceSent(client, run.landlord_id ?? null, req.body))
+        ?? { costPlace: run.cost_place ?? null, propertyId: run.property_id ?? null, unitId: run.unit_id ?? null }
+      if (run.landlord_id && !place.costPlace) {
+        throw new AppError(400, `Choose where ${PAYROLL_PLACE_WHAT} go: one unit, one property, or split across your properties by units.`)
+      }
       const moved = await client.query(
-        `UPDATE payroll_runs SET status='approved', approved_at=NOW(), approved_by=$1, updated_at=NOW()
+        `UPDATE payroll_runs SET status='approved', approved_at=NOW(), approved_by=$1, updated_at=NOW(),
+                cost_place=$3, property_id=$4, unit_id=$5
           WHERE id=$2 AND status='draft'`,
-        [req.user!.userId, req.params.id]
+        [req.user!.userId, req.params.id, place.costPlace, place.propertyId, place.unitId]
       )
       if (!moved.rowCount) throw new AppError(409, 'This run changed while you were approving it. Reload and try again.')
       // Update YTD on each employee
@@ -1374,6 +1410,11 @@ booksRouter.get('/work-trade-pay', requireBooksRead, async (req, res, next) => {
 // contractor expense to the vendor who is this work trader — the one picked
 // (vendorId), or else the contractor vendor the vendor list keeps for this
 // tenant (made the first time) — due today (services/workTradeBooksPay).
+// 10/13 (Nic): "except gams charge all those costs get logged by a person" —
+// the person confirming it says where the cost goes (costPlace, with
+// propertyId / unitId: split across the properties by units, one property,
+// one unit); nothing records without it.
+const CONTRACTOR_PLACE_WHAT = 'this contractor bill'
 booksRouter.post('/work-trade-pay/:id/contractor-payment', requireBooksWrite, async (req, res, next) => {
   try {
     const { col, id: lid } = ownerScope(req.user)
@@ -1385,8 +1426,19 @@ booksRouter.post('/work-trade-pay/:id/contractor-payment', requireBooksWrite, as
     const client = await db.connect()
     try {
       await client.query('BEGIN')
+      const b = req.body ?? {}
+      if (b.costPlace != null && b.costPlace !== '' && !(BOOKS_COST_PLACES as readonly unknown[]).includes(b.costPlace)) {
+        throw new AppError(400, `Choose where ${CONTRACTOR_PLACE_WHAT} goes: one unit, one property, or split across your properties by units.`)
+      }
+      // Checked here when sent; the hours and the vendor are checked first, and
+      // a bill with no place is refused after them (recordWorkTradeContractorPayment).
+      const place = b.costPlace || b.propertyId || b.unitId
+        ? await resolveCostPlace(client, { col: 'landlord_id', id: lid }, {
+            costPlace: b.costPlace || null, propertyId: b.propertyId || null, unitId: b.unitId || null,
+          }, CONTRACTOR_PLACE_WHAT)
+        : null
       const made = await recordWorkTradeContractorPayment(client, {
-        landlordId: lid, extraHoursId: req.params.id, vendorId, createdBy: req.user!.userId,
+        landlordId: lid, extraHoursId: req.params.id, vendorId, createdBy: req.user!.userId, place,
       })
       const xid = await currentLedgerXid(client)
       await client.query('COMMIT')

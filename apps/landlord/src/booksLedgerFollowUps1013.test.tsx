@@ -2,13 +2,15 @@
 /**
  * 10/13 (Nic) — GAM Books ledger follow-ups, the screens.
  *
- *   Company-level costs: "post to the COMPANY column by default"; "a later
- *   'split by units' splits only NEW costs". Books Settings says so while not
- *   chosen, and once chosen after the books posted says from when it applies.
+ *   10/13 evening (Nic): "each expense is chosen on the split or specific unit
+ *   or property at the time of logging. there should never be a default
+ *   setting to apply expenses." Books Settings no longer asks where
+ *   company-level costs go; each asset asks where it and its depreciation go.
  *   Fixed assets: "the form ASKS where the money came from (cash on hand /
- *   owner put money in / loan / already an expense) and posts to that";
- *   "already an expense" LINKS the expense — its cost, day and property are the
- *   asset's, so the form stops asking for them.
+ *   owner put money in / loan / already an expense) and posts to that", and
+ *   "Funding: ALLOW A MIX (several funding lines adding up to the cost; a loan
+ *   may spread over several assets)" — one line per place the money came
+ *   from; "already an expense" LINKS the expense, whole.
  *
  * Every value reads in plain words (never a raw stored value). The same files
  * ship in GAM Books (bookkeeping-parity.test.ts).
@@ -49,7 +51,7 @@ const SETTINGS = {
   booksStartDate: '2026-08-01', historyStart: 'start_date', joinedOn: '2026-08-28', joinMonthStart: '2026-08-01',
   closeBy: 'owner_or_bookkeeper', reopenBy: 'owner', openMonthFixes: 'restate',
   homeSaleMethod: null, workTradeMethod: null, registerStockMethod: 'expense_when_bought', registerStockFrom: null,
-  companyCostsMethod: null, companyCostsFrom: null, companyCostsFromDay: null, writeOffBy: 'owner', repairBills: null,
+  writeOffBy: 'owner', repairBills: null,
   closedThrough: null, today: '2026-10-13', hasPostings: true, openingItems: 0,
 }
 
@@ -98,6 +100,7 @@ beforeEach(() => {
     '/books/fixed-assets/linkable-expenses': [
       { id: 'e1', description: 'New roof', categoryName: 'Repairs', propertyName: 'Oak Park', expenseDate: '2026-02-10', amount: 12000 },
     ],
+    '/books/cost-places': { asked: true, properties: [{ id: 'p1', name: 'Oak Park', units: [{ id: 'u1', unitNumber: '7' }] }] },
   }
 })
 afterEach(() => {
@@ -108,101 +111,161 @@ afterEach(() => {
 
 const RAW = ['company_bucket', 'split_by_units', 'funded_by', 'owner_paid', 'cash_on_hand']
 
-describe('Books Settings: costs that are no one property\'s', () => {
-  it('not chosen yet: they go to the Company column, and a later split takes only new costs', async () => {
+describe('Books Settings: where a cost goes is no setting (10/13, Nic)', () => {
+  it('asks nothing about company-level costs, and shows no stored value', async () => {
     await render(<BooksSettingsPage />)
     const t = text()
-    expect(t).toContain('Until you choose, these costs go to the Company column.')
-    expect(t).toContain('splits only costs recorded from then on')
+    expect(t).not.toContain('Costs that are no one property\'s')
+    expect(t).not.toContain('Company column')
     for (const raw of RAW) expect(t).not.toContain(raw)
-    // Not locked: the owner may still pick, even though the books have posted.
-    expect(radio('companyCostsMethod', 'split_by_units').disabled).toBe(false)
-  })
-
-  it('chosen after the books posted: says from when it applies, and stays as chosen', async () => {
-    server.gets['/books/setup/settings'] = { ...SETTINGS, companyCostsMethod: 'split_by_units', companyCostsFromDay: '2026-10-13' }
-    await render(<BooksSettingsPage />)
-    expect(text()).toContain('Your choice applies to costs recorded from October 13, 2026 on. Costs recorded before then stay in the Company column.')
-    expect(radio('companyCostsMethod', 'company_bucket').disabled).toBe(true)
+    expect(host!.querySelector('input[name="companyCostsMethod"]')).toBeNull()
   })
 })
 
-describe('Fixed assets: where the money came from', () => {
+describe('Fixed assets: where it goes, and where the money came from', () => {
   async function openAdd() {
     await render(<FixedAssetsPage />)
     await act(async () => { button('+ Add Asset')!.click() })
     await flush()
   }
+  const lineKind = (i: number) => [...host!.querySelectorAll('select')].filter(s => s.textContent?.includes('Choose where it came from'))[i] as HTMLSelectElement
+  const amounts = () => [...host!.querySelectorAll('input[type="number"]')].filter(x => x.closest('.card')) as HTMLInputElement[]
+  const submit = async () => {
+    await act(async () => { button('Add Asset')!.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    await flush()
+  }
+  async function basics(name: string, cost: string, what = 'equipment') {
+    const inputs = (sel: string) => host!.querySelector(sel) as HTMLInputElement
+    await act(async () => { type(inputs('input[placeholder="e.g. Clubhouse, Riding mower"]'), name) })
+    const kind = [...host!.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === 'improvement')) as HTMLSelectElement
+    await act(async () => { choose(kind, what) })
+    const costBox = [...host!.querySelectorAll('input[type="number"][min="0.01"]')].find(x => !x.closest('.card')) as HTMLInputElement
+    await act(async () => { type(costBox, cost) })
+    await act(async () => { type(inputs('input[type="date"]'), '2026-09-01') })
+    await act(async () => { type(inputs('input[placeholder="e.g. 27.5"]'), '5') })
+    await flush()
+  }
 
-  it('asks, in plain words, with what each answer does', async () => {
+  it('asks where it goes (nothing chosen) and where each part of the money came from, in plain words', async () => {
     await openAdd()
     const t = text()
+    expect(t).toContain('Where this asset (and its depreciation) goes')
+    for (const label of ['Split across your properties by units', 'One property', 'One unit']) expect(t).toContain(label)
+    expect([...host!.querySelectorAll('input[name="assetPlace"]')].some(r => (r as HTMLInputElement).checked)).toBe(false)
     expect(t).toContain('Where the money came from')
-    for (const label of ['Cash on hand', 'The owner put money in', 'A loan', 'Already an expense']) expect(t).toContain(label)
-    expect(t).toContain('its cost moves from that expense to this asset, so it counts once')
+    for (const label of ['Cash on hand', 'The owner put money in', 'A loan', 'Already an expense']) {
+      expect([...lineKind(0).options].map(o => o.textContent)).toContain(label)
+    }
     for (const raw of RAW) expect(t).not.toContain(raw)
+    // Nothing saves until where it goes is answered.
+    await basics('Golf cart', '5000')
+    await act(async () => { choose(lineKind(0), 'cash') })
+    await act(async () => { type(amounts()[0], '5000') })
+    await flush()
+    expect(text()).toContain('this part comes out of your office cash')
+    expect(button('Add Asset')!.disabled).toBe(true)
+    await act(async () => { radio('assetPlace', 'split_by_units').click() })
+    await flush()
+    expect(button('Add Asset')!.disabled).toBe(false)
+    await submit()
+    expect(server.posts[0].url).toBe('/books/fixed-assets')
+    expect(server.posts[0].body).toMatchObject({ name: 'Golf cart', cost: '5000', acquiredOn: '2026-09-01', costPlace: 'split_by_units',
+      propertyId: null, unitId: null, funding: [{ kind: 'cash', amount: 5000, loanId: null, expenseId: null }] })
+    expect(server.posts[0].body).not.toHaveProperty('fundedBy')
   })
 
   it('a loan: only loans that paid the seller of what this asset is', async () => {
     await openAdd()
-    await act(async () => { radio('fundedBy', 'loan').click() })
+    await act(async () => { choose(lineKind(0), 'loan') })
     await flush()
     const select = [...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the loan that paid the seller')) as HTMLSelectElement
     expect(select.options[0].textContent).toBe('Choose the loan that paid the seller')
     // The form starts on a building: only the loan that paid the seller of a property.
-    expect([...select.options].slice(1).map(o => o.textContent)).toEqual(['Oak Street mortgage (First Bank)'])
+    expect([...select.options].slice(1).map(o => o.textContent?.split(' · ')[0])).toEqual(['Oak Street mortgage (First Bank)'])
     const what = [...host!.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === 'equipment')) as HTMLSelectElement
     await act(async () => { choose(what, 'equipment') })
     await flush()
-    expect([...select.options].slice(1).map(o => o.textContent)).toEqual(['Mower loan (Deere Financial)'])
+    expect([...select.options].slice(1).map(o => o.textContent?.split(' · ')[0])).toEqual(['Mower loan (Deere Financial)'])
     expect(text()).not.toContain('Line of credit')
   })
 
-  it('already an expense: pick it, and its cost, day and property are the asset\'s — the form sends only the link', async () => {
+  it('a mix: an $8,000 mower = $6,000 from a loan + $2,000 cash on hand, sent as two lines that add up to the cost', async () => {
     await openAdd()
-    await act(async () => { radio('fundedBy', 'expense').click() })
+    await basics('Riding mower', '8000')
+    await act(async () => { radio('assetPlace', 'property').click() })
     await flush()
-    expect(text()).not.toContain('What it cost')
-    expect(text()).not.toContain('Day you bought it')
+    const property = [...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the property')) as HTMLSelectElement
+    await act(async () => { choose(property, 'p1') })
+    await act(async () => { choose(lineKind(0), 'loan') })
+    await flush()
+    const loanPick = [...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the loan that paid the seller')) as HTMLSelectElement
+    await act(async () => { choose(loanPick, 'l1') })
+    await act(async () => { type(amounts()[0], '6000') })
+    await flush()
+    expect(text()).toContain('Adds up to $6,000.00 of $8,000.00')
+    expect(button('Add Asset')!.disabled).toBe(true)
+    await act(async () => { button('+ Another place the money came from')!.click() })
+    await flush()
+    await act(async () => { choose(lineKind(1), 'cash') })
+    await flush()
+    await act(async () => { type(amounts()[1], '2000') })
+    await flush()
+    expect(text()).toContain('Adds up to $8,000.00 of $8,000.00')
+    expect(button('Add Asset')!.disabled).toBe(false)
+    await submit()
+    expect(server.posts[0].body).toMatchObject({ costPlace: 'property', propertyId: 'p1', unitId: null, funding: [
+      { kind: 'loan', amount: 6000, loanId: 'l1', expenseId: null },
+      { kind: 'cash', amount: 2000, loanId: null, expenseId: null },
+    ] })
+  })
+
+  it('already an expense: its whole amount is the line, and its description and day fill in what is blank', async () => {
+    await openAdd()
+    await act(async () => { choose(lineKind(0), 'expense') })
+    await flush()
+    expect(text()).toContain('that expense moves to this asset, whole, so it counts once')
     const pick = [...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the expense')) as HTMLSelectElement
     await act(async () => { choose(pick, 'e1') })
     await flush()
-    expect(text()).toContain('$12,000.00 on')
-    expect(text()).toContain('filed under Repairs at Oak Park. Its cost, day and property are the asset\'s.')
-    const what = [...host!.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === 'improvement')) as HTMLSelectElement
-    await act(async () => { choose(what, 'improvement') })
-    const life = host!.querySelector('input[placeholder="e.g. 27.5"]') as HTMLInputElement
-    await act(async () => { type(life, '10') })
-    await act(async () => { button('Add Asset')!.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
-    await flush()
-    expect(server.posts).toHaveLength(1)
-    const sent = server.posts[0]
-    expect(sent.url).toBe('/books/fixed-assets')
-    expect(sent.body).toMatchObject({ name: 'New roof', assetClass: 'improvement', lifeYears: '10', fundedBy: 'expense', expenseId: 'e1' })
-    expect(sent.body).not.toHaveProperty('cost')
-    expect(sent.body).not.toHaveProperty('acquiredOn')
-    expect(sent.body).not.toHaveProperty('propertyId')
-    expect(sent.body).not.toHaveProperty('fundedLoanId')
+    expect(amounts()[0].value).toBe('12000')
+    expect(amounts()[0].disabled).toBe(true)
+    expect((host!.querySelector('input[placeholder="e.g. Clubhouse, Riding mower"]') as HTMLInputElement).value).toBe('New roof')
   })
 
-  it('cash on hand: sent with the asset; an asset already on the list that never said gets asked', async () => {
-    server.gets['/books/fixed-assets'] = [{
-      id: 'a1', name: 'Old mower', assetClass: 'equipment', propertyName: 'Oak Park', inServiceDate: '2026-03-01', acquiredOn: '2026-02-15',
-      cost: '6000.00', salvageValue: '600.00', lifeYears: '5.00', depreciates: true, monthly: 90, monthsLeft: 53, depreciatedToDate: 630,
-      bookValue: 5370, opensAtBooksStart: false, problem: null, voidedAt: null, sourceExpenseId: null, fundedBy: null, booksStart: '2026-01-01',
-    }]
+  // 10/13 review: an expense pays for part of an asset only where the asset is
+  // (it posts that part of the cost to the asset's account on its own property).
+  it('"already an expense" lists only the expenses filed where the asset goes', async () => {
+    server.gets['/books/fixed-assets/linkable-expenses'] = [
+      { id: 'e1', description: 'New roof', categoryName: 'Repairs', propertyId: 'p1', propertyName: 'Oak Park', expenseDate: '2026-02-10', amount: 12000 },
+      { id: 'e2', description: 'Shared mower deposit', categoryName: 'Equipment', propertyId: null, propertyName: null, expenseDate: '2026-02-11', amount: 2000 },
+    ]
     await openAdd()
-    expect(text()).toContain('Say where the money came from (Edit) so its cost is on your books')
-    await act(async () => { radio('fundedBy', 'cash').click() })
-    const inputs = (sel: string) => host!.querySelector(sel) as HTMLInputElement
-    await act(async () => { type(inputs('input[placeholder="e.g. Clubhouse, Riding mower"]'), 'Golf cart') })
-    await act(async () => { type(inputs('input[type="number"][min="0.01"]'), '5000') })
-    await act(async () => { type(inputs('input[type="date"]'), '2026-09-01') })
-    await act(async () => { type(inputs('input[placeholder="e.g. 27.5"]'), '5') })
-    await act(async () => { button('Add Asset')!.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    await act(async () => { choose(lineKind(0), 'expense') })
     await flush()
-    expect(server.posts[0].body).toMatchObject({ name: 'Golf cart', cost: '5000', acquiredOn: '2026-09-01', fundedBy: 'cash' })
-    expect(server.posts[0].body).not.toHaveProperty('expenseId')
-    expect(server.posts[0].body).not.toHaveProperty('fundedLoanId')
+    const listed = () => [...([...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the expense')) as HTMLSelectElement).options]
+      .slice(1).map(o => o.value)
+    // Before it is said where the asset goes: every expense that can be linked.
+    expect(listed()).toEqual(['e1', 'e2'])
+    await act(async () => { radio('assetPlace', 'property').click() })
+    await flush()
+    const property = [...host!.querySelectorAll('select')].find(s => s.textContent?.includes('Choose the property')) as HTMLSelectElement
+    await act(async () => { choose(property, 'p1') })
+    await flush()
+    expect(listed()).toEqual(['e1'])
+    await act(async () => { radio('assetPlace', 'split_by_units').click() })
+    await flush()
+    expect(listed()).toEqual(['e2'])
+  })
+
+  it('an asset already on the list that never said where its money came from, or where it goes, gets asked', async () => {
+    server.gets['/books/fixed-assets'] = [{
+      id: 'a1', name: 'Old mower', assetClass: 'equipment', propertyName: null, propertyId: null, inServiceDate: '2026-03-01', acquiredOn: '2026-02-15',
+      cost: '6000.00', salvageValue: '600.00', lifeYears: '5.00', depreciates: true, monthly: 90, monthsLeft: 53, depreciatedToDate: 630,
+      bookValue: 5370, opensAtBooksStart: false, problem: null, voidedAt: null, sourceExpenseId: null, fundedBy: null, funding: [],
+      costPlace: null, booksStart: '2026-01-01',
+    }]
+    await render(<FixedAssetsPage />)
+    expect(text()).toContain('Say where the money came from (Edit) so its cost is on your books')
+    expect(text()).toContain('Say where it goes (Edit)')
   })
 })

@@ -104,17 +104,19 @@ describe("a reader in GAM's own book still ties the money card to the Stripe bal
     expect(d.reconciliation.bridge.timing).toEqual([])
   })
 
-  it('a dated correction after the markup is booked: the $5.00 more is GAM’s expense on its date, the booked rows stay, and the bridge ends at $0.00 with no other line', async () => {
+  // 10/13 evening (Nic): "Redo the split" — piece 4 is split again under the corrected cost on the
+  // correction's date, so the slices say markup = what is beyond the cost.
+  it('a dated correction after the markup is booked: the $5.00 more is GAM’s expense on its date, piece 4 moves $5.00 from markup to cost repaid on that date, the booked rows stay, and the bridge ends at $0.00 with no other line', async () => {
     const f = await paidOffReader()
     await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 32.73 }, f.userId)
     await recordReaderOrderCost(f.order, { basePrice: 299, taxAndShipping: 37.73, effectiveOn: '2026-10-01' }, f.userId)
     const d = await balance(f.token)
     expect(d.revenue_all_time).toBe(13.27)
-    expect(d.readers_in_earned).toEqual({ bought: -336.73, cost_repaid: 331.73, markup: 18.27 })
+    expect(d.readers_in_earned).toEqual({ bought: -336.73, cost_repaid: 336.73, markup: 13.27 })
     expect(d.reconciliation.gap).toBe(0)
     expect(d.reconciliation.bridge).toMatchObject({
-      earned: 13.27, reader_bought: 336.73, reader_payments_collected: 350, reader_cost_repaid_collected: 331.73,
-      reader_markup_collected: 18.27, reader_billed_not_collected: 0, leftover: 0,
+      earned: 13.27, reader_bought: 336.73, reader_payments_collected: 350, reader_cost_repaid_collected: 336.73,
+      reader_markup_collected: 13.27, reader_billed_not_collected: 0, leftover: 0,
     })
     expect(d.reconciliation.bridge.timing).toEqual([])
   })

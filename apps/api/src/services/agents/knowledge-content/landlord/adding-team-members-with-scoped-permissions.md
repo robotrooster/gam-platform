@@ -11,7 +11,7 @@ You can add four kinds of team members:
 - Maintenance — a worker who receives and works repair requests.
 - Bookkeeper — sees the money for the properties you tick for them (money in, money out, receipts and maintenance costs) and does the full bookkeeping on it: adding, correcting, removing and paying expenses and bills. Every bookkeeper works at the same level; there is no read-only setting. They never work a tenant's account (no rent payments, credits, late fees or refunds). The company's bank account, payouts and payroll are a separate "Company-wide" box you tick only if they should see them.
 
-To add someone, open your Team page and send an invitation to their email address. They'll get a link to set up (or sign in to) their account and join your team. Invitation links expire after 24 hours for security — if one lapses, just resend it from the same page, which issues a fresh link. You can also revoke a pending invitation any time before it's accepted.
+To add someone, open your Team page and send an invitation to their email address. They'll get a link to set up (or sign in to) their account and join your team. Invitation links expire after 24 hours for security. Each pending invitation on the Team page has two buttons: Resend emails them a fresh link that works for another 24 hours (the earlier link stops working), and Withdraw takes the invitation back any time before it's accepted. If an invitation has expired and is no longer listed, just send them a new one from the same page.
 
 A few things worth knowing:
 

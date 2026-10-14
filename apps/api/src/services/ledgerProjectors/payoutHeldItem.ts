@@ -199,8 +199,7 @@ export const payoutHeldItemProjector: LedgerProjector = {
         lines = [
           ...dr('due_from_gam', a, { ...at, memo }),
           ...(c.kind === READER_PIECE_KIND
-            ? await readerPieceLines(client, { landlordId: h.landlord_id, propertyId: h.property_id, cents: a, day: h.day,
-                recorded: { at: h.created_at }, side: 'cr' })
+            ? readerPieceLines({ propertyId: h.property_id, cents: a, side: 'cr' })
             : cr('due_to_gam', a, { ...at, memo })),
         ]
         break

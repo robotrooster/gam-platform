@@ -24,11 +24,13 @@
  * Each paycheck must add up (gross = everything withheld + take-home); a run
  * that does not is refused by name rather than posted crooked.
  *
- * WHERE IT LANDS (Nic 10/12, L7 — companyCosts): payroll belongs to no one
- * property. The two expense lines are company level, or split across the
- * properties by units, as the owner chose — 10/13 (Nic): the Company column
- * until they choose, and a later "split by units" splits only runs approved
- * after it. What is owed stays company level (one tax account, one payroll).
+ * WHERE IT LANDS (companyCosts): 10/13 (Nic) — "each expense is chosen on the
+ * split or specific unit or property at the time of logging", and payroll is
+ * logged by a person, so the run says where its two expense lines go when it
+ * is logged (payroll_runs.cost_place): split across the properties by units on
+ * the pay date, one property, or one unit. A run approved before 10/13 (no
+ * place) stays in the Company column, as it posted. What is owed stays
+ * company level (one tax account, one payroll).
  *
  * WHAT CLEARS IT: the run's take-home pay and each tax it left owed become
  * unpaid expenses on the Expenses record when the run is approved
@@ -46,17 +48,23 @@ import { LedgerSourceError } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import { cr } from './registerBookingPayoutKit'
 import { cSql, isUuid } from './tenantShared'
-import { companyCostSpread, drSpread } from './companyCosts'
+import type { BooksCostPlace } from '@gam/shared'
+import { costPlaceSpread, drSpread } from './companyCosts'
 
-export const PAYROLL_RULE_VERSION = 1
+// 10/13 (Nic): 2 — the run's own cost_place says where its wages go, never a setting.
+export const PAYROLL_RULE_VERSION = 2
 
 interface RunRow {
   landlord_id: string | null
   status: string
   voided_at: string | null
   pay_date: string
-  /** 10/13 (Nic): when the run reached the books (approved) — a later company-costs pick splits only newer costs. */
-  recorded_at: string | null
+  /** 10/13 (Nic): where the person logging the run said its wages go (null: approved before 10/13). */
+  cost_place: BooksCostPlace | null
+  /** 10/13 review: when the run was logged (a split reads the units in GAM by then too). */
+  logged_at: string
+  property_id: string | null
+  unit_id: string | null
 }
 
 interface LineSums {
@@ -75,7 +83,7 @@ export const payrollRunProjector: LedgerProjector = {
     if (!isUuid(runId)) return []
     const run = (await client.query<RunRow>(
       `SELECT r.landlord_id, r.status, r.voided_at::text AS voided_at, r.pay_date::text AS pay_date,
-              COALESCE(r.approved_at, r.created_at)::text AS recorded_at
+              r.cost_place, r.property_id, r.unit_id, r.created_at::text AS logged_at
          FROM payroll_runs r WHERE r.id = $1`, [runId])).rows[0]
     // A business's payroll waits for the business portal's books (a later phase).
     if (!run || !run.landlord_id) return []
@@ -106,7 +114,8 @@ export const payrollRunProjector: LedgerProjector = {
     const gross = c(s.gross)
     const employerTaxes = c(s.er_ss) + c(s.er_med) + c(s.futa) + c(s.suta)
     const landlordId = run.landlord_id
-    const spread = await companyCostSpread(client, landlordId, run.pay_date, { at: run.recorded_at })
+    const spread = await costPlaceSpread(client, landlordId, run.pay_date,
+      { costPlace: run.cost_place, propertyId: run.property_id, unitId: run.unit_id, loggedAt: run.logged_at })
     const memo = `Payroll paid ${run.pay_date}`
     const owed = { propertyId: null }
     const lines: DesiredLine[] = [

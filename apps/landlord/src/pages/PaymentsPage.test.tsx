@@ -34,7 +34,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
-import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge, OpenMonthOtherMoney, OpenMonthTotals } from '@gam/shared'
+import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge, OpenMonthOtherMoney, OpenMonthSalePart, OpenMonthTotals } from '@gam/shared'
 
 const server = vi.hoisted(() => ({
   properties: [] as any[],
@@ -131,7 +131,7 @@ const row = (over: Partial<OpenMonthRow> = {}): OpenMonthRow => ({
   invoiced: 460, lateFees: 0, paid: 460, clearing: 0, credit: 0, workTrade: 0, owed: 0, owedEarlier: 0,
   methods: ['Cash'], status: 'paid', statusLabel: 'Paid', statusColor: 'green', daysPastGrace: 0,
   dueDate: '2026-10-01', workTradeOnly: false, evictionMode: false, delinquent: false, recordWith: null,
-  payments: [payment()], charges: [charge()], stay: null, ...over,
+  payments: [payment()], charges: [charge()], stay: null, otherMoney: [], otherIn: 0, otherRefunded: 0, ...over,
 })
 const vacant = (space: string, unitId: string): OpenMonthRow => row({
   key: `vacant:${unitId}`, unitId, space, leaseId: null, householdId: null, residents: [],
@@ -223,6 +223,8 @@ const setValue = async (el: HTMLInputElement, v: string) => {
   await act(async () => { setter.call(el, v); el.dispatchEvent(new Event('input', { bubbles: true })) })
 }
 const loaded = () => until(() => !!host.querySelector('table.pay-table'), 'the month')
+/** A register line's cells: its day, what it was for (who and how under it), its amount — never the caret. */
+const lineCells = (li: Element) => [...li.querySelector('.pay-other-row')!.children].filter(c => !c.classList.contains('pay-caret')).map(c => c.textContent)
 
 // ─── Pick the property first ─────────────────────────────────────────────────
 
@@ -313,19 +315,37 @@ describe('one row per household, in the server’s order, every space', () => {
     expect(c.slice(2, 7)).toEqual(['$460.00', '$200.00', '$260.00', 'Cash', 'Owes +3'])
   })
 
-  it('an empty space is a gray Vacant row in its spot, with no money and nothing to open', async () => {
+  // 10/13 (Nic): "can we have it where the vacant units are still like the unit
+  // number is still directly in line with the ones that are occupied? ... just
+  // make them all clickable even if they're vacant and just show you know an
+  // expanded box with nothing".
+  it('an empty space is a gray Vacant row in its spot, with no money — its number in line with the rest, and it opens to say nothing is billed', async () => {
     await render()
     await loaded()
     const c = cells('vacant:u3')
-    expect(c.slice(0, 7)).toEqual(['MH 03', '—', '', '', '', '', 'Vacant'])
+    expect(c.slice(0, 7)).toEqual(['▸MH 03', '—', '', '', '', '', 'Vacant'])
     const pill = rowOf('vacant:u3')!.querySelector('.pay-pill')!
     expect(pill.className).toBe('pay-pill gray')
+    // Every space number sits after the same caret, so they line up.
+    const spaces = [...host.querySelectorAll('tr.pay-row > td.pay-space')]
+    expect(spaces.map(td => td.firstElementChild?.className)).toEqual(Array(5).fill('pay-caret'))
+    expect([...host.querySelectorAll('tr.pay-row')].every(r => r.classList.contains('pay-click') && r.getAttribute('tabindex') === '0')).toBe(true)
+    expect(rowOf('vacant:u3')!.getAttribute('aria-expanded')).toBe('false')
+    await click(rowOf('vacant:u3'))
+    expect(rowOf('vacant:u3')!.getAttribute('aria-expanded')).toBe('true')
+    expect(cells('vacant:u3')[0]).toBe('▾MH 03')
+    const detail = host.querySelector('tr.pay-detail')!
+    expect(detail.querySelector('[data-block="space-only"]')!.textContent).toBe('Vacant — nothing billed this month.')
+    // An empty box: no payments, no charges, nothing to press, nothing read.
+    expect(detail.querySelectorAll('tr[data-line]')).toHaveLength(0)
+    expect(detail.querySelectorAll('button')).toHaveLength(0)
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
     await click(rowOf('vacant:u3'))
     expect(host.querySelector('tr.pay-detail')).toBeNull()
   })
 
   // 10/13 review: an occupied space is never "Vacant".
-  it('a space in use with nobody on a lease says what is there, and who, in gray — with no money and nothing to open', async () => {
+  it('a space in use with nobody on a lease says what is there, and who, in gray — with no money; opened, nothing billed', async () => {
     const inUse = (key: string, space: string, label: string, occupant: string | null) => row({
       key, unitId: key, space, leaseId: null, householdId: null, residents: [], occupant,
       invoiced: 0, paid: 0, owed: 0, methods: [], status: 'occupied', statusLabel: label, statusColor: 'gray',
@@ -334,13 +354,14 @@ describe('one row per household, in the server’s order, every space', () => {
     server.rolls['p-oak'] = roll([inUse('space:u3', 'MH 03', 'Owner Use', null), inUse('space:u10', 'RV 10', 'Checked in', 'Gina Guest')])
     await render()
     await loaded()
-    expect(cells('space:u3').slice(0, 7)).toEqual(['MH 03', '—', '', '', '', '', 'Owner Use'])
-    expect(cells('space:u10').slice(0, 7)).toEqual(['RV 10', 'Gina Guest', '', '', '', '', 'Checked in'])
+    expect(cells('space:u3').slice(0, 7)).toEqual(['▸MH 03', '—', '', '', '', '', 'Owner Use'])
+    expect(cells('space:u10').slice(0, 7)).toEqual(['▸RV 10', 'Gina Guest', '', '', '', '', 'Checked in'])
     expect(rowOf('space:u10')!.querySelector('.pay-pill')!.className).toBe('pay-pill gray')
-    expect(rowOf('space:u10')!.getAttribute('tabindex')).toBeNull()
+    expect(rowOf('space:u10')!.getAttribute('tabindex')).toBe('0')
     expect(rowOf('space:u10')!.querySelector('button')).toBeNull()
     await click(rowOf('space:u10'))
-    expect(host.querySelector('tr.pay-detail')).toBeNull()
+    expect(host.querySelector('tr.pay-detail [data-block="space-only"]')!.textContent).toBe('Checked in — no lease here, nothing billed this month.')
+    expect(host.querySelectorAll('tr.pay-detail tr[data-line]')).toHaveLength(0)
     await click(btn(/^Record payment$/))
     expect(host.querySelector('.modal-overlay')!.textContent).not.toContain('Gina Guest')
   })
@@ -473,7 +494,11 @@ describe('click the row for its payments and charges; click the name for the rep
     await act(async () => { r.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
     expect(rowOf('lease:L2')!.getAttribute('aria-expanded')).toBe('true')
     expect(host.querySelector('tr.pay-detail')).not.toBeNull()
-    expect(rowOf('vacant:u3')!.getAttribute('tabindex')).toBeNull()
+    // An empty space too (10/13, Nic: "make them all clickable").
+    const v = rowOf('vacant:u3')!
+    expect(v.getAttribute('tabindex')).toBe('0')
+    await act(async () => { v.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
+    expect(rowOf('vacant:u3')!.getAttribute('aria-expanded')).toBe('true')
   })
 
   it('nothing paid yet says so', async () => {
@@ -808,17 +833,19 @@ describe('a stay guest\'s money: on their row, with its details', () => {
     key: 'stay:b10', unitId: 'u10', space: 'RV 10', leaseId: null, householdId: null, residents: [], occupant: 'Rhea Register',
     invoiced: 0, paid: 589, owed: 0, methods: ['Cash'], status: 'stay', statusLabel: 'Checked in', statusColor: 'gray', dueDate: null,
     payments: [payment({ paymentId: 'sp1', paidOn: '2026-10-06', amount: 589, statusLabel: 'Settled', forLabel: 'Stay Oct 4 – Nov 4 · pay link' })],
-    charges: [], stay: { bookingId: 'b10', checkIn: '2026-10-04', checkOut: '2026-11-04', nights: 31, statusLabel: 'Checked in', refunded: 0, refunds: [] },
+    charges: [], stay: { bookingId: 'b10', checkIn: '2026-10-04', checkOut: '2026-11-04', nights: 31, statusLabel: 'Checked in',
+                         owed: 0, balanceBilledOn: null, refunded: 0, refunds: [] },
     ...over,
   })
 
-  it('the row: the guest, what was paid this month and how — no Invoiced, no Owed, no Record payment', async () => {
+  it('the row: the guest, what was paid this month and how — no Invoiced, nothing owed, no Record payment', async () => {
     server.rolls['p-oak'] = roll([russ, stayRow()], {
       totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 589, staysRefunded: 0 },
     })
     await render()
     await loaded()
-    expect(cells('stay:b10').slice(1, 7)).toEqual(['Rhea Register', '', '$589.00', '', 'Cash', 'Checked in'])
+    // 10/13 (Nic, round 3): "Stay rows SHOW what's still owed" — the Owed cell says it ("—": nothing).
+    expect(cells('stay:b10').slice(1, 7)).toEqual(['Rhea Register', '', '$589.00', '—', 'Cash', 'Checked in'])
     expect(rowOf('stay:b10')!.querySelector('.pay-pill')!.className).toBe('pay-pill gray')
     expect(rowOf('stay:b10')!.querySelector('.pay-name')).toBeNull()
     expect(rowOf('stay:b10')!.querySelector('td.pay-record')!.textContent).toBe('')
@@ -844,7 +871,7 @@ describe('a stay guest\'s money: on their row, with its details', () => {
     server.rolls['p-oak'] = roll([stayRow({
       statusLabel: 'Checked out', paid: 300,
       payments: [payment({ paymentId: 'sp2', paidOn: '2026-10-01', amount: 300, forLabel: 'Stay Oct 1 – Oct 8 · at the register' })],
-      stay: { bookingId: 'b10', checkIn: '2026-10-01', checkOut: '2026-10-08', nights: 7, statusLabel: 'Checked out', refunded: 100,
+      stay: { bookingId: 'b10', checkIn: '2026-10-01', checkOut: '2026-10-08', nights: 7, statusLabel: 'Checked out', owed: 0, balanceBilledOn: null, refunded: 100,
               refunds: [{ refundId: 'rf1', refundedOn: '2026-10-04', amount: 100, label: 'Cash · register Oct 1' }] },
     })], { totals: { invoiced: 0, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 0, owedEarlier: 0, stays: 300, staysRefunded: 100 } })
     await render()
@@ -870,8 +897,8 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
     line({ id: 'ref1', saleId: 'sale1', kind: 'refund', day: '2026-10-07', amount: 5, forLabel: 'Refund at the register · Propane' }),
   ]
   const totals = (over: Partial<OpenMonthTotals> = {}): OpenMonthTotals => ({
-    invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
-    otherIn: 776.09, otherRefunded: 5, ...over,
+    invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0, staysOwed: 0,
+    otherIn: 776.09, otherRefunded: 5, folderIn: 776.09, folderRefunded: 5, ...over,
   })
 
   it('a folder under the month, closed until opened, its count and sums on its head; each line its day, what for, who, how and the amount', async () => {
@@ -888,12 +915,12 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
     expect(folder.querySelector('.pay-other-list')).toBeNull()
     await click(head)
     const shown = [...folder.querySelectorAll('li.pay-other-line')]
-    expect(shown.map(li => [li.getAttribute('data-line'), ...[...li.children].map(c => c.textContent)])).toEqual([
+    expect(shown.map(li => [li.getAttribute('data-line'), ...lineCells(li)])).toEqual([
       ['sale', 'Oct 1', 'Propane · at the registerNo name given · Cash', '$23.92'],
       ['sale', 'Oct 6', 'Electric (per kWh), RV site — monthly · pay linkAndres Razo · Card · online', '$752.17'],
       ['refund', 'Oct 7', 'Refund at the register · PropaneNo name given · Cash', '−$5.00'],
     ])
-    // Money already in: nothing to press on it, and nothing more is read.
+    // Money already in: nothing to press on it (these lines carry no breakdown), and nothing more is read.
     expect(folder.querySelectorAll('li button')).toHaveLength(0)
     expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
     await click(head)
@@ -959,9 +986,13 @@ describe('on a phone: one card per household, never a table that scrolls sideway
     expect([...russCard.querySelectorAll('.pay-card-figs > div')].map(d => d.textContent)).toEqual(['Invoiced$460.00', 'Paid$200.00', 'Owed$260.00'])
     expect(russCard.querySelector('.pay-card-method')!.textContent).toBe('Payment method: Cash')
     expect(russCard.querySelector('.pay-card-record button')!.textContent).toBe('Record payment')
-    // An empty space: just the space and its pill.
+    // An empty space: just the space and its pill — its number after the same caret, and it opens too.
     expect(cards[3].querySelector('.pay-card-figs')).toBeNull()
     expect(cards[3].querySelector('.pay-pill')!.textContent).toBe('Vacant')
+    expect(cards.map(c => c.querySelector('.pay-space')!.firstElementChild?.className)).toEqual(Array(5).fill('pay-caret'))
+    expect(cards[3].querySelector('.pay-space')!.textContent).toBe('▸MH 03')
+    await click(cards[3].querySelector('.pay-card-head'))
+    expect(cards[3].querySelector('.pay-card-detail')!.textContent).toBe('Vacant — nothing billed this month.')
     await click(russCard.querySelector('.pay-card-head'))
     expect(russCard.querySelectorAll('.pay-card-detail tr[data-line="payment"]')).toHaveLength(1)
     // Record payment from the card opens the desk window, not the details.
@@ -975,5 +1006,225 @@ describe('on a phone: one card per household, never a table that scrolls sideway
     await render()
     await loaded()
     expect(host.querySelector('.pay-cards')).toBeNull()
+  })
+})
+
+// ─── 10/13 (Nic), round 3 ────────────────────────────────────────────────────
+
+describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
+  const owing = (): OpenMonthRow => row({
+    key: 'stay:b30', unitId: 'u30', space: 'RV 30', leaseId: null, householdId: null, residents: [], occupant: 'Bea Balance',
+    invoiced: 0, paid: 0, owed: 360, methods: [], status: 'stay', statusLabel: 'Confirmed', statusColor: 'gray', dueDate: null,
+    payments: [], charges: [], recordWith: null,
+    stay: { bookingId: 'b30', checkIn: '2026-10-12', checkOut: '2026-10-19', nights: 7, statusLabel: 'Confirmed',
+            owed: 360, balanceBilledOn: '2026-10-12', refunded: 0, refunds: [] },
+  })
+
+  it('the row\'s Owed is what is owed on the stay now, the day its pay link went out under it; its sum beside the stays\'', async () => {
+    server.rolls['p-oak'] = roll([owing(), russ], {
+      totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
+                staysOwed: 360, otherIn: 0, otherRefunded: 0, folderIn: 0, folderRefunded: 0 },
+    })
+    await render()
+    await loaded()
+    // The server's order: owing first — the stay with its balance, in its space order.
+    expect([...host.querySelectorAll('tr.pay-row')].map(r => r.getAttribute('data-key'))).toEqual(['stay:b30', 'lease:L7'])
+    expect(cells('stay:b30').slice(1, 7)).toEqual(['Bea Balance', '', '—', '$360.00pay link sent Oct 12', '—', 'Confirmed'])
+    // A stay is never taken at the desk.
+    expect(rowOf('stay:b30')!.querySelector('td.pay-record')!.textContent).toBe('')
+    expect(host.querySelector('.cd-totals')!.textContent).toBe('Invoiced $460.00Paid $200.00Owed $260.00Owed on stays $360.00')
+    await click(rowOf('stay:b30'))
+    expect([...host.querySelector('tr[data-line="stay-owed"]')!.querySelectorAll('td')].map(td => td.textContent))
+      .toEqual(['Still owed on the stay', '$360.00', 'Pay link sent Oct 12'])
+  })
+
+  it('a balance not owed yet (before arrival, not billed) says what is left and when it comes due; on a phone the card shows Paid and Owed', async () => {
+    ;(window as any).matchMedia = (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} })
+    try {
+      const dee = owing()
+      server.rolls['p-oak'] = roll([{ ...dee, paid: 50, owed: 0, stay: { ...dee.stay!, owed: 150, balanceBilledOn: null } }])
+      await render()
+      await until(() => !!host.querySelector('.pay-cards'), 'the cards')
+      const card = host.querySelector('.pay-card')!
+      expect(card.querySelector('.pay-card-figs')!.className).toBe('pay-card-figs two')
+      expect([...card.querySelectorAll('.pay-card-figs > div')].map(d => d.textContent))
+        .toEqual(['Paid$50.00', 'Owed—$150.00 due on arrival, Oct 12'])
+      await click(card.querySelector('.pay-card-head'))
+      expect(card.querySelector('tr[data-line="stay-owed"]')!.textContent).toBe('Still owed on the stay$150.00Due on arrival, Oct 12')
+    } finally { delete (window as any).matchMedia }
+  })
+
+  it('a stay owing now with no pay link sent (here, its balance never billed) says so in the details', async () => {
+    const hal = owing()
+    server.rolls['p-oak'] = roll([{ ...hal, occupant: 'Hal Here', owed: 200, statusLabel: 'Checked in',
+                                    stay: { ...hal.stay!, owed: 200, balanceBilledOn: null, statusLabel: 'Checked in' } }])
+    await render()
+    await loaded()
+    expect(cells('stay:b30').slice(1, 7)).toEqual(['Hal Here', '', '—', '$200.00', '—', 'Checked in'])
+    await click(rowOf('stay:b30'))
+    expect([...host.querySelector('tr[data-line="stay-owed"]')!.querySelectorAll('td')].map(td => td.textContent))
+      .toEqual(['Still owed on the stay', '$200.00', 'No pay link sent yet'])
+  })
+})
+
+describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go ON that space\'s row"', () => {
+  const andres = (over: Partial<OpenMonthOtherMoney> = {}): OpenMonthOtherMoney => ({
+    id: 'sale27', saleId: 'sale27', kind: 'sale', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
+    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Andres Razo', ...over,
+  })
+  const rv27 = (): OpenMonthRow => ({
+    ...vacant('RV 27', 'u27'),
+    otherMoney: [andres(), andres({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })],
+    otherIn: 752.17, otherRefunded: 10,
+  })
+  const walkIn: OpenMonthOtherMoney = {
+    id: 'sale1', saleId: 'sale1', kind: 'sale', day: '2026-10-01', amount: 23.92, methodLabel: 'Cash',
+    forLabel: 'Propane · at the register', who: null,
+  }
+
+  it('an empty space a sale names says the money under Paid and how it came, and opens to its lines; the folder keeps the rest', async () => {
+    server.rolls['p-oak'] = roll([russ, rv27(), { ...glenda, otherMoney: [andres({ id: 'sale2', saleId: 'sale2', amount: 20, methodLabel: 'Cash', who: null, forLabel: 'Propane — rv02 · at the register' })], otherIn: 20 }], {
+      otherMoney: [walkIn],
+      totals: { invoiced: 920, lateFees: 0, paid: 660, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
+                staysOwed: 0, otherIn: 796.09, otherRefunded: 10, folderIn: 23.92, folderRefunded: 0 },
+    })
+    await render()
+    await loaded()
+    // Still a gray Vacant row in its spot — Invoiced and Owed are a bill's; the money is under Paid, never in it.
+    expect(cells('vacant:u27').slice(2, 7)).toEqual(['', '$752.17 register & pay links$10.00 refunded', '', 'Card · online', 'Vacant'])
+    expect(rowOf('vacant:u27')!.getAttribute('aria-expanded')).toBe('false')
+    // Beside a household's bills: "+".
+    expect(cells('lease:L2')[3]).toBe('$460.00+ $20.00 register & pay links')
+    expect(cells('lease:L2')[5]).toBe('Cash')
+    // The header: all of it; the folder's head: only its own.
+    expect(host.querySelector('.cd-totals')!.textContent).toContain('Register & pay links $796.09 ($10.00 refunded)')
+    expect(host.querySelector('button.pay-other-head')!.textContent).toBe('▸Register sales and pay links1 sale · $23.92')
+    await click(rowOf('vacant:u27'))
+    const block = host.querySelector('tr.pay-detail [data-block="space-money"]')!
+    // Still said to be Vacant, nothing billed — its money is no bill.
+    expect(host.querySelector('tr.pay-detail [data-block="space-only"]')!.textContent).toBe('Vacant — nothing billed this month.')
+    expect([...block.querySelectorAll('li.pay-other-line')].map(li => [li.getAttribute('data-line'), ...lineCells(li)])).toEqual([
+      ['sale', 'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkAndres Razo · Card · online', '$752.17'],
+      ['refund', 'Oct 7', 'Refund at the register · ElectricAndres Razo · Cash', '−$10.00'],
+    ])
+    // Money already in: nothing to press, and nothing more is read.
+    expect(block.querySelectorAll('button')).toHaveLength(0)
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
+  })
+
+  it('a space whose only register money this month is a refund (its sale an earlier month\'s) says the refund, never "$0.00"', async () => {
+    const back = andres({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })
+    server.rolls['p-oak'] = roll([russ, { ...vacant('RV 27', 'u27'), otherMoney: [back], otherIn: 0, otherRefunded: 10 }])
+    await render()
+    await loaded()
+    expect(cells('vacant:u27').slice(2, 7)).toEqual(['', '—$10.00 refunded', '', '—', 'Vacant'])
+  })
+
+  it('an empty space no sale names shows no money, and opens to say nothing is billed', async () => {
+    await render()
+    await loaded()
+    expect(rowOf('vacant:u3')!.classList.contains('pay-click')).toBe(true)
+    expect(cells('vacant:u3').slice(2, 6)).toEqual(['', '', '', ''])
+    await click(rowOf('vacant:u3'))
+    const detail = host.querySelector('tr.pay-detail')!
+    expect(detail.textContent).toBe('Vacant — nothing billed this month.')
+    expect(detail.querySelector('[data-block="space-money"]')).toBeNull()
+  })
+})
+
+// 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it looks
+// like that charge is just for electric. It's not. ... It's not clickable to
+// show an expanded breakdown. It shows electric per kilowatt hour, electric per
+// kilowatt hour, September, RV 27, RV site monthly pay link. It's not got a
+// good breakdown between what's a billback on the electricity and what is not."
+describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () => {
+  // As production has it (read-only, 10/13): pay link ff58520a…, Oct 6, card
+  // online, $752.17 + $26.88 card fee = $779.05 charged; its three line items.
+  const part = (over: Partial<OpenMonthSalePart>): OpenMonthSalePart => ({
+    kind: 'item', label: '', what: null, qty: null, unitPrice: null, unit: null, amount: 0, ...over,
+  })
+  const andres: OpenMonthOtherMoney = {
+    id: 'ff58520a', saleId: 'ff58520a', kind: 'sale', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
+    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Andres Razo',
+    parts: [
+      part({ label: 'Electric (per kWh)', what: 'Electric bill-back', qty: 387, unitPrice: 0.21, unit: 'kWh', amount: 81.27 }),
+      part({ label: 'Electric (per kWh) — September, RV 27', what: 'Electric bill-back', qty: 390, unitPrice: 0.21, unit: 'kWh', amount: 81.9 }),
+      part({ label: 'RV site — monthly', what: 'Site rent', qty: 1, unitPrice: 589, amount: 589 }),
+    ],
+    cardFee: 26.88,
+  }
+  const propane: OpenMonthOtherMoney = {
+    id: '37fe8a03', saleId: '37fe8a03', kind: 'sale', day: '2026-10-06', amount: 23.92, methodLabel: 'Cash',
+    forLabel: 'Propane · at the register', who: null, cardFee: 0,
+    parts: [
+      part({ label: 'Propane', qty: 6.8, unitPrice: 3.3, amount: 22.44 }),
+      part({ kind: 'tax', label: 'Transaction privilege tax', amount: 1.48 }),
+    ],
+  }
+  const breakdown = (li: Element) => [...li.querySelectorAll('[data-block="sale-parts"] tr')]
+    .map(tr => [tr.getAttribute('data-part'), ...[...tr.querySelectorAll('td')].map(td => td.textContent)])
+
+  it('on its space\'s row: each part, what it is — the electric bill-backs apart from the site rent — and its own amount', async () => {
+    server.rolls['p-oak'] = roll([russ, { ...vacant('RV 27', 'u27'), otherMoney: [andres], otherIn: 752.17 }])
+    await render()
+    await loaded()
+    await click(rowOf('vacant:u27'))
+    const li = host.querySelector('tr.pay-detail [data-block="space-money"] li.pay-other-line')!
+    const open = li.querySelector('button.pay-other-row')!
+    expect(open.getAttribute('aria-expanded')).toBe('false')
+    expect(lineCells(li)).toEqual([
+      'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkAndres Razo · Card · online', '$752.17',
+    ])
+    expect(li.querySelector('[data-block="sale-parts"]')).toBeNull()
+    await click(open)
+    expect(li.querySelector('button.pay-other-row')!.getAttribute('aria-expanded')).toBe('true')
+    expect(breakdown(li)).toEqual([
+      ['item', 'Electric (per kWh)Electric bill-back · 387 kWh × $0.21', '$81.27'],
+      ['item', 'Electric (per kWh) — September, RV 27Electric bill-back · 390 kWh × $0.21', '$81.90'],
+      ['item', 'RV site — monthlySite rent', '$589.00'],
+      ['total', 'In all', '$752.17'],
+      ['card-fee', 'Card fee the payer paid on top — not in the $752.17', '$26.88'],
+    ])
+    // Opening the sale never closes the row, and nothing more is read.
+    expect(rowOf('vacant:u27')!.getAttribute('aria-expanded')).toBe('true')
+    expect(server.gets.some(u => u.startsWith('/balances/payments-by-month') || u.startsWith('/payments?'))).toBe(false)
+    await click(li.querySelector('button.pay-other-row'))
+    expect(li.querySelector('[data-block="sale-parts"]')).toBeNull()
+  })
+
+  it('in the folder too: a counter sale\'s gallons and its tax; a refund has no breakdown, its day still in line', async () => {
+    const back: OpenMonthOtherMoney = {
+      id: 'ref1', saleId: '37fe8a03', kind: 'refund', day: '2026-10-07', amount: 5, methodLabel: 'Cash',
+      forLabel: 'Refund at the register · Propane', who: null, parts: [], cardFee: 0,
+    }
+    server.rolls['p-oak'] = roll([russ], { otherMoney: [propane, back] })
+    await render()
+    await loaded()
+    const folder = host.querySelector('[data-section="other-money"]')!
+    await click(folder.querySelector('button.pay-other-head'))
+    const [saleLi, refundLi] = [...folder.querySelectorAll('li.pay-other-line')]
+    expect(refundLi.querySelector('button')).toBeNull()
+    // The caret's place is kept on the refund, so both days start in the same column.
+    expect(refundLi.querySelector('.pay-other-row')!.firstElementChild!.className).toBe('pay-caret')
+    expect(refundLi.querySelector('.pay-other-row')!.firstElementChild!.textContent).toBe('')
+    await click(saleLi.querySelector('button.pay-other-row'))
+    expect(breakdown(saleLi)).toEqual([
+      ['item', 'Propane6.8 × $3.30', '$22.44'],
+      ['tax', 'Transaction privilege tax', '$1.48'],
+      ['total', 'In all', '$23.92'],
+    ])
+  })
+
+  it('on a phone the breakdown opens inside the card', async () => {
+    ;(window as any).matchMedia = (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} })
+    try {
+      server.rolls['p-oak'] = roll([{ ...vacant('RV 27', 'u27'), otherMoney: [andres], otherIn: 752.17 }])
+      await render()
+      await until(() => !!host.querySelector('.pay-cards'), 'the cards')
+      const card = host.querySelector('.pay-card')!
+      await click(card.querySelector('.pay-card-head'))
+      await click(card.querySelector('.pay-card-detail button.pay-other-row'))
+      expect(card.querySelectorAll('[data-block="sale-parts"] tr[data-part="item"]')).toHaveLength(3)
+    } finally { delete (window as any).matchMedia }
   })
 })

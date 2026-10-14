@@ -358,6 +358,40 @@ describe('splitting money out', () => {
     expect((await expenseRows(id)).every((r: any) => r.status === 'voided')).toBe(true)
     expect(await landlordExpensesTotal(co.landlordId, '2026-10-01', '2026-10-31')).toBe(0)
   })
+
+  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+  // property at the time of logging." A part going out may be split across
+  // the company's properties by units (naming none); a part coming in may not.
+  it('a part going out may be split across the properties by units; the line lists it so', async () => {
+    const co = await company()
+    const id = await line(co, -1300, { description: 'STATE FARM', merchant: 'STATE FARM' })
+    const named = await split(co, id, [
+      { category: 'insurance', amount: 1200, scopeKind: 'split_by_units', propertyId: co.propertyId },
+      { category: 'repairs', amount: 100, scopeKind: 'unit', unitId: co.unitId },
+    ])
+    expect([named.status, named.body.error]).toEqual([400, 'Part 1: a part split across your properties names no one property or unit'])
+    const res = await split(co, id, [
+      { category: 'insurance', amount: 1200, scopeKind: 'split_by_units' },
+      { category: 'repairs', amount: 100, scopeKind: 'unit', unitId: co.unitId },
+    ])
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const rows = (await db.query<any>(
+      `SELECT category, cost_place, property_id, unit_id, is_common FROM landlord_expenses
+        WHERE bank_transaction_id = $1 AND status = 'active' ORDER BY amount DESC`, [id])).rows
+    expect(rows).toEqual([
+      { category: 'insurance', cost_place: 'split_by_units', property_id: null, unit_id: null, is_common: false },
+      { category: 'repairs', cost_place: 'unit', property_id: co.propertyId, unit_id: co.unitId, is_common: false },
+    ])
+    const listed = (await request(app()).get(`/api/bank-feed/transactions?lineId=${id}`).set(as(co))).body.data[0]
+    expect((listed.splitParts ?? listed.split_parts).map((p: any) => p.costPlace ?? p.cost_place)).toEqual(['split_by_units', 'unit'])
+
+    const deposit = await line(co, 48.39)
+    const inSplit = await split(co, deposit, [
+      { category: 'other', amount: 30, scopeKind: 'split_by_units' },
+      { category: 'other', amount: 18.39, scopeKind: 'property_common', propertyId: co.propertyId },
+    ])
+    expect([inSplit.status, inSplit.body.error]).toEqual([400, 'Part 1: money coming in is filed on a unit or a property'])
+  })
 })
 
 describe('10/12 review: what a re-split keeps, and a line the bank voided', () => {

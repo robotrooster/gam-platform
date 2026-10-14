@@ -37,6 +37,12 @@
  * with its cost entered or a payment billed cannot go back to Requested. A
  * plan cancelled after GAM bought the reader bills nothing more: what its
  * payments did not repay shows as a loss, not as still to be repaid.
+ *
+ * 10/13 evening (Nic): "Redo the split" — a correction after payments are
+ * booked splits them again under the corrected cost, as a dated correction:
+ * what moves between cost repaid and markup goes into GAM's book on the
+ * correction's date, listed here as "split again"; the rows already in the
+ * book stay as they were.
  */
 import React from 'react'
 import type { AxiosInstance } from 'axios'
@@ -217,6 +223,8 @@ export function ReaderOrdersDesk({ api }: { api: AxiosInstance }) {
                             {o.stillToRepay != null && Number(o.stillToRepay) > 0.004 && <div style={{ fontSize: '.74rem', color: 'var(--t2)' }}>Still to be repaid <span className="mono">{money(o.stillToRepay)}</span></div>}
                             {(o.book || []).length > 0 && <div style={{ fontSize: '.74rem', color: 'var(--t3)' }}>In GAM's book <span className="mono">{signed(Number(o.bookedTotal || 0))}</span></div>}
                             {Math.abs(Number(o.notBooked || 0)) >= 0.005 && <div style={{ color: 'var(--amber)', fontSize: '.74rem' }}>Not in GAM's book yet <span className="mono">{signed(Number(o.notBooked))}</span></div>}
+                            {/* 10/13 (review): the total is right but cost repaid and markup are split otherwise than GAM's records say. */}
+                            {Math.abs(Number(o.splitNotBooked || 0)) >= 0.005 && <div style={{ color: 'var(--amber)', fontSize: '.74rem' }}>Split differs from GAM's records</div>}
                           </>}
                       {/* A cancelled plan stops billing (raiseDueInstallments). */}
                       {o.status === 'cancelled' && Number(o.billed || 0) > 0 && <div style={{ color: 'var(--t3)', fontSize: '.74rem' }}>Cancelled — <span className="mono">{money(o.billed)}</span> billed; the rest is not billed</div>}
@@ -274,6 +282,9 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
   // 10/13 (Nic, full purchase): a row GAM's records expect that the book does
   // not hold yet (the server's not_booked) — the next morning's run writes it.
   const notBooked = Number(o.notBooked || 0)
+  // 10/13 (review): cost repaid the book holds as markup (below zero: the other
+  // way) — the total is right, and the morning run never books a split twice.
+  const splitNotBooked = Number(o.splitNotBooked || 0)
   // What a correction changes: the difference goes into GAM's book on its date.
   const change = total != null && isCorrection ? Math.round((total - Number(o.costTotal)) * 100) / 100 : null
   const earliest = (o.costHistory || [])[0]?.effectiveOn || gamDay(o.createdAt)
@@ -284,7 +295,7 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
         <div style={{ fontWeight: 700, fontSize: '.86rem', marginBottom: 6 }}>{isCorrection ? 'Correct what this reader cost GAM' : 'What this reader cost GAM'}</div>
         {/* 10/13 (Nic): "allow dated cost corrections" — the old figure stays on record, the new one applies from its date. */}
         {isCorrection && <div style={{ fontSize: '.74rem', color: 'var(--t2)', marginBottom: 8 }}>
-          A correction (a refund, extra shipping) applies from the date you pick: {money(o.costTotal)} stays on record for the days before it, the difference goes into GAM's book on that date, and a payment billed on or after it is split under the new figure. Anything already in GAM's book stays as it was. Fixing a typo? Give it the date of the figure it fixes.
+          A correction (a refund, extra shipping) applies from the date you pick: {money(o.costTotal)} stays on record for the days before it, the difference goes into GAM's book on that date, and a payment billed on or after it is split under the new figure. Payments already billed are split again under it: what moves between cost repaid and markup goes into GAM's book on that date. The rows already in GAM's book stay as they were. Fixing a typo? Give it the date of the figure it fixes.
         </div>}
         <label style={{ display: 'block', fontSize: '.74rem', color: 'var(--t3)', marginBottom: 8 }}>{isCorrection ? 'Applies from' : 'Date GAM bought it'}
           <input type="date" className="inp mono" style={{ width: '100%', fontSize: '.82rem', marginTop: 2 }}
@@ -314,7 +325,8 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
               : `GAM's book gets the ${money(total)} as GAM's expense on ${calDay(cost.on)}.`}
             {' '}Each payment is booked as it is billed — the cost it repays first, then the markup.
             {isLoss && ` A loss: the payments never repay ${money(Math.round((total - Number(o.charged)) * 100) / 100)} of it, which stays as GAM's expense.`}
-            {changesBilled && ' Payments already billed stay as booked.'}
+            {/* 10/13 evening (Nic): "Redo the split". */}
+            {changesBilled && ' Payments already billed are split again under the new figure, cost first: what moves between cost repaid and markup goes into GAM\'s book on that date (on the day a payment was billed, if that is later).'}
           </div>}
         </div>
         {err && <div style={{ color: 'var(--red)', fontSize: '.76rem', marginBottom: 8 }}>{err}</div>}
@@ -326,7 +338,7 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
       <div>
         <div style={{ fontWeight: 700, fontSize: '.86rem', marginBottom: 6 }}>The plan, cost first</div>
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginBottom: 6 }}>
-          The payments repay what the reader cost GAM first; the markup is in the last payment(s) and is GAM's earnings. Each payment goes into GAM's book as it is billed, split under the cost in force that day.
+          The payments repay what the reader cost GAM first; the markup is in the last payment(s) and is GAM's earnings. Each payment goes into GAM's book as it is billed, split under the cost in force that day; a later correction splits it again on the correction's date.
           {o.costTotal == null && ' Until the cost is entered, every dollar counts as cost and nothing is in GAM\'s book.'}
         </div>
         <table className="tbl" style={{ fontSize: '.76rem', marginBottom: 12 }}>
@@ -386,6 +398,7 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
                     <td>
                       {READER_BOOK_ROW_KIND_LABEL[b.kind as ReaderBookRowKind] ?? b.kind}
                       {b.n != null && ` — payment ${b.n} of ${o.installments}`}
+                      {b.resplit ? ' — split again under the corrected cost' : ''}
                       {b.voided ? ' (payment voided — still in the book)' : ''}
                       {b.notes && <div style={{ color: 'var(--t3)', fontSize: '.7rem' }}>{b.notes}</div>}
                     </td>
@@ -397,6 +410,9 @@ function CostPanel({ o, cost, setCost, err, busy, preview, onSave, onCancel }: {
             </table>}
         {Math.abs(notBooked) >= 0.005 && <div style={{ fontSize: '.74rem', color: 'var(--amber)', marginTop: 6 }}>
           Not in GAM's book yet: <span className="mono">{signed(notBooked)}</span> — a row GAM's records expect is missing; the next morning's run writes it.
+        </div>}
+        {Math.abs(splitNotBooked) >= 0.005 && <div style={{ fontSize: '.74rem', color: 'var(--amber)', marginTop: 6 }}>
+          GAM's book holds <span className="mono">{money(Math.abs(splitNotBooked))}</span> of this reader as {splitNotBooked > 0 ? 'markup' : 'cost repaid'} that GAM's records say is {splitNotBooked > 0 ? 'cost repaid' : 'markup'}. The total is right; the morning run does not move it by itself.
         </div>}
       </div>
     </div>

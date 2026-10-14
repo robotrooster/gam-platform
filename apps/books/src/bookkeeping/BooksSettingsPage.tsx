@@ -3,8 +3,12 @@
  * count money. "Landlord's choice", each one (Nic's 10/12 answers): where the
  * books start (since joining GAM, or a date the owner picks), who may close and
  * reopen a month, where a fix to an open month shows, home sales, work trade
- * that covers rent, register stock, costs that are no one property's, and who
- * may write off a balance.
+ * that covers rent, register stock, and who may write off a balance. 10/13
+ * (Nic): where a cost goes is no setting — "each expense is chosen on the
+ * split or specific unit or property at the time of logging. there should
+ * never be a default setting to apply expenses." — so the "Costs that are no
+ * one property's" choice is gone from this page; each expense, payroll run,
+ * loan and asset asks it when it is logged.
  *
  * The owner changes them; a bookkeeper with the ledger box reads them (the
  * server decides — routes/booksSettings.ts). GAM Books' own page, shown in GAM
@@ -22,7 +26,6 @@ import {
   BOOKS_HOME_SALE_METHODS, BOOKS_HOME_SALE_METHOD_LABEL,
   BOOKS_WORK_TRADE_METHODS, BOOKS_WORK_TRADE_METHOD_LABEL,
   LEDGER_REGISTER_STOCK_METHODS, LEDGER_REGISTER_STOCK_METHOD_LABEL,
-  BOOKS_COMPANY_COST_METHODS, BOOKS_COMPANY_COST_METHOD_LABEL,
   LEDGER_WRITE_OFF_PERMISSIONS, LEDGER_WRITE_OFF_PERMISSION_LABEL,
   LEDGER_CLOSE_PERMISSIONS, LEDGER_CLOSE_PERMISSION_LABEL,
   LEDGER_OPEN_MONTH_FIX_MODES, LEDGER_OPEN_MONTH_FIX_MODE_LABEL,
@@ -45,9 +48,6 @@ export interface BooksSettings {
   workTradeMethod: string | null
   registerStockMethod: string
   registerStockFrom: string | null
-  companyCostsMethod: string | null
-  /** 10/13 (Nic): the day a company-costs choice made after the books posted applies from (null: every cost). */
-  companyCostsFromDay: string | null
   writeOffBy: string
   /** 10/12 (Nic, L6): what a repair closed with a cost does (null: not chosen — the button). */
   repairBills: string | null
@@ -61,13 +61,13 @@ type Form = {
   historyStart: string | null; startDate: string
   closeBy: string; reopenBy: string; openMonthFixes: string
   homeSaleMethod: string | null; workTradeMethod: string | null; registerStockMethod: string
-  companyCostsMethod: string | null; writeOffBy: string; repairBills: string | null
+  writeOffBy: string; repairBills: string | null
 }
 const formOf = (s: BooksSettings): Form => ({
   historyStart: s.historyStart, startDate: s.historyStart === 'start_date' ? (s.booksStartDate ?? '') : '',
   closeBy: s.closeBy, reopenBy: s.reopenBy, openMonthFixes: s.openMonthFixes,
   homeSaleMethod: s.homeSaleMethod, workTradeMethod: s.workTradeMethod, registerStockMethod: s.registerStockMethod,
-  companyCostsMethod: s.companyCostsMethod, writeOffBy: s.writeOffBy, repairBills: s.repairBills,
+  writeOffBy: s.writeOffBy, repairBills: s.repairBills,
 })
 
 // What each choice means, in a sentence or two (the labels are the shared ones).
@@ -82,10 +82,6 @@ const WORK_TRADE_HELP: Record<string, string> = {
 const STOCK_HELP: Record<string, string> = {
   expense_when_bought: 'Stock counts as an expense the day you buy it.',
   cost_per_item_sold: 'Stock you buy is inventory until it sells; each sale counts what its items cost.',
-}
-const COMPANY_COST_HELP: Record<string, string> = {
-  company_bucket: 'Payroll and company-wide bills stay in a Company column of their own, apart from your properties.',
-  split_by_units: 'Payroll and company-wide bills are split across your properties by how many units each has.',
 }
 // 10/12 (Nic, L6): "a repair closed with a cost → landlord's choice".
 const REPAIR_BILL_HELP: Record<string, string> = {
@@ -167,7 +163,7 @@ export function BooksSettingsPage() {
     changes.historyStart = form.historyStart
     if (form.historyStart === 'start_date') changes.startDate = form.startDate
   }
-  for (const k of ['closeBy', 'reopenBy', 'openMonthFixes', 'homeSaleMethod', 'workTradeMethod', 'registerStockMethod', 'companyCostsMethod', 'writeOffBy', 'repairBills'] as const) {
+  for (const k of ['closeBy', 'reopenBy', 'openMonthFixes', 'homeSaleMethod', 'workTradeMethod', 'registerStockMethod', 'writeOffBy', 'repairBills'] as const) {
     const v = form[k]
     if (v !== null && v !== (data as any)[k]) changes[k] = v
   }
@@ -280,20 +276,6 @@ export function BooksSettingsPage() {
           <Choice key={v} name="registerStockMethod" value={v} checked={form.registerStockMethod === v} disabled={ro}
             label={LEDGER_REGISTER_STOCK_METHOD_LABEL[v]} help={STOCK_HELP[v]} onPick={x => set('registerStockMethod', x)} />
         ))}
-      </Section>
-
-      {/* 10/13 (Nic): "Company-level costs before the owner picks: post to the
-          COMPANY column by default"; "a later 'split by units' splits only NEW costs". */}
-      <Section title="Costs that are no one property's" help={data.companyCostsMethod !== null && data.companyCostsFromDay
-        ? `Your choice applies to costs recorded from ${longCalendarDate(data.companyCostsFromDay)} on. Costs recorded before then stay in the Company column.`
-        : undefined}>
-        {data.companyCostsMethod === null && <div className="alert aw" style={{ marginBottom: 10 }}>Not chosen yet. Until you choose, these costs go to the Company column. Choosing to split them by units splits only costs recorded from then on; what is already in the Company column stays there.</div>}
-        {BOOKS_COMPANY_COST_METHODS.map(v => (
-          <Choice key={v} name="companyCostsMethod" value={v} checked={form.companyCostsMethod === v}
-            disabled={ro || lockedMethod(data.companyCostsMethod)}
-            label={BOOKS_COMPANY_COST_METHOD_LABEL[v]} help={COMPANY_COST_HELP[v]} onPick={x => set('companyCostsMethod', x)} />
-        ))}
-        {lockedMethod(data.companyCostsMethod) && <Locked />}
       </Section>
 
       <Section title="Repairs closed with a cost" help={<>Either way the repair's cost counts once — on its bill once it has one. Your expense and income categories (and the accounts they charge to) are on <Link to={booksPath('categories')} style={{ color: 'var(--gold)' }}>Categories</Link>.</>}>

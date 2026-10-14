@@ -1340,6 +1340,8 @@ export interface UndoneMarker {
   undoneBy: string | null
   /** The record of the match that was undone. */
   was: unknown
+  /** 10/13 evening (Nic: "void what bounced"): undone because the bank took the deposit back. */
+  bankVoided?: true
 }
 
 export interface UndoDepositResult {
@@ -1372,9 +1374,20 @@ export interface UndoDepositResult {
  * zeroed fee no longer zero, a credited fee changed or its credit used elsewhere; a credit it made already used (or set aside for a
  * payment); the receipt already closed. The reason is said plainly and nothing
  * is changed.
+ *
+ * 10/13 evening (Nic): "Bank takes back a bounced deposit that was MATCHED to
+ * income: void what bounced." `bankVoided`: the bank voided this deposit (the
+ * sync, services/bankFeed voidWhatBounced) — the same exact undo, but the bank
+ * row is set aside as the bank's void instead of going back to review (no
+ * money came in to file), the receipt says the bank took it back, and the
+ * tenant is told in those words. Not for a deposit the office logged by hand,
+ * nor (10/13 review) a deposit slip or the office's cash with payments or
+ * register sales in it — refused: GAM has no way yet to take back a payment
+ * recorded at the desk, and voiding only the bag's other money would treat
+ * money from one bag two ways.
  */
 export async function undoDepositMatch(input: {
-  bankTransactionId: string; landlordId: string; undoneBy: string | null
+  bankTransactionId: string; landlordId: string; undoneBy: string | null; bankVoided?: boolean
 }): Promise<UndoDepositResult> {
   const client = await getClient()
   let result: UndoDepositResult
@@ -1395,19 +1408,39 @@ export async function undoDepositMatch(input: {
       throw new AppError(409, 'This deposit is a payout GAM sent you. It is matched to that payout and there is nothing to undo.')
     }
     const undo = txn.undo
+    // 10/13 evening: where the bank row goes — back to review, or (the bank took
+    // the deposit back) set aside as the bank's void.
+    const after = input.bankVoided ? { status: 'ignored', reason: 'bank_void' } : { status: 'needs_review', reason: null }
     const marker = (was: unknown): UndoneMarker => ({
+      ...(input.bankVoided ? { bankVoided: true as const } : {}),
       version: 1, undone: true, undoneAt: new Date().toISOString(), undoneBy: input.undoneBy, was,
     })
 
     if (undo?.kind === 'deposit_slip') {
+      // 10/13 (review): the bank took back a bag with payments or register
+      // sales the office took in it — those stay as recorded (GAM cannot take
+      // a desk payment back yet), so the bag is left whole for the owner, other
+      // money and all (told, as before: depositSlips alertSlipDepositVoided).
+      // Only a bag of other money alone (laundry coins) is voided by itself.
+      // The bank row is locked above; the slip is locked here, in that order.
+      if (input.bankVoided) {
+        await client.query(`SELECT id FROM bank_deposit_slips WHERE id = $1 AND landlord_id = $2 FOR UPDATE`,
+          [undo.slipId, txn.landlord_id])
+        const held = (await client.query<{ n: number }>(
+          `SELECT COUNT(*)::int AS n FROM bank_deposit_slip_items WHERE slip_id = $1 AND voided_at IS NULL`,
+          [undo.slipId])).rows[0]?.n ?? 0
+        if (held > 0) {
+          throw new AppError(409, 'This deposit holds payments or register sales the office took, which stay as recorded.')
+        }
+      }
       const { undoSlipMatch } = await import('./depositSlips')
       const r = await undoSlipMatch(client, {
         transactionId: txn.id, landlordId: txn.landlord_id, undo, undoneBy: input.undoneBy,
       })
       await client.query(
         `UPDATE bank_transactions
-            SET status = 'needs_review', landlord_other_income_id = NULL, auto_settle_undo = $2::jsonb, updated_at = NOW()
-          WHERE id = $1`, [txn.id, JSON.stringify(marker(undo))])
+            SET status = $3, ignored_reason = $4, landlord_other_income_id = NULL, auto_settle_undo = $2::jsonb, updated_at = NOW()
+          WHERE id = $1`, [txn.id, JSON.stringify(marker(undo)), after.status, after.reason])
       await client.query('COMMIT')
       return {
         kind: 'deposit_slip', reopenedChargeIds: [], lateFeesRestored: 0, creditsWithdrawn: [],
@@ -1418,6 +1451,9 @@ export async function undoDepositMatch(input: {
     // 10/6: a bank line tied to a deposit the office logged by hand — the
     // receipt and its payments stay; what the bank's date changed goes back.
     if (undo?.kind === 'recorded_deposit') {
+      // 10/13 evening: the receipt the office logged by hand stays — GAM has no
+      // way yet to take back a payment recorded at the desk (see voidWhatBounced).
+      if (input.bankVoided) throw new AppError(409, 'This deposit is tied to a payment the office logged by hand, which stays as recorded.')
       const { undoRecordedDepositMatch } = await import('./recordedDepositMatch')
       const r = await undoRecordedDepositMatch(client, {
         transactionId: txn.id, landlordId: txn.landlord_id, undo, undoneBy: input.undoneBy,
@@ -1657,7 +1693,9 @@ export async function undoDepositMatch(input: {
               undone_at = NOW(), undone_by = $3,
               notes = COALESCE(notes || ' — ', '') || $2
         WHERE id = $1 AND status = 'settled'`,
-      [snap.receiptId, `Undone ${day}: this bank deposit was taken back off the bills it paid`, input.undoneBy])
+      [snap.receiptId, input.bankVoided
+        ? `Undone ${day}: the bank took this deposit back (it did not go through), so it was taken back off the bills it paid`
+        : `Undone ${day}: this bank deposit was taken back off the bills it paid`, input.undoneBy])
     // The on-time marks this settle wrote were never earned by this money:
     // withdrawn (a mark pointing at itself is withdrawn; the score skips it).
     // 10/6: a mark a later late-fee delete replaced (re-rated from the
@@ -1693,9 +1731,9 @@ export async function undoDepositMatch(input: {
     }
     await client.query(
       `UPDATE bank_transactions
-          SET status = 'needs_review', matched_payment_id = NULL, auto_settled_at = NULL,
+          SET status = $3, ignored_reason = $4, matched_payment_id = NULL, auto_settled_at = NULL,
               auto_settle_undo = $2::jsonb, updated_at = NOW()
-        WHERE id = $1`, [txn.id, JSON.stringify(marker(snap))])
+        WHERE id = $1`, [txn.id, JSON.stringify(marker(snap)), after.status, after.reason])
     await client.query('COMMIT')
     tenantToTell = { tenantId: receipt.tenant_id, amount: toDollars(toCents(txn.amount)), postedDate: txn.posted_date }
     result = {
@@ -1730,8 +1768,12 @@ export async function undoDepositMatch(input: {
         userId: u,
         type: 'payment_recorded',
         title: 'A bank deposit is no longer applied to your bill',
-        body: `Your landlord took the $${t.amount.toFixed(2)} bank deposit of ${t.postedDate} back off your bill — it did not match your payment. ` +
-          'What it paid is owed again. If you made that deposit, tell your landlord.',
+        // 10/13 evening (Nic: "void what bounced"): the bank took it back.
+        body: input.bankVoided
+          ? `The $${t.amount.toFixed(2)} bank deposit of ${t.postedDate} did not go through — the bank took it back, so it was taken off your bill. ` +
+            'What it paid is owed again. If you think this is a mistake, check with your bank and tell your landlord.'
+          : `Your landlord took the $${t.amount.toFixed(2)} bank deposit of ${t.postedDate} back off your bill — it did not match your payment. ` +
+            'What it paid is owed again. If you made that deposit, tell your landlord.',
         actionUrl: '/payments',
       })
     })().catch(e => logger.error({ err: e }, '[deposit-undo] tenant notice failed'))

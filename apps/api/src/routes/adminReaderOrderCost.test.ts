@@ -81,7 +81,10 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
   // 10/13 (Nic): "allow dated cost corrections" — after the markup is booked too (10/12's "fixed once
   // booked" is replaced): the old figure stays on record, the new one applies from its date. And
   // (afternoon, full purchase) the difference goes into GAM's book on that date as GAM's expense.
-  it('takes a dated correction after the markup is booked — the booked rows stay, the difference is GAM’s expense on its date; refuses one dated before the figure it corrects (409), a day to come, and a bad body (400)', async () => {
+  // 10/13 evening (Nic): "Redo the split" — the pieces already booked are split again under the
+  // correction on its date (here today, the day they were billed): $7.27 of piece 4 moves from
+  // markup to cost repaid.
+  it('takes a dated correction after the markup is booked — the booked rows stay, the difference is GAM’s expense on its date and the pieces are split again on it; refuses one dated before the figure it corrects (409), a day to come, and a bad body (400)', async () => {
     const f = await fixture()
     const app = buildApp()
     const post = (body: any) => request(app).post(`/api/admin/reader-orders/${f.order}/cost`)
@@ -98,14 +101,14 @@ describe('POST /api/admin/reader-orders/:id/cost', () => {
     const r = await post({ basePrice: 299, taxAndShipping: 40, note: 'extra shipping' })
     expect(r.status).toBe(200)
     expect(r.body.data).toMatchObject({
-      cost_total: 339, markup: 11, booked_total: 11, purchase_booked: -339, cost_repaid_booked: 331.73, markup_booked: 18.27,
-      not_booked: 0, still_to_repay: 7.27, cost_booked: true,
+      cost_total: 339, markup: 11, booked_total: 11, purchase_booked: -339, cost_repaid_booked: 339, markup_booked: 11,
+      not_booked: 0, still_to_repay: 0, cost_booked: true,
     })
     expect(r.body.data.cost_history).toHaveLength(2)
-    expect(r.body.data.book.map((b: any) => [b.kind, b.n, b.amount])).toEqual([
-      ['purchase', null, -331.73],
-      ['cost_repaid', 1, 87.5], ['cost_repaid', 2, 87.5], ['cost_repaid', 3, 87.5], ['cost_repaid', 4, 69.23], ['markup', 4, 18.27],
-      ['purchase', null, -7.27],
+    expect(r.body.data.book.map((b: any) => [b.kind, b.n, b.amount, b.resplit])).toEqual([
+      ['purchase', null, -331.73, false],
+      ['cost_repaid', 1, 87.5, false], ['cost_repaid', 2, 87.5, false], ['cost_repaid', 3, 87.5, false], ['cost_repaid', 4, 69.23, false], ['markup', 4, 18.27, false],
+      ['purchase', null, -7.27, false], ['cost_repaid', 4, 7.27, true], ['markup', 4, -7.27, true],
     ])
     const back = await post({ basePrice: 299, taxAndShipping: 32.73, effectiveOn: '2000-01-01' })
     expect(back.status).toBe(400)   // before the landlord asked for it

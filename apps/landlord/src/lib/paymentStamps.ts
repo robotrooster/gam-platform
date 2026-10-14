@@ -4,7 +4,7 @@
  * (the server's services/householdMonths decides every stamp; this only says
  * it). Words and letters come from the shared maps, never a raw value.
  */
-import type { PaymentStamp } from '@gam/shared'
+import { HEALTH_ONBOARDING_NOT_COUNTED, HEALTH_NOTHING_JUDGED, type PaymentStamp } from '@gam/shared'
 import { monthTitle } from './creditDesk'
 
 /** One month of one household, as the server sends it (camelCase on the wire). */
@@ -37,6 +37,8 @@ export interface HealthFigure {
   from: string
   through: string
   label: string
+  /** The onboarding month was judged and left out (paid late; good news only). */
+  onboardingLeftOut?: boolean
 }
 
 export interface ChargeLine {
@@ -88,15 +90,35 @@ export function healthColor(p: number | null | undefined): string {
   if (p === null || p === undefined) return 'var(--text-3)'
   return p >= HEALTH_GOOD_PCT ? 'var(--green)' : p >= HEALTH_FAIR_PCT ? 'var(--amber)' : 'var(--red)'
 }
-/** The word under the figure on the profile. */
-export function healthWord(p: number | null | undefined): string {
-  if (p === null || p === undefined) return 'No months to judge yet'
+/**
+ * 10/13 (Nic), the onboarding month (September at Mountain View) paid late:
+ * "Keep it out, but say so." What health says while nothing is counted —
+ * "Onboarding month — not counted" when the onboarding month was judged and
+ * left out, else "No months to judge yet" — never a bare dash.
+ */
+export function healthNoneWords(h: { onboardingLeftOut?: boolean } | null | undefined): string {
+  return h?.onboardingLeftOut ? HEALTH_ONBOARDING_NOT_COUNTED : HEALTH_NOTHING_JUDGED
+}
+
+/** The word under the figure on the profile; nothing counted yet: why (healthNoneWords). */
+export function healthWord(p: number | null | undefined, h?: { onboardingLeftOut?: boolean } | null): string {
+  if (p === null || p === undefined) return healthNoneWords(h)
   return p >= HEALTH_GOOD_PCT ? 'Excellent' : p >= HEALTH_FAIR_PCT ? 'Good' : 'Needs attention'
 }
 
-/** "50%, 1 of 2 months" — the server's words, or a dash before any month is judged. */
-export function healthText(h: HealthFigure | null | undefined): string {
-  return h && h.percent !== null ? `${h.percent}%` : '—'
+/** The figure: "50%" — or, before any month is counted, why in words (healthNoneWords), never a dash. */
+export function healthText(h: Pick<HealthFigure, 'percent' | 'onboardingLeftOut'> | null | undefined): string {
+  return h && h.percent !== null ? `${h.percent}%` : healthNoneWords(h)
+}
+
+/**
+ * On hover: "Pays on time: 50%, 1 of 2 months — all time through October
+ * 2026"; when the onboarding month was left out beside counted months, it says
+ * so ("Keep it out, but say so").
+ */
+export function healthTitle(h: Pick<HealthFigure, 'percent' | 'label' | 'through' | 'onboardingLeftOut'>): string {
+  const left = h.onboardingLeftOut && h.percent !== null ? ' · the onboarding month is not counted' : ''
+  return `Pays on time: ${h.label}${left} — all time through ${monthTitle(h.through)}`
 }
 
 /**

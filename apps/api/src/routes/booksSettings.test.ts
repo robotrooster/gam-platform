@@ -24,7 +24,7 @@ import {
 } from '@gam/shared'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
-import { booksSettingsRouter } from './booksSettings'
+import { booksSettingsRouter, COMPANY_COSTS_RETIRED } from './booksSettings'
 import { BOOKS_CHOOSE_COMPANY } from './books'
 import { errorHandler } from '../middleware/errorHandler'
 import { LEDGER_REFUSAL } from '../lib/bookkeeperScope'
@@ -175,13 +175,16 @@ describe('Books settings — the owner\'s choices', () => {
     expect(s).toMatchObject({
       companyName: 'Canyon LLC', canEdit: true, viewer: 'owner',
       booksStartDate: null, historyStart: null,
-      homeSaleMethod: null, workTradeMethod: null, companyCostsMethod: null,
+      homeSaleMethod: null, workTradeMethod: null,
       // Register stock starts on the register lane's default (expense when bought), from the books' start.
       registerStockMethod: 'expense_when_bought', registerStockFrom: null,
       writeOffBy: 'owner', closeBy: 'owner_or_bookkeeper', reopenBy: 'owner', openMonthFixes: 'restate',
       closedThrough: null, hasPostings: false, openingItems: 0,
     })
     expect(s.joinMonthStart).toBe(`${s.joinedOn.slice(0, 7)}-01`)
+    // 10/13 (Nic): "there should never be a default setting to apply expenses" — no company-costs choice.
+    expect(s).not.toHaveProperty('companyCostsMethod')
+    expect(s).not.toHaveProperty('companyCostsFromDay')
   })
 
   it('an owner of two companies names one; a company that is not theirs is refused', async () => {
@@ -200,18 +203,18 @@ describe('Books settings — the owner\'s choices', () => {
     const w = await world()
     const r = await request(app).patch('/api/books/setup/settings').set(asOwner(w)).send({
       homeSaleMethod: 'income_as_paid', workTradeMethod: 'rent_discount', registerStockMethod: 'cost_per_item_sold',
-      companyCostsMethod: 'split_by_units', writeOffBy: 'owner_or_property_manager',
+      writeOffBy: 'owner_or_property_manager',
       closeBy: 'owner', reopenBy: 'owner_or_bookkeeper', openMonthFixes: 'day_made',
     })
     expect(r.status, JSON.stringify(r.body)).toBe(200)
     expect(r.body.data).toMatchObject({
       homeSaleMethod: 'income_as_paid', workTradeMethod: 'rent_discount', registerStockMethod: 'cost_per_item_sold', registerStockFrom: null,
-      companyCostsMethod: 'split_by_units', writeOffBy: 'owner_or_property_manager',
+      writeOffBy: 'owner_or_property_manager',
       closeBy: 'owner', reopenBy: 'owner_or_bookkeeper', openMonthFixes: 'day_made',
     })
     expect(await landlordRow(w.canyon)).toMatchObject({
       books_home_sale_method: 'income_as_paid', books_work_trade_method: 'rent_discount',
-      books_register_stock: 'cost_per_item_sold', books_register_stock_from: null, books_company_costs_method: 'split_by_units',
+      books_register_stock: 'cost_per_item_sold', books_register_stock_from: null, books_company_costs_method: null,
       books_write_off_by: 'owner_or_property_manager', books_close_by: 'owner', books_reopen_by: 'owner_or_bookkeeper',
       books_open_month_fixes: 'day_made',
     })
@@ -228,6 +231,10 @@ describe('Books settings — the owner\'s choices', () => {
     const badWho = await request(app).patch('/api/books/setup/settings').set(asOwner(w)).send({ writeOffBy: 'bookkeeper' })
     expect(badWho.status).toBe(400)
     expect(badWho.body.error).toBe('Choose who may write off a balance.')
+    // 10/13 (Nic): where a cost goes is no setting — the retired choice is refused in words and never saved.
+    const retired = await request(app).patch('/api/books/setup/settings').set(asOwner(w)).send({ companyCostsMethod: 'split_by_units' })
+    expect([retired.status, retired.body.error]).toEqual([400, COMPANY_COSTS_RETIRED])
+    expect((await landlordRow(w.canyon)).books_company_costs_method).toBeNull()
   })
 
   it('a start date the owner picks: the bank feed\'s cutoff moves with it and the opening posting is marked', async () => {

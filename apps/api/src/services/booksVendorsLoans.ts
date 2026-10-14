@@ -35,7 +35,7 @@ import type { PoolClient } from 'pg'
 import {
   FORM_1099_NOT_REPORTED_PAYMENT_METHODS, BOOKS_LOAN_MATCH_WINDOW_DAYS, form1099NecThreshold, loanPaymentSuggestion,
   depreciationSchedule, depreciationThrough, fixedAssetDepreciates, fixedAssetLifeMonths, taxIdLast4,
-  type BooksLoanState, type LoanPaymentSplit, type DepreciationMonth,
+  type BooksLoanState, type LoanPaymentSplit, type DepreciationMonth, type BooksCostPlace,
 } from '@gam/shared'
 import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
@@ -47,6 +47,64 @@ type Q = Pick<PoolClient, 'query'>
 
 /** The company a Books request names (routes/books.ts ownerScope). */
 export interface BooksOwner { col: 'landlord_id' | 'business_id'; id: string }
+
+// ─── Where a cost goes (10/13, Nic) ──────────────────────────────────────────
+
+/** Where a logged cost goes, as saved: its place and the property and unit it names. */
+export interface CostPlaceChoice { costPlace: BooksCostPlace | null; propertyId: string | null; unitId: string | null }
+
+/**
+ * 10/13 (Nic): "each expense is chosen on the split or specific unit or
+ * property at the time of logging. there should never be a default setting to
+ * apply expenses." Where a loan's interest, an asset's depreciation or a
+ * payroll run's wages go, as the form chose it — checked and filled in: a unit
+ * (the company's; its property comes with it), a property (the company's), or
+ * split across the properties by units (naming neither). Refused in words
+ * when nothing was chosen (`what`: "this loan's interest"…). A business's
+ * books have no properties: nothing is asked of it.
+ */
+export async function resolveCostPlace(q: Q, owner: BooksOwner, v: {
+  costPlace?: BooksCostPlace | null; propertyId?: string | null; unitId?: string | null
+}, what: string): Promise<CostPlaceChoice> {
+  if (owner.col !== 'landlord_id') {
+    if (v.costPlace || v.unitId || v.propertyId) throw new AppError(400, 'A business\'s books have no properties.')
+    return { costPlace: null, propertyId: null, unitId: null }
+  }
+  const place: BooksCostPlace | null = v.costPlace ?? (v.unitId ? 'unit' : v.propertyId ? 'property' : null)
+  if (!place) throw new AppError(400, `Choose where ${what} goes: one unit, one property, or split across your properties by units.`)
+  if (place === 'split_by_units') {
+    if (v.propertyId || v.unitId) throw new AppError(400, `Split across your properties, ${what} names no one property or unit.`)
+    return { costPlace: place, propertyId: null, unitId: null }
+  }
+  if (place === 'unit') {
+    if (!v.unitId) throw new AppError(400, `Choose the unit ${what} goes to.`)
+    const u = (await q.query<{ property_id: string }>(
+      `SELECT u.property_id FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1 AND p.landlord_id = $2`, [v.unitId, owner.id])).rows[0]
+    if (!u) throw new AppError(404, 'That unit is not this company\'s.')
+    if (v.propertyId && v.propertyId !== u.property_id) throw new AppError(400, 'That unit is not on that property.')
+    return { costPlace: place, propertyId: u.property_id, unitId: v.unitId }
+  }
+  if (!v.propertyId) throw new AppError(400, `Choose the property ${what} goes to.`)
+  const p = (await q.query(`SELECT 1 FROM properties WHERE id = $1 AND landlord_id = $2`, [v.propertyId, owner.id])).rows[0]
+  if (!p) throw new AppError(404, 'That property is not this company\'s.')
+  return { costPlace: place, propertyId: v.propertyId, unitId: null }
+}
+
+/**
+ * 10/13 (Nic): the company's properties and their units, for the forms that
+ * ask where a cost goes (split across them by units, one property, one unit).
+ * A property that left the company is not offered.
+ */
+export async function costPlaceOptions(q: Q, owner: BooksOwner): Promise<{ id: string; name: string; units: { id: string; unitNumber: string }[] }[]> {
+  if (owner.col !== 'landlord_id') return []
+  const r = await q.query<{ id: string; name: string; units: { id: string; unitNumber: string }[] }>(
+    `SELECT p.id, p.name,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('id', u.id, 'unitNumber', u.unit_number) ORDER BY u.unit_number, u.id)
+                        FROM units u WHERE u.property_id = p.id AND u.retired_at IS NULL), '[]'::jsonb) AS units
+       FROM properties p WHERE p.landlord_id = $1 ORDER BY p.name, p.id`, [owner.id])
+  return r.rows
+}
 
 /** Whole cents from a numeric column read as text. */
 export const toCents = (v: string | number | null | undefined): number => Math.round((Number(v) || 0) * 100)
@@ -306,7 +364,11 @@ export const LOAN_COLUMNS = `
   l.created_at, l.updated_at, l.voided_at::text AS voided_at, l.void_reason,
   (SELECT x.books_start_date::text FROM landlords x WHERE x.id = l.landlord_id) AS books_start,
   (SELECT p.name FROM properties p WHERE p.id = l.property_id) AS property_name,
-  (SELECT v.name FROM books_vendors v WHERE v.id = l.vendor_id) AS vendor_name`
+  (SELECT v.name FROM books_vendors v WHERE v.id = l.vendor_id) AS vendor_name,
+  -- 10/13 (Nic): where each payment's interest goes, picked when the loan was logged.
+  l.cost_place, l.unit_id, (SELECT u.unit_number FROM units u WHERE u.id = l.unit_id) AS unit_number,
+  -- 10/13 (Nic, "a loan may spread over several assets"): what live assets say came from it.
+  books_loan_used_by_assets(l.id)::text AS used_by_assets`
 
 /** What is still owed on a loan on `day` (before a payment that day), in cents; null when its opening balance is not entered. */
 export async function loanBalanceOn(q: Q, loanId: string, day: string, excludePaymentId?: string | null): Promise<number | null> {
@@ -561,7 +623,17 @@ export const ASSET_COLUMNS = `
   (SELECT x.books_start_date::text FROM landlords x WHERE x.id = a.landlord_id) AS books_start,
   (SELECT p.name FROM properties p WHERE p.id = a.property_id) AS property_name,
   (SELECT e.description FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_description,
-  a.funded_by, a.funded_loan_id, (SELECT l.name FROM books_loans l WHERE l.id = a.funded_loan_id) AS funded_loan_name`
+  a.funded_by, a.funded_loan_id, (SELECT l.name FROM books_loans l WHERE l.id = a.funded_loan_id) AS funded_loan_name,
+  -- 10/13 (Nic): where its depreciation goes, picked when the asset was logged.
+  a.cost_place, a.unit_id, (SELECT u.unit_number FROM units u WHERE u.id = a.unit_id) AS unit_number,
+  -- 10/13 (Nic, "ALLOW A MIX"): its live funding lines, in the order they were said.
+  COALESCE((SELECT jsonb_agg(jsonb_build_object(
+              'kind', x.kind, 'amount', x.amount, 'loanId', x.loan_id, 'expenseId', x.expense_id,
+              'loanName', (SELECT l.name FROM books_loans l WHERE l.id = x.loan_id),
+              'expenseDescription', (SELECT e.description FROM landlord_expenses e WHERE e.id = x.expense_id),
+              'expenseDate', (SELECT e.expense_date::text FROM landlord_expenses e WHERE e.id = x.expense_id))
+              ORDER BY x.created_at, x.line_no, x.id)
+              FROM books_fixed_asset_funding x WHERE x.asset_id = a.id AND x.replaced_at IS NULL), '[]'::jsonb) AS funding`
 
 export interface AssetFigures {
   /** Bought before the books start (and not from an expense): it opens at its cost less what was already taken. */
@@ -661,7 +733,7 @@ export async function capitalExpense(q: Q, landlordId: string, expenseId: string
             COALESCE((SELECT a.type FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)),
                      books_category_account_type(e.category_id)) AS account_type,
             (SELECT a.name FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)) AS account_name,
-            EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL) AS has_asset,
+            books_expense_fixed_asset(e.id) IS NOT NULL AS has_asset,
             ${REPAIR_BILL_FOLLOWS_REPAIR_SQL} AS follows_repair
        FROM landlord_expenses e WHERE e.id = $1 AND e.landlord_id = $2`, [expenseId, landlordId])).rows[0]
   if (!e) throw new AppError(404, 'That expense is not this company\'s.')
@@ -687,7 +759,7 @@ export async function capitalExpense(q: Q, landlordId: string, expenseId: string
  */
 const LINKABLE_EXPENSE_SQL = `e.status = 'active' AND e.voided_at IS NULL AND e.amount > 0 AND e.allocation_split_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM payroll_run_expenses x WHERE x.expense_id = e.id)
-  AND NOT EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL)
+  AND books_expense_fixed_asset(e.id) IS NULL
   AND NOT ${REPAIR_BILL_FOLLOWS_REPAIR_SQL}
   AND COALESCE(CASE WHEN e.category_id IS NULL THEN NULL ELSE books_category_account_type_on(e.category_id, e.expense_date) END,
                'expense') IN ('expense', 'asset')`
@@ -703,7 +775,7 @@ export async function linkableExpense(q: Q, landlordId: string, expenseId: strin
     `SELECT e.id, e.amount::text AS amount, e.expense_date::text AS expense_date, e.description,
             COALESCE((SELECT u.property_id FROM units u WHERE u.id = e.unit_id), e.property_id) AS property_id,
             e.status, e.voided_at::text AS voided_at,
-            EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL) AS has_asset,
+            books_expense_fixed_asset(e.id) IS NOT NULL AS has_asset,
             ${REPAIR_BILL_FOLLOWS_REPAIR_SQL} AS follows_repair,
             (${LINKABLE_EXPENSE_SQL}) AS ok
        FROM landlord_expenses e WHERE e.id = $1 AND e.landlord_id = $2`, [expenseId, landlordId])).rows[0]
@@ -739,7 +811,7 @@ export async function capitalExpenses(q: Q, landlordId: string): Promise<Record<
       WHERE e.landlord_id = $1 AND e.status = 'active' AND e.voided_at IS NULL
         AND COALESCE((SELECT a.type FROM books_accounts a WHERE a.id = books_category_account(e.category_id, e.expense_date)),
                      books_category_account_type(e.category_id)) = 'asset'
-        AND NOT EXISTS (SELECT 1 FROM books_fixed_assets f WHERE f.source_expense_id = e.id AND f.voided_at IS NULL)
+        AND books_expense_fixed_asset(e.id) IS NULL
         AND NOT ${REPAIR_BILL_FOLLOWS_REPAIR_SQL}
       ORDER BY e.expense_date DESC, e.id`, [landlordId])
   return r.rows

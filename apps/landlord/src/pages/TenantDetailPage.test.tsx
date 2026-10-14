@@ -305,6 +305,34 @@ describe('payment health, lease by lease', () => {
     expect(host.querySelector('[data-lease="L15"]')!.textContent).toContain('No months to judge yet')
   })
 
+  // 10/13 (Nic), the onboarding month paid late: "Keep it out, but say so" —
+  // nothing counted yet is said in words, never a bare dash.
+  it('one lease whose only judged month is the onboarding month: the words, in the tile and on the card — no dash', async () => {
+    const onb = { percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0,
+      label: 'Onboarding month — not counted', onboardingLeftOut: true }
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: null, health: onb,
+      healthByLease: [{ ...leaseHealth('L27', 'RV 27', 100), health: onb }] } })
+    await render()
+    const tile = [...host.querySelectorAll('.card')].find(c => c.textContent?.startsWith('Payment Health') && !c.textContent.includes('Full report'))!
+    expect(tile.textContent).toBe('Payment HealthOnboarding month — not counted')
+    // The card: the words beside the ring, said once.
+    expect(text().match(/Onboarding month — not counted/g)).toHaveLength(2)
+    expect(text()).toContain('Since joining GAM')
+  })
+
+  it('two leases, one with nothing counted yet: its words in the tile and its block, never a dash', async () => {
+    const onb = { percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0,
+      label: 'Onboarding month — not counted', onboardingLeftOut: true }
+    server.profile = profile({ stats: { ...profile().stats,
+      healthByLease: [{ ...leaseHealth('L27', 'RV 27', 100), health: onb },
+                      { ...leaseHealth('L30', 'RV 30', 100), health: { ...leaseHealth('L30', 'RV 30', 100).health!, onboardingLeftOut: true } }] } })
+    await render()
+    expect(text()).toContain('RV 27 Onboarding month — not counted · RV 30 100%')
+    expect(host.querySelector('[data-lease="L27"]')!.textContent).toContain('Onboarding month — not counted · since joining GAM')
+    // Beside a percentage, the onboarding month left out is said too.
+    expect(host.querySelector('[data-lease="L30"]')!.textContent).toContain('100%, 1 of 1 month · since joining GAM · onboarding month not counted')
+  })
+
   it('one lease: its figure on the card, and the full report opens for that lease', async () => {
     server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
       health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' },

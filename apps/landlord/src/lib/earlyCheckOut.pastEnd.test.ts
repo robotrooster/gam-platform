@@ -1,6 +1,6 @@
 /**
- * 10/13 (Nic): "void the cancelled nights: owner + managers with booking
- * permission" — "OWNER + PROPERTY MANAGERS only (not on-site staff)." The
+ * 10/13 evening (Nic): "anyone who can schedule reservations and take payments
+ * can cancel. refund is separate permission." The
  * schedule's shorter-stay question and the Check out window
  * offer exactly the answers the server sent for rent a payment was tried on
  * past the day they left: "Take those charges off" only when it was offered,
@@ -10,7 +10,7 @@ import { describe, it, expect } from 'vitest'
 import { pastEndChoices, pastEndQuestion, KEEP_THEM_OWED } from './earlyCheckOut'
 
 describe('pastEndChoices — the answers offered, as the server sent them', () => {
-  it('the owner (or a property manager with booking permission): both answers, "Take those charges off" first, in the server\'s words', () => {
+  it('the owner (or anybody who can schedule reservations and take payments): both answers, "Take those charges off" first, in the server\'s words', () => {
     expect(pastEndChoices({ void: 'Take those charges off', keep: 'Keep them owed' })).toEqual([
       { value: 'void', label: 'Take those charges off' },
       { value: 'keep', label: 'Keep them owed' },
@@ -37,8 +37,8 @@ describe('pastEndChoices — the answers offered, as the server sent them', () =
 
 describe('pastEndQuestion — why "Take those charges off" is not offered, when the server says', () => {
   it('adds the reason under the question', () => {
-    expect(pastEndQuestion('Rent was tried on Oct 9.', 'Only the owner or a property manager with booking permission can take them off.'))
-      .toBe('Rent was tried on Oct 9.\n\nOnly the owner or a property manager with booking permission can take them off.')
+    expect(pastEndQuestion('Rent was tried on Oct 9.', 'Taking those charges off needs a reservation permission and "Record a cash / check payment".'))
+      .toBe('Rent was tried on Oct 9.\n\nTaking those charges off needs a reservation permission and "Record a cash / check payment".')
   })
 
   it('the question alone when there is no reason', () => {

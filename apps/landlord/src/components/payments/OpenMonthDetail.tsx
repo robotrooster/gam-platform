@@ -6,7 +6,8 @@ import {
   ZERO_TOLERANCE_TEXT, CREDIT_TAKEN_BACK_TEXT, type LedgerPayment, type ReturnFacts,
 } from '../../lib/creditDesk'
 import { BankReceiptPhoto } from '../BankReceiptPhoto'
-import { paidWords } from './openMonth'
+import { paidWords, spaceOnlyWords } from './openMonth'
+import { OtherMoneyLines } from './OtherMoney'
 
 // ── A ROW OPENED ON THE PAYMENTS PAGE ───────────────────────────────────────
 //
@@ -188,6 +189,42 @@ export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }:
           </table>
         )}
       </div>
+      <SpaceMoney row={row} month={month} />
+    </div>
+  )
+}
+
+// ── THE REGISTER'S AND PAY LINKS' MONEY ON A ROW (10/13, Nic, round 3) ──────
+//
+//   "Pay links / register sales that name a space go ON that space's row."
+//
+// Every sale and pay link this month that names the row's space, and what went
+// back on one at the register (OpenMonthRow.otherMoney) — in the folder's own
+// lines. Nothing is read; nothing here is a desk action. Nothing when there is
+// none.
+export function SpaceMoney({ row, month }: { row: Pick<OpenMonthRow, 'otherMoney'>; month: string }) {
+  if (!row.otherMoney?.length) return null
+  return (
+    <div className="pay-detail-block" data-block="space-money">
+      <div className="cd-section-label">Register sales and pay links</div>
+      <OtherMoneyLines lines={row.otherMoney} month={month} />
+    </div>
+  )
+}
+
+/**
+ * A space nobody holds on a lease, opened (10/13, Nic: "just make them all
+ * clickable even if they're vacant and just show you know an expanded box with
+ * nothing"): that nothing is billed on it this month, and the register's and
+ * the pay links' money that names it, when there is some.
+ */
+export function SpaceDetail({ row, month }: { row: Pick<OpenMonthRow, 'otherMoney' | 'status' | 'statusLabel'>; month: string }) {
+  return (
+    <div className="pay-detail-body">
+      <div className="pay-detail-block" data-block="space-only">
+        <div className="pay-none">{spaceOnlyWords(row)}</div>
+      </div>
+      <SpaceMoney row={row} month={month} />
     </div>
   )
 }
@@ -202,7 +239,10 @@ export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }:
 // paid and what it was for (the server's words: "Booking deposit · stay Oct 12
 // – Oct 15 · booking site") — anything an early check-out gave back this
 // month, and the stay itself. Everything is on the row (OpenMonthRow.payments
-// and .stay); nothing more is read.
+// and .stay); nothing more is read. 10/13 (Nic), round 3: "Stay rows SHOW
+// what's still owed" — and what is still owed on the stay, with the day its
+// balance went out on its pay link — or, before arrival with nothing billed,
+// the day it comes due (arrival day, S649: the row's Owed is 0 until then).
 export function StayDetail({ row, month }: {
   row: OpenMonthRow
   /** 'YYYY-MM': the open month. */
@@ -250,10 +290,19 @@ export function StayDetail({ row, month }: {
                 <td>{stay.nights} {stay.nights === 1 ? 'night' : 'nights'}</td>
                 <td>{stay.statusLabel}</td>
               </tr>
+              {toCents(stay.owed) > 0 && (
+                <tr data-line="stay-owed">
+                  <td>Still owed on the stay</td>
+                  <td className="num">{toCents(row.owed) > 0 ? <span className="pay-owed">{money(stay.owed)}</span> : money(stay.owed)}</td>
+                  <td>{stay.balanceBilledOn ? `Pay link sent ${dayWord(stay.balanceBilledOn, year)}`
+                    : toCents(row.owed) > 0 ? 'No pay link sent yet' : `Due on arrival, ${dayWord(stay.checkIn, year)}`}</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
       )}
+      <SpaceMoney row={row} month={month} />
     </div>
   )
 }

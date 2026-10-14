@@ -1,12 +1,14 @@
 /**
  * jobs/creditNightly — the 03:00 credit nightly runs the chain check (10/13,
  * Nic: "ADD the nightly chain check (break flagged in the morning admin
- * email)"): after tonight's marks, before the scores and stats; a broken chain
- * sends the admin email, all whole sends nothing, and a failing check never
- * stops the scores and stats — it sends the "did not run" email instead (10/13,
- * review). The marks, score and stats passes are stubbed here (their own suites
- * cover them); the chain check and the admin notification's row run for real
- * (only the mail call is stubbed).
+ * email)"): after tonight's marks, before the scores and stats. 10/13 evening
+ * (Nic): "Broken credit chain: fold into the 8:05 MORNING admin email (not its
+ * own 3 am email)" — nobody is emailed at 3 am; what the check found is
+ * written down (credit_chain_check_runs) for the morning email
+ * (services/creditChainCheck.test.ts covers that email), and a failing check
+ * never stops the scores and stats — it is written down as failed. The marks,
+ * score and stats passes are stubbed here (their own suites cover them); the
+ * chain check and its record run for real.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { randomUUID } from 'crypto'
@@ -18,7 +20,6 @@ const h = vi.hoisted(() => ({
   order: [] as string[],
   adminNote: vi.fn(),
   chainCheckFails: false,
-  writeFails: false,
 }))
 
 vi.mock('../services/email', async (importOriginal) => ({
@@ -27,9 +28,7 @@ vi.mock('../services/email', async (importOriginal) => ({
 }))
 vi.mock('../services/adminNotifications', async (importOriginal) => {
   const real = await importOriginal<typeof import('../services/adminNotifications')>()
-  // A severity outside the table's CHECK makes the real insert fail; the real
-  // helper logs it and returns as if nothing happened.
-  h.adminNote.mockImplementation((o: any) => real.createAdminNotification(h.writeFails ? { ...o, severity: 'not-a-severity' } : o))
+  h.adminNote.mockImplementation((o: any) => real.createAdminNotification(o))
   return { ...real, createAdminNotification: (o: any) => h.adminNote(o) }
 })
 vi.mock('../services/creditBillMarks', () => ({
@@ -45,10 +44,10 @@ vi.mock('../services/creditChainCheck', async (importOriginal) => {
   const real = await importOriginal<typeof import('../services/creditChainCheck')>()
   return {
     ...real,
-    flagBrokenCreditChains: async (...a: Parameters<typeof real.flagBrokenCreditChains>) => {
+    recordCreditChainCheck: async (...a: Parameters<typeof real.recordCreditChainCheck>) => {
       h.order.push('chains')
       if (h.chainCheckFails) throw new Error('chain check down')
-      return real.flagBrokenCreditChains(...a)
+      return real.recordCreditChainCheck(...a)
     },
   }
 })
@@ -59,13 +58,18 @@ beforeEach(async () => {
   await cleanupAllSchema()
   h.order = []
   h.chainCheckFails = false
-  h.writeFails = false
   h.adminNote.mockClear()
 })
 
 async function onRecord() {
   return (await db.query<{ severity: string; category: string; title: string }>(
     `SELECT severity, category, title FROM admin_notifications ORDER BY created_at, id`)).rows
+}
+
+/** The nightly runs on record (10/13 evening), oldest first. */
+async function runs() {
+  return (await db.query<{ outcome: string; subjects: number | null; whole: number | null; broken: number | null; error: string | null }>(
+    `SELECT outcome, subjects, whole, broken, error FROM credit_chain_check_runs ORDER BY started_at, id`)).rows
 }
 
 const ev = (refId: string, i: number) => ({
@@ -89,47 +93,47 @@ async function forkedChain() {
   return { subjectId: a.subjectId, firstBad: c.eventId }
 }
 
-describe('processCreditNightly — the chain check (10/13)', () => {
-  it('a broken chain: checked after tonight\'s marks, one admin email, scores and stats still run', async () => {
-    const f = await forkedChain()
+describe('processCreditNightly — the chain check (10/13; written down for the 8:05 morning email, 10/13 evening)', () => {
+  it('a broken chain: checked after tonight\'s marks, written down for the morning — nobody emailed at 3 am — and scores and stats still run', async () => {
+    await forkedChain()
     await appendEvent(ev(randomUUID(), 1))   // a whole one beside it
     const r = await processCreditNightly()
     expect(h.order).toEqual(['marks', 'chains', 'scores', 'stats'])
-    expect(r.chains).toEqual({ subjects: 2, whole: 1, broken: 1, sent: true, errors: 0 })
-    expect(h.adminNote).toHaveBeenCalledTimes(1)
-    const n = h.adminNote.mock.calls[0][0]
-    expect(n).toMatchObject({ category: 'credit_chain_broken', emailSuperAdmins: true, title: '1 credit history chain broken' })
-    expect(n.body).toContain(`(entry ${f.firstBad})`)
-    expect(n.body).toContain(`Credit record ${f.subjectId}`)
-    expect(await onRecord()).toEqual([{ severity: 'critical', category: 'credit_chain_broken', title: '1 credit history chain broken' }])
-  })
-
-  it('a broken chain whose email is not on record: not sent, an error in the log line, scores and stats still run', async () => {
-    await forkedChain()
-    h.writeFails = true
-    const r = await processCreditNightly()
-    expect(h.order).toEqual(['marks', 'chains', 'scores', 'stats'])
-    expect(r.chains).toEqual({ subjects: 1, whole: 0, broken: 1, sent: false, errors: 1 })
-    expect(await onRecord()).toEqual([])
-  })
-
-  it('every chain whole: nothing sent', async () => {
-    await appendEvent(ev(randomUUID(), 1))
-    const r = await processCreditNightly()
-    expect(r.chains).toEqual({ subjects: 1, whole: 1, broken: 0, sent: false, errors: 0 })
+    expect(r.chains).toEqual({ subjects: 2, whole: 1, broken: 1, recorded: true, errors: 0 })
     expect(h.adminNote).not.toHaveBeenCalled()
     expect(await onRecord()).toEqual([])
+    expect(await runs()).toEqual([{ outcome: 'broken', subjects: 2, whole: 1, broken: 1, error: null }])
   })
 
-  it('the check failing never stops the scores and stats, and the admins hear it did not run', async () => {
+  it('a run that cannot be written down: an error in the log line, scores and stats still run', async () => {
+    await forkedChain()
+    await db.query(`ALTER TABLE credit_chain_check_runs ADD CONSTRAINT test_refuse CHECK (false) NOT VALID`)
+    try {
+      const r = await processCreditNightly()
+      expect(h.order).toEqual(['marks', 'chains', 'scores', 'stats'])
+      expect(r.chains).toEqual({ subjects: 1, whole: 0, broken: 1, recorded: false, errors: 1 })
+    } finally { await db.query(`ALTER TABLE credit_chain_check_runs DROP CONSTRAINT test_refuse`) }
+    expect(await runs()).toEqual([])
+    expect(await onRecord()).toEqual([])
+  })
+
+  it('every chain whole: written down, nothing sent', async () => {
+    await appendEvent(ev(randomUUID(), 1))
+    const r = await processCreditNightly()
+    expect(r.chains).toEqual({ subjects: 1, whole: 1, broken: 0, recorded: true, errors: 0 })
+    expect(h.adminNote).not.toHaveBeenCalled()
+    expect(await onRecord()).toEqual([])
+    expect(await runs()).toEqual([{ outcome: 'whole', subjects: 1, whole: 1, broken: 0, error: null }])
+  })
+
+  it('the check failing never stops the scores and stats, and it is written down as failed for the morning email', async () => {
     h.chainCheckFails = true
     const r = await processCreditNightly()
     expect(h.order).toEqual(['marks', 'chains', 'scores', 'stats'])
-    expect(r.chains).toEqual({ subjects: 0, whole: 0, broken: 0, sent: true, errors: 1 })
+    expect(r.chains).toEqual({ subjects: 0, whole: 0, broken: 0, recorded: true, errors: 1 })
     expect(r.scores).toEqual({ processed: 0, errors: 0 })
     expect(r.stats).toEqual({ processed: 0, errors: 0 })
-    expect(h.adminNote).toHaveBeenCalledTimes(1)
-    expect(h.adminNote.mock.calls[0][0]).toMatchObject({ emailSuperAdmins: true, body: expect.stringContaining('chain check down') })
-    expect(await onRecord()).toEqual([{ severity: 'warn', category: 'credit_chain_check_failed', title: 'The credit chain check did not run tonight' }])
+    expect(h.adminNote).not.toHaveBeenCalled()
+    expect(await runs()).toEqual([{ outcome: 'failed', subjects: null, whole: null, broken: null, error: 'chain check down' }])
   })
 })

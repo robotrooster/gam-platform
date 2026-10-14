@@ -32,8 +32,24 @@
 .rrs.gray   { background: var(--bg-4); color: var(--text-2); border-color: var(--border-1); }
 /* No bill that month: a quiet dash, not a pill. */
 .rrs.empty  { background: transparent; color: var(--text-3); border-color: transparent; font-weight: 400; }
-/* The household's first month on GAM (good news only). */
-.rrs.onboarding { box-shadow: inset 0 -2px 0 var(--gold); }
+/* The household's first month on GAM (good news only): the gold underline,
+   labeled (10/13, Nic: "KEEP it, and give it a label") — a button, so a tap
+   says it too (StatusStamp's OnboardingStamp). */
+.rrs.onboarding { box-shadow: inset 0 -2px 0 var(--gold); cursor: help; }
+button.rrs { margin: 0; -webkit-appearance: none; appearance: none; }
+button.rrs:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+.rrs-onb { position: relative; display: inline-flex; }
+.rrs-tip {
+  position: absolute; left: 50%; bottom: calc(100% + 6px); transform: translateX(-50%); z-index: 30;
+  width: max-content; max-width: 220px; padding: 6px 9px; border-radius: 8px;
+  background: var(--bg-2); border: 1px solid var(--gold); color: var(--text-0);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .25);
+  font-family: var(--font-body); font-size: .68rem; font-weight: 400; line-height: 1.35; text-align: center; white-space: normal;
+}
+.rrs-tip strong { display: block; font-weight: 700; color: var(--gold); }
+.rrs-tip-sub { display: block; margin-top: 2px; color: var(--text-2); }
+/* Nothing counted yet (10/13, Nic: "Keep it out, but say so"): health in words, never a bare dash. */
+.rr-health-words { display: inline-block; max-width: 10em; font-size: .68rem; font-weight: 600; line-height: 1.3; white-space: normal; color: var(--text-3); }
 
 /* A month's count in words, in its status color ("3 paid late"). */
 .rrs-count { display: block; font-size: .64rem; font-weight: 600; white-space: nowrap; line-height: 1.35; }
@@ -103,6 +119,31 @@
 .rrh-mo-table th { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 700; }
 .rrh-mo-table .num { text-align: right; font-family: var(--font-mono); }
 .rrh-mo-table td.wrap { white-space: normal; }
+
+/* ── 10/13 (Nic): the range's stays, below the households — "an aggregate by
+   line items … below with expandable notes" (one line each, its notes per site
+   opened under it; nothing scrolls sideways on a phone) ── */
+.rrh-stays { padding: 0; overflow: hidden; margin-bottom: 14px; }
+.rrh-stays-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 16px;
+  background: var(--bg-2); color: var(--text-0); font-size: .88rem; font-weight: 700;
+}
+.rrh-stays-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--border-0); }
+.rrh-stay { border-bottom: 1px solid var(--border-0); }
+.rrh-stay:last-child { border-bottom: none; }
+.rrh-stay-head {
+  width: 100%; display: flex; align-items: baseline; gap: 8px; text-align: left; padding: 10px 16px;
+  background: none; border: none; color: var(--text-0); font-family: var(--font-body); font-size: .82rem; cursor: pointer;
+}
+.rrh-stay-head:hover { background: var(--bg-3); }
+.rrh-stay-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.rrh-stay-label { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.rrh-stay-paid { font-family: var(--font-mono); color: var(--text-1); white-space: nowrap; }
+.rrh-stay-notes {
+  list-style: none; margin: 0; padding: 0 16px 10px 38px; display: flex; flex-wrap: wrap; gap: 4px 14px;
+  font-size: .76rem; color: var(--text-2);
+}
+.rrh-stay-notes li { overflow-wrap: anywhere; }
 
 /* ── The tenant report's month history (10/13: "the kind of information I want to see on the customer history") ── */
 .tr-months { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }

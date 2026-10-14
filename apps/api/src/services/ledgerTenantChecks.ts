@@ -187,7 +187,9 @@ export const undepositedFundsCheck: LedgerCheck = {
     // (expense_payment, method 'cash') takes it out. 10/13 (Nic): so does a
     // fixed asset typed in by hand that was bought with cash on hand
     // (books_fixed_assets.funded_by 'cash', ledgerProjectors/loansAssets),
-    // once it is on the books (bought on or after the books start).
+    // once it is on the books (bought on or after the books start) — and,
+    // 10/13 (Nic, "ALLOW A MIX"), each live cash-on-hand funding line of one
+    // (books_fixed_asset_funding kind 'cash', its part of the cost).
     const r = await client.query<{ n: string }>(
       `WITH live_slip AS (
          SELECT s.id, s.other_amount FROM bank_deposit_slips s JOIN bank_transactions bt ON bt.id = s.bank_transaction_id
@@ -220,6 +222,11 @@ export const undepositedFundsCheck: LedgerCheck = {
                     WHERE xp.landlord_id = $1 AND xp.method = 'cash' AND xp.voided_at IS NULL), 0)
        - COALESCE((SELECT ${C('sum(fa.cost)')} FROM books_fixed_assets fa JOIN landlords fl ON fl.id = fa.landlord_id
                     WHERE fa.landlord_id = $1 AND fa.funded_by = 'cash' AND fa.voided_at IS NULL AND fa.source_expense_id IS NULL
+                      AND fl.books_start_date IS NOT NULL AND fa.acquired_on >= fl.books_start_date), 0)
+       - COALESCE((SELECT ${C('sum(fx.amount)')} FROM books_fixed_asset_funding fx
+                     JOIN books_fixed_assets fa ON fa.id = fx.asset_id JOIN landlords fl ON fl.id = fa.landlord_id
+                    WHERE fa.landlord_id = $1 AND fx.kind = 'cash' AND fx.replaced_at IS NULL AND fa.voided_at IS NULL
+                      AND fa.source_expense_id IS NULL
                       AND fl.books_start_date IS NOT NULL AND fa.acquired_on >= fl.books_start_date), 0))::text AS n`, [id])
     const expected = new Map([['', cents(r.rows[0]?.n)]])
     return compare('undeposited_funds', await severityFor(client, id, TENANT_CHECK_RULES.undepositedFunds), ledger, expected, [], 1)

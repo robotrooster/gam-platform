@@ -223,6 +223,8 @@ describe('extra work-trade hours paid by hand, then the expense removed', () => 
     const run = await request(app).post('/api/books/payroll/runs').set(bearer(tok)).send({
       periodStart: '2026-10-01', periodEnd: '2026-10-14', payDate: '2026-10-20', payFrequency: 'biweekly',
       employeeIds: [], extraHours: [{ id: x, employeeId: emp }],
+      // 10/13 (Nic): where the run's wages go, picked when it is logged.
+      costPlace: 'property', propertyId: co.propertyId,
     })
     expect(run.status, JSON.stringify(run.body)).toBe(201)
     const ok = await request(app).post(`/api/books/payroll/runs/${run.body.data.id}/approve`).set(bearer(tok)).send({})
