@@ -195,3 +195,28 @@ in ~/gam-geo-raw). Tests: API 13,876, frontends 1,210. Books: integrity 0,
 drift 0. Record: ~/gam-backups/deploy-1013d/. Open questions (29):
 ~/gam-backups/deploy-1013d/questions_for_nic.txt. Arturo's MH 15: Nic signed;
 waiting on Arturo.
+
+## 10/14: answers deploy (live ~4:20 pm Phoenix)
+
+Nic answered all 29 questions plus new requests (`~/gam-nic-answers-2026-10-13.md`,
+10/14 sections). Shipped `512e96b`..`84be052`: documents deleted not voided
+(invites, half-signed, subleases, automatic paths, Discard, 30-day sweep that
+skips drafts waiting on the landlord), Payments/Rent Roll answers, desk picks the
+bills a payment pays (each bill whole, oldest first per space), front-desk staff
+see Payments without totals, returned checks / money orders / tenant check
+deposits taken back automatically, money in files itself only on exact matches
+(incl. Stripe ST- payouts), payroll place per employee (owner can change),
+Mark paid and expense form ask, birthdays (18+, verified, current tenants,
+landlord-only edits, read-only for tenants), itemized income by space type with
+Detailed/Summary and an itemized monthly PDF. Tests: API 14,025, tenant 279,
+landlord 918. Migrations 20261016140000..158000 on gam + gam_demo.
+Production one-time steps applied (log `~/gam-backups/deploy-1014/`): late fees
+removed for Selene Arvizu, Valentin Flores, Michael Moreno, Billy Miranda; Dump
+station register button; MH 3.5 added, MH 11/26 $589, vacant trailers
+park-owned, wide tags; Andres Razo's RV 27 stay Aug 1-Sep 1; RV 09 erased; 81
+birthdays copied; storage account renamed; Mountain View work trade left_out;
+both ledgers rebuilt from scratch (integrity 0, drift 0, pending 0).
+PARKED (weekly limit 98%): map levels + 3D globe, faster deploys, admin Metrics
+number answers 22-26 — `~/gam-parked/metrics-globe-deployspeed-1014/`.
+Open edge-case questions for after the reset: in the follow-up journal
+(wf_28a46c97-da9) and the Nic email of 10/14 evening.
