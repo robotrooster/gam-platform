@@ -969,12 +969,17 @@ export const BOOKS_HOME_SALE_METHOD_LABEL: Record<BooksHomeSaleMethod, string> =
  * landlords.books_work_trade_method (Nic L12): work-trade hours that cover rent
  *   rent_and_labor  full rent as income, the hours as a labor cost
  *   rent_discount   rent as income less what the hours covered
+ *   left_out        10/14 (Nic, after asking his bookkeeper: "she doesn't keep
+ *                   track of workers, just the paying customers"): only money
+ *                   paid counts; the hours take the bill back off the income
+ *                   it was charged to, so no rent, discount or labor shows
  */
-export const BOOKS_WORK_TRADE_METHODS = ['rent_and_labor', 'rent_discount'] as const
+export const BOOKS_WORK_TRADE_METHODS = ['rent_and_labor', 'rent_discount', 'left_out'] as const
 export type BooksWorkTradeMethod = typeof BOOKS_WORK_TRADE_METHODS[number]
 export const BOOKS_WORK_TRADE_METHOD_LABEL: Record<BooksWorkTradeMethod, string> = {
   rent_and_labor: 'Full rent, plus the hours as a labor cost',
   rent_discount:  'A rent discount',
+  left_out:       'Leave it out of the books',
 }
 
 /**

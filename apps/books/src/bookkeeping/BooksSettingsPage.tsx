@@ -78,6 +78,7 @@ const HOME_SALE_HELP: Record<string, string> = {
 const WORK_TRADE_HELP: Record<string, string> = {
   rent_and_labor: 'Rent counts in full as income, and the hours worked count as a labor cost.',
   rent_discount: 'Rent counts as income less what the hours covered.',
+  left_out: 'Only money tenants pay counts. Rent the hours covered shows nowhere: no income, no discount, no labor cost.',
 }
 const STOCK_HELP: Record<string, string> = {
   expense_when_bought: 'Stock counts as an expense the day you buy it.',

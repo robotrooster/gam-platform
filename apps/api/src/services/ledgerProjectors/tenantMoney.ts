@@ -67,7 +67,7 @@ export async function projectPayment(client: PoolClient, paymentId: string): Pro
   const charge = await projectCharge(client, f, co)
   if (charge) out.push(charge)
   out.push(...projectRowSettlement(f))
-  const hours = projectWorkTrade(f, co)
+  const hours = projectWorkTrade(f, co, charge)
   if (hours) out.push(hours)
   const deposit = projectPaidFromDeposit(f)
   if (deposit) out.push(deposit)

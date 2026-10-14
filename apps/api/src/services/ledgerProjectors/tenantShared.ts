@@ -126,7 +126,7 @@ export function requireHomeSaleMethod(co: CompanyBooks): BooksHomeSaleMethod {
 export function requireWorkTradeMethod(co: CompanyBooks): BooksWorkTradeMethod {
   if (!co.workTradeMethod) {
     throw new LedgerSourceError('owner_not_ready',
-      'Waiting on the owner: how work-trade hours that cover rent count (full rent plus a labor cost, or a rent discount) is not chosen yet on the Books settings page.')
+      'Waiting on the owner: how work-trade hours that cover rent count (full rent plus a labor cost, a rent discount, or left out of the books) is not chosen yet on the Books settings page.')
   }
   return co.workTradeMethod
 }

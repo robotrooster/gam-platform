@@ -52,7 +52,9 @@
  * hours applied to a bill (payments.work_trade_credit) pay it, dated the bill's
  * due date (Nic S652: work trade counts as on time) — Dr 5190 Work-trade labor
  * (rent_and_labor) or Dr 4096 Work-trade discount (rent_discount) / Cr
- * receivables. Waits while the owner has not chosen.
+ * receivables. left_out (10/14): Dr the very income lines the charge credited,
+ * split in the charge's own proportions, so the covered part nets to nothing
+ * and only money paid shows. Waits while the owner has not chosen.
  */
 import type { PoolClient } from 'pg'
 import type { LedgerAccountRole } from '@gam/shared'
@@ -61,20 +63,30 @@ import type { LedgerOwner } from '../ledgerOwner'
 import { STAY_SHORTENED_CREDIT_NOTE } from '../bookingLeaseBilling'
 import {
   type PaymentFacts, type CompanyBooks, Lines, rowDims, loadPaymentFacts, incomeRoleFor, requireWorkTradeMethod,
-  cSql, centsOf, localDaySql, propertyTzSql, leasePropertySql, companyTzSql, isUuid,
+  splitCents, cSql, centsOf, localDaySql, propertyTzSql, leasePropertySql, companyTzSql, isUuid,
 } from './tenantShared'
 
 export const TENANT_CREDITS_RULE_VERSION = 1
 
 // ─── C5: work-trade hours that paid a bill ──────────────────────────────────
 
-export function projectWorkTrade(f: PaymentFacts, co: CompanyBooks): DesiredPosting | null {
+export function projectWorkTrade(f: PaymentFacts, co: CompanyBooks, charge: DesiredPosting | null = null): DesiredPosting | null {
   if (f.voided || f.exclusion || f.workTradeCents === 0) return null
   const method = requireWorkTradeMethod(co)
   const d = rowDims(f)
   const L = new Lines()
-  L.dr(method === 'rent_and_labor' ? 'work_trade_labor' : 'work_trade_discount', f.workTradeCents,
-    { ...d, reportCategory: 'work_trade', memo: 'Work-trade hours' })
+  if (method === 'left_out') {
+    const credited = (charge?.lines ?? []).filter(l => l.role && (l.creditCents ?? 0) > 0)
+    if (credited.length === 0) {
+      L.dr(incomeRoleFor(f), f.workTradeCents, { ...d, reportCategory: f.category, memo: 'Work-trade hours (left out of the books)' })
+    } else {
+      const parts = splitCents(f.workTradeCents, credited.map(l => l.creditCents ?? 0))
+      credited.forEach((l, i) => L.dr(l.role!, parts[i], { ...l, memo: 'Work-trade hours (left out of the books)' }))
+    }
+  } else {
+    L.dr(method === 'rent_and_labor' ? 'work_trade_labor' : 'work_trade_discount', f.workTradeCents,
+      { ...d, reportCategory: 'work_trade', memo: 'Work-trade hours' })
+  }
   L.cr('ar_tenants', f.workTradeCents, { ...d, reportCategory: f.category })
   return { owner: { landlordId: f.landlordId }, postingKind: 'work_trade', intendedDate: f.dueDate,
     memo: 'Paid by work-trade hours', lines: L.lines }

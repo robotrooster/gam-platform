@@ -123,6 +123,25 @@ describe('C5: work-trade hours, by the owner\'s choice (L12)', () => {
     expect(await bal(co.landlordId, 'space_rent') + await bal(co.landlordId, 'work_trade_discount')).toBe(0)
   })
 
+  it('left out (10/14): the hours cover rent and nothing shows in the books', async () => {
+    const co = await tenantCo({ workTrade: 'left_out' })
+    const id = await bill(co, { amount: 0, due: '2026-09-01', status: 'settled', settledAt: '2026-09-30T18:00:00Z', workTradeCredit: 460 })
+    await drain()
+    expect(triples(await activeLines('payment', id), 'work_trade')).toEqual([['space_rent', 46000, 0], ['ar_tenants', 0, 46000]])
+    expect(await bal(co.landlordId, 'space_rent')).toBe(0)
+    expect(await bal(co.landlordId, 'work_trade_discount')).toBe(0)
+    expect(await bal(co.landlordId, 'work_trade_labor')).toBe(0)
+    expect(await bal(co.landlordId, 'ar_tenants')).toBe(0)
+  })
+
+  it('left out, part paid in money: only the money counts as rent', async () => {
+    const co = await tenantCo({ workTrade: 'left_out' })
+    await bill(co, { amount: 100, due: '2026-09-01', workTradeCredit: 360 })
+    await drain()
+    expect(Math.abs(await bal(co.landlordId, 'space_rent'))).toBe(10000)
+    expect(await bal(co.landlordId, 'ar_tenants')).toBe(10000)
+  })
+
   it('not chosen yet: the bill waits on the owner', async () => {
     const co = await tenantCo()
     const id = await bill(co, { amount: 0, due: '2026-09-01', status: 'settled', settledAt: '2026-09-30T18:00:00Z', workTradeCredit: 460 })
