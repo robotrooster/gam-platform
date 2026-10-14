@@ -666,8 +666,12 @@ function uniqueRecipients<T extends { email?: string | null }>(rows: T[]): T[] {
  * them too, instead of voiding." GAM ending a document on its own, in one
  * transaction: ERASED when it never completed and no money touched it
  * (lib/eraseUnfinishedDocument — the one test the void button uses: with its
- * packet's unfinished forms, the lease it issued when nothing paid, credited
- * or settled on it, and #1 the invite waiting on it canceled). Anything that
+ * packet's unfinished forms, and the lease it issued when nothing paid,
+ * credited or settled on it). 10/14 afternoon (Nic): "invite and signing by
+ * tenant is one flow after landlord has already signed" — GAM ending it on
+ * its own never cancels an invite (onItsOwn): the invite waiting on it stays
+ * open and lets go of it, so the household is drafted again; only the
+ * landlord's own Delete closes one (#1). Anything that
  * test keeps is voided by `voidKept`, each job's own void, exactly as before.
  * 'gone': it completed, was voided, or was deleted since the job read it —
  * nothing done, nobody told. Files only the erased documents used are removed
@@ -689,7 +693,7 @@ async function endDocumentOnItsOwn(
       await vc.query('ROLLBACK')
       return 'gone'
     }
-    const out = await eraseUnfinishedDocument(vq, first)
+    const out = await eraseUnfinishedDocument(vq, first, { onItsOwn: true })
     if (out.erased) {
       files = out.files
       ended = 'deleted'
@@ -742,15 +746,26 @@ export const UNSIGNED_DRAFT_EXPIRY_DAYS = 30
  *   NOT a new lease for a household already living there (renews_lease_id):
  *     it has its own clock — canceled at its start date when the landlord
  *     never signed (processNewLeaseSignings, S655).
+ *   NOT AN ONBOARDING DRAFT. 10/14 afternoon (Nic): "30-day auto-delete:
+ *     leave ONBOARDING drafts (waiting on the landlord's own signature) out."
+ *     S647: an invite drafts the lease for the landlord to sign first, and
+ *     he signs at his own pace; nobody else has been told. Waiting on him:
+ *     the landlord's is the first signature it asks for (the lowest signing
+ *     position) — on it, or on any open document of its packet. Every lease
+ *     and addendum asks for his first (the send route's landlord-first
+ *     rule), so what is left is a document that opens with somebody else's
+ *     signature (a purchase agreement or contract the buyer signs first).
  *   NO MONEY: the erase's own test (lib/eraseUnfinishedDocument). A draft it
  *     keeps is LEFT exactly as it is — Nic's answer deletes; it never voids.
+ *   THE INVITE STAYS. 10/14 afternoon (Nic): an automatic delete never
+ *     cancels an invite (endDocumentOnItsOwn — onItsOwn); it lets go of the
+ *     document and the household is drafted again.
  *
  * THE EMAIL: the waiting signers — every signer who was sent a signing link
  * (invite_sent_at) — get "This document expired and is no longer available
  * to sign." ONCE per person per packet (one email per thing), read before the
- * erase takes their signer rows. A tenant still waiting on the landlord's
- * signature was never sent anything (S647) and hears nothing. Returns what
- * it deleted.
+ * erase takes their signer rows. A signer whose turn had not come was never
+ * sent a link and hears nothing. Returns what it deleted.
  */
 export async function processUnsignedDraftExpiry(opts: { days?: number } = {}): Promise<{ deleted: string[]; kept: string[] }> {
   const days = opts.days ?? UNSIGNED_DRAFT_EXPIRY_DAYS
@@ -772,6 +787,16 @@ export async function processUnsignedDraftExpiry(opts: { days?: number } = {}): 
                JOIN lease_document_signers s ON s.document_id = o.id
               WHERE (o.id = d.id OR (d.package_group_id IS NOT NULL AND o.package_group_id = d.package_group_id))
                 AND s.signed_at IS NOT NULL)
+       -- 10/14 afternoon (Nic): not an onboarding draft waiting on the
+       -- landlord's own signature — his is the first one asked for, on it or
+       -- on any open document of its packet (nobody has signed, above).
+       AND NOT EXISTS (
+             SELECT 1 FROM lease_documents o
+               JOIN lease_document_signers ls ON ls.document_id = o.id AND ls.role = 'landlord'
+              WHERE (o.id = d.id OR (d.package_group_id IS NOT NULL AND o.package_group_id = d.package_group_id))
+                AND o.status IN ('pending', 'sent', 'in_progress')
+                AND NOT EXISTS (SELECT 1 FROM lease_document_signers e
+                                 WHERE e.document_id = o.id AND e.order_index < ls.order_index))
        AND (d.package_group_id IS NULL OR d.document_type = 'original_lease'
             OR NOT EXISTS (SELECT 1 FROM lease_documents pl
                             WHERE pl.package_group_id = d.package_group_id AND pl.id <> d.id
@@ -1115,8 +1140,9 @@ export async function processEsignTimeouts() {
         // 10/14 (Nic, #4): "Automatic voids (48h timeout, lapsed new lease):
         // delete them too, instead of voiding." ERASED when it never completed
         // and no money touched it (lib/eraseUnfinishedDocument — with its
-        // packet's unfinished forms, and #1 the invite waiting on it canceled);
-        // anything that test keeps is voided exactly as before.
+        // packet's unfinished forms; 10/14 afternoon, the invite waiting on it
+        // stays open to be drafted again); anything that test keeps is voided
+        // exactly as before.
         const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
           await cascadeLeaseTenantsOnVoid(vq, live)
           await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,

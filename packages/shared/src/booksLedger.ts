@@ -325,7 +325,11 @@ export const LEDGER_ACCOUNT_ROLE_DEFS = [
   { role: 'application_fees',            code: '4030', name: 'Application fees',                                  type: 'income',    control: false },
   { role: 'pet_fees',                    code: '4040', name: 'Pet fees',                                          type: 'income',    control: false },
   { role: 'laundry_vending',             code: '4050', name: 'Laundry and vending',                               type: 'income',    control: false },
-  { role: 'storage_fees',                code: '4060', name: 'Storage',                                           type: 'income',    control: false },
+  // 10/14 (Nic): "storage units vs storage for rvs/boats etc" — kept SEPARATE.
+  // 4060 is a lease's storage fee (a tenant storing an RV or a boat); a
+  // storage unit's own rent is its rent line under 4010 (LEDGER_RENT_LINES
+  // 'storage', "Storage unit rent").
+  { role: 'storage_fees',                code: '4060', name: 'RV and boat storage',                               type: 'income',    control: false },
   { role: 'utility_reimbursements',      code: '4070', name: 'Utility reimbursements',                            type: 'income',    control: false },
   { role: 'utility_electric',            code: '4071', name: 'Utility reimbursements: electric',                  type: 'income',    control: false, parent: 'utility_reimbursements' },
   { role: 'utility_water',               code: '4072', name: 'Utility reimbursements: water',                     type: 'income',    control: false, parent: 'utility_reimbursements' },
@@ -445,7 +449,10 @@ export const LEDGER_MAP_KIND_PARENT_ROLE: Record<Exclude<LedgerMapKind, 'role'>,
 //
 //   I2  under 30 nights is short-term (taxed); 30+ nights or a lease is
 //       long-term. Long-term money books to a rent line, short stays to a
-//       stay line.
+//       stay line. 10/14 (Nic): "month stays are long-term; short-term =
+//       nightly/weekly stays under 30 nights" — a stay sold by the month
+//       (LEDGER_MONTH_STAY_LEASE_TYPES) is long-term at any length, a
+//       February month of 28 nights too.
 //   I4/I5  a park-owned trailer that is rented (units.dwelling_ownership
 //       'landlord'): the unit's lot rent (units.lot_rent_amount) is lot rent,
 //       the rest is trailer rent — derived, no new box. A tenant-owned
@@ -457,6 +464,18 @@ export const LEDGER_MAP_KIND_PARENT_ROLE: Record<Exclude<LedgerMapKind, 'role'>,
 
 /** Stays this many nights or more are long-term (Nic I2); a lease always is. */
 export const LEDGER_LONG_TERM_STAY_NIGHTS = 30
+
+/**
+ * 10/14 (Nic): "month stays are long-term; short-term = nightly/weekly stays
+ * under 30 nights". The unit_bookings.lease_type of a stay sold by the month —
+ * what the register and a pay link write for a month (services/registerStay
+ * bookingLeaseTypeFor), the booking site for a first month (propertyBooking
+ * bookingSiteLeaseType), the schedule for 30+ nights or a space rented by the
+ * month only — the same stays the Rent Roll counts in months (rentRoll
+ * bookingLineItems). Long-term at any length: a February month of 28 nights
+ * books to its space's rent line (RV long-term rent), never a short-term one.
+ */
+export const LEDGER_MONTH_STAY_LEASE_TYPES = ['month_to_month', 'long_term', 'lease_hold'] as const
 
 /** Long-term income by space (map kind 'rent_line'), in report order. */
 export const LEDGER_RENT_LINES = [
@@ -472,7 +491,8 @@ export const LEDGER_RENT_LINE_LABEL: Record<LedgerRentLine, string> = {
   single_family:       'House rent',
   campsite:            'Campsite long-term rent',
   hotel_room:          'Room long-term rent',
-  storage:             'Storage space rent',
+  // 10/14 (Nic): a storage unit's rent — never RV and boat storage (4060).
+  storage:             'Storage unit rent',
   parking:             'Parking rent',
   boat_slip:           'Boat slip rent',
   land_lot:            'Land lot rent',
@@ -492,7 +512,7 @@ export const LEDGER_STAY_LINE_LABEL: Record<LedgerStayLine, string> = {
   mobile_home:   'Mobile home short-term stays (under 30 nights)',
   apartment:     'Apartment short-term stays (under 30 nights)',
   single_family: 'House short-term stays (under 30 nights)',
-  storage:       'Storage short-term stays (under 30 nights)',
+  storage:       'Storage unit short-term stays (under 30 nights)',
   parking:       'Parking short-term stays (under 30 nights)',
   boat_slip:     'Boat slip short-term stays (under 30 nights)',
   land_lot:      'Land lot short-term stays (under 30 nights)',
@@ -524,6 +544,14 @@ export const INCOME_REPORT_VIEW_LABEL: Record<IncomeReportView, string> = {
   summary:  'Summary',
   detailed: 'Detailed',
 }
+
+/**
+ * 10/14 (Nic): the monthly property report prints the itemized lines under
+ * each Summary group. The part of a group no line itemizes (rent on a space
+ * with no type on record, money for a bill billed before the books began)
+ * is printed under it as this, so the lines add up to their group.
+ */
+export const LEDGER_INCOME_NOT_ITEMIZED_LABEL = 'Not itemized'
 
 /**
  * The effective_from of a role's first map row — "from the beginning". Every

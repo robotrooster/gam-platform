@@ -158,7 +158,8 @@ export const payoutHeldItemProjector: LedgerProjector = {
   sourceType: 'held_item',
   // 10/13 (Nic): 2 — a GAM charge given back on a payout (a won pull dispute, a voided collected charge).
   // 3 — 10/14 (Nic I1, I2): a chargeback on stay money comes off the stay's own line (incomeLines).
-  ruleVersion: 3,
+  // 4 — 10/14 (Nic): a stay sold by the month is long-term at any length (incomeLines stayIsLongTerm).
+  ruleVersion: 4,
 
   async project(client: PoolClient, itemId: string): Promise<DesiredPosting[]> {
     const h = (await client.query<HeldRow & { created_at: string }>(

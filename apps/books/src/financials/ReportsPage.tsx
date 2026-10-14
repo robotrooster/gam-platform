@@ -898,28 +898,62 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
  * Owed side by side, the money with no category under its line, the totals,
  * and how the columns tie. Exported for its test (10/14, the Detailed switch).
  */
-export function CategoryBreakdownCard({ title, view, categories }: {
+export function CategoryBreakdownCard({ title, view, categories, groups, initialMode }: {
   title: string; view: MoneyView | undefined
   /** An older reply's breakdown (billed / collected / still owed), read when there is no view. */
   categories?: CategoryRow[]
+  /**
+   * 10/14 (Nic): "itemized lines under each group" (the monthly property
+   * report): each Summary group's own itemized lines (the API's
+   * incomeGroupsOf). Given, Detailed shows every Summary row with its lines
+   * indented beneath it — as the emailed PDF prints them.
+   */
+  groups?: IncomeGroup[]
+  /** The view it opens on (Summary unless given). */
+  initialMode?: IncomeReportView
 }) {
   // 10/14 (Nic I1): Summary is today's groups; Detailed itemizes them —
   // rent and stays by space (mobile home lot rent, park-owned trailer rent,
   // RV long-term rent, RV short-term stays, …), home sales, each space
   // subtype under its line. Offered when the books itemized the period.
-  const [mode, setMode] = useState<IncomeReportView>('summary')
+  const [mode, setMode] = useState<IncomeReportView>(initialMode ?? 'summary')
   const details = view?.details ?? []
   const detailed = mode === 'detailed' && details.length > 0
-  const rows = detailed
+  type Row = MoneyThree & { key: string; label: string; level: 0 | 1 | 2; group?: boolean }
+  // 10/14 (Nic): a Summary row, then its own itemized lines (level 1) and
+  // each line's subtypes (level 2) — the lines add up to the row.
+  const withLines = (key: string, row: Row): Row[] => {
+    const own = groups?.find(g => g.key === key)?.lines ?? []
+    return [
+      { ...row, group: own.length > 0 },
+      ...own.flatMap(l => [
+        { key: `${key}>${l.key}`, label: l.label, charged: l.charged, received: l.received, owed: l.owed, level: 1 as const },
+        ...l.subtypes.map(t => ({ key: `${key}>${l.key}|${t.name}`, label: t.name, charged: t.charged, received: t.received, owed: t.owed, level: 2 as const })),
+      ]),
+    ]
+  }
+  const rows: Row[] = detailed && groups && view
+    ? [
+        ...view.categories.flatMap(c => withLines(`c:${c.category}`, { key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, level: 0 })),
+        ...view.uncategorized.flatMap(l => withLines(`l:${l.line}`, { key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, level: 0 })),
+      ]
+    : detailed
     ? details.flatMap(d => [
-        { key: `d:${d.key}`, label: d.label, charged: d.charged, received: d.received, owed: d.owed, sub: false },
-        ...d.subtypes.map(t => ({ key: `d:${d.key}|${t.name}`, label: t.name, charged: t.charged, received: t.received, owed: t.owed, sub: true })),
+        { key: `d:${d.key}`, label: d.label, charged: d.charged, received: d.received, owed: d.owed, level: 0 as const },
+        ...d.subtypes.map(t => ({ key: `d:${d.key}|${t.name}`, label: t.name, charged: t.charged, received: t.received, owed: t.owed, level: 1 as const })),
       ])
     : view
-    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, sub: false }))
-    : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r), sub: false }))
-  const lines = detailed ? [] : (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, sub: false }))
+    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, level: 0 as const }))
+    : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r), level: 0 as const }))
+  const lines: Row[] = detailed ? [] : (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, level: 0 as const }))
   const all = [...rows, ...lines]
+  // Under a group (the monthly report): its lines set in, a subtype further in.
+  // On its own (Detailed elsewhere): the subtype set in beneath its line.
+  const grouped = detailed && !!groups
+  const rowClass = (r: Row) => r.group ? 'rb-group-row' : (grouped ? r.level === 2 : r.level === 1) ? 'rb-subtype-row' : undefined
+  const nameClass = (r: Row) => r.level === 0 ? 'rb-cat-name'
+    : !grouped ? 'rb-cat-name rb-subtype-name'
+    : r.level === 1 ? 'rb-cat-name rb-item-name' : 'rb-cat-name rb-subtype-name rb-subtype-deep'
   const total = view ? { charged: view.charged, received: view.received, owed: view.owed } : sumThree(all)
   return (
     <div className="card" style={{ marginBottom: 14 }}>
@@ -949,8 +983,8 @@ export function CategoryBreakdownCard({ title, view, categories }: {
             <tbody>
               {/* data-label: on a phone each row stacks, every figure named. */}
               {all.map(r => (
-                <tr key={r.key} className={r.sub ? 'rb-subtype-row' : undefined}>
-                  <td className={r.sub ? 'rb-cat-name rb-subtype-name' : 'rb-cat-name'}>{r.label}</td>
+                <tr key={r.key} className={rowClass(r)}>
+                  <td className={nameClass(r)}>{r.label}</td>
                   {COLS.map(c => (
                     <td key={c.key} data-label={c.label} className={`rb-num${c.key === 'owed' && r.owed ? ' rb-owed' : ''}`}>{fmt(r[c.key])}</td>
                   ))}
@@ -1606,6 +1640,14 @@ function ThreeColumnPnL({ title, view, expenses, expensesHeading = 'Expenses', n
 // each property, printable, and as the PDF the email attaches. The owner picks
 // who it is emailed to on the 2nd (the card at the bottom).
 // ══════════════════════════════════════════════════════════════
+/** 10/14 (Nic): one Summary group of the monthly report and its own itemized lines (services/monthlyPropertyReport ReportIncomeGroup). */
+interface IncomeGroup {
+  /** 'c:<category>' or 'l:<line>'. */
+  key: string
+  label: string
+  lines: Array<MoneyThree & { key: string; label: string; subtypes: Array<MoneyThree & { name: string }> }>
+}
+
 interface ReportProperty {
   property: { id: string; name: string; city: string | null; state: string | null }
   tenants: {
@@ -1620,6 +1662,8 @@ interface ReportProperty {
   }
   money: {
     view: MoneyView
+    /** 10/14 (Nic): each group's itemized lines, when the books itemized the month. */
+    itemized?: IncomeGroup[]
     expenses: { lines: Array<{ key: string; label: string; amount: number }>; total: number }
     net: { received: number; charged: number }
     workTradeCovered: number; depositsReceived: number; depositsReturned: number
@@ -1847,7 +1891,9 @@ function PropertyMonthCard({ p, monthLabel: ml }: { p: ReportProperty; monthLabe
       )}
 
       <div className="rb-mr-section-title">Money — {COLS.map(c => c.label.toLowerCase()).join(', ')}</div>
-      <CategoryBreakdownCard title={`Income by category — ${ml}`} view={money.view} />
+      {/* 10/14 (Nic): "itemized lines under each group" — opens Detailed when the books itemized the month, as the PDF prints it. */}
+      <CategoryBreakdownCard title={`Income by category — ${ml}`} view={money.view} groups={money.itemized ?? []}
+        initialMode={money.itemized?.length ? 'detailed' : 'summary'} />
       <div className="data-table-wrap">
         <table className="data-table rb-three">
           <thead><tr><th>Expenses</th><th className="rb-num">Amount</th></tr></thead>

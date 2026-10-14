@@ -15,7 +15,9 @@
  * refund, a chargeback) ask the same question of the same facts, so they land
  * on the same line and net to nothing there.
  *
- *   Long-term (a lease's rent, a stay of 30+ nights or one a lease bills, I2):
+ *   Long-term (a lease's rent, a stay of 30+ nights or one a lease bills, I2;
+ *   10/14, Nic: "month stays are long-term" — a stay sold by the month at
+ *   any length, a February month of 28 nights too):
  *     mobile home, tenant-owned trailer   all of it lot rent
  *     mobile home, park-owned trailer     lot rent = the unit's lot rent as a
  *       (units.dwelling_ownership          share of the month's rent (the
@@ -23,7 +25,8 @@
  *                                          trailer rent (I4/I5: derived, no box)
  *     every other type                    its own rent line (RV long-term rent,
  *                                          apartment rent, house rent, …)
- *   Short-term (a stay under 30 nights, I2): its type's stay line.
+ *   Short-term (a nightly or weekly stay under 30 nights, I2): its type's
+ *   stay line.
  *   A space GAM cannot place (no unit) stays on the role's own account.
  *
  * I5 — "the leases and purchase contracts combined with lot rent setting
@@ -40,7 +43,7 @@
  */
 import type { PoolClient } from 'pg'
 import {
-  LEDGER_LONG_TERM_STAY_NIGHTS, LEDGER_RENT_LINES, LEDGER_RENT_LINE_LABEL, LEDGER_STAY_LINES, LEDGER_STAY_LINE_LABEL,
+  LEDGER_LONG_TERM_STAY_NIGHTS, LEDGER_MONTH_STAY_LEASE_TYPES, LEDGER_RENT_LINES, LEDGER_RENT_LINE_LABEL, LEDGER_STAY_LINES, LEDGER_STAY_LINE_LABEL,
   type LedgerAccountRole, type LedgerRentLine, type LedgerStayLine,
 } from '@gam/shared'
 import type { DesiredLine } from '../ledgerEngine'
@@ -100,16 +103,28 @@ export function rentParts(space: SpaceFacts | null, cents: number, role: LedgerA
   return isRentLine(t) ? [{ role, sub: rentSub(t), cents }] : [{ role, cents }]
 }
 
-/** A stay's facts: its space, the nights sold and its terms ('lease': a lease bills the rest). */
+/**
+ * A stay's facts: its space, the nights sold, its terms ('lease': a lease
+ * bills the rest) and how it was sold (unit_bookings.lease_type: 'nightly',
+ * 'weekly', 'month_to_month', …).
+ */
 export interface StayFacts {
   space: SpaceFacts | null
   nightsSold: number
   stayTerms: string | null
+  leaseType: string | null
 }
 
-/** Pure: is the stay long-term (Nic I2: 30+ nights, or a lease)? */
-export function stayIsLongTerm(s: Pick<StayFacts, 'nightsSold' | 'stayTerms'>): boolean {
+/**
+ * Pure: is the stay long-term? Nic I2: 30+ nights, or a lease. 10/14 (Nic):
+ * "month stays are long-term; short-term = nightly/weekly stays under 30
+ * nights" — a stay sold by the month (LEDGER_MONTH_STAY_LEASE_TYPES: a month
+ * at the register or on a pay link, a booking site's first month) is
+ * long-term whatever its nights.
+ */
+export function stayIsLongTerm(s: Pick<StayFacts, 'nightsSold' | 'stayTerms' | 'leaseType'>): boolean {
   return s.stayTerms === 'lease' || s.nightsSold >= LEDGER_LONG_TERM_STAY_NIGHTS
+    || (LEDGER_MONTH_STAY_LEASE_TYPES as readonly string[]).includes(s.leaseType ?? '')
 }
 
 /** Pure: stay money of `cents` (signed) on its line(s); `role` defaults to stay income. */
@@ -178,17 +193,33 @@ export async function loadSpace(client: PoolClient, unitId: string | null, lease
   return r.rows[0] ? spaceOf(r.rows[0]) : null
 }
 
-/** A booking's stay facts (null: no such booking), its space as it stood when booked. The nights sold are the later of check-out and the booked check-out. */
+/**
+ * SQL: a booking's stay facts — its space as it stood when booked
+ * (SPACE_COLS_SQL), its terms, how it was sold (lease_type) and the nights
+ * sold (the later of check-out and the booked check-out) — from the
+ * unit_bookings row aliased `b`, joined to its unit as `su` and to no lease
+ * (`sl` ON FALSE). Read with stayOf. The projectors (loadStay) and the
+ * reports (ledgerReports bookingShares) read a stay with this one query, so
+ * they never disagree on its line.
+ */
+export const STAY_FACTS_SQL = (b: string) => `${SPACE_COLS_SQL('su', 'sl', `${b}.created_at`)},
+            ${b}.stay_terms, ${b}.lease_type AS stay_lease_type,
+            (GREATEST(${b}.check_out, COALESCE(${b}.booked_check_out, ${b}.check_out)) - ${b}.check_in) AS stay_nights`
+
+/** The StayFacts of a row read with STAY_FACTS_SQL. */
+export function stayOf(x: Parameters<typeof spaceOf>[0] & { stay_terms: string | null; stay_lease_type: string | null; stay_nights: number | string | null }): StayFacts {
+  return { space: spaceOf(x), nightsSold: Number(x.stay_nights) || 0, stayTerms: x.stay_terms ?? null, leaseType: x.stay_lease_type ?? null }
+}
+
+/** A booking's stay facts (null: no such booking), its space as it stood when booked (STAY_FACTS_SQL). */
 export async function loadStay(client: PoolClient, bookingId: string | null): Promise<StayFacts | null> {
   if (!bookingId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(bookingId)) return null
   const r = await client.query<any>(
-    `SELECT ${SPACE_COLS_SQL('su', 'sl', 'b.created_at')}, b.stay_terms,
-            (GREATEST(b.check_out, COALESCE(b.booked_check_out, b.check_out)) - b.check_in) AS nights
+    `SELECT ${STAY_FACTS_SQL('b')}
        FROM unit_bookings b
        LEFT JOIN units su ON su.id = b.unit_id
        LEFT JOIN leases sl ON FALSE
       WHERE b.id = $1::uuid`, [bookingId])
   const x = r.rows[0]
-  if (!x) return null
-  return { space: spaceOf(x), nightsSold: Number(x.nights) || 0, stayTerms: x.stay_terms ?? null }
+  return x ? stayOf(x) : null
 }

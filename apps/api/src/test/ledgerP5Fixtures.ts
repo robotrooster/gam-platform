@@ -102,13 +102,15 @@ export async function sale(co: LedgerCompany, s: SaleInput): Promise<string> {
 export async function booking(co: LedgerCompany, b: {
   checkIn: string; checkOut: string; bookedCheckOut?: string | null; status?: string; total?: number
   stayTerms?: 'lease' | 'stay' | null; pi?: string | null
+  /** 10/14: how the stay was sold (unit_bookings.lease_type); 'nightly' unless given. */
+  leaseType?: 'nightly' | 'weekly' | 'month_to_month' | 'long_term' | 'lease_hold'
 }): Promise<string> {
   const r = await db.query<{ id: string }>(
     `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status,
                                 total_amount, stay_terms, stripe_payment_intent_id)
-     VALUES ($1, $2, $3, $4, $5, 'nightly', $6, $7, $8, $9) RETURNING id`,
+     VALUES ($1, $2, $3, $4, $5, $10, $6, $7, $8, $9) RETURNING id`,
     [co.unitId, co.landlordId, b.checkIn, b.checkOut, b.bookedCheckOut ?? b.checkOut, b.status ?? 'confirmed',
-     b.total ?? null, b.stayTerms ?? null, b.pi ?? null])
+     b.total ?? null, b.stayTerms ?? null, b.pi ?? null, b.leaseType ?? 'nightly'])
   return r.rows[0].id
 }
 

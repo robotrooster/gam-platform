@@ -30,6 +30,19 @@ const NOTIF_TYPES = [
   { type:'birthday',                    label:'Birthday Email',         desc:'A happy-birthday note from GAM on your birthday', emailOnly:true },
 ]
 
+/**
+ * 10/14 afternoon (Nic): the tenant's birthday as words ("April 23, 1980"),
+ * read off the date at the start of what the server sends ('1980-04-23', or a
+ * timestamp starting with it) — never moved a day by the viewer's time zone.
+ * Empty when none is on file.
+ */
+function birthdayWords(raw: unknown): string {
+  const m = typeof raw === 'string' ? /^(\d{4})-(\d{2})-(\d{2})/.exec(raw) : null
+  if (!m) return ''
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
+
 export function ProfilePage() {
   const qc = useQueryClient()
   const [tab, setTab]     = useUrlTab('tab', 'profile', ['profile','notifications','security','customize'] as const)
@@ -188,6 +201,17 @@ export function ProfilePage() {
           </div>
           <div style={{ fontSize:'.68rem', color:'var(--text-3)', marginBottom:14, padding:'6px 10px', background:'rgba(201,162,39,.06)', border:'1px solid rgba(201,162,39,.15)', borderRadius:6 }}>
             🔒 Legal name is locked after registration. Contact your landlord if a correction is needed.
+          </div>
+          {/* 10/14 afternoon (Nic): "Tenant profile shows the birthday
+              read-only, 'ask your landlord to fix it'." Only the landlord can
+              fix a birthday (copied off the signed lease; the happy-birthday
+              email reads it) — nothing here changes it. */}
+          <div style={{ marginBottom:14 }}>
+            <label style={s('Birthday')}>Birthday</label>
+            <div style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-2)' }}>{birthdayWords(me?.dateOfBirth) || '—'}</div>
+            <div style={{ fontSize:'.68rem', color:'var(--text-3)', marginTop:6 }}>
+              🔒 Your landlord keeps your birthday on file. If it is wrong, ask your landlord to fix it.
+            </div>
           </div>
           <div style={{ marginBottom:12 }}>
             <label style={s('Email')}>Email</label>

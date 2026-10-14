@@ -13,25 +13,28 @@
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import { randomUUID } from 'crypto'
-import type { LedgerAccountRole } from '@gam/shared'
+import { LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_RENT_LINE_LABEL, LEDGER_STAY_LINE_LABEL, type LedgerAccountRole } from '@gam/shared'
 import { db } from '../../db'
 import { tenantCo, addLease, bill, receipt, cleanupTenantLedger } from '../../test/ledgerTenantFixtures'
 import { inTx } from '../../test/ledgerFixtures'
 import { booking, siteDeposit } from '../../test/ledgerP5Fixtures'
-import { seedUnit } from '../../test/dbHelpers'
+import { seedUnit, seedLeaseFee } from '../../test/dbHelpers'
 import { drainLedgerOutbox } from '../ledgerEngine'
 import { registerProductionLedgerProjectors, unregisterProductionLedgerProjectors } from '../ledgerProjectors'
 import { rebuildOwner } from '../ledgerRebuild'
 import { checkOwner } from '../ledgerCheck'
 import { ledgerProfitAndLoss } from '../ledgerReports'
-import { rentParts, stayParts, type SpaceFacts, type StayFacts } from './incomeLines'
+import { checkCompanyParity } from '../ledgerParity'
+import { rentParts, stayParts, stayIsLongTerm, type SpaceFacts, type StayFacts } from './incomeLines'
 
 // 10/14 (the deploy proof): before this change every rent and stay line booked
 // on its role's own account (4010 Space and lot rent, 4400 Stay income).
 // `legacy.on` makes the rule do that again, so a test can post the old way and
 // prove what the deploy's from-scratch rebuild does to those books. Off, the
-// rule is the real one.
-const legacy = vi.hoisted(() => ({ on: false }))
+// rule is the real one. `legacy.monthStays` is the rule before Nic's 10/14
+// answer "month stays are long-term": how a stay was sold did not count, only
+// its nights.
+const legacy = vi.hoisted(() => ({ on: false, monthStays: false }))
 vi.mock('./incomeLines', async (importOriginal) => {
   const m = await importOriginal<typeof import('./incomeLines')>()
   const flat = (role: LedgerAccountRole, cents: number) => (cents ? [{ role, cents }] : [])
@@ -40,7 +43,7 @@ vi.mock('./incomeLines', async (importOriginal) => {
     rentParts: (space: SpaceFacts | null, cents: number, role: LedgerAccountRole = 'space_rent') =>
       legacy.on ? flat(role, cents) : m.rentParts(space, cents, role),
     stayParts: (st: StayFacts | null, cents: number, role: LedgerAccountRole = 'stay_income') =>
-      legacy.on ? flat(role, cents) : m.stayParts(st, cents, role),
+      legacy.on ? flat(role, cents) : m.stayParts(st && legacy.monthStays ? { ...st, leaseType: null } : st, cents, role),
   }
 })
 
@@ -72,10 +75,33 @@ describe('the rule (pure)', () => {
 
   it('a stay under 30 nights is short-term; 30+ nights or a lease is long-term, on the rent line, still stay income (I2)', () => {
     const rv = space({ unitType: 'rv_spot' })
-    expect(keyed(stayParts({ space: rv, nightsSold: 29, stayTerms: null }, 10000))).toEqual([['stay_income', 'stay_line:rv_spot', 10000]])
-    expect(keyed(stayParts({ space: rv, nightsSold: 30, stayTerms: null }, 10000))).toEqual([['stay_income', 'rent_line:rv_spot', 10000]])
-    expect(keyed(stayParts({ space: rv, nightsSold: 3, stayTerms: 'lease' }, 10000))).toEqual([['stay_income', 'rent_line:rv_spot', 10000]])
+    expect(keyed(stayParts({ space: rv, nightsSold: 29, stayTerms: null, leaseType: 'nightly' }, 10000))).toEqual([['stay_income', 'stay_line:rv_spot', 10000]])
+    expect(keyed(stayParts({ space: rv, nightsSold: 30, stayTerms: null, leaseType: 'nightly' }, 10000))).toEqual([['stay_income', 'rent_line:rv_spot', 10000]])
+    expect(keyed(stayParts({ space: rv, nightsSold: 3, stayTerms: 'lease', leaseType: 'nightly' }, 10000))).toEqual([['stay_income', 'rent_line:rv_spot', 10000]])
     expect(keyed(stayParts(null, 10000))).toEqual([['stay_income', null, 10000]])
+  })
+
+  // 10/14 (Nic): "month stays are long-term; short-term = nightly/weekly stays under 30 nights."
+  it('a stay sold by the month is long-term at any length — a February month of 28 nights; a weekly 28 nights stays short-term', () => {
+    const rv = space({ unitType: 'rv_spot' })
+    for (const leaseType of ['month_to_month', 'long_term', 'lease_hold']) {
+      expect(stayIsLongTerm({ nightsSold: 28, stayTerms: null, leaseType })).toBe(true)
+      expect(keyed(stayParts({ space: rv, nightsSold: 28, stayTerms: 'stay', leaseType }, 58900))).toEqual([['stay_income', 'rent_line:rv_spot', 58900]])
+    }
+    for (const leaseType of ['nightly', 'weekly', null]) {
+      expect(stayIsLongTerm({ nightsSold: 28, stayTerms: null, leaseType })).toBe(false)
+      expect(keyed(stayParts({ space: rv, nightsSold: 28, stayTerms: null, leaseType }, 26900))).toEqual([['stay_income', 'stay_line:rv_spot', 26900]])
+    }
+  })
+})
+
+// 10/14 (Nic): "storage units vs storage for rvs/boats etc" — kept separate, each named plainly.
+describe('storage stays separate', () => {
+  it('a storage unit\'s rent is "Storage unit rent" (under 4010); a lease\'s storage fee is "RV and boat storage" (4060)', () => {
+    expect(keyed(rentParts(space({ unitType: 'storage' }), 7500))).toEqual([['space_rent', 'rent_line:storage', 7500]])
+    expect(LEDGER_RENT_LINE_LABEL.storage).toBe('Storage unit rent')
+    expect(LEDGER_STAY_LINE_LABEL.storage).toBe('Storage unit short-term stays (under 30 nights)')
+    expect(LEDGER_ACCOUNT_ROLE_BY_NAME.storage_fees).toMatchObject({ code: '4060', name: 'RV and boat storage' })
   })
 })
 
@@ -85,7 +111,7 @@ beforeEach(async () => {
   await cleanupTenantLedger()
   registerProductionLedgerProjectors()
 })
-afterEach(() => { legacy.on = false; unregisterProductionLedgerProjectors() })
+afterEach(() => { legacy.on = false; legacy.monthStays = false; unregisterProductionLedgerProjectors() })
 afterAll(async () => { await cleanupTenantLedger() })
 
 interface ItemLine { kind: string; role: string; line: string | null; account: string; parentCode: string | null; net: number }
@@ -150,14 +176,15 @@ async function earlyCheckOutRefund(co: { landlordId: string }, bookingId: string
 }
 
 /** A chargeback of $amount on the booking-site deposit paid with `pi` (the payout line GAM holds back). */
-async function stayChargeback(co: { landlordId: string }, pi: string, amount: number, propertyId: string): Promise<string> {
+async function stayChargeback(co: { landlordId: string }, pi: string, amount: number, propertyId: string,
+  at = '2026-09-25 18:00:00+00'): Promise<string> {
   const dp = `dp_${randomUUID()}`
   await db.query(
     `INSERT INTO connect_disputes (stripe_dispute_id, stripe_charge_id, stripe_payment_intent_id, landlord_id, amount, status)
      VALUES ($1, $2, $3, $4, $5, 'needs_response')`, [dp, `ch_${randomUUID()}`, pi, co.landlordId, amount])
   return (await db.query<{ id: string }>(
     `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, property_id, created_at)
-     VALUES ($1, 'dispute', $2, $3, $4, '2026-09-25 18:00:00+00') RETURNING id`, [co.landlordId, dp, -amount, propertyId])).rows[0].id
+     VALUES ($1, 'dispute', $2, $3, $4, $5::timestamptz) RETURNING id`, [co.landlordId, dp, -amount, propertyId, at])).rows[0].id
 }
 
 describe('rent books to its space\'s line', () => {
@@ -192,6 +219,24 @@ describe('rent books to its space\'s line', () => {
     expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
     expect((await incomeLines('payment', rent)).map(l => [l.line, l.account, l.net])).toEqual([['rent_line:mobile_home_lot', 'Mobile home lot rent', 46000]])
     expect((await incomeLines('payment', rv)).map(l => [l.line, l.account, l.net])).toEqual([['rent_line:rv_spot', 'RV long-term rent', 55000]])
+  })
+
+  // 10/14 (Nic): "storage units vs storage for rvs/boats etc" — kept separate.
+  it('a storage unit\'s rent is "Storage unit rent" under 4010; a lease\'s storage fee (an RV or boat stored) is "RV and boat storage", 4060', async () => {
+    const co = await tenantCo()
+    const unit = await addLease(co, co.propertyId)
+    await db.query(`UPDATE units SET unit_type = 'storage' WHERE id = $1`, [unit.unitId])
+    const unitRent = await bill(co, { amount: 75, due: '2026-09-01', unitId: unit.unitId, leaseId: unit.leaseId })
+    const storageFee = await inTx(c => seedLeaseFee(c, { leaseId: co.leaseId, feeType: 'storage_rent', amount: 40, dueTiming: 'monthly_ongoing' }))
+    const boat = await bill(co, { type: 'fee', entry: 'OTHERFEE', amount: 40, due: '2026-09-01', leaseFeeId: storageFee })
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect((await incomeLines('payment', unitRent)).map(l => [l.role, l.line, l.account, l.parentCode, l.net])).toEqual([
+      ['space_rent', 'rent_line:storage', 'Storage unit rent', '4010', 7500]])
+    const fee = await incomeLines('payment', boat)
+    expect(fee.map(l => [l.role, l.line, l.account, l.net])).toEqual([['storage_fees', null, 'RV and boat storage', 4000]])
+    expect((await db.query<{ code: string }>(
+      `SELECT a.code FROM books_accounts a WHERE a.landlord_id = $1 AND a.name = 'RV and boat storage'`, [co.landlordId])).rows)
+      .toEqual([{ code: '4060' }])
   })
 
   it('a space changed after its rent was billed never moves that rent: the space as it stood then; a rebuild finds no drift', async () => {
@@ -258,6 +303,75 @@ describe('stays book short-term or long-term (I2)', () => {
     expect([...new Set((await incomeLines('booking', stay)).map(l => l.line))]).toEqual(['rent_line:rv_spot'])
     expect((await incomeLines('refund_part', refund)).map(l => l.line)).toEqual(['rent_line:rv_spot'])
     expect((await checkOwner(co.owner, { repair: false })).findings).toEqual([])
+  })
+})
+
+// 10/14 (Nic): "month stays are long-term; short-term = nightly/weekly stays
+// under 30 nights" — any stay sold by the month books to RV long-term rent.
+describe('a stay sold by the month is long-term at any length', () => {
+  /** A February month sold by the month (28 nights) and four weeks sold by the week on the same nights, each on its own RV site. */
+  async function februaryStays() {
+    const co = await tenantCo()
+    const site = async () => ({ ...co, unitId: await inTx(c => seedUnit(c, { propertyId: co.propertyId, landlordId: co.landlordId, unitType: 'rv_spot' })) })
+    const a = await site(), b = await site()
+    const pi = `pi_${randomUUID()}`
+    const month = await booking(a, { checkIn: '2027-02-01', checkOut: '2027-03-01', leaseType: 'month_to_month', stayTerms: 'stay', pi })
+    await siteDeposit(a, month, { toward: 589, lodgingTax: 0, held: 589, at: '2027-01-25 18:00:00+00', pi })
+    const weeks = await booking(b, { checkIn: '2027-02-01', checkOut: '2027-03-01', leaseType: 'weekly' })
+    await siteDeposit(b, weeks, { toward: 1076, lodgingTax: 76, held: 1076, at: '2027-01-25 18:00:00+00' })
+    const refund = await earlyCheckOutRefund(co, month, { toward: 100, tax: 0, on: '2027-02-24' })
+    const chargeback = await stayChargeback(co, pi, 50, co.propertyId, '2027-02-26 18:00:00+00')
+    return { co, month, weeks, refund, chargeback }
+  }
+
+  it('a February month of 28 nights books to RV long-term rent, and its refund and chargeback come off the same line; four weeks stay short-term', async () => {
+    const { co, month, weeks, refund, chargeback } = await februaryStays()
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect((await incomeLines('booking', month)).map(l => [l.role, l.line, l.account, l.parentCode, l.net])).toEqual([
+      ['stay_income', 'rent_line:rv_spot', 'RV long-term rent', '4010', 58900]])
+    expect((await incomeLines('booking', weeks)).map(l => [l.role, l.line, l.account, l.parentCode, l.net])).toEqual([
+      ['stay_income', 'stay_line:rv_spot', 'RV short-term stays (under 30 nights)', '4400', 100000]])
+    expect((await incomeLines('refund_part', refund)).map(l => [l.role, l.line, l.net])).toEqual([['stay_income', 'rent_line:rv_spot', -10000]])
+    expect((await incomeLines('held_item', chargeback)).map(l => [l.role, l.line, l.net])).toEqual([['stay_income', 'rent_line:rv_spot', -5000]])
+    expect(await incomeByAccount(co.landlordId)).toEqual({ 'RV long-term rent': 43900, 'RV short-term stays (under 30 nights)': 100000 })
+    // The Detailed view reads the stay the projectors' way: the month's money is RV long-term rent.
+    const pl = await ledgerProfitAndLoss({ landlordIds: [co.landlordId] }, '2027-01-01', '2027-02-28', 'Jan–Feb')
+    const line = (key: string) => pl.view.details!.find(x => x.key === key)
+    expect(line('rent_line:rv_spot')?.charged).toBe(439)
+    expect(line('stay_line:rv_spot')?.charged).toBe(1000)
+  })
+
+  it('the deploy: books the old rule posted move with a from-scratch rebuild — debits equal credits, every property nets to $0, no drift, parity as before', async () => {
+    const nonZero = (m: Record<string, number>) => Object.fromEntries(Object.entries(m).filter(([, n]) => n !== 0))
+    // Company A: posted with the February month on the short-term line (the rule before 10/14's answer).
+    legacy.monthStays = true
+    const a = await februaryStays()
+    expect(await drainLedgerOutbox()).toMatchObject({ failed: 0 })
+    expect(nonZero(await incomeByAccount(a.co.landlordId))).toEqual({ 'RV short-term stays (under 30 nights)': 143900 })
+    const parityBefore = await checkCompanyParity(a.co.landlordId, '2027-02-27')
+    legacy.monthStays = false
+    expect((await rebuildOwner(a.co.owner, { mode: 'dry_run' })).counts.drift).toBeGreaterThan(0)
+
+    const run = await rebuildOwner(a.co.owner, { mode: 'from_scratch' })
+    expect(run.status).toBe('done')
+    expect(run.counts.failed).toBe(0)
+    expect(nonZero(await incomeByAccount(a.co.landlordId))).toEqual({ 'RV long-term rent': 43900, 'RV short-term stays (under 30 nights)': 100000 })
+    // Every posting balances (debits = credits) and so every property nets to $0.
+    const unbalanced = await db.query(
+      `SELECT l.posting_id FROM ledger_posting_lines l WHERE l.landlord_id = $1
+        GROUP BY l.posting_id HAVING SUM(l.debit) <> SUM(l.credit)`, [a.co.landlordId])
+    expect(unbalanced.rows).toEqual([])
+    expect(Object.values(await netByProperty(a.co.landlordId)).every(n => n === 0)).toBe(true)
+    expect((await checkOwner(a.co.owner, { repair: false })).findings).toEqual([])
+    expect((await rebuildOwner(a.co.owner, { mode: 'dry_run' })).counts.drift).toBe(0)
+    // Parity reads totals by role, never the line: the move changes nothing it
+    // reads — every measure, records and books, and what is unexplained, as
+    // before. (These fixtures write no money record of the site deposits and
+    // run no platform-fee accrual, so parity here is compared, not zero.)
+    const parityAfter = await checkCompanyParity(a.co.landlordId, '2027-02-27')
+    expect(parityAfter.months.map(m => m.measures.map(x => [x.key, x.records, x.ledger, x.explained]))).toEqual(
+      parityBefore.months.map(m => m.measures.map(x => [x.key, x.records, x.ledger, x.explained])))
+    expect(parityAfter.unexplained).toBe(parityBefore.unexplained)
   })
 })
 

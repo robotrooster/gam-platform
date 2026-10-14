@@ -339,9 +339,10 @@ bankFeedRouter.get('/transactions/:id/matches', requireBankViewer, async (req: a
 
 // POST /api/bank-feed/transactions/:id/returned-check — { remittanceId }:
 // 10/14 (Nic, answer 15) the owner says this line going out is that check (or
-// money order) on a matched deposit slip, returned by the bank — when GAM
-// could not be sure which check it was. The same take-back GAM does by itself
-// (services/returnedCheck): just that check, its bills owed again with late
+// money order) on a matched deposit slip — or, 10/14 afternoon, that tenant's
+// own bank deposit GAM matched — returned by the bank, when GAM could not be
+// sure which it was. The same take-back GAM does by itself
+// (services/returnedCheck): just that payment, its bills owed again with late
 // fees, the returned-check fee billed, everyone told once. Refused in words
 // when the take-back is not clean. Undone with POST /deposits/:id/undo.
 bankFeedRouter.post('/transactions/:id/returned-check', requireLandlord, async (req: any, res, next) => {
@@ -783,10 +784,35 @@ bankFeedRouter.post('/deposit-slips/:id/match', requireLandlord, async (req: any
 
 // POST /api/bank-feed/deposits/:id/undo — take a deposit's match back exactly
 // (a tenant deposit a person confirmed or the feed applied by itself, or a
-// deposit slip). Refused when anything changed since.
+// deposit slip). Refused when anything changed since. 10/14 afternoon: a
+// returned line that took back a tenant's own deposit has its own Undo
+// (services/returnedCheck undoReturnedDeposit), and the deposit it came back
+// from is put back from there, never from its own line. 10/14 follow-up: a
+// Stripe ACH payout GAM matched by its trace code has its own Undo too
+// (services/bankFeed undoTracedPayout — Nic 10/12: "every bank filing
+// (hand-filed too) can be undone").
 bankFeedRouter.post('/deposits/:id/undo', requireLandlord, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { RETURNED_DEPOSIT_KIND, CAME_BACK_MARK, undoReturnedDeposit } = await import('../services/returnedCheck')
+    const { TRACED_PAYOUT_KIND, undoTracedPayout } = await import('../services/bankFeed')
+    const line = await queryOne<{ kind: string | null; came_back: string | null; payout: boolean }>(
+      `SELECT auto_settle_undo->>'kind' AS kind, auto_settle_undo->'${CAME_BACK_MARK}'->>'postedDate' AS came_back,
+              matched_disbursement_id IS NOT NULL AS payout
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND status = 'matched'`, [req.params.id, landlordId])
+    if (line?.payout && line.kind === TRACED_PAYOUT_KIND) {
+      res.json({ success: true, data: await undoTracedPayout({ landlordId, lineId: req.params.id, undoneBy: req.user.userId }) })
+      return
+    }
+    if (line?.kind === RETURNED_DEPOSIT_KIND) {
+      res.json({ success: true, data: await undoReturnedDeposit({
+        lineId: req.params.id, landlordId, undoneBy: req.user.userId,
+      }) })
+      return
+    }
+    if (line?.came_back) {
+      throw new AppError(409, `This deposit came back from your bank on ${line.came_back}, and GAM took it back off the bills it paid. Undo that on the returned line (Undo this match there) to put this deposit's match back.`)
+    }
     const { undoDepositMatch } = await import('../services/bankDepositConfirm')
     res.json({ success: true, data: await undoDepositMatch({
       bankTransactionId: req.params.id, landlordId, undoneBy: req.user.userId,

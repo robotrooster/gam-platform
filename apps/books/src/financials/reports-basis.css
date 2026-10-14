@@ -26,6 +26,10 @@
 /* 10/14 (Nic I1): the Detailed income view — a space subtype under its line. */
 .rb-subtype-row td { color: var(--text-2); font-size: .78rem; }
 .rb-subtype-name { padding-left: 22px !important; }
+/* 10/14 (Nic): the monthly report — each group's itemized lines beneath it, a subtype beneath its line. */
+.rb-group-row td { color: var(--text-0); font-weight: 600; }
+.rb-item-name { padding-left: 22px !important; }
+.rb-subtype-name.rb-subtype-deep { padding-left: 40px !important; }
 .basis-note { margin: 0; font-size: .74rem; color: var(--text-3); line-height: 1.5; max-width: 760px; }
 .basis-print-note { display: none; font-size: .72rem; color: var(--text-2); margin: 0 0 10px; }
 @media print {

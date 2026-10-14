@@ -35,6 +35,7 @@ import type { MerchantRuleScope, BankTxnBankStatus, BankFilingScope } from '@gam
 import { OTHER_INCOME_CATEGORIES, BANK_TXN_HIDDEN_REASONS, isRentChannelPayer, BOOKS_LOAN_MATCH_WINDOW_DAYS } from '@gam/shared'
 import { payableRowSql, bankPayableRowSql } from './moneyPredicates'
 import { BANK_BOILERPLATE_WORDS, memoSaysTransfer } from './bankDepositMatch'
+import { RETURNED_KINDS_SQL, RETURNED_DEPOSIT_KIND, CAME_BACK_MARK } from './returnedCheck'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 const cents = (n: number | string) => Math.round(Number(n) * 100)
@@ -467,10 +468,11 @@ export async function upsertTransactions(
     // A deposit that paid a TENANT's bills, and (Step 12 review) one matched
     // to a deposit slip or to the office's cash GAM worked out: each is told,
     // in its own words. A voided payout match is flagged on the feed itself.
-    const voided = await query<{ id: string; kind: 'tenant' | 'slip' | null }>(
+    const voided = await query<{ id: string; kind: 'tenant' | 'slip' | 'returned' | null }>(
       `SELECT id,
               CASE WHEN matched_payment_id IS NOT NULL OR (auto_settle_undo ? 'receiptId') THEN 'tenant'
-                   WHEN auto_settle_undo->>'kind' = 'deposit_slip' THEN 'slip' END AS kind
+                   WHEN auto_settle_undo->>'kind' = 'deposit_slip' THEN 'slip'
+                   WHEN auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} THEN 'returned' END AS kind
          FROM bank_transactions WHERE id = ANY($1::uuid[]) AND matched_disbursement_id IS NULL`, [voidedMatched])
     const { alertMatchedDepositVoided } = await import('./bankDepositConfirm')
     const { alertSlipDepositVoided } = await import('./depositSlips')
@@ -481,6 +483,13 @@ export async function upsertTransactions(
       if (r.kind && await voidWhatBounced(r.id)) continue
       if (r.kind === 'tenant') await alertMatchedDepositVoided(r.id)
       else if (r.kind === 'slip') await alertSlipDepositVoided(r.id)
+      // 10/14 afternoon: the bank voided its own returned-item line, and what
+      // GAM took back could not be put back by itself (something changed
+      // since) — the owner is told; it used to stand taken back unseen.
+      else if (r.kind === 'returned') {
+        const { tellOwnerReturnVoidStands } = await import('./returnedCheck')
+        await tellOwnerReturnVoidStands(r.id)
+      }
     }
     // 10/12 (Nic, L5): money out matched to expenses, GAM's debit, a refund
     // check or a transfer never left — the match is undone by itself and the
@@ -687,6 +696,8 @@ export async function voidIncomeOfBankVoidedLine(client: Pick<PoolClient, 'query
  *   - a check returned on a bank line of its own (part of a deposit bouncing)
  *     is not a void at all: 10/14 (Nic, answer 15) it is taken back by itself
  *     when it is exactly one check in a matched deposit (services/returnedCheck).
+ *     When the bank voids THAT returned line, what GAM took back is put back
+ *     here the same way (10/14 afternoon: either kind of returned line).
  * Nor a GAM payout, or any match the Undo refuses because something changed
  * since (a bill paid again, the paid-ahead money already used). Runs after the
  * sync commits, each in its own transaction. Returns whether it was taken back;
@@ -700,6 +711,16 @@ export async function voidWhatBounced(lineId: string): Promise<boolean> {
          FROM bank_transactions WHERE id = $1`, [lineId])
     if (!t || t.status !== 'matched' || t.bank_status !== 'void' || t.disbursement || t.matched_kind) return false
     if (t.kind === 'recorded_deposit') return false
+    // 10/14 afternoon: a returned line that took back a tenant's own deposit has
+    // its own Undo (bankDepositConfirm undoDepositMatch knows only the
+    // returned_check kind); its notices are its own (tellCheckPutBack).
+    if (t.kind === RETURNED_DEPOSIT_KIND) {
+      const { undoReturnedDeposit } = await import('./returnedCheck')
+      await undoReturnedDeposit({ lineId, landlordId: t.landlord_id, undoneBy: null, bankVoided: true })
+      logger.info({ transactionId: lineId, kind: t.kind },
+        '[bank-feed] the bank voided its returned-item line — the deposit it took back was put back')
+      return true
+    }
     const { undoDepositMatch } = await import('./bankDepositConfirm')
     const r = await undoDepositMatch({ bankTransactionId: lineId, landlordId: t.landlord_id, undoneBy: null, bankVoided: true })
     await tellOwnerWhatBounced(lineId, r)
@@ -999,18 +1020,32 @@ export async function refreshBalance(conn: any): Promise<void> {
  * FBO Gold Asset Management…" (or, cut short, "…FBO Gold Asset M MOUNTAIN").
  * A Stripe ACH payout's memo ("ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A
  * CORPORATE ACH") names the landlord, not GAM, exactly as another Stripe
- * platform's does ("ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH") — so a line like
- * that, of a payout's amount, is offered to a person instead
- * (listTransactions payout_suggestion, matchPayoutByHand).
+ * platform's does ("ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH") — 10/14 afternoon
+ * (Nic): it files itself when it is exactly one payout by its Stripe trace
+ * code, amount and arrival day (matchTracedPayouts); otherwise it is offered
+ * to a person (listTransactions payout_suggestion, matchPayoutByHand).
  */
 export function memoNamesGam(description: string | null | undefined): boolean {
   return /\bGOLD ASSET\b/.test(` ${String(description ?? '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ')} `)
 }
 
 /**
+ * The "ST-…" trace code Stripe puts in the bank's memo of an ACH payout
+ * ("ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH" → "ST-G5D4S5T9R5P7"),
+ * or null. Every Stripe platform's payouts carry one (DoorLoop's do too), so
+ * the code alone never says the money is GAM's.
+ */
+export function stripeTraceCode(description: string | null | undefined): string | null {
+  const m = /(?:^|[^A-Z0-9])(ST-[A-Z0-9]{6,})(?![A-Z0-9])/.exec(String(description ?? '').toUpperCase())
+  return m ? m[1] : null
+}
+
+/**
  * Auto-match INBOUND (amount > 0) needs_review transactions to the settled GAM
  * disbursement that produced them (same amount, posted date within the window,
- * and — 10/14, Nic answer 16 — a memo that names GAM: memoNamesGam).
+ * and — 10/14, Nic answer 16 — a memo that names GAM: memoNamesGam; or — 10/14
+ * afternoon — a Stripe ACH payout that is exactly one payout by its trace code,
+ * amount and arrival day: matchTracedPayouts).
  * Matched rows drop out of the review queue — the landlord never re-categorizes
  * money GAM already moved. Amounts GAM did NOT move stay needs_review.
  *
@@ -1072,6 +1107,10 @@ export async function autoMatchLandlord(landlordId: string): Promise<number> {
         [t.id, disb.id, t.amount, t.posted_date])
       if (res.rowCount) matched++
     }
+    // 10/14 afternoon (Nic): a Stripe ACH payout, by its trace code — after the
+    // memos that name GAM, so a payout those already account for is never
+    // offered again.
+    matched += await matchTracedPayouts(client, landlordId)
     await client.query('COMMIT')
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -1080,6 +1119,173 @@ export async function autoMatchLandlord(landlordId: string): Promise<number> {
     client.release()
   }
   return matched
+}
+
+/**
+ * 10/14 afternoon (Nic): "Stripe payouts: an exact payout (amount + Stripe's
+ * ST- trace code + expected day) files itself." A Stripe ACH payout's memo
+ * names the landlord, not GAM ("ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A
+ * CORPORATE ACH" — Oak Park's $400.26 payout of 10/6), so it is matched by what
+ * GAM knows of the payout:
+ *   - not by the trace code itself: Stripe's payout record carries no "ST-"
+ *     code for GAM to store (its trace_id came empty and its
+ *     statement_descriptor null on every payout notice production kept), so
+ *     there is nothing to match it to exactly;
+ *   - so a deposit in review whose memo carries a Stripe trace code
+ *     (stripeTraceCode) and does not name GAM, of exactly a settled payout's
+ *     amount, posted ON the day Stripe said the payout would arrive
+ *     (connect_payouts.arrival_date — Nic's "expected day"; 10/14 follow-up:
+ *     a day later is a guess, and waits), into the account the payout went to
+ *     when GAM knows both last fours;
+ *   - one to one, or nothing: the deposit fits exactly one payout, and no
+ *     other deposit of that amount that carries a Stripe trace code or names
+ *     GAM sits within MATCH_DATE_WINDOW_DAYS of that payout's arrival, however
+ *     it was filed (only a copy from an earlier link, a bank void, or a line
+ *     matched to another payout is left out). DoorLoop pays through Stripe too
+ *     ("ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH"): two deposits that could be
+ *     the payout, or two payouts the deposit could be, wait for a person —
+ *     the payout is offered beside the deposit (payout_suggestion,
+ *     matchPayoutByHand);
+ *   - one to one after the fact too (10/14 follow-up): a rival that syncs
+ *     later (DoorLoop's line, or GAM's own, a sync behind) makes the match a
+ *     guess — it is taken back off by itself, and both wait for a person.
+ * The match is written down (auto_settle_undo kind TRACED_PAYOUT_KIND), so a
+ * person can undo it like any filing (undoTracedPayout — Nic 10/12: "every
+ * bank filing (hand-filed too) can be undone"); it matches on what GAM knows
+ * of the payout, not on the code itself.
+ * A payout GAM has no arrival day for (Stripe's notice of it never came) is
+ * never matched this way. Runs inside autoMatchLandlord's transaction and
+ * lock, after the memos that name GAM; the write re-checks the row the same
+ * way. Returns how many it matched.
+ */
+async function matchTracedPayouts(client: PoolClient, landlordId: string): Promise<number> {
+  // The deposits a payout arriving on `arrival` could be, besides `lineId`:
+  // any of them makes a match a guess.
+  const rivalsOf = async (o: { lineId: string; amount: string; arrival: string; last4: string | null }) =>
+    (await client.query<{ description: string | null }>(
+      `SELECT o.description
+         FROM bank_transactions o JOIN bank_connections oc ON oc.id = o.bank_connection_id
+        WHERE o.landlord_id = $1 AND o.id <> $2 AND o.amount = $3::numeric
+          AND o.posted_date BETWEEN ($4::date - $5::int) AND ($4::date + $5::int)
+          AND COALESCE(o.bank_status, 'posted') <> 'void'
+          AND o.ignored_reason IS DISTINCT FROM 'duplicate' AND o.ignored_reason IS DISTINCT FROM 'bank_void'
+          AND o.matched_disbursement_id IS NULL
+          AND ($6::text IS NULL OR NULLIF(TRIM(oc.account_last4), '') IS NULL OR TRIM(oc.account_last4) = $6::text)`,
+      [landlordId, o.lineId, o.amount, o.arrival, MATCH_DATE_WINDOW_DAYS, o.last4])).rows
+      .filter(r => stripeTraceCode(r.description) || memoNamesGam(r.description))
+
+  // 10/14 follow-up: a match this rule made that a later line now rivals was a
+  // guess — taken back off (back to an untouched deposit in review, which the
+  // rival keeps waiting below). A person's own match is never touched.
+  const made = (await client.query<{ id: string; amount: string; arrival: string; last4: string | null; disbursement: string }>(
+    `SELECT t.id, t.amount::text AS amount, t.auto_settle_undo->>'arrival' AS arrival,
+            NULLIF(TRIM(d.bank_last4), '') AS last4, d.id AS disbursement
+       FROM bank_transactions t JOIN disbursements d ON d.id = t.matched_disbursement_id
+      WHERE t.landlord_id = $1 AND t.status = 'matched' AND t.matched_by IS NULL
+        AND t.auto_settle_undo->>'kind' = '${TRACED_PAYOUT_KIND}'
+      ORDER BY t.id`, [landlordId])).rows
+  for (const m of made) {
+    if ((await rivalsOf({ lineId: m.id, amount: m.amount, arrival: m.arrival, last4: m.last4 })).length === 0) continue
+    const off = await client.query(
+      `UPDATE bank_transactions
+          SET status = 'needs_review', matched_disbursement_id = NULL, matched_at = NULL, auto_settle_undo = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'matched' AND matched_by IS NULL AND auto_settle_undo->>'kind' = '${TRACED_PAYOUT_KIND}'`, [m.id])
+    if (off.rowCount) {
+      logger.info({ transactionId: m.id, disbursementId: m.disbursement },
+        '[bank-feed] a Stripe ACH payout matched by its trace code now has a rival deposit — taken back off; both wait for a person')
+    }
+  }
+
+  const lines = (await client.query<{ id: string; amount: string; posted_date: string; description: string | null; last4: string | null }>(
+    `SELECT t.id, t.amount::text AS amount, to_char(t.posted_date, 'YYYY-MM-DD') AS posted_date, t.description,
+            NULLIF(TRIM(c.account_last4), '') AS last4
+       FROM bank_transactions t JOIN bank_connections c ON c.id = t.bank_connection_id
+      WHERE t.landlord_id = $1 AND ${AUTO_MATCHABLE_SQL('t')} AND t.auto_settle_undo IS NULL
+      ORDER BY t.id`, [landlordId])).rows
+    .filter(t => stripeTraceCode(t.description) && !memoNamesGam(t.description))
+  let matched = 0
+  for (const t of lines) {
+    // The payouts it could be: due to arrive the day it posted.
+    const payouts = (await client.query<{ id: string; arrival: string; last4: string | null }>(
+      `SELECT d.id, to_char(cp.arrival_date, 'YYYY-MM-DD') AS arrival, NULLIF(TRIM(d.bank_last4), '') AS last4
+         FROM disbursements d
+         JOIN connect_payouts cp ON cp.stripe_payout_id = d.stripe_payout_id
+        WHERE d.landlord_id = $1 AND d.status = 'settled' AND d.settled_at IS NOT NULL
+          AND d.amount = $2::numeric
+          AND cp.arrival_date = $3::date
+          AND ($4::text IS NULL OR NULLIF(TRIM(d.bank_last4), '') IS NULL OR TRIM(d.bank_last4) = $4::text)
+          AND NOT EXISTS (SELECT 1 FROM bank_transactions bt WHERE bt.matched_disbursement_id = d.id)
+        ORDER BY d.id`, [landlordId, t.amount, t.posted_date, t.last4])).rows
+    if (payouts.length !== 1) continue
+    const p = payouts[0]
+    if ((await rivalsOf({ lineId: t.id, amount: t.amount, arrival: p.arrival, last4: p.last4 })).length > 0) continue
+    const trace = stripeTraceCode(t.description)
+    const res = await client.query(
+      `UPDATE bank_transactions t
+          SET status = 'matched', matched_disbursement_id = $2::uuid, matched_at = now(), updated_at = now(),
+              auto_settle_undo = jsonb_build_object('version', 1, 'kind', '${TRACED_PAYOUT_KIND}', 'disbursementId', $2::uuid,
+                                                    'trace', $5::text, 'arrival', $6::text)
+        WHERE t.id = $1 AND ${AUTO_MATCHABLE_SQL('t')} AND t.auto_settle_undo IS NULL
+          AND t.amount = $3::numeric AND t.posted_date = $4::date`,
+      [t.id, p.id, t.amount, t.posted_date, trace, p.arrival])
+    if (res.rowCount) {
+      matched++
+      logger.info({ transactionId: t.id, disbursementId: p.id, trace, arrival: p.arrival },
+        '[bank-feed] a Stripe ACH payout matched by its trace code, amount and arrival day')
+    }
+  }
+  return matched
+}
+
+/**
+ * 10/14 follow-up: the auto_settle_undo kind on a deposit matchTracedPayouts
+ * matched to a GAM payout by itself (a Stripe ACH payout, by its trace code,
+ * amount and arrival day). It is what makes that match undoable (can_undo,
+ * undoTracedPayout) — a memo that names GAM is certain and has no Undo.
+ */
+export const TRACED_PAYOUT_KIND = 'traced_payout'
+
+/**
+ * 10/14 follow-up (Nic 10/12: "every bank filing (hand-filed too) can be
+ * undone"): a person takes a payout match matchTracedPayouts made back off —
+ * it matched on GAM's own record of the payout (its amount and arrival day),
+ * not the trace code, so another Stripe platform's deposit (DoorLoop's) of the
+ * same amount on that day could have been taken for it. The deposit goes back
+ * to review, the person's from then on — never matched by itself again (the
+ * mark bankDepositConfirm UndoneMarker keeps) — and the payout is offered again
+ * beside it and any other deposit (payout_suggestion, matchPayoutByHand).
+ */
+export async function undoTracedPayout(o: { landlordId: string; lineId: string; undoneBy: string | null }): Promise<{
+  kind: 'gam_payout'; reopenedChargeIds: string[]; lateFeesRestored: number; creditsWithdrawn: string[]; declarationId: null
+}> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const t = (await client.query<{ landlord_id: string; status: string; disbursement: string | null; undo: any }>(
+      `SELECT landlord_id, status, matched_disbursement_id AS disbursement, auto_settle_undo AS undo
+         FROM bank_transactions WHERE id = $1 FOR UPDATE`, [o.lineId])).rows[0]
+    if (!t || t.landlord_id !== o.landlordId) throw new AppError(404, 'Deposit not found')
+    if (t.status !== 'matched' || !t.disbursement || t.undo?.kind !== TRACED_PAYOUT_KIND) {
+      throw new AppError(409, 'This deposit is not a payout GAM matched by its trace code, so there is nothing to undo here.')
+    }
+    const marker = {
+      version: 1, undone: true, undoneAt: new Date().toISOString(), undoneBy: o.undoneBy,
+      was: { kind: 'gam_payout', disbursementId: t.disbursement, matchedBy: null, traced: t.undo },
+    }
+    await client.query(
+      `UPDATE bank_transactions
+          SET status = 'needs_review', matched_disbursement_id = NULL, matched_at = NULL, matched_by = NULL,
+              auto_settle_undo = $2::jsonb, updated_at = now()
+        WHERE id = $1`, [o.lineId, JSON.stringify(marker)])
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+  logger.info({ transactionId: o.lineId, undoneBy: o.undoneBy }, '[bank-feed] a Stripe ACH payout match by trace code was undone by a person')
+  return { kind: 'gam_payout', reopenedChargeIds: [], lateFeesRestored: 0, creditsWithdrawn: [], declarationId: null }
 }
 
 /**
@@ -1153,12 +1359,18 @@ export interface ReconcileResult {
  * can file it but no guessing." Confirmed: "Exact matches file themselves (GAM
  * payouts, front-desk-logged deposits for the exact amount); anything that
  * would be a guess asks." Each step, and what became of it:
- *   payouts      KEPT, ONLY WHEN THE MEMO NAMES GAM — GAM's own payout, and GAM
- *                knows every payment inside it. A line of the same amount
- *                whose memo does not name GAM (an ACH payout reads "ST-… TRANSFER
- *                <your name>", like any other Stripe platform's) is offered as
- *                GAM's payout for a person to match (payout_suggestion,
- *                matchPayoutByHand) — an amount that happens to match is a guess.
+ *   payouts      KEPT, WHEN THE MEMO NAMES GAM — GAM's own payout, and GAM
+ *                knows every payment inside it. 10/14 afternoon (Nic: "Stripe
+ *                payouts: an exact payout (amount + Stripe's ST- trace code +
+ *                expected day) files itself"): an ACH payout reads "ST-…
+ *                TRANSFER <your name>", like any other Stripe platform's, so it
+ *                files itself only one to one — the one payout of its amount
+ *                due to arrive the day it posted, and no other such deposit
+ *                near, then or later (matchTracedPayouts; a person can undo
+ *                it — undoTracedPayout). Anything else of a payout's amount
+ *                is offered as GAM's payout for a person to match
+ *                (payout_suggestion, matchPayoutByHand) — an amount that
+ *                happens to match is a guess.
  *   recorded     KEPT — a deposit the office logged by hand, tied only when
  *                certain (its reference number, or the one deposit of that
  *                exact amount with no other line of it near).
@@ -2339,11 +2551,17 @@ export async function ignoreTransaction(landlordId: string, txnId: string) {
   // 10/14 (Nic, answer 15): a returned check GAM took back is in the books
   // through that check (services/returnedCheck) — ignoring the line would
   // leave the bank's side of it out.
-  const returned = await queryOne<{ id: string }>(
-    `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND auto_settle_undo->>'kind' = 'returned_check'
-        AND status = 'matched'`, [txnId, landlordId])
+  // 10/14 afternoon: the same for a money order or a tenant's own deposit that
+  // came back — on its returned line, and on the deposit line it came back from.
+  const returned = await queryOne<{ id: string; came_back: boolean }>(
+    `SELECT id, COALESCE(auto_settle_undo ? '${CAME_BACK_MARK}', FALSE) AS came_back
+       FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND status = 'matched'
+        AND (auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} OR auto_settle_undo ? '${CAME_BACK_MARK}')`, [txnId, landlordId])
+  if (returned?.came_back) {
+    throw new AppError(409, 'This deposit came back from your bank, and GAM already took it back off the bills it paid. Undo that first (Undo this match on the returned line), then ignore it.')
+  }
   if (returned) {
-    throw new AppError(409, 'This line is the check your bank returned, and GAM already took that check back. Undo that first (Undo this match), then ignore it.')
+    throw new AppError(409, 'This line is the check or money order your bank returned, and GAM already took that payment back. Undo that first (Undo this match), then ignore it.')
   }
   const res = await queryOne<{ id: string }>(
     `UPDATE bank_transactions SET status='ignored', ignored_reason='landlord', updated_at=now()
@@ -2542,15 +2760,25 @@ export async function listTransactions(landlordId: string, opts: {
                  WHEN bt.matched_payment_id IS NOT NULL THEN 'tenant_deposit'
                  WHEN bt.auto_settle_undo->>'kind' = 'deposit_slip' THEN 'deposit_slip'
                  -- 10/14 (Nic, answer 15): a check the bank returned, taken back by itself.
-                 WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN 'returned_check'
+                 -- 10/14 afternoon: a money order too, and a tenant's own bank
+                 -- deposit that came back (services/returnedCheck).
+                 WHEN bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} THEN 'returned_check'
             END AS match_kind,
-            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN (bt.auto_settle_undo->>'feeAmount')::float END
+            CASE WHEN bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} THEN (bt.auto_settle_undo->>'feeAmount')::float END
               AS returned_check_fee,
-            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN bt.auto_settle_undo->>'feeFrom' END
+            CASE WHEN bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} THEN bt.auto_settle_undo->>'feeFrom' END
               AS returned_check_fee_from,
+            -- 10/14 afternoon: what came back (the method it was paid by — the
+            -- page says it in words), and whether it was the tenant's own deposit.
+            CASE WHEN bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL}
+                 THEN COALESCE(bt.auto_settle_undo->'rows'->0->>'manualMethod', 'check') END AS returned_check_method,
+            (bt.auto_settle_undo->>'kind' = '${RETURNED_DEPOSIT_KIND}') IS TRUE AS returned_check_from_deposit,
+            -- 10/14 afternoon: a tenant's own deposit that came back — the day the
+            -- bank returned it (its returned line is matched to it).
+            bt.auto_settle_undo->'${CAME_BACK_MARK}'->>'postedDate' AS came_back_on,
             -- 10/14 (Nic, answer 16): a deposit in review of a GAM payout's amount,
-            -- sent within the window and matched to no other line, whose memo does
-            -- not name GAM — offered for the person to match (matchPayoutByHand).
+            -- sent within the window and matched to no other line, that GAM did
+            -- not match by itself — offered for the person to match (matchPayoutByHand).
             CASE WHEN bt.status = 'needs_review' AND bt.amount > 0 AND bt.matched_disbursement_id IS NULL THEN (
               SELECT json_build_object('id', d.id, 'amount', d.amount::float, 'sentOn', to_char(d.settled_at, 'YYYY-MM-DD'))
                 FROM disbursements d
@@ -2559,7 +2787,7 @@ export async function listTransactions(landlordId: string, opts: {
                  AND NOT EXISTS (SELECT 1 FROM bank_transactions x WHERE x.matched_disbursement_id = d.id)
                ORDER BY ABS(d.settled_at::date - bt.posted_date), d.id
                LIMIT 1) END AS payout_suggestion,
-            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN (
+            CASE WHEN bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL} THEN (
               SELECT NULLIF(TRIM(COALESCE(rus.first_name,'') || ' ' || COALESCE(rus.last_name,'')), '')
                 FROM tenant_remittances rr JOIN tenants rt ON rt.id = rr.tenant_id JOIN users rus ON rus.id = rt.user_id
                WHERE rr.id::text = bt.auto_settle_undo->>'returnedReceiptId') END AS returned_check_tenant_name,
@@ -2568,10 +2796,16 @@ export async function listTransactions(landlordId: string, opts: {
             bt.auto_settled_at, bt.auto_filed_at,
             -- 10/14 (Nic 10/12: "every bank filing (hand-filed too) can be
             -- undone"): a returned check taken back, and a payout a person matched.
+            -- 10/14 afternoon: a tenant's deposit that came back is undone on its
+            -- returned line, not here. 10/14 follow-up: and a Stripe ACH payout
+            -- GAM matched by its trace code (on its amount and arrival day, so
+            -- it can be wrong — undoTracedPayout).
             (bt.status = 'matched' AND (
-              (bt.matched_disbursement_id IS NULL
-                AND ((bt.auto_settle_undo ? 'receiptId') OR bt.auto_settle_undo->>'kind' IN ('deposit_slip', 'returned_check')))
-              OR (bt.matched_disbursement_id IS NOT NULL AND bt.matched_by IS NOT NULL))) AS can_undo,
+              (bt.matched_disbursement_id IS NULL AND NOT COALESCE(bt.auto_settle_undo ? '${CAME_BACK_MARK}', FALSE)
+                AND ((bt.auto_settle_undo ? 'receiptId') OR bt.auto_settle_undo->>'kind' = 'deposit_slip'
+                     OR bt.auto_settle_undo->>'kind' IN ${RETURNED_KINDS_SQL}))
+              OR (bt.matched_disbursement_id IS NOT NULL
+                  AND (bt.matched_by IS NOT NULL OR COALESCE(bt.auto_settle_undo->>'kind' = '${TRACED_PAYOUT_KIND}', FALSE))))) AS can_undo,
             slip.slip_deposit_date, slip.slip_item_count, slip.slip_other_amount, slip.slip_source,
             dep.unit_number AS matched_unit_number, dep.tenant_name AS matched_tenant_name,
             dep.charge_count AS matched_charge_count,

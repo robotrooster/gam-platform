@@ -19,9 +19,12 @@ import { createSlip } from './depositSlips'
 import { reconcileDeposits, normalizeMerchant, ignoreTransaction, listTransactions } from './bankFeed'
 import {
   takeBackReturnedChecks, readReturnedItemMemo, checkChoices, takeBackChosenCheck, FEE_LINE_GIVE_UP_DAYS, mentionsAReturn,
+  undoReturnedDeposit, RETURNED_DEPOSIT_KIND,
 } from './returnedCheck'
-import { undoDepositMatch } from './bankDepositConfirm'
+import { undoDepositMatch, confirmDepositMatch } from './bankDepositConfirm'
+import { voidWhatBounced, upsertTransactions } from './bankFeed'
 import { projectBankMatchTenant, projectDepositSlip } from './ledgerProjectors/tenantReceipts'
+import { createIssuedCredit, applyCredit } from './creditUse'
 import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 
 // The late-fee engine's back-fill runs for real in returnedCheckEndToEnd.test.ts;
@@ -133,6 +136,10 @@ describe('reading the bank’s words', () => {
     for (const m of ['DEPOSITED ITEM RETURNED FEE', 'RETURN DEP ITEM CHG', 'RETURNED CHECK FEE', 'CHARGEBACK DEPOSITED ITEM FEE']) {
       expect(readReturnedItemMemo(m), m).toBe('fee')
     }
+    // 10/14 afternoon (Nic): a money order that comes back, in the bank's words.
+    for (const m of ['RETURNED MONEY ORDER', 'MONEY ORDER RETURNED 10/03', 'RET MONEY ORD']) expect(readReturnedItemMemo(m), m).toBe('item')
+    expect(readReturnedItemMemo('RETURNED MONEY ORDER FEE')).toBe('fee')
+    expect(readReturnedItemMemo('WESTERN UNION MONEY ORDER')).toBeNull()
   })
 
   it('never an ACH, a card or processor chargeback, or a return that names no deposit or check', () => {
@@ -329,10 +336,27 @@ describe('anything that is not certainly one check waits for a person', () => {
     expect([await statusOf('tenant_remittances', a.id), await statusOf('tenant_remittances', b.id)]).toEqual(['settled', 'settled'])
     const told = await notices(ctx.userId)
     expect(told).toHaveLength(1)
-    expect(told[0].title).toBe('Your bank returned a check — it needs you')
+    expect(told[0].title).toBe('Your bank returned a check or money order — it needs you')
     expect(told[0].body).toContain('2 payments of $460.00 were in deposits matched')
-    expect(told[0].body).toContain('pick the check that bounced')
-    expect(emails.map(e => e.subject)).toEqual(['Your bank returned a check — it needs you'])
+    expect(told[0].body).toContain('pick the one that came back')
+    expect(emails.map(e => e.subject)).toEqual(['Your bank returned a check or money order — it needs you'])
+  })
+
+  // 10/14 afternoon ("anything that is not exactly one match waits"): one to one both ways.
+  it('two returned items of that amount and one check: GAM cannot tell which line it is, so both wait', async () => {
+    const ctx = await build()
+    const rosa = await check(ctx, 460, daysAgo(9))
+    const sam = await check(ctx, 300, daysAgo(9))
+    await bank(ctx, [rosa.id, sam.id], 760, daysAgo(8))
+    const one = await bankRow(ctx, -460, daysAgo(3), 'RETURNED DEPOSIT ITEM')
+    const two = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 2, feesBilled: 0 })
+    expect(await statusOf('payments', rosa.rentId)).toBe('settled')
+    expect((await notices(ctx.userId))[0].body).toContain('Another returned item of $460.00 is on your bank too')
+    // The owner picks for one; the other, alone now, is GAM's to judge again — and nothing is left for it.
+    await takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: one, remittanceId: rosa.id, by: ctx.userId })
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 1, feesBilled: 0 })
+    expect((await lineOf(two)).status).toBe('needs_review')
   })
 
   it('a slip’s other money big enough to be that check: GAM cannot be sure, so nothing is taken back', async () => {
@@ -342,7 +366,7 @@ describe('anything that is not certainly one check waits for a person', () => {
     await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
     expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 1, feesBilled: 0 })
     expect(await statusOf('payments', rosa.rentId)).toBe('settled')
-    expect((await notices(ctx.userId))[0].body).toContain('Money GAM cannot see inside could hold a check of $460.00 too')
+    expect((await notices(ctx.userId))[0].body).toContain('Money GAM cannot see inside could hold a check or money order of $460.00 too')
   })
 
   it('a deposit GAM cannot see inside blocks it; an electronic credit (a Square payout) does not', async () => {
@@ -388,7 +412,10 @@ describe('anything that is not certainly one check waits for a person', () => {
     expect([await statusOf('payments', cash.rentId), await statusOf('payments', old.rentId)]).toEqual(['settled', 'settled'])
   })
 
-  it('a check and a money order of that amount: GAM cannot tell which came back; a money order alone is not taken back either', async () => {
+  // 10/14 afternoon (Nic): "can a money order come back?" — yes (counterfeit,
+  // stolen, altered): one alone is taken back like a check; one beside a check
+  // of the same amount is still a guess.
+  it('a check and a money order of that amount: GAM cannot tell which came back; a money order alone is taken back like a check', async () => {
     const ctx = await build()
     const chk = await check(ctx, 460, daysAgo(9))
     const mo = await check(ctx, 460, daysAgo(9), { method: 'money_order' })
@@ -396,11 +423,12 @@ describe('anything that is not certainly one check waits for a person', () => {
     await bank(ctx, [chk.id, mo.id, other.id], 1220, daysAgo(8))
     await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
     await bankRow(ctx, -300, daysAgo(2), 'RETURNED DEPOSIT ITEM')
-    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 2, feesBilled: 0 })
-    for (const r of [chk, mo, other]) expect(await statusOf('tenant_remittances', r.id)).toBe('settled')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 1, waiting: 1, feesBilled: 0 })
+    for (const r of [chk, mo]) expect(await statusOf('tenant_remittances', r.id)).toBe('settled')
+    expect(await statusOf('tenant_remittances', other.id)).toBe('failed')
+    expect(await statusOf('payments', other.rentId)).toBe('pending')
     const bodies = (await notices(ctx.userId)).map(n => n.body).join(' ')
     expect(bodies).toContain('2 payments of $460.00')
-    expect(bodies).toContain('is a money order, which GAM does not take back by itself')
   })
 
   it('a check part of which was kept as credit is not taken back by itself', async () => {
@@ -413,6 +441,9 @@ describe('anything that is not certainly one check waits for a person', () => {
     expect((await lineOf(returned)).status).toBe('needs_review')
     expect(await statusOf('payments', rosa.rentId)).toBe('settled')
     expect((await notices(ctx.userId))[0].body).toContain('kept as credit or paid ahead')
+    // 10/14 follow-up: GAM knows which check it is, so the owner is not told to pick it (that is refused too).
+    expect((await notices(ctx.userId))[0].body).toContain('GAM cannot take that check back by itself or when you pick it')
+    expect((await notices(ctx.userId))[0].body).not.toContain('pick the one that came back')
   })
 
   it('a card chargeback or an ACH return is never read as a check, and nobody is told about it', async () => {
@@ -440,7 +471,7 @@ describe('anything that is not certainly one check waits for a person', () => {
     expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 1, waiting: 0, feesBilled: 0 })
     expect((await lineOf(returned)).status).toBe('matched')
     expect((await notices(ctx.userId)).map(n => n.title)).toEqual([
-      'Your bank returned a check — it needs you', 'A check bounced — GAM took it back',
+      'Your bank returned a check or money order — it needs you', 'A check bounced — GAM took it back',
     ])
   })
 })
@@ -460,14 +491,14 @@ describe('the person picks the check that bounced', () => {
       ['Ana Tenant', 'check', 460, false], ['Bo Tenant', 'check', 460, false],
     ])
     await expect(takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: returned, remittanceId: randomUUID(), by: ctx.userId }))
-      .rejects.toThrow(/not a check of \$460.00/)
+      .rejects.toThrow(/not a check or money order of \$460.00/)
     const r = await takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: returned, remittanceId: b.id, by: ctx.userId })
     expect(r).toMatchObject({ remittanceId: b.id, reopenedPaymentIds: [b.rentId], fee: { kind: 'bank', cents: 2500 } })
     expect(await statusOf('payments', b.rentId)).toBe('pending')
     expect(await statusOf('payments', a.rentId)).toBe('settled')
     expect((await lineOf(returned)).auto_settle_undo).toMatchObject({ kind: 'returned_check', pickedBy: ctx.userId })
     expect((await notices(ctx.userId)).map(n => n.title)).toEqual([
-      'Your bank returned a check — it needs you', 'A check bounced — GAM took it back',
+      'Your bank returned a check or money order — it needs you', 'A check bounced — GAM took it back',
     ])
     expect((await notices(ctx.userId))[1].body).toContain('took just that check back, as you picked')
     // Nothing left to pick on a line that is matched.
@@ -480,7 +511,7 @@ describe('the person picks the check that bounced', () => {
     await bank(ctx, [rosa.id], 500, daysAgo(8))
     const returned = await bankRow(ctx, -500, daysAgo(2), 'RETURNED DEPOSIT ITEM')
     await expect(takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: returned, remittanceId: rosa.id, by: ctx.userId }))
-      .rejects.toThrow(/kept as credit or paid ahead.*Nothing was taken back/)
+      .rejects.toThrow(/kept as credit or paid ahead.*Nothing was taken back\. GAM cannot take that check back.*Contact GAM support/)
     expect(await statusOf('payments', rosa.rentId)).toBe('settled')
     expect((await lineOf(returned)).status).toBe('needs_review')
   })
@@ -536,6 +567,31 @@ describe('Undo (Nic 10/12: "every bank filing (hand-filed too) can be undone (ke
     expect(await statusOf('tenant_remittances', rosa.id)).toBe('failed')
   })
 
+  // 10/14 afternoon: the sync itself sends a voided returned line to be put
+  // back — it used to leave the take-back standing, unseen.
+  it('the sync: the bank voids the returned line → the check is put back by itself; if it cannot be, the owner is told', async () => {
+    const ctx = await build()
+    const rosa = await check(ctx, 460, daysAgo(9))
+    const sam = await check(ctx, 300, daysAgo(9))
+    await bank(ctx, [rosa.id, sam.id], 760, daysAgo(8))
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    const samBack = await bankRow(ctx, -300, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toMatchObject({ takenBack: 2 })
+    // Sam paid again since, so his cannot be put back by itself.
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now(), manual_method = 'cash' WHERE id = $1`, [sam.rentId])
+    const ext = async (id: string) => (await db.query(`SELECT external_id FROM bank_transactions WHERE id = $1`, [id])).rows[0].external_id
+    await upsertTransactions(ctx.connectionId, ctx.landlordId, [
+      { externalId: await ext(returned), postedDate: daysAgo(2), amount: -460, description: 'RETURNED DEPOSIT ITEM', status: 'void' },
+      { externalId: await ext(samBack), postedDate: daysAgo(2), amount: -300, description: 'RETURNED DEPOSIT ITEM', status: 'void' },
+    ])
+    expect(await lineOf(returned)).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void' })
+    expect(await statusOf('payments', rosa.rentId)).toBe('settled')
+    expect((await lineOf(samBack)).status).toBe('matched')
+    const titles = (await notices(ctx.userId)).map(n => n.title)
+    expect(titles).toContain('Your bank took back a returned check')
+    expect(titles).toContain('Your bank voided a returned check — it needs you')
+  })
+
   it('the bank voiding its own returned line puts the check back the same way, set aside, and the owner hears it', async () => {
     const ctx = await build()
     const rosa = await check(ctx, 460, daysAgo(9))
@@ -548,5 +604,401 @@ describe('Undo (Nic 10/12: "every bank filing (hand-filed too) can be undone (ke
     expect(await lineOf(returned)).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void' })
     expect(await statusOf('payments', rosa.rentId)).toBe('settled')
     expect((await notices(ctx.userId)).map(n => n.title)).toContain('Your bank took back a returned check')
+  })
+})
+
+// ── 10/14 afternoon (Nic): "Automatic bounce handling also for: money orders
+// that come back, and a tenant's own single-check bank deposit that comes back."
+
+describe('a money order that comes back', () => {
+  it('is taken back by itself exactly like a check, and says it was a money order', async () => {
+    const ctx = await build()
+    const mo = await check(ctx, 460, daysAgo(9), { method: 'money_order', first: 'Rosa' })
+    const sam = await check(ctx, 300, daysAgo(9))
+    await bank(ctx, [mo.id, sam.id], 760, daysAgo(8))
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED MONEY ORDER')
+    await bankRow(ctx, -15, daysAgo(2), 'RETURNED MONEY ORDER FEE')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 1, waiting: 0, feesBilled: 0 })
+    expect((await db.query(`SELECT status, undone_at IS NOT NULL AS undone, notes FROM tenant_remittances WHERE id = $1`, [mo.id])).rows[0])
+      .toMatchObject({ status: 'failed', undone: true, notes: expect.stringContaining('the money order came back') })
+    expect(await statusOf('payments', mo.rentId)).toBe('pending')
+    expect(await statusOf('payments', sam.rentId)).toBe('settled')
+    expect(lateFeeBackfills).toEqual([mo.invoiceId])
+    expect((await db.query(`SELECT amount::float AS amount, notes FROM payments WHERE tenant_id = $1 AND type = 'fee'`, [mo.tenantId])).rows)
+      .toEqual([{ amount: 15, notes: expect.stringContaining('Returned payment fee — what the bank charged for the money order returned') }])
+    expect((await lineOf(returned)).auto_settle_undo).toMatchObject({
+      kind: 'returned_check', returnedReceiptId: mo.id, feeFrom: 'bank', rows: [{ manualMethod: 'money_order' }],
+    })
+    expect((await notices(ctx.userId)).map(n => n.title)).toEqual(['A money order came back — GAM took it back'])
+    expect((await notices(ctx.userId))[0].body).toContain('Rosa Tenant')
+    expect((await notices(ctx.userId))[0].body).toContain('$460.00 money order from the deposit of')
+    expect((await notices(mo.tenantUser)).map(n => n.title)).toEqual(['Your money order was returned by the bank'])
+    expect((await notices(mo.tenantUser))[0].body).toContain('a returned-payment fee of $15.00 is added')
+    const listed = (await listTransactions(ctx.landlordId, { lineId: returned }))[0]
+    expect(listed).toMatchObject({ match_kind: 'returned_check', returned_check_method: 'money_order', returned_check_from_deposit: false })
+
+    // Its Undo puts it back as a money order.
+    await undoDepositMatch({ bankTransactionId: returned, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect((await db.query(`SELECT status, manual_method FROM payments WHERE id = $1`, [mo.rentId])).rows[0])
+      .toEqual({ status: 'settled', manual_method: 'money_order' })
+    expect((await notices(mo.tenantUser)).map(n => n.title)).toContain('Your returned money order was put back')
+  })
+})
+
+describe('a tenant’s own bank deposit that comes back', () => {
+  /**
+   * A tenant's rent bill, and the check they deposited into the landlord's
+   * bank themselves, matched to it the way a person confirms one
+   * (bankDepositConfirm confirmDepositMatch).
+   */
+  async function ownDeposit(ctx: Ctx, amount: number, o: { method?: 'check' | 'money_order' | 'cash'; first?: string; day?: number } = {}) {
+    const c = await getClient()
+    let s: { tenantId: string; tenantUser: string; leaseId: string; unitId: string; rentId: string; invoiceId: string; deposit: string }
+    try {
+      const tenantId = await seedTenant(c)
+      if (o.first) await c.query(`UPDATE users SET first_name = $2 WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId, o.first])
+      const unitId = await seedUnit(c, { propertyId: ctx.propertyId, landlordId: ctx.landlordId, rentAmount: amount })
+      const leaseId = await seedLease(c, { unitId, landlordId: ctx.landlordId, rentAmount: amount })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      const due = daysAgo((o.day ?? 8) + 1)
+      const invoiceId = (await c.query(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount)
+         VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7) RETURNING id`,
+        [ctx.landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, due, amount.toFixed(2)])).rows[0].id
+      const rentId = (await c.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,$5,'rent',$6,'pending',$7::date,'RENT') RETURNING id`,
+        [invoiceId, unitId, leaseId, tenantId, ctx.landlordId, amount.toFixed(2), due])).rows[0].id
+      const tenantUser = (await c.query(`SELECT user_id FROM tenants WHERE id = $1`, [tenantId])).rows[0].user_id
+      s = { tenantId, tenantUser, leaseId, unitId, rentId, invoiceId, deposit: '' }
+    } finally { c.release() }
+    s.deposit = await bankRow(ctx, amount, daysAgo(o.day ?? 8), 'MOBILE DEPOSIT')
+    await confirmDepositMatch({ bankTransactionId: s.deposit, chargeIds: [s.rentId], method: o.method ?? 'check', confirmedByUserId: ctx.userId })
+    expect(await statusOf('payments', s.rentId)).toBe('settled')
+    return s
+  }
+  const allocations = async (lineId: string) => (await db.query(
+    `SELECT payment_id, reversed_at IS NOT NULL AS reversed FROM bank_deposit_allocations WHERE bank_transaction_id = $1`, [lineId])).rows
+
+  it('is taken back by itself: the match undone, the bill owed again with late fees, the bank’s fee billed, both lines out of review', async () => {
+    const ctx = await build()
+    const dee = await ownDeposit(ctx, 460, { first: 'Dee' })
+    const receiptId = (await lineOf(dee.deposit)).auto_settle_undo.receiptId as string
+    expect(await allocations(dee.deposit)).toEqual([{ payment_id: dee.rentId, reversed: false }])
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'DEPOSITED ITEM RETURNED')
+    const fee = await bankRow(ctx, -25, daysAgo(2), 'DEPOSITED ITEM RETURNED FEE')
+
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 1, waiting: 0, feesBilled: 0 })
+    // The deposit's match is undone: its receipt taken back (kept on record), the rent owed again.
+    expect((await db.query(`SELECT status, undone_at IS NOT NULL AS undone, notes FROM tenant_remittances WHERE id = $1`, [receiptId])).rows[0])
+      .toMatchObject({ status: 'failed', undone: true, notes: expect.stringContaining('the check in this bank deposit bounced') })
+    expect((await db.query(`SELECT status, manual_method, settled_at FROM payments WHERE id = $1`, [dee.rentId])).rows[0])
+      .toEqual({ status: 'pending', manual_method: null, settled_at: null })
+    expect(await allocations(dee.deposit)).toEqual([{ payment_id: dee.rentId, reversed: true }])
+    // Late fees from the bill's own due date, as if never paid.
+    expect(lateFeeBackfills).toEqual([dee.invoiceId])
+    // The bank's fee, billed to Dee; the fee line stays the landlord's bank expense.
+    expect((await db.query(`SELECT amount::float AS amount, status, lease_id FROM payments WHERE tenant_id = $1 AND type = 'fee'`, [dee.tenantId])).rows)
+      .toEqual([{ amount: 25, status: 'pending', lease_id: dee.leaseId }])
+    expect((await lineOf(fee)).status).toBe('needs_review')
+    // The returned line is matched to the deposit; the deposit line says it came back.
+    expect(await lineOf(returned)).toMatchObject({
+      status: 'matched',
+      auto_settle_undo: {
+        kind: RETURNED_DEPOSIT_KIND, returnedReceiptId: receiptId, depositLineId: dee.deposit, slipId: null,
+        allocationPaymentIds: [dee.rentId], feeFrom: 'bank', feeAmount: 25, feeLineId: fee, pickedBy: null,
+      },
+    })
+    const dep = await lineOf(dee.deposit)
+    expect(dep.status).toBe('matched')
+    expect(dep.auto_settle_undo).toMatchObject({ receiptId, cameBack: { lineId: returned, postedDate: daysAgo(2) } })
+    // The Bank page: the returned line says whose deposit, and is undone there; the deposit line is not.
+    expect((await listTransactions(ctx.landlordId, { lineId: returned }))[0]).toMatchObject({
+      match_kind: 'returned_check', returned_check_from_deposit: true, returned_check_method: 'check',
+      returned_check_tenant_name: 'Dee Tenant', returned_check_fee: 25, can_undo: true,
+    })
+    expect((await listTransactions(ctx.landlordId, { lineId: dee.deposit }))[0]).toMatchObject({
+      match_kind: 'tenant_deposit', came_back_on: daysAgo(2), can_undo: false,
+    })
+    await expect(ignoreTransaction(ctx.landlordId, returned)).rejects.toThrow(/Undo that first/)
+    await expect(ignoreTransaction(ctx.landlordId, dee.deposit)).rejects.toThrow(/came back from your bank/)
+    // The deposit's own Undo has nothing left to undo (its receipt is taken back).
+    await expect(undoDepositMatch({ bankTransactionId: dee.deposit, landlordId: ctx.landlordId, undoneBy: ctx.userId }))
+      .rejects.toThrow(/already closed/)
+
+    // Told once each, by email too: the owner and Dee — as her own deposit.
+    expect((await notices(ctx.userId)).map(n => n.title)).toEqual(['A check bounced — GAM took it back'])
+    expect((await notices(ctx.userId))[0].body).toContain(`Your bank returned the $460.00 check Dee Tenant`)
+    expect((await notices(ctx.userId))[0].body).toContain(`deposited to your account on ${daysAgo(8)}`)
+    expect((await notices(dee.tenantUser)).map(n => n.title)).toEqual(['Your check was returned by the bank'])
+    expect((await notices(dee.tenantUser))[0].body).toContain(`The $460.00 check you deposited on ${daysAgo(8)} did not go through`)
+    const bounceMail = () => emails.filter(e => /returned by the bank|GAM took it back/.test(e.subject))
+    expect(bounceMail().map(e => [e.to, e.subject]).sort()).toEqual([
+      [await emailOf(ctx.userId), 'A check bounced — GAM took it back'],
+      [await emailOf(dee.tenantUser), 'Your check was returned by the bank'],
+    ].sort())
+
+    // Again: nothing more happens.
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 0, feesBilled: 0 })
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM payments WHERE tenant_id = $1 AND type = 'fee'`, [dee.tenantId])).rows[0].n).toBe(1)
+  })
+
+  it('the books: neither line puts anything in them once the deposit is taken back', async () => {
+    const ctx = await build()
+    const dee = await ownDeposit(ctx, 460)
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    const c = await getClient()
+    try {
+      expect(await projectBankMatchTenant(c, dee.deposit)).toHaveLength(1)
+      await takeBackReturnedChecks(ctx.landlordId)
+      expect(await projectBankMatchTenant(c, dee.deposit)).toEqual([])
+      expect(await projectBankMatchTenant(c, returned)).toEqual([])
+    } finally { c.release() }
+  })
+
+  it('a money order the tenant deposited themselves that comes back is taken back too', async () => {
+    const ctx = await build()
+    const mo = await ownDeposit(ctx, 300, { method: 'money_order' })
+    const returned = await bankRow(ctx, -300, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toMatchObject({ takenBack: 1 })
+    expect(await statusOf('payments', mo.rentId)).toBe('pending')
+    expect((await lineOf(returned)).auto_settle_undo).toMatchObject({ kind: RETURNED_DEPOSIT_KIND })
+    expect((await notices(mo.tenantUser)).map(n => n.title)).toEqual(['Your money order was returned by the bank'])
+  })
+
+  it('Undo puts the deposit’s match back exactly; the line goes back to review for good', async () => {
+    const ctx = await build()
+    const dee = await ownDeposit(ctx, 460)
+    const before = (await db.query(`SELECT settled_at, manual_method FROM payments WHERE id = $1`, [dee.rentId])).rows[0]
+    const receiptId = (await lineOf(dee.deposit)).auto_settle_undo.receiptId as string
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    await bankRow(ctx, -25, daysAgo(2), 'DEPOSITED ITEM RETURNED FEE')
+    await takeBackReturnedChecks(ctx.landlordId)
+    const feeId = (await lineOf(returned)).auto_settle_undo.feePaymentId as string
+
+    const r = await undoReturnedDeposit({ lineId: returned, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect(r).toMatchObject({ kind: 'returned_check', checkPutBack: { paidAgainIds: [dee.rentId], feeVoided: feeId, lateFeesVoided: [] } })
+    expect((await db.query(`SELECT status, settled_at, manual_method FROM payments WHERE id = $1`, [dee.rentId])).rows[0])
+      .toEqual({ status: 'settled', ...before })
+    expect((await db.query(`SELECT status, undone_at FROM tenant_remittances WHERE id = $1`, [receiptId])).rows[0])
+      .toEqual({ status: 'settled', undone_at: null })
+    expect(await allocations(dee.deposit)).toEqual([{ payment_id: dee.rentId, reversed: false }])
+    expect(await statusOf('payments', feeId)).toBe('voided')
+    const dep = await lineOf(dee.deposit)
+    expect(dep.status).toBe('matched')
+    expect(dep.auto_settle_undo.cameBack).toBeUndefined()
+    const line = await lineOf(returned)
+    expect(line.status).toBe('needs_review')
+    expect(line.auto_settle_undo).toMatchObject({ undone: true, was: { kind: RETURNED_DEPOSIT_KIND } })
+    expect((await notices(dee.tenantUser)).map(n => n.title)).toContain('Your returned check was put back')
+    // A person took it back off: never taken back by itself again; the deposit's own Undo works as before.
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 0, feesBilled: 0 })
+    expect(await undoDepositMatch({ bankTransactionId: dee.deposit, landlordId: ctx.landlordId, undoneBy: ctx.userId }))
+      .toMatchObject({ kind: 'tenant_deposit', reopenedChargeIds: [dee.rentId] })
+  })
+
+  it('Undo is refused when the tenant paid again since, and nothing changes', async () => {
+    const ctx = await build()
+    const dee = await ownDeposit(ctx, 460)
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    await takeBackReturnedChecks(ctx.landlordId)
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now(), manual_method = 'cash' WHERE id = $1`, [dee.rentId])
+    await expect(undoReturnedDeposit({ lineId: returned, landlordId: ctx.landlordId, undoneBy: ctx.userId }))
+      .rejects.toThrow(/paid again.*Nothing was undone — the check stays taken back/)
+    expect((await lineOf(returned)).status).toBe('matched')
+    expect((await lineOf(dee.deposit)).auto_settle_undo.cameBack).toMatchObject({ lineId: returned })
+  })
+
+  it('the bank voiding its own returned line puts the deposit back, set aside, and the owner hears it', async () => {
+    const ctx = await build()
+    const dee = await ownDeposit(ctx, 460)
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    await takeBackReturnedChecks(ctx.landlordId)
+    await db.query(`UPDATE bank_transactions SET bank_status = 'void' WHERE id = $1`, [returned])
+    expect(await voidWhatBounced(returned)).toBe(true)
+    expect(await lineOf(returned)).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void' })
+    expect(await statusOf('payments', dee.rentId)).toBe('settled')
+    expect((await notices(ctx.userId)).map(n => n.title)).toContain('Your bank took back a returned check')
+  })
+
+  /**
+   * A rent bill due 20 days ago with late fees charged since, and the tenant's
+   * check deposited 18 days ago, matched by a person: the bank's date shows the
+   * fees were never owed, so the match takes them off (bankDepositConfirm
+   * reverseLateFees) — an unpaid one at $0.00, one with other credit on it
+   * paid by a late-fee credit, one already paid refunded as credit.
+   */
+  async function depositThatTookLateFeesOff(ctx: Ctx, fees: Array<{ amount: number; status: 'pending' | 'settled'; day: number; otherCredit?: number }>) {
+    const c = await getClient()
+    let s: { tenantId: string; leaseId: string; rentId: string; invoiceId: string; deposit: string; feeIds: string[] }
+    try {
+      const tenantId = await seedTenant(c)
+      const unitId = await seedUnit(c, { propertyId: ctx.propertyId, landlordId: ctx.landlordId, rentAmount: 460 })
+      const leaseId = await seedLease(c, { unitId, landlordId: ctx.landlordId, rentAmount: 460 })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      const due = daysAgo(20)
+      const invoiceId = (await c.query(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount)
+         VALUES ($1,$2,$3,$4,$5,$6::date,460,460) RETURNING id`,
+        [ctx.landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, due])).rows[0].id
+      const rentId = (await c.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,$5,'rent',460,'pending',$6::date,'RENT') RETURNING id`,
+        [invoiceId, unitId, leaseId, tenantId, ctx.landlordId, due])).rows[0].id
+      const feeIds: string[] = []
+      for (const f of fees) {
+        const id = (await c.query(
+          `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
+                                 settled_at)
+           VALUES ($1,$2,$3,$4,$5,'late_fee',$6,$7,$8::date,'LATEFEE',CASE WHEN $7 = 'settled' THEN now() END) RETURNING id`,
+          [invoiceId, unitId, leaseId, tenantId, ctx.landlordId, f.amount.toFixed(2), f.status, daysAgo(f.day)])).rows[0].id
+        if (f.otherCredit) {
+          // The landlord's own credit already on part of it: it cannot go to $0.00, so the match credits the rest.
+          await c.query('BEGIN')
+          const creditId = await createIssuedCredit(c, { landlordId: ctx.landlordId, tenantId, leaseId, amount: f.otherCredit, category: 'goodwill', createdBy: ctx.userId })
+          await applyCredit(c, [{ creditKind: 'issued', creditId, paymentId: id, leaseId, amount: f.otherCredit, billingMonth: `${due.slice(0, 7)}-01` }],
+            { source: 'desk', createdBy: ctx.userId })
+          await c.query('COMMIT')
+        }
+        feeIds.push(id)
+      }
+      s = { tenantId, leaseId, rentId, invoiceId, deposit: '', feeIds }
+    } finally { c.release() }
+    s.deposit = await bankRow(ctx, 460, daysAgo(18), 'MOBILE DEPOSIT')
+    await confirmDepositMatch({ bankTransactionId: s.deposit, chargeIds: [s.rentId], method: 'check', confirmedByUserId: ctx.userId })
+    return s
+  }
+  const feeRow = async (id: string) => (await db.query(
+    `SELECT amount::float AS amount, status, notes, settled_at, issued_credit_amount::float AS issued FROM payments WHERE id = $1`, [id])).rows[0]
+  const creditStatus = async (ids: string[]) => (await db.query(
+    `SELECT status, amount_original::float AS amount, category, reason FROM tenant_credits WHERE id = ANY($1::uuid[]) ORDER BY id`, [ids])).rows
+
+  // 10/14 follow-up (Nic, answer 15: "reopen their invoice with any late fees
+  // that apply"; the lane: "the bills reopened with late fees as if never paid").
+  it('a match that took a late fee off by the bank’s date: taken back by itself, the fee owed again as if never paid; Undo takes it off again', async () => {
+    const ctx = await build()
+    const s = await depositThatTookLateFeesOff(ctx, [{ amount: 15, status: 'pending', day: 5 }])
+    const [feeId] = s.feeIds
+    expect((await lineOf(s.deposit)).auto_settle_undo.lateFeesZeroed).toMatchObject([{ paymentId: feeId, priorAmount: 15 }])
+    const zeroed = await feeRow(feeId)
+    expect(zeroed).toMatchObject({ amount: 0, status: 'settled' })
+
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 1, waiting: 0, feesBilled: 0 })
+    expect(await statusOf('payments', s.rentId)).toBe('pending')
+    expect(await feeRow(feeId)).toMatchObject({ amount: 15, status: 'pending', settled_at: null })
+    expect((await lineOf(returned)).auto_settle_undo.lateFeesOwedAgain)
+      .toEqual([{ paymentId: feeId, was: 'zeroed', notes: zeroed.notes, settledAt: expect.any(String) }])
+    // The engine back-fills the days after, from the bill's due date.
+    expect(lateFeeBackfills).toEqual([s.invoiceId])
+    expect((await notices(ctx.userId))[0].body).toContain('the late fees the deposit’s date had taken off are owed again too')
+
+    // Undo: the fee is off again exactly as the match had it; the deposit's own Undo then works as before.
+    const r = await undoReturnedDeposit({ lineId: returned, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect(r.checkPutBack.paidAgainIds).toEqual([s.rentId])
+    expect(await feeRow(feeId)).toEqual(zeroed)
+    expect(await statusOf('payments', s.rentId)).toBe('settled')
+    expect(await undoDepositMatch({ bankTransactionId: s.deposit, landlordId: ctx.landlordId, undoneBy: ctx.userId }))
+      .toMatchObject({ kind: 'tenant_deposit', reopenedChargeIds: [s.rentId], lateFeesRestored: 1 })
+    expect(await feeRow(feeId)).toMatchObject({ amount: 15, status: 'pending' })
+  })
+
+  it('a match that credited a late fee and refunded one already paid: both taken back with the deposit; Undo gives new credits the deposit’s own Undo then takes back', async () => {
+    const ctx = await build()
+    const s = await depositThatTookLateFeesOff(ctx, [
+      { amount: 15, status: 'pending', day: 5, otherCredit: 5 },
+      { amount: 10, status: 'settled', day: 4 },
+    ])
+    const [creditedFee, paidFee] = s.feeIds
+    const m = (await lineOf(s.deposit)).auto_settle_undo
+    expect(m.lateFeesCredited).toMatchObject([{ paymentId: creditedFee, amount: 10, priorIssued: 5 }])
+    expect(m.lateFeeRefundCreditIds).toHaveLength(1)
+    const credited = await feeRow(creditedFee)
+    expect(credited).toMatchObject({ amount: 15, status: 'settled', issued: 15 })
+    const [lateFeeCredit, refund] = [m.lateFeesCredited[0].creditId as string, m.lateFeeRefundCreditIds[0] as string]
+
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toMatchObject({ takenBack: 1, waiting: 0 })
+    // Owed again as before the match: the late-fee credit withdrawn (the landlord's own $5 stays on it), the refund withdrawn.
+    expect(await feeRow(creditedFee)).toMatchObject({ amount: 15, status: 'pending', issued: 5, settled_at: null })
+    expect(await statusOf('payments', paidFee)).toBe('settled')
+    expect((await creditStatus([lateFeeCredit, refund])).map(c => c.status)).toEqual(['void', 'void'])
+    expect((await lineOf(returned)).auto_settle_undo).toMatchObject({
+      lateFeesOwedAgain: [{ paymentId: creditedFee, was: 'credited', notes: credited.notes }],
+      refundCreditsWithdrawn: [refund],
+    })
+
+    // Undo: credited again from the same day, the refund given again — new credits, named in the deposit's match.
+    await undoReturnedDeposit({ lineId: returned, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect(await feeRow(creditedFee)).toEqual(credited)
+    const after = (await lineOf(s.deposit)).auto_settle_undo
+    expect(after.cameBack).toBeUndefined()
+    const [newCredit, newRefund] = [after.lateFeesCredited[0].creditId as string, after.lateFeeRefundCreditIds[0] as string]
+    expect([newCredit, newRefund]).not.toContain(lateFeeCredit)
+    expect(newRefund).not.toBe(refund)
+    const [was, now] = [await creditStatus([refund]), await creditStatus([newRefund])]
+    expect(now).toEqual([{ ...was[0], status: 'active' }])
+    // The deposit's own Undo takes the new ones back, as it would have the old.
+    expect(await undoDepositMatch({ bankTransactionId: s.deposit, landlordId: ctx.landlordId, undoneBy: ctx.userId }))
+      .toMatchObject({ kind: 'tenant_deposit', creditsWithdrawn: expect.arrayContaining([newCredit, newRefund]) })
+    expect(await feeRow(creditedFee)).toMatchObject({ amount: 15, status: 'pending', issued: 5 })
+  })
+
+  it('a refund credit the match gave that was spent since: waits, and the owner is told to undo that deposit and bill the fee', async () => {
+    const ctx = await build()
+    const s = await depositThatTookLateFeesOff(ctx, [{ amount: 10, status: 'settled', day: 4 }])
+    const refund = (await lineOf(s.deposit)).auto_settle_undo.lateFeeRefundCreditIds[0] as string
+    await db.query(`UPDATE tenant_credits SET status = 'void', voided_at = now() WHERE id = $1`, [refund])
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 1, feesBilled: 0 })
+    expect(await statusOf('payments', s.rentId)).toBe('settled')
+    expect((await lineOf(returned)).status).toBe('needs_review')
+    const body = (await notices(ctx.userId))[0].body
+    expect(body).toContain('refund credit that deposit’s match gave has been used (or withdrawn) since')
+    expect(body).toContain(`press Undo this match on that deposit of ${daysAgo(18)}`)
+    expect(body).toContain('so bill the returned-check fee by hand')
+    expect(body).not.toContain('Please do not bill the fee by hand')
+  })
+
+  it('a deposit the office logged by hand as a bank deposit is never taken back here; the owner is told it stays paid, not to undo or pick it', async () => {
+    const ctx = await build()
+    const office = await check(ctx, 460, daysAgo(9), { method: 'bank_deposit' })
+    // The office's "Bank deposit" receipt, tied to the bank's line (bankDepositConfirm's recorded-deposit kind).
+    const deposit = await bankRow(ctx, 460, daysAgo(8), 'MOBILE DEPOSIT')
+    await db.query(`UPDATE bank_transactions SET status = 'matched', auto_settle_undo = $2::jsonb WHERE id = $1`,
+      [deposit, JSON.stringify({ version: 1, kind: 'recorded_deposit', receiptId: office.id })])
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toEqual({ takenBack: 0, waiting: 1, feesBilled: 0 })
+    const body = (await notices(ctx.userId))[0].body
+    expect(body).toContain('a deposit the office logged by hand as a bank deposit, which GAM does not take back by itself')
+    // Undo on that deposit leaves the hand-logged payment paid (recordedDepositMatch): never offered as the way.
+    expect(body).toContain('GAM cannot take back a payment the office logged by hand yet, so the bills it paid stay paid')
+    expect(body).toContain('Contact GAM support')
+    expect(body).not.toContain('pick the one that came back')
+    const choices = await checkChoices(ctx.landlordId, returned)
+    expect(choices.map(c => [c.remittanceId, c.tenantDeposit, c.takeBackHere])).toEqual([[office.id, true, false]])
+    expect(choices[0].whyNot).toContain('GAM cannot take back a payment the office logged by hand yet')
+    await expect(takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: returned, remittanceId: office.id, by: ctx.userId }))
+      .rejects.toThrow(/logged by hand as a bank deposit, which GAM does not take back here\. Nothing was taken back\. GAM cannot take back a payment the office logged by hand yet/)
+    expect(await statusOf('payments', office.rentId)).toBe('settled')
+  })
+
+  it('two deposits of that amount: the owner picks the tenant’s own one, and it is taken back as GAM would', async () => {
+    const ctx = await build()
+    const a = await ownDeposit(ctx, 460, { first: 'Ana' })
+    const b = await ownDeposit(ctx, 460, { first: 'Bo', day: 7 })
+    const returned = await bankRow(ctx, -460, daysAgo(2), 'RETURNED DEPOSIT ITEM')
+    expect(await takeBackReturnedChecks(ctx.landlordId)).toMatchObject({ takenBack: 0, waiting: 1 })
+    const choices = await checkChoices(ctx.landlordId, returned)
+    expect(choices.map(c => [c.tenantName, c.tenantDeposit, c.takeBackHere]).sort()).toEqual([
+      ['Ana Tenant', true, true], ['Bo Tenant', true, true],
+    ])
+    const bReceipt = (await lineOf(b.deposit)).auto_settle_undo.receiptId as string
+    const r = await takeBackChosenCheck({ landlordId: ctx.landlordId, lineId: returned, remittanceId: bReceipt, by: ctx.userId })
+    expect(r).toMatchObject({ remittanceId: bReceipt, reopenedPaymentIds: [b.rentId] })
+    expect(await statusOf('payments', b.rentId)).toBe('pending')
+    expect(await statusOf('payments', a.rentId)).toBe('settled')
+    expect((await lineOf(returned)).auto_settle_undo).toMatchObject({ kind: RETURNED_DEPOSIT_KIND, pickedBy: ctx.userId, depositLineId: b.deposit })
+    expect((await notices(ctx.userId))[1].body).toContain('took that deposit back off the bills it paid, as you picked')
   })
 })

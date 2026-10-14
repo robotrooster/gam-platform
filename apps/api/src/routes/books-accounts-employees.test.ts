@@ -622,19 +622,65 @@ describe('10/14 (Nic): where an employee\'s pay goes — set once on the employe
     expect(list.body.data.find((e: any) => e.id === ok.body.data.id).pay_property_name).toBeTruthy()
   })
 
-  it('an employee with none gets one once; the same answer again is fine; a different one is refused and nothing changes', async () => {
+  it('an employee with none gets one (a bookkeeper may set it); the same answer again is fine; a bookkeeper\'s different one is refused and nothing changes', async () => {
     const f = await seedPortfolio()
     const id = (await db.query<{ id: string }>(
       `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate) VALUES ($1, 'Old', 'Hand', 'salary', 50000) RETURNING id`,
       [f.landlordAId])).rows[0].id
-    const patch = (b: object) => request(buildApp()).patch(`/api/books/employees/${id}`).set('Authorization', `Bearer ${f.landlordAToken}`).send(b)
+    const patch = (b: object, token = f.bkAToken) => request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${token}`).set('X-Client-Id', f.landlordAId).send(b)
     expect((await patch({ payPlace: 'company' })).status).toBe(200)
+    expect((await db.query(`SELECT pay_place_set_by FROM books_employees WHERE id = $1`, [id])).rows[0].pay_place_set_by).toBe(f.bkAUserId)
     expect((await patch({ payPlace: 'company', payPropertyId: null })).status).toBe(200)
-    const moved = await patch({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordAId) })
-    expect(moved.status).toBe(409)
-    expect(moved.body.error).toBe('This employee\'s pay goes to company level. Once set, where an employee\'s pay goes does not change.')
-    expect((await patch({ payPlace: null, payPropertyId: null })).status).toBe(409)
-    const row = (await db.query(`SELECT pay_place, pay_property_id FROM books_employees WHERE id = $1`, [id])).rows[0]
-    expect(row).toEqual({ pay_place: 'company', pay_property_id: null })
+    const moved = await patch({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordAId), title: 'Lead' })
+    expect(moved.status).toBe(403)
+    expect(moved.body.error).toBe('This employee\'s pay goes to company level. Only the owner can change where an employee\'s pay goes.')
+    // A place is changed, never taken away — by anyone.
+    const cleared = await patch({ payPlace: null, payPropertyId: null }, f.landlordAToken)
+    expect(cleared.status).toBe(409)
+    expect(cleared.body.error).toBe('Choose where this employee\'s pay goes: the one property they work at, or company level if they work at several.')
+    // Nothing of the refused form was saved (one transaction).
+    const row = (await db.query(`SELECT pay_place, pay_property_id, title FROM books_employees WHERE id = $1`, [id])).rows[0]
+    expect(row).toEqual({ pay_place: 'company', pay_property_id: null, title: null })
+  })
+
+  it('10/14 afternoon: the owner changes it — only future paychecks follow: a draft run\'s paycheck moves, an approved run stays as it posted', async () => {
+    const f = await seedPortfolio()
+    const pA = await propertyOf(f.landlordAId)
+    const pA2 = await propertyOf(f.landlordAId)
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_place, pay_property_id, pay_place_set_at)
+       VALUES ($1, 'Moving', 'Worker', 'hourly', 20, 'property', $2, NOW()) RETURNING id`, [f.landlordAId, pA])).rows[0].id
+    const run = async (status: 'draft' | 'approved', payDate: string) => {
+      const r = (await db.query<{ id: string }>(
+        `INSERT INTO payroll_runs (landlord_id, period_start, period_end, pay_date, pay_frequency, status, approved_at)
+         VALUES ($1, $2::date - 13, $2::date, $2::date, 'biweekly', $3::varchar, CASE WHEN $3::varchar = 'approved' THEN NOW() END) RETURNING id`,
+        [f.landlordAId, payDate, status])).rows[0].id
+      const line = (await db.query<{ id: string }>(
+        `INSERT INTO payroll_run_lines (run_id, employee_id, pay_type, gross_pay, net_pay, pay_place, pay_property_id)
+         VALUES ($1, $2, 'hourly', 1600, 1600, 'property', $3) RETURNING id`, [r, id, pA])).rows[0].id
+      return line
+    }
+    const posted = await run('approved', '2026-09-30')
+    const next = await run('draft', '2026-10-14')
+    const placeOf = async (lineId: string) =>
+      (await db.query(`SELECT pay_place, pay_property_id FROM payroll_run_lines WHERE id = $1`, [lineId])).rows[0]
+
+    const res = await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ payPlace: 'property', payPropertyId: pA2 })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ pay_place: 'property', pay_property_id: pA2, pay_place_set_by: f.landlordAUserId })
+    expect(await placeOf(next)).toEqual({ pay_place: 'property', pay_property_id: pA2 })
+    expect(await placeOf(posted)).toEqual({ pay_place: 'property', pay_property_id: pA })
+
+    // The person works at several properties now: company level.
+    expect((await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ payPlace: 'company' })).status).toBe(200)
+    expect(await placeOf(next)).toEqual({ pay_place: 'company', pay_property_id: null })
+    expect(await placeOf(posted)).toEqual({ pay_place: 'property', pay_property_id: pA })
+    // Another company's property is still refused, for the owner too.
+    expect((await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordBId) })).status).toBe(404)
   })
 })

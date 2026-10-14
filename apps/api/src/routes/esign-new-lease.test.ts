@@ -1220,6 +1220,24 @@ describe('the never-signed draft and the reminders', () => {
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'active', end_date: null })
   })
 
+  // 10/14 afternoon (Nic): an automatic delete never cancels an invite — only
+  // the landlord's own Delete does. The invite lets go of the lapsed draft and
+  // stays open, to be drafted again.
+  it('a lapsed draft deleted on its own leaves the invite waiting on it open', async () => {
+    const park = await seedPark()
+    const h = await addHousehold(park)
+    const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
+    const intent = (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, parser_status, draft_document_id)
+       VALUES ($1,$2,$3,$4,'not_uploaded',$5) RETURNING id`,
+      [h.landlordId, h.tenantId, h.unitId, h.propertyId, lapsed.docId])).rows[0].id
+    await processNewLeaseSignings({ hour: 12 })
+    expect(await docStatus(lapsed.docId)).toBe(null)
+    expect((await db.query<any>(
+      `SELECT cancelled_at, resolved_at, draft_document_id FROM pending_tenant_intents WHERE id = $1`, [intent])).rows[0])
+      .toEqual({ cancelled_at: null, resolved_at: null, draft_document_id: null })
+  })
+
   // 10/14 (Nic, #4): only what no money touched is deleted. A lapsed draft the
   // erase's test keeps (a rent change from it already reached the bill) is
   // canceled exactly as before, and the landlord hears the old words.

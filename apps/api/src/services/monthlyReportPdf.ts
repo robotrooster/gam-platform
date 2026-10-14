@@ -10,15 +10,16 @@
  * prints the way the screen reads. One cover with every property added up
  * (when there is more than one), then one section per property in Nic's four
  * groups: tenants & leases, payments (the colored stamps), money (Received /
- * Charged / Owed side by side — 10/12, Nic: Received leads — how they tie,
- * expenses, net), operations.
+ * Charged / Owed side by side — 10/12, Nic: Received leads — each group's
+ * itemized lines indented beneath it (10/14, Nic), how they tie, expenses,
+ * net), operations.
  *
  * Buffer out, nothing written to disk: the email attaches it, the report page
  * streams it.
  */
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage, type RGB } from 'pdf-lib'
 import { MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, PAYMENT_STAMP_LETTER, type PaymentStamp } from '@gam/shared'
-import type { MonthlyPropertyReport, ReportProperty, ReportPayments } from './monthlyPropertyReport'
+import type { MonthlyPropertyReport, ReportProperty, ReportPayments, ReportIncomeGroup } from './monthlyPropertyReport'
 import type { MoneyView } from './incomeBasis'
 
 const PAGE_W = 792    // 11" landscape
@@ -35,6 +36,8 @@ const ZEBRA = rgb(0.965, 0.965, 0.97)
 const HEAD_BG = rgb(0.93, 0.93, 0.94)
 const GOLD = rgb(0.72, 0.56, 0.13)
 const BAND = rgb(0.05, 0.07, 0.10)
+/** 10/14: how far an itemized line sits in from its group (a subtype twice as far). */
+const INDENT_STEP = 12
 
 /** 10/12 (Nic): the stamp colors — green paid, yellow partial, orange paid late, red outstanding, gray due. */
 export const STAMP_PDF_COLOR: Record<PaymentStamp, RGB> = {
@@ -154,19 +157,25 @@ class Layout {
     }
   }
 
-  table(cols: Col[], rows: string[][], opts: { totalRow?: boolean; bolds?: number[] } = {}): void {
+  /**
+   * `indents`: a row's first cell set in by that many steps (10/14, Nic: an
+   * itemized line under its group, a space subtype under its line — the
+   * second step in gray).
+   */
+  table(cols: Col[], rows: string[][], opts: { totalRow?: boolean; bolds?: number[]; indents?: number[] } = {}): void {
     const rowH = 14
-    const drawRow = (cells: string[], y: number, font: PDFFont, bg?: RGB) => {
+    const drawRow = (cells: string[], y: number, font: PDFFont, bg?: RGB, indent = 0) => {
       if (bg) this.page.drawRectangle({ x: MX, y: y - 4, width: W, height: rowH, color: bg })
       let x = MX
       cells.forEach((c, j) => {
         const col = cols[j]
         const size = 8.5
+        const inset = j === 0 ? indent * INDENT_STEP : 0
         let s = pdfText(c)
-        while (s.length > 1 && font.widthOfTextAtSize(s, size) > col.width - 8) s = s.slice(0, -2) + '.'
+        while (s.length > 1 && font.widthOfTextAtSize(s, size) > col.width - 8 - inset) s = s.slice(0, -2) + '.'
         const tw = font.widthOfTextAtSize(s, size)
-        const tx = col.align === 'right' ? x + col.width - 4 - tw : col.align === 'center' ? x + (col.width - tw) / 2 : x + 4
-        this.text(s, tx, y, size, font, INK)
+        const tx = col.align === 'right' ? x + col.width - 4 - tw : col.align === 'center' ? x + (col.width - tw) / 2 : x + 4 + inset
+        this.text(s, tx, y, size, font, j === 0 && indent >= 2 ? MUTED : INK)
         x += col.width
       })
     }
@@ -180,7 +189,8 @@ class Layout {
       if (this.y - rowH < BOTTOM) { this.newPage(); head() }
       const isTotal = opts.totalRow && i === rows.length - 1
       if (isTotal) this.page.drawLine({ start: { x: MX, y: this.y + rowH - 4 }, end: { x: PAGE_W - MX, y: this.y + rowH - 4 }, thickness: 0.8, color: INK })
-      drawRow(r, this.y, isTotal || opts.bolds?.includes(i) ? this.bold : this.font, !isTotal && i % 2 === 1 ? ZEBRA : undefined)
+      drawRow(r, this.y, isTotal || opts.bolds?.includes(i) ? this.bold : this.font, !isTotal && i % 2 === 1 ? ZEBRA : undefined,
+        opts.indents?.[i] ?? 0)
       this.y -= rowH
     })
     this.y -= 8
@@ -217,20 +227,41 @@ export function notInTotalsWords(x: NonNullable<MonthlyPropertyReport['notInTota
     + `expenses ${money(x.expenses)}. With these, the figures add up to the month's profit and loss.`
 }
 
-function moneyTable(L: Layout, view: MoneyView): void {
+/**
+ * Income by Summary group, Received / Charged / Owed. 10/14 (Nic): "Monthly
+ * property report PDF/email: itemized lines under each group" — each group's
+ * itemized lines (services/monthlyPropertyReport incomeGroupsOf: rent and
+ * stays by space, home sales; they add up to the group) indented beneath it,
+ * and a space's subtypes (Single wide, Double wide) beneath their line.
+ */
+function moneyTable(L: Layout, view: MoneyView, itemized: readonly ReportIncomeGroup[] = []): void {
   const cols: Col[] = [
     { label: 'Category', width: 300 },
     { label: MONEY_COLUMN_LABEL.received, width: 140, align: 'right' },
     { label: MONEY_COLUMN_LABEL.charged, width: 140, align: 'right' },
     { label: MONEY_COLUMN_LABEL.owed, width: 140, align: 'right' },
   ]
-  const rows = [
-    ...view.categories.map(c => [c.label, money(c.received), money(c.charged), money(c.owed)]),
-    ...view.uncategorized.map(c => [c.label, money(c.received), money(c.charged), money(c.owed)]),
-  ]
-  if (!rows.length) rows.push(['Nothing received or charged', money(0), money(0), money(0)])
-  rows.push(['Total', money(view.received), money(view.charged), money(view.owed)])
-  L.table(cols, rows, { totalRow: true })
+  const rows: string[][] = []
+  const indents: number[] = []
+  const bolds: number[] = []
+  const put = (label: string, x: { received: number; charged: number; owed: number }, indent: number) => {
+    indents[rows.length] = indent
+    rows.push([label, money(x.received), money(x.charged), money(x.owed)])
+  }
+  const group = (key: string, label: string, x: { received: number; charged: number; owed: number }) => {
+    const lines = itemized.find(g => g.key === key)?.lines ?? []
+    if (lines.length) bolds.push(rows.length)
+    put(label, x, 0)
+    for (const l of lines) {
+      put(l.label, l, 1)
+      for (const t of l.subtypes) put(t.name, t, 2)
+    }
+  }
+  for (const c of view.categories) group(`c:${c.category}`, c.label, c)
+  for (const u of view.uncategorized) group(`l:${u.line}`, u.label, u)
+  if (!rows.length) put('Nothing received or charged', { received: 0, charged: 0, owed: 0 }, 0)
+  put('Total', view, 0)
+  L.table(cols, rows, { totalRow: true, bolds, indents })
   for (const t of view.tieText) L.paragraph(t, 8, MUTED)
   L.y -= 4
 }
@@ -276,7 +307,7 @@ function propertySection(L: Layout, r: MonthlyPropertyReport, p: ReportProperty)
   }
 
   L.heading('Money - received, charged and owed')
-  moneyTable(L, p.money.view)
+  moneyTable(L, p.money.view, p.money.itemized ?? [])
   L.table([
     { label: 'Expenses', width: 580 },
     { label: 'Amount', width: 140, align: 'right' },

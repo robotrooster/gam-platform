@@ -154,7 +154,7 @@ export function LeasesPage() {
       const r: any = await apiPost(`/leases/${l.id}/discard`, {})
       const done = r?.data ?? r
       // The API camelizes its replies (kept_words arrives as keptWords).
-      const kept = done?.keptWords ?? done?.kept_words
+      const kept = done?.keptWords
       toast(done?.status === 'deleted' ? 'Draft deleted.' : kept ? `Draft discarded. ${kept}` : 'Draft discarded.')
       refreshAfterLeaseClose(leasesQc)
     } catch (e: any) {

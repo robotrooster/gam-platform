@@ -24,8 +24,13 @@ describe('action parity — the gap stays closed', () => {
   it('the surface is roughly the size we think it is', () => {
     // A large move either way means routes were added in bulk, or the silo list
     // rotted and is now hiding a whole product's endpoints.
+    // 10/14: a growth guard, not a correctness check. The 10/14 build's routes
+    // (the landlord's birthday fix, the returned check, the payout match…)
+    // reached the old ceiling: 450 counted. Raised to that real count plus
+    // room for one build's worth of routes — raise it again, on purpose, when
+    // a build passes it, never to hide a bulk addition.
     expect(gap.all.length).toBeGreaterThan(250)
-    expect(gap.all.length).toBeLessThan(450)
+    expect(gap.all.length).toBeLessThan(460)
   })
 
   it('every endpoint is either reachable or deliberately not — nothing is merely forgotten', () => {

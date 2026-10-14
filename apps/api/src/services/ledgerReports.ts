@@ -77,7 +77,7 @@ import { cutoffsParam, withinCutoffsSql, pastCutoff, type PropertyCutoff } from 
 import type {
   IncomeEvent, IncomeQuery, ReportLine, AsideLine, LedgerProofTerm, MoneyView, IncomeDetailPiece,
 } from './incomeBasis'
-import { SPACE_COLS_SQL, spaceOf, stayParts } from './ledgerProjectors/incomeLines'
+import { STAY_FACTS_SQL, stayOf, stayParts } from './ledgerProjectors/incomeLines'
 import { moneyViewFrom } from './incomeBasis'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -328,7 +328,8 @@ async function chargedEvents(s: LedgerScope, start: string, end: string): Promis
 //   - money received or still owed on a bill is itemized as the bill was
 //     charged (its charge posting's income lines, in proportion);
 //   - stay money received before the stay is earned, as the stay will earn it
-//     (its booking: under 30 nights short-term, else long-term, I2).
+//     (its booking: a nightly or weekly stay under 30 nights short-term, else
+//     long-term — I2, and 10/14 (Nic) a stay sold by the month at any length).
 // The space's subtype rides along (a reporting dimension, never an account).
 // Facts keep their grain: a fact's pieces add to its amount, and what they do
 // not cover stays on its Summary group.
@@ -380,13 +381,14 @@ async function bookingShares(bookingIds: readonly string[]): Promise<Map<string,
   const out = new Map<string, Share[]>()
   const ids = [...new Set(bookingIds)].filter(id => /^[0-9a-f-]{36}$/i.test(id))
   if (!ids.length) return out
+  // 10/14 (Nic): the projectors' own read of a stay (incomeLines
+  // STAY_FACTS_SQL) — a stay sold by the month is long-term at any length.
   const rows = await query<any>(
-    `SELECT b.id::text AS id, ${SPACE_COLS_SQL('su', 'sl', 'b.created_at')}, b.stay_terms,
-            (GREATEST(b.check_out, COALESCE(b.booked_check_out, b.check_out)) - b.check_in) AS nights
+    `SELECT b.id::text AS id, ${STAY_FACTS_SQL('b')}
        FROM unit_bookings b LEFT JOIN units su ON su.id = b.unit_id LEFT JOIN leases sl ON FALSE
       WHERE b.id = ANY($1::uuid[])`, [ids])
   for (const r of rows) {
-    const parts = stayParts({ space: spaceOf(r), nightsSold: Number(r.nights) || 0, stayTerms: r.stay_terms ?? null }, 10_000)
+    const parts = stayParts(stayOf(r), 10_000)
     out.set(r.id, parts.map(p => {
       const d = p.sub ? ledgerIncomeDetailOf(p.sub.kind, p.sub.value) : null
       return { key: d?.key ?? '', label: d?.label ?? '', order: d?.order ?? 0, weight: Math.abs(p.cents) }

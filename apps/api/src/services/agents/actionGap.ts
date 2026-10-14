@@ -495,6 +495,10 @@ const DELIBERATE = new Map(Object.entries({
     'finishes a bank reconciliation at a $0.00 difference and freezes every line cleared on it. Pressed on the Bank Reconciliation page with the statement, the cleared balance and the difference on screen; a month cannot close until its linked banks are reconciled.',
   'booksClose POST /:id/undo':
     'sets aside a statement being reconciled, or undoes the latest reconciled one (never inside a closed month), saying why; its lines are let go and the record is kept. The press on the Bank Reconciliation page with that statement on screen.',
+  // 10/14 (Nic): "Only the landlord can fix a birthday" (routes/tenants.ts,
+  // services/tenantBirthday) — the tenant's profile shows it read-only.
+  'tenants PATCH /:id/birthday':
+    'the owner corrects a resident\'s birthday (copied off their signed lease; GAM\'s happy-birthday email reads it). Typed on the resident\'s page with the date on screen, by the owner only; a misheard day or year is a wrong age on record and a birthday email on the wrong day.',
 }))
 
 /** router variable -> route-file area. */

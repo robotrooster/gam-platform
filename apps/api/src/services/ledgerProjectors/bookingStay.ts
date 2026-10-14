@@ -179,10 +179,11 @@ async function stayMoney(client: PoolClient, b: BookingFacts): Promise<{ earnedC
 }
 
 /**
- * 10/14 (Nic I1, I2): the stay earns on its line — a stay under 30 nights on
- * its space type's short-term stay line (the taxed ones), 30+ nights or one a
- * lease bills on its space's rent line (RV long-term rent, mobile home lot
- * rent, …). The role stays stay_income.
+ * 10/14 (Nic I1, I2): the stay earns on its line — a nightly or weekly stay
+ * under 30 nights on its space type's short-term stay line (the taxed ones),
+ * 30+ nights, one sold by the month (10/14, Nic: "month stays are long-term")
+ * or one a lease bills on its space's rent line (RV long-term rent, mobile
+ * home lot rent, …). The role stays stay_income.
  */
 function earnPosting(b: BookingFacts, stay: StayFacts | null, day: string, cents: number, memo: string): DesiredPosting | null {
   if (!cents) return null
@@ -202,7 +203,8 @@ function earnPosting(b: BookingFacts, stay: StayFacts | null, day: string, cents
 export const bookingStayProjector: LedgerProjector = {
   sourceType: 'booking',
   // 2 — 10/14 (Nic I1, I2): earned on the stay's own line (incomeLines).
-  ruleVersion: 2,
+  // 3 — 10/14 (Nic): a stay sold by the month is long-term at any length (incomeLines stayIsLongTerm).
+  ruleVersion: 3,
 
   async project(client: PoolClient, sourceId: string): Promise<DesiredPosting[]> {
     const id = parseBookingSourceId(sourceId)

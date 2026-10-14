@@ -20,8 +20,9 @@ import { registerTenantLedgerProjectors } from './ledgerProjectors/tenantMoney'
 import { registerTenantLedgerChecks, unregisterTenantLedgerChecks, TENANT_LEDGER_CHECKS } from './ledgerTenantChecks'
 import { createSlip } from './depositSlips'
 import { reconcileDeposits, normalizeMerchant } from './bankFeed'
-import { takeBackReturnedChecks } from './returnedCheck'
-import { undoDepositMatch } from './bankDepositConfirm'
+import { takeBackReturnedChecks, undoReturnedDeposit } from './returnedCheck'
+import { undoDepositMatch, confirmDepositMatch } from './bankDepositConfirm'
+import { createIssuedCredit, applyCredit } from './creditUse'
 
 // No email leaves a test.
 vi.mock('./email', async (orig) => ({ ...(await orig<any>()), sendNotificationEmail: async () => 'msg_test' }))
@@ -84,6 +85,87 @@ describe('the books after a returned check is taken back, and after its Undo', (
     expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
     expect(await bal(co.landlordId, 'undeposited_funds')).toBe(0)
     expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(0)
+  })
+
+  // 10/14 afternoon (Nic): "a tenant's own single-check bank deposit that comes
+  // back" — the deposit came in and went out again, so neither bank line is in
+  // the books once its receipt is taken back; the rent and the fee are owed.
+  it('a tenant’s own deposit that comes back: the books tie out, counted once — before, after the take-back, and after the Undo', async () => {
+    const co = await tenantCo({ booksStart: '2026-01-01' })
+    const conn = await bankConnection(co)
+    const rent = await bill(co, { amount: 460, due: daysAgo(12) })
+    const deposit = await bankRow(co.landlordId, conn, 460, daysAgo(10), 'MOBILE DEPOSIT')
+    await confirmDepositMatch({ bankTransactionId: deposit, chargeIds: [rent], method: 'check', confirmedByUserId: co.ownerUserId })
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    expect(await bal(co.landlordId, 'bank_checking')).toBe(46000)
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(0)
+
+    const returned = await bankRow(co.landlordId, conn, -460, daysAgo(2), 'DEPOSITED ITEM RETURNED')
+    await bankRow(co.landlordId, conn, -25, daysAgo(2), 'DEPOSITED ITEM RETURNED FEE')
+    expect(await takeBackReturnedChecks(co.landlordId)).toMatchObject({ takenBack: 1 })
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    // In and out again: nothing in the bank from either line, nothing in the drawer, the rent and the bank's fee owed.
+    expect(await bal(co.landlordId, 'bank_checking')).toBe(0)
+    expect(await bal(co.landlordId, 'undeposited_funds')).toBe(0)
+    expect(await bal(co.landlordId, 'deposits_in_transit')).toBe(0)
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(46000 + 2500)
+
+    await undoReturnedDeposit({ lineId: returned, landlordId: co.landlordId, undoneBy: co.ownerUserId })
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    expect(await bal(co.landlordId, 'bank_checking')).toBe(46000)
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(0)
+  })
+
+  // 10/14 follow-up (Nic, answer 15: "reopen their invoice with any late fees
+  // that apply"): the late fees the deposit's date had taken off — one at
+  // $0.00, one paid by a late-fee credit (the landlord's own $5 already on it),
+  // one already paid refunded as credit — come back with it, and go off again
+  // on Undo. Counted once at every step.
+  it('a tenant’s own deposit whose match took late fees off: the books tie out — before, after the take-back, and after the Undo', async () => {
+    const co = await tenantCo({ booksStart: '2026-01-01' })
+    const conn = await bankConnection(co)
+    const rent = await bill(co, { amount: 460, due: daysAgo(20) })
+    const zeroFee = await bill(co, { type: 'late_fee', amount: 15, due: daysAgo(6) })
+    const creditFee = await bill(co, { type: 'late_fee', amount: 15, due: daysAgo(5) })
+    const paidFee = await bill(co, { type: 'late_fee', amount: 10, due: daysAgo(4) })
+    await receipt(co, { method: 'cash', settledAt: `${daysAgo(4)}T18:00:00Z`, apps: [{ paymentId: paidFee, amount: 10 }] })
+    await inTx(async c => {
+      const inv = (await c.query(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount)
+         VALUES ($1,$2,$3,$4,$5,$6::date,460,460) RETURNING id`,
+        [co.landlordId, co.tenantId, co.leaseId, co.unitId, `INV-${randomUUID().slice(0, 8)}`, daysAgo(20)])).rows[0].id
+      await c.query(`UPDATE payments SET invoice_id = $2 WHERE id = ANY($1::uuid[])`, [[rent, zeroFee, creditFee, paidFee], inv])
+      const goodwill = await createIssuedCredit(c, {
+        landlordId: co.landlordId, tenantId: co.tenantId, leaseId: co.leaseId, amount: 5, category: 'goodwill', createdBy: co.ownerUserId,
+      })
+      await applyCredit(c, [{ creditKind: 'issued', creditId: goodwill, paymentId: creditFee, leaseId: co.leaseId, amount: 5,
+        billingMonth: `${daysAgo(20).slice(0, 7)}-01` }], { source: 'desk', createdBy: co.ownerUserId })
+    })
+    const deposit = await bankRow(co.landlordId, conn, 460, daysAgo(18), 'MOBILE DEPOSIT')
+    await confirmDepositMatch({ bankTransactionId: deposit, chargeIds: [rent], method: 'check', confirmedByUserId: co.ownerUserId })
+    const m = (await db.query(`SELECT auto_settle_undo AS u FROM bank_transactions WHERE id = $1`, [deposit])).rows[0].u
+    expect([m.lateFeesZeroed.length, m.lateFeesCredited.length, m.lateFeeRefundCreditIds.length]).toEqual([1, 1, 1])
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(0)
+
+    const returned = await bankRow(co.landlordId, conn, -460, daysAgo(2), 'DEPOSITED ITEM RETURNED')
+    await bankRow(co.landlordId, conn, -25, daysAgo(2), 'DEPOSITED ITEM RETURNED FEE')
+    expect(await takeBackReturnedChecks(co.landlordId)).toMatchObject({ takenBack: 1 })
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    // Owed once each: the rent, the $15 fee back from $0.00, the $10 the late-fee credit had paid, the bank's $25.
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(46000 + 1500 + 1000 + 2500)
+    expect(await bal(co.landlordId, 'bank_checking')).toBe(0)
+
+    await undoReturnedDeposit({ lineId: returned, landlordId: co.landlordId, undoneBy: co.ownerUserId })
+    await drain()
+    expect(problems((await checkOwner({ landlordId: co.landlordId }, { repair: false })).findings)).toEqual([])
+    expect(await bal(co.landlordId, 'ar_tenants', { tenantId: co.tenantId })).toBe(0)
+    expect(await bal(co.landlordId, 'bank_checking')).toBe(46000)
   })
 })
 

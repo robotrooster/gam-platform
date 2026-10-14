@@ -52,7 +52,8 @@ import {
 import {
   upsertTransactions, autoMatchLandlord, categorizeTransaction, ignoreTransaction,
   suggestForMerchant, normalizeMerchant, listTransactions, setBooksStartDate,
-  undoAutoFile, disconnectConnection, reconcileDeposits, namesAPayer, memoNamesGam, matchPayoutByHand,
+  undoAutoFile, disconnectConnection, reconcileDeposits, namesAPayer, memoNamesGam, matchPayoutByHand, stripeTraceCode,
+  undoTracedPayout, TRACED_PAYOUT_KIND,
 } from './bankFeed'
 import { landlordExpensesTotal, unitAllocatedExpenses, createLandlordExpense } from './landlordExpenses'
 import { memoSaysTransfer, isTenantCheckMemo, NOT_CUSTOMER_MONEY_WORDS, BANK_BOILERPLATE_WORDS } from './bankDepositMatch'
@@ -101,6 +102,24 @@ async function seedDisbursement(landlordId: string, amount: number, settledAt: s
      VALUES ($1,$2,'settled',$3::timestamptz,$4::date) RETURNING id`,
     [landlordId, amount.toFixed(2), settledAt, settledAt])
   return r.rows[0].id
+}
+
+/**
+ * 10/14 afternoon: a GAM payout as production records it — the disbursements
+ * row the weekly run wrote (paid the evening before it arrives) and Stripe's
+ * own record of it (connect_payouts, from its notice), with the day Stripe
+ * said it would arrive.
+ */
+async function seedStripePayout(landlordId: string, amount: number, arrival: string, o: { bankLast4?: string | null } = {}) {
+  const po = `po_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+  const id = (await db.query(
+    `INSERT INTO disbursements (landlord_id, amount, status, settled_at, stripe_payout_id, trigger_type, bank_last4)
+     VALUES ($1,$2,'settled',($3::date - 1) + time '18:58',$4,'auto_friday',$5) RETURNING id`,
+    [landlordId, amount.toFixed(2), arrival, po, o.bankLast4 ?? null])).rows[0].id as string
+  await db.query(
+    `INSERT INTO connect_payouts (stripe_payout_id, stripe_account_id, amount, status, arrival_date)
+     VALUES ($1,'acct_test',$2,'paid',$3::date)`, [po, amount.toFixed(2), arrival])
+  return id
 }
 
 describe('normalizeMerchant', () => {
@@ -155,7 +174,10 @@ describe('bank feed sync', () => {
   // it can file it but no guessing." Production's memos: GAM's instant payouts
   // name GAM; a Stripe ACH payout names the landlord ("ST-… TRANSFER OAK PARK
   // MOTEL A"), just as DoorLoop's Stripe payouts do ("ST-… DOORLOOP").
-  it('a payout files itself only when the memo names GAM; one that does not waits with the payout offered to a person', async () => {
+  // 10/14 afternoon (Nic): "an exact payout (amount + Stripe's ST- trace code +
+  // expected day) files itself" — below; a payout GAM has no arrival day for
+  // still waits with the payout offered to a person.
+  it('a Stripe-coded deposit of a payout GAM has no arrival day for waits, with the payout offered to a person', async () => {
     expect(memoNamesGam('Instant Pmt from STP FBO Gold Asset Management -Gold Asset Management LLC on 10/08 Ref#202')).toBe(true)
     expect(memoNamesGam('Instant Pmt from STP FBO Gold Asset M MOUNTAIN')).toBe(true)
     expect(memoNamesGam('ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH')).toBe(false)
@@ -163,9 +185,10 @@ describe('bank feed sync', () => {
     expect(memoNamesGam('BRANCH DEPOSIT')).toBe(false)
 
     const f = await seed()
+    // No Stripe record of the payout (its notice never came): no arrival day.
     const payout = await seedDisbursement(f.landlordId, 400.26, '2026-10-05T18:00:00Z')
     await upsertTransactions(f.connectionId, f.landlordId, [
-      // The same amount as the payout, a day later — but nothing in the memo says it is GAM's.
+      // The same amount as the payout, a day later — but nothing says when the payout was due to arrive.
       { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: 'ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
     ])
     const ach = await row('ach')
@@ -186,6 +209,191 @@ describe('bank feed sync', () => {
     // Never matched by itself again, and the payout is offered again.
     expect(await autoMatchLandlord(f.landlordId)).toBe(0)
     expect((await listTransactions(f.landlordId, { lineId: ach.id }))[0].payout_suggestion).toMatchObject({ id: payout })
+  })
+
+  // 10/14 afternoon (Nic): "Stripe payouts: an exact payout (amount + Stripe's
+  // ST- trace code + expected day) files itself." Oak Park's 10/6 $400.26.
+  describe('a Stripe ACH payout files itself by its trace code, amount and arrival day — one to one, or a person', () => {
+    const OAK = 'ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH'
+    const DOORLOOP = 'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH'
+
+    it('reads Stripe’s trace code out of a memo', () => {
+      expect(stripeTraceCode(OAK)).toBe('ST-G5D4S5T9R5P7')
+      expect(stripeTraceCode('ST-J4S5D2P2N4R8 GAM FEES ACH WEB')).toBe('ST-J4S5D2P2N4R8')
+      expect(stripeTraceCode('Instant Pmt from STP FBO Gold Asset Management')).toBeNull()
+      expect(stripeTraceCode('FIRST-NATIONAL DEPOSIT')).toBeNull()
+      expect(stripeTraceCode(null)).toBeNull()
+    })
+
+    it('the deposit on the day the payout was due to arrive files itself as that payout — and a person can undo it', async () => {
+      const f = await seed()
+      const payout = await seedStripePayout(f.landlordId, 400.26, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+      ])
+      const ach = await row('ach')
+      expect(ach.status).toBe('matched')
+      expect((await db.query(`SELECT matched_disbursement_id, matched_by, auto_settle_undo FROM bank_transactions WHERE id = $1`, [ach.id])).rows[0])
+        .toEqual({
+          matched_disbursement_id: payout, matched_by: null,
+          auto_settle_undo: { version: 1, kind: TRACED_PAYOUT_KIND, disbursementId: payout, trace: 'ST-G5D4S5T9R5P7', arrival: '2026-10-06' },
+        })
+      // 10/14 follow-up (Nic 10/12: "every bank filing (hand-filed too) can be
+      // undone"): it matched on GAM's record of the payout, not the code itself.
+      expect((await listTransactions(f.landlordId, { lineId: ach.id }))[0]).toMatchObject({
+        match_kind: 'gam_payout', matched_disbursement_id: payout, payout_suggestion: null, can_undo: true,
+      })
+      expect(await undoTracedPayout({ landlordId: f.landlordId, lineId: ach.id, undoneBy: f.llUser })).toMatchObject({ kind: 'gam_payout' })
+      const after = (await db.query(`SELECT status, matched_disbursement_id, matched_by, auto_settle_undo FROM bank_transactions WHERE id = $1`, [ach.id])).rows[0]
+      expect(after).toMatchObject({
+        status: 'needs_review', matched_disbursement_id: null, matched_by: null,
+        auto_settle_undo: { undone: true, undoneBy: f.llUser, was: { kind: 'gam_payout', disbursementId: payout } },
+      })
+      // The person's from now on: never matched by itself again; the payout is offered beside it.
+      expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+      expect((await row('ach')).status).toBe('needs_review')
+      expect((await listTransactions(f.landlordId, { lineId: ach.id }))[0].payout_suggestion).toMatchObject({ id: payout })
+      await expect(undoTracedPayout({ landlordId: f.landlordId, lineId: ach.id, undoneBy: f.llUser })).rejects.toThrow(/nothing to undo/)
+    })
+
+    // 10/14 follow-up (Nic: "expected day"): a day late, or early, is a guess.
+    it('only on the arrival day: a day late, or before it, waits for a person with the payout offered', async () => {
+      const f = await seed()
+      const onTime = await seedStripePayout(f.landlordId, 519.68, '2026-10-13')
+      const late = await seedStripePayout(f.landlordId, 612.4, '2026-10-13')
+      const early = await seedStripePayout(f.landlordId, 852.61, '2026-10-13')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'on', postedDate: '2026-10-13', amount: 519.68, description: 'ST-A1B2C3D4E5F6 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
+        { externalId: 'late', postedDate: '2026-10-14', amount: 612.4, description: 'ST-M1N2B3V4C5X6 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
+        { externalId: 'early', postedDate: '2026-10-12', amount: 852.61, description: 'ST-Z9Y8X7W6V5U4 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
+      ])
+      expect((await db.query(`SELECT matched_disbursement_id FROM bank_transactions WHERE external_id = 'on'`)).rows[0].matched_disbursement_id).toBe(onTime)
+      expect((await row('late')).status).toBe('needs_review')
+      expect((await row('early')).status).toBe('needs_review')
+      // Each is still offered beside its deposit for a person to match.
+      expect((await listTransactions(f.landlordId, { lineId: (await row('late')).id }))[0].payout_suggestion).toMatchObject({ id: late })
+      expect((await listTransactions(f.landlordId, { lineId: (await row('early')).id }))[0].payout_suggestion).toMatchObject({ id: early })
+    })
+
+    // 10/14 follow-up: one to one after the fact — DoorLoop's line, or GAM's own, a sync behind.
+    it('a deposit that could be the payout syncing later takes the match back off: both wait for a person', async () => {
+      const f = await seed()
+      const payout = await seedStripePayout(f.landlordId, 400.26, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'dl', postedDate: '2026-10-06', amount: 400.26, description: DOORLOOP },
+      ])
+      expect((await row('dl')).status).toBe('matched')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+      ])
+      expect((await db.query(`SELECT status, matched_disbursement_id, auto_settle_undo FROM bank_transactions WHERE external_id = 'dl'`)).rows[0])
+        .toEqual({ status: 'needs_review', matched_disbursement_id: null, auto_settle_undo: null })
+      expect((await row('ach')).status).toBe('needs_review')
+      expect((await listTransactions(f.landlordId, { lineId: (await row('ach')).id }))[0].payout_suggestion).toMatchObject({ id: payout })
+      // The person says which; the other stays theirs to file.
+      await matchPayoutByHand(f.landlordId, (await row('ach')).id, payout, f.llUser)
+      expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+      expect((await row('dl')).status).toBe('needs_review')
+    })
+
+    it('a person’s own match is never taken back off by a later deposit', async () => {
+      const f = await seed()
+      const payout = await seedStripePayout(f.landlordId, 400.26, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-07', amount: 400.26, description: OAK },
+      ])
+      await matchPayoutByHand(f.landlordId, (await row('ach')).id, payout, f.llUser)
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'dl', postedDate: '2026-10-06', amount: 400.26, description: DOORLOOP },
+      ])
+      expect((await row('ach')).status).toBe('matched')
+      expect((await row('dl')).status).toBe('needs_review')
+    })
+
+    it('two deposits that could be the payout (DoorLoop pays through Stripe too): neither files itself', async () => {
+      const f = await seed()
+      const payout = await seedStripePayout(f.landlordId, 400.26, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+        { externalId: 'dl', postedDate: '2026-10-07', amount: 400.26, description: DOORLOOP },
+      ])
+      expect((await row('ach')).status).toBe('needs_review')
+      expect((await row('dl')).status).toBe('needs_review')
+      expect((await listTransactions(f.landlordId, { lineId: (await row('ach')).id }))[0].payout_suggestion).toMatchObject({ id: payout })
+      // The person says which: matched by hand, and the other stays theirs to file.
+      await matchPayoutByHand(f.landlordId, (await row('ach')).id, payout, f.llUser)
+      expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+      expect((await row('dl')).status).toBe('needs_review')
+    })
+
+    it('a DoorLoop deposit the owner already filed still makes it two: GAM never guesses past it', async () => {
+      const f = await seed()
+      await seedStripePayout(f.landlordId, 400.26, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'dl', postedDate: '2026-10-05', amount: 400.26, description: DOORLOOP },
+      ])
+      await db.query(`UPDATE bank_transactions SET status = 'ignored', ignored_reason = 'landlord' WHERE external_id = 'dl'`)
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+      ])
+      expect((await row('ach')).status).toBe('needs_review')
+    })
+
+    it('two payouts the deposit could be: it waits for a person', async () => {
+      const f = await seed()
+      // Both due to arrive the day it posted (10/14 follow-up: only that day's payouts can be it).
+      await seedStripePayout(f.landlordId, 400.26, '2026-10-07')
+      await seedStripePayout(f.landlordId, 400.26, '2026-10-07')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'ach', postedDate: '2026-10-07', amount: 400.26, description: OAK },
+      ])
+      expect((await row('ach')).status).toBe('needs_review')
+    })
+
+    it('a payout sent to another bank account is never this account’s deposit', async () => {
+      const f = await seed()
+      await db.query(`UPDATE bank_connections SET account_last4 = '9677' WHERE id = $1`, [f.connectionId])
+      await seedStripePayout(f.landlordId, 400.26, '2026-10-06', { bankLast4: '8739' })
+      const same = await seedStripePayout(f.landlordId, 519.68, '2026-10-13', { bankLast4: '9677' })
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'other', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+        { externalId: 'same', postedDate: '2026-10-13', amount: 519.68, description: 'ST-A1B2C3D4E5F6 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
+      ])
+      expect((await row('other')).status).toBe('needs_review')
+      expect((await db.query(`SELECT matched_disbursement_id FROM bank_transactions WHERE external_id = 'same'`)).rows[0].matched_disbursement_id).toBe(same)
+    })
+
+    it('another company’s payout, or a deposit with no trace code, never files itself; a person’s undo is never redone', async () => {
+      const f = await seed()
+      const c = await db.connect()
+      const other = await seedLandlord(c).finally(() => c.release())
+      await seedStripePayout(other.landlordId, 400.26, '2026-10-06')
+      const mine = await seedStripePayout(f.landlordId, 612.5, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'theirs', postedDate: '2026-10-06', amount: 400.26, description: OAK },
+        { externalId: 'plain', postedDate: '2026-10-06', amount: 612.5, description: 'ACH DEPOSIT OAK PARK MOTEL' },
+      ])
+      expect((await row('theirs')).status).toBe('needs_review')
+      expect((await row('plain')).status).toBe('needs_review')
+      // Matched by hand, then undone by the person: theirs from then on, never matched by itself again.
+      const plain = await row('plain')
+      await matchPayoutByHand(f.landlordId, plain.id, mine, f.llUser)
+      const { undoDepositMatch } = await import('./bankDepositConfirm')
+      await undoDepositMatch({ bankTransactionId: plain.id, landlordId: f.landlordId, undoneBy: f.llUser })
+      await db.query(`UPDATE bank_transactions SET description = $2 WHERE id = $1`, [plain.id, OAK])
+      expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+      expect((await row('plain')).status).toBe('needs_review')
+    })
+
+    it('an instant payout whose memo names GAM keeps matching as before (it posts before Stripe’s arrival day)', async () => {
+      const f = await seed()
+      const payout = await seedStripePayout(f.landlordId, 1612.89, '2026-10-06')
+      await upsertTransactions(f.connectionId, f.landlordId, [
+        { externalId: 'inst', postedDate: '2026-10-05', amount: 1612.89, description: 'Instant Pmt from STP FBO Gold Asset Management -Gold Asset Management LLC' },
+      ])
+      expect((await db.query(`SELECT status, matched_disbursement_id FROM bank_transactions WHERE external_id = 'inst'`)).rows[0])
+        .toEqual({ status: 'matched', matched_disbursement_id: payout })
+    })
   })
 
   it('a payout GAM matched by itself (its memo names GAM) cannot be undone — nothing to undo', async () => {

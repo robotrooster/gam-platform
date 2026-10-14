@@ -24,7 +24,8 @@
  *   - payments: services/householdMonths (one stamp per household per bill
  *     month — the Rent Roll's stamps and the tenant payment report's);
  *   - money: services/incomeBasis (both kinds of facts — Received, Charged,
- *     Owed — and the tie line) and services/landlordPL
+ *     Owed — and the tie line; 10/14, Nic: each group's itemized lines, read
+ *     by the same moneyViewFrom over that group's facts) and services/landlordPL
  *     landlordPLExpensesByProperty (the P&L's expenses, every property read
  *     at once and split by property), so a property's net here is its By
  *     Property row's and the properties add up to the company P&L for those
@@ -49,7 +50,7 @@
 import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
 import {
   PAYMENT_STAMPS, PAYMENT_STAMP_LABEL, INCOME_UTILITY_CATEGORIES, INCOME_CATEGORY_LABEL,
-  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, FALLBACK_TIMEZONE,
+  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, FALLBACK_TIMEZONE, LEDGER_INCOME_NOT_ITEMIZED_LABEL, ledgerIncomeDetailOf,
   LANDLORD_ASSIGNABLE_ROLE_LABEL, MONTHLY_REPORT_MAX_EXTRA_EMAILS, MONTHLY_REPORT_SEND_STATUS_LABEL,
   type PaymentStamp, type ExpenseCategory, type LandlordAssignableRole,
   type MonthlyReportRecipientKind, type MonthlyReportSendStatus,
@@ -57,7 +58,7 @@ import {
 import { query, queryOne, getClient } from '../db'
 import { bookkeeperScopesOf, requestScopeOf } from '../lib/bookkeeperScope'
 import { householdMonthsBoth, addMonths, isBillMonth, type HouseholdMonth } from './householdMonths'
-import { incomeBoth, moneyViewFrom, monthWords, type MoneyView, type IncomeEvent } from './incomeBasis'
+import { incomeBoth, moneyViewFrom, monthWords, type MoneyView, type MoneyColumns, type IncomeEvent } from './incomeBasis'
 import { landlordPLExpensesByProperty, NO_PROPERTY_KEY, type LandlordPL } from './landlordPL'
 import { utilityBillSentSql, stayHeldSql } from './moneyPredicates'
 import { occupiedSpacesSql } from './billableUnits'
@@ -113,8 +114,29 @@ export interface ReportPayments {
 
 export interface ReportExpenseLine { key: string; label: string; amount: number }
 
+/** 10/14 (Nic): one itemized line under a Summary group, with the space subtypes beneath it. */
+export interface ReportIncomeLine extends MoneyColumns {
+  key: string
+  label: string
+  subtypes: Array<MoneyColumns & { name: string }>
+}
+
+/**
+ * 10/14 (Nic): one Summary group (an income category, or money with no
+ * category under its line — the key is 'c:<category>' or 'l:<line>') and the
+ * itemized lines of ITS money, which add up to the group's row in every
+ * column (the part no line itemizes is LEDGER_INCOME_NOT_ITEMIZED_LABEL).
+ */
+export interface ReportIncomeGroup { key: string; label: string; lines: ReportIncomeLine[] }
+
 export interface ReportMoney {
   view: MoneyView
+  /**
+   * 10/14 (Nic): "Monthly property report PDF/email: itemized lines under each
+   * group" — the groups that itemize, in the view's order (incomeGroupsOf).
+   * Empty when the month's facts are not itemized (books not live yet).
+   */
+  itemized?: ReportIncomeGroup[]
   /** 10/12 (ledger P8): `paid` — on the books, the expenses paid in the month (the Received net takes it). */
   expenses: { lines: ReportExpenseLine[]; total: number; paid?: number }
   /** Received less expenses (it leads — 10/12, Nic), and Charged less expenses. */
@@ -440,6 +462,51 @@ export function expenseReportLines(
   return out
 }
 
+/** An itemized line's place under its group: rent lines, then stays, then home sales (ledgerIncomeDetailOf). */
+function lineOrder(key: string): number {
+  const at = key.indexOf(':')
+  const d = at < 0 ? ledgerIncomeDetailOf(null, null, key) : ledgerIncomeDetailOf(key.slice(0, at), key.slice(at + 1))
+  return d?.order ?? 1000
+}
+
+/**
+ * 10/14 (Nic): "Monthly property report PDF/email: itemized lines under each
+ * group." Each Summary group of `view` (an income category, or money with no
+ * category under its line) with the itemized lines of its OWN money: the same
+ * moneyViewFrom over only that group's facts, so the lines add up to the
+ * group's row in every column — a stay sold by the month is "RV long-term
+ * rent" under Stays and pay links, where its money is, and a lease's rent is
+ * "RV long-term rent" under Space rent. The part no line itemizes (rent on a
+ * space with no type on record, money for a bill billed before the books
+ * began) is LEDGER_INCOME_NOT_ITEMIZED_LABEL, last. A group with nothing
+ * itemized is left out (its Summary row says it all). Empty when the facts
+ * are not itemized (a company whose books are not live reads the money
+ * records, which carry no lines).
+ */
+export function incomeGroupsOf(
+  billed: readonly IncomeEvent[], received: readonly IncomeEvent[],
+  period: { start: string; end: string; label: string }, view: MoneyView,
+): ReportIncomeGroup[] {
+  if (!view.details?.length) return []
+  const groups: Array<{ key: string; label: string; of: (e: IncomeEvent) => boolean }> = [
+    ...view.categories.map(c => ({ key: `c:${c.category}`, label: c.label, of: (e: IncomeEvent) => e.category === c.category })),
+    ...view.uncategorized.map(l => ({ key: `l:${l.line}`, label: l.label, of: (e: IncomeEvent) => !e.category && e.line === l.line })),
+  ]
+  const out: ReportIncomeGroup[] = []
+  for (const g of groups) {
+    const own = moneyViewFrom(billed.filter(g.of), received.filter(g.of), period)
+    const lines: ReportIncomeLine[] = (own.details ?? [])
+      .map(d => ({
+        key: d.key, label: d.key === g.key ? LEDGER_INCOME_NOT_ITEMIZED_LABEL : d.label,
+        charged: d.charged, received: d.received, owed: d.owed, subtypes: d.subtypes,
+      }))
+      .sort((a, b) => Number(a.key === g.key) - Number(b.key === g.key) || lineOrder(a.key) - lineOrder(b.key) || a.label.localeCompare(b.label))
+    if (!lines.some(l => l.key !== g.key)) continue
+    out.push({ key: g.key, label: g.label, lines })
+  }
+  return out
+}
+
 const sumBy = <T>(xs: readonly T[], f: (x: T) => number) => round2(xs.reduce((s, x) => s + f(x), 0))
 
 /**
@@ -502,7 +569,8 @@ export async function buildMonthlyPropertyReport(opts: {
     const lc = leases.get(p.id) ?? {}
     const occ = occupancy.get(p.id) ?? { spaces: 0, occupied: 0, vacant: 0, asOf: end, from: 'today' as const }
     const hhMonths = hh.filter(m => m.property_id === p.id)
-    const view = moneyViewFrom(eventsOf(both.billed, p.id), eventsOf(both.received, p.id), { start, end, label })
+    const billedHere = eventsOf(both.billed, p.id), receivedHere = eventsOf(both.received, p.id)
+    const view = moneyViewFrom(billedHere, receivedHere, { start, end, label })
     const ex = expensesByProperty.get(p.id) ?? noExpenses
     const lines = expenseReportLines(ex, facts.expenses.get(p.id) ?? [])
     const besideOf = (k: string) => view.beside.find(b => b.key === k)?.amount ?? 0
@@ -531,6 +599,7 @@ export async function buildMonthlyPropertyReport(opts: {
       },
       money: {
         view,
+        itemized: incomeGroupsOf(billedHere, receivedHere, { start, end, label }, view),
         expenses: { lines, total: ex.total, ...(ex.cashTotal !== undefined ? { paid: ex.cashTotal } : {}) },
         net: { received: round2(view.received - (ex.cashTotal ?? ex.total)), charged: round2(view.charged - ex.total) },
         workTradeCovered: besideOf('workTrade'),

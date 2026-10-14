@@ -236,7 +236,7 @@ financialsRouter.get('/bank-activity', async (req: any, res, next) => {
                    WHEN bt.matched_payment_id IS NOT NULL THEN 'tenant_deposit'
                    WHEN bt.auto_settle_undo->>'kind' = 'deposit_slip' THEN 'deposit_slip'
                    -- 10/14 (Nic, answer 15): a check the bank returned, taken back (services/returnedCheck).
-                   WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN 'returned_check'
+                   WHEN bt.auto_settle_undo->>'kind' IN ('returned_check', 'returned_tenant_deposit') THEN 'returned_check'
               END AS match_kind,
               -- 10/12 review (Nic L5): a money-out line matched to bills, GAM's
               -- fee debit, a refund, a transfer or a loan (BANK_LINE_MATCH_KINDS).

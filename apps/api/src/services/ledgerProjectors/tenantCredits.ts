@@ -68,7 +68,8 @@ import {
 import { rentParts, stayParts, loadSpace, loadStay, type IncomePart } from './incomeLines'
 
 // 2 — 10/14 (Nic I1-I7): rent and stay money taken back lands on the line it was charged to (incomeLines).
-export const TENANT_CREDITS_RULE_VERSION = 2
+// 3 — 10/14 (Nic): a stay sold by the month is long-term at any length (incomeLines stayIsLongTerm).
+export const TENANT_CREDITS_RULE_VERSION = 3
 
 // ─── C5: work-trade hours that paid a bill ──────────────────────────────────
 

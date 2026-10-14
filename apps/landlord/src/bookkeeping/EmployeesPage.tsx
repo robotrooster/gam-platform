@@ -14,17 +14,20 @@ import {
   BOOKS_EMPLOYEE_PAY_PLACES, BOOKS_EMPLOYEE_PAY_PLACE_LABEL,
   type BooksPayFrequency, type BooksEmployeePayPlace,
 } from '@gam/shared'
-import { booksGet as get, booksPost as post, booksPatch as patch } from './adapter'
+import { booksGet as get, booksPost as post, booksPatch as patch, useBooksRole } from './adapter'
 import { Modal } from './common'
 import { useCostPlaces, type CostPlaceProperty } from './CostPlaceField'
 
 // ── WHERE AN EMPLOYEE'S PAY GOES ──────────────────────────────────────
 // 10/14 (Nic): "an employee at one property goes to that property ... once you
 // set it it shouldnt change. if they work at multiple properties it would be
-// at the company level." Asked once, on the employee: each paycheck follows
-// it, and Run Payroll no longer asks. Nothing is chosen for the person; once
-// saved it is shown, not changed (the API refuses a change too). A business's
-// books have no properties, so nothing is asked of a business.
+// at the company level." Asked on the employee: each paycheck follows it, and
+// Run Payroll no longer asks. Nothing is chosen for the person. 10/14
+// afternoon (Nic): "the owner can change it; only future paychecks follow" —
+// the owner sees Change beside it (a mistake, or the person moved); anyone
+// else sees it, not a button (the API refuses them too). A draft run's
+// paychecks move with the change; approved runs stay as they posted. A
+// business's books have no properties, so nothing is asked of a business.
 type PayPlaceValue={payPlace:BooksEmployeePayPlace|'';payPropertyId:string}
 const BLANK_PAY_PLACE:PayPlaceValue={payPlace:'',payPropertyId:''}
 const payPlaceChosen=(v:PayPlaceValue)=>v.payPlace==='company'||(v.payPlace==='property'&&!!v.payPropertyId)
@@ -41,7 +44,7 @@ export function payPlaceText(emp:{payPlace?:string|null;payPropertyName?:string|
 function PayPlaceField({value,onChange,properties,name='payPlace'}:{value:PayPlaceValue;onChange:(v:PayPlaceValue)=>void;properties:CostPlaceProperty[];name?:string}){
   return(
     <div className="frow">
-      <label>Where their pay goes (set once)</label>
+      <label>Where their pay goes</label>
       {BOOKS_EMPLOYEE_PAY_PLACES.map(p=>(
         <label key={p} style={{display:'flex',gap:8,alignItems:'flex-start',textTransform:'none',letterSpacing:0,fontWeight:400,fontSize:'.8rem',color:'var(--t1)',marginBottom:6,cursor:'pointer'}}>
           <input type="radio" name={name} value={p} checked={value.payPlace===p} onChange={()=>onChange({payPlace:p,payPropertyId:p==='property'?value.payPropertyId:''})}
@@ -77,7 +80,9 @@ export function EmployeesPage(){
   // 10/14 (Nic): where the new employee's pay goes — nothing chosen until the person chooses.
   const[place,setPlace]=useState<PayPlaceValue>(BLANK_PAY_PLACE)
   const{properties,asked}=useCostPlaces()
-  // An employee with no place yet (added before 10/14): set once, here.
+  // An employee with no place yet (added before 10/14) is set here; the
+  // owner changes a set one here too (10/14 afternoon).
+  const isOwner=useBooksRole()==='landlord'
   const[placing,setPlacing]=useState<any|null>(null)
   const[placingValue,setPlacingValue]=useState<PayPlaceValue>(BLANK_PAY_PLACE)
   const[placeErr,setPlaceErr]=useState('')
@@ -149,7 +154,12 @@ export function EmployeesPage(){
                   <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{(BOOKS_PAY_FREQUENCY_LABEL as Record<string,string>)[emp.payFrequency]??humanize(emp.payFrequency)}</td>
                   <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(calcPaycheck(+emp.payRate,emp.payFrequency,emp.payType))}</td>
                   <td className="mono">{formatCurrency(emp.ytdGross)}</td>
-                  {asked&&<td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.payPlace?payPlaceText(emp):(
+                  {asked&&<td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.payPlace?(
+                    <div style={{display:'flex',alignItems:'center',gap:8}}>
+                      <span>{payPlaceText(emp)}</span>
+                      {isOwner&&<button className="btn bp bsm" onClick={()=>{setPlacing(emp);setPlacingValue(BLANK_PAY_PLACE);setPlaceErr('')}}>Change</button>}
+                    </div>
+                  ):(
                     <button className="btn bp bsm" onClick={()=>{setPlacing(emp);setPlacingValue(BLANK_PAY_PLACE);setPlaceErr('')}}>Set where pay goes</button>
                   )}</td>}
                   <td><span className={`badge ${emp.status==='active'?'bg2':'bmu'}`}>{humanize(emp.status)}</span></td>
@@ -217,7 +227,9 @@ export function EmployeesPage(){
       {placing&&(
         <Modal title={`Where ${placing.firstName} ${placing.lastName}'s pay goes`} onClose={()=>setPlacing(null)}>
           {placeErr&&<div className="alert ae">{placeErr}</div>}
-          <p style={{fontSize:'.78rem',color:'var(--t2)',marginBottom:10}}>Each paycheck goes here. Once set, it does not change.</p>
+          <p style={{fontSize:'.78rem',color:'var(--t2)',marginBottom:10}}>{placing.payPlace
+            ?`Their pay goes to ${payPlaceText(placing)} now. Their next paychecks go to the new place; paychecks already approved stay where they were booked.`
+            :'Each paycheck goes here. Only the owner can change it later.'}</p>
           <PayPlaceField value={placingValue} onChange={setPlacingValue} properties={properties} name="payPlaceSet"/>
           <div className="factions">
             <button type="button" className="btn bg-btn" onClick={()=>setPlacing(null)}>Cancel</button>

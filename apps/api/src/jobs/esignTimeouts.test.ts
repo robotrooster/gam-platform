@@ -100,12 +100,15 @@ describe('S636 — window A: waiting on the landlord', () => {
   // S647: window A is "from the time the tenant accepts the portal invite to
   // the time the landlord signs". These fixtures now include the accepted
   // tenant that makes somebody actually be waiting.
-  it('deletes a document the landlord left unsigned for 48 hours after a tenant accepted (10/14 #4: no money touched it) — and cancels the invite (#1)', async () => {
+  // 10/14 afternoon (Nic): "invite and signing by tenant is one flow after
+  // landlord has already signed" — an automatic delete never cancels the
+  // invite; it lets go of the document and stays open to be drafted again.
+  it('deletes a document the landlord left unsigned for 48 hours after a tenant accepted (10/14 #4: no money touched it) — the invite stays open, to be drafted again', async () => {
     const id = await seedDoc({ status: 'sent', sentHoursAgo: 49, tenantAcceptedHoursAgo: 49 })
     await processEsignTimeouts()
     expect(await statusOf(id)).toBe(null)
-    const pti = (await db.query(`SELECT cancelled_at IS NOT NULL AS c, draft_document_id FROM pending_tenant_intents`)).rows
-    expect(pti).toEqual([{ c: true, draft_document_id: null }])
+    const pti = (await db.query(`SELECT cancelled_at IS NOT NULL AS c, resolved_at, draft_document_id FROM pending_tenant_intents`)).rows
+    expect(pti).toEqual([{ c: false, resolved_at: null, draft_document_id: null }])
   })
 
   // 10/14 (Nic, #4): only a document no money touched is deleted. One the

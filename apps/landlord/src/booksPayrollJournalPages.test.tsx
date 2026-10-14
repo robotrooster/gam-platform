@@ -21,6 +21,8 @@ const server = vi.hoisted(() => ({
   posts: [] as Array<{ url: string; body: any }>,
   patches: [] as Array<{ url: string; body: any }>,
   replies: {} as Record<string, any>,
+  // 10/14 afternoon: who is looking (the owner changes an employee's pay place).
+  role: 'landlord',
 }))
 
 vi.mock('./lib/api', () => ({
@@ -39,7 +41,7 @@ vi.mock('./lib/api', () => ({
     },
   },
 }))
-vi.mock('./context/AuthContext', () => ({ useAuth: () => ({ user: { id: 'u1', role: 'landlord' } }) }))
+vi.mock('./context/AuthContext', () => ({ useAuth: () => ({ user: { id: 'u1', role: server.role } }) }))
 vi.mock('./components/dialogs', () => ({ toast: Object.assign(() => {}, { error: () => {} }), appConfirm: async () => true }))
 
 import { JournalEntriesPage } from './bookkeeping/JournalEntriesPage'
@@ -83,6 +85,7 @@ beforeEach(() => {
   server.posts = []
   server.patches = []
   server.replies = {}
+  server.role = 'landlord'
 })
 afterEach(() => {
   act(() => root?.unmount())
@@ -256,7 +259,7 @@ describe('Run Payroll', () => {
   })
 })
 
-describe('Employees: where each one\'s pay goes, set once (10/14, Nic)', () => {
+describe('Employees: where each one\'s pay goes (10/14, Nic) — the owner changes it (10/14 afternoon)', () => {
   beforeEach(() => {
     server.gets = {
       '/books/employees': [
@@ -268,14 +271,15 @@ describe('Employees: where each one\'s pay goes, set once (10/14, Nic)', () => {
     }
   })
 
-  it('a set place is shown, not offered for change; one with none is set once, nothing chosen for the person', async () => {
+  it('a set place is shown, with Change for the owner; one with none is set here, nothing chosen for the person', async () => {
     await render(<EmployeesPage />)
     const boRow = [...host!.querySelectorAll('tr')].find(r => r.textContent?.includes('Bo Keeper'))!
     expect(boRow.textContent).toContain('Oak Park')
     expect(boRow.textContent).not.toContain('Set where pay goes')
+    expect([...boRow.querySelectorAll('button')].some(b => b.textContent === 'Change')).toBe(true)
     await act(async () => { button('Set where pay goes')!.click() })
     await flush()
-    expect(text()).toContain('Once set, it does not change.')
+    expect(text()).toContain('Each paycheck goes here. Only the owner can change it later.')
     const radios = [...host!.querySelectorAll('input[name="payPlaceSet"]')] as HTMLInputElement[]
     expect(radios.map(r => r.checked)).toEqual([false, false])
     expect(button('Save')!.disabled).toBe(true)
@@ -287,11 +291,40 @@ describe('Employees: where each one\'s pay goes, set once (10/14, Nic)', () => {
     expect(server.patches).toEqual([{ url: '/books/employees/e1', body: { payPlace: 'company', payPropertyId: null } }])
   })
 
+  it('the owner changes a set place: only the next paychecks follow, said in words; nothing is chosen for him', async () => {
+    await render(<EmployeesPage />)
+    const boRow = [...host!.querySelectorAll('tr')].find(r => r.textContent?.includes('Bo Keeper'))!
+    await act(async () => { ([...boRow.querySelectorAll('button')].find(b => b.textContent === 'Change') as HTMLButtonElement).click() })
+    await flush()
+    expect(text()).toContain('Their pay goes to Oak Park now. Their next paychecks go to the new place; paychecks already approved stay where they were booked.')
+    const radios = [...host!.querySelectorAll('input[name="payPlaceSet"]')] as HTMLInputElement[]
+    expect(radios.map(r => r.checked)).toEqual([false, false])
+    expect(button('Save')!.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="payPlaceSet"][value="property"]') as HTMLInputElement).click() })
+    await flush()
+    const pick = [...host!.querySelectorAll('select')].find(x => [...x.options].some(o => o.textContent === 'Choose the property'))!
+    await setValue(pick, 'p2')
+    await flush()
+    await act(async () => { button('Save')!.click() })
+    await flush()
+    expect(server.patches).toEqual([{ url: '/books/employees/e2', body: { payPlace: 'property', payPropertyId: 'p2' } }])
+  })
+
+  it('a bookkeeper sees where pay goes, never a Change button (only the owner changes it)', async () => {
+    server.role = 'bookkeeper'
+    await render(<EmployeesPage />)
+    const boRow = [...host!.querySelectorAll('tr')].find(r => r.textContent?.includes('Bo Keeper'))!
+    expect(boRow.textContent).toContain('Oak Park')
+    expect([...boRow.querySelectorAll('button')].some(b => b.textContent === 'Change')).toBe(false)
+    // One with none is still set by whoever keeps the books.
+    expect(button('Set where pay goes')).toBeTruthy()
+  })
+
   it('Add Employee asks where their pay goes and does not save until it is answered', async () => {
     await render(<EmployeesPage />)
     await act(async () => { button('+ Add Employee')!.click() })
     await flush()
-    expect(text()).toContain('Where their pay goes (set once)')
+    expect(text()).toContain('Where their pay goes')
     const add = [...host!.querySelectorAll('button[type="submit"]')].pop() as HTMLButtonElement
     expect(add.disabled).toBe(true)
     await act(async () => { (host!.querySelector('input[name="payPlace"][value="property"]') as HTMLInputElement).click() })

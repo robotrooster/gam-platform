@@ -50,7 +50,13 @@
  *     invite is canceled in the same transaction (cancelOpenInvites): the
  *     link stops working, and the hourly re-draft
  *     (householdLeaseDraft.draftAllPendingLeases, open invites only) never
- *     drafts a new one.
+ *     drafts a new one. ONLY the landlord's own Delete does this. 10/14
+ *     afternoon (Nic): "thats not how the flow works. invite and signing by
+ *     tenant is one flow after landlord has already signed" — GAM ending a
+ *     document ON ITS OWN (the 48-hour timeout, a lapsed new lease, the
+ *     30-day step, a new invite's stale draft: EraseOptions.onItsOwn) never
+ *     cancels an invite. The invite stays open and lets go of the document,
+ *     so the household is drafted again.
  *
  * WHAT GOES WITH AN ERASED DOCUMENT, in one transaction: its boxes and signers
  * (ON DELETE CASCADE); the never-joined person an add-tenant addendum put on
@@ -59,8 +65,9 @@
  * cascade); its money changes that never reached billing; the home sale it
  * papered that never started, with its installment schedule; the sublease
  * request it papered that never started; an OPEN invite waiting on it is
- * canceled (a closed one only lets go of it); the lease it issued, when it
- * issued one, with that lease's $0.00 bills; the bell notifications that only point at it ("Lease
+ * canceled by the landlord's own Delete (a closed one, or any invite when GAM
+ * ends the document on its own, only lets go of it); the lease it issued,
+ * when it issued one, with that lease's $0.00 bills; the bell notifications that only point at it ("Lease
  * drafted — ready for your signature" for a lease that no longer exists — his
  * "I don't want to search through a long ass list of stuff that maybe
  * happened"). A packet's lease takes every other unfinished document of its
@@ -452,6 +459,15 @@ export interface EraseOptions {
   /** The one-time cleanup only: documents Nic named after seeing what they
    *  billed, judged by MoneyRule 'paid' (a bill voided unpaid is no money). */
   voidedUnpaidIds?: readonly string[]
+  /**
+   * 10/14 afternoon (Nic): GAM is ending the document ON ITS OWN — the
+   * 48-hour timeout, a lapsed new lease, the 30-day step, the draft a new
+   * invite makes stale. "invite and signing by tenant is one flow after
+   * landlord has already signed": every invite waiting on it, or reopened by
+   * taking back the lease it issued, stays OPEN and lets go of it, to be
+   * drafted again. Only the landlord's own Delete closes an invite (#1).
+   */
+  onItsOwn?: boolean
 }
 
 export async function planErase(
@@ -569,7 +585,7 @@ export async function eraseUnfinishedDocument(
   if (plan.leaseId) {
     await q('SAVEPOINT erase_issued_lease')
     try {
-      await eraseLeaseRows(q, plan.leaseId, live)
+      await eraseLeaseRows(q, plan.leaseId, live, { onItsOwn: opts.onItsOwn })
       await q('RELEASE SAVEPOINT erase_issued_lease')
     } catch (e: any) {
       await q('ROLLBACK TO SAVEPOINT erase_issued_lease')
@@ -610,8 +626,11 @@ export async function eraseUnfinishedDocument(
     // (routes/landlords DELETE /me/pending-tenants/:intentId): stamped, with
     // the same company's screening-waiver row beside it, so the link stops
     // working and the hourly re-draft never drafts a new lease for it. A
-    // closed invite only lets go of it.
-    await cancelOpenInvites(q, d.id)
+    // closed invite only lets go of it. 10/14 afternoon (Nic): only the
+    // landlord's own Delete — when GAM ends it on its own (opts.onItsOwn) the
+    // invite stays open and only lets go of it, so the hourly re-draft
+    // drafts the household again.
+    if (!opts.onItsOwn) await cancelOpenInvites(q, d.id)
     await q(
       `UPDATE pending_tenant_intents SET draft_document_id = NULL, updated_at = NOW()
         WHERE draft_document_id = $1`, [d.id])
@@ -691,7 +710,10 @@ async function cancelInvites(q: Q, candidates: string[]): Promise<string[]> {
  *     Review 10/14: the invite the unwind reopens is canceled after it (#1),
  *     even one that never pointed at the document (a lease hand-drafted on
  *     GoldSign for an invited household) — otherwise the hourly re-draft
- *     would draft and send a new lease for the lease just deleted.
+ *     would draft and send a new lease for the lease just deleted. 10/14
+ *     afternoon (Nic): only for the landlord's own Delete. GAM ending it on
+ *     its own (`opts.onItsOwn`) leaves the reopened invite open, and the
+ *     re-draft drafts the household again — that is the flow.
  *   - Its charge rows, all $0.00 with nothing paid, credited or settled; its
  *     bills; a work-trade period on them that never credited anything; a
  *     deposit record that never held a dollar; the bell notifications that
@@ -711,6 +733,7 @@ async function cancelInvites(q: Q, candidates: string[]): Promise<string[]> {
 export async function eraseLeaseRows(
   q: Q, leaseId: string,
   issuedBy?: { id: string; status: string; issued_at: string | Date | null; unit_id: string | null } | null,
+  opts: Pick<EraseOptions, 'onItsOwn'> = {},
 ): Promise<void> {
   const bills = (await q(
     `SELECT id, payment_id FROM utility_bills WHERE lease_id = $1`, [leaseId])).rows
@@ -729,7 +752,7 @@ export async function eraseLeaseRows(
       `SELECT id FROM pending_tenant_intents WHERE resolved_lease_id = $1 AND cancelled_at IS NULL`,
       [leaseId])).rows.map((r: any) => r.id as string)
     await unwindIssuedLease(q, { id: issuedBy.id, lease_id: leaseId, issued_at: issuedBy.issued_at, unit_id: issuedBy.unit_id })
-    await cancelInvites(q, resolved)
+    if (!opts.onItsOwn) await cancelInvites(q, resolved)
   }
   const invoices = (await q(
     `SELECT id FROM invoices WHERE lease_id = $1`, [leaseId])).rows.map((r: any) => r.id as string)

@@ -17,8 +17,10 @@
  * 10/14 (Nic): "an employee at one property goes to that property ... once
  * you set it it shouldnt change. if they work at multiple properties it would
  * be at the company level" — each paycheck's wages and employer taxes follow
- * its employee's place, set once on the Employees page. The run no longer asks
- * (it did from 10/13); an employee with no place yet is set there first.
+ * its employee's place, set on the Employees page (10/14 afternoon: the owner
+ * can change it there; only future paychecks follow, a draft run's included).
+ * The run no longer asks (it did from 10/13); an employee with no place yet
+ * is set there first.
  * A 1099 contractor bill still asks where its cost goes, on each one.
  */
 import React, { useState } from 'react'
@@ -76,7 +78,8 @@ export function RunPayrollPage(){
   const[recording,setRecording]=useState<string|null>(null)
   // 10/14 (Nic): "an employee at one property goes to that property ... once
   // you set it it shouldnt change" — each paycheck follows its employee's
-  // place, set once on the Employees page; the run no longer asks.
+  // place, set on the Employees page (the owner changes it there); the run
+  // no longer asks.
   const{properties,asked}=useCostPlaces()
   const[freq,setFreq]=useState<BooksPayFrequency>('biweekly')
   const defaultHours=booksDefaultHours(freq)

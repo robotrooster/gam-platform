@@ -469,11 +469,13 @@ async function voidUnsignedDraft(client: PoolClient, unitId: string, documentId:
   await client.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL, updated_at=NOW() WHERE unit_id=$1 AND draft_document_id=$2`, [unitId, documentId])
   // 10/14 (Nic, #4): an automatic end deletes instead of voiding when no money
   // touched the draft (lib/eraseUnfinishedDocument — its packet's unfinished
-  // forms with it); one that test keeps is voided as before.
+  // forms with it); one that test keeps is voided as before. 10/14 afternoon
+  // (Nic): an automatic delete never cancels an invite (onItsOwn) — only the
+  // landlord's own Delete does; the household is drafted again with the new person.
   const { eraseUnfinishedDocument } = await import('../lib/eraseUnfinishedDocument')
   const live = (await client.query(
     `SELECT id, lease_id, document_type FROM lease_documents WHERE id=$1 AND status NOT IN ('completed','voided')`, [documentId])).rows[0]
-  const out = live ? await eraseUnfinishedDocument(client.query.bind(client) as any, live) : null
+  const out = live ? await eraseUnfinishedDocument(client.query.bind(client) as any, live, { onItsOwn: true }) : null
   if (out && !out.erased) {
     await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [documentId])
   }

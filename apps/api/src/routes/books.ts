@@ -831,42 +831,58 @@ booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) =>
     const { col, id: lid } = ownerScope(req.user)
     const f = req.body
     assertBooksFieldsFit(f, ['firstName', 'lastName', 'email', 'phone', 'title', 'department'])
-    // 10/14 (Nic): where the employee's pay goes — set once (an employee
-    // added before 10/14 has none until it is set here); a different answer
-    // once set is refused (services/booksEmployeePayPlace).
-    const payPlace = await employeePayPlaceFrom(db, col === 'landlord_id' ? lid : null, f)
-    if (payPlace.given) {
-      const cur = (await db.query<{ id: string; pay_place: string | null; pay_property_id: string | null }>(
-        `SELECT id, pay_place, pay_property_id FROM books_employees WHERE id = $1 AND (${col} = $2 OR $2 IS NULL)`,
-        [req.params.id, lid])).rows[0]
-      if (!cur) throw new AppError(404, 'Employee not found')
-      if (!payPlace.value) {
-        if (cur.pay_place) throw new AppError(409, 'Once set, where an employee\'s pay goes does not change.')
-      } else {
-        await setEmployeePayPlace(db, cur, payPlace.value, req.user!.userId)
-      }
-    }
     // 10/11: pay type and frequency, when sent, are from the shared lists (as
-    // on create) — payroll reads both.
+    // on create) — payroll reads both. Checked before anything is saved.
     if (f.payType != null && f.payType !== '' && !(BOOKS_PAY_TYPES as readonly string[]).includes(f.payType)) {
       throw new AppError(400, 'Pay type is hourly or salary.')
     }
     if (f.payFrequency != null && f.payFrequency !== '' && !(BOOKS_PAY_FREQUENCIES as readonly string[]).includes(f.payFrequency)) {
       throw new AppError(400, 'Choose how often this employee is paid: weekly, every two weeks, twice a month or monthly.')
     }
-    const { rows: [emp] } = await db.query(
-      `UPDATE books_employees SET
-         first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name),
-         email=COALESCE($3,email), phone=COALESCE($4,phone), title=COALESCE($5,title),
-         department=COALESCE($6,department), pay_type=COALESCE($7,pay_type),
-         pay_rate=COALESCE($8,pay_rate), pay_frequency=COALESCE($9,pay_frequency),
-         status=COALESCE($10,status), updated_at=NOW()
-       WHERE id=$11 AND (${col}=$12 OR $12 IS NULL) RETURNING *`,
-      [f.firstName||null, f.lastName||null, f.email||null, f.phone||null,
-       f.title||null, f.department||null, f.payType||null, f.payRate||null,
-       f.payFrequency||null, f.status||null, req.params.id, lid]
-    )
-    if (!emp) throw new AppError(404, 'Employee not found')
+    // 10/14 (Nic): where the employee's pay goes — set by anyone who keeps the
+    // books (an employee added before 10/14 has none until it is set here).
+    // 10/14 afternoon (Nic): "the owner can change it; only future paychecks
+    // follow" — only the owner's different answer is saved, and the
+    // employee's paychecks on draft runs move with it; approved runs stay as
+    // they posted (services/booksEmployeePayPlace). Saved with the rest of the
+    // form, in one transaction.
+    const payPlace = await employeePayPlaceFrom(db, col === 'landlord_id' ? lid : null, f)
+    const client = await db.connect()
+    let emp: any
+    try {
+      await client.query('BEGIN')
+      if (payPlace.given) {
+        const cur = (await client.query<{ id: string; pay_place: string | null; pay_property_id: string | null }>(
+          `SELECT id, pay_place, pay_property_id FROM books_employees WHERE id = $1 AND (${col} = $2 OR $2 IS NULL)`,
+          [req.params.id, lid])).rows[0]
+        if (!cur) throw new AppError(404, 'Employee not found')
+        if (!payPlace.value) {
+          // A paycheck always goes somewhere: a place is changed, never taken away.
+          if (cur.pay_place) throw new AppError(409, EMPLOYEE_PAY_PLACE_REQUIRED)
+        } else {
+          await setEmployeePayPlace(client, cur, payPlace.value, req.user!.userId, { owner: req.user!.role === 'landlord' })
+        }
+      }
+      emp = (await client.query(
+        `UPDATE books_employees SET
+           first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name),
+           email=COALESCE($3,email), phone=COALESCE($4,phone), title=COALESCE($5,title),
+           department=COALESCE($6,department), pay_type=COALESCE($7,pay_type),
+           pay_rate=COALESCE($8,pay_rate), pay_frequency=COALESCE($9,pay_frequency),
+           status=COALESCE($10,status), updated_at=NOW()
+         WHERE id=$11 AND (${col}=$12 OR $12 IS NULL) RETURNING *`,
+        [f.firstName||null, f.lastName||null, f.email||null, f.phone||null,
+         f.title||null, f.department||null, f.payType||null, f.payRate||null,
+         f.payFrequency||null, f.status||null, req.params.id, lid]
+      )).rows[0]
+      if (!emp) throw new AppError(404, 'Employee not found')
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
     res.json({ success: true, data: emp })
   } catch (e) { next(e) }
 })

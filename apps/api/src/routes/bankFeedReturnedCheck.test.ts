@@ -5,6 +5,10 @@
  *     check the bank returned (offered by GET /transactions/:id/matches);
  *   POST /api/bank-feed/transactions/:id/match-payout — the owner says a
  *     deposit is GAM's payout (offered on the line, payout_suggestion).
+ * And (10/14 afternoon) POST /api/bank-feed/deposits/:id/undo on a returned
+ * line that took back a tenant's own bank deposit — its own Undo — and on the
+ * deposit it came back from (refused: undone on the returned line). And (10/14
+ * follow-up) the same Undo on a Stripe ACH payout GAM matched by its trace code.
  * Both are the owner's: taking a tenant's payment back is a tenant action, never
  * a bookkeeper's (Nic 10/12), and an id from another company is never acted on.
  */
@@ -18,6 +22,8 @@ import { errorHandler } from '../middleware/errorHandler'
 import { bankFeedRouter } from './bankFeed'
 import { createSlip } from '../services/depositSlips'
 import { reconcileDeposits } from '../services/bankFeed'
+import { confirmDepositMatch } from '../services/bankDepositConfirm'
+import { takeBackReturnedChecks } from '../services/returnedCheck'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedTenant, seedUnit, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 
 vi.mock('../services/email', async (orig) => ({ ...(await orig<any>()), sendNotificationEmail: async () => 'msg_test' }))
@@ -126,7 +132,7 @@ describe('POST /transactions/:id/returned-check', () => {
     const r = await request(app()).post(`/api/bank-feed/transactions/${returnedA}/returned-check`).set(as(a.owner))
       .send({ remittanceId: b.checkId })
     expect(r.status).toBe(409)
-    expect(r.body.error).toMatch(/not a check of \$460.00/)
+    expect(r.body.error).toMatch(/not a check or money order of \$460.00/)
     expect((await db.query(`SELECT status FROM payments WHERE id = $1`, [b.rentId])).rows[0].status).toBe('settled')
   })
 })
@@ -152,5 +158,72 @@ describe('POST /transactions/:id/match-payout', () => {
     expect(ok.status, JSON.stringify(ok.body)).toBe(200)
     expect((await db.query(`SELECT status, matched_disbursement_id, matched_by FROM bank_transactions WHERE id = $1`, [dep])).rows[0])
       .toEqual({ status: 'matched', matched_disbursement_id: pa, matched_by: expect.any(String) })
+  })
+})
+
+// 10/14 follow-up (Nic 10/12: "every bank filing (hand-filed too) can be
+// undone"): a Stripe ACH payout GAM matched by its trace code, amount and
+// arrival day matched on GAM's record of the payout, not the code itself.
+describe('POST /deposits/:id/undo — a Stripe ACH payout GAM matched by its trace code', () => {
+  it('the owner undoes it: back in review, never matched by itself again; a bookkeeper may not, nor another company', async () => {
+    const a = await company()
+    const b = await company()
+    const po = `po_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+    const payout = (await db.query<{ id: string }>(
+      `INSERT INTO disbursements (landlord_id, amount, status, settled_at, stripe_payout_id, trigger_type)
+       VALUES ($1, 400.26, 'settled', ($2::date - 1) + time '18:58', $3, 'auto_friday') RETURNING id`,
+      [a.landlordId, daysAgo(1), po])).rows[0].id
+    await db.query(`INSERT INTO connect_payouts (stripe_payout_id, stripe_account_id, amount, status, arrival_date)
+                    VALUES ($1, 'acct_test', 400.26, 'paid', $2::date)`, [po, daysAgo(1)])
+    const dep = await line(a, 400.26, daysAgo(1), 'ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH')
+    await reconcileDeposits(a.landlordId)
+    expect((await db.query(`SELECT status, matched_disbursement_id FROM bank_transactions WHERE id = $1`, [dep])).rows[0])
+      .toEqual({ status: 'matched', matched_disbursement_id: payout })
+
+    expect((await request(app()).post(`/api/bank-feed/deposits/${dep}/undo`).set(as(a.bk)).send({})).status).toBe(403)
+    expect((await request(app()).post(`/api/bank-feed/deposits/${dep}/undo`).set(as(b.owner)).send({})).status).toBe(404)
+    const ok = await request(app()).post(`/api/bank-feed/deposits/${dep}/undo`).set(as(a.owner)).send({})
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    expect(ok.body.data).toMatchObject({ kind: 'gam_payout' })
+    expect((await db.query(`SELECT status, matched_disbursement_id FROM bank_transactions WHERE id = $1`, [dep])).rows[0])
+      .toEqual({ status: 'needs_review', matched_disbursement_id: null })
+    await reconcileDeposits(a.landlordId)
+    expect((await db.query(`SELECT status FROM bank_transactions WHERE id = $1`, [dep])).rows[0].status).toBe('needs_review')
+  })
+})
+
+describe('POST /deposits/:id/undo — a tenant’s own deposit that came back (10/14 afternoon)', () => {
+  it('the returned line puts the deposit back; the deposit’s own line refuses and says where; a bookkeeper may not', async () => {
+    const co = await company()
+    // Another tenant's rent, paid by a check they deposited at the bank themselves.
+    const c = await db.connect()
+    let rentId: string
+    try {
+      const propertyId = (await c.query<{ id: string }>(`SELECT id FROM properties WHERE landlord_id = $1 LIMIT 1`, [co.landlordId])).rows[0].id
+      const tenantId = await seedTenant(c)
+      const unitId = await seedUnit(c, { propertyId, landlordId: co.landlordId, rentAmount: 515 })
+      const leaseId = await seedLease(c, { unitId, landlordId: co.landlordId, rentAmount: 515 })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      rentId = (await c.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'rent',515,'pending',$5::date,'RENT') RETURNING id`,
+        [unitId, leaseId, tenantId, co.landlordId, daysAgo(9)])).rows[0].id
+    } finally { c.release() }
+    const deposit = await line(co, 515, daysAgo(7), 'MOBILE DEPOSIT')
+    await confirmDepositMatch({ bankTransactionId: deposit, chargeIds: [rentId], method: 'check', confirmedByUserId: co.ownerId })
+    const returned = await line(co, -515, daysAgo(2), 'DEPOSITED ITEM RETURNED')
+    expect(await takeBackReturnedChecks(co.landlordId)).toMatchObject({ takenBack: 1 })
+    expect((await db.query(`SELECT status FROM payments WHERE id = $1`, [rentId])).rows[0].status).toBe('pending')
+
+    const onDeposit = await request(app()).post(`/api/bank-feed/deposits/${deposit}/undo`).set(as(co.owner)).send({})
+    expect(onDeposit.status).toBe(409)
+    expect(onDeposit.body.error).toMatch(/came back from your bank.*Undo that on the returned line/)
+    expect((await request(app()).post(`/api/bank-feed/deposits/${returned}/undo`).set(as(co.bk)).send({})).status).toBe(403)
+
+    const ok = await request(app()).post(`/api/bank-feed/deposits/${returned}/undo`).set(as(co.owner)).send({})
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    expect(ok.body.data).toMatchObject({ kind: 'returned_check', checkPutBack: { paidAgainIds: [rentId] } })
+    expect((await db.query(`SELECT status FROM payments WHERE id = $1`, [rentId])).rows[0].status).toBe('settled')
+    expect((await db.query(`SELECT status FROM bank_transactions WHERE id = $1`, [returned])).rows[0].status).toBe('needs_review')
   })
 })

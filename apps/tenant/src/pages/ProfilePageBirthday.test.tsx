@@ -6,6 +6,10 @@
  * a saved "off", and saves email-off for type 'birthday' when unticked (the
  * job skips anyone with that off). Nothing is posted in the app for it, so the
  * In-App cell says "—" instead of the always-on check.
+ *
+ * 10/14 afternoon (Nic): "Tenant profile shows the birthday read-only, 'ask
+ * your landlord to fix it'." Profile → Profile shows the birthday on file as
+ * words, with no box to change it and nothing of it sent on Save.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
@@ -15,12 +19,14 @@ import { QueryClient, QueryClientProvider } from 'react-query'
 const http = vi.hoisted(() => ({
   prefs: [] as any[],
   patches: [] as { url: string; body: any }[],
+  me: { firstName: 'Rosa', lastName: 'Lee', email: 'rosa@test.dev' } as Record<string, any>,
 }))
 vi.mock('axios', () => ({
   default: {
     create: () => ({
       get: async (url: string) => {
-        if (url === '/tenants/me') return { data: { data: { firstName: 'Rosa', lastName: 'Lee', email: 'rosa@test.dev' } } }
+        if (url === '/tenants/me') return { data: { data: http.me } }
+        if (url === '/emergency-contacts/mine') return { data: { data: null } }
         if (url === '/notifications/preferences') return { data: { data: http.prefs } }
         if (url === '/auth/email-otp/status') return { data: { data: { email: 'rosa@test.dev' } } }
         throw new Error(`unexpected GET ${url}`)
@@ -40,6 +46,7 @@ let host: HTMLDivElement
 let root: Root
 beforeEach(() => {
   http.prefs = []; http.patches = []
+  http.me = { firstName: 'Rosa', lastName: 'Lee', email: 'rosa@test.dev' }
   window.history.replaceState(null, '', '/profile?tab=notifications')
   host = document.createElement('div')
   document.body.appendChild(host)
@@ -99,5 +106,47 @@ describe('the Birthday Email row on the tenant Profile → Notifications tab', (
       url: '/notifications/preferences',
       body: { type: 'birthday', emailEnabled: false, inAppEnabled: true },
     })
+  })
+})
+
+describe('the birthday on the tenant Profile → Profile tab (10/14 afternoon, Nic)', () => {
+  /** The Birthday block: its label, the date shown, and the note under it. */
+  const birthdayBlock = () => [...host.querySelectorAll('label')]
+    .find(l => l.textContent === 'Birthday')?.parentElement as HTMLDivElement | undefined
+  async function openProfile() {
+    window.history.replaceState(null, '', '/profile?tab=profile')
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await act(async () => {
+      root.render(<QueryClientProvider client={qc}><ProfilePage /></QueryClientProvider>)
+    })
+    await until(() => !!birthdayBlock(), 'the Birthday block')
+  }
+
+  it('shows the birthday on file as words, read-only, and says to ask the landlord to fix it', async () => {
+    // The server sends the date column as a timestamp at its own midnight.
+    http.me = { ...http.me, dateOfBirth: '1980-04-23T07:00:00.000Z' }
+    await openProfile()
+    await until(() => birthdayBlock()!.textContent!.includes('April 23, 1980'), 'the birthday')
+    expect(birthdayBlock()!.textContent).toContain('ask your landlord to fix it')
+    expect(birthdayBlock()!.querySelector('input, select, textarea')).toBeNull()
+    // Save Changes sends nothing of it.
+    await act(async () => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Save Changes')!.click() })
+    await until(() => http.patches.length === 1, 'the save')
+    expect(http.patches[0].url).toBe('/tenants/profile')
+    expect(Object.keys(http.patches[0].body)).not.toContain('dateOfBirth')
+  })
+
+  it('a plain date reads the same, and none on file shows a dash with the same note', async () => {
+    http.me = { ...http.me, dateOfBirth: '1962-01-02' }
+    await openProfile()
+    await until(() => birthdayBlock()!.textContent!.includes('January 2, 1962'), 'the birthday')
+    act(() => root.unmount())
+    root = createRoot(host)
+    http.me = { ...http.me, dateOfBirth: null }
+    await openProfile()
+    // Read once the profile has loaded (its email box is filled), not before.
+    await until(() => (host.querySelector('input[type="email"]') as HTMLInputElement | null)?.value === 'rosa@test.dev', 'the profile')
+    expect(birthdayBlock()!.textContent).toContain('—')
+    expect(birthdayBlock()!.textContent).toContain('ask your landlord to fix it')
   })
 })

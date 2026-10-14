@@ -12,10 +12,16 @@
  *   property  the one property they work at (pay_property_id)
  *   company   company level — someone who works at several properties (the
  *             Company column, property NULL)
- * Asked on the employee form (routes/books.ts POST/PATCH /employees). Once
- * set it does not change: a different answer is refused in words. An
+ * Asked on the employee form (routes/books.ts POST/PATCH /employees). An
  * employee with no place yet is asked before their next paycheck — a payroll
  * run naming them is refused until it is set.
+ *
+ * 10/14 afternoon (Nic): "Payroll place: the owner can change it; only future
+ * paychecks follow." Set by anyone who keeps the books; CHANGED only by the
+ * owner (a mistake, or the person moved) — a bookkeeper's or manager's
+ * different answer is refused in words. Their next paychecks follow: the
+ * paychecks on a payroll run still in draft move with it (not paid, never
+ * posted). Every approved run stays exactly as it posted.
  *
  * Each paycheck copies its employee's place onto its own line
  * (payroll_run_lines.pay_place / pay_property_id) when the run is calculated,
@@ -73,22 +79,59 @@ async function placeWords(q: Q, place: string, propertyId: string | null): Promi
   return name ?? BOOKS_EMPLOYEE_PAY_PLACE_LABEL.property.toLowerCase()
 }
 
+/** What a bookkeeper or manager is told when they try to change a place already set. */
+export const PAY_PLACE_OWNER_CHANGES = 'Only the owner can change where an employee\'s pay goes.'
+
 /**
  * Sets an employee's place when it has none; the same answer again changes
- * nothing; a different one is refused ("once you set it it shouldnt
- * change"). `employee` is the row as read (pay_place, pay_property_id).
+ * nothing. A different one: 10/14 afternoon (Nic), "the owner can change it;
+ * only future paychecks follow" — the owner's (`opts.owner`) is saved and the
+ * employee's paychecks on runs still in draft move with it; anyone else's is
+ * refused. `employee` is the row as read (pay_place, pay_property_id). Inside
+ * the caller's transaction: the draft runs are locked before the employee,
+ * the order an approval takes them (its run, then its employees' totals), so
+ * a run approved at the same moment either posted first — and keeps its
+ * place — or is still a draft and moves. Returns how many draft paychecks
+ * moved.
  */
 export async function setEmployeePayPlace(q: Q, employee: { id: string; pay_place: string | null; pay_property_id: string | null },
-  value: EmployeePayPlace, by: string | null): Promise<void> {
-  if (employee.pay_place) {
-    if (employee.pay_place === value.place && (employee.pay_property_id ?? null) === value.propertyId) return
-    throw new AppError(409, `This employee's pay goes to ${await placeWords(q, employee.pay_place, employee.pay_property_id)}. `
-      + 'Once set, where an employee\'s pay goes does not change.')
+  value: EmployeePayPlace, by: string | null, opts: { owner?: boolean } = {}): Promise<{ draftPaychecksMoved: number }> {
+  if (!employee.pay_place) {
+    const set = await q.query(
+      `UPDATE books_employees SET pay_place = $2, pay_property_id = $3, pay_place_set_at = NOW(), pay_place_set_by = $4,
+              updated_at = NOW()
+        WHERE id = $1 AND pay_place IS NULL`, [employee.id, value.place, value.propertyId, by])
+    if (!set.rowCount) throw new AppError(409, 'This employee changed while you were saving. Reload and try again.')
+    return { draftPaychecksMoved: 0 }
   }
-  await q.query(
+  if (employee.pay_place === value.place && (employee.pay_property_id ?? null) === value.propertyId) return { draftPaychecksMoved: 0 }
+  if (!opts.owner) {
+    throw new AppError(403, `This employee's pay goes to ${await placeWords(q, employee.pay_place, employee.pay_property_id)}. `
+      + PAY_PLACE_OWNER_CHANGES)
+  }
+  const drafts = (await q.query<{ id: string }>(
+    `SELECT r.id FROM payroll_runs r
+      WHERE r.status = 'draft'
+        AND EXISTS (SELECT 1 FROM payroll_run_lines l WHERE l.run_id = r.id AND l.employee_id = $1)
+      ORDER BY r.id FOR UPDATE OF r`, [employee.id])).rows.map(r => r.id)
+  // Changed from what the person saw, or not at all: a second change made
+  // meanwhile is never overwritten unseen.
+  const changed = await q.query(
     `UPDATE books_employees SET pay_place = $2, pay_property_id = $3, pay_place_set_at = NOW(), pay_place_set_by = $4,
             updated_at = NOW()
-      WHERE id = $1 AND pay_place IS NULL`, [employee.id, value.place, value.propertyId, by])
+      WHERE id = $1 AND pay_place = $5 AND pay_property_id IS NOT DISTINCT FROM $6::uuid`,
+    [employee.id, value.place, value.propertyId, by, employee.pay_place, employee.pay_property_id])
+  if (!changed.rowCount) throw new AppError(409, 'This employee changed while you were saving. Reload and try again.')
+  // Only future paychecks follow: those on runs still in draft (locked above,
+  // still a draft once locked). Approved and voided runs stay as they posted.
+  const moved = drafts.length
+    ? await q.query(
+        `UPDATE payroll_run_lines l SET pay_place = $2, pay_property_id = $3
+           FROM payroll_runs r
+          WHERE r.id = l.run_id AND r.id = ANY($4::uuid[]) AND r.status = 'draft' AND l.employee_id = $1`,
+        [employee.id, value.place, value.propertyId, drafts])
+    : { rowCount: 0 }
+  return { draftPaychecksMoved: moved.rowCount ?? 0 }
 }
 
 /**

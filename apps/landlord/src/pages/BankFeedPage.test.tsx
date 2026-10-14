@@ -9,6 +9,8 @@
  * 10/14 (Nic, answer 15): a line going out that may be a check the bank
  * returned lists the checks of its amount under "What did this pay?" for the
  * owner to pick; a returned check GAM took back says so and can be undone.
+ * 10/14 afternoon (Nic): a money order, and a tenant's own bank deposit, that
+ * come back are taken back the same way and say so.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
@@ -117,6 +119,9 @@ describe('money coming in: nothing is filled in by a guess', () => {
   })
 })
 
+/** 10/14 follow-up: what the server says beside a payment GAM cannot take back (returnedCheck whatInstead). */
+const OFFICE_LOGGED = 'GAM cannot take back a payment the office logged by hand yet, so the bills it paid stay paid and no fee is billed (Undo this match on that deposit would not change that). Contact GAM support to have it taken back.'
+
 describe('a check the bank returned', () => {
   it('“What did this pay?” lists the checks of its amount; the owner picks the one that bounced', async () => {
     server.txns = [line({ id: 't3', amount: -460, status: 'needs_review', description: 'RETURNED DEPOSIT ITEM' })]
@@ -124,14 +129,17 @@ describe('a check the bank returned', () => {
       expenses: [], checks: [], records: [], returnedLine: true,
       returnedChecks: [
         { remittanceId: 'r1', method: 'check', amount: 460, depositedOn: '2026-10-01', tenantName: 'Rosa Tenant', spaces: 'Unit 5', tenantDeposit: false },
-        { remittanceId: 'r2', method: 'bank_deposit', amount: 460, depositedOn: '2026-10-02', tenantName: 'Sam Tenant', spaces: 'Unit 6', tenantDeposit: true },
+        { remittanceId: 'r2', method: 'bank_deposit', amount: 460, depositedOn: '2026-10-02', tenantName: 'Sam Tenant', spaces: 'Unit 6', tenantDeposit: true,
+          takeBackHere: false, whyNot: OFFICE_LOGGED },
       ],
     }
     await render()
     await click(buttons('What did this pay?')[0])
-    expect(host.textContent).toContain('If this is a check your bank returned, pick the one that bounced:')
+    expect(host.textContent).toContain('If this is a check or money order your bank returned, pick the one that came back:')
     expect(host.textContent).toContain('Rosa Tenant (Unit 5) · Check · $460.00 · deposited 2026-10-01')
-    expect(host.textContent).toContain('Use Undo this match on that deposit')
+    // 10/14 follow-up: one GAM cannot take back says what the owner can do instead (the server's words).
+    expect(host.textContent).toContain(OFFICE_LOGGED)
+    expect(host.textContent).not.toContain('Use Undo this match on that deposit')
     expect(buttons('This one bounced')).toHaveLength(1)
     await click(buttons('This one bounced')[0])
     expect(server.posts).toEqual([{ url: '/bank-feed/transactions/t3/returned-check', body: { remittanceId: 'r1', entityId: '' } }])
@@ -146,9 +154,64 @@ describe('a check the bank returned', () => {
     await render()
     await click(buttons('What did this pay?')[0])
     expect(buttons('This one bounced')).toEqual([])
-    await click(buttons('Was this a check your bank returned?')[0])
+    await click(buttons('Was this a check or money order your bank returned?')[0])
     expect(buttons('This one bounced')).toHaveLength(1)
     expect(server.posts).toEqual([])
+  })
+
+  it('a tenant’s own bank deposit GAM matched is picked like a check; one the office logged by hand says GAM cannot take it back', async () => {
+    server.txns = [line({ id: 't6', amount: -460, status: 'needs_review', description: 'RETURNED DEPOSIT ITEM' })]
+    server.matches.t6 = {
+      expenses: [], checks: [], records: [], returnedLine: true,
+      returnedChecks: [
+        { remittanceId: 'r3', method: 'check', amount: 460, depositedOn: '2026-10-03', tenantName: 'Dee Tenant', spaces: 'Unit 7', tenantDeposit: true, takeBackHere: true },
+        { remittanceId: 'r4', method: 'bank_deposit', amount: 460, depositedOn: '2026-10-04', tenantName: 'Sam Tenant', spaces: 'Unit 6', tenantDeposit: true, takeBackHere: false,
+          whyNot: OFFICE_LOGGED },
+      ],
+    }
+    await render()
+    await click(buttons('What did this pay?')[0])
+    expect(host.textContent).toContain('Dee Tenant (Unit 7) · Their own bank deposit (a check) · $460.00 · deposited 2026-10-03')
+    expect(host.textContent).toContain('Sam Tenant (Unit 6) · Their own bank deposit · $460.00')
+    expect(host.textContent).toContain(OFFICE_LOGGED)
+    expect(buttons('This one bounced')).toHaveLength(1)
+    await click(buttons('This one bounced')[0])
+    expect(server.posts).toEqual([{ url: '/bank-feed/transactions/t6/returned-check', body: { remittanceId: 'r3', entityId: '' } }])
+  })
+
+  it('a money order, and a tenant’s own deposit, GAM took back say what they were; the deposit line says it came back and is not undone there', async () => {
+    server.txns = [
+      line({
+        id: 't7', amount: -300, status: 'matched', description: 'RETURNED MONEY ORDER', matchKind: 'returned_check',
+        returnedCheckMethod: 'money_order', returnedCheckFee: 15, returnedCheckFeeFrom: 'bank', returnedCheckTenantName: 'Mo Tenant', canUndo: true,
+      }),
+      line({
+        id: 't8', amount: -460, status: 'matched', description: 'DEPOSITED ITEM RETURNED', matchKind: 'returned_check',
+        returnedCheckMethod: 'check', returnedCheckFromDeposit: true, returnedCheckFeeFrom: 'later', returnedCheckTenantName: 'Dee Tenant', canUndo: true,
+      }),
+      line({
+        id: 't9', amount: 460, status: 'matched', description: 'MOBILE DEPOSIT', matchKind: 'tenant_deposit',
+        matchedTenantName: 'Dee Tenant', matchedUnitNumber: 'Unit 7', cameBackOn: '2026-10-12', canUndo: false,
+      }),
+    ]
+    await render()
+    // 10/14 follow-up: a money order is not headed "Returned check".
+    expect(host.textContent).toContain('Returned money order — GAM took back Mo Tenant’s money order; the bills it paid are owed again, and a $15.00 returned-payment fee was billed to them.')
+    expect(host.textContent).toContain('Returned check — GAM took back Dee Tenant’s own bank deposit (a check); the bills it paid are owed again, and the returned-check fee is billed to them when your bank’s fee for it shows.')
+    expect(host.textContent).toContain('Tenant’s bank deposit — it came back: your bank returned it on 2026-10-12, and GAM took it back off Unit 7 · Dee Tenant’s bills.')
+    // Undo on the two returned lines only.
+    expect(buttons('Undo this match')).toHaveLength(2)
+  })
+
+  // 10/14 follow-up (Nic 10/12: "every bank filing (hand-filed too) can be undone").
+  it('a Stripe ACH payout GAM matched by its trace code offers Undo', async () => {
+    server.txns = [line({
+      id: 't10', amount: 400.26, status: 'matched', description: 'ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH',
+      matchKind: 'gam_payout', matchedDisbursementId: 'd1', canUndo: true,
+    })]
+    await render()
+    await click(buttons('Undo this match')[0])
+    expect(server.posts).toEqual([{ url: '/bank-feed/deposits/t10/undo', body: { entityId: '' } }])
   })
 
   it('a returned check GAM took back says so, and can be undone', async () => {

@@ -61,7 +61,8 @@ import {
 import { loadStay, stayParts, rentParts, type IncomePart } from './incomeLines'
 
 // 2 — 10/14 (Nic I1, I2): money refunded for nights not stayed comes off the stay's own line (incomeLines).
-export const TENANT_DEPOSITS_RULE_VERSION = 2
+// 3 — 10/14 (Nic): a stay sold by the month is long-term at any length (incomeLines stayIsLongTerm).
+export const TENANT_DEPOSITS_RULE_VERSION = 3
 
 // ─── A bill the deposit paid ────────────────────────────────────────────────
 

@@ -6,7 +6,10 @@
  *      nothing was ever paid, credited or settled on it;
  *   #3 an unsigned sublease agreement takes its sublease request with it;
  *   #7 drafts out for signature nobody signed for 30 days are deleted
- *      nightly, the waiting signers told once.
+ *      nightly, the waiting signers told once — never an onboarding draft
+ *      waiting on the landlord's own signature (10/14 afternoon);
+ *   10/14 afternoon: GAM deleting on its own never cancels an invite; only
+ *      the landlord's own Delete does (#1).
  * (#1, #2 and the button's words: eraseUnfinishedDocument.test; #4/#5:
  * jobs/esignTimeouts.test; #6: routes/leaseDiscard.test.)
  */
@@ -81,11 +84,15 @@ async function lease(status: 'pending' | 'active' | 'terminated' = 'active'): Pr
   } finally { c.release() }
 }
 
-/** A lease document with a landlord and a primary signer. */
+/**
+ * A lease document with a landlord and a primary signer — the landlord signs
+ * first (S28), or, `residentFirst`, the resident does (a purchase agreement
+ * or contract the buyer signs first, S568) and only they were sent a link.
+ */
 async function doc(o: {
   status?: string; leaseId?: string | null; issued?: boolean; type?: string; title?: string
   sentDaysAgo?: number | null; landlordSigned?: boolean; packet?: string | null; renews?: string | null
-  invited?: boolean
+  invited?: boolean; residentFirst?: boolean
 } = {}): Promise<string> {
   const d = (await query<{ id: string }>(
     `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status, issued_at, finalized_at,
@@ -97,6 +104,16 @@ async function doc(o: {
     [f.landlordId, f.unitId, o.leaseId ?? null, o.title ?? 'Lease — Unit 1', o.type ?? 'original_lease',
      o.status ?? 'sent', o.issued === true, o.sentDaysAgo ?? null, o.packet ?? null, o.renews ?? null]))[0].id
   const invited = o.invited !== false
+  if (o.residentFirst) {
+    await query(
+      `INSERT INTO lease_document_signers
+         (document_id, user_id, role, name, email, order_index, token, status, signed_at, invite_sent_at)
+       VALUES ($1,$2,'primary','T T','t@test.dev',1,$3,'sent', NULL, CASE WHEN $4 THEN NOW() - INTERVAL '31 days' END),
+              ($1,$5,'landlord','L L','ll@test.dev',2,$6, $7, CASE WHEN $8 THEN NOW() END, NULL)`,
+      [d, f.tenantUserId, crypto.randomBytes(16).toString('hex'), invited,
+       f.landlordUserId, crypto.randomBytes(16).toString('hex'), o.landlordSigned ? 'signed' : 'pending', o.landlordSigned === true])
+    return d
+  }
   await query(
     `INSERT INTO lease_document_signers
        (document_id, user_id, role, name, email, order_index, token, status, signed_at, invite_sent_at)
@@ -362,23 +379,43 @@ describe('10/14 (Nic, #3): an unsigned sublease agreement takes the sublease req
 })
 
 describe('10/14 (Nic, #7): drafts out for signature nobody signed for 30 days are deleted nightly', () => {
-  it('31 days out, nobody signed: deleted, and the waiting signer told once that it expired', async () => {
-    const id = await doc({ sentDaysAgo: 31 })
+  const tenantEmail = async () =>
+    (await query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [f.tenantUserId]))[0].email
+
+  it('31 days out, nobody signed, waiting on the resident: deleted, and the waiting signer told once that it expired', async () => {
+    const id = await doc({ sentDaysAgo: 31, type: 'purchase_agreement', title: 'Purchase Agreement', residentFirst: true })
     const out = await processUnsignedDraftExpiry()
     expect(out.deleted).toEqual([id])
     expect(await exists('lease_documents', id)).toBe(false)
     const calls = (emailDocumentAutoVoided as any).mock.calls
-    // Only the landlord was sent a link (the tenant waits on his signature, S647).
-    expect(calls.map((c: any[]) => c[0])).toEqual(['ll@test.dev'])
-    // …and their copy never tells them to contact the landlord.
-    expect(calls[0][4]).toMatchObject({ deleted: true, toLandlord: true })
+    // Only the buyer was sent a link (the landlord's turn never came)…
+    expect(calls.map((c: any[]) => c[0])).toEqual([await tenantEmail()])
+    // …and theirs is the resident's copy.
+    expect(calls[0][4]).toMatchObject({ deleted: true, toLandlord: false })
+  })
+
+  it('10/14 afternoon: an ONBOARDING draft waiting on the landlord\'s own signature is left out, however long it waits (S647: he signs at his own pace)', async () => {
+    const lease90 = await doc({ sentDaysAgo: 90 })
+    const form90 = await doc({ sentDaysAgo: 90, type: 'addendum_terms', title: 'Pet addendum' })
+    const out = await processUnsignedDraftExpiry()
+    expect(out).toEqual({ deleted: [], kept: [] })
+    for (const id of [lease90, form90]) expect(await exists('lease_documents', id)).toBe(true)
+    expect(emailDocumentAutoVoided).not.toHaveBeenCalled()
+  })
+
+  it('10/14 afternoon: a packet waits on the landlord when any open document of it does — left whole', async () => {
+    const packet = crypto.randomUUID()
+    const leaseDoc = await doc({ sentDaysAgo: 90, packet, residentFirst: true })
+    const form = await doc({ sentDaysAgo: 90, packet, type: 'addendum_terms', title: 'Radon' })
+    expect(await processUnsignedDraftExpiry()).toEqual({ deleted: [], kept: [] })
+    for (const id of [leaseDoc, form]) expect(await exists('lease_documents', id)).toBe(true)
   })
 
   it('left alone: 29 days out, someone signed, never sent, or a new lease on its own start-date clock', async () => {
-    const young = await doc({ sentDaysAgo: 29 })
+    const young = await doc({ sentDaysAgo: 29, residentFirst: true })
     const signed = await doc({ sentDaysAgo: 40, status: 'in_progress', landlordSigned: true })
-    const unsent = await doc({ status: 'pending', sentDaysAgo: null, invited: false })
-    const renewal = await doc({ sentDaysAgo: 40, renews: await lease('active') })
+    const unsent = await doc({ status: 'pending', sentDaysAgo: null, invited: false, residentFirst: true })
+    const renewal = await doc({ sentDaysAgo: 40, renews: await lease('active'), residentFirst: true })
     const out = await processUnsignedDraftExpiry()
     expect(out.deleted).toEqual([])
     for (const id of [young, signed, unsent, renewal]) expect(await exists('lease_documents', id)).toBe(true)
@@ -387,9 +424,9 @@ describe('10/14 (Nic, #7): drafts out for signature nobody signed for 30 days ar
 
   it('a packet is one thing: its lease takes the forms, and each waiting signer gets ONE email for the packet', async () => {
     const packet = crypto.randomUUID()
-    const leaseDoc = await doc({ sentDaysAgo: 35, packet })
-    const form1 = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Radon' })
-    const form2 = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Lead' })
+    const leaseDoc = await doc({ sentDaysAgo: 35, packet, residentFirst: true })
+    const form1 = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Radon', residentFirst: true })
+    const form2 = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Lead', residentFirst: true })
     const out = await processUnsignedDraftExpiry()
     expect(out.deleted).toEqual([leaseDoc])
     for (const id of [leaseDoc, form1, form2]) expect(await exists('lease_documents', id)).toBe(false)
@@ -398,7 +435,7 @@ describe('10/14 (Nic, #7): drafts out for signature nobody signed for 30 days ar
 
   it('a draft the erase keeps (a rent change from it already reached the bill) is LEFT as it is — never voided, nobody emailed', async () => {
     const leaseId = await lease('active')
-    const id = await doc({ sentDaysAgo: 35, type: 'addendum_terms', title: 'Rent change', leaseId })
+    const id = await doc({ sentDaysAgo: 35, type: 'addendum_terms', title: 'Rent change', leaseId, residentFirst: true })
     await query(
       `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
        VALUES ($1,'rent','2026-10-01',600,'applied',$2)`, [leaseId, id])
@@ -410,9 +447,49 @@ describe('10/14 (Nic, #7): drafts out for signature nobody signed for 30 days ar
 
   it('a packet one person signed any part of is left whole', async () => {
     const packet = crypto.randomUUID()
-    const leaseDoc = await doc({ sentDaysAgo: 35, packet })
-    const form = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Radon', landlordSigned: true, status: 'in_progress' })
+    const leaseDoc = await doc({ sentDaysAgo: 35, packet, residentFirst: true })
+    const form = await doc({ sentDaysAgo: 35, packet, type: 'addendum_terms', title: 'Radon', residentFirst: true,
+                             landlordSigned: true, status: 'in_progress' })
     expect((await processUnsignedDraftExpiry()).deleted).toEqual([])
     for (const id of [leaseDoc, form]) expect(await exists('lease_documents', id)).toBe(true)
+  })
+})
+
+describe('10/14 afternoon (Nic): "invite and signing by tenant is one flow after landlord has already signed" — GAM deleting on its own never cancels an invite', () => {
+  const invite = async (o: { draft?: string | null; resolvedLease?: string | null } = {}) =>
+    (await query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, parser_status, draft_document_id, resolved_at, resolved_lease_id)
+       VALUES ($1,$2,$3,'not_uploaded',$4, CASE WHEN $5::uuid IS NOT NULL THEN NOW() END, $5) RETURNING id`,
+      [f.landlordId, f.tenantId, f.unitId, o.draft ?? null, o.resolvedLease ?? null]))[0].id
+  const inviteRow = async (id: string) => (await query<any>(
+    `SELECT cancelled_at IS NOT NULL AS cancelled, resolved_at IS NOT NULL AS resolved, resolved_lease_id, draft_document_id
+       FROM pending_tenant_intents WHERE id = $1`, [id]))[0]
+
+  it('an unsigned draft deleted on its own: the invite waiting on it stays open and lets go of it, to be drafted again', async () => {
+    const id = await doc({ sentDaysAgo: 2 })
+    const intent = await invite({ draft: id })
+    const out = await inTx(q => eraseUnfinishedDocument(q, { id, document_type: 'original_lease' }, { onItsOwn: true }))
+    expect(out).toMatchObject({ erased: true })
+    expect(await exists('lease_documents', id)).toBe(false)
+    expect(await inviteRow(intent)).toEqual({ cancelled: false, resolved: false, resolved_lease_id: null, draft_document_id: null })
+  })
+
+  it('a lease the landlord\'s signature issued, deleted on its own: the invite it closed reopens and stays open', async () => {
+    const leaseId = await lease('active')
+    const id = await doc({ status: 'in_progress', leaseId, issued: true, landlordSigned: true })
+    const intent = await invite({ draft: id, resolvedLease: leaseId })
+    const out = await inTx(q => eraseUnfinishedDocument(q, { id, lease_id: leaseId, document_type: 'original_lease' }, { onItsOwn: true }))
+    expect(out).toMatchObject({ erased: true, leaseId })
+    expect(await exists('leases', leaseId)).toBe(false)
+    expect(await inviteRow(intent)).toEqual({ cancelled: false, resolved: false, resolved_lease_id: null, draft_document_id: null })
+  })
+
+  it('the landlord\'s own Delete still closes it (#1)', async () => {
+    const id = await doc({ sentDaysAgo: 2 })
+    const intent = await invite({ draft: id })
+    const res = await request(buildApp()).post(`/api/esign/documents/${id}/void`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.body.data.deleted).toBe(true)
+    expect(await inviteRow(intent)).toMatchObject({ cancelled: true, draft_document_id: null })
   })
 })

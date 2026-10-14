@@ -43,7 +43,8 @@ import { loadStay, stayParts } from './incomeLines'
 export const registerRefundProjector: LedgerProjector = {
   sourceType: 'pos_refund',
   // 2 — 10/14 (Nic I1, I2): stay money refunded off the stay's own line (incomeLines).
-  ruleVersion: 2,
+  // 3 — 10/14 (Nic): a stay sold by the month is long-term at any length (incomeLines stayIsLongTerm).
+  ruleVersion: 3,
 
   async project(client: PoolClient, refundId: string): Promise<DesiredPosting[]> {
     const r = (await client.query<{

@@ -17,7 +17,12 @@
 // that payout for the person to match. 10/14 (Nic, answer 15): a line going out
 // that is a check the bank returned — when GAM could not be sure which check —
 // lists the checks of its amount under "What did this pay?" for the person to
-// pick; a returned check GAM took back can be undone like any match.
+// pick; a returned check GAM took back can be undone like any match. 10/14
+// afternoon (Nic): a money order that comes back, and a tenant's own bank
+// deposit that comes back, are taken back the same way — and a Stripe ACH
+// payout files itself when it is exactly one payout by its trace code, amount
+// and arrival day (otherwise it is still offered here to match), and can be
+// undone like any filing (10/14 follow-up).
 import { useMemo, useState, useEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
@@ -308,16 +313,19 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   })
 
   // S655 (Step 12, K-C / K-D): take a match or a filing back, exactly.
-  const undoMatch = useMutation((id: string) => apiPost(`/bank-feed/deposits/${id}/undo`, { entityId }), {
-    onSuccess: (r: any) => {
+  // 10/14 follow-up: given the line, so a returned money order or a tenant's
+  // own deposit put back is said as what it was.
+  const undoMatch = useMutation((t: any) => apiPost(`/bank-feed/deposits/${t.id}/undo`, { entityId }), {
+    onSuccess: (r: any, t: any) => {
       qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('unmatched-deposits')
       qc.invalidateQueries('cash-position'); qc.invalidateQueries('deposit-slips'); qc.invalidateQueries('undeposited-cash')
       const d = r?.data
+      const back = returnedWords(t)
       toast(d?.kind === 'deposit_slip'
         ? (d?.slipReopened ? 'Match undone. The deposit slip is waiting for the bank again.' : 'Match undone. Those payments are back on the "not banked" list.')
         // 10/14 (Nic, answer 15): a returned check put back.
         : d?.kind === 'returned_check'
-          ? 'Undone. The check counts as paid again; the returned-check fee and the late fees it brought are voided (kept on record). The line is back in review.'
+          ? `Undone. The ${back.what} counts as paid again; the ${back.fee} and the late fees it brought came off (kept on record). The line is back in review.`
         // 10/14 (Nic, answer 16): a payout matched by hand.
         : d?.kind === 'gam_payout'
           ? 'Undone. The deposit is back in review.'
@@ -456,12 +464,14 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       t.matchKind === 'deposit_slip'
         ? 'Undo this match? The deposit goes back to review and its slip waits for the bank again. Any "other money" on the slip comes back out of your income.'
         : t.matchKind === 'returned_check'
-          ? 'Undo this returned check? The check counts as paid again on the day it was paid, the returned-check fee and the late fees it brought are voided (kept on record), the tenant is told, and the line goes back to review. Nothing is undone if the tenant paid since.'
+          ? `Undo this returned ${returnedWords(t).item}? The ${returnedWords(t).what} counts as paid again on the day it was paid, `
+            + `the ${returnedWords(t).fee} and the late fees it brought come off (kept on record), the tenant is told, and the line goes back to review. `
+            + 'Nothing is undone if the tenant paid since.'
         : t.matchKind === 'gam_payout'
           ? 'Undo this match? The deposit goes back to review, no longer matched to GAM’s payout.'
         : 'Undo this match? The bills it paid are owed again, any late fees it took off come back, credit it created is withdrawn, and the deposit goes back to review. Nothing is undone if any of that changed since.',
       { title: 'Undo this match', confirmLabel: 'Undo it' })
-    if (ok) undoMatch.mutate(t.id)
+    if (ok) undoMatch.mutate(t)
   }
 
   const categorize = useMutation(
@@ -1071,6 +1081,21 @@ function SplitEditor({ total, parts, categories, properties, unitsForProp, repla
   )
 }
 
+/**
+ * 10/14 (follow-up): a returned line GAM took back, in words — a check or a
+ * money order (the fee billed for a money order is the "returned-payment fee",
+ * services/returnedCheck billFee), and what counts as paid again when it is
+ * undone (the tenant's own bank deposit, when it was theirs).
+ */
+function returnedWords(t: any): { item: string; fee: string; what: string } {
+  const item = t?.returnedCheckMethod === 'money_order' ? 'money order' : 'check'
+  return {
+    item,
+    fee: item === 'check' ? 'returned-check fee' : 'returned-payment fee',
+    what: t?.returnedCheckFromDeposit ? 'tenant’s own bank deposit' : item,
+  }
+}
+
 // S655: what a matched row was matched TO. Every matched row used to read "GAM
 // payout", including a tenant's own cash deposit. A payout now lists the
 // payments inside it; a tenant's deposit names whose rent it paid.
@@ -1101,6 +1126,16 @@ function MatchedLine({ t }: { t: any }) {
   if (t.matchKind === 'tenant_deposit') {
     const who = [t.matchedUnitNumber, t.matchedTenantName].filter(Boolean).join(' · ')
     const more = Number(t.matchedChargeCount) > 1 ? ` (${t.matchedChargeCount} charges)` : ''
+    // 10/14 afternoon: the deposit came back — GAM took it back off the bills
+    // it paid, on the bank's returned line (undone there, not here).
+    if (t.cameBackOn) {
+      return (
+        <div style={line}>
+          {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — it came back: your bank returned it on {fmtDate(t.cameBackOn)}, and GAM
+          {' '}took it back off {who ? `${who}’s` : 'the tenant’s'} bills. The returned line says what was billed; undo it there.
+        </div>
+      )
+    }
     return (
       <div style={line}>
         {BANK_TXN_MATCH_KIND_LABEL['tenant_deposit']} — applied to {who ? `${who}’s` : 'a tenant’s'} rent{more}
@@ -1123,14 +1158,19 @@ function MatchedLine({ t }: { t: any }) {
   // 10/14 (Nic, answer 15): a check the bank returned out of a deposit, taken
   // back by itself — just that check; the bills it paid are owed again.
   if (t.matchKind === 'returned_check') {
+    // 10/14 afternoon: a money order that came back, or the tenant's own bank deposit.
+    const { item, fee } = returnedWords(t)
+    const whose = t.returnedCheckTenantName ? `${t.returnedCheckTenantName}’s` : 'the'
     return (
       <div style={line}>
-        {BANK_TXN_MATCH_KIND_LABEL['returned_check']} — GAM took back {t.returnedCheckTenantName ? `${t.returnedCheckTenantName}’s` : 'the'} check;
+        {/* 10/14 follow-up: a money order is not headed "Returned check". */}
+        {item === 'check' ? BANK_TXN_MATCH_KIND_LABEL['returned_check'] : 'Returned money order'} — GAM took back {whose}
+        {t.returnedCheckFromDeposit ? ` own bank deposit (a ${item})` : ` ${item}`};
         {' '}the bills it paid are owed again
-        {t.returnedCheckFee != null ? `, and a ${fmt(t.returnedCheckFee)} returned-check fee was billed to them`
+        {t.returnedCheckFee != null ? `, and a ${fmt(t.returnedCheckFee)} ${fee} was billed to them`
           : t.returnedCheckFeeFrom === 'unreadable' ? '; their lease’s returned-payment fee could not be read as an amount, so add it by hand'
           : t.returnedCheckFeeFrom === 'none' ? '; your bank showed no fee for it, so none was billed'
-          : ', and the returned-check fee is billed to them when your bank’s fee for it shows'}.
+          : `, and the ${fee} is billed to them when your bank’s fee for it shows`}.
         {' '}The bank’s own fee line is yours to file as a bank fee.
       </div>
     )
@@ -1210,20 +1250,25 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
     onError: (e: any) => toast.error(e?.message || 'That match could not be saved.'),
   })
   // 10/14 (Nic, answer 15): the owner picks the check the bank returned.
-  const bounced = useMutation((remittanceId: string) =>
-    apiPost(`/bank-feed/transactions/${t.id}/returned-check`, { remittanceId, entityId }), {
-    onSuccess: () => {
-      toast('Taken back. The bills that check paid are owed again, with any late fees and the returned-check fee, and the tenant was told.')
+  // 10/14 follow-up: given the pick, so a money order is said as one.
+  const bounced = useMutation((c: any) =>
+    apiPost(`/bank-feed/transactions/${t.id}/returned-check`, { remittanceId: c.remittanceId, entityId }), {
+    onSuccess: (_r: any, c: any) => {
+      const { what, fee } = returnedWords({ returnedCheckMethod: c.method, returnedCheckFromDeposit: c.tenantDeposit })
+      toast(`Taken back. The bills that ${what} paid are owed again, with any late fees and the ${fee}, and the tenant was told.`)
       setOpen(false); onDone()
     },
-    onError: (e: any) => toast.error(e?.message || 'That check could not be taken back.'),
+    onError: (e: any) => toast.error(e?.message || 'That payment could not be taken back.'),
   })
   const askBounced = async (c: any) => {
+    const { item, fee } = returnedWords({ returnedCheckMethod: c.method })
     const ok = await appConfirm(
-      `Take back ${c.tenantName ? `${c.tenantName}’s` : 'this'} ${fmt(c.amount)} ${c.method === 'money_order' ? 'money order' : 'check'} from the deposit of ${fmtDate(c.depositedOn)}? `
-        + 'Just that payment comes off the bills it paid: they are owed again with any late fees from their due dates, the returned-check fee is billed, and the tenant is told. You can undo it.',
-      { title: 'A check bounced', confirmLabel: 'Take it back' })
-    if (ok) bounced.mutate(c.remittanceId)
+      (c.tenantDeposit
+        ? `Take back ${c.tenantName ? `${c.tenantName}’s` : 'this'} own ${fmt(c.amount)} bank deposit of ${fmtDate(c.depositedOn)} (a ${item})? `
+        : `Take back ${c.tenantName ? `${c.tenantName}’s` : 'this'} ${fmt(c.amount)} ${item} from the deposit of ${fmtDate(c.depositedOn)}? `)
+        + `Just that payment comes off the bills it paid: they are owed again with any late fees from their due dates, the ${fee} is billed, and the tenant is told. You can undo it.`,
+      { title: item === 'check' ? 'A check bounced' : 'A money order came back', confirmLabel: 'Take it back' })
+    if (ok) bounced.mutate(c)
   }
   if (!open) {
     return (
@@ -1249,25 +1294,29 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
       {isLoading ? <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Looking…</div> : (
         <>
           {/* 10/14 (Nic, answer 15): a check the bank returned — GAM could not be
-              sure which one, so the owner picks. A tenant's own bank deposit is
-              taken back with Undo this match on that deposit instead. */}
+              sure which one, so the owner picks. 10/14 afternoon: a money order
+              too, and a tenant's own bank deposit GAM matched. 10/14 follow-up:
+              one GAM cannot take back (a deposit the office logged by hand)
+              says what the owner can do instead, in the server's words. */}
           {returnedChecks.length > 0 && !showReturned && (
             <div style={{ marginBottom: 6 }}>
-              <button className="btn btn-primary btn-sm" onClick={() => setAskReturned(true)}>Was this a check your bank returned?</button>
+              <button className="btn btn-primary btn-sm" onClick={() => setAskReturned(true)}>Was this a check or money order your bank returned?</button>
             </div>
           )}
           {showReturned && (
             <div style={{ marginBottom: 6 }}>
               <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 2 }}>
-                If this is a check your bank returned, pick the one that bounced:
+                If this is a check or money order your bank returned, pick the one that came back:
               </div>
               {returnedChecks.map(c => (
                 <div key={c.remittanceId} style={row}>
                   <span style={{ flex: 1 }}>
-                    {c.tenantName ?? 'A tenant'}{c.spaces ? ` (${c.spaces})` : ''} · {c.method === 'money_order' ? 'Money order' : c.tenantDeposit ? 'Their own bank deposit' : 'Check'} · {fmt(c.amount)} · deposited {fmtDate(c.depositedOn)}
+                    {c.tenantName ?? 'A tenant'}{c.spaces ? ` (${c.spaces})` : ''} · {c.tenantDeposit
+                      ? `Their own bank deposit${c.method === 'check' ? ' (a check)' : c.method === 'money_order' ? ' (a money order)' : ''}`
+                      : c.method === 'money_order' ? 'Money order' : 'Check'} · {fmt(c.amount)} · deposited {fmtDate(c.depositedOn)}
                   </span>
-                  {c.tenantDeposit
-                    ? <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Use Undo this match on that deposit</span>
+                  {c.takeBackHere === false
+                    ? <span style={{ fontSize: '.72rem', color: 'var(--text-3)', flex: 1 }}>{c.whyNot}</span>
                     : <button className="btn btn-primary btn-sm" disabled={bounced.isLoading} onClick={() => askBounced(c)}>This one bounced</button>}
                 </div>
               ))}
