@@ -741,7 +741,8 @@ export function splitRegisterMoney(sales: readonly RegisterSale[]): {
 // number, leading zeros dropped). A space that is a bare number ("15") is
 // named only after a word for a space or a # ("site 15", "#15") — never by any
 // number in the words ("Propane 20 lb" names nothing). Words that name two of
-// the property's spaces name no one space: the sale stays in the folder.
+// the property's spaces name no one space: the sale splits by its lines
+// (splitSaleBySpace), else stays in the folder.
 
 /** Words before a bare number that make it a space's ("site 15"). */
 const SPACE_WORDS = new Set(['space', 'site', 'lot', 'spot', 'pad', 'unit', 'stall', 'no'])
@@ -765,43 +766,60 @@ export function spaceKeysOf(name: string | null | undefined): string[] {
   return [`= ${s}`]
 }
 
-/** Every way a space could be named in these words ("rv 27"; "# 15" after "site" or "#"). */
-export function spaceKeysIn(text: string | null | undefined): string[] {
-  const s = String(text ?? '').toLowerCase()
-  const out = new Set<string>()
+/** Each way a space could be named in these words, with where it is first said in them (spaceKeysIn). */
+function spaceKeyPlaces(text: string): Map<string, number> {
+  const s = text.toLowerCase()
+  const out = new Map<string, number>()
+  const at = (k: string, i: number) => { if (i < (out.get(k) ?? Infinity)) out.set(k, i) }
   for (const m of s.matchAll(/(?<![a-z0-9])([a-z]+)[ \t#.-]*(\d+)([a-z]?)(?![a-z0-9])/g)) {
     const n = `${parseInt(m[2], 10)}${m[3]}`
-    out.add(`${m[1]} ${n}`)
-    if (SPACE_WORDS.has(m[1])) out.add(`# ${n}`)
+    at(`${m[1]} ${n}`, m.index ?? 0)
+    if (SPACE_WORDS.has(m[1])) at(`# ${n}`, m.index ?? 0)
   }
-  for (const m of s.matchAll(/(?<![a-z0-9])#\s*(\d+)([a-z]?)(?![a-z0-9])/g)) out.add(`# ${parseInt(m[1], 10)}${m[2]}`)
-  return [...out]
+  for (const m of s.matchAll(/(?<![a-z0-9])#\s*(\d+)([a-z]?)(?![a-z0-9])/g)) at(`# ${parseInt(m[1], 10)}${m[2]}`, m.index ?? 0)
+  return out
+}
+
+/** Every way a space could be named in these words ("rv 27"; "# 15" after "site" or "#"). */
+export function spaceKeysIn(text: string | null | undefined): string[] {
+  return [...spaceKeyPlaces(String(text ?? '')).keys()]
 }
 
 /**
- * The one space of these that the words name (see above); null when they name
- * none, or more than one. `spaces`: each space's id and its names (number,
- * printed label).
+ * Every space of these that the words name (see above), the first named
+ * first (10/14, Nic: "the first space named takes the odd cent"). `spaces`:
+ * each space's id and its names (number, printed label).
  */
+export function spacesNamedIn(
+  texts: readonly (string | null | undefined)[],
+  spaces: readonly { unitId: string; names: readonly (string | null | undefined)[] }[],
+): string[] {
+  // The words as one, each text apart ('|' joins no space's name across two).
+  const all = texts.map(t => String(t ?? '').toLowerCase()).join(' | ')
+  const said = spaceKeyPlaces(all)
+  const first = new Map<string, number>()
+  for (const sp of spaces) {
+    for (const name of sp.names) {
+      for (const k of spaceKeysOf(name)) {
+        // A name in words ("Cabin Moose"): its words whole, whatever is between them.
+        const words = k.startsWith('= ') ? k.slice(2).replace(/[^a-z0-9#]+/g, ' ').trim() : null
+        const i = words === null ? said.get(k)
+          : words ? new RegExp(`(?<![a-z0-9#])${words.split(' ').join('[^a-z0-9#]+')}(?![a-z0-9#])`).exec(all)?.index
+          : undefined
+        if (i !== undefined && i < (first.get(sp.unitId) ?? Infinity)) first.set(sp.unitId, i)
+      }
+    }
+  }
+  return [...first.entries()].sort((a, z) => a[1] - z[1]).map(([unitId]) => unitId)
+}
+
+/** The one space of these that the words name (spacesNamedIn); null when they name none, or more than one. */
 export function spaceNamedIn(
   texts: readonly (string | null | undefined)[],
   spaces: readonly { unitId: string; names: readonly (string | null | undefined)[] }[],
 ): string | null {
-  const said = new Set<string>()
-  for (const t of texts) for (const k of spaceKeysIn(t)) said.add(k)
-  const words = ` ${texts.map(t => String(t ?? '').toLowerCase().replace(/[^a-z0-9#]+/g, ' ')).join(' ')} `.replace(/\s+/g, ' ')
-  const hits = new Set<string>()
-  for (const sp of spaces) {
-    for (const name of sp.names) {
-      for (const k of spaceKeysOf(name)) {
-        const named = k.startsWith('= ')
-          ? words.includes(` ${k.slice(2).replace(/[^a-z0-9#]+/g, ' ').trim()} `)
-          : said.has(k)
-        if (named) hits.add(sp.unitId)
-      }
-    }
-  }
-  return hits.size === 1 ? [...hits][0] : null
+  const hits = spacesNamedIn(texts, spaces)
+  return hits.length === 1 ? hits[0] : null
 }
 
 // ─── A sale naming two spaces (10/14, Nic) ───────────────────────────────────
@@ -812,13 +830,23 @@ export function spaceNamedIn(
 // A sale whose words name more than one of the property's spaces is split by
 // its own lines: each line whose own name names one space ("Electric — RV 2",
 // "Electric — RV 27") is that space's, with the line's own tax
-// (pos_transaction_items.tax_rate). The rest of the sale — a line that names no
-// space or several, the rest of its tax, a discount — names no one space, so it
-// stays in the folder ("only money with no space stays in the folder"), and so
-// do the sale's refunds (a refund names no line). A line toward a stay is the
-// stay's (its row reads it), never a piece. Nothing to split — no line names a
-// single space, or the lines come to more than the sale's money after a
-// discount — and the whole sale stays in the folder, as before.
+// (pos_transaction_items.tax_rate). 10/14 (Nic): one line naming several
+// spaces ("Electric — RV 2 and RV 27", $40) is split EVENLY between them, its
+// tax with it — $20 each; the odd cent to the first space named in it. The
+// rest of the sale — a line that names no space, the rest of its tax, a
+// discount — names no one space, so it stays in the folder ("only money with
+// no space stays in the folder"), and so do the sale's refunds (a refund names
+// no line). A line toward a stay is the stay's (its row reads it), never a
+// piece. Nothing to split — no line names a space, or the lines come to more
+// than the sale's money after a discount — and the whole sale stays in the
+// folder, as before.
+
+/** `totalC` cents in `n` even shares, the first ones taking the odd cents (10/14, Nic). */
+export function evenShares(totalC: number, n: number): number[] {
+  const each = Math.floor(totalC / n)
+  const odd = totalC - each * n
+  return Array.from({ length: n }, (_, i) => each + (i < odd ? 1 : 0))
+}
 
 /** One space's part of a sale naming several (splitSaleBySpace). */
 export interface SaleSpacePiece {
@@ -828,8 +856,10 @@ export interface SaleSpacePiece {
 
 /**
  * The parts of a sale's line in the month's money (`x`, a sale — never a
- * refund) that its lines name one space each: one line of money per space, in
- * space order, and what is left of the sale (null when nothing is). The parts
+ * refund) that its lines name a space — a line naming one, that space's; a
+ * line naming several, an even share for each (10/14, Nic): one line of money
+ * per space, in space order, and what is left of the sale (null when nothing
+ * is). The parts
  * add up to `x.amount`. null: the sale does not split (see above). Pure.
  */
 export function splitSaleBySpace(
@@ -839,24 +869,44 @@ export function splitSaleBySpace(
   if (x.kind !== 'sale') return null
   type Line = NonNullable<RegisterSale['lines']>[number]
   const towardC = (s.stays ?? []).reduce((t, y) => t + Math.max(0, cents(y.toward)), 0)
-  const byUnit = new Map<string, Line[]>()
+  const taxOf = (l: Line) => Math.round(cents(l.subtotal) * (Number(l.taxRate) || 0))
+  // Each space's lines, each with its tax in cents (`shared`: its even share of a line naming several).
+  const byUnit = new Map<string, Array<{ line: Line; taxC: number; shared: boolean }>>()
+  const add = (unitId: string, x: { line: Line; taxC: number; shared: boolean }) => byUnit.set(unitId, [...(byUnit.get(unitId) ?? []), x])
   const others: Line[] = []
   for (const l of s.lines ?? []) {
-    const unitId = towardC > 0 && l.stayUnit ? null : spaceNamedIn([l.name], spaces)
-    if (unitId) byUnit.set(unitId, [...(byUnit.get(unitId) ?? []), l])
-    else others.push(l)
+    const named = towardC > 0 && l.stayUnit ? [] : spacesNamedIn([l.name], spaces)
+    if (named.length === 1) add(named[0], { line: l, taxC: taxOf(l), shared: false })
+    else if (named.length > 1 && cents(l.subtotal) > 0) {
+      // 10/14 (Nic): split EVENLY between the spaces it names, the first named taking the odd cent.
+      const amounts = evenShares(cents(l.subtotal) + taxOf(l), named.length)
+      const taxes = evenShares(taxOf(l), named.length)
+      const qty = Math.round((Number(l.qty) / named.length) * 1000) / 1000
+      named.forEach((unitId, i) => add(unitId, {
+        line: { ...l, name: `${String(l.name ?? '').trim() || 'Item'} (split evenly)`, qty, subtotal: dollars(amounts[i] - taxes[i]) },
+        taxC: taxes[i], shared: true,
+      }))
+    } else others.push(l)
   }
-  const taxOf = (l: Line) => Math.round(cents(l.subtotal) * (Number(l.taxRate) || 0))
   const order = new Map(spaces.map((sp, i) => [sp.unitId, i]))
-  const parts = [...byUnit.entries()]
-    .map(([unitId, lines]) => {
-      const taxC = lines.reduce((t, l) => t + taxOf(l), 0)
-      return { unitId, lines, taxC, amountC: lines.reduce((t, l) => t + cents(l.subtotal), 0) + taxC }
+  const all = [...byUnit.entries()]
+    .map(([unitId, xs]) => {
+      const taxC = xs.reduce((t, x) => t + x.taxC, 0)
+      return {
+        unitId, lines: xs.map(x => x.line), shared: xs.some(x => x.shared), taxC,
+        amountC: xs.reduce((t, x) => t + cents(x.line.subtotal), 0) + taxC,
+      }
     })
-    .filter(p => p.amountC > 0)
+  const parts = all.filter(p => p.amountC > 0)
     .sort((a, z) => (order.get(a.unitId) ?? 0) - (order.get(z.unitId) ?? 0))
-  // A line with no money ($0) names its space for nothing: only lines with money split.
-  for (const [unitId, lines] of byUnit) if (!parts.some(p => p.unitId === unitId)) others.push(...lines)
+  // A line with no money ($0) names its space for nothing: only lines with money
+  // split. (A space whose lines come to nothing though one is a share of a line
+  // naming several: the shares no longer add up to that line — no split.)
+  for (const p of all) {
+    if (p.amountC > 0) continue
+    if (p.shared) return null
+    others.push(...p.lines)
+  }
   if (!parts.length) return null
   const splitC = parts.reduce((t, p) => t + p.amountC, 0)
   const splitTaxC = parts.reduce((t, p) => t + p.taxC, 0)
@@ -1616,7 +1666,12 @@ export class RentRollRangeError extends Error {}
 // refunds (early check-out)" — its early check-out's parts and a refund at the
 // register on a sale that paid it, splitRegisterMoney's rule) — shared over
 // the nights it was sold for, to the cent, as GAM Books earns a stay
-// (ledgerProjectors/bookingStay). So a month paid late is in its own month,
+// (ledgerProjectors/bookingStay). 10/14 (Nic): a stay that checked out early
+// with nights refunded counts the nights ACTUALLY STAYED ("booked 7, stayed 3,
+// refunded 4 → 3 nights"), its money after the refund shared over them — its
+// length is check-in to the day it checked out, not the length sold. One that
+// checked out early with nothing given back still counts the length it paid
+// for. So a month paid late is in its own month,
 // as a bill paid late is on the Rent Roll. A stay nothing was kept on is no
 // line. It reads "via POS" when any of its money was rung on a stay item at
 // the register or on a pay link, or when it was not booked on the booking
@@ -1756,10 +1811,11 @@ export async function rentRollStays(opts: {
   // that paid two stays is a part of each).
   const booked = await query<{
     booking_id: string; space: string; lease_type: string; check_in: string; booked_check_out: string
-    toward: string; booked_online: boolean; by_stay_line: boolean
+    check_out: string; checked_out: boolean; toward: string; booked_online: boolean; by_stay_line: boolean
   }>(`
     SELECT b.id AS booking_id, u.unit_number AS space, b.lease_type,
            to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(${soldCheckOutSql('b')}, 'YYYY-MM-DD') AS booked_check_out,
+           to_char(b.check_out, 'YYYY-MM-DD') AS check_out, (b.status = 'checked_out') AS checked_out,
            SUM(s.toward_stay)::text AS toward,
            EXISTS (SELECT 1 FROM stay_payments d WHERE d.booking_id = b.id AND d.kind = 'site_deposit') AS booked_online,
            BOOL_OR(s.pos_transaction_id IS NOT NULL AND ${hasStayLine('s.pos_transaction_id')}) AS by_stay_line
@@ -1772,7 +1828,7 @@ export async function rentRollStays(opts: {
        AND b.check_in < $4::date AND GREATEST(${soldCheckOutSql('b')}, b.check_in + 1) > $3::date
        -- A stay that became a lease is that lease's.
        AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id)
-     GROUP BY b.id, u.unit_number, b.lease_type, b.check_in, b.check_out, b.booked_check_out
+     GROUP BY b.id, u.unit_number, b.lease_type, b.check_in, b.check_out, b.booked_check_out, b.status
      ORDER BY b.check_in, b.id`, [property.id, landlordIds, start, end])
   const back = await stayRefundsAllTime(landlordIds, booked.map(r => r.booking_id))
   // A stay item sold with no stay on the schedule: counted by its line — what
@@ -1806,9 +1862,12 @@ export async function rentRollStays(opts: {
 
   const pieces: StayPiece[] = []
   for (const r of booked) {
-    const kept = cents(r.toward) - (back.get(r.booking_id) ?? 0)
+    const backC = back.get(r.booking_id) ?? 0
+    const kept = cents(r.toward) - backC
     if (kept <= 0) continue
-    const at = stayInRange(r, kept, start, end)
+    // 10/14 (Nic): checked out early with nights refunded — the nights stayed.
+    const early = r.checked_out && backC > 0 && r.check_out < r.booked_check_out
+    const at = stayInRange(early ? { ...r, booked_check_out: r.check_out } : r, kept, start, end)
     if (!at) continue
     pieces.push({
       unit: at.unit, via: r.booked_online && !r.by_stay_line ? 'booking_site' : 'pos', quantity: at.quantity,
@@ -1991,8 +2050,8 @@ export async function buildRentRollHistory(opts: {
         invoiced: s.invoiced, lateFees: s.lateFees, paid: s.paid, credit: s.credit, workTrade: s.workTrade, owed: s.owed,
       }
       movedOutOwing.push({
-        key, leaseId: d.leaseId, householdId: d.householdId, residents: d.residents,
-        spaces: [...d.spaces].sort(compareSpaces),
+        key, kind: 'household', leaseId: d.leaseId, householdId: d.householdId, residents: d.residents,
+        guest: null, stayDates: null, checkedOut: null, spaces: [...d.spaces].sort(compareSpaces),
         owed: dollars(owedC),
         months: ms.filter(m => cents(m.owed) > 0).map(m => ({ month: m.month, owed: m.owed })),
         leaseEnded: opts.showLeaseDates === false ? null : (d.f?.ended_on ?? null),
@@ -2033,8 +2092,19 @@ export async function buildRentRollHistory(opts: {
   }
   rows.sort((a, z) => compareSpaces(a.spaces[0], z.spaces[0]) || (startOf.get(a.key) ?? '').localeCompare(startOf.get(z.key) ?? '')
     || (a.residents[0]?.name ?? '').localeCompare(z.residents[0]?.name ?? '') || a.key.localeCompare(z.key))
+  // 10/14 (Nic): the folder also lists checked-out stay guests who still owe
+  // — the Payments page's rule (checkedOutStillOwing), whatever the range. A
+  // stay is no bill: nothing of it is in the range totals (its money paid is
+  // the stays' lines below).
+  for (const m of await checkedOutStillOwing(landlordIds, property, new Set())) {
+    movedOutOwing.push({
+      key: m.key, kind: 'stay', leaseId: null, householdId: null, residents: [], guest: m.guest, stayDates: m.stayDates,
+      checkedOut: m.leftOn, spaces: m.space ? [m.space] : [], owed: m.owed, months: [], leaseEnded: null, inRange: zeroTotals(),
+    })
+  }
+  const whoOf = (m: RentRollMovedOutOwing) => m.residents[0]?.name ?? m.guest ?? ''
   movedOutOwing.sort((a, z) => compareSpaces(a.spaces[0], z.spaces[0])
-    || (a.residents[0]?.name ?? '').localeCompare(z.residents[0]?.name ?? '') || a.key.localeCompare(z.key))
+    || whoOf(a).localeCompare(whoOf(z)) || a.key.localeCompare(z.key))
   // 10/13 (Nic): "show stays as an aggregate by line items … put them below
   // with expandable notes" — the range's stays (all time: every stay, whether
   // or not a bill came before it), up to a bookkeeper's cut at a sale.

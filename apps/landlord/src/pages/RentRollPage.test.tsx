@@ -395,6 +395,32 @@ describe('the Rent Roll: one property at a time', () => {
     await until(() => text().includes('REPORT m1 ?leaseId=l9'), 'the report')
   })
 
+  // 10/14 (Nic): "The Rent Roll's 'Moved out, still owes' folder also lists
+  // checked-out stay guests who still owe — same rule, same wording."
+  it('a stay guest who checked out still owing is in the folder too, in the Payments page\'s words; the name opens nothing', async () => {
+    const zero = { invoiced: 0, lateFees: 0, paid: 0, credit: 0, workTrade: 0, owed: 0 }
+    server.history = q => history(q, { movedOutOwing: [
+      { key: 'lease:l9', kind: 'household', leaseId: 'l9', householdId: 'm1', residents: [resident('m1', 'Marta Diaz')], guest: null,
+        stayDates: null, checkedOut: null, spaces: ['RV 7'], owed: 495, months: [{ month: '2026-08', owed: 495 }], leaseEnded: null,
+        inRange: zero },
+      { key: 'stay:b1', kind: 'stay', leaseId: null, householdId: null, residents: [], guest: 'Olaf Over', stayDates: 'Sep 20 – Sep 27',
+        checkedOut: '2026-09-27', spaces: ['RV 35'], owed: 360, months: [], leaseEnded: null, inRange: zero },
+    ] })
+    await render()
+    const head = host.querySelector('.rrh-folder-head') as HTMLButtonElement
+    expect(head.textContent).toBe('Moved out, still owes1 household · 1 stay guest')
+    await click(head)
+    const rows = [...host.querySelectorAll('.rrh-mo-table tbody tr')]
+    expect([...rows[1].querySelectorAll('td')].map(td => td.textContent)).toEqual(
+      ['RV 35', 'Olaf Over', '—', 'Stay Sep 20 – Sep 27 · checked out Sep 27, 2026', '$360.00'])
+    expect(rows[1].querySelector('button')).toBeNull()
+    const lines = rentRollCsv(server.history!(new URLSearchParams('propertyId=mv&from=2026-09&to=2026-09'))).trimEnd().split('\n')
+    expect(lines.slice(-2)).toEqual([
+      'RV 7,Marta Diaz,,0,0,0,495,August 2026 $495.00',
+      'RV 35,Olaf Over,,0,0,0,360,"Stay Sep 20 – Sep 27 · checked out Sep 27, 2026"',
+    ])
+  })
+
   it('no folder when nobody who moved out still owes; a range nobody was billed in says so', async () => {
     server.history = q => history(q, { rows: [] })
     await render('Nobody was billed here')

@@ -684,16 +684,30 @@ export interface RentRollMonthCount {
   counts: Array<{ status: RentRollMonthStatus; label: string; households: number }>
 }
 
-/** 10/13 (Nic): "Moved out, still owes" — a collapsed folder, each household until paid. */
+/**
+ * 10/13 (Nic): "Moved out, still owes" — a collapsed folder, each household
+ * until paid. 10/14 (Nic): it also lists every stay guest who checked out
+ * still owing — the Payments page's rule and words (OpenMonthMovedOut), its
+ * key 'stay:<booking id>'.
+ */
 export interface RentRollMovedOutOwing {
   key: string
+  /** A household, or a stay whose guest checked out still owing (10/14). */
+  kind: 'household' | 'stay'
   leaseId: string | null
   householdId: string | null
+  /** A household's residents, primary first; [] on a stay. */
   residents: RentRollResident[]
+  /** A stay's guest in words (the booking's guest name, else their resident's); null on a household. */
+  guest: string | null
+  /** A stay's dates in words ("Sep 1 – Oct 1"); null on a household. */
+  stayDates: string | null
+  /** 'YYYY-MM-DD': the day a stay's guest checked out; null on a household (its day is `leaseEnded`). */
+  checkedOut: string | null
   spaces: string[]
-  /** Everything still owed on its bills here, all time. */
+  /** Everything still owed on its bills here, all time (a stay: by the register's own rule — its price less what was paid toward it). */
   owed: number
-  /** The months it still owes on, oldest first. */
+  /** The months it still owes on, oldest first; [] on a stay. */
   months: Array<{ month: string; owed: number }>
   /**
    * 'YYYY-MM-DD': the day the lease ended (terminated, else its end date);
@@ -703,7 +717,7 @@ export interface RentRollMovedOutOwing {
    */
   leaseEnded: string | null
   /**
-   * Its bills in the range (zero when none): what the range totals count for
+   * Its bills in the range (zero when none; a stay is no bill, always zero): what the range totals count for
    * it (10/13, Nic: "Range totals INCLUDE moved-out folder households"), so a
    * printout or spreadsheet can show where the totals' extra comes from.
    */
@@ -811,7 +825,9 @@ export interface RentRollHistory {
    * (money in, a charge account's never) is the range's by its nights in it:
    * the whole length it was sold for when all of it is in the range ("1
    * month"), else only its nights in the range (Sep 1 – Nov 1: 30 nights in
-   * September, 31 in October). A stay item sold with no stay on the schedule
+   * September, 31 in October). A stay that checked out early with nights
+   * refunded counts the nights actually stayed (10/14, Nic: "booked 7, stayed
+   * 3, refunded 4 → 3 nights"). A stay item sold with no stay on the schedule
    * is the month it was sold. A stay that became a lease is that lease's row.
    * Nights, weeks, then months; POS before the booking site. [] when none.
    */

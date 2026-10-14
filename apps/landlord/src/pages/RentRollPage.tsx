@@ -4,8 +4,8 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ChevronDown, ChevronRight, Download, Printer, ScrollText } from 'lucide-react'
 import {
   RENT_ROLL_STATUS_COLOR,
-  type RentRollHistory, type RentRollHistoryRow, type RentRollMonthCount, type RentRollMonthStatus, type RentRollResident,
-  type RentRollStatusColor, type RentRollStayLine,
+  type RentRollHistory, type RentRollHistoryRow, type RentRollMonthCount, type RentRollMonthStatus, type RentRollMovedOutOwing,
+  type RentRollResident, type RentRollStatusColor, type RentRollStayLine,
 } from '@gam/shared'
 import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
@@ -15,6 +15,7 @@ import {
   RANGE_PICKS, RANGE_PICK_LABEL, viewFromParams, withViewParams, historyPath, rangeKey, monthChoices, customRange, type RangePick,
 } from '../components/rentroll/rentRollRange'
 import { StatusStamp, monthStampTitle } from '../components/rentroll/StatusStamp'
+import { movedOutMeta, movedOutWho, movedOutDetail } from '../components/payments/MovedOut'
 import {
   useRentRollProperties, chosenProperty, PropertyPickList, householdName, householdNames, reportPath,
 } from '../components/rentroll/PropertyPick'
@@ -43,8 +44,10 @@ import '../components/rentroll/rentroll.css'
  * one colored stamp per month (green paid, orange paid late +N, yellow
  * partial, red owes +N, gray due; a month with no bill is a dash); people who
  * moved out and still owe sit in a collapsed "Moved out, still owes" folder
- * until paid. The "keep moved-out households" setting and the instruction
- * paragraph are gone. A name opens that household's tenant report.
+ * until paid — 10/14 (Nic), with every stay guest who checked out still
+ * owing, in the Payments page's words (MovedOutFolder). The "keep moved-out
+ * households" setting and the instruction paragraph are gone. A name opens
+ * that household's tenant report (a stay guest's name opens nothing).
  *
  * 10/13 (Nic), the afternoon answers: "Bookkeepers SEE the Payments and Rent
  * Roll pages, read-only" — the same page for their properties (the server
@@ -107,6 +110,16 @@ export function movedOutInRangeWords(h: Pick<RentRollHistory, 'movedOutTotals' |
   return `Includes the moved-out households' bills in this range: invoiced ${money(mo.invoiced)} · paid ${money(mo.paid)} · owed ${money(mo.owed)}`
 }
 
+/**
+ * "Still owes for" in the folder: a household's months and what each still
+ * owes; 10/14 (Nic) a stay guest who checked out still owing, the Payments
+ * page's words ("Stay Sep 1 – Oct 1 · checked out Oct 1, 2026").
+ */
+export function movedOutOwesFor(m: Pick<RentRollMovedOutOwing, 'kind' | 'months' | 'stayDates' | 'checkedOut'>): string {
+  if (m.kind === 'stay') return movedOutDetail({ kind: 'stay', leftOn: m.checkedOut, stayDates: m.stayDates, months: [] }, '')
+  return m.months.map(x => `${shortMonth(x.month)} ${x.month.slice(0, 4)} ${money(x.owed)}`).join(' · ')
+}
+
 /** The Stays card's head: "6 stays" — how many stays the lines add up. */
 export function staysMeta(stays: readonly Pick<RentRollStayLine, 'stays'>[]): string {
   const n = stays.reduce((t, s) => t + s.stays, 0)
@@ -143,9 +156,10 @@ export function rentRollCsv(h: RentRollHistory): string {
     lines.push('', csvLine(['Moved out, still owes']),
       csvLine(['Space', 'Tenant', 'Lease ended', 'Invoiced in range', 'Paid in range', 'Owed in range', 'Owed', 'Still owes for']))
     for (const m of h.movedOutOwing) {
-      lines.push(csvLine([m.spaces.join(' '), names(m.residents), m.leaseEnded ?? '',
+      const stay = m.kind === 'stay'
+      lines.push(csvLine([m.spaces.join(' '), stay ? movedOutWho(m) : names(m.residents), m.leaseEnded ?? '',
         m.inRange?.invoiced ?? 0, m.inRange?.paid ?? 0, m.inRange?.owed ?? 0, m.owed,
-        m.months.map(x => `${monthTitle(x.month)} ${money(x.owed)}`).join('; ')]))
+        stay ? movedOutOwesFor(m) : m.months.map(x => `${monthTitle(x.month)} ${money(x.owed)}`).join('; ')]))
     }
   }
   // 10/13 (Nic): the stays, an aggregate by line item, with the notes per site.
@@ -491,7 +505,7 @@ export function RentRollPage() {
                   <button type="button" className="rrh-folder-head" aria-expanded={movedOpen} onClick={() => setMovedOpen(o => !o)}>
                     {movedOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
                     Moved out, still owes
-                    <span className="rrh-folder-meta">{data.movedOutOwing.length} household{data.movedOutOwing.length === 1 ? '' : 's'}</span>
+                    <span className="rrh-folder-meta">{movedOutMeta(data.movedOutOwing)}</span>
                   </button>
                   {movedOpen && (
                     <div className="rrh-folder-body">
@@ -501,9 +515,9 @@ export function RentRollPage() {
                           {data.movedOutOwing.map(m => (
                             <tr key={m.key}>
                               <td>{m.spaces.join(', ') || '—'}</td>
-                              <td><NameLink row={m} /></td>
+                              <td>{m.kind === 'stay' ? <span className="rr-name-link" style={{ cursor: 'default' }}>{movedOutWho(m)}</span> : <NameLink row={m} />}</td>
                               <td>{m.leaseEnded ? dayWord(m.leaseEnded, '') : '—'}</td>
-                              <td className="wrap">{m.months.map(x => `${shortMonth(x.month)} ${x.month.slice(0, 4)} ${money(x.owed)}`).join(' · ')}</td>
+                              <td className="wrap">{movedOutOwesFor(m)}</td>
                               <td className="num"><span className="rr-owed">{money(m.owed)}</span></td>
                             </tr>
                           ))}
