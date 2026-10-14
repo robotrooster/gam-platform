@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict c3yIfwGE7MDeAPX2ES4JdnORdvcFxhRhbKfYC1Wh956aNw07PctqoTpFxGtEcOR
+\restrict SpdZcfSfJIyqqL1VgfLs6KjX3QaSpDAzeZz2HNp6POAukhULn5cz1Fl5kGsBpWf
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -748,6 +748,30 @@ COMMENT ON FUNCTION public.books_contractors_fold() IS '10/12 (Nic): the Contrac
 
 
 --
+-- Name: books_expense_fixed_asset(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_expense_fixed_asset(p_expense uuid) RETURNS uuid
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT f.id FROM books_fixed_assets f
+   WHERE f.voided_at IS NULL
+     AND (f.source_expense_id = p_expense
+          OR EXISTS (SELECT 1 FROM books_fixed_asset_funding x
+                      WHERE x.asset_id = f.id AND x.expense_id = p_expense AND x.replaced_at IS NULL))
+   ORDER BY f.created_at, f.id
+   LIMIT 1
+$$;
+
+
+--
+-- Name: FUNCTION books_expense_fixed_asset(p_expense uuid); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.books_expense_fixed_asset(p_expense uuid) IS '10/13 (Nic): the live fixed asset an expense is part of — made from it (source_expense_id) or named by a live funding line — or NULL.';
+
+
+--
 -- Name: books_fill_category_id(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -768,6 +792,139 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+
+
+--
+-- Name: books_fixed_asset_funding_check(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_fixed_asset_funding_check() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  msg text;
+BEGIN
+  IF TG_TABLE_NAME = 'books_loans' THEN
+    msg := books_loan_funding_problem(NEW.id);
+  ELSIF TG_TABLE_NAME = 'books_fixed_assets' THEN
+    msg := books_fixed_asset_funding_problem(NEW.id);
+    IF msg IS NULL AND NEW.funded_loan_id IS NOT NULL THEN
+      msg := books_loan_funding_problem(NEW.funded_loan_id);
+    END IF;
+  ELSE
+    msg := books_fixed_asset_funding_problem(NEW.asset_id);
+  END IF;
+  IF msg IS NOT NULL THEN
+    RAISE EXCEPTION '%', msg USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: books_fixed_asset_funding_guard(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_fixed_asset_funding_guard() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'A fixed asset''s funding line is never removed; say where the money came from again instead.' USING ERRCODE = 'check_violation';
+  END IF;
+  IF OLD.replaced_at IS NOT NULL
+     OR (NEW.asset_id, NEW.landlord_id, NEW.kind, NEW.loan_id, NEW.expense_id, NEW.amount, NEW.line_no, NEW.created_by, NEW.created_at)
+        IS DISTINCT FROM (OLD.asset_id, OLD.landlord_id, OLD.kind, OLD.loan_id, OLD.expense_id, OLD.amount, OLD.line_no, OLD.created_by, OLD.created_at) THEN
+    RAISE EXCEPTION 'A fixed asset''s funding line does not change; say where the money came from again instead.' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
+-- Name: books_fixed_asset_funding_problem(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_fixed_asset_funding_problem(p_asset uuid) RETURNS text
+    LANGUAGE plpgsql STABLE
+    AS $_$
+DECLARE
+  a record;
+  total numeric;
+  bad record;
+  msg text;
+BEGIN
+  SELECT f.id, f.name, f.cost, f.landlord_id, f.voided_at, f.funded_by, f.funded_loan_id, f.source_expense_id, f.property_id
+    INTO a FROM books_fixed_assets f WHERE f.id = p_asset;
+  IF NOT FOUND THEN
+    IF EXISTS (SELECT 1 FROM books_fixed_asset_funding x WHERE x.asset_id = p_asset AND x.replaced_at IS NULL) THEN
+      RETURN format('A funding line names fixed asset %s, which is not on the books.', p_asset);
+    END IF;
+    RETURN NULL;
+  END IF;
+  IF a.voided_at IS NOT NULL THEN RETURN NULL; END IF;
+  SELECT sum(x.amount) INTO total FROM books_fixed_asset_funding x WHERE x.asset_id = a.id AND x.replaced_at IS NULL;
+  IF total IS NULL THEN RETURN NULL; END IF;
+  IF a.funded_by IS NOT NULL OR a.funded_loan_id IS NOT NULL OR a.source_expense_id IS NOT NULL THEN
+    RETURN format('The fixed asset "%s" says where its money came from once, as a list.', a.name);
+  END IF;
+  IF total <> a.cost THEN
+    RETURN format('Where the money for "%s" came from adds up to %s, and it cost %s. The amounts must add up to what it cost.',
+                  a.name, to_char(total, 'FM$999,999,990.00'), to_char(a.cost, 'FM$999,999,990.00'));
+  END IF;
+  IF EXISTS (SELECT 1 FROM books_fixed_asset_funding x WHERE x.asset_id = a.id AND x.replaced_at IS NULL
+                AND x.landlord_id IS DISTINCT FROM a.landlord_id) THEN
+    RETURN format('Where the money for "%s" came from must be its own company''s.', a.name);
+  END IF;
+  FOR bad IN SELECT DISTINCT x.loan_id FROM books_fixed_asset_funding x
+              WHERE x.asset_id = a.id AND x.replaced_at IS NULL AND x.loan_id IS NOT NULL LOOP
+    msg := books_loan_funding_problem(bad.loan_id);
+    IF msg IS NOT NULL THEN RETURN msg; END IF;
+  END LOOP;
+  SELECT e.id, e.amount, x.amount AS line, e.description,
+         (SELECT count(*) FROM books_fixed_asset_funding y WHERE y.asset_id = a.id AND y.replaced_at IS NULL AND y.expense_id = e.id) AS lines_here,
+         EXISTS (SELECT 1 FROM books_fixed_assets g
+                  WHERE g.id <> a.id AND g.voided_at IS NULL
+                    AND (g.source_expense_id = e.id
+                         OR EXISTS (SELECT 1 FROM books_fixed_asset_funding z
+                                     WHERE z.asset_id = g.id AND z.expense_id = e.id AND z.replaced_at IS NULL))) AS elsewhere
+    INTO bad
+    FROM books_fixed_asset_funding x JOIN landlord_expenses e ON e.id = x.expense_id
+   WHERE x.asset_id = a.id AND x.replaced_at IS NULL
+     AND (x.amount <> e.amount OR e.landlord_id IS DISTINCT FROM a.landlord_id
+          OR (SELECT count(*) FROM books_fixed_asset_funding y WHERE y.asset_id = a.id AND y.replaced_at IS NULL AND y.expense_id = e.id) > 1
+          OR EXISTS (SELECT 1 FROM books_fixed_assets g
+                      WHERE g.id <> a.id AND g.voided_at IS NULL
+                        AND (g.source_expense_id = e.id
+                             OR EXISTS (SELECT 1 FROM books_fixed_asset_funding z
+                                         WHERE z.asset_id = g.id AND z.expense_id = e.id AND z.replaced_at IS NULL))))
+   LIMIT 1;
+  IF FOUND THEN
+    IF bad.elsewhere THEN RETURN format('The expense "%s" is already part of another fixed asset.', COALESCE(bad.description, 'chosen')); END IF;
+    IF bad.lines_here > 1 THEN RETURN format('The expense "%s" is named twice for "%s".', COALESCE(bad.description, 'chosen'), a.name); END IF;
+    RETURN format('An expense counts toward a fixed asset whole: the expense "%s" is %s.', COALESCE(bad.description, 'chosen'),
+                  to_char(bad.amount, 'FM$999,999,990.00'));
+  END IF;
+  IF EXISTS (SELECT 1 FROM books_fixed_asset_funding x WHERE x.asset_id = a.id AND x.replaced_at IS NULL AND x.expense_id IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM landlord_expenses e WHERE e.id = x.expense_id)) THEN
+    RETURN format('Where the money for "%s" came from names an expense that is not on the books.', a.name);
+  END IF;
+  -- 10/13 review: an expense pays for part of an asset only where the asset is.
+  SELECT e.description INTO bad
+    FROM books_fixed_asset_funding x JOIN landlord_expenses e ON e.id = x.expense_id
+   WHERE x.asset_id = a.id AND x.replaced_at IS NULL
+     AND COALESCE((SELECT u.property_id FROM units u WHERE u.id = e.unit_id), e.property_id) IS DISTINCT FROM a.property_id
+   LIMIT 1;
+  IF FOUND THEN
+    RETURN format('The expense "%s" is not filed where the fixed asset "%s" goes. An expense pays for part of an asset only where the asset is.',
+                  COALESCE(bad.description, 'chosen'), a.name);
+  END IF;
+  IF EXISTS (SELECT 1 FROM books_fixed_asset_funding x WHERE x.asset_id = a.id AND x.replaced_at IS NULL AND x.loan_id IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM books_loans l WHERE l.id = x.loan_id AND l.landlord_id = a.landlord_id)) THEN
+    RETURN format('Where the money for "%s" came from names a loan that is not this company''s.', a.name);
+  END IF;
+  RETURN NULL;
+END $_$;
 
 
 --
@@ -805,6 +962,20 @@ CREATE FUNCTION public.books_legacy_expense_key(p_category uuid) RETURNS text
                                            'supplies', 'landscaping', 'professional', 'mortgage_interest', 'hoa',
                                            'advertising', 'lot_rent', 'bank_fees', 'other')), 'other')
 $$;
+
+
+--
+-- Name: books_loan_funding_problem(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_loan_funding_problem(p_loan uuid) RETURNS text
+    LANGUAGE sql STABLE
+    AS $_$
+  SELECT format('The loan "%s" lent %s, and the fixed assets it paid for add up to %s. Lower what the assets say came from it, or check the amount borrowed.',
+                l.name, to_char(l.original_amount, 'FM$999,999,990.00'), to_char(books_loan_used_by_assets(l.id), 'FM$999,999,990.00'))
+    FROM books_loans l
+   WHERE l.id = p_loan AND books_loan_used_by_assets(l.id) > l.original_amount
+$_$;
 
 
 --
@@ -857,6 +1028,21 @@ END $$;
 
 
 --
+-- Name: books_loan_used_by_assets(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.books_loan_used_by_assets(p_loan uuid) RETURNS numeric
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT COALESCE((SELECT sum(x.amount) FROM books_fixed_asset_funding x
+                     JOIN books_fixed_assets f ON f.id = x.asset_id AND f.voided_at IS NULL
+                    WHERE x.loan_id = p_loan AND x.replaced_at IS NULL), 0)
+       + COALESCE((SELECT sum(f.cost) FROM books_fixed_assets f
+                    WHERE f.funded_loan_id = p_loan AND f.funded_by = 'loan' AND f.voided_at IS NULL), 0)
+$$;
+
+
+--
 -- Name: books_loans_asset_guard(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -867,7 +1053,11 @@ DECLARE
   a record;
 BEGIN
   IF (NEW.voided_at IS NOT NULL AND OLD.voided_at IS NULL) OR NEW.funded_to IS DISTINCT FROM OLD.funded_to THEN
-    SELECT f.name INTO a FROM books_fixed_assets f WHERE f.funded_loan_id = NEW.id AND f.voided_at IS NULL LIMIT 1;
+    SELECT f.name INTO a FROM books_fixed_assets f
+     WHERE f.voided_at IS NULL
+       AND (f.funded_loan_id = NEW.id
+            OR EXISTS (SELECT 1 FROM books_fixed_asset_funding x WHERE x.asset_id = f.id AND x.loan_id = NEW.id AND x.replaced_at IS NULL))
+     LIMIT 1;
     IF FOUND THEN
       RAISE EXCEPTION 'This loan paid for the fixed asset "%". Void the asset on the Fixed assets page first.', a.name
         USING ERRCODE = 'check_violation';
@@ -876,7 +1066,9 @@ BEGIN
   IF NEW.start_date IS DISTINCT FROM OLD.start_date THEN
     SELECT f.name, f.acquired_on, x.books_start_date INTO a
       FROM books_fixed_assets f JOIN landlords x ON x.id = f.landlord_id
-     WHERE f.funded_loan_id = NEW.id AND f.voided_at IS NULL AND x.books_start_date IS NOT NULL
+     WHERE f.voided_at IS NULL AND x.books_start_date IS NOT NULL
+       AND (f.funded_loan_id = NEW.id
+            OR EXISTS (SELECT 1 FROM books_fixed_asset_funding y WHERE y.asset_id = f.id AND y.loan_id = NEW.id AND y.replaced_at IS NULL))
        AND (NEW.start_date < x.books_start_date) <> (f.acquired_on < x.books_start_date)
      LIMIT 1;
     IF FOUND THEN
@@ -1200,6 +1392,20 @@ BEGIN
   IF FOUND THEN
     RAISE EXCEPTION 'Your books cannot start on %: the fixed asset "%" (bought on %) and the loan "%" that paid for it (made on %) would be on different sides of that day, so the asset''s cost would count twice, or not at all. Change the asset''s day or the loan''s first.',
       NEW.books_start_date, a.asset_name, a.acquired_on, a.loan_name, a.start_date
+      USING ERRCODE = 'check_violation';
+  END IF;
+  SELECT f.name AS asset_name, f.acquired_on, l.name AS loan_name, l.start_date INTO a
+    FROM books_fixed_assets f
+    JOIN books_fixed_asset_funding x ON x.asset_id = f.id AND x.replaced_at IS NULL AND x.kind IN ('loan', 'expense')
+    LEFT JOIN books_loans l ON l.id = x.loan_id
+   WHERE f.landlord_id = NEW.id AND f.voided_at IS NULL
+     AND (f.acquired_on < NEW.books_start_date OR l.start_date < NEW.books_start_date)
+   ORDER BY f.acquired_on, f.id
+   LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION 'Your books cannot start on %: the fixed asset "%" (bought on %) was paid for in part by %, which would then be before your books start, so part of its cost would count twice. Change where that asset''s money came from first.',
+      NEW.books_start_date, a.asset_name, a.acquired_on,
+      CASE WHEN a.loan_name IS NOT NULL THEN format('the loan "%s" (made on %s)', a.loan_name, a.start_date) ELSE 'an expense' END
       USING ERRCODE = 'check_violation';
   END IF;
   RETURN NEW;
@@ -2289,11 +2495,32 @@ CREATE FUNCTION public.landlord_expenses_asset_guard() RETURNS trigger
 DECLARE
   a record;
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    -- 10/13 review: an expense an asset stands on is never removed (a line
+    -- naming a missing expense would drop that part of the asset's cost).
+    SELECT f.name INTO a FROM books_fixed_assets f WHERE f.id = books_expense_fixed_asset(OLD.id);
+    IF FOUND THEN
+      RAISE EXCEPTION 'This expense is part of the fixed asset "%", so it is never removed. Void the asset, or change where its money came from, on the Fixed assets page first.', a.name
+        USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN OLD;
+  END IF;
   IF (NEW.status IS DISTINCT FROM 'active' OR NEW.voided_at IS NOT NULL)
      AND OLD.status = 'active' AND OLD.voided_at IS NULL THEN
     SELECT f.name INTO a FROM books_fixed_assets f WHERE f.source_expense_id = NEW.id AND f.voided_at IS NULL LIMIT 1;
     IF FOUND THEN
       RAISE EXCEPTION 'This expense became the fixed asset "%". Void the asset on the Fixed assets page first.', a.name
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+  IF (NEW.status IS DISTINCT FROM 'active' OR NEW.voided_at IS NOT NULL OR NEW.amount IS DISTINCT FROM OLD.amount
+      OR NEW.property_id IS DISTINCT FROM OLD.property_id OR NEW.unit_id IS DISTINCT FROM OLD.unit_id)
+     AND OLD.status = 'active' AND OLD.voided_at IS NULL THEN
+    SELECT f.name INTO a FROM books_fixed_assets f
+      JOIN books_fixed_asset_funding x ON x.asset_id = f.id AND x.expense_id = NEW.id AND x.replaced_at IS NULL
+     WHERE f.voided_at IS NULL LIMIT 1;
+    IF FOUND THEN
+      RAISE EXCEPTION 'This expense paid for part of the fixed asset "%". Change where that asset''s money came from on the Fixed assets page first.', a.name
         USING ERRCODE = 'check_violation';
     END IF;
   END IF;
@@ -3003,6 +3230,79 @@ END $$;
 
 
 --
+-- Name: ledger_capture_books_fixed_asset_funding_del(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ledger_capture_books_fixed_asset_funding_del() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- ledger columns: asset_id,landlord_id,kind,loan_id,expense_id,amount,replaced_at
+  INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+  SELECT DISTINCT k.source_type, k.source_id, k.owner_id
+    FROM ledger_old r
+    CROSS JOIN LATERAL (SELECT 'fixed_asset'::text, r.asset_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense', r.expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.expense_id) k(source_type, source_id, owner_id)
+   WHERE k.source_id IS NOT NULL;
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: ledger_capture_books_fixed_asset_funding_ins(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ledger_capture_books_fixed_asset_funding_ins() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- ledger columns: asset_id,landlord_id,kind,loan_id,expense_id,amount,replaced_at
+  INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+  SELECT DISTINCT k.source_type, k.source_id, k.owner_id
+    FROM ledger_new r
+    CROSS JOIN LATERAL (SELECT 'fixed_asset'::text, r.asset_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense', r.expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.expense_id) k(source_type, source_id, owner_id)
+   WHERE k.source_id IS NOT NULL;
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: ledger_capture_books_fixed_asset_funding_upd(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ledger_capture_books_fixed_asset_funding_upd() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- ledger columns: asset_id,landlord_id,kind,loan_id,expense_id,amount,replaced_at
+  INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+  SELECT DISTINCT k.source_type, k.source_id, k.owner_id
+    FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
+           WHERE ROW(o.asset_id::text, o.landlord_id::text, o.kind::text, o.loan_id::text, o.expense_id::text, o.amount::text, o.replaced_at::text) IS DISTINCT FROM ROW(n.asset_id::text, n.landlord_id::text, n.kind::text, n.loan_id::text, n.expense_id::text, n.amount::text, n.replaced_at::text)
+          UNION ALL
+          SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
+           WHERE ROW(o.asset_id::text, o.landlord_id::text, o.kind::text, o.loan_id::text, o.expense_id::text, o.amount::text, o.replaced_at::text) IS DISTINCT FROM ROW(n.asset_id::text, n.landlord_id::text, n.kind::text, n.loan_id::text, n.expense_id::text, n.amount::text, n.replaced_at::text)) r
+    CROSS JOIN LATERAL (SELECT 'fixed_asset'::text, r.asset_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense', r.expense_id::text, r.landlord_id
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.expense_id) k(source_type, source_id, owner_id)
+   WHERE k.source_id IS NOT NULL;
+  RETURN NULL;
+END $$;
+
+
+--
 -- Name: ledger_capture_books_fixed_assets_del(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -3010,7 +3310,7 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -3029,7 +3329,14 @@ BEGIN
       SELECT 'expense', r.source_expense_id::text, r.landlord_id
       UNION ALL
       SELECT 'expense_payment', xp.id::text, xp.landlord_id
-        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id
+      UNION ALL
+      SELECT 'expense', x.expense_id::text, r.landlord_id
+        FROM books_fixed_asset_funding x WHERE x.asset_id = r.id AND x.expense_id IS NOT NULL
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM books_fixed_asset_funding x JOIN landlord_expense_payments xp ON xp.expense_id = x.expense_id
+       WHERE x.asset_id = r.id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -3043,7 +3350,7 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -3062,7 +3369,14 @@ BEGIN
       SELECT 'expense', r.source_expense_id::text, r.landlord_id
       UNION ALL
       SELECT 'expense_payment', xp.id::text, xp.landlord_id
-        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id
+      UNION ALL
+      SELECT 'expense', x.expense_id::text, r.landlord_id
+        FROM books_fixed_asset_funding x WHERE x.asset_id = r.id AND x.expense_id IS NOT NULL
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM books_fixed_asset_funding x JOIN landlord_expense_payments xp ON xp.expense_id = x.expense_id
+       WHERE x.asset_id = r.id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -3076,14 +3390,14 @@ CREATE FUNCTION public.ledger_capture_books_fixed_assets_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id
+  -- ledger columns: landlord_id,business_id,property_id,name,asset_class,cost,salvage_value,acquired_on,in_service_date,life_years,method,prior_depreciation,source_expense_id,voided_at,funded_by,funded_loan_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text)
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text, o.cost_place::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text, n.cost_place::text, n.unit_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text)) r
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.asset_class::text, o.cost::text, o.salvage_value::text, o.acquired_on::text, o.in_service_date::text, o.life_years::text, o.method::text, o.prior_depreciation::text, o.source_expense_id::text, o.voided_at::text, o.funded_by::text, o.funded_loan_id::text, o.cost_place::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.asset_class::text, n.cost::text, n.salvage_value::text, n.acquired_on::text, n.in_service_date::text, n.life_years::text, n.method::text, n.prior_depreciation::text, n.source_expense_id::text, n.voided_at::text, n.funded_by::text, n.funded_loan_id::text, n.cost_place::text, n.unit_id::text)) r
     CROSS JOIN LATERAL (SELECT 'fixed_asset'::text, r.id::text, COALESCE(r.landlord_id, r.business_id)
       UNION ALL
       SELECT 'fixed_asset', r.id::text || '|' || to_char(m, 'YYYY-MM'), COALESCE(r.landlord_id, r.business_id)
@@ -3099,7 +3413,14 @@ BEGIN
       SELECT 'expense', r.source_expense_id::text, r.landlord_id
       UNION ALL
       SELECT 'expense_payment', xp.id::text, xp.landlord_id
-        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id) k(source_type, source_id, owner_id)
+        FROM landlord_expense_payments xp WHERE xp.expense_id = r.source_expense_id
+      UNION ALL
+      SELECT 'expense', x.expense_id::text, r.landlord_id
+        FROM books_fixed_asset_funding x WHERE x.asset_id = r.id AND x.expense_id IS NOT NULL
+      UNION ALL
+      SELECT 'expense_payment', xp.id::text, xp.landlord_id
+        FROM books_fixed_asset_funding x JOIN landlord_expense_payments xp ON xp.expense_id = x.expense_id
+       WHERE x.asset_id = r.id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -3171,7 +3492,7 @@ CREATE FUNCTION public.ledger_capture_books_loans_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id
+  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -3191,7 +3512,7 @@ CREATE FUNCTION public.ledger_capture_books_loans_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id
+  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -3211,14 +3532,14 @@ CREATE FUNCTION public.ledger_capture_books_loans_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id
+  -- ledger columns: landlord_id,business_id,property_id,name,original_amount,start_date,funded_to,funded_bank_connection_id,opening_balance,opening_escrow,voided_at,funded_bank_transaction_id,cost_place,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.original_amount::text, o.start_date::text, o.funded_to::text, o.funded_bank_connection_id::text, o.opening_balance::text, o.opening_escrow::text, o.voided_at::text, o.funded_bank_transaction_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.original_amount::text, n.start_date::text, n.funded_to::text, n.funded_bank_connection_id::text, n.opening_balance::text, n.opening_escrow::text, n.voided_at::text, n.funded_bank_transaction_id::text)
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.original_amount::text, o.start_date::text, o.funded_to::text, o.funded_bank_connection_id::text, o.opening_balance::text, o.opening_escrow::text, o.voided_at::text, o.funded_bank_transaction_id::text, o.cost_place::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.original_amount::text, n.start_date::text, n.funded_to::text, n.funded_bank_connection_id::text, n.opening_balance::text, n.opening_escrow::text, n.voided_at::text, n.funded_bank_transaction_id::text, n.cost_place::text, n.unit_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.original_amount::text, o.start_date::text, o.funded_to::text, o.funded_bank_connection_id::text, o.opening_balance::text, o.opening_escrow::text, o.voided_at::text, o.funded_bank_transaction_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.original_amount::text, n.start_date::text, n.funded_to::text, n.funded_bank_connection_id::text, n.opening_balance::text, n.opening_escrow::text, n.voided_at::text, n.funded_bank_transaction_id::text)) r
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.property_id::text, o.name::text, o.original_amount::text, o.start_date::text, o.funded_to::text, o.funded_bank_connection_id::text, o.opening_balance::text, o.opening_escrow::text, o.voided_at::text, o.funded_bank_transaction_id::text, o.cost_place::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.property_id::text, n.name::text, n.original_amount::text, n.start_date::text, n.funded_to::text, n.funded_bank_connection_id::text, n.opening_balance::text, n.opening_escrow::text, n.voided_at::text, n.funded_bank_transaction_id::text, n.cost_place::text, n.unit_id::text)) r
     CROSS JOIN LATERAL (SELECT 'loan'::text, r.id::text, COALESCE(r.landlord_id, r.business_id)
       UNION ALL SELECT 'loan_payment', p.id::text, COALESCE(r.landlord_id, r.business_id)
                   FROM books_loan_payments p WHERE p.loan_id = r.id) k(source_type, source_id, owner_id)
@@ -4036,7 +4357,7 @@ CREATE FUNCTION public.ledger_capture_landlord_expenses_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id
+  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id,cost_place
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -4055,7 +4376,7 @@ CREATE FUNCTION public.ledger_capture_landlord_expenses_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id
+  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id,cost_place
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -4074,14 +4395,14 @@ CREATE FUNCTION public.ledger_capture_landlord_expenses_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id
+  -- ledger columns: landlord_id,property_id,unit_id,category,amount,expense_date,is_common,allocate_per_unit,status,voided_at,utility_type,vendor,bank_transaction_id,category_id,vendor_id,allocation_split_id,cost_place
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.property_id::text, o.unit_id::text, o.category::text, o.amount::text, o.expense_date::text, o.is_common::text, o.allocate_per_unit::text, o.status::text, o.voided_at::text, o.utility_type::text, o.vendor::text, o.bank_transaction_id::text, o.category_id::text, o.vendor_id::text, o.allocation_split_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.property_id::text, n.unit_id::text, n.category::text, n.amount::text, n.expense_date::text, n.is_common::text, n.allocate_per_unit::text, n.status::text, n.voided_at::text, n.utility_type::text, n.vendor::text, n.bank_transaction_id::text, n.category_id::text, n.vendor_id::text, n.allocation_split_id::text)
+           WHERE ROW(o.landlord_id::text, o.property_id::text, o.unit_id::text, o.category::text, o.amount::text, o.expense_date::text, o.is_common::text, o.allocate_per_unit::text, o.status::text, o.voided_at::text, o.utility_type::text, o.vendor::text, o.bank_transaction_id::text, o.category_id::text, o.vendor_id::text, o.allocation_split_id::text, o.cost_place::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.property_id::text, n.unit_id::text, n.category::text, n.amount::text, n.expense_date::text, n.is_common::text, n.allocate_per_unit::text, n.status::text, n.voided_at::text, n.utility_type::text, n.vendor::text, n.bank_transaction_id::text, n.category_id::text, n.vendor_id::text, n.allocation_split_id::text, n.cost_place::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.property_id::text, o.unit_id::text, o.category::text, o.amount::text, o.expense_date::text, o.is_common::text, o.allocate_per_unit::text, o.status::text, o.voided_at::text, o.utility_type::text, o.vendor::text, o.bank_transaction_id::text, o.category_id::text, o.vendor_id::text, o.allocation_split_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.property_id::text, n.unit_id::text, n.category::text, n.amount::text, n.expense_date::text, n.is_common::text, n.allocate_per_unit::text, n.status::text, n.voided_at::text, n.utility_type::text, n.vendor::text, n.bank_transaction_id::text, n.category_id::text, n.vendor_id::text, n.allocation_split_id::text)) r
+           WHERE ROW(o.landlord_id::text, o.property_id::text, o.unit_id::text, o.category::text, o.amount::text, o.expense_date::text, o.is_common::text, o.allocate_per_unit::text, o.status::text, o.voided_at::text, o.utility_type::text, o.vendor::text, o.bank_transaction_id::text, o.category_id::text, o.vendor_id::text, o.allocation_split_id::text, o.cost_place::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.property_id::text, n.unit_id::text, n.category::text, n.amount::text, n.expense_date::text, n.is_common::text, n.allocate_per_unit::text, n.status::text, n.voided_at::text, n.utility_type::text, n.vendor::text, n.bank_transaction_id::text, n.category_id::text, n.vendor_id::text, n.allocation_split_id::text, n.cost_place::text)) r
     CROSS JOIN LATERAL (SELECT 'expense'::text, r.id::text, r.landlord_id
       UNION ALL SELECT 'expense_payment', p.id::text, p.landlord_id FROM landlord_expense_payments p WHERE p.expense_id = r.id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
@@ -4695,7 +5016,7 @@ CREATE FUNCTION public.ledger_capture_payroll_runs_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta
+  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta,cost_place,property_id,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -4713,7 +5034,7 @@ CREATE FUNCTION public.ledger_capture_payroll_runs_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta
+  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta,cost_place,property_id,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -4731,14 +5052,14 @@ CREATE FUNCTION public.ledger_capture_payroll_runs_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta
+  -- ledger columns: landlord_id,business_id,pay_date,status,total_gross,total_federal_tax,total_state_tax,total_ss,total_medicare,total_net,approved_at,voided_at,total_employer_ss,total_employer_medicare,total_futa,total_suta,cost_place,property_id,unit_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.pay_date::text, o.status::text, o.total_gross::text, o.total_federal_tax::text, o.total_state_tax::text, o.total_ss::text, o.total_medicare::text, o.total_net::text, o.approved_at::text, o.voided_at::text, o.total_employer_ss::text, o.total_employer_medicare::text, o.total_futa::text, o.total_suta::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.pay_date::text, n.status::text, n.total_gross::text, n.total_federal_tax::text, n.total_state_tax::text, n.total_ss::text, n.total_medicare::text, n.total_net::text, n.approved_at::text, n.voided_at::text, n.total_employer_ss::text, n.total_employer_medicare::text, n.total_futa::text, n.total_suta::text)
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.pay_date::text, o.status::text, o.total_gross::text, o.total_federal_tax::text, o.total_state_tax::text, o.total_ss::text, o.total_medicare::text, o.total_net::text, o.approved_at::text, o.voided_at::text, o.total_employer_ss::text, o.total_employer_medicare::text, o.total_futa::text, o.total_suta::text, o.cost_place::text, o.property_id::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.pay_date::text, n.status::text, n.total_gross::text, n.total_federal_tax::text, n.total_state_tax::text, n.total_ss::text, n.total_medicare::text, n.total_net::text, n.approved_at::text, n.voided_at::text, n.total_employer_ss::text, n.total_employer_medicare::text, n.total_futa::text, n.total_suta::text, n.cost_place::text, n.property_id::text, n.unit_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.business_id::text, o.pay_date::text, o.status::text, o.total_gross::text, o.total_federal_tax::text, o.total_state_tax::text, o.total_ss::text, o.total_medicare::text, o.total_net::text, o.approved_at::text, o.voided_at::text, o.total_employer_ss::text, o.total_employer_medicare::text, o.total_futa::text, o.total_suta::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.pay_date::text, n.status::text, n.total_gross::text, n.total_federal_tax::text, n.total_state_tax::text, n.total_ss::text, n.total_medicare::text, n.total_net::text, n.approved_at::text, n.voided_at::text, n.total_employer_ss::text, n.total_employer_medicare::text, n.total_futa::text, n.total_suta::text)) r
+           WHERE ROW(o.landlord_id::text, o.business_id::text, o.pay_date::text, o.status::text, o.total_gross::text, o.total_federal_tax::text, o.total_state_tax::text, o.total_ss::text, o.total_medicare::text, o.total_net::text, o.approved_at::text, o.voided_at::text, o.total_employer_ss::text, o.total_employer_medicare::text, o.total_futa::text, o.total_suta::text, o.cost_place::text, o.property_id::text, o.unit_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.business_id::text, n.pay_date::text, n.status::text, n.total_gross::text, n.total_federal_tax::text, n.total_state_tax::text, n.total_ss::text, n.total_medicare::text, n.total_net::text, n.approved_at::text, n.voided_at::text, n.total_employer_ss::text, n.total_employer_medicare::text, n.total_futa::text, n.total_suta::text, n.cost_place::text, n.property_id::text, n.unit_id::text)) r
     CROSS JOIN LATERAL (SELECT 'payroll_run'::text, r.id::text, COALESCE(r.landlord_id, r.business_id)) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
@@ -7893,6 +8214,25 @@ COMMENT ON COLUMN public.bank_transactions.matched_kind IS '10/12 (Nic, L5): wha
 
 
 --
+-- Name: birthday_greetings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.birthday_greetings (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    greeting_year integer NOT NULL,
+    sent_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE birthday_greetings; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.birthday_greetings IS '10/13 (Nic): one row per person per year a happy-birthday email went out (jobs/birthdayEmails.ts). The unique (user_id, greeting_year) is what keeps it to once a year.';
+
+
+--
 -- Name: booking_change_requests; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8253,6 +8593,56 @@ COMMENT ON COLUMN public.books_employees.tenant_id IS '10/12 (Nic, ledger P7): t
 
 
 --
+-- Name: books_fixed_asset_funding; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_fixed_asset_funding (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    asset_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    kind text NOT NULL,
+    loan_id uuid,
+    expense_id uuid,
+    amount numeric(12,2) NOT NULL,
+    line_no smallint DEFAULT 1 NOT NULL,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    replaced_at timestamp with time zone,
+    CONSTRAINT books_fixed_asset_funding_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT books_fixed_asset_funding_kind_check CHECK ((kind = ANY (ARRAY['cash'::text, 'owner'::text, 'loan'::text, 'expense'::text]))),
+    CONSTRAINT books_fixed_asset_funding_shape CHECK ((((loan_id IS NOT NULL) = (kind = 'loan'::text)) AND ((expense_id IS NOT NULL) = (kind = 'expense'::text))))
+);
+
+
+--
+-- Name: TABLE books_fixed_asset_funding; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.books_fixed_asset_funding IS '10/13 (Nic): "Funding: ALLOW A MIX (several funding lines adding up to the cost; a loan may spread over several assets)." Where the money for a fixed asset came from, one line per source (cash on hand, the owner, a loan, an expense already on the books), adding up to its cost. Never removed or changed: an edit stamps replaced_at and adds new lines.';
+
+
+--
+-- Name: COLUMN books_fixed_asset_funding.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_asset_funding.kind IS '10/13 (Nic): BOOKS_FIXED_ASSET_FUNDED_BY — cash (Cr Undeposited funds 1040), owner (Cr Owner equity and contributions 3010), loan (loan_id; the loan''s posting carries it), expense (expense_id, its whole amount; the expense posts it to the asset''s account).';
+
+
+--
+-- Name: COLUMN books_fixed_asset_funding.line_no; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_asset_funding.line_no IS '10/13 (Nic): the line''s place in the list as it was said (lines said together share one created_at).';
+
+
+--
+-- Name: COLUMN books_fixed_asset_funding.replaced_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_asset_funding.replaced_at IS '10/13 (Nic): when an edit of the asset''s funding replaced this line (NULL: live while its asset is).';
+
+
+--
 -- Name: books_fixed_assets; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8280,8 +8670,11 @@ CREATE TABLE public.books_fixed_assets (
     void_reason text,
     funded_by text,
     funded_loan_id uuid,
+    cost_place text,
+    unit_id uuid,
     CONSTRAINT books_fixed_assets_class_check CHECK ((asset_class = ANY (ARRAY['building'::text, 'improvement'::text, 'equipment'::text, 'vehicle'::text, 'land'::text]))),
     CONSTRAINT books_fixed_assets_cost_check CHECK (((cost > (0)::numeric) AND (salvage_value >= (0)::numeric) AND (salvage_value <= cost))),
+    CONSTRAINT books_fixed_assets_cost_place_check CHECK ((((cost_place IS NULL) AND (unit_id IS NULL)) OR ((landlord_id IS NOT NULL) AND (((cost_place = 'unit'::text) AND (unit_id IS NOT NULL) AND (property_id IS NOT NULL)) OR ((cost_place = 'property'::text) AND (property_id IS NOT NULL) AND (unit_id IS NULL)) OR ((cost_place = 'split_by_units'::text) AND (property_id IS NULL) AND (unit_id IS NULL)))))),
     CONSTRAINT books_fixed_assets_dates_check CHECK ((in_service_date >= acquired_on)),
     CONSTRAINT books_fixed_assets_funded_by_check CHECK (((funded_by IS NULL) OR (funded_by = ANY (ARRAY['cash'::text, 'owner'::text, 'loan'::text, 'expense'::text])))),
     CONSTRAINT books_fixed_assets_funded_shape CHECK ((((funded_loan_id IS NOT NULL) = (NOT (funded_by IS DISTINCT FROM 'loan'::text))) AND ((funded_by IS DISTINCT FROM 'expense'::text) OR (source_expense_id IS NOT NULL)) AND ((source_expense_id IS NULL) OR (funded_by IS NULL) OR (funded_by = 'expense'::text)))),
@@ -8327,6 +8720,20 @@ COMMENT ON COLUMN public.books_fixed_assets.funded_by IS '10/13 (Nic): where the
 --
 
 COMMENT ON COLUMN public.books_fixed_assets.funded_loan_id IS '10/13 (Nic): for funded_by = loan, the loan (Loans page) whose money went straight to the seller of this asset.';
+
+
+--
+-- Name: COLUMN books_fixed_assets.cost_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_assets.cost_place IS '10/13 (Nic): where each month''s depreciation goes, picked when the asset is logged — split_by_units, property (property_id) or unit (unit_id). NULL: an asset logged before 10/13 (its property, else the Company column). BOOKS_COST_PLACES.';
+
+
+--
+-- Name: COLUMN books_fixed_assets.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_fixed_assets.unit_id IS '10/13 (Nic): the unit each month''s depreciation goes to (cost_place unit; property_id is that unit''s property).';
 
 
 --
@@ -8412,7 +8819,10 @@ CREATE TABLE public.books_loans (
     voided_at timestamp with time zone,
     voided_by uuid,
     void_reason text,
+    cost_place text,
+    unit_id uuid,
     CONSTRAINT books_loans_amount_check CHECK ((original_amount > (0)::numeric)),
+    CONSTRAINT books_loans_cost_place_check CHECK ((((cost_place IS NULL) AND (unit_id IS NULL)) OR ((landlord_id IS NOT NULL) AND (((cost_place = 'unit'::text) AND (unit_id IS NOT NULL) AND (property_id IS NOT NULL)) OR ((cost_place = 'property'::text) AND (property_id IS NOT NULL) AND (unit_id IS NULL)) OR ((cost_place = 'split_by_units'::text) AND (property_id IS NULL) AND (unit_id IS NULL)))))),
     CONSTRAINT books_loans_escrow_check CHECK (((escrow_amount >= (0)::numeric) AND ((payment_amount IS NULL) OR (escrow_amount <= payment_amount)))),
     CONSTRAINT books_loans_funded_bank_is_bank CHECK (((funded_bank_connection_id IS NULL) OR (funded_to = 'bank'::text))),
     CONSTRAINT books_loans_funded_to_check CHECK (((funded_to IS NULL) OR (funded_to = ANY (ARRAY['bank'::text, 'property'::text, 'equipment'::text])))),
@@ -8455,6 +8865,20 @@ COMMENT ON COLUMN public.books_loans.funded_bank_transaction_id IS '10/12: the b
 --
 
 COMMENT ON COLUMN public.books_loans.opening_balance IS '10/12: for a loan made before the books start, what was still owed on the books start date (from the lender''s statement); opening_escrow the escrow the lender held that day.';
+
+
+--
+-- Name: COLUMN books_loans.cost_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_loans.cost_place IS '10/13 (Nic): where each payment''s interest goes, picked when the loan is logged — split_by_units, property (property_id) or unit (unit_id). NULL: a loan logged before 10/13 (its property, else the Company column). BOOKS_COST_PLACES.';
+
+
+--
+-- Name: COLUMN books_loans.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_loans.unit_id IS '10/13 (Nic): the unit each payment''s interest goes to (cost_place unit; property_id is that unit''s property).';
 
 
 --
@@ -9992,6 +10416,32 @@ CREATE TABLE public.contractors (
     contractor_license_state text,
     CONSTRAINT contractors_listing_tier_check CHECK ((listing_tier = ANY (ARRAY['featured'::text, 'premium'::text, 'exclusive'::text])))
 );
+
+
+--
+-- Name: credit_chain_check_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_chain_check_runs (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    outcome text DEFAULT 'running'::text NOT NULL,
+    subjects integer,
+    whole integer,
+    broken integer,
+    broken_chains jsonb DEFAULT '[]'::jsonb NOT NULL,
+    error text,
+    CONSTRAINT credit_chain_check_runs_finished CHECK (((outcome = 'running'::text) = (finished_at IS NULL))),
+    CONSTRAINT credit_chain_check_runs_outcome_check CHECK ((outcome = ANY (ARRAY['running'::text, 'whole'::text, 'broken'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE credit_chain_check_runs; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.credit_chain_check_runs IS '10/13 (Nic): the nightly credit chain check writes what it found here; the 8:05 morning admin email reports it (broken chains, or that the check did not run).';
 
 
 --
@@ -11823,9 +12273,11 @@ CREATE TABLE public.landlord_expenses (
     allocation_split_id uuid,
     migrated_from_table text,
     migrated_from_id uuid,
+    cost_place text,
     CONSTRAINT landlord_expenses_amount_check CHECK ((amount >= (0)::numeric)),
     CONSTRAINT landlord_expenses_bill_number_check CHECK (((bill_number IS NULL) OR (length(bill_number) <= 100))),
     CONSTRAINT landlord_expenses_check CHECK ((((unit_id IS NOT NULL) AND (is_common = false)) OR (unit_id IS NULL))),
+    CONSTRAINT landlord_expenses_cost_place_check CHECK (((cost_place IS NULL) OR ((cost_place = 'unit'::text) AND (unit_id IS NOT NULL)) OR ((cost_place = 'property'::text) AND (property_id IS NOT NULL) AND (unit_id IS NULL)) OR ((cost_place = 'split_by_units'::text) AND (property_id IS NULL) AND (unit_id IS NULL)))),
     CONSTRAINT landlord_expenses_migrated_from_check CHECK ((((migrated_from_table IS NULL) = (migrated_from_id IS NULL)) AND ((migrated_from_table IS NULL) OR (migrated_from_table = ANY (ARRAY['books_bills'::text, 'books_transactions'::text]))))),
     CONSTRAINT landlord_expenses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'voided'::text]))),
     CONSTRAINT landlord_expenses_utility_type_check CHECK (((utility_type IS NULL) OR (utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text]))))
@@ -11865,6 +12317,13 @@ COMMENT ON COLUMN public.landlord_expenses.payments_tracked IS '10/12 (Nic, L5):
 --
 
 COMMENT ON COLUMN public.landlord_expenses.allocation_split_id IS '10/12 (Nic, L18): the manager''s cut GAM held too little to pay — the unpaid bill the landlord owes the manager. Its cost posts from the split (ledger ''allocation''); the bill posts its payments only.';
+
+
+--
+-- Name: COLUMN landlord_expenses.cost_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_expenses.cost_place IS '10/13 (Nic): where this cost goes, picked when it was logged — split_by_units (across the company''s properties by units on its day; property and unit NULL), property, or unit. NULL: logged before 10/13 (its property, else the Company column) or a bill GAM made for another record that places no cost. BOOKS_COST_PLACES.';
 
 
 --
@@ -12630,7 +13089,7 @@ COMMENT ON COLUMN public.landlords.books_work_trade_method IS '10/12 (Nic, L12):
 -- Name: COLUMN landlords.books_company_costs_method; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.landlords.books_company_costs_method IS '10/12 (Nic, L7): company-level costs stay in a Company bucket or are split across properties by units. NULL = not chosen. BOOKS_COMPANY_COST_METHODS.';
+COMMENT ON COLUMN public.landlords.books_company_costs_method IS 'RETIRED 10/13 (Nic): "there should never be a default setting to apply expenses." Nothing reads it; where a cost goes is picked on each record (cost_place). Kept until a contract migration drops it.';
 
 
 --
@@ -14574,10 +15033,35 @@ CREATE TABLE public.payroll_runs (
     total_employer_medicare numeric(12,2) DEFAULT 0 NOT NULL,
     total_futa numeric(12,2) DEFAULT 0 NOT NULL,
     total_suta numeric(12,2) DEFAULT 0 NOT NULL,
+    cost_place text,
+    property_id uuid,
+    unit_id uuid,
+    CONSTRAINT payroll_runs_cost_place_check CHECK ((((cost_place IS NULL) AND (property_id IS NULL) AND (unit_id IS NULL)) OR ((landlord_id IS NOT NULL) AND (((cost_place = 'unit'::text) AND (unit_id IS NOT NULL) AND (property_id IS NOT NULL)) OR ((cost_place = 'property'::text) AND (property_id IS NOT NULL) AND (unit_id IS NULL)) OR ((cost_place = 'split_by_units'::text) AND (property_id IS NULL) AND (unit_id IS NULL)))))),
     CONSTRAINT payroll_runs_employer_taxes_nonneg CHECK (((total_employer_ss >= (0)::numeric) AND (total_employer_medicare >= (0)::numeric) AND (total_futa >= (0)::numeric) AND (total_suta >= (0)::numeric))),
     CONSTRAINT payroll_runs_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1)),
     CONSTRAINT payroll_runs_status_check CHECK (((status)::text = ANY ((ARRAY['draft'::character varying, 'approved'::character varying, 'voided'::character varying])::text[])))
 );
+
+
+--
+-- Name: COLUMN payroll_runs.cost_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payroll_runs.cost_place IS '10/13 (Nic): where the run''s gross wages and the employer''s taxes go, picked when the run is logged — split_by_units, property (property_id) or unit (unit_id). Required to approve a landlord company''s run. NULL: a run approved before 10/13 (the Company column) or a business''s run. BOOKS_COST_PLACES.';
+
+
+--
+-- Name: COLUMN payroll_runs.property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payroll_runs.property_id IS '10/13 (Nic): the property the run''s wages and employer taxes go to (cost_place property, or the unit''s property for unit).';
+
+
+--
+-- Name: COLUMN payroll_runs.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payroll_runs.unit_id IS '10/13 (Nic): the unit the run''s wages and employer taxes go to (cost_place unit).';
 
 
 --
@@ -15664,6 +16148,26 @@ ALTER TABLE public.pos_reader_order_costs ALTER COLUMN seq ADD GENERATED ALWAYS 
     NO MAXVALUE
     CACHE 1
 );
+
+
+--
+-- Name: pos_reader_order_resplits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_reader_order_resplits (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    reader_order_id uuid NOT NULL,
+    charge_id uuid NOT NULL,
+    cost_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE pos_reader_order_resplits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_reader_order_resplits IS '10/13 (Nic: "Redo the split"): a card-reader piece split again under a later cost entry. Its id is the reference of the cost-repaid and markup difference rows in platform_revenue_ledger.';
 
 
 --
@@ -19566,6 +20070,7 @@ CREATE TABLE public.users (
     tenant_invite_accepted_at timestamp with time zone,
     tenant_invite_sent_at timestamp with time zone,
     sessions_valid_from timestamp with time zone,
+    date_of_birth date,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -19673,6 +20178,13 @@ COMMENT ON COLUMN public.users.tenant_invite_accepted_at IS 'S637: when a tenant
 --
 
 COMMENT ON COLUMN public.users.tenant_invite_sent_at IS 'S639: when a tenant invite token was first issued to this user. Survives the token being consumed or cleared, so the pending pool can tell "we have written to them" from "we never have".';
+
+
+--
+-- Name: COLUMN users.date_of_birth; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.date_of_birth IS '10/13 (Nic): a landlord''s own birthday, typed on Settings → Account, for the happy-birthday email (jobs/birthdayEmails.ts). Optional. Tenants'' birthdays live on tenants.date_of_birth.';
 
 
 --
@@ -20811,6 +21323,22 @@ ALTER TABLE ONLY public.bank_transactions
 
 
 --
+-- Name: birthday_greetings birthday_greetings_once_a_year; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.birthday_greetings
+    ADD CONSTRAINT birthday_greetings_once_a_year UNIQUE (user_id, greeting_year);
+
+
+--
+-- Name: birthday_greetings birthday_greetings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.birthday_greetings
+    ADD CONSTRAINT birthday_greetings_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: booking_change_requests booking_change_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -20912,6 +21440,14 @@ ALTER TABLE ONLY public.books_contractors
 
 ALTER TABLE ONLY public.books_employees
     ADD CONSTRAINT books_employees_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_fixed_asset_funding books_fixed_asset_funding_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_fixed_asset_funding
+    ADD CONSTRAINT books_fixed_asset_funding_pkey PRIMARY KEY (id);
 
 
 --
@@ -21416,6 +21952,14 @@ ALTER TABLE ONLY public.contractors
 
 ALTER TABLE ONLY public.contractors
     ADD CONSTRAINT contractors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_chain_check_runs credit_chain_check_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_chain_check_runs
+    ADD CONSTRAINT credit_chain_check_runs_pkey PRIMARY KEY (id);
 
 
 --
@@ -23107,6 +23651,22 @@ ALTER TABLE ONLY public.pos_reader_order_costs
 
 
 --
+-- Name: pos_reader_order_resplits pos_reader_order_resplits_once; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_order_resplits
+    ADD CONSTRAINT pos_reader_order_resplits_once UNIQUE (charge_id, cost_id);
+
+
+--
+-- Name: pos_reader_order_resplits pos_reader_order_resplits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_order_resplits
+    ADD CONSTRAINT pos_reader_order_resplits_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: pos_reader_orders pos_reader_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24657,6 +25217,27 @@ CREATE UNIQUE INDEX books_employees_landlord_tenant ON public.books_employees US
 
 
 --
+-- Name: books_fixed_asset_funding_asset; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_fixed_asset_funding_asset ON public.books_fixed_asset_funding USING btree (asset_id);
+
+
+--
+-- Name: books_fixed_asset_funding_expense; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_fixed_asset_funding_expense ON public.books_fixed_asset_funding USING btree (expense_id) WHERE ((expense_id IS NOT NULL) AND (replaced_at IS NULL));
+
+
+--
+-- Name: books_fixed_asset_funding_loan; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_fixed_asset_funding_loan ON public.books_fixed_asset_funding USING btree (loan_id) WHERE ((loan_id IS NOT NULL) AND (replaced_at IS NULL));
+
+
+--
 -- Name: books_fixed_assets_business; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24682,6 +25263,13 @@ CREATE INDEX books_fixed_assets_loan ON public.books_fixed_assets USING btree (f
 --
 
 CREATE UNIQUE INDEX books_fixed_assets_one_per_expense ON public.books_fixed_assets USING btree (source_expense_id) WHERE ((source_expense_id IS NOT NULL) AND (voided_at IS NULL));
+
+
+--
+-- Name: books_fixed_assets_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_fixed_assets_unit ON public.books_fixed_assets USING btree (unit_id) WHERE (unit_id IS NOT NULL);
 
 
 --
@@ -24724,6 +25312,13 @@ CREATE INDEX books_loans_landlord ON public.books_loans USING btree (landlord_id
 --
 
 CREATE UNIQUE INDEX books_loans_one_funding_line ON public.books_loans USING btree (funded_bank_transaction_id) WHERE ((funded_bank_transaction_id IS NOT NULL) AND (voided_at IS NULL));
+
+
+--
+-- Name: books_loans_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX books_loans_unit ON public.books_loans USING btree (unit_id) WHERE (unit_id IS NOT NULL);
 
 
 --
@@ -24871,6 +25466,13 @@ CREATE INDEX common_areas_landlord_idx ON public.common_areas USING btree (landl
 --
 
 CREATE INDEX common_areas_property_idx ON public.common_areas USING btree (property_id) WHERE active;
+
+
+--
+-- Name: credit_chain_check_runs_started; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX credit_chain_check_runs_started ON public.credit_chain_check_runs USING btree (started_at DESC);
 
 
 --
@@ -26512,6 +27114,13 @@ CREATE INDEX idx_home_ownerships_owner ON public.home_ownerships USING btree (ow
 
 
 --
+-- Name: idx_home_ownerships_sale_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_home_ownerships_sale_document ON public.home_ownerships USING btree (sale_document_id) WHERE (sale_document_id IS NOT NULL);
+
+
+--
 -- Name: idx_home_ownerships_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26922,6 +27531,20 @@ CREATE INDEX idx_lease_templates_property ON public.lease_templates USING btree 
 --
 
 CREATE INDEX idx_lease_templates_purpose ON public.lease_templates USING btree (landlord_id, purpose) WHERE (purpose <> 'lease'::text);
+
+
+--
+-- Name: idx_lease_tenants_add_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_tenants_add_document ON public.lease_tenants USING btree (add_document_id) WHERE (add_document_id IS NOT NULL);
+
+
+--
+-- Name: idx_lease_tenants_remove_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_tenants_remove_document ON public.lease_tenants USING btree (remove_document_id) WHERE (remove_document_id IS NOT NULL);
 
 
 --
@@ -27405,6 +28028,13 @@ CREATE INDEX idx_pending_intents_waived_unit ON public.pending_tenant_intents US
 --
 
 CREATE INDEX idx_pending_lease_drafts_open ON public.pending_lease_drafts USING btree (unit_id, household_order) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: idx_pending_tenant_intents_draft_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pending_tenant_intents_draft_document ON public.pending_tenant_intents USING btree (draft_document_id) WHERE (draft_document_id IS NOT NULL);
 
 
 --
@@ -28315,6 +28945,13 @@ CREATE INDEX idx_stripe_webhook_events_type_received ON public.stripe_webhook_ev
 --
 
 CREATE INDEX idx_subleases_active ON public.subleases USING btree (master_lease_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_subleases_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subleases_document ON public.subleases USING btree (sublease_document_id) WHERE (sublease_document_id IS NOT NULL);
 
 
 --
@@ -29830,6 +30467,20 @@ CREATE INDEX payroll_run_lines_work_trade_extra_hours ON public.payroll_run_line
 
 
 --
+-- Name: payroll_runs_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payroll_runs_property ON public.payroll_runs USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: payroll_runs_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payroll_runs_unit ON public.payroll_runs USING btree (unit_id) WHERE (unit_id IS NOT NULL);
+
+
+--
 -- Name: pending_tenant_intents_tenant_landlord_nounit_live_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -29988,6 +30639,13 @@ CREATE INDEX pos_reader_order_costs_order ON public.pos_reader_order_costs USING
 --
 
 CREATE UNIQUE INDEX pos_reader_order_costs_seq ON public.pos_reader_order_costs USING btree (seq);
+
+
+--
+-- Name: pos_reader_order_resplits_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_reader_order_resplits_order ON public.pos_reader_order_resplits USING btree (reader_order_id);
 
 
 --
@@ -30891,6 +31549,13 @@ CREATE TRIGGER audit_books_contractors AFTER DELETE OR UPDATE ON public.books_co
 --
 
 CREATE TRIGGER audit_books_employees AFTER DELETE OR UPDATE ON public.books_employees FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_fixed_asset_funding audit_books_fixed_asset_funding; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_fixed_asset_funding AFTER DELETE OR UPDATE ON public.books_fixed_asset_funding FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -32175,6 +32840,27 @@ CREATE TRIGGER books_contractors_fold AFTER INSERT OR UPDATE ON public.books_con
 
 
 --
+-- Name: books_fixed_asset_funding books_fixed_asset_funding_check; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER books_fixed_asset_funding_check AFTER INSERT OR UPDATE ON public.books_fixed_asset_funding DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.books_fixed_asset_funding_check();
+
+
+--
+-- Name: books_fixed_asset_funding books_fixed_asset_funding_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER books_fixed_asset_funding_guard BEFORE DELETE OR UPDATE ON public.books_fixed_asset_funding FOR EACH ROW EXECUTE FUNCTION public.books_fixed_asset_funding_guard();
+
+
+--
+-- Name: books_fixed_assets books_fixed_assets_funding_check; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER books_fixed_assets_funding_check AFTER INSERT OR UPDATE OF cost, voided_at, funded_by, funded_loan_id, property_id ON public.books_fixed_assets DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.books_fixed_asset_funding_check();
+
+
+--
 -- Name: books_fixed_assets books_fixed_assets_guard; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -32193,6 +32879,13 @@ CREATE TRIGGER books_loan_payments_guard BEFORE INSERT OR DELETE OR UPDATE ON pu
 --
 
 CREATE TRIGGER books_loans_asset_guard BEFORE UPDATE OF voided_at, funded_to, start_date ON public.books_loans FOR EACH ROW EXECUTE FUNCTION public.books_loans_asset_guard();
+
+
+--
+-- Name: books_loans books_loans_funding_check; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER books_loans_funding_check AFTER UPDATE OF original_amount ON public.books_loans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.books_fixed_asset_funding_check();
 
 
 --
@@ -32280,10 +32973,17 @@ CREATE CONSTRAINT TRIGGER landlord_expense_payments_sums AFTER INSERT OR UPDATE 
 
 
 --
+-- Name: landlord_expenses landlord_expenses_asset_delete_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER landlord_expenses_asset_delete_guard BEFORE DELETE ON public.landlord_expenses FOR EACH ROW EXECUTE FUNCTION public.landlord_expenses_asset_guard();
+
+
+--
 -- Name: landlord_expenses landlord_expenses_asset_guard; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER landlord_expenses_asset_guard BEFORE UPDATE OF status, voided_at ON public.landlord_expenses FOR EACH ROW EXECUTE FUNCTION public.landlord_expenses_asset_guard();
+CREATE TRIGGER landlord_expenses_asset_guard BEFORE UPDATE OF status, voided_at, amount, property_id, unit_id ON public.landlord_expenses FOR EACH ROW EXECUTE FUNCTION public.landlord_expenses_asset_guard();
 
 
 --
@@ -32368,6 +33068,13 @@ CREATE TRIGGER ledger_capture_del AFTER DELETE ON public.bank_deposit_slips REFE
 --
 
 CREATE TRIGGER ledger_capture_del AFTER DELETE ON public.bank_transactions REFERENCING OLD TABLE AS ledger_old FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_capture_bank_transactions_del();
+
+
+--
+-- Name: books_fixed_asset_funding ledger_capture_del; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER ledger_capture_del AFTER DELETE ON public.books_fixed_asset_funding REFERENCING OLD TABLE AS ledger_old FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_capture_books_fixed_asset_funding_del();
 
 
 --
@@ -32721,6 +33428,13 @@ CREATE TRIGGER ledger_capture_ins AFTER INSERT ON public.bank_transactions REFER
 
 
 --
+-- Name: books_fixed_asset_funding ledger_capture_ins; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER ledger_capture_ins AFTER INSERT ON public.books_fixed_asset_funding REFERENCING NEW TABLE AS ledger_new FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_capture_books_fixed_asset_funding_ins();
+
+
+--
 -- Name: books_fixed_assets ledger_capture_ins; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -33068,6 +33782,13 @@ CREATE TRIGGER ledger_capture_upd AFTER UPDATE ON public.bank_deposit_slips REFE
 --
 
 CREATE TRIGGER ledger_capture_upd AFTER UPDATE ON public.bank_transactions REFERENCING OLD TABLE AS ledger_old NEW TABLE AS ledger_new FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_capture_bank_transactions_upd();
+
+
+--
+-- Name: books_fixed_asset_funding ledger_capture_upd; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER ledger_capture_upd AFTER UPDATE ON public.books_fixed_asset_funding REFERENCING OLD TABLE AS ledger_old NEW TABLE AS ledger_new FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_capture_books_fixed_asset_funding_upd();
 
 
 --
@@ -34703,6 +35424,14 @@ ALTER TABLE ONLY public.bank_transactions
 
 
 --
+-- Name: birthday_greetings birthday_greetings_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.birthday_greetings
+    ADD CONSTRAINT birthday_greetings_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: booking_change_requests booking_change_requests_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -35023,6 +35752,14 @@ ALTER TABLE ONLY public.books_fixed_assets
 
 
 --
+-- Name: books_fixed_assets books_fixed_assets_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_fixed_assets
+    ADD CONSTRAINT books_fixed_assets_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
 -- Name: books_fixed_assets books_fixed_assets_voided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -35132,6 +35869,14 @@ ALTER TABLE ONLY public.books_loans
 
 ALTER TABLE ONLY public.books_loans
     ADD CONSTRAINT books_loans_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: books_loans books_loans_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_loans
+    ADD CONSTRAINT books_loans_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
 
 
 --
@@ -38935,6 +39680,14 @@ ALTER TABLE ONLY public.payroll_runs
 
 
 --
+-- Name: payroll_runs payroll_runs_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_runs
+    ADD CONSTRAINT payroll_runs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
 -- Name: pending_lease_drafts pending_lease_drafts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -39796,6 +40549,30 @@ ALTER TABLE ONLY public.pos_reader_order_costs
 
 ALTER TABLE ONLY public.pos_reader_order_costs
     ADD CONSTRAINT pos_reader_order_costs_reader_order_id_fkey FOREIGN KEY (reader_order_id) REFERENCES public.pos_reader_orders(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_reader_order_resplits pos_reader_order_resplits_charge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_order_resplits
+    ADD CONSTRAINT pos_reader_order_resplits_charge_id_fkey FOREIGN KEY (charge_id) REFERENCES public.landlord_gam_charges(id);
+
+
+--
+-- Name: pos_reader_order_resplits pos_reader_order_resplits_cost_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_order_resplits
+    ADD CONSTRAINT pos_reader_order_resplits_cost_id_fkey FOREIGN KEY (cost_id) REFERENCES public.pos_reader_order_costs(id);
+
+
+--
+-- Name: pos_reader_order_resplits pos_reader_order_resplits_reader_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_reader_order_resplits
+    ADD CONSTRAINT pos_reader_order_resplits_reader_order_id_fkey FOREIGN KEY (reader_order_id) REFERENCES public.pos_reader_orders(id);
 
 
 --
@@ -42531,5 +43308,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict c3yIfwGE7MDeAPX2ES4JdnORdvcFxhRhbKfYC1Wh956aNw07PctqoTpFxGtEcOR
+\unrestrict SpdZcfSfJIyqqL1VgfLs6KjX3QaSpDAzeZz2HNp6POAukhULn5cz1Fl5kGsBpWf
 
