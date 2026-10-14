@@ -361,6 +361,32 @@ export function staffLandingPath(user: NavUser): string {
 }
 
 /**
+ * Where Layout sends a bookkeeper who is on a page that is not theirs (null:
+ * stay). 10/11: one who follows an old link or types a path lands back on their
+ * pages rather than on a screen the API will refuse piece by piece. 10/12:
+ * until their scope has answered, the company-wide pages (Bank Activity,
+ * Payouts, Bookkeeping) are let through — a link to one is not bounced before
+ * it is known whether it is theirs; the server still refuses it if not, and
+ * this runs again once the scope is in.
+ *
+ * 10/13: the portal's own address ('/', where every sign-in arrives) is not one
+ * of their pages either, so this — not RoleRedirect — decided where a
+ * bookkeeper landed, and it picked the first page of the menu: Payments since
+ * 10/13 put it first. The decided landing is Money in (staffLandingPath; "where
+ * they land did not change"). It goes there now, and so does any other page
+ * that is not theirs.
+ */
+export function bookkeeperRedirect(pathname: string, navUser: NavUser, scopeLoading: boolean): string | null {
+  const effective = scopeLoading ? { ...navUser, companyWide: true } : navUser
+  const theirs = visibleNavItemsFor(effective).map(i => i.to)
+  // 10/12 review: the bare /bookkeeping address opens the Books dashboard
+  // (main.tsx's own redirect), never their first page, when it is theirs.
+  if (pathname === '/bookkeeping' && theirs.includes(BOOKS_PATHS.dashboard)) return BOOKS_PATHS.dashboard
+  if (theirs.includes(pathname)) return null
+  return staffLandingPath(effective)
+}
+
+/**
  * 10/12 (Nic): the signed-in user as the menu reads them. A bookkeeper's
  * company-wide box and whether they keep any property's money are not on the
  * sign-in; they are on GET /financials/scope (the shared financial pages read
@@ -579,20 +605,11 @@ export function Layout() {
   const { navUser, scopeLoading } = useNavUser()
   const visibleItems = sidebarNavItemsFor(navUser)
 
-  // 10/11: a bookkeeper who follows an old link or types a path lands back on
-  // their pages rather than on a screen the API will refuse piece by piece.
-  // 10/12: until their scope has answered, the company-wide pages (Bank
-  // Activity, Payouts, Bookkeeping) are let through — a link to one is not
-  // bounced before it is known whether it is theirs; the server still refuses
-  // it if not, and the redirect runs again once the scope is in.
+  // A bookkeeper on a page that is not theirs — including the portal's own
+  // address after signing in — goes to their landing (bookkeeperRedirect).
   if (isBookkeeper) {
-    const theirs = visibleNavItemsFor(scopeLoading ? { ...navUser, companyWide: true } : navUser).map(i => i.to)
-    // 10/12 review: the bare /bookkeeping address opens the Books dashboard
-    // (main.tsx's own redirect), never their first page, when it is theirs.
-    if (layoutLocation.pathname === '/bookkeeping' && theirs.includes(BOOKS_PATHS.dashboard)) {
-      return <Navigate to={BOOKS_PATHS.dashboard} replace />
-    }
-    if (!theirs.includes(layoutLocation.pathname)) return <Navigate to={theirs[0] ?? '/income'} replace />
+    const to = bookkeeperRedirect(layoutLocation.pathname, navUser, scopeLoading)
+    if (to) return <Navigate to={to} replace />
   }
 
   // Track section headers without side effects

@@ -23,6 +23,8 @@ import { logger } from '../lib/logger'
 import { portalUrl, portalLink } from '../lib/portalUrls'
 import { resolveLandlordTarget, landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 import { keptIdsSql, coversAllSql, companyWideSql, formerSql, bookkeeperScopesOf } from '../lib/bookkeeperScope'
+// 10/13 (Nic): a new account goes from Create account straight to the code box.
+import { emailCodeStepFor } from './auth'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
@@ -800,10 +802,17 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
       if (existing) throw new AppError(409, 'This user is already an on-site manager for another landlord')
     }
 
-    // Block duplicate pending invite (same landlord + role + email)
+    // Block duplicate pending invite (same landlord + role + email).
+    // 10/13 (Nic): a LIVE one only. The invitation page tells someone whose
+    // link has expired to ask for a new one, but a pending row past its
+    // expires_at keeps status 'pending' until the hourly sweep (jobs/scheduler
+    // processInvitationExpiry, :10 past) — so the owner who did as asked was
+    // refused here for up to an hour, with no Resend on the Team page. A lapsed
+    // one is marked expired below, in the same transaction as the new one.
     const dup = await queryOne<any>(
       `SELECT id FROM invitations
        WHERE landlord_id=$1 AND role=$2 AND lower(email)=lower($3) AND status='pending'
+         AND expires_at > NOW()
        LIMIT 1`,
       [landlordId, role, body.email])
     if (dup) throw new AppError(409, 'A pending invitation already exists for this email')
@@ -814,6 +823,23 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
     const client = await getClient()
     try {
       await client.query('BEGIN')
+      // 10/13 (Nic): the lapsed invitation for this address, if any, is marked
+      // expired now, exactly as the hourly sweep would (status + a system
+      // invitation.expired event, no actor), so it no longer holds the one
+      // pending slot (invitations_unique_pending) and its old link keeps saying
+      // "expired". A live one was refused above.
+      const lapsed = await client.query<{ id: string }>(
+        `UPDATE invitations SET status = 'expired'
+          WHERE landlord_id=$1 AND role=$2 AND lower(email)=lower($3) AND status='pending'
+            AND expires_at <= NOW()
+          RETURNING id`,
+        [landlordId, role, body.email])
+      for (const row of lapsed.rows) {
+        await client.query(
+          `INSERT INTO platform_events (subject_type, subject_id, event_type, actor_user_id, payload)
+           VALUES ('invitation', $1, 'invitation.expired', NULL, '{}'::jsonb)`,
+          [row.id])
+      }
       const invRes = await client.query(
         `INSERT INTO invitations
            (email, landlord_id, role, scope_payload, invited_by_user_id, token, expires_at,
@@ -1178,6 +1204,10 @@ invitationsRouter.get('/:token', async (req, res, next) => {
         role:        inv.role,
         status:      inv.status,
         expiresAt:   inv.expires_at,
+        // 10/13 (Nic): the page says "expired, ask for a new one" before the
+        // person fills the form, by the server's clock (a pending row keeps
+        // status 'pending' until the hourly sweep marks it 'expired').
+        expired:     inv.status === 'expired' || (inv.status === 'pending' && new Date(inv.expires_at) <= new Date()),
         inviterName: inv.inviter_business
           || [inv.inviter_first, inv.inviter_last].filter(Boolean).join(' ')
           || 'Your landlord',
@@ -1210,6 +1240,20 @@ function sessionIfSent(req: any, res: any, next: any) {
 const ACCEPT_FROM_OWN_ACCOUNT =
   'This email already has a GAM account. Sign in to that account, then open this link again to accept.'
 
+/**
+ * 10/13 (Nic): a bookkeeper who opened her invitation link again after setting
+ * up her account was told "This invitation is accepted. Ask your employer to
+ * send a new invite link" — false, and a dead end. A used link is not an
+ * expired one (the tenant invite learned this in S637): the account exists and
+ * works, so say so and say to sign in. The link authorizes nothing more.
+ */
+const ALREADY_SET_UP =
+  "You've already set up your account with this link. Sign in with your email and password — you don't need a new invitation."
+const INVITATION_EXPIRED =
+  'This invitation link has expired. Ask the person who invited you to send a new one.'
+const INVITATION_WITHDRAWN =
+  'This invitation was withdrawn. If you still need access, ask the person who invited you to send a new one.'
+
 // POST /api/invitations/:token/accept
 invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) => {
   try {
@@ -1221,6 +1265,9 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
     }).parse(req.body)
 
     const client = await getClient()
+    // 10/13 (Nic): what was accepted, read after the transaction has committed
+    // and its connection has gone back to the pool.
+    let accepted: { userId: string; role: LandlordAssignableRole; scope: any; newAccount: boolean } | null = null
     try {
       await client.query('BEGIN')
 
@@ -1230,8 +1277,10 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
         [req.params.token])
       const inv = invRes.rows[0]
       if (!inv) throw new AppError(404, 'Invitation not found')
-      if (inv.status !== 'pending') throw new AppError(400, `Invitation is ${inv.status}`)
-      if (new Date(inv.expires_at) <= new Date()) throw new AppError(400, 'Invitation has expired')
+      // 10/13 (Nic): in plain words, and a used link is told to sign in.
+      if (inv.status === 'accepted') throw new AppError(409, ALREADY_SET_UP, { code: 'ALREADY_ACCEPTED' })
+      if (inv.status === 'revoked') throw new AppError(400, INVITATION_WITHDRAWN)
+      if (inv.status !== 'pending' || new Date(inv.expires_at) <= new Date()) throw new AppError(400, INVITATION_EXPIRED)
 
       const role = inv.role as LandlordAssignableRole
       if (!isAssignableRole(role)) throw new AppError(500, 'Invitation has invalid role')
@@ -1241,6 +1290,7 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
         `SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1`,
         [inv.email])
       let user = userRes.rows[0]
+      const newAccount = !user
 
       if (!user) {
         if (!body.password) throw new AppError(400, 'Password required for new account')
@@ -1250,9 +1300,12 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
           // email_verified=TRUE: clicking the invite link (delivered to this
           // exact address) proves email ownership, so the staff member is
           // verified on accept — no separate verification step to block login.
+          // 10/13: email_2fa_enabled=TRUE in the same write, as the tenant
+          // activation does (S637) — the code step below is part of what the
+          // account IS from its first minute, not a flag /login flips later.
           `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
-                              email_verified, email_verified_at)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW()) RETURNING *`,
+                              email_verified, email_verified_at, email_2fa_enabled)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), TRUE) RETURNING *`,
           [inv.email, hash, role, body.firstName, body.lastName, body.phone || null])
         user = newUser.rows[0]
       } else {
@@ -1302,7 +1355,7 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
         [inv.id, user.id])
 
       await client.query('COMMIT')
-      res.json({ success: true, data: { userId: user.id, role, scope: scopeRow } })
+      accepted = { userId: user.id, role, scope: scopeRow, newAccount }
     } catch (e: any) {
       await client.query('ROLLBACK')
       // S349: the invite-time onsite-manager uniqueness guard (scopes.ts:378)
@@ -1319,5 +1372,38 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
     } finally {
       client.release()
     }
+
+    const data = { userId: accepted.userId, role: accepted.role, scope: accepted.scope }
+    // An existing account accepted from its own session (above): already
+    // signed in, nothing more to do.
+    if (!accepted.newAccount) return res.json({ success: true, data })
+
+    // ── 10/13 (Nic): FROM THE LINK TO HER PAGES IN ONE PATH ─────────────────
+    //
+    // "It told her to sign in and then something about it not going anywhere."
+    // The accept answered with no way in, so the page sent the bookkeeper off
+    // to sign in at GAM Books (whose /login was a 404), and opening the link
+    // again said to ask for a new invite. She got in only by finding the
+    // landlord portal's sign-in herself and typing again the password she had
+    // just chosen.
+    //
+    // A new account now answers with the emailed-code step — the pending pass
+    // /login would hand out, and its code mailed to the invited address — so
+    // the page goes from Create account to the code box and then to her pages.
+    // The code is still required (S578). The account is committed whatever
+    // happens here: if the step cannot be started, the page sends her to sign
+    // in, and the link tells her the same.
+    let step: { emailOtpSession: string; otpSent: boolean } | null = null
+    try {
+      step = await emailCodeStepFor(accepted.userId)
+    } catch (err) {
+      logger.error({ err, userId: accepted.userId }, '[invitations] account set up, but the code step could not start')
+    }
+    res.json({
+      success: true,
+      data: step
+        ? { ...data, requiresEmailOtp: true, emailOtpSession: step.emailOtpSession, otpSent: step.otpSent }
+        : { ...data, requiresEmailOtp: false },
+    })
   } catch (e) { next(e) }
 })

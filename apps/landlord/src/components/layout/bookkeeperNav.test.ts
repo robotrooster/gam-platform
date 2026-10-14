@@ -9,7 +9,7 @@
 // Roll pages, read-only" (with any property money), and "REMOVE the
 // Outstanding Balances tab".
 import { describe, it, expect } from 'vitest'
-import { visibleNavItemsFor, sidebarNavItemsFor, staffLandingPath } from './Layout'
+import { visibleNavItemsFor, sidebarNavItemsFor, staffLandingPath, bookkeeperRedirect } from './Layout'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
 
 const PROPERTY_MONEY = ['/payments', '/rent-roll', '/income', '/reports', '/expenses', '/maintenance-costs']
@@ -208,5 +208,52 @@ describe('landlord portal navigation for staff', () => {
       expect(viewOnly, role).toContain('/payments')
     }
     expect(paths({ role: 'onsite_manager', permissions: {} })).not.toContain('/rent-roll')
+  })
+})
+
+// 10/13 (Nic): "there was some kind of issue on the signing up flow through the
+// bookkeeper invite link." After her code she arrived at the portal's own
+// address ('/'), which is not one of her pages, so Layout's guard sent her to
+// the first page of her menu — Payments, since 10/13 put it first — and
+// RoleRedirect's landing (Money in, pinned above) never ran for a bookkeeper.
+describe("where Layout sends a bookkeeper who is not on one of their pages", () => {
+  const BK = { role: 'bookkeeper' }
+  const BK_WIDE = { role: 'bookkeeper', companyWide: true }
+
+  it("signing in ('/') lands on Money in — the decided landing, not the first menu item", () => {
+    for (const [u, loading] of [[BK, true], [BK, false], [BK_WIDE, true], [BK_WIDE, false], [{ role: 'bookkeeper', ledger: true }, false]] as const) {
+      expect(bookkeeperRedirect('/', u, loading), JSON.stringify({ u, loading })).toBe('/income')
+      expect(bookkeeperRedirect('/', u, loading)).toBe(staffLandingPath(loading ? { ...u, companyWide: true } : u))
+    }
+  })
+
+  it('a page that is not theirs goes to the same landing; their own pages stay put', () => {
+    for (const p of ['/dashboard', '/tenants', '/settings', '/team', '/balances']) {
+      expect(bookkeeperRedirect(p, BK_WIDE, false), p).toBe('/income')
+    }
+    for (const p of ['/payments', '/rent-roll', '/income', '/reports', BOOKS_PATHS.categories]) {
+      expect(bookkeeperRedirect(p, BK, false), p).toBeNull()
+    }
+    expect(bookkeeperRedirect('/bank-activity', BK_WIDE, false)).toBeNull()
+  })
+
+  it('while the scope is loading, the company-wide pages are let through; once it answers, a page that is not theirs leaves', () => {
+    expect(bookkeeperRedirect('/bank-activity', { role: 'bookkeeper' }, true)).toBeNull()
+    expect(bookkeeperRedirect('/bank-activity', { role: 'bookkeeper', companyWide: false }, false)).toBe('/income')
+  })
+
+  it('no property ticked: no Money in, so the first page they have (never a loop)', () => {
+    const noProps = { role: 'bookkeeper', companyWide: true, propertyMoney: false }
+    const to = bookkeeperRedirect('/', noProps, false)
+    expect(to).toBe(staffLandingPath(noProps))
+    expect(bookkeeperRedirect(to!, noProps, false)).toBeNull()
+    const onlyCategories = { role: 'bookkeeper', propertyMoney: false }
+    expect(bookkeeperRedirect('/', onlyCategories, false)).toBe(BOOKS_PATHS.categories)
+    expect(bookkeeperRedirect(BOOKS_PATHS.categories, onlyCategories, false)).toBeNull()
+  })
+
+  it('the bare /bookkeeping address opens the Books dashboard when it is theirs (10/12 review)', () => {
+    expect(bookkeeperRedirect('/bookkeeping', BK_WIDE, false)).toBe(BOOKS_PATHS.dashboard)
+    expect(bookkeeperRedirect('/bookkeeping', BK, false)).toBe('/income')
   })
 })

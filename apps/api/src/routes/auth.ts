@@ -569,6 +569,42 @@ async function sessionClaimsFor(user: any) {
   return { scope, profileId, landlordIds, businessId, staffRole, claims }
 }
 
+/**
+ * 10/13 (Nic): "it told her to sign in and then something about it not going
+ * anywhere." A bookkeeper who had just created her account from the owner's
+ * emailed invitation was sent off to sign in somewhere else, with the password
+ * she had typed a moment before.
+ *
+ * An account set up from an emailed team invitation goes straight to the
+ * emailed-code step instead: the same pending pass /login hands out, built
+ * from the same claims (sessionClaimsFor), and the same code. The code is
+ * still required (S578: no account is exempt); only the second trip to a
+ * sign-in page is gone. The page that set the account up shows the code box
+ * and the person lands on their own pages.
+ *
+ * Call it after the account (and its team row) has committed. otpSent: false
+ * means no code could be issued at all (it was never stored, so nothing was
+ * mailed); that does not fail the caller — the account exists and the code
+ * screen's Resend issues one. A code that was stored but that the mail
+ * provider then refused is NOT seen here: issueEmailOtp logs that and returns
+ * normally (the same as at /login), so otpSent stays true and the code
+ * screen's Resend is the way out, as it is for any sign-in.
+ */
+export async function emailCodeStepFor(userId: string): Promise<{ emailOtpSession: string; otpSent: boolean }> {
+  const user = await loadUserForSession('id', userId)
+  if (!user) throw new AppError(404, 'Account not found')
+  const { claims } = await sessionClaimsFor(user)
+  const emailOtpSession = signEmailOtpSessionToken({ ...claims, sp: sessionPolicyFor(user.role, null, false) })
+  let otpSent = true
+  try {
+    await issueEmailOtp(user.id, user.email)
+  } catch (err) {
+    otpSent = false
+    logger.error({ err, userId: user.id }, '[auth] account set up, but no sign-in code could be issued')
+  }
+  return { emailOtpSession, otpSent }
+}
+
 authRouter.post('/login', async (req, res, next) => {
   try {
     const { email, password, portal, keepSignedIn, emailFactor } = loginSchema.parse(req.body)
