@@ -294,6 +294,8 @@ describe('5. The Add forms save', () => {
       address: '12 Palm Way, Mesa AZ 85201', title: 'Groundskeeper', department: 'Grounds',
       payType: 'hourly', payRate: 18, payFrequency: 'weekly', filingStatus: 'head_of_household',
       federalAllowances: 0, stateWithholdingPct: 2.5, startDate: `${YEAR}-01-05`, ssnLast4: '4321',
+      // 10/14 (Nic): every employee's pay place is asked when they are added.
+      payPlace: 'company',
     }
     const ok = await post(f.A, '/employees', form)
     expect(ok.status).toBe(201)
@@ -344,8 +346,8 @@ describe('5. The Add forms save', () => {
 
 async function employee(aId: string, payType = 'salary', payRate = 52000): Promise<string> {
   return (await db.query<{ id: string }>(
-    `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency)
-     VALUES ($1, 'Pat', 'Kim', $2, $3, 'biweekly') RETURNING id`, [aId, payType, payRate])).rows[0].id
+    `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, pay_place)
+     VALUES ($1, 'Pat', 'Kim', $2, $3, 'biweekly', 'company') RETURNING id`, [aId, payType, payRate])).rows[0].id
 }
 /** An approved run on `payDate` paying the employee `gross` (SS/Medicare as stored). */
 async function approvedRun(aId: string, empId: string, payDate: string, gross: number, ss = 0) {
