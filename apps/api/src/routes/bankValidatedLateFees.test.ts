@@ -347,7 +347,6 @@ describe('1b. review fixes — re-validation edges', () => {
     const t = await bankRow(s, b.dueDay)   // 'BRANCH DEPOSIT' — no reference number
     const r = await reconcileDeposits(s.landlordId)
     expect(r.recorded).toBe(0)
-    expect(r.autoSettled).toBe(0)
     expect((await txn(t)).status).toBe('needs_review')
     expect(await row(b.feeId)).toMatchObject({ amount: 25, credited: 25 })   // the hand logging's state, untouched
     expect(await row(otherRent)).toMatchObject({ status: 'pending' })
@@ -476,7 +475,7 @@ describe('2. "Tenants may deposit rent directly at the bank" (per property, defa
     const b = await lateBill(s)
     await db.query(`DELETE FROM payments WHERE id = $1`, [b.feeId])
     const t = await bankRow(s, await b.plus(1))   // exactly the whole bill, a memo that names nobody
-    expect((await reconcileDeposits(s.landlordId)).autoSettled).toBe(0)
+    await reconcileDeposits(s.landlordId)
     expect(await row(b.rentId)).toMatchObject({ status: 'pending' })
     const row2 = (await db.query<any>(
       `SELECT id, landlord_id, amount::float AS amount, to_char(posted_date,'YYYY-MM-DD') AS posted_date, description FROM bank_transactions WHERE id = $1`, [t])).rows[0]
@@ -502,7 +501,7 @@ describe('2. "Tenants may deposit rent directly at the bank" (per property, defa
     })
     const t = await bankRow(s, day)
     const r = await reconcileDeposits(s.landlordId)
-    expect(r).toMatchObject({ slips: 0, autoSettled: 0 })
+    expect(r).toMatchObject({ slips: 0 })
     expect((await txn(t)).status).toBe('needs_review')
     // No tenant bill fits: the slip matches by itself, as always.
     await db.query(`UPDATE payments SET amount = 550 WHERE id = $1`, [b.rentId])
@@ -526,12 +525,16 @@ describe('2. "Tenants may deposit rent directly at the bank" (per property, defa
     const pq = await request(app()).get(`/api/payments/post-payment/quote?tenantId=${s.tenantId}`).set('Authorization', `Bearer ${s.token}`)
     expect(pq.body.data.bankDepositAllowed).toBe(true)
 
-    // The feed settles a whole bill to the cent by itself.
+    // 10/14 (Nic, answer 16): "no guessing" — a whole bill to the cent is
+    // offered (picked for the person to confirm), never settled by itself.
     const t = await stack({ bank: true })
     const c = await lateBill(t)
     await db.query(`DELETE FROM payments WHERE id = $1`, [c.feeId])
-    await bankRow(t, await c.plus(1))
-    expect((await reconcileDeposits(t.landlordId)).autoSettled).toBe(1)
-    expect(await row(c.rentId)).toMatchObject({ status: 'settled' })
+    const line = await bankRow(t, await c.plus(1))
+    await reconcileDeposits(t.landlordId)
+    expect(await row(c.rentId)).toMatchObject({ status: 'pending' })
+    const lineRow = (await db.query<any>(
+      `SELECT id, landlord_id, amount::float AS amount, to_char(posted_date,'YYYY-MM-DD') AS posted_date, description FROM bank_transactions WHERE id = $1`, [line])).rows[0]
+    expect((await candidatesForDeposit(lineRow)).candidates[0]).toMatchObject({ chargeIds: [c.rentId], preselect: true, depositsTaken: true })
   })
 })

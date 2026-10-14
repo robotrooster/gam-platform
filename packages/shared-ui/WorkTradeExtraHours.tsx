@@ -21,8 +21,8 @@ import { useMutation } from 'react-query'
 import {
   WORK_TRADE_EXTRA_HOURS_MODES, WORK_TRADE_EXTRA_HOURS_MODE_LABEL, WORK_TRADE_EXTRA_PAY_METHODS,
   WORK_TRADE_EXTRA_PAY_METHOD_LABEL, WORK_TRADE_EXTRA_HOURS_NOTICE, WORK_TRADE_EXTRA_PAYABLE_STATUS_LABEL,
-  WORK_TRADE_EXTRA_PAID_HOW, WORK_TRADE_EXTRA_PAID_HOW_LABEL,
-  type WorkTradeExtraHoursMode, type WorkTradeExtraPayMethod, type WorkTradeExtraPaidHow,
+  WORK_TRADE_EXTRA_PAID_HOW, WORK_TRADE_EXTRA_PAID_HOW_LABEL, BOOKS_COST_PLACES, BOOKS_COST_PLACE_LABEL,
+  type WorkTradeExtraHoursMode, type WorkTradeExtraPayMethod, type WorkTradeExtraPaidHow, type BooksCostPlace,
 } from '@gam/shared'
 import type { PanelApi } from './WorkTradePanel'
 
@@ -133,10 +133,30 @@ export function ExtraHoursPayables({ rows, api, onChanged, notify, showWho = fal
   // default ("cannot be in the future").
   const now = new Date()
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-  const [paying, setPaying] = useState<{ id: string; paidOn: string; paidHow: WorkTradeExtraPaidHow; note: string } | null>(null)
+  // 10/14 (Nic): "ask where it goes every time (split, property or unit), like
+  // other expenses." Where the cost goes and how it was paid start blank —
+  // nothing is chosen for the person (10/13: "they pick as the expense happens").
+  type Paying = { id: string; paidOn: string; paidHow: WorkTradeExtraPaidHow | ''; note: string
+    costPlace: BooksCostPlace | ''; propertyId: string; unitId: string }
+  const [paying, setPaying] = useState<Paying | null>(null)
+  const [places, setPlaces] = useState<{ id: string; name: string; units: { id: string; unitNumber: string }[] }[]>([])
+  const placeChosen = (p: Paying) => p.costPlace === 'split_by_units' || (p.costPlace === 'property' && !!p.propertyId)
+    || (p.costPlace === 'unit' && !!p.unitId)
+  const startPaying = (id: string) => {
+    setPaying({ id, paidOn: today, paidHow: '', note: '', costPlace: '', propertyId: '', unitId: '' })
+    setPlaces([])
+    Promise.resolve(api.get(`/work-trade/extra-hours/${id}/cost-places`))
+      .then((d: any) => setPlaces(d?.properties ?? []))
+      .catch((e: any) => notify?.(errText(e, 'Could not load your properties'), 'error'))
+  }
   const markPaid = useMutation(
-    (p: { id: string; paidOn: string; paidHow: WorkTradeExtraPaidHow; note: string }) =>
-      api.post(`/work-trade/extra-hours/${p.id}/mark-paid`, { paidOn: p.paidOn, paidHow: p.paidHow, note: p.note.trim() || undefined }),
+    (p: Paying) =>
+      api.post(`/work-trade/extra-hours/${p.id}/mark-paid`, {
+        paidOn: p.paidOn, paidHow: p.paidHow, note: p.note.trim() || undefined,
+        costPlace: p.costPlace || null,
+        propertyId: p.costPlace === 'property' || p.costPlace === 'unit' ? p.propertyId || null : null,
+        unitId: p.costPlace === 'unit' ? p.unitId || null : null,
+      }),
     // 10/12 (Nic): money out is one record — Mark paid also records the pay as
     // a paid expense under "Work trade labor" (routes/workTrade mark-paid).
     { onSuccess: () => { setPaying(null); onChanged(); notify?.('Marked paid, and recorded on Expenses under Work trade labor') },
@@ -176,7 +196,7 @@ export function ExtraHoursPayables({ rows, api, onChanged, notify, showWho = fal
             {r.status !== 'paid' && paying?.id !== r.id && (
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 <button className="btn btn-primary btn-sm" disabled={markPaid.isLoading}
-                  onClick={() => setPaying({ id: r.id, paidOn: today, paidHow: 'check', note: '' })}>Mark paid</button>
+                  onClick={() => startPaying(r.id)}>Mark paid</button>
                 {r.status === 'unpaid' && (
                   <button className="btn btn-primary btn-sm" disabled={sendToBooks.isLoading}
                     onClick={() => sendToBooks.mutate(r.id)}>Send to GAM Books</button>
@@ -200,12 +220,39 @@ export function ExtraHoursPayables({ rows, api, onChanged, notify, showWho = fal
                   ))}
                 </div>
               </div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-2)', gridColumn: '1 / -1' }}>Where the cost goes
+                <div style={{ display: 'flex', gap: 12, marginTop: 6, flexWrap: 'wrap' }}>
+                  {BOOKS_COST_PLACES.map(p => (
+                    <label key={p} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '.78rem', color: 'var(--text-1)', cursor: 'pointer' }}>
+                      <input type="radio" name={`cost-place-${r.id}`} checked={paying.costPlace === p}
+                        onChange={() => setPaying({ ...paying, costPlace: p, propertyId: p === 'split_by_units' ? '' : paying.propertyId, unitId: p === 'unit' ? paying.unitId : '' })} />
+                      {BOOKS_COST_PLACE_LABEL[p]}
+                    </label>
+                  ))}
+                </div>
+                {(paying.costPlace === 'property' || paying.costPlace === 'unit') && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+                    <select className="input" value={paying.propertyId} style={{ flex: '1 1 160px' }}
+                      onChange={e => setPaying({ ...paying, propertyId: e.target.value, unitId: '' })}>
+                      <option value="">Choose the property</option>
+                      {places.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                    </select>
+                    {paying.costPlace === 'unit' && (
+                      <select className="input" value={paying.unitId} disabled={!paying.propertyId} style={{ flex: '1 1 120px' }}
+                        onChange={e => setPaying({ ...paying, unitId: e.target.value })}>
+                        <option value="">Choose the unit</option>
+                        {(places.find(p => p.id === paying.propertyId)?.units ?? []).map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
+                      </select>
+                    )}
+                  </div>
+                )}
+              </div>
               <label style={{ fontSize: '.7rem', color: 'var(--text-2)', gridColumn: '1 / -1' }}>Note (optional)
                 <input className="input" placeholder="e.g. check #1042" value={paying.note} style={{ width: '100%', marginTop: 2 }}
                   onChange={e => setPaying({ ...paying, note: e.target.value })} />
               </label>
               <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 6 }}>
-                <button className="btn btn-primary btn-sm" disabled={markPaid.isLoading || !paying.paidOn}
+                <button className="btn btn-primary btn-sm" disabled={markPaid.isLoading || !paying.paidOn || !paying.paidHow || !placeChosen(paying)}
                   onClick={() => markPaid.mutate(paying)}>{markPaid.isLoading ? '…' : `Mark ${money(r.amount)} paid`}</button>
                 <button className="btn btn-ghost btn-sm" onClick={() => setPaying(null)}>Cancel</button>
               </div>

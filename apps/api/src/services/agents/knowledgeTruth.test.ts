@@ -246,20 +246,29 @@ describe('S655 credit is described the way it works', () => {
     expect(article('tenant/updating-your-payment-method.md')).toMatch(/Adding a bank account never removes the one you already have/)
   })
 
-  it('names both deposits GAM settles by itself — a confirmed report and an unreported whole bill — and the Undo', () => {
-    // bankFeed.decideDeposit: 'declared' (a report the bank confirms) and
-    // 'auto_settle' (bankDepositMatch.isAutoSettleable: exactly one tenant's
-    // whole bill, nothing rival). Both write bank_transactions.auto_settle_undo,
-    // and bankDepositConfirm.undoDepositMatch undoes either from the Bank feed.
+  it('says no tenant deposit settles rent by itself — a report, a whole bill, a payout the memo does not name — with the Undo', () => {
+    // bankFeed.decideDeposit, 10/14 (Nic, answer 16 confirmed: "Exact matches
+    // file themselves (GAM payouts, front-desk-logged deposits for the exact
+    // amount); anything that would be a guess asks"): a tenant's report, a whole
+    // bill to the cent, a named check, the office's cash worked out, a payer
+    // filed before and a payout whose memo does not name GAM are all picked or
+    // offered for a person to confirm. bankDepositConfirm.undoDepositMatch undoes a match.
     const text = article('landlord/matching-cash-deposits-to-rent.md')
+    expect(text).not.toMatch(/There are two cases GAM settles without asking/)
     expect(text).not.toMatch(/There is one case GAM settles without asking/)
-    expect(text).toMatch(/There are two cases GAM settles without asking/)
-    expect(text).toMatch(/The tenant reported the deposit themselves, the bank confirms it/)
-    expect(text).toMatch(/A deposit equal to the cent to everything one tenant owes you/)
-    expect(text).toMatch(/no other deposit of the same amount came in within a few days/)
-    expect(text).toMatch(/A payout from a payment company that happens to match is never taken as rent/)
-    expect(text).toMatch(/The tenant and you are both told/)
+    expect(text).toMatch(/GAM never settles a tenant's rent from a bank deposit without asking — \*\*not even when the tenant reported it\.\*\*/)
+    expect(text).toMatch(/their report is picked for you on the review: one press confirms it/)
+    expect(text).toMatch(/an amount that happens to match is never taken as rent by itself/)
+    expect(text).toMatch(/its own payouts when your bank's line names GAM/)
     expect(text).toMatch(/press \*\*Undo this match\*\* on the deposit under \*\*Bank → Bank feed\*\*/)
+    // 10/14 (Nic, answer 15): a check returned out of a matched deposit, by
+    // itself only when certain; otherwise the owner picks it, and either is undone.
+    expect(text).toMatch(/GAM takes that check back by itself: the bills it paid are owed again/)
+    expect(text).toMatch(/pick the check with \*\*This one bounced\*\*/)
+    expect(text).toMatch(/A card chargeback or an ACH return is never read as a bounced check/)
+    for (const path of ['tenant/paying-rent.md', 'tenant/checking-what-you-owe.md']) {
+      expect(article(path), path).not.toMatch(/we apply it automatically when the deposit shows up/)
+    }
   })
 
   it('a bank a payment is still clearing from, or is set to be tried again from, is never said to be removable', () => {

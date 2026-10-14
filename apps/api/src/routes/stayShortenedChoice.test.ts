@@ -140,7 +140,8 @@ describe('the Check out window', () => {
 // schedule reservations and take payments can cancel. refund is separate
 // permission." (replacing the afternoon's "OWNER + PROPERTY MANAGERS only (not
 // on-site staff)"). The owner always; anybody with "Create reservations" or
-// "Edit / move / cancel reservations" AND "Record a cash / check payment",
+// "Edit / move / cancel reservations" AND a way to take payments — 10/14
+// (Nic): either kind, "Record a cash / check payment" or "Ring sales" —
 // whatever their role. Anybody else who reaches the question is offered "Keep
 // them owed" only, and a 'void' they send is refused with nothing saved.
 async function staff(f: { landlordId: string }, role: 'onsite_manager' | 'property_manager', permissions: Record<string, boolean>) {
@@ -158,7 +159,7 @@ async function staff(f: { landlordId: string }, role: 'onsite_manager' | 'proper
 }
 
 const REFUSED = 'Taking those charges off needs "Create reservations" or "Edit / move / cancel reservations", '
-  + 'together with "Record a cash / check payment". You can keep them owed, or ask someone who has both to change the stay.'
+  + 'together with "Record a cash / check payment" or "Ring sales". You can keep them owed, or ask someone who has both to change the stay.'
 
 describe('10/13 (Nic): who may take the charges off', () => {
   it('a desk person who checks guests out without the reservation and payment permissions is offered "Keep them owed" only, and "take it off" is refused with nothing saved', async () => {
@@ -241,6 +242,22 @@ describe('10/13 (Nic): who may take the charges off', () => {
     })
     // Giving money back is still its own permission: without "Issue refunds" the window cannot refund.
     expect(q.body.data.canRefund).toBe(false)
+  })
+
+  it('10/14 (Nic): "Ring sales" counts as taking payments too — "Edit / move / cancel reservations" with "Ring sales" may take them off', async () => {
+    const f = await seed()
+    const desk = await staff(f, 'onsite_manager', { 'schedule.edit_reservation': true, 'pos.ring_sale': true })
+    const first = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+      .set('Authorization', `Bearer ${desk.token}`).send({ checkOut: '2026-10-20' })
+    expect(first.status, JSON.stringify(first.body)).toBe(409)
+    expect(first.body.choices).toEqual({ void: 'Take those charges off', keep: 'Keep them owed' })
+    expect(first.body.voidRefused).toBeNull()
+    const second = await request(app()).patch(`/api/units/${f.unitId}/bookings/${f.stay}`)
+      .set('Authorization', `Bearer ${desk.token}`).send({ checkOut: '2026-10-20', pastEndAttempted: 'void' })
+    expect(second.status, JSON.stringify(second.body)).toBe(200)
+    await settle()
+    expect((await db.query<any>(`SELECT status, void_reason FROM payments WHERE id = $1`, [f.nov])).rows[0])
+      .toEqual({ status: 'voided', void_reason: STAY_SHORTENED_CHOSEN_VOID_REASON })
   })
 
   it('a property manager who can edit reservations and take payments is offered both and may take them off', async () => {

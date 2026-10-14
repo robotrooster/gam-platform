@@ -1,19 +1,20 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne, getClient } from '../db'
+import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, landlordIdForUnit, ownsLandlord } from '../lib/landlordScope'
 import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
-import { EXTRA_HOURS_ON_LIVE_RUN_SQL, recordWorkTradeHoursPaidByHand } from '../services/workTradeBooksPay'
+import { EXTRA_HOURS_ON_LIVE_RUN_SQL, recordWorkTradeHoursPaidByHand, WORK_TRADE_HOURS_PLACE_WHAT } from '../services/workTradeBooksPay'
+import { resolveCostPlace, costPlaceOptions } from '../services/booksVendorsLoans'
 import { currentLedgerXid, kickLedgerAfterCommit } from '../services/ledgerEngine'
 import { DateTime } from 'luxon'
 import {
   lastBusinessDay, WORK_TRADE_SKILLS, WORK_TRADE_FIELD_PERMISSIONS, WORK_TRADE_COVERABLE,
   WORK_TRADE_COVERAGE_REMOVAL_CHOICES, WORK_TRADE_EXTRA_HOURS_MODES, WORK_TRADE_EXTRA_PAY_METHODS,
-  WORK_TRADE_EXTRA_PAID_HOW,
+  WORK_TRADE_EXTRA_PAID_HOW, BOOKS_COST_PLACES,
 } from '@gam/shared'
 
 // 10/12: what a work trade covers, from the one shared list — and never
@@ -334,15 +335,28 @@ async function payableForManager(payableId: string, user: any) {
  * outside payroll), so hours paid by hand reach the books and the P&L
  * (services/workTradeBooksPay recordWorkTradeHoursPaidByHand). Removing that
  * expense puts the hours back to owed.
+ *
+ * 10/14 (Nic): "ask where it goes every time (split, property or unit), like
+ * other expenses." The person marking it paid says where its cost goes —
+ * `costPlace` (split across the company's properties by units, one property,
+ * or one unit), with the property or unit it names. Required; nothing is
+ * chosen for them (it used to go on the work trader's own property).
  */
 workTradeRouter.post('/extra-hours/:payableId/mark-paid', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const body = z.object({
       paidOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Pick the date it was paid.'),
-      paidHow: z.enum(WORK_TRADE_EXTRA_PAID_HOW),
+      paidHow: z.enum(WORK_TRADE_EXTRA_PAID_HOW, { errorMap: () => ({ message: 'Choose how it was paid: check or cash.' }) }),
       note: z.string().max(1000).optional(),
+      costPlace: z.enum(BOOKS_COST_PLACES).nullable().optional(),
+      propertyId: z.string().uuid().nullable().optional(),
+      unitId: z.string().uuid().nullable().optional(),
     }).parse(req.body)
     const before = await payableForManager(req.params.payableId, req.user)
+    // 10/14 (Nic): where the cost goes, checked against this company before anything is written.
+    const place = await resolveCostPlace(db, { col: 'landlord_id', id: before.landlord_id },
+      { costPlace: body.costPlace ?? null, propertyId: body.propertyId ?? null, unitId: body.unitId ?? null },
+      WORK_TRADE_HOURS_PLACE_WHAT)
     const tz = (await queryOne<{ timezone: string | null }>(
       `SELECT p.timezone FROM work_trade_agreements wta
          JOIN units un ON un.id = wta.unit_id JOIN properties p ON p.id = un.property_id
@@ -380,7 +394,7 @@ workTradeRouter.post('/extra-hours/:payableId/mark-paid', requirePerm('work_trad
           : 'GAM Books has just picked these extra hours up. Pay them there.')
       }
       // 10/12 (Nic): the paid expense that records it (money out is one record).
-      const paid = await recordWorkTradeHoursPaidByHand(client, { extraHoursId: before.id, createdBy: req.user!.userId })
+      const paid = await recordWorkTradeHoursPaidByHand(client, { extraHoursId: before.id, createdBy: req.user!.userId, place })
       updated = { ...updated, books_reference_id: paid.expenseId }
       xid = await currentLedgerXid(client)
       await client.query('COMMIT')
@@ -394,6 +408,18 @@ workTradeRouter.post('/extra-hours/:payableId/mark-paid', requirePerm('work_trad
     logger.info({ payableId: before.id, agreementId: before.agreement_id, by: req.user!.userId, expenseId: updated.books_reference_id },
       '[work-trade] extra hours marked paid by hand')
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/14 (Nic): the company's properties and their units, for Mark paid to ask
+ * where the hours' cost goes (split across them by units, one property, one
+ * unit) — for the people who may pay these hours (payableForManager).
+ */
+workTradeRouter.get('/extra-hours/:payableId/cost-places', requirePerm('work_trade.manage'), async (req, res, next) => {
+  try {
+    const row = await payableForManager(req.params.payableId, req.user)
+    res.json({ success: true, data: { properties: await costPlaceOptions(db, { col: 'landlord_id', id: row.landlord_id }) } })
   } catch (e) { next(e) }
 })
 

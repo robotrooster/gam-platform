@@ -236,7 +236,9 @@ describe('expenses: incurred (Charged-based) and paid (Received-based)', () => {
     const ledgerPl = await ledgerProfitAndLoss({ landlordIds: [co.landlordId] }, '2026-09-01', '2026-10-31', 'Sep–Oct')
     expect(ledgerPl.expenses).toMatchObject({ paid: 300, incurred: 300 })
     expect(ledgerPl.nets).toEqual({ received: 700, charged: 700 })
-    expect(ledgerPl.incomeAccounts.map(a => [a.code, a.charged])).toEqual([['4010', 1000]])
+    // 10/14 (Nic I1): rent books to its space's own line — an apartment's
+    // rent to "Apartment rent", a sub-account under 4010 Space and lot rent.
+    expect(ledgerPl.incomeAccounts.map(a => [a.code, a.name, a.charged])).toEqual([['4010-1', 'Apartment rent', 1000]])
   })
 
   it('money out: incurred, paid and still unpaid by category, and unpaid by vendor', async () => {

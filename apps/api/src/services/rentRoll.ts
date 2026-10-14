@@ -122,12 +122,12 @@ import {
   FALLBACK_TIMEZONE, RENT_ROLL_MONTH_STATUSES, RENT_ROLL_STATUS_LABEL, RENT_ROLL_STATUS_COLOR,
   UNIT_STATUS_LABEL, BOOKING_STATUS_LABEL, STAY_PAYMENT_METHOD_LABEL,
   RENT_ROLL_STAY_UNITS, RENT_ROLL_STAY_VIAS, RENT_ROLL_STAY_VIA_LABEL,
-  rentRollStatusOf, rentRollStatusText, compareSpaces, stayQuantityText, stayNightsBetween, addCalendarMonths,
+  rentRollStatusOf, rentRollStatusText, compareSpaces, stayQuantityText, stayNightsBetween, addCalendarMonths, addStayDays,
   type RentRollProperty, type RentRollResident, type RentRollPayment, type RentRollCharge, type OpenMonthRow,
   type OpenMonthRoll, type OpenMonthTotals, type RentRollTotals, type RentRollHealth, type RentRollStamp, type RentRollHistoryRow,
   type RentRollMonthCount, type RentRollMovedOutOwing, type RentRollHistory, type RentRollRowStatus, type UnitStatus,
   type OpenMonthStay, type BookingStatus, type OpenMonthOtherMoney, type OpenMonthSalePart, type RentRollStayLine, type RentRollStayUnit,
-  type RentRollStayVia, UTILITY_TYPE_LABEL, type UtilityType,
+  type RentRollStayVia, UTILITY_TYPE_LABEL, type UtilityType, type OpenMonthMovedOut,
 } from '@gam/shared'
 import {
   householdMonths, householdLines, paymentHealth, addMonths, monthsBetween, leaseOfRowSql, householdOfRowSql,
@@ -555,6 +555,8 @@ export interface RegisterSale {
   lines?: Array<{
     name: string; category: string | null; qty: string | number; unitPrice: string | number; subtotal: string | number
     stayUnit?: string | null
+    /** The line's own tax rate (pos_transaction_items.tax_rate, a fraction); absent when none. */
+    taxRate?: string | number | null
   }>
   /** The sale's tax, and its named taxes when the register wrote them (pos_transactions.tax_breakdown). */
   tax?: string | number
@@ -787,6 +789,88 @@ export function spaceNamedIn(
   return hits.size === 1 ? [...hits][0] : null
 }
 
+// ─── A sale naming two spaces (10/14, Nic) ───────────────────────────────────
+//
+//   "A sale naming two spaces ('Electric — RV 2 and RV 27'): split it between
+//    the two rows."
+//
+// A sale whose words name more than one of the property's spaces is split by
+// its own lines: each line whose own name names one space ("Electric — RV 2",
+// "Electric — RV 27") is that space's, with the line's own tax
+// (pos_transaction_items.tax_rate). The rest of the sale — a line that names no
+// space or several, the rest of its tax, a discount — names no one space, so it
+// stays in the folder ("only money with no space stays in the folder"), and so
+// do the sale's refunds (a refund names no line). A line toward a stay is the
+// stay's (its row reads it), never a piece. Nothing to split — no line names a
+// single space, or the lines come to more than the sale's money after a
+// discount — and the whole sale stays in the folder, as before.
+
+/** One space's part of a sale naming several (splitSaleBySpace). */
+export interface SaleSpacePiece {
+  unitId: string
+  line: OpenMonthOtherMoney
+}
+
+/**
+ * The parts of a sale's line in the month's money (`x`, a sale — never a
+ * refund) that its lines name one space each: one line of money per space, in
+ * space order, and what is left of the sale (null when nothing is). The parts
+ * add up to `x.amount`. null: the sale does not split (see above). Pure.
+ */
+export function splitSaleBySpace(
+  x: OpenMonthOtherMoney, s: RegisterSale,
+  spaces: readonly { unitId: string; names: readonly (string | null | undefined)[] }[],
+): { pieces: SaleSpacePiece[]; rest: OpenMonthOtherMoney | null } | null {
+  if (x.kind !== 'sale') return null
+  type Line = NonNullable<RegisterSale['lines']>[number]
+  const towardC = (s.stays ?? []).reduce((t, y) => t + Math.max(0, cents(y.toward)), 0)
+  const byUnit = new Map<string, Line[]>()
+  const others: Line[] = []
+  for (const l of s.lines ?? []) {
+    const unitId = towardC > 0 && l.stayUnit ? null : spaceNamedIn([l.name], spaces)
+    if (unitId) byUnit.set(unitId, [...(byUnit.get(unitId) ?? []), l])
+    else others.push(l)
+  }
+  const taxOf = (l: Line) => Math.round(cents(l.subtotal) * (Number(l.taxRate) || 0))
+  const order = new Map(spaces.map((sp, i) => [sp.unitId, i]))
+  const parts = [...byUnit.entries()]
+    .map(([unitId, lines]) => {
+      const taxC = lines.reduce((t, l) => t + taxOf(l), 0)
+      return { unitId, lines, taxC, amountC: lines.reduce((t, l) => t + cents(l.subtotal), 0) + taxC }
+    })
+    .filter(p => p.amountC > 0)
+    .sort((a, z) => (order.get(a.unitId) ?? 0) - (order.get(z.unitId) ?? 0))
+  // A line with no money ($0) names its space for nothing: only lines with money split.
+  for (const [unitId, lines] of byUnit) if (!parts.some(p => p.unitId === unitId)) others.push(...lines)
+  if (!parts.length) return null
+  const splitC = parts.reduce((t, p) => t + p.amountC, 0)
+  const splitTaxC = parts.reduce((t, p) => t + p.taxC, 0)
+  const restC = cents(x.amount) - splitC
+  if (restC < 0 || splitTaxC > cents(s.tax)) return null
+  const via = s.via_link ? 'pay link' : 'at the register'
+  const numberOf = (unitId: string) => String(spaces.find(sp => sp.unitId === unitId)?.names[0] ?? '').trim()
+  const named = parts.map(p => numberOf(p.unitId)).filter(Boolean).join(' and ')
+  const pieces: SaleSpacePiece[] = parts.map((p, i) => ({
+    unitId: p.unitId,
+    line: {
+      ...x, id: `${x.id}:${p.unitId}`, amount: dollars(p.amountC),
+      forLabel: `${p.lines.map(l => String(l.name ?? '').trim() || 'Item').join(', ')} · ${via} · part of a sale naming ${named}`,
+      parts: saleParts({ ...s, lines: p.lines, tax: dollars(p.taxC), taxes: null, discount: 0, discount_reason: null },
+        { shareC: p.amountC, screeningC: 0, towardC: 0 }),
+      // The card fee rides once: on what is left of the sale, else the first space's part.
+      cardFee: restC === 0 && i === 0 ? x.cardFee : 0,
+    },
+  }))
+  const rest: OpenMonthOtherMoney | null = restC === 0 ? null : {
+    ...x,
+    forLabel: `${others.map(l => String(l.name ?? '').trim() || 'Item').join(', ') || 'The rest of the sale'} · ${via} · its lines naming ${named} are on their rows`,
+    amount: dollars(restC),
+    parts: saleParts({ ...s, lines: others, tax: dollars(cents(s.tax) - splitTaxC), taxes: splitTaxC > 0 ? null : s.taxes },
+      { shareC: restC, screeningC: cents(s.screening), towardC }),
+  }
+  return { pieces, rest }
+}
+
 /**
  * Every register sale and paid pay link at this property that came in this
  * month or was refunded at the register this month, on the property's own
@@ -834,7 +918,7 @@ async function registerMoney(landlordIds: string[], property: RentRollPropertyRe
            -- 10/13 (Nic): the sale's own line items, for its breakdown (saleParts).
            COALESCE((SELECT jsonb_agg(jsonb_build_object(
                               'name', i.item_name, 'category', i.item_category, 'qty', i.qty, 'unitPrice', i.unit_price,
-                              'subtotal', i.subtotal, 'stayUnit', li.stay_unit) ORDER BY i.item_name, i.id)
+                              'subtotal', i.subtotal, 'stayUnit', li.stay_unit, 'taxRate', i.tax_rate) ORDER BY i.item_name, i.id)
                        FROM pos_transaction_items i LEFT JOIN pos_items li ON li.id = i.item_id
                       WHERE i.transaction_id = t.id), '[]'::jsonb) AS lines,
            t.tax_amount::text AS tax,
@@ -1145,13 +1229,20 @@ export async function buildOpenMonth(opts: {
 
   const leaseIds = [...rows.values()].map(b => b.leaseId).filter((x): x is string => !!x)
   const facts = await leaseFacts(leaseIds, property.id)
+  // 10/14 (Nic): "show in the moved-out section of Payments" — a household no
+  // longer living here, owing only on earlier months, is that section's.
+  const movedOutHouseholds: Array<{ key: string; leaseId: string; householdId: string | null; space: string; leftOn: string | null }> = []
   for (const b of [...rows.values()]) {
     if (!b.leaseId) continue
     const f = facts.get(b.leaseId)
     if (!f) continue
     b.householdId = f.household_id ?? b.householdId
     b.movedOut = f.status !== 'active' && !f.lives_here && f.status !== 'pending'
-    if (b.earlierOnly && b.movedOut) { rows.delete(b.key); continue }
+    if (b.earlierOnly && b.movedOut) {
+      movedOutHouseholds.push({ key: b.key, leaseId: b.leaseId, householdId: b.householdId, space: f.unit_number, leftOn: f.ended_on ?? null })
+      rows.delete(b.key)
+      continue
+    }
     if (b.earlierOnly) { b.space = f.unit_number; b.unitId = f.unit_id }
     if (!b.unitId && f.unit_number === b.space) b.unitId = f.unit_id
     // Eviction mode is the space's: a household's row there says so too.
@@ -1181,25 +1272,40 @@ export async function buildOpenMonth(opts: {
   const peopleOf = (b: Building): string[] => b.stay ? [b.stay.booking.tenant_id].filter((x): x is string => !!x)
     : b.spaceOnly ? [b.stayTenantId].filter((x): x is string => !!x)
     : (b.leaseId ? byLease.get(b.leaseId) ?? [] : byPerson.get(b.householdId ?? '') ?? []).map(r => r.tenantId)
-  const saleRow = new Map<string, string>()
-  for (const s of register.sales) {
-    const unitId = spaceNamedIn(s.named ?? [], spaceNames)
-    if (!unitId) continue
+  const rowAt = (unitId: string, s: RegisterSale): Building | undefined => {
     const at = [...rows.values()].filter(b => b.unitId === unitId || (!b.unitId && b.space === numberOf.get(unitId)))
-    const pick = at.find(b => !!b.stay && (s.stays ?? []).some(x => x.bookingId === b.stay!.booking.id))
+    return at.find(b => !!b.stay && (s.stays ?? []).some(x => x.bookingId === b.stay!.booking.id))
       ?? (s.payer_id ? at.find(b => peopleOf(b).includes(s.payer_id!)) : undefined)
       ?? at.find(b => !!b.leaseId && !b.movedOut && !b.earlierOnly)
       ?? at.find(b => !!b.stay && b.stay.booking.status === 'checked_in')
       ?? at.find(b => b.spaceOnly)
       ?? at[0]
+  }
+  const saleRow = new Map<string, string>()
+  for (const s of register.sales) {
+    const unitId = spaceNamedIn(s.named ?? [], spaceNames)
+    const pick = unitId ? rowAt(unitId, s) : undefined
     if (pick) saleRow.set(s.id, pick.key)
   }
+  const saleOf = new Map(register.sales.map(s => [s.id, s]))
   const atRow = new Map<string, OpenMonthOtherMoney[]>()
+  const putAt = (key: string, x: OpenMonthOtherMoney) => atRow.set(key, [...(atRow.get(key) ?? []), x])
   const folder: OpenMonthOtherMoney[] = []
   for (const x of register.other) {
     const key = saleRow.get(x.saleId)
-    if (!key) { folder.push(x); continue }
-    atRow.set(key, [...(atRow.get(key) ?? []), x])
+    if (key) { putAt(key, x); continue }
+    // 10/14 (Nic): "A sale naming two spaces … split it between the two
+    // rows" — by its own lines (splitSaleBySpace); what names no one space
+    // stays in the folder.
+    const s = saleOf.get(x.saleId)
+    const split = s ? splitSaleBySpace(x, s, spaceNames) : null
+    const placed = split?.pieces.map(p => ({ key: rowAt(p.unitId, s!)?.key, line: p.line }))
+    if (split && placed && placed.every(p => !!p.key)) {
+      for (const p of placed) putAt(p.key!, p.line)
+      if (split.rest) folder.push(split.rest)
+      continue
+    }
+    folder.push(x)
   }
   /** A row's own register money (OpenMonthRow.otherMoney, otherIn, otherRefunded). */
   const registerOf = (key: string) => {
@@ -1293,11 +1399,65 @@ export async function buildOpenMonth(opts: {
   }
   for (const x of register.other) addTo(x, 'otherIn', 'otherRefunded')
   for (const x of folder) addTo(x, 'folderIn', 'folderRefunded')
+  // 10/14 (Nic): "A checked-out guest still owing, nothing paid this month:
+  // show in the moved-out section of Payments" — with every household no
+  // longer living here still owing on earlier months, in space order.
+  const movedOutOwing: OpenMonthMovedOut[] = [
+    ...movedOutHouseholds.map((h): OpenMonthMovedOut => ({
+      key: h.key, kind: 'household', space: h.space, leaseId: h.leaseId, householdId: h.householdId,
+      residents: byLease.get(h.leaseId) ?? [], guest: null, leftOn: h.leftOn, stayDates: null,
+      owed: dollars(owedEarlier.get(h.key) ?? 0),
+      months: earlier.filter(m => householdKey(m.lease_id, m.household_id) === h.key && cents(m.owed) > 0)
+        .sort((a, z) => a.month.localeCompare(z.month)).map(m => ({ month: m.month, owed: m.owed })),
+    })),
+    ...(await checkedOutStillOwing(landlordIds, property, new Set(stays.bookings.map(b => b.id)))),
+  ].filter(m => cents(m.owed) > 0)
+    .sort((a, z) => compareSpaces(a.space, z.space) || (a.leftOn ?? '').localeCompare(z.leftOn ?? '') || a.key.localeCompare(z.key))
+  totals.movedOutOwed = dollars(movedOutOwing.reduce((t, m) => t + cents(m.owed), 0))
   const roll: OpenMonthRoll = {
-    propertyId: property.id, propertyName: property.name, month, rows: out, otherMoney: folder,
+    propertyId: property.id, propertyName: property.name, month, rows: out, otherMoney: folder, movedOutOwing,
   }
   if (opts.withTotals) roll.totals = totals
   return roll
+}
+
+/**
+ * 10/14 (Nic): "A checked-out guest still owing, nothing paid this month:
+ * show in the moved-out section of Payments." Every stay at the property whose
+ * guest checked out with money still owed on it — by the register's own rule
+ * (registerStay reservationDue: its price less what was paid toward it; a stay
+ * its lease bills is that lease's) — that is not a stay row this month (`rows`:
+ * the stays the month shows — one paid toward this month is a row, its Owed
+ * already said). A stay whose balance link was canceled is not owed here, as
+ * on its row (stayMoney).
+ */
+async function checkedOutStillOwing(
+  landlordIds: string[], property: RentRollPropertyRef, rows: ReadonlySet<string>,
+): Promise<OpenMonthMovedOut[]> {
+  const left = await query<{ id: string; unit_number: string; check_in: string; check_out: string; guest: string | null }>(`
+    SELECT b.id, u.unit_number, to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+           COALESCE(NULLIF(TRIM(b.guest_name), ''), NULLIF(TRIM(CONCAT_WS(' ', gu.first_name, gu.last_name)), '')) AS guest
+      FROM unit_bookings b
+      JOIN units u ON u.id = b.unit_id
+      LEFT JOIN tenants gt ON gt.id = b.tenant_id
+      LEFT JOIN users gu ON gu.id = gt.user_id
+     WHERE u.property_id = $1 AND b.landlord_id = ANY($2::uuid[])
+       AND b.status = 'checked_out' AND COALESCE(b.total_amount, 0) > 0 AND b.balance_paid_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM leases sl WHERE sl.source_booking_id = b.id)
+       AND NOT EXISTS (SELECT 1 FROM pos_pay_links bl WHERE bl.id = b.balance_pay_link_id AND bl.status = 'cancelled')
+     ORDER BY b.check_out, b.id`, [property.id, landlordIds])
+  const out: OpenMonthMovedOut[] = []
+  for (const b of left) {
+    if (rows.has(b.id)) continue
+    const r = await reservationDue(db, b.id)
+    const owed = r && !r.closed ? dollars(cents(r.owed)) : 0
+    if (cents(owed) <= 0) continue
+    out.push({
+      key: `stay:${b.id}`, kind: 'stay', space: b.unit_number, leaseId: null, householdId: null, residents: [],
+      guest: b.guest, leftOn: b.check_out, stayDates: stayDatesText(b.check_in, b.check_out), owed, months: [],
+    })
+  }
+  return out
 }
 
 /**
@@ -1381,31 +1541,43 @@ export class RentRollRangeError extends Error {}
 //
 // A stay on the schedule is its own line items: the length it was sold for
 // (its booked nights; a weekly stay of whole weeks in weeks, a month stay of
-// whole calendar months in months — bookingLineItems), counted ONCE in a
-// range however many payments it took (a deposit ticket, then its balance
-// link). Never the quantity on a sale's line: the register, a reservation
-// ticket and a pay link record a stay as ONE line at the whole stay's price
-// (routes/pos-stays.test, decisions #9 — "RV site — night — 3 nights at site
-// RV 01" is quantity 1), and a stay rung at the counter is booked as what its
-// item buys (registerStay bookingLeaseTypeFor), so 3 nights rung is 3 nights
-// booked. Only a stay item sold with no stay on the schedule (Andres Razo's
-// month at RV 27, on a pay link) is counted by its line: what one of it buys
-// (pos_items.stay_unit) × its quantity. A stay is the range's when money came
-// in for it in the range — the month paid, as on the Payments page (10/13,
-// Nic: "Stay money in the month paid") — never a voided sale, never a charge
-// account (nothing came in yet). It reads "via POS" when any of that money was
-// rung on a stay item at the register or on a pay link, or when it was not
-// booked on the booking site; "via the booking site" otherwise. A stay that
-// became a lease is that lease's (its row), never a stay as well. Its site is
-// the stay's own space; a stay item sold with no stay on the schedule is the
-// space its sale names (spaceNamedIn), else "no site named".
+// whole calendar months in months — bookingLineItems). Never the quantity on
+// a sale's line: the register, a reservation ticket and a pay link record a
+// stay as ONE line at the whole stay's price (routes/pos-stays.test,
+// decisions #9 — "RV site — night — 3 nights at site RV 01" is quantity 1),
+// and a stay rung at the counter is booked as what its item buys
+// (registerStay bookingLeaseTypeFor), so 3 nights rung is 3 nights booked.
+//
+// 10/14 (Nic): "A month stay lengthened with 'Add a month': each month counts
+// only its own nights." A stay is the range's by its NIGHTS, never by the
+// month money came in: all of it in the range is its whole sold length, once
+// however many payments it took ("1 month"); a stay the range cuts counts only
+// its nights in the range (Sep 1 – Nov 1: 30 nights in September, 31 in
+// October — stayInRange). Its money rides with its nights: what the property
+// kept on it — every payment toward it (never a voided sale, never a charge
+// account: nothing came in yet), less every refund (10/14, Nic: "subtract
+// refunds (early check-out)" — its early check-out's parts and a refund at the
+// register on a sale that paid it, splitRegisterMoney's rule) — shared over
+// the nights it was sold for, to the cent, as GAM Books earns a stay
+// (ledgerProjectors/bookingStay). So a month paid late is in its own month,
+// as a bill paid late is on the Rent Roll. A stay nothing was kept on is no
+// line. It reads "via POS" when any of its money was rung on a stay item at
+// the register or on a pay link, or when it was not booked on the booking
+// site; "via the booking site" otherwise. A stay that became a lease is that
+// lease's (its row), never a stay as well. Its site is the stay's own space.
+//
+// Only a stay item sold with no stay on the schedule has no nights to place:
+// it is the month it was sold, counted by its line — what one of it buys
+// (pos_items.stay_unit) × its quantity, its money the line's less what went
+// back on the sale beyond its other items — at the space its sale names
+// (spaceNamedIn), else "no site named".
 
 /** One sold piece of a stay, before it is added up. */
 export interface StayPiece {
   unit: RentRollStayUnit
   via: RentRollStayVia
   quantity: number
-  /** Cents that came in for it in the range. */
+  /** Cents the property kept for it in the range (10/14: its share by its nights in the range, refunds off). */
   paidCents: number
   space: string | null
   /** The stay it is part of ('booking:<id>'), or the sale when it is no stay on the schedule ('sale:<id>'). */
@@ -1477,10 +1649,36 @@ export function stayLinesOf(pieces: readonly StayPiece[], withMoney: boolean): R
 }
 
 /**
+ * 10/14 (Nic): "each month counts only its own nights." A stay on the
+ * schedule in a range of days — `start` its first, `end` the day after its
+ * last ('YYYY-MM-DD'): all of it in the range, its whole sold length in line
+ * items (bookingLineItems); a part, only its nights in the range. `keptCents`
+ * (what the property kept on it) is shared over the nights sold, to the cent —
+ * shares of the same stay in ranges side by side add up to all of it. null:
+ * none of its nights is in the range (a stay of no nights is the day it
+ * began). Pure.
+ */
+export function stayInRange(
+  b: { lease_type: string; check_in: string; booked_check_out: string }, keptCents: number, start: string, end: string,
+): { unit: RentRollStayUnit; quantity: number; paidCents: number } | null {
+  const sold = Math.max(0, stayNightsBetween(b.check_in, b.booked_check_out))
+  if (sold === 0) return b.check_in >= start && b.check_in < end ? { unit: 'night', quantity: 0, paidCents: keptCents } : null
+  const from = b.check_in > start ? b.check_in : start
+  const to = b.booked_check_out < end ? b.booked_check_out : end
+  const nights = stayNightsBetween(from, to)
+  if (nights <= 0) return null
+  const before = stayNightsBetween(b.check_in, from)
+  const upTo = (n: number) => Math.round((keptCents * n) / sold)
+  const paidCents = upTo(before + nights) - upTo(before)
+  if (nights === sold) return { ...bookingLineItems(b), paidCents }
+  return { unit: 'night', quantity: nights, paidCents }
+}
+
+/**
  * The range's stays at a property, as the Rent Roll shows them below its rows
  * (see above). `from`/`to` are bill months ('YYYY-MM', the property's
- * calendar); `lastDay` is a bookkeeper's clean cut at a sale (nothing after
- * it), null for everyone else.
+ * calendar); `lastDay` is a bookkeeper's clean cut at a sale (no night, and no
+ * sale, after it), null for everyone else.
  */
 export async function rentRollStays(opts: {
   landlordIds: string[]; property: Pick<RentRollPropertyRef, 'id' | 'timezone'>; from: string; to: string
@@ -1489,15 +1687,16 @@ export async function rentRollStays(opts: {
   const { landlordIds, property } = opts
   if (!landlordIds.length) return []
   const tz = property.timezone ?? FALLBACK_TIMEZONE
-  const inRange = (col: string) => `to_char((${col}) AT TIME ZONE $3, 'YYYY-MM') BETWEEN $4 AND $5
-       AND ($6::date IS NULL OR ((${col}) AT TIME ZONE $3)::date <= $6::date)`
-  const params = [property.id, landlordIds, tz, opts.from, opts.to, opts.lastDay ?? null]
+  // The range's days: its first, and the day after its last (a bookkeeper's cut ends it sooner).
+  const start = `${opts.from}-01`
+  const afterRange = `${addMonths(opts.to, 1)}-01`
+  const end = opts.lastDay && addStayDays(opts.lastDay, 1) < afterRange ? addStayDays(opts.lastDay, 1) : afterRange
   // A sale that carries a stay item's line (the register, a reservation ticket, a pay link).
   const hasStayLine = (t: string) => `EXISTS (SELECT 1 FROM pos_transaction_items hi JOIN pos_items hp ON hp.id = hi.item_id
                                                WHERE hi.transaction_id = ${t} AND hp.stay_unit IS NOT NULL)`
-  // Every stay on the schedule with money toward it in the range: one piece
-  // each — its own site, its own money (a sale that paid two stays is two
-  // pieces, never one), its length counted once (bookingLineItems).
+  // Every stay on the schedule paid for (money in toward it, ever) whose
+  // nights sold reach into the range: its own site, all its money (a sale
+  // that paid two stays is a part of each).
   const booked = await query<{
     booking_id: string; space: string; lease_type: string; check_in: string; booked_check_out: string
     toward: string; booked_online: boolean; by_stay_line: boolean
@@ -1513,51 +1712,127 @@ export async function rentRollStays(opts: {
       LEFT JOIN pos_transactions t ON t.id = s.pos_transaction_id
      WHERE u.property_id = $1 AND s.landlord_id = ANY($2::uuid[])
        AND s.method <> 'charge' AND (t.id IS NULL OR t.status <> 'voided')
-       AND ${inRange('s.paid_at')}
+       AND b.check_in < $4::date AND GREATEST(${soldCheckOutSql('b')}, b.check_in + 1) > $3::date
        -- A stay that became a lease is that lease's.
        AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id)
      GROUP BY b.id, u.unit_number, b.lease_type, b.check_in, b.check_out, b.booked_check_out
-     ORDER BY b.check_in, b.id`, params)
+     ORDER BY b.check_in, b.id`, [property.id, landlordIds, start, end])
+  const back = await stayRefundsAllTime(landlordIds, booked.map(r => r.booking_id))
   // A stay item sold with no stay on the schedule: counted by its line — what
-  // one of it buys × its quantity — at the space its sale names.
-  const unscheduled = await query<{ sale_id: string; unit: RentRollStayUnit; qty: string; line_money: string; named: string[] }>(`
+  // one of it buys × its quantity — at the space its sale names, the month it
+  // was sold.
+  const unscheduled = await query<{
+    sale_id: string; unit: RentRollStayUnit; qty: string; line_money: string; named: string[]
+    base: string; screening: string; refunded: string
+  }>(`
     SELECT t.id AS sale_id, sp.stay_unit AS unit, SUM(i.qty)::text AS qty,
            SUM(ROUND(i.subtotal * (1 + COALESCE(i.tax_rate, 0)), 2))::text AS line_money,
            COALESCE((SELECT jsonb_agg(ni.item_name ORDER BY ni.item_name, ni.id)
                        FROM pos_transaction_items ni WHERE ni.transaction_id = t.id), '[]'::jsonb)
-             || CASE WHEN NULLIF(TRIM(pl.label), '') IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(pl.label) END AS named
+             || CASE WHEN NULLIF(TRIM(pl.label), '') IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(pl.label) END AS named,
+           (t.total - COALESCE(t.surcharge, 0))::text AS base,
+           COALESCE((SELECT SUM(ssp.amount) FROM screening_prepayments ssp
+                      WHERE ssp.status <> 'void' AND ssp.source_id IN (t.id, t.pay_link_id)), 0)::text AS screening,
+           COALESCE((SELECT SUM(r.amount - r.card_fee_refunded) FROM pos_refunds r
+                      WHERE r.transaction_id = t.id AND r.stay_refund_part_id IS NULL AND r.reversed_at IS NULL), 0)::text AS refunded
       FROM pos_transactions t
       JOIN pos_transaction_items i ON i.transaction_id = t.id
       JOIN pos_items sp ON sp.id = i.item_id AND sp.stay_unit IS NOT NULL
       LEFT JOIN pos_pay_links pl ON pl.id = t.pay_link_id
      WHERE t.property_id = $1 AND t.landlord_id = ANY($2::uuid[])
        AND t.status <> 'voided' AND t.payment_method <> 'charge'
-       AND ${inRange('t.created_at')}
+       AND (t.created_at AT TIME ZONE $3)::date >= $4::date AND (t.created_at AT TIME ZONE $3)::date < $5::date
        -- A sale that paid toward a stay on the schedule is that stay's (above).
        AND NOT EXISTS (SELECT 1 FROM stay_payments ss WHERE ss.pos_transaction_id = t.id)
      GROUP BY t.id, sp.stay_unit, pl.label
-     ORDER BY MIN(t.created_at), t.id, sp.stay_unit`, params)
+     ORDER BY MIN(t.created_at), t.id, sp.stay_unit`, [property.id, landlordIds, tz, start, end])
 
-  const pieces: StayPiece[] = booked.map(r => {
-    const items = bookingLineItems(r)
-    return {
-      unit: items.unit, via: r.booked_online && !r.by_stay_line ? 'booking_site' : 'pos', quantity: items.quantity,
-      paidCents: cents(r.toward), space: r.space, stay: `booking:${r.booking_id}`,
-    }
-  })
+  const pieces: StayPiece[] = []
+  for (const r of booked) {
+    const kept = cents(r.toward) - (back.get(r.booking_id) ?? 0)
+    if (kept <= 0) continue
+    const at = stayInRange(r, kept, start, end)
+    if (!at) continue
+    pieces.push({
+      unit: at.unit, via: r.booked_online && !r.by_stay_line ? 'booking_site' : 'pos', quantity: at.quantity,
+      paidCents: at.paidCents, space: r.space, stay: `booking:${r.booking_id}`,
+    })
+  }
   if (unscheduled.length) {
     const spaces = (await query<{ id: string; unit_number: string; display_label: string | null }>(
       `SELECT id, unit_number, display_label FROM units WHERE property_id = $1`, [property.id]))
       .map(u => ({ unitId: u.id, number: u.unit_number, names: [u.unit_number, u.display_label] }))
-    for (const s of unscheduled) {
-      const unitId = spaceNamedIn(s.named ?? [], spaces)
-      pieces.push({
-        unit: s.unit, via: 'pos', quantity: Number(s.qty) || 0, paidCents: cents(s.line_money),
-        space: unitId ? (spaces.find(u => u.unitId === unitId)?.number ?? null) : null, stay: `sale:${s.sale_id}`,
+    // What went back at the register on the sale comes off its other items
+    // first; only what is beyond them comes off its stay lines, by their money.
+    for (const rows of groupBy(unscheduled, s => s.sale_id).values()) {
+      const linesC = rows.reduce((t, x) => t + cents(x.line_money), 0)
+      const otherC = Math.max(0, cents(rows[0].base) - cents(rows[0].screening) - linesC)
+      const backC = Math.min(linesC, Math.max(0, cents(rows[0].refunded) - otherC))
+      let left = backC
+      rows.forEach((s, i) => {
+        const lineC = cents(s.line_money)
+        const off = i === rows.length - 1 ? left : Math.min(left, linesC > 0 ? Math.round((backC * lineC) / linesC) : 0)
+        left -= off
+        const unitId = spaceNamedIn(s.named ?? [], spaces)
+        pieces.push({
+          unit: s.unit, via: 'pos', quantity: Number(s.qty) || 0, paidCents: Math.max(0, lineC - off),
+          space: unitId ? (spaces.find(u => u.unitId === unitId)?.number ?? null) : null, stay: `sale:${s.sale_id}`,
+        })
       })
     }
   }
   return stayLinesOf(pieces, opts.withMoney)
+}
+
+/** Rows grouped by a key, in the order first seen. */
+function groupBy<T>(rows: readonly T[], key: (r: T) => string): Map<string, T[]> {
+  const out = new Map<string, T[]>()
+  for (const r of rows) out.set(key(r), [...(out.get(key(r)) ?? []), r])
+  return out
+}
+
+/**
+ * 10/14 (Nic): "subtract refunds (early check-out)." Everything given back on
+ * these stays, ever, in cents by booking: an early check-out's parts
+ * (stay_refund_parts — refunded, handed back or put on the account, never one
+ * reversed) and, on a register sale that paid a stay, what a refund at the
+ * register gave back beyond the sale's other items (splitRegisterMoney: the
+ * early check-out's rule, the stays it paid by their parts). A refund Stripe
+ * sent back is never one.
+ */
+async function stayRefundsAllTime(landlordIds: string[], bookingIds: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>()
+  if (!bookingIds.length) return out
+  const add = (id: string, c: number) => out.set(id, (out.get(id) ?? 0) + c)
+  for (const r of await query<{ booking_id: string; back: string }>(`
+    SELECT rp.booking_id, SUM(rp.toward_amount)::text AS back
+      FROM stay_refund_parts rp
+     WHERE rp.booking_id = ANY($1::uuid[]) AND rp.landlord_id = ANY($2::uuid[])
+       AND rp.refunded_at IS NOT NULL AND rp.reversed_at IS NULL
+       AND rp.status IN ('refunded', 'handed_back', 'credited')
+     GROUP BY rp.booking_id`, [bookingIds, landlordIds])) add(r.booking_id, cents(r.back))
+  const sales = await query<Pick<RegisterSale, 'id' | 'base' | 'screening' | 'stays' | 'refunds'>>(`
+    SELECT t.id, (t.total - COALESCE(t.surcharge, 0))::text AS base,
+           COALESCE((SELECT SUM(ssp.amount) FROM screening_prepayments ssp
+                      WHERE ssp.status <> 'void' AND ssp.source_id IN (t.id, t.pay_link_id)), 0)::text AS screening,
+           COALESCE((SELECT jsonb_agg(jsonb_build_object('bookingId', sp.booking_id, 'toward', sp.toward_stay) ORDER BY sp.paid_at, sp.id)
+                       FROM stay_payments sp WHERE sp.pos_transaction_id = t.id), '[]'::jsonb) AS stays,
+           (SELECT jsonb_agg(jsonb_build_object('id', r.id, 'day', to_char(r.created_at, 'YYYY-MM-DD'), 'inMonth', TRUE,
+                                                'net', r.amount - r.card_fee_refunded, 'method', r.refund_method) ORDER BY r.created_at, r.id)
+              FROM pos_refunds r WHERE r.transaction_id = t.id AND r.stay_refund_part_id IS NULL AND r.reversed_at IS NULL) AS refunds
+      FROM pos_transactions t
+     WHERE t.id IN (SELECT sp.pos_transaction_id FROM stay_payments sp WHERE sp.booking_id = ANY($1::uuid[]))
+       AND t.landlord_id = ANY($2::uuid[]) AND t.status <> 'voided' AND t.payment_method <> 'charge'
+       AND EXISTS (SELECT 1 FROM pos_refunds er
+                    WHERE er.transaction_id = t.id AND er.stay_refund_part_id IS NULL AND er.reversed_at IS NULL)`,
+  [bookingIds, landlordIds])
+  if (!sales.length) return out
+  const { stayRefunds } = splitRegisterMoney(sales.map(s => ({
+    ...s, sold_on: '', sold_in_month: false, method: 'cash', paid_online: null, via_link: false, who: null, items: null,
+  })))
+  const wanted = new Set(bookingIds)
+  for (const [id, list] of stayRefunds) if (wanted.has(id)) add(id, list.reduce((t, x) => t + cents(x.amount), 0))
+  return out
 }
 
 /** THE RENT ROLL PAGE: one property's history over a range of months (or all time). */

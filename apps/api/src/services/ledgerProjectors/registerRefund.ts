@@ -38,10 +38,12 @@ import {
   cr, dr, toCents, splitCents, taxLines, scaleTaxParts, loadSale, saleMakeUp, missingFact, waitsOnRule,
   localDaySql, propertyTzSql,
 } from './registerBookingPayoutKit'
+import { loadStay, stayParts } from './incomeLines'
 
 export const registerRefundProjector: LedgerProjector = {
   sourceType: 'pos_refund',
-  ruleVersion: 1,
+  // 2 — 10/14 (Nic I1, I2): stay money refunded off the stay's own line (incomeLines).
+  ruleVersion: 2,
 
   async project(client: PoolClient, refundId: string): Promise<DesiredPosting[]> {
     const r = (await client.query<{
@@ -78,12 +80,16 @@ export const registerRefundProjector: LedgerProjector = {
     const parts = splitCents(beforeTax, [Math.max(0, mk.goodsPreTaxCents), ...mk.stays.map(s => Math.max(0, s.preTaxCents))])
     const lines: DesiredLine[] = []
     lines.push(...dr('sales_returns', parts[0] ?? 0, { ...at, ...back, memo: 'Register refund' }))
-    mk.stays.forEach((s, i) => {
-      lines.push(...dr('stay_income', parts[i + 1] ?? 0, {
-        propertyId: s.propertyId ?? sale.property_id, unitId: s.unitId, tenantId: s.tenantId ?? sale.tenant_id,
-        ...back, memo: 'Stay money refunded at the register',
-      }))
-    })
+    // 10/14 (Nic I1, I2): off the stay's own line, where it was earned.
+    for (const [i, s] of mk.stays.entries()) {
+      const stay = await loadStay(client, s.bookingId)
+      for (const p of stayParts(stay, parts[i + 1] ?? 0)) {
+        lines.push(...dr(p.role, p.cents, {
+          propertyId: s.propertyId ?? sale.property_id, unitId: s.unitId, tenantId: s.tenantId ?? sale.tenant_id,
+          ...back, sub: p.sub, memo: 'Stay money refunded at the register',
+        }))
+      }
+    }
     lines.push(...taxLines(scaleTaxParts(mk.taxParts, tax), 'dr', { ...at, cashEffect: 'in', reportCategory: 'tax_collected' }))
     lines.push(...dr('card_fees_refunded', feeBack, { ...at, memo: 'Card fee given back with a refund' }))
     lines.push(...cr(r.refund_method === 'cash' ? 'undeposited_funds' : 'outstanding_checks', amount, {

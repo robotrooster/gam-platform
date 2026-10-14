@@ -14,12 +14,12 @@
  * extra hours the landlord sent to GAM Books are paid here too: W-2 hours as
  * their own paycheck on this run, 1099 hours as an unpaid contractor bill.
  *
- * 10/13 (Nic): "each expense is chosen on the split or specific unit or
- * property at the time of logging. there should never be a default setting to
- * apply expenses" — payroll is logged by a person, so each run asks where its
- * wages and the employer's taxes go (split across the properties by units, one
- * property, or one unit) before it is calculated; nothing carries over from
- * one run to the next.
+ * 10/14 (Nic): "an employee at one property goes to that property ... once
+ * you set it it shouldnt change. if they work at multiple properties it would
+ * be at the company level" — each paycheck's wages and employer taxes follow
+ * its employee's place, set once on the Employees page. The run no longer asks
+ * (it did from 10/13); an employee with no place yet is set there first.
+ * A 1099 contractor bill still asks where its cost goes, on each one.
  */
 import React, { useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -27,12 +27,13 @@ import { useQuery, useQueryClient } from 'react-query'
 import {
   formatCurrency, humanize, BOOKS_PAY_TYPE_LABEL, BOOKS_PAY_FREQUENCIES, BOOKS_PAY_FREQUENCY_LABEL,
   BOOKS_PAY_PERIODS_PER_YEAR, booksDefaultHours, socialSecurityWageBase, WORK_TRADE_EXTRA_PAY_METHOD_LABEL,
-  BOOKS_COST_PLACE_LABEL, type BooksPayFrequency,
+  type BooksPayFrequency,
 } from '@gam/shared'
 import { booksGet as get, booksPost as post, toast, appConfirm, booksPath } from './adapter'
 import { payFreqLabel } from './common'
 import { localToday } from './booksMoney'
 import { CostPlaceField, useCostPlaces, costPlaceChosen, costPlaceBody, BLANK_COST_PLACE, type CostPlaceValue } from './CostPlaceField'
+import { payPlaceText } from './EmployeesPage'
 
 // ── RUN PAYROLL ───────────────────────────────────────────────────────
 // 10/11: frequencies, their labels and the hourly default hours are the API's
@@ -73,9 +74,10 @@ export function RunPayrollPage(){
   // where each contractor bill's cost goes, asked on each one, never remembered.
   const[contractorPlace,setContractorPlace]=useState<Record<string,CostPlaceValue>>({})
   const[recording,setRecording]=useState<string|null>(null)
-  // 10/13 (Nic): where this run's wages go — asked on every run, never remembered.
+  // 10/14 (Nic): "an employee at one property goes to that property ... once
+  // you set it it shouldnt change" — each paycheck follows its employee's
+  // place, set once on the Employees page; the run no longer asks.
   const{properties,asked}=useCostPlaces()
-  const[place,setPlace]=useState<CostPlaceValue>(BLANK_COST_PLACE)
   const[freq,setFreq]=useState<BooksPayFrequency>('biweekly')
   const defaultHours=booksDefaultHours(freq)
   const[periodStart,setPeriodStart]=useState('')
@@ -104,7 +106,6 @@ export function RunPayrollPage(){
         hoursMap:Object.fromEntries(Object.entries(hoursMap).filter(([,v])=>v!=='').map(([k,v])=>[k,+v])),
         taxMap:Object.fromEntries(selectedIds.map(id=>[id,taxBody(taxMap[id])])),
         extraHours:extraChosen.map((x:any)=>({id:x.id,employeeId:empFor(x),...taxBody(extraTax[x.id])})),
-        ...(asked?costPlaceBody(place):{}),
       })
       setDraftRun(r.data)
       setStep('review')
@@ -165,10 +166,11 @@ export function RunPayrollPage(){
   const taxInput=(value:string,onChange:(v:string)=>void,disabled:boolean)=>(
     <input type="number" min="0" step="0.01" style={{width:84}} placeholder="0.00" value={value} onChange={e=>onChange(e.target.value)} disabled={disabled}/>
   )
-  const canCalc=(selectedIds.length>0||extraChosen.length>0)&&(!asked||costPlaceChosen(place))
-  // 10/13 (Nic): the run's place, in words, for the review.
-  const runPlaceWords=(r:any)=>r?.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
-    :r?.unitNumber?`${r.propertyName??''} · Unit ${r.unitNumber}`:r?.propertyName??'—'
+  // 10/14 (Nic): an employee on this run with no place yet is set on the
+  // Employees page first (the server refuses the run too).
+  const onRun=new Set<string>([...selectedIds,...extraChosen.map((x:any)=>empFor(x)).filter(Boolean)])
+  const unplaced=asked?(employees as any[]).filter((e:any)=>onRun.has(e.id)&&!e.payPlace):[]
+  const canCalc=(selectedIds.length>0||extraChosen.length>0)&&unplaced.length===0
 
   return(
     <div>
@@ -305,8 +307,8 @@ export function RunPayrollPage(){
             </div>
           )}
 
-          {asked&&<div className="card" style={{marginBottom:16}}>
-            <CostPlaceField value={place} onChange={setPlace} properties={properties} what="this payroll's cost (wages and employer taxes)" name="payrollPlace"/>
+          {unplaced.length>0&&<div className="alert ae" style={{marginBottom:16}}>
+            Set where {unplaced.length===1?'this employee\'s':'these employees\''} pay goes on the <Link to={booksPath('employees')}>Employees</Link> page first: {unplaced.map((e:any)=>`${e.firstName} ${e.lastName}`).join(', ')}.
           </div>}
 
           <div style={{display:'flex',justifyContent:'flex-end'}}>
@@ -335,7 +337,7 @@ export function RunPayrollPage(){
                 <tbody>
                   {draftRun.lines?.map((line:any)=>(
                     <tr key={line.id}>
-                      <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.firstName} {line.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.memo||line.title||''}{line.hoursWorked?' · '+line.hoursWorked+' hrs':''}</div></td>
+                      <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.firstName} {line.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.memo||line.title||''}{line.hoursWorked?' · '+line.hoursWorked+' hrs':''}</div>{asked&&line.payPlace&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>Pay goes to {payPlaceText({payPlace:line.payPlace,payPropertyName:line.payPropertyName})}</div>}</td>
                       <td><span className={`badge ${line.payType==='salary'?'bb':'ba'}`}>{(BOOKS_PAY_TYPE_LABEL as Record<string,string>)[line.payType]??humanize(line.payType)}</span></td>
                       <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(line.grossPay)}</td>
                       <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(line.federalTax)}</td>
@@ -370,7 +372,6 @@ export function RunPayrollPage(){
             <div className="dr"><span className="dk">State unemployment</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.totalSuta)}</span></div>
             <div className="dr"><span className="dk">Total employer tax cost</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>{formatCurrency(employerTaxes)}</span></div>
             <div className="dr"><span className="dk">Total cost to employer (gross + employer taxes)</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((+draftRun.totalGross)+employerTaxes)}</span></div>
-            {asked&&<div className="dr"><span className="dk">Wages and employer taxes go to</span><span className="dv">{runPlaceWords(draftRun)}</span></div>}
           </div>
 
           <div style={{display:'flex',gap:12,justifyContent:'flex-end',flexWrap:'wrap'}}>
@@ -391,7 +392,7 @@ export function RunPayrollPage(){
           <p style={{color:'var(--t2)',marginBottom:24}}>Net pay: <strong style={{color:'var(--green)'}}>{formatCurrency(draftRun?.totalNet)}</strong> for {draftRun?.employeeCount} employee{draftRun?.employeeCount!==1?'s':''}</p>
           <p style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:24}}>It is booked on the pay date. Each paycheck's take-home pay and the payroll taxes are on Expenses as unpaid bills, ready to match the bank lines that pay them.</p>
           <div style={{display:'flex',gap:12,justifyContent:'center',flexWrap:'wrap'}}>
-            <button className="btn bp" onClick={()=>{setStep('setup');setDraftRun(null);setSelectedIds([]);setHoursMap({});setTaxMap({});setExtraOn({});setExtraTax({});setPlace(BLANK_COST_PLACE)}}>Run Another Payroll</button>
+            <button className="btn bp" onClick={()=>{setStep('setup');setDraftRun(null);setSelectedIds([]);setHoursMap({});setTaxMap({});setExtraOn({});setExtraTax({})}}>Run Another Payroll</button>
             <Link to={booksPath('payHistory')} className="btn bp">View Pay History →</Link>
           </div>
         </div>

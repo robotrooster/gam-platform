@@ -171,12 +171,12 @@ describe('paying extra hours: Mark paid and Send to GAM Books', () => {
 
     const id = await payableId(w)
     const r = await request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`)
-      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-05', paidHow: 'check', note: 'check #1042' })
+      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-05', paidHow: 'check', note: 'check #1042', costPlace: 'split_by_units' })
     expect(r.status).toBe(200)
     expect(await payable(id)).toMatchObject({ status: 'paid', paid_on: '2026-10-05', paid_how: 'check', paid_note: 'check #1042' })
     // Paid once is paid.
     const again = await request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`)
-      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-05', paidHow: 'cash' })
+      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-05', paidHow: 'cash', costPlace: 'split_by_units' })
     expect(again.status).toBe(409)
     // Off the to-pay list.
     const after = await request(app()).get('/api/work-trade/extra-hours').set('Authorization', `Bearer ${w.ownerToken}`)
@@ -195,7 +195,7 @@ describe('paying extra hours: Mark paid and Send to GAM Books', () => {
       .set('Authorization', `Bearer ${w.ownerToken}`).send({})).status).toBe(409)
     // Paid another way after all: Mark paid still closes it.
     const paid = await request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`)
-      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-06', paidHow: 'cash' })
+      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2026-10-06', paidHow: 'cash', costPlace: 'split_by_units' })
     expect(paid.status).toBe(200)
   })
 
@@ -203,7 +203,7 @@ describe('paying extra hours: Mark paid and Send to GAM Books', () => {
     const w = await world({ mode: 'pay' })
     await runWorkTradeSettlement('2026-09-01')
     const r = await request(app()).post(`/api/work-trade/extra-hours/${await payableId(w)}/mark-paid`)
-      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2999-01-01', paidHow: 'cash' })
+      .set('Authorization', `Bearer ${w.ownerToken}`).send({ paidOn: '2999-01-01', paidHow: 'cash', costPlace: 'split_by_units' })
     expect(r.status).toBe(400)
   })
 
@@ -212,7 +212,7 @@ describe('paying extra hours: Mark paid and Send to GAM Books', () => {
     await runWorkTradeSettlement('2026-09-01')
     const id = await payableId(w)
     const other = await world()
-    const paidBody = { paidOn: '2026-10-05', paidHow: 'cash' }
+    const paidBody = { paidOn: '2026-10-05', paidHow: 'cash', costPlace: 'split_by_units' }
     const tries: Array<[string, number]> = [
       [w.tenantToken, 403],
       [other.ownerToken, 403],

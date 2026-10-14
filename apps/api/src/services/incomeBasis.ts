@@ -2243,6 +2243,14 @@ export interface IncomeEvent {
   ledger?: 'line' | 'owed' | 'owedStart' | 'proof'
   proofTerm?: LedgerProofTerm
   /**
+   * 10/14 (Nic I1): the fact itemized for the Detailed view (facts read from
+   * the ledger, services/ledgerReports): the income line(s) it is — mobile
+   * home lot rent, park-owned trailer rent, RV long-term rent, RV short-term
+   * stays, home sales, … — each with its share of `amount` and the space's
+   * subtype. What the pieces do not cover stays on its Summary group.
+   */
+  detail?: IncomeDetailPiece[]
+  /**
    * 10/12 (Nic, review): on 'owed' / 'owedStart' facts, every day the query
    * read the receivables on (sorted). Only days with something owed have
    * facts, so the Owed column's day comes from this list (ledgerOwedDay): a
@@ -2698,6 +2706,23 @@ export async function categoryTotals(q: IncomeQuery): Promise<CategoryBreakdown>
 /** One line (or category) in the three columns. */
 export interface MoneyColumns { charged: number; received: number; owed: number }
 
+/** 10/14 (Nic I1): one itemized piece of a fact — its income line, its share, and the space's subtype (a reporting dimension, never an account). */
+export interface IncomeDetailPiece { key: string; label: string; order: number; amount: number; subtype: string | null }
+
+/**
+ * 10/14 (Nic I1): one line of the Detailed view — an itemized income line
+ * (rent and stays by space, home sales and their interest), or a Summary
+ * group no line itemizes — with its subtypes (Single wide, Double wide, …).
+ * The lines add up to each column exactly as the Summary groups do.
+ */
+export interface MoneyViewDetail extends MoneyColumns {
+  key: string
+  label: string
+  /** The Summary group it rolls up to (null: money with no category, under its line). */
+  category: IncomeCategory | null
+  subtypes: Array<MoneyColumns & { name: string }>
+}
+
 export interface MoneyViewLine extends MoneyColumns { line: ReportLine; label: string }
 export interface MoneyViewCategory extends MoneyColumns { category: IncomeCategory; label: string }
 
@@ -2755,6 +2780,8 @@ export interface MoneyView extends MoneyColumns {
    */
   source?: 'ledger'
   proof?: LedgerProof
+  /** 10/14 (Nic I1): the Detailed view's lines, when the facts were itemized (the ledger's). Summary is `categories` + `uncategorized`. */
+  details?: MoneyViewDetail[]
 }
 
 /**
@@ -2827,6 +2854,34 @@ export function moneyViewFrom(
     if (!x) { x = { charged: 0, received: 0, owed: 0 }; m.set(k, x) }
     return x
   }
+  // 10/14 (Nic I1): the Detailed view — each fact's itemized pieces on their
+  // lines, what they leave on the fact's Summary group (category, else line).
+  const itemized = [...billed, ...received].some(e => !!e.detail?.length)
+  type DetailCell = MoneyColumns & { label: string; category: IncomeCategory | null; group: number; order: number; subs: Map<string, MoneyColumns> }
+  const byDetail = new Map<string, DetailCell>()
+  const DETAIL_GROUP: Record<string, IncomeCategory> = { rent_line: 'space_rent', stay_line: 'stays_and_pay_links', home_sales: 'home_payments', home_note_interest: 'home_payments' }
+  const catIndex = (c: IncomeCategory | null) => (c ? INCOME_CATEGORIES.indexOf(c) : INCOME_CATEGORIES.length)
+  const addDetail = (e: IncomeEvent, col: keyof MoneyColumns) => {
+    if (!itemized) return
+    let left = e.amount
+    const put = (key: string, label: string, category: IncomeCategory | null, order: number, amount: number, subtype: string | null) => {
+      let d = byDetail.get(key)
+      if (!d) {
+        d = { charged: 0, received: 0, owed: 0, label, category, group: catIndex(category), order, subs: new Map() }
+        byDetail.set(key, d)
+      }
+      d[col] += amount
+      if (subtype) cell(d.subs, subtype)[col] += amount
+    }
+    for (const p of e.detail ?? []) {
+      const group = DETAIL_GROUP[p.key.split(':')[0]] ?? e.category
+      put(p.key, p.label, group, p.order, p.amount, p.subtype)
+      left -= p.amount
+    }
+    if (Math.abs(left) < 0.005) return
+    if (e.category) put(`c:${e.category}`, INCOME_CATEGORY_LABEL[e.category], e.category, 1000, left, null)
+    else if (isLine(e.line)) put(`l:${e.line}`, REPORT_LINE_LABEL[e.line], null, 1000 + REPORT_LINES.indexOf(e.line), left, null)
+  }
   const tie: MoneyTie = {
     charged: { collected: 0, clearing: 0, owed: 0, other: 0 },
     received: { forPeriodBills: 0, forEarlierBills: 0, paidAhead: 0, noBill: 0 },
@@ -2863,6 +2918,7 @@ export function moneyViewFrom(
       if (line) cell(byLine, line).owed += e.amount
       const g = e.category ? cell(byCat, e.category) : line ? cell(noCat, line) : null
       if (g) g.owed += e.amount
+      if (g) addDetail(e, 'owed')
       continue
     }
     if (e.ledger === 'proof') {
@@ -2876,10 +2932,12 @@ export function moneyViewFrom(
     if (line) cell(byLine, line).charged += e.amount
     const g = e.category ? cell(byCat, e.category) : line ? cell(noCat, line) : null
     if (g) g.charged += e.amount
+    if (g) addDetail(e, 'charged')
     if (isOwed) {
       owed += e.amount
       if (line) cell(byLine, line).owed += e.amount
       if (g) g.owed += e.amount
+      if (g) addDetail(e, 'owed')
       tie.charged.owed += e.amount
     } else if (e.part === 'clearing') tie.charged.clearing += e.amount
     else if (e.part && COLLECTED_PARTS.includes(e.part)) tie.charged.collected += e.amount
@@ -2896,8 +2954,10 @@ export function moneyViewFrom(
     if (isLine(e.line)) {
       cell(byLine, e.line).received += e.amount
       ;(e.category ? cell(byCat, e.category) : cell(noCat, e.line)).received += e.amount
+      addDetail(e, 'received')
     } else if (e.category) {
       cell(byCat, e.category).received += e.amount
+      addDetail(e, 'received')
     }
     const due = e.dueDate ? ymd(e.dueDate) : null
     if (e.line === 'paidAhead') tie.received.paidAhead += e.amount
@@ -2927,6 +2987,17 @@ export function moneyViewFrom(
     charged: round2(charged), received: round2(rec), owed: round2(owed),
     collected: tie.charged.collected, clearing: tie.charged.clearing,
     lines, categories, uncategorized, tie, tieText: [],
+    ...(itemized ? {
+      details: [...byDetail.entries()]
+        .map(([key, d]) => ({
+          key, label: d.label, category: d.category, ...tidy(d), group: d.group, order: d.order,
+          subtypes: [...d.subs.entries()].map(([name, x]) => ({ name, ...tidy(x) })).filter(nonZero)
+            .sort((a, b) => a.name.localeCompare(b.name)),
+        }))
+        .filter(nonZero)
+        .sort((a, b) => a.group - b.group || a.order - b.order || a.label.localeCompare(b.label))
+        .map(({ group: _g, order: _o, ...d }) => d),
+    } : {}),
     beside: [
       ...VIEW_BESIDE_KEYS
         .map(k => ({ key: k as string, label: ASIDE_LINE_LABEL[k], amount: round2(beside.get(k) ?? 0) }))

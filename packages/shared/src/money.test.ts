@@ -65,7 +65,8 @@ describe('S655 money vocabulary', () => {
   it('the bank-feed match kinds are the one money list', () => {
     expect(BANK_TXN_MATCH_KINDS).toBe(BANK_MATCH_KINDS)
     expect(BANK_TXN_MATCH_KIND_LABEL).toBe(BANK_MATCH_KIND_LABEL)
-    expect(BANK_MATCH_KINDS).toEqual(['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed'])
+    // 10/14 (Nic, answer 15): 'returned_check' — a check the bank returned out of a deposit, taken back.
+    expect(BANK_MATCH_KINDS).toEqual(['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed', 'returned_check'])
   })
 
   it('a landlord cannot issue a deposit-interest credit; the full list matches the table', () => {

@@ -84,8 +84,10 @@ async function hours(w: World, month = '2026-09-01', hrs = 6): Promise<string> {
   return r.rows[0].id
 }
 
+/** Mark paid; 10/14 (Nic): where the cost goes is asked every time — the work trader's property unless the test says. */
 const markPaid = (w: World, id: string, body: object) =>
-  request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`).set(as(w.ownerToken)).send(body)
+  request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`).set(as(w.ownerToken))
+    .send({ costPlace: 'property', propertyId: w.propertyId, ...body })
 
 const record = async (id: string) => (await db.query(
   `SELECT status, paid_how, to_char(paid_on, 'YYYY-MM-DD') AS paid_on, paid_at IS NOT NULL AS stamped, books_reference_id
@@ -246,5 +248,48 @@ describe('the Work Trade page says what the books say', () => {
     expect((await markPaid(w, x, { paidOn: '2026-10-05', paidHow: 'cash' })).status).toBe(200)
     expect((await markPaid(w, x, { paidOn: '2026-10-05', paidHow: 'cash' })).status).toBe(409)
     expect((await db.query(`SELECT count(*)::int AS n FROM landlord_expenses WHERE work_trade_extra_hours_id = $1`, [x])).rows[0].n).toBe(1)
+  })
+})
+
+// 10/14 (Nic): "Work Trade 'Mark paid': ask where it goes every time (split,
+// property or unit), like other expenses." Nothing is chosen for the person.
+describe('Mark paid asks where the cost goes, every time (10/14, Nic)', () => {
+  const bare = (w: World, id: string, body: object) =>
+    request(app()).post(`/api/work-trade/extra-hours/${id}/mark-paid`).set(as(w.ownerToken)).send(body)
+
+  it('no place: refused in words, and nothing is paid or recorded', async () => {
+    const w = await world('payroll_w2')
+    const x = await hours(w)
+    const r = await bare(w, x, { paidOn: '2026-10-05', paidHow: 'check' })
+    expect([r.status, r.body.error]).toEqual([400,
+      'Choose where the cost of these extra hours goes: one unit, one property, or split across your properties by units.'])
+    expect(await record(x)).toMatchObject({ status: 'unpaid', books_reference_id: null })
+    expect((await db.query(`SELECT 1 FROM landlord_expenses WHERE work_trade_extra_hours_id = $1`, [x])).rows).toEqual([])
+  })
+
+  it('one unit, or split across the properties by units — the expense goes where the person said', async () => {
+    const w = await world('payroll_w2')
+    const sept = await hours(w, '2026-09-01')
+    const oct = await hours(w, '2026-10-01')
+    expect((await bare(w, sept, { paidOn: '2026-10-05', paidHow: 'cash', costPlace: 'unit', unitId: w.unitId })).status).toBe(200)
+    expect((await bare(w, oct, { paidOn: '2026-10-10', paidHow: 'cash', costPlace: 'split_by_units' })).status).toBe(200)
+    const placed = async (x: string) => (await db.query(
+      `SELECT e.cost_place, e.property_id, e.unit_id, e.is_common FROM landlord_expenses e
+        JOIN work_trade_extra_hours h ON h.books_reference_id = e.id WHERE h.id = $1`, [x])).rows[0]
+    expect(await placed(sept)).toEqual({ cost_place: 'unit', property_id: w.propertyId, unit_id: w.unitId, is_common: false })
+    expect(await placed(oct)).toEqual({ cost_place: 'split_by_units', property_id: null, unit_id: null, is_common: false })
+  })
+
+  it('another company\'s property is refused; the form reads only the paying company\'s places', async () => {
+    const w = await world('contractor_1099')
+    const x = await hours(w)
+    const other = await ledgerCompany()
+    const r = await bare(w, x, { paidOn: '2026-10-05', paidHow: 'cash', costPlace: 'property', propertyId: other.propertyId })
+    expect([r.status, r.body.error]).toEqual([404, 'That property is not this company\'s.'])
+    expect((await record(x)).status).toBe('unpaid')
+    const places = await request(app()).get(`/api/work-trade/extra-hours/${x}/cost-places`).set(as(w.ownerToken))
+    expect(places.status).toBe(200)
+    expect(places.body.data.properties.map((p: any) => p.id)).toContain(w.propertyId)
+    expect(places.body.data.properties.map((p: any) => p.id)).not.toContain(other.propertyId)
   })
 })

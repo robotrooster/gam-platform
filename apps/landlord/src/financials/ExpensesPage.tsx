@@ -120,8 +120,9 @@ const blankForm = () => ({
   utilityType: null as string | null,
   // 10/12 (Nic, L5): paid now (and how), or a bill to pay. 10/13 (Nic): "they
   // don't pick as a setting, they pick as the expense happens" — how it was
-  // paid starts blank.
-  paidNow: true, method: '' as LandlordExpensePaymentMethod | '', paidOn: '', bankConnectionId: '',
+  // paid starts blank. 10/14 (Nic): "paid already" or "a bill to pay later"
+  // starts unanswered too (null) — the form does not save until it is picked.
+  paidNow: null as boolean | null, method: '' as LandlordExpensePaymentMethod | '', paidOn: '', bankConnectionId: '',
   dueDate: '', billNumber: '',
 })
 const blankPay = () => ({ method: '' as LandlordExpensePaymentMethod | '', amount: '', paidOn: today(), bankConnectionId: '' })
@@ -306,7 +307,8 @@ export function ExpensesPage() {
     (placeFixed || (form.scope === 'unit' ? form.unitId : form.scope === 'property' ? form.propertyId
       : onNoProperty && places.includes(form.scope as FormPlace) ? !!companyId : false)) &&
     // 10/13 (Nic): how it was paid is picked on each expense.
-    (editingId || !form.paidNow || !!form.method)
+    // 10/14 (Nic): paid already or a bill to pay — picked on each one.
+    (editingId || form.paidNow === false || (form.paidNow === true && !!form.method))
 
   const statusOf = (e: Expense) => e.payState === 'paid'
     ? EXPENSE_PAY_STATE_LABEL.paid
@@ -429,15 +431,15 @@ export function ExpensesPage() {
 
           {!editingId && (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button type="button" className={`btn btn-sm ${form.paidNow ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set({ paidNow: true })}>
+              <button type="button" className={`btn btn-sm ${form.paidNow === true ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set({ paidNow: true })}>
                 Paid already
               </button>
-              <button type="button" className={`btn btn-sm ${!form.paidNow ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set({ paidNow: false })}>
+              <button type="button" className={`btn btn-sm ${form.paidNow === false ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set({ paidNow: false })}>
                 A bill to pay
               </button>
             </div>
           )}
-          {!editingId && form.paidNow ? (
+          {!editingId && form.paidNow === true ? (
             <div className="fin-form-row">
               <label>Paid how
                 <select className="form-input" value={form.method} onChange={e => set({ method: e.target.value as LandlordExpensePaymentMethod | '' })}>
@@ -457,7 +459,7 @@ export function ExpensesPage() {
                 </label>
               )}
             </div>
-          ) : (
+          ) : (editingId || form.paidNow === false) && (
             <div className="fin-form-row">
               <label>Due date{editingId ? '' : ' (optional)'}
                 <input className="form-input" type="date" value={form.dueDate} onChange={e => set({ dueDate: e.target.value })} />
@@ -480,7 +482,7 @@ export function ExpensesPage() {
           {err && <div className="fin-error">{err}</div>}
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="btn btn-primary" disabled={!canSubmit || save.isLoading} onClick={() => save.mutate()}>
-              {save.isLoading ? 'Saving…' : editingId ? 'Save changes' : form.paidNow ? 'Log expense' : 'Add bill'}
+              {save.isLoading ? 'Saving…' : editingId ? 'Save changes' : form.paidNow === false ? 'Add bill' : 'Log expense'}
             </button>
             {editingId && <button className="btn btn-ghost" onClick={() => { resetForm(); setErr(null) }}>Cancel</button>}
           </div>

@@ -45,6 +45,7 @@ import type {
   LedgerAccountRole, LedgerReportCategory, LedgerCashEffect, BooksHomeSaleMethod, BooksWorkTradeMethod,
 } from '@gam/shared'
 import { LedgerSourceError, type DesiredLine } from '../ledgerEngine'
+import { SPACE_COLS_SQL, spaceOf, rentParts, type SpaceFacts, type IncomePart } from './incomeLines'
 
 // ─── Amounts ────────────────────────────────────────────────────────────────
 
@@ -182,6 +183,8 @@ export interface PaymentFacts {
   /** Paid by at least one settled receipt (a remittance application). */
   hasSettledApplication: boolean
   exclusion: RowExclusion | null
+  /** 10/14 (Nic I1-I7): the space the row is for (its unit, else its lease's) as it stood when the row was billed, for which rent line it books to. */
+  space: SpaceFacts | null
 }
 
 /** The UTILITY_NAMED_IN_NOTES patterns of services/incomeBasis.categorySql (a utility row with no bill). */
@@ -247,8 +250,11 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
               OR (b.type = 'deposit' AND b.lease_fee_id IS NULL
                   AND EXISTS (SELECT 1 FROM security_deposits sd
                                WHERE sd.lease_id = b.lease_id AND sd.flex_deposit_enabled IS TRUE AND sd.status <> 'voided'))) AS is_flex
+            , ${SPACE_COLS_SQL('su', 'sl', 'b.created_at')}
        FROM b
-       CROSS JOIN LATERAL (SELECT ${propertyTzSql('b.prop', 'b.landlord_id')} AS tz) z`,
+       CROSS JOIN LATERAL (SELECT ${propertyTzSql('b.prop', 'b.landlord_id')} AS tz) z
+       LEFT JOIN leases sl ON sl.id = b.lease_id
+       LEFT JOIN units su ON su.id = COALESCE(b.unit_id, sl.unit_id)`,
     [uuids])
   for (const x of r.rows) {
     const amountCents = centsOf(x.amount_c)
@@ -273,6 +279,7 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
       isMoveOutGap: !!x.is_gap,
       hasSettledApplication: !!x.has_app,
       exclusion,
+      space: spaceOf(x),
     })
   }
   return out
@@ -317,6 +324,19 @@ export function incomeRoleFor(f: Pick<PaymentFacts, 'category' | 'feeType'>): Le
   const role = CATEGORY_INCOME_ROLE[f.category]
   if (!role) throw new LedgerSourceError('projector_error', `No income account for category ${f.category}`)
   return role
+}
+
+/**
+ * 10/14 (Nic I1-I7): the income a bill row's `cents` credit (or, negative,
+ * take back), on its line(s): rent by the space it is for (incomeLines
+ * rentParts — a park-owned trailer's rent in two, lot and trailer), every
+ * other category on its one role (incomeRoleFor). A charge and whatever later
+ * takes it back call this with the same row, so both land on the same lines.
+ */
+export function incomePartsFor(f: Pick<PaymentFacts, 'category' | 'feeType' | 'space'>, cents: number): IncomePart[] {
+  if (!cents) return []
+  const role = incomeRoleFor(f)
+  return role === 'space_rent' ? rentParts(f.space, cents, role) : [{ role, cents }]
 }
 
 /** The utility-type income role (4071-4075). */

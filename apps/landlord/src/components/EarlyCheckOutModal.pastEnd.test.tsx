@@ -34,7 +34,7 @@ vi.mock('../lib/api', () => ({
 import { EarlyCheckOutModal } from './EarlyCheckOutModal'
 
 const REFUSED = 'Taking those charges off needs "Create reservations" or "Edit / move / cancel reservations", '
-  + 'together with "Record a cash / check payment". You can keep them owed, or ask someone who has both to change the stay.'
+  + 'together with "Record a cash / check payment" or "Ring sales". You can keep them owed, or ask someone who has both to change the stay.'
 
 function quote(pastEnd: any) {
   return {

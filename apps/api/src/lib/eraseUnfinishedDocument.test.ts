@@ -122,8 +122,27 @@ describe('the void button erases a document that never completed and no money to
     expect(await exists(id)).toBe(false)
   })
 
-  it('a document a resident signed is refused, as before, and left exactly as it was', async () => {
-    const id = await doc({ status: 'in_progress', landlordSigned: true, residentSigned: true })
+  it('10/14 (Nic, #2): one co-tenant signed, the other never, nothing billed — deleted', async () => {
+    const id = await doc({ status: 'in_progress', residentSigned: true })
+    // The second resident, who never signed.
+    const c = await db.connect()
+    let coUser: string
+    try { coUser = (await c.query(`SELECT user_id FROM tenants WHERE id = $1`, [await seedTenant(c)])).rows[0].user_id } finally { c.release() }
+    await query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'co_tenant_1','C T','c@test.dev',3,$3,'sent')`, [id, coUser, crypto.randomBytes(16).toString('hex')])
+    const res = await press(id)
+    expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(true)
+    expect(await exists(id)).toBe(false)
+  })
+
+  it('a resident signed a lease that billed the household: it stays, and the void refuses it as before (supersede)', async () => {
+    const leaseId = await lease()
+    const id = await doc({ status: 'in_progress', landlordSigned: true, residentSigned: true, issued: true, leaseId })
+    await query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',460,'pending','2026-11-01','RENT')`, [f.unitId, leaseId, f.tenantId, f.landlordId])
     const res = await press(id)
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/superseding/)
@@ -139,16 +158,24 @@ describe('the void button erases a document that never completed and no money to
     expect(row).toEqual({ status: 'voided', void_reason: 'not needed' })
   })
 
-  it('a lease an OPEN invite is waiting on is voided, not erased — the invite keeps pointing at it, so the hourly re-draft does not make a new one', async () => {
+  it('10/14 (Nic, #1): a lease an OPEN invite waits on is deleted and the invite canceled — its link stops working, its screening waiver closes, and the hourly re-draft passes it by', async () => {
     const id = await doc()
     const intent = (await query<{ id: string }>(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, parser_status, draft_document_id)
        VALUES ($1,$2,$3,'not_uploaded',$4) RETURNING id`, [f.landlordId, f.tenantId, f.unitId, id]))[0].id
+    const waiver = (await query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, screening_waived)
+       VALUES ($1,$2,'not_uploaded',TRUE) RETURNING id`, [f.landlordId, f.tenantId]))[0].id
     const res = await press(id)
-    expect(res.body.data.deleted).toBe(false)
-    expect(await statusOf(id)).toBe('voided')
-    const pti = (await query<any>(`SELECT draft_document_id FROM pending_tenant_intents WHERE id = $1`, [intent]))[0]
-    expect(pti.draft_document_id).toBe(id)
+    expect(res.body.data.deleted).toBe(true)
+    expect(await exists(id)).toBe(false)
+    const pti = (await query<any>(
+      `SELECT draft_document_id, cancelled_at IS NOT NULL AS canceled FROM pending_tenant_intents WHERE id = $1`, [intent]))[0]
+    expect(pti).toEqual({ draft_document_id: null, canceled: true })
+    expect((await query<any>(`SELECT cancelled_at IS NOT NULL AS c FROM pending_tenant_intents WHERE id = $1`, [waiver]))[0].c).toBe(true)
+    // The hourly re-draft reads open invites only (householdLeaseDraft).
+    expect(await query(
+      `SELECT 1 FROM pending_tenant_intents WHERE id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL`, [intent])).toHaveLength(0)
   })
 
   it('a closed (canceled) invite lets go of the lease it pointed at, and the lease is erased', async () => {
@@ -289,14 +316,21 @@ describe('GET /documents says which the button does', () => {
     expect(res.body.data.every((d: any) => !('kept_reason' in d))).toBe(true)
   })
 
-  it('an open invite waiting on a lease is the reason given', async () => {
+  it('10/14: an open invite waiting on a lease no longer keeps it (Delete); money on the lease it issued is the reason given', async () => {
     const id = await doc()
     await query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, parser_status, draft_document_id)
        VALUES ($1,$2,$3,'not_uploaded',$4)`, [f.landlordId, f.tenantId, f.unitId, id])
+    const leaseId = await lease()
+    const billed = await doc({ title: 'Billed', status: 'in_progress', landlordSigned: true, issued: true, leaseId })
+    await query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',460,'pending','2026-11-01','RENT')`, [f.unitId, leaseId, f.tenantId, f.landlordId])
     const res = await request(buildApp()).get('/api/esign/documents').set('Authorization', `Bearer ${f.token}`)
-    expect(res.body.data.find((d: any) => d.id === id)).toMatchObject({
-      end_action: 'void', end_reason: 'The invite for this household is still open and waiting on this lease.',
+    expect(res.body.data.find((d: any) => d.id === id)).toMatchObject({ end_action: 'delete', end_reason: null })
+    expect(res.body.data.find((d: any) => d.id === billed)).toMatchObject({
+      end_action: 'void',
+      end_reason: 'Money touched the lease it issued: something on it was billed, paid, credited or settled.',
     })
   })
 

@@ -56,9 +56,12 @@ import { LedgerSourceError } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import {
   type PaymentFacts, Lines, rowDims, cSql, centsOf, localDaySql, propertyTzSql, leasePropertySql, companyTzSql, isUuid,
+  loadPaymentFacts, incomePartsFor,
 } from './tenantShared'
+import { loadStay, stayParts, rentParts, type IncomePart } from './incomeLines'
 
-export const TENANT_DEPOSITS_RULE_VERSION = 1
+// 2 — 10/14 (Nic I1, I2): money refunded for nights not stayed comes off the stay's own line (incomeLines).
+export const TENANT_DEPOSITS_RULE_VERSION = 2
 
 // ─── A bill the deposit paid ────────────────────────────────────────────────
 
@@ -195,12 +198,35 @@ export const depositReturnProjector: LedgerProjector = {
 
 // ─── D4: refund parts ───────────────────────────────────────────────────────
 
+/**
+ * 10/14 (Nic I1-I7): rent paid for nights a stay no longer has, taken back
+ * off the lines its rent bill was charged to (tenantCharges: the bill's space
+ * as it stood when billed): the rent bill the refunded money paid, else the
+ * latest rent bill of the stay's lease made before the refund. No such bill:
+ * the stay's space.
+ */
+async function rentRefundParts(client: PoolClient, p: { booking_id: string | null; remittance_id: string | null; made_at: string },
+  cents: number): Promise<IncomePart[]> {
+  const bill = (await client.query<{ id: string }>(
+    `SELECT pb.id::text AS id FROM payments pb
+      CROSS JOIN LATERAL (SELECT EXISTS (SELECT 1 FROM remittance_applications ra
+                                          WHERE ra.remittance_id = $2::uuid AND ra.payment_id = pb.id) AS paid_by) x
+      WHERE pb.type = 'rent'
+        AND (x.paid_by OR (pb.created_at <= $3::timestamptz
+                           AND pb.lease_id IN (SELECT sl.id FROM leases sl WHERE sl.source_booking_id = $1::uuid)))
+      ORDER BY x.paid_by DESC, pb.created_at DESC, pb.id DESC LIMIT 1`, [p.booking_id, p.remittance_id, p.made_at])).rows[0]
+  const f = bill ? (await loadPaymentFacts(client, [bill.id])).get(bill.id) : undefined
+  if (f && f.category === 'space_rent') return incomePartsFor(f, cents)
+  return rentParts((await loadStay(client, p.booking_id))?.space ?? null, cents, 'space_rent')
+}
+
+
 export async function projectRefundPart(client: PoolClient, partId: string): Promise<DesiredPosting[]> {
   if (!isUuid(partId)) return []
   const p = (await client.query<any>(
     `SELECT rp.landlord_id, rp.kind, rp.status, rp.reversed_at IS NOT NULL AS reversed,
             rp.decision_id, rp.paid_ahead_choice_id, rp.deposit_return_id, rp.stay_payment_id, rp.remittance_id,
-            rp.prepaid_credit_id, rp.booking_id,
+            rp.prepaid_credit_id, rp.booking_id, rp.created_at::text AS made_at,
             ${cSql('rp.toward_amount')} AS toward_c, ${cSql('rp.card_fee_back')} AS cfb_c, ${cSql('rp.amount')} AS amount_c,
             ${cSql('rp.payout_drop')} AS drop_c, ${cSql('rp.lodging_tax_share')} AS tax_c,
             pc.funded_by, COALESCE(src.payment_method IN ('card', 'ach') AND src.stripe_payment_intent_id IS NOT NULL, FALSE) AS src_online,
@@ -281,9 +307,18 @@ export async function projectRefundPart(client: PoolClient, partId: string): Pro
     const income: LedgerAccountRole = p.stay_payment_id ? 'stay_income' : 'space_rent'
     const t = Math.max(0, Math.min(tax, toward))
     L.dr('lodging_tax_payable', t, { propertyId: prop, reportCategory: 'tax_collected', memo: 'Lodging tax refunded' })
-    L.dr(income, toward - t, {
-      propertyId: prop, reportCategory: 'refunds', cashEffect: left ? null : 'in', memo: 'Refunded for nights not stayed',
-    })
+    // 10/14 (Nic I1, I2): off the line it was earned on — stay money as the
+    // stay earned it; rent paid for its nights as the rent bill was charged
+    // (the bill the refunded money paid, else the stay's lease's latest rent
+    // bill before the refund), so each line nets alike.
+    const parts = income === 'stay_income'
+      ? stayParts(await loadStay(client, p.booking_id), toward - t)
+      : await rentRefundParts(client, p, toward - t)
+    for (const x of parts) {
+      L.dr(x.role, x.cents, {
+        propertyId: prop, reportCategory: 'refunds', cashEffect: left ? null : 'in', sub: x.sub, memo: 'Refunded for nights not stayed',
+      })
+    }
   }
   // The card fee given back is the landlord's cost (Nic G10) — its own line,
   // "Card fees refunded" (5117), as the register's refunds post it, so the

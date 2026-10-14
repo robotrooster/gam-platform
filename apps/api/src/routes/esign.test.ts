@@ -1062,7 +1062,11 @@ describe('POST /documents/:id/void', () => {
     expect(doc.rows).toHaveLength(0)
   })
 
-  it('S558: rejects voiding once a TENANT has signed (409 → supersede)', async () => {
+  // 10/14 (Nic, #2): "One co-tenant signed, other never, nothing billed: may
+  // be deleted." A tenant's signature alone no longer keeps a document; one
+  // whose lease billed the household is still refused (supersede) —
+  // lib/eraseUnfinishedDocument.test.
+  it('S558 → 10/14 #2: a document a TENANT signed that billed nobody is deleted, not refused', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
     // Both landlord and the primary tenant have signed.
@@ -1074,8 +1078,9 @@ describe('POST /documents/:id/void', () => {
       .post(`/api/esign/documents/${documentId}/void`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({})
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/superseding/)
+    expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(true)
+    expect((await db.query(`SELECT 1 FROM lease_documents WHERE id = $1`, [documentId])).rows).toHaveLength(0)
   })
 
   it('cross-landlord rejected', async () => {

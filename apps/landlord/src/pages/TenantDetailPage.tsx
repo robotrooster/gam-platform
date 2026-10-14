@@ -15,6 +15,43 @@ import { healthColor, healthWord, healthText } from '../lib/paymentStamps'
 import '../styles/credit-desk.css'
 
 /**
+ * 10/14 (Nic): "Only the landlord can fix a birthday." The tenant's birthday
+ * (copied off their signed lease; GAM's happy-birthday email reads it), shown
+ * to the landlord — the owner of a company the person has had a lease with —
+ * with Fix. The tenant cannot change it. Anyone else is refused by the server,
+ * and the row is not shown.
+ */
+function BirthdayRow({ tenantId }: { tenantId: string }) {
+  const { data, isError, refetch } = useQuery(['tenant-birthday', tenantId],
+    () => apiGet<{ dateOfBirth: string | null }>(`/tenants/${tenantId}/birthday`), { retry: false })
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState('')
+  const save = useMutation((dateOfBirth: string | null) => apiPatch(`/tenants/${tenantId}/birthday`, { dateOfBirth }), {
+    onSuccess: () => { setEditing(false); refetch(); toast('Birthday saved.') },
+    onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not save the birthday.'),
+  })
+  if (isError || !data) return null
+  const dob = data.dateOfBirth
+  return (
+    <div className="data-row">
+      <span className="data-key">Birthday</span>
+      {editing ? (
+        <span className="data-val" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input className="input" type="date" value={value} onChange={e => setValue(e.target.value)} aria-label="Birthday" />
+          <button className="btn btn-primary btn-sm" disabled={save.isLoading || !value} onClick={() => save.mutate(value)}>Save</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>Cancel</button>
+        </span>
+      ) : (
+        <span className="data-val" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {dob ? new Date(dob + 'T12:00:00').toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }) : 'Not on file'}
+          <button className="btn btn-primary btn-sm" onClick={() => { setValue(dob ?? ''); setEditing(true) }}>{dob ? 'Fix' : 'Add'}</button>
+        </span>
+      )}
+    </div>
+  )
+}
+
+/**
  * A charge's status color, one per status. Amber is owed (not paid yet, being
  * paid); a voided charge is owed by nobody (decisions #48.5), so it is muted —
  * never the amber an unpaid bill wears.
@@ -221,6 +258,7 @@ export function TenantDetailPage() {
                   <span className="data-val" style={{ color: (row as any).color }}>{row.val}</span>
                 </div>
               ))}
+              {id && <BirthdayRow tenantId={id} />}
             </div>
             {/* W-25 (S531): the health card drills into how late — aggregate
                 health hides whether "late" meant 2 days or 3 weeks. 10/12

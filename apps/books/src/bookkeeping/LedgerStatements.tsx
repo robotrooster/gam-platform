@@ -18,8 +18,11 @@
  * (bookkeeping-parity.test.ts). ProfitLossPage and CashFlowPage hand their
  * figures here when the server says they came from the ledger.
  */
+import { useState } from 'react'
 import { useQuery } from 'react-query'
-import { formatCurrency, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE_LEDGER } from '@gam/shared'
+import {
+  formatCurrency, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE_LEDGER, INCOME_REPORT_VIEWS, INCOME_REPORT_VIEW_LABEL, type IncomeReportView,
+} from '@gam/shared'
 import { booksGet as get } from './adapter'
 import { MoneyThreeTable, MoneyTieLines, type MoneyThreeRow } from './common'
 import { loadErrorText } from './booksMoney'
@@ -60,10 +63,21 @@ export function LedgerProfitLossView({ data, startDate, endDate, setStartDate, s
   data: any; startDate: string; endDate: string; setStartDate: (v: string) => void; setEndDate: (v: string) => void
 }) {
   const view = data?.view ?? {}
-  const rows: MoneyThreeRow[] = [
-    ...(view.categories ?? []).map((c: any) => ({ key: `c:${c.category}`, label: c.label, received: c.received, charged: c.charged, owed: c.owed })),
-    ...(view.uncategorized ?? []).map((l: any) => ({ key: `l:${l.line}`, label: l.label, received: l.received, charged: l.charged, owed: l.owed })),
-  ]
+  // 10/14 (Nic I1): Summary is today's groups; Detailed itemizes them — rent
+  // and stays by space (mobile home lot rent, park-owned trailer rent, RV
+  // long-term rent, RV short-term stays, …), home sales, and each space
+  // subtype (Single wide, Double wide) under its line.
+  const [mode, setMode] = useState<IncomeReportView>('summary')
+  const details: any[] = view.details ?? []
+  const rows: MoneyThreeRow[] = mode === 'detailed' && details.length > 0
+    ? details.flatMap((d: any) => [
+        { key: `d:${d.key}`, label: d.label, received: d.received, charged: d.charged, owed: d.owed },
+        ...(d.subtypes ?? []).map((t: any) => ({ key: `d:${d.key}|${t.name}`, label: `\u00a0\u00a0\u00a0\u00a0${t.name}`, received: t.received, charged: t.charged, owed: t.owed })),
+      ])
+    : [
+        ...(view.categories ?? []).map((c: any) => ({ key: `c:${c.category}`, label: c.label, received: c.received, charged: c.charged, owed: c.owed })),
+        ...(view.uncategorized ?? []).map((l: any) => ({ key: `l:${l.line}`, label: l.label, received: l.received, charged: l.charged, owed: l.owed })),
+      ]
   const ex = data?.expenses ?? { rows: [], paid: 0, incurred: 0 }
   const nets = data?.nets ?? { received: 0, charged: 0 }
   return (
@@ -84,7 +98,17 @@ export function LedgerProfitLossView({ data, startDate, endDate, setStartDate, s
       </div>
 
       <div className="card" style={{ marginBottom: 12 }}>
-        <div className="ct">Income</div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+          <div className="ct">Income</div>
+          {details.length > 0 && (
+            <div role="group" aria-label="Income view" style={{ display: 'inline-flex', gap: 4 }}>
+              {INCOME_REPORT_VIEWS.map(v => (
+                <button key={v} type="button" aria-pressed={mode === v} onClick={() => setMode(v)}
+                  className={mode === v ? 'btn bp bsm' : 'btn bg-btn bsm'}>{INCOME_REPORT_VIEW_LABEL[v]}</button>
+              ))}
+            </div>
+          )}
+        </div>
         <MoneyThreeTable rows={rows} totalLabel="Total income" total={{ received: view.received, charged: view.charged, owed: view.owed }} />
         <MoneyTieLines lines={view.tieText} />
         {(view.beside ?? []).length > 0 && (

@@ -208,7 +208,7 @@ describe('extra work-trade hours paid by hand, then the expense removed', () => 
       [agreementId, co.landlordId, tenantId, co.ownerUserId])).rows[0].id
     const tok = sign({ userId: co.ownerUserId, role: 'landlord', email: 'o@t.dev', profileId: null, landlordIds: [co.landlordId], permissions: {} })
 
-    const paid = await request(app).post(`/api/work-trade/extra-hours/${x}/mark-paid`).set(bearer(tok)).send({ paidOn: '2026-10-05', paidHow: 'check' })
+    const paid = await request(app).post(`/api/work-trade/extra-hours/${x}/mark-paid`).set(bearer(tok)).send({ paidOn: '2026-10-05', paidHow: 'check', costPlace: 'property', propertyId: co.propertyId })
     expect(paid.status, JSON.stringify(paid.body)).toBe(200)
     const expenseId = paid.body.data.books_reference_id
     expect((await request(app).post(`/api/expenses/${expenseId}/void`).set(bearer(tok)).send({})).status).toBe(200)
@@ -218,13 +218,12 @@ describe('extra work-trade hours paid by hand, then the expense removed', () => 
     expect((await db.query(`SELECT work_trade_extra_hours_id FROM landlord_expenses WHERE id = $1`, [expenseId])).rows[0].work_trade_extra_hours_id).toBe(x)
 
     const emp = (await db.query<{ id: string }>(
-      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, filing_status, state_withholding_pct, status)
-       VALUES ($1, 'Wanda', 'Worker', 'salary', 26000, 'biweekly', 'single', 0, 'active') RETURNING id`, [co.landlordId])).rows[0].id
+      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, filing_status, state_withholding_pct, status,
+                                    pay_place, pay_property_id)
+       VALUES ($1, 'Wanda', 'Worker', 'salary', 26000, 'biweekly', 'single', 0, 'active', 'property', $2) RETURNING id`, [co.landlordId, co.propertyId])).rows[0].id
     const run = await request(app).post('/api/books/payroll/runs').set(bearer(tok)).send({
       periodStart: '2026-10-01', periodEnd: '2026-10-14', payDate: '2026-10-20', payFrequency: 'biweekly',
       employeeIds: [], extraHours: [{ id: x, employeeId: emp }],
-      // 10/13 (Nic): where the run's wages go, picked when it is logged.
-      costPlace: 'property', propertyId: co.propertyId,
     })
     expect(run.status, JSON.stringify(run.body)).toBe(201)
     const ok = await request(app).post(`/api/books/payroll/runs/${run.body.data.id}/approve`).set(bearer(tok)).send({})

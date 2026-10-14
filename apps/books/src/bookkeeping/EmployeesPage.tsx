@@ -11,10 +11,54 @@ import { useQuery, useQueryClient } from 'react-query'
 import {
   formatCurrency, humanize, BOOKS_PAY_TYPES, BOOKS_PAY_TYPE_LABEL, BOOKS_PAY_FREQUENCIES, BOOKS_PAY_FREQUENCY_LABEL,
   BOOKS_PAY_PERIODS_PER_YEAR, BOOKS_EMPLOYEE_FILING_STATUSES, BOOKS_EMPLOYEE_FILING_STATUS_LABEL, booksDefaultHours,
-  type BooksPayFrequency,
+  BOOKS_EMPLOYEE_PAY_PLACES, BOOKS_EMPLOYEE_PAY_PLACE_LABEL,
+  type BooksPayFrequency, type BooksEmployeePayPlace,
 } from '@gam/shared'
 import { booksGet as get, booksPost as post, booksPatch as patch } from './adapter'
 import { Modal } from './common'
+import { useCostPlaces, type CostPlaceProperty } from './CostPlaceField'
+
+// ── WHERE AN EMPLOYEE'S PAY GOES ──────────────────────────────────────
+// 10/14 (Nic): "an employee at one property goes to that property ... once you
+// set it it shouldnt change. if they work at multiple properties it would be
+// at the company level." Asked once, on the employee: each paycheck follows
+// it, and Run Payroll no longer asks. Nothing is chosen for the person; once
+// saved it is shown, not changed (the API refuses a change too). A business's
+// books have no properties, so nothing is asked of a business.
+type PayPlaceValue={payPlace:BooksEmployeePayPlace|'';payPropertyId:string}
+const BLANK_PAY_PLACE:PayPlaceValue={payPlace:'',payPropertyId:''}
+const payPlaceChosen=(v:PayPlaceValue)=>v.payPlace==='company'||(v.payPlace==='property'&&!!v.payPropertyId)
+const PAY_PLACE_HELP:Record<BooksEmployeePayPlace,string>={
+  property:'They work at one property: their pay goes to it.',
+  company:'They work at several properties: their pay goes to the company.',
+}
+/** Where an employee's pay goes, in words, for the list. */
+export function payPlaceText(emp:{payPlace?:string|null;payPropertyName?:string|null}):string{
+  if(emp.payPlace==='company')return 'Company level'
+  if(emp.payPlace==='property')return emp.payPropertyName||BOOKS_EMPLOYEE_PAY_PLACE_LABEL.property
+  return ''
+}
+function PayPlaceField({value,onChange,properties,name='payPlace'}:{value:PayPlaceValue;onChange:(v:PayPlaceValue)=>void;properties:CostPlaceProperty[];name?:string}){
+  return(
+    <div className="frow">
+      <label>Where their pay goes (set once)</label>
+      {BOOKS_EMPLOYEE_PAY_PLACES.map(p=>(
+        <label key={p} style={{display:'flex',gap:8,alignItems:'flex-start',textTransform:'none',letterSpacing:0,fontWeight:400,fontSize:'.8rem',color:'var(--t1)',marginBottom:6,cursor:'pointer'}}>
+          <input type="radio" name={name} value={p} checked={value.payPlace===p} onChange={()=>onChange({payPlace:p,payPropertyId:p==='property'?value.payPropertyId:''})}
+            style={{width:'auto',marginTop:3,accentColor:'var(--gold)'}}/>
+          <span><span style={{fontWeight:600,color:'var(--t0)'}}>{BOOKS_EMPLOYEE_PAY_PLACE_LABEL[p]}</span>
+            <span style={{display:'block',fontSize:'.72rem',color:'var(--t3)'}}>{PAY_PLACE_HELP[p]}</span></span>
+        </label>
+      ))}
+      {value.payPlace==='property'&&(
+        <select value={value.payPropertyId} required onChange={e=>onChange({...value,payPropertyId:e.target.value})}>
+          <option value="">Choose the property</option>
+          {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      )}
+    </div>
+  )
+}
 
 // ── EMPLOYEES ─────────────────────────────────────────────────────────
 // 10/11: Add Employee could not save — it had no address box (the API
@@ -30,6 +74,13 @@ export function EmployeesPage(){
   const[saving,setSaving]=useState(false)
   const initForm={firstName:'',lastName:'',email:'',phone:'',address:'',title:'',department:'',payType:'salary',payRate:'',payFrequency:'biweekly',filingStatus:'single',federalAllowances:'0',stateWithholdingPct:'0',startDate:'',ssnLast4:''}
   const[form,setForm]=useState(initForm)
+  // 10/14 (Nic): where the new employee's pay goes — nothing chosen until the person chooses.
+  const[place,setPlace]=useState<PayPlaceValue>(BLANK_PAY_PLACE)
+  const{properties,asked}=useCostPlaces()
+  // An employee with no place yet (added before 10/14): set once, here.
+  const[placing,setPlacing]=useState<any|null>(null)
+  const[placingValue,setPlacingValue]=useState<PayPlaceValue>(BLANK_PAY_PLACE)
+  const[placeErr,setPlaceErr]=useState('')
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
   const activeEmp=(employees as any[]).filter((e:any)=>e.status==='active')
@@ -46,10 +97,22 @@ export function EmployeesPage(){
   const addEmp=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
     try{
-      await post('/books/employees',{...form,payRate:+form.payRate,federalAllowances:+form.federalAllowances,stateWithholdingPct:+form.stateWithholdingPct})
+      await post('/books/employees',{...form,payRate:+form.payRate,federalAllowances:+form.federalAllowances,stateWithholdingPct:+form.stateWithholdingPct,
+        ...(asked?{payPlace:place.payPlace||null,payPropertyId:place.payPlace==='property'?place.payPropertyId||null:null}:{})})
       qc.invalidateQueries('emp')
-      setShowAdd(false);setForm(initForm)
+      setShowAdd(false);setForm(initForm);setPlace(BLANK_PAY_PLACE)
     }catch(ex:any){setErr(ex.response?.data?.error||'Failed to save')}
+    finally{setSaving(false)}
+  }
+
+  const savePlace=async()=>{
+    if(!placing)return
+    setSaving(true);setPlaceErr('')
+    try{
+      await patch(`/books/employees/${placing.id}`,{payPlace:placingValue.payPlace||null,payPropertyId:placingValue.payPlace==='property'?placingValue.payPropertyId||null:null})
+      qc.invalidateQueries('emp')
+      setPlacing(null);setPlacingValue(BLANK_PAY_PLACE)
+    }catch(ex:any){setPlaceErr(ex.response?.data?.error||'Failed to save')}
     finally{setSaving(false)}
   }
 
@@ -75,7 +138,7 @@ export function EmployeesPage(){
       <div className="card" style={{padding:0}}>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
           <table className="tbl">
-            <thead><tr><th>Employee</th><th>Title</th><th>Pay Type</th><th>Rate</th><th>Frequency</th><th>Per Check</th><th>YTD Gross{ytdYear?` (${ytdYear})`:''}</th><th>Status</th><th></th></tr></thead>
+            <thead><tr><th>Employee</th><th>Title</th><th>Pay Type</th><th>Rate</th><th>Frequency</th><th>Per Check</th><th>YTD Gross{ytdYear?` (${ytdYear})`:''}</th>{asked&&<th>Pay Goes To</th>}<th>Status</th><th></th></tr></thead>
             <tbody>
               {(employees as any[]).length?(employees as any[]).map((emp:any)=>(
                 <tr key={emp.id}>
@@ -86,10 +149,13 @@ export function EmployeesPage(){
                   <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{(BOOKS_PAY_FREQUENCY_LABEL as Record<string,string>)[emp.payFrequency]??humanize(emp.payFrequency)}</td>
                   <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(calcPaycheck(+emp.payRate,emp.payFrequency,emp.payType))}</td>
                   <td className="mono">{formatCurrency(emp.ytdGross)}</td>
+                  {asked&&<td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.payPlace?payPlaceText(emp):(
+                    <button className="btn bp bsm" onClick={()=>{setPlacing(emp);setPlacingValue(BLANK_PAY_PLACE);setPlaceErr('')}}>Set where pay goes</button>
+                  )}</td>}
                   <td><span className={`badge ${emp.status==='active'?'bg2':'bmu'}`}>{humanize(emp.status)}</span></td>
                   <td><button className={emp.status==='active'?'btn bd bsm':'btn bp bsm'} onClick={()=>toggleStatus(emp.id,emp.status)}>{emp.status==='active'?'Deactivate':'Activate'}</button></td>
                 </tr>
-              )):<tr><td colSpan={9}><div className="empty">No employees yet. Add your first W-2 employee.</div></td></tr>}
+              )):<tr><td colSpan={asked?10:9}><div className="empty">No employees yet. Add your first W-2 employee.</div></td></tr>}
             </tbody>
           </table>
         )}
@@ -139,11 +205,24 @@ export function EmployeesPage(){
               <div><label>Start Date</label><input type="date" value={form.startDate} onChange={f('startDate')} required/></div>
             </div>
             <div className="frow"><label>SSN Last 4</label><input type="text" inputMode="numeric" pattern="\d{4}" maxLength={4} value={form.ssnLast4} onChange={f('ssnLast4')} placeholder="For the W-2" required/></div>
+            {asked&&<PayPlaceField value={place} onChange={setPlace} properties={properties}/>}
             <div className="factions">
               <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Employee'}</button>
+              <button type="submit" className="btn bp" disabled={saving||(asked&&!payPlaceChosen(place))}>{saving?<><span className="spinner"/>Saving…</>:'Add Employee'}</button>
             </div>
           </form>
+        </Modal>
+      )}
+
+      {placing&&(
+        <Modal title={`Where ${placing.firstName} ${placing.lastName}'s pay goes`} onClose={()=>setPlacing(null)}>
+          {placeErr&&<div className="alert ae">{placeErr}</div>}
+          <p style={{fontSize:'.78rem',color:'var(--t2)',marginBottom:10}}>Each paycheck goes here. Once set, it does not change.</p>
+          <PayPlaceField value={placingValue} onChange={setPlacingValue} properties={properties} name="payPlaceSet"/>
+          <div className="factions">
+            <button type="button" className="btn bg-btn" onClick={()=>setPlacing(null)}>Cancel</button>
+            <button type="button" className="btn bp" disabled={saving||!payPlaceChosen(placingValue)} onClick={savePlace}>{saving?<><span className="spinner"/>Saving…</>:'Save'}</button>
+          </div>
         </Modal>
       )}
     </div>

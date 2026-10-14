@@ -3,6 +3,7 @@
 // Pure-DB paths (no Stripe): the Stripe boundary is only createLinkSession /
 // finalize / syncConnection's pull, which are exercised in the route/integration
 // layer; here we drive upsertTransactions directly with normalized rows.
+import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 // S655 (Step 12): a disconnect asks Stripe whether a link can be debited and
@@ -50,8 +51,8 @@ import {
 } from '../test/dbHelpers'
 import {
   upsertTransactions, autoMatchLandlord, categorizeTransaction, ignoreTransaction,
-  suggestForMerchant, normalizeMerchant, listTransactions, setBooksStartDate, autoSettleDeclaredDeposits,
-  undoAutoFile, disconnectConnection, reconcileDeposits, namesAPayer,
+  suggestForMerchant, normalizeMerchant, listTransactions, setBooksStartDate,
+  undoAutoFile, disconnectConnection, reconcileDeposits, namesAPayer, memoNamesGam, matchPayoutByHand,
 } from './bankFeed'
 import { landlordExpensesTotal, unitAllocatedExpenses, createLandlordExpense } from './landlordExpenses'
 import { memoSaysTransfer, isTenantCheckMemo, NOT_CUSTOMER_MONEY_WORDS, BANK_BOILERPLATE_WORDS } from './bankDepositMatch'
@@ -143,11 +144,62 @@ describe('bank feed sync', () => {
     const f = await seed()
     await seedDisbursement(f.landlordId, 800, '2026-08-09')
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'in_a', postedDate: '2026-08-10', amount: 800, description: 'PAYOUT' },
-      { externalId: 'in_b', postedDate: '2026-08-11', amount: 800, description: 'PAYOUT' },
+      { externalId: 'in_a', postedDate: '2026-08-10', amount: 800, description: 'Instant Pmt from STP FBO Gold Asset Management' },
+      { externalId: 'in_b', postedDate: '2026-08-11', amount: 800, description: 'Instant Pmt from STP FBO Gold Asset Management' },
     ])
     const matched = await db.query(`SELECT count(*)::int AS n FROM bank_transactions WHERE landlord_id=$1 AND status='matched'`, [f.landlordId])
     expect(matched.rows[0].n).toBe(1)
+  })
+
+  // 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from
+  // it can file it but no guessing." Production's memos: GAM's instant payouts
+  // name GAM; a Stripe ACH payout names the landlord ("ST-… TRANSFER OAK PARK
+  // MOTEL A"), just as DoorLoop's Stripe payouts do ("ST-… DOORLOOP").
+  it('a payout files itself only when the memo names GAM; one that does not waits with the payout offered to a person', async () => {
+    expect(memoNamesGam('Instant Pmt from STP FBO Gold Asset Management -Gold Asset Management LLC on 10/08 Ref#202')).toBe(true)
+    expect(memoNamesGam('Instant Pmt from STP FBO Gold Asset M MOUNTAIN')).toBe(true)
+    expect(memoNamesGam('ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH')).toBe(false)
+    expect(memoNamesGam('ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH')).toBe(false)
+    expect(memoNamesGam('BRANCH DEPOSIT')).toBe(false)
+
+    const f = await seed()
+    const payout = await seedDisbursement(f.landlordId, 400.26, '2026-10-05T18:00:00Z')
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      // The same amount as the payout, a day later — but nothing in the memo says it is GAM's.
+      { externalId: 'ach', postedDate: '2026-10-06', amount: 400.26, description: 'ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A CORPORATE ACH' },
+    ])
+    const ach = await row('ach')
+    expect(ach.status).toBe('needs_review')
+    expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+    const listed = (await listTransactions(f.landlordId, { lineId: ach.id }))[0]
+    expect(listed.payout_suggestion).toEqual({ id: payout, amount: 400.26, sentOn: '2026-10-05' })
+
+    // The person says it is: matched, kept as theirs, and undone like any filing.
+    await expect(matchPayoutByHand(f.landlordId, ach.id, randomUUID(), f.llUser)).rejects.toThrow(/doesn’t fit this deposit/)
+    await matchPayoutByHand(f.landlordId, ach.id, payout, f.llUser)
+    const after = (await listTransactions(f.landlordId, { lineId: ach.id }))[0]
+    expect(after).toMatchObject({ status: 'matched', match_kind: 'gam_payout', can_undo: true, payout_suggestion: null })
+    const { undoDepositMatch } = await import('./bankDepositConfirm')
+    expect(await undoDepositMatch({ bankTransactionId: ach.id, landlordId: f.landlordId, undoneBy: f.llUser }))
+      .toMatchObject({ kind: 'gam_payout' })
+    expect(await row('ach')).toMatchObject({ status: 'needs_review' })
+    // Never matched by itself again, and the payout is offered again.
+    expect(await autoMatchLandlord(f.landlordId)).toBe(0)
+    expect((await listTransactions(f.landlordId, { lineId: ach.id }))[0].payout_suggestion).toMatchObject({ id: payout })
+  })
+
+  it('a payout GAM matched by itself (its memo names GAM) cannot be undone — nothing to undo', async () => {
+    const f = await seed()
+    await seedDisbursement(f.landlordId, 1612.89, '2026-10-05T18:00:00Z')
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'inst', postedDate: '2026-10-05', amount: 1612.89, description: 'Instant Pmt from STP FBO Gold Asset Management -Gold Asset Management LLC' },
+    ])
+    const inst = await row('inst')
+    expect(inst.status).toBe('matched')
+    expect((await listTransactions(f.landlordId, { lineId: inst.id }))[0]).toMatchObject({ can_undo: false })
+    const { undoDepositMatch } = await import('./bankDepositConfirm')
+    await expect(undoDepositMatch({ bankTransactionId: inst.id, landlordId: f.landlordId, undoneBy: f.llUser }))
+      .rejects.toThrow(/payout GAM sent you/)
   })
 
   // S654: the sibling key read posted_date as a JS Date ('Wed Sep 30 …'), so it
@@ -618,20 +670,23 @@ describe('a deposit still pending at the bank', () => {
   it('is not matched to a GAM payout until the bank posts it', async () => {
     const f = await seed()
     await seedDisbursement(f.landlordId, 1200, '2026-09-09T18:00:00Z')
-    await legacyDeposit(f, 'gam_p', 1200, '2026-09-10', 'GAM PAYOUT')
+    await legacyDeposit(f, 'gam_p', 1200, '2026-09-10', 'Instant Pmt from STP FBO Gold Asset Management')
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'gam_p', postedDate: '2026-09-10', amount: 1200, description: 'GAM PAYOUT', status: 'pending' },
+      { externalId: 'gam_p', postedDate: '2026-09-10', amount: 1200, description: 'Instant Pmt from STP FBO Gold Asset Management', status: 'pending' },
     ])
     expect(await row('gam_p')).toMatchObject({ status: 'needs_review', bank_status: 'pending' })
     expect(await autoMatchLandlord(f.landlordId)).toBe(0)
 
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'gam_p', postedDate: '2026-09-10', amount: 1200, description: 'GAM PAYOUT', status: 'posted' },
+      { externalId: 'gam_p', postedDate: '2026-09-10', amount: 1200, description: 'Instant Pmt from STP FBO Gold Asset Management', status: 'posted' },
     ])
     expect(await row('gam_p')).toMatchObject({ status: 'matched', bank_status: 'posted' })
   })
 
-  it('does not settle a tenant’s reported rent until the bank posts it', async () => {
+  // 10/14 (Nic, answer 16): a tenant's report never settles rent by itself —
+  // not while the bank shows the deposit pending, nor once it posts; it is
+  // picked on the deposit review for the person to confirm.
+  it('never settles a tenant’s reported rent by itself, pending or posted', async () => {
     const f = await seed()
     const today = (await db.query(`SELECT CURRENT_DATE::text AS d`)).rows[0].d as string
     const c = await db.connect()
@@ -654,15 +709,15 @@ describe('a deposit still pending at the bank', () => {
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'cash_p', postedDate: today, amount: 250, description: 'ATM CASH DEPOSIT', status: 'pending' },
     ])
-    expect(await autoSettleDeclaredDeposits(f.landlordId)).toBe(0)
+    await reconcileDeposits(f.landlordId)
     expect(await rentStatus()).toBe('pending')
     expect((await row('cash_p')).status).toBe('needs_review')
 
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'cash_p', postedDate: today, amount: 250, description: 'ATM CASH DEPOSIT', status: 'posted' },
     ])
-    expect(await rentStatus()).toBe('settled')
-    expect((await row('cash_p')).status).toBe('matched')
+    expect(await rentStatus()).toBe('pending')
+    expect((await row('cash_p')).status).toBe('needs_review')
   })
 })
 
@@ -949,8 +1004,11 @@ describe('an auto-match never overwrites a row someone acted on while it ran', (
       const tenantId = await seedTenant(c)
       paymentId = await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 800 })
     } finally { c.release() }
+    // 10/14 (Nic, answer 16): a "TELLER DEPOSIT" is never even a payout
+    // candidate any more (its memo does not name GAM); the race is still
+    // possible on a line whose memo does, which a person confirms as a tenant's.
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'race_cash', postedDate: '2026-09-10', amount: 800, description: 'TELLER DEPOSIT' },
+      { externalId: 'race_cash', postedDate: '2026-09-10', amount: 800, description: 'GOLD ASSET MGMT TELLER' },
     ])
     const disb = await seedDisbursement(f.landlordId, 800, '2026-09-09')
     const id = (await row('race_cash')).id
@@ -1211,7 +1269,7 @@ describe('decisions #48.1: a transfer between accounts', () => {
     await deskCash(office, 250, today)
     await upsertTransactions(office.connectionId, office.landlordId, [
       { externalId: 'xfer_cash', postedDate: today, amount: 250, description: TRANSFER_MEMO }])
-    expect(await reconcileDeposits(office.landlordId)).toMatchObject({ slips: 0, inferred: 0, autoSettled: 0, autoFiled: 0 })
+    expect(await reconcileDeposits(office.landlordId)).toMatchObject({ slips: 0, recorded: 0 })
     expect((await row('xfer_cash')).status).toBe('needs_review')
     expect((await db.query(`SELECT COUNT(*)::int AS n FROM bank_deposit_slips WHERE landlord_id = $1`, [office.landlordId])).rows[0].n).toBe(0)
     // One tenant's whole bill equals the transfer: never paid on amount alone.
@@ -1221,7 +1279,7 @@ describe('decisions #48.1: a transfer between accounts', () => {
     const rentId = await openBill(bill)
     await upsertTransactions(bill.connectionId, bill.landlordId, [
       { externalId: 'xfer_bill', postedDate: today, amount: 250, description: TRANSFER_MEMO }])
-    expect(await reconcileDeposits(bill.landlordId)).toMatchObject({ slips: 0, inferred: 0, declared: 0, autoSettled: 0, autoFiled: 0 })
+    expect(await reconcileDeposits(bill.landlordId)).toMatchObject({ slips: 0, recorded: 0 })
     expect((await row('xfer_bill')).status).toBe('needs_review')
     expect(await status('payments', rentId)).toBe('pending')
     // It still names nobody (never a payer to file income from), and it is no tenant's check.
@@ -1247,120 +1305,67 @@ describe('decisions #48.1: a transfer between accounts', () => {
   })
 })
 
-describe('Step 12: money GAM never handled files itself after the first', () => {
+// 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from it
+// can file it but no guessing." A payer the landlord filed before (S655 Step
+// 12 had its next deposit file itself) is a familiar name — a guess. The line
+// waits on the Bank page with that category suggested and the place it went
+// last time offered as a suggestion, never filled in. Lines that filed
+// themselves before 10/14 keep their Undo.
+describe('10/14: money in from a payer filed before waits for a person', () => {
   async function fileFirst(f: any, externalId: string, description: string, amount: number, postedDate = '2026-09-10') {
     await upsertTransactions(f.connectionId, f.landlordId, [{ externalId, postedDate, amount, description }])
     const r = await row(externalId)
     return categorizeTransaction(f.landlordId, r.id, { category: 'other', scopeKind: 'property_common', propertyId: f.propertyId })
   }
   const ruleFor = async (f: any, merchant: string) => (await db.query(
-    `SELECT last_direction, auto_file_income FROM landlord_merchant_rules WHERE landlord_id=$1 AND normalized_merchant=$2`,
+    `SELECT id, last_direction, auto_file_income FROM landlord_merchant_rules WHERE landlord_id=$1 AND normalized_merchant=$2`,
     [f.landlordId, merchant])).rows[0]
+  /** A deposit that filed itself before 10/14, as it sits on file. */
+  async function filedItselfBefore(f: any, externalId: string, description: string, amount: number, postedDate: string) {
+    await fileFirst(f, externalId, description, amount, postedDate)
+    const id = (await row(externalId)).id
+    const rule = await ruleFor(f, normalizeMerchant(description))
+    await db.query(`UPDATE bank_transactions SET auto_filed_rule_id = $2, auto_filed_at = now() WHERE id = $1`, [id, rule.id])
+    return id as string
+  }
+  const incomeCount = async (f: any) =>
+    (await db.query(`SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id=$1 AND status='active'`, [f.landlordId])).rows[0].n
 
-  it('the second deposit from a filed payer files itself, labeled', async () => {
+  it('the second deposit from a filed payer waits: its category suggested, the place offered, nothing filed', async () => {
     const f = await seed()
     await fileFirst(f, 'sq1', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
-    expect(await ruleFor(f, 'SQUARE INC')).toEqual({ last_direction: 'in', auto_file_income: true })
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'sq2', postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' },
     ])
-    const r = (await db.query(
-      `SELECT id, status, auto_filed_rule_id, auto_filed_at, landlord_other_income_id FROM bank_transactions WHERE external_id='sq2'`)).rows[0]
-    expect(r.status).toBe('categorized')
-    expect(r.auto_filed_rule_id).toBeTruthy()
-    expect(r.auto_filed_at).toBeTruthy()
-    const inc = (await db.query(`SELECT amount::float AS amount, category, property_id, income_date::text AS d FROM landlord_other_income WHERE id=$1`,
-      [r.landlord_other_income_id])).rows[0]
-    expect(inc).toEqual({ amount: 251.05, category: 'other', property_id: f.propertyId, d: '2026-09-21' })
+    const r = await row('sq2')
+    expect(r.status).toBe('needs_review')
+    expect(await incomeCount(f)).toBe(1)
     const listed = (await listTransactions(f.landlordId)).find((t: any) => t.id === r.id)
-    expect(listed.match_kind).toBe('auto_filed')
+    expect(listed).toMatchObject({
+      match_kind: null, suggested_category: 'other', suggested_scope_kind: 'property_common', suggested_property_id: f.propertyId,
+    })
+    // The person confirms it.
+    await categorizeTransaction(f.landlordId, r.id, { category: 'other', scopeKind: 'property_common', propertyId: f.propertyId })
+    expect((await row('sq2')).status).toBe('categorized')
   })
 
-  // 10/13 (Nic, afternoon): "Bank void of a deposit filed as other income →
-  // VOID the income record too" — a deposit that filed itself included.
-  it('a deposit that filed itself as income, then voided by the bank: its income is voided (kept) and the line set aside', async () => {
+  it('a deposit equal to an open bill, and one that is not, both wait', async () => {
     const f = await seed()
-    await fileFirst(f, 'sqv1', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
-    const sq = { postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' }
-    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'sqv2', ...sq }])
-    const r = (await db.query(
-      `SELECT id, status, auto_filed_rule_id, landlord_other_income_id FROM bank_transactions WHERE external_id='sqv2'`)).rows[0]
-    expect(r.status).toBe('categorized')
-    expect(r.auto_filed_rule_id).toBeTruthy()
-    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'sqv2', ...sq, status: 'void' }])
-    const inc = (await db.query(`SELECT status, voided_at IS NOT NULL AS voided, bank_transaction_id FROM landlord_other_income WHERE id=$1`,
-      [r.landlord_other_income_id])).rows[0]
-    expect(inc).toEqual({ status: 'voided', voided: true, bank_transaction_id: r.id })
-    const after = (await db.query(
-      `SELECT status, ignored_reason, bank_status, landlord_other_income_id, auto_filed_rule_id, auto_filed_at, auto_settle_undo
-         FROM bank_transactions WHERE id=$1`, [r.id])).rows[0]
-    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void',
-      landlord_other_income_id: null, auto_filed_rule_id: null, auto_filed_at: null })
-    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({
-      was: 'auto_filed', incomeIds: [r.landlord_other_income_id], ruleId: r.auto_filed_rule_id })
-    // The payer still files itself: the bank's void says nothing about them.
-    expect((await ruleFor(f, 'SQUARE INC')).auto_file_income).toBe(true)
-    // 10/13 review: the owner never filed it — the feed did — and the notice says so.
-    const owner = (await db.query(`SELECT user_id FROM landlords WHERE id=$1`, [f.landlordId])).rows[0].user_id
-    const told = (await db.query(`SELECT title, body FROM notifications WHERE user_id=$1 AND type='bank_line_voided'`, [owner])).rows
-    expect(told.map((n: any) => n.title)).toEqual(['Your bank voided a deposit that was filed as income by itself'])
-    expect(told[0].body).toContain('The income it was filed as by itself, like the last deposit from that payer, was voided too')
-    expect(told[0].body).not.toContain('you filed')
-  })
-
-  it('DoorLoop is never auto-filed', async () => {
-    const f = await seed()
-    await fileFirst(f, 'dl1', 'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH', 904.7)
-    expect((await ruleFor(f, 'DOORLOOP CORPORATE')).last_direction).toBeNull()
-    // Even a rule someone set to "in" by hand never files a rent channel.
-    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'dl2', postedDate: '2026-09-15', amount: 590.91, description: 'ST-X4O0K9S9Y9T4 DOORLOOP CORPORATE ACH' },
-    ])
-    expect((await row('dl2')).status).toBe('needs_review')
-  })
-
-  it('a transfer from savings filed once as income never files itself again', async () => {
-    const f = await seed()
-    await fileFirst(f, 'xs1', 'XFER FROM SAVINGS 1234', 500)
-    const merchant = normalizeMerchant('XFER FROM SAVINGS 1234')
-    expect(namesAPayer(merchant)).toBe(true)
-    expect((await ruleFor(f, merchant)).last_direction).toBeNull()
-    // Even a rule someone set to "in" by hand never files a transfer.
-    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'xs2', postedDate: '2026-09-15', amount: 750, description: 'XFER FROM SAVINGS 1234' },
-    ])
-    expect((await row('xs2')).status).toBe('needs_review')
-    expect((await db.query(`SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id=$1`, [f.landlordId])).rows[0].n).toBe(1)
-  })
-
-  it('a payer once matched to rent is never auto-filed', async () => {
-    const f = await seed()
-    await fileFirst(f, 'jd1', 'ZELLE FROM JOHN DOE', 120)
-    expect((await ruleFor(f, 'ZELLE FROM JOHN DOE')).last_direction).toBe('in')
-    // Later, a deposit from the same payer was matched to a tenant's rent.
+    await fileFirst(f, 'cm1', 'COINMACH LAUNDRY', 210)
     const c = await db.connect()
-    let rentId: string
     try {
       const tenantId = await seedTenant(c)
-      rentId = await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 777 })
+      await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 250, status: 'pending' })
     } finally { c.release() }
-    await db.query(
-      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description,
-                                      normalized_merchant, status, matched_payment_id)
-       VALUES ($1,$2,'jd_rent','2026-09-12',777,'ZELLE FROM JOHN DOE','ZELLE FROM JOHN DOE','matched',$3)`,
-      [f.connectionId, f.landlordId, rentId])
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'jd2', postedDate: '2026-09-20', amount: 130, description: 'ZELLE FROM JOHN DOE' },
+      { externalId: 'cm2', postedDate: '2026-09-20', amount: 250, description: 'COINMACH LAUNDRY' },
+      { externalId: 'cm3', postedDate: '2026-09-27', amount: 199.5, description: 'COINMACH LAUNDRY' },
     ])
-    expect((await row('jd2')).status).toBe('needs_review')
-    // And filing it by hand now leaves the payer with no direction.
-    await categorizeTransaction(f.landlordId, (await row('jd2')).id, { category: 'other', scopeKind: 'property_common', propertyId: f.propertyId })
-    expect((await ruleFor(f, 'ZELLE FROM JOHN DOE')).last_direction).toBeNull()
+    expect((await row('cm2')).status).toBe('needs_review')
+    expect((await row('cm3')).status).toBe('needs_review')
   })
 
-  it('money out is never auto-filed', async () => {
+  it('money out is never filed by itself either', async () => {
     const f = await seed()
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'hd_out', postedDate: '2026-09-10', amount: -50, description: 'HOME DEPOT #12 AZ' },
@@ -1375,91 +1380,54 @@ describe('Step 12: money GAM never handled files itself after the first', () => 
     expect((await row('hd_refund')).status).toBe('needs_review')
   })
 
-  it('a deposit equal to an open bill is never auto-filed', async () => {
+  it('a rent channel, a transfer, or a memo that names nobody is remembered with no direction', async () => {
     const f = await seed()
-    await fileFirst(f, 'cm1', 'COINMACH LAUNDRY', 210)
-    const c = await db.connect()
-    try {
-      const tenantId = await seedTenant(c)
-      await seedRentPayment(c, { unitId: f.unitA, tenantId, landlordId: f.landlordId, amount: 250, status: 'pending' })
-    } finally { c.release() }
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'cm2', postedDate: '2026-09-20', amount: 250, description: 'COINMACH LAUNDRY' },
-      { externalId: 'cm3', postedDate: '2026-09-27', amount: 199.5, description: 'COINMACH LAUNDRY' },
-    ])
-    expect((await row('cm2')).status).toBe('needs_review')     // the same as an open bill: may be rent
-    expect((await row('cm3')).status).toBe('categorized')
-  })
-
-  it('a deposit whose memo names nobody never teaches GAM a payer', async () => {
-    const f = await seed()
+    await fileFirst(f, 'dl1', 'ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH', 904.7)
+    expect((await ruleFor(f, 'DOORLOOP CORPORATE')).last_direction).toBeNull()
+    await fileFirst(f, 'xs1', 'XFER FROM SAVINGS 1234', 500)
+    expect((await ruleFor(f, normalizeMerchant('XFER FROM SAVINGS 1234'))).last_direction).toBeNull()
     await fileFirst(f, 'md1', 'MOBILE DEPOSIT', 60)
     expect((await ruleFor(f, 'MOBILE DEPOSIT')).last_direction).toBeNull()
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'md2', postedDate: '2026-09-20', amount: 65, description: 'MOBILE DEPOSIT' },
-    ])
-    expect((await row('md2')).status).toBe('needs_review')
-    // A Wells Fargo branch deposit filed as income (laundry, say) teaches nothing
-    // either: the next branch deposit may be the office's rent cash.
-    const wf = 'EDEPOSIT IN BRANCH 09/15/26 02:31:45 PM 123 W CONTINENTAL RD GREEN VALLEY AZ'
-    await fileFirst(f, 'wf1', wf, 41)
-    expect((await ruleFor(f, normalizeMerchant(wf))).last_direction).toBeNull()
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'wf2', postedDate: '2026-09-22', amount: 43, description: wf.replace('09/15/26', '09/22/26') },
-    ])
-    expect((await row('wf2')).status).toBe('needs_review')
+    const memo = 'MOBILE DEPOSIT REF NUMBER 812345678 RHOADES'
+    expect(normalizeMerchant(memo)).toBe('MOBILE DEPOSIT REF NUMBER')
+    expect(namesAPayer(normalizeMerchant(memo))).toBe(false)
   })
 
-  it('a mobile deposit’s REF NUMBER memo names no payer and never files itself as income', async () => {
-    // Step 12 fix round 2: "NUMBER" (like "REF") is the bank's word. Before,
-    // the payer key "MOBILE DEPOSIT REF NUMBER" read as a named payer, so one
-    // such deposit filed as income taught GAM to file the next one by itself —
-    // which could be the office's rent cash or a tenant's paid-ahead check.
+  // 10/13 (Nic, afternoon): "Bank void of a deposit filed as other income →
+  // VOID the income record too" — a deposit that filed itself before 10/14 included.
+  it('a deposit that filed itself before, then voided by the bank: its income is voided (kept) and the line set aside', async () => {
     const f = await seed()
-    const memo = (ref: string) => `MOBILE DEPOSIT REF NUMBER ${ref} RHOADES`
-    expect(normalizeMerchant(memo('812345678'))).toBe('MOBILE DEPOSIT REF NUMBER')
-    expect(namesAPayer(normalizeMerchant(memo('812345678')))).toBe(false)
-    await fileFirst(f, 'mr1', memo('812345678'), 60)
-    expect((await ruleFor(f, 'MOBILE DEPOSIT REF NUMBER')).last_direction).toBeNull()
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'mr2', postedDate: '2026-09-20', amount: 65, description: memo('812349999') },
-    ])
-    expect((await row('mr2')).status).toBe('needs_review')
-    // Even a rule someone set to "in" by hand never files a memo that names nobody.
-    await db.query(`UPDATE landlord_merchant_rules SET last_direction='in' WHERE landlord_id=$1`, [f.landlordId])
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'mr3', postedDate: '2026-09-22', amount: 70, description: memo('812350000') },
-    ])
-    expect((await row('mr3')).status).toBe('needs_review')
+    await fileFirst(f, 'sqv1', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
+    const sq = { postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' }
+    const id = await filedItselfBefore(f, 'sqv2', sq.description, sq.amount, sq.postedDate)
+    const r = (await db.query(`SELECT id, auto_filed_rule_id, landlord_other_income_id FROM bank_transactions WHERE id=$1`, [id])).rows[0]
+    await upsertTransactions(f.connectionId, f.landlordId, [{ externalId: 'sqv2', ...sq, status: 'void' }])
+    const inc = (await db.query(`SELECT status, voided_at IS NOT NULL AS voided, bank_transaction_id FROM landlord_other_income WHERE id=$1`,
+      [r.landlord_other_income_id])).rows[0]
+    expect(inc).toEqual({ status: 'voided', voided: true, bank_transaction_id: r.id })
+    const after = (await db.query(
+      `SELECT status, ignored_reason, bank_status, landlord_other_income_id, auto_filed_rule_id, auto_filed_at, auto_settle_undo
+         FROM bank_transactions WHERE id=$1`, [r.id])).rows[0]
+    expect(after).toMatchObject({ status: 'ignored', ignored_reason: 'bank_void', bank_status: 'void',
+      landlord_other_income_id: null, auto_filed_rule_id: null, auto_filed_at: null })
+    expect(after.auto_settle_undo.bankVoidedFiling).toMatchObject({
+      was: 'auto_filed', incomeIds: [r.landlord_other_income_id], ruleId: r.auto_filed_rule_id })
+    const owner = (await db.query(`SELECT user_id FROM landlords WHERE id=$1`, [f.landlordId])).rows[0].user_id
+    const told = (await db.query(`SELECT title, body FROM notifications WHERE user_id=$1 AND type='bank_line_voided'`, [owner])).rows
+    expect(told.map((n: any) => n.title)).toEqual(['Your bank voided a deposit that was filed as income by itself'])
+    expect(told[0].body).not.toContain('you filed')
   })
 
-  it('undo can stop auto-filing a payer', async () => {
+  it('a deposit that filed itself before can be undone, and waits from then on', async () => {
     const f = await seed()
     await fileFirst(f, 'sqa', 'Square Inc       SQ260910   260910 T3S9K91T5HR7', 72.13)
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'sqb', postedDate: '2026-09-21', amount: 251.05, description: 'Square Inc       SQ260921   260921 T3RS4VZNYDHF' },
-    ])
-    const b = (await db.query(`SELECT id, landlord_other_income_id FROM bank_transactions WHERE external_id='sqb'`)).rows[0]
-    // Undo alone: back to review, its income voided, and it never files itself again.
-    await undoAutoFile(f.landlordId, b.id, { undoneBy: f.llUser })
+    const id = await filedItselfBefore(f, 'sqb', 'Square Inc       SQ260921   260921 T3RS4VZNYDHF', 251.05, '2026-09-21')
+    const income = (await db.query(`SELECT landlord_other_income_id AS i FROM bank_transactions WHERE id=$1`, [id])).rows[0].i
+    expect(await undoAutoFile(f.landlordId, id, { undoneBy: f.llUser })).toEqual({ id })
     expect((await row('sqb')).status).toBe('needs_review')
-    expect((await db.query(`SELECT status FROM landlord_other_income WHERE id=$1`, [b.landlord_other_income_id])).rows[0].status).toBe('voided')
+    expect((await db.query(`SELECT status FROM landlord_other_income WHERE id=$1`, [income])).rows[0].status).toBe('voided')
     await reconcileDeposits(f.landlordId)
     expect((await row('sqb')).status).toBe('needs_review')
-    // The next Square deposit still files itself.
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'sqc', postedDate: '2026-09-23', amount: 24.13, description: 'Square Inc       SQ260923   260923 T3BD7AW9SENW' },
-    ])
-    const c = (await db.query(`SELECT id, status FROM bank_transactions WHERE external_id='sqc'`)).rows[0]
-    expect(c.status).toBe('categorized')
-    // Undo and stop: Square stops filing itself.
-    const stopped = await undoAutoFile(f.landlordId, c.id, { stopAutoFiling: true, undoneBy: f.llUser })
-    expect(stopped.stoppedForPayer).toBe('SQUARE INC')
-    expect((await ruleFor(f, 'SQUARE INC')).auto_file_income).toBe(false)
-    await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'sqd', postedDate: '2026-09-29', amount: 61.73, description: 'Square Inc       SQ260929   260929 T3QHTR8RAS82' },
-    ])
-    expect((await row('sqd')).status).toBe('needs_review')
     // A row the landlord filed by hand is not "filed by itself".
     await expect(undoAutoFile(f.landlordId, (await row('sqa')).id, { undoneBy: null })).rejects.toThrow(/was not filed by itself/)
   })

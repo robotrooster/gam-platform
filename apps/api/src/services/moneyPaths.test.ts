@@ -93,7 +93,7 @@ import { chargeLeaseBalance } from './rentCharge'
 import * as stripeConnect from './stripeConnect'
 import { createPaidAhead, createIssuedCredit, runWholeBillCheckAfterCommit } from './creditUse'
 import { confirmDepositMatch, undoDepositMatch } from './bankDepositConfirm'
-import { autoSettleByAmount } from './bankFeed'
+import { reconcileDeposits } from './bankFeed'
 import { checkMoneyInvariants } from '../scripts/oct3_money_invariants_check'
 
 // ─── harness ────────────────────────────────────────────────────────────────
@@ -560,20 +560,24 @@ describe('the bank', () => {
     await invariantsHold('bank match short')
   })
 
-  it('auto-settle by amount, then Undo: the whole bill to the cent settles by itself and Undo puts every row back', async () => {
+  // 10/14 (Nic, answer 16): "no guessing" — the whole bill to the cent no
+  // longer settles by itself; the person confirms it (the deposit review picks it).
+  it('the whole bill to the cent waits for a person; confirmed, then Undo: every row goes back', async () => {
     const h = await household()
     const rent = await bill(h, { amount: 460, due: '2026-09-01' })
     const water = await bill(h, { type: 'utility', amount: 12.34, due: '2026-09-01' })
     const txn = await bankRow(h, 472.34)
-    expect(await autoSettleByAmount(h.landlordId)).toBe(1)
+    await reconcileDeposits(h.landlordId)
+    expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['pending', 'pending'])
+    await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [rent, water], method: 'cash', confirmedByUserId: h.landlordUserId })
     expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['settled', 'settled'])
-    await invariantsHold('auto-settled')
+    await invariantsHold('confirmed')
 
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: h.landlordId, undoneBy: h.landlordUserId })
     expect(u).toBeTruthy()
     expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['pending', 'pending'])
     expect((await db.query(`SELECT status FROM bank_transactions WHERE id = $1`, [txn])).rows[0].status).toBe('needs_review')
-    await invariantsHold('auto-settle undone')
+    await invariantsHold('confirm undone')
   })
 })
 

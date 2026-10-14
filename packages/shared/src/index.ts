@@ -1931,14 +1931,16 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
         // 10/13 (review): creating alone never shortens a stay — that is an
         // edit (the booking PATCH) or an early check-out (routes/stayCheckOut),
         // so this hint names the check-out it also takes.
+        // 10/14 (Nic): "take payments" is either kind — "Record a cash / check
+        // payment" or "Ring sales".
         { key: 'schedule.create_reservation', label: 'Create reservations',
-          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it. With "Record a cash / check payment" and "Check guests out" too, they may take off rent a payment was tried on when a guest leaves early.' },
+          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it. With "Record a cash / check payment" or "Ring sales", and "Check guests out" too, they may take off rent a payment was tried on when a guest leaves early.' },
         { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations',
-          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. With "Record a cash / check payment" too, they may also take off rent a payment was tried on when a stay is shortened. Not checking guests in.' },
+          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. With "Record a cash / check payment" or "Ring sales" too, they may also take off rent a payment was tried on when a stay is shortened. Not checking guests in.' },
         { key: 'guests.check_in',             label: 'Check guests in',
           hint: 'Mark a guest as arrived on the schedule. Taking a closing meter read on the site first may also be needed.' },
         { key: 'guests.check_out',            label: 'Check guests out',
-          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding also needs "Issue refunds". Taking off rent a payment was tried on needs a reservation permission and "Record a cash / check payment".' },
+          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding also needs "Issue refunds". Taking off rent a payment was tried on needs a reservation permission and "Record a cash / check payment" or "Ring sales".' },
         { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)',
           hint: 'Set up a site: type, size, hookups, rent and nightly, weekly, and monthly rates, deposit, and whether guests can book it. Marking a site out of order stays owner-only.' },
         { key: 'guest_access',                label: 'Guest stay links',
@@ -7188,6 +7190,10 @@ export const CREDIT_SUPERSEDE_REASONS = [
   // "Nic Test"): "withdrawn: no bill" — the mark points at itself, stops
   // counting anywhere, and the record stays (scripts/oct12_rerate_late_marks).
   'withdrawn_no_bill',
+  // 10/14 (review of Nic's #8): the marks of a lease erased as never having
+  // come to be ("signed a lease", its bills' marks) — withdrawn the same way,
+  // record kept (apps/api lib/eraseUnfinishedDocument.eraseLeaseRows).
+  'withdrawn_no_lease',
 ] as const
 export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
 

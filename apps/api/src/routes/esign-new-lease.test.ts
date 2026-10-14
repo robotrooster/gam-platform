@@ -1199,7 +1199,8 @@ describe('the never-signed draft and the reminders', () => {
       [d.rows[0].id, isoToDocumentDate(opts.start)])
     return { docId: d.rows[0].id, leaseId }
   }
-  const docStatus = async (id: string) => (await db.query<any>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0].status
+  // 10/14 (Nic, #4): an automatic end deletes what no money touched — null = gone.
+  const docStatus = async (id: string) => (await db.query<any>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0]?.status ?? null
 
   it('a draft the landlord never signed lapses once its start date has passed — only the landlord hears, nothing changes', async () => {
     const park = await seedPark()
@@ -1207,14 +1208,32 @@ describe('the never-signed draft and the reminders', () => {
     const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
     const waiting = await seedDoc(await addHousehold(park), { issued: false, start: plusDays(10) })
     await processNewLeaseSignings({ hour: 12 })
-    expect(await docStatus(lapsed.docId)).toBe('voided')
+    // 10/14 (Nic, #4/#5): deleted (nothing billed from it), and the notice says it expired.
+    expect(await docStatus(lapsed.docId)).toBe(null)
     expect(await docStatus(waiting.docId)).toBe('sent')
     // The landlord side only (the signer and the account owner); the household
     // was never sent the draft.
     const to = mocks.draftLapsed.mock.calls.map(c => c[0])
     expect(to).toContain('ll@test.dev')
     expect(to).not.toContain(h.tenantEmail)
+    expect(mocks.draftLapsed.mock.calls.every((c: any[]) => c[3]?.deleted === true)).toBe(true)
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'active', end_date: null })
+  })
+
+  // 10/14 (Nic, #4): only what no money touched is deleted. A lapsed draft the
+  // erase's test keeps (a rent change from it already reached the bill) is
+  // canceled exactly as before, and the landlord hears the old words.
+  it('a lapsed draft the erase keeps is voided as before, and the notice keeps the canceled wording', async () => {
+    const park = await seedPark()
+    const h = await addHousehold(park)
+    const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
+    await db.query(
+      `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
+       VALUES ($1,'rent', CURRENT_DATE, 600, 'applied', $2)`, [h.leaseId, lapsed.docId])
+    await processNewLeaseSignings({ hour: 12 })
+    expect(await docStatus(lapsed.docId)).toBe('voided')
+    expect(mocks.draftLapsed.mock.calls.length).toBeGreaterThan(0)
+    expect(mocks.draftLapsed.mock.calls.every((c: any[]) => c[3]?.deleted === false)).toBe(true)
   })
 
   it('a new lease the landlord signed is never canceled for want of the tenant\'s signature', async () => {

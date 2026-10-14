@@ -67,6 +67,7 @@ import {
   cr, dr, toCents, splitCents, taxLines, scaleTaxParts, loadSale, saleMakeUp, missingFact, localDaySql,
   propertyTzSql, LODGING_TAX_NAME, type LineExtra,
 } from './registerBookingPayoutKit'
+import { loadStay, stayParts } from './incomeLines'
 import { READER_PIECE_KIND, readerPieceLines } from './payoutGamCharges'
 
 const WON = ':returned_on_win'
@@ -118,13 +119,19 @@ async function chargebackLines(client: PoolClient, h: HeldRow): Promise<DesiredL
     const parts = splitCents(income, [Math.max(0, mk.goodsPreTaxCents), ...mk.stays.map(s => Math.max(0, s.preTaxCents))])
     const saleAt: LineExtra = { propertyId: sale.property_id, tenantId: sale.tenant_id }
     out.push(...dr('sales_returns', sign * (parts[0] ?? 0), { ...saleAt, ...back, memo: 'Chargeback on a register sale' }))
-    mk.stays.forEach((s, i) => out.push(...dr('stay_income', sign * (parts[i + 1] ?? 0), {
-      propertyId: s.propertyId ?? sale.property_id, unitId: s.unitId, tenantId: s.tenantId, ...back, memo: 'Chargeback on stay money',
-    })))
+    // 10/14 (Nic I1, I2): off the stay's own line, where it was earned.
+    for (const [i, s] of mk.stays.entries()) {
+      const stay = await loadStay(client, s.bookingId)
+      for (const p of stayParts(stay, sign * (parts[i + 1] ?? 0))) {
+        out.push(...dr(p.role, p.cents, {
+          propertyId: s.propertyId ?? sale.property_id, unitId: s.unitId, tenantId: s.tenantId, ...back, sub: p.sub, memo: 'Chargeback on stay money',
+        }))
+      }
+    }
     out.push(...taxLines(scaleTaxParts(mk.taxParts, sign * tax), 'dr', { ...saleAt, cashEffect: 'in', reportCategory: 'tax_collected' }))
   } else {
-    const dep = (await client.query<{ property_id: string | null; unit_id: string | null; tenant_id: string | null; toward: string | null; tax: string | null }>(
-      `SELECT u.property_id, b.unit_id, b.tenant_id, sp.toward_stay::text AS toward, sp.lodging_tax_amount::text AS tax
+    const dep = (await client.query<{ booking_id: string; property_id: string | null; unit_id: string | null; tenant_id: string | null; toward: string | null; tax: string | null }>(
+      `SELECT b.id::text AS booking_id, u.property_id, b.unit_id, b.tenant_id, sp.toward_stay::text AS toward, sp.lodging_tax_amount::text AS tax
          FROM unit_bookings b
          LEFT JOIN units u ON u.id = b.unit_id
          LEFT JOIN stay_payments sp ON sp.booking_id = b.id AND sp.kind = 'site_deposit'
@@ -135,7 +142,9 @@ async function chargebackLines(client: PoolClient, h: HeldRow): Promise<DesiredL
     const taken = Math.min(disputed, toward)
     const tax = toward > 0 ? Math.round((taken * toCents(dep.tax)) / toward) : 0
     const stayAt: LineExtra = { propertyId: dep.property_id, unitId: dep.unit_id, tenantId: dep.tenant_id }
-    out.push(...dr('stay_income', sign * (taken - tax), { ...stayAt, ...back, memo: 'Chargeback on a stay deposit' }))
+    for (const p of stayParts(await loadStay(client, dep.booking_id), sign * (taken - tax))) {
+      out.push(...dr(p.role, p.cents, { ...stayAt, ...back, sub: p.sub, memo: 'Chargeback on a stay deposit' }))
+    }
     out.push(...dr('lodging_tax_payable', sign * tax, { ...stayAt, cashEffect: 'in', reportCategory: 'tax_collected', taxName: LODGING_TAX_NAME }))
   }
   // The line itself, and the rest of it — Stripe's dispute fee and the card fee — to chargeback fees.
@@ -148,7 +157,8 @@ async function chargebackLines(client: PoolClient, h: HeldRow): Promise<DesiredL
 export const payoutHeldItemProjector: LedgerProjector = {
   sourceType: 'held_item',
   // 10/13 (Nic): 2 — a GAM charge given back on a payout (a won pull dispute, a voided collected charge).
-  ruleVersion: 2,
+  // 3 — 10/14 (Nic I1, I2): a chargeback on stay money comes off the stay's own line (incomeLines).
+  ruleVersion: 3,
 
   async project(client: PoolClient, itemId: string): Promise<DesiredPosting[]> {
     const h = (await client.query<HeldRow & { created_at: string }>(

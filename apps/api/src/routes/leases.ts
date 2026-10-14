@@ -2582,9 +2582,14 @@ leasesRouter.post('/:id/discard', requirePerm('leases.terminate'), async (req, r
     if (voided.refused) {
       return res.status(409).json({ success: false, error: voided.refused.words, code: voided.refused.code })
     }
-    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source, voidedDocuments: voided.documentIds.length },
+    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source, voidedDocuments: voided.documentIds.length,
+                  deletedDocuments: voided.deletedDocumentIds.length, leaseDeleted: voided.leaseDeleted },
       '[lease] unsigned draft discarded')
-    res.json({ success: true, data: { id: req.params.id, status: 'terminated' } })
+    // 10/14 (Nic, #6): 'deleted' — the paperwork and the lease row are gone;
+    // 'terminated' — money touched it, so it stays on record (kept_words says why).
+    res.json({ success: true, data: {
+      id: req.params.id, status: voided.leaseDeleted ? 'deleted' : 'terminated', kept_words: voided.keptWords,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -2599,17 +2604,40 @@ export const DISCARD_VOID_REASON = 'The lease ended: the unsigned draft was disc
  * Fix pass 3: discard an unsigned draft — ONE transaction. The lease and its
  * own paperwork are locked, the "nobody signed" test runs again under the
  * locks (a signature since the page read it is refused in plain words, nothing
- * changed), its documents still out for signature are voided (they can't be
- * signed afterwards; a home-sale document is not the lease's and is left
- * alone), their scheduled money changes canceled (as every void does), and the
- * lease ends. Soft: every row stays.
+ * changed), its documents still out for signature end (they can't be signed
+ * afterwards). A home-sale document of its own is not the lease's and is left
+ * alone; one in the lease's packet goes with the lease (the packet is one
+ * thing, S652).
+ *
+ * 10/14 (Nic, #6): "Leases → Discard on an unsigned draft: delete the
+ * paperwork and the never-signed lease record." Each document is ERASED by
+ * the void button's own test (lib/eraseUnfinishedDocument — its packet's
+ * unfinished forms with it, and #1 an invite waiting on it canceled, so the
+ * hourly re-draft never makes a new one); one that test keeps is voided as
+ * before, its scheduled money changes canceled. Then the lease row itself is
+ * erased with every row of it (eraseLeaseRows) when no money touched it and
+ * nothing else lives on it (leaseMoneyTouchedSql, leaseInUseSql — a kept
+ * document on it is such a thing); otherwise it ends as before — soft, every
+ * row stays, and `keptWords` says why. Review 10/14: a document on it voided
+ * EARLIER that no money touched is erased first too (10/13: "If it never
+ * completed, it doesn't exist") — left, it would keep the lease row as
+ * "another document on it".
  */
 async function discardUnsignedDraft(leaseId: string): Promise<{
-  documentIds: string[]; refused: { code: 'tenant_signed' | 'landlord_signed' | 'not_a_draft'; words: string } | null
+  documentIds: string[]; deletedDocumentIds: string[]; leaseDeleted: boolean; keptWords: string | null
+  refused: { code: 'tenant_signed' | 'landlord_signed' | 'not_a_draft'; words: string } | null
 }> {
+  const {
+    eraseUnfinishedDocument, eraseLeaseRows, leaseMoneyTouchedSql, leaseInUseSql, removeOrphanedDocumentFiles,
+  } = await import('../lib/eraseUnfinishedDocument')
+  const { lockLeaseHousehold } = await import('../lib/unwindIssuedLease')
   const c = await getClient()
+  let files: string[] = []
   try {
     await c.query('BEGIN')
+    const cq = c.query.bind(c) as any
+    // The void's lock order (S655): the household, then the lease, then its paperwork.
+    await lockLeaseHousehold(cq, leaseId)
     const l = (await c.query<{ status: string }>(`SELECT status FROM leases WHERE id = $1 FOR UPDATE`, [leaseId])).rows[0]
     await c.query(`SELECT id FROM lease_documents WHERE lease_id = $1 ORDER BY id FOR UPDATE`, [leaseId])
     const now = (await c.query<{ tenant: boolean; anyone: boolean }>(
@@ -2622,27 +2650,70 @@ async function discardUnsignedDraft(leaseId: string): Promise<{
       : null
     if (refused) {
       await c.query('ROLLBACK')
-      return { documentIds: [], refused }
+      return { documentIds: [], deletedDocumentIds: [], leaseDeleted: false, keptWords: null, refused }
     }
-    const documentIds = (await c.query<{ id: string }>(
-      `UPDATE lease_documents
-          SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+    const open = (await c.query<{ id: string; lease_id: string; document_type: string; status: string }>(
+      `SELECT id, lease_id, document_type, status FROM lease_documents
         WHERE lease_id = $1
-          AND status IN ('pending', 'sent', 'in_progress')
+          AND status IN ('pending', 'sent', 'in_progress', 'voided')
           AND document_type IN ('original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms',
                                 'work_trade_addendum', 'sublease_agreement')
-        RETURNING id`, [leaseId, DISCARD_VOID_REASON])).rows.map((r) => r.id)
-    if (documentIds.length > 0) {
+        ORDER BY (document_type = 'original_lease') DESC, id`, [leaseId])).rows
+    const documentIds: string[] = []
+    const deletedDocumentIds: string[] = []
+    for (const d of open) {
+      if (deletedDocumentIds.includes(d.id)) continue   // taken with its packet lease
+      const out = await eraseUnfinishedDocument(cq, d)
+      if (out.erased) {
+        deletedDocumentIds.push(...out.documents.map(x => x.id))
+        files.push(...out.files)
+        continue
+      }
+      if (d.status === 'voided') continue   // kept, and already voided
+      await c.query(
+        `UPDATE lease_documents
+            SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+          WHERE id = $1 AND status IN ('pending', 'sent', 'in_progress')`, [d.id, DISCARD_VOID_REASON])
       await c.query(
         `UPDATE scheduled_lease_changes SET status = 'cancelled', updated_at = NOW()
-          WHERE source_document_id = ANY($1::uuid[]) AND status IN ('draft', 'scheduled')`, [documentIds])
+          WHERE source_document_id = $1 AND status IN ('draft', 'scheduled')`, [d.id])
+      documentIds.push(d.id)
     }
-    await c.query(
-      `UPDATE leases
-          SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
-        WHERE id = $1`, [leaseId])
+    // The never-signed lease row: erased when no money touched it and nothing
+    // else lives on it. The in-use test asks about every document still on it
+    // (nothing is being erased beside it now — hence no document of its own).
+    const why = (await c.query<{ money: boolean; in_use: boolean }>(
+      `SELECT ${leaseMoneyTouchedSql('$1')} AS money, ${leaseInUseSql('$1', 'nd')} AS in_use
+         FROM (SELECT '00000000-0000-0000-0000-000000000000'::uuid AS id, NULL::uuid AS package_group_id) nd`,
+      [leaseId])).rows[0]
+    let leaseDeleted = false
+    let keptWords: string | null = why?.money
+      ? 'Money touched this lease (something on it was billed, paid, credited or settled), so it stays on record as ended.'
+      : why?.in_use
+        ? 'Other records were made on this lease (a document, a notice, an inspection or a request), so it stays on record as ended.'
+        : null
+    if (!keptWords) {
+      await c.query('SAVEPOINT erase_discarded_lease')
+      try {
+        await eraseLeaseRows(cq, leaseId)
+        await c.query('RELEASE SAVEPOINT erase_discarded_lease')
+        leaseDeleted = true
+      } catch (e: any) {
+        await c.query('ROLLBACK TO SAVEPOINT erase_discarded_lease')
+        if (e?.code !== '23503') throw e
+        keptWords = 'Another record still points at this lease, so it stays on record as ended.'
+      }
+    }
+    if (!leaseDeleted) {
+      await c.query(
+        `UPDATE leases
+            SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
+          WHERE id = $1`, [leaseId])
+    }
     await c.query('COMMIT')
-    return { documentIds, refused: null }
+    // Files only the erased paperwork used — after COMMIT, best-effort.
+    if (files.length) await removeOrphanedDocumentFiles(cq, files).catch(() => {})
+    return { documentIds, deletedDocumentIds, leaseDeleted, keptWords, refused: null }
   } catch (e) {
     await c.query('ROLLBACK').catch(() => {})
     throw e

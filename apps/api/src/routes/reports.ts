@@ -102,12 +102,14 @@ export function viewForViewer(view: MoneyView, seesTotals: boolean) {
   if (seesTotals) return view
   // 10/12 (Nic, ledger P8): the ledger's proof strip starts and ends on what
   // is owed, so it goes with the Owed column.
-  const { owed: _owed, collected: _collected, clearing: _clearing, tie, tieText, lines, categories, uncategorized, proof: _proof, ...rest } = view
+  const { owed: _owed, collected: _collected, clearing: _clearing, tie, tieText, lines, categories, uncategorized, proof: _proof, details, ...rest } = view
   return {
     ...rest,
     lines: lines.map(dropOwed),
     categories: categories.map(dropOwed),
     uncategorized: uncategorized.map(dropOwed),
+    // 10/14 (Nic I1): the Detailed view's lines, and their subtypes, without Owed too.
+    ...(details ? { details: details.map(d => ({ ...dropOwed(d), subtypes: d.subtypes.map(dropOwed) })) } : {}),
     tie: { received: tie.received, stillClearing: tie.stillClearing },
     // moneyTieText: the second line is what became of what was charged (it
     // names what is still owed); the first says what the money received was

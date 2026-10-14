@@ -81,8 +81,10 @@ async function seedDoc(opts: {
   finally { c.release() }
 }
 
+// 10/14 (Nic, #4): an automatic end DELETES a document no money touched —
+// null here means it no longer exists.
 const statusOf = async (id: string) =>
-  (await db.query<{ status: string }>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0].status
+  (await db.query<{ status: string }>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0]?.status ?? null
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -98,10 +100,31 @@ describe('S636 — window A: waiting on the landlord', () => {
   // S647: window A is "from the time the tenant accepts the portal invite to
   // the time the landlord signs". These fixtures now include the accepted
   // tenant that makes somebody actually be waiting.
-  it('voids a document the landlord left unsigned for 48 hours after a tenant accepted', async () => {
+  it('deletes a document the landlord left unsigned for 48 hours after a tenant accepted (10/14 #4: no money touched it) — and cancels the invite (#1)', async () => {
     const id = await seedDoc({ status: 'sent', sentHoursAgo: 49, tenantAcceptedHoursAgo: 49 })
     await processEsignTimeouts()
+    expect(await statusOf(id)).toBe(null)
+    const pti = (await db.query(`SELECT cancelled_at IS NOT NULL AS c, draft_document_id FROM pending_tenant_intents`)).rows
+    expect(pti).toEqual([{ c: true, draft_document_id: null }])
+  })
+
+  // 10/14 (Nic, #4): only a document no money touched is deleted. One the
+  // erase's test keeps (here a rent change from it already reached the bill)
+  // is VOIDED exactly as before, and everyone hears the old words.
+  it('voids, as before, a document the erase keeps — and the notice keeps the void wording', async () => {
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 49, tenantAcceptedHoursAgo: 49 })
+    const d = (await db.query<any>(`SELECT landlord_id, unit_id FROM lease_documents WHERE id=$1`, [id])).rows[0]
+    const leaseId = (await db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date)
+       VALUES ($1,$2,500,'month_to_month','active', CURRENT_DATE) RETURNING id`, [d.unit_id, d.landlord_id])).rows[0].id
+    await db.query(
+      `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
+       VALUES ($1,'rent', CURRENT_DATE, 600, 'applied', $2)`, [leaseId, id])
+    await processEsignTimeouts()
     expect(await statusOf(id)).toBe('voided')
+    const calls = (emailDocumentAutoVoided as any).mock.calls
+    expect(calls.length).toBeGreaterThan(0)
+    for (const c of calls) expect(c[4]).toMatchObject({ deleted: false })
   })
 
   // S647 (Nic, DIRECTIVE): onboarding drafts leases for the landlord to sign
@@ -161,10 +184,10 @@ describe('S636 — window B: waiting on the tenant', () => {
 
   // The landlord's own inaction is still his problem: nothing of his is at
   // stake, so the original window stands.
-  it('still voids when the LANDLORD is the one who has not signed', async () => {
+  it('still ends it when the LANDLORD is the one who has not signed (deleted: no money touched it)', async () => {
     const id = await seedDoc({ status: 'sent', sentHoursAgo: 50, tenantAcceptedHoursAgo: 50 })
     await processEsignTimeouts()
-    expect(await statusOf(id)).toBe('voided')
+    expect(await statusOf(id)).toBe(null)
   })
 
   it('leaves an in-progress document inside the window alone', async () => {
@@ -463,9 +486,13 @@ describe('S654 — reminders and resends go to the account, not the signer row',
 
     await processEsignTimeouts()
 
-    expect(await statusOf(id)).toBe('voided')
-    const to = (emailDocumentAutoVoided as any).mock.calls.map((c: any[]) => c[0])
+    // 10/14 (Nic, #4/#5): deleted (no money touched it), and the notice says
+    // it expired — still to the account, never the stale row.
+    expect(await statusOf(id)).toBe(null)
+    const calls = (emailDocumentAutoVoided as any).mock.calls
+    const to = calls.map((c: any[]) => c[0])
     expect(to).toContain(RIGHT)
     expect(to).not.toContain(TYPO)
+    expect(calls.every((c: any[]) => c[4]?.deleted === true)).toBe(true)
   })
 })

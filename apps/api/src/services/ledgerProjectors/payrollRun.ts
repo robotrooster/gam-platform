@@ -31,6 +31,14 @@
  * the pay date, one property, or one unit. A run approved before 10/13 (no
  * place) stays in the Company column, as it posted. What is owed stays
  * company level (one tax account, one payroll).
+ * 10/14 (Nic): "an employee at one property goes to that property ... if
+ * they work at multiple properties it would be at the company level" — each
+ * paycheck carries its employee's place (payroll_run_lines.pay_place,
+ * services/booksEmployeePayPlace): its property, or the Company column for
+ * company level. Paychecks are grouped by place and each group's wages and
+ * employer taxes land there. A paycheck with no place (a run approved before
+ * 10/14) is placed by the run's own cost_place, so those runs post exactly as
+ * they did.
  *
  * WHAT CLEARS IT: the run's take-home pay and each tax it left owed become
  * unpaid expenses on the Expenses record when the run is approved
@@ -49,10 +57,11 @@ import type { LedgerOwner } from '../ledgerOwner'
 import { cr } from './registerBookingPayoutKit'
 import { cSql, isUuid } from './tenantShared'
 import type { BooksCostPlace } from '@gam/shared'
-import { costPlaceSpread, drSpread } from './companyCosts'
+import { costPlaceSpread, drSpread, COMPANY_COLUMN, type CostSpread } from './companyCosts'
 
 // 10/13 (Nic): 2 — the run's own cost_place says where its wages go, never a setting.
-export const PAYROLL_RULE_VERSION = 2
+// 10/14 (Nic): 3 — each paycheck's own place (its employee's) wins; runs before it post as they did.
+export const PAYROLL_RULE_VERSION = 3
 
 interface RunRow {
   landlord_id: string | null
@@ -111,16 +120,34 @@ export const payrollRunProjector: LedgerProjector = {
         `Payroll run ${runId}: ${s.crooked} paycheck(s) do not add up (gross pay is not the withholding plus the take-home pay). Fix the run before it can post.`)
     }
     const c = (v: string) => Number(v)
-    const gross = c(s.gross)
-    const employerTaxes = c(s.er_ss) + c(s.er_med) + c(s.futa) + c(s.suta)
     const landlordId = run.landlord_id
-    const spread = await costPlaceSpread(client, landlordId, run.pay_date,
-      { costPlace: run.cost_place, propertyId: run.property_id, unitId: run.unit_id, loggedAt: run.logged_at })
+    // 10/14 (Nic): the wages and employer taxes by paycheck place. A paycheck
+    // with no place of its own (a run approved before 10/14) is placed by the
+    // run, as it posted.
+    const groups = (await client.query<{ pay_place: string | null; pay_property_id: string | null; gross: string; er: string }>(
+      `SELECT pay_place, pay_property_id,
+              ${cSql('COALESCE(sum(gross_pay), 0)')} AS gross,
+              ${cSql('COALESCE(sum(employer_ss_tax), 0) + COALESCE(sum(employer_medicare_tax), 0) + COALESCE(sum(futa_tax), 0) + COALESCE(sum(suta_tax), 0)')} AS er
+         FROM payroll_run_lines WHERE run_id = $1
+        GROUP BY pay_place, pay_property_id
+        ORDER BY (pay_place IS NOT NULL), pay_place, pay_property_id`, [runId])).rows
     const memo = `Payroll paid ${run.pay_date}`
     const owed = { propertyId: null }
+    const wages: DesiredLine[] = []
+    const employerTaxLines: DesiredLine[] = []
+    for (const g of groups) {
+      const spread: CostSpread = g.pay_place === 'property' && g.pay_property_id
+        ? [{ propertyId: g.pay_property_id, weight: 1 }]
+        : g.pay_place === 'company'
+          ? COMPANY_COLUMN
+          : await costPlaceSpread(client, landlordId, run.pay_date,
+            { costPlace: run.cost_place, propertyId: run.property_id, unitId: run.unit_id, loggedAt: run.logged_at })
+      wages.push(...drSpread('payroll_expense', c(g.gross), spread, { memo: 'Gross wages' }))
+      employerTaxLines.push(...drSpread('employer_payroll_taxes', c(g.er), spread, { memo: 'Employer Social Security, Medicare and unemployment tax' }))
+    }
     const lines: DesiredLine[] = [
-      ...drSpread('payroll_expense', gross, spread, { memo: 'Gross wages' }),
-      ...drSpread('employer_payroll_taxes', employerTaxes, spread, { memo: 'Employer Social Security, Medicare and unemployment tax' }),
+      ...wages,
+      ...employerTaxLines,
       ...cr('payroll_federal_withholding', c(s.fed), { ...owed, memo: 'Federal income tax withheld' }),
       ...cr('payroll_state_withholding', c(s.state), { ...owed, memo: 'State income tax withheld' }),
       ...cr('payroll_fica', c(s.ss) + c(s.med) + c(s.er_ss) + c(s.er_med), { ...owed, memo: 'Social Security and Medicare, withheld and the employer\'s' }),

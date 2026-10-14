@@ -464,7 +464,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'duplicate, paperwork started for somebody who never came. Use for "get rid of that draft on ' +
       'RV 1" or "kill the pending lease nobody signed".\n' +
       'Only a draft nobody has signed: a lease that is active is an agreement between two people and ' +
-      'this will refuse it. Nothing is sent to anyone, and the record is kept, marked cancelled.\n' +
+      'this will refuse it. Nothing is sent to anyone. The draft and its paperwork are deleted for good; ' +
+      'one money already touched stays on record, ended.\n' +
       'Read back WHICH draft — the space and the park — before calling; drafts look alike in a list.',
     params: {
       leaseId: { type: 'string', description: 'The lease id, from a lookup — never asked of the landlord.' },

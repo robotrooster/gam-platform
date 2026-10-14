@@ -38,16 +38,21 @@ export function documentEndButton(d: EndableDocument): EndButton {
     // everyone already signed stays (the server erases only what never
     // completed).
     const packetLease = d.documentType === 'original_lease' && !!d.packageGroupId
+    // 10/14 (Nic, #1 and #8): a lease takes the invite waiting on it (canceled)
+    // and a lease its signature issued with only $0.00 bills (erased).
+    const lease = d.documentType === 'original_lease'
+      ? ' An invite waiting on it is canceled, and a lease it issued with nothing billed is erased with it.'
+      : ''
     return {
       action: 'delete', label: 'Delete', confirmLabel: 'Delete',
       title: 'It never completed and no money touched it, so it is erased',
       confirm: packetLease
-        ? 'Delete this lease and the unfinished forms in its packet? None of them completed, so they are erased for good. A form everyone already signed stays.'
-        : 'Delete this document? It never completed, so it is erased for good — nothing is kept.',
+        ? 'Delete this lease and the unfinished forms in its packet? None of them completed, so they are erased for good. A form everyone already signed stays.' + lease
+        : 'Delete this document? It never completed, so it is erased for good — nothing is kept.' + lease,
     }
   }
-  // Why it can't be deleted — so the landlord can act on it (the open invite
-  // waiting on a lease, say).
+  // Why it can't be deleted — so the landlord can act on it (money that
+  // touched the lease it issued, say).
   const why = d.endReason?.trim() || null
   return {
     action: 'void', label: 'Void', confirmLabel: 'Void',

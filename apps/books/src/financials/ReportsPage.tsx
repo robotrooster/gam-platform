@@ -20,8 +20,8 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   humanize, UNIT_TYPE_LABEL, UNIT_STATUS_LABEL, MAINTENANCE_STATUS_LABEL, PAYMENT_STATUS_LABEL,
-  PAYMENT_STAMP_LETTER, MONEY_COLUMN_LABEL,
-  type PaymentStatus, type PaymentStamp, type MoneyColumn,
+  PAYMENT_STAMP_LETTER, MONEY_COLUMN_LABEL, INCOME_REPORT_VIEWS, INCOME_REPORT_VIEW_LABEL,
+  type PaymentStatus, type PaymentStamp, type MoneyColumn, type IncomeReportView,
 } from '@gam/shared'
 import { finGet as apiGet, finPost, openProtectedFile, useViewer, toast, toastError } from './adapter'
 // S633: tax + statement documents belong to ONE company; the picker renders
@@ -896,22 +896,45 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
 /**
  * Decision #4, 10/12 (Nic): income by category with Charged, Received and
  * Owed side by side, the money with no category under its line, the totals,
- * and how the columns tie.
+ * and how the columns tie. Exported for its test (10/14, the Detailed switch).
  */
-function CategoryBreakdownCard({ title, view, categories }: {
+export function CategoryBreakdownCard({ title, view, categories }: {
   title: string; view: MoneyView | undefined
   /** An older reply's breakdown (billed / collected / still owed), read when there is no view. */
   categories?: CategoryRow[]
 }) {
-  const rows = view
-    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed }))
-    : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r) }))
-  const lines = (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed }))
+  // 10/14 (Nic I1): Summary is today's groups; Detailed itemizes them —
+  // rent and stays by space (mobile home lot rent, park-owned trailer rent,
+  // RV long-term rent, RV short-term stays, …), home sales, each space
+  // subtype under its line. Offered when the books itemized the period.
+  const [mode, setMode] = useState<IncomeReportView>('summary')
+  const details = view?.details ?? []
+  const detailed = mode === 'detailed' && details.length > 0
+  const rows = detailed
+    ? details.flatMap(d => [
+        { key: `d:${d.key}`, label: d.label, charged: d.charged, received: d.received, owed: d.owed, sub: false },
+        ...d.subtypes.map(t => ({ key: `d:${d.key}|${t.name}`, label: t.name, charged: t.charged, received: t.received, owed: t.owed, sub: true })),
+      ])
+    : view
+    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, sub: false }))
+    : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r), sub: false }))
+  const lines = detailed ? [] : (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, sub: false }))
   const all = [...rows, ...lines]
   const total = view ? { charged: view.charged, received: view.received, owed: view.owed } : sumThree(all)
   return (
     <div className="card" style={{ marginBottom: 14 }}>
-      <div className="card-header"><span className="card-title">{title}</span></div>
+      <div className="card-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+        <span className="card-title">{title}</span>
+        {details.length > 0 && (
+          <div className="basis-toggle" role="group" aria-label="Income view">
+            {INCOME_REPORT_VIEWS.map(v => (
+              <button key={v} type="button" className={`basis-toggle-btn${mode === v ? ' on' : ''}`} aria-pressed={mode === v} onClick={() => setMode(v)}>
+                {INCOME_REPORT_VIEW_LABEL[v]}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
       {all.length === 0 ? (
         <div style={{ padding: 16, color: 'var(--text-3)', fontSize: '.82rem', textAlign: 'center' }}>
           Nothing was received or charged in this period.
@@ -926,8 +949,8 @@ function CategoryBreakdownCard({ title, view, categories }: {
             <tbody>
               {/* data-label: on a phone each row stacks, every figure named. */}
               {all.map(r => (
-                <tr key={r.key}>
-                  <td className="rb-cat-name">{r.label}</td>
+                <tr key={r.key} className={r.sub ? 'rb-subtype-row' : undefined}>
+                  <td className={r.sub ? 'rb-cat-name rb-subtype-name' : 'rb-cat-name'}>{r.label}</td>
                   {COLS.map(c => (
                     <td key={c.key} data-label={c.label} className={`rb-num${c.key === 'owed' && r.owed ? ' rb-owed' : ''}`}>{fmt(r[c.key])}</td>
                   ))}

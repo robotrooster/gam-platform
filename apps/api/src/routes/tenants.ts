@@ -2562,6 +2562,31 @@ export const PROFILE_HISTORY_PAGE_SIZE = 50
 const profileQuery = z.object({
   historyPage: z.coerce.number().int().min(1, 'Pick a page from 1.').max(100000).optional(),
 })
+// 10/14 (Nic): "Only the landlord can fix a birthday." A tenant's birthday
+// (copied off their signed lease) is read and corrected here by the landlord
+// — the owner of a company the person has had a lease with — never by the
+// tenant (services/tenantBirthday). The happy-birthday email reads it.
+tenantsRouter.get('/:id/birthday', async (req, res, next) => {
+  try {
+    const { assertMayFixTenantBirthday, readTenantBirthday } = await import('../services/tenantBirthday')
+    await assertMayFixTenantBirthday(req.user, req.params.id)
+    res.json({ success: true, data: { dateOfBirth: await readTenantBirthday(req.params.id) } })
+  } catch (e) { next(e) }
+})
+tenantsRouter.patch('/:id/birthday', async (req, res, next) => {
+  try {
+    const { assertMayFixTenantBirthday, tenantBirthdayFrom, writeTenantBirthday } = await import('../services/tenantBirthday')
+    await assertMayFixTenantBirthday(req.user, req.params.id)
+    if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'dateOfBirth')) {
+      throw new AppError(400, 'Enter the birthday as a date, like 1980-04-23.')
+    }
+    const dob = tenantBirthdayFrom(req.body.dateOfBirth)
+    const saved = await writeTenantBirthday(req.params.id, dob)
+    logger.info({ tenantId: req.params.id, by: req.user!.userId, cleared: dob === null }, '[tenants] birthday fixed by the landlord')
+    res.json({ success: true, data: { dateOfBirth: saved } })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.get('/:id/profile', async (req, res, next) => {
   try {
     const pq = profileQuery.safeParse(req.query)

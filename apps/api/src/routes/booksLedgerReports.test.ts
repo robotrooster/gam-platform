@@ -176,8 +176,12 @@ describe('the chart of accounts', () => {
     expect(r.status).toBe(200)
     const ar = r.body.data.find((a: any) => a.code === '1100')
     expect(ar).toMatchObject({ balance: '900.00', balance_source: 'ledger', normal_balance: 900 })
-    const rent = r.body.data.find((a: any) => a.code === '4010')
-    expect(rent.normal_balance).toBe(1300)
+    // 10/14 (Nic I1): an apartment's rent books to its own line, "Apartment
+    // rent", under 4010 Space and lot rent (which carries none itself now).
+    const parent = r.body.data.find((a: any) => a.code === '4010')
+    const rent = r.body.data.find((a: any) => a.code === '4010-1')
+    expect(rent).toMatchObject({ name: 'Apartment rent', parent_account_id: parent.id, normal_balance: 1300 })
+    expect(parent.normal_balance).toBe(0)
   })
 })
 

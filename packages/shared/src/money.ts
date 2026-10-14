@@ -257,13 +257,15 @@ export const DEPOSIT_SLIP_SOURCE_LABEL: Record<DepositSlipSource, string> = {
  * What a matched money-in bank row was matched TO. index.ts's
  * BANK_TXN_MATCH_KINDS is this same list (one definition).
  */
-export const BANK_MATCH_KINDS = ['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed'] as const
+export const BANK_MATCH_KINDS = ['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed', 'returned_check'] as const
 export type BankMatchKind = typeof BANK_MATCH_KINDS[number]
 export const BANK_MATCH_KIND_LABEL: Record<BankMatchKind, string> = {
   gam_payout:     'GAM payout',
   tenant_deposit: 'Tenant’s bank deposit',
   deposit_slip:   'Bank deposit slip',
   auto_filed:     'Filed by itself',
+  // 10/14 (Nic, answer 15): a check the bank returned out of a deposit, taken back by itself.
+  returned_check: 'Returned check',
 }
 
 /**

@@ -455,9 +455,14 @@ export async function upsertTransactions(
   }
 
   // S655 (Step 12): every automatic step, in the money plan's order — GAM's
-  // payouts, deposit slips, the office's cash worked out, tenant reports, a
-  // tenant's whole bill to the cent, then income filed by itself.
+  // payouts, deposits the office logged, deposit slips, tenant reports
+  // (10/14: only what GAM is certain of — reconcileDeposits).
   await reconcileDeposits(landlordId)
+  // 10/14 (Nic, answer 15): a check the bank returned out of a deposit GAM
+  // already matched is taken back by itself — just that check (services/
+  // returnedCheck). Never throws.
+  const { takeBackReturnedChecks } = await import('./returnedCheck')
+  await takeBackReturnedChecks(landlordId)
   if (voidedMatched.length) {
     // A deposit that paid a TENANT's bills, and (Step 12 review) one matched
     // to a deposit slip or to the office's cash GAM worked out: each is told,
@@ -680,7 +685,8 @@ export async function voidIncomeOfBankVoidedLine(client: Pick<PoolClient, 'query
  *     register sales in it: the whole bag stays as it is, other money too —
  *     voiding only the other money would treat money from one bag two ways;
  *   - a check returned on a bank line of its own (part of a deposit bouncing)
- *     is not handled at all: it arrives as money out, for review.
+ *     is not a void at all: 10/14 (Nic, answer 15) it is taken back by itself
+ *     when it is exactly one check in a matched deposit (services/returnedCheck).
  * Nor a GAM payout, or any match the Undo refuses because something changed
  * since (a bill paid again, the paid-ahead money already used). Runs after the
  * sync commits, each in its own transaction. Returns whether it was taken back;
@@ -723,6 +729,9 @@ async function tellOwnerWhatBounced(
               to_char(bt.posted_date, 'FMMon FMDD, YYYY') AS day, bt.auto_settle_undo->'was' AS was
          FROM bank_transactions bt JOIN landlords l ON l.id = bt.landlord_id WHERE bt.id = $1`, [lineId])
     if (!t?.owner_user_id) return
+    // 10/14 (Nic, answer 15): the bank voided its own returned-check line —
+    // services/returnedCheck tellCheckPutBack says what that put back.
+    if (r.kind === 'returned_check') return
     const amount = `$${(Math.abs(cents(t.amount)) / 100).toFixed(2)}`
     const { createNotification } = await import('./notifications')
     if (r.kind === 'deposit_slip') {
@@ -984,8 +993,24 @@ export async function refreshBalance(conn: any): Promise<void> {
 }
 
 /**
+ * 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from
+ * it can file it but no guessing." A bank line is certainly GAM's payout when
+ * its memo names GAM — production's instant payouts read "Instant Pmt from STP
+ * FBO Gold Asset Management…" (or, cut short, "…FBO Gold Asset M MOUNTAIN").
+ * A Stripe ACH payout's memo ("ST-G5D4S5T9R5P7 TRANSFER OAK PARK MOTEL A
+ * CORPORATE ACH") names the landlord, not GAM, exactly as another Stripe
+ * platform's does ("ST-B9S6S4F0D0I0 DOORLOOP CORPORATE ACH") — so a line like
+ * that, of a payout's amount, is offered to a person instead
+ * (listTransactions payout_suggestion, matchPayoutByHand).
+ */
+export function memoNamesGam(description: string | null | undefined): boolean {
+  return /\bGOLD ASSET\b/.test(` ${String(description ?? '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ')} `)
+}
+
+/**
  * Auto-match INBOUND (amount > 0) needs_review transactions to the settled GAM
- * disbursement that produced them (same amount, posted date within the window).
+ * disbursement that produced them (same amount, posted date within the window,
+ * and — 10/14, Nic answer 16 — a memo that names GAM: memoNamesGam).
  * Matched rows drop out of the review queue — the landlord never re-categorizes
  * money GAM already moved. Amounts GAM did NOT move stay needs_review.
  *
@@ -1008,15 +1033,19 @@ export async function autoMatchLandlord(landlordId: string): Promise<number> {
   try {
     await client.query('BEGIN')
     await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bank_feed_auto_match:${landlordId}`])
-    const candidates = (await client.query<{ id: string; amount: string; posted_date: string }>(
-      `SELECT t.id, t.amount::text AS amount, to_char(t.posted_date, 'YYYY-MM-DD') AS posted_date
+    const candidates = (await client.query<{ id: string; amount: string; posted_date: string; description: string | null }>(
+      `SELECT t.id, t.amount::text AS amount, to_char(t.posted_date, 'YYYY-MM-DD') AS posted_date, t.description
          FROM bank_transactions t
         WHERE t.landlord_id = $1
           -- an untouched deposit in review, once the bank has posted it
           AND ${AUTO_MATCHABLE_SQL('t')}
+          -- 10/14: and no person took a match off it (theirs from then on)
+          AND t.auto_settle_undo IS NULL
         -- id order, the order every other bank-row locker takes (the sync, the
         -- books start date), so a match landing mid-save waits, never deadlocks
         ORDER BY t.id`, [landlordId])).rows
+      // 10/14 (Nic, answer 16): only a line whose memo names GAM is certain.
+      .filter(t => memoNamesGam(t.description))
     for (const t of candidates) {
       const disb = (await client.query<{ id: string }>(
         `SELECT d.id FROM disbursements d
@@ -1054,43 +1083,46 @@ export async function autoMatchLandlord(landlordId: string): Promise<number> {
 }
 
 /**
- * S624 — auto-settle a deposit the TENANT declared and the BANK confirms.
- *
- * It takes TWO INDEPENDENT SIGNALS that had to agree, neither of them the
- * landlord's guess: the tenant said they deposited $X on a date; a bank row for
- * exactly $X posted within the window; and the instrument they named does not
- * contradict what the memo describes.
- *
- * S655 (Step 12): one step of reconcileDeposits, kept callable on its own.
- * A deposit slip or a combination of the office's unbanked cash of the same
- * amount competes with the report, so the row waits for a person instead.
- *
- * Never throws. A deposit that cannot be auto-settled simply stays in the review
- * queue with its shortlist, which is exactly where it would have been anyway.
+ * 10/14 (Nic, answer 16): the person says this deposit IS GAM's payout — the
+ * one listTransactions offers beside it (payout_suggestion: the same amount,
+ * sent within MATCH_DATE_WINDOW_DAYS, not matched to another line) when its
+ * memo does not name GAM. Same checks as the automatic match, under the same
+ * lock; the person who matched it is kept (matched_by), so the match can be
+ * undone (bankDepositConfirm undoDepositMatch).
  */
-export async function autoSettleDeclaredDeposits(landlordId: string): Promise<number> {
-  return (await runDepositSteps(landlordId, new Set<DepositActionKind>(['declared']))).declared
-}
-
-/**
- * S655 (money plan §3, "Bank-deposit auto-settle by amount"; Step 12). A
- * deposit nobody reported settles a tenant's bills by itself only when it is
- * exactly one tenant's WHOLE bank-payable bill to the cent and nothing else
- * fits (bankDepositMatch.isAutoSettleable). Both sides are told; the landlord
- * can undo it (bankDepositConfirm.undoDepositMatch).
- */
-export async function autoSettleByAmount(landlordId: string): Promise<number> {
-  return (await runDepositSteps(landlordId, new Set<DepositActionKind>(['auto_settle']))).autoSettled
-}
-
-/**
- * S655 (Nic 10/2, K-D): money GAM never handled files itself once the landlord
- * has filed money in from the same payer — labeled, with one-click undo. Never
- * money out, a rent-channel payer, a payer ever matched to a tenant bill, a
- * memo that names no payer, or a deposit equal to any open bill.
- */
-export async function autoFileIncome(landlordId: string): Promise<number> {
-  return (await runDepositSteps(landlordId, new Set<DepositActionKind>(['auto_file']))).autoFiled
+export async function matchPayoutByHand(landlordId: string, lineId: string, disbursementId: string, by: string):
+  Promise<{ id: string; disbursementId: string }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bank_feed_auto_match:${landlordId}`])
+    const t = (await client.query<{ amount: string; posted_date: string }>(
+      `SELECT t.amount::text AS amount, to_char(t.posted_date, 'YYYY-MM-DD') AS posted_date
+         FROM bank_transactions t
+        WHERE t.id = $1 AND t.landlord_id = $2 AND ${AUTO_MATCHABLE_SQL('t')}
+        FOR UPDATE`, [lineId, landlordId])).rows[0]
+    if (!t) throw new AppError(409, 'This line is not a deposit waiting in review any more, so it can’t be matched to a payout.')
+    const d = (await client.query<{ id: string }>(
+      `SELECT d.id FROM disbursements d
+        WHERE d.id = $1 AND d.landlord_id = $2 AND d.status = 'settled' AND d.settled_at IS NOT NULL
+          AND d.amount = $3::numeric AND ABS(d.settled_at::date - $4::date) <= $5
+          AND NOT EXISTS (SELECT 1 FROM bank_transactions bt WHERE bt.matched_disbursement_id = d.id)
+        FOR UPDATE`, [disbursementId, landlordId, t.amount, t.posted_date, MATCH_DATE_WINDOW_DAYS])).rows[0]
+    if (!d) {
+      throw new AppError(409, `That payout doesn’t fit this deposit: it must be the same amount, sent within ${MATCH_DATE_WINDOW_DAYS} days of it, and not matched to another line.`)
+    }
+    await client.query(
+      `UPDATE bank_transactions
+          SET status = 'matched', matched_disbursement_id = $2, matched_at = now(), matched_by = $3, updated_at = now()
+        WHERE id = $1`, [lineId, disbursementId, by])
+    await client.query('COMMIT')
+    return { id: lineId, disbursementId }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 /**
@@ -1105,30 +1137,60 @@ export async function tieRecordedDeposits(landlordId: string): Promise<number> {
 }
 
 export interface ReconcileResult {
-  payouts: number; slips: number; inferred: number; declared: number; autoSettled: number; autoFiled: number
+  payouts: number; slips: number
   /** 10/6: bank lines tied to a deposit the office already logged by hand. */
   recorded: number
 }
 
 /**
  * Every automatic step for a company's new money in, in the money plan's order
- * (§3): GAM's own payouts, then for each untouched deposit — a deposit slip,
- * the office's cash worked out (everything not banked, or the only combination),
- * a tenant's report, a tenant's whole bill to the cent, income from a payer the
- * landlord already filed. A deposit two of these could explain waits for a
- * person (decideDeposit). Never throws: a sync must never fail on this.
+ * (§3): GAM's own payouts, then for each untouched deposit — a deposit the
+ * office logged by hand, a deposit slip, a tenant's report. A deposit two of
+ * these could explain waits for a person (decideDeposit). Never throws: a sync
+ * must never fail on this.
+ *
+ * 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from it
+ * can file it but no guessing." Confirmed: "Exact matches file themselves (GAM
+ * payouts, front-desk-logged deposits for the exact amount); anything that
+ * would be a guess asks." Each step, and what became of it:
+ *   payouts      KEPT, ONLY WHEN THE MEMO NAMES GAM — GAM's own payout, and GAM
+ *                knows every payment inside it. A line of the same amount
+ *                whose memo does not name GAM (an ACH payout reads "ST-… TRANSFER
+ *                <your name>", like any other Stripe platform's) is offered as
+ *                GAM's payout for a person to match (payout_suggestion,
+ *                matchPayoutByHand) — an amount that happens to match is a guess.
+ *   recorded     KEPT — a deposit the office logged by hand, tied only when
+ *                certain (its reference number, or the one deposit of that
+ *                exact amount with no other line of it near).
+ *   slip         KEPT — a deposit slip the office made, for the exact total.
+ *   declared     NOW ASKS — the tenant's own report of the deposit and a bank
+ *                line of the same amount: the report is the tenant's claim, not
+ *                GAM knowing who the money came from, and Nic named only GAM
+ *                payouts and the office's own deposits as filing themselves. The
+ *                matcher still pairs reports with lines (declaredDepositAssign);
+ *                the paired report is picked on the deposit review for the
+ *                person to confirm, and the bank's date still decides.
+ *   inferred     NOW ASKS — the office's cash worked out from a combination
+ *                that happens to add up: proposed on "Make a bank deposit"
+ *                for a person to accept (GET /deposit-slips, its proposal).
+ *   auto_settle  NOW ASKS — a tenant's whole bill that happens to equal the
+ *                line, or a check memo naming them: offered on the deposit
+ *                review, picked for the person to confirm (candidate preselect).
+ *   auto_file    NOW ASKS — income from a payer the landlord filed before (a
+ *                familiar name): the line waits on the Bank page with that
+ *                category suggested, and the place it went last time offered
+ *                as a suggestion, never filled in (listTransactions).
  */
 export async function reconcileDeposits(landlordId: string): Promise<ReconcileResult> {
   let payouts = 0
   try { payouts = await autoMatchLandlord(landlordId) } catch (e) {
     logger.warn({ err: e, landlordId }, '[bank-feed] payout matching skipped')
   }
-  const r = await runDepositSteps(landlordId, new Set<DepositActionKind>(
-    ['recorded', 'slip', 'inferred', 'declared', 'auto_settle', 'auto_file']))
+  const r = await runDepositSteps(landlordId, new Set<DepositActionKind>(['recorded', 'slip']))
   return { ...r, payouts }
 }
 
-export type DepositActionKind = 'recorded' | 'slip' | 'inferred' | 'declared' | 'auto_settle' | 'auto_file'
+export type DepositActionKind = 'recorded' | 'slip'
 
 /** A money-in row nobody has acted on, the bank has posted, and no person has undone. */
 const RECONCILABLE_SQL = (t: string) => `(${AUTO_MATCHABLE_SQL(t)} AND ${t}.auto_settle_undo IS NULL)`
@@ -1141,20 +1203,10 @@ interface DepositRow {
 type DepositDecision =
   | { kind: 'recorded'; receiptId: string }
   | { kind: 'slip'; slipId: string }
-  | { kind: 'inferred'; items: import('./depositSlips').CashItem[] }
-  | { kind: 'declared'; chargeIds: string[]; declarationId: string; method: string }
-  | { kind: 'auto_settle'; chargeIds: string[]; method: 'cash' | 'check' | 'money_order' }
-  | { kind: 'auto_file'; rule: AutoFileRule }
   | { kind: 'review'; why: string }
 
-interface AutoFileRule {
-  id: string; category: string; scope_kind: MerchantRuleScope; property_id: string | null; unit_id: string | null
-  /** 10/12 (Nic, L5): the company's own category the payer files under. */
-  category_id?: string | null
-}
-
 async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKind>): Promise<Omit<ReconcileResult, 'payouts'>> {
-  const out = { slips: 0, inferred: 0, declared: 0, autoSettled: 0, autoFiled: 0, recorded: 0 }
+  const out = { slips: 0, recorded: 0 }
   let rows: DepositRow[]
   try {
     rows = await query<DepositRow>(
@@ -1174,10 +1226,6 @@ async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKin
       if (await actOnDeposit(txn, d)) {
         if (d.kind === 'recorded') out.recorded++
         else if (d.kind === 'slip') out.slips++
-        else if (d.kind === 'inferred') out.inferred++
-        else if (d.kind === 'declared') out.declared++
-        else if (d.kind === 'auto_settle') out.autoSettled++
-        else if (d.kind === 'auto_file') out.autoFiled++
       }
     } catch (e) {
       // One bad deposit must not stop the rest, and must not fail a bank sync.
@@ -1194,7 +1242,7 @@ async function runDepositSteps(landlordId: string, allowed: Set<DepositActionKin
 async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   const { openSlipsFitting, cashProposalFor } = await import('./depositSlips')
   const { candidatesForDeposit } = await import('./bankDepositCandidates')
-  const { isPreselectable, isAutoSettleable, memoMethodHint, memoSaysTransfer, AUTO_SETTLE_SAME_AMOUNT_DAYS } =
+  const { isPreselectable, isAutoSettleable, memoSaysTransfer, AUTO_SETTLE_SAME_AMOUNT_DAYS } =
     await import('./bankDepositMatch')
   const slips = await openSlipsFitting(db, txn.landlord_id, txn)
   // Who the memo names, read fresh from the bank's own words (a row stored
@@ -1221,10 +1269,12 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
   const reports = verdict?.kind === 'assigned' ? 1
     : verdict?.kind === 'conflict' ? verdict.conflict.reportIds.length : 0
 
-  // A tenant's whole bill, to the cent, with nothing else fitting.
+  // A tenant's whole bill, to the cent, with nothing else fitting. 10/14 (Nic,
+  // answer 16): never settled by itself any more — an amount that happens to
+  // match is a guess, so it is offered on the deposit review for a person to
+  // confirm. It is still a reason a slip or the office's cash is not assumed.
   const cashAny = cash.kind === 'everything' || cash.kind === 'one' || cash.kind === 'several'
-  let autoSettle: { chargeIds: string[]; method: 'cash' | 'check' | 'money_order' } | null = null
-  let offPropertyBillFits = false
+  let tenantBillFits = false
   const sameAmount = Number((await queryOne<{ n: string }>(
     `SELECT COUNT(*)::text AS n FROM bank_transactions o
       WHERE o.landlord_id = $1 AND o.id <> $2 AND o.amount = $3::numeric AND o.amount > 0
@@ -1271,19 +1321,14 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
       competingCash: false,
       description: txn.description,
     })) {
-      // 10/6 (Nic): only where tenants deposit rent at the bank does GAM
-      // settle their bill from a bank line by itself. Elsewhere the whole bill
-      // that fits is still a reason the office's slip or cash is not assumed
-      // (tenantSignal, exactly as before the setting) — a person looks.
-      if (!m.depositsTaken) { offPropertyBillFits = true; break }
-      // A named match settles only from a check-shaped memo (isTenantCheckMemo).
-      const hint = memoMethodHint(txn.description)
-      autoSettle = { chargeIds: m.chargeIds, method: m.confidence === 'named_exact' ? 'check' : (hint ?? 'cash') }
+      // Where tenants deposit rent at the bank or not, the whole bill that fits
+      // is a reason the office's slip or cash is not assumed — a person looks.
+      tenantBillFits = true
       break
     }
   }
   // Something says a tenant paid this — their report, or a whole bill that fits it.
-  const tenantSignal = reports > 0 || autoSettle !== null || offPropertyBillFits
+  const tenantSignal = reports > 0 || tenantBillFits
 
   // 0. 10/5 (Nic): a bank deposit the office already recorded from the bank's
   //    receipt is money this line may well BE. It is never cash on hand (no
@@ -1323,31 +1368,27 @@ async function decideDeposit(txn: DepositRow): Promise<DepositDecision> {
     if (slips.length === 1 && !tenantSignal) return { kind: 'slip', slipId: slips[0].id }
     return { kind: 'review', why: slips.length > 1 ? 'several slips fit' : 'a tenant may have paid this' }
   }
-  // 2. The office's cash, worked out: everything not banked, or the only combination.
-  if (cashAny) {
-    if ((cash.kind === 'everything' || cash.kind === 'one') && !tenantSignal) return { kind: 'inferred', items: cash.items }
-    return { kind: 'review', why: 'the office’s cash may be this deposit' }
-  }
-  // 3. A tenant's report the bank confirms.
+  // 2. The office's cash, worked out (everything not banked, or the only
+  //    combination). 10/14 (Nic, answer 16): a combination that happens to add
+  //    up is a guess — never matched by itself; "Make a bank deposit" proposes
+  //    it (GET /deposit-slips) for a person to accept.
+  if (cashAny) return { kind: 'review', why: 'the office’s cash may be this deposit' }
+  // 3. A tenant's report the bank shows. 10/14 (Nic, answer 16 confirmed:
+  //    "Exact matches file themselves (GAM payouts, front-desk-logged deposits
+  //    for the exact amount); anything that would be a guess asks"): the
+  //    tenant's report is their claim, not GAM knowing who the money came
+  //    from, so the report the matcher pairs with this line is picked on the
+  //    deposit review (bankDepositCandidates preselect) for the person to
+  //    confirm — the bank's date still decides (bankDepositConfirm).
   const top = candidates[0]
-  if (top && top.confidence === 'declared' && top.depositsTaken && isPreselectable(top) && top.chargeIds.length > 0) {
-    // 10/5: the very report the match was made from (before, the newest
-    // pending report of that amount on the lease — which could be another
-    // month's, out of this deposit's reach, and the confirm then refused it).
-    const decl = top.declaration ? await queryOne<{ id: string; method: string }>(
-      `SELECT id, method FROM tenant_declared_deposits WHERE id = $1 AND status = 'pending'`,
-      [top.declaration.id]) : null
-    if (decl) return { kind: 'declared', chargeIds: top.chargeIds, declarationId: decl.id, method: decl.method }
+  if (top && top.confidence === 'declared' && isPreselectable(top)) {
+    return { kind: 'review', why: 'a tenant’s report — the person confirms it' }
   }
-  // 4. A tenant's whole bill, to the cent, nothing else fitting (no slip and no
-  //    combination of the office's cash competes — those returned above).
-  if (autoSettle) return { kind: 'auto_settle', ...autoSettle }
-  // 5. Income from a payer the landlord already filed — only when no tenant
-  //    could have paid it at all.
-  if (candidates.length === 0 && reports === 0) {
-    const rule = await autoFileRuleFor(txn)
-    if (rule) return { kind: 'auto_file', rule }
-  }
+  // 4. 10/14 (Nic, answer 16): "no guessing." A tenant's whole bill that equals
+  //    the line, or a check memo naming them, is offered on the deposit review
+  //    (picked for the person to confirm), and a payer the landlord filed
+  //    before is suggested on the Bank page — neither files itself.
+  if (tenantBillFits) return { kind: 'review', why: 'a tenant’s bill of this amount — the person confirms it' }
   return { kind: 'review', why: 'nothing certain' }
 }
 
@@ -1355,18 +1396,6 @@ async function actOnDeposit(txn: DepositRow, d: DepositDecision): Promise<boolea
   if (d.kind === 'recorded') {
     const { matchRecordedDeposit } = await import('./recordedDepositMatch')
     await matchRecordedDeposit({ bankTransactionId: txn.id, receiptId: d.receiptId, confirmedByUserId: null, auto: true })
-    return true
-  }
-  if (d.kind === 'declared' || d.kind === 'auto_settle') {
-    const { confirmDepositMatch } = await import('./bankDepositConfirm')
-    await confirmDepositMatch({
-      bankTransactionId: txn.id,
-      chargeIds: d.chargeIds,
-      method: d.method as any,
-      declarationId: d.kind === 'declared' ? d.declarationId : null,
-      confirmedByUserId: null,
-      auto: d.kind === 'auto_settle',
-    })
     return true
   }
   const client = await getClient()
@@ -1380,20 +1409,6 @@ async function actOnDeposit(txn: DepositRow, d: DepositDecision): Promise<boolea
     if (d.kind === 'slip') {
       const { matchSlipToDeposit } = await import('./depositSlips')
       await matchSlipToDeposit(client, { slipId: d.slipId, transactionId: txn.id, landlordId: txn.landlord_id, matchedBy: null, inferred: false })
-    } else if (d.kind === 'inferred') {
-      const { matchInferredBatch } = await import('./depositSlips')
-      await matchInferredBatch(client, { landlordId: txn.landlord_id, transactionId: txn.id, postedDate: txn.posted_date, items: d.items })
-    } else if (d.kind === 'auto_file') {
-      const row = (await client.query(
-        `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str FROM bank_transactions WHERE id = $1`, [txn.id])).rows[0]
-      await fileAsIncome(client, txn.landlord_id, row, {
-        category: d.rule.category, categoryId: d.rule.category_id ?? null, scopeKind: d.rule.scope_kind,
-        unitId: d.rule.unit_id, propertyId: d.rule.property_id,
-        description: row.description ?? null, vendor: row.normalized_merchant ?? null,
-      })
-      await client.query(
-        `UPDATE bank_transactions SET auto_filed_rule_id = $2, auto_filed_at = now(), updated_at = now() WHERE id = $1`,
-        [txn.id, d.rule.id])
     }
     await client.query('COMMIT')
     return true
@@ -1412,70 +1427,13 @@ async function actOnDeposit(txn: DepositRow, d: DepositDecision): Promise<boolea
 }
 
 /**
- * Has this payer ever been matched to a tenant's bill at this company? A deposit
- * that once paid rent (matched, confirmed, auto-settled, a tenant's report —
- * undone or not) means that payer can carry rent, so its money is never filed
- * as income by itself.
- */
-async function payerEverMatchedToTenantBill(landlordId: string, normalized: string): Promise<boolean> {
-  const r = await queryOne<{ hit: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM bank_transactions bt
-        WHERE bt.landlord_id = $1 AND bt.normalized_merchant = $2
-          AND (bt.matched_payment_id IS NOT NULL
-               OR EXISTS (SELECT 1 FROM bank_deposit_allocations a WHERE a.bank_transaction_id = bt.id)
-               OR EXISTS (SELECT 1 FROM tenant_declared_deposits d WHERE d.bank_transaction_id = bt.id)
-               OR (bt.auto_settle_undo ? 'receiptId')
-               OR (bt.auto_settle_undo -> 'was' ? 'receiptId'))) AS hit`, [landlordId, normalized])
-  return !!r?.hit
-}
-
-/**
- * Does this amount equal any open bill at the company — one line, one
- * household's whole balance, or one invoice's open lines? Then it may be rent,
- * and it is never filed as income by itself.
- */
-async function equalsAnyOpenBill(landlordId: string, amount: number): Promise<boolean> {
-  const r = await queryOne<{ hit: boolean }>(
-    `WITH open AS (
-       SELECT p.id, p.tenant_id, p.invoice_id, vm.money_part
-         FROM payments p JOIN v_payment_money vm ON vm.payment_id = p.id
-        WHERE p.landlord_id = $1 AND ${payableRowSql('p')} AND vm.money_part > 0)
-     SELECT EXISTS (SELECT 1 FROM open WHERE money_part = $2::numeric)
-         OR EXISTS (SELECT 1 FROM (SELECT SUM(money_part) AS s FROM open WHERE tenant_id IS NOT NULL GROUP BY tenant_id) x
-                     WHERE x.s = $2::numeric)
-         OR EXISTS (SELECT 1 FROM (SELECT SUM(money_part) AS s FROM open WHERE invoice_id IS NOT NULL GROUP BY invoice_id) x
-                     WHERE x.s = $2::numeric) AS hit`,
-    [landlordId, Number(amount).toFixed(2)])
-  return !!r?.hit
-}
-
-/** The payer rule a deposit would file itself under, or null (every refusal in one place). */
-async function autoFileRuleFor(txn: DepositRow): Promise<AutoFileRule | null> {
-  const merchant = txn.normalized_merchant ?? ''
-  if (!(Number(txn.amount) > 0) || !merchant || !namesAPayer(merchant)) return null
-  if (isRentChannelPayer(merchant) || isRentChannelPayer(txn.description)) return null
-  // #48.1: a transfer between accounts ("XFER FROM SAVINGS") is most often the
-  // landlord's own money — never income that files itself.
-  if (memoSaysTransfer(merchant) || memoSaysTransfer(txn.description)) return null
-  const rule = await queryOne<AutoFileRule & { last_direction: string | null; auto_file_income: boolean }>(
-    `SELECT id, category, category_id, scope_kind, property_id, unit_id, last_direction, auto_file_income
-       FROM landlord_merchant_rules WHERE landlord_id = $1 AND normalized_merchant = $2`, [txn.landlord_id, merchant])
-  if (!rule || rule.last_direction !== 'in' || !rule.auto_file_income) return null
-  if (!(OTHER_INCOME_CATEGORIES as readonly string[]).includes(rule.category)) return null
-  if (await payerEverMatchedToTenantBill(txn.landlord_id, merchant)) return null
-  if (await equalsAnyOpenBill(txn.landlord_id, txn.amount)) return null
-  return { id: rule.id, category: rule.category, category_id: rule.category_id ?? null, scope_kind: rule.scope_kind, property_id: rule.property_id, unit_id: rule.unit_id }
-}
-
-/**
  * Undo an income filing the feed made by itself: the income is voided and the
- * deposit goes back to review — never filed by itself again. With
- * stopAutoFiling, this payer's deposits stop filing themselves at all.
+ * deposit goes back to review. 10/14 (Nic, answer 16): nothing files itself
+ * from a payer's name any more; this undoes a line that did before.
  */
 export async function undoAutoFile(
-  landlordId: string, txnId: string, opts: { stopAutoFiling?: boolean; undoneBy: string | null },
-): Promise<{ id: string; stoppedForPayer: string | null }> {
+  landlordId: string, txnId: string, opts: { undoneBy: string | null },
+): Promise<{ id: string }> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -1510,15 +1468,8 @@ export async function undoAutoFile(
               landlord_other_income_id = NULL, categorized_at = NULL,
               auto_filed_rule_id = NULL, auto_filed_at = NULL, auto_settle_undo = $2::jsonb, updated_at = now()
         WHERE id = $1`, [txnId, JSON.stringify(marker), t.bank_status === 'void' ? 'ignored' : 'needs_review'])
-    let stopped: string | null = null
-    if (opts.stopAutoFiling) {
-      await client.query(
-        `UPDATE landlord_merchant_rules SET auto_file_income = FALSE, updated_at = now() WHERE id = $1 AND landlord_id = $2`,
-        [t.auto_filed_rule_id, landlordId])
-      stopped = t.normalized_merchant ?? null
-    }
     await client.query('COMMIT')
-    return { id: txnId, stoppedForPayer: stopped }
+    return { id: txnId }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     throw e
@@ -1545,15 +1496,13 @@ export async function suggestForMerchant(landlordId: string, normalizedMerchant:
 }
 
 /**
- * Remember what the landlord did with this payer, for next time. S655 (Step
- * 12): and which way the money went. Money in from a payer sets
- * last_direction 'in' — what lets that payer's next deposit file itself
- * (autoFileRuleFor) — EXCEPT for a rent channel (RENT_CHANNEL_PAYERS: DoorLoop,
- * AppFolio…), a payer ever matched to a tenant's bill, a transfer between
- * accounts ("XFER FROM SAVINGS", #48.1 — most often the landlord's own money),
- * or a memo that names no payer at all ("MOBILE DEPOSIT"): those are written
- * with no direction, so they
- * never file themselves. Money out sets 'out'.
+ * Remember what the landlord did with this payer, for next time: the category
+ * the next line from them is suggested under, and the place it went (offered
+ * on a deposit as a suggestion the person presses, never filled in). S655
+ * (Step 12): and which way the money went. 10/14 (Nic, answer 16): nothing
+ * files itself from a payer's name any more ("no guessing"), so the direction
+ * is only a record; a memo that names no payer, a rent channel or a transfer
+ * between accounts is still written with no direction, as before.
  */
 async function rememberMerchantChoice(landlordId: string, normalizedMerchant: string, input: {
   category: string; scopeKind: MerchantRuleScope; propertyId: string | null; unitId: string | null
@@ -1566,8 +1515,7 @@ async function rememberMerchantChoice(landlordId: string, normalizedMerchant: st
   if (direction === 'in' && (
     !namesAPayer(normalizedMerchant)
     || isRentChannelPayer(normalizedMerchant) || isRentChannelPayer(input.description)
-    || memoSaysTransfer(normalizedMerchant) || memoSaysTransfer(input.description)
-    || await payerEverMatchedToTenantBill(landlordId, normalizedMerchant))) {
+    || memoSaysTransfer(normalizedMerchant) || memoSaysTransfer(input.description))) {
     direction = null
   }
   await query(
@@ -1984,15 +1932,12 @@ async function activePartIds(client: PoolClient, txnId: string): Promise<{ incom
  * it twice.
  */
 export async function splitTransaction(landlordId: string, txnId: string, parts: SplitPartInput[], opts: { by?: string | null; notAMatch?: boolean } = {}):
-  Promise<{ incomeIds: string[]; expenseIds: string[]; replaced: number; payerQuestion: PayerQuestion | null }> {
+  Promise<{ incomeIds: string[]; expenseIds: string[]; replaced: number }> {
   if (!Array.isArray(parts) || parts.length < 2) {
     throw new AppError(400, 'A split needs at least two parts. To file it as one, pick its category and press Confirm.')
   }
   if (parts.length > SPLIT_MAX_PARTS) throw new AppError(400, `A bank line splits into at most ${SPLIT_MAX_PARTS} parts.`)
-  let saved!: {
-    incomeIds: string[]; expenseIds: string[]; replaced: number
-    moneyIn: boolean; merchant: string | null; description: string | null
-  }
+  let saved!: { incomeIds: string[]; expenseIds: string[]; replaced: number }
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -2170,23 +2115,17 @@ export async function splitTransaction(landlordId: string, txnId: string, parts:
               categorized_at = now(), updated_at = now()
         WHERE id = $1`, [txnId])
     await client.query('COMMIT')
-    saved = { incomeIds, expenseIds, replaced, moneyIn, merchant: txn.normalized_merchant ?? null, description: txn.description ?? null }
+    saved = { incomeIds, expenseIds, replaced }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally {
     client.release()
   }
-  // 10/12 (Nic): "after a split, ASK whether future deposits from that payer
-  // should stop filing automatically." Asked of a deposit only (money going
-  // out never files itself), and only when the answer can change anything.
-  const payerQuestion = saved.moneyIn
-    ? await payerQuestionFor(landlordId, saved.merchant, saved.description).catch(e => {
-        logger.warn({ err: e, transactionId: txnId }, '[bank-feed] payer question skipped')
-        return null
-      })
-    : null
-  return { incomeIds: saved.incomeIds, expenseIds: saved.expenseIds, replaced: saved.replaced, payerQuestion }
+  // 10/14 (Nic, answer 16): nothing files itself from a payer's name any more,
+  // so the 10/12 question after a split ("should deposits from that payer stop
+  // filing automatically?") has nothing left to ask.
+  return saved
 }
 
 /**
@@ -2390,99 +2329,6 @@ export async function undoFiling(landlordId: string, txnId: string, opts: { undo
   }
 }
 
-// ── After a split: does this payer keep filing itself? (10/12, Nic) ─────────
-//
-//   "after a split, ASK whether future deposits from that payer should stop
-//    filing automatically"
-//
-// A deposit from a payer the owner already filed as one category files itself
-// the same way next time (autoFileRuleFor). A split says that payer's deposits
-// can hold more than one kind of money — Mountain View's Square deposit was
-// propane and a night's stay — so the owner is asked, right after the split,
-// whether that payer's deposits should stop filing themselves. Yes turns it
-// off for that payer (landlord_merchant_rules.auto_file_income, the switch
-// "Undo and stop filing" already throws); no leaves everything as it is.
-
-/** What the owner is asked after splitting a deposit. */
-export interface PayerQuestion {
-  /** The payer, as GAM keys it (the bank memo's leading words). */
-  payer: string
-  /** True: the next deposit from them files itself today. False: it would, once one is filed as one category. */
-  filesItself: boolean
-  /** The category it files itself under today, when it does. */
-  category: string | null
-}
-
-/**
- * The question to ask after splitting a deposit from this payer, or null when
- * the answer could change nothing: a memo that names no payer, a rent channel,
- * a transfer between accounts, a payer that ever paid a tenant's bill (none of
- * those ever file themselves), or a payer already stopped.
- */
-export async function payerQuestionFor(landlordId: string, merchant: string | null, description: string | null):
-  Promise<PayerQuestion | null> {
-  const payer = merchant ?? ''
-  if (!payer || !namesAPayer(payer)) return null
-  if (isRentChannelPayer(payer) || isRentChannelPayer(description)) return null
-  if (memoSaysTransfer(payer) || memoSaysTransfer(description)) return null
-  const rule = await queryOne<{ category: string; last_direction: string | null; auto_file_income: boolean }>(
-    `SELECT category, last_direction, auto_file_income FROM landlord_merchant_rules
-      WHERE landlord_id = $1 AND normalized_merchant = $2`, [landlordId, payer])
-  if (rule && !rule.auto_file_income) return null
-  if (await payerEverMatchedToTenantBill(landlordId, payer)) return null
-  const filesItself = !!rule && rule.last_direction === 'in'
-    && (OTHER_INCOME_CATEGORIES as readonly string[]).includes(rule.category)
-  return { payer, filesItself, category: filesItself ? rule!.category : null }
-}
-
-/**
- * The owner's "yes": deposits from this line's payer stop filing themselves.
- * Only money in ever files itself, so a line of money going out is refused.
- * When GAM has never remembered this payer, the remembered choice is written
- * now — from how this line is filed (its largest part, or its one category) —
- * with no direction, so it pre-fills the next deposit for the owner to confirm
- * and never files one by itself. Pressing it twice is harmless.
- */
-export async function stopPayerAutoFiling(landlordId: string, txnId: string):
-  Promise<{ payer: string; alreadyStopped: boolean }> {
-  const t = await queryOne<{ amount: string; normalized_merchant: string | null }>(
-    `SELECT amount::text AS amount, normalized_merchant FROM bank_transactions WHERE id = $1 AND landlord_id = $2`,
-    [txnId, landlordId])
-  if (!t) throw new AppError(404, 'Transaction not found')
-  if (!(Number(t.amount) > 0)) {
-    throw new AppError(409, 'Only money coming in ever files itself. Money going out always waits for you.')
-  }
-  const payer = t.normalized_merchant ?? ''
-  if (!payer || !namesAPayer(payer)) {
-    throw new AppError(409, 'This deposit names no payer, so nothing from it ever files itself.')
-  }
-  const existing = await queryOne<{ id: string; auto_file_income: boolean }>(
-    `SELECT id, auto_file_income FROM landlord_merchant_rules WHERE landlord_id = $1 AND normalized_merchant = $2`,
-    [landlordId, payer])
-  if (existing) {
-    if (existing.auto_file_income) {
-      await query(`UPDATE landlord_merchant_rules SET auto_file_income = FALSE, updated_at = now() WHERE id = $1`, [existing.id])
-    }
-    return { payer, alreadyStopped: !existing.auto_file_income }
-  }
-  // Where this line is filed now: its largest part, else its one category.
-  const place = await queryOne<{ category: string; property_id: string | null; unit_id: string | null }>(
-    `SELECT category, property_id, unit_id FROM (
-       SELECT category, amount, property_id, unit_id FROM landlord_other_income
-        WHERE landlord_id = $1 AND status = 'active'
-          AND (bank_transaction_id = $2 OR id = (SELECT landlord_other_income_id FROM bank_transactions WHERE id = $2))
-     ) x ORDER BY amount DESC, category LIMIT 1`, [landlordId, txnId])
-  const category = place && (OTHER_INCOME_CATEGORIES as readonly string[]).includes(place.category) ? place.category : 'other'
-  await query(
-    `INSERT INTO landlord_merchant_rules
-       (landlord_id, normalized_merchant, category, scope_kind, property_id, unit_id, last_direction, auto_file_income)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, FALSE)
-     ON CONFLICT (landlord_id, normalized_merchant) DO UPDATE SET auto_file_income = FALSE, updated_at = now()`,
-    [landlordId, payer, category, place?.unit_id ? 'unit' : 'property_common', place?.unit_id ? null : place?.property_id ?? null,
-     place?.unit_id ?? null])
-  return { payer, alreadyStopped: false }
-}
-
 /** The landlord dismisses a row. Recorded as THEIR call, so nothing automatic ever undoes it. */
 export async function ignoreTransaction(landlordId: string, txnId: string) {
   // 10/12 (Nic, L5): a line matched to expenses (or GAM's debit, a refund
@@ -2490,6 +2336,15 @@ export async function ignoreTransaction(landlordId: string, txnId: string) {
   const matched = await queryOne<{ id: string }>(
     `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND matched_kind IS NOT NULL`, [txnId, landlordId])
   if (matched) throw new AppError(409, 'This line is matched to what it paid. Undo that match first, then ignore it.')
+  // 10/14 (Nic, answer 15): a returned check GAM took back is in the books
+  // through that check (services/returnedCheck) — ignoring the line would
+  // leave the bank's side of it out.
+  const returned = await queryOne<{ id: string }>(
+    `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND auto_settle_undo->>'kind' = 'returned_check'
+        AND status = 'matched'`, [txnId, landlordId])
+  if (returned) {
+    throw new AppError(409, 'This line is the check your bank returned, and GAM already took that check back. Undo that first (Undo this match), then ignore it.')
+  }
   const res = await queryOne<{ id: string }>(
     `UPDATE bank_transactions SET status='ignored', ignored_reason='landlord', updated_at=now()
       WHERE id=$1 AND landlord_id=$2 AND status IN ('needs_review','matched') RETURNING id`,
@@ -2686,12 +2541,37 @@ export async function listTransactions(landlordId: string, opts: {
                  WHEN bt.matched_disbursement_id IS NOT NULL THEN 'gam_payout'
                  WHEN bt.matched_payment_id IS NOT NULL THEN 'tenant_deposit'
                  WHEN bt.auto_settle_undo->>'kind' = 'deposit_slip' THEN 'deposit_slip'
+                 -- 10/14 (Nic, answer 15): a check the bank returned, taken back by itself.
+                 WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN 'returned_check'
             END AS match_kind,
+            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN (bt.auto_settle_undo->>'feeAmount')::float END
+              AS returned_check_fee,
+            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN bt.auto_settle_undo->>'feeFrom' END
+              AS returned_check_fee_from,
+            -- 10/14 (Nic, answer 16): a deposit in review of a GAM payout's amount,
+            -- sent within the window and matched to no other line, whose memo does
+            -- not name GAM — offered for the person to match (matchPayoutByHand).
+            CASE WHEN bt.status = 'needs_review' AND bt.amount > 0 AND bt.matched_disbursement_id IS NULL THEN (
+              SELECT json_build_object('id', d.id, 'amount', d.amount::float, 'sentOn', to_char(d.settled_at, 'YYYY-MM-DD'))
+                FROM disbursements d
+               WHERE d.landlord_id = bt.landlord_id AND d.status = 'settled' AND d.settled_at IS NOT NULL
+                 AND d.amount = bt.amount AND ABS(d.settled_at::date - bt.posted_date) <= ${MATCH_DATE_WINDOW_DAYS}
+                 AND NOT EXISTS (SELECT 1 FROM bank_transactions x WHERE x.matched_disbursement_id = d.id)
+               ORDER BY ABS(d.settled_at::date - bt.posted_date), d.id
+               LIMIT 1) END AS payout_suggestion,
+            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN (
+              SELECT NULLIF(TRIM(COALESCE(rus.first_name,'') || ' ' || COALESCE(rus.last_name,'')), '')
+                FROM tenant_remittances rr JOIN tenants rt ON rt.id = rr.tenant_id JOIN users rus ON rus.id = rt.user_id
+               WHERE rr.id::text = bt.auto_settle_undo->>'returnedReceiptId') END AS returned_check_tenant_name,
             bt.matched_disbursement_id,
             -- Settled by itself on amount; and whether Undo can be offered.
             bt.auto_settled_at, bt.auto_filed_at,
-            (bt.status = 'matched' AND bt.matched_disbursement_id IS NULL
-              AND ((bt.auto_settle_undo ? 'receiptId') OR bt.auto_settle_undo->>'kind' = 'deposit_slip')) AS can_undo,
+            -- 10/14 (Nic 10/12: "every bank filing (hand-filed too) can be
+            -- undone"): a returned check taken back, and a payout a person matched.
+            (bt.status = 'matched' AND (
+              (bt.matched_disbursement_id IS NULL
+                AND ((bt.auto_settle_undo ? 'receiptId') OR bt.auto_settle_undo->>'kind' IN ('deposit_slip', 'returned_check')))
+              OR (bt.matched_disbursement_id IS NOT NULL AND bt.matched_by IS NOT NULL))) AS can_undo,
             slip.slip_deposit_date, slip.slip_item_count, slip.slip_other_amount, slip.slip_source,
             dep.unit_number AS matched_unit_number, dep.tenant_name AS matched_tenant_name,
             dep.charge_count AS matched_charge_count,

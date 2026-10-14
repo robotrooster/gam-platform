@@ -445,6 +445,42 @@ export interface OpenMonthTotals extends RentRollTotals {
    */
   folderIn: number
   folderRefunded: number
+  /**
+   * 10/14 (Nic): what the "Moved out, still owes" section owes (the sum of
+   * OpenMonthRoll.movedOutOwing), apart from the month's Owed and the earlier
+   * months' — nobody in it is a row. Absent from an older server.
+   */
+  movedOutOwed?: number
+}
+
+/**
+ * 10/14 (Nic): "A checked-out guest still owing, nothing paid this month:
+ * show in the moved-out section of Payments." One entry of the Payments page's
+ * "Moved out, still owes" section: a household whose lease ended and who no
+ * longer lives here, still owing on earlier months (with a bill this month it
+ * is a row, tagged Moved out, instead), or a stay whose guest checked out with
+ * money still owed on it and nothing paid toward it this month (one paid
+ * toward this month is a stay row). Never a row as well.
+ */
+export interface OpenMonthMovedOut {
+  /** 'lease:<id>' (a household) or 'stay:<booking id>'. */
+  key: string
+  kind: 'household' | 'stay'
+  space: string | null
+  leaseId: string | null
+  householdId: string | null
+  /** A household's residents, primary first; [] on a stay. */
+  residents: RentRollResident[]
+  /** A stay's guest in words (the booking's guest name, else their resident's); null on a household. */
+  guest: string | null
+  /** 'YYYY-MM-DD': the day they left — the lease's end, or the stay's check-out; null when not on record. */
+  leftOn: string | null
+  /** A stay's dates in words ("Sep 1 – Oct 1"); null on a household. */
+  stayDates: string | null
+  /** Everything still owed here (a stay: by the register's own rule — its price less what was paid toward it). */
+  owed: number
+  /** A household's months still owed, oldest first; [] on a stay. */
+  months: Array<{ month: string; owed: number }>
 }
 
 /**
@@ -547,6 +583,14 @@ export interface OpenMonthRoll {
    * that space's row (OpenMonthRow.otherMoney), never here as well.
    */
   otherMoney: OpenMonthOtherMoney[]
+  /**
+   * 10/14 (Nic): the "Moved out, still owes" section under the month — every
+   * household no longer living here still owing on earlier months, and every
+   * stay whose guest checked out still owing with nothing paid this month
+   * (OpenMonthMovedOut), in space order. [] when nobody. Absent from an older
+   * server.
+   */
+  movedOutOwing?: OpenMonthMovedOut[]
   totals?: OpenMonthTotals
 }
 
@@ -719,8 +763,12 @@ export interface RentRollStayLine {
   /** How many stays (or sales of a stay item with no stay on the schedule) it adds up. */
   stays: number
   /**
-   * The money that came in for them in the range (what was paid toward the
-   * stays; a stay item sold with no stay on the schedule, its line). Sent only
+   * What the property kept for them (10/14, Nic: refunds — an early
+   * check-out's — are subtracted): a stay on the schedule, what was paid
+   * toward it less what went back, with its nights — the share of its nights
+   * in the range (10/14, Nic: "each month counts only its own nights"), so a
+   * month paid late is in its own month, as a bill paid late is; a stay item
+   * sold with no stay on the schedule, its line, in the month sold. Sent only
    * with the range totals (decisions #25: a sum across guests).
    */
   paid?: number
@@ -759,10 +807,13 @@ export interface RentRollHistory {
    * 10/13 (Nic): the range's stays BELOW the lease rows, never in the spaces'
    * spots — an aggregate by line item ("22 nights paid for via POS", "1 week
    * paid for via POS"), each with its notes per site ("4 nights in RV 15").
-   * A stay is the range's when money came in for it in the range (the month
-   * paid, as on the Payments page); a stay that became a lease is that
-   * lease's row. Nights, weeks, then months; POS before the booking site. []
-   * when none.
+   * 10/14 (Nic): "each month counts only its own nights" — a stay paid for
+   * (money in, a charge account's never) is the range's by its nights in it:
+   * the whole length it was sold for when all of it is in the range ("1
+   * month"), else only its nights in the range (Sep 1 – Nov 1: 30 nights in
+   * September, 31 in October). A stay item sold with no stay on the schedule
+   * is the month it was sold. A stay that became a lease is that lease's row.
+   * Nights, weeks, then months; POS before the booking site. [] when none.
    */
   stays: RentRollStayLine[]
   /**

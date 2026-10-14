@@ -35,6 +35,8 @@ export function moneyColumns(fromBooks = false): Array<{ key: MoneyColumn; label
 
 export interface MoneyViewLine extends MoneyThree { line: string; label: string }
 export interface MoneyViewCategory extends MoneyThree { category: string; label: string }
+/** 10/14 (Nic I1): a Detailed-view line (services/incomeBasis MoneyViewDetail) with its subtypes. */
+export interface MoneyViewDetail extends MoneyThree { key: string; label: string; category: string | null; subtypes: Array<MoneyThree & { name: string }> }
 
 /** The API's three-column view of a period (services/incomeBasis MoneyView). */
 export interface MoneyView extends MoneyThree {
@@ -54,6 +56,8 @@ export interface MoneyView extends MoneyThree {
   beside: BesideItem[]
   /** 10/12 (Nic, review): 'ledger' when the view was read from the company's books (Owed is then a balance at the period's end). */
   source?: 'ledger'
+  /** 10/14 (Nic I1): the Detailed view's lines (income itemized by space, home sales), when the books itemized it. */
+  details?: MoneyViewDetail[]
 }
 
 /** Add rows of the three columns to the cent. */

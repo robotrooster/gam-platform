@@ -36,6 +36,8 @@ const server = vi.hoisted(() => ({
   hold: null as null | Promise<void>,   // a POST waits on this (a request still running)
   // What POST /leases/:id/never-moved-in answers, as the server sends it (null: the close's ordinary answer).
   postAnswer: null as null | Record<string, unknown>,
+  // What POST /leases/:id/discard answers, as the server sends it (null: the ordinary 'terminated').
+  discardAnswer: null as null | Record<string, unknown>,
 }))
 const httpError = (status: number, error: string, code?: string) =>
   Object.assign(new Error(error), { response: { status, data: { success: false, error, ...(code ? { code } : {}) } } })
@@ -64,6 +66,7 @@ vi.mock('../lib/api', async () => {
           reservation_canceled: false, kept: [], kept_total: 0, kept_words: null,
         }) }
       }
+      if (url.endsWith('/discard') && server.discardAnswer) return { success: true, data: camel(server.discardAnswer) }
       return { success: true, data: camel({ id: 'lease1', status: 'terminated' }) }
     },
     apiPatch: async () => ({}),
@@ -101,6 +104,7 @@ let root: Root
 let closed = 0
 beforeEach(() => {
   server.answers = [applies()]; server.gets = 0; server.posts = []; server.postFail = null; server.hold = null; server.postAnswer = null
+  server.discardAnswer = null
   server.leases = []; server.leaseGets = 0; perms.keys = null
   toasts.length = 0; closed = 0
   host = document.createElement('div')
@@ -520,6 +524,31 @@ describe('the Leases list: which way out a waiting lease offers', () => {
     await click([...rowOf('RV 1').querySelectorAll('button')].find(b => (b.textContent ?? '').trim() === 'Discard'))
     await until(() => toasts.includes('Draft discarded.'), 'the discard')
     await until(() => Object.values(reads).every(n => n === 2), `every page read again (${JSON.stringify(reads)})`)
+  })
+
+  // 10/14 (Nic, #6): Discard deletes the draft and its paperwork. The confirm
+  // says so before anything happens; the toast says what the server did —
+  // deleted, or kept on record with its reason.
+  it('Discard confirms that the draft and its paperwork are deleted for good, then says "Draft deleted."', async () => {
+    const { appConfirm } = await import('../components/dialogs')
+    ;(appConfirm as any).mockClear()
+    server.discardAnswer = { id: 'draft', status: 'deleted', kept_words: null }
+    await openList()
+    await click([...rowOf('RV 1').querySelectorAll('button')].find(b => (b.textContent ?? '').trim() === 'Discard'))
+    await until(() => toasts.includes('Draft deleted.'), 'the deleted toast')
+    const [message, opts] = (appConfirm as any).mock.calls[0]
+    expect(message).toMatch(/^The unsigned draft lease .* and its paperwork will be deleted for good\. /)
+    expect(message).toContain('An invite waiting on it is canceled')
+    expect(opts).toMatchObject({ title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true })
+  })
+
+  it('a draft money already touched: kept on record, and the toast says why in the server\'s words', async () => {
+    server.discardAnswer = { id: 'draft', status: 'terminated',
+      kept_words: 'Money touched this lease (something on it was billed, paid, credited or settled), so it stays on record as ended.' }
+    await openList()
+    await click([...rowOf('RV 1').querySelectorAll('button')].find(b => (b.textContent ?? '').trim() === 'Discard'))
+    await until(() => toasts.some(t => t.startsWith('Draft discarded. Money touched this lease')), 'the kept toast')
+    expect(toasts).not.toContain('Draft deleted.')
   })
 
   it('the window Discard opens instead says why, once: a tenant signed since the list was read, nothing was changed', async () => {

@@ -14,13 +14,16 @@
  *
  * WHAT IT ERASES: a VOIDED document of those two companies that nothing keeps
  * — the one test the void button uses (keptReasonSql): it never issued a
- * lease or billed anyone, no resident signed it, no sale or money change from
- * it started. Each goes with its boxes, signers and the rows hanging off it,
- * exactly as the button erases one.
+ * lease that billed anyone, no sale or money change from it started (10/14,
+ * Nic #1/#2: a resident's signature or an open invite no longer keeps one).
+ * Each goes with its boxes, signers and the rows hanging off it, exactly as
+ * the button erases one.
  *
  * WHAT IT NEVER TOUCHES:
  *   - A voided document money touched — RV 09's lease, which Nic's signature
- *     issued and billed, stays on record as voided. Printed with the reason.
+ *     issued and billed ($495.42 on its move-in bill, voided unpaid 9/18),
+ *     stays on record as voided. Printed with the reason. (10/14 #8 —
+ *     scripts/oct14_erase_documents, only once Nic confirms with that fact.)
  *   - Any document not voided: still out for signature, or drafted and
  *     waiting. Nic said to erase what never completed, but one still in
  *     progress may yet complete — printed, and left (the question of drafts

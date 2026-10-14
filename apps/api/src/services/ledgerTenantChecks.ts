@@ -206,6 +206,13 @@ export const undepositedFundsCheck: LedgerCheck = {
        - COALESCE((SELECT ${C('sum(i.amount)')} FROM bank_deposit_slip_items i JOIN live_slip s ON s.id = i.slip_id
                     WHERE i.voided_at IS NULL), 0)
        - COALESCE((SELECT ${C('sum(s.other_amount)')} FROM live_slip s), 0)
+       -- 10/14 (Nic, answer 15): a check the bank returned out of a slip and
+       -- GAM took back — its receipt counts nothing now, the slip above still
+       -- took it out of the drawer, and the bank's returned line puts it back
+       -- (ledgerProjectors/tenantReceipts projectReturnedCheck: Dr 1040 / Cr bank).
+       + COALESCE((SELECT ${C('sum(-bt.amount)')} FROM bank_transactions bt
+                    WHERE bt.landlord_id = $1 AND bt.status = 'matched'
+                      AND bt.auto_settle_undo->>'kind' = 'returned_check'), 0)
        - COALESCE((SELECT ${C('sum(pr.amount)')} FROM pos_refunds pr
                     WHERE pr.landlord_id = $1 AND pr.refund_method = 'cash' AND pr.stay_refund_part_id IS NULL
                       AND pr.reversed_at IS NULL), 0)

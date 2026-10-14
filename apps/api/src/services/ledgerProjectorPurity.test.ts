@@ -11,6 +11,8 @@
  *   - landlord_gam_charges.collected_amount (use the collections table)
  *   - books_accounts (accounts come from the map, by role, on the line's day)
  *   - today's property settings (who pays the fee, the tax rate)
+ *   - today's space settings (its type, who owns its trailer, its lot rent,
+ *     its rent) — 10/14: read as they stood, from the change journal
  * and it never writes, and never locks a money row (a poster must hold no lock
  * a money write could wait on, §3).
  *
@@ -50,6 +52,10 @@ const FORBIDDEN: [RegExp, string][] = [
   [/books_accounts/, 'reads the chart directly (lines name a posting role; the map resolves it)'],
   [/fee_payer/, 'reads today\'s fee-payer setting'],
   [/short_term_tax_rate|lodging_tax_rate/, 'reads today\'s tax rate (use the stored tax amount)'],
+  // 10/14 (Nic I1-I7): which income line rent and stays book to reads the
+  // space as it stood when the money was made (incomeLines SPACE_COLS_SQL, the
+  // change journal), never the space today.
+  [/\b\w+\.(unit_type|dwelling_ownership|lot_rent_amount|monthly_rate|rent_amount)\b/, 'reads a space\'s setting as it is today (incomeLines SPACE_COLS_SQL reads it as it stood)'],
   [/\bFOR\s+(NO\s+KEY\s+)?UPDATE\b|\bFOR\s+(KEY\s+)?SHARE\b|pg_advisory/i, 'locks a row'],
   [/\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b/i, 'writes'],
 ]

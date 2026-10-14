@@ -62,11 +62,13 @@ import type { DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledger
 import type { LedgerOwner } from '../ledgerOwner'
 import { STAY_SHORTENED_CREDIT_NOTE } from '../bookingLeaseBilling'
 import {
-  type PaymentFacts, type CompanyBooks, Lines, rowDims, loadPaymentFacts, incomeRoleFor, requireWorkTradeMethod,
+  type PaymentFacts, type CompanyBooks, Lines, rowDims, loadPaymentFacts, incomePartsFor, requireWorkTradeMethod,
   splitCents, cSql, centsOf, localDaySql, propertyTzSql, leasePropertySql, companyTzSql, isUuid,
 } from './tenantShared'
+import { rentParts, stayParts, loadSpace, loadStay, type IncomePart } from './incomeLines'
 
-export const TENANT_CREDITS_RULE_VERSION = 1
+// 2 — 10/14 (Nic I1-I7): rent and stay money taken back lands on the line it was charged to (incomeLines).
+export const TENANT_CREDITS_RULE_VERSION = 2
 
 // ─── C5: work-trade hours that paid a bill ──────────────────────────────────
 
@@ -78,7 +80,9 @@ export function projectWorkTrade(f: PaymentFacts, co: CompanyBooks, charge: Desi
   if (method === 'left_out') {
     const credited = (charge?.lines ?? []).filter(l => l.role && (l.creditCents ?? 0) > 0)
     if (credited.length === 0) {
-      L.dr(incomeRoleFor(f), f.workTradeCents, { ...d, reportCategory: f.category, memo: 'Work-trade hours (left out of the books)' })
+      for (const p of incomePartsFor(f, f.workTradeCents)) {
+        L.dr(p.role, p.cents, { ...d, reportCategory: f.category, sub: p.sub, memo: 'Work-trade hours (left out of the books)' })
+      }
     } else {
       const parts = splitCents(f.workTradeCents, credited.map(l => l.creditCents ?? 0))
       credited.forEach((l, i) => L.dr(l.role!, parts[i], { ...l, memo: 'Work-trade hours (left out of the books)' }))
@@ -271,10 +275,12 @@ export async function projectPrepaidCredit(client: PoolClient, creditId: string)
   const c = (await client.query<{
     funded_by: string | null; has_source: boolean; anchor: string | null; note: string | null; voided: boolean
     c: string; landlord_id: string; lease_id: string; tenant_id: string; property_id: string | null; day: string | null
+    made_at: string; booking_id: string | null
   }>(
     `SELECT pc.funded_by, (pc.source_remittance_id IS NOT NULL OR pc.source_payment_id IS NOT NULL) AS has_source,
             pc.source_payment_id AS anchor, pc.note, pc.voided_at IS NOT NULL AS voided, ${cSql('pc.amount_original')} AS c,
             l.landlord_id, COALESCE(pc.received_lease_id, pc.lease_id) AS lease_id, pc.tenant_id,
+            pc.created_at::text AS made_at, l.source_booking_id::text AS booking_id,
             ${leasePropertySql('COALESCE(pc.received_lease_id, pc.lease_id)')} AS property_id,
             ${localDaySql('COALESCE(pc.received_at, pc.created_at)', propertyTzSql(leasePropertySql('COALESCE(pc.received_lease_id, pc.lease_id)'), 'l.landlord_id'))} AS day
        FROM lease_prepaid_credits pc
@@ -290,18 +296,29 @@ export async function projectPrepaidCredit(client: PoolClient, creditId: string)
     const stayShortened = !!c.anchor || c.note === STAY_SHORTENED_CREDIT_NOTE
     if (stayShortened) {
       // C8: rent already paid for nights the stay no longer has.
-      let role: LedgerAccountRole = 'space_rent'
+      // 10/14 (Nic I1-I7): off the line the rent was charged to — the anchor
+      // bill's, else the lease's space.
+      let parts: IncomePart[] | null = null
       if (c.anchor) {
         const f = (await loadPaymentFacts(client, [c.anchor])).get(c.anchor)
         if (f && !f.exclusion && f.category !== 'deposits' && f.category !== 'home_payments' && f.category !== 'balances_collected') {
-          role = incomeRoleFor(f)
+          parts = incomePartsFor(f, cents)
         }
       }
-      L.dr(role, cents, { ...d, reportCategory: 'space_rent', memo: 'Stay shortened: rent already paid moved to credit' })
+      // No anchor bill: the lease's space as it stood when the credit was made.
+      parts ??= rentParts(await loadSpace(client, null, c.lease_id, c.made_at), cents, 'space_rent')
+      for (const p of parts) L.dr(p.role, p.cents, { ...d, reportCategory: 'space_rent', sub: p.sub, memo: 'Stay shortened: rent already paid moved to credit' })
       memo = 'Stay shortened: rent moved to credit'
     } else {
       // The reservation deposit's leftover after the arrival rent.
-      L.dr('stay_income', cents, { ...d, reportCategory: 'stays_and_pay_links', memo: 'Reservation deposit left over, moved to credit' })
+      // 10/14 (Nic I2): off the line the stay earned it on (bookingStay) — the
+      // lease's booking; a stay a lease bills is long-term, on its space's rent
+      // line. A lease with no booking named: its unit as it stood then.
+      const stay = await loadStay(client, c.booking_id)
+      const parts = stay ? stayParts(stay, cents) : rentParts(await loadSpace(client, null, c.lease_id, c.made_at, 'unit'), cents, 'stay_income')
+      for (const p of parts) {
+        L.dr(p.role, p.cents, { ...d, reportCategory: 'stays_and_pay_links', sub: p.sub, memo: 'Reservation deposit left over, moved to credit' })
+      }
       memo = 'Reservation deposit moved to credit'
     }
   } else if (c.funded_by === 'landlord' && !c.has_source) {

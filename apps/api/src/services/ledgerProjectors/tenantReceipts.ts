@@ -238,10 +238,19 @@ export function projectRowSettlement(f: PaymentFacts): DesiredPosting[] {
  */
 export async function projectBankMatchTenant(client: PoolClient, bankTransactionId: string): Promise<DesiredPosting[]> {
   if (!isUuid(bankTransactionId)) return []
-  const t = (await client.query<{ landlord_id: string; bank_connection_id: string; posted_date: string; status: string; receipt_id: string | null }>(
+  const t = (await client.query<{
+    landlord_id: string; bank_connection_id: string; posted_date: string; status: string; receipt_id: string | null
+    returned_receipt_id: string | null; amount_c: string
+  }>(
     `SELECT bt.landlord_id, bt.bank_connection_id, bt.posted_date::text AS posted_date, bt.status,
-            bt.auto_settle_undo->>'receiptId' AS receipt_id
+            bt.auto_settle_undo->>'receiptId' AS receipt_id,
+            CASE WHEN bt.auto_settle_undo->>'kind' = 'returned_check' THEN bt.auto_settle_undo->>'returnedReceiptId' END
+              AS returned_receipt_id,
+            ${cSql('bt.amount')} AS amount_c
        FROM bank_transactions bt WHERE bt.id = $1`, [bankTransactionId])).rows[0]
+  if (t && t.status === 'matched' && t.returned_receipt_id && isUuid(t.returned_receipt_id)) {
+    return projectReturnedCheck(client, { ...t, returned_receipt_id: t.returned_receipt_id })
+  }
   if (!t || t.status !== 'matched' || !t.receipt_id || !isUuid(t.receipt_id)) return []
   const receipt = await projectRemittance(client, t.receipt_id)
   const own = receipt.find(p => p.owner.landlordId === t.landlord_id)
@@ -257,6 +266,51 @@ export async function projectBankMatchTenant(client: PoolClient, bankTransaction
   return [{ owner: { landlordId: t.landlord_id }, intendedDate: t.posted_date, memo: 'Deposit reached the bank', lines: L.lines }]
 }
 
+/** What a receipt paid, by the property of each line (company level for a line on no unit). */
+async function receiptPropertySplit(client: PoolClient, remittanceId: string): Promise<Array<{ propertyId: string | null; cents: number }>> {
+  return (await client.query<{ property_id: string | null; c: string }>(
+    `SELECT u.property_id, ${cSql('SUM(ra.amount_applied)')} AS c
+       FROM remittance_applications ra
+       JOIN payments p ON p.id = ra.payment_id
+       LEFT JOIN units u ON u.id = p.unit_id
+      WHERE ra.remittance_id = $1
+      GROUP BY u.property_id ORDER BY u.property_id NULLS LAST`, [remittanceId])).rows
+    .map(r => ({ propertyId: r.property_id, cents: centsOf(r.c) }))
+}
+
+/**
+ * 10/14 (Nic, answer 15): a check the bank returned out of a deposit slip,
+ * taken back (services/returnedCheck). The slip already moved that check from
+ * the drawer into the bank (B8: Dr bank / Cr Undeposited funds); its receipt
+ * is taken back — as the whole-deposit bounce and the deposit Undo take a
+ * receipt back, so the books and the money records (incomeBasis) agree — and
+ * the ledger engine posts that as a correction (on the day it was made or
+ * restated, per the company's choice; never inside a closed month). The
+ * bank's returned-item line puts the check back: Dr Undeposited funds / Cr
+ * the bank, on the bank's day, property by property as the check paid
+ * (ledgerTenantChecks undepositedFundsCheck counts it). Counted once.
+ */
+async function projectReturnedCheck(client: PoolClient, t: {
+  landlord_id: string; bank_connection_id: string; posted_date: string; returned_receipt_id: string; amount_c: string
+}): Promise<DesiredPosting[]> {
+  const cents = -centsOf(t.amount_c)
+  if (cents <= 0) return []
+  const parts = await receiptPropertySplit(client, t.returned_receipt_id)
+  const L = new Lines()
+  const bank = { sub: { kind: 'bank_connection' as const, value: t.bank_connection_id } }
+  if (parts.length && parts.reduce((x, p) => x + p.cents, 0) === cents) {
+    for (const p of parts) {
+      L.dr('undeposited_funds', p.cents, { propertyId: p.propertyId })
+      L.cr('bank_checking', p.cents, { propertyId: p.propertyId, ...bank })
+    }
+  } else {
+    const propertyId = parts[0]?.propertyId ?? null
+    L.dr('undeposited_funds', cents, { propertyId })
+    L.cr('bank_checking', cents, { propertyId, ...bank })
+  }
+  return [{ owner: { landlordId: t.landlord_id }, intendedDate: t.posted_date, memo: 'Check returned by the bank', lines: L.lines }]
+}
+
 export const bankMatchTenantProjector: LedgerProjector = {
   sourceType: 'bank_match',
   ruleVersion: TENANT_RECEIPTS_RULE_VERSION,
@@ -265,7 +319,8 @@ export const bankMatchTenantProjector: LedgerProjector = {
     if (!owner.landlordId) return []
     const r = await client.query<{ id: string; day: string }>(
       `SELECT bt.id::text AS id, bt.posted_date::text AS day FROM bank_transactions bt
-        WHERE bt.landlord_id = $1 AND bt.status = 'matched' AND bt.auto_settle_undo ? 'receiptId'
+        WHERE bt.landlord_id = $1 AND bt.status = 'matched'
+          AND (bt.auto_settle_undo ? 'receiptId' OR bt.auto_settle_undo->>'kind' = 'returned_check')
           AND ($2::date IS NULL OR bt.posted_date >= $2::date)`, [owner.landlordId, opts.since ?? null])
     return r.rows
   },
@@ -297,7 +352,13 @@ export async function projectDepositSlip(client: PoolClient, slipId: string): Pr
     const own = (await projectRemittance(client, it.remittance_id)).find(p => p.owner.landlordId === s.landlord_id)
     const drawer = (own?.lines ?? []).filter(l => l.role === 'undeposited_funds' && (l.debitCents ?? 0) > 0)
     const total = drawer.reduce((x, l) => x + (l.debitCents ?? 0), 0)
-    if (total === cents && drawer.length) for (const l of drawer) add(l.propertyId ?? null, l.debitCents!)
+    if (total === cents && drawer.length) { for (const l of drawer) add(l.propertyId ?? null, l.debitCents!); continue }
+    // 10/14 (Nic, answer 15): a check the bank returned out of this slip is
+    // taken back (its receipt posts nothing now); it still went into the bank
+    // by the properties its lines paid, which is where the bank's returned-item
+    // line puts it back (projectReturnedCheck) — the same split both ways.
+    const paid = drawer.length ? [] : await receiptPropertySplit(client, it.remittance_id)
+    if (paid.length && paid.reduce((x, p) => x + p.cents, 0) === cents) for (const p of paid) add(p.propertyId, p.cents)
     else add(drawer[0]?.propertyId ?? s.property_id, cents)
   }
   add(s.property_id, centsOf(s.other_c))

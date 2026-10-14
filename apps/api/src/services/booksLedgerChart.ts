@@ -77,7 +77,7 @@
 import type { PoolClient } from 'pg'
 import {
   LEDGER_ACCOUNT_ROLE_DEFS, LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_MAP_BEGINNING, LEDGER_MAP_KIND_PARENT_ROLE,
-  LEDGER_MAP_KINDS, type LedgerAccountRole, type LedgerMapKind, type BooksAccountType,
+  LEDGER_MAP_KINDS, ledgerIncomeDetailOf, type LedgerAccountRole, type LedgerMapKind, type BooksAccountType,
 } from '@gam/shared'
 import type { LedgerOwnerContext } from './ledgerOwner'
 import { db } from '../db'
@@ -416,6 +416,8 @@ function isControlKey(k: MapKey): boolean {
 }
 function keyLabel(k: MapKey): string {
   if (k.kind === 'role') return LEDGER_ACCOUNT_ROLE_BY_NAME[k.value as LedgerAccountRole]?.name ?? k.value
+  // 10/14 (Nic I1): an itemized income line is named as the report names it.
+  if (k.kind === 'rent_line' || k.kind === 'stay_line') return ledgerIncomeDetailOf(k.kind, k.value)?.label ?? k.value
   return k.kind === 'bank_connection' ? 'a linked bank account' : `the ${k.value} tax`
 }
 

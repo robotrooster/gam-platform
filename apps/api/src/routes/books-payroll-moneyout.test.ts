@@ -56,16 +56,16 @@ afterAll(async () => { await cleanupAllSchema() })
 
 async function employee(co: Co, first: string, rate: number): Promise<string> {
   const r = await db.query<{ id: string }>(
+    // 10/14 (Nic): each employee says where their pay goes (here: company level).
     `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, filing_status,
-                                  state_withholding_pct, status)
-     VALUES ($1, $2, 'Worker', 'salary', $3, 'biweekly', 'single', 0, 'active') RETURNING id`, [co.landlordId, first, rate])
+                                  state_withholding_pct, status, pay_place)
+     VALUES ($1, $2, 'Worker', 'salary', $3, 'biweekly', 'single', 0, 'active', 'company') RETURNING id`, [co.landlordId, first, rate])
   return r.rows[0].id
 }
 
 async function approved(co: Co, body: object): Promise<string> {
-  // 10/13 (Nic): a run says where its wages go when it is logged (here: split across the properties by units).
   const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly',
-    costPlace: 'split_by_units', ...body })
+    ...body })
   expect(calc.status, JSON.stringify(calc.body)).toBe(201)
   const ok = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
   expect(ok.status, JSON.stringify(ok.body)).toBe(200)
@@ -197,7 +197,7 @@ describe('work-trade extra hours sent to GAM Books (I6)', () => {
     expect((await post(co, `/work-trade-pay/${x}/contractor-payment`, { vendorId: v })).status).toBe(409)
     // Marked paid by hand on the Work Trade page too, the same hours would be paid twice.
     const byHand = await request(app).post(`/api/work-trade/extra-hours/${x}/mark-paid`).set('Authorization', `Bearer ${co.token}`)
-      .send({ paidOn: '2026-10-01', paidHow: 'check' })
+      .send({ paidOn: '2026-10-01', paidHow: 'check', costPlace: 'split_by_units' })
     expect([byHand.status, byHand.body.error]).toEqual([409, 'These extra hours are a contractor bill in GAM Books. Pay that bill there, or void it first.'])
     // The expense voided on the Expenses page: the hours are waiting for Books again.
     await db.query(`UPDATE landlord_expenses SET status = 'voided', voided_at = NOW() WHERE id = $1`, [made.body.data.expenseId])

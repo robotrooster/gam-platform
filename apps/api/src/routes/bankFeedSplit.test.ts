@@ -23,7 +23,7 @@ import { bankFeedRouter } from './bankFeed'
 import { financialsRouter } from './financials'
 import { expensesRouter } from './expenses'
 import { errorHandler } from '../middleware/errorHandler'
-import { reconcileDeposits } from '../services/bankFeed'
+import { reconcileDeposits, categorizeTransaction } from '../services/bankFeed'
 import { incomeTotals } from '../services/incomeBasis'
 import {
   listLandlordExpenses, landlordExpensesTotal, voidLandlordExpense, updateLandlordExpense,
@@ -250,14 +250,17 @@ describe('changing how a line is filed — everything kept', () => {
     expect(await activeIncome(co)).toBe(48.39)
   })
 
-  it('splits a deposit that filed itself: the filing is the owner’s now', async () => {
+  it('splits a deposit that filed itself (before 10/14): the filing is the owner’s now', async () => {
     const co = await company()
     const ruleId = (await db.query(
       `INSERT INTO landlord_merchant_rules (landlord_id, normalized_merchant, category, scope_kind, property_id, last_direction, auto_file_income)
        VALUES ($1, 'SQUARE INC', 'propane_fuel', 'property_common', $2, 'in', TRUE) RETURNING id`,
       [co.landlordId, co.propertyId])).rows[0].id
     const id = await line(co, 48.39)
-    expect(await reconcileDeposits(co.landlordId)).toBeTruthy()
+    // 10/14 (Nic, answer 16): nothing files itself any more — a line that did
+    // before sits on file filed as one category, with the rule that filed it.
+    await categorizeTransaction(co.landlordId, id, { category: 'propane_fuel', scopeKind: 'property_common', propertyId: co.propertyId })
+    await db.query(`UPDATE bank_transactions SET auto_filed_rule_id = $2, auto_filed_at = now() WHERE id = $1`, [id, ruleId])
     const before = await txn(id)
     expect(before).toMatchObject({ status: 'categorized', auto_filed_rule_id: ruleId })
     expect(before.landlord_other_income_id).not.toBeNull()
@@ -292,10 +295,11 @@ describe('changing how a line is filed — everything kept', () => {
     expect(rows.every((r: any) => r.status === 'voided')).toBe(true)
     expect(await activeIncome(co)).toBe(0)
 
-    // A fresh deposit from the same payer files itself; the one a person undid does not.
+    // 10/14 (Nic, answer 16): no deposit files itself from its payer's name —
+    // neither a fresh one from the same payer nor the one a person undid.
     const fresh = await line(co, 12.5, { day: '2026-10-02' })
     await reconcileDeposits(co.landlordId)
-    expect((await txn(fresh)).status).toBe('categorized')
+    expect((await txn(fresh)).status).toBe('needs_review')
     expect((await txn(id)).status).toBe('needs_review')
 
     // Back in review, it can be filed again — as one category or split again.

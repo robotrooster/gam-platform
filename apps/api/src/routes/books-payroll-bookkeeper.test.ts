@@ -105,10 +105,11 @@ async function seedEmployee(landlordId: string, opts: {
   filingStatus?: string; statePct?: number; status?: string;
 } = {}): Promise<string> {
   const r = await db.query<{ id: string }>(
+    // 10/14 (Nic): each employee says where their pay goes (here: company level).
     `INSERT INTO books_employees
        (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency,
-        filing_status, state_withholding_pct, status)
-     VALUES ($1,$2,$3,$4,$5,'biweekly',$6,$7,$8) RETURNING id`,
+        filing_status, state_withholding_pct, status, pay_place)
+     VALUES ($1,$2,$3,$4,$5,'biweekly',$6,$7,$8,'company') RETURNING id`,
     [landlordId, opts.firstName ?? 'Test', opts.lastName ?? 'Emp',
      opts.payType ?? 'salary', opts.payRate ?? 52000,
      opts.filingStatus ?? 'single', opts.statePct ?? 0,
@@ -348,9 +349,9 @@ describe('10/11: hours typed 0, and the Additional Medicare Tax', () => {
     expect(res.status, JSON.stringify(res.body)).toBe(201)
     // 10,000 × 1.45% + (205,000 − 200,000) × 0.9% = 145 + 45
     expect(Number(res.body.data.lines[0].medicare_tax)).toBe(190)
-    // 10/13 (Nic): the run says where its wages go when it is approved.
+    // 10/14 (Nic): each paycheck follows its employee's place; approving asks nothing.
     const ok = await request(buildApp()).post(`/api/books/payroll/runs/${res.body.data.id}/approve`).set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ costPlace: 'split_by_units' })
+      .send({})
     expect(ok.status, JSON.stringify(ok.body)).toBe(200)
     const tax = await request(buildApp()).get('/api/books/tax/summary?year=2026').set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(tax.status, JSON.stringify(tax.body)).toBe(200)
@@ -397,21 +398,25 @@ describe('POST /payroll/runs/:id/approve', () => {
     const f = await seedPortfolio()
     const empId = await seedEmployee(f.landlordAId)
     const runId = await seedDraftRun(f, empId, 2000)
-    // 10/13 (Nic): "there should never be a default setting to apply expenses" —
-    // a landlord company's run is not approved until it says where its wages go.
+    // 10/14 (Nic): each paycheck follows its employee's place — a run whose
+    // employee has none yet is not approved until it is set on the employee.
+    await db.query(`UPDATE books_employees SET pay_place = NULL WHERE id = $1`, [empId])
     const unsaid = await request(buildApp())
       .post(`/api/books/payroll/runs/${runId}/approve`)
       .set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(unsaid.status).toBe(400)
-    expect(unsaid.body.error).toMatch(/^Choose where this payroll's wages and employer taxes go/)
+    expect(unsaid.body.error).toBe('Set where this employee\'s pay goes on the Employees page before running payroll: Test Emp.')
     expect((await db.query(`SELECT status FROM payroll_runs WHERE id = $1`, [runId])).rows[0].status).toBe('draft')
+    await db.query(`UPDATE books_employees SET pay_place = 'company' WHERE id = $1`, [empId])
     const res = await request(buildApp())
       .post(`/api/books/payroll/runs/${runId}/approve`)
       .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ costPlace: 'split_by_units' })
+      .send({})
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('approved')
-    expect(res.body.data.cost_place).toBe('split_by_units')
+    // 10/14 (Nic): the paycheck carries its employee's place; the run names none.
+    expect(res.body.data.cost_place).toBeNull()
+    expect((await db.query(`SELECT pay_place FROM payroll_run_lines WHERE run_id = $1`, [runId])).rows).toEqual([{ pay_place: 'company' }])
     const emp = await db.query<{ ytd_gross: string; ytd_net: string }>(
       `SELECT ytd_gross, ytd_net FROM books_employees WHERE id=$1`, [empId])
     expect(Number(emp.rows[0].ytd_gross)).toBe(2000)

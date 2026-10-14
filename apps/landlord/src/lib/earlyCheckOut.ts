@@ -186,7 +186,8 @@ export const KEEP_THEM_OWED = 'Keep them owed'
  * day they left — the schedule's shorter-stay question (SchedulePage) and the
  * Check out window's (EarlyCheckOutModal) — exactly as the server sent them:
  * "Take those charges off" only when it was offered (the owner, and anybody
- * with a reservation permission and "Record a cash / check payment"), "Keep them owed" always,
+ * with a reservation permission and "Record a cash / check payment" or, 10/14
+ * (Nic), "Ring sales"), "Keep them owed" always,
  * since anybody who reaches the
  * question may keep them owed. A reply that names neither (an older server, a
  * reply cut short) still leaves "Keep them owed" — never a chooser with

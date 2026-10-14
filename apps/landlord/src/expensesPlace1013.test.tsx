@@ -10,7 +10,8 @@
  *
  * The busiest logging form: nothing is chosen when it opens and nothing
  * carries over from the last expense; it does not save until where the cost
- * goes and how it was paid are answered. 10/13 review: money out that is not a
+ * goes and how it was paid are answered. 10/14 (Nic): "paid already" or "a
+ * bill to pay later" starts unanswered too. 10/13 review: money out that is not a
  * cost (an owner's draw) is never split — it goes on a unit, a property or the
  * company; a bookkeeper kept to some properties is not offered a split; a bill
  * another record keeps (a work trader's hours) keeps that record's place, and
@@ -70,6 +71,8 @@ const text = () => host!.textContent || ''
 const button = (label: string) => [...host!.querySelectorAll('button')].find(b => b.textContent?.trim() === label) as HTMLButtonElement | undefined
 const PLACES = ['One unit', 'One property', 'Split across your properties by units', 'The company']
 const chosenPlace = () => PLACES.filter(l => button(l)?.className.includes('btn-primary'))
+/** 10/14 (Nic): which of "Paid already" / "A bill to pay" is picked. */
+const payOrBill = () => ['Paid already', 'A bill to pay'].filter(l => button(l)?.className.includes('btn-primary'))
 const selectWith = (option: string) => [...host!.querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === option)) as HTMLSelectElement
 function choose(select: HTMLSelectElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!
@@ -124,13 +127,21 @@ describe('Expenses: where a cost goes and how it was paid are picked when it is 
     expect(text()).toContain('Where does this cost go?')
     for (const l of PLACES.slice(0, 3)) expect(button(l)).toBeTruthy()
     expect(chosenPlace()).toEqual([])
-    const paidHow = selectWith('Choose how it was paid…')
-    expect(paidHow.value).toBe('')
+    // 10/14 (Nic): paid already or a bill to pay — neither is picked, so how it
+    // was paid (or when the bill is due) is not asked yet.
+    expect(payOrBill()).toEqual([])
+    expect(selectWith('Choose how it was paid…')).toBeUndefined()
     await fill('cat-ins', '1200')
     expect(button('Log expense')!.disabled).toBe(true)
     await click('Split across your properties by units')
     expect(text()).toContain('split across all of the company\'s properties by how many units each has')
-    // Where it goes is answered; how it was paid is not.
+    // Where it goes is answered; paid or a bill is not.
+    expect(button('Log expense')!.disabled).toBe(true)
+    await click('Paid already')
+    expect(payOrBill()).toEqual(['Paid already'])
+    const paidHow = selectWith('Choose how it was paid…')
+    expect(paidHow.value).toBe('')
+    // Paid already; how it was paid is not answered yet.
     expect(button('Log expense')!.disabled).toBe(true)
     await act(async () => { choose(paidHow, 'cash') })
     await flush()
@@ -143,7 +154,8 @@ describe('Expenses: where a cost goes and how it was paid are picked when it is 
     })
     // The next expense asks again.
     expect(chosenPlace()).toEqual([])
-    expect(selectWith('Choose how it was paid…').value).toBe('')
+    expect(payOrBill()).toEqual([])
+    expect(selectWith('Choose how it was paid…')).toBeUndefined()
     expect(button('Log expense')!.disabled).toBe(true)
   })
 
@@ -154,6 +166,7 @@ describe('Expenses: where a cost goes and how it was paid are picked when it is 
     await act(async () => { choose(selectWith('Select a property…'), 'p1') })
     await flush()
     await act(async () => { choose(selectWith('Select a unit…'), 'u1') })
+    await click('Paid already')
     await act(async () => { choose(selectWith('Choose how it was paid…'), 'check') })
     await flush()
     await click('Log expense')
@@ -172,6 +185,7 @@ describe('Expenses: where a cost goes and how it was paid are picked when it is 
     expect(chosenPlace()).toEqual([])
     await click('The company')
     expect(text()).toContain('Owner draw is not a cost, so it is not split; it goes on the company.')
+    await click('Paid already')
     await act(async () => { choose(selectWith('Choose how it was paid…'), 'owner_paid') })
     await flush()
     await click('Log expense')

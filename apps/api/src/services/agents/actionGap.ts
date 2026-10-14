@@ -317,15 +317,19 @@ const DELIBERATE = new Map(Object.entries({
   // 10/12 (Nic): "every bank filing (hand-filed too) can be undone (kept on record)."
   'bankFeed POST /transactions/:id/undo-filing':
     'takes back how a bank line is filed (one category, a filing the feed made itself, a split, or an Ignore): what it booked is voided and the line returns to review. The Undo beside the filed line on the Bank page, confirmed with that line and what comes out of the books on screen.',
-  // 10/12 (Nic): "after a split, ASK whether future deposits from that payer should stop filing automatically."
-  'bankFeed POST /transactions/:id/stop-auto-filing':
-    'the owner\'s yes to the question asked right after splitting a deposit: that payer\'s deposits stop filing themselves into the books. Answered on the Bank page with the split line and its payer on screen.',
   // 10/12 (Nic, ledger P6, L5): "money out = ONE record" — a bank line going
   // out matches the record it paid first (services/bankMoneyOut).
   'bankFeed POST /transactions/:id/match-expenses':
     'says which open bills (or checks already written) a bank line going out paid, which marks them paid from the bank. Picked on the Bank page from the open expenses offered beside the line, adding up to it to the cent; in a company with several bills of the same amount an amount names nobody, and the assistant makes no money decision (#38 Q6).',
   'bankFeed POST /transactions/:id/match-record':
     'says a bank line going out IS GAM\'s fee debit, a register refund check, a refund check, a transfer to another of the company\'s accounts or a payment on one of its loans (split into principal, interest and escrow), or that money coming in IS a loan\'s money arriving, which clears it from what is owed to the bank. Picked on the Bank page from the records of the same amount offered beside the line (a loan payment\'s split checked against the lender\'s statement); a wrong match books the money twice, and the assistant makes no money decision (#38 Q6).',
+  // 10/14 (Nic, answer 15): a check the bank returned out of a bigger deposit,
+  // when GAM could not be sure which check it was.
+  'bankFeed POST /transactions/:id/returned-check':
+    'the owner says which check (or money order) in a deposit is the one the bank returned on a line going out, which takes that payment back off the bills it paid, owes them again with late fees and bills the returned-check fee. Picked on the Bank page from the checks of that amount listed beside the line; a wrong pick reopens another tenant\'s rent, and the assistant makes no money decision (#38 Q6).',
+  // 10/14 (Nic, answer 16): "no guessing" — a deposit of a payout's amount whose memo does not name GAM.
+  'bankFeed POST /transactions/:id/match-payout':
+    'the owner says a deposit IS the payout GAM sent, offered beside a deposit of that amount whose memo does not name GAM, which keeps the money from being filed as income a second time. The button beside the deposit on the Bank page, with the payout\'s amount and day on screen; the assistant makes no money decision (#38 Q6).',
   // 10/12 (Nic, L5): "just let bookkeeper/landlord create custom labels or categories to charge things off to."
   'expenses POST /categories':
     'the owner or bookkeeper makes a category of their own and, optionally, points it at an account of the chart, which decides whether its money counts on the Profit & Loss. Done on the Categories page with the chart on screen; an assistant never picks where a company\'s money posts.',

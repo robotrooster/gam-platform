@@ -117,8 +117,8 @@ export interface ConfirmDepositInput {
 /**
  * May a landlord's confirm settle rent from a deposit the bank still shows as
  * PENDING (not yet posted)? Automatic settling never does (bankFeed
- * autoSettleDeclaredDeposits: "settle rent from it only once the bank has
- * posted it"), "Money received" counts money on the day it arrived (money plan
+ * reconcileDeposits: "settle rent from it only once the bank has posted
+ * it"), "Money received" counts money on the day it arrived (money plan
  * §0.0), and a pending deposit can still be voided — leaving rent settled and
  * backdated with no money behind it. ASKED NIC (Step 9, needs-Nic item 5):
  * true keeps today's behavior (the landlord's confirm takes it); false refuses
@@ -1346,7 +1346,7 @@ export interface UndoneMarker {
 
 export interface UndoDepositResult {
   /** 10/6: 'recorded_deposit' — a bank line tied to a deposit the office logged by hand (the payments stay). */
-  kind: 'tenant_deposit' | 'deposit_slip' | 'recorded_deposit'
+  kind: 'tenant_deposit' | 'deposit_slip' | 'recorded_deposit' | 'returned_check' | 'gam_payout'
   /** Bill lines that are owed again. */
   reopenedChargeIds: string[]
   /** Late fees put back. */
@@ -1357,6 +1357,12 @@ export interface UndoDepositResult {
   declarationId: string | null
   /** A slip staff made, open again (deposit_slip kind). */
   slipReopened?: boolean
+  /**
+   * 10/14 (Nic, answer 15): a check the bank returned, put back (returned_check
+   * kind, services/returnedCheck undoReturnedCheck): what it pays again, and the
+   * fee and late fees the bounce brought, voided (kept on record).
+   */
+  checkPutBack?: { paidAgainIds: string[]; feeVoided: string | null; lateFeesVoided: string[] }
 }
 
 /**
@@ -1392,19 +1398,25 @@ export async function undoDepositMatch(input: {
   const client = await getClient()
   let result: UndoDepositResult
   let tenantToTell: { tenantId: string; amount: number; postedDate: string } | null = null
+  // 10/14 (Nic, answer 15): a returned check put back — told after the commit.
+  let putBack: import('./returnedCheck').ReturnedCheckPutBack | null = null
   const subjects = new Set<string>()
   try {
     await client.query('BEGIN')
     const txn = (await client.query<{
       id: string; landlord_id: string; status: string; amount: string; posted_date: string
-      matched_disbursement_id: string | null; undo: any
+      matched_disbursement_id: string | null; matched_by: string | null; undo: any
     }>(
       `SELECT id, landlord_id, status, amount::text AS amount, to_char(posted_date,'YYYY-MM-DD') AS posted_date,
-              matched_disbursement_id, auto_settle_undo AS undo
+              matched_disbursement_id, matched_by, auto_settle_undo AS undo
          FROM bank_transactions WHERE id = $1 FOR UPDATE`, [input.bankTransactionId])).rows[0]
     if (!txn || txn.landlord_id !== input.landlordId) throw new AppError(404, 'Deposit not found')
     if (txn.status !== 'matched') throw new AppError(409, 'This deposit is not matched to anything, so there is nothing to undo.')
-    if (txn.matched_disbursement_id) {
+    // 10/14 (Nic, answer 16): a payout GAM matched by itself named GAM in its
+    // memo — certain, nothing to undo. One a person matched by hand
+    // (bankFeed matchPayoutByHand) is a filing like any other (Nic 10/12:
+    // "every bank filing (hand-filed too) can be undone"): back to review.
+    if (txn.matched_disbursement_id && (!txn.matched_by || input.bankVoided)) {
       throw new AppError(409, 'This deposit is a payout GAM sent you. It is matched to that payout and there is nothing to undo.')
     }
     const undo = txn.undo
@@ -1416,7 +1428,28 @@ export async function undoDepositMatch(input: {
       version: 1, undone: true, undoneAt: new Date().toISOString(), undoneBy: input.undoneBy, was,
     })
 
+    if (txn.matched_disbursement_id) {
+      await client.query(
+        `UPDATE bank_transactions
+            SET status = 'needs_review', matched_disbursement_id = NULL, matched_at = NULL, matched_by = NULL,
+                auto_settle_undo = $2::jsonb, updated_at = NOW()
+          WHERE id = $1`,
+        [txn.id, JSON.stringify(marker({ kind: 'gam_payout', disbursementId: txn.matched_disbursement_id, matchedBy: txn.matched_by }))])
+      await client.query('COMMIT')
+      return { kind: 'gam_payout', reopenedChargeIds: [], lateFeesRestored: 0, creditsWithdrawn: [], declarationId: null }
+    }
+
     if (undo?.kind === 'deposit_slip') {
+      // 10/14 (Nic, answer 15): a check in this bag the bank returned and GAM
+      // took back stands on this match (its returned line puts it back in the
+      // drawer the slip took it from) — that comes off first.
+      const returnedOut = (await client.query(
+        `SELECT 1 FROM bank_transactions
+          WHERE landlord_id = $1 AND status = 'matched' AND auto_settle_undo->>'kind' = 'returned_check'
+            AND auto_settle_undo->>'slipId' = $2 LIMIT 1`, [txn.landlord_id, String(undo.slipId ?? '')])).rowCount
+      if (returnedOut) {
+        throw new AppError(409, 'A check in this deposit was returned by the bank and taken back. Undo that first (Undo this match on the returned check’s own line), then this match.')
+      }
       // 10/13 (review): the bank took back a bag with payments or register
       // sales the office took in it — those stay as recorded (GAM cannot take
       // a desk payment back yet), so the bag is left whole for the owner, other
@@ -1448,9 +1481,29 @@ export async function undoDepositMatch(input: {
       }
     }
 
+    // 10/14 (Nic, answer 15; Nic 10/12: "every bank filing (hand-filed too)
+    // can be undone (kept on record)"): a check the bank returned, taken back
+    // out of a deposit — put back exactly (services/returnedCheck). The line
+    // goes back to review, never taken back by itself again; a bank that voids
+    // its own returned line puts the check back the same way, set aside.
+    if (undo?.kind === 'returned_check') {
+      const { undoReturnedCheck } = await import('./returnedCheck')
+      const r = await undoReturnedCheck(client, { lineId: txn.id, landlordId: txn.landlord_id, undo, undoneBy: input.undoneBy })
+      for (const s of r.subjects) subjects.add(s)
+      await client.query(
+        `UPDATE bank_transactions
+            SET status = $3, ignored_reason = $4, matched_at = NULL, matched_by = NULL,
+                auto_settle_undo = $2::jsonb, updated_at = NOW()
+          WHERE id = $1`, [txn.id, JSON.stringify(marker(undo)), after.status, after.reason])
+      await client.query('COMMIT')
+      putBack = r
+      result = {
+        kind: 'returned_check', reopenedChargeIds: [], lateFeesRestored: 0, creditsWithdrawn: [], declarationId: null,
+        checkPutBack: { paidAgainIds: r.paidAgainIds, feeVoided: r.feeVoided, lateFeesVoided: r.lateFeesVoided },
+      }
     // 10/6: a bank line tied to a deposit the office logged by hand — the
     // receipt and its payments stay; what the bank's date changed goes back.
-    if (undo?.kind === 'recorded_deposit') {
+    } else if (undo?.kind === 'recorded_deposit') {
       // 10/13 evening: the receipt the office logged by hand stays — GAM has no
       // way yet to take back a payment recorded at the desk (see voidWhatBounced).
       if (input.bankVoided) throw new AppError(409, 'This deposit is tied to a payment the office logged by hand, which stays as recorded.')
@@ -1758,6 +1811,10 @@ export async function undoDepositMatch(input: {
   }
   if (result.reopenedChargeIds.length > 0) {
     await noteEscrowDepositMatchUndone(input.bankTransactionId, result.reopenedChargeIds)
+  }
+  if (putBack) {
+    const { tellCheckPutBack } = await import('./returnedCheck')
+    await tellCheckPutBack(input.bankTransactionId, putBack, { bankVoided: input.bankVoided })
   }
   if (tenantToTell) {
     const t = tenantToTell

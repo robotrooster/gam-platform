@@ -154,6 +154,31 @@ describe('runBirthdayEmails', () => {
     expect(sendMock).not.toHaveBeenCalled()
   })
 
+  it('10/14 (Nic): "18 and up" — nobody under 18 is emailed; an 18th birthday is', async () => {
+    await seedResident({ dob: '2009-10-14', firstName: 'Kid' })      // turns 17 today
+    await seedResident({ dob: '2020-10-14', firstName: 'Small' })    // a lease's date typed in years ago
+    const adult = await seedResident({ dob: '2008-10-14', firstName: 'Eighteen' }) // turns 18 today
+    await seedOwner('2010-10-14', 'Young')                            // a landlord too
+    const res = await runBirthdayEmails(MORNING)
+    expect(res).toMatchObject({ birthdays: 1, sent: 1 })
+    expect(sendMock.mock.calls[0][0]).toMatchObject({ to: adult.tenantEmail, firstName: 'Eighteen' })
+  })
+
+  it('10/14 (Nic): an 18th birthday on Feb 29 is greeted on Feb 28 in a year without one', async () => {
+    await seedResident({ dob: '2008-02-29' })
+    expect((await runBirthdayEmails(new Date('2026-02-28T16:15:00Z'))).sent).toBe(1)
+  })
+
+  it('10/14 (Nic): only verified email addresses — tenant or landlord', async () => {
+    const r = await seedResident({ firstName: 'Unproven' })
+    const owner = await seedOwner('1979-10-14', 'Nic')
+    await db.query(`UPDATE users SET email_verified = FALSE WHERE id = ANY($1::uuid[])`, [[r.tenantUserId, owner.userId]])
+    const res = await runBirthdayEmails(MORNING)
+    expect(res).toMatchObject({ birthdays: 0, sent: 0 })
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(await greetings(r.tenantUserId)).toEqual([])
+  })
+
   it('only CURRENT tenants — not a lease that ended or has not started, not a seat taken off the lease', async () => {
     await seedResident({ leaseStatus: 'expired' })
     await seedResident({ leaseStatus: 'terminated' })

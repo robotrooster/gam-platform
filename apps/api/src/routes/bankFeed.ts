@@ -18,7 +18,7 @@ import { NOT_RENT_MARK } from '../services/bankDepositCandidates'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
-  splitTransaction, undoSplit, SPLIT_MAX_PARTS, undoFiling, stopPayerAutoFiling,
+  splitTransaction, undoSplit, SPLIT_MAX_PARTS, undoFiling,
 } from '../services/bankFeed'
 
 export const bankFeedRouter = Router()
@@ -236,10 +236,7 @@ bankFeedRouter.post('/transactions/:id/categorize', requireBankFiler, async (req
 // already filed from the Bank page (as one category, or in parts) it replaces
 // that filing; the old rows are voided, never deleted. Body { parts: [{
 // category, amount, scopeKind, unitId | propertyId, description? }] }. The
-// owner's, like filing (services/bankFeed splitTransaction). 10/12 (Nic): the
-// reply carries payerQuestion for a deposit whose payer files itself (or
-// would) — the page asks whether that payer should stop; yes is
-// POST /transactions/:id/stop-auto-filing.
+// owner's, like filing (services/bankFeed splitTransaction).
 bankFeedRouter.post('/transactions/:id/split', requireBankFiler, async (req: any, res, next) => {
   try {
     const body = z.object({
@@ -290,17 +287,8 @@ bankFeedRouter.post('/transactions/:id/undo-filing', requireBankFiler, async (re
   } catch (e) { next(e) }
 })
 
-// POST /api/bank-feed/transactions/:id/stop-auto-filing — 10/12 (Nic): "after
-// a split, ASK whether future deposits from that payer should stop filing
-// automatically." The owner's yes: deposits from this line's payer stop filing
-// themselves (services/bankFeed stopPayerAutoFiling). No body — the payer is
-// the line's own, never a name sent in. A no needs no call.
-bankFeedRouter.post('/transactions/:id/stop-auto-filing', requireLandlord, async (req: any, res, next) => {
-  try {
-    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
-    res.json({ success: true, data: await stopPayerAutoFiling(landlordId, req.params.id) })
-  } catch (e) { next(e) }
-})
+// (10/14, Nic answer 16: POST /transactions/:id/stop-auto-filing is gone —
+// nothing files itself from a payer's name any more, so there is nothing to stop.)
 
 // POST /api/bank-feed/transactions/:id/ignore
 bankFeedRouter.post('/transactions/:id/ignore', requireBankFiler, async (req: any, res, next) => {
@@ -335,7 +323,49 @@ bankFeedRouter.get('/transactions/:id/matches', requireBankViewer, async (req: a
       }
       found.records = allowed
     }
-    res.json({ success: true, data: found })
+    // 10/14 (Nic, answer 15): a line going out may be a check the bank
+    // returned — the checks of its amount in deposits on that account, for the
+    // owner to pick the one that bounced (POST /transactions/:id/returned-check).
+    // Never a bookkeeper's: taking a tenant's payment back is a tenant action.
+    const isOwner = req.user?.role === 'landlord' || req.user?.role === 'admin' || req.user?.role === 'super_admin'
+    const { checkChoices, mentionsAReturn } = await import('../services/returnedCheck')
+    const returnedChecks = isOwner ? await checkChoices(landlordId, req.params.id) : []
+    const memo = returnedChecks.length
+      ? (await queryOne<{ description: string | null }>(`SELECT description FROM bank_transactions WHERE id = $1`, [req.params.id]))?.description
+      : null
+    res.json({ success: true, data: { ...found, returnedChecks, returnedLine: returnedChecks.length > 0 && mentionsAReturn(memo) } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/returned-check — { remittanceId }:
+// 10/14 (Nic, answer 15) the owner says this line going out is that check (or
+// money order) on a matched deposit slip, returned by the bank — when GAM
+// could not be sure which check it was. The same take-back GAM does by itself
+// (services/returnedCheck): just that check, its bills owed again with late
+// fees, the returned-check fee billed, everyone told once. Refused in words
+// when the take-back is not clean. Undone with POST /deposits/:id/undo.
+bankFeedRouter.post('/transactions/:id/returned-check', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { remittanceId } = z.object({ remittanceId: z.string().uuid() }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { takeBackChosenCheck } = await import('../services/returnedCheck')
+    res.json({ success: true, data: await takeBackChosenCheck({
+      landlordId, lineId: req.params.id, remittanceId, by: req.user.userId,
+    }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-payout — { disbursementId }:
+// 10/14 (Nic, answer 16) the owner says this deposit IS GAM's payout — offered
+// beside a deposit of a payout's amount whose memo does not name GAM, so GAM
+// would be guessing (services/bankFeed matchPayoutByHand). Undone with
+// POST /deposits/:id/undo.
+bankFeedRouter.post('/transactions/:id/match-payout', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { disbursementId } = z.object({ disbursementId: z.string().uuid() }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { matchPayoutByHand } = await import('../services/bankFeed')
+    res.json({ success: true, data: await matchPayoutByHand(landlordId, req.params.id, disbursementId, req.user.userId) })
   } catch (e) { next(e) }
 })
 
@@ -765,14 +795,12 @@ bankFeedRouter.post('/deposits/:id/undo', requireLandlord, async (req: any, res,
 })
 
 // POST /api/bank-feed/transactions/:id/undo-auto-file — a deposit that filed
-// itself as income goes back to review; optionally stop that payer filing itself.
+// itself as income (before 10/14, when nothing files itself from a payer's
+// name any more — Nic, answer 16) goes back to review.
 bankFeedRouter.post('/transactions/:id/undo-auto-file', requireLandlord, async (req: any, res, next) => {
   try {
-    const body = z.object({ stopAutoFiling: z.boolean().default(false) }).parse(req.body ?? {})
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
     const { undoAutoFile } = await import('../services/bankFeed')
-    res.json({ success: true, data: await undoAutoFile(landlordId, req.params.id, {
-      stopAutoFiling: body.stopAutoFiling, undoneBy: req.user.userId,
-    }) })
+    res.json({ success: true, data: await undoAutoFile(landlordId, req.params.id, { undoneBy: req.user.userId }) })
   } catch (e) { next(e) }
 })

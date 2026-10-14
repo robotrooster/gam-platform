@@ -36,7 +36,7 @@ async function refuseUnvoidable(q: Q, doc: any): Promise<void> {
 
 /** What ending a document did: erased (with what went with it), or voided. */
 export type DocumentEndOutcome =
-  | { deleted: true; documents: ErasedDocument[]; files: string[] }
+  | { deleted: true; documents: ErasedDocument[]; files: string[]; leaseId: string | null }
   | { deleted: false }
 
 /**
@@ -48,6 +48,13 @@ export type DocumentEndOutcome =
  * voiding them": anything that ends a document calls this, not voidDocument —
  * voidDocument is for a caller that must keep the record whatever it is.
  *
+ * 10/14 (Nic): the same for every AUTOMATIC end — #4 "Automatic voids (48h
+ * timeout, lapsed new lease): delete them too, instead of voiding", and #7,
+ * the 30-day sweep of drafts nobody signed (jobs/scheduler). A lease the
+ * landlord's signature issued is erased with the lease it issued when no
+ * money touched it (#8); a resident's signature alone no longer keeps a
+ * document (#2), and an open invite waiting on it is canceled with it (#1).
+ *
  * Inside the caller's open transaction. A completed or already voided document
  * is refused as the void always refused it, before anything is locked. Files
  * only the erased documents used are the caller's to remove after COMMIT
@@ -57,7 +64,7 @@ export async function endDocument(q: Q, doc: any, reason: string | null): Promis
   if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
   if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
   const erased = await eraseUnfinishedDocument(q, doc)
-  if (erased.erased) return { deleted: true, documents: erased.documents, files: erased.files }
+  if (erased.erased) return { deleted: true, documents: erased.documents, files: erased.files, leaseId: erased.leaseId }
   await voidDocument(q, doc, reason)
   return { deleted: false }
 }

@@ -47,6 +47,9 @@ export const EXTRA_HOURS_ON_LIVE_RUN_SQL = `EXISTS (
   SELECT 1 FROM payroll_run_lines l JOIN payroll_runs r ON r.id = l.run_id
    WHERE l.work_trade_extra_hours_id = x.id AND r.status IN ('draft', 'approved'))`
 
+/** 10/14 (Nic): what Mark paid calls the cost it asks a place for. */
+export const WORK_TRADE_HOURS_PLACE_WHAT = 'the cost of these extra hours'
+
 /** 10/13 (Nic): what a contractor bill confirmed with no place is told. */
 export const CONTRACTOR_BILL_NO_PLACE = 'Choose where this contractor bill goes: one unit, one property, or split across your properties by units.'
 
@@ -128,8 +131,10 @@ export async function recordWorkTradeContractorPayment(client: PoolClient, args:
 //     vendor per person, their 1099 total adds up every payment); a plain
 //     expense naming them in its words when they are W-2 wages paid outside
 //     payroll;
-//   - on the agreement's property (common, split across its spaces) while the
-//     company still owns it, else at company level.
+//   - 10/14 (Nic): "ask where it goes every time (split, property or unit),
+//     like other expenses" — where the person marking it paid said its cost
+//     goes (routes/workTrade mark-paid resolves it). Until 10/14 it went on
+//     the agreement's property without asking.
 // The expense names the hours (work_trade_extra_hours_id) and the hours name
 // the expense (books_reference_id). Removing the expense on the Expenses page
 // puts the hours back to owed (services/landlordExpenses voidLandlordExpense);
@@ -153,15 +158,17 @@ export interface WorkTradeHoursPaidByHand {
  */
 export async function recordWorkTradeHoursPaidByHand(client: PoolClient, args: {
   extraHoursId: string; createdBy: string | null
+  /** 10/14 (Nic): where the person marking it paid said the cost goes. */
+  place: CostPlaceChoice
 }): Promise<WorkTradeHoursPaidByHand> {
+  if (!args.place?.costPlace) throw new AppError(400, `Choose where ${WORK_TRADE_HOURS_PLACE_WHAT} goes: one unit, one property, or split across your properties by units.`)
   const { rows: [x] } = await client.query<{
     id: string; landlord_id: string; tenant_id: string; amount: string; pay_method: string
     status: string; paid_how: string | null; paid_on: string | null; paid_note: string | null; period_ym: string
-    property_id: string | null; who: string | null
+    who: string | null
   }>(
     `SELECT x.id, x.landlord_id, x.tenant_id, x.amount::text AS amount, x.pay_method, x.status, x.paid_how,
             to_char(x.paid_on, 'YYYY-MM-DD') AS paid_on, x.paid_note, to_char(x.period_month, 'YYYY-MM') AS period_ym,
-            (SELECT p.id FROM properties p WHERE p.id = un.property_id AND p.landlord_id = x.landlord_id) AS property_id,
             NULLIF(btrim(concat_ws(' ', u.first_name, u.last_name)), '') AS who
        FROM work_trade_extra_hours x
        JOIN work_trade_agreements wta ON wta.id = x.agreement_id
@@ -200,9 +207,9 @@ export async function recordWorkTradeHoursPaidByHand(client: PoolClient, args: {
     description: `Work-trade extra hours, ${x.period_ym}: ${who}`
       + (contractor ? ' (contractor, 1099)' : ' (wages paid outside payroll)'),
     vendorId: vendor?.id ?? null,
-    propertyId: x.property_id, isCommon: !!x.property_id,
-    // 10/13: GAM's record of hours marked paid by hand — on the work trader's
-    // property (company level if that property has left the company).
+    // 10/14 (Nic): where the person marking it paid said its cost goes.
+    costPlace: args.place.costPlace, propertyId: args.place.propertyId, unitId: args.place.unitId,
+    isCommon: args.place.costPlace === 'property',
     systemBill: true,
     workTradeExtraHoursId: x.id,
     payment: { method: x.paid_how, paidOn: x.paid_on, memo: x.paid_note },

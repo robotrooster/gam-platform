@@ -9,7 +9,9 @@
  *
  * Through the real paths: the bank feed's own steps (reconcileDeposits), the
  * landlord's match screen (unmatchedDepositsWithCandidates) and the
- * landlord's confirm (confirmDepositMatch).
+ * landlord's confirm (confirmDepositMatch). 10/14 (Nic, answer 16: "no
+ * guessing"): the matcher's pair is PICKED on the match screen and the person
+ * confirms it — a tenant's report never settles rent by itself (confirmPaired).
  */
 import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
@@ -23,7 +25,7 @@ vi.mock('../lib/stripe', async (importOriginal) => {
 })
 
 import { db, getClient } from '../db'
-import { reconcileDeposits, autoSettleDeclaredDeposits } from './bankFeed'
+import { reconcileDeposits } from './bankFeed'
 import { confirmDepositMatch, undoDepositMatch } from './bankDepositConfirm'
 import { unmatchedDepositsWithCandidates } from './bankDepositCandidates'
 import {
@@ -94,17 +96,44 @@ async function bankLine(p: Park, posted: string, description: string, amount = 4
 const branch = (mmddyy: string, time: string) =>
   `eDeposit in Branch ${mmddyy} ${time} 360 W CONTINENTAL RD GREEN VALLEY AZ`
 
+/**
+ * 10/14 (Nic, answer 16): the person confirms, line by line in the bank's
+ * order, the report the matcher paired with each line (picked on the match
+ * screen). Returns how many were confirmed.
+ */
+async function confirmPaired(p: Park): Promise<number> {
+  let n = 0
+  for (let guard = 0; guard < 10; guard++) {
+    const { deposits } = await unmatchedDepositsWithCandidates(p.landlordId)
+    const card = [...deposits]
+      .sort((a, b) => String(a.postedDate).localeCompare(String(b.postedDate)) || a.transactionId.localeCompare(b.transactionId))
+      .find(d => d.candidates.some(c => c.preselect && c.declaration))
+    if (!card) return n
+    const c = card.candidates.find(x => x.preselect && x.declaration)!
+    await confirmDepositMatch({
+      bankTransactionId: card.transactionId, chargeIds: c.chargeIds, method: 'cash', declarationId: c.declaration!.id,
+      confirmedByUserId: null,
+    })
+    n++
+  }
+  return n
+}
+
 const reportRow = async (id: string) => (await db.query(
   `SELECT status, bank_transaction_id, false_date_flagged_at FROM tenant_declared_deposits WHERE id = $1`, [id])).rows[0]
 const rentRow = async (id: string) => (await db.query(
   `SELECT status, to_char(settled_at AT TIME ZONE 'UTC','YYYY-MM-DD') AS settled_on FROM payments WHERE id = $1`, [id])).rows[0]
 
-describe('the bank feed pairs reports with lines by itself', () => {
+describe('the bank feed pairs reports with lines; the person confirms each pair', () => {
   it('a single report matches its deposit', async () => {
     const p = await park(1)
     const r = await reportFor(p, 0, { declared: '2026-10-01', hour: 15, madeAt: '2026-10-01T23:00:00Z' })
     const l = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(1)
+    // Never by itself (10/14, Nic answer 16).
+    await reconcileDeposits(p.landlordId)
+    expect(await rentRow(p.lots[0].rentId)).toMatchObject({ status: 'pending' })
+    expect((await reportRow(r)).status).toBe('pending')
+    expect(await confirmPaired(p)).toBe(1)
     expect(await reportRow(r)).toMatchObject({ status: 'confirmed', bank_transaction_id: l, false_date_flagged_at: null })
     expect(await rentRow(p.lots[0].rentId)).toEqual({ status: 'settled', settled_on: '2026-10-01' })
   })
@@ -117,8 +146,8 @@ describe('the bank feed pairs reports with lines by itself', () => {
     const lA = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
     const lB = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
     const earliestLine = [lA, lB].sort()[0]
-    const r = await reconcileDeposits(p.landlordId)
-    expect(r.declared).toBe(2)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(2)
     expect((await reportRow(first)).bank_transaction_id).toBe(earliestLine)
     expect((await reportRow(second)).bank_transaction_id).toBe([lA, lB].sort()[1])
     // Swapped or not, the outcome is the same: both paid on Oct 1, nothing flagged.
@@ -134,7 +163,8 @@ describe('the bank feed pairs reports with lines by itself', () => {
     // Mountain View's bank: the deposit's own date and time, posted the next day.
     const morning = await bankLine(p, '2026-10-01', branch('09/30/26', '09:12:40 AM'))
     const afternoon = await bankLine(p, '2026-10-01', branch('09/30/26', '04:39:28 PM'))
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(2)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(2)
     expect((await reportRow(four)).bank_transaction_id).toBe(afternoon)
     expect((await reportRow(nine)).bank_transaction_id).toBe(morning)
     for (const lot of p.lots) expect(await rentRow(lot.rentId)).toEqual({ status: 'settled', settled_on: '2026-09-30' })
@@ -146,7 +176,8 @@ describe('the bank feed pairs reports with lines by itself', () => {
     const fri = await reportFor(p, 1, { declared: '2026-10-02', hour: 10, madeAt: '2026-10-02T14:00:00Z' })
     const lThu = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
     const lFri = await bankLine(p, '2026-10-02', 'DEPOSIT *4662')
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(2)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(2)
     expect((await reportRow(thu)).bank_transaction_id).toBe(lThu)
     expect((await reportRow(fri)).bank_transaction_id).toBe(lFri)
   })
@@ -155,7 +186,7 @@ describe('the bank feed pairs reports with lines by itself', () => {
     const p = await park(1)
     const r = await reportFor(p, 0, { declared: '2026-10-01', hour: 15, madeAt: '2026-10-01T23:00:00Z' })
     const l = await bankLine(p, '2026-10-06', 'DEPOSIT *4662')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(1)
+    expect(await confirmPaired(p)).toBe(1)
     const row = await reportRow(r)
     expect(row.bank_transaction_id).toBe(l)
     expect(row.false_date_flagged_at).not.toBeNull()
@@ -170,8 +201,8 @@ describe('a real conflict waits for the landlord', () => {
     const b = await reportFor(p, 1, { declared: '2026-10-01', madeAt: '2026-10-01T23:10:00Z' })
     const onTime = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
     const late = await bankLine(p, '2026-10-07', 'DEPOSIT *4662')
-    const r = await reconcileDeposits(p.landlordId)
-    expect(r.declared + r.autoSettled).toBe(0)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(0)
     for (const id of [a, b]) expect((await reportRow(id)).status).toBe('pending')
 
     const { deposits } = await unmatchedDepositsWithCandidates(p.landlordId)
@@ -193,7 +224,8 @@ describe('a real conflict waits for the landlord', () => {
     expect(done.declarationId).toBe(b)
     expect(await rentRow(p.lots[1].rentId)).toEqual({ status: 'settled', settled_on: '2026-10-01' })
     // What is left is certain: Ana's report and the later deposit (the bank's date decides).
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(1)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(1)
     expect(await reportRow(a)).toMatchObject({ status: 'confirmed', bank_transaction_id: late })
     expect((await reportRow(a)).false_date_flagged_at).not.toBeNull()
   })
@@ -203,7 +235,8 @@ describe('a real conflict waits for the landlord', () => {
     await reportFor(p, 0, { declared: '2026-10-01', hour: 15, madeAt: '2026-10-01T23:00:00Z' })
     await reportFor(p, 1, { declared: '2026-10-01', hour: 15, madeAt: '2026-10-01T23:10:00Z' })
     const l = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(0)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(0)
     const { deposits } = await unmatchedDepositsWithCandidates(p.landlordId)
     expect(deposits.find(d => d.transactionId === l)!.reportConflict?.kind).toBe('fewer_deposits')
   })
@@ -219,7 +252,8 @@ describe('a real conflict waits for the landlord', () => {
       [p.lots[2].unitId, p.lots[2].leaseId, p.lots[2].tenantId, p.landlordId])
     const l = await bankLine(p, '2026-10-01', 'DEPOSIT *4662', 900)
     const r = await reconcileDeposits(p.landlordId)
-    expect(r.declared + r.autoSettled + r.slips + r.inferred).toBe(0)
+    expect(r.slips).toBe(0)
+    expect(await confirmPaired(p)).toBe(0)
     expect((await db.query(`SELECT status FROM bank_transactions WHERE id = $1`, [l])).rows[0].status).toBe('needs_review')
     const { deposits } = await unmatchedDepositsWithCandidates(p.landlordId)
     const card = deposits.find(d => d.transactionId === l)!
@@ -244,7 +278,8 @@ describe('the landlord’s confirm that names no report', () => {
     })
     expect(done.declarationId).toBe(r15)
     expect((await reportRow(r9)).status).toBe('pending')
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(1)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(1)
     expect((await reportRow(r9)).bank_transaction_id).toBe(l9)
   })
 
@@ -270,7 +305,7 @@ describe('Undo means "not this line" for the matcher too', () => {
     const p = await park(1)
     const r = await reportFor(p, 0, { declared: '2026-10-01', hour: 15, madeAt: '2026-10-01T23:00:00Z' })
     const wrong = await bankLine(p, '2026-10-01', 'DEPOSIT *4662')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(1)
+    expect(await confirmPaired(p)).toBe(1)
     expect((await reportRow(r)).bank_transaction_id).toBe(wrong)
     await undoDepositMatch({ bankTransactionId: wrong, landlordId: p.landlordId, undoneBy: null })
     expect((await reportRow(r)).status).toBe('pending')
@@ -280,7 +315,8 @@ describe('Undo means "not this line" for the matcher too', () => {
     const { deposits } = await unmatchedDepositsWithCandidates(p.landlordId)
     expect(deposits.find(d => d.transactionId === wrong)!.candidates.some(c => c.declaration?.id === r)).toBe(false)
     expect(deposits.find(d => d.transactionId === real)!.candidates.some(c => c.declaration?.id === r)).toBe(true)
-    expect((await reconcileDeposits(p.landlordId)).declared).toBe(1)
+    await reconcileDeposits(p.landlordId)
+    expect(await confirmPaired(p)).toBe(1)
     expect(await reportRow(r)).toMatchObject({ status: 'confirmed', bank_transaction_id: real, false_date_flagged_at: null })
     expect(await rentRow(p.lots[0].rentId)).toEqual({ status: 'settled', settled_on: '2026-10-01' })
   })

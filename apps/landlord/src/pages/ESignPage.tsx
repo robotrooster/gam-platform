@@ -1921,8 +1921,9 @@ export function ESignPage() {
   // erases a document that never completed and that no money touched, and
   // voids anything else; the server decides (lib/voidDocument.endDocument) and
   // the row's endAction — with endReason when it can't delete — says which
-  // before it is pressed (lib/documentEnd). A refusal (a resident has signed)
-  // used to vanish without a word — it is shown now.
+  // before it is pressed (lib/documentEnd). A refusal (a resident signed a
+  // lease that billed the household — 10/14: a signature alone no longer
+  // keeps one) used to vanish without a word — it is shown now.
   const voidMut = useMutation(
     (id: string) => apiPost<any>(`/esign/documents/${id}/void`, { reason: 'Voided by landlord' }),
     {
@@ -1930,8 +1931,10 @@ export function ESignPage() {
         const d = r?.data ?? r
         toast(d?.deleted ? 'Deleted' : 'Voided')
         qc.invalidateQueries('esign-documents')
-        // A deleted lease drops off the household's onboarding row too.
+        // A deleted lease drops off the household's onboarding row too — and,
+        // 10/14 (Nic, #8), the lease it issued off the Leases list.
         qc.invalidateQueries('pending-tenants')
+        if (d?.deleted) qc.invalidateQueries('leases')
       },
       onError: (e: any) =>
         toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not do that. Press the button again.'),

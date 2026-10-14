@@ -108,7 +108,9 @@ async function bankFeedWatching(landlordId: string): Promise<boolean> {
  */
 function whatHappensNext(bankFeedLinked: boolean): string {
   return bankFeedLinked
-    ? 'Your balance stays the same until your deposit shows up in the bank — usually a day or two. We will apply it automatically, dated the day you paid when the bank shows it that day or the next business day (otherwise the bank’s date counts).'
+    // 10/14 (Nic, answer 16: "no guessing"): GAM finds the deposit and puts the
+    // report in front of the landlord, who confirms it — never applied by itself.
+    ? 'Your balance stays the same until your deposit shows up in the bank — usually a day or two — and your landlord confirms it. It counts from the day you paid when the bank shows it that day or the next business day (otherwise the bank’s date counts).'
     : 'Your landlord’s bank isn’t connected to GAM right now, so we can’t watch for this deposit ourselves. Let your landlord know you paid and keep your deposit slip — they’ll check their bank and mark your bill paid. Your balance stays the same until they do.'
 }
 

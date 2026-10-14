@@ -50,12 +50,15 @@ import type { DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledger
 import { LedgerSourceError } from '../ledgerEngine'
 import type { LedgerOwner } from '../ledgerOwner'
 import {
-  type PaymentFacts, type CompanyBooks, Lines, rowDims, incomeRoleFor, utilityRoleFor, splitCents, cSql, centsOf,
+  type PaymentFacts, type CompanyBooks, Lines, rowDims, incomePartsFor, utilityRoleFor, splitCents, cSql, centsOf,
   requireHomeSaleMethod, loadCompanyBooks, isUuid,
 } from './tenantShared'
 
-/** Bumped when a family-A rule changes (metadata only; the fingerprint decides). */
-export const TENANT_CHARGES_RULE_VERSION = 1
+/**
+ * Bumped when a family-A rule changes (metadata only; the fingerprint decides).
+ * 2 — 10/14 (Nic I1-I7): rent books to its space's line (incomeLines).
+ */
+export const TENANT_CHARGES_RULE_VERSION = 2
 
 /** Why a row has no charge posting of its own (null: it has one). */
 export function chargeSkipReason(f: PaymentFacts): string | null {
@@ -104,7 +107,7 @@ export async function projectCharge(client: PoolClient, f: PaymentFacts, co: Com
   if (f.workTradeSettlementId) {
     // A9 — hours not worked, billed with no bill to carry them: rent owed.
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'space_rent' })
-    L.cr('space_rent', gross, { ...d, reportCategory: 'space_rent' })
+    for (const p of incomePartsFor({ ...f, category: 'space_rent' }, gross)) L.cr(p.role, p.cents, { ...d, reportCategory: 'space_rent', sub: p.sub })
     memo = 'Work-trade hours not completed, billed as rent'
   } else if (f.type === 'carried_balance') {
     // A8 — a balance from before GAM: owed to the company, never income here.
@@ -137,7 +140,7 @@ export async function projectCharge(client: PoolClient, f: PaymentFacts, co: Com
          FROM utility_bills WHERE payment_id = $1 ORDER BY created_at, id`, [f.id])).rows
     L.dr('ar_tenants', gross, { ...d, reportCategory: f.category })
     if (bills.length === 0) {
-      L.cr(incomeRoleFor(f), gross, { ...d, reportCategory: f.category })
+      for (const p of incomePartsFor(f, gross)) L.cr(p.role, p.cents, { ...d, reportCategory: f.category, sub: p.sub })
     } else {
       const taxTotal = bills.reduce((s, b) => s + centsOf(b.x), 0)
       const tax = gross > 0 ? Math.max(0, Math.min(taxTotal, gross)) : 0
@@ -151,7 +154,8 @@ export async function projectCharge(client: PoolClient, f: PaymentFacts, co: Com
   } else {
     // A1 / A3 / A5 — income by what the row is.
     L.dr('ar_tenants', gross, { ...d, reportCategory: f.category })
-    L.cr(incomeRoleFor(f), gross, { ...d, reportCategory: f.category })
+    // 10/14 (Nic I1-I7): rent by the space it is for (a park-owned trailer's in two lines).
+    for (const p of incomePartsFor(f, gross)) L.cr(p.role, p.cents, { ...d, reportCategory: f.category, sub: p.sub })
     memo = f.category === 'late_fees' ? 'Late fee billed' : 'Billed'
   }
   if (L.empty) return null

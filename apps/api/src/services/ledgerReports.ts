@@ -69,14 +69,15 @@
  * Read-only. Never writes to the ledger.
  */
 import {
-  INCOME_CATEGORIES, INCOME_CATEGORY_LABEL, LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_SOURCE_TYPE_LABEL,
+  INCOME_CATEGORIES, INCOME_CATEGORY_LABEL, LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_SOURCE_TYPE_LABEL, ledgerIncomeDetailOf,
   type IncomeCategory, type IncomeBasis, type LedgerAccountRole, type LedgerSourceType,
 } from '@gam/shared'
 import { query } from '../db'
 import { cutoffsParam, withinCutoffsSql, pastCutoff, type PropertyCutoff } from '../lib/bookkeeperScope'
 import type {
-  IncomeEvent, IncomeQuery, ReportLine, AsideLine, LedgerProofTerm, MoneyView,
+  IncomeEvent, IncomeQuery, ReportLine, AsideLine, LedgerProofTerm, MoneyView, IncomeDetailPiece,
 } from './incomeBasis'
+import { SPACE_COLS_SQL, spaceOf, stayParts } from './ledgerProjectors/incomeLines'
 import { moneyViewFrom } from './incomeBasis'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -279,37 +280,173 @@ const LINE_COLS = `l.landlord_id::text AS landlord_id, l.property_id::text AS pr
 
 async function receivedEvents(s: LedgerScope, start: string, end: string): Promise<IncomeEvent[]> {
   const params: unknown[] = [start, end]
-  const rows = await query<LineRow>(
-    `SELECT ${LINE_COLS}, ROUND(SUM(l.credit - l.debit), 2)::text AS amount
+  const rows = await query<DetailRow>(
+    `SELECT ${LINE_COLS}, l.map_kind, l.map_value, ${STAY_BOOKING_SQL} AS booking_id,
+            ROUND(SUM(l.credit - l.debit), 2)::text AS amount
        FROM ledger_posting_lines l
        JOIN books_accounts a ON a.id = l.account_id
+       JOIN ledger_postings ps ON ps.id = l.posting_id
        LEFT JOIN payments pay ON pay.id = l.payment_id
       WHERE l.cash_effect = 'in' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
-      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
      HAVING SUM(l.credit - l.debit) <> 0`, params)
-  return rows.map(r => ({ ...baseEvent(r), ...receivedLineOf(r.report_category, r.account_role, r.account_type), amount: Number(r.amount) }))
+  return (await itemized(rows)).map(({ row: r, amount, detail }) => ({
+    ...baseEvent(r), ...receivedLineOf(r.report_category, r.account_role, r.account_type), amount, ...(detail.length ? { detail } : {}),
+  }))
 }
 
 async function chargedEvents(s: LedgerScope, start: string, end: string): Promise<IncomeEvent[]> {
   const params: unknown[] = [start, end]
-  const income = query<LineRow>(
-    `SELECT ${LINE_COLS}, ROUND(SUM(l.credit - l.debit), 2)::text AS amount
+  const income = query<DetailRow>(
+    `SELECT ${LINE_COLS}, l.map_kind, l.map_value, NULL::text AS booking_id, ROUND(SUM(l.credit - l.debit), 2)::text AS amount
        FROM ledger_posting_lines l
        JOIN books_accounts a ON a.id = l.account_id
        LEFT JOIN payments pay ON pay.id = l.payment_id
       WHERE a.type = 'income' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
-      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-     HAVING SUM(l.credit - l.debit) <> 0`, params)
+      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+     HAVING SUM(l.credit - l.debit) <> 0`, params).then(itemized)
   // 10/12 (Nic, review): every snapshot day travels with each 'owed' fact, so
   // a day on which nothing was owed still counts as the day Owed is read
   // (Owed $0), and the day before the start gives the proof strip a real
   // owed-at-start to tie out against.
   const [rows, owed, flows] = await Promise.all([income, owedSnapshots(s, [addDays(start, -1), ...snapshotDays(start, end)], end), receivableFlows(s, start, end)])
   return [
-    ...rows.map(r => ({ ...baseEvent(r), ...chargedLineOf(r.report_category, r.account_role), inTotal: true, amount: Number(r.amount) })),
+    ...rows.map(({ row: r, amount, detail }) => ({
+      ...baseEvent(r), ...chargedLineOf(r.report_category, r.account_role), inTotal: true, amount, ...(detail.length ? { detail } : {}),
+    })),
     ...owed,
     ...flows,
   ]
+}
+
+// ─── 10/14 (Nic I1): the Detailed view's pieces ─────────────────────────────
+//
+// Nic's bookkeeper (10/14): "we need everything to be as itemized as
+// possible". Each fact names the income line(s) it is (IncomeEvent.detail):
+//   - a line on an itemized income account names its own (the line's
+//     sub-account — rent and stays by space — or the home-sale roles, I3);
+//   - money received or still owed on a bill is itemized as the bill was
+//     charged (its charge posting's income lines, in proportion);
+//   - stay money received before the stay is earned, as the stay will earn it
+//     (its booking: under 30 nights short-term, else long-term, I2).
+// The space's subtype rides along (a reporting dimension, never an account).
+// Facts keep their grain: a fact's pieces add to its amount, and what they do
+// not cover stays on its Summary group.
+
+const ITEMIZED_CATEGORIES: ReadonlySet<string> = new Set(['space_rent', 'stays_and_pay_links', 'home_payments'])
+
+interface DetailRow extends LineRow { map_kind: string | null; map_value: string | null; booking_id: string | null }
+
+/**
+ * SQL over l / ps: the booking a stay's money received toward it belongs to
+ * (none for any other line). Money taken in before the stay sits on a role's
+ * own account (map kind 'role': guest deposits, the register); a line on an
+ * itemized income account names its own line instead (itemized, own).
+ */
+const STAY_BOOKING_SQL = `(CASE WHEN l.payment_id IS NULL AND l.report_category = 'stays_and_pay_links' AND COALESCE(l.map_kind, 'role') = 'role' THEN
+   COALESCE(CASE WHEN ps.source_type = 'booking' THEN split_part(ps.source_id, '|', 1) END,
+            (SELECT sp.booking_id::text FROM stay_payments sp JOIN unit_bookings bk ON bk.id = sp.booking_id
+              WHERE ps.source_type = 'pos_sale' AND sp.pos_transaction_id::text = ps.source_id
+                AND bk.unit_id IS NOT DISTINCT FROM l.unit_id
+              ORDER BY sp.booking_id LIMIT 1)) END)`
+
+/** One weighted share of a split: an income line (key '' = not itemized). */
+interface Share { key: string; label: string; order: number; weight: number }
+
+/** How each bill was charged: its charge posting's credits, by income line. */
+async function billShares(paymentIds: readonly string[]): Promise<Map<string, Share[]>> {
+  const out = new Map<string, Share[]>()
+  if (!paymentIds.length) return out
+  const rows = await query<{ pid: string; map_kind: string | null; map_value: string | null; role: string | null; c: string }>(
+    `SELECT l.payment_id::text AS pid, l.map_kind, l.map_value, l.account_role AS role,
+            round(SUM(l.credit - l.debit) * 100)::bigint::text AS c
+       FROM ledger_posting_lines l
+       JOIN ledger_postings ps ON ps.id = l.posting_id
+      WHERE l.payment_id = ANY($1::uuid[]) AND ps.source_type = 'payment' AND ps.posting_kind = 'charge'
+        AND ps.role = 'post' AND ps.superseded_at IS NULL AND l.account_role IS DISTINCT FROM 'ar_tenants'
+      GROUP BY 1, 2, 3, 4
+     HAVING SUM(l.credit - l.debit) <> 0`, [[...new Set(paymentIds)]])
+  for (const r of rows) {
+    const d = ledgerIncomeDetailOf(r.map_kind, r.map_value, r.role)
+    const list = out.get(r.pid) ?? []
+    list.push({ key: d?.key ?? '', label: d?.label ?? '', order: d?.order ?? 0, weight: Math.abs(Number(r.c)) })
+    out.set(r.pid, list)
+  }
+  return out
+}
+
+/** How each stay earns (incomeLines.stayParts, the projector's own rule): one share, its line. */
+async function bookingShares(bookingIds: readonly string[]): Promise<Map<string, Share[]>> {
+  const out = new Map<string, Share[]>()
+  const ids = [...new Set(bookingIds)].filter(id => /^[0-9a-f-]{36}$/i.test(id))
+  if (!ids.length) return out
+  const rows = await query<any>(
+    `SELECT b.id::text AS id, ${SPACE_COLS_SQL('su', 'sl', 'b.created_at')}, b.stay_terms,
+            (GREATEST(b.check_out, COALESCE(b.booked_check_out, b.check_out)) - b.check_in) AS nights
+       FROM unit_bookings b LEFT JOIN units su ON su.id = b.unit_id LEFT JOIN leases sl ON FALSE
+      WHERE b.id = ANY($1::uuid[])`, [ids])
+  for (const r of rows) {
+    const parts = stayParts({ space: spaceOf(r), nightsSold: Number(r.nights) || 0, stayTerms: r.stay_terms ?? null }, 10_000)
+    out.set(r.id, parts.map(p => {
+      const d = p.sub ? ledgerIncomeDetailOf(p.sub.kind, p.sub.value) : null
+      return { key: d?.key ?? '', label: d?.label ?? '', order: d?.order ?? 0, weight: Math.abs(p.cents) }
+    }))
+  }
+  return out
+}
+
+/** Each unit's subtypes, named ("Double wide"; several joined by " · "). */
+async function subtypeNames(unitIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(unitIds.filter(Boolean))]
+  if (!ids.length) return new Map()
+  const rows = await query<{ unit_id: string; names: string }>(
+    `SELECT k.unit_id::text AS unit_id, string_agg(DISTINCT st.name, ' · ') AS names
+       FROM unit_subtype_links k JOIN property_unit_subtypes st ON st.id = k.subtype_id
+      WHERE k.unit_id = ANY($1::uuid[]) GROUP BY 1`, [ids])
+  return new Map(rows.map(r => [r.unit_id, r.names]))
+}
+
+/** `amountCents` split over the shares, as pieces (a share that is not itemized stays off them). */
+function piecesOf(amountCents: number, shares: readonly Share[], subtype: string | null): IncomeDetailPiece[] {
+  const parts = splitBy(amountCents, shares.map(x => x.weight))
+  const out: IncomeDetailPiece[] = []
+  shares.forEach((x, i) => {
+    if (!x.key || !parts[i]) return
+    out.push({ key: x.key, label: x.label, order: x.order, amount: parts[i] / 100, subtype: x.key.includes(':') ? subtype : null })
+  })
+  return out
+}
+
+/** The rows' pieces, and the rows merged back to a fact's grain (every column but the line's account and booking). */
+async function itemized(rows: readonly DetailRow[]): Promise<Array<{ row: LineRow; amount: number; detail: IncomeDetailPiece[] }>> {
+  const own = (r: DetailRow) => ledgerIncomeDetailOf(r.map_kind, r.map_value, r.account_role)
+  const billIds = rows.filter(r => !own(r) && r.payment_id && ITEMIZED_CATEGORIES.has(r.report_category ?? '')).map(r => r.payment_id!)
+  const [bills, stays, subtypes] = await Promise.all([
+    billShares(billIds),
+    bookingShares(rows.filter(r => !own(r) && r.booking_id).map(r => r.booking_id!)),
+    subtypeNames(rows.map(r => r.unit_id ?? '')),
+  ])
+  const merged = new Map<string, { row: LineRow; cents: number; detail: IncomeDetailPiece[] }>()
+  for (const r of rows) {
+    const cents = Math.round(Number(r.amount) * 100)
+    const sub = r.unit_id ? subtypes.get(r.unit_id) ?? null : null
+    const mine = own(r)
+    const detail: IncomeDetailPiece[] = mine
+      ? [{ key: mine.key, label: mine.label, order: mine.order, amount: cents / 100, subtype: mine.key.includes(':') ? sub : null }]
+      : r.payment_id && bills.has(r.payment_id) && ITEMIZED_CATEGORIES.has(r.report_category ?? '') ? piecesOf(cents, bills.get(r.payment_id)!, sub)
+      : r.booking_id && stays.has(r.booking_id) ? piecesOf(cents, stays.get(r.booking_id)!, sub)
+      : []
+    const k = [r.landlord_id, r.property_id, r.unit_id, r.lease_id, r.payment_id, r.due_date, r.day, r.report_category, r.account_role, r.account_type].join('\u0000')
+    const m = merged.get(k)
+    if (!m) { merged.set(k, { row: r, cents, detail }); continue }
+    m.cents += cents
+    for (const p of detail) {
+      const same = m.detail.find(x => x.key === p.key && x.subtype === p.subtype)
+      if (same) same.amount = round2(same.amount + p.amount)
+      else m.detail.push(p)
+    }
+  }
+  return [...merged.values()].filter(m => m.cents !== 0).map(m => ({ row: m.row, amount: m.cents / 100, detail: m.detail }))
 }
 
 /** 'YYYY-MM-DD' plus n days. */
@@ -332,23 +469,45 @@ async function owedSnapshots(s: LedgerScope, days: string[], lastDay: string): P
   const params: unknown[] = [days]
   const rows = await query<{
     day: string; landlord_id: string; property_id: string | null; unit_id: string | null; lease_id: string | null
-    report_category: string | null; amount: string
+    report_category: string | null; amount: string; payment_id: string | null
   }>(
     `SELECT d.day::text AS day, l.landlord_id::text AS landlord_id, l.property_id::text AS property_id,
             l.unit_id::text AS unit_id, l.lease_id::text AS lease_id, l.report_category,
+            l.payment_id::text AS payment_id,
             ROUND(SUM(l.debit - l.credit), 2)::text AS amount
        FROM unnest($1::date[]) AS d(day)
        JOIN ledger_posting_lines l ON l.accounting_date <= d.day
       WHERE l.account_role = 'ar_tenants' AND ${scopeSql(s, params)}
-      GROUP BY 1, 2, 3, 4, 5, 6
+      GROUP BY 1, 2, 3, 4, 5, 6, 7
      HAVING SUM(l.debit - l.credit) <> 0`, params)
+  // 10/14 (Nic I1): what is still owed on a bill, itemized as the bill was
+  // charged (the Detailed view); the facts keep their grain (no bill on them).
+  const owedBills = rows.filter(r => r.payment_id && ITEMIZED_CATEGORIES.has(r.report_category ?? '')).map(r => r.payment_id!)
+  const [bills, subtypes] = await Promise.all([billShares(owedBills), subtypeNames(rows.map(r => r.unit_id ?? ''))])
+  const grain = new Map<string, { r: typeof rows[number]; cents: number; detail: IncomeDetailPiece[] }>()
+  for (const r of rows) {
+    const cents = Math.round(Number(r.amount) * 100)
+    const shares = r.payment_id && ITEMIZED_CATEGORIES.has(r.report_category ?? '') ? bills.get(r.payment_id) : undefined
+    const detail = shares ? piecesOf(cents, shares, r.unit_id ? subtypes.get(r.unit_id) ?? null : null) : []
+    const k = [r.day, r.landlord_id, r.property_id, r.unit_id, r.lease_id, r.report_category].join('\u0000')
+    const g = grain.get(k)
+    if (!g) { grain.set(k, { r, cents, detail }); continue }
+    g.cents += cents
+    for (const p of detail) {
+      const same = g.detail.find(x => x.key === p.key && x.subtype === p.subtype)
+      if (same) same.amount = round2(same.amount + p.amount)
+      else g.detail.push(p)
+    }
+  }
   const owedDays: readonly string[] = Object.freeze([...new Set(days)].sort())
   const first = owedDays[0]
   const out: IncomeEvent[] = []
-  for (const r of rows) {
+  for (const { r, cents, detail } of grain.values()) {
+    if (cents === 0) continue
     const base = {
       landlordId: r.landlord_id, propertyId: r.property_id, unitId: r.unit_id, leaseId: r.lease_id, paymentId: null,
-      dueDate: null, ...owedLineOf(r.report_category), amount: Number(r.amount), inTotal: false, moveOutId: null, owedDays,
+      dueDate: null, ...owedLineOf(r.report_category), amount: cents / 100, inTotal: false, moveOutId: null, owedDays,
+      ...(detail.length ? { detail } : {}),
     }
     // The day before the period is read only as the period's opening balance.
     if (r.day !== first) out.push({ ...base, day: r.day, part: 'stillOwed', ledger: 'owed' })

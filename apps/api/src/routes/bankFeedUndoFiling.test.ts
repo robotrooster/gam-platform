@@ -78,8 +78,6 @@ const split = (co: Co, id: string, parts: any[]) =>
   request(app()).post(`/api/bank-feed/transactions/${id}/split`).set(as(co)).send({ parts })
 const undo = (co: Co, id: string) =>
   request(app()).post(`/api/bank-feed/transactions/${id}/undo-filing`).set(as(co)).send({})
-const stopPayer = (co: Co, id: string) =>
-  request(app()).post(`/api/bank-feed/transactions/${id}/stop-auto-filing`).set(as(co)).send({})
 const txn = async (id: string) => (await db.query(
   `SELECT status, ignored_reason, landlord_other_income_id, expense_id, auto_filed_rule_id, auto_settle_undo
      FROM bank_transactions WHERE id = $1`, [id])).rows[0]
@@ -145,14 +143,14 @@ describe('undoing a line filed as one category', () => {
     expect(await octSpend(co)).toBe(0)
   })
 
-  it('money in: the income is voided and that deposit never files itself again (the payer\'s next one still does)', async () => {
+  it('money in: the income is voided, and neither that deposit nor the payer\'s next one files itself (10/14: no guessing)', async () => {
     const co = await company()
     const id = await line(co, 48.39)
     const filed = await fileAs(co, id, { category: 'propane_fuel', scopeKind: 'property_common', propertyId: co.propertyId })
     expect(filed.status).toBe(200)
     const incomeId = filed.body.data.incomeId
-    // Filing it taught GAM the payer: their next deposit files itself.
-    expect(await rule(co)).toMatchObject({ last_direction: 'in', auto_file_income: true })
+    // Filing it taught GAM the payer: their next deposit is suggested the same way, never filed by itself.
+    expect(await rule(co)).toMatchObject({ category: 'propane_fuel', last_direction: 'in' })
 
     const res = await undo(co, id)
     expect(res.body.data).toMatchObject({ kind: 'one_category', voided: 1, status: 'needs_review' })
@@ -161,9 +159,9 @@ describe('undoing a line filed as one category', () => {
 
     const fresh = await line(co, 12.5, { day: '2026-10-02' })
     await reconcileDeposits(co.landlordId)
-    expect((await txn(fresh)).status).toBe('categorized')
+    expect((await txn(fresh)).status).toBe('needs_review')
     expect((await txn(id)).status).toBe('needs_review')
-    expect(await activeIncome(co)).toBe(12.5)
+    expect(await activeIncome(co)).toBe(0)
   })
 
   it('what the owner added to the expense rides onto the filing that replaces it', async () => {
@@ -281,11 +279,15 @@ describe('undoing a line filed as one category', () => {
 })
 
 describe('one Undo for every kind of filing', () => {
-  it('takes back a deposit that filed itself, stamping the income with its line', async () => {
+  it('takes back a deposit that filed itself (before 10/14), stamping the income with its line', async () => {
     const co = await company()
     await squareFilesItself(co)
     const id = await line(co, 48.39)
-    await reconcileDeposits(co.landlordId)
+    // As a line that filed itself before 10/14 sits on file.
+    expect((await fileAs(co, id, { category: 'propane_fuel', scopeKind: 'property_common', propertyId: co.propertyId })).status).toBe(200)
+    await db.query(
+      `UPDATE bank_transactions SET auto_filed_rule_id = (SELECT id FROM landlord_merchant_rules WHERE landlord_id = $2 AND normalized_merchant = 'SQUARE INC'),
+              auto_filed_at = now() WHERE id = $1`, [id, co.landlordId])
     const before = await txn(id)
     expect(before.status).toBe('categorized')
     const res = await undo(co, id)
@@ -366,7 +368,7 @@ describe('the Expenses page sends a bank-filed expense to the Bank page', () => 
     const id = await homeDepot(co)
     const res = await split(co, id, hdParts(co))
     expect(res.status).toBe(200)
-    expect(res.body.data.payerQuestion).toBeNull()
+    expect(res.body.data).not.toHaveProperty('payerQuestion')
     for (const partId of res.body.data.expenseIds) {
       const r = await request(app()).post(`/api/expenses/${partId}/void`).set(as(co)).send({})
       expect(r.status).toBe(409)
@@ -389,78 +391,20 @@ describe('the Expenses page sends a bank-filed expense to the Bank page', () => 
   })
 })
 
-describe('after a deposit is split, the owner is asked about its payer', () => {
-  it('a payer that files itself: asked, and yes stops it — the next deposit waits', async () => {
+// 10/14 (Nic, answer 16): nothing files itself from a payer's name any more, so
+// the 10/12 question after a split ("should deposits from that payer stop
+// filing automatically?") is gone, and so is its "stop" button.
+describe('after a deposit is split', () => {
+  it('nothing is asked about its payer, and the payer\'s next deposit waits for a person', async () => {
     const co = await company()
     await squareFilesItself(co)
     const id = await line(co, 48.39)
     const res = await split(co, id, nicsParts(co))
     expect(res.status).toBe(200)
-    expect(res.body.data.payerQuestion).toEqual({ payer: 'SQUARE INC', filesItself: true, category: 'propane_fuel' })
-
-    const yes = await stopPayer(co, id)
-    expect(yes.status).toBe(200)
-    expect(yes.body.data).toEqual({ payer: 'SQUARE INC', alreadyStopped: false })
-    expect(await rule(co)).toMatchObject({ auto_file_income: false, category: 'propane_fuel' })
+    expect(res.body.data).not.toHaveProperty('payerQuestion')
     const fresh = await line(co, 12.5, { day: '2026-10-02' })
     await reconcileDeposits(co.landlordId)
     expect((await txn(fresh)).status).toBe('needs_review')
-    // Pressing it twice is harmless.
-    expect((await stopPayer(co, id)).body.data).toEqual({ payer: 'SQUARE INC', alreadyStopped: true })
-    // Already stopped: the next split asks nothing.
-    expect((await split(co, fresh, [
-      { category: 'propane_fuel', amount: 10, scopeKind: 'property_common', propertyId: co.propertyId },
-      { category: 'vending', amount: 2.5, scopeKind: 'property_common', propertyId: co.propertyId },
-    ])).body.data.payerQuestion).toBeNull()
-  })
-
-  it('no leaves it: the payer\'s next deposit still files itself', async () => {
-    const co = await company()
-    await squareFilesItself(co)
-    const id = await line(co, 48.39)
-    expect((await split(co, id, nicsParts(co))).body.data.payerQuestion).toMatchObject({ filesItself: true })
-    const fresh = await line(co, 12.5, { day: '2026-10-02' })
-    await reconcileDeposits(co.landlordId)
-    expect((await txn(fresh)).status).toBe('categorized')
-  })
-
-  it('a payer GAM never remembered: asked as one that would file itself; yes keeps it from ever starting', async () => {
-    const co = await company()
-    const id = await line(co, 48.39)
-    expect((await split(co, id, nicsParts(co))).body.data.payerQuestion)
-      .toEqual({ payer: 'SQUARE INC', filesItself: false, category: null })
-    expect((await stopPayer(co, id)).body.data).toEqual({ payer: 'SQUARE INC', alreadyStopped: false })
-    // Remembered from the split's largest part, with no direction: it pre-fills, never files.
-    expect(await rule(co)).toMatchObject({
-      category: 'propane_fuel', scope_kind: 'property_common', property_id: co.propertyId,
-      last_direction: null, auto_file_income: false,
-    })
-    // Filing the next one as one category teaches the direction, and still nothing files itself.
-    const second = await line(co, 20, { day: '2026-10-02' })
-    expect((await fileAs(co, second, { category: 'propane_fuel', scopeKind: 'property_common', propertyId: co.propertyId })).status).toBe(200)
-    expect(await rule(co)).toMatchObject({ last_direction: 'in', auto_file_income: false })
-    const third = await line(co, 7, { day: '2026-10-03' })
-    await reconcileDeposits(co.landlordId)
-    expect((await txn(third)).status).toBe('needs_review')
-  })
-
-  it('not asked when the answer could change nothing; money going out is refused', async () => {
-    const co = await company()
-    const named = (description: string, merchant: string) => line(co, 48.39, { description, merchant })
-    for (const id of [
-      await named('MOBILE DEPOSIT', 'MOBILE DEPOSIT'),
-      await named('DOORLOOP INC PAYOUT 0921', 'DOORLOOP INC PAYOUT'),
-      await named('ONLINE TRANSFER FROM SAVINGS', 'ONLINE TRANSFER FROM SAVINGS'),
-    ]) {
-      const res = await split(co, id, nicsParts(co))
-      expect(res.status, JSON.stringify(res.body)).toBe(200)
-      expect(res.body.data.payerQuestion).toBeNull()
-    }
-    const out = await homeDepot(co)
-    const r = await stopPayer(co, out)
-    expect(r.status).toBe(409)
-    expect(r.body.error).toMatch(/Money going out/)
-    const nobody = await named('MOBILE DEPOSIT', 'MOBILE DEPOSIT')
-    expect((await stopPayer(co, nobody)).status).toBe(409)
+    expect((await request(app()).post(`/api/bank-feed/transactions/${id}/stop-auto-filing`).set(as(co)).send({})).status).toBe(404)
   })
 })

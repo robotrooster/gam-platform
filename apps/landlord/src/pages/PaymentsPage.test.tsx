@@ -1228,3 +1228,51 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
     } finally { delete (window as any).matchMedia }
   })
 })
+
+// ─── 10/14 (Nic): "show in the moved-out section of Payments" ────────────────
+
+describe('10/14 (Nic): "Moved out, still owes" under the month', () => {
+  const olaf = {
+    key: 'stay:b35', kind: 'stay' as const, space: 'RV 35', leaseId: null, householdId: null, residents: [],
+    guest: 'Olaf Over', leftOn: '2026-09-27', stayDates: 'Sep 20 – Sep 27', owed: 360, months: [],
+  }
+  const moe = {
+    key: 'lease:L5', kind: 'household' as const, space: 'MH 05', leaseId: 'L5', householdId: 't-moe',
+    residents: [{ tenantId: 't-moe', name: 'Moe Moved', primary: true }], guest: null, leftOn: '2026-09-30', stayDates: null,
+    owed: 495, months: [{ month: '2026-09', owed: 495 }],
+  }
+
+  it('a closed folder with who is in it and, with the sums, what they owe; opened, each space, who, when they left and what is owed', async () => {
+    server.rolls['p-oak'] = roll([russ], {
+      movedOutOwing: [moe, olaf],
+      totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
+                staysOwed: 0, otherIn: 0, otherRefunded: 0, folderIn: 0, folderRefunded: 0, movedOutOwed: 855 },
+    })
+    await render()
+    await loaded()
+    const head = host.querySelector('[data-section="moved-out"] button.pay-other-head')!
+    expect(head.textContent).toBe('▸Moved out, still owes1 household · 1 stay guest · $855.00 owed')
+    expect(host.querySelector('.cd-totals')!.textContent).toContain('Moved out, still owes $855.00')
+    // Nobody in it is a row.
+    expect(rowOf('stay:b35')).toBeNull()
+    await click(head)
+    const lines = [...host.querySelectorAll('[data-section="moved-out"] li')].map(li => lineCells(li))
+    expect(lines).toEqual([
+      ['MH 05', 'Moe MovedLease ended Sep 30 · still owes for Sep 2026 $495.00', '$495.00'],
+      ['RV 35', 'Olaf OverStay Sep 20 – Sep 27 · checked out Sep 27', '$360.00'],
+    ])
+  })
+
+  it('without the sums, the folder still says who; nobody in it, no folder', async () => {
+    server.rolls['p-oak'] = roll([russ], { movedOutOwing: [olaf] })
+    await render()
+    await loaded()
+    expect(host.querySelector('[data-section="moved-out"] button.pay-other-head')!.textContent).toBe('▸Moved out, still owes1 stay guest')
+    server.rolls['p-oak'] = roll([russ])
+    act(() => root.unmount())
+    root = createRoot(host)
+    await render()
+    await loaded()
+    expect(host.querySelector('[data-section="moved-out"]')).toBeNull()
+  })
+})

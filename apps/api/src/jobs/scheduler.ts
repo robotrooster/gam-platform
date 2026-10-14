@@ -650,6 +650,182 @@ async function processInvitationExpiry() {
 // tests can place the cutover in the past and exercise the real query.
 const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00:00Z'
 
+/** One row per address (case-insensitive), first one wins — one email per person per thing. */
+function uniqueRecipients<T extends { email?: string | null }>(rows: T[]): T[] {
+  const seen = new Set<string>()
+  return rows.filter(r => {
+    const k = String(r.email ?? '').trim().toLowerCase()
+    if (!k || seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+}
+
+/**
+ * 10/14 (Nic, #4): "Automatic voids (48h timeout, lapsed new lease): delete
+ * them too, instead of voiding." GAM ending a document on its own, in one
+ * transaction: ERASED when it never completed and no money touched it
+ * (lib/eraseUnfinishedDocument — the one test the void button uses: with its
+ * packet's unfinished forms, the lease it issued when nothing paid, credited
+ * or settled on it, and #1 the invite waiting on it canceled). Anything that
+ * test keeps is voided by `voidKept`, each job's own void, exactly as before.
+ * 'gone': it completed, was voided, or was deleted since the job read it —
+ * nothing done, nobody told. Files only the erased documents used are removed
+ * after COMMIT. Sends nothing; the caller tells people.
+ */
+async function endDocumentOnItsOwn(
+  d: { id: string; lease_id?: string | null; document_type?: string | null },
+  voidKept: (vq: (sql: string, params?: any[]) => Promise<any>, live: any) => Promise<void>,
+): Promise<'deleted' | 'voided' | 'gone'> {
+  const { eraseUnfinishedDocument, removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
+  const vc = await getClient()
+  let files: string[] = []
+  let ended: 'deleted' | 'voided' | 'gone'
+  try {
+    await vc.query('BEGIN')
+    const vq = vc.query.bind(vc) as any
+    const first = (await vc.query(`SELECT id, lease_id, document_type, status FROM lease_documents WHERE id = $1`, [d.id])).rows[0]
+    if (!first || ['completed', 'voided'].includes(first.status)) {
+      await vc.query('ROLLBACK')
+      return 'gone'
+    }
+    const out = await eraseUnfinishedDocument(vq, first)
+    if (out.erased) {
+      files = out.files
+      ended = 'deleted'
+    } else {
+      // Kept: read again under the lock the erase took — a signature that
+      // completed it a moment ago leaves it alone.
+      const live = (await vc.query(
+        `SELECT * FROM lease_documents WHERE id = $1 AND status NOT IN ('completed','voided') FOR UPDATE`, [d.id])).rows[0]
+      if (!live) {
+        await vc.query('ROLLBACK')
+        return 'gone'
+      }
+      await voidKept(vq, live)
+      ended = 'voided'
+    }
+    await vc.query('COMMIT')
+  } catch (e) {
+    await vc.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    vc.release()
+  }
+  if (files.length) {
+    await removeOrphanedDocumentFiles(async (sql, params) => ({ rows: await query<any>(sql, params) }), files).catch(() => {})
+  }
+  return ended
+}
+
+/** 10/14 (Nic, #7): how long a draft waits out for signature, with nobody signing, before GAM deletes it. */
+export const UNSIGNED_DRAFT_EXPIRY_DAYS = 30
+
+/**
+ * 10/14 (Nic, #7): "Drafts out for signature nobody has signed: GAM deletes
+ * them on its own after 30 days (no money touched)." Nightly, beside the
+ * e-sign timeouts.
+ *
+ *   OUT FOR SIGNATURE: lease_documents.status 'sent' or 'in_progress' — sent
+ *     to its signers (a 'pending' draft was never sent; 'completed',
+ *     'voided' and 'execution_failed' are done).
+ *   NOBODY HAS SIGNED: no signer row — landlord, resident or witness — has a
+ *     signed_at; for a packet (S652, one thing), on no document of the
+ *     packet.
+ *   THE 30-DAY CLOCK: from when it went out — lease_documents.sent_at, else
+ *     its first signing invite (MIN(lease_document_signers.invite_sent_at));
+ *     a document never sent to anyone has no clock. The S637 window restart
+ *     needs the landlord's signature, so it never applies here.
+ *   A PACKET is judged by its lease (it takes the packet's unfinished forms
+ *     with it); a form whose packet lease is still waiting is never taken on
+ *     its own.
+ *   NOT a new lease for a household already living there (renews_lease_id):
+ *     it has its own clock — canceled at its start date when the landlord
+ *     never signed (processNewLeaseSignings, S655).
+ *   NO MONEY: the erase's own test (lib/eraseUnfinishedDocument). A draft it
+ *     keeps is LEFT exactly as it is — Nic's answer deletes; it never voids.
+ *
+ * THE EMAIL: the waiting signers — every signer who was sent a signing link
+ * (invite_sent_at) — get "This document expired and is no longer available
+ * to sign." ONCE per person per packet (one email per thing), read before the
+ * erase takes their signer rows. A tenant still waiting on the landlord's
+ * signature was never sent anything (S647) and hears nothing. Returns what
+ * it deleted.
+ */
+export async function processUnsignedDraftExpiry(opts: { days?: number } = {}): Promise<{ deleted: string[]; kept: string[] }> {
+  const days = opts.days ?? UNSIGNED_DRAFT_EXPIRY_DAYS
+  const deleted: string[] = []
+  const kept: string[] = []
+  const due = await query<any>(`
+    SELECT d.id, d.title, d.document_type, d.landlord_id, d.lease_id, d.package_group_id,
+           COALESCE(u.display_label, u.unit_number) AS unit_number, u.property_id, p.name AS property_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+     WHERE d.status IN ('sent', 'in_progress')
+       AND d.renews_lease_id IS NULL
+       AND COALESCE(d.sent_at,
+                    (SELECT MIN(s.invite_sent_at) FROM lease_document_signers s WHERE s.document_id = d.id))
+             < NOW() - make_interval(days => $1::int)
+       AND NOT EXISTS (
+             SELECT 1 FROM lease_documents o
+               JOIN lease_document_signers s ON s.document_id = o.id
+              WHERE (o.id = d.id OR (d.package_group_id IS NOT NULL AND o.package_group_id = d.package_group_id))
+                AND s.signed_at IS NOT NULL)
+       AND (d.package_group_id IS NULL OR d.document_type = 'original_lease'
+            OR NOT EXISTS (SELECT 1 FROM lease_documents pl
+                            WHERE pl.package_group_id = d.package_group_id AND pl.id <> d.id
+                              AND pl.document_type = 'original_lease'
+                              AND pl.status IN ('pending', 'sent', 'in_progress')))
+     ORDER BY (d.document_type = 'original_lease') DESC, d.created_at, d.id`, [days])
+  for (const d of due as any[]) {
+    try {
+      // Taken with its packet lease earlier in this run.
+      if (!(await queryOne(`SELECT 1 FROM lease_documents WHERE id = $1`, [d.id]))) continue
+      // The waiting signers, before the erase takes their rows: whoever was
+      // sent a link (S654: the address on their own account; the landlord's
+      // row keeps its own) — across the packet, once each.
+      const waiting = uniqueRecipients(await query<any>(`
+        SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email,
+               s.name, s.role
+          FROM lease_documents o
+          JOIN lease_document_signers s ON s.document_id = o.id
+          LEFT JOIN users su ON su.id = s.user_id
+         WHERE (o.id = $1 OR ($2::uuid IS NOT NULL AND o.package_group_id = $2::uuid))
+           AND o.status IN ('sent', 'in_progress')
+           AND s.invite_sent_at IS NOT NULL AND s.signed_at IS NULL
+         ORDER BY s.order_index, s.id`, [d.id, d.package_group_id]))
+      const ended = await endDocumentOnItsOwn(d, async () => {
+        // Kept by the erase's test (money touched it, or its packet): left
+        // exactly as it is — Nic's answer is a delete, never a void.
+        throw new KeptOnItsOwn()
+      }).catch((e) => { if (e instanceof KeptOnItsOwn) return 'kept' as const; throw e })
+      if (ended === 'kept') { kept.push(d.id); continue }
+      if (ended !== 'deleted') continue
+      deleted.push(d.id)
+      logger.info({ document_id: d.id, title: d.title, days }, '[ESIGN-EXPIRY] unsigned draft deleted after its signing window')
+      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+      for (const rcp of waiting) {
+        try {
+          await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, {
+            landlordId: d.landlord_id, documentId: d.id, deleted: true, toLandlord: rcp.role === 'landlord',
+            replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id),
+          })
+        } catch (e) {
+          logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-EXPIRY] expired email failed')
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, document_id: d.id }, '[ESIGN-EXPIRY] could not delete an unsigned draft')
+    }
+  }
+  if (deleted.length) logger.info(`[ESIGN-EXPIRY] ${deleted.length} unsigned draft(s) deleted after ${days} days`)
+  return { deleted, kept }
+}
+
+/** Thrown inside endDocumentOnItsOwn to roll back a draft the erase keeps (processUnsignedDraftExpiry never voids). */
+class KeptOnItsOwn extends Error {}
+
 // S652 (Nic, Blu): "he just wants one per packet." Blu's eight re-drafted
 // packets produced fifty-four reminder emails in one tick — one for every
 // document, each saying the same sentence. A packet is signed as one thing:
@@ -801,7 +977,7 @@ export async function processEsignTimeouts() {
     // cutover, so pre-existing documents get a full fresh 48 hours from
     // the moment the rule started existing. Harmless once past.
     const expired = await query<any>(`
-      SELECT d.id, d.title, d.document_type, d.landlord_id,
+      SELECT d.id, d.title, d.document_type, d.landlord_id, d.lease_id,
              u.unit_number, u.property_id, p.name as property_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
@@ -921,27 +1097,42 @@ export async function processEsignTimeouts() {
           continue
         }
 
-        await cascadeLeaseTenantsOnVoid(query, d)
-        await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: signers did not respond within 48 hours', d.id])
-
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
         // S654: each signer at the address on their own account (the landlord's
-        // row keeps its own), never a signer row's possibly stale one.
-        const recipients = await query<any>(`
+        // row keeps its own), never a signer row's possibly stale one. Read
+        // BEFORE the document ends: an erased document takes its signer rows
+        // with it. 10/14: once per address (the landlord's signer row and the
+        // account owner are usually the same person — one email per thing).
+        const recipients = uniqueRecipients(await query<any>(`
           SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name, s.role
             FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id=$1
           UNION ALL
           SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name, 'landlord' AS role
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
-        `, [d.id, d.landlord_id])
-        for (const rcp of recipients as any[]) {
+        `, [d.id, d.landlord_id]))
+
+        // 10/14 (Nic, #4): "Automatic voids (48h timeout, lapsed new lease):
+        // delete them too, instead of voiding." ERASED when it never completed
+        // and no money touched it (lib/eraseUnfinishedDocument — with its
+        // packet's unfinished forms, and #1 the invite waiting on it canceled);
+        // anything that test keeps is voided exactly as before.
+        const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
+          await cascadeLeaseTenantsOnVoid(vq, live)
+          await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+            ['auto-voided: signers did not respond within 48 hours', live.id])
+        })
+        if (ended === 'gone') continue
+
+        for (const rcp of recipients) {
           try {
             // 10/5: a resident's reply ("contact the landlord") reaches the property
             // (services/replyRouting); the landlord side's copies stay GAM's.
+            // 10/14 (Nic, #5): deleted → "This document expired and is no
+            // longer available to sign."
             await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id,
-              replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id) })
+              replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id),
+              deleted: ended === 'deleted', toLandlord: rcp.role === 'landlord' })
           } catch(e) {
             logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-TIMEOUTS] auto-void email failed')
           }
@@ -1023,31 +1214,15 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
   let lapsed = 0
   // One lapse email per landlord-side person, listing every draft of theirs that
   // lapsed in this run.
-  const lapseMail = new Map<string, { email: string; name: string; landlordId: string; items: NewLeaseDigestItem[]; documentId: string }>()
+  const lapseMail = new Map<string, { email: string; name: string; landlordId: string; items: NewLeaseDigestItem[]; documentId: string; deleted: boolean }>()
   for (const d of drafts as any[]) {
     try {
       const today = todayIn(d.tz)
       const startIso = docBoxDate(d.start_raw)
       const due = startIso ? today > startIso : today >= addDaysTo(d.fallback_last, -1)
       if (!due) continue
-      const vc = await getClient()
-      try {
-        await vc.query('BEGIN')
-        await cascadeLeaseTenantsOnVoid(vc.query.bind(vc) as any, d)
-        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
-        await unwindIssuedLease(vc.query.bind(vc), d)
-        await vc.query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: the landlord never signed this new lease before its start date', d.id])
-        await vc.query('COMMIT')
-      } catch (e) {
-        await vc.query('ROLLBACK').catch(() => {})
-        throw e
-      } finally {
-        vc.release()
-      }
-      lapsed++
-      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
       // The household was never sent this draft — only the landlord side hears.
+      // Read before it ends: an erased draft takes its signer rows with it.
       const recipients = await query<any>(`
         SELECT s.email, s.name FROM lease_document_signers s
          WHERE s.document_id = $1 AND s.role = 'landlord'
@@ -1055,11 +1230,25 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         SELECT lu.email, (lu.first_name || ' ' || lu.last_name) AS name
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2
       `, [d.id, d.landlord_id])
+      // 10/14 (Nic, #4): "a lapsed new lease ... delete them too, instead of
+      // voiding" — erased when no money touched it; voided as before otherwise.
+      const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
+        await cascadeLeaseTenantsOnVoid(vq, live)
+        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
+        await unwindIssuedLease(vq, live)
+        await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+          ['auto-voided: the landlord never signed this new lease before its start date', live.id])
+      })
+      if (ended === 'gone') continue
+      lapsed++
+      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
       for (const rcp of recipients as any[]) {
-        const key = String(rcp.email || '').toLowerCase()
-        if (!key) continue
+        // One email per person per kind (deleted reads "expired", 10/14 #5).
+        const key = `${String(rcp.email || '').toLowerCase()}|${ended}`
+        if (!rcp.email) continue
         if (!lapseMail.has(key)) {
-          lapseMail.set(key, { email: rcp.email, name: rcp.name, landlordId: d.landlord_id, items: [], documentId: d.id })
+          lapseMail.set(key, { email: rcp.email, name: rcp.name, landlordId: d.landlord_id, items: [], documentId: d.id,
+                               deleted: ended === 'deleted' })
         }
         const m = lapseMail.get(key)!
         if (!m.items.some(i => i.unitLabel === unitLabel && i.startDate === startIso)) {
@@ -1072,7 +1261,7 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
   }
   for (const m of lapseMail.values()) {
     try {
-      await emailNewLeaseDraftLapsed(m.email, m.name, m.items, { landlordId: m.landlordId, documentId: m.documentId })
+      await emailNewLeaseDraftLapsed(m.email, m.name, m.items, { landlordId: m.landlordId, documentId: m.documentId, deleted: m.deleted })
     } catch (e) {
       logger.error({ err: e, recipient_email: m.email }, '[ESIGN-TIMEOUTS] new-lease lapse email failed')
     }
@@ -1134,7 +1323,11 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
     const {
       newLeasesAfterEarlyEnd, clearNeverOwedOnHeldNewLease, sayMoney, sayKeptCharges,
     } = await import('../services/renewalSuccessor')
-    const { voidDocument } = await import('../lib/voidDocument')
+    // 10/14 (Nic, #4): this automatic cancel ends the new lease the one way
+    // (endDocument) — erased with the lease it issued when no money touched
+    // it, voided exactly as before otherwise.
+    const { endDocument } = await import('../lib/voidDocument')
+    const { removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
     // S655: the deposit move that counts the new lease's own deposit payments
     // once, and the household lock every writer of a household's money takes
     // — resolved the void's own way (lockLeaseHousehold), so the cancel, the
@@ -1191,9 +1384,10 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         const live = (await vc.query(
           `SELECT * FROM lease_documents WHERE id = $1 AND status NOT IN ('completed','voided') FOR UPDATE`, [d.id])).rows[0]
         if (!live) { await vc.query('ROLLBACK'); continue }
-        await voidDocument(vc.query.bind(vc), live,
+        const out = await endDocument(vc.query.bind(vc), live,
           `canceled: the lease it follows ended early (${d.ended_on}) and nobody in the household had signed it`)
         await vc.query('COMMIT')
+        if (out.deleted) await removeOrphanedDocumentFiles(vc.query.bind(vc), out.files).catch(() => {})
       } catch (e) {
         await vc.query('ROLLBACK').catch(() => {})
         logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
@@ -3939,6 +4133,12 @@ export function schedulerInit() {
 
   // S29 item 4: e-sign reminders (2h) + auto-void (24h). Every 15 min.
   cron.schedule('*/15 * * * *', processEsignTimeouts)
+
+  // 10/14 (Nic, #7): drafts out for signature that nobody has signed in 30
+  // days are deleted (no money touched them); the waiting signers hear once.
+  cron.schedule('20 2 * * *', async () => {
+    try { await processUnsignedDraftExpiry() } catch (e) { logger.error({ err: e }, '[ESIGN-EXPIRY] fatal') }
+  }, { timezone: 'America/Phoenix' })
 
   // Run every hour — flip scheduled-activation units to active once due
   cron.schedule('5 * * * *', async () => {

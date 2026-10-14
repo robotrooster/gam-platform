@@ -12,7 +12,8 @@ import { registerBooksLoansAssetsRoutes } from './booksLoansAssets'
 // 10/12 (Nic, ledger P8): the Books statements read the ledger.
 import { registerBooksLedgerReportRoutes, wholeLedgerScope } from './booksLedgerReports'
 import { ledgerReportsLive, ledgerTaxSummary, ledgerProfitAndLoss, ledgerAccountBalances } from '../services/ledgerReports'
-import { vendor1099List, resolveCostPlace, type CostPlaceChoice } from '../services/booksVendorsLoans'
+import { vendor1099List, resolveCostPlace } from '../services/booksVendorsLoans'
+import { employeePayPlaceFrom, setEmployeePayPlace, paycheckPlaceOf, payPlaceMissingRefusal, EMPLOYEE_PAY_PLACE_REQUIRED } from '../services/booksEmployeePayPlace'
 import { todayIn, monthStartOf } from '../lib/timezone'
 import { basisMeta, incomeEvents, incomeTotals, incomeBoth, moneyViewFrom, summarize, lineList, ledgerOwedDay, type IncomeEvent } from '../services/incomeBasis'
 import type { IncomeBasis } from '@gam/shared'
@@ -741,7 +742,9 @@ booksRouter.get('/employees', requireBooksRead, async (req, res, next) => {
   try {
     const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
-      `SELECT * FROM books_employees WHERE (${col}=$1 OR $1 IS NULL) ORDER BY last_name,first_name`,
+      // 10/14 (Nic): where each employee's pay goes, with its property's name.
+      `SELECT e.*, (SELECT p.name FROM properties p WHERE p.id = e.pay_property_id) AS pay_property_name
+         FROM books_employees e WHERE (e.${col}=$1 OR $1 IS NULL) ORDER BY e.last_name, e.first_name`,
       [lid]
     )
     const year = Number(todayIn(null).slice(0, 4))
@@ -798,15 +801,26 @@ booksRouter.post('/employees', requireBooksWrite, async (req, res, next) => {
       throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
     }
     const stateRate = body.stateWithholdingPct ?? body.azWithholdingPct ?? 0
+    // 10/14 (Nic): "an employee at one property goes to that property ...
+    // once you set it it shouldnt change. if they work at multiple properties
+    // it would be at the company level" — a landlord company's new employee
+    // says where their pay goes (services/booksEmployeePayPlace).
+    const landlordId = col === 'landlord_id' ? lid : null
+    const payPlace = (await employeePayPlaceFrom(db, landlordId, req.body)).value
+    if (landlordId && !payPlace) throw new AppError(400, EMPLOYEE_PAY_PLACE_REQUIRED)
     const { rows: [emp] } = await db.query(
       `INSERT INTO books_employees
          (${col}, first_name, last_name, email, phone, address, ssn_last4,
           pay_type, pay_rate, pay_frequency, filing_status, federal_allowances,
-          state_withholding_pct, title, department, start_date)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+          state_withholding_pct, title, department, start_date,
+          pay_place, pay_property_id, pay_place_set_at, pay_place_set_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+               $17,$18,CASE WHEN $17::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $17::text IS NULL THEN NULL ELSE $19::uuid END)
+       RETURNING *`,
       [lid, body.firstName, body.lastName, body.email, body.phone, body.address, body.ssnLast4,
        body.payType, body.payRate, body.payFrequency, body.filingStatus,
-       body.federalAllowances, stateRate, body.title, body.department, body.startDate]
+       body.federalAllowances, stateRate, body.title, body.department, body.startDate,
+       payPlace?.place ?? null, payPlace?.propertyId ?? null, req.user!.userId]
     )
     res.status(201).json({ success: true, data: emp })
   } catch (e) { next(e) }
@@ -817,6 +831,21 @@ booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) =>
     const { col, id: lid } = ownerScope(req.user)
     const f = req.body
     assertBooksFieldsFit(f, ['firstName', 'lastName', 'email', 'phone', 'title', 'department'])
+    // 10/14 (Nic): where the employee's pay goes — set once (an employee
+    // added before 10/14 has none until it is set here); a different answer
+    // once set is refused (services/booksEmployeePayPlace).
+    const payPlace = await employeePayPlaceFrom(db, col === 'landlord_id' ? lid : null, f)
+    if (payPlace.given) {
+      const cur = (await db.query<{ id: string; pay_place: string | null; pay_property_id: string | null }>(
+        `SELECT id, pay_place, pay_property_id FROM books_employees WHERE id = $1 AND (${col} = $2 OR $2 IS NULL)`,
+        [req.params.id, lid])).rows[0]
+      if (!cur) throw new AppError(404, 'Employee not found')
+      if (!payPlace.value) {
+        if (cur.pay_place) throw new AppError(409, 'Once set, where an employee\'s pay goes does not change.')
+      } else {
+        await setEmployeePayPlace(db, cur, payPlace.value, req.user!.userId)
+      }
+    }
     // 10/11: pay type and frequency, when sent, are from the shared lists (as
     // on create) — payroll reads both.
     if (f.payType != null && f.payType !== '' && !(BOOKS_PAY_TYPES as readonly string[]).includes(f.payType)) {
@@ -905,25 +934,6 @@ const PAYROLL_RUN_COLUMNS = `pr.*, pr.pay_date::text AS pay_date, pr.period_star
   (SELECT p.name FROM properties p WHERE p.id = pr.property_id) AS property_name,
   (SELECT u.unit_number FROM units u WHERE u.id = pr.unit_id) AS unit_number`
 
-/**
- * 10/13 (Nic): "each expense is chosen on the split or specific unit or
- * property at the time of logging" — payroll is logged by a person, so a
- * landlord company's run says where its wages and the employer's taxes go
- * (payroll_runs.cost_place): split across the properties by units, one
- * property, or one unit. Sent when the run is calculated (kept on the draft)
- * or when it is approved; a run is never approved without it.
- */
-const PAYROLL_PLACE_WHAT = 'this payroll\'s wages and employer taxes'
-async function payrollPlaceSent(q: Pick<PoolClient, 'query'>, landlordId: string | null, body: any): Promise<CostPlaceChoice | null> {
-  const v = { costPlace: body?.costPlace ?? null, propertyId: body?.propertyId ?? null, unitId: body?.unitId ?? null }
-  if (!v.costPlace && !v.propertyId && !v.unitId) return null
-  if (v.costPlace !== null && !(BOOKS_COST_PLACES as readonly unknown[]).includes(v.costPlace)) {
-    throw new AppError(400, `Choose where ${PAYROLL_PLACE_WHAT} go: one unit, one property, or split across your properties by units.`)
-  }
-  if (!landlordId) throw new AppError(400, 'A business\'s books have no properties.')
-  return resolveCostPlace(q, { col: 'landlord_id', id: landlordId }, v, 'this payroll\'s cost')
-}
-
 /** A date column's value (a Date at the server's midnight, or text) as 'YYYY-MM-DD'. */
 function toIsoDay(v: unknown): string {
   if (v instanceof Date) {
@@ -962,7 +972,8 @@ booksRouter.get('/payroll/runs/:id', requireBooksRead, async (req, res, next) =>
     )
     if (!run) throw new AppError(404, 'Run not found')
     const { rows: lines } = await db.query(
-      `SELECT prl.*, e.first_name, e.last_name, e.title, e.pay_type as emp_pay_type,
+      `SELECT prl.*, e.first_name, e.last_name, e.title,
+              (SELECT p.name FROM properties p WHERE p.id = prl.pay_property_id) AS pay_property_name, e.pay_type as emp_pay_type,
               e.pay_rate, to_char(x.period_month, 'YYYY-MM-DD') AS work_trade_period_month
        FROM payroll_run_lines prl
        JOIN books_employees e ON e.id = prl.employee_id
@@ -1073,16 +1084,28 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
     // the wage base once, not twice.
     const ytdSoFar = new Map<string, number>(everyone.map(id => [id, yearToDate.get(id)?.ytd_gross ?? 0]))
 
-    // 10/13 (Nic): where its wages go, when the form says it now (kept on the draft).
-    const place = await payrollPlaceSent(db, col === 'landlord_id' ? lid : null, req.body)
+    // 10/14 (Nic): "an employee at one property goes to that property ... if
+    // they work at multiple properties it would be at the company level" —
+    // each paycheck follows its employee's place (no per-run pick). Everyone
+    // on a landlord company's run must have one; who has none is named.
+    const paycheckPlaces = new Map<string, { place: string; propertyId: string | null }>()
+    if (col === 'landlord_id' && lid) {
+      const missing: string[] = []
+      for (const emp of [...employees, ...[...extraEmployees.values()].filter(e => !employees.some((x: any) => x.id === e.id))]) {
+        const at = await paycheckPlaceOf(db, lid, emp)
+        if (at) paycheckPlaces.set(emp.id, at)
+        else missing.push(`${emp.first_name} ${emp.last_name}`)
+      }
+      if (missing.length) throw new AppError(400, payPlaceMissingRefusal(missing))
+    }
 
     const client = await db.connect()
     try {
       await client.query('BEGIN')
       const { rows: [run] } = await client.query(
-        `INSERT INTO payroll_runs (${col}, period_start, period_end, pay_date, pay_frequency, status, cost_place, property_id, unit_id)
-         VALUES ($1,$2,$3,$4,$5,'draft',$6,$7,$8) RETURNING *`,
-        [lid, periodStart, periodEnd, payDate, payFrequency, place?.costPlace ?? null, place?.propertyId ?? null, place?.unitId ?? null]
+        `INSERT INTO payroll_runs (${col}, period_start, period_end, pay_date, pay_frequency, status)
+         VALUES ($1,$2,$3,$4,$5,'draft') RETURNING *`,
+        [lid, periodStart, periodEnd, payDate, payFrequency]
       )
 
       let totalGross = 0, totalFed = 0, totalState = 0, totalSS = 0, totalMedicare = 0, totalNet = 0
@@ -1102,11 +1125,14 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
           `INSERT INTO payroll_run_lines
              (run_id, employee_id, pay_type, hours_worked, gross_pay,
               federal_tax, state_tax, ss_tax, medicare_tax, net_pay,
-              employer_ss_tax, employer_medicare_tax, futa_tax, suta_tax, memo, work_trade_extra_hours_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+              employer_ss_tax, employer_medicare_tax, futa_tax, suta_tax, memo, work_trade_extra_hours_id,
+              pay_place, pay_property_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
           [run.id, emp.id, line.payType, line.hours, line.gross,
            taxes.federalTax, taxes.stateTax, taxes.ssTax, taxes.medicareTax, taxes.netPay,
-           employer.employerSs, employer.employerMedicare, t.futa, t.suta, line.memo ?? null, line.extraHoursId ?? null]
+           employer.employerSs, employer.employerMedicare, t.futa, t.suta, line.memo ?? null, line.extraHoursId ?? null,
+           // 10/14 (Nic): the employee's place, kept on the paycheck so a posted run never moves.
+           paycheckPlaces.get(emp.id)?.place ?? null, paycheckPlaces.get(emp.id)?.propertyId ?? null]
         )
         ytdSoFar.set(emp.id, before + line.gross)
         totalGross += line.gross; totalFed += taxes.federalTax; totalState += taxes.stateTax
@@ -1200,7 +1226,8 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
       await client.query('COMMIT')
       const { rows: [finalRun] } = await db.query(`SELECT ${PAYROLL_RUN_COLUMNS} FROM payroll_runs pr WHERE pr.id=$1`, [run.id])
       const { rows: lines } = await db.query(
-        `SELECT prl.*, e.first_name, e.last_name, e.title, to_char(x.period_month, 'YYYY-MM-DD') AS work_trade_period_month
+        `SELECT prl.*, e.first_name, e.last_name, e.title,
+              (SELECT p.name FROM properties p WHERE p.id = prl.pay_property_id) AS pay_property_name, to_char(x.period_month, 'YYYY-MM-DD') AS work_trade_period_month
            FROM payroll_run_lines prl
            JOIN books_employees e ON e.id = prl.employee_id
            LEFT JOIN work_trade_extra_hours x ON x.id = prl.work_trade_extra_hours_id
@@ -1243,18 +1270,27 @@ booksRouter.post('/payroll/runs/:id/approve', requireBooksWrite, async (req, res
       )
       if (!run) throw new AppError(404, 'Run not found')
       if (run.status !== 'draft') throw new AppError(400, `This run is already ${PAYROLL_RUN_STATUS_WORD[run.status] ?? 'closed'}.`)
-      // 10/13 (Nic): a landlord company's run says where its wages go before
-      // it books — sent now, or kept from when it was calculated.
-      const place: CostPlaceChoice = (await payrollPlaceSent(client, run.landlord_id ?? null, req.body))
-        ?? { costPlace: run.cost_place ?? null, propertyId: run.property_id ?? null, unitId: run.unit_id ?? null }
-      if (run.landlord_id && !place.costPlace) {
-        throw new AppError(400, `Choose where ${PAYROLL_PLACE_WHAT} go: one unit, one property, or split across your properties by units.`)
+      // 10/14 (Nic): each paycheck follows its employee's place. A draft
+      // calculated before 10/14 has paychecks with no place: they take their
+      // employee's now; an employee with none yet is named and the run waits.
+      if (run.landlord_id) {
+        const { rows: unplaced } = await client.query<any>(
+          `SELECT prl.id, prl.employee_id, e.first_name, e.last_name, e.pay_place, e.pay_property_id
+             FROM payroll_run_lines prl JOIN books_employees e ON e.id = prl.employee_id
+            WHERE prl.run_id = $1 AND prl.pay_place IS NULL`, [run.id])
+        const missing = new Set<string>()
+        for (const line of unplaced) {
+          const at = await paycheckPlaceOf(client, run.landlord_id, line)
+          if (!at) { missing.add(`${line.first_name} ${line.last_name}`); continue }
+          await client.query(`UPDATE payroll_run_lines SET pay_place = $2, pay_property_id = $3 WHERE id = $1`,
+            [line.id, at.place, at.propertyId])
+        }
+        if (missing.size) throw new AppError(400, payPlaceMissingRefusal([...missing]))
       }
       const moved = await client.query(
-        `UPDATE payroll_runs SET status='approved', approved_at=NOW(), approved_by=$1, updated_at=NOW(),
-                cost_place=$3, property_id=$4, unit_id=$5
+        `UPDATE payroll_runs SET status='approved', approved_at=NOW(), approved_by=$1, updated_at=NOW()
           WHERE id=$2 AND status='draft'`,
-        [req.user!.userId, req.params.id, place.costPlace, place.propertyId, place.unitId]
+        [req.user!.userId, req.params.id]
       )
       if (!moved.rowCount) throw new AppError(409, 'This run changed while you were approving it. Reload and try again.')
       // Update YTD on each employee

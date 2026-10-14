@@ -5822,9 +5822,10 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     // 10/13 (Nic): "If it never completed, it doesn't exist." A document that
     // never completed and that no money touched is ERASED — with its packet's
     // other unfinished documents when it is the packet's lease — not voided.
-    // Anything the test in lib/eraseUnfinishedDocument keeps (issued and
-    // billed, a resident's signature, a sale started, an open invite waiting
-    // on it) is voided, unchanged: S29 item 6 / S558 / S581 / S647 / S652,
+    // Anything the test in lib/eraseUnfinishedDocument keeps (a lease it
+    // issued that billed someone, a sale started, a roster changed — 10/14:
+    // no longer a resident's signature alone, #2, nor an open invite, #1,
+    // which the erase cancels) is voided, unchanged: S29 item 6 / S558 / S581 / S647 / S652,
     // every step of a void lives in lib/voidDocument. One call decides
     // (endDocument); the GoldSign list and the new-lease window read the same
     // test (end_action) so the button says which one happens. A completed or

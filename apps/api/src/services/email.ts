@@ -583,17 +583,31 @@ export async function emailSigningReminder(to: string, signerName: string, docum
   )
 }
 
-export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }) {
-  await send(to, `Document auto-voided: ${documentTitle}`,
+/**
+ * A document GAM ended on its own. 10/14 (Nic, #5): when it was DELETED — no
+ * money touched it (#4: the 48-hour timeout; #7: 30 days out for signature
+ * with nobody signing) — it reads "This document expired and is no longer
+ * available to sign." (`deleted`), same layout. One that stays on record as
+ * voided keeps today's words. `toLandlord` (review 10/14): the landlord is
+ * the one who sends a new document, so their copy never tells them to
+ * contact the landlord.
+ */
+export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo; deleted?: boolean; toLandlord?: boolean }) {
+  const deleted = ctx?.deleted === true
+  await send(to, deleted ? `Document expired: ${documentTitle}` : `Document auto-voided: ${documentTitle}`,
     base(
-      h('Document Has Been Auto-Voided') +
-      p(`Hi ${recipientName},`) +
-      p('The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
+      h(deleted ? 'Document Expired' : 'Document Has Been Auto-Voided') +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      p(deleted
+        ? 'This document expired and is no longer available to sign.'
+        : 'The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(documentTitle)}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)}</div>
       </div>` +
-      p('No action is required. If you still need to complete this signing, please contact the landlord to send a new document.')
+      p(ctx?.toLandlord
+        ? 'No action is required. If you still need it signed, send a new document from GoldSign.'
+        : 'No action is required. If you still need to complete this signing, please contact the landlord to send a new document.')
     ),
     {
       category: 'esign_document_auto_voided',
@@ -779,18 +793,33 @@ export async function emailNewLeasesAwaitingLandlord(to: string, recipientName: 
  */
 export async function emailNewLeaseDraftLapsed(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
   landlordId?: string; documentId?: string
+  /** 10/14 (Nic, #4/#5): the drafts were DELETED (no money touched them) —
+   *  "This document expired and is no longer available to sign." */
+  deleted?: boolean
 } = {}) {
   if (items.length === 0) return
   const one = items.length === 1
   const only = items[0]
-  await send(to, one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`,
+  const deleted = ctx.deleted === true
+  await send(to, deleted
+      ? (one ? `New lease expired (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} expired (never signed)`)
+      : (one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`),
     base(
-      h(one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`) +
+      h(deleted
+        ? (one ? 'A New Lease Draft Expired' : `${items.length} New Lease Drafts Expired`)
+        : (one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`)) +
       p(`Hi ${escapeHtml(recipientName)},`) +
-      (one
-        ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
-            `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
-        : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items)) +
+      (deleted
+        ? (one
+          ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+              `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}. ` +
+              'This document expired and is no longer available to sign.')
+          : p('These new leases were never signed on your side before their start dates. ' +
+              'These documents expired and are no longer available to sign:') + newLeaseList(items))
+        : (one
+          ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+              `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
+          : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items))) +
       p(one
         ? 'Nothing changed for the household: their current lease carries on exactly as it is, and they were never sent this draft.'
         : 'Nothing changed for those households: each current lease carries on exactly as it is, and none of them was sent a draft.') +

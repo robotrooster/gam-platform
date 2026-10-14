@@ -258,6 +258,24 @@ describe('e-sign emails', () => {
     expect(log.category).toBe('esign_document_auto_voided')
   })
 
+  // 10/14 (Nic, #5) + review: the expired wording when GAM deleted it; the
+  // landlord's copy never tells them to contact the landlord; names escaped.
+  it('emailDocumentAutoVoided: expired wording when deleted, and the right next step for each reader', async () => {
+    const htmlOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).html as string
+    for (const id of ['msg_av_1', 'msg_av_2', 'msg_av_3']) resendSendMock.mockResolvedValueOnce({ data: { id }, error: null } as any)
+    await email.emailDocumentAutoVoided('t1@mailer-test.co', 'Tenant <b>', 'Lease & Co', 'Unit A1', { deleted: true })
+    expect(htmlOf()).toContain('This document expired and is no longer available to sign.')
+    expect(htmlOf()).toContain('please contact the landlord to send a new document')
+    expect(htmlOf()).toContain('Lease &amp; Co')
+    expect(htmlOf()).not.toContain('Tenant <b>')
+    await email.emailDocumentAutoVoided('l1@mailer-test.co', 'Landlord', 'Lease', 'Unit A1', { deleted: true, toLandlord: true })
+    expect(htmlOf()).toContain('This document expired and is no longer available to sign.')
+    expect(htmlOf()).toContain('send a new document from GoldSign')
+    expect(htmlOf()).not.toContain('contact the landlord')
+    await email.emailDocumentAutoVoided('t2@mailer-test.co', 'Tenant', 'Lease', 'Unit A1')
+    expect(htmlOf()).toContain('automatically voided because it was not signed by all parties within 48 hours')
+  })
+
   it('emailSigningReminder: category', async () => {
     await email.emailSigningReminder(
       's@mailer-test.co', 'Signer', 'Lease', 'A1', 'Landlord', 'https://x')

@@ -13,6 +13,7 @@ import { money, toCents, monthTitle, serverStatus, serverMessage, dayWord, CREDI
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
 import { OpenMonthDetail, StayDetail, SpaceDetail } from '../components/payments/OpenMonthDetail'
 import { OtherMoneyFolder } from '../components/payments/OtherMoney'
+import { MovedOutFolder } from '../components/payments/MovedOut'
 import { RecordPaymentPicker } from '../components/payments/RecordPaymentPicker'
 import {
   propertyToShow, openProperties, householdName, reportPath, rowTakesPayment, paidWords, earlierWords,
@@ -107,6 +108,15 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // it). Phones the same. And a register sale or pay link opens to its breakdown
 // ("it looks like that charge is just for electric. It's not ... not clickable
 // to show an expanded breakdown") — each part, what it is, its own amount.
+
+// 10/14 (Nic): "A checked-out guest still owing, nothing paid this month: show
+// in the moved-out section of Payments." Under the month, beside the register
+// folder: "Moved out, still owes" (MovedOutFolder) — each guest who checked out
+// still owing with nothing paid this month, and each household no longer here
+// still owing on earlier months (with a bill this month a household is a row,
+// tagged Moved out). Its sum rides apart. "A sale naming two spaces ... split
+// it between the two rows": each space's part is under that row's Paid, the
+// rest in the register folder (the server splits it).
 
 // S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
 // overcharge, goodwill). Funded by the landlord (they receive less rent) and
@@ -485,6 +495,8 @@ export function PaymentsPage() {
               )}
               {/* 10/13 (Nic, round 3): "Stay rows SHOW what's still owed". */}
               {toCents(t.staysOwed) > 0 && <span>Owed on stays <strong>{money(t.staysOwed)}</strong></span>}
+              {/* 10/14 (Nic): the "Moved out, still owes" section's sum, apart. */}
+              {toCents(t.movedOutOwed) > 0 && <span>Moved out, still owes <strong>{money(t.movedOutOwed)}</strong></span>}
               {/* "ALL money coming in" — the register's and pay links' other money, its own sum. */}
               {toCents(t.otherIn) > 0 && (
                 <span>Register &amp; pay links <strong>{money(t.otherIn)}</strong>
@@ -583,6 +595,9 @@ export function PaymentsPage() {
       </div>
       {/* 10/13 (Nic): "show ALL money coming in" — what is no bill and no stay. */}
       <OtherMoneyFolder lines={roll.otherMoney ?? []} month={roll.month} totals={t} />
+      {/* 10/14 (Nic): "show in the moved-out section of Payments" — guests checked out
+          still owing, and households no longer here still owing. */}
+      <MovedOutFolder list={roll.movedOutOwing ?? []} month={roll.month} totals={t} />
       </>
     )
   }

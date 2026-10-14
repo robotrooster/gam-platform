@@ -15,8 +15,13 @@ describe('documentEndButton (GoldSign row)', () => {
 
   it('a packet lease says its unfinished forms go too — and that a form everyone signed stays', () => {
     const b = documentEndButton({ endAction: 'delete', documentType: 'original_lease', packageGroupId: 'p1' })
-    expect(b.confirm).toBe('Delete this lease and the unfinished forms in its packet? None of them completed, so they are erased for good. A form everyone already signed stays.')
+    expect(b.confirm).toBe('Delete this lease and the unfinished forms in its packet? None of them completed, so they are erased for good. A form everyone already signed stays. An invite waiting on it is canceled, and a lease it issued with nothing billed is erased with it.')
     expect(b.confirm).not.toMatch(/nothing is kept/)
+  })
+
+  it('10/14 (Nic, #1/#8): a lease on its own says the invite waiting on it is canceled and an unbilled issued lease goes too', () => {
+    const b = documentEndButton({ endAction: 'delete', documentType: 'original_lease' })
+    expect(b.confirm).toBe('Delete this document? It never completed, so it is erased for good — nothing is kept. An invite waiting on it is canceled, and a lease it issued with nothing billed is erased with it.')
   })
 
   it('Void says why it cannot be deleted, in the server\'s words', () => {

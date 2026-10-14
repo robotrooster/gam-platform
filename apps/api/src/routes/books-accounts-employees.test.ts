@@ -402,6 +402,8 @@ describe('POST /employees', () => {
     title:               'Property Manager',
     department:          'Operations',
     startDate:           '2026-01-15',
+    // 10/14 (Nic): where the employee's pay goes, set once.
+    payPlace:            'company',
   })
 
   it('happy: creates employee with all required fields', async () => {
@@ -590,5 +592,49 @@ describe('PATCH /employees/:id', () => {
     expect(res.body.data.title).toBe('Lead')
     expect(res.body.data.department).toBe('maintenance')  // preserved
     expect(res.body.data.first_name).toBe('Ann')          // preserved
+  })
+})
+
+describe('10/14 (Nic): where an employee\'s pay goes — set once on the employee', () => {
+  const propertyOf = async (landlordId: string) => {
+    const owner = (await db.query<{ user_id: string }>(`SELECT user_id FROM landlords WHERE id = $1`, [landlordId])).rows[0].user_id
+    return seedProperty(db as any, { landlordId, ownerUserId: owner, managedByUserId: owner })
+  }
+  const body = {
+    firstName: 'Ann', lastName: 'Smith', email: 'ann.place@employer.test', phone: '5555550100', address: '100 Main St',
+    ssnLast4: '1234', payType: 'salary', payRate: 55000, payFrequency: 'biweekly', filingStatus: 'single',
+    federalAllowances: 0, stateWithholdingPct: 0, title: 'Manager', department: 'Ops', startDate: '2026-01-15',
+  }
+
+  it('a new employee says where their pay goes; nothing is chosen for them; another company\'s property is refused', async () => {
+    const f = await seedPortfolio()
+    const send = (b: object) => request(buildApp()).post('/api/books/employees').set('Authorization', `Bearer ${f.landlordAToken}`).send(b)
+    const none = await send(body)
+    expect(none.status).toBe(400)
+    expect(none.body.error).toBe('Choose where this employee\'s pay goes: the one property they work at, or company level if they work at several.')
+    expect((await send({ ...body, payPlace: 'property' })).body.error).toBe('Choose the property this employee works at.')
+    expect((await send({ ...body, payPlace: 'property', payPropertyId: await propertyOf(f.landlordBId) })).status).toBe(404)
+    const pA = await propertyOf(f.landlordAId)
+    const ok = await send({ ...body, payPlace: 'property', payPropertyId: pA })
+    expect(ok.status).toBe(201)
+    expect(ok.body.data).toMatchObject({ pay_place: 'property', pay_property_id: pA, pay_place_set_by: f.landlordAUserId })
+    const list = await request(buildApp()).get('/api/books/employees').set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(list.body.data.find((e: any) => e.id === ok.body.data.id).pay_property_name).toBeTruthy()
+  })
+
+  it('an employee with none gets one once; the same answer again is fine; a different one is refused and nothing changes', async () => {
+    const f = await seedPortfolio()
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate) VALUES ($1, 'Old', 'Hand', 'salary', 50000) RETURNING id`,
+      [f.landlordAId])).rows[0].id
+    const patch = (b: object) => request(buildApp()).patch(`/api/books/employees/${id}`).set('Authorization', `Bearer ${f.landlordAToken}`).send(b)
+    expect((await patch({ payPlace: 'company' })).status).toBe(200)
+    expect((await patch({ payPlace: 'company', payPropertyId: null })).status).toBe(200)
+    const moved = await patch({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordAId) })
+    expect(moved.status).toBe(409)
+    expect(moved.body.error).toBe('This employee\'s pay goes to company level. Once set, where an employee\'s pay goes does not change.')
+    expect((await patch({ payPlace: null, payPropertyId: null })).status).toBe(409)
+    const row = (await db.query(`SELECT pay_place, pay_property_id FROM books_employees WHERE id = $1`, [id])).rows[0]
+    expect(row).toEqual({ pay_place: 'company', pay_property_id: null })
   })
 })

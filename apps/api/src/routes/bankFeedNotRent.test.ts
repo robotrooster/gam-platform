@@ -124,7 +124,7 @@ describe('Not a rent payment', () => {
     const id = await deposit(p, 'ATM CASH DEPOSIT')
     await notRent(p, id)
     const r = await reconcileDeposits(p.landlordId)
-    expect(r.declared + r.autoSettled + r.autoFiled + r.inferred + r.slips).toBe(0)
+    expect(r.recorded + r.slips).toBe(0)
     expect(await txn(id)).toMatchObject({ status: 'needs_review', matched_payment_id: null })
     expect(await rentStatus(p)).toBe('pending')
   })
@@ -138,10 +138,15 @@ describe('Not a rent payment', () => {
     expect(back.status).toBe(200)
     expect((await txn(id)).auto_settle_undo).toBeNull()
     expect(await unmatchedIds(p)).toEqual([id])
-    // Nothing of the owner's "no" is left: the tenant's report and the bank row settle it.
+    // Nothing of the owner's "no" is left: the tenant's report is picked for
+    // the person on the deposit review again. 10/14 (Nic, answer 16: "no
+    // guessing"): a tenant's report never settles it by itself any more.
     await reconcileDeposits(p.landlordId)
-    expect((await txn(id)).status).toBe('matched')
-    expect(await rentStatus(p)).toBe('settled')
+    expect((await txn(id)).status).toBe('needs_review')
+    const res = await request(app()).get('/api/bank-feed/deposits/unmatched').set(as(p))
+    const card = res.body.data.deposits.find((d: any) => (d.transactionId ?? d.transaction_id) === id)
+    expect(card.candidates.find((c: any) => c.declaration)?.preselect).toBe(true)
+    expect(await rentStatus(p)).toBe('pending')
   })
 
   it('keeps the record of a match a person undid earlier, through the mark and its Undo', async () => {

@@ -92,20 +92,24 @@ async function waitingReason(sourceType: string, sourceId: string): Promise<stri
   return r.rows[0]?.reason_code ?? null
 }
 
-async function employee(co: LedgerCompany, o: { first: string; payType?: 'salary' | 'hourly'; rate: number }): Promise<string> {
+/**
+ * 10/14 (Nic): each employee says where their pay goes — the company's first
+ * property unless the test says another, company level, or (none) not yet.
+ */
+async function employee(co: LedgerCompany, o: { first: string; payType?: 'salary' | 'hourly'; rate: number
+  propertyId?: string; company?: boolean; none?: boolean }): Promise<string> {
+  const place = o.none ? null : o.company ? 'company' : 'property'
   const r = await db.query<{ id: string }>(
     `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_frequency, filing_status,
-                                  state_withholding_pct, status)
-     VALUES ($1, $2, 'Worker', $3, $4, 'biweekly', 'single', 0, 'active') RETURNING id`,
-    [co.landlordId, o.first, o.payType ?? 'salary', o.rate])
+                                  state_withholding_pct, status, pay_place, pay_property_id)
+     VALUES ($1, $2, 'Worker', $3, $4, 'biweekly', 'single', 0, 'active', $5, $6) RETURNING id`,
+    [co.landlordId, o.first, o.payType ?? 'salary', o.rate, place, place === 'property' ? (o.propertyId ?? co.propertyId) : null])
   return r.rows[0].id
 }
 
 /** A run calculated and approved through the routes; returns its id. */
 async function approvedRun(co: LedgerCompany, body: object): Promise<string> {
-  // 10/13 (Nic): a run says where its wages go when it is logged (here: the company's first property, unless the test says).
-  const place = 'costPlace' in body ? {} : { costPlace: 'property', propertyId: co.propertyId }
-  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly', ...place, ...body })
+  const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20', payFrequency: 'biweekly', ...body })
   expect(calc.status, JSON.stringify(calc.body)).toBe(201)
   const ok = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
   expect(ok.status, JSON.stringify(ok.body)).toBe(200)
@@ -149,7 +153,7 @@ describe('a payroll run posts on its pay date (J3)', () => {
     // Take-home: 3,000 − 200 − 40 − 186 − 43.50
     expect(by('net_pay_payable')).toBeCloseTo(-2530.5, 2)
     expect(new Set(ls.map(l => l.day))).toEqual(new Set(['2026-03-20']))
-    // 10/13 (Nic): the wages and the employer's taxes where the run said (its property); what is owed at company level.
+    // 10/14 (Nic): the wages and the employer's taxes where the employees work (here: the first property); what is owed at company level.
     const costs = new Set(['payroll_expense', 'employer_payroll_taxes'])
     expect(ls.filter(l => costs.has(l.role ?? '')).every(l => l.property === co.propertyId)).toBe(true)
     expect(ls.filter(l => !costs.has(l.role ?? '') && l.role !== 'interproperty_clearing').every(l => l.property === null)).toBe(true)
@@ -165,11 +169,68 @@ describe('a payroll run posts on its pay date (J3)', () => {
     expect(await roleBalance(co.landlordId, 'accounts_payable')).toBeCloseTo(-(2530.5 + 200 + 40 + 459 + 18 + 30), 2)
   })
 
-  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
-  // property at the time of logging. there should never be a default setting
-  // to apply expenses" — payroll is logged by a person, so the run says where
-  // its wages go; nothing approves without it.
-  it('goes where the run says when it is logged: split by units, one unit; a run approved before 10/13 stays in the Company column', async () => {
+  // 10/14 (Nic): "an employee at one property goes to that property ... once
+  // you set it it shouldnt change. if they work at multiple properties it
+  // would be at the company level" — each paycheck follows its employee's
+  // place; the run asks nothing. Runs approved before 10/14 post as they did.
+  it('each paycheck goes where its employee works: one property, or company level; someone with no place stops the run', async () => {
+    const co = await ledgerCompany()
+    const a = await employee(co, { first: 'Ann', rate: 26000, propertyId: co.propertyId2 })   // 1,000 on the second property
+    const b = await employee(co, { first: 'Bo', rate: 52000, company: true })                  // 2,000 at company level
+    const runId = await approvedRun(co, { employeeIds: [a, b] })
+    const run = (await db.query<any>(`SELECT cost_place, property_id, unit_id FROM payroll_runs WHERE id = $1`, [runId])).rows[0]
+    expect(run).toEqual({ cost_place: null, property_id: null, unit_id: null })
+    const lines = (await db.query<any>(`SELECT employee_id, pay_place, pay_property_id FROM payroll_run_lines WHERE run_id = $1`, [runId])).rows
+    expect(lines.sort((x: any, y: any) => x.pay_place.localeCompare(y.pay_place))).toEqual([
+      { employee_id: b, pay_place: 'company', pay_property_id: null },
+      { employee_id: a, pay_place: 'property', pay_property_id: co.propertyId2 },
+    ])
+    expect(await settle()).toEqual({ failed: 0 })
+    const ls = await activeLines('payroll_run', runId)
+    const wages = ls.filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr])
+    expect(wages.sort()).toEqual([[co.propertyId2, 1000], [null, 2000]].sort())
+    const er = ls.filter(l => l.role === 'employer_payroll_taxes').map(l => [l.property, l.dr])
+    expect(er.sort()).toEqual([[co.propertyId2, 76.5], [null, 153]].sort())
+    for (const p of [co.propertyId2, null]) {
+      expect(Math.round(ls.filter(l => l.property === p).reduce((s, l) => s + l.dr - l.cr, 0) * 100)).toBe(0)
+    }
+
+    // An employee with no place yet: named, and the run waits.
+    const c = await employee(co, { first: 'Cy', rate: 26000, none: true })
+    const refused = await post(co, '/payroll/runs', { periodStart: '2026-04-01', periodEnd: '2026-04-14', payDate: '2026-04-17',
+      payFrequency: 'biweekly', employeeIds: [a, c] })
+    expect([refused.status, refused.body.error]).toEqual([400,
+      'Set where this employee\'s pay goes on the Employees page before running payroll: Cy Worker.'])
+    // A per-run place sent by an old page decides nothing.
+    const ignored = await approvedRun(co, { employeeIds: [a], costPlace: 'split_by_units', payDate: '2026-04-17',
+      periodStart: '2026-04-01', periodEnd: '2026-04-14' })
+    expect(await settle()).toEqual({ failed: 0 })
+    expect((await activeLines('payroll_run', ignored)).filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr]))
+      .toEqual([[co.propertyId2, 1000]])
+  })
+
+  it('a draft calculated before 10/14 takes its employees\' places when approved; an employee with none is named', async () => {
+    const co = await ledgerCompany()
+    const a = await employee(co, { first: 'Ann', rate: 26000 })
+    const calc = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20',
+      payFrequency: 'biweekly', employeeIds: [a] })
+    expect(calc.status, JSON.stringify(calc.body)).toBe(201)
+    // As a draft from before 10/14: no place on its paycheck, and Ann has none yet.
+    await db.query(`UPDATE payroll_run_lines SET pay_place = NULL, pay_property_id = NULL WHERE run_id = $1`, [calc.body.data.id])
+    await db.query(`UPDATE books_employees SET pay_place = NULL, pay_property_id = NULL WHERE id = $1`, [a])
+    const refused = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
+    expect([refused.status, refused.body.error]).toEqual([400,
+      'Set where this employee\'s pay goes on the Employees page before running payroll: Ann Worker.'])
+    await db.query(`UPDATE books_employees SET pay_place = 'company' WHERE id = $1`, [a])
+    const ok = await post(co, `/payroll/runs/${calc.body.data.id}/approve`)
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
+    expect((await db.query(`SELECT pay_place FROM payroll_run_lines WHERE run_id = $1`, [calc.body.data.id])).rows).toEqual([{ pay_place: 'company' }])
+    expect(await settle()).toEqual({ failed: 0 })
+    expect((await activeLines('payroll_run', calc.body.data.id)).filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr]))
+      .toEqual([[null, 1000]])
+  })
+
+  it('runs approved before 10/14 (no place on their paychecks) post as they did: by the run\'s own place', async () => {
     const co = await ledgerCompany()
     const a = await employee(co, { first: 'Ann', rate: 26000 })     // 1,000
     // Three units on the first property, one on the second (the fixture's unit plus three), there on the pay dates.
@@ -179,52 +240,33 @@ describe('a payroll run posts on its pay date (J3)', () => {
       }
       await c.query(`UPDATE units SET created_at = '2026-01-01' WHERE landlord_id = $1`, [co.landlordId])
     })
-    // The retired setting decides nothing.
-    await db.query(`UPDATE landlords SET books_company_costs_method = 'company_bucket' WHERE id = $1`, [co.landlordId])
-    // Nothing chosen: calculated, but never approved.
-    const bare = await post(co, '/payroll/runs', { periodStart: '2026-03-01', periodEnd: '2026-03-14', payDate: '2026-03-20',
-      payFrequency: 'biweekly', employeeIds: [a] })
-    expect(bare.status, JSON.stringify(bare.body)).toBe(201)
-    const refused = await post(co, `/payroll/runs/${bare.body.data.id}/approve`)
-    expect([refused.status, refused.body.error]).toEqual([400,
-      'Choose where this payroll\'s wages and employer taxes go: one unit, one property, or split across your properties by units.'])
-    // Said at approval instead: split across the properties by units.
-    const ok = await post(co, `/payroll/runs/${bare.body.data.id}/approve`, { costPlace: 'split_by_units' })
-    expect(ok.status, JSON.stringify(ok.body)).toBe(200)
-    expect(ok.body.data).toMatchObject({ cost_place: 'split_by_units', property_id: null, unit_id: null })
-    expect(await settle()).toEqual({ failed: 0 })
-    const ls = await activeLines('payroll_run', bare.body.data.id)
-    const wages = ls.filter(l => l.role === 'payroll_expense')
-    expect(wages.map(l => [l.property, l.dr]).sort()).toEqual([[co.propertyId, 750], [co.propertyId2, 250]].sort())
-    // What is owed stays company level; the clearing lines balance each property.
-    expect(ls.filter(l => l.role === 'net_pay_payable').every(l => l.property === null)).toBe(true)
-    const clearing = ls.filter(l => l.role === 'interproperty_clearing')
-    expect(clearing.length).toBeGreaterThan(0)
-    expect(clearing.every(l => l.system)).toBe(true)
-    for (const p of [co.propertyId, co.propertyId2, null]) {
-      const net = ls.filter(l => l.property === p).reduce((s, l) => s + l.dr - l.cr, 0)
-      expect(Math.round(net * 100)).toBe(0)
+    const asBefore = async (runId: string, place: { cost_place: string | null; property_id?: string | null; unit_id?: string | null }) => {
+      await settle()
+      await inTx(async c => {
+        await c.query(`UPDATE payroll_run_lines SET pay_place = NULL, pay_property_id = NULL WHERE run_id = $1`, [runId])
+        await c.query(`UPDATE payroll_runs SET cost_place = $2, property_id = $3, unit_id = $4 WHERE id = $1`,
+          [runId, place.cost_place, place.property_id ?? null, place.unit_id ?? null])
+      })
     }
-
-    // One unit: on its property, tagged with the unit.
-    const onUnit = await approvedRun(co, { employeeIds: [a], costPlace: 'unit', unitId: co.unitId, payDate: '2026-04-03',
-      periodStart: '2026-03-15', periodEnd: '2026-03-28' })
+    // Split across the properties by units (10/13).
+    const split = await approvedRun(co, { employeeIds: [a] })
+    await asBefore(split, { cost_place: 'split_by_units' })
+    expect(await settle()).toEqual({ failed: 0 })
+    expect((await activeLines('payroll_run', split)).filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr]).sort())
+      .toEqual([[co.propertyId, 750], [co.propertyId2, 250]].sort())
+    // One unit (10/13): on its property, tagged with the unit.
+    const onUnit = await approvedRun(co, { employeeIds: [a], payDate: '2026-04-03', periodStart: '2026-03-15', periodEnd: '2026-03-28' })
+    await asBefore(onUnit, { cost_place: 'unit', property_id: co.propertyId, unit_id: co.unitId })
     expect(await settle()).toEqual({ failed: 0 })
     const unitLines = (await db.query<{ property_id: string | null; unit_id: string | null }>(
       `SELECT l.property_id, l.unit_id FROM ledger_posting_lines l JOIN ledger_postings p ON p.id = l.posting_id
-        WHERE p.source_type = 'payroll_run' AND p.source_id = $1 AND p.superseded_at IS NULL AND l.account_role = 'payroll_expense'`,
+        WHERE p.source_type = 'payroll_run' AND p.source_id = $1 AND p.role = 'post' AND p.superseded_at IS NULL
+          AND l.account_role = 'payroll_expense'`,
       [onUnit])).rows
     expect(unitLines).toEqual([{ property_id: co.propertyId, unit_id: co.unitId }])
-    // A unit that is not the company's is refused.
-    const other = await ledgerCompany()
-    const theirs = await post(co, '/payroll/runs', { periodStart: '2026-04-01', periodEnd: '2026-04-14', payDate: '2026-04-17',
-      payFrequency: 'biweekly', employeeIds: [a], costPlace: 'unit', unitId: other.unitId })
-    expect([theirs.status, theirs.body.error]).toEqual([404, 'That unit is not this company\'s.'])
-
-    // Approved before 10/13 (no place): the Company column, as it posted.
-    const legacy = await approvedRun(co, { employeeIds: [a], costPlace: 'split_by_units', payDate: '2026-04-17',
-      periodStart: '2026-04-01', periodEnd: '2026-04-14' })
-    await db.query(`UPDATE payroll_runs SET cost_place = NULL WHERE id = $1`, [legacy])
+    // Approved before 10/13 (no place at all): the Company column, as it posted.
+    const legacy = await approvedRun(co, { employeeIds: [a], payDate: '2026-04-17', periodStart: '2026-04-01', periodEnd: '2026-04-14' })
+    await asBefore(legacy, { cost_place: null })
     expect(await settle()).toEqual({ failed: 0 })
     expect((await activeLines('payroll_run', legacy)).filter(l => l.role === 'payroll_expense').map(l => [l.property, l.dr]))
       .toEqual([[null, 1000]])

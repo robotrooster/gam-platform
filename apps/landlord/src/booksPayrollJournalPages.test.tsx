@@ -45,6 +45,7 @@ vi.mock('./components/dialogs', () => ({ toast: Object.assign(() => {}, { error:
 import { JournalEntriesPage } from './bookkeeping/JournalEntriesPage'
 import { RunPayrollPage } from './bookkeeping/RunPayrollPage'
 import { ChartOfAccountsPage } from './bookkeeping/ChartOfAccountsPage'
+import { EmployeesPage } from './bookkeeping/EmployeesPage'
 
 let root: Root | null = null
 let host: HTMLDivElement | null = null
@@ -158,20 +159,24 @@ describe('Journal Entries', () => {
 describe('Run Payroll', () => {
   beforeEach(() => {
     server.gets = {
-      '/books/employees': [{ id: 'e1', firstName: 'Ann', lastName: 'Worker', payType: 'salary', payRate: 52000, status: 'active', title: '' }],
+      // 10/14 (Nic): each employee says where their pay goes, set once.
+      '/books/employees': [{ id: 'e1', firstName: 'Ann', lastName: 'Worker', payType: 'salary', payRate: 52000, status: 'active', title: '',
+        payPlace: 'property', payPropertyId: 'p1', payPropertyName: 'Oak Park' }],
       '/books/work-trade-pay': [
         { id: 'x1', payMethod: 'payroll_w2', hours: 6, rate: 15, amount: 90, periodMonth: '2026-09-01', tenantFirst: 'Pat', tenantLast: 'Trader', employeeId: 'e1', draftRunId: null },
         { id: 'x2', payMethod: 'contractor_1099', hours: 4, rate: 20, amount: 80, periodMonth: '2026-09-01', tenantFirst: 'Lee', tenantLast: 'Helper', employeeId: null, draftRunId: null },
       ],
       '/books/vendors': [{ id: 'v1', name: 'Acme Plumbing' }],
-      // 10/13 (Nic): where each run's wages go is asked on the run.
+      // 10/13 (Nic): where a contractor bill's cost goes is asked on each one.
       '/books/cost-places': { asked: true, properties: [{ id: 'p1', name: 'Oak Park', units: [{ id: 'u1', unitNumber: '7' }] }] },
     }
     server.replies['/books/payroll/runs'] = {
-      id: 'r1', lines: [], employeeCount: 2, payFrequency: 'biweekly', payDate: '2026-03-20', periodStart: '2026-03-01', periodEnd: '2026-03-14',
+      id: 'r1', employeeCount: 2,
+      lines: [{ id: 'l1', firstName: 'Ann', lastName: 'Worker', payType: 'salary', grossPay: '2000', federalTax: '0', ssTax: '124', medicareTax: '29',
+        stateTax: '0', netPay: '1847', payPlace: 'property', payPropertyId: 'p1', payPropertyName: 'Oak Park' }], payFrequency: 'biweekly', payDate: '2026-03-20', periodStart: '2026-03-01', periodEnd: '2026-03-14',
       totalGross: '2090', totalFederalTax: '0', totalStateTax: '0', totalSs: '129.58', totalMedicare: '30.31', totalNet: '1930.11',
       totalEmployerSs: '129.58', totalEmployerMedicare: '30.31', totalFuta: '12', totalSuta: '0',
-      costPlace: 'split_by_units', propertyId: null, unitId: null,
+      costPlace: null, propertyId: null, unitId: null,
     }
   })
 
@@ -191,12 +196,10 @@ describe('Run Payroll', () => {
     const annRow = (host!.querySelector('input[aria-label="Pay Ann Worker"]') as HTMLElement).closest('tr')!
     const annTaxes = annRow.querySelectorAll('input[type="number"]')
     await setValue(annTaxes[annTaxes.length - 2], '12')
-    // 10/13 (Nic): nothing is chosen for where the wages go; it is asked, and the run waits for it.
-    expect(text()).toContain('Where this payroll\'s cost (wages and employer taxes) goes')
+    // 10/14 (Nic): each paycheck follows its employee's place — the run asks nothing.
+    expect(text()).not.toContain('Where this payroll\'s cost')
+    expect(host!.querySelector('input[name="payrollPlace"]')).toBeNull()
     const calc = [...form.querySelectorAll('button[type="submit"]')].pop() as HTMLButtonElement
-    expect(calc.disabled).toBe(true)
-    await act(async () => { (host!.querySelector('input[name="payrollPlace"][value="split_by_units"]') as HTMLInputElement).click() })
-    await flush()
     expect(calc.disabled).toBe(false)
     await submit(form)
     expect(server.posts).toEqual([{ url: '/books/payroll/runs', body: {
@@ -204,12 +207,22 @@ describe('Run Payroll', () => {
       employeeIds: ['e1'], hoursMap: {},
       taxMap: { e1: { federal: 0, state: 0, futa: 12, suta: 0 } },
       extraHours: [{ id: 'x1', employeeId: 'e1', federal: 0, state: 0, futa: 0, suta: 0 }],
-      costPlace: 'split_by_units', propertyId: null, unitId: null,
     } }])
-    // The review reads the employer's taxes the server recorded, and where the wages go.
+    // The review reads the employer's taxes the server recorded, and where each paycheck goes.
     expect(text()).toContain('Federal unemployment')
     expect(text()).toContain('$12.00')
-    expect(text()).toContain('Split across your properties by units')
+    expect(text()).toContain('Pay goes to Oak Park')
+  })
+
+  it('an employee with no place yet is named, and the run waits until it is set on the Employees page (10/14, Nic)', async () => {
+    server.gets['/books/employees'] = [{ id: 'e1', firstName: 'Ann', lastName: 'Worker', payType: 'salary', payRate: 52000, status: 'active', title: '' }]
+    await render(<RunPayrollPage />)
+    const form = host!.querySelector('form')!
+    await act(async () => { (host!.querySelector('input[aria-label="Pay Ann Worker"]') as HTMLInputElement).click() })
+    await flush()
+    expect(text()).toContain('Set where this employee\'s pay goes on the Employees page first: Ann Worker.')
+    const calc = [...form.querySelectorAll('button[type="submit"]')].pop() as HTMLButtonElement
+    expect(calc.disabled).toBe(true)
   })
 
   it('records 1099 hours as a contractor bill — to the person themselves unless another vendor is picked', async () => {
@@ -240,6 +253,54 @@ describe('Run Payroll', () => {
     await flush()
     expect(server.posts[1]).toEqual({ url: '/books/work-trade-pay/x2/contractor-payment',
       body: { vendorId: 'v1', costPlace: 'unit', propertyId: 'p1', unitId: 'u1' } })
+  })
+})
+
+describe('Employees: where each one\'s pay goes, set once (10/14, Nic)', () => {
+  beforeEach(() => {
+    server.gets = {
+      '/books/employees': [
+        { id: 'e1', firstName: 'Ann', lastName: 'Worker', payType: 'salary', payRate: 52000, payFrequency: 'biweekly', status: 'active', ytdGross: 0 },
+        { id: 'e2', firstName: 'Bo', lastName: 'Keeper', payType: 'hourly', payRate: 20, payFrequency: 'biweekly', status: 'active', ytdGross: 0,
+          payPlace: 'property', payPropertyId: 'p1', payPropertyName: 'Oak Park' },
+      ],
+      '/books/cost-places': { asked: true, properties: [{ id: 'p1', name: 'Oak Park', units: [] }, { id: 'p2', name: 'Mountain View', units: [] }] },
+    }
+  })
+
+  it('a set place is shown, not offered for change; one with none is set once, nothing chosen for the person', async () => {
+    await render(<EmployeesPage />)
+    const boRow = [...host!.querySelectorAll('tr')].find(r => r.textContent?.includes('Bo Keeper'))!
+    expect(boRow.textContent).toContain('Oak Park')
+    expect(boRow.textContent).not.toContain('Set where pay goes')
+    await act(async () => { button('Set where pay goes')!.click() })
+    await flush()
+    expect(text()).toContain('Once set, it does not change.')
+    const radios = [...host!.querySelectorAll('input[name="payPlaceSet"]')] as HTMLInputElement[]
+    expect(radios.map(r => r.checked)).toEqual([false, false])
+    expect(button('Save')!.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="payPlaceSet"][value="company"]') as HTMLInputElement).click() })
+    await flush()
+    expect(button('Save')!.disabled).toBe(false)
+    await act(async () => { button('Save')!.click() })
+    await flush()
+    expect(server.patches).toEqual([{ url: '/books/employees/e1', body: { payPlace: 'company', payPropertyId: null } }])
+  })
+
+  it('Add Employee asks where their pay goes and does not save until it is answered', async () => {
+    await render(<EmployeesPage />)
+    await act(async () => { button('+ Add Employee')!.click() })
+    await flush()
+    expect(text()).toContain('Where their pay goes (set once)')
+    const add = [...host!.querySelectorAll('button[type="submit"]')].pop() as HTMLButtonElement
+    expect(add.disabled).toBe(true)
+    await act(async () => { (host!.querySelector('input[name="payPlace"][value="property"]') as HTMLInputElement).click() })
+    await flush()
+    expect(add.disabled).toBe(true)
+    const pick = [...host!.querySelectorAll('select')].find(x => [...x.options].some(o => o.textContent === 'Choose the property'))!
+    await setValue(pick, 'p2')
+    await flush()
+    expect(add.disabled).toBe(false)
   })
 })
 

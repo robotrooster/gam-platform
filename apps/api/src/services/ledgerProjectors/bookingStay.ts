@@ -62,6 +62,7 @@ import type { LedgerOwner } from '../ledgerOwner'
 import {
   cr, dr, toCents, splitCents, loadSale, saleMakeUp, missingFact, localDaySql, propertyTzSql, LODGING_TAX_NAME,
 } from './registerBookingPayoutKit'
+import { loadStay, stayParts, type StayFacts } from './incomeLines'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -177,7 +178,13 @@ async function stayMoney(client: PoolClient, b: BookingFacts): Promise<{ earnedC
   return { earnedCents: earned, site }
 }
 
-function earnPosting(b: BookingFacts, day: string, cents: number, memo: string): DesiredPosting | null {
+/**
+ * 10/14 (Nic I1, I2): the stay earns on its line — a stay under 30 nights on
+ * its space type's short-term stay line (the taxed ones), 30+ nights or one a
+ * lease bills on its space's rent line (RV long-term rent, mobile home lot
+ * rent, …). The role stays stay_income.
+ */
+function earnPosting(b: BookingFacts, stay: StayFacts | null, day: string, cents: number, memo: string): DesiredPosting | null {
   if (!cents) return null
   const at = { propertyId: b.property_id, unitId: b.unit_id, tenantId: b.tenant_id }
   return {
@@ -187,14 +194,15 @@ function earnPosting(b: BookingFacts, day: string, cents: number, memo: string):
     memo,
     lines: [
       ...dr('guest_deposits', cents, { ...at, memo }),
-      ...cr('stay_income', cents, { ...at, reportCategory: 'stays_and_pay_links', memo }),
+      ...stayParts(stay, cents).flatMap(p => cr(p.role, p.cents, { ...at, reportCategory: 'stays_and_pay_links', sub: p.sub, memo })),
     ],
   }
 }
 
 export const bookingStayProjector: LedgerProjector = {
   sourceType: 'booking',
-  ruleVersion: 1,
+  // 2 — 10/14 (Nic I1, I2): earned on the stay's own line (incomeLines).
+  ruleVersion: 2,
 
   async project(client: PoolClient, sourceId: string): Promise<DesiredPosting[]> {
     const id = parseBookingSourceId(sourceId)
@@ -203,6 +211,7 @@ export const bookingStayProjector: LedgerProjector = {
     if (!b) return []
     const money = await stayMoney(client, b)
     const sched = staySchedule(b, money.earnedCents)
+    const stay = await loadStay(client, b.id)
     const out: DesiredPosting[] = []
 
     if (id.part.kind === 'base') {
@@ -231,17 +240,17 @@ export const bookingStayProjector: LedgerProjector = {
       }
       const first = sched.pieces[0]
       if (first?.reached) {
-        const p = earnPosting(b, first.start, first.cents, 'Stay earned: the guest arrived')
+        const p = earnPosting(b, stay, first.start, first.cents, 'Stay earned: the guest arrived')
         if (p) out.push(p)
       }
     } else if (id.part.kind === 'month') {
       const piece = sched.pieces.find(p => p.k === (id.part as { k: number }).k)
       if (piece?.reached) {
-        const p = earnPosting(b, piece.start, piece.cents, 'Stay month earned')
+        const p = earnPosting(b, stay, piece.start, piece.cents, 'Stay month earned')
         if (p) out.push(p)
       }
     } else {
-      const p = earnPosting(b, sched.endDay, sched.unreachedCents,
+      const p = earnPosting(b, stay, sched.endDay, sched.unreachedCents,
         b.status === 'cancelled' ? 'Stay money kept: the stay was cancelled'
           : b.status === 'no_show' ? 'Stay money kept: the guest did not arrive'
           : 'Stay money kept for nights not stayed')

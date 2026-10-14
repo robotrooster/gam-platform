@@ -13,9 +13,16 @@
  *     co-owner). Their birthday is users.date_of_birth, typed on their own
  *     Settings → Account card.
  *   Demo and system companies are left out. No birthday on file, no email —
- *   ever. A birthday dated today or later is not a birthday and is skipped
- *   (that catches a lease's signing date typed into the birthdate box only in
- *   the year it was signed; there is no minimum age).
+ *   ever.
+ *   10/14 (Nic): "people under 18 cant be on a lease legally right? 18 and
+ *   up" — nobody under 18 is emailed: a birthday that makes the person
+ *   younger than 18 today is skipped (that also catches a lease's signing
+ *   date typed into the birthdate box). They turn 18 on the birthday itself,
+ *   so an 18th birthday is greeted.
+ *   10/14 (Nic): only VERIFIED email addresses (users.email_verified) — an
+ *   address nobody has proven is never written to.
+ *   10/14 (Nic): only CURRENT tenants, never past ones (above); a landlord
+ *   who typed their own birthday keeps getting theirs.
  *
  * ── When ─────────────────────────────────────────────────────────────────
  * Once a day, a Phoenix morning (scheduler.ts). "Today" is Phoenix's calendar
@@ -107,6 +114,7 @@ export async function runBirthdayEmails(now: Date = new Date()): Promise<Birthda
         FROM tenants t
         JOIN users u ON u.id = t.user_id
        WHERE t.date_of_birth IS NOT NULL
+         AND u.email_verified = TRUE
          AND EXISTS (
            SELECT 1
              FROM lease_tenants lt
@@ -122,6 +130,7 @@ export async function runBirthdayEmails(now: Date = new Date()): Promise<Birthda
         FROM users u
        WHERE u.role = 'landlord'
          AND u.date_of_birth IS NOT NULL
+         AND u.email_verified = TRUE
          AND EXISTS (
            SELECT 1 FROM landlords la
             WHERE la.is_demo   = FALSE
@@ -140,7 +149,9 @@ export async function runBirthdayEmails(now: Date = new Date()): Promise<Birthda
       FROM people p
      WHERE EXTRACT(MONTH FROM p.dob)::int = $1
        AND EXTRACT(DAY   FROM p.dob)::int = ANY($2::int[])
-       AND p.dob < $3::date
+       -- 10/14 (Nic): 18 and up (18 on the birthday itself; a Feb 29
+       -- birthday's 18th falls on Feb 28 in a year without one).
+       AND (p.dob + interval '18 years')::date <= $3::date
      ORDER BY p.user_id, (p.audience = 'landlord') DESC`,
     [month, days, today, BIRTHDAY_NOTIFICATION_TYPE, year])
 

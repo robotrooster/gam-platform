@@ -9,7 +9,15 @@
 // apply expenses." Money going out is never pre-filled with where it goes —
 // the line asks (one unit, the whole property, or split across all the
 // company's properties by units), and so does each part of a split; the
-// remembered category still pre-fills.
+// remembered category still pre-fills. 10/14 (Nic): "if gam 100 percent knows
+// who that money came from it can file it but no guessing." Money coming in
+// is never pre-filled with a place either: where the payer's last deposit went
+// is offered as a button the person presses, and nothing files itself. A
+// deposit of a GAM payout's amount whose memo does not name GAM is offered as
+// that payout for the person to match. 10/14 (Nic, answer 15): a line going out
+// that is a check the bank returned — when GAM could not be sure which check —
+// lists the checks of its amount under "What did this pay?" for the person to
+// pick; a returned check GAM took back can be undone like any match.
 import { useMemo, useState, useEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
@@ -157,16 +165,39 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     return cats.find(c => c.systemKey === d.category)?.id ?? ''
   }
 
-  // Per-row categorize draft, pre-seeded from the merchant suggestion.
+  // Per-row categorize draft, pre-seeded with the merchant's remembered category.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const draftFor = (t: any): Draft => drafts[t.id] || {
     // Income rows must not default to an expense category — confirming without
     // touching the dropdown would file a deposit as 'repairs'.
     category: t.suggestedCategory || (Number(t.amount) > 0 ? 'other' : 'repairs'),
     // 10/13 (Nic): money going out starts with no place (the API never suggests one for it).
-    scopeKind: t.suggestedScopeKind || (Number(t.amount) > 0 ? 'unit' : ''),
-    propertyId: t.suggestedPropertyId || '',
-    unitId: t.suggestedUnitId || '',
+    // 10/14 (Nic, answer 16): "no guessing" — money coming in starts with no
+    // place either. Where this payer's last deposit went is offered beside
+    // the pickers as a suggestion the person presses (placeSuggestion), never
+    // filled in for them.
+    scopeKind: '',
+    propertyId: '',
+    unitId: '',
+  }
+  /** 10/14: the place this payer's last deposit went, in words, or null (money in only). */
+  const placeSuggestion = (t: any): { label: string; patch: Partial<Draft> } | null => {
+    if (!(Number(t.amount) > 0) || !t.suggestedScopeKind) return null
+    const prop = (properties as any[]).find((p: any) => p.id === t.suggestedPropertyId)
+    if (t.suggestedScopeKind === 'unit') {
+      const u = (units as any[]).find((x: any) => x.id === t.suggestedUnitId)
+      if (!u) return null
+      const uProp = (properties as any[]).find((p: any) => p.id === propOf(u))
+      return {
+        label: `${u.unitNumber || u.name || u.label || 'Unit'}${uProp?.name ? `, ${uProp.name}` : ''}`,
+        patch: { scopeKind: 'unit', propertyId: propOf(u), unitId: u.id },
+      }
+    }
+    if (!prop) return null
+    return {
+      label: `${prop.name} — ${scopeChoices(false).find(([k]) => k === t.suggestedScopeKind)?.[1] ?? 'the whole property'}`,
+      patch: { scopeKind: t.suggestedScopeKind, propertyId: prop.id, unitId: '' },
+    }
   }
   const setDraft = (id: string, patch: Partial<Draft>) => {
     const row = (txns as any[]).find(t => t.id === id) || { id }
@@ -284,6 +315,12 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       const d = r?.data
       toast(d?.kind === 'deposit_slip'
         ? (d?.slipReopened ? 'Match undone. The deposit slip is waiting for the bank again.' : 'Match undone. Those payments are back on the "not banked" list.')
+        // 10/14 (Nic, answer 15): a returned check put back.
+        : d?.kind === 'returned_check'
+          ? 'Undone. The check counts as paid again; the returned-check fee and the late fees it brought are voided (kept on record). The line is back in review.'
+        // 10/14 (Nic, answer 16): a payout matched by hand.
+        : d?.kind === 'gam_payout'
+          ? 'Undone. The deposit is back in review.'
         // 10/6: a line tied to a deposit the office recorded by hand — the payments stay as recorded.
         : d?.kind === 'recorded_deposit'
           ? 'Match undone. The deposit you recorded stays as you recorded it, late fees and all; the bank line is back in review.'
@@ -291,12 +328,18 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     },
     onError: (e: any) => toast.error(e?.message || 'That match could not be undone.'),
   })
+  // 10/14 (Nic, answer 16): the person says this deposit IS GAM's payout.
+  const matchPayout = useMutation(
+    ({ id, disbursementId }: { id: string; disbursementId: string }) =>
+      apiPost(`/bank-feed/transactions/${id}/match-payout`, { disbursementId, entityId }), {
+    onSuccess: () => { qc.invalidateQueries(['bank-txns']); toast('Matched to GAM’s payout. It is counted once, through the payments inside it.') },
+    onError: (e: any) => toast.error(e?.message || 'That match could not be saved.'),
+  })
   const undoFiling = useMutation(
-    ({ id, stop }: { id: string; stop: boolean }) => apiPost(`/bank-feed/transactions/${id}/undo-auto-file`, { entityId, stopAutoFiling: stop }), {
-    onSuccess: (r: any) => {
+    ({ id }: { id: string }) => apiPost(`/bank-feed/transactions/${id}/undo-auto-file`, { entityId }), {
+    onSuccess: () => {
       qc.invalidateQueries(['bank-txns'])
-      const payer = r?.data?.stoppedForPayer
-      toast(payer ? `Undone. Deposits from ${payer} will no longer file themselves.` : 'Undone. The deposit is back in review.')
+      toast('Undone. The deposit is back in review.')
     },
     onError: (e: any) => toast.error(e?.message || 'That filing could not be undone.'),
   })
@@ -333,11 +376,6 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   }
   const setPart = (id: string, i: number, patch: Partial<SplitPart>) =>
     setSplits(s => ({ ...s, [id]: (s[id] || []).map((p, j) => (j === i ? { ...p, ...patch } : p)) }))
-  // 10/12 (Nic): "after a split, ASK whether future deposits from that payer
-  // should stop filing automatically." The server says when the answer can
-  // change anything (a deposit from a payer that files itself, or would).
-  const [payerAsk, setPayerAsk] = useState<Record<string, { payer: string; filesItself: boolean; category: string | null }>>({})
-  const closeAsk = (id: string) => setPayerAsk(s => { const n = { ...s }; delete n[id]; return n })
   // 10/12 review (Nic L5, match first): a money-out line the server found
   // already on record to the cent (409 MATCH_FIRST) opens its "What did this
   // pay?" panel, with "None of these" to file it anyway — by the action the
@@ -348,15 +386,10 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const split = useMutation(
     ({ id, parts, notAMatch }: { id: string; parts: any[]; notAMatch?: boolean }) =>
       apiPost(`/bank-feed/transactions/${id}/split`, { parts, entityId, ...(notAMatch ? { notAMatch: true } : {}) }), {
-    onSuccess: (r: any, v) => {
+    onSuccess: (_r: any, v) => {
       qc.invalidateQueries(['bank-txns'])
       clearMatchFirst(v.id)
       closeSplit(v.id)
-      const ask = r?.data?.payerQuestion
-      // One question per payer, however many of their deposits were just split.
-      if (ask?.payer) setPayerAsk(s => ({
-        ...Object.fromEntries(Object.entries(s).filter(([, a]) => a.payer !== ask.payer)), [v.id]: ask,
-      }))
       toast('Split saved. Each part is filed in its own category.')
     },
     onError: (e: any, v) => {
@@ -367,14 +400,6 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       }
       toast.error(e?.message || 'That split could not be saved.')
     },
-  })
-  const stopPayer = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/stop-auto-filing`, { entityId }), {
-    onSuccess: (r: any, id) => {
-      closeAsk(id)
-      qc.invalidateQueries(['bank-txns'])
-      toast(`Deposits from ${r?.data?.payer || 'this payer'} will wait for you to file them.`)
-    },
-    onError: (e: any) => toast.error(e?.message || 'That could not be saved.'),
   })
 
   // 10/12 (Nic): "every bank filing (hand-filed too) can be undone (kept on
@@ -430,6 +455,10 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     const ok = await appConfirm(
       t.matchKind === 'deposit_slip'
         ? 'Undo this match? The deposit goes back to review and its slip waits for the bank again. Any "other money" on the slip comes back out of your income.'
+        : t.matchKind === 'returned_check'
+          ? 'Undo this returned check? The check counts as paid again on the day it was paid, the returned-check fee and the late fees it brought are voided (kept on record), the tenant is told, and the line goes back to review. Nothing is undone if the tenant paid since.'
+        : t.matchKind === 'gam_payout'
+          ? 'Undo this match? The deposit goes back to review, no longer matched to GAM’s payout.'
         : 'Undo this match? The bills it paid are owed again, any late fees it took off come back, credit it created is withdrawn, and the deposit goes back to review. Nothing is undone if any of that changed since.',
       { title: 'Undo this match', confirmLabel: 'Undo it' })
     if (ok) undoMatch.mutate(t.id)
@@ -644,28 +673,6 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
         ))}
       </div>}
 
-      {/* 10/12 (Nic): asked right after a deposit is split — here, above the
-          list, so it stays on screen whichever view the split line moves to. */}
-      {Object.entries(payerAsk).map(([id, ask]) => (
-        <div key={id} className="card" style={{ marginBottom: 12, padding: 12 }}>
-          <div style={{ fontWeight: 600, fontSize: '.82rem', color: 'var(--text-0)' }}>
-            Should future deposits from {ask.payer} stop filing themselves?
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '2px 0 10px', lineHeight: 1.5 }}>
-            {ask.filesItself
-              ? `Right now the next deposit from ${ask.payer} is filed by itself, as ${categoryLabel(false, ask.category || 'other')}, like the last one you filed.`
-              : `Right now deposits from ${ask.payer} wait for you. Once you file one as a single category, the next ones would file themselves the same way.`}
-            {' '}The deposit you just split held more than one kind of money. If you stop it, every deposit from them waits for you to file or split.
-          </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button className="btn btn-primary btn-sm" disabled={stopPayer.isLoading} onClick={() => stopPayer.mutate(id)}>
-              {stopPayer.isLoading ? 'Saving…' : 'Yes, stop it'}
-            </button>
-            <button className="btn btn-ghost btn-sm" disabled={stopPayer.isLoading} onClick={() => closeAsk(id)}>No, leave it</button>
-          </div>
-        </div>
-      ))}
-
       <div className="card">
         {isLoading ? <div style={{ color: 'var(--text-3)' }}>Loading…</div>
           : txns.length === 0 ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>
@@ -718,6 +725,20 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                     {t.status === 'needs_review' && !isExpense && t.loanFundingFits && !splits[t.id] && (
                       <MoneyOutMatches t={t} entityId={entityId} moneyIn onDone={() => { qc.invalidateQueries(['bank-txns']) }} />
                     )}
+                    {/* 10/14 (Nic, answer 16): "no guessing" — a payout GAM sent of this
+                        amount fits, but the memo does not name GAM: the person says. */}
+                    {t.status === 'needs_review' && !isExpense && t.payoutSuggestion && !splits[t.id] && (
+                      <div className="bankrec-matched" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+                        <span style={{ flex: 1, minWidth: 220 }}>
+                          GAM’s payout of {fmt(t.payoutSuggestion.amount)} sent {fmtDate(t.payoutSuggestion.sentOn)} fits this deposit.
+                          {' '}GAM already counts the payments inside a payout — filing it as income would count them twice.
+                        </span>
+                        <button className="btn btn-primary btn-sm" disabled={matchPayout.isLoading}
+                          onClick={() => matchPayout.mutate({ id: t.id, disbursementId: t.payoutSuggestion.id })}>
+                          {matchPayout.isLoading ? 'Matching…' : 'Match it to that payout'}
+                        </button>
+                      </div>
+                    )}
                     {t.status === 'needs_review' && !splits[t.id] && (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' }}>
                         {companyCategories(t, isExpense).length > 0 ? (
@@ -758,6 +779,18 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                           </select>
                         )}
                         {t.suggestedCategory && <span style={{ fontSize: '.68rem', color: 'var(--gold)' }}>suggested</span>}
+                        {/* 10/14 (Nic, answer 16): where this payer's last deposit went is a
+                            suggestion the person presses — never filled in for them. */}
+                        {(() => {
+                          const sug = placeSuggestion(t)
+                          if (!sug || (d.scopeKind === sug.patch.scopeKind && d.propertyId === sug.patch.propertyId
+                            && (d.unitId || '') === (sug.patch.unitId || ''))) return null
+                          return (
+                            <button type="button" className="btn btn-primary btn-sm" onClick={() => setDraft(t.id, sug.patch)}>
+                              Same place as last time: {sug.label}
+                            </button>
+                          )
+                        })()}
                         <button className="btn btn-primary btn-sm" onClick={() => submit(t)} disabled={categorize.isLoading}>
                           <Check size={14} /> Confirm
                         </button>
@@ -848,14 +881,12 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       <div className="bankrec-matched">
                         <span>
                           {BANK_TXN_MATCH_KIND_LABEL['auto_filed']} — added to your income like the last deposit from {t.normalizedMerchant || 'this payer'}.
+                          {/* 10/14 (Nic, answer 16): nothing files itself from a payer's name any
+                              more; a line filed that way before keeps its Undo. */}
                         </span>
                         <span className="bankrec-undo-box">
                           <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
-                            onClick={() => undoFiling.mutate({ id: t.id, stop: false })}>Undo</button>
-                          <button className="btn btn-primary btn-sm" disabled={undoFiling.isLoading}
-                            onClick={() => undoFiling.mutate({ id: t.id, stop: true })}>
-                            Undo and stop filing {t.normalizedMerchant || 'this payer'} by itself
-                          </button>
+                            onClick={() => undoFiling.mutate({ id: t.id })}>Undo</button>
                           {!splits[t.id] && t.bankStatus !== 'void' && (
                             <button className="btn btn-primary btn-sm" onClick={() => openSplit(t)}>Split into parts</button>
                           )}
@@ -1089,6 +1120,21 @@ function MatchedLine({ t }: { t: any }) {
       </div>
     )
   }
+  // 10/14 (Nic, answer 15): a check the bank returned out of a deposit, taken
+  // back by itself — just that check; the bills it paid are owed again.
+  if (t.matchKind === 'returned_check') {
+    return (
+      <div style={line}>
+        {BANK_TXN_MATCH_KIND_LABEL['returned_check']} — GAM took back {t.returnedCheckTenantName ? `${t.returnedCheckTenantName}’s` : 'the'} check;
+        {' '}the bills it paid are owed again
+        {t.returnedCheckFee != null ? `, and a ${fmt(t.returnedCheckFee)} returned-check fee was billed to them`
+          : t.returnedCheckFeeFrom === 'unreadable' ? '; their lease’s returned-payment fee could not be read as an amount, so add it by hand'
+          : t.returnedCheckFeeFrom === 'none' ? '; your bank showed no fee for it, so none was billed'
+          : ', and the returned-check fee is billed to them when your bank’s fee for it shows'}.
+        {' '}The bank’s own fee line is yours to file as a bank fee.
+      </div>
+    )
+  }
   return <div style={line}>Matched to money GAM already has on record — never counted twice.</div>
 }
 
@@ -1150,6 +1196,7 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
   const [open, setOpen] = useState(startOpen)
   useEffect(() => { if (startOpen) setOpen(true) }, [startOpen])
   const [picked, setPicked] = useState<Record<string, boolean>>({})
+  const [askReturned, setAskReturned] = useState(false)
   const { data, isLoading } = useQuery<any>(['bank-out-matches', t.id], () => apiGet(`/bank-feed/transactions/${t.id}/matches`), { enabled: open })
   const lineCents = Math.round(Math.abs(Number(t.amount)) * 100)
   const matchExpenses = useMutation((body: { expenseIds: string[]; paymentIds: string[] }) =>
@@ -1162,6 +1209,22 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
     onSuccess: () => { toast('Matched.'); setOpen(false); onDone() },
     onError: (e: any) => toast.error(e?.message || 'That match could not be saved.'),
   })
+  // 10/14 (Nic, answer 15): the owner picks the check the bank returned.
+  const bounced = useMutation((remittanceId: string) =>
+    apiPost(`/bank-feed/transactions/${t.id}/returned-check`, { remittanceId, entityId }), {
+    onSuccess: () => {
+      toast('Taken back. The bills that check paid are owed again, with any late fees and the returned-check fee, and the tenant was told.')
+      setOpen(false); onDone()
+    },
+    onError: (e: any) => toast.error(e?.message || 'That check could not be taken back.'),
+  })
+  const askBounced = async (c: any) => {
+    const ok = await appConfirm(
+      `Take back ${c.tenantName ? `${c.tenantName}’s` : 'this'} ${fmt(c.amount)} ${c.method === 'money_order' ? 'money order' : 'check'} from the deposit of ${fmtDate(c.depositedOn)}? `
+        + 'Just that payment comes off the bills it paid: they are owed again with any late fees from their due dates, the returned-check fee is billed, and the tenant is told. You can undo it.',
+      { title: 'A check bounced', confirmLabel: 'Take it back' })
+    if (ok) bounced.mutate(c.remittanceId)
+  }
   if (!open) {
     return (
       <div style={{ marginTop: 8 }}>
@@ -1172,6 +1235,9 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
   const expenses: any[] = data?.expenses ?? []
   const checks: any[] = data?.checks ?? []
   const records: any[] = data?.records ?? []
+  const returnedChecks: any[] = moneyIn ? [] : (data?.returnedChecks ?? [])
+  // Open at once on a line that speaks of a return; one press away on any other.
+  const showReturned = returnedChecks.length > 0 && (!!data?.returnedLine || askReturned)
   const pickedCents = [...expenses.filter(e => picked[`e:${e.expenseId}`]).map(e => Math.round(e.unpaid * 100)),
     ...checks.filter(c => picked[`c:${c.paymentId}`]).map(c => Math.round(c.amount * 100))].reduce((a, b) => a + b, 0)
   const pickedCount = Object.values(picked).filter(Boolean).length
@@ -1182,7 +1248,32 @@ function MoneyOutMatches({ t, entityId, onDone, moneyIn = false, startOpen = fal
     <div className="bankrec-matched" style={{ display: 'block', marginTop: 8 }}>
       {isLoading ? <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Looking…</div> : (
         <>
-          {expenses.length + checks.length + records.length === 0 && (
+          {/* 10/14 (Nic, answer 15): a check the bank returned — GAM could not be
+              sure which one, so the owner picks. A tenant's own bank deposit is
+              taken back with Undo this match on that deposit instead. */}
+          {returnedChecks.length > 0 && !showReturned && (
+            <div style={{ marginBottom: 6 }}>
+              <button className="btn btn-primary btn-sm" onClick={() => setAskReturned(true)}>Was this a check your bank returned?</button>
+            </div>
+          )}
+          {showReturned && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 2 }}>
+                If this is a check your bank returned, pick the one that bounced:
+              </div>
+              {returnedChecks.map(c => (
+                <div key={c.remittanceId} style={row}>
+                  <span style={{ flex: 1 }}>
+                    {c.tenantName ?? 'A tenant'}{c.spaces ? ` (${c.spaces})` : ''} · {c.method === 'money_order' ? 'Money order' : c.tenantDeposit ? 'Their own bank deposit' : 'Check'} · {fmt(c.amount)} · deposited {fmtDate(c.depositedOn)}
+                  </span>
+                  {c.tenantDeposit
+                    ? <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Use Undo this match on that deposit</span>
+                    : <button className="btn btn-primary btn-sm" disabled={bounced.isLoading} onClick={() => askBounced(c)}>This one bounced</button>}
+                </div>
+              ))}
+            </div>
+          )}
+          {expenses.length + checks.length + records.length + returnedChecks.length === 0 && (
             <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
               {moneyIn ? 'No loan fits this deposit any more. File it below.' : 'Nothing on record fits this line. File it below as a new expense.'}
             </div>

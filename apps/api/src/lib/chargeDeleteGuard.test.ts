@@ -48,7 +48,17 @@ vi.mock('../lib/stripe', async (orig) => ({
 const voidCalls = vi.hoisted(() => ({ n: 0 }))
 vi.mock('./voidDocument', async (orig) => {
   const real = await orig<typeof import('./voidDocument')>()
-  return { ...real, voidDocument: async (...a: Parameters<typeof real.voidDocument>) => { voidCalls.n++; return real.voidDocument(...a) } }
+  return {
+    ...real,
+    voidDocument: async (...a: Parameters<typeof real.voidDocument>) => { voidCalls.n++; return real.voidDocument(...a) },
+    // 10/14 (Nic, #4): the cancel ends the document the one way (endDocument —
+    // erased when no money touched it); a void inside it is counted the same.
+    endDocument: async (...a: Parameters<typeof real.endDocument>) => {
+      const out = await real.endDocument(...a)
+      if (!out.deleted) voidCalls.n++
+      return out
+    },
+  }
 })
 
 import { unwindIssuedLease, returnDepositCountedOnce, LEASE_VOIDED_CHARGE_REASON } from './unwindIssuedLease'

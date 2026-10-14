@@ -412,7 +412,12 @@ export const LEDGER_MAP_KINDS = ['role', 'bank_connection', 'sales_tax', 'loan',
   // (map_value = books_categories.id) → the account it charges to. A category
   // may point at any account but one GAM keeps (a control account); until it
   // is pointed, a seeded category charges to its default role's account.
-  'expense_category', 'income_category'] as const
+  'expense_category', 'income_category',
+  // 10/14 (Nic, I1-I7): income itemized by the space it is for. 'rent_line'
+  // (map_value = a LEDGER_RENT_LINES key) → its own sub-account under Space
+  // and lot rent; 'stay_line' (map_value = a LEDGER_STAY_LINES key) → its own
+  // sub-account under Stay income. Added the first time a company uses one.
+  'rent_line', 'stay_line'] as const
 export type LedgerMapKind = typeof LEDGER_MAP_KINDS[number]
 /** The role a map kind's sub-accounts hang under (and share their type with). */
 export const LEDGER_MAP_KIND_PARENT_ROLE: Record<Exclude<LedgerMapKind, 'role'>, LedgerAccountRole> = {
@@ -424,6 +429,100 @@ export const LEDGER_MAP_KIND_PARENT_ROLE: Record<Exclude<LedgerMapKind, 'role'>,
   // sub-account of their own (services/booksLedgerChart resolveAccount).
   expense_category: 'other_expenses',
   income_category:  'other_income',
+  rent_line:        'space_rent',
+  stay_line:        'stay_income',
+}
+
+// ─── Itemized income: rent and stays by space (10/14, Nic I1-I7) ────────────
+//
+// Nic's bookkeeper, 10/14: "a breakdown of where it's from, a distinction by
+// unit type for mobile home spaces, the lot rent, any trailer payments that
+// may be made, and RV stays that are long-term versus the short-term taxable
+// ones ... we need everything to be as itemized as possible". For EVERY
+// company (I1). The posting role stays space_rent / stay_income (every check
+// that reads a role reads the same money); the line's sub-account says what
+// it was for.
+//
+//   I2  under 30 nights is short-term (taxed); 30+ nights or a lease is
+//       long-term. Long-term money books to a rent line, short stays to a
+//       stay line.
+//   I4/I5  a park-owned trailer that is rented (units.dwelling_ownership
+//       'landlord'): the unit's lot rent (units.lot_rent_amount) is lot rent,
+//       the rest is trailer rent — derived, no new box. A tenant-owned
+//       trailer's whole rent is lot rent.
+//   I3  trailers bought from the park are home sales (4300) and home-note
+//       interest (4310), their own lines already.
+// A space's subtype (Single wide, Double wide) is a reporting dimension on
+// the Detailed view, never an account (Nic D3: subtypes describe, never price).
+
+/** Stays this many nights or more are long-term (Nic I2); a lease always is. */
+export const LEDGER_LONG_TERM_STAY_NIGHTS = 30
+
+/** Long-term income by space (map kind 'rent_line'), in report order. */
+export const LEDGER_RENT_LINES = [
+  'mobile_home_lot', 'mobile_home_trailer', 'rv_spot', 'apartment', 'single_family', 'campsite',
+  'hotel_room', 'storage', 'parking', 'boat_slip', 'land_lot', 'commercial',
+] as const
+export type LedgerRentLine = typeof LEDGER_RENT_LINES[number]
+export const LEDGER_RENT_LINE_LABEL: Record<LedgerRentLine, string> = {
+  mobile_home_lot:     'Mobile home lot rent',
+  mobile_home_trailer: 'Park-owned trailer rent',
+  rv_spot:             'RV long-term rent',
+  apartment:           'Apartment rent',
+  single_family:       'House rent',
+  campsite:            'Campsite long-term rent',
+  hotel_room:          'Room long-term rent',
+  storage:             'Storage space rent',
+  parking:             'Parking rent',
+  boat_slip:           'Boat slip rent',
+  land_lot:            'Land lot rent',
+  commercial:          'Commercial rent',
+}
+
+/** Short-term stays (under 30 nights) by space type (map kind 'stay_line'), in report order. */
+export const LEDGER_STAY_LINES = [
+  'rv_spot', 'campsite', 'hotel_room', 'mobile_home', 'apartment', 'single_family',
+  'storage', 'parking', 'boat_slip', 'land_lot', 'commercial',
+] as const
+export type LedgerStayLine = typeof LEDGER_STAY_LINES[number]
+export const LEDGER_STAY_LINE_LABEL: Record<LedgerStayLine, string> = {
+  rv_spot:       'RV short-term stays (under 30 nights)',
+  campsite:      'Campsite short-term stays (under 30 nights)',
+  hotel_room:    'Room short-term stays (under 30 nights)',
+  mobile_home:   'Mobile home short-term stays (under 30 nights)',
+  apartment:     'Apartment short-term stays (under 30 nights)',
+  single_family: 'House short-term stays (under 30 nights)',
+  storage:       'Storage short-term stays (under 30 nights)',
+  parking:       'Parking short-term stays (under 30 nights)',
+  boat_slip:     'Boat slip short-term stays (under 30 nights)',
+  land_lot:      'Land lot short-term stays (under 30 nights)',
+  commercial:    'Commercial short-term stays (under 30 nights)',
+}
+
+/**
+ * The Detailed view's line for an income line's account (its map kind and
+ * value), or for the home-sale roles (I3): a stable key, its label and its
+ * place in the report. null: the line is not itemized (its Summary group).
+ */
+export function ledgerIncomeDetailOf(mapKind: string | null | undefined, mapValue: string | null | undefined, role?: string | null):
+  { key: string; label: string; order: number } | null {
+  if (mapKind === 'rent_line' && mapValue && mapValue in LEDGER_RENT_LINE_LABEL) {
+    return { key: `rent_line:${mapValue}`, label: LEDGER_RENT_LINE_LABEL[mapValue as LedgerRentLine], order: LEDGER_RENT_LINES.indexOf(mapValue as LedgerRentLine) }
+  }
+  if (mapKind === 'stay_line' && mapValue && mapValue in LEDGER_STAY_LINE_LABEL) {
+    return { key: `stay_line:${mapValue}`, label: LEDGER_STAY_LINE_LABEL[mapValue as LedgerStayLine], order: 100 + LEDGER_STAY_LINES.indexOf(mapValue as LedgerStayLine) }
+  }
+  if (role === 'home_sales' || role === 'home_notes_receivable') return { key: 'home_sales', label: 'Home sales', order: 200 }
+  if (role === 'home_note_interest') return { key: 'home_note_interest', label: 'Interest on home notes', order: 201 }
+  return null
+}
+
+/** 10/14 (Nic I1): the income reports' two views. Summary is today's groups; Detailed itemizes them. */
+export const INCOME_REPORT_VIEWS = ['summary', 'detailed'] as const
+export type IncomeReportView = typeof INCOME_REPORT_VIEWS[number]
+export const INCOME_REPORT_VIEW_LABEL: Record<IncomeReportView, string> = {
+  summary:  'Summary',
+  detailed: 'Detailed',
 }
 
 /**
@@ -729,7 +828,9 @@ export const LEDGER_CAPTURE_COLUMNS = {
   payroll_run_lines: ['run_id', 'employee_id', 'gross_pay', 'federal_tax', 'state_tax', 'ss_tax', 'medicare_tax',
     'other_deductions', 'net_pay',
     // 10/12 (Nic, ledger P7): the employer's taxes on each paycheck (design J3).
-    'employer_ss_tax', 'employer_medicare_tax', 'futa_tax', 'suta_tax'],
+    'employer_ss_tax', 'employer_medicare_tax', 'futa_tax', 'suta_tax',
+    // 10/14 (Nic): where each paycheck goes — its employee's place (20261016153000).
+    'pay_place', 'pay_property_id'],
   journal_entries: ['landlord_id', 'business_id', 'date', 'type', 'status', 'voided_at', 'reverses_entry_id',
     'adjusts_line_key'],
   journal_entry_lines: ['entry_id', 'account_id', 'debit', 'credit', 'property_id', 'unit_id', 'lease_id'],
@@ -1029,6 +1130,20 @@ export const BOOKS_COST_PLACE_LABEL: Record<BooksCostPlace, string> = {
 }
 /** What "where it goes" says on a list row, for a cost logged before 10/13 with no place (the Company column). */
 export const BOOKS_COST_PLACE_NONE_LABEL = 'The company'
+
+/**
+ * 10/14 (Nic): payroll is placed per EMPLOYEE, set once — "an employee at one
+ * property goes to that property ... once you set it it shouldnt change. if
+ * they work at multiple properties it would be at the company level". Each
+ * paycheck follows its employee's place. Mirrors
+ * books_employees_pay_place_check (migration 20261016153000).
+ */
+export const BOOKS_EMPLOYEE_PAY_PLACES = ['property', 'company'] as const
+export type BooksEmployeePayPlace = typeof BOOKS_EMPLOYEE_PAY_PLACES[number]
+export const BOOKS_EMPLOYEE_PAY_PLACE_LABEL: Record<BooksEmployeePayPlace, string> = {
+  property: 'One property',
+  company:  'Company level (works at several properties)',
+}
 
 /**
  * 10/13 (Nic): the place a form sends, worked out from what it names — a unit

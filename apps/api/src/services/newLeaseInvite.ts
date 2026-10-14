@@ -235,6 +235,8 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
   const rentDueDay = o.rentDueDay ?? null
 
   const invited: InvitedPerson[] = []
+  // Files only an erased draft used — removed after COMMIT (review 10/14).
+  const erasedFiles: string[] = []
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -251,7 +253,7 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
         `SELECT draft_document_id FROM pending_tenant_intents
           WHERE unit_id=$1 AND resolved_at IS NULL AND cancelled_at IS NULL AND draft_document_id IS NOT NULL LIMIT 1`,
         [unit.id]).then(r => r.rows[0])
-      if (draft?.draft_document_id) await voidUnsignedDraft(client, unit.id, draft.draft_document_id)
+      if (draft?.draft_document_id) await voidUnsignedDraft(client, unit.id, draft.draft_document_id, erasedFiles)
     }
 
     for (let i = 0; i < people.length; i++) {
@@ -295,7 +297,7 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
             WHERE tenant_id=$1 AND unit_id=$2 AND resolved_at IS NULL AND cancelled_at IS NULL LIMIT 1`,
           [tenantId, unit.id]).then(r => r.rows[0])
         if (mine) {
-          if (mine.draft_document_id) await voidUnsignedDraft(client, unit.id, mine.draft_document_id)
+          if (mine.draft_document_id) await voidUnsignedDraft(client, unit.id, mine.draft_document_id, erasedFiles)
         } else {
           await assertUnitCanAcceptNewLease(client as any, unit.id)
         }
@@ -364,6 +366,11 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
     throw e
   } finally {
     client.release()
+  }
+  if (erasedFiles.length) {
+    const { removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
+    await removeOrphanedDocumentFiles(async (sql, params) => ({ rows: await query<any>(sql, params) }), erasedFiles)
+      .catch(() => {})
   }
 
   // S579: an attested sitting resident skips the background check while the
@@ -449,7 +456,7 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
  * the landlord's (S647: his signature issued it — it is live and billing) means
  * the people must be added by addendum instead.
  */
-async function voidUnsignedDraft(client: PoolClient, unitId: string, documentId: string): Promise<void> {
+async function voidUnsignedDraft(client: PoolClient, unitId: string, documentId: string, erasedFiles: string[]): Promise<void> {
   const tenantSigned = await client.query(
     `SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1`,
     [documentId]).then(r => r.rows[0])
@@ -457,8 +464,21 @@ async function voidUnsignedDraft(client: PoolClient, unitId: string, documentId:
   const issued = await client.query(
     `SELECT 1 FROM lease_documents WHERE id=$1 AND issued_at IS NOT NULL`, [documentId]).then(r => r.rows[0])
   if (issued) throw new AppError(409, 'You have already signed the lease for this unit, so it is live and billing. Add this person with an addendum instead.')
-  await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [documentId])
+  // The household's invites let go of it first: they stay open, and the
+  // household is drafted again with the new person.
   await client.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL, updated_at=NOW() WHERE unit_id=$1 AND draft_document_id=$2`, [unitId, documentId])
+  // 10/14 (Nic, #4): an automatic end deletes instead of voiding when no money
+  // touched the draft (lib/eraseUnfinishedDocument — its packet's unfinished
+  // forms with it); one that test keeps is voided as before.
+  const { eraseUnfinishedDocument } = await import('../lib/eraseUnfinishedDocument')
+  const live = (await client.query(
+    `SELECT id, lease_id, document_type FROM lease_documents WHERE id=$1 AND status NOT IN ('completed','voided')`, [documentId])).rows[0]
+  const out = live ? await eraseUnfinishedDocument(client.query.bind(client) as any, live) : null
+  if (out && !out.erased) {
+    await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [documentId])
+  }
+  // Removed by the caller after its COMMIT, like every other erase path.
+  if (out?.erased) erasedFiles.push(...out.files)
 }
 
 /**

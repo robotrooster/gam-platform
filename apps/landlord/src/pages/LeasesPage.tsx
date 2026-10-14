@@ -138,17 +138,24 @@ export function LeasesPage() {
   // opens the editable confirm form for staff who can edit — that row is
   // flagged for action, not reading. Lease details moved to the Details
   // row button.
-  // S640: discard an unsigned draft. Soft — the row stays, marked canceled.
+  // S640: discard an unsigned draft. 10/14 (Nic, #6): "delete the paperwork
+  // and the never-signed lease record" — the server erases both when no money
+  // touched the lease (status 'deleted'); otherwise it ends it and keeps it on
+  // record, and says why (keptWords).
   const discardDraft = async (l: any) => {
     const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
     if (!await appConfirm(
-      `The unsigned draft lease${where ? ` for ${where}` : ''} will be canceled. `
-      + 'It stays on record. A signing link already sent for it stops working, and nothing new is sent to anyone.',
+      `The unsigned draft lease${where ? ` for ${where}` : ''} and its paperwork will be deleted for good. `
+      + 'An invite waiting on it is canceled, a signing link already sent for it stops working, and nothing new is sent to anyone. '
+      + 'If money was already paid, credited or settled on it, it is canceled instead and stays on record.',
       { title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true },
     )) return
     try {
-      await apiPost(`/leases/${l.id}/discard`, {})
-      toast('Draft discarded.')
+      const r: any = await apiPost(`/leases/${l.id}/discard`, {})
+      const done = r?.data ?? r
+      // The API camelizes its replies (kept_words arrives as keptWords).
+      const kept = done?.keptWords ?? done?.kept_words
+      toast(done?.status === 'deleted' ? 'Draft deleted.' : kept ? `Draft discarded. ${kept}` : 'Draft discarded.')
       refreshAfterLeaseClose(leasesQc)
     } catch (e: any) {
       // Fix pass 2: a tenant signed since this list was read — it is no
@@ -543,7 +550,7 @@ export function LeasesPage() {
                           && !(l.supersedesLeaseId && l.signedByLandlord) && !tenantSigned(l) && !anyoneSigned(l) && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            title="Discard this unsigned draft — it stays on record as canceled"
+                            title="Discard this unsigned draft — it is deleted with its paperwork (canceled and kept if money touched it)"
                             onClick={() => discardDraft(l)}
                             style={{ padding: '3px 8px' }}
                           >
