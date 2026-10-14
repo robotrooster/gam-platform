@@ -8,6 +8,7 @@ import {
   bookkeeperAccessSummary,
   BOOKKEEPER_MONEY_IN_FILING, BOOKKEEPER_MONEY_IN_FILING_LABEL, DEFAULT_BOOKKEEPER_MONEY_IN_FILING,
   type BookkeeperMoneyInFiling,
+  TEAM_INVITATION_TTL_HOURS,
 } from '@gam/shared'
 import { PermissionCatalogEditor } from '../components/PermissionCatalogEditor'
 import { EntityPicker, useEntities } from '../components/EntityPicker'
@@ -44,13 +45,18 @@ interface Member {
   connectDetailsSubmitted?: boolean
 }
 
-interface Invitation {
+export interface Invitation {
   id: string
   email: string
   role: LandlordAssignableRole
   status: string
   expiresAt: string
+  /** 10/13: its link has lapsed by the server's clock (still listed until the hourly sweep). */
+  expired?: boolean
   createdAt: string
+  // 10/13 review: the company it is for, as on a member's row.
+  landlordId?: string
+  companyName?: string | null
   // 10/11: a pending bookkeeper invitation's ticked properties.
   propertyIds?: string[] | null
   // 10/12: and its company-wide and lease-dates boxes.
@@ -84,6 +90,11 @@ interface TeamPayload {
  */
 const BOXES_NOT_LIVE = 'Bookkeeper access is being updated. Try again in a few minutes.'
 
+/** S652: the rows belong to more than one of the account's companies, so each names its company. */
+export function spansCompanies(rows: Array<{ landlordId?: string | null }>): boolean {
+  return new Set(rows.map(r => r.landlordId).filter(Boolean)).size > 1
+}
+
 const ROLE_BADGE: Record<LandlordAssignableRole, string> = {
   property_manager: 'badge-blue',
   onsite_manager:   'badge-amber',
@@ -109,7 +120,7 @@ export function TeamPage() {
 
   const members = data?.members || []
   const invitations = data?.invitations || []
-  const multiCompany = new Set(members.map(m => m.landlordId)).size > 1
+  const multiCompany = spansCompanies(members)
 
   return (
     <div>
@@ -236,41 +247,118 @@ export function TeamPage() {
             )
           })()}
 
-          {invitations.length > 0 && (
-            <div className="card" style={{ padding: 0 }}>
-              <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border-1)', fontWeight: 600, fontSize: '.88rem' }}>Pending invitations</div>
-              <table className="data-table">
-                <thead>
-                  <tr><th>Email</th><th>Role</th><th>Sent</th><th>Expires</th></tr>
-                </thead>
-                <tbody>
-                  {invitations.map(inv => (
-                    <tr key={inv.id}>
-                      <td style={{ fontSize: '.82rem' }}>{inv.email}</td>
-                      <td>
-                        <span className={`badge ${ROLE_BADGE[inv.role] || 'badge-muted'}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[inv.role]}</span>
-                        {inv.role === 'bookkeeper' && (
-                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 3 }}>
-                            {[
-                              propertyNames(inv.propertyIds ?? [], properties as any[]) || (inv.companyWide ? null : 'No property ticked'),
-                              inv.companyWide ? 'Company-wide (bank, payouts, payroll)' : null,
-                              ...extraBoxWords({ companyWide: !!inv.companyWide, companyLedger: !!inv.companyLedger,
-                                wholeCompanyReports: !!inv.wholeCompanyReports, seesMonthlyReport: !!inv.seesMonthlyReport }),
-                              inv.showLeaseDates ? 'Lease dates shown' : null,
-                            ].filter(Boolean).join(' · ')}
-                          </div>
-                        )}
-                      </td>
-                      <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.createdAt).toLocaleDateString()}</td>
-                      <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.expiresAt).toLocaleDateString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          {/* 10/13 review: the company column, when the rows (members or
+              invitations) span more than one of the account's companies. */}
+          <PendingInvitations invitations={invitations} properties={properties as any[]}
+            multiCompany={spansCompanies([...members, ...invitations])}
+            onChanged={() => qc.invalidateQueries('team')} />
         </>
       )}
+    </div>
+  )
+}
+
+/**
+ * ── 10/13 (Nic): RESEND AND WITHDRAW ON EACH PENDING INVITATION ────────────
+ *
+ * "Team invites expire after 24 HOURS ... Add RESEND and WITHDRAW buttons on
+ * each pending invitation." The list had neither: a link that lapsed (or an
+ * email that never arrived) meant typing the whole invitation again, and one
+ * sent to the wrong address could not be taken back.
+ *
+ * Resend mails a brand-new link that works for 24 hours and kills the old one
+ * (the email says so). Withdraw asks first, then the link stops working and
+ * says "withdrawn". Both work on a row whose link has already lapsed; it shows
+ * "Expired" (by the server's clock) until the hourly sweep takes it off the
+ * list. Expires shows the time too: with a 24-hour link the date alone was
+ * nearly always "tomorrow". The company comes from the row on the server, so
+ * an owner of two companies needs to choose nothing.
+ */
+export function PendingInvitations({ invitations, properties, onChanged, multiCompany = false }: {
+  invitations: Invitation[]
+  properties: any[]
+  onChanged: () => void
+  /**
+   * 10/13 review: the account's rows span more than one company. The same
+   * address may be invited to two of them (one pending invitation per company,
+   * role and address), and those rows looked alike: each row and each
+   * question then names its company, so Withdraw takes back the one meant.
+   */
+  multiCompany?: boolean
+}) {
+  const [busy, setBusy] = useState<string | null>(null)
+  if (invitations.length === 0) return null
+  const named = (inv: Invitation) => multiCompany && inv.companyName ? `${inv.email} (${inv.companyName})` : inv.email
+
+  const run = async (inv: Invitation, path: 'resend' | 'revoke', done: string, failed: string) => {
+    setBusy(inv.id)
+    try {
+      await apiPost(`/scopes/invitations/${inv.id}/${path}`, {})
+      toast(done)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || e?.message || failed)
+    } finally {
+      setBusy(null)
+      onChanged()
+    }
+  }
+  const resend = (inv: Invitation) => run(inv, 'resend',
+    `A new link is on its way to ${named(inv)}. It works for ${TEAM_INVITATION_TTL_HOURS} hours, and the earlier link no longer works.`,
+    'Could not resend the invitation.')
+  const withdraw = async (inv: Invitation) => {
+    const ok = await appConfirm(`Withdraw the invitation to ${named(inv)}? The link in their email stops working right away.`,
+      { title: 'Withdraw invitation', confirmLabel: 'Withdraw', danger: true })
+    if (ok) await run(inv, 'revoke', `Invitation to ${named(inv)} withdrawn. Its link no longer works.`, 'Could not withdraw the invitation.')
+  }
+
+  return (
+    <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+      <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border-1)', fontWeight: 600, fontSize: '.88rem' }}>Pending invitations</div>
+      <table className="data-table">
+        <thead>
+          <tr><th>Email</th>{multiCompany && <th>Company</th>}<th>Role</th><th>Sent</th><th>Expires</th><th></th></tr>
+        </thead>
+        <tbody>
+          {invitations.map(inv => (
+            <tr key={inv.id} data-invitation={inv.id}>
+              <td style={{ fontSize: '.82rem' }}>{inv.email}</td>
+              {multiCompany && <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{inv.companyName || '—'}</td>}
+              <td>
+                <span className={`badge ${ROLE_BADGE[inv.role] || 'badge-muted'}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[inv.role]}</span>
+                {inv.role === 'bookkeeper' && (
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 3 }}>
+                    {[
+                      propertyNames(inv.propertyIds ?? [], properties) || (inv.companyWide ? null : 'No property ticked'),
+                      inv.companyWide ? 'Company-wide (bank, payouts, payroll)' : null,
+                      ...extraBoxWords({ companyWide: !!inv.companyWide, companyLedger: !!inv.companyLedger,
+                        wholeCompanyReports: !!inv.wholeCompanyReports, seesMonthlyReport: !!inv.seesMonthlyReport }),
+                      inv.showLeaseDates ? 'Lease dates shown' : null,
+                    ].filter(Boolean).join(' · ')}
+                  </div>
+                )}
+              </td>
+              <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.createdAt).toLocaleDateString()}</td>
+              <td style={{ fontSize: '.78rem', color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
+                {inv.expired
+                  ? <span className="badge badge-red">Expired</span>
+                  : new Date(inv.expiresAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+              </td>
+              <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                <span style={{ display: 'inline-flex', gap: 6 }}>
+                  <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
+                    disabled={busy === inv.id} onClick={() => resend(inv)}>
+                    Resend
+                  </button>
+                  <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
+                    disabled={busy === inv.id} onClick={() => withdraw(inv)}>
+                    Withdraw
+                  </button>
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -322,7 +410,8 @@ function InviteForm({ onSent }: { onSent: () => void }) {
     {
       onSuccess: () => {
         setError(null)
-        setSuccess(`Invitation emailed to ${email.trim()}. They'll land with the permissions you set — adjust anytime on their permissions page.`)
+        // 10/13 (Nic): the link works for 24 hours; Resend is on the row below.
+        setSuccess(`Invitation emailed to ${email.trim()}. The link works for ${TEAM_INVITATION_TTL_HOURS} hours. They'll land with the permissions you set — adjust anytime on their permissions page.`)
         reset()
         onSent()
         setTimeout(() => setSuccess(null), 5000)
@@ -510,7 +599,8 @@ function BookkeeperInviteForm({ boxesLive, moreBoxes, onSent }: { boxesLive: boo
           propertyIds.length ? `the money for ${propertyNames(propertyIds, companyProperties)}` : null,
           companyWide ? 'the company-wide books' : null,
         ].filter(Boolean).join(' and ')
-        setSuccess(`Invitation emailed to ${email.trim()}. They set their own password from the link, then see ${sees}.`)
+        // 10/13 (Nic): the link works for 24 hours; Resend is on the row below.
+        setSuccess(`Invitation emailed to ${email.trim()}. The link works for ${TEAM_INVITATION_TTL_HOURS} hours. They set their own password from the link, then see ${sees}.`)
         setFirstName(''); setLastName(''); setEmail(''); setPropertyIds([]); setCompanyWide(false); setShowLeaseDates(false)
         setMore(NO_MORE_BOXES)
         onSent()

@@ -2171,6 +2171,19 @@ adminRouter.get('/metrics', requireSuperAdmin, async (_req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// GET /api/admin/metrics/lifetime — 10/13 (Nic): the Metrics page's money
+// billed and collected (rent, each utility, GAM's platform fees), tenants ever
+// on GAM, the landlords' default rate through GAM (by rent range) and ages.
+// Super admin only, read only, cached a minute (services/platformMetrics
+// platformLifetimeMetrics). Its own request, so the page's first numbers never
+// wait on it.
+adminRouter.get('/metrics/lifetime', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { platformLifetimeMetrics } = await import('../services/platformMetrics')
+    res.json({ success: true, data: await platformLifetimeMetrics() })
+  } catch (e) { next(e) }
+})
+
 // GET /api/admin/income/breakdown?window=X — drill-down for one window: every
 // income stream with its actual line items (the transactions that made up the
 // pie). Feeds the click-through detail modal. Each stream's items are capped;

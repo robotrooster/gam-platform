@@ -1,5 +1,6 @@
 import { Resend } from 'resend'
 import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
+import { TEAM_INVITATION_TTL_HOURS } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { portalLink } from '../lib/portalUrls'
@@ -886,7 +887,11 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
     base(
       h(isResend ? 'Your new invitation link' : "You've been invited") +
       intro +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13 (Nic): "team invites expire after 24 HOURS (fix the email that
+      // says 7 days)". The link has always died at 24 hours (routes/scopes.ts);
+      // this sentence said 7 days, so a person who waited a day or two found a
+      // dead link the email had promised would still work.
+      p(`Click below to accept and set up your account. This invitation expires in <strong style="color:#eef1f8">${TEAM_INVITATION_TTL_HOURS} hours</strong>.`) +
       btnWithLink(isResend ? 'Set Up My Account' : 'Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1049,7 +1054,10 @@ export async function emailPmInvitation(
       h(`You've been invited to ${companyName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${companyName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${companyName} uses GAM (Gold Asset Management) to manage rental properties on behalf of property owners. As ${roleLabel.toLowerCase()}, you'll have access to the company's portfolio inside the GAM platform.`) +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13: the same wrong "7 days" as the team invitation (Nic: "fix the
+      // email that says 7 days"). This link dies at 24 hours too (routes/pm.ts
+      // INVITATION_TTL_HOURS).
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1095,7 +1103,10 @@ export async function emailBusinessInvitation(
       h(`You've been invited to ${businessName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13: the same wrong "7 days" as the team invitation (Nic: "fix the
+      // email that says 7 days"). This link dies at 24 hours too
+      // (routes/businessUsers.ts INVITATION_TTL_HOURS).
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -2557,6 +2568,50 @@ ${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
       metadata: { stalled_in_setup: args.stalledInSetup },
     },
     'support',
+  )
+}
+
+// ── 10/13: HAPPY BIRTHDAY FROM GAM ───────────────────────────────────
+//
+// Nic: "emailing tenants on their birthday and saying, Hey, happy birthday
+// from GAM ... just like a happy birthday message. Thank you for using GAM,
+// that sort of thing." Tenants and landlords alike, once a person a year — who
+// and when live in jobs/birthdayEmails.ts. GAM's normal sender (noreply, with
+// replies routed to support like every other send). The last line says where
+// to switch it off: the same per-type email switch every other GAM email has
+// (notification type 'birthday').
+
+/**
+ * Does mail actually leave this machine? send()'s own rule: production (or an
+ * explicit EMAIL_SEND_LIVE=1), with a mail-service key configured. A job that
+ * writes a once-a-year "greeted" row asks this first, so a machine that sends
+ * nothing (a dev API pointed at the shared database, the keyless demo
+ * instance) never touches that row — not even to give it back.
+ */
+export function mailLeavesThisMachine(): boolean {
+  return EMAIL_ENABLED
+    && ((process.env.NODE_ENV || 'development') === 'production' || process.env.EMAIL_SEND_LIVE === '1')
+}
+
+export async function emailBirthdayGreeting(args: {
+  to: string
+  firstName: string | null
+  ctx?: { userId?: string | null; audience?: 'tenant' | 'landlord' }
+}): Promise<string | null> {
+  const name = (args.firstName || '').trim()
+  return send(args.to, 'Happy birthday from GAM',
+    base(
+      h(name ? `Happy birthday, ${escapeHtml(name)}!` : 'Happy birthday!') +
+      p('Happy birthday from all of us at GAM. We hope you have a great day.') +
+      p('Thank you for using GAM.') +
+      `<p style="margin:18px 0 0;color:#4a5568;font-size:.72rem;line-height:1.5">Rather not get a birthday email? Turn it off under Notifications in your GAM settings.</p>`
+    ),
+    {
+      category: 'birthday',
+      relatedEntityType: 'user',
+      relatedEntityId: args.ctx?.userId ?? null,
+      metadata: args.ctx?.audience ? { audience: args.ctx.audience } : undefined,
+    },
   )
 }
 

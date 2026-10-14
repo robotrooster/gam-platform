@@ -85,6 +85,11 @@ import { liveReversalSql, reversedUseOfWonDisputeSql } from './creditUse'
 import { occupiedSpacesSql } from './billableUnits'
 import { utilityBillSentSql, stayHeldSql } from './moneyPredicates'
 import { todayIn, monthStartOf } from '../lib/timezone'
+import { INCOME_CATEGORY_LABEL, INCOME_UTILITY_CATEGORIES } from '@gam/shared'
+import { incomeEvents, breakdownFrom } from './incomeBasis'
+import { PLATFORM_FEE_LINES_SQL } from './platformFeeBill'
+import { normalizeNameSql } from './leaseBirthdates'
+import { NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
 
 export interface RentByMethod {
   method: string
@@ -947,4 +952,471 @@ export async function platformMetrics(opts: { fresh?: boolean } = {}): Promise<P
 }
 
 /** Tests seed between calls; they start from nothing. */
-export function clearPlatformMetricsCache(): void { cached = null }
+export function clearPlatformMetricsCache(): void { cached = null; lifetimeCached = null }
+
+// ══ 10/13 (Nic): money billed and collected, tenants ever, default rate, ages ══
+//
+// Nic (10/13 evening): "Money metrics, all time, BILLED AND COLLECTED:
+// utilities billed back BY UTILITY + total; rent; total platform fees."
+// "Total tenants ever on GAM: every person on a lease, counted once (even if
+// they come back)." "Landlords' DEFAULT RATE through GAM: months left unpaid by
+// tenants who moved out owing ÷ all calendar months of rent billed — AS A
+// FRACTION of a month ($300 of $460 = 0.65), plus a DOLLAR % too, plus where
+// defaults happen by RENT RANGE. Paying later does NOT take it off." ("No,
+// stays counted.") "Ages: every person on a lease; average age toggled by
+// property, oldest/youngest, age at default."
+//
+// Served on its own (GET /admin/metrics/lifetime) so the page's first numbers
+// never wait on these, and a failure here never blanks them.
+//
+// MONEY reads the landlords' own report facts (services/incomeBasis, Money
+// billed, from the money records): Billed = each bill due through today, less
+// credits given; Collected = of that, what was paid, covered by money paid
+// ahead or deposit interest, or kept from a deposit — the same Charged and
+// Collected every landlord report shows, by the same categories (the utility a
+// bill was for: its utility bill, else its trash fee, else PROPANE, else the
+// utility its note names). Rent is "Lot/space rent". Platform fees are GAM's
+// monthly fee from GAM's revenue book (platformFeeBill PLATFORM_FEE_LINES_SQL),
+// collected unless its charge to the landlord is still open — the Recurring
+// Revenue card's own rule, all months together.
+//
+// PEOPLE ON A LEASE (TENANTS_EVER, AGES). A lease counts once it has started
+// (start date today or before) and was not closed as never moved in
+// (lib/unwindIssuedLease NEVER_MOVED_IN_REASON); a tenant on it counts unless
+// their place on it was void or never joined (pending_add). A tenant is one
+// person however many leases they had — leaving and coming back is still one.
+// An occupant listed on a lease (lease_occupants) has no account, so one
+// listed on two leases is recognized by name and birthday — by name at the
+// same landlord when no birthday is on file (never across landlords) — and an
+// occupant whose name is a tenant's on the same lease is that tenant.
+//
+// THE DEFAULT RATE (DEFAULT_LEASES). A household MOVED OUT when its lease
+// ended (expired or terminated, not closed as never moved in) and nobody on it
+// went on living under the same landlord: not renewed (no lease supersedes
+// it), and no lease for any of them with that landlord in force the day after
+// it ended. Coming back later does not undo the move-out. What it left unpaid
+// is its RENT still open at the moment the lease ended (terminated_at — every
+// real end stamps it), for rent due by that day (or by its end date, when the
+// lease-end run ended it the night after) — read off each bill's own history,
+// so a payment made afterward never takes it off:
+//   - a bill paid by then is paid: settled by then, or settled through a
+//     payment the tenant started by then (a bank payment still clearing);
+//   - otherwise what credit had paid of it by then, and work-trade labor,
+//     come off; the rest was unpaid (a line labor is still paying, its
+//     work-trade month open, is not money billed and is left out);
+//   - a bill a dispute reopened counts as the reopened copy only, and only if
+//     the dispute came before the move-out (one after it took back money that
+//     had been paid); a voided bill was never owed.
+// Rent the deposit covered at move-out is still rent left unpaid (the deposit
+// is settled after the lease ends).
+// Months left unpaid = that rent ÷ the lease's monthly rent ($300 of $460 =
+// 0.65). Rent billed is the MONEY section's own rent Billed, lease by lease
+// (the same report facts — never a second "rent billed" on the page): rent $
+// billed = each lease's rent billed through today, less what work trade and
+// credits given covered; calendar months of rent billed = each lease's months
+// with rent billed in them (a prorated month is a month; a month work trade
+// covered in full billed no money, so it is not one).
+
+/** 10/13 (Nic): "where defaults happen by RENT RANGE" — the bands, by the lease's monthly rent. */
+export const RENT_BANDS: ReadonlyArray<{ min: number; max: number | null }> = [
+  { min: 0, max: 300 }, { min: 300, max: 400 }, { min: 400, max: 500 }, { min: 500, max: 600 },
+  { min: 600, max: 800 }, { min: 800, max: 1000 }, { min: 1000, max: 1500 }, { min: 1500, max: 2000 },
+  { min: 2000, max: null },
+]
+const dollars0 = (n: number) => `$${n.toLocaleString('en-US')}`
+/** "Under $300", "$400 to $499", "$2,000 and up". */
+export function rentBandLabel(b: { min: number; max: number | null }): string {
+  if (b.max == null) return `${dollars0(b.min)} and up`
+  if (b.min <= 0) return `Under ${dollars0(b.max)}`
+  return `${dollars0(b.min)} to ${dollars0(b.max - 1)}`
+}
+export function rentBandOf(rent: number): { min: number; max: number | null } {
+  return RENT_BANDS.find(b => rent >= b.min && (b.max == null || rent < b.max)) ?? RENT_BANDS[0]
+}
+
+export interface BilledCollected { billed: number; collected: number; owed: number }
+export interface AgeSummary {
+  /** People counted (each once). */
+  people: number
+  /** Of them, with a birthday on file. */
+  withBirthday: number
+  /** In whole years, to one decimal; null when nobody has a birthday on file. */
+  average: number | null
+  youngest: number | null
+  oldest: number | null
+}
+export interface RentRangeDefaults {
+  label: string
+  min: number
+  max: number | null
+  leases: number
+  monthsBilled: number
+  rentBilled: number
+  householdsOwing: number
+  monthsUnpaid: number
+  dollarsUnpaid: number
+  /** monthsUnpaid ÷ monthsBilled; null when nothing was billed. */
+  rate: number | null
+  /** dollarsUnpaid ÷ rentBilled; null when nothing was billed. */
+  dollarRate: number | null
+}
+export interface PlatformLifetimeMetrics {
+  asOf: string
+  /** 'YYYY-MM-DD' (GAM's calendar): bills due through this day. */
+  through: string
+  money: {
+    rent: BilledCollected & { label: string }
+    utilities: BilledCollected & { byUtility: Array<BilledCollected & { utility: string; label: string }> }
+    platformFees: BilledCollected
+  }
+  tenants: {
+    /** Every person ever on a lease on GAM, once. */
+    ever: number
+    /** Of them: tenants (signers, with an account) and occupants listed on a lease. */
+    tenants: number
+    occupants: number
+    /** On an active lease today. */
+    onALeaseNow: number
+    /** The rest: moved on. */
+    movedOn: number
+  }
+  defaults: Omit<RentRangeDefaults, 'label' | 'min' | 'max'> & { byRentRange: RentRangeDefaults[] }
+  ages: AgeSummary & {
+    byProperty: Array<AgeSummary & { propertyId: string; name: string }>
+    /** Age on the day their household moved out owing, each household once per person. */
+    atDefault: AgeSummary
+  }
+}
+
+const sqlLit = (s: string) => `'${s.replace(/'/g, "''")}'`
+
+/**
+ * 10/13 (Nic): a lease whose people count as on GAM, on a leases alias: a real
+ * landlord's, started by `today` (a SQL date), not closed as never moved in.
+ * An ended lease with no end moment stamped never went into force: every
+ * real end stamps terminated_at (the lease-end run, a termination, the
+ * never-moved-in close), while discarding an unsigned draft or cancelling a
+ * reservation's draft lease ends paperwork only, with a bare status change.
+ */
+const COUNTED_LEASE = (l: string, today: string) => `(${realLandlordSql(`${l}.landlord_id`)}
+  AND ${l}.status IN ('pending', 'active', 'expired', 'terminated')
+  AND (${l}.status IN ('pending', 'active') OR ${l}.terminated_at IS NOT NULL)
+  AND ${l}.start_date <= ${today}
+  AND ${l}.termination_reason IS DISTINCT FROM ${sqlLit(NEVER_MOVED_IN_REASON)})`
+
+/** A tenant's place on a lease they were really on: not void, not an add that never joined. */
+const WAS_ON_LEASE = (lt: string) => `${lt}.status IN ('active', 'pending_remove', 'removed')`
+
+/**
+ * 10/13 (Nic): an occupant listed on a lease (a lease_occupants alias) who is
+ * not one of its tenants under another listing — a tenant whose name is also
+ * on the occupant list is counted once, as the tenant.
+ */
+const OCCUPANT_NOT_A_TENANT = (o: string) => `(${normalizeNameSql(`${o}.full_name`)} <> ''
+  AND NOT EXISTS (
+    SELECT 1 FROM lease_tenants xlt
+      JOIN tenants xt ON xt.id = xlt.tenant_id
+      JOIN users xu ON xu.id = xt.user_id
+     WHERE xlt.lease_id = ${o}.lease_id AND ${WAS_ON_LEASE('xlt')}
+       AND ${normalizeNameSql(`xu.first_name || ' ' || xu.last_name`)} = ${normalizeNameSql(`${o}.full_name`)}))`
+
+/**
+ * 10/13 (Nic): everyone on a lease, one row per person per lease: person (a
+ * key: one per tenant; one per occupant as recognized above), kind, lease,
+ * property, birthday, and whether they are on an active lease now. $1 = today.
+ */
+const PEOPLE_ROWS = (): string => `
+  SELECT 'tenant:' || lt.tenant_id::text AS person, 'tenant' AS kind, lt.lease_id, u.property_id,
+         t.date_of_birth::text AS dob,
+         (l.status = 'active' AND lt.status IN ('active', 'pending_remove')) AS current
+    FROM lease_tenants lt
+    JOIN leases l ON l.id = lt.lease_id
+    JOIN units u ON u.id = l.unit_id
+    JOIN tenants t ON t.id = lt.tenant_id
+   WHERE ${COUNTED_LEASE('l', '$1::date')} AND ${WAS_ON_LEASE('lt')}
+  UNION ALL
+  SELECT 'occupant:' || ${normalizeNameSql('o.full_name')} || '|'
+           || COALESCE(o.date_of_birth::text, 'landlord:' || l.landlord_id::text),
+         'occupant', o.lease_id, u.property_id, o.date_of_birth::text, (l.status = 'active')
+    FROM lease_occupants o
+    JOIN leases l ON l.id = o.lease_id
+    JOIN units u ON u.id = l.unit_id
+   WHERE ${COUNTED_LEASE('l', '$1::date')} AND ${OCCUPANT_NOT_A_TENANT('o')}`
+
+/**
+ * 10/13 (Nic): the households that moved out owing (a real landlord's, ended
+ * by $1 = today), with the rent they left unpaid. See the block comment above.
+ */
+const DEFAULT_CTES = (): string => `
+  ended AS (
+    SELECT l.id AS lease_id, l.landlord_id, l.rent_amount, l.start_date, x.tz,
+           -- The moment the lease ended, and the day it ended on (its end
+           -- date, when the lease-end run stamped it the night after).
+           l.terminated_at AS t,
+           LEAST((l.terminated_at AT TIME ZONE x.tz)::date, l.end_date) AS d
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      LEFT JOIN properties pr ON pr.id = u.property_id
+      CROSS JOIN LATERAL (SELECT COALESCE(pr.timezone, 'America/Phoenix') AS tz) x
+     WHERE ${realLandlordSql('l.landlord_id')}
+       AND l.status IN ('expired', 'terminated')
+       AND l.termination_reason IS DISTINCT FROM ${sqlLit(NEVER_MOVED_IN_REASON)}
+       -- Went into force (see COUNTED_LEASE): ended paperwork has no end moment.
+       AND l.terminated_at IS NOT NULL
+       AND EXISTS (SELECT 1 FROM lease_tenants elt WHERE elt.lease_id = l.id AND ${WAS_ON_LEASE('elt')})
+  ), moved_out AS (
+    SELECT e.* FROM ended e
+     WHERE e.d <= $1::date
+       -- Not renewed.
+       AND NOT EXISTS (SELECT 1 FROM leases s WHERE s.supersedes_lease_id = e.lease_id
+                          AND s.status IN ('pending', 'active', 'expired', 'terminated')
+                          AND s.termination_reason IS DISTINCT FROM ${sqlLit(NEVER_MOVED_IN_REASON)})
+       -- Nobody on it went on living under the same landlord.
+       AND NOT EXISTS (
+         SELECT 1 FROM lease_tenants elt
+           JOIN lease_tenants nlt ON nlt.tenant_id = elt.tenant_id AND nlt.lease_id <> elt.lease_id
+           JOIN leases n ON n.id = nlt.lease_id
+          WHERE elt.lease_id = e.lease_id AND ${WAS_ON_LEASE('elt')} AND ${WAS_ON_LEASE('nlt')}
+            AND n.landlord_id = e.landlord_id
+            AND n.status IN ('pending', 'active', 'expired', 'terminated')
+            AND n.termination_reason IS DISTINCT FROM ${sqlLit(NEVER_MOVED_IN_REASON)}
+            AND n.start_date >= e.start_date AND n.start_date <= e.d + 1
+            -- (LEAST skips a missing end: no end at all is still in force.)
+            AND COALESCE(LEAST((n.terminated_at AT TIME ZONE e.tz)::date, n.end_date), 'infinity'::date) >= e.d)
+  ), unpaid AS (
+    SELECT m.lease_id, SUM(x.unpaid) AS owed
+      FROM moved_out m
+      JOIN payments p ON p.lease_id = m.lease_id AND p.type = 'rent'
+                     AND p.status NOT IN ('voided', 'returned') AND p.amount > 0
+                     AND p.due_date <= m.d
+                     -- Labor is paying it (work trade, the month still open): not
+                     -- money billed, so not money left unpaid either.
+                     AND p.work_trade_suspended_at IS NULL
+                     AND (p.reversal_id IS NULL OR p.created_at <= m.t)
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN (p.status = 'settled' AND COALESCE(p.settled_at, p.created_at) <= m.t)
+            OR EXISTS (SELECT 1 FROM remittance_applications ra
+                         JOIN tenant_remittances r ON r.id = ra.remittance_id
+                        WHERE ra.payment_id = p.id AND r.status = 'settled' AND r.created_at <= m.t)
+          THEN 0
+          ELSE GREATEST(0, p.amount - COALESCE(p.work_trade_credit, 0) - COALESCE((
+                 SELECT SUM(cu.amount) FROM credit_uses cu
+                  WHERE cu.payment_id = p.id AND cu.applied_at IS NOT NULL AND cu.applied_at <= m.t
+                    AND (cu.released_at IS NULL OR cu.released_at > m.t)), 0))
+          END AS unpaid
+      ) x
+     GROUP BY m.lease_id
+    HAVING SUM(x.unpaid) > 0.005
+  )`
+
+/** Whole years from a birthday to a day, both 'YYYY-MM-DD'. */
+export function ageOn(dob: string, day: string): number {
+  const [by, bm, bd] = dob.slice(0, 10).split('-').map(Number)
+  const [y, m, d] = day.slice(0, 10).split('-').map(Number)
+  return y - by - (m < bm || (m === bm && d < bd) ? 1 : 0)
+}
+
+function summarizeAges(people: number, ages: number[]): AgeSummary {
+  if (!ages.length) return { people, withBirthday: 0, average: null, youngest: null, oldest: null }
+  return {
+    people,
+    withBirthday: ages.length,
+    average: Math.round((ages.reduce((s, a) => s + a, 0) / ages.length) * 10) / 10,
+    youngest: Math.min(...ages),
+    oldest: Math.max(...ages),
+  }
+}
+
+/** A birthday that is a real day before `day` (a typo of today or later is not one). */
+const knownBirthday = (dob: string | null, day: string): dob is string => !!dob && dob.slice(0, 10) < day
+
+const ratio = (a: number, b: number): number | null => (b > 0 ? a / b : null)
+
+export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetimeMetrics> {
+  const today = todayIn(null)
+  const realIds = (await query<{ id: string }>(
+    `SELECT l.id FROM landlords l WHERE ${realLandlordSql('l.id')}`)).map(r => r.id)
+
+  const [billedFacts, feeRows, peopleRows, leaseRows, defaultPeople] = await Promise.all([
+    // The landlords' own Money billed facts, all time through today, from the money records.
+    incomeEvents({ landlordIds: realIds, start: '2000-01-01', end: today, basis: 'billed', source: 'records' }),
+    // GAM's monthly platform fee: each line in the revenue book and what of it is still open.
+    query<{ billed: string; not_collected: string }>(`
+      WITH fee AS (${PLATFORM_FEE_LINES_SQL}),
+      lines AS (
+        SELECT f.amount,
+               -- platformFeeBill's rule: the charge each line raised, one per line;
+               -- a charge GAM took back is voided and nobody owes it.
+               (SELECT COALESCE(SUM(c.amount - c.collected_amount), 0)
+                  FROM landlord_gam_charges c
+                 WHERE c.kind = 'subscription' AND c.voided_at IS NULL
+                   AND c.source_id = f.reference_id
+                   AND c.source_type = ANY (CASE f.reference_type
+                         WHEN 'platform_fee_accrual' THEN ARRAY['platform_fee_accrual', 'platform_fee_topup']
+                         ELSE ARRAY[f.reference_type] END)) AS not_collected
+          FROM fee f
+         WHERE f.property_id IS NULL
+            OR EXISTS (SELECT 1 FROM properties fp WHERE fp.id = f.property_id AND ${realLandlordSql('fp.landlord_id')})
+      )
+      SELECT COALESCE(SUM(amount), 0)::text AS billed, COALESCE(SUM(not_collected), 0)::text AS not_collected
+        FROM lines`),
+    query<{ person: string; kind: string; property_id: string; property_name: string | null; dob: string | null; current: boolean }>(`
+      SELECT DISTINCT x.person, x.kind, x.property_id, pr.name AS property_name, x.dob, x.current
+        FROM (${PEOPLE_ROWS()}) x
+        LEFT JOIN properties pr ON pr.id = x.property_id`, [today]),
+    // Every lease's monthly rent (for its rent range), and what it left unpaid when it moved out owing.
+    query<{ lease_id: string; rent_amount: string; owed: string | null }>(`
+      WITH ${DEFAULT_CTES()}
+      SELECT l.id AS lease_id, l.rent_amount::text AS rent_amount, un.owed::text AS owed
+        FROM leases l
+        LEFT JOIN unpaid un ON un.lease_id = l.id
+       WHERE ${realLandlordSql('l.landlord_id')}`, [today]),
+    // Everyone on a household that moved out owing, with their age that day.
+    query<{ person: string; lease_id: string; dob: string | null; d: string }>(`
+      WITH ${DEFAULT_CTES()}
+      SELECT 'tenant:' || lt.tenant_id::text AS person, m.lease_id, t.date_of_birth::text AS dob, m.d::text AS d
+        FROM moved_out m
+        JOIN unpaid un ON un.lease_id = m.lease_id
+        JOIN lease_tenants lt ON lt.lease_id = m.lease_id
+        JOIN tenants t ON t.id = lt.tenant_id
+       WHERE ${WAS_ON_LEASE('lt')}
+         -- On it when it ended: not someone who had moved out of it, or been
+         -- replaced on it, before that day.
+         AND (lt.removed_reason IS NULL OR lt.removed_reason NOT IN ('moved_out', 'replaced')
+              OR (lt.removed_at AT TIME ZONE m.tz)::date >= m.d)
+      UNION
+      SELECT 'occupant:' || o.id::text, m.lease_id, o.date_of_birth::text, m.d::text
+        FROM moved_out m
+        JOIN unpaid un ON un.lease_id = m.lease_id
+        JOIN lease_occupants o ON o.lease_id = m.lease_id
+       WHERE ${OCCUPANT_NOT_A_TENANT('o')}`, [today]),
+  ])
+
+  // ── Money ──
+  const breakdown = breakdownFrom('billed', billedFacts, null)
+  const cat = (c: string) => breakdown.categories.find(x => x.category === c)
+  const bc = (row: { billed: number; collected: number } | undefined): BilledCollected => {
+    const billed = r2(row?.billed ?? 0), collected = r2(row?.collected ?? 0)
+    return { billed, collected, owed: r2(billed - collected) }
+  }
+  const byUtility = INCOME_UTILITY_CATEGORIES
+    .map(u => ({ utility: u as string, label: INCOME_CATEGORY_LABEL[u], ...bc(cat(u)) }))
+    // Every utility Nic named stays on the list; "Other utilities" only when there is some.
+    .filter(u => u.utility !== 'utility_other' || u.billed !== 0 || u.collected !== 0)
+  const utilBilled = r2(byUtility.reduce((s, u) => s + u.billed, 0))
+  const utilCollected = r2(byUtility.reduce((s, u) => s + u.collected, 0))
+  const feeBilled = r2(feeRows[0]?.billed)
+  const feeOpen = r2(feeRows[0]?.not_collected)
+
+  // ── People ──
+  const persons = new Map<string, { kind: string; dob: string | null; current: boolean }>()
+  const byProperty = new Map<string, Map<string, string | null>>()
+  for (const r of peopleRows) {
+    const p = persons.get(r.person)
+    persons.set(r.person, { kind: r.kind, dob: p?.dob ?? r.dob, current: (p?.current ?? false) || r.current })
+    const at = byProperty.get(r.property_id) ?? new Map<string, string | null>()
+    at.set(r.person, at.get(r.person) ?? r.dob)
+    byProperty.set(r.property_id, at)
+  }
+  const everyone = [...persons.values()]
+  const agesOf = (dobs: Iterable<string | null>) =>
+    [...dobs].filter((d): d is string => knownBirthday(d, today)).map(d => ageOn(d, today))
+  const propertyName = new Map(peopleRows.map(r => [r.property_id, r.property_name ?? 'Unnamed property']))
+
+  // ── Defaults ──
+  const bands = RENT_BANDS.map(b => ({
+    label: rentBandLabel(b), min: b.min, max: b.max,
+    leases: 0, monthsBilled: 0, rentBilled: 0, householdsOwing: 0, monthsUnpaid: 0, dollarsUnpaid: 0,
+    rate: null as number | null, dollarRate: null as number | null,
+  }))
+  // Rent billed per lease and lease-month, from the same facts as the Billed
+  // column: a month counts when rent was billed in it (net of what work trade
+  // and credits given covered — the landlord reports' own Charged).
+  const rentByLease = new Map<string, { dollars: number; months: Map<string, number> }>()
+  for (const e of billedFacts) {
+    if (e.category !== 'space_rent' || !e.inTotal || !e.leaseId) continue
+    const x = rentByLease.get(e.leaseId) ?? { dollars: 0, months: new Map<string, number>() }
+    x.dollars += e.amount
+    const month = String(e.dueDate ?? e.day).slice(0, 7)
+    x.months.set(month, (x.months.get(month) ?? 0) + e.amount)
+    rentByLease.set(e.leaseId, x)
+  }
+  for (const l of leaseRows) {
+    const billedRent = rentByLease.get(l.lease_id)
+    const owed = Number(l.owed ?? 0)
+    if (!billedRent && owed <= 0) continue
+    const rent = Number(l.rent_amount)
+    const band = bands[RENT_BANDS.indexOf(rentBandOf(rent))]
+    band.leases += 1
+    band.monthsBilled += billedRent ? [...billedRent.months.values()].filter(v => v > 0.005).length : 0
+    band.rentBilled += billedRent?.dollars ?? 0
+    if (owed > 0) {
+      band.householdsOwing += 1
+      band.dollarsUnpaid += owed
+      if (rent > 0) band.monthsUnpaid += owed / rent
+    }
+  }
+  const sum = (k: 'leases' | 'monthsBilled' | 'rentBilled' | 'householdsOwing' | 'monthsUnpaid' | 'dollarsUnpaid') =>
+    bands.reduce((s, b) => s + b[k], 0)
+  const finish = <T extends { monthsBilled: number; rentBilled: number; monthsUnpaid: number; dollarsUnpaid: number }>(x: T) => ({
+    ...x,
+    rentBilled: r2(x.rentBilled),
+    dollarsUnpaid: r2(x.dollarsUnpaid),
+    monthsUnpaid: Math.round(x.monthsUnpaid * 100) / 100,
+    rate: ratio(x.monthsUnpaid, x.monthsBilled),
+    dollarRate: ratio(x.dollarsUnpaid, x.rentBilled),
+  })
+  const totals = finish({
+    leases: sum('leases'), monthsBilled: sum('monthsBilled'), rentBilled: sum('rentBilled'),
+    householdsOwing: sum('householdsOwing'), monthsUnpaid: sum('monthsUnpaid'), dollarsUnpaid: sum('dollarsUnpaid'),
+  })
+  const atDefault = new Map<string, number | null>()
+  for (const r of defaultPeople) {
+    const key = `${r.person}|${r.lease_id}`
+    const age = knownBirthday(r.dob, r.d) ? ageOn(r.dob, r.d) : null
+    if (!atDefault.has(key) || atDefault.get(key) == null) atDefault.set(key, age)
+  }
+  const defaultAges = [...atDefault.values()].filter((a): a is number => a != null)
+
+  return {
+    asOf: new Date().toISOString(),
+    through: today,
+    money: {
+      rent: { label: INCOME_CATEGORY_LABEL.space_rent, ...bc(cat('space_rent')) },
+      utilities: { billed: utilBilled, collected: utilCollected, owed: r2(utilBilled - utilCollected), byUtility },
+      platformFees: { billed: feeBilled, collected: r2(feeBilled - feeOpen), owed: feeOpen },
+    },
+    tenants: {
+      ever: everyone.length,
+      tenants: everyone.filter(p => p.kind === 'tenant').length,
+      occupants: everyone.filter(p => p.kind === 'occupant').length,
+      onALeaseNow: everyone.filter(p => p.current).length,
+      movedOn: everyone.filter(p => !p.current).length,
+    },
+    defaults: {
+      ...totals,
+      byRentRange: bands.filter(b => b.leases > 0).map(finish),
+    },
+    ages: {
+      ...summarizeAges(everyone.length, agesOf(everyone.map(p => p.dob))),
+      byProperty: [...byProperty.entries()]
+        .map(([propertyId, at]) => ({
+          propertyId, name: propertyName.get(propertyId) ?? 'Unnamed property',
+          ...summarizeAges(at.size, agesOf(at.values())),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      atDefault: summarizeAges(atDefault.size, defaultAges),
+    },
+  }
+}
+
+let lifetimeCached: { at: number; data: PlatformLifetimeMetrics } | null = null
+
+/** Cached a minute, like platformMetrics: all-time figures, and the page polls. */
+export async function platformLifetimeMetrics(opts: { fresh?: boolean } = {}): Promise<PlatformLifetimeMetrics> {
+  if (!opts.fresh && lifetimeCached && Date.now() - lifetimeCached.at < TTL_MS) return lifetimeCached.data
+  const data = await computePlatformLifetimeMetrics()
+  lifetimeCached = { at: Date.now(), data }
+  return data
+}

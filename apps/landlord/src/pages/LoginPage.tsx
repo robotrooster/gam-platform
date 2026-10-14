@@ -3,35 +3,31 @@ import { useNavigate, useLocation, useSearchParams, Link, type NavigateFunction 
 import { useForm } from 'react-hook-form'
 import { useAuth } from '../context/AuthContext'
 
-// ── 10/13 (Nic): A NEW TEAM MEMBER'S CODE STEP, AND THE WAY BACK ─────────────
+// ── 10/13 (Nic): A NEW TEAM MEMBER, AND THE WAY BACK ─────────────────────────
 //
 // "It told her to sign in and then something about it not going anywhere."
 // A bookkeeper who had just created her account from the owner's invitation was
 // told to go sign in elsewhere with the password she had typed seconds before.
-// The invitation page now hands her straight to the code step here (the
-// account's pending pass, from the accept) and the code takes her to her
-// pages. An existing account asked to sign in to accept comes back to the
-// invitation (?next=), not to a dashboard with the invitation dropped.
+// 10/13 evening (Nic): "the invite link counts as proof of email" — Create
+// account now signs her straight in (AcceptInvitePage), so she does not come
+// here at all. She comes here only when the account was set up but could not
+// be signed in from the link: the sign-in form, her address filled in, saying
+// the account is set up. An existing account asked to sign in to accept comes
+// back to the invitation (?next=), not to a dashboard with the invitation
+// dropped.
 const PENDING_CODE_KEY = 'gam.otp.landlord.login'
 
-/** What the invitation page hands over (router state): who just set up an account, and its pending pass. */
+/** What the invitation page hands over (router state): who just set up an account. */
 export interface JoinedHandoff {
-  joined: { email: string; otpSent?: boolean }
-  emailOtpSession?: string
+  joined: { email: string }
 }
 
 /**
- * 10/13: from the invitation page to this page's code step. The pending pass is
- * kept in sessionStorage (S639: a phone reloads the page while its owner reads
- * the code in the mail app) and in the router state for a browser that refuses
- * storage. Replaces the invitation in history, so Back does not reopen a used
- * form. With no pass (the code step could not start), the sign-in form shows
- * with the same "your account is set up" line.
+ * 10/13: from the invitation page to this page's sign-in form, with the "your
+ * account is set up" line. Replaces the invitation in history, so Back does not
+ * reopen a used form.
  */
 export function continueToSignIn(navigate: NavigateFunction, handoff: JoinedHandoff): void {
-  try {
-    if (handoff.emailOtpSession) sessionStorage.setItem(PENDING_CODE_KEY, handoff.emailOtpSession)
-  } catch { /* private mode — the router state below carries it */ }
   navigate('/login', { replace: true, state: handoff })
 }
 
@@ -64,9 +60,9 @@ export function safeNextPath(raw: string | null | undefined): string | null {
 // and that is worthless without the code from their inbox, the same trust level
 // as the page holding it in memory. Cleared as soon as the code is accepted or
 // the step is abandoned.
-function usePendingOtpSession(key: string, handedOver?: string | null): [string | null, (v: string | null) => void] {
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
   const [v, setV] = useState<string | null>(() => {
-    try { return sessionStorage.getItem(key) ?? handedOver ?? null } catch { return handedOver ?? null }
+    try { return sessionStorage.getItem(key) } catch { return null }
   })
   const set = (next: string | null) => {
     setV(next)
@@ -93,20 +89,8 @@ export function LoginPage() {
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string | null>(null)
-  const [emailOtpSession, setPendingCode] = usePendingOtpSession(PENDING_CODE_KEY, handoff?.emailOtpSession)
-  // 10/13: a handed-over pass that is spent or abandoned must not come back
-  // from the router state on a reload.
-  const setEmailOtpSession = (v: string | null) => {
-    setPendingCode(v)
-    if (!v && handoff?.emailOtpSession) {
-      navigate(`${location.pathname}${location.search}`, { replace: true, state: joined ? { joined } : null })
-    }
-  }
-  const codeFromInvite = !!joined && !!handoff?.emailOtpSession && emailOtpSession === handoff.emailOtpSession
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession(PENDING_CODE_KEY)
   const [resent, setResent] = useState(false)
-  // 10/13: the account was set up but no code could be issued (otpSent: false
-  // — nothing stored, nothing mailed), until Resend issues one. Not "we sent".
-  const codeNotIssued = codeFromInvite && joined!.otpSent === false && !resent
   const [code, setCode] = useState('')
   const { register, handleSubmit } = useForm<{email:string;password:string}>({ defaultValues: { email: joined?.email ?? '' } })
 
@@ -148,7 +132,7 @@ export function LoginPage() {
   // S574: email-code 2FA (mandatory for landlords). Verify the emailed code.
   const onEmailOtpSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); setPendingCode(null); signedInGoTo() }
+    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); setEmailOtpSession(null); signedInGoTo() }
     catch (ex: any) {
       const msg = ex.response?.data?.error || 'Invalid code.'
       setErr(msg)
@@ -174,14 +158,8 @@ export function LoginPage() {
           </div>
           <div className="card" style={{padding:28}}>
             <h2 style={{marginBottom:16,fontSize:'1.2rem'}}>Check Your Email</h2>
-            {/* 10/13: straight from setting up an account on an invitation (its own pass, not a later sign-in). */}
-            {codeFromInvite && (codeNotIssued
-              ? <div className="alert alert-danger" style={{marginBottom:16}}>Your account is set up, but we couldn't send your sign-in code. Tap Resend code below.</div>
-              : <div className="alert alert-success" style={{marginBottom:16}}>Your account is set up. One last step to sign in.</div>)}
             <div style={{fontSize:'.85rem',color:'var(--text-2)',marginBottom:16,lineHeight:1.6}}>
-              {codeNotIssued
-                ? <>Tap Resend code to get a 6-digit code at <strong style={{color:'var(--text-1)'}}>{joined!.email}</strong>, then enter it below.</>
-                : <>We sent a 6-digit code to {codeFromInvite ? <strong style={{color:'var(--text-1)'}}>{joined!.email}</strong> : 'your email'}. Enter it below to finish signing in.</>}
+              We sent a 6-digit code to your email. Enter it below to finish signing in.
             </div>
             {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
             {resent && !err && <div className="alert alert-success" style={{marginBottom:16}}>A new code is on its way.</div>}
@@ -284,7 +262,7 @@ export function LoginPage() {
         </div>
         <div className="card" style={{padding:28}}>
           <h2 style={{marginBottom:24,fontSize:'1.2rem'}}>Sign In</h2>
-          {/* 10/13: an account set up on an invitation whose code step could not start. */}
+          {/* 10/13: an account set up on an invitation that could not be signed in from the link. */}
           {joined && !err && <div className="alert alert-success" style={{marginBottom:16}}>Your account is set up. Sign in with {joined.email} and the password you just chose.</div>}
           {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
           <form onSubmit={handleSubmit(onSubmit)}>

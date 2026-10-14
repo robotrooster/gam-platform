@@ -12,10 +12,13 @@
  * sign-in herself.
  *
  * Driven here on the real pages (the invitation page and the sign-in page,
- * through the router): Create account → the code box → her pages; the link
- * opened again → "already set up", Sign in; an existing account → sign in →
- * back to the invitation. The server's side is apps/api
- * routes/teamInviteSignIn1013.test.ts.
+ * through the router): Create account → her pages; the link opened again →
+ * "already set up", Sign in; an existing account → sign in → back to the
+ * invitation. The server's side is apps/api routes/teamInviteSignIn1013.test.ts.
+ *
+ * 10/13 evening (Nic): "SKIP the code step once (the invite link counts as
+ * proof of email) — sign straight in." Create account now keeps the session
+ * the accept hands back and opens the portal at its own address: no code box.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
@@ -125,6 +128,10 @@ async function createAccount() {
   await click('Create account')
 }
 
+// 10/13 evening: window.location stands in for the full load to the portal.
+const realLocation = Object.getOwnPropertyDescriptor(window, 'location')!
+let nav: { href: string; assign: ReturnType<typeof vi.fn> }
+
 beforeEach(() => {
   el = document.createElement('div')
   document.body.appendChild(el)
@@ -141,103 +148,117 @@ beforeEach(() => {
   auth.loginWithTotp = vi.fn(async () => undefined)
   auth.resendEmailOtp = vi.fn(async () => undefined)
   sessionStorage.clear()
+  localStorage.clear()
+  // 10/13 evening: signing in from the link is a full load of the portal.
+  nav = { href: 'http://localhost/invite/tok', assign: vi.fn() }
+  Object.defineProperty(window, 'location', { configurable: true, value: nav })
 })
 afterEach(() => {
   act(() => root.unmount())
   el.remove()
   vi.restoreAllMocks()
+  Object.defineProperty(window, 'location', realLocation)
 })
 
+
 describe("10/13: the bookkeeper's invitation, from the email to her pages", () => {
-  it('Create account goes straight to the code box, and the code lands her on her pages — no GAM Books, no second sign-in', async () => {
+  it('Create account signs her straight in: the session is kept and the portal opens — no code box, no GAM Books, no second sign-in', async () => {
     await open('/invite/tok')
     expect(text()).toContain('Create your account')
     // What she was told before: sign in at GAM Books (whose /login was a 404).
     expect(el.innerHTML).not.toMatch(/GAM Books|books\.goldassetmanagement/)
 
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'pending-pass', otpSent: true } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', signedIn: true, token: 'full-pass' } })
     await createAccount()
     expect(server.posts).toEqual([{ url: '/invitations/tok/accept', body: { password: 'her_own_pw_1013', firstName: 'Kay', lastName: 'Keeper', phone: undefined } }])
 
-    // The code step, with plain words — not a sign-in form asking for the password again.
-    expect(where()).toBe('/login')
-    expect(text()).toContain('Check Your Email')
-    expect(text()).toContain('Your account is set up')
-    expect(text()).toContain(EMAIL)
-    expect(input('input[type="password"]')).toBeNull()
-    expect(sessionStorage.getItem(CODE_KEY)).toBe('pending-pass')
-
-    fill(input('input[autocomplete="one-time-code"]'), '123456')
-    await click('Verify')
-    expect(auth.loginWithEmailOtp).toHaveBeenCalledWith('pending-pass', '123456')
-    expect(where()).toBe('/')
-    expect(text()).toContain('HER PAGES')
+    // 10/13 evening (Nic): "the invite link counts as proof of email" — her
+    // session, kept where the portal keeps it, and a full load of the portal
+    // (her landing is decided there: a bookkeeper lands on Money in).
+    expect(localStorage.getItem('gam_token')).toBe('full-pass')
+    expect(nav.assign).toHaveBeenCalledWith('/')
+    expect(nav.assign).toHaveBeenCalledTimes(1)
+    // Never the code box, never the sign-in form.
+    expect(where()).toBe('/invite/tok')
+    expect(text()).not.toContain('Check Your Email')
     expect(sessionStorage.getItem(CODE_KEY)).toBeNull()
+    expect(auth.loginWithEmailOtp).not.toHaveBeenCalled()
+    expect(auth.login).not.toHaveBeenCalled()
   })
 
-  it('the code box survives the phone reloading the page while she reads the code (S639)', async () => {
+  it('the session from the link replaces whoever was signed in on this device', async () => {
+    localStorage.setItem('gam_token', 'the-owners-pass')
+    auth.user = { email: 'owner@example.com', role: 'landlord' }
     await open('/invite/tok')
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'pending-pass', otpSent: true } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', signedIn: true, token: 'her-pass' } })
     await createAccount()
-    act(() => root.unmount())
-    root = createRoot(el)
-    await open('/login')   // a reload: the router state is gone, the tab's storage is not
-    expect(text()).toContain('Check Your Email')
+    expect(localStorage.getItem('gam_token')).toBe('her-pass')
+    expect(nav.assign).toHaveBeenCalledWith('/')
   })
 
-  it('a browser that refuses storage still gets the code box (the pass rides in the router state)', async () => {
+  it('a browser that will not keep the session sends her to sign in, saying the account is set up', async () => {
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('denied') })
     await open('/invite/tok')
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'pending-pass', otpSent: true } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', signedIn: true, token: 'full-pass' } })
     await createAccount()
+    expect(nav.assign).not.toHaveBeenCalled()
     expect(where()).toBe('/login')
-    expect(text()).toContain('Check Your Email')
-    fill(input('input[autocomplete="one-time-code"]'), '654321')
-    await click('Verify')
-    expect(auth.loginWithEmailOtp).toHaveBeenCalledWith('pending-pass', '654321')
+    expect(text()).toContain(`Your account is set up. Sign in with ${EMAIL}`)
+    expect(input('input[type="email"]')!.value).toBe(EMAIL)
   })
 
-  // otpSent: false is the server saying no code could be issued at all (none
-  // stored, none mailed) — the page must not also claim "We sent a code".
-  it('a code that could not be issued says so, does not claim it was sent, and points at Resend', async () => {
+  it('if the account could not be signed in from the link, the sign-in form says it is set up, with her email filled in', async () => {
     await open('/invite/tok')
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'pending-pass', otpSent: false } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', signedIn: false } })
     await createAccount()
-    expect(text()).toMatch(/couldn't send your sign-in code\. Tap Resend code/)
-    expect(text()).toContain(`Tap Resend code to get a 6-digit code at ${EMAIL}`)
-    expect(text()).not.toMatch(/We sent a 6-digit code/)
-    await click('Resend code')
-    expect(auth.resendEmailOtp).toHaveBeenCalledWith('pending-pass')
-    expect(text()).toContain('A new code is on its way')
-    expect(text()).toContain(`We sent a 6-digit code to ${EMAIL}`)
-    expect(text()).not.toMatch(/couldn't send your sign-in code/)
+    expect(nav.assign).not.toHaveBeenCalled()
+    expect(localStorage.getItem('gam_token')).toBeNull()
+    expect(where()).toBe('/login')
+    expect(text()).toContain(`Your account is set up. Sign in with ${EMAIL}`)
+    expect(input('input[type="email"]')!.value).toBe(EMAIL)
   })
 
-  it('backing out of the code step and signing in again is an ordinary sign-in (no "your account is set up" over a new code)', async () => {
+  it('…and signing in from there is the ordinary password + emailed code, landing on her pages', async () => {
     auth.login = vi.fn(async () => ({ kind: 'email_otp_required', emailOtpSession: 'later-pass' }))
     await open('/invite/tok')
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'pending-pass', otpSent: false } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', signedIn: false } })
     await createAccount()
-    await click('← Back to sign in')
-    expect(sessionStorage.getItem(CODE_KEY)).toBeNull()
-    expect(text()).toContain(`Your account is set up. Sign in with ${EMAIL}`)
     fill(input('input[type="password"]'), 'her_own_pw_1013')
     await click('Sign in')
+    expect(auth.login).toHaveBeenCalledWith(EMAIL, 'her_own_pw_1013')
     expect(text()).toContain('Check Your Email')
-    expect(text()).not.toMatch(/couldn't send your sign-in code|One last step/)
+    expect(text()).toContain('We sent a 6-digit code to your email.')
     fill(input('input[autocomplete="one-time-code"]'), '777888')
     await click('Verify')
     expect(auth.loginWithEmailOtp).toHaveBeenCalledWith('later-pass', '777888')
     expect(where()).toBe('/')
+    expect(sessionStorage.getItem(CODE_KEY)).toBeNull()
   })
 
-  it('if the code step could not start, the sign-in form says the account is set up, with her email filled in', async () => {
+  // Deploy order: a server from before 10/13 evening still answers with a
+  // code step (its pending pass). The page does not use that pass; the
+  // person signs in as usual, which mails a fresh code.
+  it('an older server that answers with a code step: the sign-in form, not a code box fed by that pass', async () => {
     await open('/invite/tok')
-    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: false } })
+    server.postAnswers.push({ ok: { userId: 'u1', role: 'bookkeeper', requiresEmailOtp: true, emailOtpSession: 'old-pending-pass', otpSent: true } })
     await createAccount()
+    expect(nav.assign).not.toHaveBeenCalled()
+    expect(localStorage.getItem('gam_token')).toBeNull()
+    expect(sessionStorage.getItem(CODE_KEY)).toBeNull()
     expect(where()).toBe('/login')
     expect(text()).toContain(`Your account is set up. Sign in with ${EMAIL}`)
-    expect(input('input[type="email"]')!.value).toBe(EMAIL)
+  })
+
+  it('a password shorter than 12 characters is refused on the page, before anything is sent', async () => {
+    await open('/invite/tok')
+    expect(input('#invite-password')!.placeholder).toBe('Min 12 characters')
+    fill(input('#invite-first'), 'Kay')
+    fill(input('#invite-last'), 'Keeper')
+    fill(input('#invite-password'), 'elevenchars')
+    fill(input('#invite-confirm'), 'elevenchars')
+    await click('Create account')
+    expect(text()).toContain('Password must be at least 12 characters.')
+    expect(server.posts).toEqual([])
   })
 
   for (const role of ['onsite_manager', 'property_manager', 'maintenance']) {
@@ -245,11 +266,11 @@ describe("10/13: the bookkeeper's invitation, from the email to her pages", () =
       server.invite = pendingInvite({ role, bookkeeperAccess: undefined })
       await open('/invite/tok')
       expect(text()).toContain('join their team')
-      server.postAnswers.push({ ok: { userId: 'u2', role, requiresEmailOtp: true, emailOtpSession: `pass-${role}`, otpSent: true } })
+      server.postAnswers.push({ ok: { userId: 'u2', role, signedIn: true, token: `pass-${role}` } })
       await createAccount()
-      expect(where()).toBe('/login')
-      expect(text()).toContain('Check Your Email')
-      expect(sessionStorage.getItem(CODE_KEY)).toBe(`pass-${role}`)
+      expect(localStorage.getItem('gam_token')).toBe(`pass-${role}`)
+      expect(nav.assign).toHaveBeenCalledWith('/')
+      expect(text()).not.toContain('Check Your Email')
     })
   }
 })
@@ -311,6 +332,27 @@ describe('10/13: expired, withdrawn and unknown links say what to do', () => {
     server.getFail = true
     await open('/invite/tok')
     expect(text()).toContain('Invitation unavailable')
+    // 10/13: Resend replaces the link, so the likeliest reason is a newer email.
+    expect(text()).toContain('If you got a newer invitation email, use the link in that one.')
+    await click('Go to sign in')
+    expect(where()).toBe('/login')
+  })
+
+  // 10/13 review: the owner pressed Resend after she opened the link, so the
+  // link in front of her was replaced. Create account used to show the bare
+  // "Invitation not found" under a form that could never work.
+  it('a link replaced while the form is open (Resend): Create account says to use the newer email, not "Invitation not found"', async () => {
+    await open('/invite/tok')
+    expect(text()).toContain('Create your account')
+    server.postAnswers.push({ fail: { status: 404, error: 'Invitation not found' } })
+    await createAccount()
+    expect(server.posts).toHaveLength(1)
+    expect(text()).toContain('Invitation unavailable')
+    expect(text()).toContain('This invite link no longer works. If you got a newer invitation email, use the link in that one.')
+    expect(text()).not.toContain('Invitation not found')
+    expect(el.querySelector('#invite-password')).toBeNull()
+    expect(localStorage.getItem('gam_token')).toBeNull()
+    expect(nav.assign).not.toHaveBeenCalled()
     await click('Go to sign in')
     expect(where()).toBe('/login')
   })

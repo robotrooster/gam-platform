@@ -4,7 +4,7 @@ import { api, apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 
-const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string }[] = [
+const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string; landlordOnly?: boolean }[] = [
   { type: 'rent_collected',                label: 'Rent collected' },
   { type: 'rent_failed',                   label: 'Rent failed' },
   { type: 'ach_retry_scheduled',           label: 'ACH retry scheduled' },
@@ -19,6 +19,10 @@ const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string }[] = [
   { type: 'low_stock',                     label: 'Low POS stock' },
   { type: 'tenant_invite_accepted',        label: 'Tenant accepted invite' },
   { type: 'reservation_requested',         label: 'Amenity reservation request' },
+  // 10/13 (Nic): GAM's happy-birthday email (jobs/birthdayEmails.ts). Only a
+  // landlord account gets one (team members have no birthday on file and are
+  // never emailed), so only a landlord account sees the switch.
+  { type: 'birthday',                      label: 'Happy birthday email from GAM', landlordOnly: true },
 ]
 
 interface EmailFailureRow {
@@ -83,7 +87,7 @@ export function NotificationPrefsSection() {
               </tr>
             </thead>
             <tbody>
-              {LANDLORD_NOTIFICATION_TYPES.map(({ type, label }) => {
+              {LANDLORD_NOTIFICATION_TYPES.filter(t => !t.landlordOnly || user?.role === 'landlord').map(({ type, label }) => {
                 const p = prefMap.get(type) || { emailEnabled: true }
                 return (
                   <tr key={type}>

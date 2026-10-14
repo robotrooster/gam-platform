@@ -33,6 +33,7 @@ import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 import { MetricsHeatMap } from './components/MetricsHeatMap'
 import { ReaderOrdersDesk } from './components/ReaderOrdersDesk'
+import { MetricsLifetime } from './components/MetricsLifetime'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API}/api` })
@@ -1968,6 +1969,9 @@ function Metrics(){
           money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap).
           10/12 (Nic, H1): Units toggles Occupied (billed) — the tile's occupied count — and All spaces. */}
       <MetricsHeatMap data={m.map}/>
+
+      {/* 10/13 (Nic): money billed and collected, tenants ever, the default rate, ages (components/MetricsLifetime). */}
+      <MetricsLifetime api={api}/>
 
       {/* ── Paperwork and operations ── */}
       <div className="ct mx-section">Done on GAM</div>

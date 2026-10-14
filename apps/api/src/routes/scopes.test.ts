@@ -529,7 +529,9 @@ describe('POST /invitations/:id/revoke + /resend', () => {
       .post(`/api/scopes/invitations/${invId}/resend`)
       .set('Authorization', `Bearer ${f.landlordToken}`).send({})
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Only pending invitations can be resent/)
+    // 10/13: in plain words — the Team page's button says Withdraw, not revoke.
+    expect(res.body.error).toBe('This invitation was already withdrawn.')
+    expect(emailInvitationMock).toHaveBeenCalledTimes(1)   // the invite only; no second link
   })
 
   it('cross-landlord revoke → 404 (invitation lookup is landlord-scoped)', async () => {

@@ -472,7 +472,9 @@ app.use('/api/books/reconcile', booksReconcileRouter) // ahead of the Books rout
 app.use('/api/books',          booksRouter)
 app.use('/api/renter-pool',    renterPoolRouter)
 app.use('/api/scopes',         scopesRouter)
-app.use('/api/invitations',    invitationsRouter)
+// 10/13 (Nic): accepting a team invitation now signs a new account straight
+// in (routes/scopes.ts), so it is held to the sign-in limit, as admin-invite is.
+app.use('/api/invitations',    authLimiter, invitationsRouter)
 app.use('/api/pm',             pmRouter)
 app.use('/api/pm/:pmCompanyId/agent-activity', pmAgentActivityRouter)
 app.use('/api/credit',         creditRouter)

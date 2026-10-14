@@ -25,6 +25,9 @@ const NOTIF_TYPES = [
   { type:'lease_expiring',              label:'Lease Expiry',           desc:'Reminders as your lease end date approaches' },
   { type:'bulk_message',                label:'Landlord Messages',      desc:'Announcements from your landlord' },
   { type:'maintenance_building_notice', label:'Building Notices',       desc:'Maintenance affecting multiple units' },
+  // 10/13 (Nic): GAM's happy-birthday email (jobs/birthdayEmails.ts). Email
+  // only — nothing is posted in the app, so that column says so.
+  { type:'birthday',                    label:'Birthday Email',         desc:'A happy-birthday note from GAM on your birthday', emailOnly:true },
 ]
 
 export function ProfilePage() {
@@ -221,7 +224,9 @@ export function ProfilePage() {
                   {(['in_app','email'] as const).map(ch => (
                     <div key={n.type+ch} style={{ padding:'12px 16px', textAlign:'center', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none', display:'flex', alignItems:'center', justifyContent:'center' }}>
                       {ch === 'in_app'
-                        ? <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
+                        ? (n.emailOnly
+                          ? <span title="Sent by email only" style={{ color:'var(--text-3)', fontSize:'.85rem' }}>—</span>
+                          : <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>)
                         : isCriticalNotificationType(n.type)
                           // S570 (Nic): critical alerts (e.g. failed payment) always email — can't be turned off.
                           ? <span title="This alert is too important to turn off — it's always emailed." style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>

@@ -4,6 +4,8 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
 import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal, FALLBACK_TIMEZONE } from '@gam/shared'
+// 10/13 (Nic): the roles an emailed team invitation creates (sessionFromTeamInvitation).
+import { LANDLORD_ASSIGNABLE_ROLES } from '@gam/shared'
 import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
 import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
 import { requireAuth, forgetSessionCutoff } from '../middleware/auth'
@@ -13,6 +15,7 @@ import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsU
          sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
+import { dateIn } from '../lib/timezone'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
 import { signEmailOtpSessionToken, issueEmailOtp, verifyEmailFactorToken } from './emailOtp'
@@ -570,39 +573,70 @@ async function sessionClaimsFor(user: any) {
 }
 
 /**
- * 10/13 (Nic): "it told her to sign in and then something about it not going
- * anywhere." A bookkeeper who had just created her account from the owner's
- * emailed invitation was sent off to sign in somewhere else, with the password
- * she had typed a moment before.
+ * ── 10/13 (Nic): THE INVITE LINK COUNTS AS PROOF OF EMAIL ──────────────────
  *
- * An account set up from an emailed team invitation goes straight to the
- * emailed-code step instead: the same pending pass /login hands out, built
- * from the same claims (sessionClaimsFor), and the same code. The code is
- * still required (S578: no account is exempt); only the second trip to a
- * sign-in page is gone. The page that set the account up shows the code box
- * and the person lands on their own pages.
+ * "After creating the account from the invite link, SKIP the code step once
+ * (the invite link counts as proof of email) — sign straight in."
  *
- * Call it after the account (and its team row) has committed. otpSent: false
- * means no code could be issued at all (it was never stored, so nothing was
- * mailed); that does not fail the caller — the account exists and the code
- * screen's Resend issues one. A code that was stored but that the mail
- * provider then refused is NOT seen here: issueEmailOtp logs that and returns
- * normally (the same as at /login), so otpSent stays true and the code
- * screen's Resend is the way out, as it is for any sign-in.
+ * Earlier on 10/13 a new team member went from Create account to the emailed
+ * code box, then to her pages. The code proves one thing: that the person
+ * reads that mailbox. The invitation link already proved it — its token is 32
+ * random bytes that went only to that address, by email, and it works once.
+ * The same reasoning let a sign-in through a bill's own emailed link skip the
+ * code in S654 (the emailFactor branch of /login). The password she chose a
+ * moment ago is the other factor.
+ *
+ * So the new account gets a full session here, built exactly as /login builds
+ * one (loadUserForSession + sessionClaimsFor, the same policy as a landlord-
+ * portal sign-in). Only for this:
+ *   - only a team role (an invitation can create no other kind of account);
+ *   - only once: the accept route calls this only for the account it just
+ *     created, in the same request that moved the invitation from pending to
+ *     accepted under a row lock, so opening the link again signs nobody in;
+ *   - email_2fa_enabled stays TRUE (set when the account was created), so every
+ *     later sign-in is password + emailed code, as for everyone (S578).
+ *
+ * Call it after the account (and its team row) has committed. If it throws,
+ * the account still exists; the caller sends the person to sign in normally.
  */
-export async function emailCodeStepFor(userId: string): Promise<{ emailOtpSession: string; otpSent: boolean }> {
+export async function sessionFromTeamInvitation(userId: string): Promise<{ token: string; user: Record<string, unknown> }> {
   const user = await loadUserForSession('id', userId)
   if (!user) throw new AppError(404, 'Account not found')
-  const { claims } = await sessionClaimsFor(user)
-  const emailOtpSession = signEmailOtpSessionToken({ ...claims, sp: sessionPolicyFor(user.role, null, false) })
-  let otpSent = true
-  try {
-    await issueEmailOtp(user.id, user.email)
-  } catch (err) {
-    otpSent = false
-    logger.error({ err, userId: user.id }, '[auth] account set up, but no sign-in code could be issued')
+  if (!(LANDLORD_ASSIGNABLE_ROLES as readonly string[]).includes(user.role)) {
+    throw new AppError(403, 'Only a team account set up from its invitation signs in this way.')
   }
-  return { emailOtpSession, otpSent }
+  // Same order as /login: who they are and what they may reach, from the
+  // database (a worker with no team row is refused here as it is there).
+  const { scope, profileId, businessId, staffRole, claims } = await sessionClaimsFor(user)
+  const token = signSessionToken(claims, sessionPolicyFor(user.role, null, false))
+  // A sign-in, recorded as /login records one. Never blocks it.
+  try {
+    await db.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id])
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, '[auth] signed in from a team invitation; last_login_at not stamped')
+  }
+  db.query(
+    `INSERT INTO product_events (portal, event, user_id, role, meta)
+     VALUES ('auth', 'login', $1, $2, '{"via":"team_invitation"}'::jsonb)`,
+    [user.id, user.role],
+  ).catch(() => {})
+  return {
+    token,
+    // The shape /login answers with, so the page needs nothing else.
+    user: {
+      id: user.id, email: user.email, role: user.role,
+      firstName: user.first_name, lastName: user.last_name,
+      profileId,
+      landlordId: scope?.landlordId || null,
+      businessId,
+      staffRole,
+      permissions: scope?.permissions || null,
+      directDepositEnabled: scope?.directDepositEnabled ?? false,
+      propertyIds: scope?.propertyIds ?? null,
+      allProperties: scope?.allProperties ?? false,
+      mustEnrollTotp: false,
+    },
+  }
 }
 
 authRouter.post('/login', async (req, res, next) => {
@@ -811,6 +845,9 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- S630: so the account screen can show a change awaiting confirmation
          -- rather than looking like the request was lost.
          u.pending_email,
+         -- 10/13 (Nic): a landlord's own birthday (Settings → Account), for
+         -- the happy-birthday email. Text, so no time zone can shift the day.
+         to_char(u.date_of_birth, 'YYYY-MM-DD') AS date_of_birth,
          COALESCE(l.id, t.id, b.id) AS profile_id,
          l.business_name, l.onboarding_complete,
          b.id   AS business_id,
@@ -985,17 +1022,51 @@ authRouter.post('/refresh', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/13 (Nic): a landlord's own birthday, for the happy-birthday email
+ * (jobs/birthdayEmails.ts). `dateOfBirth` absent → unchanged; null or '' →
+ * cleared; otherwise a real calendar date (YYYY-MM-DD), in the past, no
+ * earlier than 1900. Only a landlord account keeps one here. "In the past" is
+ * by Phoenix's calendar — the same "today" the birthday job greets on — not
+ * UTC's, which turns over at 5 pm Phoenix time and would let today's date in.
+ */
+export function ownBirthdayFrom(body: any, role: string, now: Date = new Date()): { given: boolean; value: string | null } {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'dateOfBirth')) return { given: false, value: null }
+  if (role !== 'landlord') throw new AppError(403, 'Only a landlord account keeps its birthday here.')
+  const raw = body.dateOfBirth
+  if (raw === null || raw === '') return { given: true, value: null }
+  const m = typeof raw === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw) : null
+  const d = m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : null
+  if (!m || !d || d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) {
+    throw new AppError(400, 'Enter your birthday as a date, like 1980-04-23.')
+  }
+  if (+m[1] < 1900) throw new AppError(400, 'That birthday is before 1900 — check the year.')
+  if (raw >= dateIn(FALLBACK_TIMEZONE, now)) {
+    throw new AppError(400, 'That birthday is not a date in the past.')
+  }
+  return { given: true, value: raw }
+}
+
 // PATCH /api/auth/me — update user profile
 authRouter.patch('/me', requireAuth, async (req, res, next) => {
   try {
     const { firstName, lastName, phone } = req.body
-    await query(`UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name), phone=COALESCE($3,phone), updated_at=NOW() WHERE id=$4`,
-      [firstName||null, lastName||null, phone||null, req.user!.userId])
+    // 10/13 (Nic): "emailing tenants on their birthday ... happy birthday from
+    // GAM" — tenants AND landlords, and landlords need a birthday on their
+    // profile. A landlord types their own here (Settings → Account); absent
+    // leaves it alone, null clears it. A tenant's comes from their signed lease
+    // (tenants.date_of_birth), so no other account sets one here.
+    const birthday = ownBirthdayFrom(req.body, req.user!.role)
+    await query(`UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name), phone=COALESCE($3,phone),
+        date_of_birth = CASE WHEN $5::boolean THEN $6::date ELSE date_of_birth END,
+        updated_at=NOW() WHERE id=$4`,
+      [firstName||null, lastName||null, phone||null, req.user!.userId, birthday.given, birthday.value])
     // Return ONLY safe columns — `SELECT *` here leaked password_hash, the
     // reset/verify tokens, and 2FA fields back to the client on every profile
     // save (GET /me already scopes its columns; this path did not).
     const user = await queryOne<any>(
-      `SELECT id, email, role, first_name, last_name, phone, created_at, updated_at
+      `SELECT id, email, role, first_name, last_name, phone,
+              to_char(date_of_birth, 'YYYY-MM-DD') AS date_of_birth, created_at, updated_at
          FROM users WHERE id=$1`, [req.user!.userId])
     res.json({ success: true, data: user })
   } catch(e) { next(e) }

@@ -3,7 +3,7 @@ import { useParams, useNavigate, Navigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { continueToSignIn } from './LoginPage'
-import { bookkeeperAccessSummary, type BookkeeperAccessChoice } from '@gam/shared'
+import { bookkeeperAccessSummary, type BookkeeperAccessChoice, PASSWORD_MIN_LEN } from '@gam/shared'
 
 // Staff-invitation accept page. The landlord adds a staff member on the Team
 // page → this is the "next page" the invitee lands on from their email link
@@ -23,15 +23,18 @@ import { bookkeeperAccessSummary, type BookkeeperAccessChoice } from '@gam/share
 // reopening the link said "This invitation is accepted. Ask your employer to
 // send a new invite link."
 //
-// Now: Create account goes straight to the emailed-code step (the accept hands
-// back the account's pending pass), and the code lands her on her own pages in
-// this portal — a bookkeeper's Bookkeeping, Payments and Rent Roll live here
-// (10/12: the Books pages are inside this portal, not a link out). That
-// replaces the 10/11 ending, which sent a bookkeeper to GAM Books to sign in
-// (and GAM Books has no Payments page). A link opened again says the account is set up and offers Sign in
-// (or, signed in already as that address, goes to her pages). An existing
-// account signs in and comes right back here to accept. Every role on the Team
-// page (bookkeeper, on-site manager, property manager, maintenance) uses it.
+// Now: Create account lands her on her own pages in this portal — a
+// bookkeeper's Bookkeeping, Payments and Rent Roll live here (10/12: the Books
+// pages are inside this portal, not a link out). That replaces the 10/11
+// ending, which sent a bookkeeper to GAM Books to sign in (and GAM Books has no
+// Payments page). 10/13 evening (Nic): "SKIP the code step once (the invite
+// link counts as proof of email) — sign straight in": the accept hands back
+// the new account's session, so there is no code box between Create account
+// and her pages. Her next sign-in asks for the code as usual. A link opened
+// again says the account is set up and offers Sign in (or, signed in already
+// as that address, goes to her pages) — it never signs anyone in. An existing
+// account signs in and comes right back here to accept. Every role on the
+// Team page (bookkeeper, on-site manager, property manager, maintenance) uses it.
 interface InviteInfo {
   email: string
   role?: string
@@ -48,13 +51,29 @@ interface InviteInfo {
   bookkeeperAccess?: BookkeeperAccessChoice
 }
 
-/** What POST /invitations/:token/accept answers. A new account carries its code step (10/13). */
+/** What POST /invitations/:token/accept answers. A new account carries its session (10/13 evening). */
 interface AcceptResult {
   userId: string
   role: string
-  requiresEmailOtp?: boolean
-  emailOtpSession?: string
-  otpSent?: boolean
+  /** A new account: true with its session token; false when it is set up but could not be signed in. */
+  signedIn?: boolean
+  token?: string
+}
+
+/**
+ * 10/13 evening: the new account's session, kept where the portal keeps every
+ * session, then a full load of the portal — so whoever was signed in on this
+ * device before is gone with everything cached for them (S639), and the menu,
+ * the landing (a bookkeeper lands on Money in) and /auth/me are read fresh for
+ * her. False when this browser will not keep it: she signs in instead.
+ */
+function startSession(token: string): boolean {
+  try {
+    localStorage.setItem('gam_token', token)
+    if (localStorage.getItem('gam_token') !== token) return false
+  } catch { return false }
+  window.location.assign('/')
+  return true
 }
 
 const wrap: React.CSSProperties = { minHeight: '100vh', background: '#060809', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: 'system-ui' }
@@ -65,6 +84,15 @@ const titleStyle: React.CSSProperties = { fontSize: '1.2rem', fontWeight: 800, c
 const bodyStyle: React.CSSProperties = { fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6 }
 
 const sameAddress = (a?: string | null, b?: string | null) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase()
+
+/**
+ * 10/13: a Resend (Team page) replaces the link, so the likeliest reason an
+ * invitation link is unknown is that a newer email is in the same inbox. Said
+ * when the page is opened with such a link, and (10/13 review) when the link
+ * is replaced while this form is open: the owner pressed Resend after she
+ * opened it, and Create account answered "Invitation not found".
+ */
+const LINK_REPLACED = 'This invite link no longer works. If you got a newer invitation email, use the link in that one.'
 
 export function AcceptInvitePage() {
   const { token = '' } = useParams<{ token: string }>()
@@ -86,7 +114,9 @@ export function AcceptInvitePage() {
         setForm(f => ({ ...f, firstName: data.firstName || '', lastName: data.lastName || '', phone: data.phone || '' }))
         setLoading(false)
       })
-      .catch(() => { setError('This invite link is invalid or has already been used.'); setLoading(false) })
+      // 10/13: a Resend (Team page) replaces the link, so the likeliest reason
+      // an old one is unknown is that a newer email is in the same inbox.
+      .catch(() => { setError(LINK_REPLACED); setLoading(false) })
   }, [token])
 
   // 10/13: this link, after signing in — the sign-in page returns here.
@@ -100,7 +130,8 @@ export function AcceptInvitePage() {
     setError('')
     if (!info?.userExists) {
       if (!form.firstName.trim() || !form.lastName.trim()) { setError('First and last name are required.'); return }
-      if (form.password.length < 8) { setError('Password must be at least 8 characters.'); return }
+      // 10/13: the platform's one minimum (S631), as the server checks it.
+      if (form.password.length < PASSWORD_MIN_LEN) { setError(`Password must be at least ${PASSWORD_MIN_LEN} characters.`); return }
       if (form.password !== form.confirm) { setError('Passwords do not match.'); return }
     }
     setSubmitting(true)
@@ -112,16 +143,23 @@ export function AcceptInvitePage() {
         phone: form.phone.trim() || undefined,
       })
       if (info?.userExists) { setJoinedTeam(true); setSubmitting(false); return }
-      // 10/13: a new account goes straight to its code step, then its pages.
+      // 10/13 evening: a new account is signed straight in, to its pages.
       const d = r.data
-      continueToSignIn(navigate, {
-        joined: { email: info!.email, otpSent: d?.otpSent },
-        emailOtpSession: d?.requiresEmailOtp ? d.emailOtpSession : undefined,
-      })
+      if (d?.signedIn && d.token && startSession(d.token)) return
+      // Set up, but not signed in from the link: the sign-in form, which says so.
+      continueToSignIn(navigate, { joined: { email: info!.email } })
     } catch (e: any) {
       // A second tap, or the link finished in another tab: it is set up — say so.
       if (e?.response?.data?.code === 'ALREADY_ACCEPTED') {
         setInfo(i => i ? { ...i, status: 'accepted', userExists: true } : i)
+        setSubmitting(false)
+        return
+      }
+      // 10/13 review: the link was replaced while the form was open (Resend).
+      // The newer email's link is the way in; this form cannot get there.
+      if (e?.response?.status === 404) {
+        setInfo(null)
+        setError(LINK_REPLACED)
         setSubmitting(false)
         return
       }
@@ -264,7 +302,7 @@ export function AcceptInvitePage() {
               </div>
               <div style={{ marginBottom: 14 }}>
                 <label style={labelStyle} htmlFor="invite-password">Password</label>
-                <input id="invite-password" type="password" autoComplete="new-password" style={inputStyle} placeholder="Min 8 characters" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} />
+                <input id="invite-password" type="password" autoComplete="new-password" style={inputStyle} placeholder={`Min ${PASSWORD_MIN_LEN} characters`} value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} />
               </div>
               <div style={{ marginBottom: 18 }}>
                 <label style={labelStyle} htmlFor="invite-confirm">Confirm password</label>

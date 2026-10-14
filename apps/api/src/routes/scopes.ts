@@ -23,12 +23,15 @@ import { logger } from '../lib/logger'
 import { portalUrl, portalLink } from '../lib/portalUrls'
 import { resolveLandlordTarget, landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 import { keptIdsSql, coversAllSql, companyWideSql, formerSql, bookkeeperScopesOf } from '../lib/bookkeeperScope'
-// 10/13 (Nic): a new account goes from Create account straight to the code box.
-import { emailCodeStepFor } from './auth'
+// 10/13 (Nic): a new account goes from Create account straight to its pages
+// ("the invite link counts as proof of email").
+import { sessionFromTeamInvitation } from './auth'
+// 10/13 (Nic): "team invites expire after 24 HOURS". S631: one password minimum.
+import { TEAM_INVITATION_TTL_HOURS, PASSWORD_MIN_LEN } from '@gam/shared'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
-const INVITATION_TTL_HOURS = 24
+const INVITATION_TTL_HOURS = TEAM_INVITATION_TTL_HOURS
 
 /**
  * S654: every column of an invitation except its token.
@@ -588,18 +591,27 @@ scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'),
 
     // 10/11: a pending bookkeeper invitation says which properties it carries.
     // 10/12: and whether it carries the company-wide and lease-dates boxes.
+    // 10/13 (Nic): each row carries Resend and Withdraw. `expired`: its link has
+    // lapsed by the server's clock (the hourly sweep marks it 'expired' up to an
+    // hour later), so the page says so instead of a time in the past.
+    // 10/13 review: and the company it is for (company_name, as on the members
+    // above). The same address may be invited to two of the account's
+    // companies; without the name the two rows looked alike, and Withdraw
+    // could take back the wrong company's invitation.
     const invitations = await query<any>(
-      `SELECT id, email, role, status, expires_at, created_at, accepted_at, revoked_at, landlord_id,
-              CASE WHEN role = 'bookkeeper' AND jsonb_typeof(scope_payload->'propertyIds') = 'array'
-                   THEN scope_payload->'propertyIds' END AS property_ids,
-              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'companyWide')::boolean, FALSE) END AS company_wide,
-              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'showLeaseDates')::boolean, FALSE) END AS show_lease_dates,
-              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'companyLedger')::boolean, FALSE) END AS company_ledger,
-              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'wholeCompanyReports')::boolean, FALSE) END AS whole_company_reports,
-              CASE WHEN role = 'bookkeeper' THEN COALESCE((scope_payload->>'seesMonthlyReport')::boolean, FALSE) END AS sees_monthly_report
-         FROM invitations
-        WHERE landlord_id = ANY($1::uuid[]) AND status = 'pending'
-        ORDER BY created_at DESC`, [landlordIds])
+      `SELECT i.id, i.email, i.role, i.status, i.expires_at, i.created_at, i.accepted_at, i.revoked_at, i.landlord_id,
+              la.business_name AS company_name,
+              (i.expires_at <= NOW()) AS expired,
+              CASE WHEN i.role = 'bookkeeper' AND jsonb_typeof(i.scope_payload->'propertyIds') = 'array'
+                   THEN i.scope_payload->'propertyIds' END AS property_ids,
+              CASE WHEN i.role = 'bookkeeper' THEN COALESCE((i.scope_payload->>'companyWide')::boolean, FALSE) END AS company_wide,
+              CASE WHEN i.role = 'bookkeeper' THEN COALESCE((i.scope_payload->>'showLeaseDates')::boolean, FALSE) END AS show_lease_dates,
+              CASE WHEN i.role = 'bookkeeper' THEN COALESCE((i.scope_payload->>'companyLedger')::boolean, FALSE) END AS company_ledger,
+              CASE WHEN i.role = 'bookkeeper' THEN COALESCE((i.scope_payload->>'wholeCompanyReports')::boolean, FALSE) END AS whole_company_reports,
+              CASE WHEN i.role = 'bookkeeper' THEN COALESCE((i.scope_payload->>'seesMonthlyReport')::boolean, FALSE) END AS sees_monthly_report
+         FROM invitations i JOIN landlords la ON la.id = i.landlord_id
+        WHERE i.landlord_id = ANY($1::uuid[]) AND i.status = 'pending'
+        ORDER BY i.created_at DESC`, [landlordIds])
 
     // 10/12 review (deploy order): the Team page sends a company-wide-only
     // bookkeeper as propertyIds [] + companyWide, and an untick-everything edit
@@ -1077,22 +1089,69 @@ scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions')
   } catch (e) { next(e) }
 })
 
-// POST /api/scopes/invitations/:id/resend — new token, reset expiry
+// ── 10/13 (Nic): RESEND AND WITHDRAW ON EACH PENDING INVITATION ─────────────
+//
+// "Add RESEND and WITHDRAW buttons on each pending invitation (Team page)."
+// The routes below are what those buttons call. Three things changed with them:
+//
+//   1. The company comes from the invitation itself. These looked the row up
+//      under getLandlordIdFromReq, which asks an account that owns two
+//      companies "which one?" (S654: nothing is guessed) — and a button on a
+//      row names no company. Nic owns Oak Park and Mountain View, so every
+//      Resend and Withdraw he pressed would have been refused. The row is
+//      looked up among every company whose team the caller may see (the same
+//      set the Team page lists, teamLandlordIds), so another company's
+//      invitation is still not found.
+//   2. The row is locked (FOR UPDATE) and its status read under the lock. The
+//      accept route locks the same row, so a Withdraw racing the invitee's
+//      Create account can no longer stamp "withdrawn" on an invitation that was
+//      just accepted (they would be on the team while the owner was told they
+//      were not), and a Resend cannot mail a fresh link for one.
+//   3. Anything but a pending invitation is answered in plain words (a second
+//      owner or a second tab got there first), never "revoked".
+//
+// Resend gives a brand-new link that works for TEAM_INVITATION_TTL_HOURS from
+// now and kills the old one (the email says so). It works on a pending
+// invitation whose link has already lapsed, too: that is the one most likely
+// to need it.
+
+/** The companies whose invitations this caller's buttons may touch (before any transaction opens). */
+async function invitationButtonScope(req: any): Promise<string[]> {
+  if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Invitation not found')
+  return teamLandlordIds(req)
+}
+
+/** The invitation behind a Team-page button, locked, from one of those companies. */
+async function lockTeamInvitation(client: any, id: string, landlordIds: string[]): Promise<any> {
+  const { rows } = await client.query(
+    `SELECT id, email, role, status, landlord_id FROM invitations
+      WHERE id = $1 AND landlord_id = ANY($2::uuid[])
+      FOR UPDATE`,
+    [id, landlordIds])
+  if (!rows[0]) throw new AppError(404, 'Invitation not found')
+  return rows[0]
+}
+
+function notPendingMessage(status: string, action: 'resend' | 'withdraw'): string {
+  if (status === 'accepted') return "They've already accepted this invitation and are on your team."
+  if (status === 'revoked') return 'This invitation was already withdrawn.'
+  return action === 'resend'
+    ? 'This invitation has expired. Send them a new one from the invite form.'
+    : 'This invitation has already expired, so its link no longer works.'
+}
+
+// POST /api/scopes/invitations/:id/resend — new token, a fresh 24 hours
 scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (req, res, next) => {
   try {
-    const landlordId = await getLandlordIdFromReq(req)
-    const inv = await queryOne<any>(
-      `SELECT * FROM invitations WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, landlordId])
-    if (!inv) throw new AppError(404, 'Invitation not found')
-    if (inv.status !== 'pending') throw new AppError(400, 'Only pending invitations can be resent')
-
+    const landlordIds = await invitationButtonScope(req)
     const token = crypto.randomBytes(32).toString('hex')
     const expiresAt = new Date(Date.now() + INVITATION_TTL_HOURS * 60 * 60 * 1000)
 
     const client = await getClient()
     try {
       await client.query('BEGIN')
+      const inv = await lockTeamInvitation(client, req.params.id, landlordIds)
+      if (inv.status !== 'pending') throw new AppError(400, notPendingMessage(inv.status, 'resend'))
       const upd = await client.query(
         `UPDATE invitations SET token = $1, expires_at = $2 WHERE id = $3 RETURNING ${INVITATION_COLUMNS}`,
         [token, expiresAt, inv.id])
@@ -1102,10 +1161,10 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
         [inv.id, req.user!.userId])
       await client.query('COMMIT')
 
-      const inviterName = await getInviterName(landlordId)
+      const inviterName = await getInviterName(inv.landlord_id)
       // 10/5: replies reach the person who re-sent this invite (services/replyRouting).
       emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token),
-        { landlordId, invitationId: inv.id, resend: true, replyTo: { kind: 'person', userId: req.user!.userId } })
+        { landlordId: inv.landlord_id, invitationId: inv.id, resend: true, replyTo: { kind: 'person', userId: req.user!.userId } })
         .catch(e => logger.error({ err: e }, '[EMAIL] resend failed'))
 
       res.json({ success: true, data: upd.rows[0] })
@@ -1118,19 +1177,15 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
   } catch (e) { next(e) }
 })
 
-// POST /api/scopes/invitations/:id/revoke
+// POST /api/scopes/invitations/:id/revoke — the Team page's Withdraw
 scopesRouter.post('/invitations/:id/revoke', requirePerm('team.invite'), async (req, res, next) => {
   try {
-    const landlordId = await getLandlordIdFromReq(req)
-    const inv = await queryOne<any>(
-      `SELECT * FROM invitations WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, landlordId])
-    if (!inv) throw new AppError(404, 'Invitation not found')
-    if (inv.status !== 'pending') throw new AppError(400, 'Only pending invitations can be revoked')
-
+    const landlordIds = await invitationButtonScope(req)
     const client = await getClient()
     try {
       await client.query('BEGIN')
+      const inv = await lockTeamInvitation(client, req.params.id, landlordIds)
+      if (inv.status !== 'pending') throw new AppError(400, notPendingMessage(inv.status, 'withdraw'))
       const upd = await client.query(
         `UPDATE invitations SET status='revoked', revoked_at=NOW(), revoked_by_user_id=$1
          WHERE id=$2 RETURNING ${INVITATION_COLUMNS}`,
@@ -1172,6 +1227,15 @@ function bookkeeperAccessOf(raw: unknown): BookkeeperAccessChoice {
   }
 }
 
+/**
+ * 10/13 review: a link no invitation carries. A Resend (Team page) replaces the
+ * link, so the likeliest reason is a newer email in the same inbox; an owner who
+ * pressed Resend while the invitee had the form open left her with "Invitation
+ * not found" under Create account. The same words the accept page shows.
+ */
+const INVITATION_LINK_REPLACED =
+  'This invite link no longer works. If you got a newer invitation email, use the link in that one.'
+
 // GET /api/invitations/:token — accept-screen payload
 invitationsRouter.get('/:token', async (req, res, next) => {
   try {
@@ -1183,7 +1247,7 @@ invitationsRouter.get('/:token', async (req, res, next) => {
        LEFT JOIN landlords l ON l.id = i.landlord_id
        WHERE i.token = $1`,
       [req.params.token])
-    if (!inv) throw new AppError(404, 'Invitation not found')
+    if (!inv) throw new AppError(404, INVITATION_LINK_REPLACED)
 
     if (inv.status === 'pending' && new Date(inv.expires_at) > new Date()) {
       await query(
@@ -1258,7 +1322,11 @@ const INVITATION_WITHDRAWN =
 invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) => {
   try {
     const body = z.object({
-      password:  z.string().min(8).optional(),
+      // 10/13: the length is checked below, for a new account only, against
+      // the platform minimum — this said 8 while every other door says 12
+      // (S631: PASSWORD_MIN_LEN, "every login-minting path uses one number"),
+      // and this door now signs the person straight in.
+      password:  z.string().optional(),
       firstName: z.string().min(1).optional(),
       lastName:  z.string().min(1).optional(),
       phone:     z.string().optional(),
@@ -1276,7 +1344,7 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
         `SELECT * FROM invitations WHERE token = $1 FOR UPDATE`,
         [req.params.token])
       const inv = invRes.rows[0]
-      if (!inv) throw new AppError(404, 'Invitation not found')
+      if (!inv) throw new AppError(404, INVITATION_LINK_REPLACED)
       // 10/13 (Nic): in plain words, and a used link is told to sign in.
       if (inv.status === 'accepted') throw new AppError(409, ALREADY_SET_UP, { code: 'ALREADY_ACCEPTED' })
       if (inv.status === 'revoked') throw new AppError(400, INVITATION_WITHDRAWN)
@@ -1294,6 +1362,9 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
 
       if (!user) {
         if (!body.password) throw new AppError(400, 'Password required for new account')
+        if (body.password.length < PASSWORD_MIN_LEN) {
+          throw new AppError(400, `Password must be at least ${PASSWORD_MIN_LEN} characters.`)
+        }
         if (!body.firstName || !body.lastName) throw new AppError(400, 'First and last name required')
         const hash = await bcrypt.hash(body.password, 12)
         const newUser = await client.query(
@@ -1301,8 +1372,10 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
           // exact address) proves email ownership, so the staff member is
           // verified on accept — no separate verification step to block login.
           // 10/13: email_2fa_enabled=TRUE in the same write, as the tenant
-          // activation does (S637) — the code step below is part of what the
+          // activation does (S637) — the emailed code is part of what the
           // account IS from its first minute, not a flag /login flips later.
+          // The link stands in for it once, on this accept (below); every
+          // later sign-in asks for it.
           `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
                               email_verified, email_verified_at, email_2fa_enabled)
            VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), TRUE) RETURNING *`,
@@ -1387,23 +1460,27 @@ invitationsRouter.post('/:token/accept', sessionIfSent, async (req, res, next) =
     // landlord portal's sign-in herself and typing again the password she had
     // just chosen.
     //
-    // A new account now answers with the emailed-code step — the pending pass
-    // /login would hand out, and its code mailed to the invited address — so
-    // the page goes from Create account to the code box and then to her pages.
-    // The code is still required (S578). The account is committed whatever
-    // happens here: if the step cannot be started, the page sends her to sign
-    // in, and the link tells her the same.
-    let step: { emailOtpSession: string; otpSent: boolean } | null = null
+    // 10/13 evening (Nic): "After creating the account from the invite link,
+    // SKIP the code step once (the invite link counts as proof of email) —
+    // sign straight in." So a new account answers with its session (auth.ts
+    // sessionFromTeamInvitation), and the page lands the person on their pages.
+    // This is the only place it is minted: for the account this request just
+    // created, after this request moved the invitation from pending to accepted
+    // under the row lock. Opening the link again is told the account is set up
+    // (ALREADY_SET_UP) and signs nobody in; a later sign-in asks for the code.
+    // The account is committed whatever happens here: if the session cannot be
+    // made, signedIn is false and the page sends her to sign in as usual.
+    let session: { token: string; user: Record<string, unknown> } | null = null
     try {
-      step = await emailCodeStepFor(accepted.userId)
+      session = await sessionFromTeamInvitation(accepted.userId)
     } catch (err) {
-      logger.error({ err, userId: accepted.userId }, '[invitations] account set up, but the code step could not start')
+      logger.error({ err, userId: accepted.userId }, '[invitations] account set up, but it could not be signed in')
     }
     res.json({
       success: true,
-      data: step
-        ? { ...data, requiresEmailOtp: true, emailOtpSession: step.emailOtpSession, otpSent: step.otpSent }
-        : { ...data, requiresEmailOtp: false },
+      data: session
+        ? { ...data, signedIn: true, token: session.token, user: session.user }
+        : { ...data, signedIn: false },
     })
   } catch (e) { next(e) }
 })
