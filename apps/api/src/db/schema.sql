@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SpdZcfSfJIyqqL1VgfLs6KjX3QaSpDAzeZz2HNp6POAukhULn5cz1Fl5kGsBpWf
+\restrict oBQPfYvGNlRYtQnlXHbjFghFVjOKhNMbJ4qTxPEn8aTwbRFnvMpclydclF5yRgH
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -12899,7 +12899,7 @@ CREATE TABLE public.landlords (
     CONSTRAINT landlords_books_register_stock_check CHECK ((books_register_stock = ANY (ARRAY['expense_when_bought'::text, 'cost_per_item_sold'::text]))),
     CONSTRAINT landlords_books_reopen_by_check CHECK ((books_reopen_by = ANY (ARRAY['owner'::text, 'owner_or_bookkeeper'::text]))),
     CONSTRAINT landlords_books_repair_bills_check CHECK (((books_repair_bills IS NULL) OR (books_repair_bills = ANY (ARRAY['automatic'::text, 'button'::text])))),
-    CONSTRAINT landlords_books_work_trade_method_check CHECK (((books_work_trade_method IS NULL) OR (books_work_trade_method = ANY (ARRAY['rent_and_labor'::text, 'rent_discount'::text])))),
+    CONSTRAINT landlords_books_work_trade_method_check CHECK (((books_work_trade_method IS NULL) OR (books_work_trade_method = ANY (ARRAY['rent_and_labor'::text, 'rent_discount'::text, 'left_out'::text])))),
     CONSTRAINT landlords_books_write_off_by_check CHECK ((books_write_off_by = ANY (ARRAY['owner'::text, 'owner_or_property_manager'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
@@ -43308,5 +43308,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SpdZcfSfJIyqqL1VgfLs6KjX3QaSpDAzeZz2HNp6POAukhULn5cz1Fl5kGsBpWf
+\unrestrict oBQPfYvGNlRYtQnlXHbjFghFVjOKhNMbJ4qTxPEn8aTwbRFnvMpclydclF5yRgH
 
