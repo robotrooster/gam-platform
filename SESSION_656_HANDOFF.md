@@ -179,3 +179,19 @@ Oct 1 (Nic: "as if billed on time"); the late-bill rule counts from the day
 written, so expect to adjust it.
 
 Round-2 open questions (21): `~/gam-backups/deploy-1013c/questions_for_nic.txt`.
+
+## 10/13 night: third deploy (live ~20:22 Phoenix)
+
+Shipped (`e8d066c`..`cf92e44`): team invite path fixed (email link → own
+pages; 24h wording; Resend/Withdraw; new account signed in once), round 3
+(unfinished documents ERASED not voided unless money touched them — 8 erased
+at Mountain View incl. MH 15's five forms; expenses/payroll/loans/assets placed
+when logged, no default; Payments/Rent Roll polish incl. pay-link breakdowns,
+stays, vacant rows, onboarding "not counted"; small money/credit/reader rules),
+admin lifetime metrics (numbers only), birthday emails (landlords only until
+the lease-birthdate backfill is applied — Nic's call). Map levels + 3D globe
+PARKED at ~/gam-parked/map-globe-1013 (Nic: wait on non-critical; Census files
+in ~/gam-geo-raw). Tests: API 13,876, frontends 1,210. Books: integrity 0,
+drift 0. Record: ~/gam-backups/deploy-1013d/. Open questions (29):
+~/gam-backups/deploy-1013d/questions_for_nic.txt. Arturo's MH 15: Nic signed;
+waiting on Arturo.
