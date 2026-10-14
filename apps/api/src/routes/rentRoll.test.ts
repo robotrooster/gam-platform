@@ -28,7 +28,8 @@ import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
 import { currentBillMonth, addMonths } from '../services/householdMonths'
 import { lateFeeTermsText, latenessPattern, median, firstLateDayText } from '../services/tenantPaymentReport'
-import { splitRegisterMoney, registerBillBackOf, unitInName, type RegisterSale } from '../services/rentRoll'
+import { splitRegisterMoney, registerBillBackOf, unitInName, withoutWorkTrade, type RegisterSale } from '../services/rentRoll'
+import type { OpenMonthRow } from '@gam/shared'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret'
 
@@ -181,8 +182,12 @@ describe('GET /api/balances/rent-roll/properties', () => {
     ])
     const locked = await get(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [p.propertyId]), '/api/balances/rent-roll/properties')
     expect(locked.body.data.map((x: any) => x.name)).toEqual(['Oak Park Motel and RV'])
-    const desk = await get(await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true }), '/api/balances/rent-roll/properties')
-    expect(desk.status).toBe(403)
+    // 10/14 (Nic): the front desk ("View who owes") gets the picker too — their properties only.
+    const desk = await get(await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true }, [mv.propertyId]), '/api/balances/rent-roll/properties')
+    expect(desk.status, JSON.stringify(desk.body)).toBe(200)
+    expect(desk.body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
+    // "View payments" alone is neither.
+    expect((await get(await teamToken(p, 'onsite_manager', { 'payments.view': true, take_payment: true }), '/api/balances/rent-roll/properties')).status).toBe(403)
   })
 })
 
@@ -409,11 +414,15 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
       .toEqual([[`person:${guest}`, 'Gina Guest', 40]])
   })
 
-  it('who: "View all payments" or the owner; staff get no sums; a property that is not theirs is a 404', async () => {
+  it('who: "View all payments", "View who owes" (10/14) or the owner; staff get no sums; a property that is not theirs is a 404', async () => {
     const p = await park()
     const elsewhere = await park('Oak Park Motel and RV', p)
     await rent(p, await household(p, 'RV 48', 'Gerald Logue'), THIS, 495)
-    expect((await openMonth(await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true }), p.propertyId)).status).toBe(403)
+    expect((await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view': true, take_payment: true }), p.propertyId)).status).toBe(403)
+    const desk = await openMonth(await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true }), p.propertyId)
+    expect(desk.status).toBe(200)
+    expect(desk.body.data.rows).toHaveLength(1)
+    expect(desk.body.data.totals).toBeUndefined()
     const staff = await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }), p.propertyId)
     expect(staff.status).toBe(200)
     expect(staff.body.data.rows).toHaveLength(1)
@@ -427,6 +436,111 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     expect((await openMonth(owner(stranger), p.propertyId)).status).toBe(404)
     expect((await get(owner(p), '/api/balances/rent-roll/open-month')).status).toBe(400)
     expect((await get(owner(p), '/api/balances/rent-roll/open-month?propertyId=nope')).status).toBe(400)
+  })
+})
+
+// ─── 10/14 (Nic): the front desk sees the Payments page ─────────────────────
+
+describe('10/14 (Nic): the front desk ("View who owes") sees the open month, without the top view', () => {
+  // About Lisa Scheeler, Mountain View's on-site manager: "they should see at
+  // least the payments tab ... kind of the same way that I see it, but not with
+  // that top view ... not show all the totals, the work trade, all these things
+  // at the top in the header. Just have it show the record payment like it does
+  // and down the list, everybody else who's paid or paid late or whatever."
+  // S641 (Nic): "I don't want her to see the covered by work trade."
+  it('every row at her property, the desk window on what is owed, no sums and no work trade anywhere', async () => {
+    const p = await park()
+    const oak = await park('Oak Park Motel and RV', p)
+    const penny = await household(p, 'RV 10', 'Penny Paid')
+    const gerald = await household(p, 'RV 2', 'Gerald Logue')
+    const walt = await household(p, 'RV 20', 'Walt Worktrade')
+    const wanda = await household(p, 'RV 21', 'Wanda Halftrade')
+    await space(p, 'RV 3')
+    await rent(p, penny, THIS, 495, 1)
+    const geraldRent = await rent(p, gerald, THIS, 495)
+    await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
+    await bill(p, wanda, THIS, [{ type: 'rent', amount: 295, paidDay: 1 }, { type: 'utility', amount: 200, workTrade: true }])
+    await rent(oak, await household(oak, 'MH 03', 'Josh Roby'), THIS, 440)
+
+    const lisa = await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true, take_payment: true }, [p.propertyId])
+    const res = await openMonth(lisa, p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const d = res.body.data
+    expect(d).toMatchObject({ propertyId: p.propertyId, propertyName: 'Mountain View RV Ranch', month: THIS })
+    // "not show all the totals ... at the top": no sums at all.
+    expect(d.totals).toBeUndefined()
+    // Everybody, in the owner's order: owing first, then every space.
+    expect(d.rows.map((r: any) => r.space)).toEqual(['RV 2', 'RV 3', 'RV 10', 'RV 20', 'RV 21'])
+    const row = (space: string) => d.rows.find((r: any) => r.space === space)
+    expect(row('RV 10')).toMatchObject({ invoiced: 495, paid: 495, owed: 0, status: 'paid', methods: ['Cash'] })
+    // "the record payment like it does": the desk window opens on what is owed.
+    expect(row('RV 2')).toMatchObject({ invoiced: 495, paid: 0, owed: 495, recordWith: geraldRent.paymentId })
+    // The hours' charges are not on her rows; what is owed is the same.
+    expect(row('RV 20')).toMatchObject({ invoiced: 0, paid: 0, owed: 0, workTrade: 0, workTradeOnly: false, methods: [], charges: [], status: 'paid' })
+    expect(row('RV 21')).toMatchObject({ invoiced: 295, paid: 295, owed: 0, workTrade: 0, workTradeOnly: false, methods: ['Cash'] })
+    expect(row('RV 21').charges.map((c: any) => [c.invoiced, c.paid, c.workTrade, c.howPaid])).toEqual([[295, 295, 0, 'Cash']])
+    expect(JSON.stringify(d).toLowerCase()).not.toContain('work trade')
+    // The owner's month is as it was: the work trade and the sums.
+    const mine = (await openMonth(owner(p), p.propertyId)).body.data
+    expect(mine.rows.find((r: any) => r.space === 'RV 20')).toMatchObject({ invoiced: 495, workTrade: 495, workTradeOnly: true, methods: ['Work trade'] })
+    expect(mine.rows.find((r: any) => r.space === 'RV 21')).toMatchObject({ invoiced: 495, workTrade: 200, methods: ['Cash', 'Work trade'] })
+    expect(mine.totals).toMatchObject({ invoiced: 1980, workTrade: 695, owed: 495 })
+    // Another property is not hers; the picker lists hers alone.
+    expect((await openMonth(lisa, oak.propertyId)).status).toBe(404)
+    expect((await get(lisa, '/api/balances/rent-roll/properties')).body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
+    // The Rent Roll (history, payment health), the tenant report and the Payments ledger stay "View all payments".
+    expect((await history(lisa, p.propertyId, 'range=all')).status).toBe(403)
+    expect((await report(lisa, gerald.tenantId)).status).toBe(403)
+    expect((await get(lisa, `/api/balances/payments-by-month?month=${THIS}`)).status).toBe(403)
+  })
+
+  it('"View who owes" without "View all payments" is the desk\'s view for a property manager too; no desk window without "Take payments"', async () => {
+    const p = await park()
+    const walt = await household(p, 'RV 20', 'Walt Worktrade')
+    await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
+    await rent(p, await household(p, 'RV 2', 'Gerald Logue'), THIS, 495)
+    const desk = await openMonth(await teamToken(p, 'property_manager', { 'balances.view': true }), p.propertyId)
+    expect(desk.status).toBe(200)
+    expect(desk.body.data.totals).toBeUndefined()
+    expect(desk.body.data.rows.find((r: any) => r.space === 'RV 2')).toMatchObject({ owed: 495, recordWith: null })
+    expect(JSON.stringify(desk.body.data).toLowerCase()).not.toContain('work trade')
+    // With "View all payments" it is all there, as before.
+    const all = await openMonth(await teamToken(p, 'property_manager', { 'payments.view_all': true }), p.propertyId)
+    expect(all.body.data.totals).toMatchObject({ workTrade: 495 })
+    expect(all.body.data.rows.find((r: any) => r.space === 'RV 20')).toMatchObject({ workTrade: 495, methods: ['Work trade'] })
+  })
+})
+
+describe('withoutWorkTrade: a row as the front desk gets it (10/14; S641)', () => {
+  const line = (over: Record<string, unknown>) => ({
+    chargeId: 'c', label: 'Rent', detail: null, dueDate: `${THIS}-01`, month: THIS, invoiced: 0, paid: 0, credit: 0,
+    workTrade: 0, owed: 0, paidOn: null, howPaid: null, daysPastGrace: 0, isLateFee: false, loggedAfterLateFee: false, ...over,
+  })
+  const base = (over: Record<string, unknown>) => ({
+    key: 'lease:L', unitId: 'u', space: 'RV 21', leaseId: 'L', householdId: 't', residents: [], occupant: null, movedOut: false,
+    invoiced: 0, lateFees: 0, paid: 0, clearing: 0, credit: 0, workTrade: 0, owed: 0, owedEarlier: 0, methods: [],
+    status: 'paid', statusLabel: 'Paid', statusColor: 'green', daysPastGrace: 0, dueDate: `${THIS}-01`, workTradeOnly: false,
+    evictionMode: false, delinquent: false, recordWith: null, payments: [], charges: [], stay: null,
+    otherMoney: [], otherIn: 0, otherRefunded: 0, ...over,
+  }) as unknown as OpenMonthRow
+
+  it('a line covered in full is gone, one covered in part shows what was left of it, and Invoiced = Paid + Owed', () => {
+    const r = withoutWorkTrade(base({
+      invoiced: 560, paid: 40, workTrade: 420, owed: 100, methods: ['Cash', 'Work trade'],
+      charges: [
+        line({ chargeId: 'work-trade:inv', label: 'Rent', detail: 'Covered by work trade at month close', invoiced: 300, workTrade: 300, howPaid: 'Work trade' }),
+        line({ chargeId: 'water', label: 'Water', invoiced: 160, paid: 40, workTrade: 120, howPaid: 'Work trade', paidOn: `${THIS}-03` }),
+        line({ chargeId: 'late', label: 'Late fee', invoiced: 100, owed: 100, isLateFee: true }),
+      ],
+    }))
+    expect(r).toMatchObject({ invoiced: 140, paid: 40, owed: 100, workTrade: 0, workTradeOnly: false, methods: ['Cash'] })
+    expect(r.charges.map(c => [c.chargeId, c.invoiced, c.paid, c.workTrade, c.howPaid, c.owed]))
+      .toEqual([['water', 40, 40, 0, null, 0], ['late', 100, 0, 0, null, 100]])
+  })
+
+  it('a row with no work trade comes back as it was', () => {
+    const r = base({ invoiced: 495, paid: 495, methods: ['Cash'], charges: [line({ invoiced: 495, paid: 495, howPaid: 'Cash' })] })
+    expect(withoutWorkTrade(r)).toBe(r)
   })
 })
 

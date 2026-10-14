@@ -100,13 +100,6 @@ vi.mock('../components/RecordPaymentWindow', async () => {
   }
 })
 
-// The list of who owes (Outstanding Balances' page) is tested on its own; here
-// only that front-desk staff get it, under the Payments name.
-vi.mock('./BalancesPage', async () => {
-  const { createElement: h } = await import('react')
-  return { BalancesPage: (p: any) => h('div', { className: 'stub-balances' }, `WHO OWES title=${p.title}`) }
-})
-
 import { PaymentsPage } from './PaymentsPage'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
@@ -726,23 +719,85 @@ describe('a payment from a bank deposit the tenant dated earlier than the bank',
 
 // ─── Who may see it ──────────────────────────────────────────────────────────
 
-describe('somebody who cannot see the page is told the next step', () => {
-  // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Front-desk staff who take
-  // payments but may not see payment histories (S641) keep who owes and Record
-  // payment — here, under Payments; the month (payment histories) is never read.
-  it('front-desk staff who see who owes get that list here, named Payments, and nothing else is read', async () => {
-    server.user = { role: 'onsite_manager', permissions: { 'payments.view': true, 'balances.view': true, take_payment: true } }
+// 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View who
+// owes" and "Take payments", not "View all payments"): "they should see at
+// least the payments tab ... kind of the same way that I see it, but not with
+// that top view ... not show all the totals, the work trade, all these things
+// at the top in the header. Just have it show the record payment like it does
+// and down the list, everybody else who's paid or paid late or whatever."
+describe('10/14 (Nic): the front desk sees the Payments page, without the top view', () => {
+  const lisa = { role: 'onsite_manager', permissions: { 'payments.view': true, 'balances.view': true, take_payment: true } }
+
+  it('the month for their property: its header, Record payment, every row — no totals, no report from a name, nothing more read', async () => {
+    server.user = lisa
+    // The server sends the desk no sums (routes/balances); the page shows what it was sent.
     await render()
-    expect(host.querySelector('.stub-balances')!.textContent).toBe('WHO OWES title=Payments')
+    await loaded()
+    expect(host.querySelector('.pay-title')!.textContent).toBe('Oak Park · October 2026')
+    expect(btn(/^Change property$/)).toBeUndefined()
+    expect(host.querySelector('.cd-totals')).toBeNull()
     expect(text()).not.toContain('Outstanding Balances')
-    expect(server.gets).toEqual([])
+    // Everybody: owing, due, paid, vacant, paid late — in the server's order.
+    expect([...host.querySelectorAll('tr.pay-row')].map(r => r.getAttribute('data-key')))
+      .toEqual(['lease:L7', 'lease:L12', 'lease:L2', 'vacant:u3', 'lease:L10'])
+    expect(cells('lease:L7').slice(2, 7)).toEqual(['$460.00', '$200.00', '$260.00', 'Cash', 'Owes +3'])
+    expect(cells('lease:L10').slice(6, 7)).toEqual(['Paid late +5'])
+    // Record payment at the top and on a row that owes; no Issue credit or Import (not her switches).
+    expect(btn(/^Record payment$/)).toBeDefined()
+    expect(rowOf('lease:L7')!.querySelector('.pay-record button')!.textContent).toBe('Record payment')
+    expect(btn(/Issue credit/)).toBeUndefined()
+    expect(btn(/Import payment history/)).toBeUndefined()
+    // The name is just the name: the tenant report is "View all payments".
+    expect(host.querySelector('.pay-name')).toBeNull()
+    expect(cells('lease:L7')[1]).toContain('Russ Fuller & Ann Fuller')
+    // A row opens to its payments and charges from the row itself — the Payments ledger is never asked.
+    await click(rowOf('lease:L7'))
+    expect(host.querySelectorAll('tr[data-line="payment"]')).toHaveLength(1)
+    expect(host.querySelectorAll('tr[data-line="charge"]')).toHaveLength(1)
+    expect(server.gets.every(u => u.startsWith('/balances/rent-roll/'))).toBe(true)
   })
+
+  it('logs a payment right here: the desk window on the row\'s charge, the month read again when it closes', async () => {
+    server.user = lisa
+    await render()
+    await loaded()
+    await click(rowOf('lease:L7')!.querySelector('.pay-record button'))
+    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-russ tenant=t-russ name=Russ Fuller & Ann Fuller')
+    const before = openMonthReads().length
+    await click(btn(/stub record and close/))
+    await until(() => text().includes('Recorded $260.00 from Russ Fuller.'), 'the result')
+    await until(() => openMonthReads().length > before, 'the month read again')
+  })
+
+  it('more than one property in their scope: Which property?, then Change property', async () => {
+    server.user = lisa
+    server.properties = [property(), property({ propertyId: 'p-mv', name: 'Mountain View RV', spaces: 61 })]
+    server.rolls['p-mv'] = roll([row({ key: 'lease:M1', space: 'RV 1', residents: [{ tenantId: 't-m', name: 'Mo Reyes', primary: true }] })],
+      { propertyId: 'p-mv', propertyName: 'Mountain View RV' })
+    await render()
+    await until(() => text().includes('Which property?'), 'the picker')
+    await click(btn(/^Mountain View RV/))
+    await until(() => text().includes('Mo Reyes'), 'Mountain View')
+    expect(host.querySelector('.pay-title')!.textContent).toBe('Mountain View RV · October 2026')
+    expect(btn(/^Change property$/)).toBeDefined()
+  })
+
+  it('seeing who owes without taking payments: the month, and no Record payment anywhere', async () => {
+    server.user = { role: 'onsite_manager', permissions: { 'balances.view': true } }
+    await render()
+    await loaded()
+    expect(btn(/Record payment/)).toBeUndefined()
+    expect([...host.querySelectorAll('table.pay-table thead th')]).toHaveLength(7)
+  })
+})
+
+describe('somebody who cannot see the page is told the next step', () => {
   it('taking payments without seeing who owes: who to ask, and for which switch', async () => {
     server.user = { role: 'onsite_manager', permissions: { 'payments.view': true, take_payment: true } }
     await render()
     expect(text()).toContain('Payments are taken here once your account can see who owes. Ask the account owner to turn on “View who owes + contact” for you under Team.')
     expect(text()).not.toContain('Outstanding Balances')
-    expect(host.querySelector('.stub-balances')).toBeNull()
+    expect(server.gets).toEqual([])
   })
   it('neither: ask the account owner', async () => {
     server.user = { role: 'onsite_manager', permissions: { 'payments.view': true } }

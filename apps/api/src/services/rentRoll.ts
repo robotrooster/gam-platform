@@ -30,6 +30,21 @@
  * properties (getScopedPropertyIds). Sums across households (`totals`) ride
  * only for a viewer seesGrandTotals admits (decisions #25).
  *
+ * 10/14 (Nic), about Lisa Scheeler, Mountain View's on-site manager ("View who
+ * owes", "Take payments", not "View all payments"): "they should see at least
+ * the payments tab on the financials tab ... kind of the same way that I see
+ * it, but not with that top view. Like it should just have the header that
+ * says it's for Mountain View RV, but not show all the totals, the work trade,
+ * all these things at the top in the header. Just have it show the record
+ * payment like it does and down the list, everybody else who's paid or paid
+ * late or whatever. I want to see all that." The picker and the open month
+ * also answer "View who owes" (balances.view) — the desk's view: their
+ * properties only (getScopedPropertyIds), every row, no `totals` (routes/
+ * balances: sums only with "View all payments"), and no work trade on any row
+ * (`workTrade: false` — S641, Nic: "I don't want her to see the covered by
+ * work trade"; withoutWorkTrade). The Rent Roll (history, payment health) and
+ * the tenant report stay "View all payments".
+ *
  * 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
  * The three GETs are on the bookkeeper allowlist (lib/bookkeeperAccess); their
  * property boxes narrow every read here as they narrow staff
@@ -1083,11 +1098,18 @@ export async function buildOpenMonth(opts: {
    * tenant-account actions"), staff without "Take payments" — no row does.
    */
   mayRecord?: boolean
+  /**
+   * The viewer may see work trade ("View all payments" or the books — routes/
+   * balances seesWorkTrade). false — the front desk (10/14, Nic; S641): every
+   * row leaves without it (withoutWorkTrade), and no sums ride (they carry it).
+   */
+  workTrade?: boolean
   /** The day to judge on ('YYYY-MM-DD'); default the property's today. For tests. */
   asOf?: string | null
 }): Promise<OpenMonthRoll> {
   const { landlordIds, property } = opts
   const mayRecord = opts.mayRecord !== false
+  const showWorkTrade = opts.workTrade !== false
   const month = openMonthOf(property, opts.asOf)
   const asOf = opts.asOf ?? null
   const propertyIds = [property.id]
@@ -1415,10 +1437,45 @@ export async function buildOpenMonth(opts: {
     .sort((a, z) => compareSpaces(a.space, z.space) || (a.leftOn ?? '').localeCompare(z.leftOn ?? '') || a.key.localeCompare(z.key))
   totals.movedOutOwed = dollars(movedOutOwing.reduce((t, m) => t + cents(m.owed), 0))
   const roll: OpenMonthRoll = {
-    propertyId: property.id, propertyName: property.name, month, rows: out, otherMoney: folder, movedOutOwing,
+    propertyId: property.id, propertyName: property.name, month,
+    rows: showWorkTrade ? out : out.map(withoutWorkTrade), otherMoney: folder, movedOutOwing,
   }
-  if (opts.withTotals) roll.totals = totals
+  if (opts.withTotals && showWorkTrade) roll.totals = totals
   return roll
+}
+
+/**
+ * 10/14 (Nic) — a row as the front desk gets it. S641 (Nic): "I don't want her
+ * to see the covered by work trade." For a viewer who may not see work trade
+ * the row leaves the server without it, the way GET /balances/:tenantId/
+ * invoices leaves it out: no work-trade amount, no "Work trade" in the methods,
+ * and the charges the hours covered are not on it — a line covered in full is
+ * gone, one covered in part shows what was left of it — so Invoiced = Paid +
+ * Owed still reads on the row, and what is owed (never work trade) is the
+ * same. A row with no work trade comes back as it was.
+ */
+export function withoutWorkTrade(row: OpenMonthRow): OpenMonthRow {
+  const covered = cents(row.workTrade) > 0 || row.workTradeOnly
+    || row.methods.includes(WORK_TRADE_MARKER_LABEL) || row.charges.some(c => cents(c.workTrade) > 0)
+  if (!covered) return row
+  const charges: RentRollCharge[] = []
+  for (const c of row.charges) {
+    const wt = cents(c.workTrade)
+    if (wt <= 0) { charges.push(c); continue }
+    const left = cents(c.invoiced) - wt
+    if (left <= 0) continue
+    // "Work trade" is how such a line reads paid; the money's own way is not
+    // on the line, so it says none.
+    charges.push({ ...c, invoiced: dollars(left), workTrade: 0, howPaid: c.howPaid === WORK_TRADE_MARKER_LABEL ? null : c.howPaid })
+  }
+  return {
+    ...row,
+    invoiced: dollars(Math.max(0, cents(row.invoiced) - cents(row.workTrade))),
+    workTrade: 0,
+    workTradeOnly: false,
+    methods: row.methods.filter(m => m !== WORK_TRADE_MARKER_LABEL),
+    charges,
+  }
 }
 
 /**

@@ -44,7 +44,8 @@ export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }:
    * Read what the Payments ledger says on each payment (the receipt photo, the
    * deposit date flag, why one came back). false for a bookkeeper (10/13, Nic:
    * the pages read-only) — those reads are not theirs (lib/bookkeeperAccess),
-   * so they are never asked.
+   * so they are never asked — and for the front desk (10/14, Nic: "View who
+   * owes" without "View all payments"), whom the Payments ledger refuses.
    */
   ledgerFacts?: boolean
 }) {

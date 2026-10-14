@@ -246,6 +246,18 @@ balancesRouter.get('/payments-by-month', requirePerm('payments.view_all'), async
  * server-side for anyone else; staff limited to their properties (a property
  * that is not theirs is a 404, never another property's money). Sums across
  * households ride only for a viewer seesGrandTotals admits (decisions #25).
+ * 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View who
+ * owes" and "Take payments", not "View all payments"): "they should see at
+ * least the payments tab ... kind of the same way that I see it, but not with
+ * that top view ... not show all the totals, the work trade, all these things
+ * at the top in the header. Just have it show the record payment like it does
+ * and down the list, everybody else who's paid or paid late or whatever." So
+ * the picker and the open month also answer "View who owes" (balances.view) —
+ * the desk's view, decided here: their properties only, every row, no sums
+ * (only with "View all payments"), and no work trade on any row (S641, Nic:
+ * "I don't want her to see the covered by work trade" — the same rule as GET
+ * /balances and /:tenantId/invoices). The Rent Roll (history, payment health)
+ * and the tenant report stay "View all payments".
  * 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages, read-only."
  * These three GETs are on the bookkeeper allowlist (lib/bookkeeperAccess) and
  * a bookkeeper holds payments.view_all there; their property boxes narrow
@@ -284,7 +296,7 @@ async function rentRollPropertyFor(req: import('express').Request, propertyId: s
   return property
 }
 
-balancesRouter.get('/rent-roll/properties', requirePerm('payments.view_all'), async (req, res, next) => {
+balancesRouter.get('/rent-roll/properties', requirePerm('payments.view_all', 'balances.view'), async (req, res, next) => {
   try {
     const data = await rentRollProperties({
       landlordIds: landlordScopeIds(req.user!),
@@ -295,17 +307,22 @@ balancesRouter.get('/rent-roll/properties', requirePerm('payments.view_all'), as
   } catch (e) { next(e) }
 })
 
-balancesRouter.get('/rent-roll/open-month', requirePerm('payments.view_all'), async (req, res, next) => {
+balancesRouter.get('/rent-roll/open-month', requirePerm('payments.view_all', 'balances.view'), async (req, res, next) => {
   try {
     const parsed = rentRollPropertyQuery.safeParse(req.query)
     if (!parsed.success) throw new AppError(400, parsed.error.issues[0]?.message ?? 'Pick a property.')
     const property = await rentRollPropertyFor(req, parsed.data.propertyId)
     // A property sold out of the account has history (the Rent Roll), never an open month.
     if (!property.owned) throw new AppError(404, 'That property is no longer yours — its bills from before are on the Rent Roll.')
+    // 10/14 (Nic): the front desk ("View who owes" without "View all payments")
+    // gets "not ... all the totals, the work trade, all these things at the top".
+    const seesAll = userHasPerm(req.user, 'payments.view_all')
     const data = await buildOpenMonth({
-      landlordIds: landlordScopeIds(req.user!), property, withTotals: seesGrandTotals(req.user),
+      landlordIds: landlordScopeIds(req.user!), property, withTotals: seesAll && seesGrandTotals(req.user),
       // The desk window only for a viewer who may log a payment (never a bookkeeper).
       mayRecord: userHasPerm(req.user, 'take_payment'),
+      // S641: work trade only for a viewer who may see it (as GET /balances).
+      workTrade: userHasPerm(req.user, 'payments.view_all', 'books.view'),
     })
     res.json({ success: true, data })
   } catch (e) { next(e) }

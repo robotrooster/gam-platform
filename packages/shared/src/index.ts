@@ -2123,7 +2123,9 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'balances', label: 'Who owes',
     sections: [{ label: 'Access', items: [
       { key: 'balances.view', label: 'View who owes + contact',
-        hint: 'Shows who owes, under Payments: their unit, how much, and their phone and email. Look only.' },
+        // 10/14 (Nic): the front desk sees the Payments page "the same way that
+        // I see it, but not with that top view" (no totals, no work trade).
+        hint: 'Shows the Payments page for this month at their properties: everyone who paid, paid late or still owes, with no totals and no work trade. Look only.' },
     ]}],
   },
   {

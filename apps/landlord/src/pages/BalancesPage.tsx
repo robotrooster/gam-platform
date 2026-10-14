@@ -43,6 +43,11 @@ import '../styles/credit-desk.css'
  * want her to see ... the payment histories from people") keep this list and
  * its Record payment, under the Payments tab (PaymentsPage renders it for
  * them, `title` "Payments").
+ *
+ * 10/14 (Nic): no longer rendered anywhere. The front desk sees the Payments
+ * page itself ("kind of the same way that I see it, but not with that top
+ * view" — PaymentsPage). Nothing imports this page; it and its test are left
+ * for removal.
  */
 export function BalancesPage({ title = 'Outstanding Balances', subtitle }: {
   /** The page's heading (the Payments tab names it "Payments"). */

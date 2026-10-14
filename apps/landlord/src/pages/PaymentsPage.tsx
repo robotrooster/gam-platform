@@ -20,7 +20,6 @@ import {
   rowName, hasRegisterMoney, stayRefundWords, registerWords, rowMethods, stayOwedWords,
 } from '../components/payments/openMonth'
 import { usePhone } from '../components/payments/usePhone'
-import { BalancesPage } from './BalancesPage'
 import '../styles/credit-desk.css'
 import '../components/payments/payments.css'
 
@@ -70,10 +69,25 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // payments". 10/13 (Nic): "Bookkeepers SEE the Payments and Rent Roll pages,
 // read-only" — the month for their properties, no Record payment, Issue credit
 // or Import, and no tenant report from a name. 10/13 (Nic): "REMOVE the
-// Outstanding Balances tab" — front-desk staff who take payments without
-// "View all payments" (S641: no payment histories) get the list of who owes
-// and its Record payment here instead; anyone else is told whom to ask. The
-// server refuses the month to them too.
+// Outstanding Balances tab"; anyone who may see neither is told whom to ask
+// (the server refuses the month to them too).
+//
+// 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View
+// who owes" and "Take payments", not "View all payments"): "they should see
+// at least the payments tab on the financials tab ... kind of the same way
+// that I see it, but not with that top view. Like it should just have the
+// header that says it's for Mountain View RV, but not show all the totals, the
+// work trade, all these things at the top in the header. Just have it show the
+// record payment like it does and down the list, everybody else who's paid or
+// paid late or whatever. I want to see all that." The front desk ("View who
+// owes" without "View all payments") gets this page — the old who-owes list is
+// gone — for the properties their scope gives them: the property in the
+// header (Change property only when there is another), Record payment and the
+// desk actions their own switches allow, and every row. The server sends them
+// no sums and no work trade (routes/balances; S641), so the strip at the top
+// is simply not there; a name opens no tenant report and an opened row reads
+// nothing more (the Rent Roll, the report and the Payments ledger stay "View
+// all payments").
 //
 // 10/13 (Nic), the afternoon answers: "the payments page ... should show all
 // money coming in. The people that paid short-term stays like Space RV 10 and
@@ -232,7 +246,12 @@ export function PaymentsPage() {
   // Nic: "never tenant-account actions"), and the tenant report a name opens
   // is not theirs either.
   const readOnly = role === 'bookkeeper'
-  const seesLedger = readOnly || can('payments.view_all')
+  const seesAll = readOnly || can('payments.view_all')
+  // 10/14 (Nic): the front desk — "View who owes" without "View all payments".
+  // The month, every row; no report from a name and no ledger reads (those are
+  // "View all payments"), and the server sends no sums or work trade.
+  const desk = !seesAll && can('balances.view')
+  const seesMonth = seesAll || desk
   const canTake = !readOnly && can('take_payment')
   const phone = usePhone()
   const [params, setParams] = useSearchParams()
@@ -240,7 +259,7 @@ export function PaymentsPage() {
 
   const propsQ = useQuery<RentRollProperty[]>(
     ['payments-page', 'properties'], () => apiGet<RentRollProperty[]>('/balances/rent-roll/properties'),
-    { enabled: seesLedger, retry: (n: number, e: unknown) => serverStatus(e) !== 403 && n < 2 })
+    { enabled: seesMonth, retry: (n: number, e: unknown) => serverStatus(e) !== 403 && n < 2 })
   const properties = openProperties(propsQ.data)
   const propertyId = propsQ.data ? propertyToShow(picked, propsQ.data) : null
   // Under 'payments-ledger': the desk window and posting ahead refresh it
@@ -248,7 +267,7 @@ export function PaymentsPage() {
   const rollQ = useQuery<OpenMonthRoll>(
     ['payments-ledger', 'open-month', propertyId],
     () => apiGet<OpenMonthRoll>(`/balances/rent-roll/open-month?propertyId=${encodeURIComponent(propertyId ?? '')}`),
-    { enabled: seesLedger && !!propertyId,
+    { enabled: seesMonth && !!propertyId,
       retry: (n: number, e: unknown) => ![400, 403, 404].includes(serverStatus(e) ?? 0) && n < 2 })
   const roll = rollQ.data && rollQ.data.propertyId === propertyId ? rollQ.data : undefined
   const refused = serverStatus(propsQ.error) === 403 || serverStatus(rollQ.error) === 403
@@ -323,14 +342,7 @@ export function PaymentsPage() {
       onDone={(msg) => { setCreditOpen(false); setNotice(msg); refresh() }} />
   )
 
-  // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Front-desk staff who
-  // take payments but may not see payment histories (S641) keep the list of
-  // who owes and its Record payment — here, under Payments.
-  if (!seesLedger && can('balances.view')) {
-    return <BalancesPage title="Payments" subtitle="Who owes, every unpaid month, and where you take a payment — open a property, then a name for the charges" />
-  }
-
-  if (!seesLedger || refused) {
+  if (!seesMonth || refused) {
     // Where to go from here, for exactly the switches this person has.
     return (
       <div>
@@ -338,7 +350,7 @@ export function PaymentsPage() {
         {noticeBar}
         <div className="card cd-empty">
           <p className="cd-msg">
-            Payments already made are shown to owners, property managers and staff allowed to see all payments.
+            Payments are shown to owners, property managers and staff allowed to see all payments or who owes.
             {canTake
               ? ' Payments are taken here once your account can see who owes. Ask the account owner to turn on “View who owes + contact” for you under Team.'
               : ' If you need to see payments, ask the account owner.'}
@@ -360,7 +372,8 @@ export function PaymentsPage() {
   /** The name, and the tags beside it: Delinquent, moved out, eviction mode. */
   const who = (r: OpenMonthRow) => {
     const name = rowName(r)
-    const report = readOnly ? null : reportPath(r)
+    // The tenant report is "View all payments" (never a bookkeeper's or the desk's).
+    const report = readOnly || desk ? null : reportPath(r)
     return (
       <>
         {name === null ? <span className="pay-muted">—</span> : report ? (
@@ -421,7 +434,7 @@ export function PaymentsPage() {
   const detail = (r: OpenMonthRow, month: string) => isStayRow(r)
     ? <StayDetail row={r} month={month} />
     : isSpaceOnlyRow(r) ? <SpaceDetail row={r} month={month} />
-      : <OpenMonthDetail row={r} month={month} canAddPhoto={canTake} ledgerFacts={!readOnly} />
+      : <OpenMonthDetail row={r} month={month} canAddPhoto={canTake} ledgerFacts={!readOnly && !desk} />
   const recordButton = (r: OpenMonthRow) => rowTakesPayment(r, canTake) && (
     <button className="btn btn-primary btn-sm" onClick={e => { e.stopPropagation(); openRecord(r) }}>
       Record payment

@@ -222,8 +222,9 @@ export function rowTakesPayment(row: OpenMonthRow, canTake: boolean): boolean {
  * What the Paid cell says. Work trade reads the way the Rent Roll reads it —
  * "+ $X work trade" beside Paid — so Invoiced = Paid + work trade + Owed adds
  * up on the row (10/13: "the payments page is the rent roll for the open
- * month"). Both pages open only for viewers allowed to see work trade
- * ("View all payments" — S641, routes/balances seesWorkTrade).
+ * month"). The front desk (10/14, Nic: the Payments page "not with that top
+ * view") is sent no work trade at all (S641, routes/balances seesWorkTrade), so
+ * for them there is never any to say.
  */
 export function paidWords(v: { paid: number; workTrade: number }): { amount: string | null; workTrade: string | null } {
   const amount = toCents(v.paid) > 0 ? money(v.paid) : null

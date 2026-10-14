@@ -104,9 +104,9 @@ const NAV_ITEMS: Array<{
   // visibleNavItemsFor).
   { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials', category: 'payments', bookkeeper: true },
   // 10/13 (Nic): "REMOVE the Outstanding Balances tab." Its address opens
-  // Payments (main.tsx); front-desk staff who see who owes find that list and
-  // Record payment under Payments (PaymentsPage), so "View who owes" alone
-  // shows the Payments tab (visibleNavItemsFor).
+  // Payments (main.tsx); front-desk staff who see who owes find the month and
+  // Record payment under Payments (PaymentsPage — 10/14, Nic: "not with that
+  // top view"), so "View who owes" alone shows the Payments tab (visibleNavItemsFor).
   { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
   // 10/11 (Nic): money in by type — by month and by day, no names.
   { to: '/income',        icon: BarChart2,        label: 'Money In',         section: null, hub: 'financials', bookkeeper: true },
