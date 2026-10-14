@@ -38,6 +38,8 @@ const server = vi.hoisted(() => ({
   showHold: null as Promise<void> | null,
   /** When set, reading the desk bill waits on it (a slow read). */
   quoteHold: null as Promise<void> | null,
+  /** When set, the desk bill is worked out from its URL (10/14: the bills ticked, ?bills=). */
+  quoteFor: null as ((url: string) => any) | null,
 }))
 
 const httpError = (status: number, error: string) =>
@@ -48,7 +50,7 @@ vi.mock('../lib/api', () => ({
     server.gets.push(url)
     if (url.includes('/record-manual/quote')) {
       if (server.quoteHold) await server.quoteHold
-      return JSON.parse(JSON.stringify(server.quote))
+      return JSON.parse(JSON.stringify(server.quoteFor ? server.quoteFor(url) : server.quote))
     }
     if (url.startsWith('/balances/')) return []
     if (url.startsWith('/payments?type=rent')) {
@@ -128,7 +130,7 @@ beforeEach(() => {
   server.recordHold = null; server.readerQuoteFor = null; server.readerGate = null; server.rentPages = null
   server.onCapture = null
   server.readers = [{ stripeReaderId: 'rdr_1', nickname: 'Front desk reader' }]
-  server.closed = new Set(); server.showHold = null; server.quoteHold = null
+  server.closed = new Set(); server.showHold = null; server.quoteHold = null; server.quoteFor = null
   server.intentStatus = 'requires_payment_method'
   server.readerQuote = null
   onClose = vi.fn(); onRecorded = vi.fn()
@@ -1127,5 +1129,74 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
     server.quote = allHeld([card])
     await act(async () => { await new Promise(r => setTimeout(r, 400)) })
     expect(quoteReads()).toBe(2)
+  })
+})
+
+describe('10/14 (Nic): each bill is its own thing — the desk ticks the bills', () => {
+  // Billy Miranda: RV 34 and RV 35 on two leases.
+  const line = (id: string, leaseId: string, unit: string, dueDate: string, amount: number, invoiceId: string) => ({
+    id, leaseId, invoiceId, type: 'rent', entryDescription: 'RENT', amount, dueDate,
+    creditAlreadyApplied: 0, notes: null, unitNumber: unit, propertyName: 'Oak Park',
+  })
+  const bill = (id: string, leaseId: string, unit: string, dueDate: string, amount: number, older: string[] = []) => ({
+    id, leaseId, unitNumber: unit, dueDate, total: amount, creditAlreadyApplied: 0, owed: amount, olderBillIds: older,
+    rows: [line(`${id}-rent`, leaseId, unit, dueDate, amount, id)],
+  })
+  const bills = [
+    bill('34sep', 'L34', 'RV 34', '2026-09-01', 457.07),
+    bill('35sep', 'L35', 'RV 35', '2026-09-01', 445.22),
+    bill('34oct', 'L34', 'RV 34', '2026-10-01', 370.13, ['34sep']),
+  ]
+  /** The server's quote for the bills named in ?bills=. */
+  const forUrl = (url: string) => {
+    const named = (/[?&]bills=([^&]*)/.exec(url)?.[1] ?? '').split(',').filter(Boolean)
+    const rows = bills.filter(b => named.includes(b.id)).flatMap(b => b.rows)
+    const current = Math.round(rows.reduce((t, r) => t + r.amount * 100, 0)) / 100
+    return deskQuote(0, {
+      rows, currentTotal: current, owedIfUsed: current, owedIfSaved: current, fullBalance: 1272.42,
+      bills, pickedBillIds: bills.filter(b => named.includes(b.id)).map(b => b.id), pickRefusal: null,
+    })
+  }
+  const box = (unit: string, month: string) => {
+    const group = [...host.querySelectorAll('.cd-bill-group')].find(g => g.textContent?.includes(`Space ${unit}`))
+    const label = [...(group?.querySelectorAll('label.cd-check') ?? [])].find(l => l.textContent?.startsWith(`${month} bill`))
+    return label?.querySelector('input[type=checkbox]') as HTMLInputElement | undefined
+  }
+
+  it('nothing is ticked for the desk; October waits for September; RV 34 alone is recorded with its bills named', async () => {
+    server.quoteFor = forUrl
+    await open()
+    expect(server.gets.find(u => u.includes('/record-manual/quote'))).toBe('/payments/r1/record-manual/quote?bills=')
+    expect(text()).toContain('Tick the bills this money pays.')
+    expect(box('RV 34', 'September')!.checked).toBe(false)
+    expect(box('RV 35', 'September')!.checked).toBe(false)
+    expect(box('RV 34', 'October')!.disabled).toBe(true)
+    expect(text()).toContain('Tick the September bill first — the oldest bill is paid first.')
+    expect(button(/^Cash$/)!.disabled).toBe(true)
+
+    await act(async () => { box('RV 34', 'September')!.click() })
+    await until(() => server.gets.includes('/payments/r1/record-manual/quote?bills=34sep'), 'the bill read for RV 34\'s September')
+    await until(() => !box('RV 34', 'October')!.disabled, 'October open once September is ticked')
+    await act(async () => { box('RV 34', 'October')!.click() })
+    await until(() => server.gets.includes('/payments/r1/record-manual/quote?bills=34sep,34oct'), 'the bill read for both RV 34 bills')
+    await until(() => text().includes('$827.20'), 'the total of the bills ticked')
+    await press(/^Cash$/)
+    await type(amountBox(), '827.20')
+    await press(/^Record \$827\.20/)
+    await until(() => records().length === 1, 'the record')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 827.2, bills: ['34sep', '34oct'] })
+  })
+
+  it('unticking September unticks October too, and nothing left ticked puts the method away', async () => {
+    server.quoteFor = forUrl
+    await open()
+    await act(async () => { box('RV 34', 'September')!.click() })
+    await until(() => !box('RV 34', 'October')!.disabled, 'October open')
+    await act(async () => { box('RV 34', 'October')!.click() })
+    await press(/^Cash$/)
+    await act(async () => { box('RV 34', 'September')!.click() })
+    await until(() => !box('RV 34', 'October')!.checked && box('RV 34', 'October')!.disabled, 'October unticked with September')
+    expect(button(/^Record /)).toBeUndefined()
+    expect(button(/^Cash$/)!.disabled).toBe(true)
   })
 })

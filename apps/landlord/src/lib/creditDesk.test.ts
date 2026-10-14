@@ -18,7 +18,8 @@ import {
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
   deskFigures, sameFigures, figuresMovedMessage, payerHits, matchPayerHits, returnDetail, chargeMonthsRange,
   readChargesById, plainRefusal, localToday, calendarDay, localDayOf, awaitingOpensAtWord,
-  type DeskQuote, type DeskQuoteRow, type TenderInput, type OutstandingRow, type PickerLease,
+  billsBySpace, canPickBill, togglePick, picksStillOpen, quoteMatchesPick, pickBillName,
+  type DeskQuote, type DeskQuoteBill, type DeskQuoteRow, type TenderInput, type OutstandingRow, type PickerLease,
 } from './creditDesk'
 import { PAYMENT_STATUSES, PAYMENT_STATUS_LABEL } from '@gam/shared'
 
@@ -907,5 +908,55 @@ describe('review fix (10/6): no credit talk while a balance is owed, and no "pai
     expect(postAheadText(40000, 300)).toBe('They owe $300.00 now. That is paid first; the other $100.00 is kept as paid ahead and goes on their bills by itself as they come.')
     expect(postAheadText(40000, 0)).toBe('They owe nothing now. The $400.00 is kept as paid ahead and goes on their bills by itself as they come.')
     expect(postAheadText(40000, undefined)).toBeNull()
+  })
+})
+
+describe('10/14 (Nic): the desk ticks the bills — each invoice is its own thing', () => {
+  // Billy Miranda: RV 34 and RV 35, two leases, a September and an October bill each.
+  const b = (id: string, leaseId: string, unit: string, dueDate: string, older: string[] = []): DeskQuoteBill => ({
+    id, leaseId, unitNumber: unit, dueDate, total: 100, creditAlreadyApplied: 0, owed: 100, olderBillIds: older,
+    rows: [row({ id: `${id}-rent`, leaseId, unitNumber: unit, dueDate, invoiceId: id })],
+  })
+  const bills = [
+    b('34sep', 'L34', 'RV 34', '2026-09-01'), b('35sep', 'L35', 'RV 35', '2026-09-01'),
+    b('34oct', 'L34', 'RV 34', '2026-10-01', ['34sep']), b('35oct', 'L35', 'RV 35', '2026-10-01', ['35sep']),
+  ]
+
+  it('lists the bills by space, oldest first, named by month', () => {
+    const g = billsBySpace(bills)
+    expect(g.map(x => [x.label, x.bills.map(y => y.id)])).toEqual([['Space RV 34', ['34sep', '34oct']], ['Space RV 35', ['35sep', '35oct']]])
+    expect(pickBillName(bills[2])).toBe('October bill')
+  })
+
+  it('October waits for September within a space; the other space is independent', () => {
+    expect(canPickBill(bills[2], [])).toBe(false)
+    expect(canPickBill(bills[2], ['34sep'])).toBe(true)
+    expect(canPickBill(bills[2], ['35sep'])).toBe(false)
+    // A newer bill whose older bill is not ticked stays unticked.
+    expect(togglePick(bills, [], '34oct')).toEqual([])
+    expect(togglePick(bills, [], '34sep')).toEqual(['34sep'])
+    expect(togglePick(bills, ['34sep'], '34oct')).toEqual(['34sep', '34oct'])
+    // RV 35 alone, without touching RV 34.
+    expect(togglePick(bills, [], '35sep')).toEqual(['35sep'])
+  })
+
+  it('unticking a bill unticks the newer bills of its space, and only those', () => {
+    expect(togglePick(bills, ['34sep', '35sep', '34oct', '35oct'], '34sep')).toEqual(['35sep', '35oct'])
+    expect(togglePick(bills, ['34sep', '34oct'], '34oct')).toEqual(['34sep'])
+  })
+
+  it('a ticked bill paid meanwhile drops off; Record waits for a read of exactly the bills ticked', () => {
+    expect(picksStillOpen(bills.slice(1), ['34sep', '35sep'])).toEqual(['35sep'])
+    expect(quoteMatchesPick({ bills, pickedBillIds: ['35sep', '34sep'] }, ['34sep', '35sep'])).toBe(true)
+    expect(quoteMatchesPick({ bills, pickedBillIds: ['34sep'] }, ['34sep', '35sep'])).toBe(false)
+    expect(quoteMatchesPick({ bills, pickedBillIds: [] }, [])).toBe(true)
+    // An older server sends no bills: nothing to match.
+    expect(quoteMatchesPick({ pickedBillIds: undefined }, ['x'])).toBe(true)
+  })
+
+  it('nothing ticked: Record still has a charge to post to, and the reader still lists every space', () => {
+    const q = quote({ rows: [], anchorOpen: false, bills })
+    expect(postAnchor(q)).toBe('34sep-rent')
+    expect(readerLeases(q).map(x => x.leaseId)).toEqual(['L34', 'L35'])
   })
 })

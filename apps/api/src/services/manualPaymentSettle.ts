@@ -55,6 +55,26 @@
 // The bank-deposit match (services/bankDepositConfirm) still settles ONE named
 // row at a time through the 'row' scope below: no credit, no receipt (it writes
 // its own), no surplus.
+//
+// 10/14 (Nic) — EACH BILL IS PAID ON ITS OWN: "we also need to be able to log
+// each separate bill as one payment ... the only thing I wanted paid together
+// was the itemized lines of that invoice. It couldn't settle separately, but
+// each separate invoice is its own thing." Billy Miranda (Oak Park, RV 34 and
+// RV 35, two leases): Tyler could not log his cash against RV 34 alone. The
+// desk now PICKS the bills the money pays (billIds; nothing is picked for it):
+//   - A BILL is one invoice — every line on it the desk takes, paid together
+//     and whole (a charge on no invoice is a bill by itself);
+//   - within ONE space the oldest bill is paid first: a bill can be picked
+//     only with every older open bill of that space ("October waits for
+//     September"); different spaces are independent (Nic 10/13: two spaces on
+//     two leases are two households);
+//   - everything above applies to the picked bills exactly as it applied to
+//     the whole balance: pay in full unless the property takes part payments,
+//     Use or Save, change or credit, the receipt, late fees judged bill by
+//     bill, every guard. Credit pays only the picked bills (the plan is built
+//     over them, creditUse householdQuote planOnly).
+// No bills named (the landlord assistant, a posted payment): every bill, the
+// whole balance, as before.
 
 import type { PoolClient } from 'pg'
 import type { ManualPaymentMethod } from '@gam/shared'
@@ -153,6 +173,12 @@ export interface ManualSettleInput {
    */
   settleWholeBalance?: boolean
   settleHousehold?: boolean
+  /**
+   * 10/14 (Nic): "each separate invoice is its own thing" — the bills (DeskBill
+   * ids) this money pays, picked at the desk. Within a space every older open
+   * bill must be picked too. Absent: every bill (the whole balance).
+   */
+  billIds?: readonly string[] | null
   /** What was handed over (household scope: required). */
   amountTendered?: number | null
   /** Cash over the bill: "Give $X change" or "Keep $X as credit". No default. */
@@ -317,11 +343,53 @@ export interface DeskRow {
   unitId: string | null
 }
 
+/**
+ * 10/14 (Nic): one bill — "the itemized lines of that invoice", paid together
+ * and whole. Its id is its invoice's (deskBillId); a charge on no invoice is a
+ * bill by itself.
+ */
+export interface DeskBill {
+  id: string
+  /** The space (lease) the bill is on; null for charges on no lease. */
+  leaseId: string | null
+  unitNumber: string | null
+  /** YYYY-MM-DD: the invoice's due date, else its oldest line's. */
+  dueDate: string
+  /** Its lines the desk takes, oldest first. */
+  rows: DeskRow[]
+  total: number
+  /** Credit already spent on its lines. */
+  creditAlreadyApplied: number
+  /** What it still owes before any credit the desk uses now. */
+  owed: number
+  /**
+   * The older open bills of the same space. "October waits for September":
+   * this bill can be picked only with every one of them.
+   */
+  olderBillIds: string[]
+}
+
+/** 10/14: the bill a charge is on — its invoice, else the charge itself. */
+export function deskBillId(r: { id: string; invoiceId: string | null }): string {
+  return r.invoiceId ?? r.id
+}
+
 export interface DeskQuote {
   tenantId: string
   landlordId: string
-  /** What the desk takes now: the household's bank-payable rows (not the old balance), oldest first. */
+  /**
+   * What the desk takes now: the bank-payable rows (not the old balance) of
+   * the bills picked — every bill when none were named — oldest first.
+   */
   rows: DeskRow[]
+  /** 10/14 (Nic): every open bill the desk takes, oldest first — what the desk picks from. */
+  bills: DeskBill[]
+  /** The bills picked that are open here, in bill order; null when none were named (every bill). */
+  pickedBillIds: string[] | null
+  /** Picked bills no longer open here (paid meanwhile, or a payment on its way): in no figure. */
+  pickedNotOpen: string[]
+  /** A picked bill an older open bill of the same space waits on, that older bill not picked. */
+  pickedOutOfOrder: Array<{ billId: string; olderBillId: string }>
   /** The old balance (carried forward): paid last, from whatever is over. */
   carried: DeskRow[]
   /** GAM's charges and another company's on this household's bill: paid online. */
@@ -349,7 +417,7 @@ export interface DeskQuote {
   owedIfUsed: number
   /** Money owed now if the desk saves it. */
   owedIfSaved: number
-  /** The whole balance the portal shows: current + old balance + pay online. */
+  /** The whole balance the portal shows: every bill + old balance + pay online (picked or not). */
   fullBalance: number
   creditPlan: CreditPlanLine[]
   scheduledRetries: ScheduledRetry[]
@@ -378,28 +446,72 @@ function sortDesk(rows: DeskRow[]): DeskRow[] {
   }))).map(x => byId.get(x.id)!)
 }
 
+/** 10/14: "September" for a bill due 2026-09-01. */
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+function billWords(b: Pick<DeskBill, 'dueDate' | 'unitNumber'>): string {
+  const m = /^\d{4}-(\d{2})/.exec(b.dueDate)
+  const month = m ? MONTH_NAMES[Number(m[1]) - 1] : null
+  return `the ${month ? `${month} ` : ''}bill${b.unitNumber ? ` on ${b.unitNumber}` : ''}`
+}
+
+/**
+ * 10/14 (Nic): why the bills picked cannot be taken as they are — a picked
+ * bill no longer open here (409: look at the bills again), or one an older
+ * open bill of its space waits on (422: "October waits for September").
+ * Null when the pick is good (or nothing was named).
+ */
+export function pickRefusal(q: Pick<DeskQuote, 'bills' | 'pickedBillIds' | 'pickedNotOpen' | 'pickedOutOfOrder'>): { status: 409 | 422; text: string } | null {
+  if (q.pickedBillIds === null) return null
+  if (q.pickedNotOpen.length > 0) {
+    return {
+      status: 409,
+      text: 'A bill picked here is no longer open — it was paid, or a payment for it is on its way. Nothing was recorded; look at the bills again.',
+    }
+  }
+  const first = q.pickedOutOfOrder[0]
+  if (first) {
+    const older = q.bills.find(b => b.id === first.olderBillId)
+    const w = older ? billWords(older) : 'an older bill of the same space'
+    return {
+      status: 422,
+      text: `${w.charAt(0).toUpperCase()}${w.slice(1)} is older and still open — pick it too. In one space the oldest bill is paid first.`,
+    }
+  }
+  return null
+}
+
 /**
  * What the desk window shows for one household (a person with one company),
  * and what the desk settle takes. Read-only; `lock` inside a write after
- * lockHousehold.
+ * lockHousehold. 10/14 (Nic): `billIds` — the bills the desk picked; every
+ * figure but the full balance is for those bills alone. Absent: every bill.
  */
 export async function deskQuote(
   client: PoolClient,
-  opts: { tenantId: string; landlordId: string; lock?: boolean },
+  opts: { tenantId: string; landlordId: string; lock?: boolean; billIds?: readonly string[] | null },
 ): Promise<DeskQuote> {
-  const q = await householdQuote(client, { tenantId: opts.tenantId, landlordId: opts.landlordId, lock: opts.lock })
+  const picked = opts.billIds == null ? null : new Set(opts.billIds)
+  const q = await householdQuote(client, {
+    tenantId: opts.tenantId, landlordId: opts.landlordId, lock: opts.lock,
+    // 10/14: credit pays only the bills picked.
+    ...(picked ? { planOnly: (r: QuoteRow) => picked.has(deskBillId(r)) } : {}),
+  })
   const all: QuoteRow[] = [...q.leases.flatMap(l => l.rows), ...q.noLeaseRows]
   const ids = [...new Set(all.map(r => r.id))]
-  const units = new Map<string, { unitId: string | null; blocked: boolean }>()
+  const units = new Map<string, { unitId: string | null; blocked: boolean; unitNumber: string | null; billDue: string | null }>()
   if (ids.length > 0) {
-    const u = await client.query<{ id: string; unit_id: string | null; blocked: boolean }>(
-      `SELECT p.id, p.unit_id, COALESCE(un.payment_block, FALSE) AS blocked
+    const u = await client.query<{ id: string; unit_id: string | null; blocked: boolean; unit_number: string | null; bill_due: string | null }>(
+      `SELECT p.id, p.unit_id, COALESCE(un.payment_block, FALSE) AS blocked, un.unit_number,
+              inv.due_date::text AS bill_due
          FROM payments p LEFT JOIN units un ON un.id = p.unit_id
+         LEFT JOIN invoices inv ON inv.id = p.invoice_id
         WHERE p.id = ANY($1::uuid[])`, [ids])
-    for (const r of u.rows) units.set(r.id, { unitId: r.unit_id, blocked: r.blocked })
+    for (const r of u.rows) units.set(r.id, { unitId: r.unit_id, blocked: r.blocked, unitNumber: r.unit_number, billDue: r.bill_due })
   }
   const seen = new Set<string>()
-  const rows: DeskRow[] = []
+  // Every row the desk takes, on every bill (deskRows), and the space each is on.
+  const deskRows: DeskRow[] = []
+  const spaceOf = new Map<string, string | null>()
   const carried: DeskRow[] = []
   const payOnline: DeskRow[] = []
   const paused: DeskRow[] = []
@@ -407,7 +519,7 @@ export async function deskQuote(
   for (const r of all) {
     if (seen.has(r.id)) continue
     seen.add(r.id)
-    const unit = units.get(r.id) ?? { unitId: null, blocked: false }
+    const unit = units.get(r.id) ?? { unitId: null, blocked: false, unitNumber: null, billDue: null }
     const row = toDeskRow(r, unit.unitId)
     // Money already on its way. GAM's FlexPay pull is never counted: FlexPay
     // never appears in the landlord portal (CLAUDE.md, S541).
@@ -415,20 +527,61 @@ export async function deskQuote(
     if (!r.payable || r.pastStayEnd) continue
     if (r.bankPayable && unit.blocked) { paused.push(row); continue }
     if (r.bankPayable && r.carried) { carried.push(row); continue }
-    if (r.bankPayable) { rows.push(row); continue }
+    if (r.bankPayable) { deskRows.push(row); spaceOf.set(r.id, r.scopeLeaseId ?? r.leaseId); continue }
     if (r.required) payOnline.push(row)
   }
+
+  // 10/14 (Nic): the bills — each invoice's lines the desk takes, together.
+  const byBill = new Map<string, DeskRow[]>()
+  for (const r of sortDesk(deskRows)) {
+    const k = deskBillId(r)
+    byBill.set(k, [...(byBill.get(k) ?? []), r])
+  }
+  const billList = [...byBill.entries()].map(([id, rs]) => {
+    const head = units.get(rs[0].id)
+    const total = rs.reduce((s, r) => s + toCents(r.amount), 0)
+    const appliedC = rs.reduce((s, r) => s + toCents(r.appliedCredit), 0)
+    return {
+      id,
+      leaseId: spaceOf.get(rs[0].id) ?? null,
+      unitNumber: rs.map(r => units.get(r.id)?.unitNumber).find(x => !!x) ?? null,
+      dueDate: (head?.billDue ?? rs.map(r => r.dueDate).sort()[0]).slice(0, 10),
+      rows: rs,
+      total: toDollars(total),
+      creditAlreadyApplied: toDollars(appliedC),
+      owed: toDollars(Math.max(0, total - appliedC)),
+      olderBillIds: [] as string[],
+    }
+  }).sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.id.localeCompare(b.id))
+  // "October waits for September": within one space, every bill due earlier.
+  for (const b of billList) {
+    b.olderBillIds = billList.filter(o => o.leaseId === b.leaseId && o.dueDate < b.dueDate).map(o => o.id)
+  }
+  const bills: DeskBill[] = billList
+  const openBills = new Set(bills.map(b => b.id))
+  const pickedBillIds = picked == null ? null : bills.filter(b => picked.has(b.id)).map(b => b.id)
+  const pickedNotOpen = picked == null ? [] : [...picked].filter(id => !openBills.has(id)).sort()
+  const pickedOutOfOrder: Array<{ billId: string; olderBillId: string }> = []
+  if (picked) {
+    for (const b of bills) {
+      if (!picked.has(b.id)) continue
+      for (const o of b.olderBillIds) if (!picked.has(o)) pickedOutOfOrder.push({ billId: b.id, olderBillId: o })
+    }
+  }
+  // What the desk takes now: the bills picked (every bill when none were named).
+  const rows = picked == null ? deskRows : deskRows.filter(r => picked.has(deskBillId(r)))
+
   const deskIds = new Set(rows.map(r => r.id))
   // The household plan counts credit a scheduled bank retry sets aside as
   // free (paying now replaces the retry). The desk replaces only the retries
   // on rows it takes (supersedeScheduledRetry on the current bill and the old
   // balance), so credit a retry holds on any other row — a space in eviction
-  // hold, rent past a stay's end — is not the desk's to spend: spending it
-  // would take the credit below zero. Each credit's share here is cut to what
-  // is free at the desk: what is on it now, plus what replacing those
-  // retries gives back. The figure is the same before and after that
-  // replacing, so the window and the settle agree. (The portal refuses the
-  // same case: rentCharge creditStillHeldElsewhere.)
+  // hold, rent past a stay's end, a bill not picked — is not the desk's to
+  // spend: spending it would take the credit below zero. Each credit's share
+  // here is cut to what is free at the desk: what is on it now, plus what
+  // replacing those retries gives back. The figure is the same before and
+  // after that replacing, so the window and the settle agree. (The portal
+  // refuses the same case: rentCharge creditStillHeldElsewhere.)
   const takenIds = [...rows, ...carried].map(r => r.id)
   const releasedHere = new Map<string, number>()
   if (takenIds.length > 0) {
@@ -485,10 +638,15 @@ export async function deskQuote(
   const usable = creditPlan.reduce((s, l) => s + toCents(l.amount), 0)
   const current = sum(rows)
   const allRows = [...rows, ...carried]
+  const taken = new Set(takenIds)
   return {
     tenantId: opts.tenantId,
     landlordId: opts.landlordId,
     rows: sortDesk(rows),
+    bills,
+    pickedBillIds,
+    pickedNotOpen,
+    pickedOutOfOrder,
     carried: sortDesk(carried),
     payOnline: sortDesk(payOnline),
     paused: sortDesk(paused),
@@ -503,9 +661,13 @@ export async function deskQuote(
     creditOnFile: q.totals.creditOnFile,
     owedIfUsed: toDollars(Math.max(0, current - applied - usable)),
     owedIfSaved: toDollars(Math.max(0, current - applied)),
-    fullBalance: toDollars(current + sum(carried) + sum(payOnline)),
+    // The whole balance, every bill whether picked or not.
+    fullBalance: toDollars(sum(deskRows) + sum(carried) + sum(payOnline)),
     creditPlan,
-    scheduledRetries: q.leases.flatMap(l => l.scheduledRetries),
+    // A bank retry is replaced only when its bill is taken here (10/14: a bill
+    // not picked keeps its retry).
+    scheduledRetries: q.leases.flatMap(l => l.scheduledRetries)
+      .filter(rt => picked == null || rt.paymentIds.some(id => taken.has(id))),
     retryRowIds: allRows.filter(r => all.some(x => x.id === r.id && (x.retryScheduled || x.heldOnRow > 0))).map(r => r.id),
     partialAllowed,
   }
@@ -849,14 +1011,24 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   }
 
   await lockHousehold(client, tenantId, landlordId)
+  // 10/14 (Nic): the bills the desk picked (none named: every bill). A pick
+  // that no longer stands — a bill paid meanwhile, or one an older open bill
+  // of its space waits on — is refused before anything is written.
+  const billIds = input.billIds ?? null
   // Paying at the desk over a scheduled bank retry replaces that retry: its
   // held credit comes back first and the pull is canceled after commit.
-  const before = await deskQuote(client, { tenantId, landlordId, lock: true })
+  const before = await deskQuote(client, { tenantId, landlordId, lock: true, billIds })
+  const badPick = pickRefusal(before)
+  if (badPick) throw new AppError(badPick.status, badPick.text)
   let cancelAfterCommit: string[] = []
   if (before.retryRowIds.length > 0) {
     cancelAfterCommit = (await supersedeScheduledRetry(client, before.retryRowIds)).cancelAfterCommit
   }
-  let q = before.retryRowIds.length > 0 ? await deskQuote(client, { tenantId, landlordId, lock: true }) : before
+  let q = before.retryRowIds.length > 0 ? await deskQuote(client, { tenantId, landlordId, lock: true, billIds }) : before
+  // 10/14: extra money kept on the account sits on the space of the newest
+  // bill picked (paid-ahead money then goes on that space's own bills).
+  const pickedLease = billIds === null ? null
+    : before.bills.filter(b => (before.pickedBillIds ?? []).includes(b.id) && b.leaseId).at(-1)?.leaseId ?? null
 
   // 10/5 (Nic): a bank deposit dated before late fees were charged — the
   // unpaid ones come off first on each bill the deposit pays in full
@@ -890,7 +1062,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
         await client.query('RELEASE SAVEPOINT bank_deposit_backdate')
         break
       }
-      const withoutFees = await deskQuote(client, { tenantId, landlordId, lock: true })
+      const withoutFees = await deskQuote(client, { tenantId, landlordId, lock: true, billIds })
       // A property that takes no part payments: paid in full, or refused
       // below as short anyway — the refusal then names the bill without those fees.
       const paidInFull = withoutFees.partialAllowed ? invoicesPaidInFull(withoutFees, tendered, choseCredit) : keep
@@ -912,6 +1084,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     }
   }
 
+  // 10/14 (Nic): nothing is picked for the desk.
+  if (q.pickedBillIds !== null && q.pickedBillIds.length === 0 && q.bills.length > 0 && q.carried.length === 0) {
+    throw new AppError(422, 'Pick the bills this money pays — each bill is paid whole.')
+  }
   if (q.rows.length === 0 && q.carried.length === 0) {
     if (q.paused.length > 0) {
       throw new AppError(409, 'This space is in eviction mode — recording a payment is paused. Contact the landlord.')
@@ -1078,7 +1254,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // so a resident with no lease here — a moved-out resident paying a final
   // bill with a check over it — is refused once, never asked to confirm the
   // amount first, and nothing (not even an old-balance split) is written.
-  const creditLease = keepAsCredit ? await leaseForCredit(client, input, tenantId, landlordId) : null
+  const creditLease = keepAsCredit ? await leaseForCredit(client, input, tenantId, landlordId, pickedLease) : null
   if (keepAsCredit && !creditLease) {
     throw new AppError(409, isCash
       ? 'This resident has no lease here to hold a credit on. Hand the difference back as change.'
@@ -1225,7 +1401,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
           payment_method, gross_amount, processing_fee_amount, settled_at, reference, notes, received_by)
        VALUES ($1, $2, $3, $4, $5, $6, 'settled', $7, NULL, 0, COALESCE($8::timestamptz, NOW()), $9, $10, $11)
        RETURNING id`,
-      [tenantId, creditLease ?? payment.lease_id, landlordId, toDollars(kept).toFixed(2),
+      [tenantId, creditLease ?? pickedLease ?? payment.lease_id, landlordId, toDollars(kept).toFixed(2),
        toDollars(amountSettled).toFixed(2), toDollars(keepAsCredit ? surplus : 0).toFixed(2),
        method, input.settledAt, input.reference || null,
        [input.notes, handed].filter(Boolean).join(' ') || null, input.takenBy ?? null])
@@ -1447,16 +1623,22 @@ async function tellTenantLateFeesCredited(
   })
 }
 
-/** The lease paid-ahead money sits on: the one asked for, the opened charge's, else the newest active one. */
-async function leaseForCredit(client: PoolClient, input: ManualSettleInput, tenantId: string, landlordId: string): Promise<string | null> {
+/**
+ * The lease paid-ahead money sits on: the one asked for, the space of the
+ * bills picked (10/14), the opened charge's, else the newest active one.
+ */
+async function leaseForCredit(
+  client: PoolClient, input: ManualSettleInput, tenantId: string, landlordId: string, pickedLease: string | null = null,
+): Promise<string | null> {
   const r = await client.query<{ id: string }>(
     `SELECT l.id FROM leases l
       WHERE l.landlord_id = $2
         AND l.status IN ('active','pending')
         AND EXISTS (SELECT 1 FROM lease_tenants lt WHERE lt.lease_id = l.id AND lt.tenant_id = $1
                        AND lt.status IN ('active','pending_add','pending_remove'))
-      ORDER BY COALESCE(l.id = $3::uuid, FALSE) DESC, COALESCE(l.id = $4::uuid, FALSE) DESC, (l.status = 'active') DESC, l.start_date DESC, l.id
+      ORDER BY COALESCE(l.id = $3::uuid, FALSE) DESC, COALESCE(l.id = $5::uuid, FALSE) DESC,
+               COALESCE(l.id = $4::uuid, FALSE) DESC, (l.status = 'active') DESC, l.start_date DESC, l.id
       LIMIT 1`,
-    [tenantId, landlordId, input.creditLeaseId ?? null, input.payment.lease_id ?? null])
+    [tenantId, landlordId, input.creditLeaseId ?? null, input.payment.lease_id ?? null, pickedLease])
   return r.rows[0]?.id ?? null
 }

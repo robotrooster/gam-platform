@@ -23,7 +23,7 @@ import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_R
          confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
 import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
-import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, tenantsDepositAtBank, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
+import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, tenantsDepositAtBank, pickRefusal, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
 import { canDeleteLateFees, deleteLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '../services/lateFeeDelete'
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
          usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
@@ -1862,6 +1862,11 @@ const recordManualSchema = z.object({
   // S652 (Nic): one person, several leases, one balance. Always the household
   // now; kept so an older screen's flag is accepted.
   settleHousehold:  z.boolean().optional(),
+  // 10/14 (Nic): "each separate invoice is its own thing" — the bills this
+  // money pays, as the window listed them (its quote's bills[].id). Each is
+  // paid whole; within a space every older open bill is picked too. Absent:
+  // every bill (the whole balance).
+  bills:            z.array(z.string().uuid()).max(500).optional(),
   // 10/5 (Nic): a bank deposit is logged after the fact, from the bank's
   // receipt — the day the resident put the money in the bank (YYYY-MM-DD, not
   // after today). The payment counts from that day (its on-time or late mark),
@@ -2004,6 +2009,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       settledAt: depositedAt,
       reference: body.reference ?? null,
       settleHousehold: true,
+      billIds: body.bills ?? null,
       amountTendered: body.amountTendered,
       surplusHandling: body.surplusHandling,
       creditToUse: body.creditToUse ?? null,
@@ -2111,6 +2117,12 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
     const depositedOn = typeof req.query.depositedOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.depositedOn)
       ? req.query.depositedOn : null
     if (depositedOn) depositedOnAsSettledAt('bank_deposit', depositedOn, await propertyToday(pmt.property_id))
+    // 10/14 (Nic): ?bills=id,id — the bills the desk picked (?bills= : none
+    // yet). Every figure but the full balance is for those bills alone.
+    // Absent: every bill.
+    const billIds = typeof req.query.bills === 'string'
+      ? req.query.bills.split(',').map((x: string) => x.trim()).filter((x: string) => z.string().uuid().safeParse(x).success)
+      : null
     let lateFeesOffIfPaidInFull = 0
     // 10/6 (Nic): how much of that is on the onboarding month's bill — where
     // the window offers "Delete the late fee completely (onboarding month)".
@@ -2123,17 +2135,17 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       await client.query('BEGIN')
       try {
         await lockHousehold(client, pmt.tenant_id, pmt.landlord_id)
-        const q0 = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true })
+        const q0 = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true, billIds })
         const z = await backdatedLateFeesPreview(client, q0, depositedOn)
         lateFeesOffIfPaidInFull = z.unbilled
         for (const [invoiceId, amount] of z.byBill) lateFeesOffByBill.set(invoiceId, amount)
         onboardingLateFeesOff = z.onboardingOff
-        q = z.offIds.length > 0 ? await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true }) : q0
+        q = z.offIds.length > 0 ? await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, lock: true, billIds }) : q0
       } finally {
         await client.query('ROLLBACK').catch(() => {})
       }
     } else {
-      q = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id })
+      q = await deskQuote(client, { tenantId: pmt.tenant_id, landlordId: pmt.landlord_id, billIds })
     }
     // decisions.md #48.4: a card payment still waiting on its card's bank
     // (inside its 30 minutes) has charged nothing yet. Its rows are held, so
@@ -2144,7 +2156,7 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
     // household's is still processing.
     const awaitingCard = (await awaitingCardConfirmations(client, pmt.tenant_id))
       .filter(a => a.landlordId === pmt.landlord_id)
-    const ids = [...q.rows, ...q.carried, ...q.payOnline, ...q.paused].map(r => r.id)
+    const ids = [...q.bills.flatMap(b => b.rows), ...q.carried, ...q.payOnline, ...q.paused].map(r => r.id)
     const labels = ids.length ? await client.query<any>(
       `SELECT p.id, p.notes, u.unit_number, pr.name AS property_name
          FROM payments p LEFT JOIN units u ON u.id = p.unit_id LEFT JOIN properties pr ON pr.id = u.property_id
@@ -2159,11 +2171,25 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       notes: byId.get(r.id)?.notes ?? null, unitNumber: byId.get(r.id)?.unit_number ?? null,
       propertyName: byId.get(r.id)?.property_name ?? null,
     }))
+    // 10/14 (Nic): a picked bill no longer open is left out of every figure
+    // (the window drops it too); one an older open bill of its space waits on
+    // is said, and Record waits until that older bill is picked.
+    const refusal = pickRefusal(q)
     res.json({ success: true, data: {
       anchorPaymentId: pmt.id,
       anchorOpen: (pmt.status === 'pending' || pmt.status === 'failed') && !pmt.work_trade_suspended_at,
       paymentsPaused: pmt.payment_block === true,
+      // What the desk takes now: the bills picked (every bill when none were named).
       rows: show(q.rows),
+      // 10/14 (Nic): every open bill the desk takes — each invoice's lines,
+      // paid together — with the older bills of its space it waits on.
+      bills: q.bills.map(b => ({
+        id: b.id, leaseId: b.leaseId, unitNumber: b.unitNumber, dueDate: b.dueDate,
+        total: b.total, creditAlreadyApplied: b.creditAlreadyApplied, owed: b.owed,
+        olderBillIds: b.olderBillIds, rows: show(b.rows),
+      })),
+      pickedBillIds: q.pickedBillIds,
+      pickRefusal: refusal && refusal.status === 422 ? refusal.text : null,
       currentTotal: q.currentTotal,
       oldBalance: show(q.carried),
       oldBalanceTotal: q.carriedTotal,

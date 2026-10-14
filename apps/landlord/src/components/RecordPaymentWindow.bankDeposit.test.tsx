@@ -217,7 +217,7 @@ describe('Bank deposit in the desk window', () => {
     await press(/^Bank deposit$/)
     expect(text()).toContain('625')
     await type(field(/^Date deposited$/)!, '2026-10-01')
-    await until(() => server.gets.some(u => u === '/payments/r1/record-manual/quote?depositedOn=2026-10-01'), 'the bill as of the deposit')
+    await until(() => server.gets.some(u => u === '/payments/r1/record-manual/quote?bills=&depositedOn=2026-10-01'), 'the bill as of the deposit')
     // 10/6 (Nic): nothing hypothetical — no word about late fees until an
     // amount is typed that pays the bill in full.
     expect(text()).not.toContain('late fees were charged')

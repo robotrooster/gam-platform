@@ -42,6 +42,7 @@ import {
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
   AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeeOutcomeText, lateFeesBackOnShortBills,
   onboardingLateFeeBoxApplies, recordableMethods, partPaymentLines, backdatedLateFeeText, deskBillBalance, postAheadText,
+  billsBySpace, canPickBill, togglePick, picksStillOpen, quoteMatchesPick, pickBillName,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -161,6 +162,49 @@ function BillLines({ title, rows, labels, sub }: {
 }
 
 /**
+ * 10/14 (Nic): every open bill, by space, a box each — "each separate invoice
+ * is its own thing", its lines paid together. Nothing is ticked for the desk.
+ * Within a space the oldest bill is paid first: a newer bill's box opens once
+ * every older one is ticked, and unticking a bill unticks the newer ones.
+ */
+function BillPicker({ bills, picked, labels, disabled = false, onPick }: {
+  bills: NonNullable<DeskQuote['bills']>; picked: string[]
+  labels: Map<string, { label: string; detail: string | null }>; disabled?: boolean; onPick: (id: string) => void
+}) {
+  if (!bills.length) return null
+  const spaces = billsBySpace(bills)
+  return (<>
+    {spaces.map(sp => (
+      <div key={sp.key} className="cd-bill-group">
+        <div className="cd-section-label">{sp.label ?? (spaces.length > 1 ? 'Other charges' : 'Bills')}</div>
+        {sp.bills.map(b => {
+          const on = picked.includes(b.id)
+          const open = on || canPickBill(b, picked)
+          const waitsOn = open ? null : bills.find(o => b.olderBillIds.includes(o.id) && !picked.includes(o.id))
+          return (
+            <div key={b.id} className="cd-line">
+              <label className="cd-check">
+                <input type="checkbox" checked={on} disabled={disabled || !open} onChange={() => onPick(b.id)} />
+                <span>
+                  {pickBillName(b)}
+                  <span className="cd-line-meta"> · due {dayWord(b.dueDate)}</span>
+                  <span className="cd-check-sub">
+                    {b.rows.map(r => `${lineName(r, labels)} ${money(r.amount)}`).join(' · ')}
+                    {toCents(b.creditAlreadyApplied) > 0 ? ` · credit applied ${money(-b.creditAlreadyApplied)}` : ''}
+                  </span>
+                  {waitsOn && <span className="cd-check-sub">Tick the {pickBillName(waitsOn)} first — the oldest bill is paid first.</span>}
+                </span>
+              </label>
+              <span className="mono">{money(b.owed)}</span>
+            </div>
+          )
+        })}
+      </div>
+    ))}
+  </>)
+}
+
+/**
  * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
  * discretion." Off by default; shown only when a bank deposit dated back takes
  * a late fee off the onboarding month's bill and this person may tick it.
@@ -205,7 +249,11 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const [depositedOn, setDepositedOn] = useState(deskToday)
   const backdatedTo = mode === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(depositedOn) && depositedOn < deskToday
     ? depositedOn : null
-  const quoteKey = ['desk-quote', anchorPaymentId, backdatedTo]
+  // 10/14 (Nic): "each separate invoice is its own thing" — the bills this
+  // money pays, ticked by the desk (nothing is ticked for it). The bill is
+  // read for exactly those (?bills=).
+  const [picked, setPicked] = useState<string[]>([])
+  const quoteKey = ['desk-quote', anchorPaymentId, backdatedTo, picked.join(',')]
   // The window's result, said ONCE (fix pass 3): the screen that stays up with
   // the change to hand back, and the one notice the page keeps.
   const [done, setDone] = useState<{ text: string; change: number } | null>(null)
@@ -222,7 +270,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // moment that space is taken. Fix pass 3: once the window is finished it is
   // not read at all — the done screen (and the change on it) never moves.
   const { data: quote, isLoading, error: quoteError, refetch, isFetching, dataUpdatedAt, errorUpdatedAt } = useQuery<DeskQuote>(
-    quoteKey, () => apiGet<DeskQuote>(`/payments/${anchorPaymentId}/record-manual/quote${backdatedTo ? `?depositedOn=${backdatedTo}` : ''}`),
+    quoteKey, () => apiGet<DeskQuote>(`/payments/${anchorPaymentId}/record-manual/quote?bills=${picked.join(',')}${backdatedTo ? `&depositedOn=${backdatedTo}` : ''}`),
     { staleTime: 0, cacheTime: 0, retry: false, enabled: !done, keepPreviousData: true,
       refetchOnWindowFocus: !anyReaderBusy && !done, refetchOnReconnect: !anyReaderBusy && !done })
   // The words each line goes by — the same lines the Outstanding breakdown reads.
@@ -305,7 +353,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
         }
       } else {
         finished.current = true
-        const restOpen = !!quote && (quote.rows.length > 0 || quote.oldBalance.length > 0)
+        const restOpen = !!quote && ((quote.bills ?? quote.rows).length > 0 || quote.oldBalance.length > 0)
         onRecorded(`Took ${money(taken)} by card on the reader from ${name}.${restOpen ? ' The rest of what they owe is still open.' : ''}`)
       }
     }
@@ -341,6 +389,26 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }
   /** The desk did something: the last message has been read. One message at a time. */
   const clearMsg = () => { setMsg(null); refusal.current = null }
+
+  // 10/14: a ticked bill paid meanwhile (another desk, the tenant online) drops off.
+  useEffect(() => {
+    if (!quote?.bills) return
+    const still = picksStillOpen(quote.bills, picked)
+    if (still.length !== picked.length) setPicked(still)
+  }, [quote?.bills])   // eslint-disable-line react-hooks/exhaustive-deps
+  /** Tick or untick a bill: the figures are read again for the bills ticked, and every answer is asked again. */
+  const pickBill = (id: string) => {
+    if (!quote?.bills) return
+    const next = togglePick(quote.bills, picked, id)
+    setPicked(next)
+    clearAnswers(); clearMsg()
+    if (next.length === 0 && mode !== null && mode !== 'reader') setMode(null)
+  }
+  // Bills listed but none ticked: nothing is taken by hand until one is.
+  const needPick = !!quote?.bills && quote.bills.length > 0 && picked.length === 0
+  // Record waits while the read is for other bills than those ticked, or the
+  // server says the pick cannot stand (an older bill of the space not ticked).
+  const pickBlocked = !!quote?.bills && (needPick || !quoteMatchesPick(quote, picked) || !!quote.pickRefusal)
   useEffect(() => {
     if (!stale || !answeredOn || !figures) return
     const text = refusal.current ?? figuresMovedMessage(answeredOn, figures)
@@ -374,7 +442,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // 10/6 (Nic): the bill as one balance, and the whole balance as owed now.
   const bill = quote ? deskBillBalance(quote) : null
   const fullOwedCents = quote
-    ? Math.max(0, toCents(quote.fullBalance) - toCents(quote.creditAlreadyApplied)
+    // 10/14: credit already on EVERY bill, ticked or not (creditAlreadyApplied is the ticked bills' alone).
+    ? Math.max(0, toCents(quote.fullBalance)
+      - (quote.bills ? quote.bills.reduce((t, b) => t + toCents(b.creditAlreadyApplied), 0) : toCents(quote.creditAlreadyApplied))
       - (quote.oldBalance ?? []).reduce((t, r) => t + toCents(r.creditAlreadyApplied), 0))
     : 0
   const needNumber = !!method && numberRequired(method)
@@ -402,6 +472,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
     try {
       const r: any = await apiPost(`/payments/${anchor}/record-manual`, {
         ...plan.body,
+        // 10/14 (Nic): the bills this money pays, each whole.
+        ...(quote.bills ? { bills: picked } : {}),
         reference: reference.trim() || undefined,
         // Today is the default: sent only when the deposit was made earlier.
         ...(method === 'bank_deposit' && depositedOn && depositedOn !== deskToday ? { depositedOn } : {}),
@@ -513,7 +585,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
     )
   }
 
-  const nothingHere = !!quote && quote.rows.length === 0 && quote.oldBalance.length === 0
+  const nothingHere = !!quote && (quote.bills ?? quote.rows).length === 0 && quote.oldBalance.length === 0
   // Nothing left to take here: ONE message. When a refusal or a moved figure
   // brought the window here (another desk paid it, the space went into eviction
   // mode), it says that what they owe changed and where it stands now — never
@@ -553,14 +625,19 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
           ) : quote ? (<>
             {/* ── The whole balance, the way the desk takes it ── */}
             <div className="cd-bill">
-              <BillLines title="This bill" rows={quote.rows} labels={labels} />
+              {quote.bills ? (
+                <BillPicker bills={quote.bills} picked={picked} labels={labels} disabled={saving || anyReaderBusy || closing}
+                  onPick={pickBill} />
+              ) : (
+                <BillLines title="This bill" rows={quote.rows} labels={labels} />
+              )}
               {quote.rows.length > 0 && bill && bill.creditApplied > 0 && (<>
                 <div className="cd-line"><span>Charges</span><span className="mono">{money(toDollars(bill.charges))}</span></div>
                 <div className="cd-line"><span>Credit applied</span><span className="mono">{money(-toDollars(bill.creditApplied))}</span></div>
                 <div className="cd-line cd-line-total"><span>Still owed</span><span className="mono">{money(toDollars(bill.stillOwed))}</span></div>
               </>)}
               {quote.rows.length > 0 && bill && bill.creditApplied === 0 && (
-                <div className="cd-line cd-line-total"><span>This bill</span><span className="mono">{money(quote.currentTotal)}</span></div>
+                <div className="cd-line cd-line-total"><span>{quote.bills ? 'Bills ticked' : 'This bill'}</span><span className="mono">{money(quote.currentTotal)}</span></div>
               )}
               <BillLines title="Old balance" sub="paid last, from whatever is over this bill" rows={quote.oldBalance} labels={labels} />
               {toCents(quote.payOnlineTotal) > 0 && (
@@ -613,6 +690,12 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
             {nothingHere ? (
               <Message msg={nothingMsg} />
             ) : (<>
+              {/* 10/14 (Nic): nothing is ticked for the desk; a pick the server
+                  refuses ("pick the September bill too") is said here. */}
+              {needPick && mode !== 'reader' && (
+                <Message msg={{ kind: 'info', text: 'Tick the bills this money pays. Each bill is paid whole; in one space the oldest bill is paid first.' }} />
+              )}
+              {!needPick && quote.pickRefusal && <Message msg={{ kind: 'warn', text: quote.pickRefusal }} />}
               {/* ── Credit: beside the bill, used only when the desk says so.
                   The card reader asks its own Use / Save per space (fix round 2:
                   never the same question twice, one answer of which does nothing). ── */}
@@ -682,8 +765,8 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
                     away would cancel a charge the customer is about to tap. */}
                 {/* 10/6 (Nic): "Bank deposit" only where tenants deposit rent at the bank. */}
                 {recordableMethods(MANUAL_PAYMENT_METHODS, quote).map(m => (
-                  <button key={m} type="button" className={`cd-option${mode === m ? ' on' : ''}`} disabled={anyReaderBusy || closing}
-                    title={anyReaderBusy ? 'Finish or cancel the payment on the reader first' : undefined}
+                  <button key={m} type="button" className={`cd-option${mode === m ? ' on' : ''}`} disabled={anyReaderBusy || closing || needPick}
+                    title={anyReaderBusy ? 'Finish or cancel the payment on the reader first' : needPick ? 'Tick the bills this money pays first' : undefined}
                     onClick={() => pickMode(m)}>
                     <span className="cd-option-title">{MANUAL_PAYMENT_METHOD_LABELS[m]}</span>
                   </button>
@@ -881,7 +964,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
         <div className="cd-actions cd-footer">
           {method && quote && !nothingHere && (
             <button className="btn btn-primary cd-grow"
-              disabled={saving || closing || isFetching || !plan || plan.stop !== null || !anchor || (needNumber && !reference.trim())
+              disabled={saving || closing || isFetching || pickBlocked || !plan || plan.stop !== null || !anchor || (needNumber && !reference.trim())
                 || (method === 'bank_deposit' && (!depositedOn || depositedOn > deskToday))}
               onClick={record}>
               {saving ? 'Recording…'

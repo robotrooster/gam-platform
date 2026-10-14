@@ -406,6 +406,25 @@ export interface DeskQuoteRow {
   propertyName: string | null
 }
 
+/**
+ * 10/14 (Nic): one open bill — "the itemized lines of that invoice", paid
+ * together and whole ("each separate invoice is its own thing"). The desk
+ * picks the bills the money pays; nothing is picked for it.
+ */
+export interface DeskQuoteBill {
+  id: string
+  /** The space (lease) the bill is on. */
+  leaseId: string | null
+  unitNumber: string | null
+  dueDate: string
+  total: number
+  creditAlreadyApplied: number
+  owed: number
+  /** The older open bills of the same space: "October waits for September". */
+  olderBillIds: string[]
+  rows: DeskQuoteRow[]
+}
+
 /** A card payment of the household's waiting on its card's bank, as the desk quote carries it. */
 export interface AwaitingCardAtDesk {
   amount: number
@@ -457,7 +476,17 @@ export interface DeskQuote {
   anchorPaymentId: string
   anchorOpen: boolean
   paymentsPaused: boolean
+  /** What the desk takes now: the lines of the bills picked (10/14). */
   rows: DeskQuoteRow[]
+  /**
+   * 10/14 (Nic): every open bill the desk takes, oldest first — what the desk
+   * picks from (read with ?bills=). Absent: an older server (rows is everything).
+   */
+  bills?: DeskQuoteBill[]
+  /** The bills picked that are still open (null when none were named). */
+  pickedBillIds?: string[] | null
+  /** Why the pick cannot be recorded as it is ("pick the September bill too"), or null. */
+  pickRefusal?: string | null
   currentTotal: number
   oldBalance: DeskQuoteRow[]
   oldBalanceTotal: number
@@ -585,9 +614,76 @@ export function oldBalanceOwedCents(q: Pick<DeskQuote, 'oldBalance'>): number {
 }
 
 /** The charge Record posts to: the one the window opened on while it is still open, else the oldest one the desk takes. */
-export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' | 'rows' | 'oldBalance'>): string | null {
+export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' | 'rows' | 'oldBalance'> & Pick<Partial<DeskQuote>, 'bills'>): string | null {
   if (q.anchorOpen) return q.anchorPaymentId
-  return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? null
+  // 10/14: the anchor only says whose balance it is — any open bill will do.
+  return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? q.bills?.[0]?.rows[0]?.id ?? null
+}
+
+// ─── 10/14 (Nic): the desk picks the bills ──────────────────────────────────
+// "we also need to be able to log each separate bill as one payment ... the
+// only thing I wanted paid together was the itemized lines of that invoice."
+// Each bill is ticked on its own; within one space the oldest bill is paid
+// first (October waits for September); two spaces are independent.
+
+/** The open bills, by space, in the quote's order (oldest first). */
+export function billsBySpace(bills: readonly DeskQuoteBill[]): Array<{ key: string; label: string | null; bills: DeskQuoteBill[] }> {
+  const out: Array<{ key: string; label: string | null; bills: DeskQuoteBill[] }> = []
+  for (const b of bills) {
+    const key = b.leaseId ?? 'none'
+    let g = out.find(x => x.key === key)
+    if (!g) { g = { key, label: b.unitNumber ? `Space ${b.unitNumber}` : null, bills: [] }; out.push(g) }
+    g.bills.push(b)
+  }
+  return out
+}
+
+/** A bill may be ticked once every older open bill of its space is. */
+export function canPickBill(b: Pick<DeskQuoteBill, 'olderBillIds'>, picked: readonly string[]): boolean {
+  return b.olderBillIds.every(id => picked.includes(id))
+}
+
+/**
+ * Tick or untick one bill. Unticking a bill unticks every newer bill of its
+ * space too (they wait on it); a bill whose older bills are not ticked is not
+ * ticked. Returned in the quote's bill order.
+ */
+export function togglePick(bills: readonly DeskQuoteBill[], picked: readonly string[], id: string): string[] {
+  const b = bills.find(x => x.id === id)
+  if (!b) return picked.filter(x => bills.some(y => y.id === x))
+  let next: Set<string>
+  if (picked.includes(id)) {
+    next = new Set(picked.filter(x => x !== id))
+    // Drop everything that (now) waits on a bill not ticked.
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const o of bills) if (next.has(o.id) && !o.olderBillIds.every(x => next.has(x))) { next.delete(o.id); changed = true }
+    }
+  } else {
+    if (!canPickBill(b, picked)) return [...picked]
+    next = new Set([...picked, id])
+  }
+  return bills.filter(x => next.has(x.id)).map(x => x.id)
+}
+
+/** The bills still ticked that the quote still lists (a bill paid meanwhile drops off). */
+export function picksStillOpen(bills: readonly DeskQuoteBill[], picked: readonly string[]): string[] {
+  const open = new Set(bills.map(b => b.id))
+  return picked.filter(id => open.has(id))
+}
+
+/** The quote read is for exactly the bills ticked (an older server: always). */
+export function quoteMatchesPick(q: Pick<DeskQuote, 'bills' | 'pickedBillIds'>, picked: readonly string[]): boolean {
+  if (!q.bills) return true
+  const got = [...(q.pickedBillIds ?? [])].sort()
+  const want = [...picked].sort()
+  return got.length === want.length && got.every((x, i) => x === want[i])
+}
+
+/** "September bill" — a bill by its month, for the picker. */
+export function pickBillName(b: Pick<DeskQuoteBill, 'dueDate'>): string {
+  return billName(b.dueDate, 'bill')
 }
 
 const METHOD_WORD: Record<ManualPaymentMethod, string> = MANUAL_PAYMENT_METHOD_WORD
@@ -1169,12 +1265,15 @@ export interface ReaderSpace { leaseId: string; anchorId: string; unitNumber: st
  * other space keeps its name.
  */
 export function readerLeases(
-  q: Pick<DeskQuote, 'rows' | 'oldBalance'>,
+  q: Pick<DeskQuote, 'rows' | 'oldBalance'> & Pick<Partial<DeskQuote>, 'bills'>,
   taken: readonly ReaderSpace[] = [],
 ): Array<ReaderSpace & { label: string | null }> {
   const seen = new Map<string, ReaderSpace>()
   for (const s of taken) if (s?.leaseId && !seen.has(s.leaseId)) seen.set(s.leaseId, s)
-  for (const r of [...(q.rows ?? []), ...(q.oldBalance ?? [])]) {
+  // 10/14: the reader takes a space at a time on its own quote — every open
+  // bill's space, whatever is ticked for cash.
+  const open = q.bills ? q.bills.flatMap(b => b.rows) : (q.rows ?? [])
+  for (const r of [...open, ...(q.oldBalance ?? [])]) {
     if (!r.leaseId || seen.has(r.leaseId)) continue
     seen.set(r.leaseId, { leaseId: r.leaseId, anchorId: r.id, unitNumber: r.unitNumber ?? null })
   }

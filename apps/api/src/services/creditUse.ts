@@ -292,6 +292,15 @@ export interface HouseholdQuoteOptions {
    * and a row with a scheduled retry gets no credit set aside (#46 1b).
    */
   includeReleasable?: boolean
+  /**
+   * 10/14 (Nic): "each separate invoice is its own thing" — the desk picks the
+   * bills the money pays. When given, the credit plan is built over only the
+   * rows this keeps (the picked bills), so "credit available" is what credit
+   * could pay of THOSE bills: a general credit is never set aside for a bill
+   * left for another day. Every other figure still reads every row. Absent:
+   * the plan covers the whole household balance.
+   */
+  planOnly?: (row: QuoteRow) => boolean
 }
 
 // ─── The quote ────────────────────────────────────────────────────────────────
@@ -471,8 +480,10 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
   const credits = await readCredits(client, { tenantId, landlordId, leaseIds: hl.ids, memberLeaseIds: [...hl.tenantOnLease], includeReleasable })
   const drawn = await paidAheadDrawnByMonth(client, hl.ids, includeReleasable)
 
+  // 10/14: the bills being paid now, when the caller picked them (planOnly).
+  const planRows = opts.planOnly ? rows.filter(opts.planOnly) : rows
   const plan = buildCreditPlan({
-    rows, credits, caps: hl.caps, drawn, tenantId, tenantOnLease: hl.tenantOnLease, includeReleasable,
+    rows: planRows, credits, caps: hl.caps, drawn, tenantId, tenantOnLease: hl.tenantOnLease, includeReleasable,
   })
   // Only to tell GAM a bill is waiting on rent the lease no longer owes: the
   // plan as it would be if credit could pay that rent. Never spent.
@@ -480,7 +491,7 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
     pastEndEligible.has(r.id) && r.scopeLeaseId !== null && r.leaseId === r.scopeLeaseId
       ? { ...r, required: true, creditEligible: true } : r
   const planIfPastEndPayable = pastEndEligible.size === 0 ? plan : buildCreditPlan({
-    rows: rows.map(asIfOwed),
+    rows: planRows.map(asIfOwed),
     credits, caps: hl.caps, drawn, tenantId, tenantOnLease: hl.tenantOnLease, includeReleasable,
   })
   const covers = (required: QuoteRow[], lines: CreditPlanLine[], eligible: (r: QuoteRow) => boolean): boolean => {
