@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict oBQPfYvGNlRYtQnlXHbjFghFVjOKhNMbJ4qTxPEn8aTwbRFnvMpclydclF5yRgH
+\restrict yYNj8cnvhhsbmfqMgWUxJ6tRuiz8EWfejwt2NjSQjuhaSojNcBLNdXYGkqyLOyk
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -363,6 +363,8 @@ BEGIN
                 WHEN 'role' THEN ledger_account_role_type(NEW.map_value)
                 WHEN 'bank_connection' THEN 'asset'
                 WHEN 'sales_tax' THEN 'liability'
+                WHEN 'rent_line' THEN 'income'
+                WHEN 'stay_line' THEN 'income'
                 WHEN 'loan' THEN 'liability'
                 WHEN 'expense_category' THEN '*'
                 WHEN 'income_category' THEN '*'
@@ -4958,7 +4960,7 @@ CREATE FUNCTION public.ledger_capture_payroll_run_lines_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax
+  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax,pay_place,pay_property_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -4976,7 +4978,7 @@ CREATE FUNCTION public.ledger_capture_payroll_run_lines_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax
+  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax,pay_place,pay_property_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -4994,14 +4996,14 @@ CREATE FUNCTION public.ledger_capture_payroll_run_lines_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax
+  -- ledger columns: run_id,employee_id,gross_pay,federal_tax,state_tax,ss_tax,medicare_tax,other_deductions,net_pay,employer_ss_tax,employer_medicare_tax,futa_tax,suta_tax,pay_place,pay_property_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.run_id::text, o.employee_id::text, o.gross_pay::text, o.federal_tax::text, o.state_tax::text, o.ss_tax::text, o.medicare_tax::text, o.other_deductions::text, o.net_pay::text, o.employer_ss_tax::text, o.employer_medicare_tax::text, o.futa_tax::text, o.suta_tax::text) IS DISTINCT FROM ROW(n.run_id::text, n.employee_id::text, n.gross_pay::text, n.federal_tax::text, n.state_tax::text, n.ss_tax::text, n.medicare_tax::text, n.other_deductions::text, n.net_pay::text, n.employer_ss_tax::text, n.employer_medicare_tax::text, n.futa_tax::text, n.suta_tax::text)
+           WHERE ROW(o.run_id::text, o.employee_id::text, o.gross_pay::text, o.federal_tax::text, o.state_tax::text, o.ss_tax::text, o.medicare_tax::text, o.other_deductions::text, o.net_pay::text, o.employer_ss_tax::text, o.employer_medicare_tax::text, o.futa_tax::text, o.suta_tax::text, o.pay_place::text, o.pay_property_id::text) IS DISTINCT FROM ROW(n.run_id::text, n.employee_id::text, n.gross_pay::text, n.federal_tax::text, n.state_tax::text, n.ss_tax::text, n.medicare_tax::text, n.other_deductions::text, n.net_pay::text, n.employer_ss_tax::text, n.employer_medicare_tax::text, n.futa_tax::text, n.suta_tax::text, n.pay_place::text, n.pay_property_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.run_id::text, o.employee_id::text, o.gross_pay::text, o.federal_tax::text, o.state_tax::text, o.ss_tax::text, o.medicare_tax::text, o.other_deductions::text, o.net_pay::text, o.employer_ss_tax::text, o.employer_medicare_tax::text, o.futa_tax::text, o.suta_tax::text) IS DISTINCT FROM ROW(n.run_id::text, n.employee_id::text, n.gross_pay::text, n.federal_tax::text, n.state_tax::text, n.ss_tax::text, n.medicare_tax::text, n.other_deductions::text, n.net_pay::text, n.employer_ss_tax::text, n.employer_medicare_tax::text, n.futa_tax::text, n.suta_tax::text)) r
+           WHERE ROW(o.run_id::text, o.employee_id::text, o.gross_pay::text, o.federal_tax::text, o.state_tax::text, o.ss_tax::text, o.medicare_tax::text, o.other_deductions::text, o.net_pay::text, o.employer_ss_tax::text, o.employer_medicare_tax::text, o.futa_tax::text, o.suta_tax::text, o.pay_place::text, o.pay_property_id::text) IS DISTINCT FROM ROW(n.run_id::text, n.employee_id::text, n.gross_pay::text, n.federal_tax::text, n.state_tax::text, n.ss_tax::text, n.medicare_tax::text, n.other_deductions::text, n.net_pay::text, n.employer_ss_tax::text, n.employer_medicare_tax::text, n.futa_tax::text, n.suta_tax::text, n.pay_place::text, n.pay_property_id::text)) r
     CROSS JOIN LATERAL (SELECT 'payroll_run'::text, r.run_id::text, (SELECT COALESCE(pr.landlord_id, pr.business_id) FROM payroll_runs pr WHERE pr.id = r.run_id)) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
@@ -5918,7 +5920,25 @@ BEGIN
                            ('booking', r.id::text || '|end', r.landlord_id)) v
      UNION ALL
      SELECT 'booking', r.id::text || '|' || m.k::text, r.landlord_id
-       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)) k(source_type, source_id, owner_id)
+       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)
+     UNION ALL
+     SELECT 'refund_part', rp.id::text, rp.landlord_id FROM stay_refund_parts rp WHERE rp.booking_id = r.id
+     UNION ALL
+     SELECT 'pos_refund', pr.id::text, pr.landlord_id FROM pos_refunds pr
+      WHERE pr.transaction_id IN (SELECT sp.pos_transaction_id FROM stay_payments sp
+                                   WHERE sp.booking_id = r.id AND sp.pos_transaction_id IS NOT NULL)
+     UNION ALL
+     SELECT 'held_item', h.id::text, h.landlord_id FROM held_payout_items h
+       JOIN connect_disputes cd ON cd.stripe_dispute_id = split_part(h.source_id, ':', 1)
+      WHERE h.source_type = 'dispute'
+        AND (cd.stripe_payment_intent_id = r.stripe_payment_intent_id
+             OR cd.stripe_payment_intent_id IN (SELECT t.stripe_payment_intent_id FROM stay_payments sp
+                                                  JOIN pos_transactions t ON t.id = sp.pos_transaction_id
+                                                 WHERE sp.booking_id = r.id))
+     UNION ALL
+     SELECT 'prepaid_credit', pc.id::text, l.landlord_id FROM lease_prepaid_credits pc
+       JOIN leases l ON l.id = COALESCE(pc.received_lease_id, pc.lease_id)
+      WHERE l.source_booking_id = r.id AND pc.funded_by = 'reclassified') k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -5940,7 +5960,25 @@ BEGIN
                            ('booking', r.id::text || '|end', r.landlord_id)) v
      UNION ALL
      SELECT 'booking', r.id::text || '|' || m.k::text, r.landlord_id
-       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)) k(source_type, source_id, owner_id)
+       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)
+     UNION ALL
+     SELECT 'refund_part', rp.id::text, rp.landlord_id FROM stay_refund_parts rp WHERE rp.booking_id = r.id
+     UNION ALL
+     SELECT 'pos_refund', pr.id::text, pr.landlord_id FROM pos_refunds pr
+      WHERE pr.transaction_id IN (SELECT sp.pos_transaction_id FROM stay_payments sp
+                                   WHERE sp.booking_id = r.id AND sp.pos_transaction_id IS NOT NULL)
+     UNION ALL
+     SELECT 'held_item', h.id::text, h.landlord_id FROM held_payout_items h
+       JOIN connect_disputes cd ON cd.stripe_dispute_id = split_part(h.source_id, ':', 1)
+      WHERE h.source_type = 'dispute'
+        AND (cd.stripe_payment_intent_id = r.stripe_payment_intent_id
+             OR cd.stripe_payment_intent_id IN (SELECT t.stripe_payment_intent_id FROM stay_payments sp
+                                                  JOIN pos_transactions t ON t.id = sp.pos_transaction_id
+                                                 WHERE sp.booking_id = r.id))
+     UNION ALL
+     SELECT 'prepaid_credit', pc.id::text, l.landlord_id FROM lease_prepaid_credits pc
+       JOIN leases l ON l.id = COALESCE(pc.received_lease_id, pc.lease_id)
+      WHERE l.source_booking_id = r.id AND pc.funded_by = 'reclassified') k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -5966,7 +6004,25 @@ BEGIN
                            ('booking', r.id::text || '|end', r.landlord_id)) v
      UNION ALL
      SELECT 'booking', r.id::text || '|' || m.k::text, r.landlord_id
-       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)) k(source_type, source_id, owner_id)
+       FROM generate_series(1, ledger_booking_stay_month_count(r.check_in, r.check_out, r.booked_check_out)) AS m(k)
+     UNION ALL
+     SELECT 'refund_part', rp.id::text, rp.landlord_id FROM stay_refund_parts rp WHERE rp.booking_id = r.id
+     UNION ALL
+     SELECT 'pos_refund', pr.id::text, pr.landlord_id FROM pos_refunds pr
+      WHERE pr.transaction_id IN (SELECT sp.pos_transaction_id FROM stay_payments sp
+                                   WHERE sp.booking_id = r.id AND sp.pos_transaction_id IS NOT NULL)
+     UNION ALL
+     SELECT 'held_item', h.id::text, h.landlord_id FROM held_payout_items h
+       JOIN connect_disputes cd ON cd.stripe_dispute_id = split_part(h.source_id, ':', 1)
+      WHERE h.source_type = 'dispute'
+        AND (cd.stripe_payment_intent_id = r.stripe_payment_intent_id
+             OR cd.stripe_payment_intent_id IN (SELECT t.stripe_payment_intent_id FROM stay_payments sp
+                                                  JOIN pos_transactions t ON t.id = sp.pos_transaction_id
+                                                 WHERE sp.booking_id = r.id))
+     UNION ALL
+     SELECT 'prepaid_credit', pc.id::text, l.landlord_id FROM lease_prepaid_credits pc
+       JOIN leases l ON l.id = COALESCE(pc.received_lease_id, pc.lease_id)
+      WHERE l.source_booking_id = r.id AND pc.funded_by = 'reclassified') k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
   RETURN NULL;
 END $$;
@@ -8379,7 +8435,7 @@ CREATE TABLE public.books_account_map (
     set_by uuid,
     set_at timestamp with time zone DEFAULT now() NOT NULL,
     note text,
-    CONSTRAINT books_account_map_kind_check CHECK ((map_kind = ANY (ARRAY['role'::text, 'bank_connection'::text, 'sales_tax'::text, 'loan'::text, 'expense_category'::text, 'income_category'::text]))),
+    CONSTRAINT books_account_map_kind_check CHECK ((map_kind = ANY (ARRAY['role'::text, 'bank_connection'::text, 'sales_tax'::text, 'loan'::text, 'expense_category'::text, 'income_category'::text, 'rent_line'::text, 'stay_line'::text]))),
     CONSTRAINT books_account_map_one_owner CHECK ((num_nonnulls(landlord_id, business_id) = 1)),
     CONSTRAINT books_account_map_role_known CHECK (((map_kind <> 'role'::text) OR (public.ledger_account_role_type(map_value) IS NOT NULL)))
 );
@@ -8581,7 +8637,12 @@ CREATE TABLE public.books_employees (
     updated_at timestamp with time zone DEFAULT now(),
     business_id uuid,
     tenant_id uuid,
-    CONSTRAINT books_employees_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
+    pay_place text,
+    pay_property_id uuid,
+    pay_place_set_at timestamp with time zone,
+    pay_place_set_by uuid,
+    CONSTRAINT books_employees_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1)),
+    CONSTRAINT books_employees_pay_place_check CHECK ((((pay_place IS NULL) AND (pay_property_id IS NULL)) OR ((landlord_id IS NOT NULL) AND (((pay_place = 'property'::text) AND (pay_property_id IS NOT NULL)) OR ((pay_place = 'company'::text) AND (pay_property_id IS NULL))))))
 );
 
 
@@ -8590,6 +8651,34 @@ CREATE TABLE public.books_employees (
 --
 
 COMMENT ON COLUMN public.books_employees.tenant_id IS '10/12 (Nic, ledger P7): the tenant this employee record is — a work trader paid for extra hours through payroll.';
+
+
+--
+-- Name: COLUMN books_employees.pay_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_employees.pay_place IS '10/14 (Nic): where this employee''s pay goes — property (pay_property_id) or company (company level, someone at several properties). Asked on the employee form. 10/14 afternoon (Nic): only the owner changes it once set; only future paychecks follow (draft runs move with it, approved runs stay as posted). NULL: not set yet (asked before their next paycheck). BOOKS_EMPLOYEE_PAY_PLACES.';
+
+
+--
+-- Name: COLUMN books_employees.pay_property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_employees.pay_property_id IS '10/14 (Nic): the property this employee''s pay goes to (pay_place property).';
+
+
+--
+-- Name: COLUMN books_employees.pay_place_set_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_employees.pay_place_set_at IS '10/14 (Nic): when the employee''s pay place was set, or last changed by the owner.';
+
+
+--
+-- Name: COLUMN books_employees.pay_place_set_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_employees.pay_place_set_by IS '10/14 (Nic): who set the employee''s pay place, or last changed it (the owner).';
 
 
 --
@@ -14083,7 +14172,7 @@ CREATE TABLE public.ledger_posting_lines (
     system_line boolean DEFAULT false NOT NULL,
     CONSTRAINT ledger_posting_lines_cash_effect_check CHECK (((cash_effect IS NULL) OR (cash_effect = ANY (ARRAY['in'::text, 'out'::text])))),
     CONSTRAINT ledger_posting_lines_expense_kind_check CHECK (((expense_kind IS NULL) OR (expense_kind = ANY (ARRAY['asset'::text, 'liability'::text, 'equity'::text, 'income'::text, 'expense'::text])))),
-    CONSTRAINT ledger_posting_lines_map_kind_check CHECK (((map_kind IS NULL) OR (map_kind = ANY (ARRAY['role'::text, 'bank_connection'::text, 'sales_tax'::text, 'loan'::text, 'expense_category'::text, 'income_category'::text])))),
+    CONSTRAINT ledger_posting_lines_map_kind_check CHECK (((map_kind IS NULL) OR (map_kind = ANY (ARRAY['role'::text, 'bank_connection'::text, 'sales_tax'::text, 'loan'::text, 'expense_category'::text, 'income_category'::text, 'rent_line'::text, 'stay_line'::text])))),
     CONSTRAINT ledger_posting_lines_one_owner CHECK ((num_nonnulls(landlord_id, business_id) = 1)),
     CONSTRAINT ledger_posting_lines_one_side CHECK (((debit >= (0)::numeric) AND (credit >= (0)::numeric) AND ((debit > (0)::numeric) <> (credit > (0)::numeric)))),
     CONSTRAINT ledger_posting_lines_report_category_check CHECK (((report_category IS NULL) OR (report_category = ANY (ARRAY['space_rent'::text, 'electric'::text, 'water'::text, 'sewer'::text, 'gas'::text, 'trash'::text, 'propane'::text, 'utility_other'::text, 'late_fees'::text, 'home_payments'::text, 'other_fees'::text, 'balances_collected'::text, 'register_sales'::text, 'stays_and_pay_links'::text, 'other_income'::text, 'paid_ahead'::text, 'deposits'::text, 'tax_collected'::text, 'not_income'::text, 'credits_given'::text, 'work_trade'::text, 'refunds'::text, 'opening'::text, 'maintenance'::text, 'repairs'::text, 'utilities'::text, 'insurance'::text, 'property_tax'::text, 'management'::text, 'supplies'::text, 'landscaping'::text, 'professional'::text, 'mortgage_interest'::text, 'hoa'::text, 'advertising'::text, 'lot_rent'::text, 'bank_fees'::text, 'other'::text])))),
@@ -14964,7 +15053,10 @@ CREATE TABLE public.payroll_run_lines (
     futa_tax numeric(10,2) DEFAULT 0 NOT NULL,
     suta_tax numeric(10,2) DEFAULT 0 NOT NULL,
     work_trade_extra_hours_id uuid,
-    CONSTRAINT payroll_run_lines_employer_taxes_nonneg CHECK (((employer_ss_tax >= (0)::numeric) AND (employer_medicare_tax >= (0)::numeric) AND (futa_tax >= (0)::numeric) AND (suta_tax >= (0)::numeric)))
+    pay_place text,
+    pay_property_id uuid,
+    CONSTRAINT payroll_run_lines_employer_taxes_nonneg CHECK (((employer_ss_tax >= (0)::numeric) AND (employer_medicare_tax >= (0)::numeric) AND (futa_tax >= (0)::numeric) AND (suta_tax >= (0)::numeric))),
+    CONSTRAINT payroll_run_lines_pay_place_check CHECK ((((pay_place IS NULL) AND (pay_property_id IS NULL)) OR ((pay_place = 'property'::text) AND (pay_property_id IS NOT NULL)) OR ((pay_place = 'company'::text) AND (pay_property_id IS NULL))))
 );
 
 
@@ -15001,6 +15093,20 @@ COMMENT ON COLUMN public.payroll_run_lines.suta_tax IS '10/12 (Nic, ledger P7): 
 --
 
 COMMENT ON COLUMN public.payroll_run_lines.work_trade_extra_hours_id IS '10/12 (Nic, ledger P7): the work-trade extra hours (sent to GAM Books as W-2 pay) this paycheck line pays.';
+
+
+--
+-- Name: COLUMN payroll_run_lines.pay_place; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payroll_run_lines.pay_place IS '10/14 (Nic): the place this paycheck was booked with, copied from its employee (property or company). A draft run''s paychecks follow the owner''s change of the employee''s place; once the run is approved it never moves. NULL: a paycheck on a run approved before 10/14 — the run''s own cost_place places it.';
+
+
+--
+-- Name: COLUMN payroll_run_lines.pay_property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payroll_run_lines.pay_property_id IS '10/14 (Nic): the property this paycheck was booked to (pay_place property).';
 
 
 --
@@ -35704,6 +35810,22 @@ ALTER TABLE ONLY public.books_employees
 
 
 --
+-- Name: books_employees books_employees_pay_place_set_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_employees
+    ADD CONSTRAINT books_employees_pay_place_set_by_fkey FOREIGN KEY (pay_place_set_by) REFERENCES public.users(id);
+
+
+--
+-- Name: books_employees books_employees_pay_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_employees
+    ADD CONSTRAINT books_employees_pay_property_id_fkey FOREIGN KEY (pay_property_id) REFERENCES public.properties(id);
+
+
+--
 -- Name: books_employees books_employees_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -39640,6 +39762,14 @@ ALTER TABLE ONLY public.payroll_run_lines
 
 
 --
+-- Name: payroll_run_lines payroll_run_lines_pay_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_run_lines
+    ADD CONSTRAINT payroll_run_lines_pay_property_id_fkey FOREIGN KEY (pay_property_id) REFERENCES public.properties(id);
+
+
+--
 -- Name: payroll_run_lines payroll_run_lines_run_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43308,5 +43438,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict oBQPfYvGNlRYtQnlXHbjFghFVjOKhNMbJ4qTxPEn8aTwbRFnvMpclydclF5yRgH
+\unrestrict yYNj8cnvhhsbmfqMgWUxJ6tRuiz8EWfejwt2NjSQjuhaSojNcBLNdXYGkqyLOyk
 
