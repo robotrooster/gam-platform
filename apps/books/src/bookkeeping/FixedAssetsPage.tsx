@@ -61,7 +61,7 @@ const fundingWords=(a:any)=>a.funding?.length
   ?(a.funding as any[]).map(f=>`${fundedLabel(f.kind)}${f.loanName?`: ${f.loanName}`:f.expenseDescription?`: ${f.expenseDescription}`:''} ${formatCurrency(f.amount)}`).join(' + ')
   :a.fundedBy?`${fundedLabel(a.fundedBy)}${a.fundedLoanName?`: ${a.fundedLoanName}`:''}`:''
 /** 10/13 (Nic): where an asset and its depreciation go, in words. */
-const placeWords=(a:any)=>a.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units
+const placeWords=(a:any)=>a.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
   :a.unitNumber?`${a.propertyName??''} · Unit ${a.unitNumber}`:(a.propertyName??BOOKS_COST_PLACE_NONE_LABEL)
 
 export function FixedAssetsPage(){

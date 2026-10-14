@@ -36,7 +36,7 @@ const methodLabel=(m:string)=>(BOOKS_LOAN_PAYMENT_METHOD_LABEL as Record<string,
 const fundedLabel=(f:string)=>(BOOKS_LOAN_FUNDED_TO_LABEL as Record<string,string>)[f]??'—'
 const money=(n:number)=>Math.round(n*100)/100
 // 10/13 (Nic): where a loan's interest goes, in words, for its row.
-const placeWords=(l:any)=>l.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units
+const placeWords=(l:any)=>l.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
   :l.unitNumber?`${l.propertyName??''} · Unit ${l.unitNumber}`:(l.propertyName??BOOKS_COST_PLACE_NONE_LABEL)
 
 const blankLoan={name:'',lenderName:'',vendorId:'',originalAmount:'',annualRate:'',startDate:'',termMonths:'',

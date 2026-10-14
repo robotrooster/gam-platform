@@ -62,7 +62,7 @@ const SCOPE_CHOICES: [string, string][] = [
 // 10/13 (Nic): money going out may also be split across all the company's
 // properties by units (BOOKS_COST_PLACES); money coming in sits on a unit or a property.
 const scopeChoices = (moneyOut: boolean): [string, string][] => moneyOut
-  ? [...SCOPE_CHOICES, ['split_by_units', BOOKS_COST_PLACE_LABEL.split_by_units]]
+  ? [...SCOPE_CHOICES, ['split_by_units', BOOKS_COST_PLACE_LABEL.split_by_units]]  // wire-ok: a shared label key, not a field off an API response
   : SCOPE_CHOICES
 /** 10/13: a filing's place is fully said — a unit, a property, or a split (naming neither). */
 const scopePlaced = (p: { scopeKind: string; propertyId: string; unitId: string }) =>
@@ -804,7 +804,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                             <span style={{ fontWeight: 600, color: 'var(--text-1)' }}>{fmt(p.amount)}</span>
                             <span>{p.categoryName ?? categoryLabel(isExpense, p.category)}</span>
                             <span style={{ color: 'var(--text-3)' }}>
-                              {p.costPlace === 'split_by_units' ? BOOKS_COST_PLACE_LABEL.split_by_units
+                              {p.costPlace === 'split_by_units' ? BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
                                 : [p.propertyName, p.unitNumber].filter(Boolean).join(' · ')}
                             </span>
                           </div>

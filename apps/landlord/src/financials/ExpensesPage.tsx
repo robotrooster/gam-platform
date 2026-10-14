@@ -106,7 +106,7 @@ const placeLabel = (s: FormPlace) => (s === 'company' ? BOOKS_COST_PLACE_NONE_LA
 /** 10/13 (Nic): where an expense's cost goes, in words, for its row. */
 function placeWords(e: Pick<Expense, 'unitNumber' | 'propertyName' | 'costPlace' | 'isCommon'>): string {
   if (e.unitNumber) return `${e.propertyName ? e.propertyName + ' · ' : ''}Unit ${e.unitNumber}`
-  if (e.costPlace === 'split_by_units') return BOOKS_COST_PLACE_LABEL.split_by_units
+  if (e.costPlace === 'split_by_units') return BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
   if (e.propertyName) return e.isCommon ? `${e.propertyName} · common (split per unit)` : e.propertyName
   return BOOKS_COST_PLACE_NONE_LABEL
 }

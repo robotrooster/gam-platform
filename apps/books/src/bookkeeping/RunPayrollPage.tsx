@@ -167,7 +167,7 @@ export function RunPayrollPage(){
   )
   const canCalc=(selectedIds.length>0||extraChosen.length>0)&&(!asked||costPlaceChosen(place))
   // 10/13 (Nic): the run's place, in words, for the review.
-  const runPlaceWords=(r:any)=>r?.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units
+  const runPlaceWords=(r:any)=>r?.costPlace==='split_by_units'?BOOKS_COST_PLACE_LABEL.split_by_units  // wire-ok: a shared label key, not a field off an API response
     :r?.unitNumber?`${r.propertyName??''} · Unit ${r.unitNumber}`:r?.propertyName??'—'
 
   return(
