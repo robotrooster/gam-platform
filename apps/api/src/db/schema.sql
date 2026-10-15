@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 6jOlANQ9Rhdnx9akSVkM2Y8Hbt0lygFV3yYRxWBZn1oaqC4bVovbBHy4A9Iv8xg
+\restrict Hr3ekkORilnX6ab9TZgarXw1iFRb9jbq56x3MdKprRuATQ6lADIAUH98yI8KLd1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -19271,6 +19271,8 @@ CREATE TABLE public.tenant_remittances (
     deposit_photo_uploaded_at timestamp with time zone,
     undone_at timestamp with time zone,
     undone_by uuid,
+    received_ip inet,
+    received_device text,
     CONSTRAINT tenant_remittances_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_remittances_applied_amount_check CHECK ((applied_amount >= (0)::numeric)),
     CONSTRAINT tenant_remittances_deposit_photo_bank_deposit_only CHECK (((deposit_photo_url IS NULL) OR (payment_method = 'bank_deposit'::text))),
@@ -19327,6 +19329,20 @@ COMMENT ON COLUMN public.tenant_remittances.undone_at IS '10/12 (Nic, ledger P1)
 --
 
 COMMENT ON COLUMN public.tenant_remittances.undone_by IS '10/12 (Nic, ledger P1): who pressed Undo match (NULL when undone by the system or before 10/12 with no record).';
+
+
+--
+-- Name: COLUMN tenant_remittances.received_ip; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.received_ip IS '10/15 (Nic): the address a hand-recorded payment was entered from; NULL when GAM wrote the receipt itself.';
+
+
+--
+-- Name: COLUMN tenant_remittances.received_device; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.received_device IS '10/15 (Nic): the browser that entered a hand-recorded payment (user agent, 300 chars).';
 
 
 --
@@ -43452,5 +43468,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 6jOlANQ9Rhdnx9akSVkM2Y8Hbt0lygFV3yYRxWBZn1oaqC4bVovbBHy4A9Iv8xg
+\unrestrict Hr3ekkORilnX6ab9TZgarXw1iFRb9jbq56x3MdKprRuATQ6lADIAUH98yI8KLd1
 
