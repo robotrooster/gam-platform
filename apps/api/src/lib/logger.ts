@@ -151,6 +151,12 @@ export const httpLogSerializers = {
     id:     req.id,
     method: req.method,
     url:    redactLoggedUrl(req.url),
+    // 10/15 (Nic), after a day spent asking which computer recorded two cash
+    // payments: "yes lets record devices so if a problem happens we can
+    // solve." Every request line now says where it came from.
+    ip:     req.raw?.ip ?? req.ip ?? undefined,
+    device: typeof req.headers?.['user-agent'] === 'string'
+      ? String(req.headers['user-agent']).slice(0, 180) : undefined,
   }),
   res: (res: any) => ({
     statusCode: res.statusCode,

@@ -39,6 +39,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
 import { paymentsRouter } from './payments'
+import { deviceWords } from '../services/paymentsByMonth'
 import { errorHandler } from '../middleware/errorHandler'
 import { createIssuedCredit } from '../services/creditUse'
 
@@ -133,8 +134,10 @@ async function issueCredit(c: Parameters<typeof createIssuedCredit>[1]) {
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 }
 
-const record = (s: Stack, anchor: string, body: Record<string, unknown>) =>
-  request(app()).post(`/api/payments/${anchor}/record-manual`).set('Authorization', `Bearer ${s.token}`).send(body)
+const record = (s: Stack, anchor: string, body: Record<string, unknown>, device?: string) => {
+  const r = request(app()).post(`/api/payments/${anchor}/record-manual`).set('Authorization', `Bearer ${s.token}`)
+  return (device ? r.set('User-Agent', device) : r).send(body)
+}
 const quote = (s: Stack, anchor: string, bills: string[] | null) =>
   request(app()).get(`/api/payments/${anchor}/record-manual/quote${bills === null ? '' : `?bills=${bills.join(',')}`}`)
     .set('Authorization', `Bearer ${s.token}`)
@@ -341,5 +344,36 @@ describe('a bank deposit dated back: late fees judged on the bills picked', () =
     expect(paid35.status).toBe(200)
     expect(paid35.body.data.lateFeesUnbilled).toBe(10)
     expect(await statusOf([...b.rv35Sep.ids, ...b.rv35Oct.ids])).toEqual(['settled', 'settled', 'settled', 'settled'])
+  })
+})
+
+/**
+ * 10/15 (Nic), after a day spent trying to work out which computer recorded
+ * two cash payments: "theres only one computer downstairs so i know where you
+ * think it happened but yes lets record devices so if a problem happens we can
+ * solve." The receipt kept who and when, never where from.
+ */
+describe('10/15: a recorded payment keeps the device it was typed on', () => {
+  it('the receipt keeps the browser and the address, and reads in plain words', async () => {
+    const s = await stack()
+    const b = await billysBills(s)
+    const r = await record(s, b.rv34Sep.ids[0], {
+      method: 'cash', amountTendered: 457.07, bills: [b.rv34Sep.invoiceId],
+    }, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36')
+    expect(r.status).toBe(200)
+    const rem = (await db.query<{ device: string | null; ip: string | null }>(
+      `SELECT received_device AS device, received_ip::text AS ip FROM tenant_remittances
+        ORDER BY created_at DESC LIMIT 1`)).rows[0]
+    expect(rem.device).toContain('Chrome/130')
+    expect(rem.ip).toBeTruthy()
+    expect(deviceWords(rem.device, rem.ip)).toContain('Chrome on Windows')
+  })
+
+  it('says the device in plain words, and nothing when GAM recorded it itself', () => {
+    expect(deviceWords('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/605.1', '70.112.4.9'))
+      .toBe('Safari on iPhone (70.112.4.9)')
+    expect(deviceWords('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/130.0', null))
+      .toBe('Chrome on a Mac')
+    expect(deviceWords(null, null)).toBeNull()
   })
 })

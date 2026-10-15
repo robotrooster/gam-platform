@@ -116,6 +116,14 @@ export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }:
                     <td>
                       {p.methodLabel}
                       {p.reference && <span className="pay-sub">#{p.reference}</span>}
+                      {/* 10/15 (Nic): "lets record devices so if a problem
+                          happens we can solve" — a payment somebody typed in
+                          says who, and from what. */}
+                      {p.recordedBy && (
+                        <span className="pay-sub">
+                          Recorded by {p.recordedBy}{p.recordedFrom ? ` · ${p.recordedFrom}` : ''}
+                        </span>
+                      )}
                       {f?.method === 'bank_deposit' && (
                         <BankReceiptPhoto receiptId={f.receiptId} url={f.depositPhotoUrl}
                           canAdd={canAddPhoto} onAdded={() => { void refetchLedger() }} />

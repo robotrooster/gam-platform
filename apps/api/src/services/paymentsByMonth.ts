@@ -301,6 +301,9 @@ export interface LedgerPayment {
   days_late: number
   timing_label: string
   lines: LedgerLine[]
+  /** 10/15 (Nic): the name on a hand-recorded payment, and the device it was typed on; null when GAM recorded it. */
+  recorded_by?: string | null
+  recorded_from?: string | null
 }
 
 export interface WorkTradeMonthLine {
@@ -400,6 +403,10 @@ function remCteSql(): string {
   return `rem AS (
      SELECT r.id, r.tenant_id, r.lease_id, r.status, r.payment_method, r.created_at, r.settled_at,
             r.stripe_payment_intent_id AS intent,
+            -- 10/15 (Nic): who typed it in, and the device they typed it on.
+            (SELECT TRIM(COALESCE(ru.first_name, '') || ' ' || COALESCE(ru.last_name, ''))
+               FROM users ru WHERE ru.id = r.received_by) AS received_by_name,
+            r.received_ip::text AS received_ip, r.received_device,
             COALESCE(lp.timezone,
                      (SELECT apr.timezone FROM remittance_applications ra
                         JOIN payments ap ON ap.id = ra.payment_id
@@ -633,6 +640,8 @@ interface ReceiptFacts {
   retrying: boolean; paid_on: string; arrived_on: string | null; channel: string | null
   reference: string | null; deposit_photo_url: string | null
   flag_said: string | null; flag_bank: string | null; tenant_receipt_photo_url: string | null
+  /** 10/15 (Nic): who typed a hand-recorded payment in, and from what device. */
+  received_by_name: string | null; received_ip: string | null; received_device: string | null
 }
 
 interface Draft {
@@ -720,6 +729,25 @@ function monthLabel(ymd: string): string {
 
 function lowerFirst(s: string): string {
   return s ? s.charAt(0).toLowerCase() + s.slice(1) : s
+}
+
+/**
+ * 10/15 (Nic): the device a payment was typed on, in plain words — "Chrome on
+ * Windows (70.112.4.9)". The browser's own description is kept whole on the
+ * receipt; this is only how it reads on screen. Null when GAM wrote the
+ * receipt itself (a card, a bank payment, a bank match): nobody typed it.
+ */
+export function deviceWords(device: string | null, ip: string | null): string | null {
+  if (!device && !ip) return null
+  const d = device ?? ''
+  const browser = /EdgA?\//.test(d) ? 'Edge' : /OPR\//.test(d) ? 'Opera'
+    : /Chrome\//.test(d) ? 'Chrome' : /Firefox\//.test(d) ? 'Firefox'
+    : /Safari\//.test(d) ? 'Safari' : null
+  const os = /iPhone/.test(d) ? 'iPhone' : /iPad/.test(d) ? 'iPad' : /Android/.test(d) ? 'Android'
+    : /Mac OS X|Macintosh/.test(d) ? 'a Mac' : /Windows/.test(d) ? 'Windows'
+    : /Linux/.test(d) ? 'Linux' : null
+  const what = browser && os ? `${browser} on ${os}` : browser ?? os ?? (d ? 'an app' : null)
+  return [what, ip ? `(${ip})` : null].filter(Boolean).join(' ') || null
 }
 
 function methodLabel(method: string | null, channel: string | null): string {
@@ -965,6 +993,9 @@ export async function listPaymentsByMonth(opts: PaymentsMonthOptions): Promise<P
       method,
       method_label: methodLabel(method, channel),
       receipt_id: receipt ? receipt.id : null,
+      // 10/15 (Nic): a hand-recorded payment says who typed it and from what.
+      recorded_by: receipt?.received_by_name || null,
+      recorded_from: deviceWords(receipt?.received_device ?? null, receipt?.received_ip ?? null),
       reference: receipt?.reference ?? null,
       deposit_photo_url: receipt?.deposit_photo_url ?? null,
       deposit_date_flag: receipt?.flag_said && receipt?.flag_bank ? { said: receipt.flag_said, bank: receipt.flag_bank } : null,

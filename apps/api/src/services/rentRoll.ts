@@ -423,6 +423,7 @@ export function paymentsByHousehold(
       list.push({
         paymentId: p.id, paidOn: p.paid_on, amount: dollars(part.money + part.credit), credit: dollars(part.credit),
         methodLabel: p.method_label, status: p.status, statusLabel: p.status_label, reference: p.reference,
+        recordedBy: p.recorded_by ?? null, recordedFrom: p.recorded_from ?? null,
       })
       out.set(key, list)
     }

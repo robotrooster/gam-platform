@@ -179,6 +179,11 @@ export interface ManualSettleInput {
    * bill must be picked too. Absent: every bill (the whole balance).
    */
   billIds?: readonly string[] | null
+  /**
+   * 10/15 (Nic): the device this was typed on, kept with the receipt so "who
+   * recorded this" is answerable later. GAM's own receipts pass nothing.
+   */
+  takenFrom?: { ip?: string | null; device?: string | null } | null
   /** What was handed over (household scope: required). */
   amountTendered?: number | null
   /** Cash over the bill: "Give $X change" or "Keep $X as credit". No default. */
@@ -1398,13 +1403,16 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
     const rem = await client.query<{ id: string }>(
       `INSERT INTO tenant_remittances
          (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status,
-          payment_method, gross_amount, processing_fee_amount, settled_at, reference, notes, received_by)
-       VALUES ($1, $2, $3, $4, $5, $6, 'settled', $7, NULL, 0, COALESCE($8::timestamptz, NOW()), $9, $10, $11)
+          payment_method, gross_amount, processing_fee_amount, settled_at, reference, notes, received_by,
+          received_ip, received_device)
+       VALUES ($1, $2, $3, $4, $5, $6, 'settled', $7, NULL, 0, COALESCE($8::timestamptz, NOW()), $9, $10, $11,
+               $12::inet, $13)
        RETURNING id`,
       [tenantId, creditLease ?? pickedLease ?? payment.lease_id, landlordId, toDollars(kept).toFixed(2),
        toDollars(amountSettled).toFixed(2), toDollars(keepAsCredit ? surplus : 0).toFixed(2),
        method, input.settledAt, input.reference || null,
-       [input.notes, handed].filter(Boolean).join(' ') || null, input.takenBy ?? null])
+       [input.notes, handed].filter(Boolean).join(' ') || null, input.takenBy ?? null,
+       input.takenFrom?.ip || null, input.takenFrom?.device?.slice(0, 300) || null])
     receiptId = rem.rows[0].id
     // 10/5 (Nic): "money movement is the end of onboarding" — cash, a check or
     // a money order taken at the desk ends the free onboarding window, even

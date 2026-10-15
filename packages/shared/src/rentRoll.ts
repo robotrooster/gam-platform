@@ -200,6 +200,13 @@ export interface RentRollPayment {
   /** A check or money-order number, a bank deposit's reference; null when none. */
   reference: string | null
   /**
+   * 10/15 (Nic): a payment somebody typed in says who typed it and on what
+   * device — "Lisa Scheeler · Chrome on Windows (70.112.4.9)". Both null when
+   * GAM recorded it itself (a card, a bank payment, a bank match).
+   */
+  recordedBy?: string | null
+  recordedFrom?: string | null
+  /**
    * What it was for, on a stay's row (10/13, Nic: "details of the money that
    * was paid"): "Stay Oct 4 – Nov 4 · at the register", "Booking deposit · stay
    * Oct 12 – Oct 15 · booking site". Absent on a household's row — its charges

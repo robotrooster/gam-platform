@@ -2016,6 +2016,8 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       towardOldBalance: body.towardOldBalance ?? null,
       confirmWrittenAmount: body.confirmWrittenAmount === true,
       takenBy: req.user!.userId,
+      // 10/15 (Nic): the device goes on the receipt with the person's name.
+      takenFrom: { ip: req.ip ?? null, device: req.headers['user-agent'] ?? null },
       source: 'desk',
       // 10/5 (Nic): paid in full, late fees charged after the deposit come off.
       depositedOn: body.method === 'bank_deposit' ? (body.depositedOn ?? null) : null,
