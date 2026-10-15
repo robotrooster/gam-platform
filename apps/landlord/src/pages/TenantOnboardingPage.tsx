@@ -1058,7 +1058,12 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Unit they occupy (optional)</label>
             <select className="input" value={unitId} onChange={e => setUnitId(e.target.value)} style={{ width: '100%' }}>
               <option value="">— None yet —</option>
-              {(allUnits as any[]).map((u: any) => (
+              {/* 10/15 (Nic): "they need to show up in true numerical order" —
+                  MH 3.5 belongs between MH 3 and MH 4, never after MH 26. */}
+              {[...(allUnits as any[])].sort((a: any, b: any) =>
+                String(a.propertyName ?? '').localeCompare(String(b.propertyName ?? ''))
+                || String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true })
+              ).map((u: any) => (
                 <option key={u.id} value={u.id}>{u.propertyName} — Unit {u.unitNumber}</option>
               ))}
             </select>

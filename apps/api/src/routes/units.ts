@@ -4967,11 +4967,11 @@ unitsRouter.get('/schedule/master', requirePerm(
       -- S650 (Nic): RV spots at the top — they turn over the most — and mobile
       -- homes at the bottom; everything else between. Numbers sort as numbers
       -- (RV 2 before RV 10), not as text.
+      -- 10/15 (Nic): the column's own collation sorts digit runs as numbers
+      -- (MH 3.5 before MH 11), so the hand-rolled split is gone — it read
+      -- 'MH 3.5' as 3 and tied it with MH 3.
       ORDER BY CASE u.unit_type WHEN 'rv_spot' THEN 0 WHEN 'mobile_home' THEN 2 ELSE 1 END,
-               u.unit_type, p.name,
-               substring(u.unit_number from '^\\D*'),
-               NULLIF(substring(u.unit_number from '\\d+'), '')::numeric NULLS LAST,
-               u.unit_number`,
+               u.unit_type, p.name, u.unit_number`,
       unitType ? [callerLandlordIds, scopedIds, oneProperty, unitType]
                : [callerLandlordIds, scopedIds, oneProperty])
 
