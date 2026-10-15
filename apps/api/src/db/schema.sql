@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict yYNj8cnvhhsbmfqMgWUxJ6tRuiz8EWfejwt2NjSQjuhaSojNcBLNdXYGkqyLOyk
+\restrict 6jOlANQ9Rhdnx9akSVkM2Y8Hbt0lygFV3yYRxWBZn1oaqC4bVovbBHy4A9Iv8xg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -43,6 +43,20 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
+
+--
+-- Name: unit_natural; Type: COLLATION; Schema: public; Owner: -
+--
+
+CREATE COLLATION public.unit_natural (provider = icu, locale = 'en-u-kn');
+
+
+--
+-- Name: COLLATION unit_natural; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLLATION public.unit_natural IS '10/15 (Nic): space names sort in number order (MH 3.5 before MH 11), digit runs read as numbers.';
+
 
 --
 -- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
@@ -19846,7 +19860,7 @@ CREATE TABLE public.unit_inspections (
 CREATE TABLE public.unit_number_history (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     unit_id uuid NOT NULL,
-    unit_number text NOT NULL,
+    unit_number text NOT NULL COLLATE public.unit_natural,
     building text,
     effective_from timestamp with time zone DEFAULT now() NOT NULL,
     effective_to timestamp with time zone,
@@ -19909,7 +19923,7 @@ CREATE TABLE public.units (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     property_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
-    unit_number text NOT NULL,
+    unit_number text NOT NULL COLLATE public.unit_natural,
     bedrooms integer DEFAULT 1 NOT NULL,
     bathrooms numeric(3,1) DEFAULT 1.0 NOT NULL,
     sqft integer,
@@ -19960,7 +19974,7 @@ CREATE TABLE public.units (
     owner_household_size integer DEFAULT 1 NOT NULL,
     has_propane_tank boolean DEFAULT false NOT NULL,
     building text,
-    display_label text,
+    display_label text COLLATE public.unit_natural,
     owner_occupant_name text,
     owner_occupant_phone text,
     owner_occupant_email text,
@@ -43438,5 +43452,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict yYNj8cnvhhsbmfqMgWUxJ6tRuiz8EWfejwt2NjSQjuhaSojNcBLNdXYGkqyLOyk
+\unrestrict 6jOlANQ9Rhdnx9akSVkM2Y8Hbt0lygFV3yYRxWBZn1oaqC4bVovbBHy4A9Iv8xg
 
