@@ -124,9 +124,14 @@ async function household(): Promise<H> {
 /** The landlord's next rent is due within the netting window (or not): the dispute recovery nets from it, or pulls. */
 async function nextRentDue(h: H, soon: boolean) {
   await db.query(
+    // 10/15: a due day is 1-28 (leases_rent_due_day_range), because the 29th
+    // does not exist every month. "Two weeks out" was written as today + 14
+    // days, which on the 15th of a month asks for the 29th and the insert is
+    // refused — the suite failed on the date, not on the code. Stepped round
+    // the 28-day cycle instead, which is the furthest from today it can be.
     `UPDATE leases SET rent_due_day = CASE WHEN $2
         THEN EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int
-        ELSE EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix') + interval '14 days')::int END
+        ELSE ((EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int - 1 + 14) % 28) + 1 END
       WHERE id = $1`, [h.leaseId, soon])
 }
 

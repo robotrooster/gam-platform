@@ -87,6 +87,16 @@ const billedTo = async (meter: string) =>
   (await db.query<{ lease_id: string; usage: number }>(
     `SELECT lease_id, usage_amount::float AS usage FROM utility_bills WHERE meter_id = $1`, [meter])).rows
 
+/**
+ * Every leaf value in an answer, as text — for asking "is the reading itself in
+ * here anywhere", without a substring scan over ids that happen to contain it.
+ */
+function leakedValues(v: unknown, out: string[] = []): string[] {
+  if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach(x => leakedValues(x, out))
+  else if (v != null) out.push(String(v))
+  return out
+}
+
 describe('a move-out read names whose move-out it is', () => {
   it('the to-do sends the leaving household: that household is billed, not one that left earlier', async () => {
     const f = await seed()
@@ -177,7 +187,11 @@ describe('a meter reader reads blind', () => {
     expect(m.opening_read.value).toBeUndefined()
     expect(m.rate_per_unit).toBeUndefined()
     expect(m.base_fee).toBeUndefined()
-    expect(JSON.stringify(r.body)).not.toMatch(/777/)
+    // 10/15: this read `JSON.stringify(r.body)` for the text "777", which an
+    // id like …a777f… trips once the test database holds other rows — the
+    // full suite failed on that, not on a leak. The check is now exact: no
+    // field anywhere in the answer IS the reading.
+    expect(leakedValues(r.body.data)).not.toContain('777')
   })
 
   it('staff who can see units keep the prices but still never the reading value', async () => {
