@@ -901,3 +901,29 @@ describe('where replies go', () => {
     expect((await logRowFor('someone@mailer-test.co')).metadata?.reply_to).toBeUndefined()
   })
 })
+
+/**
+ * 10/15 (Nic): Scott Vigne asked for twelve sign-in codes over two days and
+ * never got in. All were delivered — and all had the same subject, so Gmail
+ * collapsed them into one conversation and he kept typing a retired code. The
+ * code rides in the subject now, so each email stands on its own; the
+ * permanent log still never holds one (auth.test.ts covers that side).
+ */
+describe('10/15: the sign-in code is in the subject, so the emails stop threading', () => {
+  it('the subject carries the code, and two codes never share a subject', async () => {
+    const { emailLoginCode } = await import('./email')
+    await emailLoginCode('threading@gamcheck.io', '418902', 10, { userId: undefined })
+    await emailLoginCode('threading@gamcheck.io', '550317', 10, { userId: undefined })
+    const subjects = resendSendMock.mock.calls.map((c: any[]) => c[0].subject)
+    expect(subjects).toContain('Your GAM sign-in code: 418902')
+    expect(subjects).toContain('Your GAM sign-in code: 550317')
+    expect(new Set(subjects).size).toBe(subjects.length)
+  })
+
+  it('tells the reader that only the newest code works', async () => {
+    const { emailLoginCode } = await import('./email')
+    await emailLoginCode('newest@gamcheck.io', '111222', 10, { userId: undefined })
+    const html = resendSendMock.mock.calls.at(-1)![0].html as string
+    expect(html).toMatch(/only the newest one works/i)
+  })
+})

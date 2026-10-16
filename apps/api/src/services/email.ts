@@ -244,7 +244,13 @@ async function send(
          provider_message_id, body_text
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
-        to, subject, ctx.category ?? null, status, errorMessage,
+        // 10/15: a sign-in code now rides in the subject (so the emails stop
+        // threading in Gmail). email_send_log is permanent — its triggers
+        // refuse UPDATE and DELETE — so the code is cut out of the subject
+        // before it is written. A second factor anybody with database or
+        // backup access can read is not a second factor.
+        to, ctx.category === 'login_2fa_code' ? 'Your GAM sign-in code' : subject,
+        ctx.category ?? null, status, errorMessage,
         ctx.landlordId ?? null, ctx.relatedEntityType ?? null, ctx.relatedEntityId ?? null,
         ctx.metadata ? JSON.stringify(ctx.metadata) : null,
         messageId,
@@ -1730,9 +1736,17 @@ export async function emailLoginCode(
   //
   // The code lives in the body only. The body is not logged (body_text is null
   // for this category), so it never lands anywhere durable.
+  // 10/15 (Nic): Scott Vigne asked for twelve codes over two days and could
+  // not sign in. Every one was delivered — and every one had the SAME subject,
+  // so Gmail collapsed them into one conversation and the code he read was
+  // never the newest. A resend retires the one before it, so a stale code
+  // fails, he asks again, and the pile grows. The code is in the subject now:
+  // each email is its own thread and he can read it off the notification.
+  // It is REDACTED from email_send_log below, so the permanent record (and
+  // every backup) still never holds a live code.
   return send(
     to,
-    'Your GAM sign-in code',
+    `Your GAM sign-in code: ${code}`,
     base(
       h('Your sign-in code') +
       p('Use this code to finish signing in to GAM:') +
@@ -1740,6 +1754,8 @@ export async function emailLoginCode(
         <div style="font-family:monospace;font-size:2rem;font-weight:800;letter-spacing:.35em;color:#eef1f8">${code}</div>
       </div>` +
       p(`This code expires in <strong style="color:#eef1f8">${ttlMinutes} minutes</strong> and can be used once.`) +
+      // 10/15 (Nic): say it, so somebody reading an older email knows why it failed.
+      p('If you asked for more than one code, only the newest one works.') +
       p(`If you didn't try to sign in, you can ignore this email — your account is safe.`)
     ),
     {
