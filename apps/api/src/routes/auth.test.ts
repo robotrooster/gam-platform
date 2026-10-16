@@ -1002,13 +1002,16 @@ describe('POST /api/auth/register-prospect', () => {
   })
 })
 
-// ─── S637: a sign-in code must not be readable in the email log ──────────────
+// ─── 10/15 (Nic): the code IS in the log, as history ─────────────────────────
 //
-// email_send_log is PERMANENT by design — triggers refuse UPDATE and DELETE so
-// an outreach record cannot be rewritten after the fact. Putting the code in the
-// subject therefore wrote 183 live second factors into a table any admin can
-// read and every nightly backup carries. A second factor that anyone with
-// database access can read is not a second factor.
+// S637 cut the code out of the logged subject, on the reasoning that
+// email_send_log is permanent and "183 live codes" sat in it readable. Checked
+// 10/15: none of those 215 rows was inside its ten minutes. Nic: "once the
+// code dies it dies ... why wouldn't you want it to be in the server as a
+// history log." A code is a second factor that lives ten minutes, is single
+// use, and is retired by the next resend; whoever can read this table can
+// already do far worse. So the subject is logged whole, and these tests say
+// what the log is FOR: the history of what was sent, to whom, and when.
 describe('S637 login codes stay out of the permanent log', () => {
   it('logs the send without logging the code', async () => {
     const { emailLoginCode } = await import('../services/email')
@@ -1018,21 +1021,23 @@ describe('S637 login codes stay out of the permanent log', () => {
       `SELECT subject, body_text FROM email_send_log
         WHERE to_email = 'code-check@test.dev' ORDER BY created_at DESC LIMIT 1`)
     expect(rows).toHaveLength(1)
-    // The send is still recorded — we know a code went out, and when.
-    expect(rows[0].subject).toMatch(/sign-in code/i)
-    // But the code itself is nowhere in the row.
-    expect(rows[0].subject).not.toMatch(/424242/)
-    expect(rows[0].body_text ?? '').not.toMatch(/424242/)
+    // The send is recorded, code and all — that is the history.
+    expect(rows[0].subject).toBe('Your GAM sign-in code: 424242')
+    // The BODY is still never logged: the log is a record of sends, not of mail.
+    expect(rows[0].body_text ?? '').toBe('')
   })
 
-  it('no six-digit code sits in any logged subject', async () => {
+  it('the history can be read back: who got a code, when, and which one', async () => {
     const { emailLoginCode } = await import('../services/email')
     await emailLoginCode('code-check2@test.dev', '987654', 10, { userId: undefined })
-    const { rows } = await db.query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM email_send_log
-        WHERE category = 'login_2fa_code' AND subject ~ '[0-9]{6}'
-          AND created_at > NOW() - INTERVAL '1 minute'`)
-    expect(Number(rows[0].n)).toBe(0)
+    const { rows } = await db.query<{ to_email: string; subject: string; status: string }>(
+      `SELECT to_email, subject, status FROM email_send_log
+        WHERE category = 'login_2fa_code' AND created_at > NOW() - INTERVAL '1 minute'
+        ORDER BY created_at DESC LIMIT 1`)
+    expect(rows[0]).toMatchObject({ to_email: 'code-check2@test.dev', subject: 'Your GAM sign-in code: 987654' })
+    // 10/15 (Nic): the point of the row. A support question is "did we send
+    // him one, when, and did it land" — and that is answerable from here.
+    expect(rows[0].status).toBeTruthy()
   })
 })
 

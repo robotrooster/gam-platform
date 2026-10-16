@@ -244,13 +244,7 @@ async function send(
          provider_message_id, body_text
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
-        // 10/15: a sign-in code now rides in the subject (so the emails stop
-        // threading in Gmail). email_send_log is permanent — its triggers
-        // refuse UPDATE and DELETE — so the code is cut out of the subject
-        // before it is written. A second factor anybody with database or
-        // backup access can read is not a second factor.
-        to, ctx.category === 'login_2fa_code' ? 'Your GAM sign-in code' : subject,
-        ctx.category ?? null, status, errorMessage,
+        to, subject, ctx.category ?? null, status, errorMessage,
         ctx.landlordId ?? null, ctx.relatedEntityType ?? null, ctx.relatedEntityId ?? null,
         ctx.metadata ? JSON.stringify(ctx.metadata) : null,
         messageId,
@@ -1728,14 +1722,22 @@ export async function emailLoginCode(
 ): Promise<string | null> {
   // ── S637: THE CODE DOES NOT GO IN THE SUBJECT ───────────────────────────
   //
-  // Every subject line is written to email_send_log, which is PERMANENT by
-  // design — triggers refuse UPDATE and DELETE so an outreach record cannot be
-  // rewritten. That made 183 live sign-in codes readable in plaintext by any
-  // admin, and put them in every nightly backup. A second factor anybody with
-  // database access can read is not a second factor.
+  // 10/15 (Nic) — THE CODE IS IN THE SUBJECT, AND THE SUBJECT IS LOGGED.
   //
-  // The code lives in the body only. The body is not logged (body_text is null
-  // for this category), so it never lands anywhere durable.
+  // S637 took it out of the subject because every subject is written to
+  // email_send_log, which is permanent (its triggers refuse UPDATE and
+  // DELETE). That was written up as "183 live codes readable in plaintext".
+  // Checked on 10/15: 215 of 559 code emails carry a code in the subject, the
+  // last on 2026-09-04, and NONE is inside its ten minutes. Nic: "if the codes
+  // expire after 10 minutes then they're not really live, are they ... I don't
+  // understand why you wouldn't want it to be in the server as a history log."
+  //
+  // He is right, and the risk was overstated. A logged code is usable only
+  // within its ten minutes, only unused, only before a resend retires it, and
+  // only by somebody who also has the password — this is the SECOND factor.
+  // Whoever can read this table has live database access, which already reads
+  // every resident's record, moves an address or mints a session. In a backup
+  // they are dead numbers. So the whole subject is logged, as history.
   // 10/15 (Nic): Scott Vigne asked for twelve codes over two days and could
   // not sign in. Every one was delivered — and every one had the SAME subject,
   // so Gmail collapsed them into one conversation and the code he read was
