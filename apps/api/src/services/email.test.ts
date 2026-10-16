@@ -923,7 +923,8 @@ describe('10/15: the sign-in code is in the subject, so the emails stop threadin
   it('tells the reader that only the newest code works', async () => {
     const { emailLoginCode } = await import('./email')
     await emailLoginCode('newest@gamcheck.io', '111222', 10, { userId: undefined })
-    const html = resendSendMock.mock.calls.at(-1)![0].html as string
+    const calls = resendSendMock.mock.calls as any[][]
+    const html = calls[calls.length - 1][0].html as string
     expect(html).toMatch(/only the newest one works/i)
   })
 })
