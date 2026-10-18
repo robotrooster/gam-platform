@@ -21,7 +21,8 @@
 #   • API        — launchd service, needs a rebuild + kickstart
 #   • marketing  — launchd service that reads index.html ONCE AT STARTUP, so a
 #                  kickstart IS the deploy (no build step at all)
-#   • frontends  — local build → vercel build → vercel deploy --prebuilt
+#   • frontends  — vercel build --prod → vercel deploy --prebuilt (10/17: one
+#                  build, not two — see the note on the parallel stage)
 #
 # Verification is not optional here: an "in sync" claim is only worth anything
 # if it came from fetching production, so every surface is checked after.
@@ -75,7 +76,21 @@ API_FAILED=0
 echo "═══ GAM deploy $(date '+%Y-%m-%d %H:%M:%S') ═══"
 $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
 
-# ── tests, BEFORE anything ships ─────────────────────────────────────────
+# ── shared package first: every surface compiles against it ───────────────
+# 10/17: this moved AHEAD of the tests. It publishes nothing — it writes
+# packages/shared/dist and stops — and everything in the parallel stage below
+# compiles against that dist, the API suite included (apps/api imports
+# @gam/shared through it). Building it once, here, is what lets the suite and
+# every surface build run side by side without one rewriting the other's input.
+echo; echo "── @gam/shared ──"
+if (cd packages/shared && npm run build >/tmp/gam-deploy-shared.log 2>&1); then
+  ok "built"
+else
+  bad "BUILD FAILED — see /tmp/gam-deploy-shared.log"; FAILED=1
+  echo; echo "Aborting: every surface compiles against shared."; exit 1
+fi
+
+# ── tests and builds, together, BEFORE anything ships ────────────────────
 #
 # S624 (Nic asked for this after a red suite shipped twice in S623): deploy.sh
 # built, deployed and verified — and never once ran a test. "Verified" meant the
@@ -86,70 +101,109 @@ $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
 # the DEV/PROD database and its cleanup helpers truncate real tables. It is set
 # here explicitly rather than trusted to a shell profile.
 #
-# The gate runs FIRST — before the shared build, before the API build — because
-# the point is to fail before anything is published, not after.
-if $CHECK_ONLY; then
-  echo; echo "── tests ──"; warn "would run the API, tenant portal and landlord portal suites (skipped in --check)"
-elif $SKIP_TESTS; then
-  echo; echo "── tests ──"
-  bad "SKIPPED (--skip-tests). You are shipping code nothing verified."
-else
-  echo; echo "── tests (API suite, ~8 min) ──"
-  if (cd apps/api && DB_NAME=gam_test npx vitest run --reporter=dot) >/tmp/gam-deploy-tests.log 2>&1; then
-    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests.log | tail -1) — suite green"
-  else
-    bad "TESTS FAILED — nothing has been deployed."
-    echo
-    # Show the actual failures rather than a log path nobody opens.
-    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests.log | head -20
-    echo
-    echo "Full output: /tmp/gam-deploy-tests.log"
-    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
-    exit 1
+# 10/17 (Nic): "these deploys are taking longer and longer they used to take 10
+# or 15 minutes and now they're taking 45 minutes." Two changes, both here:
+#
+#   • The API suite runs on GAM_TEST_WORKERS processes at once, each on its OWN
+#     copy of the test database (apps/api/src/test/testWorkers.ts). It used to
+#     run all 737 files one after another in a single process because they all
+#     shared one database.
+#   • Every suite and every surface build starts at the same moment. A build
+#     writes to its own dist folder and publishes nothing, so there is no order
+#     to keep among them, and a deploy no longer waits out the builds after a
+#     suite it could have run beside.
+#
+# NOTHING SHIPS UNTIL EVERY SUITE IS GREEN. The gate is read below, before the
+# first deploy step, and it stops at the FIRST red suite — so a build that
+# happened to finish is a dist folder nobody published.
+TEST_WORKERS="${GAM_TEST_WORKERS:-6}"
+STAGE=/tmp/gam-deploy-stage
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+# One parallel job: its own log, and its exit code written to a file, because
+# `wait` in bash 3.2 (what macOS ships) cannot hand back one named job's status.
+stage_run(){ ( eval "$3" >"$2" 2>&1; echo $? >"$STAGE/$1.rc" ) & }
+stage_rc(){ cat "$STAGE/$1.rc" 2>/dev/null || echo 99; }
+# A red suite stops the deploy here, with the failures themselves on screen
+# rather than a log path nobody opens.
+gate_suite(){
+  if [ "$(stage_rc "$1")" = "0" ]; then
+    ok "$2 — $(grep -oE '[0-9]+ passed' "$3" | tail -1)"
+    return 0
   fi
+  bad "$2 FAILED — nothing has been deployed."
+  echo
+  grep -E "FAIL|✕|Tests +[0-9]+ failed" "$3" | head -20
+  echo
+  echo "Full output: $3"
+  echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
+  exit 1
+}
+
+echo; echo "── tests + builds (in parallel) ──"
+if $CHECK_ONLY; then
+  warn "would run the API, tenant, landlord, register and PM company suites (skipped in --check)"
+elif $SKIP_TESTS; then
+  bad "TESTS SKIPPED (--skip-tests). You are shipping code nothing verified."
+else
+  echo "  ${DIM}API suite on $TEST_WORKERS workers; tenant and landlord portals beside it${OFF}"
+  stage_run api-tests /tmp/gam-deploy-tests.log \
+    "cd apps/api && DB_NAME=gam_test GAM_TEST_WORKERS=$TEST_WORKERS npx vitest run --reporter=dot"
   # S655 review: the tenant portal's own tests (apps/tenant/vitest.config.ts) —
   # its screens' wording and behavior, which nothing else runs. No database.
-  echo; echo "── tests (tenant portal) ──"
-  if (cd apps/tenant && npx vitest run --reporter=dot) >/tmp/gam-deploy-tests-tenant.log 2>&1; then
-    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests-tenant.log | tail -1) — suite green"
-  else
-    bad "TENANT TESTS FAILED — nothing has been deployed."
-    echo
-    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests-tenant.log | head -20
-    echo
-    echo "Full output: /tmp/gam-deploy-tests-tenant.log"
-    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
-    exit 1
-  fi
+  stage_run tenant-tests /tmp/gam-deploy-tests-tenant.log \
+    "cd apps/tenant && npx vitest run --reporter=dot"
   # S655: the landlord portal's own tests (apps/landlord/vitest.config.ts) —
   # Record payment, Outstanding Balances, Payments, the Front Desk, Make a bank
   # deposit, move-out and the paid-ahead choice. No database.
-  echo; echo "── tests (landlord portal) ──"
-  if (cd apps/landlord && npx vitest run --reporter=dot) >/tmp/gam-deploy-tests-landlord.log 2>&1; then
-    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests-landlord.log | tail -1) — suite green"
-  else
-    bad "LANDLORD TESTS FAILED — nothing has been deployed."
-    echo
-    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests-landlord.log | head -20
-    echo
-    echo "Full output: /tmp/gam-deploy-tests-landlord.log"
-    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
-    exit 1
-  fi
+  stage_run landlord-tests /tmp/gam-deploy-tests-landlord.log \
+    "cd apps/landlord && npx vitest run --reporter=dot"
+  # 10/17: the register's own two suites were never run by this script, even
+  # though the note on the pos frontend below names pos-parity.test.ts as the
+  # reason that surface has to ship — the test that says the standalone
+  # register and the landlord POS tab are the same screen. Both are seconds
+  # long and both are green, and in this stage they cost no wall clock at all.
+  stage_run pos-tests /tmp/gam-deploy-tests-pos.log \
+    "cd apps/pos && npx vitest run --reporter=dot"
+  stage_run pm-company-tests /tmp/gam-deploy-tests-pm-company.log \
+    "cd apps/pm-company && npx vitest run --reporter=dot"
 fi
 
-# ── shared package first: every frontend compiles against it ──────────────
-echo; echo "── @gam/shared ──"
-if (cd packages/shared && npm run build >/tmp/gam-deploy-shared.log 2>&1); then
-  ok "built"
-else
-  bad "BUILD FAILED — see /tmp/gam-deploy-shared.log"; FAILED=1
-  echo; echo "Aborting: frontends compile against shared."; exit 1
+# The API's own build (tsc -b). The launchd restart that makes it live is its
+# own step further down — this only writes apps/api/dist.
+stage_run api-build /tmp/gam-deploy-api.log "cd apps/api && npm run build"
+
+# 10/17: ONE build per frontend, not two. This used to run `npm run build` to
+# get a bundle hash to compare against production, and then `vercel build
+# --prod` ran the project's build command — the same `tsc && vite build` — all
+# over again. Vercel reads framework=vite and buildCommand=null from
+# .vercel/project.json, so the two builds produce byte-identical output (checked
+# on all seven: same index-<hash>.js). The hash now comes off
+# .vercel/output/static, which is also exactly what `--prebuilt` ships.
+for entry in "${FRONTENDS[@]}"; do
+  app="${entry%%:*}"
+  [ -d "apps/$app" ] || continue
+  [ -f "apps/$app/.vercel/project.json" ] || continue
+  stage_run "build-$app" "/tmp/gam-deploy-$app.log" "cd apps/$app && npx vercel build --prod"
+done
+stage_run build-storefront /tmp/gam-deploy-storefront.log "cd apps/storefront && npm run build"
+# In --check the marketing build is skipped, as it always was: there is nothing
+# to compare it against without publishing.
+$CHECK_ONLY || stage_run build-marketing /tmp/gam-deploy-marketing.log \
+  "cd apps/marketing && node build.js && node package-output.js"
+wait
+
+# ── the gate ─────────────────────────────────────────────────────────────
+if ! $CHECK_ONLY && ! $SKIP_TESTS; then
+  gate_suite api-tests      "API suite green"             /tmp/gam-deploy-tests.log
+  gate_suite tenant-tests   "tenant portal suite green"   /tmp/gam-deploy-tests-tenant.log
+  gate_suite landlord-tests "landlord portal suite green" /tmp/gam-deploy-tests-landlord.log
+  gate_suite pos-tests        "register suite green"      /tmp/gam-deploy-tests-pos.log
+  gate_suite pm-company-tests "PM company suite green"    /tmp/gam-deploy-tests-pm-company.log
 fi
 
 # ── API ──────────────────────────────────────────────────────────────────
 echo; echo "── API (launchd com.gam.api) ──"
-if (cd apps/api && npm run build >/tmp/gam-deploy-api.log 2>&1); then
+if [ "$(stage_rc api-build)" = "0" ]; then
   ok "built"
   if ! $CHECK_ONLY; then
     # S652: bootout + bootstrap, not kickstart — a kickstart restarts the
@@ -239,7 +293,7 @@ if [ "$API_FAILED" -ne 0 ]; then
 elif $CHECK_ONLY; then
   warn "would build + vercel deploy --prebuilt --prod"
 else
-  if ! (cd apps/marketing && node build.js && node package-output.js) >/tmp/gam-deploy-marketing.log 2>&1; then
+  if [ "$(stage_rc build-marketing)" != "0" ]; then
     bad "BUILD FAILED — see /tmp/gam-deploy-marketing.log"; FAILED=1
   elif ! (cd apps/marketing && npx vercel deploy --prebuilt --prod --yes) >>/tmp/gam-deploy-marketing.log 2>&1; then
     bad "VERCEL DEPLOY FAILED — see /tmp/gam-deploy-marketing.log"; FAILED=1
@@ -278,10 +332,12 @@ for entry in "${FRONTENDS[@]}"; do
   [ -d "apps/$app" ] || { warn "no such app, skipping"; continue; }
   [ -f "apps/$app/.vercel/project.json" ] || { warn "not Vercel-linked, skipping"; continue; }
 
-  if ! (cd "apps/$app" && npm run build >"/tmp/gam-deploy-$app.log" 2>&1); then
+  if [ "$(stage_rc "build-$app")" != "0" ]; then
     bad "BUILD FAILED — see /tmp/gam-deploy-$app.log"; FAILED=1; continue
   fi
-  local_hash=$(ls "apps/$app"/dist/assets/index-*.js 2>/dev/null | head -1 | xargs basename 2>/dev/null)
+  # 10/17: the hash comes off .vercel/output/static, which is the build the
+  # parallel stage already made and exactly what `--prebuilt` ships.
+  local_hash=$(ls "apps/$app"/.vercel/output/static/assets/index-*.js 2>/dev/null | head -1 | xargs basename 2>/dev/null)
   prod_hash=$(curl -s --max-time 10 "https://$domain/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1)
 
   if [ -z "$local_hash" ]; then bad "no build output found"; FAILED=1; continue; fi
@@ -294,15 +350,16 @@ for entry in "${FRONTENDS[@]}"; do
   echo "  ${DIM}local $local_hash → prod ${prod_hash:-none}${OFF}"
   if $CHECK_ONLY; then warn "would deploy"; continue; fi
 
-  if ! (cd "apps/$app" && npx vercel build --prod >>"/tmp/gam-deploy-$app.log" 2>&1 \
-        && npx vercel deploy --prebuilt --prod --yes >>"/tmp/gam-deploy-$app.log" 2>&1); then
+  if ! (cd "apps/$app" && npx vercel deploy --prebuilt --prod --yes >>"/tmp/gam-deploy-$app.log" 2>&1); then
     bad "DEPLOY FAILED — see /tmp/gam-deploy-$app.log"; FAILED=1; continue
   fi
 
   # Verify against the real domain — a deploy that "succeeded" but left the
   # alias on an older build is exactly the stale-visuals problem this prevents.
-  sleep 4
-  for i in $(seq 1 10); do
+  # 10/17: the flat `sleep 4` before the first try is gone; the loop's own
+  # 3-second wait covers an alias that needs a moment, and an alias that is
+  # already live costs nothing to confirm.
+  for i in $(seq 1 12); do
     prod_hash=$(curl -s --max-time 10 "https://$domain/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1)
     [ "$local_hash" = "$prod_hash" ] && break
     sleep 3
@@ -322,7 +379,7 @@ echo; echo "── storefront (self-hosted: *.gam.biz) ──"
 STOREFRONT_PROBE="${STOREFRONT_PROBE_URL:-https://mountain-view-rv-ranch-2843.gam.biz/}"
 if [ "$API_FAILED" -ne 0 ]; then
   warn "skipped: the API did not go live"
-elif ! (cd apps/storefront && npm run build) >/tmp/gam-deploy-storefront.log 2>&1; then
+elif [ "$(stage_rc build-storefront)" != "0" ]; then
   bad "BUILD FAILED — see /tmp/gam-deploy-storefront.log"; FAILED=1
 else
   sf_local=$(ls apps/storefront/dist/assets/index-*.js 2>/dev/null | head -1 | xargs basename 2>/dev/null)

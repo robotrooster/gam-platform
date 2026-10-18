@@ -13,6 +13,12 @@ import { defineConfig } from 'vitest/config'
 //    cost a diagnosis. Per-worker databases would be the scalable fix; until
 //    then, correctness beats wall-clock.
 //
+//    10/17: the API suite HAS that fix now — apps/api/vitest.config.ts runs
+//    GAM_TEST_WORKERS files at once and apps/api/src/test/globalSetup.ts hands
+//    each worker its own copy of the database (src/test/testWorkers.ts). This
+//    root config is what a `vitest` from the REPO ROOT uses, which no suite is
+//    run that way on purpose, so it stays one file at a time.
+//
 // 2. STALE WORKTREE COPIES.
 //    `.claude/worktrees/**` holds full checkouts from earlier sessions, each
 //    with its own copy of every test file. Vitest happily collected all of
