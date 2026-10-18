@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Hr3ekkORilnX6ab9TZgarXw1iFRb9jbq56x3MdKprRuATQ6lADIAUH98yI8KLd1
+\restrict yyIt9lkpDk6QHjhPcwNj7BFTCSAhdfg5GIWdtUrHOK3KF7g9KnX0A9Ze4ycO5Sb
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2269,6 +2269,93 @@ $$;
 
 
 --
+-- Name: fn_pos_tax_rates_journal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_pos_tax_rates_journal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  actor uuid;
+  ll uuid; rid uuid; pid uuid; nm text;
+  o_rate numeric(7,4); n_rate numeric(7,4);
+  o_active boolean;    n_active boolean;
+  o_stays boolean;     n_stays boolean;
+  o_reach jsonb;       n_reach jsonb;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    -- The same row written back is not a change (keeps the journal readable).
+    IF to_jsonb(OLD) = to_jsonb(NEW) THEN RETURN NULL; END IF;
+  END IF;
+  BEGIN
+    actor := current_setting('gam.user_id', true)::uuid;
+  EXCEPTION WHEN OTHERS THEN
+    actor := NULL;
+  END;
+  IF TG_OP <> 'INSERT' THEN
+    ll := OLD.landlord_id; rid := OLD.id; pid := OLD.property_id; nm := OLD.name;
+    o_rate := OLD.rate; o_active := OLD.is_active; o_stays := OLD.on_stays;
+    o_reach := jsonb_build_object('appliesTo', to_jsonb(OLD.applies_to),
+                                  'categoryIds', to_jsonb(OLD.category_ids),
+                                  'itemIds', to_jsonb(OLD.item_ids));
+  END IF;
+  IF TG_OP <> 'DELETE' THEN
+    ll := NEW.landlord_id; rid := NEW.id; pid := NEW.property_id; nm := NEW.name;
+    n_rate := NEW.rate; n_active := NEW.is_active; n_stays := NEW.on_stays;
+    n_reach := jsonb_build_object('appliesTo', to_jsonb(NEW.applies_to),
+                                  'categoryIds', to_jsonb(NEW.category_ids),
+                                  'itemIds', to_jsonb(NEW.item_ids));
+  END IF;
+  INSERT INTO pos_tax_rate_changes
+    (landlord_id, rate_id, property_id, name,
+     old_rate, new_rate, old_is_active, new_is_active, old_on_stays, new_on_stays,
+     old_reach, new_reach, changed_by)
+  VALUES (ll, rid, pid, nm, o_rate, n_rate, o_active, n_active, o_stays, n_stays,
+          o_reach, n_reach, actor);
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: fn_pos_tax_rates_sync_stay_tax(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_pos_tax_rates_sync_stay_tax() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE ll uuid;
+BEGIN
+  IF TG_OP = 'DELETE' THEN ll := OLD.landlord_id; ELSE ll := NEW.landlord_id; END IF;
+  UPDATE properties p
+     SET short_term_tax_rate = public.property_stay_tax_pct(p.id)
+   WHERE p.landlord_id = ll
+     AND p.short_term_tax_rate IS DISTINCT FROM public.property_stay_tax_pct(p.id);
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: fn_properties_follow_stay_tax(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_properties_follow_stay_tax() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pos_tax_rates r
+                  WHERE r.landlord_id = NEW.landlord_id AND r.is_active AND r.on_stays
+                    AND (r.property_id = NEW.id OR r.property_id IS NULL)) THEN
+    RETURN NULL;
+  END IF;
+  UPDATE properties p
+     SET short_term_tax_rate = public.property_stay_tax_pct(p.id)
+   WHERE p.id = NEW.id
+     AND p.short_term_tax_rate IS DISTINCT FROM public.property_stay_tax_pct(p.id);
+  RETURN NULL;
+END $$;
+
+
+--
 -- Name: fn_unit_bookings_stamp_cancelled_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2284,6 +2371,34 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: fn_unit_bookings_stamp_stay_tax(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_unit_bookings_stamp_stay_tax() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE pct numeric;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.stay_tax_rate IS NOT NULL THEN RETURN NEW; END IF;
+  ELSE
+    IF NEW.stay_tax_rate IS DISTINCT FROM OLD.stay_tax_rate THEN RETURN NEW; END IF;
+    IF NEW.total_amount IS NOT DISTINCT FROM OLD.total_amount THEN RETURN NEW; END IF;
+    IF OLD.stay_tax_rate IS NOT NULL
+       AND (OLD.deposit_paid_at IS NOT NULL OR OLD.balance_paid_at IS NOT NULL
+            OR EXISTS (SELECT 1 FROM stay_payments sp WHERE sp.booking_id = OLD.id)) THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+  SELECT p.short_term_tax_rate INTO pct
+    FROM units u JOIN properties p ON p.id = u.property_id
+   WHERE u.id = NEW.unit_id;
+  NEW.stay_tax_rate := ROUND(COALESCE(pct, 0) / 100, 4);
+  RETURN NEW;
+END $$;
 
 
 --
@@ -6786,6 +6901,19 @@ END $$;
 
 
 --
+-- Name: pos_tax_rate_changes_append_only(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pos_tax_rate_changes_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'pos_tax_rate_changes is append-only: change the rate and let the journal record it'
+    USING ERRCODE = 'restrict_violation';
+END $$;
+
+
+--
 -- Name: prepaid_fee_follows_payment(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -6841,6 +6969,34 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+
+
+--
+-- Name: property_stay_tax_pct(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.property_stay_tax_pct(p_property_id uuid) RETURNS numeric
+    LANGUAGE sql STABLE
+    AS $$
+  WITH reaching AS (
+    SELECT r.rate, r.property_id
+      FROM pos_tax_rates r
+      JOIN properties p ON p.id = p_property_id AND p.landlord_id = r.landlord_id
+     WHERE r.is_active AND r.on_stays
+       AND (r.property_id = p_property_id OR r.property_id IS NULL)
+  )
+  SELECT LEAST(100, COALESCE(ROUND(SUM(rate) * 100, 2), 0))
+    FROM reaching
+   WHERE (property_id IS NOT NULL)
+         = EXISTS (SELECT 1 FROM reaching WHERE property_id IS NOT NULL)
+$$;
+
+
+--
+-- Name: FUNCTION property_stay_tax_pct(p_property_id uuid); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.property_stay_tax_pct(p_property_id uuid) IS '10/17 (Nic): the percent a stay at this property is taxed at, read from the one home (the active on_stays rows of pos_tax_rates). properties.short_term_tax_rate follows it.';
 
 
 --
@@ -14589,6 +14745,11 @@ CREATE TABLE public.nexus_revenue_tally (
     revenue_usd numeric(14,2) DEFAULT 0 NOT NULL,
     txn_count integer DEFAULT 0 NOT NULL,
     computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    subscription_usd numeric(14,2) DEFAULT 0 NOT NULL,
+    markup_usd numeric(14,2) DEFAULT 0 NOT NULL,
+    screening_usd numeric(14,2) DEFAULT 0 NOT NULL,
+    optin_usd numeric(14,2) DEFAULT 0 NOT NULL,
+    other_usd numeric(14,2) DEFAULT 0 NOT NULL,
     CONSTRAINT nrt_revenue_check CHECK ((revenue_usd >= (0)::numeric)),
     CONSTRAINT nrt_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
     CONSTRAINT nrt_year_check CHECK (((period_year >= 2020) AND (period_year <= 2100)))
@@ -14600,6 +14761,48 @@ CREATE TABLE public.nexus_revenue_tally (
 --
 
 COMMENT ON TABLE public.nexus_revenue_tally IS 'Nightly-recomputed GAM own-revenue by customer state + calendar year (S565). Feeds the admin nexus dashboard; compared against state_nexus_thresholds. Monitoring only — never collects tax.';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.revenue_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.revenue_usd IS 'The COMBINED total of the line items beside it (floored at zero — the pre-existing non-negative CHECK). Nic, 10/17: "I''d rather count high and register with those states early."';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.subscription_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.subscription_usd IS '10/17 (Nic) "the actual subscription costs": what customers pay GAM to be on the platform in this state — the per-space monthly fee from GAM''s revenue book, plus the business portal''s monthly fee, which has never been posted to the book.';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.markup_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.markup_usd IS '10/17 (Nic) "hard markup fees": GAM''s real margin on each card and bank payment, as the revenue book recorded it per charge — never a rate-table estimate.';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.screening_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.screening_usd IS '10/17 (Nic) "background checks or screenings": GAM''s margin on each screening, measured where the applicant lives.';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.optin_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.optin_usd IS '10/17 (Nic) "any other customer opt-in things, the credit reporting and stuff like that": FlexPay today; anything else a customer opts into as it starts earning.';
+
+
+--
+-- Name: COLUMN nexus_revenue_tally.other_usd; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.nexus_revenue_tally.other_usd IS 'Everything else GAM earned in this state that the four named line items do not cover (card-reader markup, placement fees, a new revenue type nobody has slotted yet). Counted by default so a new way of earning money can never quietly drop out of a state''s measure.';
 
 
 --
@@ -16474,6 +16677,55 @@ CREATE TABLE public.pos_tax_categories (
 
 
 --
+-- Name: pos_tax_rate_changes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_tax_rate_changes (
+    id bigint NOT NULL,
+    landlord_id uuid NOT NULL,
+    rate_id uuid NOT NULL,
+    property_id uuid,
+    name text NOT NULL,
+    old_rate numeric(7,4),
+    new_rate numeric(7,4),
+    old_is_active boolean,
+    new_is_active boolean,
+    old_on_stays boolean,
+    new_on_stays boolean,
+    old_reach jsonb,
+    new_reach jsonb,
+    changed_by uuid,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE pos_tax_rate_changes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_tax_rate_changes IS '10/17 (Nic): every change to a named tax — the rate before and after, what it reached, who changed it and when — so a filing traces to the rate that was in force. Append-only; a change by GAM itself records no user.';
+
+
+--
+-- Name: pos_tax_rate_changes_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.pos_tax_rate_changes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: pos_tax_rate_changes_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.pos_tax_rate_changes_id_seq OWNED BY public.pos_tax_rate_changes.id;
+
+
+--
 -- Name: pos_tax_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -16488,7 +16740,8 @@ CREATE TABLE public.pos_tax_rates (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     property_id uuid,
     category_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
-    item_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL
+    item_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    on_stays boolean DEFAULT false NOT NULL
 );
 
 
@@ -16497,6 +16750,13 @@ CREATE TABLE public.pos_tax_rates (
 --
 
 COMMENT ON COLUMN public.pos_tax_rates.property_id IS 'Property this tax rate applies at. NULL = landlord-wide (legacy posture). Forward-looking: wire cart math to filter applicable rates by the property the sale is recorded at.';
+
+
+--
+-- Name: COLUMN pos_tax_rates.on_stays; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_tax_rates.on_stays IS '10/17 (Nic): this tax is charged on a stay at this property — the lodging tax. The stay price every door charges (properties.short_term_tax_rate) follows the active on_stays rates here, with the tax inside the price; the register''s cart never taxes a stay item (services/posTax), so the same tax is never charged twice. A tax can be on stays AND on goods: each is charged once.';
 
 
 --
@@ -16861,6 +17121,13 @@ COMMENT ON COLUMN public.properties.requires_booking_acknowledgment IS 'When tru
 --
 
 COMMENT ON COLUMN public.properties.flexcharge_enabled IS 'S309: per-Location FlexCharge enablement gate. When FALSE (default), createFlexChargeAccount rejects new accounts at this property with a 403 and the landlord-side create UI hides the property from the dropdown. Existing flex_charge_accounts continue to function regardless of this flag — the gate applies to NEW account creation only.';
+
+
+--
+-- Name: COLUMN properties.short_term_tax_rate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.short_term_tax_rate IS '10/17 (Nic): DERIVED — the percent a stay here is taxed at, kept in step with the company''s own tax list (the active on_stays rows of pos_tax_rates) by trg_pos_tax_rates_sync_stay_tax. Every door prices a stay from this one number; change the rate on the Taxes screen, never here.';
 
 
 --
@@ -18317,6 +18584,76 @@ CREATE TABLE public.state_law_section_texts (
 
 
 --
+-- Name: state_nexus_measure_rules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_nexus_measure_rules (
+    state_code text NOT NULL,
+    effective_year integer NOT NULL,
+    counts_subscription boolean DEFAULT true NOT NULL,
+    counts_markup boolean DEFAULT true NOT NULL,
+    counts_screening boolean DEFAULT true NOT NULL,
+    counts_optin boolean DEFAULT true NOT NULL,
+    counts_other boolean DEFAULT true NOT NULL,
+    source text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT snmr_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT snmr_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: TABLE state_nexus_measure_rules; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.state_nexus_measure_rules IS '10/17 (Nic): which of GAM''s revenue line items each state measures toward its economic-nexus threshold. Seeded to count everything — the law differs by state and the published tables disagree, so this is data a tax pro can correct without a code change. Never collects tax.';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.counts_subscription; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.counts_subscription IS 'Does this state count GAM''s platform subscription receipts toward its threshold?';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.counts_markup; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.counts_markup IS 'Does this state count GAM''s card and bank payment markup toward its threshold?';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.counts_screening; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.counts_screening IS 'Does this state count GAM''s screening margin toward its threshold?';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.counts_optin; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.counts_optin IS 'Does this state count what customers pay for opt-in services (FlexPay, credit reporting) toward its threshold?';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.counts_other; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.counts_other IS 'Does this state count GAM''s remaining earnings (card-reader markup, placement fees, anything new) toward its threshold?';
+
+
+--
+-- Name: COLUMN state_nexus_measure_rules.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_nexus_measure_rules.source IS 'Where the answer came from — the state''s own publication, or the pro who confirmed it.';
+
+
+--
 -- Name: state_nexus_thresholds; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -19655,6 +19992,7 @@ CREATE TABLE public.unit_bookings (
     screening_required boolean DEFAULT false NOT NULL,
     returning_guest_at timestamp with time zone,
     returning_guest_by uuid,
+    stay_tax_rate numeric(7,4),
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -19717,6 +20055,13 @@ COMMENT ON COLUMN public.unit_bookings.returning_guest_at IS '10/6 (Nic): when t
 --
 
 COMMENT ON COLUMN public.unit_bookings.returning_guest_by IS '10/6 (Nic): who attested the guest is returning (an owner or a staff member allowed to skip the background check).';
+
+
+--
+-- Name: COLUMN unit_bookings.stay_tax_rate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.stay_tax_rate IS '10/17 (Nic, "never reprice history"): the lodging tax rate (a fraction) in force when this stay was priced, stamped by trg_unit_bookings_stamp_stay_tax. Every payment toward the stay records its share of THIS rate, so a later change never re-rates a stay already sold. NULL on stays priced before 10/17 — they read the property''s rate, as they did before.';
 
 
 --
@@ -21256,6 +21601,13 @@ ALTER TABLE ONLY public.books_register_stock_changes ALTER COLUMN id SET DEFAULT
 --
 
 ALTER TABLE ONLY public.ledger_outbox ALTER COLUMN id SET DEFAULT nextval('public.ledger_outbox_id_seq'::regclass);
+
+
+--
+-- Name: pos_tax_rate_changes id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rate_changes ALTER COLUMN id SET DEFAULT nextval('public.pos_tax_rate_changes_id_seq'::regclass);
 
 
 --
@@ -23851,6 +24203,14 @@ ALTER TABLE ONLY public.pos_tax_categories
 
 
 --
+-- Name: pos_tax_rate_changes pos_tax_rate_changes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rate_changes
+    ADD CONSTRAINT pos_tax_rate_changes_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: pos_tax_rates pos_tax_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24424,6 +24784,14 @@ ALTER TABLE ONLY public.state_deposit_custody_rules
 
 ALTER TABLE ONLY public.state_deposit_interest_rates
     ADD CONSTRAINT state_deposit_interest_rates_pkey PRIMARY KEY (state_code, effective_year, unit_types);
+
+
+--
+-- Name: state_nexus_measure_rules state_nexus_measure_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_nexus_measure_rules
+    ADD CONSTRAINT state_nexus_measure_rules_pkey PRIMARY KEY (state_code, effective_year);
 
 
 --
@@ -30827,6 +31195,20 @@ CREATE INDEX pos_sessions_property_open_idx ON public.pos_sessions USING btree (
 
 
 --
+-- Name: pos_tax_rate_changes_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_tax_rate_changes_landlord ON public.pos_tax_rate_changes USING btree (landlord_id, changed_at DESC);
+
+
+--
+-- Name: pos_tax_rate_changes_rate; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_tax_rate_changes_rate ON public.pos_tax_rate_changes USING btree (rate_id, changed_at DESC);
+
+
+--
 -- Name: pos_transactions_stripe_pi_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -34292,6 +34674,13 @@ CREATE TRIGGER pos_reader_order_costs_no_edit BEFORE DELETE OR UPDATE ON public.
 
 
 --
+-- Name: pos_tax_rate_changes pos_tax_rate_changes_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER pos_tax_rate_changes_append_only BEFORE DELETE OR UPDATE ON public.pos_tax_rate_changes FOR EACH ROW EXECUTE FUNCTION public.pos_tax_rate_changes_append_only();
+
+
+--
 -- Name: tenant_declared_deposits set_updated_at_tenant_declared_deposits; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -34733,10 +35122,45 @@ CREATE TRIGGER trg_pool_match_requests_updated_at BEFORE UPDATE ON public.pool_m
 
 
 --
+-- Name: pos_tax_rates trg_pos_tax_rates_journal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pos_tax_rates_journal AFTER INSERT OR DELETE OR UPDATE ON public.pos_tax_rates FOR EACH ROW EXECUTE FUNCTION public.fn_pos_tax_rates_journal();
+
+
+--
+-- Name: pos_tax_rates trg_pos_tax_rates_sync_stay_tax_del; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pos_tax_rates_sync_stay_tax_del AFTER DELETE ON public.pos_tax_rates FOR EACH ROW WHEN (old.on_stays) EXECUTE FUNCTION public.fn_pos_tax_rates_sync_stay_tax();
+
+
+--
+-- Name: pos_tax_rates trg_pos_tax_rates_sync_stay_tax_ins; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pos_tax_rates_sync_stay_tax_ins AFTER INSERT ON public.pos_tax_rates FOR EACH ROW WHEN (new.on_stays) EXECUTE FUNCTION public.fn_pos_tax_rates_sync_stay_tax();
+
+
+--
+-- Name: pos_tax_rates trg_pos_tax_rates_sync_stay_tax_upd; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pos_tax_rates_sync_stay_tax_upd AFTER UPDATE ON public.pos_tax_rates FOR EACH ROW WHEN ((new.on_stays OR old.on_stays)) EXECUTE FUNCTION public.fn_pos_tax_rates_sync_stay_tax();
+
+
+--
 -- Name: payments trg_prepaid_fee_follows_payment; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_prepaid_fee_follows_payment AFTER INSERT OR UPDATE OF status ON public.payments FOR EACH ROW EXECUTE FUNCTION public.prepaid_fee_follows_payment();
+
+
+--
+-- Name: properties trg_properties_follow_stay_tax; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_properties_follow_stay_tax AFTER INSERT ON public.properties FOR EACH ROW EXECUTE FUNCTION public.fn_properties_follow_stay_tax();
 
 
 --
@@ -34898,6 +35322,13 @@ CREATE TRIGGER trg_tenants_updated_at BEFORE UPDATE ON public.tenants FOR EACH R
 --
 
 CREATE TRIGGER trg_unit_bookings_stamp_cancelled_at BEFORE INSERT OR UPDATE OF status ON public.unit_bookings FOR EACH ROW EXECUTE FUNCTION public.fn_unit_bookings_stamp_cancelled_at();
+
+
+--
+-- Name: unit_bookings trg_unit_bookings_stamp_stay_tax; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_bookings_stamp_stay_tax BEFORE INSERT OR UPDATE ON public.unit_bookings FOR EACH ROW EXECUTE FUNCTION public.fn_unit_bookings_stamp_stay_tax();
 
 
 --
@@ -40864,6 +41295,22 @@ ALTER TABLE ONLY public.pos_tax_categories
 
 
 --
+-- Name: pos_tax_rate_changes pos_tax_rate_changes_changed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rate_changes
+    ADD CONSTRAINT pos_tax_rate_changes_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES public.users(id);
+
+
+--
+-- Name: pos_tax_rate_changes pos_tax_rate_changes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rate_changes
+    ADD CONSTRAINT pos_tax_rate_changes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
 -- Name: pos_tax_rates pos_tax_rates_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43468,5 +43915,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Hr3ekkORilnX6ab9TZgarXw1iFRb9jbq56x3MdKprRuATQ6lADIAUH98yI8KLd1
+\unrestrict yyIt9lkpDk6QHjhPcwNj7BFTCSAhdfg5GIWdtUrHOK3KF7g9KnX0A9Ze4ycO5Sb
 
