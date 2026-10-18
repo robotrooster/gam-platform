@@ -13,8 +13,9 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen } from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt } from 'lucide-react'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
+import { usePerms } from '../../lib/permissions'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -115,6 +116,11 @@ const NAV_ITEMS: Array<{
   { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials', bookkeeper: true },
   // 10/11 (Nic): "maintenance... the maintenance costs." Cost lines only.
   { to: '/maintenance-costs', icon: Wrench,       label: 'Maintenance Costs', section: null, hub: 'financials', bookkeeper: true },
+  // 10/17 (Nic): every item sold and every tax collected, per agency, for the
+  // filing. A company document like the ledger pages (routes/booksTaxSales
+  // refuseScopedStaff ledger), so it carries `ledger` — without it a bookkeeper
+  // on some properties was offered a page that refused her on click.
+  { to: '/sales-tax',     icon: Receipt,          label: 'Sales & Tax',      section: null, hub: 'financials', bookkeeper: true, ledger: true },
   { to: '/bank-activity', icon: Landmark,         label: 'Bank Activity',    section: null, hub: 'financials', bookkeeper: 'only', companyWide: true },
   { to: '/payouts',       icon: ArrowDownToLine,  label: 'Payouts',          section: null, hub: 'financials', bookkeeper: 'only', companyWide: true },
   // S645 (Nic): an owner whose book is split between managers reads it here,
@@ -477,17 +483,31 @@ const ROLE_BADGE: Record<string, string> = {
   maintenance:      'Maintenance',
 }
 
-function PendingSignBanner() {
+export function PendingSignBanner() {
   const navigate = useNavigate()
+  // 10/17 (Nic): "Yes, fix it." Every landlord-portal session ran this poll,
+  // including the on-site manager who spends her day on the register. The
+  // signing queue is gated on Sign leases, which she does not hold, so her
+  // browser collected a refusal every 30 seconds — 2,389 of them on 10/17
+  // alone, and the handful of refusals that meant something were buried under
+  // them.
+  //
+  // The gate is not the bug. A document only ever names a signer who holds Sign
+  // leases (services/leaseSigner falls back to the owner the moment a manager
+  // loses it), so nobody who is refused here could have had a row to read: the
+  // screen was asking a question it had no business asking. It asks only when
+  // the signed-in account may sign — the same key the route checks — so owners
+  // and a manager who holds it keep the banner, and the log goes quiet.
+  const maySign = usePerms().can('leases.sign')
   const { data: pending = [] } = useQuery('landlord-pending', () =>
     fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/landlord-pending', {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_token') }
     }).then(r => r.json()).then(r => r.data || []),
     // S636: also on return-to-tab and on navigation, not only every 30s — the
     // banner is a work queue and a stale one sends you to a lease you just signed.
-    { refetchInterval: 30000, staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true }
+    { enabled: maySign, refetchInterval: 30000, staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true }
   )
-  if (!(pending as any[]).length) return null
+  if (!maySign || !(pending as any[]).length) return null
   // S535 (Nic): landlord signs FIRST — the old copy hardcoded "Tenant has
   // signed", which is backwards for every landlord-first document, and the
   // click navigated to pending[0].token (a field the endpoint never

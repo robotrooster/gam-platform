@@ -50,6 +50,8 @@ const server = vi.hoisted(() => ({
   gets: [] as string[],
   user: { role: 'landlord', permissions: {} } as any,
   leases: [] as any[],
+  /** 10/15: GET /tenant-credits/owed — what the space picked still owes. */
+  owed: { spaceOwed: 0, householdOwed: 0, creditOnAccount: 0, message: '' } as any,
   posts: [] as { url: string; body: any }[],
   /** When set, a POST waits on it (in flight). */
   postHold: null as Promise<void> | null,
@@ -76,6 +78,8 @@ vi.mock('../lib/api', () => ({
       return server.paymentRows
     }
     if (url === '/leases') return server.leases
+    // 10/15: what the Issue-credit box says is owed on the space picked.
+    if (url.startsWith('/tenant-credits/owed?leaseId=')) return server.owed
     throw new Error(`unexpected GET ${url}`)
   },
   apiPost: vi.fn(async (url: string, body: any) => {
@@ -856,6 +860,33 @@ describe('Issue credit closes only from its own buttons', () => {
     expect(server.posts).toEqual([{ url: '/tenant-credits', body: { leaseId: 'L1', amount: 25, category: 'goodwill', reason: null } }])
     // A credit can pay a bill by itself: the month is read again.
     await until(() => openMonthReads().length > before, 'the month read again')
+  })
+
+  // 10/15 (Nic): a credit goes on the open balance, so the box says what is
+  // owed the moment a person is picked — never issuing blind to a $2,000
+  // balance. The server writes the sentence; the box shows it as it came.
+  it('the box says what the space still owes once a person is picked', async () => {
+    server.leases = [{ id: 'L1', status: 'active', unitNumber: 'MH 04', propertyName: 'Oak Park',
+                       tenants: [{ firstName: 'Glenda', lastName: 'Moss' }] }]
+    server.owed = {
+      spaceOwed: 2000, householdOwed: 2000, creditOnAccount: 0,
+      message: 'MH 04 still owes $2000.00. A credit goes on that balance, oldest bill first — only what is over it stays on their account.'
+        + ' What goes on the balance is paid: voiding the credit later takes back only what is still on their account.',
+    }
+    await render()
+    await loaded()
+    await click(btn(/Issue credit/))
+    await until(() => !!host.querySelector('.modal-overlay'), 'the window')
+    // Nothing is said before a person is picked.
+    expect(text()).not.toContain('still owes $2000.00')
+    await setValue(host.querySelector('.modal-overlay input.form-input') as HTMLInputElement, 'Glenda')
+    await until(() => !!btn(/^Glenda Moss · MH 04/), 'the match')
+    await click(btn(/^Glenda Moss · MH 04/))
+    await until(() => text().includes('MH 04 still owes $2000.00'), 'what is owed')
+    expect(text()).toContain('A credit goes on that balance, oldest bill first')
+    // Review fix (10/17): and that giving it is a one-way door.
+    expect(text()).toContain('voiding the credit later takes back only what is still on their account')
+    expect(server.gets).toContain('/tenant-credits/owed?leaseId=L1')
   })
 })
 

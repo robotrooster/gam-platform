@@ -298,11 +298,16 @@ describe('a stay on a pay link', () => {
         ...body,
       })
 
-  it('refuses to send without a site and a date', async () => {
+  // 10/17 (Nic): a site is no longer among the things a clerk has to supply —
+  // "the system can assign it but may move it as needed for compression". The
+  // arrival date and a name still are, and the refusal now asks for exactly
+  // those (the stay-picks-a-site cases live in routes/stayFromAnyDoor.test.ts).
+  it('refuses to send with no arrival date and nobody to send it to — and does not ask for a site', async () => {
     const f = await seed()
     const res = await send(f)
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/site and an arrival date/i)
+    expect(res.body.error).toMatch(/needs an arrival date and who it is for/i)
+    expect(res.body.error).not.toMatch(/needs a site/i)
   })
 
   it('holds the site from the moment the link is sent, unpaid', async () => {
@@ -349,15 +354,35 @@ describe('a stay on a pay link', () => {
 // S652 (Nic): "put the pay links as an open ticket as well. That way they can
 // be resolved in person when somebody comes in."
 describe('an emailed pay link on the open list', () => {
-  const mkLink = async (f: any) => (await query<{ id: string }>(
-    `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email)
-     VALUES (md5(random()::text) || md5(random()::text), $1, $2,
-             (SELECT user_id FROM landlords WHERE id = $1), 'one_time', '2 items', $3::jsonb, 649.72, 649.72, 'Andres Razo', 'razo@example.com')
-     RETURNING id`,
-    [f.landlordId, f.propertyId, JSON.stringify([
-      { id: f.stayItemId, cat: 'Stays', name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
-      { id: f.itemId, cat: 'Fuel', name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 },
-    ])]))[0].id
+  // 10/17 (Nic): the link HOLDS ITS RESERVATION, as every link that sells a
+  // stay has since the site came off the board when the link is sent. This
+  // fixture used to leave booking_id null — the Andres Razo shape, whose name
+  // it still carries: "somebody paid for a week, um, and it did not generate a
+  // stay to occupy a site." A link in that state can no longer be made, and the
+  // register now refuses to settle one (routes/pos), so a fixture built that way
+  // was testing cashier adjustments against an impossible link.
+  const mkLink = async (f: any) => {
+    const unitId = (await query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type, nightly_rate, is_bookable)
+       VALUES ($1,$2,'RV 01','vacant',500,'rv_spot',589,TRUE) RETURNING id`,
+      [f.propertyId, f.landlordId]))[0].id
+    const booking = (await query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, guest_email, lease_type,
+                                  check_in, check_out, booked_check_out, nights, total_amount,
+                                  status, source)
+       VALUES ($1,$2,'Andres Razo','razo@example.com','nightly',
+               '2027-02-01','2027-02-02','2027-02-02',1,589,'tentative','pay_link')
+       RETURNING id`, [unitId, f.landlordId]))[0].id
+    return (await query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email, booking_id)
+       VALUES (md5(random()::text) || md5(random()::text), $1, $2,
+               (SELECT user_id FROM landlords WHERE id = $1), 'one_time', '2 items', $3::jsonb, 649.72, 649.72, 'Andres Razo', 'razo@example.com', $4)
+       RETURNING id`,
+      [f.landlordId, f.propertyId, JSON.stringify([
+        { id: f.stayItemId, cat: 'Stays', name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
+        { id: f.itemId, cat: 'Fuel', name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 },
+      ]), booking]))[0].id
+  }
 
   it('is listed beside the tickets, marked as a pay link', async () => {
     const f = await seed()
@@ -417,14 +442,24 @@ describe('an emailed pay link on the open list', () => {
       .send({ items, paymentMethod: 'cash', propertyId: f.propertyId, payLinkId: link })
     const propaneLine = { id: f.itemId, name: 'Propane (per gal)', qty: 18.4, price: 3.30, tax: 0 }
     const stay = (qty: number, price: number, name = 'RV site — nightly') => ({ id: f.stayItemId, name, qty, price, tax: 0 })
-    for (const items of [
-      [stay(1, 589), propaneLine, stay(2, 49, 'Extra nights — Oct 1–2')],   // an extra stay
-      [stay(2, 589), propaneLine],                                        // more nights than the link
-      [stay(1, 1), propaneLine],                                          // the stay at another price
-    ]) {
+    // 10/17 (Nic): now that the fixture holds its reservation like every real
+    // stay link, these are the reservation's own refusals — the same rule, said
+    // by the checks that know where the stay lives. Changing the NIGHTS is
+    // refused in the words that point at the schedule; changing the PRICE is
+    // refused by what the reservation owes. Nothing is charged either way.
+    const nightsChanged = 'This link holds 1 night at site RV 01 (Feb 1 → Feb 2) — a reservation\'s nights, site and price change only on the schedule, '
+      + 'so nothing was charged. Put the stay back the way the link has it, then press Charge again. '
+      + 'To change the stay, change the reservation on the schedule first — the link then asks what it owes.'
+    const priceChanged = 'This link\'s reservation — 1 night at site RV 01 (Feb 1 → Feb 2) — comes to $589.00 now — '
+      + 'the cart shows something else, and nothing was charged. Press Clear, open the link again from the list, then press Charge.'
+    for (const [items, status, error] of [
+      [[stay(1, 589), propaneLine, stay(2, 49, 'Extra nights — Oct 1–2')], 400, nightsChanged],  // an extra stay
+      [[stay(2, 589), propaneLine], 400, nightsChanged],                                        // more nights than the link
+      [[stay(1, 1), propaneLine], 409, priceChanged],                                           // the stay at another price
+    ] as [any[], number, string][]) {
       const res = await settle(items)
-      expect(res.status, JSON.stringify(res.body)).toBe(400)
-      expect(res.body.error).toMatch(/is not the stay on this pay link — nothing was charged.*with a site and dates/)
+      expect(res.status, JSON.stringify(res.body)).toBe(status)
+      expect(res.body.error).toBe(error)
     }
     expect((await query<any>(`SELECT status FROM pos_pay_links WHERE id = $1`, [link]))[0].status).toBe('open')
     expect(await query(`SELECT 1 FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])).toHaveLength(0)

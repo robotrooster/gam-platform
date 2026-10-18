@@ -134,8 +134,12 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 
 // S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
 // overcharge, goodwill). Funded by the landlord (they receive less rent) and
-// never income. S655 (Nic, 10/2): it sits on their account — offered when they
-// pay, and it pays a bill by itself only when it covers that whole bill.
+// never income. S655 (Nic, 10/2): a credit that covers the whole bill pays it
+// at once. 10/15 (Nic): one that covers less goes on the open balance anyway,
+// oldest bill first — "money gets applied to the most outstanding balance
+// first" — so the box names what is still owed the moment a person is picked.
+// Giving the credit is still the landlord's call; being blind to a $2,000
+// balance while he gives $1,000 away is not.
 function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (msg: string) => void }) {
   const { data: leases = [] } = useQuery<any[]>('leases', () => apiGet('/leases'))
   const activeLeases = (leases as any[]).filter((l: any) => l.status === 'active')
@@ -154,6 +158,14 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
   const [category, setCategory] = useState<string>('goodwill')
   const [reason, setReason] = useState('')
   const [error, setError] = useState<string | null>(null)
+  // 10/15 (Nic): what this household still owes, read the moment a person is
+  // picked — the server says it in plain words (where the credit will land,
+  // and what it cannot reach on their other spaces).
+  const { data: owed } = useQuery<any>(
+    ['tenant-credit-owed', leaseId],
+    () => apiGet(`/tenant-credits/owed?leaseId=${leaseId}`),
+    { enabled: !!leaseId },
+  )
   const mut = useMutation(
     () => apiPost('/tenant-credits', { leaseId, amount: Number(amount), category, reason: reason || null }),
     // The server says what the credit did (paid the whole open bill, or is on
@@ -202,6 +214,9 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
               </>
             )}
           </div>
+          {picked && owed?.message && (
+            <div className="cd-note">{owed.message}</div>
+          )}
           <div className="cd-choice">
             <label className="cd-field">
               <span className="cd-field-label">Amount ($)</span>

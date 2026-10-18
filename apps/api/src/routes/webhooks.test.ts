@@ -122,6 +122,7 @@ import {
   seedLease, seedLeaseTenant,
   seedUtilityMeter, seedUtilityBill, seedUtilityPayment,
   seedUserBankAccount, seedPmCompany,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 /**
@@ -251,15 +252,25 @@ beforeEach(async () => {
 // rest. The process exit handles teardown.
 
 // ── Suite-wide rate setup (rent allocation needs processing rates) ──────────
-
+//
+// 10/17: this was `VALUES ('ach', 0, 1.0, 0, 0.5) ON CONFLICT DO NOTHING`, and
+// the conflict it quietly swallowed was the one that mattered. Only one ACH
+// rate can be open at a time and cleanupAllSchema leaves the rate card alone,
+// so if any earlier file had already opened an ACH rate — bookingLeaseBilling
+// opens a flat $6 one — this insert did nothing and every fee below was
+// computed on that file's numbers. The suite went red inside deploy.sh on
+// 10/15 and passed on its own. Now it STATES the rate it was written against
+// (setEffectiveProcessingRate retires whatever is open first).
 beforeEach(async () => {
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent,
-        stripe_cost_flat, stripe_cost_percent)
-     VALUES ('ach', 0, 1.0, 0, 0.5)
-        ON CONFLICT DO NOTHING`
-  )
+  const client = await getClient()
+  try {
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 0, customerFacingPercent: 1.0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'webhooks.test.ts ACH rate',
+    })
+  } finally { client.release() }
 })
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -293,11 +304,15 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
       const propertyId = await seedProperty(client, { landlordId: seedRes.landlordId, ownerUserId: seedRes.userId, managedByUserId: seedRes.userId })
       const unitId = await seedUnit(client, { propertyId, landlordId: seedRes.landlordId, rentAmount: 1000 })
       await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-      // Reference data the cleanup leaves alone: seed only if missing, tagged, removed below.
-      await client.query(
-        `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, notes)
-         SELECT 'card', 0.55, 3.5, 0.26, 2.9, 's654-tapped-card-test'
-          WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL)`)
+      // 10/17: the card rate is STATED, not seeded-if-missing — same reason as
+      // the ACH rate above. What it leaves open afterwards is the live card
+      // rate (3.5% + $0.55), which is the right thing for a later file to find.
+      await setEffectiveProcessingRate(client, {
+        paymentMethod: 'card',
+        customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+        stripeCostFlat: 0.26, stripeCostPercent: 2.9,
+        notes: 's654-tapped-card-test',
+      })
       paymentId = await seedClaimedRent(client, {
         unitId, tenantId, landlordId: seedRes.landlordId, amount: 1000,
         stripePaymentIntentId: 'pi_rent_tapped_1',
@@ -309,7 +324,6 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
     expect(res.status).toBe(200)
     const pay = await db.query<{ status: string }>(`SELECT status FROM payments WHERE id=$1`, [paymentId!])
     expect(pay.rows[0].status).toBe('settled')
-    await db.query(`DELETE FROM platform_processing_rates WHERE notes = 's654-tapped-card-test'`)
   })
 
   it('happy path: ACH rent settles → allocation runs → ledger rows written', async () => {

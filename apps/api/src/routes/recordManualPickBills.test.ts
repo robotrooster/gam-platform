@@ -249,7 +249,13 @@ describe('Billy pays RV 34 alone (10/14)', () => {
     expect(q.currentTotal).toBe(445.22)
   })
 
-  it('a check over the picked bills: the extra stays on that space as money paid ahead', async () => {
+  // 10/15 (Nic): "If somebody has an outstanding balance, why would they be
+  // able to add credit for future bills? Money gets applied to the most
+  // outstanding balance first." Billy's check pays RV 34's September bill whole
+  // (his pick, 10/14) and the $42.93 over it does NOT park on RV 34 while RV 35
+  // owes $890.44 — it goes on RV 35's September bill, the oldest still open.
+  // Paid-ahead money pays only its own space's bills, so it has to sit there.
+  it('a check over the picked bills: the extra goes on the oldest bill still open, not on the space it came in on', async () => {
     const s = await stack()
     const b = await billysBills(s)
     const res = await record(s, b.rv35Sep.ids[0], {
@@ -257,11 +263,21 @@ describe('Billy pays RV 34 alone (10/14)', () => {
     })
     expect(res.status).toBe(200)
     expect(res.body.data).toMatchObject({ surplus: 42.93, surplusHandling: 'credit' })
-    const credit = (await db.query<any>(`SELECT lease_id FROM lease_prepaid_credits WHERE id = $1`, [res.body.data.creditId])).rows[0]
-    expect(credit.lease_id).toBe(s.rv34.leaseId)
-    // Never RV 35's: nothing of it went on RV 35's bills.
-    expect(await usesOn([...b.rv35Sep.ids, ...b.rv35Oct.ids])).toBe('0')
+    const credit = (await db.query<any>(`SELECT lease_id, amount_remaining::float AS left FROM lease_prepaid_credits WHERE id = $1`,
+      [res.body.data.creditId])).rows[0]
+    expect(credit.lease_id).toBe(s.rv35.leaseId)
+    // It was spent there the moment the payment committed: nothing left over.
+    expect(credit.left).toBe(0)
+    expect((await db.query<{ a: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS a FROM credit_uses
+        WHERE payment_id = ANY($1::uuid[]) AND status = 'applied'`, [b.rv35Sep.ids])).rows[0].a).toBe('42.93')
+    expect(await usesOn(b.rv35Oct.ids)).toBe('0')
+    // No row is cut in two: RV 35's September stays open for the rest.
     expect(await statusOf([...b.rv35Sep.ids, ...b.rv35Oct.ids])).toEqual(['pending', 'pending', 'pending', 'pending'])
+    // The receipt stays where the money was taken — RV 34's.
+    const rem = (await db.query<any>(`SELECT lease_id, notes FROM tenant_remittances WHERE id = $1`, [res.body.data.receiptId])).rows[0]
+    expect(rem.lease_id).toBe(s.rv34.leaseId)
+    expect(rem.notes).toContain('$42.93 over the bill goes on what RV 35 still owes')
   })
 })
 

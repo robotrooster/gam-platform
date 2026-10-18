@@ -313,17 +313,24 @@ describe('the whole-bill rule', () => {
     expect(Number((await db.query<{ a: string }>(`SELECT amount::text AS a FROM payments WHERE id = $1`, [rent])).rows[0].a)).toBe(460)
   })
 
-  it("MH 25: $10 of credit the landlord GAVE against a $460 bill settles nothing and is offered to the tenant", async () => {
+  // 10/15 (Nic): "If somebody has an outstanding balance, why would they be
+  // able to add credit for future bills? Money gets applied to the most
+  // outstanding balance first." MH 25's $10 used to wait for a choice; it goes
+  // on the $460 bill now, exactly as $10 paid ahead does (above).
+  it("MH 25: $10 of credit the landlord GAVE against a $460 bill goes on it — $450 still owed", async () => {
     const h = await house()
     const credit = await issued(h, 10)
     const rent = await charge(h, { amount: 460 })
     expect((await wholeBill(h)).settledIds).toEqual([])
     expect(await statusOf(rent)).toBe('pending')
-    expect(Number((await db.query<{ r: string }>(`SELECT amount_remaining::text AS r FROM tenant_credits WHERE id = $1`, [credit])).rows[0].r)).toBe(10)
+    expect(await remainingIssued(credit)).toBe(0)
     const q = await quote(h)
-    expect(q.leases[0].usableCredit).toBe(10)
+    expect(q.leases[0].usableCredit).toBe(0)
     expect(q.leases[0].requiredTotal).toBe(460)
-    expect(await uses()).toEqual([])
+    expect(q.leases[0].creditAlreadyApplied).toBe(10)
+    expect(await uses()).toMatchObject([{ status: 'applied', source: 'whole_bill', amount: 10 }])
+    // The row is whole: $460 charged, $10 of credit on it, $450 for money.
+    expect(Number((await db.query<{ a: string }>(`SELECT amount::text AS a FROM payments WHERE id = $1`, [rent])).rows[0].a)).toBe(460)
   })
 
   it('older open rows on the lease are part of the whole bill', async () => {
@@ -336,23 +343,32 @@ describe('the whole-bill rule', () => {
     expect((await quote(h)).totals.creditOnFile).toBe(10)
   })
 
-  it("a bill with a GAM fee or a neighbor's utility never auto-settles", async () => {
+  // A GAM charge and another company's utility are never credit's to pay, so
+  // the bill as a whole never settles itself from credit. 10/15: the
+  // landlord's own rows on it are still paid from the credit (the credit does
+  // not sit because a $6 GAM fee shares the invoice); the GAM fee and the
+  // neighbor's utility are left exactly as they were, for an online payment.
+  it("a bill with a GAM fee or a neighbor's utility never auto-settles; the landlord's rows still take the credit", async () => {
     const h = await house()
-    await issued(h, 1000)
+    const credit = await issued(h, 1000)
     const rent = await charge(h, { amount: 460 })
     const fee = await charge(h, { amount: 6, type: 'fee', entry: 'RETURNFEE', owner: 'gam' })
-    expect((await wholeBill(h)).settledIds).toEqual([])
-    expect(await statusOf(rent)).toBe('pending')
+    expect((await wholeBill(h)).settledIds).toEqual([rent])
+    expect(await statusOf(rent)).toBe('settled')
     expect(await statusOf(fee)).toBe('pending')
+    expect(await remainingIssued(credit)).toBe(540)
+    expect((await uses()).every(u => u.amount === 460)).toBe(true)
 
     const h2 = await house()
     const neighbor = await house()
     const inv = await invoiceFor(h2)
-    await issued(h2, 1000)
+    const credit2 = await issued(h2, 1000)
     const rent2 = await charge(h2, { amount: 460, invoiceId: inv })
-    await charge(h2, { amount: 40, type: 'utility', invoiceId: inv, landlordId: neighbor.landlordId, unitId: neighbor.unitId, leaseId: null })
-    expect((await wholeBill(h2)).settledIds).toEqual([])
-    expect(await statusOf(rent2)).toBe('pending')
+    const theirs = await charge(h2, { amount: 40, type: 'utility', invoiceId: inv, landlordId: neighbor.landlordId, unitId: neighbor.unitId, leaseId: null })
+    expect((await wholeBill(h2)).settledIds).toEqual([rent2])
+    expect(await statusOf(rent2)).toBe('settled')
+    expect(await statusOf(theirs)).toBe('pending')
+    expect(await remainingIssued(credit2)).toBe(540)
   })
 
   it('a lease with a scheduled bank retry is skipped', async () => {

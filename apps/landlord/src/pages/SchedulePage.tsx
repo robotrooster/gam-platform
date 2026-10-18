@@ -5,7 +5,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, BOOKING_SOURCES, BOOKING_SOURCE_LABEL, stayHoldWords, type BookingStatus, type BookingSource, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
 import { toast, appConfirm, appPrompt, appChoose } from '../components/dialogs'
 import { pastEndChoices, pastEndQuestion } from '../lib/earlyCheckOut'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
@@ -328,6 +328,10 @@ export function SchedulePage() {
   // link emailed to the guest, or the register. The pick rides on the same save.
   const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; returning: ReturningOffer | null; resend: (m: 'link' | 'register' | 'returning') => void } | null>(null)
   const payRouteAnswer = useRef<'link' | 'register' | 'returning' | null>(null)
+  // 10/17 (Nic): which of the two the save that just went out actually asked
+  // for, so a save that comes back with neither a link nor a ticket is reported
+  // as a failure instead of looking like a quiet success (sayPayRouteDone).
+  const sentPayRoute = useRef<'link' | 'register' | null>(null)
   // 10/5 (Nic, R9): a check-in refused because the background check isn't
   // back and decided yet — shown in its own window, with no override.
   const [screeningWait, setScreeningWait] = useState<{ message: string; waitingOn: string } | null>(null)
@@ -357,6 +361,26 @@ export function SchedulePage() {
   const [pickedUnit, setPickedUnit] = useState<any | null>(null)
   const [lockSite, setLockSite] = useState(false)
   const [payMode, setPayMode] = useState<'link' | 'register'>('link')
+  // 10/17 (Nic) — THE PER-SITE "+ Book" FORM'S OWN ANSWER, AND ITS OWN DEFAULT.
+  //
+  // "when I go to add a reservation, it won't generate a pay link from doing
+  // the reservation." That form sent no pay route at all, so it could never
+  // produce a link or a ticket. But sending no route is also a real third
+  // outcome and the one it has always had: confirmed on the spot, outranking
+  // unpaid holds, because the money is being handled outside this form (they
+  // are paying now, they already paid, it is comped, it is an owner's block).
+  // So the choice is added and 'none' is the default — nobody's reservation
+  // silently changes behavior, and nobody emails a caller by accident.
+  //
+  // Deliberately NOT the New Reservation flow's `payMode` above: that form has
+  // only the two money exits and always has; sharing one piece of state made
+  // closing one form reach into the other.
+  const [bookPayMode, setBookPayMode] = useState<'none' | 'link' | 'register'>('none')
+  // 10/17 (Nic): "when I go to add a reservation, it won't generate a pay link
+  // from doing the reservation." The link WAS being made; nothing on this screen
+  // ever said so, and there was nowhere to read it. This holds the link a save
+  // just produced, so the desk can read it to the caller still on the phone.
+  const [resvLink, setResvLink] = useState<{ url: string; emailedTo: string | null; guest: string } | null>(null)
   // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
   // background check) and "Work trade" on the new-reservation form.
   const [resvReturning, setResvReturning] = useState(false)
@@ -724,6 +748,8 @@ export function SchedulePage() {
   // unit's allowed list.
   const closeBookModal = () => {
     setBookingModal({show:false,unit:null})
+    // 10/17: back to "no money here", which is what this form has always done.
+    setBookPayMode('none')
     setBookFirst(''); setBookLast('')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
@@ -748,7 +774,11 @@ export function SchedulePage() {
     const m = payRouteAnswer.current ?? fallback
     payRouteAnswer.current = null
     // 10/6 (Nic): the third choice — no background check, so nothing to pay for it.
-    if (m === 'returning') return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
+    if (m === 'returning') {
+      sentPayRoute.current = fallback
+      return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
+    }
+    sentPayRoute.current = m === 'link' || m === 'register' ? m : null
     return m ? { sendDepositLink: m === 'link', payAtRegister: m === 'register' } : {}
   }
   const askFeeRouteIf = (e: any, resend: () => void): boolean => {
@@ -782,6 +812,50 @@ export function SchedulePage() {
     }
     if (stay.workTrade?.rentTraded) toast('Work trade — the site is covered, so there is nothing to pay for it.')
   }
+  // 10/17 (Nic) — SAY WHAT THE SAVE ACTUALLY DID WITH THE MONEY.
+  //
+  // "when I go to add a reservation, it won't generate a pay link from doing the
+  // reservation... So we have some important things to address there before the
+  // schedule starts getting convoluted."
+  //
+  // The link and the register ticket were both being created and this screen
+  // threw the answer away: it closed the form, refreshed the calendar, and the
+  // desk had no way to tell a sent link from a failed one. Worse, the server
+  // deliberately does NOT roll a reservation back when the hand-off fails (the
+  // site is held and somebody has been told they have it), so a silent failure
+  // left a held site, no link and nobody aware of it.
+  //
+  // `asked` is the route the desk picked, so a save that came back with neither
+  // a link nor a ticket is reported as the failure it is, in words that say what
+  // IS true: the reservation stands, the site is held, the money part did not
+  // happen.
+  const sayPayRouteDone = (data: any, asked: 'link' | 'register' | null) => {
+    const guest = data?.guestName || 'the guest'
+    if (data?.depositLink?.url) {
+      setResvLink({ url: data.depositLink.url, emailedTo: data?.guestEmail || null, guest })
+      return
+    }
+    if (data?.registerTicketId) {
+      toast(`A ticket for ${guest} is waiting at the register — ringing it up confirms this reservation.`)
+      return
+    }
+    // Nothing to collect is not a failure: this park takes no deposit on a stay
+    // like this, so there was never a link to send.
+    if (asked === 'link' && data?.stay?.depositNothingOwed) {
+      toast(`${guest} owes no deposit on this stay, so no link was sent — the site is held for them.`)
+      return
+    }
+    // Both of these name something that exists today. The schedule has no
+    // "send it again" of its own (see openQuestions), so the desk is pointed at
+    // the register, which can take the deposit or send a link of its own.
+    if (asked === 'link') {
+      toast.error(`The reservation is on the schedule and the site is held, but no deposit link went out to ${guest}. `
+        + 'Take the deposit at the register, or send a link from Pay Links there.')
+    } else if (asked === 'register') {
+      toast.error(`The reservation is on the schedule and the site is held, but no register ticket was made for ${guest}. `
+        + 'Ring the stay up at the register with the site and the dates.')
+    }
+  }
   const createBookingMut = useMutation(
     () => {
       const nights = Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
@@ -795,11 +869,18 @@ export function SchedulePage() {
         leaseType, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut,
         source: 'direct',
         ...withTerms(),
-        ...withPayRoute(null),
+        // 10/17 (Nic): "when I go to add a reservation, it won't generate a pay
+        // link from doing the reservation." THIS is the reservation he means —
+        // the per-site "+ Book" button. It passed no pay route at all, so the
+        // stay went straight to confirmed with no link and no ticket, and the
+        // only way either flag ever reached the server was as a side effect of
+        // the background-check question (which only a 22+ night stay asks). Now
+        // the desk is asked, and 'none' keeps what this form always did.
+        ...withPayRoute(bookPayMode === 'none' ? null : bookPayMode),
       })
     },
     {
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeBookModal() },
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); sayPayRouteDone(r?.data, sentPayRoute.current); closeBookModal() },
       onError: (e: any) => {
         if (askTermsIf(e, () => createBookingMut.mutate())) return
         if (askFeeRouteIf(e, () => createBookingMut.mutate())) return
@@ -885,7 +966,7 @@ export function SchedulePage() {
       ...(resvWorkTrade ? { workTrade: workTradeTermsPayload(resvWt) } : {}),
     }),
     {
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeNewResv() },
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); sayPayRouteDone(r?.data, sentPayRoute.current); closeNewResv() },
       onError: (e: any, u: any) => {
         if (askTermsIf(e, () => createResvMut.mutate(u))) return
         if (askFeeRouteIf(e, () => createResvMut.mutate(u))) return
@@ -2252,13 +2333,14 @@ export function SchedulePage() {
               </div>
               <div>
                 <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Source</label>
+                {/* 10/17 (Nic): every door, not only the travel sites. This
+                    offered Direct and four booking sites, so a stay rung at the
+                    register, taken on the park's own booking site, or held by
+                    an emailed link showed in the list but could not be filtered
+                    for (BOOKING_SOURCES). */}
                 <select value={resvSource} onChange={e => setResvSource(e.target.value)} className="input">
                   <option value="">All</option>
-                  <option value="direct">Direct</option>
-                  <option value="airbnb">Airbnb</option>
-                  <option value="vrbo">VRBO</option>
-                  <option value="booking_com">Booking.com</option>
-                  <option value="other">Other</option>
+                  {BOOKING_SOURCES.map(s => <option key={s} value={s}>{BOOKING_SOURCE_LABEL[s]}</option>)}
                 </select>
               </div>
               <div>
@@ -2338,7 +2420,9 @@ export function SchedulePage() {
                       <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(b.totalAmount)}</td>
                       <td>
                         <span style={{ fontSize: '.72rem', color: 'var(--text-2)' }}>
-                          {humanize(b.source)}
+                          {/* The column is not constrained, so an imported
+                              stay can carry a word GAM does not know. */}
+                          {BOOKING_SOURCE_LABEL[b.source as BookingSource] ?? humanize(b.source)}
                         </span>
                       </td>
                       <td>
@@ -2787,7 +2871,21 @@ export function SchedulePage() {
                     )}
                   </div></>
                 )}
-                <div style={{color:'var(--text-3)'}}>Status</div><div>{isLease ? humanize(d.status) : bookingStatusWords(d.status)}</div>
+                <div style={{color:'var(--text-3)'}}>Status</div>
+                <div>
+                  {isLease ? humanize(d.status) : bookingStatusWords(d.status)}
+                  {/* 10/17 (Nic): "reservations are only locked in with deposits.
+                      still reserved without deposits but can be booted when space
+                      is limited by other paying people." The badge said
+                      "Tentative" and left the desk to infer the consequence; this
+                      is the consequence, in a sentence. Not a third status — the
+                      software already decides it by whether a deposit is paid. */}
+                  {!isLease && stayHoldWords(d.status as BookingStatus, !!d.depositPaidAt) && (
+                    <div style={{fontSize:'.74rem',color:d.depositPaidAt?'var(--text-3)':'var(--amber)',marginTop:2,lineHeight:1.45}}>
+                      {stayHoldWords(d.status as BookingStatus, !!d.depositPaidAt)}
+                    </div>
+                  )}
+                </div>
                 {/* 10/5 (Nic, R2): lease or stay — the desk's answer for a stay of 30+ nights. */}
                 {!isLease && (d.stayLeaseId || d.stayTerms) && (
                   <><div style={{color:'var(--text-3)'}}>Lease or stay</div>
@@ -2939,7 +3037,16 @@ export function SchedulePage() {
           a browser than anything else." No draft, no held site, no row. */}
       {newResvOpen && (() => {
         const validEmail = /.+@.+\..+/.test(newBooking.guestEmail.trim())
-        const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail && !!newBooking.guestPhone.trim()
+        // 10/17 (Nic) — A PHONE NUMBER WAS NEVER NEEDED TO EMAIL A LINK.
+        //
+        // This gate also demanded a phone number, so a desk taking a
+        // reservation over the phone from somebody who gives a name and an
+        // email met a gold button that did nothing — no toast, no refusal, just
+        // a dead button under a line of gray text. It is a third reason "I
+        // cannot get either option to do anything": the save never left the
+        // browser. The server asks for the email and nothing else (routes/units
+        // wantsDeposit), and this now asks for exactly what the server does.
+        const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail
         const offered = freeUnits.length ? freeUnits : heldUnpaidUnits
         const lastResort = freeUnits.length === 0 && heldUnpaidUnits.length > 0
         return (
@@ -3165,7 +3272,7 @@ export function SchedulePage() {
                 {resvWorkTrade && !validEmail &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A work trade is made for the guest's own account, so it needs their email.</div>}
                 {payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name and an email — the email is where the deposit link goes.</div>}
                 {payMode==='register' && !resvGuestName &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name is enough when they are paying here.</div>}
                 {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
@@ -3296,7 +3403,14 @@ export function SchedulePage() {
           ? stayNightsBetween(newBooking.checkIn, newBooking.checkOut)
           : 0
         const bkEmailValid = /.+@.+\..+/.test(newBooking.guestEmail.trim())
-        const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim() && bkEmailValid && !!newBooking.guestPhone.trim()
+        // 10/17 (Nic): a name is enough for somebody standing at the desk — the
+        // same rule the New Reservation flow already uses. An emailed deposit
+        // link needs the email it goes to (the server will not send one
+        // without it, and used to confirm the stay silently instead).
+        // A phone number is not needed to email anybody a link, and demanding
+        // one here left the button dead with no explanation.
+        const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim()
+          && (bookPayMode !== 'link' || bkEmailValid)
         return (
         <div className="modal-overlay" onClick={closeBookModal}>
           <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
@@ -3327,9 +3441,34 @@ export function SchedulePage() {
                   </div>
                 )
               })()}
+              {/* 10/17 (Nic): the money, asked here instead of assumed. Three
+                  real outcomes, and the first is what this button has always
+                  done — so an answer has to be given for anything to be sent,
+                  and nothing changes for a desk that just wants it on the
+                  board. */}
+              <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>The deposit</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:6}}>
+                {([['none','Nothing to collect'],['link','Email a deposit link'],['register','Paying at the counter']] as const).map(([m,label])=>(
+                  <button key={m} onClick={()=>setBookPayMode(m)}
+                    style={{padding:'8px 4px',border:'1px solid '+(bookPayMode===m?'var(--gold)':'var(--border-1)'),
+                            background:bookPayMode===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',
+                            cursor:'pointer',fontSize:'.74rem',fontWeight:bookPayMode===m?700:400,
+                            color:bookPayMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
+                ))}
+              </div>
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
-                {createBookingMut.isLoading?'Creating...':'Create Reservation'}
+                {createBookingMut.isLoading ? (bookPayMode==='none'?'Creating...':'Holding the site…')
+                  : bookPayMode==='register' ? 'Hold it and send to the register'
+                  : bookPayMode==='link' ? 'Reserve and email the deposit link'
+                  : 'Create Reservation'}
               </button>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.5}}>
+                {bookPayMode==='register'
+                  ? 'The site comes off the board now and a ticket appears on the register. Ringing it up confirms this same reservation.'
+                  : bookPayMode==='link'
+                  ? 'The site is held for them with no deadline. If it is still unpaid when the park fills up, they get moved to another site — or told, if there is nothing else.'
+                  : 'Nothing is sent and nothing is asked for — the reservation is confirmed and the site is theirs. Use this when they are paying now, have already paid, or the site is not being sold.'}
+              </div>
             </div>
           </div>
         </div>
@@ -3369,6 +3508,37 @@ export function SchedulePage() {
                   )}
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 10/17 (Nic): the deposit link the reservation just produced. It is
+          emailed on its own, but the desk is usually still on the phone with
+          the person it was made for, so the URL is here to read out or paste
+          into a text. */}
+      {resvLink && (
+        <div className="modal-overlay" onClick={()=>setResvLink(null)}>
+          <div className="modal" style={{maxWidth:440}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">Deposit link sent</span>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setResvLink(null)}>✕</button>
+            </div>
+            <div style={{padding:'0 20px 20px'}}>
+              <div style={{fontSize:'.82rem',color:'var(--text-2)',marginBottom:12,lineHeight:1.5}}>
+                {resvLink.emailedTo
+                  ? <>Emailed to <b>{resvLink.emailedTo}</b>. The site is held for {resvLink.guest} until they pay it.</>
+                  : <>The site is held for {resvLink.guest} until this is paid.</>}
+              </div>
+              <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10}}>
+                <input readOnly value={resvLink.url}
+                  style={{flex:1,fontSize:'.72rem',padding:'6px 8px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-2)'}}
+                  onFocus={e=>e.currentTarget.select()} />
+                <button className="btn btn-primary btn-sm" onClick={()=>{navigator.clipboard?.writeText(resvLink.url); toast('Link copied.')}}>Copy</button>
+              </div>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.5}}>
+                The link never expires. Until it is paid, a guest who pays can take this site — the reservation is only locked in once the deposit lands.
+              </div>
             </div>
           </div>
         </div>

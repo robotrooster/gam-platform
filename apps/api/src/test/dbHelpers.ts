@@ -18,654 +18,128 @@ import type { PoolClient } from 'pg'
 import { db, getClient } from '../db'
 
 /**
- * Wipe every table any suite in this package writes to. FK-dependency
- * order — children before parents. Centralized here so adding a new
- * suite-touched table updates every suite at once (avoids the
- * cross-file leakage that bit S272 / S275 — leaseLifecycle leaves
- * invoices, depositReturn's local cleanupAll didn't know to drop them
- * before leases, FK violation on the next beforeEach).
+ * 10/17 (Nic) — THE ROWS THE SUITE DOES NOT OWN.
  *
- * platform_processing_rates intentionally NOT wiped — allocation.test
- * seeds it once in beforeAll and other suites use INSERT ON CONFLICT
- * DO NOTHING / INSERT ... WHERE NOT EXISTS, so leaving the singleton
- * rows in place is correct.
+ * Everything else in the public schema is data some test created, and
+ * cleanupAllSchema below empties it. These stay: GAM's own catalogs (what a
+ * state requires, what a thing costs, what a document says), the archives the
+ * compliance job writes, and the handful of append-only platform books that
+ * carry no foreign keys at all and are cleared by the few files that read them.
+ *
+ * ADDING TO THIS LIST IS THE RARE CASE. A new table is a test's data by
+ * default and gets emptied with no change here — that is the point of naming
+ * what to keep rather than what to wipe. Name a table here only when its rows
+ * are GAM's own reference data, seeded by a migration rather than by a test;
+ * a test that seeds one of these is responsible for clearing it, because every
+ * later file in the same worker will see what it left.
+ *
+ * platform_processing_rates is the one that has cost real time: it holds ONE
+ * open row per payment method, so whichever file inserted first used to set the
+ * rate every later file read. It stays here (the rate is a price card, not a
+ * test's data) and each file now STATES the rate its numbers were worked out
+ * on — setEffectiveProcessingRate below.
+ */
+const CLEANUP_KEEPS: readonly string[] = [
+  // The migration runner's own record.
+  'schema_migrations',
+  // What a state requires of a landlord (S177 hard-compliance catalogs).
+  'state_deposit_custody_rules', 'state_deposit_interest_rates', 'state_landlord_tenant_acts',
+  'state_law_provisions', 'state_law_section_texts', 'state_nexus_thresholds',
+  'state_property_tax_provisions', 'state_screening_tax_rates', 'state_tax_forms',
+  'state_tax_registrations', 'flexpay_blocked_states',
+  // What things cost, and how a score is computed.
+  'platform_processing_rates', 'stripe_processing_costs', 'deposit_pool_yield_rates',
+  'credit_score_formulas',
+  // What the agents and the documents are made of.
+  'agent_knowledge_chunks', 'disclosure_library_documents', 'disclosure_library_fields',
+  'document_sleeves', 'library_coverage_items', 'platform_announcements', 'sales_calendar_feed',
+  // The compliance archives (jobs/complianceArchive.ts moves rows HERE; the
+  // change journal is never pruned, and neither are these).
+  'ach_monitoring_log_archive', 'admin_action_log_archive', 'admin_notifications_archive',
+  'audit_log_archive', 'email_send_log_archive',
+  // Append-only platform books with no foreign keys — nothing in the schema
+  // points at them, so no delete has ever reached them and no file has ever
+  // depended on one being empty. The files that read them clear them
+  // themselves (admin-nexus, nexusMonitor, emailSuppressions, gamDebitDispute,
+  // s541-flexpay-inquiry). allocation_splits in particular REFUSES a row
+  // delete, which is why it was never in the old cleanup's list.
+  'allocation_splits', 'ledger_derived_facts', 'float_account_state',
+  'reserve_fund_ledger', 'reserve_fund_state', 'nexus_revenue_tally',
+  'platform_growth_snapshots', 'product_events', 'stripe_webhook_events',
+  'email_suppressions',
+]
+
+/**
+ * ONE ROUND TRIP, NOT ~190 (10/17).
+ *
+ * Nic, 10/14: "these deploys are taking longer and longer they used to take 10
+ * or 15 minutes and now they're taking 45 minutes." This function is called in
+ * `beforeEach` by nearly every file in the package, and it was ~190 separate
+ * DELETE/TRUNCATE statements in hand-maintained foreign-key order — measured at
+ * ~135 ms on an empty database and ~200 ms on a populated one, almost all of it
+ * the round trips themselves, paid once per TEST. It is now a single statement:
+ * ~5 ms empty, ~25 ms populated.
+ *
+ * WHY TRUNCATE. It fires no row triggers, so the production guards that refuse
+ * to delete a money row ("the log is the log", a credit use kept forever, the
+ * append-only ledgers) stay exactly as they are in production while the fixture
+ * still resets — the old code had already reached for TRUNCATE a dozen times
+ * for that reason. It also means no delete cascades to order: the 600 lines of
+ * "this child RESTRICTs that parent, so it goes first" that this function used
+ * to be are not needed, and neither is remembering to add a new table in the
+ * right place. Forgetting that was the recurring bug (S272/S275 and on), and
+ * the cross-file leakage it leaves is exactly what makes a file pass alone and
+ * fail in a suite.
+ *
+ * WHY CASCADE. A TRUNCATE must name every table that references one it empties.
+ * CASCADE names them for us, and it cannot reach past the keep list above: no
+ * table in that list is referenced by, or references, anything being emptied
+ * (checked against pg_constraint — they are catalogs and FK-free fact tables).
+ *
+ * WHY ONLY THE TABLES WITH PAGES. TRUNCATE rewrites a table's file even when it
+ * is already empty, so doing all ~345 every time would trade the round trips
+ * for file churn. pg_relation_size is a stat() call and a table cannot hold a
+ * row in zero pages, so > 0 is an exact "may have rows" test, and because
+ * TRUNCATE puts the size back to 0 the filter stays sharp: a typical call ends
+ * up naming only what the test it follows actually wrote.
+ *
+ * The *_test rail (S578) moved INTO the statement. It used to be a separate
+ * SELECT current_database() — one more round trip, and a gap between the check
+ * and the wipe. A connection to anything not named *_test now raises before a
+ * single table is touched, in the same transaction, so nothing can slip past.
+ */
+const WIPE_TEST_DATA = `
+DO $cleanup$
+DECLARE
+  targets text;
+BEGIN
+  IF right(current_database(), 5) <> '_test' THEN
+    RAISE EXCEPTION 'cleanupAllSchema REFUSED: connected to "%", not a *_test database. Tests must run with DB_NAME=gam_test (use "npm test" from apps/api). This guard exists because a stray run once wiped the dev DB.', current_database();
+  END IF;
+
+  SELECT string_agg(quote_ident(c.relname), ', ')
+    INTO targets
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public'
+     AND c.relkind IN ('r', 'p')
+     AND NOT c.relispartition
+     AND c.relname <> ALL (ARRAY[${CLEANUP_KEEPS.map(t => `'${t}'`).join(', ')}])
+     AND (c.relkind = 'p' OR pg_relation_size(c.oid) > 0);
+
+  IF targets IS NOT NULL THEN
+    EXECUTE 'TRUNCATE ' || targets || ' CASCADE';
+  END IF;
+END
+$cleanup$`
+
+/**
+ * Empty every table a test wrote to, leaving the catalogs in CLEANUP_KEEPS
+ * alone. Called in `beforeEach` across the package; see the two notes above for
+ * what it does and why it is one statement.
  */
 export async function cleanupAllSchema(): Promise<void> {
-  // SAFETY RAIL (S578): this function DELETEs from ~every table. If a test run
-  // is ever pointed at a non-test database (e.g. `vitest` invoked without
-  // DB_NAME=gam_test, which defaults to `gam` per db/index.ts), it would wipe
-  // dev/prod data. Refuse unless the LIVE connection is a *_test database —
-  // check current_database(), not just env, so nothing can slip past.
-  const who = await db.query<{ db: string }>(`SELECT current_database() AS db`)
-  const dbName = who.rows[0]?.db ?? ''
-  if (!dbName.endsWith('_test')) {
-    throw new Error(
-      `cleanupAllSchema REFUSED: connected to "${dbName}", not a *_test database. ` +
-      `Tests must run with DB_NAME=gam_test (use \`npm test\` from apps/api). ` +
-      `This guard exists because a stray run once wiped the dev DB.`)
-  }
-  // S655 (money plan): the credit ledger FKs both credit tables, payments,
-  // deposit returns, reversals, remittances and leases, so it clears FIRST.
-  // TRUNCATE, not DELETE: a credit use refuses deletion ("kept forever") and
-  // TRUNCATE does not fire row triggers. Nothing references credit_uses.
-  // The deposit-slip tables FK remittances, register sales and bank rows; the
-  // items reference the slips, so both go in one TRUNCATE.
-  await db.query(`TRUNCATE credit_uses`)
-  // 10/12 (Nic, ledger P9): a bank reconciliation's cleared lines name the
-  // ledger lines (RESTRICT) and are never deleted (a trigger refuses it), and a
-  // ledger reconciliation is never deleted either — TRUNCATE fires no row
-  // trigger, and both go before the bank lines and the ledger they name. Guarded: migration 20261014230000.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.bank_reconciliation_items') IS NOT NULL THEN
-      TRUNCATE bank_reconciliation_items, bank_reconciliations;
-    END IF;
-  END $$`)
-  // 10/12 (Nic, ledger P6): the loan register and the fixed assets point at
-  // bank lines, expenses, vendors and properties, and refuse a row DELETE
-  // (never removed) — TRUNCATE fires no row trigger. Nothing references them.
-  // 10/12 review: first — a loan payment matched to a bank line names it, so
-  // the bank lines below could not be removed while it stood.
-  // Guarded: the tables arrive with migrations 20261014190200 / 190300.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.books_loans') IS NOT NULL THEN TRUNCATE books_loan_payments, books_loans; END IF;
-    IF to_regclass('public.books_fixed_assets') IS NOT NULL THEN TRUNCATE books_fixed_assets; END IF;
-    -- 10/13 (Nic): an asset's funding lines are never removed either (no keys; migration 20261015230100).
-    IF to_regclass('public.books_fixed_asset_funding') IS NOT NULL THEN TRUNCATE books_fixed_asset_funding; END IF;
-  END $$`)
-  // 10/12 (Nic, ledger P6): an expense's payments name the bank lines that
-  // paid them and are never deleted (a trigger refuses it) — TRUNCATE fires no
-  // row trigger; and a money-out bank line matched to a refund check, a
-  // register refund or GAM's debit names that record, so those lines clear
-  // before the records do. Guarded: migrations 20261014180100 / 180200.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.landlord_expense_payments') IS NOT NULL THEN TRUNCATE landlord_expense_payments; END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = 'bank_transactions' AND column_name = 'matched_kind') THEN
-      DELETE FROM bank_transactions WHERE matched_kind IS NOT NULL;
-    END IF;
-  END $$`)
-  // 10/4 (decisions #38): an early check-out's refund parts point at the
-  // payments they went back to (RESTRICT — never erased from under them), so
-  // they clear before those payments, with their decisions and the stay ledger.
-  await db.query(`DELETE FROM stay_refund_parts`)
-  await db.query(`DELETE FROM stay_checkout_decisions`)
-  await db.query(`DELETE FROM stay_payments`)
-  await db.query(`TRUNCATE bank_deposit_slip_items, bank_deposit_slips`)
-  // S553: call slots FK sales_leads — clear child first. Availability has
-  // no FKs but tests seed their own windows.
-  // S652: card-reader orders FK to properties/landlords; clear first.
-  // 10/12 (ledger P0): a reader installment charge names its order (RESTRICT),
-  // and GAM charge collections name the payout batch or bank pull that
-  // collected them (RESTRICT) — both clear before their parents. Guarded: the
-  // columns and the table arrive with migrations 20261013090000-090200, and a
-  // test database built before they are dumped into schema.sql has neither.
-  // 10/13 evening (Nic: "Redo the split"): a reader piece split again under a
-  // later cost names the piece, the cost entry and the order (RESTRICT) — it
-  // clears before all three. Guarded: the table arrives with migration 20261015220000.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.pos_reader_order_resplits') IS NOT NULL THEN TRUNCATE pos_reader_order_resplits; END IF;
-  END $$`)
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.landlord_gam_charge_collections') IS NOT NULL THEN
-      DELETE FROM landlord_gam_charge_collections;
-    END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = 'landlord_gam_charges' AND column_name = 'reader_order_id') THEN
-      DELETE FROM landlord_gam_charges WHERE reader_order_id IS NOT NULL;
-    END IF;
-  END $$`)
-  // 10/12 (review): a reader order's cost entries are never deleted (a row
-  // trigger refuses it) and hold their order (RESTRICT) — TRUNCATE fires no row
-  // trigger. Guarded: the table arrives with migration 20261013160100.
-  // 10/13 evening: with the re-splits that name the entries (emptied above, but
-  // a TRUNCATE must name every table that references the one it empties).
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.pos_reader_order_resplits') IS NOT NULL THEN
-      TRUNCATE pos_reader_order_resplits, pos_reader_order_costs;
-    ELSIF to_regclass('public.pos_reader_order_costs') IS NOT NULL THEN
-      TRUNCATE pos_reader_order_costs;
-    END IF;
-  END $$`)
-  await db.query(`DELETE FROM pos_reader_orders`)
-  await db.query(`DELETE FROM sales_call_slots`)
-  await db.query(`DELETE FROM sales_leads`)
-  await db.query(`DELETE FROM sales_call_availability`)
-  // S332: dispute lifecycle tables FK to credit_events; clear before
-  // the parents. credit_scores + credit_stats FK to subjects.
-  await db.query(`DELETE FROM credit_disputes`)
-  await db.query(`DELETE FROM credit_hardship_contexts`)
-  await db.query(`DELETE FROM credit_scores`)
-  await db.query(`DELETE FROM credit_stats`)
-  // credit_merkle_anchors.earliest_event_id FKs credit_events (NO ACTION) —
-  // clear anchors before events or the events delete violates the FK.
-  await db.query(`DELETE FROM credit_merkle_anchors`)
-  await db.query(`DELETE FROM credit_events`)
-  await db.query(`DELETE FROM credit_subjects`)
-  // 10/13 evening (Nic): the nightly chain check's record, read by the 8:05
-  // morning admin email. Guarded: the table arrives with migration 20261015220100.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.credit_chain_check_runs') IS NOT NULL THEN DELETE FROM credit_chain_check_runs; END IF;
-  END $$`)
-  await db.query(`DELETE FROM admin_notifications`)
-  // S362: admin_action_log + system_features FK users with NO ACTION
-  // (default). Wipe both before users delete. system_features rows
-  // come from migration seeds in prod, but the test DB is schema-only
-  // — tests seed what they need inline.
-  await db.query(`DELETE FROM admin_action_log`)
-  await db.query(`DELETE FROM feature_requests`)
-  await db.query(`DELETE FROM system_features`)
-  // S368: CSV review queue tables. csv_import_attempts CASCADEs on
-  // landlords delete so wipes transitively, but platform_review_status
-  // + platform_claim_promotions have user FKs (SET NULL) and persist
-  // across tests — clear explicitly.
-  await db.query(`DELETE FROM platform_review_status`)
-  await db.query(`DELETE FROM platform_claim_promotions`)
-  // S370: ach_monitoring_log FK payments + tenants (NO ACTION default).
-  // Blocks parent deletes; clear before payments/tenants get wiped.
-  await db.query(`DELETE FROM ach_monitoring_log`)
-  // S346: notification_preferences CASCADE on users delete but explicit
-  // clear keeps each test's prefs scope-controlled inside a describe.
-  await db.query(`DELETE FROM notification_preferences`)
-  await db.query(`DELETE FROM notifications`)
-  // S561: payments.reversal_id ⇄ payment_reversals.payment_id form a cycle —
-  // NULL the back-reference first, then clear reversals before their other
-  // parents (payments + connect_disputes, NO ACTION).
-  await db.query(`UPDATE payments SET reversal_id = NULL WHERE reversal_id IS NOT NULL`)
-  await db.query(`DELETE FROM payment_reversals`)
-  await db.query(`DELETE FROM connect_disputes`)
-  // S358: connect_payouts FK users (SET NULL) + pm_companies (SET NULL).
-  // Rows survive parent deletes — explicit cleanup keeps tests
-  // scope-deterministic.
-  await db.query(`DELETE FROM connect_payouts`)
-  // S364: email_send_log FK landlords (SET NULL) — same posture.
-  //
-  // S637: TRUNCATE, not DELETE. Correspondence rows carry a BEFORE DELETE
-  // trigger that refuses removal ("the log is the log"), so a DELETE here
-  // fails the moment any test has written one — which is every test that
-  // sends a support message. TRUNCATE does not fire row triggers, so the
-  // production guarantee is untouched while the fixture still resets.
-  //
-  // Nothing references email_send_log, so no CASCADE is needed. That the
-  // guard is bypassable by TRUNCATE is the same class of hole as disabling
-  // the trigger: both need table-owner rights, neither is reachable through
-  // the application, and the directive is about what a super_admin can do
-  // in the product.
-  await db.query(`TRUNCATE email_send_log`)
-  // 10/12 (Nic): the monthly property report's recipients and sends FK
-  // landlords and users (never cascaded: keep everything), so they clear
-  // before them. Guarded: the tables arrive with migrations 20261013150000/
-  // 150100, and a test database built before they are dumped has neither.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.monthly_report_sends') IS NOT NULL THEN DELETE FROM monthly_report_sends; END IF;
-    IF to_regclass('public.monthly_report_recipients') IS NOT NULL THEN DELETE FROM monthly_report_recipients; END IF;
-  END $$`)
-  // S631: admin_invitations FKs users three ways (inviter, acceptor, revoker)
-  // with NO ACTION — that reference IS the audit trail for who granted console
-  // access, so it restricts rather than cascades. Clear it before users.
-  await db.query(`DELETE FROM admin_invitations`)
-  // S631: platform_owner FKs users and its own trigger refuses DELETE — drop the
-  // trigger for the duration of the wipe, not in any production path.
-  await db.query(`ALTER TABLE platform_owner DISABLE TRIGGER trg_protect_platform_owner_row`)
-  await db.query(`DELETE FROM platform_owner`)
-  await db.query(`ALTER TABLE platform_owner ENABLE TRIGGER trg_protect_platform_owner_row`)
-  // S631: membership history is written by trigger on every add/remove and FKs
-  // nothing, but it accumulates across files; clearing keeps assertions honest.
-  await db.query(`DELETE FROM landlord_member_history`)
-  // S365: otp_advances FK landlords/tenants/units/leases/payments (NO ACTION).
-  // Rows block parent deletes — clear before users/landlords/tenants/payments.
-  await db.query(`DELETE FROM otp_advances`)
-  // S445: flexpay_advances FKs landlords/tenants/units/leases/payments
-  // (same NO ACTION posture as otp_advances above). Without this clear,
-  // any test that creates a FlexPay advance traps the next file's
-  // cleanupAllSchema on leases/users delete.
-  // S655 (money plan M2): a covered bill line and the FLEXPAY pull row point
-  // back at their advance (payments.flexpay_advance_id), so that link is cut
-  // before the advances go; payments themselves are cleared further down.
-  await db.query(`UPDATE payments SET flexpay_advance_id = NULL WHERE flexpay_advance_id IS NOT NULL`)
-  await db.query(`DELETE FROM flexpay_advances`)
-  // S629: suspended_utility_charges.released_bill_id FKs utility_bills — the
-  // bill a held share became when the tenant signed. Held rows go first or the
-  // bill delete violates that reference. RESTRICT rather than SET NULL on
-  // purpose: the link from a bill back to the share it was holding is the
-  // audit trail for money that moved late.
-  await db.query(`DELETE FROM suspended_utility_charges`)
-  await db.query(`DELETE FROM utility_bills`)
-  // S614: a service agreement holds units + tenants with RESTRICT, and its bills
-  // reference it, so it clears after the bills and before units/tenants below.
-  // S615: its INVOICES reference it too (RESTRICT), and invoices are cleared
-  // much further down — so they go first, together with the payment rows that
-  // hang off them, or this delete trips invoices_service_agreement_id_fkey.
-  await db.query(
-    `DELETE FROM payments WHERE invoice_id IN
-       (SELECT id FROM invoices WHERE service_agreement_id IS NOT NULL)`)
-  await db.query(`DELETE FROM invoices WHERE service_agreement_id IS NOT NULL`)
-  // S616: a cross-property link holds BOTH the agreement and the other
-  // landlord's unit with RESTRICT, so it clears ahead of both.
-  await db.query(`DELETE FROM cross_property_service_links`)
-  await db.query(`DELETE FROM utility_service_agreements`)
-  // S533: propane installments FK payments (NO ACTION) — clear the
-  // child before payments get wiped; fills cascade from installments'
-  // parent delete order (fills → installments is CASCADE, but the
-  // payments FK on installments blocks payments cleanup).
-  await db.query(`DELETE FROM propane_fill_installments`)
-  await db.query(`DELETE FROM propane_fills`)
-  await db.query(`DELETE FROM property_utility_tax_rates`)
-  await db.query(`DELETE FROM utility_meters`)
-  // 10/12 (ledger P0): a move-out's deposit-share transfer record names its
-  // deposit return (RESTRICT). Guarded like the block above (20261013090100).
-  await db.query(`DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = 'platform_transfer_intents' AND column_name = 'deposit_return_id') THEN
-      DELETE FROM platform_transfer_intents WHERE deposit_return_id IS NOT NULL;
-    END IF;
-  END $$`)
-  await db.query(`DELETE FROM deposit_returns`)
-  // S331: FlexSuite acceptance audit + FlexDeposit installment plan
-  // tables — both FK to tenants / security_deposits; clear before the
-  // parents. background_checks FKs tenants + landlords — also wipe.
-  await db.query(`DELETE FROM flexsuite_enrollment_acceptances`)
-  await db.query(`DELETE FROM flex_deposit_installments`)
-  await db.query(`DELETE FROM screening_fee_accruals`)
-  // S640: the archive can now hold a webhook we could not attribute to a check
-  // (background_check_id NULL), so nothing cascades it away — it keeps a
-  // landlord_id, which keeps a user alive, which blocks the user delete below.
-  await db.query(`DELETE FROM background_check_reports`)
-  await db.query(`DELETE FROM background_checks`)
-  // S579: pending_tenant_intents FKs properties + units (property_id +
-  // screening_waived_unit_id) with NO ACTION. Property-level intents have a
-  // NULL unit_id so the unit-delete cascade never reaches them — delete the
-  // intents explicitly before properties/units are wiped below.
-  await db.query(`DELETE FROM pending_tenant_intents`)
-  // S580: platform_transfer_intents FKs landlords + users — clear before them.
-  // S648: held items point at payees and the batch that carried them.
-  await db.query(`DELETE FROM held_payout_items`)
-  await db.query(`DELETE FROM platform_transfer_intents`)
-  // S580: instant-withdrawal margin FKs landlords + disbursements; circuit is standalone.
-  await db.query(`DELETE FROM landlord_instant_margins`)
-  await db.query(`DELETE FROM connect_instant_circuit`)
-  await db.query(`DELETE FROM state_application_fee_caps`)
-  await db.query(`DELETE FROM security_deposits`)
-  // Accrual tables FK to user_balance_ledger / platform_revenue_ledger
-  // via ledger_entry_id, so they must be cleared before the ledger
-  // tables they reference.
-  await db.query(`DELETE FROM monthly_fee_accruals`)
-  await db.query(`DELETE FROM pm_monthly_fee_accruals`)
-  await db.query(`DELETE FROM platform_fee_accruals`)
-  await db.query(`DELETE FROM user_balance_ledger`)
-  await db.query(`DELETE FROM platform_revenue_ledger`)
-  // lease_termination_requests FKs payments.id (fee_payment_id) and
-  // leases.id; clear before either.
-  await db.query(`DELETE FROM lease_termination_requests`)
-  // S446: flex_charge_statements.payment_id FKs payments (NO ACTION) —
-  // and flex_charge_transactions.statement_id FKs statements. Clear the
-  // chain transactions → statements → accounts BEFORE payments so the
-  // payments DELETE below doesn't trip the FK on any test that fired
-  // processFlexChargeStatementBilling. (Previously these lived next to
-  // the POS chain at the bottom, which only worked when no statement
-  // had been billed — i.e. payment_id IS NULL.)
-  await db.query(`DELETE FROM flex_charge_transactions`)
-  await db.query(`DELETE FROM flex_charge_statements`)
-  await db.query(`DELETE FROM flex_charge_accounts`)
-  await db.query(`DELETE FROM remittance_applications`)
-  // lease_prepaid_credit_draws stays until contract step C3 drops the table.
-  await db.query(`DELETE FROM lease_prepaid_credit_draws`)
-  await db.query(`DELETE FROM lease_prepaid_credits`)
-  // S655: tenant_credits now carries an audit trigger, so it is cleared here,
-  // before audit_row_changes below, instead of by the landlord cascade at the
-  // end (whose audit rows would pile up across files). Interest accruals point
-  // at a credit ON DELETE SET NULL, so nothing blocks this.
-  await db.query(`DELETE FROM tenant_credits`)
-  // S609: tenant autopay schedules (one per lease, cascades from leases anyway,
-  // but leases are deleted later in this chain).
-  await db.query(`DELETE FROM tenant_autopay`)
-  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
-  // allocation RESTRICTs both the transaction and the payment — the proof of a
-  // settled rent payment is not throwaway. Both clear before either parent.
-  // S655: a RECORDED declaration also RESTRICTs the receipt it became
-  // (tenant_declared_deposits.recorded_remittance_id), so both clear before
-  // tenant_remittances too.
-  await db.query(`DELETE FROM bank_deposit_allocations`)
-  await db.query(`DELETE FROM tenant_declared_deposits`)
-  await db.query(`DELETE FROM tenant_remittances`)
-  // S616: a one-off charge FKs a payments row, plus the lease, unit and tenant
-  // — all NO ACTION, so it clears before the earliest of them.
-  await db.query(`DELETE FROM tenant_one_off_charges`)
-  // S616: payout triggers carry no FKs (entity_id is polymorphic), so nothing
-  // forces an order — but they MUST be cleared, or one test file's triggers
-  // are still due in the next one's and every dueTriggers() assertion drifts.
-  await db.query(`DELETE FROM payout_triggers`)
-  // S624: bank_transactions.matched_payment_id FKs payments, so it must clear
-  // FIRST. This was latent until the deposit-match path became the first thing
-  // to ever populate that column — the constraint has always been there, nothing
-  // had exercised it. (bank_transactions is deleted again further down with its
-  // connection; a second DELETE on an empty table is free.) Allocations and
-  // declarations, which RESTRICT it, were cleared above with tenant_remittances.
-  await db.query(`DELETE FROM bank_transactions`)
-  await db.query(`DELETE FROM payments`)
-  // S550: the audit journal records every DELETE this cleanup performs —
-  // clear it too or gam_test grows without bound across runs.
-  await db.query(`DELETE FROM audit_row_changes`)
-  await db.query(`DELETE FROM invoices`)
-  await db.query(`DELETE FROM invoice_sequences`)
-  await db.query(`DELETE FROM lease_fees`)
-  // S335: addendum_remove docs have a CHECK constraint requiring
-  // target_lease_tenant_id IS NOT NULL. The FK from lease_documents
-  // to lease_tenants is ON DELETE SET NULL, so a direct DELETE FROM
-  // lease_tenants triggers a SET NULL on target_lease_tenant_id that
-  // violates the CHECK on any addendum_remove row. Break the FK
-  // direction by clearing lease_tenants' link columns first, then
-  // delete the addendum_remove docs outright before the lease_tenants
-  // wipe.
-  await db.query(`UPDATE lease_tenants SET add_document_id = NULL, remove_document_id = NULL`)
-  await db.query(`DELETE FROM lease_documents WHERE document_type = 'addendum_remove'`)
-  await db.query(`DELETE FROM lease_tenants`)
-  // Subleases ↔ sublessee_invitations have a circular FK
-  // (subleases.sublessee_invitation_id → sublessee_invitations.id and
-  // sublessee_invitations.sublease_id → subleases.id). Both columns are
-  // nullable; clear them to break the cycle before deleting either
-  // table. sublessor_credit_balances FKs subleases — clear first.
-  await db.query(`DELETE FROM sublessor_credit_balances`)
-  await db.query(`UPDATE subleases SET sublessee_invitation_id = NULL`)
-  await db.query(`UPDATE sublessee_invitations SET sublease_id = NULL`)
-  await db.query(`DELETE FROM subleases`)
-  await db.query(`DELETE FROM sublessee_invitations`)
-  // unit_inspection_videos are immutable in prod (a BEFORE DELETE trigger
-  // blocks row deletes and the inspection FK is ON DELETE RESTRICT). For test
-  // cleanup we TRUNCATE them — TRUNCATE does not fire the row-level delete
-  // trigger and clears the FK refs so the unit_inspections DELETE below can
-  // proceed. This is test-infra only; no app path can remove a video.
-  await db.query(`TRUNCATE unit_inspection_videos`)
-  // S571: entry requests now FK maintenance_requests + unit_inspections
-  // (anchors), so clear them BEFORE those parents. Responses CASCADE on request
-  // delete, but explicit order keeps the chain obvious.
-  await db.query(`DELETE FROM unit_entry_request_responses`)
-  await db.query(`DELETE FROM unit_entry_requests`)
-  // S613: resident_home_sales is GONE — the resident-to-resident sale record
-  // was retired (Nic: "scrap the person to person sale monitoring"), so there is
-  // nothing to clear here any more.
-  // documents FKs leases/units/tenants/landlords (NO cascade). S573: a
-  // finalized inspection now writes a summary-report documents row referencing
-  // its lease — clear documents BEFORE leases/units, not just before landlords.
-  await db.query(`DELETE FROM documents`)
-  // unit_inspections FKs leases.id (children — items / photos /
-  // signatures — cascade on parent delete per schema FKs).
-  await db.query(`DELETE FROM unit_inspections`)
-  // lease_documents FKs leases.id; its children (signers / fields)
-  // cascade on parent delete.
-  // S629: home_sale_contracts.purchase_document_id FKs lease_documents — the
-  // signed purchase agreement a financed sale bills from. Contracts must go
-  // first or the document delete violates that reference. (It is deliberately
-  // RESTRICT, not SET NULL: losing the link between a billing schedule and the
-  // paper it came from is exactly what this column exists to prevent.)
-  await db.query(`DELETE FROM home_sale_installments`)
-  await db.query(`DELETE FROM home_sale_contracts`)
-  await db.query(`DELETE FROM lease_documents`)
-  // 10/12 (G6): the landlord's answer when a stay was shortened names its
-  // lease, booking and company (no cascade), so it clears first. Guarded: the
-  // table arrives with migration 20261013235150, and a test database built
-  // before it is dumped into schema.sql has no such table.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.stay_shortened_charge_choices') IS NOT NULL THEN DELETE FROM stay_shortened_charge_choices; END IF;
-  END $$`)
-  await db.query(`DELETE FROM leases`)
-  // Maintenance comments + media FK to maintenance_requests, which FKs units.
-  // (assigned_to -> users is ON DELETE SET NULL, so no ordering constraint there.)
-  await db.query(`DELETE FROM maintenance_comments`)
-  await db.query(`DELETE FROM maintenance_media`)
-  // 10/12 (Nic, L6): a repair's bill names the repair; it lets go first (the
-  // expense itself clears below). Guarded: migration 20261014180100.
-  await db.query(`DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = 'landlord_expenses' AND column_name = 'maintenance_request_id') THEN
-      UPDATE landlord_expenses SET maintenance_request_id = NULL WHERE maintenance_request_id IS NOT NULL;
-    END IF;
-  END $$`)
-  await db.query(`DELETE FROM maintenance_requests`)
-  await db.query(`DELETE FROM tenant_walkthrough_media`)
-  await db.query(`DELETE FROM contractors`)
-  // S355: unit_applications FK units (SET NULL) + landlords (SET NULL) —
-  // rows survive parent deletes, so explicit cleanup is required to keep
-  // tests scope-deterministic. unit_photos / property_fee_schedules /
-  // property_duplicate_flags all CASCADE via units / properties.
-  await db.query(`DELETE FROM unit_applications`)
-  // S350: unit_bookings FK units RESTRICT; clear before units.
-  // S652: a ticket may name the booking it is payment for. Nulling that column
-  // is not an option — a ticket has to say who it is for, and for a walk-in the
-  // booking IS the answer — so the tickets go first, after releasing the sale
-  // rows that point at them.
-  await db.query(`UPDATE pos_transactions SET open_ticket_id = NULL`)
-  await db.query(`DELETE FROM pos_open_tickets`)
-  await db.query(`DELETE FROM unit_bookings`)
-  // 10/12: paid extra hours FK their agreement RESTRICT (money owed for work
-  // done is never erased from under it), so they clear first. Guarded: the
-  // table arrives with migration 20261012180200, and a test database built
-  // before it is dumped into schema.sql has no such table.
-  // 10/12 (Nic, ledger P6/P7): a paycheck line and a contractor expense name
-  // the extra hours they pay; they let go first (their own rows clear below).
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.work_trade_extra_hours') IS NOT NULL THEN
-      IF EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema = 'public' AND table_name = 'payroll_run_lines' AND column_name = 'work_trade_extra_hours_id') THEN
-        UPDATE payroll_run_lines SET work_trade_extra_hours_id = NULL WHERE work_trade_extra_hours_id IS NOT NULL;
-      END IF;
-      IF EXISTS (SELECT 1 FROM information_schema.columns
-                  WHERE table_schema = 'public' AND table_name = 'landlord_expenses' AND column_name = 'work_trade_extra_hours_id') THEN
-        UPDATE landlord_expenses SET work_trade_extra_hours_id = NULL WHERE work_trade_extra_hours_id IS NOT NULL;
-      END IF;
-      DELETE FROM work_trade_extra_hours;
-    END IF;
-  END $$`)
-  // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
-  // for work_trade_logs (CASCADE on agreement delete). Clear before units.
-  await db.query(`DELETE FROM work_trade_agreements`)
-  // S568: home_sale_contracts FK units (RESTRICT — protects the contract from
-  // unit deletion); installments CASCADE on contract delete. Clear before units.
-  await db.query(`DELETE FROM home_sale_contracts`)
-  // S568: home_ownerships FK units + users (RESTRICT). Clear before units/users.
-  await db.query(`DELETE FROM home_ownerships`)
-  // 10/12 (ledger P3): the GAM Books ledger tables are append-only (triggers
-  // refuse UPDATE and DELETE) and RESTRICT to landlords, books accounts, bank
-  // connections and journal entries, so they go first, by TRUNCATE — which
-  // fires no row trigger, so no bypass ever goes into the production guards.
-  // Journal lines now RESTRICT to their entry (an entry is voided, never
-  // erased), so both clear here too. Guarded: the ledger tables arrive with
-  // migrations 20261013200000-200600, and a test database built before they
-  // are dumped into schema.sql has none of them.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.bank_reconciliation_items') IS NOT NULL THEN
-      -- 10/12 (Nic, ledger P9): a cleared bank line names its ledger line, so
-      -- it is truncated in the same statement (already empty — cleared above).
-      TRUNCATE bank_reconciliation_items, ledger_close_balances, books_period_closes, ledger_posting_lines, ledger_postings,
-               ledger_rebuild_runs, ledger_outbox, ledger_source_errors, books_account_map, books_opening_items;
-    ELSIF to_regclass('public.ledger_postings') IS NOT NULL THEN
-      TRUNCATE ledger_close_balances, books_period_closes, ledger_posting_lines, ledger_postings,
-               ledger_rebuild_runs, ledger_outbox, ledger_source_errors, books_account_map, books_opening_items;
-    END IF;
-    -- 10/12 (Nic, ledger review): every register-stock choice is kept
-    -- (append-only, names its company) — TRUNCATE fires no row trigger.
-    -- Guarded: the table arrives with migration 20261014170100.
-    IF to_regclass('public.books_register_stock_changes') IS NOT NULL THEN
-      TRUNCATE books_register_stock_changes;
-    END IF;
-  END $$`)
-  await db.query(`TRUNCATE journal_entry_lines, journal_entries`)
-  // S570: bank feed. bank_transactions FK bank_connections + landlord_expenses;
-  // bank_connections + landlord_merchant_rules FK landlords/properties/units.
-  // Clear before landlord_expenses / units / properties / landlords below.
-  await db.query(`DELETE FROM bank_transactions`)
-  await db.query(`DELETE FROM bank_connections`)
-  await db.query(`DELETE FROM landlord_merchant_rules`)
-  // S568: lot_rent_charges FK units/properties/landlords. Clear before units.
-  await db.query(`DELETE FROM lot_rent_charges`)
-  // 10/12 (Nic, ledger P7): what a payroll run left owed names its expenses,
-  // and an expense's payments are never deleted (a trigger refuses it) —
-  // TRUNCATE fires no row trigger. Guarded: the tables arrive with migrations
-  // 20261014200300 and 20261014180100.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.payroll_run_expenses') IS NOT NULL THEN TRUNCATE payroll_run_expenses; END IF;
-    IF to_regclass('public.landlord_expense_payments') IS NOT NULL THEN TRUNCATE landlord_expense_payments CASCADE; END IF;
-  END $$`)
-  // 10/12 (Nic, ledger P6 integrate): a GAM Books bill or transaction moved
-  // onto the Expenses record names the expense it became
-  // (migrated_expense_id / migrated_other_income_id, 20261014180300); the
-  // books rows themselves clear further down, so drop the pointers first.
-  await db.query(`DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'books_bills' AND column_name = 'migrated_expense_id') THEN
-      UPDATE books_bills SET migrated_expense_id = NULL WHERE migrated_expense_id IS NOT NULL;
-      UPDATE books_transactions SET migrated_expense_id = NULL, migrated_other_income_id = NULL
-       WHERE migrated_expense_id IS NOT NULL OR migrated_other_income_id IS NOT NULL;
-    END IF;
-  END $$`)
-  // S568: landlord_expenses FK units/properties/landlords/users. Clear before units.
-  await db.query(`DELETE FROM landlord_expenses`)
-  await db.query(`DELETE FROM unit_out_of_order`)
-  await db.query(`DELETE FROM units`)
-  await db.query(`DELETE FROM property_allocation_rules`)
-  // S338: POS chain. All landlord-FK'd with ON DELETE RESTRICT;
-  // must clear before landlords delete. Children cascade where
-  // possible (transaction_items, inventory_log, purchase_order_items
-  // all CASCADE on parent delete). S339: pos_refunds → pos_transactions
-  // is RESTRICT, so refunds must be cleared before transactions.
-  // S340 / S446: flex_charge_* chain is now cleared earlier (above the
-  // payments DELETE) because flex_charge_statements.payment_id FKs
-  // payments. Order within the chain: transactions → statements →
-  // accounts (transactions.statement_id FKs statements).
-  await db.query(`DELETE FROM pos_refunds`)
-  // S342: pos_eod_settlements FKs landlords (RESTRICT) and reads from
-  // pos_transactions / pos_refunds — clear it before transactions.
-  await db.query(`DELETE FROM pos_eod_settlements`)
-  // S343: pos_sessions FKs pos_transactions via completed_transaction_id;
-  // session_items cascade on parent session delete.
-  await db.query(`DELETE FROM pos_sessions`)
-  // S652: open tickets and transactions point AT EACH OTHER — a ticket names
-  // the sale that settled it, and that sale names the ticket. Neither can be
-  // deleted first, so the link is broken before either goes.
-  await db.query(`UPDATE pos_open_tickets SET settled_transaction_id = NULL`)
-  await db.query(`DELETE FROM pos_transactions`)
-  await db.query(`DELETE FROM pos_open_tickets`)
-  // S648: register pay links FK properties, landlords, bookings and the sale.
-  await db.query(`DELETE FROM pos_pay_links`)
-  await db.query(`DELETE FROM pos_purchase_orders`)
-  await db.query(`DELETE FROM pos_items`)
-  await db.query(`DELETE FROM pos_categories`)
-  await db.query(`DELETE FROM pos_vendors`)
-  await db.query(`DELETE FROM pos_tax_rates`)
-  // S390: pos_discounts FKs landlords RESTRICT; clear before
-  // landlords. pos_item_variants CASCADE on pos_items (auto-cleared
-  // when items go).
-  await db.query(`DELETE FROM pos_discounts`)
-  await db.query(`DELETE FROM pos_item_variants`)
-  // S345: terminal readers FK landlord (default RESTRICT). Clear before
-  // landlords; no children to cascade.
-  await db.query(`DELETE FROM pos_terminal_readers`)
-  await db.query(`DELETE FROM pos_customer_invitations`)
-  await db.query(`DELETE FROM pos_customer_cards`)   // S654: cards → customers
-  await db.query(`DELETE FROM pos_customers`)
-  // S348: maintenance-portal tables — all FK landlords with RESTRICT.
-  // purchase_requests FKs maintenance_requests via work_order_id (already
-  // wiped above), users via requested_by/approved_by. scheduled_maintenance
-  // FKs properties (wiped below us) — clear before properties too.
-  await db.query(`DELETE FROM purchase_requests`)
-  await db.query(`DELETE FROM parts_inventory`)
-  await db.query(`DELETE FROM daily_tasks`)
-  await db.query(`DELETE FROM scheduled_maintenance`)
-  await db.query(`DELETE FROM shifts`)
-  // S349: scope tables + invitations + platform_events. Scope tables
-  // FK users + landlords (RESTRICT); invitations FK landlords + users
-  // (invited_by_user_id / accepted_user_id / revoked_by_user_id);
-  // platform_events FKs invitations via subject_id (currently the only
-  // subject_type) — clear in dependency order.
-  await db.query(`DELETE FROM platform_events`)
-  await db.query(`DELETE FROM property_manager_scopes`)
-  await db.query(`DELETE FROM onsite_manager_scopes`)
-  await db.query(`DELETE FROM maintenance_worker_scopes`)
-  await db.query(`DELETE FROM bookkeeper_scopes`)
-  // S383: books_* tables CASCADE on landlords delete, but admin-scoped
-  // accounts (landlord_id IS NULL) don't cascade. Explicit clear keeps
-  // tests deterministic across runs that mix admin + landlord scope.
-  // S385: payroll_run_lines CASCADE on payroll_runs delete, but
-  // RESTRICT on books_employees — clear runs first so the employees
-  // delete below doesn't trip the FK.
-  await db.query(`DELETE FROM payroll_runs`)
-  // S386: journal_entry_lines + books_bills + books_transactions all
-  // RESTRICT-FK to books_accounts (and bills RESTRICTs to books_vendors).
-  // Clear the children before books_accounts/vendors below.
-  await db.query(`DELETE FROM journal_entries`)
-  await db.query(`DELETE FROM books_bills`)
-  await db.query(`DELETE FROM books_transactions`)
-  await db.query(`DELETE FROM books_accounts`)
-  await db.query(`DELETE FROM books_employees`)
-  // 10/12 (Nic, ledger P6): a vendor folded in from a contractor names the
-  // contractor row it came from, so the vendors clear first.
-  await db.query(`DELETE FROM books_vendors`)
-  await db.query(`DELETE FROM books_contractors`)
-  await db.query(`DELETE FROM invitations`)
-  // S352: PM company chain — pm_invitations / pm_staff / pm_fee_plans /
-  // pm_property_invitations all FK pm_companies CASCADE, so wiping
-  // pm_companies cleans them transitively. pm_monthly_fee_accruals
-  // (RESTRICT) is already wiped above. landlords.default_pm_company_id
-  // and properties.pm_company_id are SET NULL, so no blocking concern.
-  await db.query(`DELETE FROM pm_companies`)
-  await db.query(`DELETE FROM properties`)
-  // S449: disbursements FKs landlords, user_bank_accounts, AND users.
-  // Without this cleanup any test that wrote a disbursement (e.g.,
-  // POST /me/withdrawals) traps the next file's beforeEach on the
-  // landlord/user DELETE. Same pattern as the S445 flexpay_advances
-  // and S446 flex_charge cleanup additions. stripeConnectWebhooks.test.ts
-  // pre-cleaned this manually; that workaround is now obsolete.
-  await db.query(`DELETE FROM disbursements`)
-  // S453: businesses chain — businesses.owner_user_id FKs users,
-  // business_users.user_id FKs users (both no ON DELETE), so leaving
-  // any business row in place traps the users DELETE. business_users +
-  // business_customers CASCADE on businesses delete, so the parent
-  // wipe transitively clears them.
-  // S456: business_user_invitations also CASCADEs on businesses, but
-  // invited_by_user_id + accepted_user_id FK users directly (no ON
-  // DELETE), so clear the chain explicitly before users DELETE.
-  await db.query(`DELETE FROM business_user_invitations`)
-  // S459: appointments CASCADE on businesses but their created_by_user_id
-  // FKs users with no ON DELETE; clearing transitively via businesses
-  // wipe is fine for the FK direction, but explicit DELETE makes the
-  // chain readable.
-  // S460: recurring_schedules CASCADE on businesses too. Order is
-  // important — appointments has an FK back to recurring_schedules
-  // (ON DELETE SET NULL), so dropping appointments first is fine,
-  // but the FK gets exercised on the schedules-delete pass.
-  // S463: route_stops + generated_routes CASCADE on businesses, but
-  // route_stops.appointment_id FKs appointments (no ON DELETE) so
-  // they must be cleared BEFORE the appointments DELETE below.
-  await db.query(`DELETE FROM route_stops`)
-  await db.query(`DELETE FROM generated_routes`)
-  await db.query(`DELETE FROM appointments`)
-  await db.query(`DELETE FROM recurring_schedules`)
-  // S462: route infrastructure tables. vehicles.home_depot_id FKs
-  // depots so trucks must be cleared first; depots / dump_locations
-  // are sibling-CASCADE on businesses but explicit clear keeps order
-  // readable.
-  await db.query(`DELETE FROM vehicles`)
-  await db.query(`DELETE FROM depots`)
-  await db.query(`DELETE FROM dump_locations`)
-  await db.query(`DELETE FROM business_platform_fee_accruals`)
-  // 10/12 (Nic, ledger P6): each company's own expense and income categories
-  // name it. A trigger refuses deleting one (they are kept); TRUNCATE fires no
-  // row trigger. Guarded: the table arrives with migration 20261014180000.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.books_categories') IS NOT NULL THEN TRUNCATE books_categories CASCADE; END IF;
-  END $$`)
-  await db.query(`DELETE FROM businesses`)
-  await db.query(`DELETE FROM landlords`)
-  await db.query(`DELETE FROM tenants`)
-  // S605: audit_log.user_id FKs users with no ON DELETE, so any test whose
-  // route writes an audit row (e.g. POST /units/:id/retire) would otherwise
-  // fail the users DELETE below with a foreign-key violation — and it would
-  // surface in the NEXT test's beforeEach, not the one that wrote the row.
-  await db.query(`DELETE FROM audit_log`)
-  await db.query(`DELETE FROM users`)
-  // 10/12 (ledger P3): every DELETE above that touched a money table marked its
-  // source in the ledger outbox; a test starts with none waiting.
-  await db.query(`DO $$ BEGIN
-    IF to_regclass('public.ledger_outbox') IS NOT NULL THEN TRUNCATE ledger_outbox; END IF;
-  END $$`)
+  await db.query(WIPE_TEST_DATA)
 }
 
 export async function withRollback<T>(
@@ -886,6 +360,63 @@ export async function seedProcessingRate(
     [params.paymentMethod,
      params.customerFacingFlat, params.customerFacingPercent,
      params.stripeCostFlat, params.stripeCostPercent]
+  )
+}
+
+/**
+ * 10/17 — STATE THE RATE CARD A FILE'S NUMBERS WERE WORKED OUT ON.
+ *
+ * platform_processing_rates holds exactly ONE open row per payment method
+ * (unique index ux_platform_processing_rates_active_per_method, where
+ * effective_until IS NULL) and cleanupAllSchema deliberately leaves the table
+ * alone, so the FIRST file in a run to insert a rate sets the rate every later
+ * file reads (services/allocation.ts fetchActiveProcessingRate,
+ * services/platformRevenue.ts, services/stripeCosts.ts all read that one row).
+ *
+ * A file that inserts "only if none is open" therefore passes or fails on who
+ * ran first. That is what sent webhooks.test.ts and
+ * incomeBasisReservationMoney.test.ts red inside deploy.sh on 10/15 and 10/16
+ * while both passed alone; allocation.test.ts had already worked around it by
+ * hand ("the file passed or failed depending on which suite the run happened to
+ * start with"). Per-worker databases do not cure it — a worker still runs many
+ * files on one database — so the cause is fixed here.
+ *
+ * This states the rate instead of hoping for it: whatever is open for that
+ * method is retired and the wanted row becomes the open one. Rates are
+ * effective-dated, so retiring is an UPDATE of effective_until, never a delete
+ * — the row stays, which the change journal requires. effective_until is
+ * pushed past effective_from so a row inserted a moment ago still closes
+ * (the window CHECK demands until > from).
+ */
+export async function setEffectiveProcessingRate(
+  client: PoolClient,
+  params: {
+    paymentMethod: 'ach' | 'card'
+    customerFacingFlat: number
+    customerFacingPercent: number
+    stripeCostFlat: number
+    stripeCostPercent: number
+    customerFacingCap?: number | null
+    stripeCostCap?: number | null
+    notes?: string
+  }
+): Promise<void> {
+  await client.query(
+    `UPDATE platform_processing_rates
+        SET effective_until = greatest(now(), effective_from + interval '1 microsecond')
+      WHERE payment_method = $1 AND effective_until IS NULL`,
+    [params.paymentMethod]
+  )
+  await client.query(
+    `INSERT INTO platform_processing_rates
+       (payment_method, customer_facing_flat, customer_facing_percent,
+        stripe_cost_flat, stripe_cost_percent, customer_facing_cap, stripe_cost_cap, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [params.paymentMethod,
+     params.customerFacingFlat, params.customerFacingPercent,
+     params.stripeCostFlat, params.stripeCostPercent,
+     params.customerFacingCap ?? null, params.stripeCostCap ?? null,
+     params.notes ?? null]
   )
 }
 

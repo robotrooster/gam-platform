@@ -69,16 +69,17 @@ describe('countyAt: a map location to its Census county', () => {
     expect(adminPkg.dependencies['us-atlas']).toBe('3.0.1')
     const fromAdmin = createRequire(join(adminDir, 'package.json'))
     expect(fromAdmin('us-atlas/package.json').version).toBe('3.0.1')
-    const ids = (t: any) => new Set<string>(t.objects.counties.geometries.map((g: any) => String(g.id)))
-    const server: any = await import('./platformMetrics.counties-10m.json')
-    const placed = ids(server.default ?? server)
-    const drawn = ids(fromAdmin('us-atlas/counties-albers-10m.json'))
-    // Every county the server can place is drawn, except in the territories,
-    // which the drawn picture leaves out (the page names those under the map).
-    const territories = new Set(['AS', 'GU', 'MP', 'PR', 'VI'].map(abbr => MAP_STATE_FIPS[abbr]))
-    expect([...placed].filter(f => !drawn.has(f) && !territories.has(f.slice(0, 2)))).toEqual([])
-    expect([...drawn].filter(f => !placed.has(f))).toEqual([])
-    expect(drawn.size).toBeGreaterThan(3000)
+    // 10/13 (Nic): the flat map and the globe both draw the longitude/latitude
+    // file (components/metricsMapGeo loadUsAtlas) — the very file the server
+    // keeps beside this one, byte for byte. The territories are drawn on the
+    // globe; the flat map's Albers USA picture leaves them out and names them.
+    const drawnFile = readFileSync(fromAdmin.resolve('us-atlas/counties-10m.json'))
+    const serverFile = readFileSync(join(__dirname, 'platformMetrics.counties-10m.json'))
+    expect(serverFile.equals(drawnFile)).toBe(true)
+    const drawn = JSON.parse(drawnFile.toString('utf8'))
+    expect(drawn.objects.counties.geometries.length).toBeGreaterThan(3000)
+    const loader = readFileSync(join(adminDir, 'src/components/metricsMapGeo.ts'), 'utf8')
+    expect(loader).toContain("import('us-atlas/counties-10m.json')")
   })
 })
 
@@ -331,6 +332,13 @@ describe('GET /api/admin/metrics: the heat map', () => {
 
   it('nothing live and no rent: empty maps, nothing missing', async () => {
     const m = await metrics()
-    expect(m.map).toEqual({ states: [], counties: [], missing: [] })
+    const { levels, ...map } = m.map
+    expect(map).toEqual({ states: [], counties: [], missing: [] })
+    // 10/13 (Nic): the city, district and ZIP code maps are empty too.
+    expect(Object.keys(levels).sort()).toEqual(['cd', 'place', 'sldl', 'sldu', 'zcta'])
+    for (const l of Object.values(levels) as any[]) {
+      expect(l.areas).toEqual([])
+      expect(l.missing).toEqual([])
+    }
   })
 })

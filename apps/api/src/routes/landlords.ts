@@ -12,7 +12,7 @@ import { payoutReadiness } from '../lib/payoutReadiness'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
-import { rentCollectedFrom, incomeCardFrom } from '../lib/rentCollected'
+import { rentCollectedFrom, incomeCardFrom, rentHealthMtd } from '../lib/rentCollected'
 import { parseIncomeBasis, basisMeta, incomeEvents, byMonth, breakdownFrom } from '../services/incomeBasis'
 import { todayIn as todayInZone } from '../lib/timezone'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
@@ -983,6 +983,33 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const collected = rentCollectedFrom(thisMonthRx, thisMonthBx, 'rent', basis)
     const collectedRow = { collected_mtd: basis === 'received' ? collected.collected : collected.billed.collected }
     const incomeCard = incomeCardFrom(rentCollectedFrom(thisMonthRx, thisMonthBx, 'all', basis), basis)
+    // ── 10/17 (Nic): THE PAYMENT-HEALTH PERCENTAGE TELLS THE TRUTH ─────────
+    //
+    //   "I've got $2,000 in outstanding rent, but my payment health is only
+    //    showing sixty-five percent... When I pick Mountain View, it goes up to
+    //    67%. That is crazy wrong for how few people have left to pay."
+    //
+    // And the rule: "the property health matches what was invoiced and what was
+    // paid. work trade isnt billed until a shortfall so it shouldnt apply here
+    // unless an invoice generates."
+    //
+    // So the health card no longer divides the Money billed figures above —
+    // those answer "what was charged and what arrived", which counted rent on
+    // hold for work trade as owed and rent settled by an account credit as
+    // unpaid. It reads its own figure: the month's rent bills, the held ones
+    // left out of both sides, paid once settled whatever settled it
+    // (lib/rentCollected rentHealthMtd, which spells out both defects with the
+    // Mountain View numbers). Mountain View 10/16: 67% → 89%, $2,061 left to
+    // collect.
+    //
+    // It is NOT the Outstanding figure below, and must not be read as it: that
+    // one sums every open invoice balance, all charge types, every month, so it
+    // is a running receivables number. Mountain View happens to match it today
+    // ($1,415 either way) because nothing else of its is open; Oak Park's
+    // October rent owes $3,300 against $8,354.43 outstanding, the rest being
+    // September rent and utilities that really are owed. The card names which
+    // months and which charges each number counts (apps/landlord DashboardPage).
+    const rentHealth = await rentHealthMtd(scopeIds, propertyFilter, { month: `${thisMonth.ym}-01` })
     // ── S640 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT OUTSTANDING ───────
     //
     //   "It's not outstanding... not good to have that integrated everywhere
@@ -1204,6 +1231,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow?.outstanding||0,
       // S655: the rent card's other figures, both ways, and the income card.
       rent_card: { basis, received: { amount: collected.collected, clearing: collected.inFlight }, billed: collected.billed },
+      // 10/17 (Nic): the health card's own figure — invoiced against paid, work
+      // trade out of both sides. Beside rent_card, never out of it: see the
+      // block above and lib/rentCollected rentHealthMtd.
+      rent_health: rentHealth,
       income_card: incomeCard,
       property_health: propertyHealth,
       basis: basisMeta(basis),

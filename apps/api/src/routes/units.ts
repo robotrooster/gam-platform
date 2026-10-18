@@ -2683,6 +2683,9 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // this site — a guest who phones and a guest who books online are buying
     // the same thing and are told the same number.
     let depositLink: { id: string; url: string } | null = null
+    // 10/17 (Nic): no link went out because this property asks no deposit on
+    // this stay — not because sending one failed. Read below.
+    let depositNothingOwed = false
     if (wantsDeposit && routedToPay) {
       try {
         const { quoteStayDeposit } = await import('../services/propertyBooking')
@@ -2698,6 +2701,20 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
           amount: depositAmount, guestName: booking.guest_name, guestEmail: booking.guest_email,
           ...(screeningFee ? { screeningFee } : {}),
         })
+        // 10/17 (Nic): nothing to ask the guest for is not a failure — a park
+        // that takes no deposit on a stay like this, with no background check
+        // to collect either, never had a link to send. The screen has to tell
+        // that apart from a send that broke, or it reports "no link went out"
+        // as an error on a park that deliberately takes none.
+        //
+        // Read from the AMOUNTS, not from the absence of a link: a null link
+        // means "no link was made", which is also what comes back when the
+        // deposit on this reservation was already claimed by an earlier link
+        // (createBookingDepositLink claims `deposit_amount IS NULL`). That
+        // cannot happen on a booking inserted a moment ago, but reading the
+        // null would have the schedule tell the desk a guest owes no deposit
+        // while one is outstanding, the first time a second link is possible.
+        depositNothingOwed = !(depositAmount > 0) && !(Number(screeningFee) > 0)
       } catch (err) {
         // The reservation is real and on the board; only the link failed. Say
         // so on the response rather than rolling back a site the counter has
@@ -2770,6 +2787,11 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       // 10/6: what the details will say.
       returningGuest: needs.screening === 'returning',
       workTrade: workTrade ? { coveredCharges: workTrade.coveredCharges, trusted: workTrade.trusted, rentTraded } : null,
+      // 10/17 (Nic): a deposit link was asked for and there was nothing to ask
+      // the guest for — this property takes no deposit on a stay like this. The
+      // schedule says that instead of reporting a failure (SchedulePage
+      // sayPayRouteDone).
+      depositNothingOwed,
     }
     res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId, stay } })
   } catch (e) { next(e) }

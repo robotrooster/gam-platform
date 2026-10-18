@@ -346,6 +346,12 @@ export interface DeskRow {
   /** Credit the desk's "Use" would spend on it (the credit plan's lines for this row). */
   creditIfUsed: number
   unitId: string | null
+  /**
+   * Credit may pay it (the quote's answer, creditEligibleRowSql). A home
+   * payment, a GAM fee and a deposit are never credit's, so money kept on the
+   * account is not "sitting beside" them (10/15).
+   */
+  creditEligible: boolean
 }
 
 /**
@@ -428,6 +434,15 @@ export interface DeskQuote {
   scheduledRetries: ScheduledRetry[]
   retryRowIds: string[]
   /**
+   * The spaces the balance draw passes over, so money kept is never parked
+   * where it could not be spent (creditUse.drawCreditOnBalance): a bank
+   * payment already on its way for one of its bills (that pull is the payer's),
+   * credit a payment set aside on a bill still owed, and rent past a shortened
+   * stay's end. Read as it stands AFTER this payment replaces the retries on
+   * the bills it takes.
+   */
+  drawSkipsLeaseIds: string[]
+  /**
    * 10/5 (Nic): whether money RECORDED here may be less than this bill —
    * every property the bill's charges sit on has "Accept partial payments"
    * on. Off (the default): pay in full.
@@ -440,6 +455,7 @@ function toDeskRow(r: QuoteRow, unitId: string | null): DeskRow {
     id: r.id, leaseId: r.leaseId, invoiceId: r.invoiceId, landlordId: r.landlordId,
     type: r.type, entryDescription: r.entryDescription, revenueOwner: r.revenueOwner,
     amount: r.amount, dueDate: r.dueDate, createdAt: r.createdAt, appliedCredit: r.appliedOnRow, creditIfUsed: 0, unitId,
+    creditEligible: r.creditEligible,
   }
 }
 
@@ -458,6 +474,50 @@ function billWords(b: Pick<DeskBill, 'dueDate' | 'unitNumber'>): string {
   const month = m ? MONTH_NAMES[Number(m[1]) - 1] : null
   return `the ${month ? `${month} ` : ''}bill${b.unitNumber ? ` on ${b.unitNumber}` : ''}`
 }
+
+/**
+ * 10/15 (Nic): "money gets applied to the most outstanding balance first.
+ * Somebody can't go put $1,000 credit and not pay a $2,000 existing bill." The
+ * household's spaces that still OWE a bill credit may pay once the rows this
+ * payment is settling are off the list, oldest bill first — where money kept
+ * on the account has to SIT if it is ever to pay that bill, because paid-ahead
+ * money pays only its own space's bills (the credit ledger's rule, M4). The
+ * caller takes the first of these in the property the money came in on
+ * (leaseForCredit), so a second space in the same park is used when the oldest
+ * bill of all is in another park; empty when nothing else is owed, and then the
+ * money waits for a next bill as before.
+ *
+ * Review fix (10/17): a space the balance draw passes over is left out — money
+ * parked there could not be spent, which is the very thing this prevents.
+ */
+function leasesOwingOldestFirst(
+  q: Pick<DeskQuote, 'bills' | 'drawSkipsLeaseIds'>, settling: ReadonlySet<string>,
+): string[] {
+  const skip = new Set(q.drawSkipsLeaseIds)
+  // The row's own lease is a neighbor landlord's on a neighbor's utility, so
+  // the space is the BILL's (the household lease its invoice sits on).
+  const spaceOfRow = new Map<string, string>()
+  const open: DeskRow[] = []
+  for (const b of q.bills) {
+    if (b.leaseId === null || skip.has(b.leaseId)) continue
+    for (const r of b.rows) {
+      if (!r.creditEligible || settling.has(r.id)) continue
+      if (toCents(r.amount) - toCents(r.appliedCredit) <= 0) continue
+      spaceOfRow.set(r.id, b.leaseId)
+      open.push(r)
+    }
+  }
+  const order: string[] = []
+  for (const r of sortDesk(open)) {
+    const leaseId = spaceOfRow.get(r.id)!
+    if (!order.includes(leaseId)) order.push(leaseId)
+  }
+  return order
+}
+
+/** The space number money kept would land on, as the desk knows it. */
+const spaceNumber = (q: Pick<DeskQuote, 'bills'>, leaseId: string): string | null =>
+  q.bills.find(b => b.leaseId === leaseId)?.unitNumber ?? null
 
 /**
  * 10/14 (Nic): why the bills picked cannot be taken as they are — a picked
@@ -674,6 +734,12 @@ export async function deskQuote(
     scheduledRetries: q.leases.flatMap(l => l.scheduledRetries)
       .filter(rt => picked == null || rt.paymentIds.some(id => taken.has(id))),
     retryRowIds: allRows.filter(r => all.some(x => x.id === r.id && (x.retryScheduled || x.heldOnRow > 0))).map(r => r.id),
+    // The same three cases the one credit service skips (creditUse
+    // drawCreditOnBalance): a scheduled bank retry, credit set aside on a bill
+    // still owed, rent past a shortened stay's end.
+    drawSkipsLeaseIds: q.leases.filter(l =>
+      l.scheduledRetries.length > 0 || l.pastStayEndRentIds.length > 0
+      || l.rows.some(r => r.payable && toCents(r.heldOnRow) > 0)).map(l => l.leaseId),
     partialAllowed,
   }
 }
@@ -1259,12 +1325,31 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // so a resident with no lease here — a moved-out resident paying a final
   // bill with a check over it — is refused once, never asked to confirm the
   // amount first, and nothing (not even an old-balance split) is written.
-  const creditLease = keepAsCredit ? await leaseForCredit(client, input, tenantId, landlordId, pickedLease) : null
+  // 10/15 (Nic): money kept goes where it is OWED. The household's spaces that
+  // still owe a bill this payment is not already settling, oldest bill first
+  // (leasesOwingOldestFirst), so the next moment's balance draw spends it there
+  // instead of parking a credit beside an open bill. The lease the money came
+  // in on still wins when nothing else is owed, and a space in another park is
+  // never chosen: the money has to be reported as arriving where it arrived, so
+  // the first of these IN THAT PROPERTY is taken (leaseForCredit) — review fix
+  // 10/17: a park where a second space owes no longer loses the money to the
+  // space that was just paid because the oldest bill of all is in another park.
+  const owesLeases = keepAsCredit ? leasesOwingOldestFirst(q, new Set(lines.map(l => l.paymentId))) : []
+  const creditLease = keepAsCredit
+    ? await leaseForCredit(client, input, tenantId, landlordId, pickedLease, owesLeases) : null
   if (keepAsCredit && !creditLease) {
     throw new AppError(409, isCash
       ? 'This resident has no lease here to hold a credit on. Hand the difference back as change.'
       : 'This resident has no lease here to hold a credit on, so a check over the bill cannot be taken.')
   }
+  // Said as what it does, never as "credit" while that balance is owed (10/6):
+  // the space the money lands on, when it is not the one it came in on. Only
+  // when that space really owes a bill credit may pay (review fix 10/17): a
+  // caller that names the space itself may name one whose only open charge is
+  // a home payment, which credit never pays — the money waits there as credit.
+  const keptGoesTo = keepAsCredit && creditLease && creditLease !== (pickedLease ?? input.payment.lease_id)
+    && owesLeases.includes(creditLease)
+    ? spaceNumber(q, creditLease) : null
 
   // A check or money order written over the bill: confirm the written amount
   // before any of it goes anywhere (a typed round-up becomes a stray credit).
@@ -1331,7 +1416,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   ].sort((a, b) => a.dueDate.localeCompare(b.dueDate))
   // 10/6 (Nic): money a part payment could not place (no rent on that bill
   // to take it) is kept as money paid ahead, and that goes on the rest of what
-  // they owe by itself right after this commit (creditUse.drawPaidAheadOnBalance,
+  // they owe by itself right after this commit (creditUse.drawCreditOnBalance,
   // via the route's whole-bill check) — so it is said that way, never as
   // "credit" while the balance is owed. Only what no open line can take
   // (a home payment is never paid with it) waits for their next bill.
@@ -1386,17 +1471,21 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       : method === 'bank_deposit'
         ? `Deposited ${money(tendered)} at the bank${partial ? '' : ' (amount confirmed)'}`
         : `Handed over a ${methodWord(method)} for ${money(tendered)}${partial ? '' : ' (amount confirmed)'}`
+    // 10/15: what the kept money IS — money going on another space's open bill,
+    // not a credit waiting for a next bill.
+    const keptWords = keptGoesTo ? `goes on what ${keptGoesTo} still owes` : 'kept as credit'
     const handed = partial
       ? `${handedOver}${oldPart}` +
         `${leftoverOnBalanceC > 0 ? `; ${money(leftoverOnBalanceC)} goes on the rest of what they owe` : ''}` +
-        `${keepAsCredit && surplus > leftoverOnBalanceC ? `; ${money(surplus - leftoverOnBalanceC)} kept toward their next bill` : ''}. ` +
+        `${keepAsCredit && surplus > leftoverOnBalanceC
+          ? `; ${money(surplus - leftoverOnBalanceC)} ${keptGoesTo ? keptWords : 'kept toward their next bill'}` : ''}. ` +
         `Part payment: ${money(stillOwedC)} still owed.`
       : changeGiven > 0
       ? `Handed over ${money(tendered)}${oldPart}; ${money(changeGiven)} given back as change.`
       : keepAsCredit && isCash
-        ? `Handed over ${money(tendered)}${oldPart}; ${towardOld > 0 ? 'the other ' : ''}${money(surplus)} kept as credit — no change on hand.`
+        ? `Handed over ${money(tendered)}${oldPart}; ${towardOld > 0 ? 'the other ' : ''}${money(surplus)} ${keptWords}${keptGoesTo ? '.' : ' — no change on hand.'}`
         : keepAsCredit
-          ? `${handedOver}${oldPart}; ${towardOld > 0 ? `the other ${money(surplus)}` : `${money(surplus)} over the bill`} kept as credit.`
+          ? `${handedOver}${oldPart}; ${towardOld > 0 ? `the other ${money(surplus)}` : `${money(surplus)} over the bill`} ${keptWords}.`
           : towardOld > 0 && over > 0
             ? `${handedOver}${oldPart}.`
             : null
@@ -1408,7 +1497,10 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
        VALUES ($1, $2, $3, $4, $5, $6, 'settled', $7, NULL, 0, COALESCE($8::timestamptz, NOW()), $9, $10, $11,
                $12::inet, $13)
        RETURNING id`,
-      [tenantId, creditLease ?? pickedLease ?? payment.lease_id, landlordId, toDollars(kept).toFixed(2),
+      // The receipt sits where the money was TAKEN (the bills picked, else the
+      // charge's lease) — 10/15: money kept may now land on another space of
+      // the household, and the receipt never moves with it.
+      [tenantId, pickedLease ?? payment.lease_id ?? creditLease, landlordId, toDollars(kept).toFixed(2),
        toDollars(amountSettled).toFixed(2), toDollars(keepAsCredit ? surplus : 0).toFixed(2),
        method, input.settledAt, input.reference || null,
        [input.notes, handed].filter(Boolean).join(' ') || null, input.takenBy ?? null,
@@ -1637,16 +1729,35 @@ async function tellTenantLateFeesCredited(
  */
 async function leaseForCredit(
   client: PoolClient, input: ManualSettleInput, tenantId: string, landlordId: string, pickedLease: string | null = null,
+  owesLeases: readonly string[] = [],
 ): Promise<string | null> {
+  // 10/15 (Nic): after a caller that says where ($3, a posted payment), the
+  // space that still OWES wins — money goes on the most outstanding balance
+  // first — taking them oldest bill first ($6, in that order). Only inside the
+  // property the money came in on: the paid-ahead line of Money received and
+  // the owner statement read the lease a credit sits on, so sending it to
+  // another park would report the arrival in the wrong place. So a park where a
+  // second space owes keeps the money (review fix 10/17), and only when no
+  // space there owes does the pick fall back to the bills picked, the charge's
+  // own lease, and the newest active lease, exactly as before.
   const r = await client.query<{ id: string }>(
-    `SELECT l.id FROM leases l
+    `WITH arrival AS (
+       SELECT un.property_id FROM leases l0 JOIN units un ON un.id = l0.unit_id WHERE l0.id = $7::uuid
+     )
+     SELECT l.id FROM leases l
+       LEFT JOIN units u ON u.id = l.unit_id
       WHERE l.landlord_id = $2
         AND l.status IN ('active','pending')
         AND EXISTS (SELECT 1 FROM lease_tenants lt WHERE lt.lease_id = l.id AND lt.tenant_id = $1
                        AND lt.status IN ('active','pending_add','pending_remove'))
-      ORDER BY COALESCE(l.id = $3::uuid, FALSE) DESC, COALESCE(l.id = $5::uuid, FALSE) DESC,
+      ORDER BY COALESCE(l.id = $3::uuid, FALSE) DESC,
+               CASE WHEN (SELECT property_id FROM arrival) IS NULL
+                          OR u.property_id = (SELECT property_id FROM arrival)
+                      THEN COALESCE(array_position($6::uuid[], l.id), 1000000) ELSE 1000000 END,
+               COALESCE(l.id = $5::uuid, FALSE) DESC,
                COALESCE(l.id = $4::uuid, FALSE) DESC, (l.status = 'active') DESC, l.start_date DESC, l.id
       LIMIT 1`,
-    [tenantId, landlordId, input.creditLeaseId ?? null, input.payment.lease_id ?? null, pickedLease])
+    [tenantId, landlordId, input.creditLeaseId ?? null, input.payment.lease_id ?? null, pickedLease,
+     owesLeases.length > 0 ? owesLeases : null, pickedLease ?? input.payment.lease_id ?? null])
   return r.rows[0]?.id ?? null
 }

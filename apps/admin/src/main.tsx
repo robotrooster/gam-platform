@@ -1968,7 +1968,7 @@ function Metrics(){
           in that area. toggleable between a heat map for units and money." Units = the Spaces tile above,
           money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap).
           10/12 (Nic, H1): Units toggles Occupied (billed) — the tile's occupied count — and All spaces. */}
-      <MetricsHeatMap data={m.map}/>
+      <MetricsHeatMap data={m.map} api={api}/>
 
       {/* 10/13 (Nic): money billed and collected, tenants ever, the default rate, ages (components/MetricsLifetime). */}
       <MetricsLifetime api={api}/>

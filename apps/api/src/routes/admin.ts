@@ -23,9 +23,10 @@ import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
 import { replyToProperty } from '../services/replyRouting'
-import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
+import { getNexusDashboard, recomputeNexusTally, setStateRegistration, setStateMeasureRule, NEXUS_LINE_ITEMS } from '../services/nexusMonitor'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { graceDaysSql } from '../services/lateness'
+import { REVENUE_SLICE_TYPE_SQL } from '../services/revenueSlices'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -981,6 +982,31 @@ adminRouter.post('/nexus/register', requireSuperAdmin, async (req, res, next) =>
       actionType: 'nexus_state_registration',
       targetType: 'state_tax_registration',
       metadata: { state: body.stateCode.toUpperCase(), registered: body.registered },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// Narrow (or re-widen) which of GAM's line items a state measures toward its
+// threshold. 10/17 (Nic): "if that state's not counting some of those, where
+// are we really at?" — a researched legal answer, recorded as data so the page
+// can show that state's own subtotal beside the combined total. It collects no
+// tax and moves no money; the combined total still drives every crossing.
+adminRouter.post('/nexus/measure-rule', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const schema = z.object({
+      stateCode: z.string().length(2),
+      counts: z.record(z.enum(NEXUS_LINE_ITEMS), z.boolean()),
+      notes: z.string().max(500).optional().nullable(),
+    })
+    const body = schema.parse(req.body)
+    await setStateMeasureRule(body.stateCode, body.counts, { notes: body.notes ?? undefined })
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'nexus_measure_rule',
+      targetType: 'state_nexus_measure_rule',
+      metadata: { state: body.stateCode.toUpperCase(), counts: body.counts },
       ipAddress: req.ip ?? null,
     })
     res.json({ success: true })
@@ -2023,41 +2049,10 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
   { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
 ]
 
-// S653 (Nic): "Where are those adjustments coming from? Because we are not
-// spending any money." The monthly processing true-up (services/platformRevenue
-// trueUpProcessingMargin) is typed 'adjustment' with its own reference_type, but
-// it IS processing income — it is the correction that makes the estimated
-// per-payment spreads equal Stripe's real invoice. It belongs in the slice it
-// corrects, or the Processing slice under-reads every month and an unexplained
-// "adjustment" appears beside it.
-//
-// S655: likewise a FlexPay $25 taken back because its pull was taken back by
-// the bank (services/flexpay handleFlexPayPullReversed) is an 'adjustment' that
-// corrects the FlexPay slice, so it nets inside it.
-// 10/5 (Nic, prepaid stays): a screening margin taken back because the check
-// paid with a stay was cancelled before a report (services/stayTerms
-// restorePrepaidScreening) corrects the Background Checks slice.
-// 10/13 (Nic, full purchase): a card reader's purchase (GAM's expense) and
-// the pieces paying it back are 'adjustment' rows with their own reference;
-// each is its own reader slice, never "Adjustments".
-// 10/12 (Nic): the old screening sweep (jobs/platformFeeAccrual
-// processScreeningFeeSweep) books background checks under the subscription
-// type. It has never posted, but the day it does those checks belong in the
-// Background Checks slice, not in Platform Fees or the recurring card
-// (services/platformFeeBill leaves them out by the same reference).
-const SLICE_TYPE_SQL = `CASE WHEN type = 'platform_fee_subscription' AND reference_type = 'screening_fee_sweep'
-                             THEN 'screening_margin'
-                             WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
-                             THEN 'banking_spread'
-                             WHEN type = 'adjustment' AND reference_type = 'screening_margin_reversal'
-                             THEN 'screening_margin'
-                             WHEN type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%'
-                             THEN 'flexpay_subscription'
-                             WHEN type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.purchase}'
-                             THEN 'reader_purchase'
-                             WHEN type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.costRepaid}'
-                             THEN 'reader_cost_repaid'
-                             ELSE type END`
+// Which slice each revenue-book row belongs to — one definition, shared with the
+// Metrics page's platform fees (services/revenueSlices, which says why each
+// adjustment goes where it goes).
+const SLICE_TYPE_SQL = REVENUE_SLICE_TYPE_SQL
 
 // 10/12 (Nic) review: `platformRunRate` is left out (null) by the polled
 // all-windows read, which does not compute the forecast unless asked.
@@ -2168,6 +2163,23 @@ adminRouter.get('/metrics', requireSuperAdmin, async (_req, res, next) => {
   try {
     const { platformMetrics } = await import('../services/platformMetrics')
     res.json({ success: true, data: await platformMetrics() })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics/boundaries/:layer[/:state] — 10/13 (Nic): the
+// Metrics map's city, district and ZIP code shapes (Census boundary files kept
+// in apps/api/geo; services/platformMetricsGeo). Behind the same login as the
+// Metrics page — never on a public site or a CDN (gam-nothing-public-rule).
+// The raw TopoJSON, gzipped as it sits on disk; cached a day by the browser.
+adminRouter.get('/metrics/boundaries/:layer/:state?', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readBoundary } = await import('../services/platformMetricsGeo')
+    const file = await readBoundary(req.params.layer, req.params.state, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There is no such map.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
   } catch (e) { next(e) }
 })
 

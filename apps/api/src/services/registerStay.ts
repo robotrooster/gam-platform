@@ -114,7 +114,10 @@ export type StayUnit = keyof typeof STAY_RATE_COLUMN
  * (memory: gam-out-of-order-sites)
  */
 export async function siteIsFree(
-  client: PoolClient, unitId: string, checkIn: string, checkOut: string,
+  // 10/17: query-only, so the same test runs outside a transaction — picking a
+  // site for a pay link (services/propertyBooking chooseFreeSite) asks it of
+  // the pool before any lock is taken.
+  client: Pick<PoolClient, 'query'>, unitId: string, checkIn: string, checkOut: string,
 ): Promise<boolean> {
   const clash = await client.query(
     `SELECT 1 WHERE

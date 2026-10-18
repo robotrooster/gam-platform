@@ -19,6 +19,7 @@ import { IncomePage } from './financials/IncomePage'
 import { ExpensesPage } from './financials/ExpensesPage'
 import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
 import { ReportsPage } from './financials/ReportsPage'
+import { SalesTaxPage } from './financials/SalesTaxPage'
 import { BankActivityPage } from './financials/BankActivityPage'
 import { PayoutsPage } from './financials/PayoutsPage'
 import { FinancialsViewerContext } from './financials/adapter'
@@ -389,6 +390,11 @@ function Layout(){
               <NavLink to="/financials/maintenance-costs" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Maintenance Costs</NavLink>
               <NavLink to="/financials/reports"           className={({isActive})=>`ni${isActive?' active':''}`}>📊 Reports</NavLink>
             </>}
+            {/* 10/17 (Nic): what was sold item by item, and each tax collected per agency. A
+                company document like the ledger pages (routes/booksTaxSales refuseScopedStaff
+                ledger), so it is showLedger's — a bookkeeper on some properties was offered it
+                and refused on click. */}
+            {showLedger&&<NavLink to="/financials/sales-tax" className={({isActive})=>`ni${isActive?' active':''}`}>🧮 Sales &amp; Tax</NavLink>}
             {/* 10/12 (Nic): the company's own categories, for the owner and EVERY bookkeeper — not only one with the
                 ledger (the server lets each keep them; pointing one at an account needs the ledger, and the page says so). */}
             {!isBusiness&&<NavLink to={BOOKS_PATHS.categories} className={({isActive})=>`ni${isActive?' active':''}`}>🏷 Categories</NavLink>}
@@ -931,6 +937,7 @@ function App(){
           <Route path="expenses"          element={<ExpensesPage/>}/>
           <Route path="maintenance-costs" element={<MaintenanceCostsPage/>}/>
           <Route path="reports"           element={<ReportsPage/>}/>
+          <Route path="sales-tax"         element={<SalesTaxPage/>}/>
           <Route path="bank-activity"     element={<BankActivityPage/>}/>
           <Route path="payouts"           element={<PayoutsPage/>}/>
         </Route>

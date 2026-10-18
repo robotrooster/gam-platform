@@ -14,7 +14,12 @@ vi.mock('../lib/api', () => ({
   apiGet: async (url: string) => {
     if (url === '/properties') return []
     if (url.startsWith('/landlords/me/dashboard')) {
-      return { monthlyRentVolume: 12345, activeUnits: 30, payableRentUnits: 30, unitsOwing: 2, unitsPastGrace: 1, outstanding: 980, trend: [] }
+      // 10/17: rentHealth is Mountain View's October as measured — $18,502
+      // invoiced once the bills on hold for work trade are out, $17,087 paid,
+      // $1,415 left. `outstanding` is deliberately a DIFFERENT number: that
+      // card counts every open charge of every month.
+      return { monthlyRentVolume: 12345, activeUnits: 30, payableRentUnits: 30, unitsOwing: 2, unitsPastGrace: 1, outstanding: 980,
+               rentHealth: { invoiced: 18502, paid: 17087, owed: 1415, workTradeHeld: 3478 }, trend: [] }
     }
     if (url === '/disbursements') return []
     if (url === '/landlords/me/todos') return { items: [] }
@@ -74,6 +79,30 @@ const goes = async (el: HTMLElement) => {
   await until(() => !!host.querySelector('.where'), 'the page it opens')
   return host.querySelector('.where')!.textContent
 }
+
+/**
+ * 10/17 (Nic): "the property health matches what was invoiced and what was
+ * paid. work trade isnt billed until a shortfall so it shouldnt apply here
+ * unless an invoice generates."
+ *
+ * The note under the percentage says WHICH money it counts, because the
+ * Outstanding card sits beside it counting every open charge of every month —
+ * two numbers on one screen that must not read as one claim. Work trade is
+ * named without a figure: S650 keeps work-trade balances off these cards.
+ */
+describe('the payment-health note says which money it is counting', () => {
+  it('names this month\'s rent and what is left to collect, and prints no work-trade balance', async () => {
+    await render()
+    const note = host.querySelector('.phm-health-note')?.textContent ?? ''
+    expect(note).toContain('$17,087.00 of $18,502.00 in this month\'s rent bills paid')
+    expect(note).toContain('$1,415.00 of it left to collect')
+    expect(note).toContain('Rent covered by work trade is not counted here')
+    expect(note).not.toContain('3,478')
+    // The Outstanding card beside it keeps its own figure, and it is not this one.
+    expect(card('Outstanding').textContent).toContain('$980')
+    expect(card('Outstanding').textContent).not.toContain('1,415')
+  })
+})
 
 describe('the dashboard\'s rent and who-owes cards open Payments', () => {
   it('Expected Monthly Rent opens Payments (this month\'s rent roll)', async () => {

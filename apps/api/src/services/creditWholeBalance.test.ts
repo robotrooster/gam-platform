@@ -20,6 +20,13 @@
  *   6. The Bowmans' $500 part payment: no credit anywhere.
  *   7. The data fix: a dry run changes nothing; --apply fixes Marc to $17.64
  *      and zeroes his six late fees; a second run finds nothing.
+ *   8. 10/15 (Nic): the same for every other kind of credit — "money gets
+ *      applied to the most outstanding balance first. Somebody can't go put
+ *      $1,000 credit and not pay a $2,000 existing bill" — and the one-time
+ *      sweep of credit already sitting on the books.
+ *   9. Money kept at the desk sits on the space that can actually spend it:
+ *      the one in that park which still owes, and never one the draw passes
+ *      over (a bank payment already on its way).
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import type { PoolClient } from 'pg'
@@ -48,6 +55,7 @@ import { createPaidAhead, createIssuedCredit, settleWholeBillIfCovered, househol
 import {
   applyCreditToWholeBalance, CREDIT_SHOULD_HAVE_PAID_NOTE, EXEMPT_BILL_NOTE,
 } from '../scripts/oct6_apply_credit_to_whole_balance'
+import { sweepCreditSittingWhileOwing } from '../scripts/oct18_credit_never_sits_while_owing'
 
 const TZ = 'America/Phoenix'
 
@@ -470,5 +478,216 @@ describe('review fix: a stay\'s rent for a month not yet due is never paid in pa
     expect(await row(oct.ids[0])).toMatchObject({ status: 'settled', on_it: 300 })
     expect(await row(later.ids[0])).toMatchObject({ status: 'settled', on_it: 300 })
     expect(await creditLeft(credit)).toBe(100)
+  })
+})
+
+/**
+ * 10/15 (Nic) — CREDIT NEVER SITS WHILE THE HOUSEHOLD OWES.
+ *
+ *   "If somebody has an outstanding balance, why would they be able to add
+ *    credit for future bills? Money gets applied to the most outstanding
+ *    balance first. Somebody can't go put $1,000 credit and not pay a $2,000
+ *    existing bill. It doesn't work like that."
+ *
+ * The 10/6 rule put MONEY PAID AHEAD on the balance by itself; everything
+ * above tests that. These are the other two kinds of credit — the credit a
+ * landlord gives and the interest GAM credits on a deposit — which used to
+ * wait on the account for a choice nobody made.
+ */
+describe('8. credit the landlord gave goes on the balance too', () => {
+  const issuedLeft = async (id: string) => Number((await db.query<{ r: string }>(
+    `SELECT amount_remaining::text AS r FROM tenant_credits WHERE id = $1`, [id])).rows[0].r)
+  const issuedCredit = (s: Stack, amount: number, category = 'goodwill') => tx(c => createIssuedCredit(c, {
+    landlordId: s.landlordId, tenantId: s.tenantId, leaseId: s.leaseId, amount, category, reason: 'test',
+    createdBy: s.ownerUserId,
+  }))
+
+  it('$1,000 of credit against a $2,000 balance pays the oldest bills; $1,000 is still owed and no credit is left', async () => {
+    const s = await stack({ rent: 1000 })
+    const credit = await issuedCredit(s, 1000)
+    const sep = await bill(s, '2026-09-01', [{ type: 'rent', amount: 1000 }])
+    const oct = await bill(s, '2026-10-01', [{ type: 'rent', amount: 1000 }])
+    await wholeBalance(s)
+    expect(await row(sep.ids[0])).toMatchObject({ status: 'settled', on_it: 1000 })
+    expect(await row(oct.ids[0])).toMatchObject({ status: 'pending', on_it: 0 })
+    expect(await owedNow(s)).toBe(1000)
+    expect(await issuedLeft(credit)).toBe(0)
+  })
+
+  it('a credit smaller than the oldest line pays part of it; the line stays whole and open', async () => {
+    const s = await stack()
+    const credit = await issuedCredit(s, 10)
+    const oct = await bill(s, '2026-10-01', [{ type: 'rent', amount: 300 }])
+    await wholeBalance(s)
+    expect(await row(oct.ids[0])).toMatchObject({ status: 'pending', amount: 300, on_it: 10 })
+    expect(await owedNow(s)).toBe(290)
+    expect(await issuedLeft(credit)).toBe(0)
+  })
+
+  it('statutory interest on their deposit goes on the balance the same way', async () => {
+    const s = await stack()
+    const credit = await issuedCredit(s, 24, 'deposit_interest')
+    const oct = await bill(s, '2026-10-01', [{ type: 'rent', amount: 300 }])
+    await wholeBalance(s)
+    expect(await row(oct.ids[0])).toMatchObject({ status: 'pending', on_it: 24 })
+    expect(await issuedLeft(credit)).toBe(0)
+  })
+
+  it('only what is over the whole balance stays as credit', async () => {
+    const s = await stack()
+    const credit = await issuedCredit(s, 500)
+    await bill(s, '2026-10-01', [{ type: 'rent', amount: 300 }, { type: 'utility', amount: 14.70 }])
+    await wholeBalance(s)
+    expect(await owedNow(s)).toBe(0)
+    expect(await issuedLeft(credit)).toBe(185.30)
+  })
+
+  // Credit never pays a home payment or a GAM fee, so money owed on one of
+  // those is not a balance the credit is "sitting beside".
+  it('a home payment is not a balance credit can pay: the credit stays on the account', async () => {
+    const s = await stack()
+    const credit = await issuedCredit(s, 50)
+    const oct = await bill(s, '2026-10-01', [{ type: 'home_payment', amount: 100 }])
+    await wholeBalance(s)
+    expect(await row(oct.ids[0])).toMatchObject({ status: 'pending', on_it: 0 })
+    expect(await issuedLeft(credit)).toBe(50)
+  })
+
+  // The one-time sweep of what was already on the books.
+  it('the sweep: a dry run changes nothing; --apply puts it on the balance; a second run finds nothing', async () => {
+    const s = await stack({ rent: 1000 })
+    const credit = await issuedCredit(s, 400)
+    const oct = await bill(s, '2026-10-01', [{ type: 'rent', amount: 1000 }])
+    // Review fix (10/17): the sweep covers every company (the rule is
+    // platform-wide), so each line names the company whose money moves.
+    await db.query(`UPDATE landlords SET business_name = 'Mountain View RV Park Ranch LLC' WHERE id = $1`, [s.landlordId])
+
+    const c = await db.connect()
+    let dry
+    try {
+      await c.query('BEGIN')
+      dry = await sweepCreditSittingWhileOwing(c)
+      await c.query('ROLLBACK')
+    } finally { c.release() }
+    expect(dry).toHaveLength(1)
+    expect(dry[0]).toMatchObject({
+      name: 'Marc Renspurger', company: 'Mountain View RV Park Ranch LLC', spaces: 'RV 52',
+      creditHeld: 400, owedBefore: 1000, creditHeldAfter: 0, owedAfter: 600, leftSitting: null,
+    })
+    // Rolled back: the books are as they were.
+    expect(await issuedLeft(credit)).toBe(400)
+    expect(await row(oct.ids[0])).toMatchObject({ on_it: 0 })
+
+    const applied = await tx(c2 => sweepCreditSittingWhileOwing(c2))
+    expect(applied).toHaveLength(1)
+    expect(await issuedLeft(credit)).toBe(0)
+    expect(await row(oct.ids[0])).toMatchObject({ status: 'pending', amount: 1000, on_it: 400 })
+    expect(await owedNow(s)).toBe(600)
+
+    expect(await tx(c3 => sweepCreditSittingWhileOwing(c3))).toEqual([])
+  })
+})
+
+/**
+ * 9. Review fix (10/17): money kept at the desk has to sit where it can be
+ * SPENT. Money paid ahead pays only its own space's bills, and the balance draw
+ * passes over a space with a bank payment already on its way — so the extra
+ * lands on the space in the park the money arrived at that still owes and that
+ * the draw can reach. Before this it could park on the space that had just been
+ * paid (because the oldest bill of all was in another park), where nothing
+ * could ever spend it.
+ */
+describe('9. money kept at the desk sits where it can be spent', () => {
+  /** Another park of the same company. */
+  const park = (s: Stack) => tx(async c => {
+    const propertyId = await seedProperty(c, {
+      landlordId: s.landlordId, ownerUserId: s.ownerUserId, managedByUserId: s.ownerUserId,
+    })
+    await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+    await c.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [propertyId, TZ])
+    return propertyId
+  })
+
+  /** Another space for the same resident, with its own unit and lease. */
+  const space = (s: Stack, propertyId: string, unitNumber: string, rent: number) => tx(async c => {
+    const unitId = await seedUnit(c, { propertyId, landlordId: s.landlordId, rentAmount: rent })
+    await c.query(`UPDATE units SET unit_number = $2 WHERE id = $1`, [unitId, unitNumber])
+    const leaseId = await seedLease(c, { unitId, landlordId: s.landlordId, rentAmount: rent, startDate: '2026-09-05' })
+    await seedLeaseTenant(c, { leaseId, tenantId: s.tenantId, role: 'primary' })
+    return { unitId, leaseId }
+  })
+
+  /** A rent bill on one space. */
+  async function billOn(s: Stack, sp: { unitId: string; leaseId: string }, due: string, amount: number) {
+    const inv = (await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7,'pending',$8::timestamptz) RETURNING id`,
+      [s.landlordId, s.tenantId, sp.leaseId, sp.unitId, `INV-${Math.random().toString(36).slice(2, 9)}`, due, amount,
+       `${due}T14:00:00Z`])).rows[0].id
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, created_at)
+       VALUES ($1,$2,$3,$4,'rent',$5,'pending','RENT',$6::date,$7,$8::timestamptz) RETURNING id`,
+      [s.landlordId, s.tenantId, sp.unitId, sp.leaseId, amount, due, inv, `${due}T14:00:00Z`])).rows[0].id
+    return { invoiceId: inv, id }
+  }
+
+  const record = (s: Stack, anchor: string, body: Record<string, unknown>) =>
+    request(app()).post(`/api/payments/${anchor}/record-manual`).set('Authorization', `Bearer ${s.token}`).send(body)
+  const keptCredit = async (creditId: string) => (await db.query<{ lease_id: string; left: number }>(
+    `SELECT lease_id, amount_remaining::float AS left FROM lease_prepaid_credits WHERE id = $1`, [creditId])).rows[0]
+  const appliedOn = async (id: string) => (await db.query<{ a: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`, [id])).rows[0].a
+
+  it('the extra goes on the space in this park that owes, not on the one just paid and not to another park', async () => {
+    const s = await stack()                                  // RV 52, another park, the oldest bill of all
+    const oakPark = await park(s)
+    const mh04 = await space(s, oakPark, 'MH 04', 200)
+    const mh09 = await space(s, oakPark, 'MH 09', 150)
+    await bill(s, '2026-09-01', [{ type: 'rent', amount: 300 }])
+    const picked = await billOn(s, mh04, '2026-10-01', 200)
+    const owing = await billOn(s, mh09, '2026-10-05', 150)
+
+    const res = await record(s, picked.id, {
+      method: 'check', reference: '2201', amountTendered: 250, confirmWrittenAmount: true, bills: [picked.invoiceId],
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ surplus: 50, surplusHandling: 'credit' })
+    // It sits on MH 09 — the only space in this park that still owes — and the
+    // draw spent it there the moment the payment committed.
+    const credit = await keptCredit(res.body.data.creditId)
+    expect(credit.lease_id).toBe(mh09.leaseId)
+    expect(credit.left).toBe(0)
+    expect(await appliedOn(owing.id)).toBe('50.00')
+    // The receipt stays where the money was taken, and says what the extra did.
+    const rem = (await db.query<{ lease_id: string; notes: string }>(
+      `SELECT lease_id, notes FROM tenant_remittances WHERE id = $1`, [res.body.data.receiptId])).rows[0]
+    expect(rem.lease_id).toBe(mh04.leaseId)
+    expect(rem.notes).toContain('$50.00 over the bill goes on what MH 09 still owes')
+  })
+
+  it('a space with a bank payment already on its way is passed over — the money goes to the next space that owes', async () => {
+    const s = await stack()
+    const oakPark = await park(s)
+    const mh04 = await space(s, oakPark, 'MH 04', 200)
+    const mh09 = await space(s, oakPark, 'MH 09', 150)
+    const mh12 = await space(s, oakPark, 'MH 12', 120)
+    const picked = await billOn(s, mh04, '2026-10-01', 200)
+    const retrying = await billOn(s, mh09, '2026-09-10', 150)
+    const owing = await billOn(s, mh12, '2026-10-05', 120)
+    // MH 09's bill is the oldest, but GAM is going to try its bank again: that
+    // pull is the payer's, so the draw leaves that space alone.
+    await db.query(
+      `UPDATE payments SET status = 'failed', stripe_payment_intent_id = 'pi_mh09_pull', next_retry_at = now() + interval '3 days'
+        WHERE id = $1`, [retrying.id])
+
+    const res = await record(s, picked.id, {
+      method: 'check', reference: '2202', amountTendered: 250, confirmWrittenAmount: true, bills: [picked.invoiceId],
+    })
+    expect(res.status).toBe(200)
+    const credit = await keptCredit(res.body.data.creditId)
+    expect(credit.lease_id).toBe(mh12.leaseId)
+    expect(credit.left).toBe(0)
+    expect(await appliedOn(owing.id)).toBe('50.00')
+    expect(await appliedOn(retrying.id)).toBe('0')
   })
 })

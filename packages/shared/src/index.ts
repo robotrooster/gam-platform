@@ -2553,6 +2553,9 @@ export * from './booksMoneyOut'
 // 10/12 (Nic, ledger P6): one list of everyone the company pays (vendors, with
 // the 1099 box for contractors), loans and fixed assets with depreciation.
 export * from './booksVendorsLoans'
+// 10/17 (Nic): "we need more breakdown so we can see exactly how much of each
+// item was sold and how much of each tax separated by category was collected."
+export * from './booksSalesTax'
 
 // ── INVITATIONS & PLATFORM EVENTS ──────────────────────────
 // The platform-wide audit trail. Every meaningful state change
@@ -4418,6 +4421,64 @@ export const BOOKING_STATUS_LABEL: Record<BookingStatus, string> = {
   // American spelling on screen; the stored value stays 'cancelled'.
   cancelled: 'Canceled',
   no_show: 'No-show',
+}
+
+/**
+ * 10/17 (Nic) — WHERE A STAY CAME FROM: one list, and the Source filter offers
+ * all of it.
+ *
+ * The first question anybody asks about a reservation is how it got on the
+ * board, and the schedule and the reservations list both have a Source filter
+ * for exactly that. Those filters offered four travel sites and "Direct" — so
+ * a stay rung at the counter, booked on the park's own booking site, or held by
+ * an emailed link could be SEEN but never filtered for, and a desk looking for
+ * "everything that came off the register today" could only pick All.
+ *
+ * The first four are the doors inside GAM; the rest are where else a landlord
+ * takes bookings. A value not in this list still shows (the schedule falls back
+ * to humanize) — the column is not constrained, so an import can carry
+ * anything.
+ */
+export const BOOKING_SOURCES = [
+  'direct', 'public', 'register', 'pay_link',
+  'airbnb', 'vrbo', 'booking_com', 'other',
+] as const
+export type BookingSource = typeof BOOKING_SOURCES[number]
+export const BOOKING_SOURCE_LABEL: Record<BookingSource, string> = {
+  direct: 'Direct',
+  public: 'Booking site',
+  register: 'Register',
+  pay_link: 'Pay link',
+  airbnb: 'Airbnb',
+  vrbo: 'VRBO',
+  booking_com: 'Booking.com',
+  other: 'Other',
+}
+
+/**
+ * 10/17 (Nic) — IS THIS RESERVATION LOCKED IN, OR CAN IT BE BOOTED?
+ *
+ * "reservations are only locked in with deposits. still reserved without
+ * deposits but can be booted when space is limited by other paying people."
+ *
+ * The schedule already had the two states and showed neither of them in words
+ * a desk clerk could act on: a badge reading "Tentative" does not tell anybody
+ * that this guest loses the site if the park fills up, and "Confirmed" does not
+ * say that this one cannot be touched. These are those two sentences.
+ *
+ * Deliberately NOT a third status. Nic's rule is the one the software already
+ * enforces — a reservation with money on it is never displaced
+ * (services/holdDisplacement tests deposit_paid_at, not the status), and one
+ * without it yields to anybody who pays — so what was missing was only the
+ * saying of it.
+ *
+ * Null for a stay where the question has stopped mattering: checked in,
+ * checked out, canceled, a no-show.
+ */
+export function stayHoldWords(status: BookingStatus, depositPaid: boolean): string | null {
+  if (status !== 'tentative' && status !== 'confirmed') return null
+  if (depositPaid) return 'Locked in — a deposit is paid on it, so nobody can take this site.'
+  return 'Reserved, not paid for — if the park fills up, a paying guest can take this site.'
 }
 
 // 10/6 (Nic): a stay is priced by ONE rule everywhere — the cheapest whole
@@ -8538,4 +8599,7 @@ export * from './monthlyReport'
 
 // 10/12 (Nic): who stays on the Rent Roll after moving out (the landlord's choice, per company).
 export * from './rentRoll'
+
+// 10/13 (Nic): the admin Metrics map's levels (cities, districts, ZIP codes) — one list for the API and the page.
+export * from './metricsMap'
 

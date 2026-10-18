@@ -813,22 +813,26 @@ describe('the hand-off: the old lease is in force through its last day, and its 
     return { f, renewalId, lines: lines.rows, credit: credit.rows }
   }
 
-  it('the moved read lands on the renewal\'s first bill; a $10 credit that does not cover the whole bill is saved for the tenant to use at payment', async () => {
+  // 10/15 (Nic): "money gets applied to the most outstanding balance first" —
+  // a credit carried over from the old lease does not wait on the account for
+  // the tenant to choose. It goes on the renewal's first bill, oldest line
+  // first, and the bill stays open for the rest.
+  it('the moved read lands on the renewal\'s first bill; a $10 credit that does not cover the whole bill goes on it', async () => {
     const { f, renewalId, lines, credit } = await movedReadAndCredit(10)
-    // $1,060 bill, $10 credit: nothing is paid from the credit on its own.
+    // $1,060 bill, $10 credit: no row is covered in full, so none settles.
     expect(lines).toEqual([
       { type: 'rent', amount: 1050, status: 'pending' },
       { type: 'utility', amount: 10, status: 'pending' },
     ])
-    // The credit moved to the renewal, untouched...
-    expect(credit).toEqual([{ lease_id: renewalId, r: 10 }])
-    // ...and is offered on the renewal's bill when the tenant pays.
+    // The credit moved to the renewal and went on its bill: nothing is left.
+    expect(credit).toEqual([{ lease_id: renewalId, r: 0 }])
     const c = await db.connect()
     try {
       const q = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId })
       const lq = q.leases.find(l => l.leaseId === renewalId)!
       expect(lq.requiredTotal).toBe(1060)
-      expect(lq.usableCredit).toBe(10)
+      expect(lq.creditAlreadyApplied).toBe(10)
+      expect(lq.usableCredit).toBe(0)
       expect(lq.coversWholeBill).toBe(false)
     } finally { c.release() }
   })

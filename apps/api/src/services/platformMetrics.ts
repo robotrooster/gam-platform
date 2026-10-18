@@ -74,6 +74,10 @@
  * including a property whose address was edited after its map location was
  * found (10/12 (Nic) review: an edit does not look the location up again yet,
  * so the old point would land it in the old county; MAP_ROWS location_stale).
+ * 10/13 (Nic): "toggle levels for cities, congressional districts, state
+ * legislative districts (senate and house), and ZIP codes" — the same numbers
+ * by those areas, from Census boundary files kept beside the API
+ * (services/platformMetricsGeo; PlatformMap.levels).
  */
 import { query } from '../db'
 import { paidByLabel, PROCESSING_FEES, US_STATE_NAME } from '@gam/shared'
@@ -86,10 +90,12 @@ import { occupiedSpacesSql } from './billableUnits'
 import { utilityBillSentSql, stayHeldSql } from './moneyPredicates'
 import { todayIn, monthStartOf } from '../lib/timezone'
 import { INCOME_CATEGORY_LABEL, INCOME_UTILITY_CATEGORIES } from '@gam/shared'
-import { incomeEvents, breakdownFrom } from './incomeBasis'
+import { incomeEvents, breakdownFrom, categorySql, landlordIncomeSql } from './incomeBasis'
 import { PLATFORM_FEE_LINES_SQL } from './platformFeeBill'
 import { normalizeNameSql } from './leaseBirthdates'
 import { NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
+import { buildMapLevels, decodeTopology, insideRings, type MapLevels } from './platformMetricsGeo'
+import { REVENUE_SLICE_TYPE_SQL } from './revenueSlices'
 
 export interface RentByMethod {
   method: string
@@ -196,6 +202,13 @@ export interface PlatformMap {
    * map, missing from the county map only.
    */
   missing: Array<{ reason: MapGap; label: string; offStateMap: boolean; properties: number; units: number; occupied: number; money: number }>
+  /**
+   * 10/13 (Nic): "toggle levels for cities, congressional districts, state
+   * legislative districts (senate and house), and ZIP codes" — the same
+   * numbers by those areas, each with its own list of what it could not place
+   * (services/platformMetricsGeo buildMapLevels).
+   */
+  levels: MapLevels
 }
 
 const ELECTRONIC = ['card', 'ach'] as const
@@ -456,7 +469,7 @@ const MAP_ROWS = (): string => `
   WITH rent AS (
     SELECT x.property_id, SUM(x.amount) AS amount FROM (${RENT_LINES()}) x GROUP BY x.property_id
   ), place AS (
-    SELECT p.id, p.state, p.latitude, p.longitude, p.address_verification, p.address_verified_at,
+    SELECT p.id, p.state, p.city, p.zip, p.latitude, p.longitude, p.address_verification, p.address_verified_at,
            (${realLandlordSql('p.landlord_id')} AND ${LIVE_PROPERTY('p')}) AS live
       FROM properties p
   ), moved AS (
@@ -485,13 +498,15 @@ const MAP_ROWS = (): string => `
          -- stamp is a try that found nothing; the point on file is older.
          (mv.at IS NOT NULL
           AND (pl.address_verified_at IS NULL OR pl.address_verified_at <= mv.at
-               OR pl.address_verification NOT IN ('geocoded', 'parcel'))) AS location_stale
+               OR pl.address_verification NOT IN ('geocoded', 'parcel'))) AS location_stale,
+         -- 10/13 (Nic): the city and ZIP on its address, for the city and ZIP code maps.
+         pl.city, pl.zip
     FROM place pl
     LEFT JOIN rent ON rent.property_id = pl.id
     LEFT JOIN moved mv ON mv.property_id = pl.id
    WHERE pl.live OR rent.property_id IS NOT NULL
   UNION ALL
-  SELECT NULL, NULL, NULL, NULL, 0, 0, rent.amount::text, FALSE FROM rent WHERE rent.property_id IS NULL`
+  SELECT NULL, NULL, NULL, NULL, 0, 0, rent.amount::text, FALSE, NULL, NULL FROM rent WHERE rent.property_id IS NULL`
 
 interface MapRow {
   property_id: string | null
@@ -504,6 +519,9 @@ interface MapRow {
   money: string
   /** 10/12 (Nic) review: the address was edited after its map location was found (MAP_ROWS). */
   location_stale: boolean
+  /** 10/13 (Nic): the city and ZIP on its address (the city and ZIP code maps). */
+  city: string | null
+  zip: string | null
 }
 
 /** Census FIPS state codes (fixed federal standard), by the two-letter code properties.state holds. */
@@ -544,71 +562,17 @@ const OFF_STATE_MAP: ReadonlySet<MapGap> = new Set<MapGap>(['unknown_state', 'no
  * neighbor — fine for a heat map, not for anything legal or billed.
  *
  * Decoded here rather than with topojson-client: the API carries no map
- * library, and a TopoJSON polygon is only its arcs, delta-decoded and joined.
+ * library, and a TopoJSON polygon is only its arcs, delta-decoded and joined
+ * (10/13: platformMetricsGeo decodeTopology, shared with the city, district
+ * and ZIP code maps).
  */
-interface CountyShape {
-  fips: string
-  name: string
-  /** [west, south, east, north] — skips the ray test for nearly every county. */
-  box: [number, number, number, number]
-  /** Polygons → rings → flat [lng, lat, lng, lat, …]. */
-  polygons: number[][][]
-}
-
-function decodeCounties(topo: any): CountyShape[] {
-  const [sx, sy] = topo.transform.scale
-  const [tx, ty] = topo.transform.translate
-  const arcs: number[][] = topo.arcs.map((arc: number[][]) => {
-    const out: number[] = []
-    let x = 0, y = 0
-    for (const [dx, dy] of arc) { x += dx; y += dy; out.push(x * sx + tx, y * sy + ty) }
-    return out
-  })
-  const ring = (ids: number[]): number[] => {
-    const out: number[] = []
-    for (const id of ids) {
-      const a = arcs[id < 0 ? ~id : id]
-      const n = a.length / 2
-      // Each arc after the first starts where the last one ended; skip the repeat.
-      for (let k = out.length ? 1 : 0; k < n; k++) {
-        const j = id < 0 ? n - 1 - k : k
-        out.push(a[2 * j], a[2 * j + 1])
-      }
-    }
-    return out
-  }
-  return topo.objects.counties.geometries.map((g: any): CountyShape => {
-    const parts: number[][][] = g.type === 'Polygon' ? [g.arcs] : g.type === 'MultiPolygon' ? g.arcs : []
-    const polygons = parts.map(rings => rings.map(ring))
-    const box: [number, number, number, number] = [Infinity, Infinity, -Infinity, -Infinity]
-    for (const poly of polygons) {
-      const outer = poly[0] ?? []
-      for (let i = 0; i < outer.length; i += 2) {
-        box[0] = Math.min(box[0], outer[i]); box[2] = Math.max(box[2], outer[i])
-        box[1] = Math.min(box[1], outer[i + 1]); box[3] = Math.max(box[3], outer[i + 1])
-      }
-    }
-    return { fips: String(g.id), name: String(g.properties?.name ?? ''), box, polygons }
-  })
-}
-
-/** Even-odd across every ring of one polygon, so a point in a hole is outside it. */
-function insidePolygon(x: number, y: number, rings: number[][]): boolean {
-  let inside = false
-  for (const r of rings) {
-    for (let i = 0, j = r.length - 2; i < r.length; j = i, i += 2) {
-      const xi = r[i], yi = r[i + 1], xj = r[j], yj = r[j + 1]
-      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside
-    }
-  }
-  return inside
-}
+type CountyShape = ReturnType<typeof decodeTopology>[number]
 
 let countyShapes: Promise<CountyShape[]> | null = null
 function loadCountyShapes(): Promise<CountyShape[]> {
   if (!countyShapes) {
     countyShapes = import('./platformMetrics.counties-10m.json')
-      .then(m => decodeCounties((m as any).default ?? m))
+      .then(m => decodeTopology((m as any).default ?? m, 'counties'))
       // A failed read is retried on the next build, not remembered.
       .catch(e => { countyShapes = null; throw e })
   }
@@ -620,7 +584,7 @@ export async function countyAt(lat: number, lng: number): Promise<{ fips: string
   const shapes = await loadCountyShapes()
   for (const c of shapes) {
     if (lng < c.box[0] || lng > c.box[2] || lat < c.box[1] || lat > c.box[3]) continue
-    if (c.polygons.some(poly => insidePolygon(lng, lat, poly))) return { fips: c.fips, name: c.name }
+    if (c.polygons.some(poly => insideRings(lng, lat, poly))) return { fips: c.id, name: c.name }
   }
   return null
 }
@@ -690,6 +654,8 @@ async function buildPlatformMap(rows: MapRow[]): Promise<PlatformMap> {
     states: [...states.values()].map(done).sort(byFips),
     counties: [...counties.values()].map(done).sort(byFips),
     missing: [...missing.values()].map(m => ({ ...m, money: r2(m.money) })),
+    // 10/13 (Nic): cities, congressional / state senate / state house districts, ZIP codes.
+    levels: await buildMapLevels(rows, STATE_FIPS),
   }
 }
 
@@ -975,10 +941,21 @@ export function clearPlatformMetricsCache(): void { cached = null; lifetimeCache
 // ahead or deposit interest, or kept from a deposit — the same Charged and
 // Collected every landlord report shows, by the same categories (the utility a
 // bill was for: its utility bill, else its trash fee, else PROPANE, else the
-// utility its note names). Rent is "Lot/space rent". Platform fees are GAM's
-// monthly fee from GAM's revenue book (platformFeeBill PLATFORM_FEE_LINES_SQL),
-// collected unless its charge to the landlord is still open — the Recurring
-// Revenue card's own rule, all months together.
+// utility its note names). Rent is "Lot/space rent".
+//
+// PLATFORM FEES, 10/14 (Nic): "show each separately (space fee, processing
+// margin, screening margin) plus a total." All three read GAM's revenue book
+// (platform_revenue_ledger), cut the way the money page's pies cut it
+// (services/revenueSlices — gam-one-book-for-gam-revenue):
+//   - the monthly space fee (platformFeeBill PLATFORM_FEE_LINES_SQL), collected
+//     unless its charge to the landlord is still open — the Recurring Revenue
+//     card's own rule, all months together;
+//   - the card and bank (ACH) processing margin — what GAM kept of each
+//     processing fee after Stripe's actual charge, with the monthly true-up
+//     (gam-book-is-actual-fees);
+//   - the screening margin — what GAM kept of each background check.
+// A margin is booked when the money it rode in on came in, so it is billed and
+// collected at once. The total is the three together.
 //
 // PEOPLE ON A LEASE (TENANTS_EVER, AGES). A lease counts once it has started
 // (start date today or before) and was not closed as never moved in
@@ -994,33 +971,53 @@ export function clearPlatformMetricsCache(): void { cached = null; lifetimeCache
 // ended (expired or terminated, not closed as never moved in) and nobody on it
 // went on living under the same landlord: not renewed (no lease supersedes
 // it), and no lease for any of them with that landlord in force the day after
-// it ended. Coming back later does not undo the move-out. What it left unpaid
-// is its RENT still open at the moment the lease ended (terminated_at — every
-// real end stamps it), for rent due by that day (or by its end date, when the
-// lease-end run ended it the night after) — read off each bill's own history,
-// so a payment made afterward never takes it off:
+// it ended — a lease of theirs that runs past the day it ended. Coming back
+// later does not undo the move-out. What it left unpaid is its RENT, UTILITIES
+// AND LATE FEES (10/14 (Nic): "Unpaid-at-move-out dollar %: rent + utilities +
+// late fees"; each bill's category as the MONEY section reads it) still open at
+// the moment the lease ended (terminated_at — every real end stamps it), for
+// bills due by that day (or by its end date, when the lease-end run ended it
+// the night after) — read off each bill's own history, so a payment made
+// afterward never takes it off:
 //   - a bill paid by then is paid: settled by then, or settled through a
 //     payment the tenant started by then (a bank payment still clearing);
-//   - otherwise what credit had paid of it by then, and work-trade labor,
-//     come off; the rest was unpaid (a line labor is still paying, its
-//     work-trade month open, is not money billed and is left out);
+//   - otherwise what credit had paid of it by then comes off, and the rest was
+//     unpaid. Work-trade hours already came off the bill's amount at its month
+//     close (payments.work_trade_credit; the amount left is the lapse), and a
+//     line labor is still working, its work-trade month open, is left out:
+//     nothing has been judged on it, so it is neither billed nor unpaid;
 //   - a bill a dispute reopened counts as the reopened copy only, and only if
 //     the dispute came before the move-out (one after it took back money that
 //     had been paid); a voided bill was never owed.
-// Rent the deposit covered at move-out is still rent left unpaid (the deposit
-// is settled after the lease ends).
-// Months left unpaid = that rent ÷ the lease's monthly rent ($300 of $460 =
-// 0.65). Rent billed is the MONEY section's own rent Billed, lease by lease
-// (the same report facts — never a second "rent billed" on the page): rent $
-// billed = each lease's rent billed through today, less what work trade and
-// credits given covered; calendar months of rent billed = each lease's months
-// with rent billed in them (a prorated month is a month; a month work trade
-// covered in full billed no money, so it is not one).
+// 10/14 (Nic): "Deposit covering unpaid rent at move-out: still a default." A
+// bill the deposit covered at move-out (depositReturn sweeps it to
+// 'paid_via_deposit', after the lease ends) is still left unpaid — only a bill
+// a payment or credit settled counts as paid.
+// Months left unpaid = the RENT left unpaid ÷ the lease's monthly rent ($300
+// of $460 = 0.65). Calendar months of rent billed = each lease's months with
+// rent billed in them (a prorated month is a month), and — 10/14 (Nic):
+// "Months fully covered by work trade: count them in months billed (as paid)"
+// — each month the hours paid the rent of. 10/17 (review): only once the month
+// has CLOSED and the hours have been judged. A month labor is still working
+// (the charge parked, nothing asked of the tenant and nothing credited yet) is
+// nobody's month yet: at its close it counts as paid in full, or its lapse is
+// billed in money and counts that way.
+// The dollar share divides the rent, utilities and late fees left unpaid by
+// the rent, utilities and late fees billed through today on every lease — the
+// MONEY section's own billed facts (less credits given, and already net of
+// what work trade covered), so the card above the tile adds up to the figure
+// the tile divides by. 10/17 (review): work trade is NOT added back into those
+// dollars. Nic's work-trade answer was about the MONTHS; his dollar answer
+// named the three categories and nothing else.
 
-/** 10/13 (Nic): "where defaults happen by RENT RANGE" — the bands, by the lease's monthly rent. */
+/**
+ * 10/13 (Nic): "where defaults happen by RENT RANGE" — the bands, by the lease's
+ * monthly rent. 10/14 (Nic): "even $100 steps (under $300, every $100 to
+ * $2,000, then $2,000+)".
+ */
 export const RENT_BANDS: ReadonlyArray<{ min: number; max: number | null }> = [
-  { min: 0, max: 300 }, { min: 300, max: 400 }, { min: 400, max: 500 }, { min: 500, max: 600 },
-  { min: 600, max: 800 }, { min: 800, max: 1000 }, { min: 1000, max: 1500 }, { min: 1500, max: 2000 },
+  { min: 0, max: 300 },
+  ...Array.from({ length: 17 }, (_, i) => ({ min: 300 + 100 * i, max: 400 + 100 * i })),
   { min: 2000, max: null },
 ]
 const dollars0 = (n: number) => `$${n.toLocaleString('en-US')}`
@@ -1050,15 +1047,35 @@ export interface RentRangeDefaults {
   min: number
   max: number | null
   leases: number
+  /** Calendar months of rent billed, months work trade paid included. */
   monthsBilled: number
-  rentBilled: number
+  /**
+   * 10/14 (Nic): of monthsBilled, the months work trade paid the rent of in
+   * full (counted as paid). A month labor is still working is not one of them
+   * until its hours are judged at the close.
+   */
+  monthsWorkTrade: number
+  /** 10/14 (Nic): rent, utilities and late fees billed — the Money section's own figures. */
+  billed: number
+  /** Households that moved out owing rent, utilities or late fees. */
   householdsOwing: number
+  /** Rent left unpaid at move-out, in months of each lease's rent. */
   monthsUnpaid: number
+  /** 10/14 (Nic): rent, utilities and late fees left unpaid at move-out. */
   dollarsUnpaid: number
   /** monthsUnpaid ÷ monthsBilled; null when nothing was billed. */
   rate: number | null
-  /** dollarsUnpaid ÷ rentBilled; null when nothing was billed. */
+  /** dollarsUnpaid ÷ billed; null when nothing was billed. */
   dollarRate: number | null
+}
+/** 10/14 (Nic): GAM's platform fees, each separately, and their total (the outer figures). */
+export interface PlatformFeeLines extends BilledCollected {
+  /** GAM's monthly fee per space. */
+  spaceFee: BilledCollected
+  /** GAM's margin on card and bank (ACH) processing. */
+  processing: BilledCollected
+  /** GAM's margin on background checks. */
+  screening: BilledCollected
 }
 export interface PlatformLifetimeMetrics {
   asOf: string
@@ -1067,7 +1084,7 @@ export interface PlatformLifetimeMetrics {
   money: {
     rent: BilledCollected & { label: string }
     utilities: BilledCollected & { byUtility: Array<BilledCollected & { utility: string; label: string }> }
-    platformFees: BilledCollected
+    platformFees: PlatformFeeLines
   }
   tenants: {
     /** Every person ever on a lease on GAM, once. */
@@ -1144,8 +1161,23 @@ const PEOPLE_ROWS = (): string => `
    WHERE ${COUNTED_LEASE('l', '$1::date')} AND ${OCCUPANT_NOT_A_TENANT('o')}`
 
 /**
+ * 10/14 (Nic): "Unpaid-at-move-out dollar %: rent + utilities + late fees" —
+ * the categories (incomeBasis categorySql) the default rate's dollars count.
+ */
+const DEFAULT_CATEGORIES: readonly string[] = ['space_rent', ...INCOME_UTILITY_CATEGORIES, 'late_fees']
+const DEFAULT_CATEGORIES_SQL = DEFAULT_CATEGORIES.map(c => `'${c}'`).join(', ')
+
+/** A bill's (alias p) category, as the MONEY section reads it; joins lf and ub. */
+const BILL_CATEGORY_JOINS = (p: string) => `
+      LEFT JOIN lease_fees lf ON lf.id = ${p}.lease_fee_id
+      LEFT JOIN LATERAL (SELECT ub0.utility_type FROM utility_bills ub0
+                          WHERE ub0.payment_id = ${p}.id ORDER BY ub0.created_at, ub0.id LIMIT 1) ub ON TRUE
+      CROSS JOIN LATERAL (SELECT ${categorySql(p, 'ub.utility_type', 'lf')} AS category) cat`
+
+/**
  * 10/13 (Nic): the households that moved out owing (a real landlord's, ended
- * by $1 = today), with the rent they left unpaid. See the block comment above.
+ * by $1 = today), with the rent, utilities and late fees they left unpaid
+ * (`owed`) and the rent among it (`owed_rent`). See the block comment above.
  */
 const DEFAULT_CTES = (): string => `
   ended AS (
@@ -1181,18 +1213,23 @@ const DEFAULT_CTES = (): string => `
             AND n.status IN ('pending', 'active', 'expired', 'terminated')
             AND n.termination_reason IS DISTINCT FROM ${sqlLit(NEVER_MOVED_IN_REASON)}
             AND n.start_date >= e.start_date AND n.start_date <= e.d + 1
+            -- In force the day after it ended: a lease of theirs ending that same
+            -- day (two spaces given up together) went on no longer than this one.
             -- (LEAST skips a missing end: no end at all is still in force.)
-            AND COALESCE(LEAST((n.terminated_at AT TIME ZONE e.tz)::date, n.end_date), 'infinity'::date) >= e.d)
+            AND COALESCE(LEAST((n.terminated_at AT TIME ZONE e.tz)::date, n.end_date), 'infinity'::date) > e.d)
   ), unpaid AS (
-    SELECT m.lease_id, SUM(x.unpaid) AS owed
+    SELECT m.lease_id, SUM(x.unpaid) AS owed,
+           COALESCE(SUM(x.unpaid) FILTER (WHERE cat.category = 'space_rent'), 0) AS owed_rent
       FROM moved_out m
-      JOIN payments p ON p.lease_id = m.lease_id AND p.type = 'rent'
+      JOIN payments p ON p.lease_id = m.lease_id AND ${landlordIncomeSql('p')}
                      AND p.status NOT IN ('voided', 'returned') AND p.amount > 0
                      AND p.due_date <= m.d
-                     -- Labor is paying it (work trade, the month still open): not
-                     -- money billed, so not money left unpaid either.
+                     -- Labor is still working this one (work trade, the month
+                     -- open): nothing has been judged on it, so it is neither
+                     -- money billed nor money left unpaid.
                      AND p.work_trade_suspended_at IS NULL
                      AND (p.reversal_id IS NULL OR p.created_at <= m.t)
+      ${BILL_CATEGORY_JOINS('p')}
       CROSS JOIN LATERAL (
         SELECT CASE
           WHEN (p.status = 'settled' AND COALESCE(p.settled_at, p.created_at) <= m.t)
@@ -1200,12 +1237,17 @@ const DEFAULT_CTES = (): string => `
                          JOIN tenant_remittances r ON r.id = ra.remittance_id
                         WHERE ra.payment_id = p.id AND r.status = 'settled' AND r.created_at <= m.t)
           THEN 0
-          ELSE GREATEST(0, p.amount - COALESCE(p.work_trade_credit, 0) - COALESCE((
+          -- The amount is already what work trade left (payments.work_trade_credit
+          -- is what the hours took off it), so only credit comes off here.
+          -- (A 'paid_via_deposit' bill is not settled: the deposit paid it after
+          -- the lease ended — 10/14 (Nic): still a default.)
+          ELSE GREATEST(0, p.amount - COALESCE((
                  SELECT SUM(cu.amount) FROM credit_uses cu
                   WHERE cu.payment_id = p.id AND cu.applied_at IS NOT NULL AND cu.applied_at <= m.t
                     AND (cu.released_at IS NULL OR cu.released_at > m.t)), 0))
           END AS unpaid
       ) x
+     WHERE cat.category IN (${DEFAULT_CATEGORIES_SQL})
      GROUP BY m.lease_id
     HAVING SUM(x.unpaid) > 0.005
   )`
@@ -1238,7 +1280,7 @@ export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetime
   const realIds = (await query<{ id: string }>(
     `SELECT l.id FROM landlords l WHERE ${realLandlordSql('l.id')}`)).map(r => r.id)
 
-  const [billedFacts, feeRows, peopleRows, leaseRows, defaultPeople] = await Promise.all([
+  const [billedFacts, feeRows, marginRows, workTradeRows, peopleRows, leaseRows, defaultPeople] = await Promise.all([
     // The landlords' own Money billed facts, all time through today, from the money records.
     incomeEvents({ landlordIds: realIds, start: '2000-01-01', end: today, basis: 'billed', source: 'records' }),
     // GAM's monthly platform fee: each line in the revenue book and what of it is still open.
@@ -1261,14 +1303,44 @@ export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetime
       )
       SELECT COALESCE(SUM(amount), 0)::text AS billed, COALESCE(SUM(not_collected), 0)::text AS not_collected
         FROM lines`),
+    // 10/14 (Nic): GAM's processing and screening margins, from the same book,
+    // cut the way the money page's pies cut it (services/revenueSlices).
+    query<{ slice: string; amount: string }>(`
+      SELECT s.slice, COALESCE(SUM(s.amount), 0)::text AS amount
+        FROM (SELECT ${REVENUE_SLICE_TYPE_SQL} AS slice, amount, property_id FROM platform_revenue_ledger) s
+       WHERE s.slice IN ('banking_spread', 'screening_margin')
+         AND (s.property_id IS NULL
+              OR EXISTS (SELECT 1 FROM properties sp WHERE sp.id = s.property_id AND ${realLandlordSql('sp.landlord_id')}))
+       GROUP BY s.slice`),
+    // 10/14 (Nic): "Months fully covered by work trade: count them in months
+    // billed (as paid)." The RENT each lease's hours actually paid, month by
+    // month (payments.work_trade_credit, written at the month close — whatever
+    // is left on the bill is the lapse, and that lapse is already a billed
+    // fact in the Money section).
+    //
+    // 10/17 (review): a month whose hours have NOT been judged is left out.
+    // While labor is still working a month the charge is parked
+    // (work_trade_suspended_at): nothing is asked of the tenant and nothing is
+    // credited, so nobody can call it covered in full. The month lands on its
+    // own at the close — see the block comment above.
+    query<{ lease_id: string; month: string; covered: string }>(`
+      SELECT p.lease_id, to_char(p.due_date, 'YYYY-MM') AS month,
+             SUM(p.work_trade_credit)::text AS covered
+        FROM payments p
+        ${BILL_CATEGORY_JOINS('p')}
+       WHERE p.lease_id IS NOT NULL AND ${realLandlordSql('p.landlord_id')} AND ${landlordIncomeSql('p')}
+         AND p.status <> 'voided' AND p.due_date <= $1::date
+         AND p.work_trade_suspended_at IS NULL AND p.work_trade_credit > 0
+         AND cat.category = 'space_rent'
+       GROUP BY 1, 2`, [today]),
     query<{ person: string; kind: string; property_id: string; property_name: string | null; dob: string | null; current: boolean }>(`
       SELECT DISTINCT x.person, x.kind, x.property_id, pr.name AS property_name, x.dob, x.current
         FROM (${PEOPLE_ROWS()}) x
         LEFT JOIN properties pr ON pr.id = x.property_id`, [today]),
     // Every lease's monthly rent (for its rent range), and what it left unpaid when it moved out owing.
-    query<{ lease_id: string; rent_amount: string; owed: string | null }>(`
+    query<{ lease_id: string; rent_amount: string; owed: string | null; owed_rent: string | null }>(`
       WITH ${DEFAULT_CTES()}
-      SELECT l.id AS lease_id, l.rent_amount::text AS rent_amount, un.owed::text AS owed
+      SELECT l.id AS lease_id, l.rent_amount::text AS rent_amount, un.owed::text AS owed, un.owed_rent::text AS owed_rent
         FROM leases l
         LEFT JOIN unpaid un ON un.lease_id = l.id
        WHERE ${realLandlordSql('l.landlord_id')}`, [today]),
@@ -1308,6 +1380,15 @@ export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetime
   const utilCollected = r2(byUtility.reduce((s, u) => s + u.collected, 0))
   const feeBilled = r2(feeRows[0]?.billed)
   const feeOpen = r2(feeRows[0]?.not_collected)
+  const margin = (slice: string): BilledCollected => {
+    const v = r2(marginRows.find(r => r.slice === slice)?.amount)
+    return { billed: v, collected: v, owed: 0 }
+  }
+  const spaceFee: BilledCollected = { billed: feeBilled, collected: r2(feeBilled - feeOpen), owed: feeOpen }
+  const processing = margin('banking_spread')
+  const screening = margin('screening_margin')
+  const feeParts = [spaceFee, processing, screening]
+  const feesTotal = (k: keyof BilledCollected) => r2(feeParts.reduce((s2, x) => s2 + x[k], 0))
 
   // ── People ──
   const persons = new Map<string, { kind: string; dob: string | null; current: boolean }>()
@@ -1327,48 +1408,71 @@ export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetime
   // ── Defaults ──
   const bands = RENT_BANDS.map(b => ({
     label: rentBandLabel(b), min: b.min, max: b.max,
-    leases: 0, monthsBilled: 0, rentBilled: 0, householdsOwing: 0, monthsUnpaid: 0, dollarsUnpaid: 0,
+    leases: 0, monthsBilled: 0, monthsWorkTrade: 0, billed: 0, householdsOwing: 0, monthsUnpaid: 0, dollarsUnpaid: 0,
     rate: null as number | null, dollarRate: null as number | null,
   }))
-  // Rent billed per lease and lease-month, from the same facts as the Billed
-  // column: a month counts when rent was billed in it (net of what work trade
-  // and credits given covered — the landlord reports' own Charged).
-  const rentByLease = new Map<string, { dollars: number; months: Map<string, number> }>()
+  // Per lease: the dollars billed (rent, utilities and late fees — the same
+  // facts as the Billed column, net of credits given) and, month by month, the
+  // rent billed; then the months work trade's judged hours paid the rent of.
+  const counted = new Set(DEFAULT_CATEGORIES)
+  type LeaseBilled = { dollars: number; rent: Map<string, number>; workTradeRent: Map<string, number> }
+  const byLease = new Map<string, LeaseBilled>()
+  const leaseOf = (id: string) => {
+    let x = byLease.get(id)
+    if (!x) { x = { dollars: 0, rent: new Map(), workTradeRent: new Map() }; byLease.set(id, x) }
+    return x
+  }
   for (const e of billedFacts) {
-    if (e.category !== 'space_rent' || !e.inTotal || !e.leaseId) continue
-    const x = rentByLease.get(e.leaseId) ?? { dollars: 0, months: new Map<string, number>() }
+    if (!e.inTotal || !e.leaseId || !e.category || !counted.has(e.category)) continue
+    const x = leaseOf(e.leaseId)
     x.dollars += e.amount
-    const month = String(e.dueDate ?? e.day).slice(0, 7)
-    x.months.set(month, (x.months.get(month) ?? 0) + e.amount)
-    rentByLease.set(e.leaseId, x)
+    if (e.category === 'space_rent') {
+      const month = String(e.dueDate ?? e.day).slice(0, 7)
+      x.rent.set(month, (x.rent.get(month) ?? 0) + e.amount)
+    }
+  }
+  // 10/17 (review): work trade makes a MONTH count, and nothing more. The
+  // dollars stay the Money section's own billed figures (see the block comment
+  // above), so the card above the tile adds up to what the tile divides by.
+  for (const w of workTradeRows) {
+    const x = leaseOf(w.lease_id)
+    x.workTradeRent.set(w.month, (x.workTradeRent.get(w.month) ?? 0) + Number(w.covered))
   }
   for (const l of leaseRows) {
-    const billedRent = rentByLease.get(l.lease_id)
+    const billed = byLease.get(l.lease_id)
     const owed = Number(l.owed ?? 0)
-    if (!billedRent && owed <= 0) continue
+    if (!billed && owed <= 0) continue
     const rent = Number(l.rent_amount)
     const band = bands[RENT_BANDS.indexOf(rentBandOf(rent))]
     band.leases += 1
-    band.monthsBilled += billedRent ? [...billedRent.months.values()].filter(v => v > 0.005).length : 0
-    band.rentBilled += billedRent?.dollars ?? 0
+    if (billed) {
+      // A month counts when rent was billed in it, or work trade's judged hours paid its rent.
+      for (const month of new Set([...billed.rent.keys(), ...billed.workTradeRent.keys()])) {
+        const money = (billed.rent.get(month) ?? 0) > 0.005
+        const labor = (billed.workTradeRent.get(month) ?? 0) > 0.005
+        if (money || labor) band.monthsBilled += 1
+        if (labor && !money) band.monthsWorkTrade += 1
+      }
+      band.billed += billed.dollars
+    }
     if (owed > 0) {
       band.householdsOwing += 1
       band.dollarsUnpaid += owed
-      if (rent > 0) band.monthsUnpaid += owed / rent
+      if (rent > 0) band.monthsUnpaid += Number(l.owed_rent ?? 0) / rent
     }
   }
-  const sum = (k: 'leases' | 'monthsBilled' | 'rentBilled' | 'householdsOwing' | 'monthsUnpaid' | 'dollarsUnpaid') =>
-    bands.reduce((s, b) => s + b[k], 0)
-  const finish = <T extends { monthsBilled: number; rentBilled: number; monthsUnpaid: number; dollarsUnpaid: number }>(x: T) => ({
+  const sum = (k: 'leases' | 'monthsBilled' | 'monthsWorkTrade' | 'billed' | 'householdsOwing' | 'monthsUnpaid' | 'dollarsUnpaid') =>
+    bands.reduce((s2, b) => s2 + b[k], 0)
+  const finish = <T extends { monthsBilled: number; billed: number; monthsUnpaid: number; dollarsUnpaid: number }>(x: T) => ({
     ...x,
-    rentBilled: r2(x.rentBilled),
+    billed: r2(x.billed),
     dollarsUnpaid: r2(x.dollarsUnpaid),
     monthsUnpaid: Math.round(x.monthsUnpaid * 100) / 100,
     rate: ratio(x.monthsUnpaid, x.monthsBilled),
-    dollarRate: ratio(x.dollarsUnpaid, x.rentBilled),
+    dollarRate: ratio(x.dollarsUnpaid, x.billed),
   })
   const totals = finish({
-    leases: sum('leases'), monthsBilled: sum('monthsBilled'), rentBilled: sum('rentBilled'),
+    leases: sum('leases'), monthsBilled: sum('monthsBilled'), monthsWorkTrade: sum('monthsWorkTrade'), billed: sum('billed'),
     householdsOwing: sum('householdsOwing'), monthsUnpaid: sum('monthsUnpaid'), dollarsUnpaid: sum('dollarsUnpaid'),
   })
   const atDefault = new Map<string, number | null>()
@@ -1385,7 +1489,10 @@ export async function computePlatformLifetimeMetrics(): Promise<PlatformLifetime
     money: {
       rent: { label: INCOME_CATEGORY_LABEL.space_rent, ...bc(cat('space_rent')) },
       utilities: { billed: utilBilled, collected: utilCollected, owed: r2(utilBilled - utilCollected), byUtility },
-      platformFees: { billed: feeBilled, collected: r2(feeBilled - feeOpen), owed: feeOpen },
+      platformFees: {
+        billed: feesTotal('billed'), collected: feesTotal('collected'), owed: feesTotal('owed'),
+        spaceFee, processing, screening,
+      },
     },
     tenants: {
       ever: everyone.length,

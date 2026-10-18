@@ -255,7 +255,9 @@ describe('a stay sent on a pay link', () => {
     expect(sent.status, JSON.stringify(sent.body)).toBe(201)
     expect(Number(sent.body.data.total)).toBe(Math.round((440 + fee) * 100) / 100)
     const link = (await query<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [sent.body.data.id]))[0]
-    expect(link.label).toBe('RV site — monthly — 30 nights at site RV 01 (Jun 1 → Jul 1)')
+    // 10/17 (Nic): the guest reads this label, so it names no site — "no site
+    // details given to the customer until morning of arrival."
+    expect(link.label).toBe('RV site — monthly — 30 nights (Jun 1 → Jul 1)')
     expect(link.items.find((l: any) => l.screening)).toMatchObject({ id: null, name: SCREENING_LINE_NAME, price: fee, qty: 1 })
     expect(await reservationDue(db, link.booking_id)).toMatchObject({ total: 440, owed: 440, leaseBillsRest: false })
 

@@ -34,7 +34,7 @@ import {
   linkStayOf, linkBookingLines, assertLinkBookingLinesKept, linkReservation, linkReservationLine, linkReservationNowWords,
   linkAsksNow, linkReservationGoneWords, settleLinkBooking, closeStaleLinkPages, assertLinkStayWhole, linkStayNightsNowWords,
   reservationSaleLine, withLodgingTax, linkStayAsSent, tellLandlordIfLeftOwed,
-  linkScreeningLine, isScreeningLine, recordLinkScreening, afterLinkPaid, feeOnlyLinkNotPayable,
+  linkScreeningLine, isScreeningLine, recordLinkScreening, afterLinkPaid, feeOnlyLinkNotPayable, linkCartIsAStay,
   type ClosedLink, type PagesClosed, type LinkReservation,
 } from './posPayLinks'
 
@@ -2371,6 +2371,24 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // never had (more nights, another price) would be a stay with no site and
     // no dates, priced by whatever the cart said; it is rung on its own.
     if (payLink) await assertStaysAreTheLinks(posLandlordId(req), items, payLink)
+    // 10/17 (Nic) — AND IT IS NOT SETTLED HERE EITHER IF IT HOLDS NO STAY.
+    //
+    //   "somebody paid for a week, um, and it did not generate a stay to occupy
+    //    a site."
+    //
+    // A link that sells site rent but holds no reservation (one sent before a
+    // link held its site — none can be made that way now) takes the money here
+    // and places nothing: the stay lines on a link are deliberately NOT turned
+    // into a booking at the counter, because a link's stay was already placed
+    // when it was sent. With nothing placed, there is nothing for this sale to
+    // confirm. The guest's own card page already refuses to open
+    // (posPayLinks linkNotPayable); this is the same refusal at the counter, so
+    // the last way to pay for a week and get no site is closed.
+    if (payLink && !payLink.booking_id && await linkCartIsAStay(db, payLink)) {
+      throw new AppError(409,
+        'This link sells a stay but holds no site or dates, so settling it would take the money and put nothing on the schedule — nothing was charged. '
+        + 'Press Clear, close the link under Pay Links, then ring the stay fresh with a site and dates.')
+    }
     // A pay link's own prices and discount were set when it was sent; the
     // cashier settling it answers only for what they change (termsOfLinkFor) —
     // and its discount is theirs only for the share of the link they keep.
@@ -4765,6 +4783,46 @@ posRouter.post('/transactions/:id/email-receipt', requirePerm('pos.ring_sale'), 
 })
 
 /**
+ * 10/17 (Nic) — A RECEIPT DOES NOT NAME A SITE THE GUEST HAS NOT ARRIVED AT.
+ *
+ * "no site details given to the customer until morning of arrival."
+ *
+ * A sale that pays toward a reservation stores its line as the clerk reads it —
+ * "RV site — weekly — 7 nights at site RV 07 (May 1 → May 8)" — because that is
+ * what the cart, the card reader and the sale's own record have to say. The
+ * emailed receipt is built from that stored line, so it was printing the site
+ * to the guest; the link's label stopped doing that, and this is the other
+ * door. Staff screens keep reading the stored line unchanged.
+ *
+ * The fence is the one the nightly packer uses: a stay whose site has not been
+ * revealed and whose arrival is still ahead CAN still be moved
+ * (services/scheduleCompression), so naming its site is a promise GAM might
+ * have to break. Once the morning-of reveal has gone out, or the guest is
+ * already here, the site is theirs and the receipt says it.
+ *
+ * Returns the site number to leave off, or null when there is nothing to hide.
+ */
+async function receiptSiteToHide(tx: { id: string; pay_link_id?: string | null; open_ticket_id?: string | null }): Promise<string | null> {
+  const r = await queryOne<{ unit_number: string }>(
+    `SELECT u.unit_number
+       FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+      WHERE b.status NOT IN ('cancelled', 'no_show')
+        AND b.site_reveal_sent_at IS NULL
+        AND b.check_in > CURRENT_DATE
+        AND (b.pos_transaction_id = $1
+             OR EXISTS (SELECT 1 FROM stay_payments sp WHERE sp.booking_id = b.id AND sp.pos_transaction_id = $1)
+             OR b.id = (SELECT booking_id FROM pos_pay_links WHERE id = $2::uuid)
+             OR b.id = (SELECT booking_id FROM pos_open_tickets WHERE id = $3::uuid))
+      ORDER BY b.check_out DESC LIMIT 1`, [tx.id, tx.pay_link_id ?? null, tx.open_ticket_id ?? null])
+  return r?.unit_number ?? null
+}
+
+/** The same line with " at site RV 07" taken out — nothing else touched. */
+export function withoutSiteName(description: string, unitNumber: string | null): string {
+  return unitNumber ? description.split(` at site ${unitNumber}`).join('') : description
+}
+
+/**
  * 10/5 (Nic, R13): the sentence a receipt carries for the stay a sale paid
  * for — "Your site is held through …" — when it is a stay of 30+ nights in a
  * row with no lease (held only through what is paid). The stay as it stands
@@ -4813,7 +4871,12 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
     if (!tx) throw new AppError(404, SALE_GONE)
     const items = await query<any>(
       `SELECT item_name, qty, unit_price, subtotal FROM pos_transaction_items WHERE transaction_id = $1 ORDER BY created_at`, [tx.id])
-    const lines = items.map(l => ({ description: String(l.item_name), quantity: Number(l.qty), unitPrice: Number(l.unit_price), lineTotal: Number(l.subtotal) }))
+    // 10/17 (Nic): the guest's copy of a stay they have not arrived at yet
+    // names no site (receiptSiteToHide above). Best-effort — a receipt still
+    // goes out if the stay cannot be read, with the line exactly as stored.
+    const hideSite = await receiptSiteToHide(tx).catch((e) => {
+      logger.warn({ err: e, saleId: tx.id }, '[POS] could not read whether this stay\'s site is still unrevealed'); return null })
+    const lines = items.map(l => ({ description: withoutSiteName(String(l.item_name), hideSite), quantity: Number(l.qty), unitPrice: Number(l.unit_price), lineTotal: Number(l.subtotal) }))
     if (Number(tx.surcharge) > 0) lines.push({ description: 'Card processing fee', quantity: 1, unitPrice: Number(tx.surcharge), lineTotal: Number(tx.surcharge) })
     const receiptNumber = String(tx.id).slice(0, 8).toUpperCase()
     // 10/5 (Nic, R13): a stay with no lease is held only through what is paid — the receipt says so.

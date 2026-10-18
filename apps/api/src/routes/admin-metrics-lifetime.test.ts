@@ -126,7 +126,8 @@ async function tx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
 
 /**
  * One landlord, two properties:
- *   Oak (P1): L1 — two tenants and an occupant, three months paid, utilities;
+ *   Oak (P1): L1 — two tenants and an occupant, June closed and covered by
+ *             work trade, three months paid, October still being worked, utilities;
  *             L2 — moved out 9/15 owing August and September ($920 = 2.0
  *             months), September paid on 9/20, after the move-out.
  *   Pine (P2): L3 → L4 — the same tenant went straight on to another lease
@@ -161,10 +162,21 @@ async function seedParks() {
     await k.occupant(l1, 'Mia Rivera', '2015-01-01')
     await k.occupant(l1, 'pat rivera', null) // the tenant again, listed as an occupant: still one person
     const a1 = { unitId: u1, leaseId: l1, tenantId: t1 }
+    // June: the month CLOSED and the hours covered the rent in full — the close
+    // zeroes the charge and writes what the hours paid (work_trade_credit), so
+    // no money was billed and the month is a month billed all the same
+    // (10/14 (Nic): "count them in months billed, as paid").
+    const june = await k.bill({ ...a1, amount: 460, due: '2026-06-01' })
+    await c.query(
+      `UPDATE payments SET amount = 0, status = 'settled', settled_at = '2026-06-30 18:00:00-07',
+              work_trade_credit = 460 WHERE id = $1`, [june])
     await k.bill({ ...a1, amount: 460, due: '2026-07-01', paid: '2026-07-01', method: 'card' })
     await k.bill({ ...a1, amount: 460, due: '2026-08-01', paid: '2026-08-01', method: 'ach' })
     await k.bill({ ...a1, amount: 460, due: '2026-09-01', paid: '2026-09-01' })
-    // October: labor is paying it (work trade, the month still open) — no money billed.
+    // October: labor is still working this one and the month has not closed —
+    // the charge is parked, nothing is asked of the tenant and nothing is
+    // credited. 10/17 (review): not a month billed, and not a month paid by
+    // work trade either, until its hours are judged at the close.
     const oct = await k.bill({ ...a1, amount: 460, due: '2026-10-01' })
     await c.query(`UPDATE payments SET work_trade_suspended_at = NOW() WHERE id = $1`, [oct])
     // Utilities, each by its own bill.
@@ -299,8 +311,14 @@ describe('GET /api/admin/metrics/lifetime', () => {
     // L1 1380 + L2 1380 + L3 1800 + L4 900 + L5 600 + L6 600.
     expect(m.money.rent.label).toBe('Lot/space rent')
     expect(m.money.rent.billed).toBeCloseTo(6660, 2)
-    // One "rent billed" on the page: the default rate divides by the same figure.
-    expect(m.defaults.rentBilled).toBeCloseTo(m.money.rent.billed, 2)
+    // 10/14 (Nic): "Unpaid-at-move-out dollar %: rent + utilities + late fees"
+    // — so what the default rate divides by is this rent plus the utilities
+    // below, and nothing else. One set of billed facts on the page: the card
+    // adds up to the figure the tile divides by (10/17 review — the figure was
+    // printed with nothing on the page adding up to it).
+    expect(m.defaults.billed).toBeCloseTo(m.money.rent.billed + m.money.utilities.billed, 2)
+    expect(m.defaults.billed).toBeCloseTo(6660 + 130, 2)
+    expect(m.defaults.rentBilled).toBeUndefined()
     // Paid: L1 1380, L2 460 + 460 (paid late, still collected), L3 900, L4 900, L6 300.
     expect(m.money.rent.collected).toBeCloseTo(4400, 2)
     expect(m.money.rent.owed).toBeCloseTo(2260, 2)
@@ -317,7 +335,47 @@ describe('GET /api/admin/metrics/lifetime', () => {
     expect(m.money.utilities.billed).toBeCloseTo(130, 2)
     expect(m.money.utilities.collected).toBeCloseTo(90, 2)
 
-    expect(m.money.platformFees).toEqual({ billed: 72, collected: 48, owed: 24 })
+    // 10/14 (Nic): "Platform fees on Metrics: show each separately (space fee,
+    // processing margin, screening margin) plus a total." Only the monthly
+    // space fee is seeded here: September's $48 collected, October's $24 open.
+    expect(m.money.platformFees.spaceFee).toEqual({ billed: 72, collected: 48, owed: 24 })
+    expect(m.money.platformFees.processing).toEqual({ billed: 0, collected: 0, owed: 0 })
+    expect(m.money.platformFees.screening).toEqual({ billed: 0, collected: 0, owed: 0 })
+    expect(m.money.platformFees).toMatchObject({ billed: 72, collected: 48, owed: 24 })
+  })
+
+  it('platform fees: the space fee, the processing margin and the screening margin, each on its own, plus the total', async () => {
+    // 10/14 (Nic): all three read GAM's own revenue book, cut the way the money
+    // page's pies cut it (services/revenueSlices) — so the monthly processing
+    // true-up is processing income, not an unexplained "adjustment", and a
+    // screening margin taken back nets inside the screening line.
+    const { oak } = await seedParks()
+    await seedDemo()
+    const book = (type: string, amount: number, propertyId: string | null, referenceType?: string) => db.query(
+      `INSERT INTO platform_revenue_ledger (type, amount, balance_after, reference_type, property_id)
+       VALUES ($1, $2, 0, $3, $4)`, [type, amount, referenceType ?? null, propertyId])
+    await book('banking_spread', 12.5, oak)                                      // the card and ACH margin
+    await book('adjustment', 1.25, oak, 'processing_margin_true_up')             // Stripe's real invoice, monthly
+    await book('screening_margin', 9, oak)
+    await book('adjustment', -4, oak, 'screening_margin_reversal')               // a check cancelled before a report
+    await book('banking_spread', 99, null)                                       // not tied to a property: GAM's own
+    // A demo landlord's margin is not GAM's revenue; neither is a slice of
+    // another kind (FlexPay here), which has its own card on the money page.
+    const demoProperty = (await db.query<{ id: string }>(
+      `SELECT p.id FROM properties p JOIN landlords l ON l.id = p.landlord_id WHERE l.is_demo = TRUE LIMIT 1`)).rows[0].id
+    await book('banking_spread', 500, demoProperty)
+    await book('flexpay_subscription', 25, oak)
+    clearPlatformMetricsCache()
+
+    const f = (await lifetime()).money.platformFees
+    expect(f.spaceFee).toEqual({ billed: 72, collected: 48, owed: 24 })
+    // A margin is earned when the money it rode in on is paid, so it is billed
+    // and collected at once — nothing of it is ever "owed".
+    expect(f.processing).toEqual({ billed: 112.75, collected: 112.75, owed: 0 })
+    expect(f.screening).toEqual({ billed: 5, collected: 5, owed: 0 })
+    expect(f.billed).toBeCloseTo(72 + 112.75 + 5, 2)
+    expect(f.collected).toBeCloseTo(48 + 112.75 + 5, 2)
+    expect(f.owed).toBeCloseTo(24, 2)
   })
 
   it('tenants ever: every person on a lease once — never moved in, void, a cancelled draft and not started left out', async () => {
@@ -338,25 +396,192 @@ describe('GET /api/admin/metrics/lifetime', () => {
     await seedParks()
     await seedDemo()
     const d = (await lifetime()).defaults
-    // L1 3 + L2 3 + L3 2 + L4 1 + L5 2 + L6 2 lease-months; L2's October and L7 were
-    // voided, and L1's October billed no money (work trade is paying it).
-    expect(d.monthsBilled).toBe(13)
-    expect(d.rentBilled).toBeCloseTo(6660, 2)
+    // L1 4 + L2 3 + L3 2 + L4 1 + L5 2 + L6 2 lease-months; L2's October and L7
+    // were voided. 10/14 (Nic): "Months fully covered by work trade: count them
+    // in months billed (as paid)" — L1's June billed no money because the hours
+    // covered it, and it is a month billed all the same. L1's October, still
+    // being worked, is in neither figure: its hours have not been judged.
+    expect(d.monthsBilled).toBe(14)
+    expect(d.monthsWorkTrade).toBe(1)
+    // Billed is rent + utilities + late fees (none here) — the Money section's
+    // own figures, nothing added back: 6660 rent + 130 utilities.
+    expect(d.billed).toBeCloseTo(6790, 2)
     // Only Sam's household moved out owing: August, and September — paid on 9/20, after
     // the move-out, which does not take it off. Kim went straight on to another
     // lease; Ray renewed; the never-moved-in lease owes nothing.
     expect(d.householdsOwing).toBe(1)
     expect(d.monthsUnpaid).toBeCloseTo(2, 4)
     expect(d.dollarsUnpaid).toBeCloseTo(920, 2)
-    expect(d.rate).toBeCloseTo(2 / 13, 6)
-    expect(d.dollarRate).toBeCloseTo(920 / 6660, 6)
+    expect(d.rate).toBeCloseTo(2 / 14, 6)
+    expect(d.dollarRate).toBeCloseTo(920 / 6790, 6)
 
     const band = Object.fromEntries(d.byRentRange.map((b: any) => [b.label, b]))
-    expect(Object.keys(band)).toEqual(['$300 to $399', '$400 to $499', '$800 to $999'])
-    expect(band['$400 to $499']).toMatchObject({ leases: 2, monthsBilled: 6, rentBilled: 2760, householdsOwing: 1, dollarsUnpaid: 920 })
-    expect(band['$400 to $499'].rate).toBeCloseTo(2 / 6, 6)
-    expect(band['$300 to $399']).toMatchObject({ leases: 2, monthsBilled: 4, householdsOwing: 0, monthsUnpaid: 0 })
-    expect(band['$800 to $999']).toMatchObject({ leases: 2, monthsBilled: 3, householdsOwing: 0 })
+    expect(Object.keys(band)).toEqual(['$300 to $399', '$400 to $499', '$900 to $999'])
+    // The $400 band is L1 and L2: L1's four months (June by work trade) and
+    // L2's three; billed is the money rent on them, 1380 + 1380, and L1's
+    // utilities 130 — June billed no money, so it adds nothing to the dollars.
+    expect(band['$400 to $499']).toMatchObject({
+      leases: 2, monthsBilled: 7, monthsWorkTrade: 1, billed: 2890, householdsOwing: 1, dollarsUnpaid: 920,
+    })
+    expect(band['$400 to $499'].rate).toBeCloseTo(2 / 7, 6)
+    expect(band['$400 to $499'].dollarRate).toBeCloseTo(920 / 2890, 6)
+    expect(band['$300 to $399']).toMatchObject({ leases: 2, monthsBilled: 4, billed: 1200, householdsOwing: 0, monthsUnpaid: 0 })
+    // 10/14 (Nic): the even $100 steps put the two $900 leases in their own band.
+    expect(band['$900 to $999']).toMatchObject({ leases: 2, monthsBilled: 3, billed: 2700, householdsOwing: 0 })
+  })
+
+  it('the rent bands are even $100 steps: under $300, every $100 to $2,000, then $2,000+', () => {
+    // 10/14 (Nic): "Rent ranges: even $100 steps (under $300, every $100 to
+    // $2,000, then $2,000+)."
+    expect(RENT_BANDS.length).toBe(19)
+    expect(rentBandLabel(RENT_BANDS[0])).toBe('Under $300')
+    expect(rentBandLabel(RENT_BANDS[1])).toBe('$300 to $399')
+    expect(rentBandLabel(RENT_BANDS[17])).toBe('$1,900 to $1,999')
+    expect(rentBandLabel(RENT_BANDS[18])).toBe('$2,000 and up')
+    // Every step is $100, with no gap and no overlap between one band and the next.
+    for (let i = 1; i < RENT_BANDS.length - 1; i++) {
+      expect(RENT_BANDS[i].max! - RENT_BANDS[i].min).toBe(100)
+      expect(RENT_BANDS[i].min).toBe(RENT_BANDS[i - 1].max)
+    }
+    expect(RENT_BANDS[18].min).toBe(2000)
+    expect(RENT_BANDS[18].max).toBeNull()
+    expect(rentBandOf(299.99)).toBe(RENT_BANDS[0])
+    expect(rentBandOf(1250)).toEqual({ min: 1200, max: 1300 })
+    expect(rentBandOf(1999.99)).toEqual({ min: 1900, max: 2000 })
+    expect(rentBandOf(2000)).toBe(RENT_BANDS[18])
+  })
+
+  it('unpaid at move-out counts rent, utilities and late fees — and what the deposit covered is still a default', async () => {
+    // 10/14 (Nic): "Unpaid-at-move-out dollar %: rent + utilities + late fees",
+    // and "Deposit covering unpaid rent at move-out: still a default."
+    await tx(async c => {
+      const { userId, landlordId } = await seedLandlord(c)
+      const p = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const k = park(c, landlordId)
+      const t = await k.tenant('Dee', 'Moore', null)
+      const u = await seedUnit(c, { propertyId: p, landlordId })
+      const l = await k.lease({ unitId: u, rent: 500, start: '2026-08-01', status: 'terminated',
+                                end: '2026-09-30', terminatedAt: '2026-09-30 12:00:00-07' })
+      await k.onLease(l, t, 'primary', 'removed')
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, amount: 500, due: '2026-08-01', paid: '2026-08-01' })
+      // September: the rent swept to the deposit after the lease ended, a water
+      // bill never paid, and a late fee. All three were left unpaid.
+      const rent = await k.bill({ unitId: u, leaseId: l, tenantId: t, amount: 500, due: '2026-09-01' })
+      await c.query(`UPDATE payments SET status = 'paid_via_deposit', settled_at = '2026-10-02 09:00:00-07' WHERE id = $1`, [rent])
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, type: 'utility', amount: 60, due: '2026-09-05' })
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, type: 'late_fee', entry: 'LATEFEE', amount: 25, due: '2026-09-06' })
+    })
+    const d = (await lifetime()).defaults
+    expect(d.householdsOwing).toBe(1)
+    // The rent left unpaid is what the months are counted in: $500 of a $500 month.
+    expect(d.monthsUnpaid).toBeCloseTo(1, 4)
+    expect(d.dollarsUnpaid).toBeCloseTo(585, 2)
+    expect(d.billed).toBeCloseTo(1085, 2)
+    expect(d.dollarRate).toBeCloseTo(585 / 1085, 6)
+  })
+
+  it('a household that left only a water bill moved out owing, and owes no month of rent', async () => {
+    // 10/14 (Nic): the dollars count "rent + utilities + late fees", so a
+    // household that left a water bill behind did move out owing and its $60 is
+    // in the dollar figure. The months figure counts RENT left unpaid, and a
+    // month has no meaning for a water bill — so it reads 0 beside it. 10/17
+    // (review): pinned here because the two tiles sit side by side on the page,
+    // and this is the case where they differ. Nic has not been asked whether a
+    // utility or a late fee should make a month; see the lane's open questions.
+    await tx(async c => {
+      const { userId, landlordId } = await seedLandlord(c)
+      const p = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const k = park(c, landlordId)
+      const t = await k.tenant('Wes', 'Doyle', null)
+      const u = await seedUnit(c, { propertyId: p, landlordId })
+      const l = await k.lease({ unitId: u, rent: 500, start: '2026-08-01', status: 'terminated',
+                                end: '2026-09-30', terminatedAt: '2026-09-30 12:00:00-07' })
+      await k.onLease(l, t, 'primary', 'removed')
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, amount: 500, due: '2026-08-01', paid: '2026-08-01' })
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, amount: 500, due: '2026-09-01', paid: '2026-09-01' })
+      await k.bill({ unitId: u, leaseId: l, tenantId: t, type: 'utility', amount: 60, due: '2026-09-05' })
+    })
+    const d = (await lifetime()).defaults
+    expect(d.householdsOwing).toBe(1)
+    expect(d.dollarsUnpaid).toBeCloseTo(60, 2)
+    expect(d.monthsUnpaid).toBe(0)
+    expect(d.rate).toBe(0)
+    expect(d.dollarRate).toBeCloseTo(60 / 1060, 6)
+  })
+
+  /**
+   * A household on two spaces: one lease owes money and ended on `ended`, the
+   * other is the same tenant's second space, ending on `secondEnds` (null = it
+   * runs on). Used by the two tests below.
+   */
+  const twoSpaces = (ended: string, secondEnds: string | null) => tx(async c => {
+    const { userId, landlordId } = await seedLandlord(c)
+    const p = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    const k = park(c, landlordId)
+    const t = await k.tenant('Jo', 'Vance', null)
+    const u1 = await seedUnit(c, { propertyId: p, landlordId })
+    const u2 = await seedUnit(c, { propertyId: p, landlordId })
+    const l1 = await k.lease({ unitId: u1, rent: 500, start: '2026-08-01', status: 'terminated',
+                               end: ended, terminatedAt: `${ended} 12:00:00-07` })
+    await k.onLease(l1, t, 'primary', 'removed')
+    await k.bill({ unitId: u1, leaseId: l1, tenantId: t, amount: 500, due: '2026-09-01' })
+    const l2 = secondEnds
+      ? await k.lease({ unitId: u2, rent: 500, start: '2026-08-01', status: 'terminated',
+                        end: secondEnds, terminatedAt: `${secondEnds} 12:00:00-07` })
+      : await k.lease({ unitId: u2, rent: 500, start: '2026-08-01' })
+    await k.onLease(l2, t, 'primary', secondEnds ? 'removed' : 'active')
+  })
+
+  it('two spaces given up the same day is still a move-out', async () => {
+    // 10/17 (review): the rule the comment on DEFAULT_CTES states — "a lease of
+    // theirs that runs past the day it ended" — now with the case it is about.
+    // Both spaces were given up on 9/30, so nobody went on living there.
+    await twoSpaces('2026-09-30', '2026-09-30')
+    const d = (await lifetime()).defaults
+    expect(d.householdsOwing).toBe(1)
+    expect(d.dollarsUnpaid).toBeCloseTo(500, 2)
+  })
+
+  it('a second space that runs on is not a move-out', async () => {
+    // The control for the test above: they kept the other space, so the
+    // household is still living under this landlord and owes a current balance.
+    await twoSpaces('2026-09-30', null)
+    const d = (await lifetime()).defaults
+    expect(d.householdsOwing).toBe(0)
+    expect(d.dollarsUnpaid).toBe(0)
+  })
+
+  it('a work-trade month counts once its hours are judged: the month still being worked does not', async () => {
+    // 10/14 (Nic): "Months FULLY COVERED by work trade: count them in months
+    // billed (as paid)." 10/17 (review): the only month anyone can call fully
+    // covered is one the month close has judged. Three months, one of each:
+    //   July — closed, the hours covered the rent: a month billed, paid by work trade.
+    //   August — closed, the hours fell short: the lapse was billed in money,
+    //            so it is a money month, not a work-trade one.
+    //   October — still being worked: neither, until the close.
+    await tx(async c => {
+      const { userId, landlordId } = await seedLandlord(c)
+      const p = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const k = park(c, landlordId)
+      const t = await k.tenant('Cal', 'Hart', null)
+      const u = await seedUnit(c, { propertyId: p, landlordId })
+      const l = await k.lease({ unitId: u, rent: 400, start: '2026-07-01' })
+      await k.onLease(l, t)
+      const a = { unitId: u, leaseId: l, tenantId: t }
+      const july = await k.bill({ ...a, amount: 400, due: '2026-07-01' })
+      await c.query(
+        `UPDATE payments SET amount = 0, status = 'settled', settled_at = '2026-07-31 18:00:00-07',
+                work_trade_credit = 400 WHERE id = $1`, [july])
+      const august = await k.bill({ ...a, amount: 400, due: '2026-08-01' })
+      await c.query(`UPDATE payments SET amount = 90, work_trade_credit = 310 WHERE id = $1`, [august])
+      const october = await k.bill({ ...a, amount: 400, due: '2026-10-01' })
+      await c.query(`UPDATE payments SET work_trade_suspended_at = NOW() WHERE id = $1`, [october])
+    })
+    const d = (await lifetime()).defaults
+    expect(d.monthsBilled).toBe(2)
+    expect(d.monthsWorkTrade).toBe(1)
+    // Only August's $90 lapse is money billed; the hours are not dollars on this page.
+    expect(d.billed).toBeCloseTo(90, 2)
   })
 
   it('a part of a month left unpaid is that part: $300 of a $460 month is 0.65', async () => {

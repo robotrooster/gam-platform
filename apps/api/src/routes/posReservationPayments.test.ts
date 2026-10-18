@@ -1703,7 +1703,11 @@ describe('10/3 (review, decisions #15) a long stay\'s deposit is paid whole — 
     const told = await noticesOf(f, 'pay_link_deposit_part')
     expect(told).toHaveLength(1)
     // 10/5: a stay link is named for the stay it sells.
-    expect(told[0].body).toBe(`Pat Payer paid ${paid} online on the pay link "RV site — nightly — 2 nights at site RV 01 (Jun 1 → Jun 3)" toward the reservation for site RV 01, `
+    // 10/17 (Nic): …and the LABEL no longer names the site, because the guest
+    // reads it ("no site details given to the customer until morning of
+    // arrival"). The landlord's notice still names the site in its own words
+    // ("toward the reservation for site RV 01"), so nothing is lost to staff.
+    expect(told[0].body).toBe(`Pat Payer paid ${paid} online on the pay link "RV site — nightly — 2 nights (Jun 1 → Jun 3)" toward the reservation for site RV 01, `
       + 'which is now a long stay whose deposit is $500.00 — a deposit is paid whole, so this payment is held. '
       + 'GAM is holding it: it was not recorded as a sale and it is not in your payouts. '
       + 'Open this notice and press Refund this payment to send it back to their card — do not pay it back from the drawer. '

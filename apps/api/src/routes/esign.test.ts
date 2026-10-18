@@ -1377,6 +1377,28 @@ describe('GET /documents/:id', () => {
 
 // ─── GET /pending and /landlord-pending ────────────────────────
 
+/** A team member of this company, scoped to every property, holding exactly
+ *  these permissions — the kind of session that was polling the signing queue
+ *  all day. */
+async function staffToken(
+  f: SeedFixture,
+  role: 'property_manager' | 'onsite_manager',
+  permissions: Record<string, boolean>,
+): Promise<string> {
+  const u = await db.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+     VALUES ($1,'x',$2,'Team','Member',TRUE) RETURNING id`,
+    [`${role}-${randomUUID()}@test.dev`, role])
+  const table = role === 'property_manager' ? 'property_manager_scopes' : 'onsite_manager_scopes'
+  await db.query(
+    `INSERT INTO ${table} (user_id, landlord_id, all_properties) VALUES ($1,$2,TRUE)`,
+    [u.rows[0].id, f.landlordId])
+  return jwt.sign(
+    { userId: u.rows[0].id, role, email: 'team@test.dev', profileId: null,
+      landlordId: f.landlordId, permissions },
+    process.env.JWT_SECRET!, { expiresIn: '10m' })
+}
+
 describe('GET /pending — tenant pending list', () => {
   it('shows documents where signer.status IN (sent, viewed) and doc not terminal', async () => {
     const f = await seedFixture()
@@ -1424,6 +1446,35 @@ describe('GET /landlord-pending — landlord pending list', () => {
     const res = await request(buildApp())
       .get('/api/esign/landlord-pending')
       .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.body.data).toEqual([])
+  })
+
+  // 10/17 (Nic): "Yes, fix it." The register clerk's browser asked for this
+  // queue every 30 seconds and was refused every time — 2,389 refusals in one
+  // day, burying the ones that meant something. The refusal itself is right and
+  // stays right: who may sign is who may read the queue, and a document never
+  // names anyone else (services/leaseSigner). The banner is what changed — it
+  // asks only when the account holds Sign leases (Layout.tsx). These two pin
+  // the rule the screen now mirrors, so the poll can never come back for a
+  // person the door will turn away.
+  it('a company\'s on-site staff may not read the signing queue', async () => {
+    const f = await seedFixture()
+    await seedDoc(f, { status: 'sent', landlordSignerStatus: 'sent' })
+    const res = await request(buildApp())
+      .get('/api/esign/landlord-pending')
+      .set('Authorization', `Bearer ${await staffToken(f, 'onsite_manager', { 'pos.ring_sale': true })}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('a manager who may sign reads their own queue', async () => {
+    const f = await seedFixture()
+    await seedDoc(f, { status: 'sent', landlordSignerStatus: 'sent' })
+    const res = await request(buildApp())
+      .get('/api/esign/landlord-pending')
+      .set('Authorization', `Bearer ${await staffToken(f, 'property_manager', { 'leases.sign': true })}`)
+    expect(res.status).toBe(200)
+    // The owner is the signer on this document, not the manager — the manager's
+    // own queue is empty, which is a queue, not a refusal.
     expect(res.body.data).toEqual([])
   })
 })

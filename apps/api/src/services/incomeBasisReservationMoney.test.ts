@@ -24,6 +24,7 @@ import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { incomeTotals, categoryTotals, incomeEvents } from './incomeBasis'
 import {
@@ -71,12 +72,19 @@ async function reservationLease(o: {
     const tenantId = await seedTenant(c)
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    await c.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent,
-                                              stripe_cost_flat, stripe_cost_percent, notes)
-       SELECT 'ach', 6, 0, 0, 0.5, $1
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach' AND effective_until IS NULL)`,
-      [RATE_NOTE])
+    // 10/17: this used to insert the $6 flat ACH rate only if no ACH rate was
+    // already open. Only one can be open at a time and cleanupAllSchema leaves
+    // the rate card alone, so when an earlier file had opened its own ACH rate
+    // (webhooks seeds 1.0% / 0.5%) this did nothing and every figure below was
+    // worked out against that file's rate instead of the $6 flat these numbers
+    // were derived from. It is why the file went red inside deploy.sh on 10/16
+    // and passed on its own. The rate is now stated outright.
+    await setEffectiveProcessingRate(c, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: RATE_NOTE,
+    })
     const unitId = await seedUnit(c, { propertyId, landlordId, rentAmount: o.rent })
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: o.rent, startDate: o.start })
     await seedLeaseTenant(c, { leaseId, tenantId })

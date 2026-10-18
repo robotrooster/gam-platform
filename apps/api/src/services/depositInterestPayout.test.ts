@@ -358,14 +358,19 @@ describe('S655 deposit interest is GAM-funded credit', () => {
     expect(Number(credit.remaining)).toBe(20)
   })
 
-  it('interest smaller than the bill pays nothing by itself and waits for the tenant', async () => {
+  // 10/15 (Nic): "money gets applied to the most outstanding balance first."
+  // Interest smaller than the bill goes on that bill instead of waiting on the
+  // account; the rent row stays open for the rest and is never cut in two.
+  it('interest smaller than the bill goes on the open bill, the rest left owed', async () => {
     const f = await household({ interestPerMonth: 2, rent: 460 })   // $24 against $460
     await payAnnualDepositInterest()
     expect((await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [f.rentId])).rows[0].status).toBe('pending')
-    expect((await db.query(`SELECT 1 FROM credit_uses`)).rows).toHaveLength(0)
+    expect((await db.query<{ a: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`,
+      [f.rentId])).rows[0].a).toBe('24.00')
     const credit = (await db.query<{ remaining: string }>(
       `SELECT amount_remaining::text AS remaining FROM tenant_credits WHERE tenant_id = $1`, [f.tenantId])).rows[0]
-    expect(Number(credit.remaining)).toBe(24)
+    expect(Number(credit.remaining)).toBe(0)
   })
 
   // Fix round 1: a renewal moves the deposit record onto the new lease, but the

@@ -192,15 +192,24 @@ export const PAID_AHEAD_COUNTED_NOTE = 'Counted in Received on the day it arrive
 // ─── Property health ─────────────────────────────────────────────────────────
 
 /**
- * How much of this month's rent bills is paid (money still clearing counts:
- * the tenant has paid, the bank is moving it). "Is rent getting paid" is a
- * question about the bills. null when nothing is billed yet.
+ * 10/17 (Nic): "the property health matches what was invoiced and what was
+ * paid. work trade isnt billed until a shortfall so it shouldnt apply here
+ * unless an invoice generates."
+ *
+ * So: how much of this month's rent bills is paid — the bills the API already
+ * leaves work trade out of, and paid once settled whatever settled it (money,
+ * money still clearing at the bank, an account credit, money paid ahead). It
+ * used to divide the Money billed figures, which answer "what was charged and
+ * what arrived": work-trade-held rent read as owed and credit-paid rent read as
+ * unpaid, so Mountain View said 67% in a month where only $2,061 was left to
+ * collect. Both figures come from one place now (the API's rentHealth, lib/
+ * rentCollected rentHealthMtd). null when nothing is invoiced yet.
  */
-export function rentBillsPaidRate(
-  rentBilled: { amount: number; collected: number; clearing: number } | null | undefined,
-): number | null {
-  if (!rentBilled || !(rentBilled.amount > 0)) return null
-  return (Number(rentBilled.collected) + Number(rentBilled.clearing)) / Number(rentBilled.amount)
+export interface RentHealthData { invoiced: number; paid: number; owed?: number; workTradeHeld?: number }
+
+export function rentBillsPaidRate(health: RentHealthData | null | undefined): number | null {
+  if (!health || !(Number(health.invoiced) > 0)) return null
+  return Number(health.paid) / Number(health.invoiced)
 }
 
 export type HealthStatus = 'awaiting' | 'full' | 'healthy' | 'attention'

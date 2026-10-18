@@ -203,6 +203,104 @@ export async function quoteStayDeposit(
   return depositForStay(row, { total: price.total, nights, monthlyRate })
 }
 
+/**
+ * 10/17 (Nic) — GAM PICKS THE SITE, AND THE GUEST IS NOT TOLD WHICH ONE.
+ *
+ * Asked whether a pay link has to name a site: "pay links work the same as
+ * booking site — no site details given to the customer until morning of
+ * arrival. the system can assign it but may move it as needed for compression."
+ *
+ * So a stay sold on a pay link no longer waits for the cashier to pick a spot
+ * off a list. The cashier rings the stay and the dates; this picks a site that
+ * is genuinely free for those nights, and the guest learns which one on the
+ * morning they arrive. That is also what makes compression possible — nobody
+ * was promised RV 14, so RV 14 can be freed for a rig that needs it.
+ *
+ * IT PICKS THE WAY THE BOOKING SITE PICKS — same sites, same order. Nic's
+ * sentence is "pay links work the same as booking site", and that is not only
+ * about what the guest is told; it is which sites are even candidates and which
+ * one wins.
+ *
+ *   • WHICH SITES: the booking site's own list (propertyBookingQuote
+ *     bookableUnits) — the sites the operator has switched on for short stays
+ *     (`is_bookable`) and whose allowed lease types include a short stay. An
+ *     earlier draft of this asked only "vacant, not storage, has a rate", and
+ *     at Mountain View that chose MH 3.5: a mobile home, switched OFF for short
+ *     stays, allowed only month-to-month and long-term, which priced at the
+ *     park's RV rate purely because the fallback found no rate of its own.
+ *     Seven such homes sort ahead of every RV site alphabetically, so EVERY
+ *     link would have landed on one.
+ *   • WHICH ONE: best fit (scheduleCompression rankUnitsBestFit), the same
+ *     ranking the booking site uses at booking time — the stay slots into the
+ *     snuggest gap so wide-open sites stay free for longer stays. First-fit in
+ *     unit-number order would scatter short stays across empty sites and leave
+ *     the park unable to take a two-week rig.
+ *
+ * And it is what makes "may move it as needed for compression" true: the
+ * nightly packer only ever looks at that same bookable list, so a stay parked
+ * outside it could never be moved. Nobody was promised RV 14, so RV 14 can be
+ * freed for a 40-footer — but only if the stay is somewhere the packer looks.
+ *
+ * FREE MEANS THE SAME THING IT MEANS EVERYWHERE ELSE. The last word is the
+ * shared per-site test (services/registerStay siteIsFree: another booking, a
+ * lease, or an out-of-order window), asked of the candidates in best-fit order,
+ * because it is stricter than the ranking in the one way that matters here — a
+ * guest who paid for a week and never showed still holds those nights
+ * (10/17 Nic), and the ranking would hand their site to somebody else. A site
+ * under an unpaid hold is also not taken: a link is not payment and displaces
+ * nobody.
+ *
+ * Storage is never a candidate (SHORT_STAY_LOCKED_UNIT_TYPES — a site switched
+ * on for short stays cannot be storage, so this is a guard on old rows), and
+ * neither is a site with no rate for this length of stay: one that cannot be
+ * priced cannot be sold.
+ *
+ * Returns null when the park is genuinely full for those nights; the caller
+ * says so in its own words.
+ */
+export async function chooseFreeSite(
+  client: Pick<PoolClient, 'query'>,
+  opts: { propertyId: string; landlordId: string; checkIn: string; checkOut: string
+          /** What one of quantity buys — the site needs a rate for it. */
+          stayUnit: 'night' | 'week' | 'month' },
+): Promise<{ id: string; unitNumber: string } | null> {
+  const { bookableUnits } = await import('./propertyBookingQuote')
+  const { rankUnitsBestFit } = await import('./scheduleCompression')
+  const { siteIsFree, STAY_RATE_COLUMN } = await import('./registerStay')
+  const rateCol = STAY_RATE_COLUMN[opts.stayUnit]
+  // The property's own rate is the fallback for a site that has none of its
+  // own — the same two places and the same order every other door reads
+  // (the counter's site list, the booking site's quote).
+  const prop = await queryOne<any>(
+    `SELECT landlord_id, nightly_rate, weekly_rate, monthly_rate FROM properties WHERE id = $1`,
+    [opts.propertyId])
+  if (!prop || prop.landlord_id !== opts.landlordId) return null
+  const bookable = (await bookableUnits(opts.propertyId)).filter((u: any) =>
+    !(SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(u.unit_type ?? '')
+    && Number(u[rateCol] ?? prop[rateCol] ?? 0) > 0)
+  if (!bookable.length) return null
+  // Retired and in-use sites are left out here rather than relied on from the
+  // booking site's list, which does not ask (a retired site keeps whatever
+  // flags it had). `vacant` is the counter's own rule for a site it may sell.
+  // Ordered, because the ranking breaks a tie on the order it is handed: on an
+  // empty park every site scores the same, and without this the winner would be
+  // whatever order the database happened to return.
+  const open = await client.query<{ id: string; unit_number: string }>(
+    `SELECT id, unit_number FROM units
+      WHERE id = ANY($1::uuid[]) AND landlord_id = $2
+        AND retired_at IS NULL AND status = 'vacant'
+      ORDER BY unit_number`,
+    [bookable.map((u: any) => u.id), opts.landlordId])
+  const numberById = new Map(open.rows.map(r => [r.id, r.unit_number]))
+  const ranked = await rankUnitsBestFit([...numberById.keys()], { checkIn: opts.checkIn, checkOut: opts.checkOut })
+  for (const id of ranked) {
+    if (await siteIsFree(client, id, opts.checkIn, opts.checkOut)) {
+      return { id, unitNumber: numberById.get(id)! }
+    }
+  }
+  return null
+}
+
 /** Landlord's Connect account for destination charges; null if not onboarded. */
 async function landlordConnect(landlordId: string): Promise<string | null> {
   const r = await queryOne<{ stripe_connect_account_id: string | null }>(

@@ -24,6 +24,8 @@ import {
   type PaymentStatus, type PaymentStamp, type MoneyColumn, type IncomeReportView,
 } from '@gam/shared'
 import { finGet as apiGet, finPost, openProtectedFile, useViewer, toast, toastError } from './adapter'
+// 10/17 (Nic): one spreadsheet writer for every books page that exports one.
+import { downloadCsv } from './common'
 // S633: tax + statement documents belong to ONE company; the picker renders
 // nothing for an account that owns a single one.
 import { EntityPicker, useEntities } from './EntityPicker'
@@ -59,24 +61,6 @@ const MONTHS = ['January','February','March','April','May','June','July','August
 const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 const COLS = moneyColumns()
 
-// ── Export helpers ────────────────────────────────────────────
-function downloadCsv(filename: string, header: string[], rows: (string | number | null | undefined)[][]) {
-  // 10/12: a field that starts like a formula is opened as one by a
-  // spreadsheet (a resident named "=HYPERLINK(…)"), so it reads as text.
-  const esc = (v: any) => {
-    const raw = v == null ? '' : String(v)
-    const s = typeof v === 'string' && /^[=+\-@\t\r]/.test(v) ? `'${raw}` : raw
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-  }
-  const csv = [header, ...rows].map(r => r.map(esc).join(',')).join('\r\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
 
 // Hide the app chrome + interactive controls when the browser prints / saves
 // to PDF, so a landlord gets a clean statement for their accountant. 10/12:

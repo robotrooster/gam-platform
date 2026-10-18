@@ -2,7 +2,7 @@ import { Router } from 'express'
 // 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
 import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
 import { z } from 'zod'
-import { collectedRentMtd, incomeCardFrom } from '../lib/rentCollected'
+import { collectedRentMtd, incomeCardFrom, rentHealthMtd } from '../lib/rentCollected'
 import {
   occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, MAINTENANCE_CATEGORY_LABEL,
   MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, MONEY_COLUMN_NOTE_LEDGER, MONTHLY_REPORT_MAX_EXTRA_EMAILS,
@@ -424,6 +424,18 @@ reportsRouter.get('/ledger-status', async (req, res, next) => {
 //                      Money billed = collected so far of this month's rent
 //   collectedMtdClearing — money still clearing, beside it (never inside)
 //   incomeCard       — the dashboard's income card, both ways (every line)
+//   rentHealth       — 10/17 (Nic): the dashboard's payment-health figure, the
+//                      SAME helper so the two cannot drift: this month's rent
+//                      bills invoiced against paid, bills on hold for work
+//                      trade out of both sides (lib/rentCollected
+//                      rentHealthMtd). Not collectedMtd divided by anything —
+//                      see that helper for why those are different questions.
+//                      Left out for a viewer who sees no grand total, like
+//                      `outstanding`: `owed` is the same KIND of claim — a
+//                      total of what everyone owes (decisions #25). It is not
+//                      the same money as `outstanding`, which counts every
+//                      open charge of every month while this is the month's
+//                      rent; see rentHealthMtd.
 //   outstanding      — sum of unsettled invoice amounts (pending + partial)
 //   occupancyRate    — round(100 × active / total) across landlord's units
 //   monthly[]        — last 6 months: charged / received / owed and the net
@@ -546,9 +558,12 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     // S642/S655: the dashboard's cards, from the same facts and the same rules
     // (lib/rentCollected), so Reports and the dashboard cannot disagree. Money
     // still clearing is its own figure beside what arrived.
-    const [rentCard, allCard] = await Promise.all([
+    const [rentCard, allCard, rentHealth] = await Promise.all([
       collectedRentMtd(landlordIds, scopedIds, { scope: 'rent', basis, cutoffs }),
       collectedRentMtd(landlordIds, scopedIds, { scope: 'all', basis, cutoffs }),
+      // 10/17 (Nic): the payment-health figure the dashboard shows, from the
+      // one helper — invoiced against paid, work trade out of both sides.
+      rentHealthMtd(landlordIds, scopedIds, { cutoffs }),
     ])
     const fullIncomeCard = incomeCardFrom(allCard, basis)
     // decisions #25: Money billed's collected / clearing / still owed add up to
@@ -688,7 +703,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
       ytdCollected,
       ytd,
       thisMonth,
-      ...(showOutstanding ? { outstanding } : {}),
+      ...(showOutstanding ? { outstanding, rentHealth } : {}),
       occupancyRate,
       occupiedUnits: active,
       totalUnits: total,

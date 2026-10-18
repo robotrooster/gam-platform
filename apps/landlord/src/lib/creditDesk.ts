@@ -1358,7 +1358,10 @@ export function tenantCreditHeadline(c: TenantCredit | null | undefined): string
 export const CREDIT_USE_RULE =
   // 10/6 (Nic): "a credit against the entire balance", not line by line.
   'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it. '
-  + 'Credit you give them is offered when they pay ("Use" or "Save it for later") and pays a bill by itself only when it covers that whole bill.'
+  // 10/15 (Nic): "money gets applied to the most outstanding balance first" —
+  // credit you give goes on the balance the same way, so none of it sits there
+  // while they owe. Only what is over the whole balance waits for a next bill.
+  + 'Credit you give them goes on their balance the same way, so credit never sits on an account while they still owe.'
 
 // ─── The Payments ledger (decisions #26, #29, #35.1, #36.A) ──────────────────
 

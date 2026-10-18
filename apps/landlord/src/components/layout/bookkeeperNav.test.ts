@@ -17,6 +17,11 @@ const PROPERTY_MONEY = ['/payments', '/rent-roll', '/income', '/reports', '/expe
 // the server lets each keep the company's categories (routes/expenses).
 const EVERY_BOOKKEEPER = [BOOKS_PATHS.categories]
 const COMPANY_WIDE_FINANCIALS = ['/bank-activity', '/payouts']
+// 10/17 (Nic): Sales & Tax — every item sold and every tax collected per agency.
+// A company document like the Books ledger pages (routes/booksTaxSales
+// refuseScopedStaff ledger), so it opens with either box and never with a
+// property cut alone.
+const LEDGER_FINANCIALS = ['/sales-tax']
 // 10/12 (Nic): the old Contractors address is a page (it opens Vendors on its
 // Contractors tab) but never a menu entry — contractors are vendors now.
 // 10/12 (Nic, L5): Transactions and Bills & AP retired for a landlord (money
@@ -52,7 +57,7 @@ describe('landlord portal navigation for a bookkeeper', () => {
     // routes/books.ts) — never "every property ticked".
     expect(sorted(paths({ role: 'bookkeeper', companyWide: false }))).toEqual(sorted([...PROPERTY_MONEY, ...EVERY_BOOKKEEPER]))
     expect(sorted(paths({ role: 'bookkeeper', companyWide: true })))
-      .toEqual(sorted([...PROPERTY_MONEY, ...COMPANY_WIDE_FINANCIALS, ...BOOKKEEPING]))
+      .toEqual(sorted([...PROPERTY_MONEY, ...COMPANY_WIDE_FINANCIALS, ...LEDGER_FINANCIALS, ...BOOKKEEPING]))
     // Every property ticked but no box: still not offered.
     expect(paths({ role: 'bookkeeper', allProperties: true } as any)).not.toContain('/bank-activity')
   })
@@ -69,13 +74,13 @@ describe('landlord portal navigation for a bookkeeper', () => {
     // 10/12 (Nic, ledger P9): closing a month is the company-wide box's too.
     const LEDGER = BOOKKEEPING.filter(p => p !== BOOKS_PATHS.cashFlow && p !== BOOKS_PATHS.ownerStatements && p !== BOOKS_PATHS.closeMonth)
     expect(sorted(paths({ role: 'bookkeeper', companyWide: false, ledger: true })))
-      .toEqual(sorted([...PROPERTY_MONEY, ...LEDGER]))
+      .toEqual(sorted([...PROPERTY_MONEY, ...LEDGER_FINANCIALS, ...LEDGER]))
     const side = sidebarNavItemsFor({ role: 'bookkeeper', ledger: true })
     expect(side.map(s => s.label)).toEqual(['Financials', 'Bookkeeping'])
     expect(side[1].to).toBe(BOOKS_PATHS.dashboard)
     // Company-wide holds the ledger too.
     expect(sorted(paths({ role: 'bookkeeper', companyWide: true, ledger: false })))
-      .toEqual(sorted([...PROPERTY_MONEY, ...COMPANY_WIDE_FINANCIALS, ...BOOKKEEPING]))
+      .toEqual(sorted([...PROPERTY_MONEY, ...COMPANY_WIDE_FINANCIALS, ...LEDGER_FINANCIALS, ...BOOKKEEPING]))
   })
 
   it('10/12 (Nic): Categories shows for every bookkeeper — no box ticked at all, property money only, or the ledger', () => {
@@ -86,8 +91,25 @@ describe('landlord portal navigation for a bookkeeper', () => {
   })
 
   it('a bookkeeper with no property ticked keeps the company-wide pages and no property money', () => {
+    // Sales & Tax stays: it is the ledger's, not the property cut's (the
+    // figures it shows are still only her properties' — routes/booksTaxSales).
     expect(sorted(paths({ role: 'bookkeeper', companyWide: true, propertyMoney: false })))
-      .toEqual(sorted([...COMPANY_WIDE_FINANCIALS, ...BOOKKEEPING]))
+      .toEqual(sorted([...COMPANY_WIDE_FINANCIALS, ...LEDGER_FINANCIALS, ...BOOKKEEPING]))
+  })
+
+  // 10/17 (review): the nav offered Sales & Tax to a bookkeeper the route then
+  // refused with a 403 — it carried `bookkeeper` with no box, so it showed on a
+  // property cut alone. It is a company document, so it needs a box.
+  it('10/17: Sales & Tax needs a box — a property cut alone is never offered it', () => {
+    expect(paths({ role: 'bookkeeper', companyWide: false, ledger: false })).not.toContain('/sales-tax')
+    expect(paths({ role: 'bookkeeper', permissions: { access_level: 'read_only' } })).not.toContain('/sales-tax')
+    for (const u of [{ ledger: true }, { companyWide: true }, { companyWide: true, propertyMoney: false }]) {
+      expect(paths({ role: 'bookkeeper', ...u }), JSON.stringify(u)).toContain('/sales-tax')
+    }
+    // The owner always has it.
+    expect(paths({ role: 'landlord' })).toContain('/sales-tax')
+    // Staff never do.
+    expect(paths({ role: 'onsite_manager', permissions: { 'payments.view_all': true } })).not.toContain('/sales-tax')
   })
 
   // 10/11: a bookkeeper lands on Money in. 10/13 review: Payments and the Rent

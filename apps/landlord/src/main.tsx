@@ -88,6 +88,8 @@ import { LotRentPage } from './pages/LotRentPage'
 import { ExpensesPage } from './financials/ExpensesPage'
 import { IncomePage } from './financials/IncomePage'
 import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+// 10/17 (Nic): what was sold item by item, and each tax collected per agency.
+import { SalesTaxPage } from './financials/SalesTaxPage'
 import { BankActivityPage } from './financials/BankActivityPage'
 import { PayoutsPage } from './financials/PayoutsPage'
 import { MyManagersPage } from './pages/MyManagersPage'
@@ -351,6 +353,7 @@ function App() {
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
                 <Route path="maintenance-costs" element={<MaintenanceCostsPage />} />
+                <Route path="sales-tax"      element={<SalesTaxPage />} />
                 <Route path="bank-activity"  element={<BankActivityPage />} />
                 <Route path="payouts"        element={<PayoutsPage />} />
                 <Route path="my-managers"    element={<MyManagersPage />} />

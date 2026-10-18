@@ -148,3 +148,27 @@ export function PageHead({ title, subtitle }: { title: string; subtitle: string 
 export function Notice({ children }: { children: ReactNode }) {
   return <div className="card fin-notice">{children}</div>
 }
+
+// ── Export ──────────────────────────────────────────────────────────────
+/**
+ * A spreadsheet of `rows` under `header`, saved to the viewer's device. 10/17:
+ * moved here from the Reports page — a Sales & tax breakdown is attached to a
+ * tax filing, so both pages save a spreadsheet the one same way.
+ */
+export function downloadCsv(filename: string, header: string[], rows: (string | number | null | undefined)[][]) {
+  // 10/12: a field that starts like a formula is opened as one by a
+  // spreadsheet (a resident named "=HYPERLINK(…)"), so it reads as text.
+  const esc = (v: any) => {
+    const raw = v == null ? '' : String(v)
+    const s = typeof v === 'string' && /^[=+\-@\t\r]/.test(v) ? `'${raw}` : raw
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  const csv = [header, ...rows].map(r => r.map(esc).join(',')).join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}

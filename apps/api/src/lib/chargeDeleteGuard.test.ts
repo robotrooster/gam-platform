@@ -202,8 +202,16 @@ describe('taking unpaid charges off keeps every credit record', () => {
     await db.query(`UPDATE unit_bookings SET check_out = '2026-11-15', nights = 97 WHERE id = $1`, [booking])
     await syncLeaseWithBookingDates(booking)
     expect(await voidOf(december)).toEqual({ status: 'voided', void_reason: STAY_SHORTENED_RENT_VOID_REASON })
-    expect(await usesOf(sCredit)).toEqual([{ status: 'released', payment_id: december }])
-    expect(await remaining(sCredit)).toBe(100)
+    // The record of the released hold survives the void. 10/15 (Nic): the
+    // freed $100 then goes on the oldest month of the stay that is still open
+    // — "money gets applied to the most outstanding balance first" — so it is
+    // never left sitting beside unpaid rent.
+    const sUses = await usesOf(sCredit)
+    expect(sUses).toContainEqual({ status: 'released', payment_id: december })
+    const spent = sUses.filter((u: any) => u.status === 'applied')
+    expect(spent).toHaveLength(1)
+    expect(spent[0].payment_id).not.toBe(december)
+    expect(await remaining(sCredit)).toBe(0)
   })
 
   it('the database refuses to delete a charge a payment has set credit aside on', async () => {

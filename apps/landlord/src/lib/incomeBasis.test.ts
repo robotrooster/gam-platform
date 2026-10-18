@@ -118,12 +118,21 @@ describe('a bill\'s due day in American words', () => {
 })
 
 describe('the property-health card', () => {
-  it('rates this month\'s rent bills paid, money still clearing counted as paid', () => {
-    expect(rentBillsPaidRate({ amount: 1000, collected: 700, clearing: 200 })).toBeCloseTo(0.9)
+  // 10/17 (Nic): "the property health matches what was invoiced and what was
+  // paid." The API hands over both figures with work trade already out of each.
+  it('rates this month\'s rent bills: paid over invoiced', () => {
+    expect(rentBillsPaidRate({ invoiced: 1000, paid: 900 })).toBeCloseTo(0.9)
   })
 
-  it('has no rate when nothing is billed yet', () => {
-    expect(rentBillsPaidRate({ amount: 0, collected: 0, clearing: 0 })).toBeNull()
+  // Mountain View's October, measured 10/16: $18,502 invoiced once the seven
+  // bills on hold for work trade are out, $16,441 of it settled.
+  it('reads 89% for Mountain View, not the 67% the Money billed figures gave', () => {
+    const pct = (r: number | null) => r == null ? null : Math.round(r * 100)
+    expect(pct(rentBillsPaidRate({ invoiced: 18502, paid: 16441, owed: 2061, workTradeHeld: 3478 }))).toBe(89)
+  })
+
+  it('has no rate when nothing is invoiced yet', () => {
+    expect(rentBillsPaidRate({ invoiced: 0, paid: 0 })).toBeNull()
     expect(rentBillsPaidRate(undefined)).toBeNull()
   })
 

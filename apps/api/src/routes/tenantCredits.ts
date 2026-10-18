@@ -18,12 +18,19 @@ import {
 // — the tenant simply owes less, so the landlord receives less rent, and the
 // credit is never counted as the landlord's income (payments.issued_credit_amount).
 //
-// S655 (Nic, 10/2): a credit pays a bill BY ITSELF only when it covers the
-// whole bill. Issuing one runs that check the moment it is saved: a $460
-// credit against a $460 bill pays it, nothing charged; a $300 credit against
-// $1,000 settles nothing and sits on the account, and the tenant chooses at
-// payment ("Use all $300" or "Save it for later"). Every spend is a record in
-// the credit ledger (services/creditUse) — this file never touches a balance.
+// S655 (Nic, 10/2): a credit that covers the whole bill pays it the moment it
+// is saved — a $460 credit against a $460 bill, nothing charged.
+//
+// 10/15 (Nic): a credit that covers LESS no longer sits on the account either.
+// "If somebody has an outstanding balance, why would they be able to add credit
+// for future bills? Money gets applied to the most outstanding balance first.
+// Somebody can't go put $1,000 credit and not pay a $2,000 existing bill." So a
+// $300 credit against a $1,000 bill goes on that balance, oldest bill first,
+// and only what is over the whole balance stays as credit. Issuing is still the
+// landlord's call — he is choosing to give money away — but the box tells him
+// what is owed first (GET /owed), so he is never issuing blind to a balance.
+// Every spend is a record in the credit ledger (services/creditUse) — this file
+// never touches a balance.
 //
 // Authority: the caller must manage the landlord that owns the lease
 // (owner or scoped property manager). GAM never computes state caps — the
@@ -69,6 +76,54 @@ async function householdCredit(tenantId: string, landlordId: string): Promise<{ 
   }
 }
 
+/**
+ * GET /api/tenant-credits/owed?leaseId= — what the Issue-credit box says before
+ * anything is given away (10/15, Nic: never issuing credit blind to a $2,000
+ * balance). `spaceOwed` is what THIS space still owes that a credit may pay —
+ * where the credit will land, oldest bill first. `householdOwed` is the same
+ * across every space this person holds with this company (one person + one
+ * company = one balance): a credit issued on this space can only pay this
+ * space's bills, so the box says when the rest of the balance is elsewhere.
+ * Rent, utilities, late fees and fees only: a home payment, a GAM fee and a
+ * deposit are never credit's to pay, so they are not counted.
+ */
+tenantCreditsRouter.get('/owed', async (req, res, next) => {
+  try {
+    const leaseId = typeof req.query.leaseId === 'string' ? req.query.leaseId : null
+    if (!leaseId || !z.string().uuid().safeParse(leaseId).success) throw new AppError(400, 'leaseId is required')
+    const lease = await leaseForLandlord(leaseId, req.user)
+
+    const client = await getClient()
+    try {
+      const q = await householdQuote(client, { tenantId: lease.tenant_id, landlordId: lease.landlord_id })
+      const owedOn = (ls: typeof q.leases) => ls.reduce((s, l) => s + l.rows
+        .filter(r => r.required && r.creditEligible)
+        .reduce((x, r) => x + cents(r.amount) - cents(r.appliedOnRow), 0), 0)
+      const spaceOwed = Math.max(0, owedOn(q.leases.filter(l => l.leaseId === lease.id))) / 100
+      const householdOwed = Math.max(0, owedOn(q.leases)) / 100
+      const elsewhere = Math.max(0, Math.round((householdOwed - spaceOwed) * 100)) / 100
+      const space = (await queryOne<{ unit_number: string | null }>(
+        `SELECT un.unit_number FROM leases l LEFT JOIN units un ON un.id = l.unit_id WHERE l.id = $1`,
+        [lease.id]))?.unit_number
+      const who = space ? space : 'This space'
+      const message = spaceOwed > 0
+        ? `${who} still owes ${money(spaceOwed)}. A credit goes on that balance, oldest bill first — only what is over it stays on their account.`
+          + (elsewhere > 0 ? ` They owe another ${money(elsewhere)} on their other spaces; a credit issued here cannot pay that.` : '')
+          // Review fix (10/17): since the credit lands on the balance at once,
+          // a wrong amount is not undone by voiding it — the box says so
+          // before he gives anything away, in the same plain words.
+          + ' What goes on the balance is paid: voiding the credit later takes back only what is still on their account.'
+        : elsewhere > 0
+          ? `${who} owes nothing right now, but they still owe ${money(elsewhere)} on their other spaces. A credit issued here can only pay ${who}'s bills.`
+          : `${who} owes nothing right now, so the credit waits on their account for their next bill.`
+      res.json({
+        success: true,
+        data: { spaceOwed, householdOwed, creditOnAccount: q.totals.creditOnFile, message },
+      })
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
 // POST /api/tenant-credits — issue a credit against a lease.
 tenantCreditsRouter.post('/', async (req, res, next) => {
   try {
@@ -92,8 +147,9 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
     // $389.55, her landlord saw settled charges no money arrived for, and she
     // was still asked for the full rent. The credit is created whole, under the
     // household lock (every writer of this household's money takes it), and
-    // only the whole-bill rule — after the commit, in its own transaction —
-    // may spend it.
+    // only the one credit service — after the commit, in its own transaction —
+    // may spend it: the whole bill if it covers it, else against the whole
+    // balance oldest bill first (10/15), never line by line.
     const client = await getClient()
     let creditId: string
     try {
@@ -109,34 +165,47 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
     finally { client.release() }
 
     // Decision 1 (Nic, 10/2): a credit that covers the whole bill pays it now,
-    // nothing charged and no "$0 beside an open bill". Never throws: the
-    // credit is already saved; a failure here only leaves the bill open.
+    // nothing charged and no "$0 beside an open bill". 10/15 (Nic): a credit
+    // that covers less goes on the open balance oldest bill first instead of
+    // waiting. Never throws: the credit is already saved; a failure here only
+    // leaves the bill open.
     const wb = await runWholeBillCheckAfterCommit({ tenantId: lease.tenant_id, landlordId: lease.landlord_id })
     // Review fix (10/6): only a bill the whole-bill rule settled is "paid by the
-    // credit". Money they paid ahead going on the balance (the 10/6 draw, whole
-    // or in part) is its own figure, never counted as this credit.
+    // credit". Credit going on part of the balance (the draw) is its own figure.
     const wholeBill = wb ? wb.leases.filter(l => l.kind === 'whole_bill' && l.settledIds.length > 0) : []
     const paidCents = wholeBill.reduce((s, l) => s + cents(l.creditUsed), 0)
     const paidBill = wholeBill.length > 0
       ? { charges: wholeBill.reduce((n, l) => n + l.settledIds.length, 0), creditUsed: paidCents / 100 }
       : null
-    const paidAheadCents = wb ? wb.leases.filter(l => l.kind === 'paid_ahead_draw').reduce((s, l) => s + cents(l.creditUsed), 0) : 0
+    const drawnCents = wb ? wb.leases.filter(l => l.kind === 'balance_draw').reduce((s, l) => s + cents(l.creditUsed), 0) : 0
 
     const row = await queryOne<any>(
       `SELECT id, amount_original, amount_remaining, category, reason, status, created_at
          FROM tenant_credits WHERE id = $1`, [creditId])
     const credit = await householdCredit(lease.tenant_id, lease.landlord_id)
-    const aheadSaid = paidAheadCents > 0 ? ` Money they paid ahead also went on their balance (${money(paidAheadCents / 100)}).` : ''
+    // What of THIS credit went on the balance (the ledger moved its remaining
+    // figure); the rest of the draw was credit already on the account.
+    const spentCents = Math.max(0, cents(row?.amount_original) - cents(row?.amount_remaining))
+    const otherCents = Math.max(0, drawnCents - spentCents)
+    const otherSaid = otherCents > 0
+      ? ` Credit already on their account also went on their balance (${money(otherCents / 100)}).` : ''
+    const leftSaid = credit.onAccount > 0
+      ? `${money(credit.onAccount)} of credit is left on their account.`
+      : 'No credit is left on their account.'
     const message = (paidBill
-      ? `The credit paid the tenant's whole open bill (${money(paidBill.creditUsed)}). ${money(credit.onAccount)} of credit is left on their account.`
-      : `The credit is on the tenant's account: ${money(credit.onAccount)} in all. It pays a bill by itself only when it covers the whole bill; until then the tenant can use it when they pay.`)
-      + aheadSaid
+      ? `The credit paid the tenant's whole open bill (${money(paidBill.creditUsed)}). ${leftSaid}`
+      : spentCents > 0
+        ? `${money(spentCents / 100)} of the credit went on their open balance, oldest bill first. ${leftSaid}`
+        : `The credit is on the tenant's account: ${money(credit.onAccount)} in all. They owe nothing it can pay right now, so it waits for their next bill.`)
+      + otherSaid
 
     res.status(201).json({
       success: true,
       data: {
         ...row,
         paidBill,
+        /** 10/15: what of this credit went straight onto the open balance. */
+        appliedToBalance: spentCents / 100,
         creditOnAccount: credit.onAccount,
         creditAvailable: credit.usableNow,
         message,
@@ -216,12 +285,13 @@ tenantCreditsRouter.post('/:id/void', async (req, res, next) => {
 
     const client = await getClient()
     let left: number
+    let spent = 0
     try {
       await client.query('BEGIN')
       await lockHousehold(client, credit.tenant_id, credit.landlord_id)
       // Fresh, under the lock: a payment may have used or held it since.
-      const cur = (await client.query<{ status: string; amount_remaining: string }>(
-        `SELECT status, amount_remaining::text FROM tenant_credits WHERE id = $1 FOR UPDATE`, [credit.id])).rows[0]
+      const cur = (await client.query<{ status: string; amount_remaining: string; amount_original: string }>(
+        `SELECT status, amount_remaining::text, amount_original::text FROM tenant_credits WHERE id = $1 FOR UPDATE`, [credit.id])).rows[0]
       if (cur.status === 'void') throw new AppError(400, 'This credit is already void.')
       const held = (await client.query<{ held: string }>(
         `SELECT COALESCE(SUM(amount), 0)::text AS held FROM credit_uses
@@ -236,16 +306,30 @@ tenantCreditsRouter.post('/:id/void', async (req, res, next) => {
         [credit.id])
       await client.query('COMMIT')
       left = cents(cur.amount_remaining) / 100
+      spent = Math.max(0, cents(cur.amount_original) - cents(cur.amount_remaining)) / 100
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
     finally { client.release() }
 
+    // Review fix (10/17): since 10/15 a credit goes on the open balance the
+    // moment it is issued, so a void often finds nothing left — and "Nothing
+    // was left on this credit" read as if the void had undone it. Say what the
+    // credit already paid and that it stays paid: a void takes back only what
+    // is still on the account, and the way back from a wrong amount is to bill
+    // that money again.
+    const spentSaid = spent > 0
+      ? ` ${money(spent)} of it had already gone on their open balance, and that stays paid — bill it again if it should not have.`
+      : ''
     res.json({
       success: true,
       data: {
         id: credit.id, status: 'void',
-        message: left > 0
+        /** 10/17: what of it was already spent before the void (never taken back). */
+        alreadyUsed: spent,
+        message: (left > 0
           ? `Voided. The ${money(left)} left on this credit can no longer be used.`
-          : 'Voided. Nothing was left on this credit.',
+          : spent > 0
+            ? 'Voided, but there was nothing left to take back.'
+            : 'Voided. Nothing was left on this credit.') + spentSaid,
       },
     })
   } catch (e) { next(e) }

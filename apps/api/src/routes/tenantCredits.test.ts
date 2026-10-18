@@ -111,6 +111,27 @@ describe('tenant credits — API', () => {
     expect(again.body.error).toBe('This credit is already void.')
   })
 
+  // Review fix (10/17): since 10/15 the credit goes on the balance the moment
+  // it is issued, so a void finds nothing left. It must not read as if the
+  // credit had been undone — a wrong amount comes back by billing it again.
+  it('voiding a credit the balance already took says so, and does not claim it was taken back', async () => {
+    const f = await seed()
+    const rent = await rentRow(f, 1000)
+    const issue = await request(app).post('/api/tenant-credits').set(auth(f.tokenA))
+      .send({ leaseId: f.leaseA, amount: 500 })
+    expect(issue.body.data.appliedToBalance).toBe(500)
+    const v = await request(app).post(`/api/tenant-credits/${issue.body.data.id}/void`).set(auth(f.tokenA))
+    expect(v.status).toBe(200)
+    expect(v.body.data.alreadyUsed).toBe(500)
+    expect(v.body.data.message).toBe(
+      'Voided, but there was nothing left to take back. $500.00 of it had already gone on their open balance, '
+      + 'and that stays paid — bill it again if it should not have.')
+    // The $500 stays on the rent row: a void takes back only what is left.
+    expect((await db.query<{ a: string }>(
+      `SELECT SUM(amount)::text AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`, [rent])).rows[0].a)
+      .toBe('500.00')
+  })
+
   it('a credit covering the whole open bill settles it', async () => {
     const f = await seed()
     const rent = await rentRow(f, 1000)
@@ -128,19 +149,53 @@ describe('tenant credits — API', () => {
     expect(Number(left.rows[0].r)).toBe(0)
   })
 
-  it('a smaller credit settles nothing and shows as available', async () => {
+  // 10/15 (Nic): "Somebody can't go put $1,000 credit and not pay a $2,000
+  // existing bill." A credit smaller than the bill goes on that bill now; the
+  // rent row stays open for the rest and nothing is left on the account.
+  it('a smaller credit goes on the open bill, the rest left owed, nothing left on the account', async () => {
     const f = await seed()
     const rent = await rentRow(f, 1000)
     const issue = await request(app).post('/api/tenant-credits').set(auth(f.tokenA))
       .send({ leaseId: f.leaseA, amount: 300 })
     expect(issue.status).toBe(201)
     expect(issue.body.data.paidBill).toBeNull()
-    expect(issue.body.data.creditOnAccount).toBe(300)
-    expect(issue.body.data.creditAvailable).toBe(300)
-    expect(issue.body.data.message).toMatch(/pays a bill by itself only when it covers the whole bill/)
-    expect((await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [rent])).rows[0].status).toBe('pending')
-    expect(Number(issue.body.data.amount_remaining)).toBe(300)
-    expect((await db.query(`SELECT 1 FROM credit_uses`)).rows).toHaveLength(0)
+    expect(issue.body.data.appliedToBalance).toBe(300)
+    expect(issue.body.data.creditOnAccount).toBe(0)
+    expect(issue.body.data.creditAvailable).toBe(0)
+    expect(issue.body.data.message).toMatch(/\$300\.00 of the credit went on their open balance, oldest bill first/)
+    const row = await db.query<{ status: string; issued: string }>(
+      `SELECT status, issued_credit_amount::text AS issued FROM payments WHERE id = $1`, [rent])
+    // The row is never cut in two: it stays open for the $700 money still owes.
+    expect(row.rows[0].status).toBe('pending')
+    expect(Number(row.rows[0].issued)).toBe(300)
+    expect((await db.query<{ a: string }>(
+      `SELECT SUM(amount)::text AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`, [rent])).rows[0].a)
+      .toBe('300.00')
+  })
+
+  // The box tells the landlord what is owed BEFORE he gives anything away.
+  it('the box says what is still owed, and says so plainly when nothing is', async () => {
+    const f = await seed()
+    await rentRow(f, 1000)
+    const owed = await request(app).get(`/api/tenant-credits/owed?leaseId=${f.leaseA}`).set(auth(f.tokenA))
+    expect(owed.status).toBe(200)
+    expect(owed.body.data.spaceOwed).toBe(1000)
+    expect(owed.body.data.householdOwed).toBe(1000)
+    expect(owed.body.data.message).toMatch(/still owes \$1000\.00\. A credit goes on that balance, oldest bill first/)
+    // And that it is a one-way door: a void later takes back only the leftover.
+    expect(owed.body.data.message).toMatch(
+      /What goes on the balance is paid: voiding the credit later takes back only what is still on their account\./)
+    // Paid off, the same box says there is nothing for a credit to pay.
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE lease_id = $1`, [f.leaseA])
+    const clear = await request(app).get(`/api/tenant-credits/owed?leaseId=${f.leaseA}`).set(auth(f.tokenA))
+    expect(clear.body.data.spaceOwed).toBe(0)
+    expect(clear.body.data.message).toMatch(/owes nothing right now, so the credit waits on their account/)
+  })
+
+  it('the box is only for a lease the caller manages', async () => {
+    const f = await seed()
+    const other = await request(app).get(`/api/tenant-credits/owed?leaseId=${f.leaseA}`).set(auth(f.tokenB))
+    expect(other.status).toBe(403)
   })
 
   it('a credit cannot be voided while a payment holds it', async () => {
@@ -242,9 +297,14 @@ describe('tenant credits — consumption at invoice generation', () => {
   // This used to assert the SPLIT: a $300 credit carved the $1,000 rent into a
   // $300 settled slice and a $700 pending remainder, so raw pending came to
   // $700. The tenant still owes $700 — that answer was never in dispute — but
-  // it now comes from netting a whole $1,000 charge against a $300 credit
-  // sitting on the account, not from rewriting the rent row.
-  it('S637: a $300 credit on $1000 rent → charge stays whole, $300 stays on account, net owed $700', async () => {
+  // it now comes from netting a whole $1,000 charge against the $300 credit
+  // recorded on it, not from rewriting the rent row.
+  //
+  // 10/15 (Nic): the credit no longer waits on the account for the tenant to
+  // choose — "money gets applied to the most outstanding balance first" — so
+  // the bill run puts it on the rent and the credit reads $0. The S637 rule it
+  // still keeps: the ROW is whole. No $300 slice, no remainder row.
+  it('S637: a $300 credit on $1000 rent → charge stays whole, the $300 goes on it, net owed $700', async () => {
     const f = await seed()
     await issueCredit(f.leaseA, f.tenantA, f.landlordAId, 300)
     await generateInvoices(NOW)
@@ -255,9 +315,13 @@ describe('tenant credits — consumption at invoice generation', () => {
       `SELECT COUNT(*)::text AS n FROM payments WHERE lease_id=$1 AND is_remainder = TRUE`, [f.leaseA])
     expect(Number(charges.rows[0].n)).toBe(0)
 
-    // The credit is still owed to the tenant, in full.
+    // The credit went on the balance: none of it is left sitting.
     const { rows } = await db.query('SELECT amount_remaining FROM tenant_credits WHERE lease_id=$1', [f.leaseA])
-    expect(Number(rows[0].amount_remaining)).toBe(300)
+    expect(Number(rows[0].amount_remaining)).toBe(0)
+    const on = await db.query<{ a: string }>(
+      `SELECT COALESCE(SUM(u.amount),0)::text AS a FROM credit_uses u
+        WHERE u.lease_id = $1 AND u.status = 'applied'`, [f.leaseA])
+    expect(on.rows[0].a).toBe('300.00')
 
     // And the number that matters — what they actually owe — is $700.
     expect(await pendingOwed(f.leaseA) - 300).toBe(700)

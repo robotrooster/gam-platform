@@ -780,9 +780,16 @@ describe('Master Schedule → lease sync', () => {
     expect(stripeCancel).toHaveBeenCalledWith('pi_oct_only')
     expect((await db.query<any>(`SELECT amount::float AS a, status, next_retry_at FROM payments WHERE id=$1`, [oct])).rows[0])
       .toEqual({ a: 429.03, status: 'failed', next_retry_at: null })
-    expect((await db.query<any>(`SELECT status, release_reason FROM credit_uses`)).rows)
-      .toEqual([{ status: 'released', release_reason: 'superseded' }])
-    expect(Number((await db.query<any>(`SELECT amount_remaining FROM tenant_credits WHERE id=$1`, [tc])).rows[0].amount_remaining)).toBe(50)
+    // The pull's hold is given back first (superseded). 10/15 (Nic): the
+    // freed $50 then goes straight on the re-priced month — "money gets
+    // applied to the most outstanding balance first" — so the row keeps $50 of
+    // credit and money owes $379.03 of the $429.03.
+    expect((await db.query<any>(`SELECT status, release_reason FROM credit_uses ORDER BY held_at`)).rows)
+      .toEqual([
+        { status: 'released', release_reason: 'superseded' },
+        { status: 'applied', release_reason: null },
+      ])
+    expect(Number((await db.query<any>(`SELECT amount_remaining FROM tenant_credits WHERE id=$1`, [tc])).rows[0].amount_remaining)).toBe(0)
     // The tenant: why, the new amount, and Pay now.
     const userId = (await db.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [s.tenantId])).rows[0].user_id
     const tn = (await db.query<any>(`SELECT body, data FROM notifications WHERE user_id=$1 AND type='stay_shortened_retry_canceled'`, [userId])).rows

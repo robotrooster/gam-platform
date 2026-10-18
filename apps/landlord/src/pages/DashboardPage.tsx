@@ -11,7 +11,7 @@ import { PropertySelect } from '../components/ListControls'
 import {
   moneyCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
   activeCategories, categoryLabel, categoryThree, sumThree, reportErrorText, monthToDate,
-  type IncomeCardData, type CategoryRow,
+  type IncomeCardData, type CategoryRow, type RentHealthData,
 } from '../lib/incomeBasis'
 import { MONEY_COLUMN_LABEL } from '@gam/shared'
 import '../styles/reports-basis.css'
@@ -60,11 +60,23 @@ interface DashStats {
   platformFeeByProperty?: { propertyId: string; name: string; fee: number }[]
   /** S655: the income card, both ways. 10/12: shown side by side (Charged / Received / Owed). */
   incomeCard?: IncomeCardData
-  /** S655: the rent card, both ways (rent only). */
+  /**
+   * S655: the rent card, both ways (rent only) — the twin of what Reports
+   * shows as collected this month. 10/17: the health card no longer divides
+   * these (see rentHealth); they answer "what was charged and what arrived".
+   */
   rentCard?: {
     received: { amount: number; clearing: number }
     billed: { amount: number; collected: number; clearing: number; stillOwed: number }
   }
+  /**
+   * 10/17 (Nic): what the payment-health percentage reads — this month's rent
+   * bills invoiced against paid, bills on hold for work trade left out of both
+   * sides, a bill paid once settled whatever settled it. Its `owed` is this
+   * month's RENT left to collect, which is NOT the Outstanding card's figure
+   * (every open charge, every month) — the note under the card says so.
+   */
+  rentHealth?: RentHealthData
   /** S655 (decision #4): this month's income by category — the property report's own totals. */
   propertyHealth?: {
     period: string
@@ -457,7 +469,7 @@ export function DashboardPage() {
             months of rent collected (taller beat = stronger month). */}
         {!loadFailed && <PropertyHealthMonitor
           months={trendData}
-          rentBilled={stats?.rentCard?.billed}
+          health={stats?.rentHealth}
           thisMonth={stats?.propertyHealth}
           stale={isPreviousData}
         />}
@@ -741,9 +753,10 @@ function PmCutThisMonthCard() {
 // S655 (decision #4): under the trace, this month's income by category — the
 // SAME totals the property report shows for the same month. 10/12 (Nic):
 // Charged, Received and Owed side by side.
-function PropertyHealthMonitor({ months, rentBilled, thisMonth, stale }: {
+function PropertyHealthMonitor({ months, health, thisMonth, stale }: {
   months: { month: string; revenue: number; rentRevenue?: number; otherRevenue?: number }[]
-  rentBilled?: { amount: number; collected: number; clearing: number; stillOwed: number }
+  /** 10/17: this month's rent bills, invoiced against paid (see DashStats.rentHealth). */
+  health?: RentHealthData
   thisMonth?: DashStats['propertyHealth']
   /** The last answer, still up while a new property loads: dimmed, like the KPI grid. */
   stale?: boolean
@@ -777,13 +790,17 @@ function PropertyHealthMonitor({ months, rentBilled, thisMonth, stale }: {
   })
   const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
 
-  // Health = how much of THIS MONTH'S RENT BILLS is paid (money still
-  // clearing counts — the tenant has paid). S655: read off the bills, not the
-  // contracted rent roll, and the same under either switch: "is rent getting
-  // paid" is a question about the bills. Under Money received, a bill paid by
-  // money that arrived last month (Todd) is paid, not missing. Red → green →
+  // Health = how much of THIS MONTH'S RENT BILLS is paid. S655: read off the
+  // bills, not the contracted rent roll — "is rent getting paid" is a question
+  // about the bills. 10/17 (Nic): "the property health matches what was
+  // invoiced and what was paid. work trade isnt billed until a shortfall so it
+  // shouldnt apply here unless an invoice generates." So it divides paid by
+  // invoiced — rent on hold for work trade out of both sides, and a bill paid once
+  // settled whatever settled it (money, money still clearing at the bank, an
+  // account credit, money paid ahead) — instead of the Money billed figures,
+  // which read held rent as owed and credit-paid rent as unpaid. Red → green →
   // gold (no amber — it'd read as the gold at a glance).
-  const rate = rentBillsPaidRate(rentBilled)
+  const rate = rentBillsPaidRate(health)
   const pct = rate == null ? null : Math.round(rate * 100)
   const hs = healthStatus(rate)
   const status = {
@@ -870,11 +887,20 @@ function PropertyHealthMonitor({ months, rentBilled, thisMonth, stale }: {
           {data.map((m, i) => <span key={i}>{m.month}</span>)}
         </div>
       </div>
-      {rentBilled && rentBilled.amount > 0 && (
+      {/* 10/17: the parts of the percentage, so it can be checked by eye. It
+          names THIS MONTH'S RENT on purpose: the Outstanding card above counts
+          every open charge of every month, so the two are different numbers
+          answering different questions and must not read as one claim.
+          Work trade is named without a figure — S650 keeps work-trade balances
+          off these cards, and Nic's rule is only that it stays out until an
+          invoice really generates. */}
+      {health && Number(health.invoiced) > 0 && (
         <div className="phm-health-note">
-          {fmt(rentBilled.collected)} of {fmt(rentBilled.amount)} in rent bills paid this month
-          {rentBilled.clearing ? `, ${fmt(rentBilled.clearing)} still clearing` : ''}
-          {rentBilled.stillOwed ? `, ${fmt(rentBilled.stillOwed)} still owed` : ''}.
+          {fmt(health.paid)} of {fmt(health.invoiced)} in this month's rent bills paid
+          {Number(health.owed) ? `, ${fmt(health.owed)} of it left to collect` : ''}.
+          {Number(health.workTradeHeld)
+            ? ' Rent covered by work trade is not counted here — it is not billed unless the hours fall short.'
+            : ''}
         </div>
       )}
       {(cats.length > 0 || otherLines.length > 0) && (

@@ -74,7 +74,7 @@ async function seed() {
     await c.query('COMMIT')
     const token = jwt.sign({ userId: a.userId, role: 'landlord', email: 'a@t.dev', profileId: a.landlordId, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
-    return { meter, unit, gone, mover, foreign, token, propertyId: prop, landlordId: a.landlordId }
+    return { meter, unit, gone, mover, foreign, token, propertyId: prop, landlordId: a.landlordId, userId: a.userId }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
@@ -118,7 +118,12 @@ describe('a move-out read names whose move-out it is', () => {
   it('the response stays blind: no reading values come back', async () => {
     const f = await seed()
     const r = await readOut(f, { leaseId: f.mover })
-    expect(JSON.stringify(r.body)).not.toMatch(/1100|1000/)
+    // 10/17: this read `JSON.stringify(r.body)` for the text "1100" or "1000",
+    // the same substring-in-an-id trap the meter-list check below was fixed for
+    // on 10/15 — an id like …a1000f… is not a leaked reading. Exact, per field.
+    const values = leakedValues(r.body)
+    expect(values).not.toContain('1100')
+    expect(values).not.toContain('1000')
   })
 })
 
@@ -158,12 +163,16 @@ describe('a meter reader reads blind', () => {
   }
   const meters = (token: string, propertyId: string) =>
     request(buildApp()).get(`/api/utility/meters?propertyId=${propertyId}`).set('Authorization', `Bearer ${token}`)
-  async function withOpeningRead(f: { meter: string }) {
+  // 10/17: the opening read used to be stamped `(SELECT user_id FROM landlords
+  // LIMIT 1)` — an unordered pick over every landlord in the database, which is
+  // this seed's OTHER company as often as its own. It is the owner's read, so
+  // it says so.
+  async function withOpeningRead(f: { meter: string; userId: string }) {
     await db.query(`UPDATE utility_meters SET base_fee = 3 WHERE id = $1`, [f.meter])
     await db.query(
       `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
-       VALUES ($1, CURRENT_DATE - 60, 777, date_trunc('month', CURRENT_DATE - 60)::date,
-               (SELECT user_id FROM landlords LIMIT 1), 'baseline')`, [f.meter])
+       VALUES ($1, CURRENT_DATE - 60, 777, date_trunc('month', CURRENT_DATE - 60)::date, $2, 'baseline')`,
+      [f.meter, f.userId])
   }
 
   it('master bills are owner-only: a meter reader gets 403, the owner gets the list', async () => {

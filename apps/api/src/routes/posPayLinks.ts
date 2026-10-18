@@ -22,7 +22,7 @@ import type { PoolClient } from 'pg'
 import crypto from 'crypto'
 import QRCode from 'qrcode'
 import { z } from 'zod'
-import { cardFeeSplit, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
+import { cardFeeSplit, isNamedAgencyTax, scaleNamedTaxes, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
 import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -251,6 +251,24 @@ export async function linkStayOf(q: Q, link: any): Promise<LinkStay | null> {
            qty: mine.reduce((n: number, l: any) => n + (Number(l.qty) || 0), 0), price: Number(mine[0]?.price) || 0 }
 }
 
+/**
+ * 10/17 (Nic): is what this link SELLS a stay? Read from the items, so it
+ * answers for a link that holds no reservation — which is the whole point of
+ * asking (linkNotPayable: a link selling site rent with nothing on the schedule
+ * behind it is refused rather than charged). linkStayOf above cannot answer it,
+ * because it needs the booking that this case is missing.
+ */
+export async function linkCartIsAStay(q: Q, link: any): Promise<boolean> {
+  const ids = (Array.isArray(link?.items) ? link.items : [])
+    .map((i: any) => (typeof i?.id === 'string' ? i.id.trim().toLowerCase() : ''))
+    .filter((x: string) => /^[0-9a-f-]{36}$/.test(x))
+  if (!ids.length) return false
+  const { rows } = await q.query(
+    `SELECT 1 FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL LIMIT 1`,
+    [[...new Set<string>(ids)], link.landlord_id])
+  return rows.length > 0
+}
+
 /** How many of the link's stay these cart lines keep. */
 export function stayQtyIn(items: any[], itemId: string): number {
   return (Array.isArray(items) ? items : [])
@@ -265,6 +283,26 @@ const nightsWord = (n: number) => `${n} night${n === 1 ? '' : 's'}`
 /** "7 nights at site RV 07 (May 1 → May 8)" */
 export function reservationWhat(due: Pick<ReservationDue, 'nights' | 'unitNumber' | 'checkIn' | 'checkOut'>): string {
   return `${nightsWord(due.nights)} at site ${due.unitNumber ?? '—'} (${shortDay(due.checkIn)} → ${shortDay(due.checkOut)})`
+}
+
+/**
+ * 10/17 (Nic) — THE SAME STAY, SAID TO THE GUEST: "7 nights (May 1 → May 8)".
+ *
+ * "no site details given to the customer until morning of arrival." The site is
+ * left out on purpose, and not only for politeness: a guest who was told RV 14
+ * has been promised RV 14, and the park then cannot move them to free the
+ * pull-through a 40-footer needs. Nic: "the system can assign it but may move
+ * it as needed for compression."
+ *
+ * Everything a STAFF member reads keeps the site (reservationWhat above) —
+ * their refusals, the pay-links list, the schedule, the cart line on the
+ * register. This is for what reaches the GUEST: a link's label, printed on the
+ * email, the card page and the thank-you page. (The emailed receipt is built
+ * from the sale's stored line instead, so it drops the site at build time —
+ * routes/pos emailReceiptForSale.)
+ */
+export function reservationWhatForGuest(due: Pick<ReservationDue, 'nights' | 'checkIn' | 'checkOut'>): string {
+  return `${nightsWord(due.nights)} (${shortDay(due.checkIn)} → ${shortDay(due.checkOut)})`
 }
 
 /** The name a reservation's line goes by in the cart, on the reader and on the receipt. */
@@ -1132,9 +1170,12 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
         qty: Number(cartLine.qty) || 0,
       }
       if (!body.stay) {
+        // 10/17 (Nic): the SITE is no longer the clerk's to supply — "the
+        // system can assign it" (chooseFreeSite below). The arrival date and a
+        // name still are, because nothing can be sold without them.
         throw new AppError(400,
-          `"${stayLine.name}" needs a site and an arrival date before a link can go out — `
-          + 'pick them for the stay in the cart, then press Send link again. The site is held for them from the moment it is sent.')
+          `"${stayLine.name}" needs an arrival date and who it is for before a link can go out — `
+          + 'fill them in for the stay in the cart, then press Send link again. A site is held for them from the moment it is sent.')
       }
     }
   }
@@ -1178,6 +1219,11 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   let screeningRequired = false
   let extendPlan: { bookingId: string; fromCheckOut: string; checkOut: string; price: number } | null = null
   let stayWhat: string | null = null
+  // 10/17 (Nic): the site GAM settled on for this stay (the clerk's, or the one
+  // chosen for them), and what the GUEST is told the stay is — the same nights
+  // without the site, since they do not learn it until the morning of arrival.
+  let staySiteId: string | null = null
+  let stayWhatForGuest: string | null = null
   let returningAttest = false
   let returningChain: string[] = []
   if (stayLine && body.stay) {
@@ -1196,6 +1242,9 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
         email: body.stay.guestEmail ?? ext.guestEmail ?? body.customer?.email ?? null, checkIn: ext.checkIn, checkOut: ext.checkOut,
         stayTerms: body.stay.stayTerms ?? null, returning })
       stayWhat = reservationWhat({ nights: ext.addedNights, unitNumber: ext.unitNumber, checkIn: ext.fromCheckOut, checkOut: ext.checkOut })
+      // 10/17 (Nic): the guest's copy leaves the site out — they may be moved
+      // for compression right up to the morning they arrive.
+      stayWhatForGuest = reservationWhatForGuest({ nights: ext.addedNights, checkIn: ext.fromCheckOut, checkOut: ext.checkOut })
       if (shown != null && Math.round(Number(shown) * 100) !== Math.round(ext.price * 100)) throw new AppError(409, linkStayNowWords(`a month added — ${stayWhat}`, ext.price))
       stayTerms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
       // 10/5 (Nic, M5): a month is sold only as a stay. Answered lease, no
@@ -1215,27 +1264,62 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
             extend: { ...extendPlan, stayTerms } }
         : i)
     } else {
-      if (!body.stay.unitId || !body.stay.checkIn || !body.stay.guestName?.trim()) {
-        throw new AppError(400, `"${stayLine.name}" needs a site, an arrival date and who it is for before a link can go out — pick them for the stay in the cart, then press ${press} again.`)
+      // 10/17 (Nic): the SITE is no longer among these — it is chosen below.
+      if (!body.stay.checkIn || !body.stay.guestName?.trim()) {
+        throw new AppError(400, `"${stayLine.name}" needs an arrival date and who it is for before a link can go out — fill them in for the stay in the cart, then press ${press} again.`)
       }
-      // The site has to be this property's before anything about it is read.
-      const site = await queryOne<{ id: string }>(
-        `SELECT id FROM units WHERE id = $1 AND property_id = $2 AND landlord_id = $3 AND retired_at IS NULL`,
-        [body.stay.unitId, prop.id, prop.landlord_id])
-      if (!site) throw new AppError(400, `That site is not at this property — pick the site again, then press ${press} again.`)
-      const priced = await priceWholeStay(db, body.stay.unitId, stayLine.stayUnit, stayLine.qty, body.stay.checkIn,
+      // 10/17 (Nic) — THE SITE IS GAM'S TO PICK, NOT THE CLERK'S TO ASK FOR.
+      //
+      // "pay links work the same as booking site — no site details given to the
+      // customer until morning of arrival. the system can assign it but may
+      // move it as needed for compression."
+      //
+      // A clerk may still name one (somebody promised a caller the spot they
+      // had last year), and then it has to be this property's before anything
+      // about it is read. With none named, a free one is chosen for the nights
+      // (services/propertyBooking chooseFreeSite) — the stay goes out either
+      // way, which is the whole point: the old refusal ("needs a site…") is how
+      // a stay ended up on a link with nothing on the schedule.
+      let stayUnitId: string
+      if (body.stay.unitId) {
+        const site = await queryOne<{ id: string }>(
+          `SELECT id FROM units WHERE id = $1 AND property_id = $2 AND landlord_id = $3 AND retired_at IS NULL`,
+          [body.stay.unitId, prop.id, prop.landlord_id])
+        if (!site) throw new AppError(400, `That site is not at this property — pick the site again, then press ${press} again.`)
+        stayUnitId = body.stay.unitId
+      } else {
+        const { chooseFreeSite } = await import('../services/propertyBooking')
+        const { checkOutFor: coFor } = await import('../services/registerStay')
+        const picked = await chooseFreeSite(db, {
+          propertyId: prop.id, landlordId: prop.landlord_id, checkIn: body.stay.checkIn,
+          checkOut: coFor(body.stay.checkIn, stayLine.stayUnit, stayLine.qty), stayUnit: stayLine.stayUnit,
+        })
+        if (!picked) {
+          throw new AppError(409, `Every site is taken for those nights, so there is nowhere to put this stay — nothing was sent. `
+            + `Change the dates or the length, then press ${press} again; or add the guest to the waitlist from the schedule.`)
+        }
+        stayUnitId = picked.id
+      }
+      const priced = await priceWholeStay(db, stayUnitId, stayLine.stayUnit, stayLine.qty, body.stay.checkIn,
         (unit, word) => `Site ${unit} has no ${word} rate set, so this stay cannot be priced — nothing was sent. `
           + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
       needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, email, checkIn: body.stay.checkIn,
         checkOut: priced.checkOut, stayTerms: body.stay.stayTerms ?? null, returning })
       stayTerms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
+      staySiteId = stayUnitId
       stayWhat = reservationWhat({ nights: priced.nights, unitNumber: priced.unitNumber, checkIn: body.stay.checkIn, checkOut: priced.checkOut })
         // 10/6 (Nic): the link says it when the stay is charged at a bigger, lower-priced rate than it was rung up at.
+        + (priced.lowerRateWords && stayTerms !== 'lease' ? ` — ${priced.lowerRateWords}` : '')
+      // 10/17 (Nic): what the GUEST is told it is — the same nights and dates
+      // with the site left out, because they do not learn the site until the
+      // morning they arrive. This is what goes in the label, and the label is
+      // what the email, the card page and the receipt all print.
+      stayWhatForGuest = reservationWhatForGuest({ nights: priced.nights, checkIn: body.stay.checkIn, checkOut: priced.checkOut })
         + (priced.lowerRateWords && stayTerms !== 'lease' ? ` — ${priced.lowerRateWords}` : '')
       stayTotal = priced.total
       // R2/R4: a lease is sent for its deposit — the reservation then asks
       // exactly that (reservationDue: its lease bills the rest).
-      stayCharge = stayTerms === 'lease' ? await leaseDepositFor(db, body.stay.unitId, priced.total, priced.nights) : priced.total
+      stayCharge = stayTerms === 'lease' ? await leaseDepositFor(db, stayUnitId, priced.total, priced.nights) : priced.total
       stayTax = stayTerms === 'lease' ? { base: stayCharge, tax: 0, taxRate: 0 } : { base: priced.base, tax: priced.tax, taxRate: priced.taxRate }
       // 10/3 (review): the figure the clerk saw ("They pay") is the figure that
       // goes out — a site list opened before the site's rates changed is
@@ -1323,7 +1407,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   }
   try {
     return await writePayLink(req, body, prop, { payItems, totals, stayLine, stayTotal, posCustomerId,
-      stayTerms, screeningRequired, extendPlan, stayWhat, returningAttest, returningChain })
+      stayTerms, screeningRequired, extendPlan, stayWhat, staySiteId, stayWhatForGuest, returningAttest, returningChain })
   } catch (e) {
     // Nothing went out: a record made for the pick goes again.
     if (madeFromPick) {
@@ -1343,6 +1427,10 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
                                  stayTerms: StayTerms | null; screeningRequired: boolean
                                  extendPlan: { bookingId: string; fromCheckOut: string; checkOut: string; price: number } | null
                                  stayWhat: string | null
+                                 /** 10/17 (Nic): the site settled on for a new stay — the clerk's, or the one GAM chose. */
+                                 staySiteId?: string | null
+                                 /** 10/17 (Nic): the stay as the GUEST is told it — no site named before arrival morning. */
+                                 stayWhatForGuest?: string | null
                                  /** 10/6 (Nic): record "Returning guest" on the stay with the link. */
                                  returningAttest?: boolean; returningChain?: string[] }) {
   const { payItems, totals, stayLine, stayTotal } = w
@@ -1357,9 +1445,19 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
   // client, one transaction. Before, the booking committed first and the link
   // was inserted after; a failed insert left a held site nobody could pay.
   const token = crypto.randomBytes(24).toString('hex')
-  // 10/5: a stay's link says which stay — its site and dates — in the email and on the card page.
+  // 10/5: a stay's link says which stay — its nights and dates — in the email
+  // and on the card page.
+  // 10/17 (Nic): and NOT which site. "no site details given to the customer
+  // until morning of arrival" — this label is what the guest reads on the
+  // email, the Stripe page and the thank-you page, and it had been printing
+  // "31 nights at site RV 10". A month added to a stay they are already on
+  // keeps the dates only, for the same reason. (A RECEIPT is not printed from
+  // this label — it prints the sale's own stored line, so the site is left off
+  // there separately, at the moment the receipt is built: routes/pos
+  // emailReceiptForSale.)
+  const guestWhat = w.stayWhatForGuest ?? w.stayWhat
   const label = body.label?.trim()
-    || (stayLine && w.stayWhat ? `${w.extendPlan ? 'Add a month' : stayLine.name} — ${w.stayWhat}`
+    || (stayLine && guestWhat ? `${w.extendPlan ? 'Add a month' : stayLine.name} — ${guestWhat}`
       : body.items.length === 1 ? body.items[0].name : `${body.items.length} items`)
   const client = await getClient()
   let link: any
@@ -1380,28 +1478,45 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
       }
       if (w.screeningRequired) await markScreeningRequired(client, ext.bookingId)
       stayBookingId = ext.bookingId
-    } else if (body.stay && stayLine && body.stay.unitId && body.stay.checkIn) {
+    } else if (body.stay && stayLine && w.staySiteId && body.stay.checkIn) {
+      // 10/17 (Nic): the site is the one settled on above — the clerk's, or the
+      // one GAM chose for these nights (chooseFreeSite). Never read from the
+      // body here again: the price and the hold have to be the same site.
+      const siteId = w.staySiteId
       const { checkOutFor, siteIsFree, createStayBooking } = await import('../services/registerStay')
       const checkOut = checkOutFor(body.stay.checkIn, stayLine.stayUnit, stayLine.qty)
       await client.query(
         `SELECT id FROM units WHERE id = $1 AND landlord_id = $2 FOR UPDATE`,
-        [body.stay.unitId, prop.landlord_id])
+        [siteId, prop.landlord_id])
       // A LINK IS NOT PAYMENT, so it displaces nobody. It may only take a site
       // nothing else is holding — the rank is money, not intent. createStayBooking
       // re-checks this under an advisory lock, which is what actually settles a
       // race; the check here is so the refusal reads like a sentence.
-      if (!(await siteIsFree(client, body.stay.unitId, body.stay.checkIn, checkOut))) {
-        throw new AppError(409, 'That site is not free for those dates — it is taken or someone is holding it, and a pay link cannot move a hold (only a payment can). Pick another site or other dates, then press Send link again — or charge for it here at the counter.')
+      if (!(await siteIsFree(client, siteId, body.stay.checkIn, checkOut))) {
+        // 10/17 (Nic): when GAM picked the site, telling the clerk to "pick
+        // another site" is nonsense — they never picked one. Press Send link
+        // again and a different site is chosen.
+        throw new AppError(409, body.stay.unitId
+          ? 'That site is not free for those dates — it is taken or someone is holding it, and a pay link cannot move a hold (only a payment can). Pick another site or other dates, then press Send link again — or charge for it here at the counter.'
+          : 'The site held for this stay was taken a moment ago — nothing was sent. Press Send link again and another one is picked for them.')
       }
       const booking = await createStayBooking(client, {
         landlordId: prop.landlord_id,
         propertyId: prop.id,
         posTransactionId: null,
         status: 'tentative',
+        // 10/17 (Nic): where the stay came FROM, said honestly. A stay held by
+        // an emailed link had been recording itself as 'register' — the
+        // schedule then printed "Register" for a guest nobody at the counter
+        // ever saw, and the first question about a stay is always how it got
+        // there. The schedule and the reservations list both FILTER on this
+        // column, so the value belongs in the one list they offer
+        // (BOOKING_SOURCE_LABEL in @gam/shared); it is not a free-text note.
+        source: 'pay_link',
         lines: [{ itemId: stayLine.itemId, qty: stayLine.qty, stayUnit: stayLine.stayUnit,
                   name: stayLine.name, lineTotal: stayTotal }],
         details: {
-          unitId: body.stay.unitId, checkIn: body.stay.checkIn,
+          unitId: siteId, checkIn: body.stay.checkIn,
           guestName: body.stay.guestName ?? '',
           guestPhone: body.stay.guestPhone ?? body.customer?.phone ?? null,
           guestEmail: body.stay.guestEmail ?? body.customer?.email ?? null,
@@ -2261,6 +2376,30 @@ async function linkNotPayable(link: any): Promise<{ status: number; html: string
         `<h1>This link needs updating</h1><p>Your reservation has no price on it yet, so nothing was charged. Please contact ${escapeHtml(link.property_name)}.</p>`) }
     }
   }
+  // 10/17 (Nic) — A STAY ON A LINK WITH NOTHING ON THE SCHEDULE IS NOT PAID.
+  //
+  //   "somebody paid for a week, um, and it did not generate a stay to occupy a
+  //    site. So we have some important things to address there before the
+  //    schedule starts getting convoluted."
+  //
+  // That is this link: sent on 9/18 with a month of site rent on it and no site
+  // or dates behind it, paid three weeks later, and the Master Schedule never
+  // heard of the guest — somebody had to notice and book him by hand. No link
+  // can be CREATED that way any anymore (createPayLink holds a site the moment
+  // the link is sent, picking one if nobody named it), so this is the door shut
+  // behind the ones sent before that: a link whose cart is a stay but which
+  // holds no reservation refuses to open at all.
+  //
+  // Refused HERE, before Stripe is involved, because this is the only moment
+  // left where nothing has been charged. Take the money first and the choice is
+  // between a stay nobody can honor and a refund — which is how a week got paid
+  // for twice.
+  if (!link.booking_id && await linkCartIsAStay(db, link)) {
+    logger.error({ payLinkId: link.id, landlordId: link.landlord_id },
+      '[pay-link] a link selling a stay holds no reservation — refused before any charge; it predates the held-site rule')
+    return { status: 409, html: page('Link needs updating',
+      `<h1>This link needs updating</h1><p>Nothing was charged. Please contact ${escapeHtml(link.property_name)} for an up-to-date link for your stay.</p>`) }
+  }
   // 10/5 (Nic, A2): a link for a stay's background check alone is paid only
   // while the stay stands and its check is not already paid for.
   const feeOnly = await feeOnlyLinkNotPayable(db, link)
@@ -2615,6 +2754,33 @@ export async function finalizePayLink(session: {
     if (reservationPart && stayTax.amount > 0) {
       const { cartTaxBreakdown } = await import('./pos')
       taxBreakdown = withLodgingTax(await cartTaxBreakdown(link.landlord_id, rest), stayTax)
+    } else if (Number(link.tax_amount) > 0) {
+      // 10/17 (Nic): "we collect sales tax on propane for the transaction
+      // privilege tax. Those need to be itemized so we can file that tax to the
+      // right departments." A link for GOODS ALONE (four gallons of propane,
+      // 9/29: $13.20 + $0.87) recorded its tax with no names on it, because
+      // only the reservation branch above named anything. The sale's own record
+      // of which tax it charged was therefore empty, and GAM Books posted that
+      // $0.87 to the generic Sales tax payable (2040) instead of the named
+      // "Sales tax payable: Transaction privilege tax" (2040-1) its projector
+      // would have used — so the bookkeeper could not see which agency it is
+      // owed to. The link's own lines name it: resolved through the same server
+      // rates the counter uses, scaled so the names add up to the tax the
+      // customer actually paid (never re-priced).
+      //
+      // 10/17 (review): ONLY A NAME THAT IS AN AGENCY'S is written
+      // (isNamedAgencyTax). cartTaxBreakdown falls back to the item's own bare
+      // rate, and to a plain "Tax" when nothing of the company's resolved at
+      // all — neither names a department. Writing one would mint a chart
+      // sub-account called "Sales tax payable: Tax" and the breakdown page
+      // would read it as a filable agency line. Money GAM cannot name belongs
+      // on the generic Sales tax payable, where the page shows it by name as a
+      // tax with no agency and says to settle it before filing. A landlord who
+      // has set up no named tax rates at all hits exactly that path.
+      const { cartTaxBreakdown } = await import('./pos')
+      const named = (await cartTaxBreakdown(link.landlord_id, rest)).filter(isNamedAgencyTax)
+      taxBreakdown = named.length ? scaleNamedTaxes(named, Number(link.tax_amount)) : null
+      if (taxBreakdown && !taxBreakdown.length) taxBreakdown = null
     }
     // 10/2 (review): a reservation that was CANCELLED while the payer had the
     // card page open (its site went to a guest who paid first — only NEW page

@@ -11,6 +11,8 @@ import { isDisposableEmail } from '../lib/email'
 import { registerBooksLoansAssetsRoutes } from './booksLoansAssets'
 // 10/12 (Nic, ledger P8): the Books statements read the ledger.
 import { registerBooksLedgerReportRoutes, wholeLedgerScope } from './booksLedgerReports'
+// 10/17 (Nic): what was sold, item by item, and what tax was collected per agency.
+import { registerBooksTaxSalesRoutes } from './booksTaxSales'
 import { ledgerReportsLive, ledgerTaxSummary, ledgerProfitAndLoss, ledgerAccountBalances } from '../services/ledgerReports'
 import { vendor1099List, resolveCostPlace } from '../services/booksVendorsLoans'
 import { employeePayPlaceFrom, setEmployeePayPlace, paycheckPlaceOf, payPlaceMissingRefusal, EMPLOYEE_PAY_PLACE_REQUIRED } from '../services/booksEmployeePayPlace'
@@ -167,7 +169,7 @@ const BOOKS_WITHOUT_COMPANY_WIDE = /^\/(bookkeeper\/clients|companies|rent-roll)
 // property at the time of logging" — the company's properties and units the
 // Loans, Fixed assets and Run Payroll forms ask that from (GET /cost-places)
 // are the ledger's, as the property list those forms read before was.
-const BOOKS_LEDGER = /^\/(?:(?:accounts|employees|vendors|loans|fixed-assets|payroll|journal|transactions|bills|work-trade-pay)(?:\/.*)?|properties\/?|cost-places\/?|reconciliation\/?|reports\/(?:pl|balance-sheet|trial-balance|general-ledger|money-out|receivables|ledger-status)\/?|tax\/summary\/?)$/
+const BOOKS_LEDGER = /^\/(?:(?:accounts|employees|vendors|loans|fixed-assets|payroll|journal|transactions|bills|work-trade-pay)(?:\/.*)?|properties\/?|cost-places\/?|reconciliation\/?|reports\/(?:pl|balance-sheet|trial-balance|general-ledger|money-out|receivables|ledger-status)\/?|tax\/(?:summary|sales-breakdown)\/?)$/
 
 // S383 fix — bookkeeper client-scope validation middleware. Pre-fix bug:
 // the middleware blindly accepted the X-Client-Id header without
@@ -2401,6 +2403,11 @@ async function companyReportPropertyScope(user: any): Promise<{ propertyIds: str
 // here, ahead of the older routes below, which still answer for a company
 // whose books are not live yet, an admin's every landlord and a business.
 registerBooksLedgerReportRoutes(booksRouter, { ownerScope, companyReportPropertyScope })
+
+// 10/17 (Nic): "we need more breakdown so we can see exactly how much of each
+// item was sold and how much of each tax separated by category was collected.
+// That way it can be forwarded on to the right agencies."
+registerBooksTaxSalesRoutes(booksRouter, { ownerScope, companyReportPropertyScope })
 
 booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
   try {
