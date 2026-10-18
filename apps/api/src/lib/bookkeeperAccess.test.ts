@@ -103,6 +103,13 @@ const EXPECTED_ALLOWED = new Set([
   'GET /api/balances/rent-roll/properties',
   'GET /api/balances/rent-roll/open-month',
   'GET /api/balances/rent-roll/history',
+  // 10/17 (Nic): "owner and bookkeeper" may change a tax rate — she is the one
+  // forwarding it to an agency, so a rate she files is a rate she can correct.
+  // The rate and only the rate: making a tax, removing one, or changing what it
+  // reaches stay the owner's (bookkeeperAccess has the reasoning).
+  'GET /api/pos/tax-rates',
+  'GET /api/pos/tax-rates/changes',
+  'PATCH /api/pos/tax-rates/:id',
   'GET /api/reports/summary',
   'GET /api/reports/monthly-pl',
   'GET /api/reports/property-pl',
