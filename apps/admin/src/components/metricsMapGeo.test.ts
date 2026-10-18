@@ -13,9 +13,9 @@ import { geoCentroid, geoPath } from 'd3-geo'
 import { feature } from 'topojson-client'
 import type { Topology } from 'topojson-specification'
 import {
-  DOT_BELOW_PX, H, MAX_ZOOM, MIN_ZOOM, US_VIEW, W, areaAt, areaName, buildLayer, buildUsAtlas,
-  buildWorld, dragRotate, flatNational, flatState, globeProjection, heat, inBounds, mixRgb,
-  nationalProjection, strength, viewFor, zoomBy,
+  DOT_BELOW_PX, H, MAX_ZOOM, MIN_ZOOM, US_VIEW, W, WORLD_VIEW, areaAt, areaCountry, areaName, buildLayer,
+  buildUsAtlas, buildWorld, dragRotate, flatCountry, flatNational, flatState, flatWorld, globeProjection, heat,
+  inBounds, mixRgb, nationalProjection, strength, viewFor, worldProjection, zoomBy,
 } from './metricsMapGeo'
 
 const require = createRequire(import.meta.url)
@@ -104,10 +104,93 @@ describe('the flat map', () => {
     expect(areaName('place', '5546775', { name: 'Lisbon', label: 'Lisbon village' })).toBe('Lisbon village')
     expect(areaName('cd', '0402', { name: 'Congressional District 2' })).toBe('Congressional District 2')
   })
+
+  // 10/17 (Nic): "break the rest of the countries down by states or province
+  // and then possibly cities as well or counties, if they have counties within
+  // those provinces."
+  it('draws the whole world at the country and province levels', () => {
+    const countries = buildLayer('country', null, boundary('country'))
+    const world = flatWorld(countries, countries)
+    expect(world.areas.length).toBeGreaterThan(200)
+    for (const id of ['USA', 'CAN', 'BRA', 'AUS', 'JPN', 'ZAF']) {
+      expect(world.areas.find(a => a.id === id)?.d, id).not.toBe('')
+    }
+    // The United States is on the world map too — this file keeps it, unlike
+    // the globe's backdrop, which leaves it out for us-atlas to draw.
+    expect(world.areas.find(a => a.id === 'USA')!.name).toMatch(/United States/)
+    // At the country level the lines between countries ARE the level's own.
+    expect(world.borders).not.toBe('')
+    expect(world.context).toBe('')
+    // Every country fits inside the frame, and the frame is the same one the
+    // United States is drawn in.
+    for (const a of world.areas.filter(x => x.d)) {
+      expect(a.d, a.id).not.toMatch(/-?\d{5,}/)
+    }
+
+    const provinces = buildLayer('adm1', null, boundary('adm1'))
+    const flat = flatWorld(provinces, countries)
+    expect(flat.areas.length).toBeGreaterThan(4000)
+    // The provinces sit on the country lines, drawn faintly underneath.
+    expect(flat.context).not.toBe('')
+    expect(flat.areas.find(a => a.name === 'Entre Ríos')?.d).not.toBe('')
+  })
+
+  it('draws one country filling the frame at the county-or-district level', () => {
+    const countries = buildLayer('country', null, boundary('country'))
+    const districts = buildLayer('adm2', 'CAN', boundary('adm2/CAN'))
+    const outline = countries.areas.find(a => a.id === 'CAN')!
+    const flat = flatCountry(districts, outline)!
+    expect(flat.areas.length).toBeGreaterThan(50)
+    expect(flat.areas.find(a => a.name === 'Toronto')!.d).not.toBe('')
+    expect(flat.nation).not.toBe('')      // the country's own edge, around its districts
+    expect(flatCountry(districts, null)).toBeNull()
+  })
+
+  it('a province carries its country, so one file names "Entre Ríos, Argentina"', () => {
+    const provinces = buildLayer('adm1', null, boundary('adm1'))
+    expect(provinces.country.get('ARG-1309')).toEqual({ code: 'ARG', name: 'Argentina' })
+    expect(areaCountry('country', 'CAN', { name: 'Canada' })).toEqual({ code: 'CAN', name: 'Canada' })
+    expect(areaCountry('adm1', 'CAN-682', { name: 'Ontario', country: 'CAN', countryName: 'Canada' }))
+      .toEqual({ code: 'CAN', name: 'Canada' })
+    // A United States level goes by state, not by country.
+    expect(areaCountry('zcta', '85362', null)).toBeNull()
+    expect(areaCountry('place', '0484980', { name: 'Yarnell' })).toBeNull()
+    // The districts of one country are drawn from that country's own file, so
+    // they carry nothing of their own.
+    const districts = buildLayer('adm2', 'CAN', boundary('adm2/CAN'))
+    expect(districts.country.size).toBe(0)
+    expect(districts.state).toBe('CAN')
+  })
+
+  it('the world is drawn in a world projection, not the United States frame', () => {
+    const p = worldProjection()
+    // Greenwich at the equator lands in the middle; the whole earth fits.
+    const [x, y] = p([0, 0])!
+    expect(Math.abs(x - W / 2)).toBeLessThan(2)
+    expect(Math.abs(y - H / 2)).toBeLessThan(2)
+    for (const pt of [[-180, 0], [180, 0], [0, 90], [0, -90], [151, -33], [-157, 21]] as Array<[number, number]>) {
+      const at = p(pt)
+      expect(at, String(pt)).not.toBeNull()
+      expect(at![0] >= 0 && at![0] <= W, String(pt)).toBe(true)
+      expect(at![1] >= 0 && at![1] <= H, String(pt)).toBe(true)
+    }
+    // Albers USA has nothing to say about Argentina; this projection does.
+    expect(nationalProjection()([-60, -32])).toBeNull()
+    expect(p([-60, -32])).not.toBeNull()
+  })
 })
 
 describe('the globe', () => {
   const arizona = us.stateById.get('04')!
+
+  it('opens on the whole earth at a world level, and nothing is zoomed in on', () => {
+    // 10/17 (Nic): the world's levels face the earth, not the lower 48.
+    expect(WORLD_VIEW.zoom).toBeLessThan(US_VIEW.zoom)
+    const p = globeProjection(WORLD_VIEW, W, H)
+    for (const pt of [[0, 0], [13, 52], [151, -33]] as Array<[number, number]>) {
+      expect(p(pt), String(pt)).not.toBeNull()
+    }
+  })
 
   it('opens on the United States, with the earth\'s curve in view', () => {
     const p = globeProjection(US_VIEW, W, H)
@@ -218,5 +301,9 @@ describe('the color', () => {
     expect(strength(0, 10)).toBe(0)
     expect(strength(10, 10)).toBe(1)
     expect(strength(1, 100)).toBeCloseTo(0.18 + 0.082, 5)
+    // 10/17 (review): the saturation overlay tops its scale out at 100%, so a
+    // value past the top is full gold rather than running over it.
+    expect(strength(211, 100)).toBe(1)
+    expect(strength(106, 100)).toBe(1)
   })
 })

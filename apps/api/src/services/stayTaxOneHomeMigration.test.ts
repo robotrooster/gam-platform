@@ -11,6 +11,11 @@
  * So this seeds exactly that shape and runs the migration over it, the way it
  * will run on production — and then runs it a SECOND time, because a migration
  * that mints a tax must never mint it twice.
+ *
+ * 10/17 (review): and a stay already sold keeps the rate it was rung at. The
+ * backfill reads each property's rate as it was the day the stay was created
+ * out of the change journal, so production's RV 12 — rung at 6.35% ten hours
+ * before the column was corrected to 6.60 — is not re-rated by the move.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
@@ -84,6 +89,10 @@ async function parkAsProductionHasIt(opts: { stayPct?: number; named?: number | 
 const stayPct = async (propertyId: string) => Number((await db.query<{ p: string }>(
   `SELECT short_term_tax_rate::text AS p FROM properties WHERE id = $1`, [propertyId])).rows[0].p)
 
+/** The rate a stay was priced at, as the stamp on the booking holds it. */
+const stampOf = async (bookingId: string) => Number((await db.query<{ r: string }>(
+  `SELECT stay_tax_rate::text AS r FROM unit_bookings WHERE id = $1`, [bookingId])).rows[0].r)
+
 const taxRows = async (landlordId: string) => (await db.query<any>(
   `SELECT name, rate::float AS rate, on_stays, item_ids FROM pos_tax_rates WHERE landlord_id = $1 ORDER BY name`,
   [landlordId])).rows
@@ -146,6 +155,52 @@ describe('the move to one home, over a company already running', () => {
     await runMigration()
     expect(await stayPct(park.propertyId)).toBe(0)
     expect((await taxRows(park.landlordId)).map(r => r.name)).toEqual(['Transaction privilege tax'])
+  })
+
+  it('a stay already sold keeps the rate it was rung at, not the one the column was corrected to', async () => {
+    // Production's RV 12, read 10/17: rung at the counter at 10:58 for
+    // 269.00 x 1.0635 = 286.08, and the property column hand-corrected from
+    // 6.35 to 6.60 at 20:56 the same evening. Left with no stamp the stay
+    // would read 6.60% today, so an early check-out would take out tax at a
+    // rate nobody was ever charged.
+    const park = await parkAsProductionHasIt()
+    const unitId = (await db.query<{ id: string }>(
+      `SELECT id FROM units WHERE property_id = $1 LIMIT 1`, [park.propertyId])).rows[0].id
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status,
+                                  total_amount, deposit_amount, deposit_paid_at, balance_paid_at)
+       VALUES ($1,$2,'2026-10-17','2026-10-24','2026-10-24','weekly','confirmed',286.08,286.08,now(),now())
+       RETURNING id`, [unitId, park.landlordId])).rows[0].id
+    // A stay from before stamping began carries none.
+    await db.query(`UPDATE unit_bookings SET stay_tax_rate = NULL WHERE id = $1`, [bookingId])
+    // The hand correction of 10/17, hours after the sale.
+    await db.query(`UPDATE properties SET short_term_tax_rate = 6.60 WHERE id = $1`, [park.propertyId])
+
+    await runMigration()
+
+    expect(await stayPct(park.propertyId)).toBe(6.60)
+    expect(await stampOf(bookingId)).toBe(0.0635)
+  })
+
+  it('and keeps it when the migration itself is what moves the property', async () => {
+    // The drift closing: the column goes 6.35 -> 6.60 inside the migration,
+    // and the stay sold at 6.35% still reads 6.35%.
+    const park = await parkAsProductionHasIt()
+    const unitId = (await db.query<{ id: string }>(
+      `SELECT id FROM units WHERE property_id = $1 LIMIT 1`, [park.propertyId])).rows[0].id
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status, total_amount)
+       VALUES ($1,$2,'2026-10-17','2026-10-24','2026-10-24','weekly','confirmed',286.08) RETURNING id`,
+      [unitId, park.landlordId])).rows[0].id
+    await db.query(`UPDATE unit_bookings SET stay_tax_rate = NULL WHERE id = $1`, [bookingId])
+
+    await runMigration()
+
+    expect(await stayPct(park.propertyId)).toBe(6.60)
+    expect(await stampOf(bookingId)).toBe(0.0635)
+    // Twice over changes nothing: the backfill only ever fills an empty stamp.
+    await runMigration()
+    expect(await stampOf(bookingId)).toBe(0.0635)
   })
 
   it('running it twice changes nothing and mints no second tax', async () => {

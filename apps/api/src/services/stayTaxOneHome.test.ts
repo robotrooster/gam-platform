@@ -39,11 +39,24 @@ import { errorHandler } from '../middleware/errorHandler'
 import { calculateCartTax } from './posTax'
 import { priceWholeStay, priceStayBySchedule, reservationDue, stayTaxRate, taxInside, taxInsidePayment } from './registerStay'
 import { resolvePropertyById, bookableUnits, groupSiteTypes, typeAvailability } from './propertyBookingQuote'
-import { isBookkeeperRequestAllowed, bookkeeperHasPerm } from '../lib/bookkeeperAccess'
+import { isBookkeeperRequestAllowed, bookkeeperHasPerm, BOOKKEEPER_GRANTED_PERMS, TAXES_EDIT_PERM } from '../lib/bookkeeperAccess'
+import { ALL_CATALOG_PERMISSION_KEYS } from '@gam/shared'
+import { camelCaseKeys } from '../lib/caseConversion'
 
+/**
+ * The app as it is DEPLOYED: every response passes the outgoing camelCase
+ * middleware (index.ts) on its way out, which is the shape the Sales & Tax
+ * card and the register's Taxes screen read. Asserting the snake_case the DB
+ * hands back would test a response nobody is ever served.
+ */
 function buildApp() {
   const app = express()
   app.use(express.json({ limit: '2mb' }))
+  app.use((_req, res, next) => {
+    const json = res.json.bind(res)
+    res.json = (body: any) => json(camelCaseKeys(body))
+    next()
+  })
   app.use('/api/pos', posRouter)
   app.use(errorHandler)
   return app
@@ -140,7 +153,7 @@ describe('the named tax list is the one home for a stay rate', () => {
     const w = await world()
     expect(await stayTaxPct(w.propertyId)).toBe(0)
     const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
-    expect(tax.on_stays).toBe(true)
+    expect(tax.onStays).toBe(true)
     expect(await stayTaxPct(w.propertyId)).toBe(6.35)
   })
 
@@ -320,15 +333,15 @@ describe('every change is kept, with who and when', () => {
     expect(rows).toHaveLength(2)
     // Newest first: 6.35% → 6.6%.
     expect(rows[0].name).toBe('Lodging tax')
-    expect(rows[0].old_rate).toBe(0.0635)
-    expect(rows[0].new_rate).toBe(0.066)
-    expect(rows[0].new_on_stays).toBe(true)
-    expect(rows[0].changed_by).toBe(w.userId)
-    expect(rows[0].changed_at).toBeTruthy()
+    expect(rows[0].oldRate).toBe(0.0635)
+    expect(rows[0].newRate).toBe(0.066)
+    expect(rows[0].newOnStays).toBe(true)
+    expect(rows[0].changedBy).toBe(w.userId)
+    expect(rows[0].changedAt).toBeTruthy()
     // The tax being made in the first place: nothing before it.
-    expect(rows[1].old_rate).toBeNull()
-    expect(rows[1].new_rate).toBe(0.0635)
-    expect(rows[1].changed_by).toBe(w.userId)
+    expect(rows[1].oldRate).toBeNull()
+    expect(rows[1].newRate).toBe(0.0635)
+    expect(rows[1].changedBy).toBe(w.userId)
   })
 
   it('turning a tax off is kept too', async () => {
@@ -338,9 +351,9 @@ describe('every change is kept, with who and when', () => {
       .set('Authorization', `Bearer ${w.token}`)
     const res = await request(buildApp()).get('/api/pos/tax-rates/changes')
       .set('Authorization', `Bearer ${w.token}`)
-    expect(res.body.data[0].old_is_active).toBe(true)
-    expect(res.body.data[0].new_is_active).toBe(false)
-    expect(res.body.data[0].changed_by).toBe(w.userId)
+    expect(res.body.data[0].oldIsActive).toBe(true)
+    expect(res.body.data[0].newIsActive).toBe(false)
+    expect(res.body.data[0].changedBy).toBe(w.userId)
   })
 
   it('the journal cannot be edited or thrown away', async () => {
@@ -358,9 +371,11 @@ describe('owner AND bookkeeper may change a rate (Nic)', () => {
     const id = randomUUID()
     expect(isBookkeeperRequestAllowed('GET', '/api/pos/tax-rates')).toBe(true)
     expect(isBookkeeperRequestAllowed('GET', '/api/pos/tax-rates/changes')).toBe(true)
-    expect(isBookkeeperRequestAllowed('POST', '/api/pos/tax-rates')).toBe(true)
     expect(isBookkeeperRequestAllowed('PATCH', `/api/pos/tax-rates/${id}`)).toBe(true)
-    expect(isBookkeeperRequestAllowed('DELETE', `/api/pos/tax-rates/${id}`)).toBe(true)
+    // Nic's words reach a RATE. Making a tax and removing one are the owner's:
+    // a removal untaxes every stay booked after it, which is not a correction.
+    expect(isBookkeeperRequestAllowed('POST', '/api/pos/tax-rates')).toBe(false)
+    expect(isBookkeeperRequestAllowed('DELETE', `/api/pos/tax-rates/${id}`)).toBe(false)
     // Nothing else of the register: not the items, the sales or the customers.
     for (const [method, path] of [
       ['GET', '/api/pos/items'], ['PATCH', `/api/pos/items/${id}`], ['POST', '/api/pos/transactions'],
@@ -371,9 +386,18 @@ describe('owner AND bookkeeper may change a rate (Nic)', () => {
   })
 
   it('a bookkeeper holds the key the tax routes ask for, and no register key', async () => {
-    expect(bookkeeperHasPerm({}, 'taxes.edit')).toBe(true)
+    expect(bookkeeperHasPerm({}, TAXES_EDIT_PERM)).toBe(true)
     expect(bookkeeperHasPerm({}, 'pos.manage_inventory')).toBe(false)
     expect(bookkeeperHasPerm({}, 'pos.ring_sale')).toBe(false)
+  })
+
+  it('that key is a real permission, in the one catalog every key lives in', async () => {
+    // A key that exists only as a string in two API files can never be granted
+    // or seen on the permissions page, and nothing holds it in step
+    // (CLAUDE.md, single source of truth). Every key a bookkeeper holds is a
+    // catalog key.
+    expect(ALL_CATALOG_PERMISSION_KEYS).toContain(TAXES_EDIT_PERM)
+    for (const k of BOOKKEEPER_GRANTED_PERMS) expect(ALL_CATALOG_PERMISSION_KEYS, k).toContain(k)
   })
 
   it('the company\'s bookkeeper changes the rate, the stay price follows, and the journal names them', async () => {
@@ -400,12 +424,259 @@ describe('owner AND bookkeeper may change a rate (Nic)', () => {
     const journal = await request(buildApp()).get('/api/pos/tax-rates/changes')
       .set('Authorization', `Bearer ${bkToken}`)
     expect(journal.status).toBe(200)
-    expect(journal.body.data[0].changed_by).toBe(bkId)
-    expect(journal.body.data[0].changed_by_name).toBe('Bo Keeper')
+    expect(journal.body.data[0].changedBy).toBe(bkId)
+    expect(journal.body.data[0].changedByName).toBe('Bo Keeper')
 
     // And nothing else of the register opens to them.
     const items = await request(buildApp()).get('/api/pos/items')
       .set('Authorization', `Bearer ${bkToken}`)
     expect(items.status).toBe(403)
+
+    // The RATE, and only the rate: turning the tax off by another name, moving
+    // it to another park or taking it off stays is the owner's. The refusal
+    // says where it is done rather than just "no".
+    for (const body of [{ isActive: false }, { onStays: false }, { name: 'Something else' },
+                        { rate: 0.07, isActive: false }, { appliesTo: ['all'] }]) {
+      const no = await request(buildApp()).patch(`/api/pos/tax-rates/${tax.id}`)
+        .set('Authorization', `Bearer ${bkToken}`).send(body)
+      expect(no.status, JSON.stringify(body)).toBe(403)
+      expect(no.body.error).toMatch(/Taxes screen/)
+    }
+    // Nothing moved: the stay is still priced at the rate they set.
+    expect(await stayTaxPct(w.propertyId)).toBe(6.60)
+  })
+
+  it('a bookkeeper kept to one park never sees or moves another park\'s rate', async () => {
+    // Nic, on a bookkeeper: "They don't need to see anything with Oak Park."
+    const w = await world()
+    const theirs = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const c = await db.connect()
+    let otherProp: string
+    let otherTax: string
+    try {
+      otherProp = await seedProperty(c, { landlordId: w.landlordId, ownerUserId: w.userId, managedByUserId: w.userId })
+      otherTax = (await c.query<{ id: string }>(
+        `INSERT INTO pos_tax_rates (landlord_id, property_id, name, rate, tax_type, applies_to, on_stays)
+         VALUES ($1, $2, 'Lodging tax', 0.12, 'sales', '{}'::text[], TRUE) RETURNING id`,
+        [w.landlordId, otherProp])).rows[0].id
+    } finally { c.release() }
+
+    const bkId = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'bookkeeper', 'One', 'Park', TRUE) RETURNING id`,
+      [`bk-${randomUUID()}@test.dev`])).rows[0].id
+    await db.query(
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide)
+       VALUES ($1, $2, 'read_write', $3, FALSE)`, [bkId, w.landlordId, [w.propertyId]])
+    const bkToken = jwt.sign(
+      { userId: bkId, role: 'bookkeeper', email: 'bk@t.dev', profileId: null, landlordId: w.landlordId,
+        permissions: { access_level: 'read_write' } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    // The list and the journal hold their park only.
+    const list = await request(buildApp()).get('/api/pos/tax-rates')
+      .set('Authorization', `Bearer ${bkToken}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data.map((r: any) => r.id)).toEqual([theirs.id])
+    const journal = await request(buildApp()).get('/api/pos/tax-rates/changes')
+      .set('Authorization', `Bearer ${bkToken}`)
+    expect(journal.body.data.map((r: any) => r.rateId)).toEqual([theirs.id])
+
+    // And the other park's rate cannot be moved — which would have changed
+    // what every stay there is priced at.
+    const no = await request(buildApp()).patch(`/api/pos/tax-rates/${otherTax}`)
+      .set('Authorization', `Bearer ${bkToken}`).send({ rate: 0.2 })
+    expect(no.status).toBe(403)
+    expect(await stayTaxPct(otherProp)).toBe(12.00)
+
+    // Their own park's rate still is.
+    const yes = await request(buildApp()).patch(`/api/pos/tax-rates/${theirs.id}`)
+      .set('Authorization', `Bearer ${bkToken}`).send({ rate: 0.066 })
+    expect(yes.status).toBe(200)
+    expect(await stayTaxPct(w.propertyId)).toBe(6.60)
+  })
+
+  it('a clerk kept to one park cannot write the company\'s own rate', async () => {
+    // A rate bound to no property prices stays at every park of the company.
+    const w = await world()
+    const staffId = (await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Des', 'Clerk', TRUE) RETURNING id`,
+      [`clerk-${randomUUID()}@test.dev`])).rows[0].id
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, $3, FALSE)`, [staffId, w.landlordId, [w.propertyId]])
+    const token = jwt.sign(
+      { userId: staffId, role: 'onsite_manager', email: 'clerk@t.dev', profileId: null, landlordId: w.landlordId,
+        permissions: { 'pos.manage_inventory': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    const wide = await request(buildApp()).post('/api/pos/tax-rates')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ name: 'Lodging tax', rate: 0.2, onStays: true })
+    expect(wide.status).toBe(403)
+    expect(wide.body.error).toMatch(/account owner/)
+    expect(await stayTaxPct(w.propertyId)).toBe(0)
+
+    // Their own park's, they may.
+    const mine = await request(buildApp()).post('/api/pos/tax-rates')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId: w.propertyId, name: 'Lodging tax', rate: 0.066, onStays: true })
+    expect(mine.status).toBe(201)
+    expect(await stayTaxPct(w.propertyId)).toBe(6.60)
+  })
+})
+
+describe('a price change never re-rates a stay that took money (review 10/17)', () => {
+  /** A three-night stay sold and PAID at `pct`, with its payment on record. */
+  async function soldAndPaid(w: World, pct: number): Promise<{ bookingId: string; total: number }> {
+    const priced = await priceWholeStay(db, w.unitId, 'night', 3, '2026-11-02')
+    expect(priced.taxRate).toBe(pct)
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status,
+                                  total_amount, deposit_amount, deposit_paid_at, balance_paid_at, source)
+       VALUES ($1,$2,'2026-11-02','2026-11-05','2026-11-05','nightly','confirmed',$3,$3,now(),now(),'desk')
+       RETURNING id`, [w.unitId, w.landlordId, priced.total])).rows[0].id
+    // The deposit's own row, as the booking site's webhook writes it.
+    await db.query(
+      `INSERT INTO stay_payments (booking_id, landlord_id, kind, method, stripe_payment_intent_id,
+                                  toward_stay, lodging_tax_amount)
+       VALUES ($1, $2, 'site_deposit', 'card', $3, $4, $5)`,
+      [bookingId, w.landlordId, `pi_${randomUUID().slice(0, 12)}`,
+       priced.total.toFixed(2), priced.tax.toFixed(2)])
+    return { bookingId, total: priced.total }
+  }
+
+  const stampOf = async (bookingId: string) => Number((await db.query<{ r: string }>(
+    `SELECT stay_tax_rate::text AS r FROM unit_bookings WHERE id = $1`, [bookingId])).rows[0].r)
+
+  it('charging only the nights stayed keeps the rate the money came in at', async () => {
+    // The guest paid 3 nights at 6.35%. The rate then went to 6.6%, and the
+    // early check-out writes a new price — which used to re-stamp the stay at
+    // 6.6% and hand back tax at a rate nobody was ever charged.
+    const w = await world()
+    const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const { bookingId } = await soldAndPaid(w, 0.0635)
+    await changeTax(w, tax.id, { rate: 0.066 })
+
+    // What services/earlyCheckOut writes for 'nights_only' (2 nights kept).
+    await db.query(
+      `UPDATE unit_bookings SET total_amount = $2, platform_fee = 0,
+              booked_check_out = check_out, updated_at = NOW() WHERE id = $1`, [bookingId, '212.70'])
+    expect(await stampOf(bookingId)).toBe(0.0635)
+    const due = await reservationDue(db, bookingId)
+    expect(due!.taxPct).toBe(6.35)
+    // And what the early check-out itself reads to work out the money going
+    // back (services/earlyCheckOut loadStay) is that same 6.35%.
+    const { loadStay } = await import('./earlyCheckOut')
+    expect((await loadStay(db, bookingId))!.tax_pct).toBe(6.35)
+  })
+
+  it('a month added at the counter keeps it too, and so does taking the month back', async () => {
+    const w = await world()
+    const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const { bookingId, total } = await soldAndPaid(w, 0.0635)
+    await changeTax(w, tax.id, { rate: 0.066 })
+
+    // registerStay extendStayByMonth: the month's price is added on.
+    await db.query(
+      `UPDATE unit_bookings SET check_out = '2026-12-05', booked_check_out = '2026-12-05', nights = 33,
+              total_amount = COALESCE(total_amount, 0) + 2000, balance_paid_at = NULL WHERE id = $1`, [bookingId])
+    expect(await stampOf(bookingId)).toBe(0.0635)
+    // undoStayExtension: and back off again.
+    await db.query(
+      `UPDATE unit_bookings SET check_out = '2026-11-05', booked_check_out = '2026-11-05', nights = 3,
+              total_amount = total_amount - 2000 WHERE id = $1`, [bookingId])
+    expect(await stampOf(bookingId)).toBe(0.0635)
+    expect(Number((await db.query<{ t: string }>(
+      `SELECT total_amount::text AS t FROM unit_bookings WHERE id = $1`, [bookingId])).rows[0].t)).toBe(total)
+  })
+
+  it('money on record is enough on its own, with no paid stamp on the booking', async () => {
+    // The paid flags and the stay's payment rows are two different records of
+    // the same fact, and a part-paid stay can carry the rows without the
+    // flags. Either one means money came in at the old rate.
+    const w = await world()
+    const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status, total_amount)
+       VALUES ($1,$2,'2026-11-02','2026-11-05','2026-11-05','nightly','confirmed',319.05) RETURNING id`,
+      [w.unitId, w.landlordId])).rows[0].id
+    await db.query(
+      `INSERT INTO stay_payments (booking_id, landlord_id, kind, method, stripe_payment_intent_id,
+                                  toward_stay, lodging_tax_amount)
+       VALUES ($1, $2, 'site_deposit', 'card', $3, 31.91, 1.91)`,
+      [bookingId, w.landlordId, `pi_${randomUUID().slice(0, 12)}`])
+    await changeTax(w, tax.id, { rate: 0.066 })
+    await db.query(`UPDATE unit_bookings SET total_amount = 212.70 WHERE id = $1`, [bookingId])
+    expect(await stampOf(bookingId)).toBe(0.0635)
+  })
+
+  it('a stay that has taken nothing is re-priced at today\'s rate', async () => {
+    // Nic's rule is about money already collected. A hold nobody has paid a
+    // cent on carries no old rate to protect, so a date change prices it now.
+    const w = await world()
+    const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status, total_amount)
+       VALUES ($1,$2,'2026-11-02','2026-11-05','2026-11-05','nightly','confirmed',319.05) RETURNING id`,
+      [w.unitId, w.landlordId])).rows[0].id
+    expect(await stampOf(bookingId)).toBe(0.0635)
+    await changeTax(w, tax.id, { rate: 0.066 })
+    const again = await priceStayBySchedule(db, w.unitId, '2026-11-02', '2026-11-05')
+    await db.query(`UPDATE unit_bookings SET total_amount = $2 WHERE id = $1`, [bookingId, again.total])
+    expect(await stampOf(bookingId)).toBe(0.066)
+  })
+
+  it('the booking site\'s deposit records the rate the card was charged at', async () => {
+    // The booking row exists before the deposit lands (the checkout session is
+    // stored on it), and a rate change in between is now instant — so the one
+    // STORED tax figure has to come off the stay's own stamp, not off the
+    // property's rate at webhook time.
+    const w = await world()
+    const tax = await addTax(w, { name: 'Lodging tax', rate: 0.0635, onStays: true })
+    const priced = await priceWholeStay(db, w.unitId, 'night', 3, '2026-11-02')
+    const bookingId = (await db.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out, lease_type, status,
+                                  total_amount, source)
+       VALUES ($1,$2,'2026-11-02','2026-11-05','2026-11-05','nightly','confirmed',$3,'public') RETURNING id`,
+      [w.unitId, w.landlordId, priced.total])).rows[0].id
+    await changeTax(w, tax.id, { rate: 0.066 })
+
+    const deposit = 31.91
+    const { siteDepositLodgingTax } = await import('./stayPayments')
+    // 31.91 − ROUND(31.91 ÷ 1.0635, 2) = 31.91 − 30.00 = 1.91, at 6.35%.
+    expect(await siteDepositLodgingTax(db, bookingId, deposit)).toBe(1.91)
+  })
+})
+
+describe('a property added after the tax was named follows it (review 10/17)', () => {
+  it('a park born under a company-wide lodging tax is priced at it, not at nothing', async () => {
+    const w = await world()
+    // A company-wide rate: no property named, so it reaches every park.
+    const wide = await request(buildApp()).post('/api/pos/tax-rates')
+      .set('Authorization', `Bearer ${w.token}`)
+      .send({ name: 'Lodging tax', rate: 0.066, onStays: true })
+    expect(wide.status).toBe(201)
+    expect(await stayTaxPct(w.propertyId)).toBe(6.60)
+
+    const c = await db.connect()
+    let later: string
+    try {
+      later = await seedProperty(c, { landlordId: w.landlordId, ownerUserId: w.userId, managedByUserId: w.userId })
+    } finally { c.release() }
+    // Before the fix this read 0.00 while the one home said 6.6%, and nothing
+    // but an unrelated tax edit would ever have corrected it.
+    expect(await stayTaxPct(later)).toBe(6.60)
+  })
+
+  it('a park whose company names no stay tax is left at nothing', async () => {
+    const w = await world()
+    const c = await db.connect()
+    let later: string
+    try {
+      later = await seedProperty(c, { landlordId: w.landlordId, ownerUserId: w.userId, managedByUserId: w.userId })
+    } finally { c.release() }
+    expect(await stayTaxPct(later)).toBe(0)
   })
 })

@@ -20,16 +20,30 @@
  *   - The land around the United States, for the globe: cut from the Natural
  *     Earth download that sits beside the Census files (public domain) and
  *     served by the API the same way, behind the same login.
+ *   - 10/17 (Nic): the rest of the world's own levels — countries and their
+ *     states and provinces (Natural Earth, public domain, one file each) and
+ *     the level below a province in the countries that have one
+ *     (geoBoundaries, CC BY 4.0, one file per country so the page loads only
+ *     the country on screen). Served by the API behind the same login.
+ *     geoBoundaries' credit line is METRICS_MAP_LEVEL_CREDIT, shown under the
+ *     map whenever that level is drawn.
+ *
+ * 10/17 (Nic) also here: loadCensus, the American Community Survey numbers the
+ * saturation overlay divides GAM's footprint by, fetched once per level the
+ * first time that overlay is turned on (services/platformCensus).
  */
 import { feature, mesh } from 'topojson-client'
 import {
-  geoAlbersUsa, geoBounds, geoCentroid, geoConicEqualArea, geoContains, geoDistance, geoOrthographic, geoPath,
+  geoAlbersUsa, geoBounds, geoCentroid, geoConicEqualArea, geoContains, geoDistance, geoNaturalEarth1,
+  geoOrthographic, geoPath,
   type GeoProjection,
 } from 'd3-geo'
 import type { Topology, GeometryCollection } from 'topojson-specification'
 import type { Feature, MultiLineString } from 'geojson'
 import type { AxiosInstance } from 'axios'
-import { METRICS_WORLD_LAYER, zipAreaName, type MetricsBoundaryLayer, type MetricsMapLevel } from '@gam/shared'
+import {
+  METRICS_WORLD_LAYER, zipAreaName, type MetricsBoundaryLayer, type MetricsMapLevel,
+} from '@gam/shared'
 
 /** The flat picture's size: us-atlas's own Albers USA frame (scale 1300, centered). */
 export const W = 975
@@ -53,6 +67,19 @@ const toAreas = (topo: Topology, objectName: string, nameOf: (f: Feature) => str
 export function areaName(level: MetricsMapLevel, id: string, props: any): string {
   if (level === 'zcta') return zipAreaName(id)
   return String(props?.label || props?.name || id)
+}
+
+/**
+ * 10/17 (Nic): the country a world area is in, off the file itself — the
+ * provinces carry it, and at the country level the area IS the country. Null
+ * for a United States level, which goes by state.
+ */
+export function areaCountry(level: MetricsMapLevel, id: string, props: any): { code: string; name: string } | null {
+  if (level === 'country') return { code: id, name: String(props?.name || id) }
+  if (level === 'adm1') {
+    return props?.country ? { code: String(props.country), name: String(props.countryName || props.country) } : null
+  }
+  return null
 }
 
 // ── States and counties (us-atlas) ───────────────────────────────────────────
@@ -119,20 +146,37 @@ export function loadUsAtlas(): Promise<UsAtlas> {
 
 export interface LayerShapes {
   level: MetricsBoundaryLayer
-  /** The state the file covers; null for the national congressional file. */
+  /**
+   * The state the file covers, or — 10/17 (Nic) — the country, for a world
+   * level drawn one country at a time. Null for a file that covers the lot
+   * (the national congressional districts, every country, every province).
+   */
   state: string | null
   areas: GeoArea[]
   /** Every area's outline, each line drawn once (a city's edge stands alone; it has no neighbor). */
   borders: MultiLineString
+  /** 10/17: for a world level, each area's country, so a name can read "Entre Ríos, Argentina". */
+  country: Map<string, { code: string; name: string }>
 }
 
 export function buildLayer(level: MetricsBoundaryLayer, state: string | null, topo: Topology): LayerShapes {
+  const obj = topo.objects.areas as GeometryCollection
   const areas = toAreas(topo, 'areas', f => areaName(level, String(f.id), f.properties))
-  return { level, state, areas, borders: mesh(topo, topo.objects.areas as GeometryCollection) }
+  const country = new Map<string, { code: string; name: string }>()
+  for (const g of obj.geometries) {
+    const of = areaCountry(level, String(g.id), (g as any).properties)
+    if (of) country.set(String(g.id), of)
+  }
+  return { level, state, areas, borders: mesh(topo, obj), country }
 }
 
 const layerCache = new Map<string, Promise<LayerShapes>>()
-/** A level's shapes (a state's, for a level drawn one state at a time); kept for the page's life. */
+/**
+ * A level's shapes — one state's, or one country's, for a level drawn that way;
+ * kept for the page's life. Each is its own fetch, so a level nobody opens is
+ * never downloaded (a country's districts are a few tens of kilobytes, and
+ * there are 199 of them).
+ */
 export function loadLayer(api: AxiosInstance, level: MetricsBoundaryLayer, state: string | null): Promise<LayerShapes> {
   const key = state ? `${level}/${state}` : level
   let p = layerCache.get(key)
@@ -143,6 +187,37 @@ export function loadLayer(api: AxiosInstance, level: MetricsBoundaryLayer, state
   }
   return p
 }
+
+// ── 10/17 (Nic): the census numbers behind the saturation overlay ────────────
+
+/**
+ * One map level's census numbers, as the API serves them (GET
+ * /admin/metrics/census/:level — American Community Survey five-year
+ * estimates, kept beside the API; services/platformCensus). Each area is keyed
+ * by the same code the map uses, so the join is code to code.
+ */
+export interface CensusLevel {
+  level: string
+  edition: string
+  numbers: string[]
+  /** code → [total population, all housing units, renter-occupied homes]. */
+  areas: Record<string, [number, number, number]>
+}
+
+const censusCache = new Map<string, Promise<CensusLevel>>()
+/** Fetched the first time the saturation overlay is turned on for a level; kept for the page's life. */
+export function loadCensus(api: AxiosInstance, level: MetricsMapLevel): Promise<CensusLevel> {
+  let p = censusCache.get(level)
+  if (!p) {
+    p = api.get<CensusLevel>(`/admin/metrics/census/${level}`).then(r => r.data)
+    censusCache.set(level, p)
+    p.catch(() => censusCache.delete(level))
+  }
+  return p
+}
+
+/** Forgets the census numbers, as reloading the page does — so a test can start cold. */
+export function forgetCensus(): void { censusCache.clear() }
 
 // ── The world, for the globe ─────────────────────────────────────────────────
 
@@ -212,15 +287,30 @@ export interface FlatPicture {
 /** us-atlas's own Albers USA frame: Alaska and Hawaii inset; the territories are not in it. */
 export const nationalProjection = (): GeoProjection => geoAlbersUsa().scale(1300).translate([W / 2, H / 2])
 
-/** A state filling the frame, drawn equal-area around its own middle (Alaska across the date line too). */
-export function stateProjection(state: Feature): GeoProjection {
-  const [[, s], [, n]] = geoBounds(state)
-  const [lng] = geoCentroid(state)
+/**
+ * 10/17 (Nic): the whole earth flat, for the world's own levels. Natural Earth
+ * — the shape a world map is usually drawn in, curved meridians and all —
+ * fitted to the same frame the United States is drawn in.
+ */
+export const worldProjection = (): GeoProjection =>
+  geoNaturalEarth1().fitExtent([[2, 2], [W - 2, H - 2]], { type: 'Sphere' } as any)
+
+/**
+ * One area filling the frame, drawn equal-area around its own middle (Alaska
+ * across the date line too). A state, at the city / district / ZIP levels; a
+ * country, at the world's county-or-district level.
+ */
+export function areaProjection(area: Feature): GeoProjection {
+  const [[, s], [, n]] = geoBounds(area)
+  const [lng] = geoCentroid(area)
   return geoConicEqualArea()
     .parallels([s + (n - s) / 6, n - (n - s) / 6])
     .rotate([-lng, 0])
-    .fitExtent([[12, 12], [W - 12, H - 12]], state)
+    .fitExtent([[12, 12], [W - 12, H - 12]], area)
 }
+
+/** The same, named for the state levels it was written for. */
+export const stateProjection = areaProjection
 
 function draw(path: ReturnType<typeof geoPath>, areas: GeoArea[]): FlatShape[] {
   return areas.map(a => {
@@ -252,13 +342,47 @@ export function flatNational(us: UsAtlas, level: 'state' | 'county' | 'cd', laye
 export function flatState(us: UsAtlas, stateFips: string, layer: LayerShapes): FlatPicture | null {
   const state = us.stateById.get(stateFips)
   if (!state) return null
-  const path = geoPath(stateProjection(state.feature))
+  const path = geoPath(areaProjection(state.feature))
   return {
     areas: draw(path, layer.areas),
     context: path(countyLinesIn(us, stateFips)) ?? '',
     borders: path(layer.borders) ?? '',
     states: '',
     nation: path(state.feature) ?? '',
+  }
+}
+
+/**
+ * 10/17 (Nic): the world flat — every country, or every state and province,
+ * with the country lines under them. `countries` is the country layer, which
+ * draws those lines (and is the level's own shapes at the country level).
+ */
+export function flatWorld(layer: LayerShapes, countries: LayerShapes | null): FlatPicture {
+  const path = geoPath(worldProjection())
+  return {
+    areas: draw(path, layer.areas),
+    // At the country level the lines between countries ARE the level's own.
+    context: layer.level === 'country' || !countries ? '' : path(countries.borders) ?? '',
+    borders: path(layer.borders) ?? '',
+    states: '',
+    nation: '',
+  }
+}
+
+/**
+ * 10/17 (Nic): one country's counties or districts, the country filling the
+ * map — "if they have counties within those provinces". `outline` is that
+ * country's own shape, from the country layer, drawn around them.
+ */
+export function flatCountry(layer: LayerShapes, outline: GeoArea | null): FlatPicture | null {
+  if (!outline) return null
+  const path = geoPath(areaProjection(outline.feature))
+  return {
+    areas: draw(path, layer.areas),
+    context: '',
+    borders: path(layer.borders) ?? '',
+    states: '',
+    nation: path(outline.feature) ?? '',
   }
 }
 
@@ -273,6 +397,9 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 
 /** The United States facing out, with the curve of the earth in view. */
 export const US_VIEW: GlobeView = { rotate: [98, -36], zoom: 1.35 }
+
+/** 10/17 (Nic): the whole earth, for the world's own levels — nothing zoomed in on. */
+export const WORLD_VIEW: GlobeView = { rotate: [20, -15], zoom: 1 }
 
 /** The globe's radius at zoom 1: a little inside the frame. */
 export const globeRadius = (width: number, height: number, zoom: number) => Math.min(width, height) * 0.46 * zoom
@@ -327,8 +454,18 @@ export function areaAt(areas: readonly GeoArea[], projection: GeoProjection, x: 
 
 // ── Color ────────────────────────────────────────────────────────────────────
 
-/** Strength of a place's color, 0.18 (a little) to 1 (the most on the map). Square-root, as before. */
-export const strength = (v: number, max: number) => (v > 0 && max > 0 ? 0.18 + 0.82 * Math.sqrt(v / max) : 0)
+/**
+ * Strength of a place's color, 0.18 (a little) to 1 (the most on the map).
+ * Square-root, as before.
+ *
+ * 10/17 (review): a value past `max` is held at full instead of running over
+ * it, because the saturation overlay tops its scale out at 100% — as many
+ * spaces as the Census counts in an area. One park in a Census place of 47
+ * renter-occupied homes reads 211%, and scaling every other area against that
+ * one washed the rest of the map out to nothing.
+ */
+export const strength = (v: number, max: number) =>
+  (v > 0 && max > 0 ? 0.18 + 0.82 * Math.sqrt(Math.min(v / max, 1)) : 0)
 
 /**
  * 10/12 (Nic) review: the one solid color for a strength — gold mixed into the

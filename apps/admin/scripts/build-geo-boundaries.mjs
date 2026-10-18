@@ -23,7 +23,7 @@
  * provinces."
  *
  *   world/ne_10m_admin_1_states_provinces   countries, and their states and provinces
- *   world/geoBoundariesCGAZ_ADM2            the level below a province, in the 218
+ *   world/geoBoundariesCGAZ_ADM2            the level below a province, in the 199
  *                                           countries that have one — counties,
  *                                           districts, municipalities, communes.
  *                                           geoBoundaries, CC BY 4.0: the map credits
@@ -86,9 +86,20 @@ import { fileURLToPath } from 'node:url'
 import { geoArea } from 'd3-geo'
 
 const require = createRequire(import.meta.url)
-const { topology } = require('topojson-server')
-const { presimplify } = require('topojson-simplify')
-const { quantize, feature } = require('topojson-client')
+/**
+ * 10/17 (review): the two build-only tools are deliberately not in any package
+ * list (see the note at the top), so say which command installs them rather
+ * than failing with a bare module-not-found three years from now.
+ */
+const buildTool = name => {
+  try { return require(name) } catch {
+    console.error(`[build-geo-boundaries] ${name} is not installed. It is a build-only tool and is kept out of the app's package list on purpose. Install both and run again:\n  npm i -D --no-save topojson-server@3.0.1 topojson-simplify@3.0.3`)
+    process.exit(1)
+  }
+}
+const { topology } = buildTool('topojson-server')
+const { presimplify } = buildTool('topojson-simplify')
+const { quantize, feature, merge } = require('topojson-client')
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const args = process.argv.slice(2)
@@ -113,6 +124,26 @@ const QUANTIZE = 1e5
 
 /** The globe's world land: one degree is drawn about this many pixels across. */
 const WORLD_PX_PER_DEGREE = 2.5
+/**
+ * 10/17 (review): the world's own map LEVELS — the countries, and their states
+ * and provinces — are cut forty times finer than the globe's backdrop, because
+ * the API places properties in them and the backdrop is only a fill. At the
+ * backdrop's detail a fjord is one straight line and a property in Nuuk came
+ * out inside no country on earth.
+ *
+ * 10/17 (second review): 25 was still too coarse for GAM's own coast. At that
+ * cut DROP_PX2 throws away every piece under about 29 square kilometers, which
+ * is every island in the Florida Keys — Key West and Marathon were in no
+ * country on earth. At 100 one pixel is a kilometer: the Keys, Nantucket,
+ * Catalina and Galveston all come through, a line is simplified by under a
+ * kilometer, and the two files together are 2 MB instead of 1 MB. A property
+ * within half a mile of a border can still land on the wrong side — fine for a
+ * heat map, not for anything legal or billed, as everywhere else here. The
+ * handful of places that are outside the land in the RAW file (downtown Miami,
+ * Venice, Copenhagen, Nuuk) are placed by WORLD_SNAP_KM in the API instead;
+ * no amount of detail here reaches them.
+ */
+const WORLD_LEVEL_PX_PER_DEGREE = 100
 
 const LAYERS = {
   // 10/17: the land around the United States, for the globe — Nic asked to
@@ -142,12 +173,61 @@ const LAYERS = {
   zcta:  { dir: 'cb_2020_us_zcta520_500k', edition: 'Census 2020 cartographic boundaries, ZIP Code Tabulation Areas, 1:500,000' },
 }
 
+/**
+ * 10/17 (review): geoBoundaries keys a country by ISO 3166 and Natural Earth
+ * by its own three letters, and for three countries the two disagree. Every
+ * world level here is keyed by Natural Earth's code, because the provinces are
+ * what the API places a property in and the country comes off the province —
+ * so a district file written under the other code can never be asked for.
+ * Kosovo, South Sudan and Western Sahara were exactly that: 30 KB of districts
+ * on disk while a property in Pristina was told its country has none.
+ */
+const ADM2_COUNTRY = { XKX: 'KOS', SSD: 'SDS', ESH: 'SAH' }
+
+/**
+ * 10/17 (review): geoBoundaries lost the alphabet for 654 of its districts —
+ * 103 distinct names, Russian and Japanese, are literally "????????? ?????"
+ * in the download, and 51 areas share one of them. A row of question marks is
+ * not a name: the area is numbered instead, which at least tells two of them
+ * apart on the map and never puts punctuation on screen as a place.
+ */
+const districtName = (name, n) => (/[\p{L}\p{N}]/u.test(name) ? name : `Unnamed area ${n}`)
+
 // ── Reading a shapefile ──────────────────────────────────────────────────────
+
+/** Strict UTF-8: throws on bytes that are not valid UTF-8, which is the whole point below. */
+const utf8 = new TextDecoder('utf-8', { fatal: true })
+
+/**
+ * One value out of a DBF, in the encoding that download writes.
+ *
+ * 10/17 (review): geoBoundaries' ADM2 file is MIXED. 5,280 of its 5,294
+ * accented names are Latin-1 ("Malësi e Madhe"), and 14 are UTF-8 bytes — the
+ * ten Māori names with macrons and four Peruvian ones with an ñ. Read as
+ * Latin-1 those fourteen shipped as "WaitematÄ Local Board Area"; read as
+ * UTF-8 the other 5,280 break. So a value with a high byte is read as UTF-8
+ * when it IS valid UTF-8 and as Latin-1 when it is not: a real Latin-1 name
+ * that happens to be valid multi-byte UTF-8 would have to contain "Ã±"
+ * literally, which no place is called.
+ */
+function dbfText(buf, at, len, encoding) {
+  const slice = buf.subarray(at, at + len)
+  if (encoding === 'latin1') {
+    for (const b of slice) {
+      if (b > 127) {
+        try { return utf8.decode(slice).replace(/\0/g, '').trim() } catch { break }
+      }
+    }
+  }
+  // Census files pad with spaces, Natural Earth with NULs; strip both.
+  return buf.toString(encoding, at, at + len).replace(/\0/g, '').trim()
+}
 
 /**
  * `encoding` is how that download writes its text: Census and Natural Earth
- * write UTF-8; geoBoundaries writes Latin-1, and read as UTF-8 every accented
- * district name in it ("Malësi e Madhe") comes out broken.
+ * write UTF-8; geoBoundaries writes Latin-1 (all but fourteen rows — see
+ * dbfText), and read as UTF-8 every accented district name in it ("Malësi e
+ * Madhe") comes out broken.
  */
 function readDbf(file, encoding = 'utf8') {
   const buf = fs.readFileSync(file)
@@ -161,8 +241,7 @@ function readDbf(file, encoding = 'utf8') {
   for (let r = 0; r < count; r++) {
     let at = headerLen + r * recordLen + 1 // the first byte is the deleted flag
     const row = {}
-    // Census files pad with spaces, Natural Earth with NULs; strip both.
-    for (const f of fields) { row[f.name] = buf.toString(encoding, at, at + f.len).replace(/\0/g, '').trim(); at += f.len }
+    for (const f of fields) { row[f.name] = dbfText(buf, at, f.len, encoding); at += f.len }
     rows.push(row)
   }
   return rows
@@ -469,6 +548,45 @@ function provinces() {
   return neProvinces
 }
 
+/**
+ * 10/17 (review): a country's provinces DISSOLVED into the country — the lines
+ * between them gone, the outside edge kept.
+ *
+ * The first cut of this simply piled every province of a country into one
+ * shape, and the simplifier then threw away every piece smaller than a pixel
+ * and a half. A province that small is not an island, it is a city: Mexico
+ * City and Reykjavík came out as HOLES punched through their own countries,
+ * and a point inside either was in no country at all. Dissolving them first
+ * means a piece that gets dropped is a real island off the coast, never a hole
+ * inland.
+ *
+ * Done on a shared topology, which is what makes the shared lines findable:
+ * two provinces that touch are the same arc in it, and merging drops it.
+ */
+function dissolveCountries(areas) {
+  const features = areas.map(a => ({
+    type: 'Feature', id: a.country, properties: null,
+    geometry: a.polygons.length === 1
+      ? { type: 'Polygon', coordinates: a.polygons[0] }
+      : { type: 'MultiPolygon', coordinates: a.polygons },
+  }))
+  const topo = topology({ areas: { type: 'FeatureCollection', features } }, 1e6)
+  const groups = new Map()
+  topo.objects.areas.geometries.forEach((g, i) => {
+    const code = features[i].id
+    groups.set(code, [...(groups.get(code) ?? []), g])
+  })
+  const nameOf = new Map(areas.map(a => [a.country, a.countryName]))
+  return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([code, geoms]) => {
+    const shape = merge(topo, geoms)
+    return {
+      id: code,
+      properties: { name: nameOf.get(code) || code },
+      polygons: shape.type === 'Polygon' ? [shape.coordinates] : shape.coordinates,
+    }
+  })
+}
+
 /** Census "ZZZ" districts are the water and land no district covers — not districts. */
 const isDistrict = code => !/^Z+$/.test(code)
 
@@ -491,15 +609,7 @@ const builders = {
    * us-atlas, and a second, coarser copy under it would only double its coast.
    */
   world() {
-    const byCountry = new Map()
-    for (const { row, polygons } of readLayer('world')) {
-      if (!polygons.length || row.adm0_a3 === 'USA') continue
-      const g = byCountry.get(row.adm0_a3)
-        ?? { id: row.adm0_a3, properties: { name: row.admin }, polygons: [] }
-      g.polygons.push(...polygons)
-      byCountry.set(row.adm0_a3, g)
-    }
-    const areas = [...byCountry.values()].sort((a, b) => a.id.localeCompare(b.id))
+    const areas = dissolveCountries(provinces().filter(p => p.country !== 'USA'))
     const { topo, kept } = buildTopology(areas, 1 / WORLD_PX_PER_DEGREE)
     const bytes = writeJson('world.json', topo)
     summary.world = { file: 'world.json.gz', areas: kept, bytes }
@@ -514,14 +624,8 @@ const builders = {
    * from us-atlas in finer detail).
    */
   country() {
-    const byCountry = new Map()
-    for (const p of provinces()) {
-      const g = byCountry.get(p.country) ?? { id: p.country, properties: { name: p.countryName }, polygons: [] }
-      g.polygons.push(...p.polygons)
-      byCountry.set(p.country, g)
-    }
-    const areas = [...byCountry.values()].sort((a, b) => a.id.localeCompare(b.id))
-    const { topo, kept } = buildTopology(areas, 1 / WORLD_PX_PER_DEGREE)
+    const areas = dissolveCountries(provinces())
+    const { topo, kept } = buildTopology(areas, 1 / WORLD_LEVEL_PX_PER_DEGREE)
     const bytes = writeJson('country.json', topo)
     summary.country = { file: 'country.json.gz', areas: kept, bytes }
     log(`country: ${kept} countries, ${(bytes / 1e6).toFixed(2)} MB`)
@@ -535,7 +639,7 @@ const builders = {
     const areas = provinces()
       .map(p => ({ id: p.id, polygons: p.polygons, properties: { name: p.name, country: p.country, countryName: p.countryName } }))
       .sort((a, b) => a.id.localeCompare(b.id))
-    const { topo, kept } = buildTopology(areas, 1 / WORLD_PX_PER_DEGREE)
+    const { topo, kept } = buildTopology(areas, 1 / WORLD_LEVEL_PX_PER_DEGREE)
     const bytes = writeJson('adm1.json', topo)
     summary.adm1 = { file: 'adm1.json.gz', areas: kept, bytes }
     log(`adm1: ${kept} states and provinces, ${(bytes / 1e6).toFixed(2)} MB`)
@@ -543,7 +647,7 @@ const builders = {
   /**
    * 10/17 (Nic): the level below a province, "if they have counties within
    * those provinces" — counties, districts, municipalities, communes,
-   * whatever that country calls it. geoBoundaries has one for 218 countries
+   * whatever that country calls it. geoBoundaries has one for 199 countries
    * and nothing for the rest, which is exactly the "show whichever levels a
    * country actually has" rule: a country with no file has no such level.
    *
@@ -552,6 +656,13 @@ const builders = {
    * nothing but these files ever reads the id — the API places properties in
    * the very shapes it serves the page — so the short one keeps 49,349 ids out
    * of the files for nothing.
+   *
+   * 10/17 (review): THE FILES ARE NAMED BY NATURAL EARTH'S CODE, not
+   * geoBoundaries' (ADM2_COUNTRY). A property reaches this level through the
+   * province it is in, and the provinces are Natural Earth's — so a file under
+   * any other code is a file nothing can ever ask for. Three of them were:
+   * Kosovo's districts sat on disk as XKX.json.gz while a property in Pristina
+   * was told its country has no districts at all.
    */
   adm2() {
     const rows = readLayerRows('adm2')
@@ -566,9 +677,20 @@ const builders = {
     const disputed = []
     rows.forEach((row, i) => {
       if (!/^[A-Z]{3}$/.test(row.shapeGroup)) { disputed.push(row.shapeName); return }
-      byCountry.set(row.shapeGroup, [...(byCountry.get(row.shapeGroup) ?? []), i])
+      const code = ADM2_COUNTRY[row.shapeGroup] ?? row.shapeGroup
+      byCountry.set(code, [...(byCountry.get(code) ?? []), i])
     })
     if (disputed.length) log(`adm2: ${disputed.length} disputed areas belong to no country and were left out: ${disputed.join(', ')}`)
+    // A country Natural Earth has no province for cannot be reached: no
+    // property can ever be placed in it, so the file would be dead weight.
+    // Nothing is in this list today — it is here so a new edition of either
+    // download says so out loud instead of writing files nobody can open.
+    const reachable = new Set(provinces().map(p => p.country))
+    const orphans = [...byCountry.keys()].filter(c => !reachable.has(c)).sort()
+    if (orphans.length) {
+      log(`adm2: ${orphans.length} countries have districts but no province in Natural Earth, so no property can reach them; left out: ${orphans.join(' ')}`)
+      for (const c of orphans) byCountry.delete(c)
+    }
     try {
       writeByCountry('adm2', [...byCountry.keys()].sort(), code => {
         const out = []
@@ -580,7 +702,7 @@ const builders = {
           out.push({
             id: `${code}.${String(n).padStart(4, '0')}`,
             polygons,
-            properties: { name: rows[i].shapeName || `${code} ${n}` },
+            properties: { name: districtName(rows[i].shapeName, n) },
           })
         }
         return out
@@ -672,7 +794,7 @@ for (const key of Object.keys(LAYERS)) {
   layers[key] = { ...rest, edition: LAYERS[key].edition }
 }
 writeJson('index.json', {
-  about: 'Built by apps/admin/scripts/build-geo-boundaries.mjs from U.S. Census cartographic boundary files, and the world land from Natural Earth (both public domain). Do not edit by hand; re-run the script.',
+  about: 'Built by apps/admin/scripts/build-geo-boundaries.mjs from U.S. Census cartographic boundary files and Natural Earth (both public domain), and — for the level below a province outside the United States — geoBoundaries, used under CC BY 4.0 and credited on the map itself. Do not edit by hand; re-run the script.',
   layers,
 }, { plain: true })
 const total = Object.values(summary).reduce((s, l) => s + (l.bytes ?? 0), 0)

@@ -120,8 +120,41 @@ describe('the boundary files', () => {
     expect(entre?.properties).toMatchObject({ country: 'ARG', countryName: 'Argentina' })
     // 10/17 (review): geoBoundaries writes Latin-1, and read as UTF-8 every
     // accented district name came out broken.
-    const alb = JSON.parse(gunzipSync(readFileSync(join(GEO_DIR, 'adm2', 'ALB.json.gz'))).toString('utf8'))
-    expect(alb.objects.areas.geometries.map((g: any) => g.properties.name)).toContain('Malësi e Madhe')
+    const names = (c: string) => (JSON.parse(gunzipSync(readFileSync(join(GEO_DIR, 'adm2', `${c}.json.gz`))).toString('utf8'))
+      .objects.areas.geometries as Array<{ properties: any }>).map(g => g.properties.name as string)
+    expect(names('ALB')).toContain('Malësi e Madhe')
+    // 10/17 (second review): that file is MIXED — fourteen of its rows are
+    // UTF-8 bytes among 5,280 Latin-1 ones, and read as Latin-1 those fourteen
+    // shipped as "WaitematÄ Local Board Area". Both kinds have to come out
+    // right, and nothing anywhere may carry a C1 byte or a replacement mark.
+    expect(names('NZL')).toContain('Waitematā Local Board Area')
+    expect(names('NZL')).toContain('Ōtorohanga District')
+    expect(names('PER')).toContain('Cañete')
+    for (const c of ['ALB', 'NZL', 'PER', 'RUS', 'SWE', 'NOR']) {
+      for (const n of names(c)) expect(/[\u0080-\u009f�]/.test(n), `${c} ${n}`).toBe(false)
+    }
+    // geoBoundaries lost the alphabet altogether for 654 districts (51 of them
+    // the same row of question marks); a row of punctuation is not a name.
+    for (const n of names('RUS')) expect(/[\p{L}\p{N}]/u.test(n), n).toBe(true)
+  })
+
+  it('every country with districts is a country a property can actually reach', () => {
+    // 10/17 (review): geoBoundaries keys a country by ISO 3166 and Natural
+    // Earth by its own three letters. Three disagreed (XKX/KOS, SSD/SDS,
+    // ESH/SAH), and because a property reaches this level through the province
+    // it is in — Natural Earth's — those three files could never be opened:
+    // Kosovo's districts sat on disk while a property in Pristina was told its
+    // country has none. The two vocabularies have to be the same one here.
+    const provinces = JSON.parse(gunzipSync(readFileSync(join(GEO_DIR, 'adm1.json.gz'))).toString('utf8'))
+    const countries = new Set((provinces.objects.areas.geometries as Array<{ properties: any }>)
+      .map(g => g.properties.country as string))
+    const index = JSON.parse(readFileSync(join(GEO_DIR, 'index.json'), 'utf8'))
+    for (const c of index.layers.adm2.countries) expect(countries.has(c), `adm2/${c}`).toBe(true)
+    for (const c of ['KOS', 'SDS', 'SAH']) expect(index.layers.adm2.countries, c).toContain(c)
+    for (const c of ['XKX', 'SSD', 'ESH']) {
+      expect(index.layers.adm2.countries, c).not.toContain(c)
+      expect(existsSync(join(GEO_DIR, 'adm2', `${c}.json.gz`)), c).toBe(false)
+    }
   })
 
   it('every ZIP code file holds TopoJSON areas named by their codes', () => {
@@ -281,6 +314,18 @@ const TORONTO_ON = { lat: 43.6532, lng: -79.3832 }
 const MEXICO_CITY = { lat: 19.4326, lng: -99.1332 }
 const HONG_KONG = { lat: 22.3193, lng: 114.1694 }
 const MID_PACIFIC = { lat: 0, lng: -150 }
+/**
+ * 10/17 (review): places the world's own shapes do not have under them.
+ * Miami, Venice and Nuuk are outside the land in the RAW Natural Earth file;
+ * Key West is an island the simplifier used to throw away. Kosovo and South
+ * Sudan are the two countries the two downloads call by different codes.
+ */
+const MIAMI_FL = { lat: 25.7617, lng: -80.1918 }
+const KEY_WEST_FL = { lat: 24.5551, lng: -81.78 }
+const NUUK_GRL = { lat: 64.1835, lng: -51.7216 }
+const VENICE_ITA = { lat: 45.4408, lng: 12.3155 }
+const PRISTINA_KOS = { lat: 42.6629, lng: 21.1655 }
+const JUBA_SSD = { lat: 4.8594, lng: 31.5713 }
 
 describe('buildMapLevels: the world levels', () => {
   it('places a property outside the United States in its country, province and district', async () => {
@@ -292,6 +337,49 @@ describe('buildMapLevels: the world levels', () => {
     for (const level of WORLD_LAYERS) expect(l[level].areas[0]).toMatchObject({ state: '', stateFips: '' })
     // Ontario is not a U.S. state, so every United States level names it as a gap.
     for (const level of US_LAYERS) expect(l[level].missing[0], level).toMatchObject({ reason: 'unknown_state' })
+  })
+
+  it('a waterfront address, which the world file draws as water, is placed by the nearest province', async () => {
+    // 10/17 (review): downtown Miami, Key West and Nuuk were in no country on
+    // earth. Two separate faults: the Keys and every island under about 29
+    // square kilometers were thrown away by the simplifier (the world levels
+    // are cut four times finer now), and Miami, Venice, Copenhagen and Nuuk
+    // are outside the land in the RAW Natural Earth file, which no amount of
+    // detail reaches — so a location inside nothing is counted in the province
+    // it is within WORLD_SNAP_KM of.
+    for (const [where, at, country, province] of [
+      ['downtown Miami', MIAMI_FL, 'USA', 'Florida'],
+      ['Key West', KEY_WEST_FL, 'USA', 'Florida'],
+      ['Nuuk', NUUK_GRL, 'GRL', 'Kommuneqarfik Sermersooq'],
+      ['Venice', VENICE_ITA, 'ITA', 'Venezia'],
+    ] as const) {
+      const l = await only({ state: 'FL', ...at })
+      expect(l.country.areas[0], where).toMatchObject({ fips: country })
+      expect(l.adm1.areas[0], where).toMatchObject({ name: province, country })
+      expect(l.country.missing, where).toEqual([])
+    }
+    // Miami is miles inside the county the Census draws, which is how it reads
+    // on the county map too — the snap does not move it anywhere else.
+    expect((await only({ state: 'FL', ...MIAMI_FL })).adm2.areas[0]).toMatchObject({ name: 'Miami-Dade', country: 'USA' })
+    // Three miles of tolerance still leaves the open sea in no country.
+    const sea = await only({ state: 'HI', ...MID_PACIFIC })
+    for (const level of WORLD_LAYERS) expect(sea[level].areas, level).toEqual([])
+  })
+
+  it('the three countries whose two sources disagree reach their own districts', async () => {
+    // 10/17 (review): Kosovo, South Sudan and Western Sahara are KOS/SDS/SAH
+    // in Natural Earth and XKX/SSD/ESH in geoBoundaries. A property in
+    // Pristina was told "its country has no counties and districts below its
+    // states and provinces" while 18 KB of Kosovo's districts sat on disk.
+    const ks = await only({ state: 'XK', city: 'Pristina', ...PRISTINA_KOS })
+    expect(ks.country.areas[0]).toMatchObject({ fips: 'KOS' })
+    expect(ks.adm1.areas[0]).toMatchObject({ name: 'Priština', country: 'KOS' })
+    expect(ks.adm2.areas[0]).toMatchObject({ name: 'Municipality of Pristina', country: 'KOS' })
+    expect(ks.adm2.missing).toEqual([])
+
+    const ss = await only({ state: 'CE', city: 'Juba', ...JUBA_SSD })
+    expect(ss.adm1.areas[0]).toMatchObject({ name: 'Central Equatoria', country: 'SDS' })
+    expect(ss.adm2.areas[0]).toMatchObject({ name: 'Juba', country: 'SDS' })
   })
 
   it('a province whose country has no level below it says so, instead of drawing nothing', async () => {
@@ -328,12 +416,12 @@ describe('buildMapLevels: the world levels', () => {
     const sea = await only({ state: 'HI', ...MID_PACIFIC })
     expect(sea.country.missing[0]).toMatchObject({
       reason: 'outside',
-      label: 'its map location is not inside any country on the world map, which draws a coastline straight',
+      label: 'its map location is out at sea, inside no country on the world map and not within a few miles of one',
     })
     expect(sea.adm1.missing[0]).toMatchObject({ reason: 'outside' })
     expect(sea.adm2.missing[0]).toMatchObject({
       reason: 'no_country',
-      label: 'its map location is not inside any country on the world map, which draws a coastline straight',
+      label: 'its map location is out at sea, inside no country on the world map and not within a few miles of one',
     })
 
     const orphan = await buildMapLevels([row({ property_id: null, state: null, units: 0, occupied: 0, money: '25' })], MAP_STATE_FIPS)

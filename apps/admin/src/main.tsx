@@ -2494,19 +2494,38 @@ function NachaMonitor(){
 }
 
 // ── SALES-TAX NEXUS MONITOR (S565) ───────────────────────────────────────
-// GAM own-revenue by customer state vs each state's economic-nexus registration
+// GAM's own earnings by state vs each state's economic-nexus registration
 // threshold. MONITORING ONLY — the dashboard never collects tax; the register
 // action flips collection (gated separately in the screening-fee path).
-const NEXUS_STATUS_BADGE:Record<string,string>={crossed:'br',approaching:'ba',registered:'bg2',under:'bmu',no_threshold:'bmu'}
-const NEXUS_STATUS_LABEL:Record<string,string>={crossed:'Threshold crossed',approaching:'Approaching',registered:'Registered',under:'Under',no_threshold:'No sales tax'}
+//
+// 10/17 (Nic): "the sales tax nexus on the admin platform is not accurately
+// reading... it would need to take into account any margins that GAM makes on
+// card payments or ACH payments", and per state he wants "a breakdown of total
+// transactions, and then the actual subscription costs, hard markup fees,
+// background checks or screenings, and then any other customer opt-in things…
+// Let's have them all as a combined total on the Nexus by default, but then we
+// can expand it and see line items and see, okay, if that state's not counting
+// some of those, where are we really at? I'd rather count high and register
+// with those states early."
+//
+// So: the column is the combined total and every crossing reads it; Breakdown
+// opens the line items, with each state's own measurement rule beside them and
+// the subtotal that rule would really measure.
+const NEXUS_STATUS_BADGE:Record<string,string>={crossed:'br',approaching:'ba',registered:'bg2',under:'bmu',no_threshold:'bmu',unresearched:'ba'}
+const NEXUS_STATUS_LABEL:Record<string,string>={crossed:'Threshold crossed',approaching:'Approaching',registered:'Registered',under:'Under',no_threshold:'No sales tax',unresearched:'Not researched'}
 function NexusMonitor(){
   const{user}=useAuth()
   const qc=useQueryClient()
   const{data,isLoading}=useQuery('nexus',()=>get<any>('/admin/nexus/dashboard'),{enabled:!!user})
   const[confirm,setConfirm]=React.useState<any>(null) // {state, register, date, notes}
+  const[open,setOpen]=React.useState<Record<string,boolean>>({})
   const states:any[]=data?.states||[]
-  const summary=data?.summary||{crossed:0,approaching:0,registered:0,under:0}
+  const summary=data?.summary||{crossed:0,approaching:0,registered:0,under:0,unresearched:0}
   const warnPct=Math.round((data?.warnFraction??0.8)*100)
+  const unattributed=data?.unattributed
+  const nonReceipt=data?.nonReceipt
+  // The legend comes from what the server returned, never a list kept here.
+  const legend:any[]=data?.lineItems||[]
 
   const recomputeMut=useMutation(()=>post('/admin/nexus/recompute'),{
     onSuccess:()=>{qc.invalidateQueries('nexus');toast('Nexus tally recomputed')},
@@ -2514,23 +2533,30 @@ function NexusMonitor(){
   const registerMut=useMutation((b:any)=>post('/admin/nexus/register',b),{
     onSuccess:()=>{qc.invalidateQueries('nexus');setConfirm(null);toast('Registration updated')},
   })
+  const ruleMut=useMutation((b:any)=>post('/admin/nexus/measure-rule',b),{
+    onSuccess:()=>{qc.invalidateQueries('nexus');toast('Measurement rule saved')},
+  })
 
-  // Show states that matter first: crossed, approaching, registered, then the
-  // rest — but only ones with a threshold + some signal by default.
-  const ORDER:Record<string,number>={crossed:0,approaching:1,registered:2,under:3,no_threshold:4}
+  // Show states that matter first: crossed, not researched, approaching,
+  // registered, then the rest.
+  const ORDER:Record<string,number>={crossed:0,unresearched:1,approaching:2,registered:3,under:4,no_threshold:5}
   const sorted=[...states].sort((a,b)=>(ORDER[a.status]-ORDER[b.status])||(b.pctOfThreshold||0)-(a.pctOfThreshold||0)||a.stateCode.localeCompare(b.stateCode))
   const crossed=sorted.filter(s=>s.status==='crossed')
+  const unresearched=sorted.filter(s=>s.status==='unresearched')
 
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">Sales-Tax Nexus Monitor</h1><p className="ps">GAM own-revenue by customer state vs economic-nexus thresholds</p></div>
+        <div><h1 className="pt">Sales-Tax Nexus Monitor</h1><p className="ps">What GAM earns in each state vs that state's registration threshold</p></div>
         <button className="btn bgold bsm" onClick={()=>recomputeMut.mutate()} disabled={recomputeMut.isLoading}>{recomputeMut.isLoading?'Recomputing…':'↻ Recompute tally'}</button>
       </div>
 
       <div className="nacha-flag" style={{borderColor:'var(--b1)'}}>
         <div style={{fontSize:'.8rem',color:'var(--t2)',lineHeight:1.6}}>
-          <strong style={{color:'var(--gold)',fontFamily:'var(--font-d)'}}>Monitoring only — this page collects no tax.</strong> Revenue counted conservatively (platform fee + screening + Flex fees, by customer state) to register <em>early</em>. A crossing means it's time to register; collection turns on only when you register a state <em>and</em> a screening service is taxable there. Thresholds + tax rates are research-grade — confirm with a tax pro before registering.
+          <strong style={{color:'var(--gold)',fontFamily:'var(--font-d)'}}>Monitoring only — this page collects no tax.</strong> Every figure is money GAM actually earned, read from GAM's own revenue book: the platform subscription, the real margin on each card and bank payment, screening margins, and what customers pay for opt-in services. Counted high on purpose, so a state gets registered early. A crossing means it's time to register; collection turns on only when you register a state <em>and</em> a screening service is taxable there. Thresholds, tax rates and what each state measures are research-grade — confirm with a tax pro before registering.
+          <div style={{marginTop:6,color:'var(--t3)',fontSize:'.72rem'}}>
+            Margins are measured at the property's state, so they line up with the space fee earned there; a screening is measured where the applicant lives, or at the property they applied to when no address was collected. The business portal's monthly fee is counted from its own billing records — it is the one receipt that has never been posted to GAM's revenue book, and it stops being counted that way the moment it is.
+          </div>
           {data?.computedAt&&<div style={{marginTop:6,color:'var(--t3)',fontSize:'.72rem'}}>Tally last computed {new Date(data.computedAt).toLocaleString()}</div>}
         </div>
       </div>
@@ -2543,20 +2569,28 @@ function NexusMonitor(){
       </div>
 
       {crossed.length>0&&<div className="alert ae">🚨 {crossed.length} state{crossed.length>1?'s have':' has'} crossed the economic-nexus threshold: {crossed.map(s=>s.stateCode).join(', ')}. Register to begin collecting where taxable.</div>}
+      {unresearched.length>0&&<div className="alert aw">GAM is earning in {unresearched.length} place{unresearched.length>1?'s':''} with no researched threshold yet: {unresearched.map(s=>s.stateCode).join(', ')}. The money is counted here; the threshold still needs looking up.</div>}
 
       <div className="card" style={{padding:0}}>
         <div style={{padding:'12px 14px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>All states</div></div>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
           <table className="tbl">
-            <thead><tr><th>State</th><th>Measured revenue</th><th>Threshold</th><th style={{width:'26%'}}>Progress</th><th>Taxable</th><th>Status</th><th></th></tr></thead>
+            <thead><tr><th>State</th><th>Measured receipts</th><th>Transactions</th><th>Threshold</th><th style={{width:'20%'}}>Progress</th><th>Taxable</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {sorted.map((s:any)=>{
                 const pct=s.pctOfThreshold!=null?Math.min(s.pctOfThreshold,1.5):null
                 const barColor=s.status==='crossed'?'var(--red)':s.status==='approaching'?'var(--amber,#d99e2b)':s.status==='registered'?'var(--gold)':'var(--green,#3fb950)'
+                const narrowed=s.measureRule&&!s.measureRule.countsEverything
                 return(
-                  <tr key={s.stateCode} style={{background:s.status==='crossed'?'rgba(239,68,68,.04)':''}}>
+                  <React.Fragment key={s.stateCode}>
+                  <tr style={{background:s.status==='crossed'?'rgba(239,68,68,.04)':''}}>
                     <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{s.stateCode}</td>
-                    <td className="mono">{formatCurrency(s.measureUsd)}</td>
+                    <td className="mono">{formatCurrency(s.measureUsd)}
+                      {narrowed&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{formatCurrency(s.countedMeasureUsd)} by this state's rule</div>}
+                    </td>
+                    <td className="mono" style={{color:'var(--t2)'}}>{s.measureTxn}
+                      {s.txnThreshold!=null&&<span style={{color:'var(--t3)',fontSize:'.65rem'}}> / {s.txnThreshold}</span>}
+                    </td>
                     <td className="mono" style={{color:'var(--t3)'}}>{s.thresholdUsd!=null?formatCurrency(s.thresholdUsd):'—'}</td>
                     <td>
                       {pct!=null?(
@@ -2564,11 +2598,14 @@ function NexusMonitor(){
                           <div style={{flex:1,height:7,background:'var(--bg3)',borderRadius:4,overflow:'hidden'}}><div style={{width:`${Math.min(pct*100,100)}%`,height:'100%',background:barColor,transition:'width .3s'}}/></div>
                           <span className="mono" style={{fontSize:'.68rem',color:'var(--t3)',minWidth:34,textAlign:'right'}}>{Math.round(s.pctOfThreshold*100)}%</span>
                         </div>
-                      ):<span style={{color:'var(--t3)',fontSize:'.72rem'}}>no threshold</span>}
+                      ):<span style={{color:'var(--t3)',fontSize:'.72rem'}}>{s.status==='unresearched'?'threshold not researched':'no threshold'}</span>}
                     </td>
                     <td>{s.thresholdUsd==null?<span style={{color:'var(--t3)'}}>—</span>:<span className={`badge ${s.taxable?'ba':'bmu'}`}>{s.taxable?'Taxable':'$0'}</span>}</td>
                     <td><span className={`badge ${NEXUS_STATUS_BADGE[s.status]||'bmu'}`}>{NEXUS_STATUS_LABEL[s.status]||s.status}</span></td>
-                    <td style={{textAlign:'right'}}>
+                    <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                      {/* Neutral, not red: this only opens the row. Red here sat
+                          flush against Unregister in the identical class. */}
+                      <button className="btn bg bsm" style={{fontSize:'.7rem',padding:'3px 8px',marginRight:6}} onClick={()=>setOpen(x=>({...x,[s.stateCode]:!x[s.stateCode]}))}>{open[s.stateCode]?'Hide':'Breakdown'}</button>
                       {s.status!=='no_threshold'&&(
                         s.registered
                           ?<button className="btn bd bsm" style={{fontSize:'.7rem',padding:'3px 8px'}} onClick={()=>setConfirm({stateCode:s.stateCode,register:false})}>Unregister</button>
@@ -2576,12 +2613,107 @@ function NexusMonitor(){
                       )}
                     </td>
                   </tr>
+                  {open[s.stateCode]&&(
+                    <tr>
+                      <td colSpan={8} style={{background:'var(--bg2)',padding:14}}>
+                        {!s.breakdownReady&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:8}}>The line items for {s.stateCode} haven't been computed yet — press Recompute tally above to fill them in.</div>}
+                        <table className="tbl" style={{marginBottom:0}}>
+                          <thead><tr><th>Line item</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th><th style={{width:180}}>{s.stateCode} counts it</th></tr></thead>
+                          <tbody>
+                            {(s.lineItems||[]).map((li:any)=>(
+                              <tr key={li.key}>
+                                <td style={{fontSize:'.75rem'}}>{li.label}</td>
+                                <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                                <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td>
+                                <td>
+                                  <label style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t3)',cursor:'pointer'}}>
+                                    <input type="checkbox" checked={!!li.counted} style={{accentColor:'var(--gold)'}} disabled={ruleMut.isLoading}
+                                      onChange={e=>ruleMut.mutate({stateCode:s.stateCode,counts:{[li.key]:e.target.checked}})}/>
+                                    {li.counted?'Counted':'Not counted here'}
+                                  </label>
+                                </td>
+                              </tr>
+                            ))}
+                            <tr>
+                              <td style={{fontSize:'.75rem',fontWeight:600,color:'var(--t0)'}}>Combined total</td>
+                              <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(s.revenueCurrentYtd)}</td>
+                              <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(s.revenuePriorYear)}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>Drives the crossing above</td>
+                            </tr>
+                            <tr>
+                              <td style={{fontSize:'.75rem'}}>What {s.stateCode} would measure</td>
+                              <td className="mono" style={{textAlign:'right'}}>{formatCurrency(s.countedCurrentYtd)}</td>
+                              <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(s.countedPriorYear)}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.countedPctOfThreshold!=null?`${Math.round(s.countedPctOfThreshold*100)}% of threshold`:'no threshold'}</td>
+                            </tr>
+                            <tr>
+                              <td style={{fontSize:'.75rem'}}>Transactions</td>
+                              <td className="mono" style={{textAlign:'right'}}>{s.txnCurrentYtd}</td>
+                              <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{s.txnPriorYear}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.txnThreshold!=null?`threshold ${s.txnThreshold}`:'no transaction threshold'}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                        <div style={{marginTop:8,fontSize:'.7rem',color:'var(--t3)',lineHeight:1.6}}>
+                          Unticking a line item records that {s.stateCode} does not measure it — a researched answer, not a guess. It changes only the subtotal above; the combined total still decides when to register.
+                          {s.measureRule?.notes&&<div style={{marginTop:4}}>{s.measureRule.notes}</div>}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 )
               })}
             </tbody>
           </table>
         )}
       </div>
+
+      {unattributed&&(unattributed.currentYtd!==0||unattributed.priorYear!==0)&&(
+        <div className="card" style={{marginTop:16}}>
+          <div className="ct">Earned, but not placed in a state</div>
+          <p style={{fontSize:'.76rem',color:'var(--t2)',lineHeight:1.6,marginBottom:10}}>
+            Money GAM earned that no single state owns — a monthly processing true-up that corrects every state at once, a fee pull from a landlord whose properties sit in two states, a receipt whose property row was removed. It is shown here rather than split across states by guesswork, so the states above, this, and what GAM spent always add back up to GAM's book.
+          </p>
+          <table className="tbl">
+            <thead><tr><th>Line item</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th></tr></thead>
+            <tbody>
+              {(unattributed.lineItems||[]).map((li:any)=>(
+                <tr key={li.key}><td style={{fontSize:'.75rem'}}>{li.label}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                  <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td></tr>
+              ))}
+              <tr><td style={{fontSize:'.75rem',fontWeight:600,color:'var(--t0)'}}>Total</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(unattributed.currentYtd)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(unattributed.priorYear)}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {nonReceipt&&(nonReceipt.currentYtd!==0||nonReceipt.priorYear!==0)&&(
+        <div className="card" style={{marginTop:16}}>
+          <div className="ct">What GAM spent — no state measures it</div>
+          <p style={{fontSize:'.76rem',color:'var(--t2)',lineHeight:1.6,marginBottom:10}}>
+            A state's threshold counts what GAM takes IN from customers there. Buying card readers from the manufacturer is money going OUT, so it belongs to no state's figure. It is listed here because it sits on GAM's revenue book, and the states, the block above and this one have to add back up to that book.
+          </p>
+          <table className="tbl">
+            <thead><tr><th>Paid out</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th></tr></thead>
+            <tbody>
+              {(nonReceipt.items||[]).map((li:any)=>(
+                <tr key={li.key}><td style={{fontSize:'.75rem'}}>{li.label}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                  <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{marginTop:8,fontSize:'.7rem',color:'var(--t3)',lineHeight:1.6}}>
+            What a landlord pays back toward a reader's cost, and GAM's markup on it, are real money received — those stay counted in the state the reader went to.
+          </div>
+        </div>
+      )}
+
+      {legend.length>0&&<div style={{marginTop:10,fontSize:'.7rem',color:'var(--t3)'}}>Line items: {legend.map((l:any)=>l.label).join(' · ')}</div>}
 
       {confirm&&(
         <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.7)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setConfirm(null)}}>
@@ -2603,7 +2735,7 @@ function NexusMonitor(){
               </div>
             )}
             <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
-              <button className="btn bd" onClick={()=>setConfirm(null)}>Cancel</button>
+              <button className="btn bg" onClick={()=>setConfirm(null)}>Cancel</button>
               <button className="btn bgold" disabled={registerMut.isLoading} onClick={()=>registerMut.mutate({stateCode:confirm.stateCode,registered:confirm.register,registeredDate:confirm.date||null,notes:confirm.notes||null})}>{registerMut.isLoading?'Saving…':confirm.register?'Confirm register':'Confirm unregister'}</button>
             </div>
           </div>

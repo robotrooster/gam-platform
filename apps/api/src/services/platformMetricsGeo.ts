@@ -223,6 +223,69 @@ export function shapeAt(shapes: readonly GeoShape[], lat: number, lng: number): 
   return null
 }
 
+/** Kilometers in one degree of latitude — near enough for a few miles of tolerance. */
+const KM_PER_DEGREE = 111.32
+
+/**
+ * Kilometers from a point to one piece of a line, measured in a flat frame
+ * around that point (longitude squeezed by the latitude, which is exact enough
+ * over a few miles).
+ */
+function segmentKm(
+  lng: number, lat: number, x1: number, y1: number, x2: number, y2: number, squeeze: number,
+): number {
+  const ax = (x1 - lng) * squeeze, ay = y1 - lat
+  const bx = (x2 - lng) * squeeze, by = y2 - lat
+  const dx = bx - ax, dy = by - ay
+  const along = dx || dy ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy))) : 0
+  return Math.hypot(ax + along * dx, ay + along * dy) * KM_PER_DEGREE
+}
+
+/**
+ * 10/17 (review): the area NEAREST a point, when the point is inside none of
+ * them, or null when the nearest is farther off than `withinKm`.
+ *
+ * The world's shapes are drawn for the whole earth, and at that scale a
+ * waterfront address is often in the water — downtown Miami, Venice,
+ * Copenhagen and Nuuk are each outside the land in the RAW Natural Earth file,
+ * before anything here simplifies it, so no amount of detail fixes them. A
+ * handful of miles' tolerance places them in the province they are plainly in
+ * (every one of those four is inside half a mile of it) and still leaves a
+ * location out at sea in no country at all, named under the map. The page says
+ * this rule on screen (METRICS_MAP_WORLD_NOTE) rather than keeping it quiet.
+ *
+ * Distances across the date line are not measured the short way: a point
+ * within a few miles of longitude 180 is simply left to the gap list.
+ */
+export function nearestShape(
+  shapes: readonly GeoShape[], lat: number, lng: number, withinKm: number,
+): GeoShape | null {
+  const squeeze = Math.max(Math.cos((lat * Math.PI) / 180), 1e-6)
+  const padLat = withinKm / KM_PER_DEGREE
+  const padLng = padLat / squeeze
+  let best: GeoShape | null = null
+  let bestKm = withinKm
+  for (const s of shapes) {
+    if (lng < s.box[0] - padLng || lng > s.box[2] + padLng || lat < s.box[1] - padLat || lat > s.box[3] + padLat) continue
+    for (const poly of s.polygons) {
+      for (const r of poly) {
+        for (let i = 0, j = r.length - 2; i < r.length; j = i, i += 2) {
+          const km = segmentKm(lng, lat, r[j], r[j + 1], r[i], r[i + 1], squeeze)
+          if (km < bestKm) { bestKm = km; best = s }
+        }
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * How far off a world shape a location may be and still be counted in it.
+ * Five kilometers — about three miles — is more than the coastline's own
+ * error at this scale and far less than the sea between two countries.
+ */
+export const WORLD_SNAP_KM = 5
+
 interface LayerShapes {
   shapes: GeoShape[]
   byId: Map<string, GeoShape>
@@ -360,21 +423,22 @@ export function levelGapLabel(level: MetricsBoundaryLayer, gap: LevelGap): strin
     case 'stale_location': return 'its address changed and no map location has been found for the new address'
     case 'outside': return METRICS_MAP_WORLD_LEVELS.includes(level)
       // The world map's lines are drawn coarsely enough to see the whole
-      // earth, so a point a mile or two off a coast can fall outside it.
-      ? `its map location is not inside any ${n.one} on the world map, which draws a coastline straight`
+      // earth, so a point off a coast is counted in the nearest one within a
+      // few miles (WORLD_SNAP_KM); this is what is left after that.
+      ? `its map location is out at sea, inside no ${n.one} on the world map and not within a few miles of one`
       : `its map location is not inside any ${n.one} of its state`
     case 'wrong_state': return 'its map location is in a different state than its address'
     case 'no_match': return level === 'zcta'
       ? 'Census draws no area for the ZIP code on its address, and no map location puts it inside one'
       : level === 'adm2'
-        ? `its map location is in a country this map has ${n.many} for, but inside none of them`
+        ? `its map location is in a country this map has ${n.many} for, but inside none of them and not within a few miles of one`
         : 'the city on its address is not a Census city or town in its state, and no map location puts it inside one'
     case 'two_places': return 'two Census places in its state have the name of the city on its address, and no map location tells them apart'
     case 'no_layer': return `Census draws no ${n.many} for its state`
     case 'no_shapes': return `the ${n.one} map could not be read on the server`
     // 10/17 (Nic): the world's own levels. A property lands on them by its map
     // location alone — GAM holds a U.S. state on an address, never a country.
-    case 'no_country': return 'its map location is not inside any country on the world map, which draws a coastline straight'
+    case 'no_country': return 'its map location is out at sea, inside no country on the world map and not within a few miles of one'
     case 'no_districts': return `its country has no ${n.many} below its states and provinces`
   }
 }
@@ -475,7 +539,12 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
     // is straight enough that a point on a waterfront can fall outside it.
     const provinces = await shapesFor('adm1')
     if (provinces === 'unreadable' || !provinces) { miss(level, 'no_shapes', n, true); return }
+    // 10/17 (review): a waterfront address is often in the water at this scale
+    // — downtown Miami and Nuuk are outside the land in the raw file — so a
+    // location inside nothing is counted in the province it is within a few
+    // miles of, and anything farther out is named under the map as before.
     const inProvince = shapeAt(provinces.shapes, lat, lng)
+      ?? nearestShape(provinces.shapes, lat, lng, WORLD_SNAP_KM)
     // A province with no country of its own would have nowhere to go on any of
     // these levels, so it counts as being in no country rather than under a
     // blank one. The file is built with every province's country, so this is a
@@ -489,7 +558,7 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
     if (!perCountry.get(level)?.has(country)) { miss(level, 'no_districts', n, true); return }
     const file = await shapesFor(level, country)
     if (file === 'unreadable' || !file) { miss(level, 'no_shapes', n, true); return }
-    const at = shapeAt(file.shapes, lat, lng)
+    const at = shapeAt(file.shapes, lat, lng) ?? nearestShape(file.shapes, lat, lng, WORLD_SNAP_KM)
     if (!at) { miss(level, 'no_match', n, true); return }
     addWorld(level, at.id, at.name, country, countryName, n)
   }

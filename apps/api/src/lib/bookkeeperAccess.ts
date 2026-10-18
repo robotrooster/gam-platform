@@ -82,6 +82,15 @@
 export const BOOKKEEPER_REFUSAL =
   'Bookkeepers see money in and who paid it, money out, receipts and maintenance costs, and with the company-wide box the bank account, payouts and payroll. This part of GAM is not included.'
 
+/**
+ * 10/17 (Nic): the key the tax list's routes ask for — one entry in the
+ * permission catalog (packages/shared PERMISSION_CATALOG, "Change a tax rate"),
+ * named here once so routes/pos and the bookkeeper's grant below read the same
+ * string. taxesEditKeyIsInTheCatalog in stayTaxOneHome.test.ts holds the two
+ * in step.
+ */
+export const TAXES_EDIT_PERM = 'taxes.edit'
+
 type Rule = { method: string; test: RegExp }
 
 const RULES: Rule[] = [
@@ -129,6 +138,21 @@ const RULES: Rule[] = [
   // invoices (/balances/:tenantId/invoices), the Payments ledger — stays
   // refused.
   { method: 'GET',    test: /^\/api\/balances\/rent-roll\/(properties|open-month|history)\/?$/ },
+  // 10/17 (Nic): "owner AND bookkeeper may change a rate." The company's own
+  // list of named taxes — the ONE home for a tax rate, which the Sales & Tax
+  // page files from: a rate the bookkeeper is forwarding to an agency is a
+  // rate they can correct. Every change is kept with who made it
+  // (pos_tax_rate_changes), so a filing traces to the rate in force.
+  //
+  // THE RATE, AND ONLY THE RATE. Nic's words reach a rate and nothing else, so
+  // making a tax, removing one and choosing what one reaches stay the owner's
+  // on the register's own Taxes screen — a removal drops the property's stay
+  // percentage to nothing and untaxes every stay booked afterwards, which is
+  // not a correction. routes/pos holds the PATCH to the rate for them too, so
+  // the one route they reach cannot turn a tax off by another name. These
+  // three and nothing else of the register: no items, no sales, no customers.
+  { method: 'GET',    test: /^\/api\/pos\/tax-rates(\/changes)?\/?$/ },
+  { method: 'PATCH',  test: /^\/api\/pos\/tax-rates\/[0-9a-f-]{36}\/?$/i },
   // The P&L reports.
   { method: 'GET',    test: /^\/api\/reports\/(summary|monthly-pl|property-pl|site-downtime|property-detail)\/?$/ },
   // 10/12 (Nic): the monthly property report, with the owner's box (see the header).
@@ -175,6 +199,13 @@ export const BOOKKEEPER_GRANTED_PERMS: ReadonlySet<string> = new Set([
   'payments.view_all',      // the P&L reports' gate, and (10/13) the Payments page and the Rent Roll
   'reports.tab.overview',
   'reports.tab.property',
+  // 10/17 (Nic): the company's named taxes — a rate the bookkeeper files with
+  // an agency is one they may change. Its own key: the register's own
+  // 'pos.manage_inventory' would have been every item, vendor and stock count
+  // too. An owner can hand the same key to one of their own staff, which is
+  // why it is in the permission catalog like every other key (packages/shared
+  // PERMISSION_CATALOG — "Change a tax rate").
+  TAXES_EDIT_PERM,
 ])
 
 /**

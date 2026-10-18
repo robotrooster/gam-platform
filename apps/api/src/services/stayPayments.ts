@@ -118,8 +118,9 @@ export async function recordSiteDeposit(q: Q, o: {
  * property's short-stay tax already in it (shared priceStay — the one price
  * every door charges) and the deposit is a share of that taxed total, so its
  * tax is the deposit less its pre-tax share: deposit − ROUND(deposit ÷ (1 +
- * rate), 2) — the split the reports make, but from the rate in force now and
- * stored, never re-derived later from whatever the rate has become
+ * rate), 2) — the split the reports make, but from the rate THE STAY WAS
+ * PRICED AT (10/17, unit_bookings.stay_tax_rate) and stored, never re-derived
+ * later from whatever the rate has become
  * (stay_payments.lodging_tax_amount). Priced over the nights SOLD
  * (registerStay soldCheckOutSql): an untaxed stay (30+ nights, or exactly
  * whole calendar months) has none. Also the backfill's rule for deposits
@@ -141,7 +142,14 @@ export async function siteDepositLodgingTax(q: Q, bookingId: string, deposit: nu
   }>(
     `SELECT to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(${soldCheckOutSql('b')}, 'YYYY-MM-DD') AS check_out,
             ${untaxedMonthStaySql('b')} AS month_stay,
-            p.short_term_tax_rate::text AS short_term_tax_rate,
+            -- 10/17 (Nic, "never reprice history"): the rate THIS stay was
+            -- priced at (stamped on the booking), not the property's rate at
+            -- the moment the webhook lands. The booking row exists before the
+            -- deposit does, and a rate change in between is now instant and
+            -- company-wide, so reading today's figure stored a tax the card
+            -- was never charged. The property's rate stands in only for a stay
+            -- priced before stamping began.
+            COALESCE(b.stay_tax_rate * 100, p.short_term_tax_rate)::text AS short_term_tax_rate,
             COALESCE(u.nightly_rate, p.nightly_rate)::text AS nightly,
             COALESCE(u.weekly_rate, p.weekly_rate)::text AS weekly,
             COALESCE(u.monthly_rate, p.monthly_rate)::text AS monthly

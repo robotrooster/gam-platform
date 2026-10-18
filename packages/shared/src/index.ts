@@ -1870,6 +1870,11 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
           hint: 'Look through past sales and customers even without "Ring sales". Each day closes on its own overnight, so there is no button to press.' },
         { key: 'pos.manage_inventory', label: 'Create / edit items, tax, vendors',
           hint: 'Set up the store: items, prices, categories, tax rates, discounts, vendors, purchase orders, stock counts, and card readers (ordering a reader bills you). Also lets them change prices at the register.' },
+        // 10/17 (Nic, one home for a tax rate): "owner AND bookkeeper may
+        // change a rate." A bookkeeper holds this key by their role; an owner
+        // can hand it to their own staff without handing over the whole store.
+        { key: 'taxes.edit',           label: 'Change a tax rate',
+          hint: 'Lets them correct the percentage on a tax you already named, and see who changed it before. A lodging tax prices every stay, so a change moves the booking site, pay links and the front desk at once. Naming or removing one is owner-only.' },
       ]},
     ],
   },

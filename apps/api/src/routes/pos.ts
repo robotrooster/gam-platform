@@ -6,7 +6,7 @@ import { cardFeeSplit, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGH
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 import { db, query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
 import { holdForTheCart, createConnectionToken, registerReader, listReaders, archiveReader, createCardPresentPaymentIntent, processPaymentIntentOnReader, captureTerminalPaymentIntent, cancelTerminalPaymentIntent, retrieveTerminalPaymentIntent, cancelReaderAction, showCartOnReader, clearCartOnReader, readerAction, retrieveTerminalPaymentIntentWithCharge } from '../services/posTerminal'
@@ -3623,18 +3623,30 @@ posRouter.patch('/items/:id/variants/:variantId', requirePerm('pos.manage_invent
 // (services/posTax).
 //
 // WHO. Nic: "owner AND bookkeeper may change a rate." The owner passes
-// requirePerm by role; a bookkeeper reaches these four routes, and only these,
-// through the bookkeeper allowlist (lib/bookkeeperAccess), holding
-// 'taxes.edit'. Nobody else's staff hold it.
+// requirePerm by role; a bookkeeper reaches the list, its journal and the rate
+// PATCH — and nothing else of the register — through the bookkeeper allowlist
+// (lib/bookkeeperAccess), holding 'taxes.edit'. Their words reach a rate and
+// no further, so on that PATCH a bookkeeper may move the percentage and
+// nothing else: naming a tax, turning one off and choosing what it reaches
+// stay the owner's on this screen (assertBookkeeperChangesOnlyTheRate).
+//
+// WHICH PROPERTY'S. 10/17 (review): every one of these routes is scoped to the
+// caller's own properties (taxRatesScope / assertTaxRateInScope). A bookkeeper
+// or a clerk ticked for one park could otherwise read every park's rates and
+// journal and move a rate bound to a park they were never given — which now
+// moves what every stay there is priced at. Nic, on a bookkeeper: "They don't
+// need to see anything with Oak Park." A company-wide rate (no property) is
+// every property's, so only somebody who holds every property may write one.
 //
 // EVERY CHANGE IS KEPT, with who and when (pos_tax_rate_changes), so a filing
 // traces to the rate that was in force — written by the journal trigger, which
 // reads the actor from the session setting writeAsActor puts there.
 
 import type { PoolClient } from 'pg'
+import { TAXES_EDIT_PERM } from '../lib/bookkeeperAccess'
 
-/** The permission a bookkeeper holds for the tax list (lib/bookkeeperAccess). */
-const TAXES_EDIT = 'taxes.edit'
+/** The permission the tax list asks for — one catalog key (packages/shared). */
+const TAXES_EDIT = TAXES_EDIT_PERM
 
 /**
  * A write that a journal trigger has to be able to name a person for, in ONE
@@ -3660,28 +3672,67 @@ async function writeAsActor<T>(userId: string, fn: (c: PoolClient) => Promise<T>
   }
 }
 
+/**
+ * 10/17 (review) — WHOSE RATES A CALLER SEES.
+ *
+ * The properties this caller holds, or null when they hold every one of the
+ * company's (an owner, a bookkeeper with the company-wide box, a worker ticked
+ * for all properties). ?propertyId= narrows to that one and is checked against
+ * them. Company-wide rates (no property) reach every property, so they are
+ * always in the answer.
+ */
+async function taxRatesScope(req: any): Promise<string[] | null> {
+  const propertyId = req.query?.propertyId ? String(req.query.propertyId) : null
+  if (propertyId) { await assertPropertyInScope(req.user, propertyId); return [propertyId] }
+  return getScopedPropertyIds(req.user)
+}
+
+/**
+ * A rate this caller may WRITE: one bound to a property they hold. A rate
+ * bound to no property is every property's — it prices stays at parks they
+ * were never given — so writing one is only theirs when they hold them all.
+ */
+async function assertTaxRateInScope(user: any, propertyId: string | null | undefined): Promise<void> {
+  if (propertyId) return assertPropertyInScope(user, propertyId)
+  if ((await getScopedPropertyIds(user)) !== null) {
+    throw new AppError(403, 'A tax for the whole company is set by the account owner. Pick a property.')
+  }
+}
+
+/**
+ * 10/17 (Nic): "owner AND bookkeeper may change a rate" — a RATE. Somebody
+ * whose authority here is only 'taxes.edit' (a bookkeeper, or a staff member
+ * the owner handed that one key) moves the percentage and nothing else: the
+ * name, what it reaches, which property, the stay tick and the off switch are
+ * the owner's on the register's own Taxes screen. Turning a stay tax off drops
+ * the property's stay percentage to nothing and untaxes every stay booked
+ * after it, which is not a correction of a rate.
+ */
+const RATE_ONLY_WORDS =
+  'Changing the rate is yours. Naming a tax, turning one off, or choosing what it applies to is set by the account owner on the register\'s Taxes screen.'
+
+function assertChangesOnlyTheRate(req: any): void {
+  if (userHasPerm(req.user, 'pos.manage_inventory')) return
+  for (const k of ['name', 'taxType', 'appliesTo', 'isActive', 'propertyId', 'categoryIds', 'itemIds', 'onStays']) {
+    if (req.body?.[k] !== undefined) throw new AppError(403, RATE_ONLY_WORDS)
+  }
+}
+
 // S217: optional ?propertyId= filter mirrors S192's pos_items shape.
 // When provided, returns (rates at that property) UNION (landlord-wide
-// rates with NULL property_id). When omitted, returns every rate
-// under the landlord — the configuration surface needs the full list.
+// rates with NULL property_id). When omitted, every rate the caller's own
+// properties are charged under — the configuration surface needs the full
+// list, and an owner holds every property (taxRatesScope).
 posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
-    const propertyFilter = req.query.propertyId as string | undefined
-    let rates: any[]
-    if (propertyFilter) {
-      rates = await query<any>(
-        `SELECT * FROM pos_tax_rates
-          WHERE landlord_id = $1
-            AND (property_id = $2 OR property_id IS NULL)
-          ORDER BY tax_type, name`,
-        [posLandlordId(req), propertyFilter],
-      )
-    } else {
-      rates = await query<any>(
-        'SELECT * FROM pos_tax_rates WHERE landlord_id=$1 ORDER BY tax_type, name',
-        [posLandlordId(req)],
-      )
-    }
+    const scoped = await taxRatesScope(req)
+    const rates = await query<any>(
+      `SELECT * FROM pos_tax_rates
+        WHERE landlord_id = $1
+          AND ($2::uuid[] IS NULL OR property_id IS NULL OR property_id = ANY($2::uuid[]))
+        ORDER BY tax_type, name`,
+      [posLandlordId(req), scoped],
+    )
     res.json({ success: true, data: rates })
   } catch (e) { next(e) }
 })
@@ -3702,7 +3753,9 @@ async function ownedTaxTargets(req: any, table: 'pos_categories' | 'pos_items',
   return uniq
 }
 
-posRouter.post('/tax-rates', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
+// 10/17: naming a tax is not changing a rate — 'taxes.edit' does not open it
+// (the bookkeeper allowlist refuses the route outright as well).
+posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, rate, taxType, appliesTo, propertyId } = req.body
     // 10/17 (Nic): is this tax charged on a stay here? That answer is the one
@@ -3721,6 +3774,8 @@ posRouter.post('/tax-rates', requirePerm('pos.manage_inventory', TAXES_EDIT), as
         throw new AppError(400, 'propertyId does not belong to this landlord')
       }
     }
+    // 10/17 (review): and it must be a property this caller holds.
+    await assertTaxRateInScope(req.user, propertyId || null)
 
     // S650: a tax applies to everything ('all'), or to the categories and
     // items it names. Naming any means it is not 'all'.
@@ -3747,6 +3802,10 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT
       [req.params.id, posLandlordId(req)],
     )
     if (!existing) throw new AppError(404, 'Tax rate not found')
+    // 10/17 (review): the rate as it stands is a property this caller holds,
+    // and (below) so is the property it is being moved to.
+    await assertTaxRateInScope(req.user, existing.property_id)
+    assertChangesOnlyTheRate(req)
 
     const { name, rate, taxType, appliesTo, isActive, propertyId } = req.body
     assertNonNeg([rate, 'Rate'])
@@ -3766,6 +3825,8 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT
       }
       newPropertyId = propertyId
     }
+    // 10/17 (review): both sides of a re-assignment are the caller's own.
+    if (newPropertyId !== existing.property_id) await assertTaxRateInScope(req.user, newPropertyId)
 
     const categoryIds = await ownedTaxTargets(req, 'pos_categories', req.body.categoryIds)
     const itemIds = await ownedTaxTargets(req, 'pos_items', req.body.itemIds)
@@ -3786,8 +3847,15 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT
   } catch (e) { next(e) }
 })
 
-posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
+// 10/17: turning a tax off is not changing a rate either — the owner's, and
+// scoped to the property the rate is bound to.
+posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
+    const existing = await queryOne<{ property_id: string | null }>(
+      'SELECT property_id FROM pos_tax_rates WHERE id=$1 AND landlord_id=$2',
+      [req.params.id, posLandlordId(req)])
+    if (!existing) throw new AppError(404, 'Tax rate not found')
+    await assertTaxRateInScope(req.user, existing.property_id)
     // 10/17: turning a stay tax off stops taxing stays here — the property's
     // percentage follows it down, in this transaction, and the journal keeps
     // who turned it off.
@@ -3806,10 +3874,11 @@ posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDI
  */
 posRouter.get('/tax-rates/changes', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
-    const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
-    const params: any[] = [posLandlordId(req)]
-    const where = propertyId
-      ? `AND (c.property_id = $${params.push(propertyId)} OR c.property_id IS NULL)` : ''
+    // 10/17 (review): the journal names the person who changed each rate, so
+    // it is narrowed to the caller's own properties like the list itself.
+    const scoped = await taxRatesScope(req)
+    const params: any[] = [posLandlordId(req), scoped]
+    const where = 'AND ($2::uuid[] IS NULL OR c.property_id IS NULL OR c.property_id = ANY($2::uuid[]))'
     const rows = await query<any>(
       `SELECT c.id, c.rate_id, c.property_id, c.name,
               c.old_rate::float AS old_rate, c.new_rate::float AS new_rate,

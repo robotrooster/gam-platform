@@ -34,10 +34,22 @@ export const isMetricsWorldLevel = (l: MetricsMapLevel): boolean =>
 
 /**
  * 10/17 (Nic): levels drawn one country at a time — "if they have counties
- * within those provinces". 218 countries have a level below their provinces
+ * within those provinces". 199 countries have a level below their provinces
  * and the rest have none, so a country with no file simply has no such level.
  */
 export const METRICS_MAP_COUNTRY_LEVELS: ReadonlyArray<MetricsBoundaryLayer> = ['adm2']
+
+/**
+ * 10/17 (review): said under the map at a world level, because it would
+ * otherwise be a quiet rule. The world's shapes are drawn for the whole earth,
+ * and at that scale a waterfront address is often in the water: downtown
+ * Miami, Venice, Copenhagen and Nuuk are all outside the land in the raw
+ * Natural Earth file, before anything here simplifies it. So a location that
+ * is inside nothing is placed in the nearest state or province within a few
+ * miles, and anything farther out than that is named under the map as always.
+ */
+export const METRICS_MAP_WORLD_NOTE =
+  'The world is drawn coarsely enough to see all of it at once, so a waterfront address can sit just off the land: one that is inside nothing is counted in the nearest state or province within a few miles, and anything farther out is named below.'
 
 /**
  * 10/17 (Nic): where each level's shapes come from, under the map. The ADM2
@@ -190,26 +202,71 @@ export const METRICS_CENSUS_BASIS_NOUN: Readonly<Record<MetricsCensusBasis, stri
 /**
  * 10/17 (Nic): "say plainly on screen what each percentage means" — the one
  * sentence under the map for the view on screen.
+ *
+ * 10/17 (review): each one used to read "out of every 100 … this many ARE
+ * spaces on GAM", which says a share can never pass 100. It can, and in GAM's
+ * own market it does: Amado, Arizona is 41 people and 41 housing units with
+ * NO renter-occupied home in the survey, and one park there is a hundred
+ * spaces. So each sentence now says what the number really is — spaces GAM
+ * has for every 100 the Census counts — which stays true at 210%.
  */
 export const METRICS_CENSUS_BASIS_MEANING: Readonly<Record<MetricsCensusBasis, string>> = {
-  renter: 'Out of every 100 renter-occupied homes the Census counts in an area, this many are spaces on GAM.',
-  homes: 'Out of every 100 housing units the Census counts in an area — rented, owned or empty — this many are spaces on GAM.',
+  renter: 'For every 100 renter-occupied homes the Census counts in an area, this is how many spaces GAM has there.',
+  homes: 'For every 100 housing units the Census counts in an area — rented, owned or empty — this is how many spaces GAM has there.',
   people: 'Spaces on GAM for every 100 people the Census counts in an area. One space can hold more than one person, so this reads low everywhere.',
 }
 
+/**
+ * 10/17 (review): the sentence that joins the one above when something on
+ * screen is over 100%. An RV or mobile-home park in a tiny Census place is
+ * routinely bigger than the survey's whole count there, and "fully saturated"
+ * is the honest reading — not an error, and not a number to hide or clip.
+ */
+export const METRICS_CENSUS_OVER_MEANING =
+  'Over 100% means GAM has more spaces in that area than the Census counts there at all — the survey does not count an RV or mobile-home site as a home unless somebody lives in it year round.'
+
+/** Where the saturation color tops out: as many spaces as the Census counts, or more. */
+export const METRICS_SATURATION_FULL = 100
+
+/**
+ * 10/17 (review): an area GAM is in that the Census counts nothing in. It used
+ * to drop off the map, out of the list and out of every note under it — it
+ * read as 0%, which says "GAM is not there". It is named instead, with the
+ * reason, and the words say which of the three counts is missing.
+ */
+export const censusCountsNothing = (noun: string): string =>
+  `The Census counts no ${noun} here, so there is no share to draw.`
+
 /** The concentration overlay's own sentence — a share of GAM, not a share of the area. */
 export const METRICS_CONCENTRATION_MEANING =
-  'Out of every 100 spaces GAM has placed on this map, this many sit in that district. It is a share of GAM, not a share of the district.'
+  'Out of every 100 spaces GAM has placed at this level, this many sit in that district. It is a share of GAM, not a share of the district.'
 
-/** A percentage, kept to one decimal; 0 when there is nothing to divide by. */
+/**
+ * A percentage, exactly — 0 when there is nothing to divide by, and never
+ * NaN or Infinity (a territory the survey has no row for divides by nothing).
+ *
+ * 10/17 (review): this used to round to a tenth, and four spaces in a city of
+ * 300,000 renter homes came out as "0%" — which reads as "GAM is not there",
+ * the opposite of the truth, on the very map Nic uses to decide where to push.
+ * The rounding belongs on screen (formatShare), where a share too small for a
+ * tenth says so; the color scale and the ranking read the exact number.
+ */
 export function sharePercent(numerator: number, denominator: number): number {
   if (!(denominator > 0) || !(numerator > 0)) return 0
-  return Math.round((numerator / denominator) * 1000) / 10
+  return (numerator / denominator) * 100
 }
 
-/** A share on screen: "3.2%", and "<0.1%" for a share too small to round to a tenth. */
+/**
+ * A share on screen: "60%", "3.2%", and "<0.1%" for a share too small for a
+ * tenth. Past 100% the tenth is noise, so it reads whole ("211%") — the number
+ * is never clipped to 100, because more spaces than the Census counts is the
+ * truth about that area, not an error (METRICS_CENSUS_OVER_MEANING).
+ */
 export function formatShare(percent: number): string {
   if (!(percent > 0)) return '0%'
-  if (percent < 0.1) return '<0.1%'
-  return `${percent % 1 === 0 ? percent.toFixed(0) : percent.toFixed(1)}%`
+  // Anything that would round to 0.0% is still something, and says so.
+  if (percent < 0.05) return '<0.1%'
+  if (percent >= 100) return `${Math.round(percent)}%`
+  const r = Math.round(percent * 10) / 10
+  return `${r % 1 === 0 ? r.toFixed(0) : r.toFixed(1)}%`
 }

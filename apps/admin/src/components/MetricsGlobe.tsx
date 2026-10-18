@@ -16,6 +16,11 @@
  * from the API's own world file — see metricsMapGeo loadWorld), so the earth
  * turns over land and not blank ocean. It arrives a moment after the globe
  * does; until then, and if it cannot be fetched, the globe draws without it.
+ *
+ * 10/17 (Nic): at a world level — countries, states and provinces, counties
+ * and districts — the areas can be whole countries, so the United States' own
+ * state lines are left off (`stateLines`): they would only cut a gold country
+ * into pieces that mean nothing at that level.
  */
 import React, { useCallback, useEffect, useRef } from 'react'
 import { geoGraticule10, geoPath } from 'd3-geo'
@@ -33,6 +38,12 @@ interface Props {
   areas: GeoArea[]
   /** The lines between the level's areas (counties, districts, cities, ZIP codes); null at the state level. */
   borders: MultiLineString | null
+  /**
+   * 10/17 (Nic): draw the United States' own state lines over the colors.
+   * False at a world level, where a whole country can be one gold shape and
+   * the state lines would only cut it up.
+   */
+  stateLines?: boolean
   /** Strength 0–1 of each area's gold, by id (only areas with a number). */
   shade: Map<string, number>
   focus: string | null
@@ -70,7 +81,7 @@ function makeColorReader() {
   }
 }
 
-export function MetricsGlobe({ us, world, areas, borders, shade, focus, target, onHover, onPick, label, describedBy }: Props) {
+export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLines = true, target, onHover, onPick, label, describedBy }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const view = useRef<GlobeView>(target)
   const size = useRef({ w: 0, h: 0 })
@@ -81,8 +92,8 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, target, 
   /** The markers drawn last frame (places too small to see), for hover and tap. */
   const dots = useRef<Array<{ id: string; x: number; y: number }>>([])
   // The latest props, for the drawing loop and the pointer handlers.
-  const props = useRef({ areas, borders, shade, focus, onHover, onPick })
-  props.current = { areas, borders, shade, focus, onHover, onPick }
+  const props = useRef({ areas, borders, shade, focus, stateLines, onHover, onPick })
+  props.current = { areas, borders, shade, focus, stateLines, onHover, onPick }
 
   const paint = useCallback(() => {
     frame.current = null
@@ -127,7 +138,7 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, target, 
       if (o) fill(a.feature, mixRgb(hi, base, o))
     }
     if (p.borders && !fast) stroke(p.borders, rgb('--bg2'), 0.5, 0.7)
-    stroke(us.stateBorders, rgb('--bg2'), 1)
+    if (p.stateLines) stroke(us.stateBorders, rgb('--bg2'), 1)
     stroke(us.nation, rgb('--b2'), 1)
     stroke(sphere, rgb('--b2'), 1)
     const f = p.focus ? p.areas.find(a => a.id === p.focus) : null
@@ -170,7 +181,7 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, target, 
   // A new target (another level, another state, a place picked from the list) turns the globe there.
   useEffect(() => { view.current = target; redraw() }, [target, redraw])
   // New numbers or a new focus: draw again.
-  useEffect(() => { redraw() }, [areas, borders, shade, focus, redraw])
+  useEffect(() => { redraw() }, [areas, borders, shade, focus, stateLines, redraw])
 
   // Fit the canvas to its box, and keep it fitted.
   useEffect(() => {

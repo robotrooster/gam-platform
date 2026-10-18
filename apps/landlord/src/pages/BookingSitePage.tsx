@@ -94,7 +94,6 @@ export function BookingSitePage() {
         nightlyRate: num(cfg.nightlyRate),
         weeklyRate: num(cfg.weeklyRate),
         monthlyRate: num(cfg.monthlyRate),
-        shortTermTaxRate: Number(cfg.shortTermTaxRate) || 0,
       })
       setCfg(updated)
       setMsg('Saved.')
@@ -288,9 +287,20 @@ export function BookingSitePage() {
               </div>
             </div>
 
-            <label className="form-label">Short-term lodging tax (% — applied to stays under 30 nights; 30+ is tax-exempt)</label>
-            <input className="input" type="number" min={0} max={100} value={cfg.shortTermTaxRate ?? 0}
-              onChange={e => setCfg((c: any) => ({ ...c, shortTermTaxRate: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
+            <label className="form-label">Short-term lodging tax (applied to stays under 30 nights; 30+ is tax-exempt)</label>
+            {/* 10/17 (Nic, one home for a tax rate): this was an editable box, and it was
+                the one that actually priced a stay — it sat at 6.35% for three weeks after
+                the company's own tax list was changed to 6.6%. It is a figure now, not a
+                box: it follows the tax ticked "charged on a stay here" in the register's
+                Taxes screen, so the two can never disagree again. */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{Number(cfg.shortTermTaxRate ?? 0).toFixed(2)}%</div>
+              <div style={{ fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.5, maxWidth: 520 }}>
+                {(cfg.shortTermTaxNames || []).length
+                  ? `From ${(cfg.shortTermTaxNames || []).join(' + ')} in your list of taxes. Change the rate there and every stay here is priced with it — the booking site, a pay link and the front desk.`
+                  : 'No tax is charged on stays here yet. Add one on the Taxes screen and tick "Charged on a stay here", and this figure follows it.'}
+              </div>
+            </div>
 
             <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
             <label className="form-label">Deposit for short stays (% of stay total — stays under 30 nights)</label>

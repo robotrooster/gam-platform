@@ -453,7 +453,9 @@ export function POSPage() {
   const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
   // S650 (Nic): one list of named taxes, each applied to everything, to whole
   // categories, or to single items. The name is what the receipt prints.
-  const blankTax = { id:'' as string, name:'', ratePct:'', all:true, categoryIds:[] as string[], itemIds:[] as string[] }
+  // 10/17 (Nic, one home for a tax rate): onStays — is this tax charged on a
+  // stay here? That one tick is what prices every stay at the property.
+  const blankTax = { id:'' as string, name:'', ratePct:'', all:true, onStays:false, categoryIds:[] as string[], itemIds:[] as string[] }
   const [taxDraft, setTaxDraft] = useState(blankTax)
   // S217: tax-rate list filter on the taxes tab.
   const [newDiscount, setNewDiscount] = useState({ name:'', type:'percent', value:'', code:'' })
@@ -1299,6 +1301,7 @@ export function POSPage() {
     name: d.name.trim(), rate: Number(d.ratePct) / 100,
     appliesTo: d.all ? ['all'] : [],
     categoryIds: d.all ? [] : d.categoryIds, itemIds: d.all ? [] : d.itemIds,
+    onStays: d.onStays,
   })
   const saveTaxMut = useMutation(() => taxDraft.id
     ? apiPatch(`/pos/tax-rates/${taxDraft.id}`, taxBody(taxDraft))
@@ -2365,13 +2368,16 @@ export function POSPage() {
                   const cats = categoriesForProperty(registerProperty).filter(c=>(t.categoryIds||[]).includes(c.id)).map(c=>c.name)
                   const legacy = Array.isArray(t.appliesTo) ? t.appliesTo.filter((x:string)=>String(x).toLowerCase()!=='all') : []
                   const its = (items as any[]).filter((i:any)=>i.propertyId===registerProperty).filter((i:any)=>(t.itemIds||[]).includes(i.id)).map((i:any)=>i.name)
-                  const reach = taxAppliesToAll(t) ? 'Everything' : [...cats, ...legacy].map(n=>`${n} (category)`).concat(its).join(', ') || 'Nothing yet'
+                  // 10/17 (Nic): a tax charged on stays says so first — that is the rate
+                  // every stay at this property is priced with, wherever it is booked.
+                  const onGoods = taxAppliesToAll(t) ? 'Everything sold here' : [...cats, ...legacy].map(n=>`${n} (category)`).concat(its).join(', ')
+                  const reach = [t.onStays===true ? 'Stays here' : '', onGoods].filter(Boolean).join(' + ') || 'Nothing yet'
                   return (<tr key={t.id}>
                     <td style={{fontWeight:500}}>{t.name}</td>
                     <td className="mono">{pct(t.rate)}</td>
                     <td style={{fontSize:'.82rem'}}>{reach}</td>
                     <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
-                      <button className="btn btn-ghost btn-sm" onClick={()=>setTaxDraft({ id:t.id, name:t.name, ratePct:String(+(Number(t.rate)*100).toFixed(4)), all:taxAppliesToAll(t), categoryIds:t.categoryIds||[], itemIds:t.itemIds||[] })}>Edit</button>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>setTaxDraft({ id:t.id, name:t.name, ratePct:String(+(Number(t.rate)*100).toFixed(4)), all:taxAppliesToAll(t), onStays:t.onStays===true, categoryIds:t.categoryIds||[], itemIds:t.itemIds||[] })}>Edit</button>
                       <button className="btn btn-ghost btn-sm" onClick={()=>deleteTaxMut.mutate(t.id)}>Remove</button>
                     </td>
                   </tr>)
@@ -2389,6 +2395,22 @@ export function POSPage() {
               <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:true}))} /> Everything sold here</label>
               <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={!taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:false}))} /> Only what I choose</label>
             </div>
+            {/* 10/17 (Nic): the ONE place a stay's tax rate is set. Ticked, this is
+                the rate every stay at this property is priced with — the booking
+                site, a pay link and the counter all follow it, so a rate can
+                never be changed in one screen and leave a stay at the old one. */}
+            <label style={{display:'flex',gap:8,alignItems:'flex-start',fontSize:'.85rem',marginTop:12}}>
+              {/* Ticking it moves the reach above to "Only what I choose" — a lodging
+                  tax is on stays, not on everything in the shop, unless the
+                  landlord says so by choosing again. */}
+              <input type="checkbox" checked={taxDraft.onStays} onChange={e=>setTaxDraft(d=>({...d,onStays:e.target.checked,all:e.target.checked?false:d.all}))} style={{marginTop:3}} />
+              <span>Charged on a stay here (a lodging tax)
+                <span style={{display:'block',color:'var(--text-3)',fontSize:'.75rem'}}>
+                  Every stay at this property is priced with it, wherever it is booked — the tax is inside the price the guest is quoted, so it is never added again at the till.
+                  {!taxDraft.all && !taxDraft.categoryIds.length && !taxDraft.itemIds.length ? ' Nothing else is taxed by it.' : ''}
+                </span>
+              </span>
+            </label>
             {!taxDraft.all && (
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginTop:12}}>
                 <div>
@@ -2401,7 +2423,9 @@ export function POSPage() {
                 </div>
                 <div>
                   <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Single items</div>
-                  {(items as any[]).filter((i:any)=>i.propertyId===registerProperty).map((i:any)=>(
+                  {/* 10/17 (Nic): sites and stays are not on this list — a stay's tax
+                      is the tick above, inside the price every door quotes. */}
+                  {(items as any[]).filter((i:any)=>i.propertyId===registerProperty).filter((i:any)=>!i.stayUnit).map((i:any)=>(
                     <label key={i.id} style={{display:'flex',gap:8,alignItems:'center',fontSize:'.82rem',marginBottom:4}}>
                       <input type="checkbox" checked={taxDraft.itemIds.includes(i.id)} onChange={e=>setTaxDraft(d=>({...d,itemIds:e.target.checked?[...d.itemIds,i.id]:d.itemIds.filter(x=>x!==i.id)}))} />
                       {i.name} <span style={{color:'var(--text-3)',fontSize:'.72rem'}}>{i.category}</span>

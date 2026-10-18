@@ -41,6 +41,7 @@ import {
   type BooksSalesAndTax, type BooksSalesTieTerm, type RentRollStayUnit,
 } from '@gam/shared'
 import { finGet } from './adapter'
+import { StayTaxCard } from './StayTaxCard'
 import {
   useFinancialsScope, usePeriod, money, dayName, errorWords, downloadCsv,
   PropertyPicker, PeriodPicker, PageHead, Notice,
@@ -369,6 +370,12 @@ export function SalesTaxPage() {
               GAM shows these figures; it does not file for you. Payroll tax is on the Tax Center — it is not collected from a customer.
             </p>
           </div>
+
+          {/* 10/17 (Nic): the rate each of those taxes is charged at, where the
+              person filing can correct one — "owner AND bookkeeper may change a
+              rate", with every change kept so a filing traces to the rate in
+              force. One home: a stay's price follows it too. */}
+          <StayTaxCard propertyId={propertyId} />
         </>
       ) : null}
     </div>
