@@ -115,7 +115,12 @@ describe('the account credit card', () => {
     expect(card.textContent).toContain('Paid ahead$200.00')
     expect(card.textContent).toContain('Credit you gave$100.00')
     expect(card.textContent).not.toContain('Statutory interest')
-    expect(card.textContent).toContain('pays a bill by itself only when it covers that whole bill')
+    // 10/15 (Nic): "money gets applied to the most outstanding balance first...
+    // somebody can't go put $1,000 credit and not pay a $2,000 existing bill."
+    // The card used to say credit waits for a bill it can cover whole; it now
+    // says the opposite, because that is what the money does.
+    expect(card.textContent).toContain('oldest bill first')
+    expect(card.textContent).toContain('credit never sits on an account while they still owe')
   })
   it('is left out when there is no credit', async () => {
     await render()
