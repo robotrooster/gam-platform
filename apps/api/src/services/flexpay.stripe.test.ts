@@ -122,6 +122,7 @@ import {
   seedLandlord, seedTenant, seedProperty, seedUnit,
   seedLease, seedLeaseTenant, seedAllocationRule,
   seedUtilityMeter, seedUtilityBill,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 const stripeMocks: {
@@ -158,11 +159,15 @@ const at = (ymd: string) => new Date(`${ymd}T12:00:00Z`)   // 5 am Phoenix that 
 beforeEach(async () => {
   await cleanupAllSchema()
   await db.query(`DELETE FROM platform_revenue_ledger`)
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     SELECT 'ach', 0, 1.0, 0, 0.5
-      WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 0, customerFacingPercent: 1.0,
+    stripeCostFlat: 0, stripeCostPercent: 0.5,
+    notes: 'flexpay.stripe.test.ts ACH rate',
+  })
   stripeMocks.customersRetrieve.mockReset()
   stripeMocks.customersRetrieve.mockResolvedValue({
     id: 'cus_default', invoice_settings: { default_payment_method: 'pm_default' }, default_source: null,

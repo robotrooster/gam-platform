@@ -63,6 +63,7 @@ import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
   seedLease, seedLeaseTenant, seedLeaseFee, seedSecurityDeposit, seedDepositReturnDraft,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import {
   createPaidAhead, holdCredit, clawBackRemittanceCredit, runWholeBillCheckAfterCommit,
@@ -87,32 +88,24 @@ const post = (body: unknown) => request(buildApp()).post('/webhooks/stripe')
 // this file and put back after only if it was there, so a run with C0 applied
 // stays post-C0 for every later suite.
 let hadOldConstraint = false
-// Fix pass 1 (rev10, review): the ACH rate row this file needs ($6 flat, 0.8%
-// Stripe cost) is reference data cleanupAllSchema never wipes. It is tagged,
-// any other suite's ACH rows are set aside for this file's run, and both are
-// put back as they were after — so no later suite reads this file's 0.8%.
+// 10/17: the ACH rate this file's figures are worked out on ($6 flat, 0.8%
+// Stripe cost) is STATED. It used to delete every ACH row, keep copies of them
+// in memory and re-insert them afterwards, so that no later file read this
+// file's 0.8% — a rate row is effective-dated and is retired, never deleted,
+// and a later file that states its own rate does not care what this one left.
 const RATE_TAG = 'dispute-reopen-test'
-let setAsideAchRates: Array<Record<string, unknown>> = []
 beforeAll(async () => {
   hadOldConstraint = (await db.query(
     `SELECT 1 FROM pg_constraint WHERE conname = 'payment_reversals_stripe_event_id_key'`)).rowCount === 1
   await db.query(`ALTER TABLE payment_reversals DROP CONSTRAINT IF EXISTS payment_reversals_stripe_event_id_key`)
-  setAsideAchRates = (await db.query(
-    `SELECT * FROM platform_processing_rates WHERE payment_method = 'ach' AND notes IS DISTINCT FROM $1`, [RATE_TAG])).rows
-  await db.query(`DELETE FROM platform_processing_rates WHERE payment_method = 'ach'`)
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, notes)
-     VALUES ('ach', 6, 0, 0, 0.8, $1)`, [RATE_TAG])
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 6, customerFacingPercent: 0,
+    stripeCostFlat: 0, stripeCostPercent: 0.8,
+    notes: RATE_TAG,
+  })
 })
 afterAll(async () => {
-  await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [RATE_TAG])
-  for (const r of setAsideAchRates) {
-    const cols = Object.keys(r)
-    await db.query(
-      `INSERT INTO platform_processing_rates (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')})`,
-      cols.map(c => r[c]))
-  }
   if (!hadOldConstraint) return
   await cleanupAllSchema()
   await db.query(`ALTER TABLE payment_reversals ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id)`)
@@ -122,8 +115,8 @@ beforeEach(async () => {
   await cleanupAllSchema()
   process.env.STRIPE_SECRET_KEY = 'sk_test_mocked'
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mocked'
-  // ACH: $6 flat to the tenant on top; Stripe's cost 0.8% (both in the rate
-  // table, the tagged row beforeAll put in place).
+  // ACH: $6 flat to the tenant on top; Stripe's cost 0.8% — the row beforeAll
+  // stated, which stays open for this whole file.
 })
 
 interface H {

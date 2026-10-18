@@ -7,11 +7,12 @@
  * the lease (dates follow, no-longer-owed pending rent drops, overpaid
  * rent banks as a lease_prepaid_credit).
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { backfillInvoices } from './invoiceGeneration'
 import { generateMoveInInvoice } from './moveInBundle'
@@ -35,11 +36,9 @@ import { todayIn } from '../lib/timezone'
 
 beforeEach(async () => { await cleanupAllSchema(); stripeCancel.mockClear() })
 
-// The ACH rate seedStack adds when none is active; removed when the file ends.
+// The ACH rate seedStack states. It stays open after the file ends — every file
+// states its own now, so there is nothing to tidy up and no row to delete.
 const SUITE_RATE_NOTE = 'bookingLeaseBilling.test suite rate'
-afterAll(async () => {
-  await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [SUITE_RATE_NOTE])
-})
 
 // Stay used throughout: Aug 10 2026 → Jan 28 2027 (exclusive), $950/mo.
 // Schedule: Aug 10→Sep 1 22n $696.67 · Sep/Oct/Nov/Dec flat $950 · Jan 1→28 27n $855.
@@ -58,19 +57,17 @@ async function seedStack(opts: { bookingSourced?: boolean } = {}) {
     // actually be booked — the release refuses to settle a tenant's bill with
     // money it cannot hand over. So the property needs a payout configuration.
     await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    // Rates are reference data cleanupAllSchema leaves alone. Seed one only
-    // when no ACH rate is active, tagged, and removed in afterAll: left behind,
-    // this flat $6 row became the active ACH rate for every suite after this
-    // one (webhooks.test seeds its 1% rate with ON CONFLICT DO NOTHING), and
-    // their fee expectations passed or failed by file order.
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent, notes)
-       SELECT 'ach', 6, 0, 0, 0.5, $1
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates
-                           WHERE payment_method = 'ach' AND effective_until IS NULL)`,
-      [SUITE_RATE_NOTE])
+    // Rates are reference data cleanupAllSchema leaves alone, and only one row is
+    // open per method, so this used to insert only when no ACH rate was active —
+    // and then this flat $6 row WAS the active ACH rate for every file after this
+    // one (webhooks.test seeded its 1% rate with ON CONFLICT DO NOTHING), whose
+    // fee expectations passed or failed by file order. It is stated outright now.
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: SUITE_RATE_NOTE,
+    })
     const unitId = await seedUnit(client, { propertyId, landlordId })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: RENT, startDate: START })
     await seedLeaseTenant(client, { leaseId, tenantId })

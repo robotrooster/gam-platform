@@ -45,19 +45,31 @@
  *
  * WHERE EACH EARNING IS MEASURED. Nic chose the PROPERTY's state for margins,
  * so they line up with the space fee earned at the same property. A screening
- * is sold to the applicant, so it is measured where the applicant lives. The
- * bank markup on a pull of GAM's own fees is measured at the landlord's
+ * is sold to the applicant, so it is measured where the applicant lives — or,
+ * when intake collected no address (which is every screening on the book
+ * today), at the property they applied to, rather than counting $0 in every
+ * state on the one line item Nic named by hand. The bank markup on a pull of
+ * GAM's own fees is measured at the landlord's
  * properties when they are all in one state. Anything left is reported as
  * unattributed rather than guessed at — a receipt whose property row was
  * removed, a monthly processing true-up that belongs to no single state, a
  * landlord with properties in two states. Nothing is split pro rata: a
  * state's figure has to be traceable to the charges behind it.
  *
+ * RECEIPTS, NOT PROFIT. A state's economic-nexus test measures what GAM took
+ * IN from customers there. Money GAM paid OUT is not a receipt in any state,
+ * and because the book records an outlay as a negative number, sweeping one
+ * into a line item pulls that state's figure DOWN — the exact opposite of
+ * "count high". GAM buying card readers from the manufacturer did precisely
+ * that, hiding $331.73 of Arizona's measure. Those rows are now held out of
+ * every state's figure and reported on their own, so the states, the
+ * unattributed block and GAM's own outlays still add back up to the book.
+ *
  * NOT marketplace facilitator. Nic parked it: "rent generally isn't taxable...
  * this would apply towards the short-term rental situation in states when we
  * start doing that... we'll analyze that when we get there."
  */
-import { query } from '../db'
+import { query, getClient } from '../db'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import { REVENUE_SLICE_TYPE_SQL } from './revenueSlices'
@@ -100,6 +112,27 @@ const NEXUS_LINE_ITEM_BY_SLICE: Record<string, NexusLineItem> = {
   banking_spread:            'markup',
   screening_margin:          'screening',
   flexpay_subscription:      'optin',
+}
+
+/**
+ * Slices that are GAM SPENDING money, not earning it — held out of every
+ * state's figure entirely.
+ *
+ * A nexus threshold measures receipts from customers in a state, so an outlay
+ * is not a smaller receipt, it is no receipt at all. And an outlay is booked
+ * negative, so counting one would SUBTRACT from the state it was spent in:
+ * GAM's $331.73 card-reader purchase was dragging Arizona's measure down by
+ * that much, against 10/17 (Nic): "I'd rather count high and register with
+ * those states early."
+ *
+ * Only the purchase itself. The landlord paying that cost back
+ * (reader_cost_repaid) and GAM's markup on the device are real money received
+ * from a customer in that state, so they keep counting.
+ */
+export const NEXUS_NON_RECEIPT_SLICES = ['reader_purchase'] as const
+
+export const NEXUS_NON_RECEIPT_LABEL: Record<string, string> = {
+  reader_purchase: 'Card readers GAM bought',
 }
 
 export interface NexusLineItemRow {
@@ -166,15 +199,24 @@ const lineItemSql = (sliceExpr: string) =>
     .map(([slice, item]) => `WHEN ${sliceExpr} = '${slice}' THEN '${item}'`)
     .join(' ')} ELSE 'other' END`
 
+// Inlined rather than bound, like the slice names above: these are code
+// constants, and every caller of the CTE numbers its own parameters.
+const NON_RECEIPT_SQL_ARRAY =
+  `ARRAY[${NEXUS_NON_RECEIPT_SLICES.map(s => `'${s}'`).join(', ')}]::text[]`
+
 /**
  * Every GAM earning, placed in a state and a calendar year.
  *
  * `attributed` is the revenue book with its slice, its nexus line item and its
- * state resolved; `measured` adds the business portal's monthly fee, the one
- * receipt that has never been posted to the revenue book at all (see
- * businessMonthlyFees — it bills the business and writes nothing to GAM's own
- * book, so the admin money page misses it too). It is counted here because
- * leaving it out would under-count a state, and Nic would rather count high.
+ * state resolved. `measured` keeps only the RECEIPTS out of it — what GAM
+ * spent is held back for nonReceiptBlock — and adds the business portal's
+ * monthly fee, the one receipt that has never been posted to the revenue book
+ * at all (see businessMonthlyFees — it bills the business and writes nothing
+ * to GAM's own book, so the admin money page misses it too). It is counted
+ * here because leaving it out would under-count a state, and Nic would rather
+ * count high. It counts exactly once: the day that fee also reaches the book,
+ * the book's copy of it is skipped, because the accrual is the only one of the
+ * two that knows which state the business is in.
  *
  * `txn_ref` is what makes one TRANSACTION: a screening writes two book rows
  * (its margin and the card markup on the same charge) under one reference, and
@@ -197,34 +239,67 @@ const MEASURED_REVENUE_CTE = `
            b.type,
            b.reference_id,
            b.period_year,
+           b.slice,
            ${lineItemSql('b.slice')} AS line_item,
-           CASE
+           -- Where the earning is measured. Looked up by WHAT the line
+           -- points at, not by the name of the reference: a take-back carries
+           -- the same reference as the charge it corrects, so it lands in the
+           -- same state without anyone having to list every kind of take-back
+           -- here. Ids are uuids, so only one of these can ever match.
+           COALESCE(
              -- 10/17 (Nic): margins are measured at the PROPERTY's state, so
              -- they line up with the space fee earned at the same property.
-             WHEN b.property_id IS NOT NULL
-               THEN (SELECT upper(trim(p.state)) FROM properties p WHERE p.id = b.property_id)
-             -- A screening (and the card markup on the same charge) is sold to
-             -- the applicant, so it is measured where the applicant lives.
-             WHEN b.reference_type = 'background_check'
-               THEN (SELECT upper(trim(bc.state)) FROM background_checks bc WHERE bc.id = b.reference_id)
-             -- The bank markup on a pull of GAM's own fees, and a take-back of
-             -- it: the landlord's properties, when they are all in one state.
-             -- A landlord spanning two states is left unattributed rather than
-             -- split pro rata.
-             WHEN b.reference_type IN ('gam_bank_debit', 'dispute_spread_reversal')
-               THEN (SELECT CASE WHEN COUNT(DISTINCT upper(trim(p.state))) = 1
-                                 THEN MIN(upper(trim(p.state))) END
-                       FROM landlord_gam_debits d
-                       JOIN properties p ON p.landlord_id = d.landlord_id
-                      WHERE d.id = b.reference_id
-                        AND p.state IS NOT NULL AND length(trim(p.state)) = 2)
-           END AS state_code
+             (SELECT upper(trim(p.state)) FROM properties p WHERE p.id = b.property_id),
+             -- A screening — and the card markup, or the take-back, on the
+             -- same charge — is sold to the applicant, so it is measured
+             -- where the applicant lives.
+             (SELECT upper(trim(bc.state)) FROM background_checks bc WHERE bc.id = b.reference_id),
+             -- Intake does not require the applicant's address, so most
+             -- screenings carry no state of their own. Measure those at the
+             -- property they applied to rather than nowhere: every screening
+             -- on the book today has one, and leaving them unplaced read
+             -- "background checks: $0" in every state — counting LOW on the
+             -- one line item Nic named by hand.
+             (SELECT upper(trim(p.state))
+                FROM background_checks bc
+                JOIN properties p ON p.id = bc.property_id
+               WHERE bc.id = b.reference_id),
+             -- A household payment's markup, when the charge paid no single
+             -- rent row: the property its lease is at.
+             (SELECT upper(trim(p.state))
+                FROM tenant_remittances tr
+                JOIN leases le ON le.id = tr.lease_id
+                JOIN units u ON u.id = le.unit_id
+                JOIN properties p ON p.id = u.property_id
+               WHERE tr.id = b.reference_id),
+             -- The bank markup on a pull of GAM's own fees: the landlord's
+             -- properties, when they are all in one state. A landlord
+             -- spanning two states is left unattributed rather than split
+             -- pro rata.
+             (SELECT CASE WHEN COUNT(DISTINCT upper(trim(p.state))) = 1
+                          THEN MIN(upper(trim(p.state))) END
+                FROM landlord_gam_debits d
+                JOIN properties p ON p.landlord_id = d.landlord_id
+               WHERE d.id = b.reference_id
+                 AND p.state IS NOT NULL AND length(trim(p.state)) = 2)
+           ) AS state_code
       FROM book b
   ),
   measured AS (
     SELECT a.state_code, a.period_year, a.line_item, a.amount,
            CASE WHEN a.type <> 'adjustment' THEN a.reference_id::text END AS txn_ref
       FROM attributed a
+     -- Receipts only: what GAM spent is reported separately (nonReceiptBlock).
+     WHERE a.slice <> ALL (${NON_RECEIPT_SQL_ARRAY})
+       -- A business portal fee counts ONCE, from the branch below. The day the
+       -- job that bills businesses starts posting the fee to GAM's book too,
+       -- this keeps it from being counted twice — and keeps it measured in the
+       -- business's own state, which the branch below knows and a book row
+       -- (no property, businesses are not properties) would not. When that
+       -- book row learns the state, this guard is what to revisit.
+       AND NOT EXISTS (
+         SELECT 1 FROM business_platform_fee_accruals bfa WHERE bfa.id = a.reference_id
+       )
     UNION ALL
     SELECT upper(trim(bz.state)) AS state_code,
            left(a.month, 4)::int AS period_year,
@@ -284,21 +359,38 @@ export async function recomputeNexusTally(nowYear?: number): Promise<{ years: nu
 
   // Overwrite the tally for these years. Delete-then-insert keeps it simple —
   // a state that dropped to $0 this run gets its row cleared.
-  await query('DELETE FROM nexus_revenue_tally WHERE period_year = ANY($1)', [years])
-  for (const r of agg) {
-    const amounts = lineItemAmounts(r)
-    // revenue_usd carries the combined total and has a non-negative CHECK that
-    // predates the line items, so it is floored; the line items stay signed
-    // because a take-back or a processing true-up can push one below zero.
-    const combined = Math.max(0, sumOf(amounts))
-    await query(
-      `INSERT INTO nexus_revenue_tally
-         (state_code, period_year, revenue_usd, txn_count,
-          subscription_usd, markup_usd, screening_usd, optin_usd, other_usd, computed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-      [r.state_code, r.period_year, combined, r.txn_count,
-       amounts.subscription, amounts.markup, amounts.screening, amounts.optin, amounts.other]
-    )
+  //
+  // All of it in ONE transaction. The page reads this table directly, so a
+  // delete that is briefly visible on its own shows every state at $0 and a
+  // state that had crossed its threshold reading "Under" — on a page whose
+  // only job is to say when to register, the worst possible failure is the one
+  // that says "do nothing". Either the whole rebuild lands or the previous
+  // numbers stay.
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query('DELETE FROM nexus_revenue_tally WHERE period_year = ANY($1)', [years])
+    for (const r of agg) {
+      const amounts = lineItemAmounts(r)
+      // revenue_usd carries the combined total and has a non-negative CHECK that
+      // predates the line items, so it is floored; the line items stay signed
+      // because a take-back or a processing true-up can push one below zero.
+      const combined = Math.max(0, sumOf(amounts))
+      await client.query(
+        `INSERT INTO nexus_revenue_tally
+           (state_code, period_year, revenue_usd, txn_count,
+            subscription_usd, markup_usd, screening_usd, optin_usd, other_usd, computed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+        [r.state_code, r.period_year, combined, r.txn_count,
+         amounts.subscription, amounts.markup, amounts.screening, amounts.optin, amounts.other]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
   }
   logger.info(`[nexusMonitor] tally recomputed for ${years.join(', ')} — ${agg.length} state-year rows`)
   return { years, rows: agg.length }
@@ -348,6 +440,57 @@ async function unattributedBlock(years: number[]) {
 }
 
 /**
+ * What GAM SPENT in the window — held out of every state's figure because a
+ * nexus threshold measures receipts, not profit. Reported so the page still
+ * reconciles to the book: states + unattributed + this = GAM's book.
+ */
+async function nonReceiptBlock(years: number[]) {
+  const rows = await query<{ slice: string; period_year: number; usd: string }>(
+    `${MEASURED_REVENUE_CTE}
+     SELECT a.slice, a.period_year, SUM(a.amount)::numeric(14,2) AS usd
+       FROM attributed a
+      WHERE a.slice = ANY (${NON_RECEIPT_SQL_ARRAY})
+        AND a.period_year = ANY($1)
+      GROUP BY a.slice, a.period_year`,
+    [years]
+  )
+  const [priorYear, currentYear] = [Math.min(...years), Math.max(...years)]
+  const at = (slice: string, year: number) =>
+    round2(rows.filter(r => r.slice === slice && r.period_year === year)
+      .reduce((s, r) => s + parseFloat(r.usd), 0))
+  const items = NEXUS_NON_RECEIPT_SLICES.map(slice => ({
+    key: slice as string,
+    label: NEXUS_NON_RECEIPT_LABEL[slice] ?? slice,
+    currentYtd: at(slice, currentYear),
+    priorYear: at(slice, priorYear),
+  }))
+  return {
+    currentYtd: round2(items.reduce((s, i) => s + i.currentYtd, 0)),
+    priorYear: round2(items.reduce((s, i) => s + i.priorYear, 0)),
+    items,
+  }
+}
+
+/**
+ * The threshold catalog year in force: the newest researched year that has
+ * started. Matching the current year exactly blanked the whole page every
+ * January until a new catalog migration landed.
+ *
+ * ONE answer, used by the read AND the write. A state's measurement rule is
+ * read at this year, so the tick box has to save at the same one — otherwise,
+ * from the first January past the catalog's newest year, every save lands on a
+ * row the page never reads: the toast says saved, the box snaps back, and
+ * nothing anywhere reports an error.
+ */
+async function effectiveCatalogYear(nowYear: number): Promise<number> {
+  const [row] = await query<{ y: number | null }>(
+    `SELECT MAX(effective_year) AS y FROM state_nexus_thresholds WHERE effective_year <= $1`,
+    [nowYear]
+  )
+  return row?.y != null ? Number(row.y) : nowYear
+}
+
+/**
  * Dashboard read model: every state in the threshold catalog, plus any state
  * GAM has actually earned in, joined against thresholds + tax catalog +
  * registrations + each state's own measurement rule.
@@ -358,19 +501,20 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
   lineItems: Array<{ key: NexusLineItem; label: string }>
   states: NexusStateRow[]
   unattributed: Awaited<ReturnType<typeof unattributedBlock>>
+  nonReceipt: Awaited<ReturnType<typeof nonReceiptBlock>>
   summary: { crossed: number; approaching: number; registered: number; under: number; unresearched: number }
 }> {
   // S654: the calendar year by GAM's home (Phoenix) clock, not the server's zone.
   const currentYear = nowYear ?? Number(todayIn(null).slice(0, 4))
   const priorYear = currentYear - 1
+  const catalogYear = await effectiveCatalogYear(currentYear)
 
   const rows = await query<any>(
     `
-    -- The catalog year in force: the newest researched year that has started.
-    -- Matching the current year exactly blanked the whole page every January
-    -- until a new catalog migration landed.
+    -- The catalog year in force (effectiveCatalogYear) — the same year the
+    -- tick box writes a measurement rule at.
     WITH yr AS (
-      SELECT MAX(effective_year) AS y FROM state_nexus_thresholds WHERE effective_year <= $3
+      SELECT $3::int AS y
     ),
     cur AS (
       SELECT * FROM nexus_revenue_tally WHERE period_year = $1
@@ -432,7 +576,7 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
     LEFT JOIN pri ON pri.state_code = s.state_code
     ORDER BY s.state_code
     `,
-    [currentYear, priorYear, currentYear]
+    [currentYear, priorYear, catalogYear]
   )
 
   let computedAt: string | null = null
@@ -564,6 +708,7 @@ export async function getNexusDashboard(nowYear?: number): Promise<{
     lineItems: NEXUS_LINE_ITEMS.map(k => ({ key: k, label: NEXUS_LINE_ITEM_LABEL[k] })),
     states,
     unattributed: await unattributedBlock([priorYear, currentYear]),
+    nonReceipt: await nonReceiptBlock([priorYear, currentYear]),
     summary,
   }
 }
@@ -605,6 +750,10 @@ export async function setStateRegistration(
  *
  * Only the line items named in `counts` move; the rest keep what they had, and
  * a state with no row starts from counting everything.
+ *
+ * Saved at the SAME catalog year the page reads the rule at — never at the
+ * wall-clock year, which from the first January past the catalog's newest year
+ * would silently save a row nothing ever reads.
  */
 export async function setStateMeasureRule(
   stateCode: string,
@@ -613,7 +762,7 @@ export async function setStateMeasureRule(
 ): Promise<void> {
   const st = stateCode.toUpperCase()
   if (st.length !== 2) throw new Error('Invalid state code')
-  const year = opts?.year ?? Number(todayIn(null).slice(0, 4))
+  const year = opts?.year ?? await effectiveCatalogYear(Number(todayIn(null).slice(0, 4)))
   const COLUMN: Record<NexusLineItem, string> = {
     subscription: 'counts_subscription',
     markup:       'counts_markup',

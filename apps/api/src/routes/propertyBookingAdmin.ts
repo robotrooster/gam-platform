@@ -88,10 +88,36 @@ propertyBookingAdminRouter.get('/properties/:id/booking-config', requireAuth, as
         weeklyRate:  prop.weekly_rate  != null ? Number(prop.weekly_rate)  : null,
         monthlyRate: prop.monthly_rate != null ? Number(prop.monthly_rate) : null,
         shortTermTaxRate: Number(prop.short_term_tax_rate),
+        // 10/17 (Nic, one home for a tax rate): the stay tax is READ here, not
+        // set — it follows the company's own named taxes, so the screen shows
+        // the figure with the names behind it and points at the one place it
+        // is changed.
+        shortTermTaxNames: await stayTaxNames(prop.landlord_id, prop.id),
       },
     })
   } catch (e) { next(e) }
 })
+
+/**
+ * 10/17 (Nic): the named taxes a stay at this property is charged — the
+ * on_stays rows of the company's tax list that the property's percentage
+ * follows. Same rule as property_stay_tax_pct (migration 20261019120000): the
+ * property's own rates where it has any, else the company-wide ones.
+ */
+async function stayTaxNames(landlordId: string, propertyId: string): Promise<string[]> {
+  const rows = await query<{ name: string; property_id: string | null }>(
+    `SELECT name, property_id FROM pos_tax_rates
+      WHERE landlord_id = $1 AND is_active AND on_stays
+        AND (property_id = $2 OR property_id IS NULL)
+      ORDER BY name`, [landlordId, propertyId])
+  const own = rows.filter(r => r.property_id)
+  return (own.length ? own : rows).map(r => r.name)
+}
+
+/** What the landlord is told if an old screen still tries to set the stay tax here. */
+const STAY_TAX_IS_ELSEWHERE =
+  'The stay tax is not set on this screen any more — it comes from your own list of taxes, so a rate can never be changed in one place and leave a stay priced at the old one. '
+  + 'Change the tax that is charged on stays on the Taxes screen, and this figure follows it.'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,60}$/
 
@@ -144,6 +170,16 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
     const enabled = body.enabled !== undefined ? body.enabled : prop.public_booking_enabled
     if (enabled && !slug) throw new AppError(400, 'Set a booking address (slug) before enabling the site')
 
+    // 10/17 (Nic, one home for a tax rate): this screen no longer sets the
+    // stay tax — the property's percentage follows the company's named taxes
+    // (migration 20261019120000). An old screen still sending the figure it
+    // was shown is left alone; one trying to CHANGE it is told where the rate
+    // lives, rather than writing a number the next rate change would undo.
+    if (body.shortTermTaxRate !== undefined
+        && Math.round(body.shortTermTaxRate * 100) !== Math.round(Number(prop.short_term_tax_rate) * 100)) {
+      throw new AppError(409, STAY_TAX_IS_ELSEWHERE)
+    }
+
     // Rates: a key present in the body sets it (null clears); absent = keep.
     const setNum = (v: number | null | undefined) => v === undefined ? undefined : v
     const updated = await queryOne<any>(
@@ -155,6 +191,8 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
               nightly_rate = CASE WHEN $6::boolean THEN $7 ELSE nightly_rate END,
               weekly_rate  = CASE WHEN $8::boolean THEN $9 ELSE weekly_rate END,
               monthly_rate = CASE WHEN $10::boolean THEN $11 ELSE monthly_rate END,
+              -- 10/17: always NULL, so this never writes the stay tax; the
+              -- column follows the company's named taxes by trigger now.
               short_term_tax_rate = COALESCE($12, short_term_tax_rate),
               booking_monthly_deposit = CASE WHEN $13::boolean THEN $14 ELSE booking_monthly_deposit END,
               booking_utilities_billed = COALESCE($15, booking_utilities_billed),
@@ -172,7 +210,7 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
        body.nightlyRate !== undefined, setNum(body.nightlyRate) ?? null,
        body.weeklyRate  !== undefined, setNum(body.weeklyRate)  ?? null,
        body.monthlyRate !== undefined, setNum(body.monthlyRate) ?? null,
-       body.shortTermTaxRate === undefined ? null : body.shortTermTaxRate,
+       null,   // $12 — the stay tax is never set from this screen (above)
        body.monthlyDeposit !== undefined, body.monthlyDeposit ?? null,
        body.utilitiesBilled === undefined ? null : body.utilitiesBilled,
        body.officePhone !== undefined, body.officePhone ?? null,
@@ -199,6 +237,7 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
         weeklyRate:  updated.weekly_rate  != null ? Number(updated.weekly_rate)  : null,
         monthlyRate: updated.monthly_rate != null ? Number(updated.monthly_rate) : null,
         shortTermTaxRate: Number(updated.short_term_tax_rate),
+        shortTermTaxNames: await stayTaxNames(updated.landlord_id, updated.id),
       },
     })
   } catch (e) { next(e) }

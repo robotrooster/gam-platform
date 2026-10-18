@@ -44,7 +44,8 @@ import path from 'path'
 import zlib from 'zlib'
 import { promisify } from 'util'
 import {
-  METRICS_BOUNDARY_LAYERS, METRICS_MAP_STATE_LEVELS, METRICS_WORLD_LAYER, isMetricsBoundaryLayer, zipAreaName,
+  METRICS_BOUNDARY_LAYERS, METRICS_MAP_COUNTRY_LEVELS, METRICS_MAP_STATE_LEVELS, METRICS_MAP_WORLD_LEVELS,
+  METRICS_WORLD_LAYER, isMetricsBoundaryLayer, zipAreaName,
   type MetricsBoundaryLayer,
 } from '@gam/shared'
 import { formatState } from '../lib/format'
@@ -58,7 +59,12 @@ export const GEO_DIR = path.resolve(__dirname, '../../geo')
 // ── The files ────────────────────────────────────────────────────────────────
 
 interface GeoIndex {
-  layers: Partial<Record<MetricsBoundaryLayer | typeof METRICS_WORLD_LAYER, { states?: string[]; file?: string }>>
+  layers: Partial<Record<MetricsBoundaryLayer | typeof METRICS_WORLD_LAYER, {
+    states?: string[]
+    /** 10/17: for a level drawn one country at a time, the ISO 3166 three-letter codes with a file. */
+    countries?: string[]
+    file?: string
+  }>>
 }
 
 let indexPromise: Promise<GeoIndex> | null = null
@@ -78,23 +84,43 @@ async function statesWith(layer: MetricsBoundaryLayer): Promise<Set<string>> {
 }
 
 /**
- * The file for a layer — and, for a per-state layer, a state — or null when
- * there is none. The path is built only from a known layer and a state code
- * the index lists, never from what a request typed.
+ * 10/17 (Nic): the countries with a file for a level drawn one country at a
+ * time — "if they have counties within those provinces". A country with no
+ * file has no such level, which is exactly that rule.
  */
-export async function boundaryFile(layer: unknown, state?: unknown): Promise<string | null> {
+async function countriesWith(layer: MetricsBoundaryLayer): Promise<Set<string>> {
+  return new Set((await loadIndex()).layers[layer]?.countries ?? [])
+}
+
+/** Is this level drawn one file per state, or one file per country, or one file for all of it? */
+const isPerStateLevel = (layer: MetricsBoundaryLayer) => METRICS_MAP_STATE_LEVELS.includes(layer)
+const isPerCountryLevel = (layer: MetricsBoundaryLayer) => METRICS_MAP_COUNTRY_LEVELS.includes(layer)
+const isWorldLevel = (layer: MetricsBoundaryLayer) => METRICS_MAP_WORLD_LEVELS.includes(layer)
+
+/**
+ * The file for a layer — and, for a per-state or per-country layer, which one
+ * — or null when there is none. The path is built only from a known layer and
+ * a code the index lists, never from what a request typed.
+ */
+export async function boundaryFile(layer: unknown, group?: unknown): Promise<string | null> {
   // 10/17: the globe's world land is served the same way, from the same folder,
   // behind the same login — but it is not a map level, so it is not one of the
   // boundary layers above.
   if (!isMetricsBoundaryLayer(layer) && layer !== METRICS_WORLD_LAYER) return null
   const index = await loadIndex()
-  if (layer === METRICS_WORLD_LAYER || !METRICS_MAP_STATE_LEVELS.includes(layer)) {
+  if (layer === METRICS_WORLD_LAYER || !(isPerStateLevel(layer) || isPerCountryLevel(layer))) {
     const file = index.layers[layer]?.file
-    return state == null && file && /^[a-z]+\.json\.gz$/.test(file) ? path.join(GEO_DIR, file) : null
+    return group == null && file && /^[a-z0-9]+\.json\.gz$/.test(file) ? path.join(GEO_DIR, file) : null
   }
-  if (typeof state !== 'string' || !/^\d{2}$/.test(state)) return null
-  if (!(index.layers[layer]?.states ?? []).includes(state)) return null
-  return path.join(GEO_DIR, layer, `${state}.json.gz`)
+  if (typeof group !== 'string') return null
+  if (isPerCountryLevel(layer)) {
+    if (!/^[A-Z]{3}$/.test(group)) return null
+    if (!(index.layers[layer]?.countries ?? []).includes(group)) return null
+    return path.join(GEO_DIR, layer, `${group}.json.gz`)
+  }
+  if (!/^\d{2}$/.test(group)) return null
+  if (!(index.layers[layer]?.states ?? []).includes(group)) return null
+  return path.join(GEO_DIR, layer, `${group}.json.gz`)
 }
 
 /**
@@ -116,6 +142,9 @@ export interface GeoShape {
   name: string
   /** For a city: its full Census name when another place in the state shares its name ("Lisbon village"). */
   label?: string
+  /** 10/17: for a state or province outside the United States, the country it is in (ISO 3166 three letters). */
+  country?: string
+  countryName?: string
   /** [west, south, east, north] over every piece — skips the ray test for nearly every area. */
   box: [number, number, number, number]
   /** Polygons → rings → flat [lng, lat, lng, lat, …]. */
@@ -165,6 +194,10 @@ export function decodeTopology(topo: any, objectName: string): GeoShape[] {
     }
     const shape: GeoShape = { id: String(g.id), name: String(g.properties?.name ?? ''), box, polygons }
     if (g.properties?.label) shape.label = String(g.properties.label)
+    // 10/17: the world's provinces carry their country, so one national file
+    // can name "Entre Ríos, Argentina" without a second file beside it.
+    if (g.properties?.country) shape.country = String(g.properties.country)
+    if (g.properties?.countryName) shape.countryName = String(g.properties.countryName)
     return shape
   })
 }
@@ -266,14 +299,24 @@ export interface GeoRow {
 export type LevelGap =
   | 'unknown_state' | 'no_property' | 'no_location' | 'stale_location' | 'outside' | 'wrong_state'
   | 'no_match' | 'two_places' | 'no_layer' | 'no_shapes'
+  // 10/17 (Nic): the world's own levels.
+  | 'no_country' | 'no_districts'
 
 export interface LevelArea {
   /** The Census code: a place's 7 digits, a district's state + district, a ZIP code. */
   fips: string
   name: string
-  /** Two-letter state the area's file is drawn with. */
+  /** Two-letter state the area's file is drawn with; empty outside the United States. */
   state: string
   stateFips: string
+  /**
+   * 10/17 (Nic): for an area outside the United States, the country it is in
+   * (ISO 3166 three letters) and that country's name. A county or district
+   * level is drawn one country at a time, as a city level is drawn one state
+   * at a time.
+   */
+  country?: string
+  countryName?: string
   units: number
   occupied: number
   money: number
@@ -287,6 +330,8 @@ export interface MapLevel {
   missing: LevelMissing[]
   /** For a level drawn one state at a time: the states (FIPS) GAM has a property in at this level. */
   states: string[]
+  /** 10/17: for a level drawn one country at a time: the countries (ISO3) GAM has a property in. */
+  countries: string[]
 }
 
 export type MapLevels = Record<MetricsBoundaryLayer, MapLevel>
@@ -297,6 +342,12 @@ const NOUN: Record<MetricsBoundaryLayer, { one: string; many: string }> = {
   sldu: { one: 'state senate district', many: 'state senate districts' },
   sldl: { one: 'state house district', many: 'state house districts' },
   zcta: { one: 'ZIP code area', many: 'ZIP code areas' },
+  // 10/17 (Nic): "break the rest of the countries down by states or province
+  // and then possibly cities as well or counties, if they have counties
+  // within those provinces."
+  country: { one: 'country', many: 'countries' },
+  adm1: { one: 'state or province', many: 'states and provinces' },
+  adm2: { one: 'county or district', many: 'counties and districts' },
 }
 
 /** Each reason in words, for this level's list under the map. */
@@ -307,14 +358,24 @@ export function levelGapLabel(level: MetricsBoundaryLayer, gap: LevelGap): strin
     case 'no_property': return 'rent on a bill with no space or lease on record'
     case 'no_location': return 'no map location on file for its address'
     case 'stale_location': return 'its address changed and no map location has been found for the new address'
-    case 'outside': return `its map location is not inside any ${n.one} of its state`
+    case 'outside': return METRICS_MAP_WORLD_LEVELS.includes(level)
+      // The world map's lines are drawn coarsely enough to see the whole
+      // earth, so a point a mile or two off a coast can fall outside it.
+      ? `its map location is not inside any ${n.one} on the world map, which draws a coastline straight`
+      : `its map location is not inside any ${n.one} of its state`
     case 'wrong_state': return 'its map location is in a different state than its address'
     case 'no_match': return level === 'zcta'
       ? 'Census draws no area for the ZIP code on its address, and no map location puts it inside one'
-      : 'the city on its address is not a Census city or town in its state, and no map location puts it inside one'
+      : level === 'adm2'
+        ? `its map location is in a country this map has ${n.many} for, but inside none of them`
+        : 'the city on its address is not a Census city or town in its state, and no map location puts it inside one'
     case 'two_places': return 'two Census places in its state have the name of the city on its address, and no map location tells them apart'
     case 'no_layer': return `Census draws no ${n.many} for its state`
     case 'no_shapes': return `the ${n.one} map could not be read on the server`
+    // 10/17 (Nic): the world's own levels. A property lands on them by its map
+    // location alone — GAM holds a U.S. state on an address, never a country.
+    case 'no_country': return 'its map location is not inside any country on the world map, which draws a coastline straight'
+    case 'no_districts': return `its country has no ${n.many} below its states and provinces`
   }
 }
 
@@ -339,18 +400,37 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
     x.units += n.units; x.occupied += n.occupied; x.money += n.money
     m.set(reason, x)
   }
-  const add = (level: MetricsBoundaryLayer, shape: GeoShape, fileState: string, n: Counts) => {
+  const tally = (level: MetricsBoundaryLayer, id: string, blank: () => LevelArea, n: Counts) => {
     const m = areas.get(level)!
-    const a = m.get(shape.id) ?? {
+    const a = m.get(id) ?? blank()
+    a.properties += 1
+    a.units += n.units; a.occupied += n.occupied; a.money += n.money
+    m.set(id, a)
+  }
+  const add = (level: MetricsBoundaryLayer, shape: GeoShape, fileState: string, n: Counts) =>
+    tally(level, shape.id, () => ({
       fips: shape.id,
       name: level === 'zcta' ? zipAreaName(shape.id) : shape.label || shape.name,
       state: abbrOf.get(fileState) ?? fileState, stateFips: fileState,
       units: 0, occupied: 0, money: 0, properties: 0,
-    }
-    a.properties += 1
-    a.units += n.units; a.occupied += n.occupied; a.money += n.money
-    m.set(shape.id, a)
-  }
+    }), n)
+  /**
+   * 10/17 (Nic): the same, for an area outside the United States. It carries
+   * its country instead of a state — that is the file it is drawn with at the
+   * county-or-district level, and the words after its name everywhere else
+   * ("Entre Ríos, Argentina"). At the country level the area IS the country,
+   * so `id` is the country code and the shape the property was found in is the
+   * province inside it.
+   */
+  const addWorld = (
+    level: MetricsBoundaryLayer, id: string, name: string, country: string, countryName: string, n: Counts,
+  ) => tally(level, id, () => ({
+    fips: id,
+    name: name || id,
+    state: '', stateFips: '',
+    country, countryName: countryName || country,
+    units: 0, occupied: 0, money: 0, properties: 0,
+  }), n)
 
   // A file that cannot be read empties its level for this build (named under
   // the map), and is tried again on the next one.
@@ -366,12 +446,52 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
   }
 
   let perState: Map<MetricsBoundaryLayer, Set<string>>
+  // 10/17 (Nic): which countries have a level below their provinces — "if
+  // they have counties within those provinces". A country with no file has no
+  // such level, and a property in it is named under the map for that reason.
+  let perCountry: Map<MetricsBoundaryLayer, Set<string>>
   try {
     perState = new Map(await Promise.all(METRICS_MAP_STATE_LEVELS.map(async l => [l, await statesWith(l)] as const)))
+    perCountry = new Map(await Promise.all(METRICS_MAP_COUNTRY_LEVELS.map(async l => [l, await countriesWith(l)] as const)))
   } catch (e) {
     logger.error({ err: e }, '[platformMetricsGeo] the boundary index could not be read; the new map levels are empty')
     perState = new Map()
+    perCountry = new Map()
     for (const l of METRICS_BOUNDARY_LAYERS) unreadable.add(l)
+  }
+
+  /**
+   * 10/17 (Nic): one property on one of the world's levels. It is placed by
+   * its map location and nothing else — GAM holds a U.S. state on an address,
+   * never a country, so there is nothing on an address to place it by. A
+   * county or district comes through the country it is in: that tells the page
+   * which country's file to draw, and whether that country has the level at all.
+   */
+  const placeWorld = async (level: MetricsBoundaryLayer, lat: number, lng: number, n: Counts): Promise<void> => {
+    // 10/17 (review): every world level is placed in the STATES AND PROVINCES
+    // file, including the country level. The provinces carry their country,
+    // and they are drawn finely enough to place a city — the countries' own
+    // file is the provinces dissolved for drawing, and at that scale a coast
+    // is straight enough that a point on a waterfront can fall outside it.
+    const provinces = await shapesFor('adm1')
+    if (provinces === 'unreadable' || !provinces) { miss(level, 'no_shapes', n, true); return }
+    const inProvince = shapeAt(provinces.shapes, lat, lng)
+    // A province with no country of its own would have nowhere to go on any of
+    // these levels, so it counts as being in no country rather than under a
+    // blank one. The file is built with every province's country, so this is a
+    // guard, not a case that happens.
+    if (!inProvince?.country) { miss(level, level === 'adm2' ? 'no_country' : 'outside', n, true); return }
+    const country = inProvince.country
+    const countryName = inProvince.countryName ?? country
+    if (level === 'country') { addWorld(level, country, countryName, country, countryName, n); return }
+    if (level === 'adm1') { addWorld(level, inProvince.id, inProvince.name, country, countryName, n); return }
+    // The level below a province, in the countries that have one.
+    if (!perCountry.get(level)?.has(country)) { miss(level, 'no_districts', n, true); return }
+    const file = await shapesFor(level, country)
+    if (file === 'unreadable' || !file) { miss(level, 'no_shapes', n, true); return }
+    const at = shapeAt(file.shapes, lat, lng)
+    if (!at) { miss(level, 'no_match', n, true); return }
+    addWorld(level, at.id, at.name, country, countryName, n)
   }
 
   for (const row of rows) {
@@ -381,13 +501,22 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
       continue
     }
     const fips = stateFips[formatState(row.state ?? '')]
-    if (!fips) { for (const l of METRICS_BOUNDARY_LAYERS) miss(l, 'unknown_state', n, true); continue }
     const hasPoint = row.lat != null && row.lng != null
     const usable = hasPoint && !row.location_stale
     const lat = Number(row.lat), lng = Number(row.lng)
 
     for (const level of METRICS_BOUNDARY_LAYERS) {
       if (unreadable.has(level)) { miss(level, 'no_shapes', n, true); continue }
+      // 10/17 (Nic): the world's levels know nothing of U.S. states — a
+      // property with a state GAM does not recognize is still somewhere on
+      // the earth, and its map location says where.
+      if (isWorldLevel(level)) {
+        if (!hasPoint) { miss(level, 'no_location', n, true); continue }
+        if (row.location_stale) { miss(level, 'stale_location', n, true); continue }
+        await placeWorld(level, lat, lng, n)
+        continue
+      }
+      if (!fips) { miss(level, 'unknown_state', n, true); continue }
       const byState = METRICS_MAP_STATE_LEVELS.includes(level)
       if (byState && !perState.get(level)?.has(fips)) { miss(level, 'no_layer', n, true); continue }
       const file = await shapesFor(level, byState ? fips : undefined)
@@ -453,6 +582,10 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
       // the pointless choices are simply gone). A state whose properties could
       // not be placed is named under the map by reason, as before.
       states: METRICS_MAP_STATE_LEVELS.includes(level) ? [...new Set(placed.map(a => a.stateFips))].sort() : [],
+      // 10/17 (Nic): and the same for the country picker on a level drawn one
+      // country at a time — the countries GAM is actually in, not all 199.
+      countries: METRICS_MAP_COUNTRY_LEVELS.includes(level)
+        ? [...new Set(placed.map(a => a.country ?? '').filter(Boolean))].sort() : [],
     }
   }
   return out

@@ -9,10 +9,11 @@
  *        and gives the lease's due date back so the bill run can write that
  *        month again if the stay grows back.
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import {
   syncLeaseWithBookingDates, pastEndAttemptedCharges, recordStayShortenedChoice,
@@ -28,7 +29,6 @@ vi.mock('../lib/stripe', async (orig) => ({
 beforeEach(async () => { await cleanupAllSchema(); stripeCancel.mockClear() })
 
 const SUITE_RATE_NOTE = 'bookingLeaseBilling.shortenedChoice suite rate'
-afterAll(async () => { await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [SUITE_RATE_NOTE]) })
 
 // Aug 10 2026 → Jan 28 2027, $950/mo (the same stay jobs/bookingLeaseBilling.test.ts uses).
 const START = '2026-08-10'
@@ -42,11 +42,15 @@ async function seedStack() {
     const tenantId = await seedTenant(client)
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    await client.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, notes)
-       SELECT 'ach', 6, 0, 0, 0.5, $1
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach' AND effective_until IS NULL)`,
-      [SUITE_RATE_NOTE])
+    // 10/17: the rate this file's figures are worked out on, STATED rather than
+    // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+    // rate card alone, so an insert-if-missing took whatever an earlier file left.
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: SUITE_RATE_NOTE,
+    })
     const unitId = await seedUnit(client, { propertyId, landlordId })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 950, startDate: START })
     await seedLeaseTenant(client, { leaseId, tenantId })

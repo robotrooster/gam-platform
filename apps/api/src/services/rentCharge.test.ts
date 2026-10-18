@@ -21,6 +21,7 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 const { paymentIntentsCancelMock } = vi.hoisted(() => ({
@@ -108,12 +109,15 @@ describe('S609 pay-ahead', () => {
   let f: Fixture
 
   beforeAll(async () => {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    // 10/17: the rate this file's figures are worked out on, STATED rather than
+    // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+    // rate card alone, so an insert-if-missing took whatever an earlier file left.
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'rentCharge.test.ts ACH rate',
+    })
   })
 
   beforeEach(async () => {
@@ -1010,11 +1014,12 @@ describe('money in the server\'s sentences', () => {
 // a bill on another lease, or left on the account for a later bill.
 describe('where the rest of the credit goes (one bill)', () => {
   beforeAll(async () => {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'rentCharge.test.ts ACH rate',
+    })
   })
 
   /** A second lease for the same tenant with the same landlord, on its own unit. */

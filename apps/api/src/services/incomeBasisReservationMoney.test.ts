@@ -20,7 +20,7 @@
  * Fix pass of 10/4: two shortenings of one stay, on the same real paths — each
  *   credit comes off its own month, and the second never rewrites the first.
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedAllocationRule,
@@ -44,8 +44,10 @@ vi.mock('../lib/stripe', async (orig) => ({
 }))
 
 beforeEach(cleanupAllSchema)
+// The rate this file's figures are worked out on. It stays open after the file
+// ends: every file states its own now (10/17), so there is nothing to take back
+// — and a rate row is retired, never deleted.
 const RATE_NOTE = 'incomeBasisReservationMoney test rate'
-afterAll(async () => { await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [RATE_NOTE]) })
 
 const cents = (n: number) => Math.round(n * 100) / 100
 const lastDay = (m: string) => new Date(Date.UTC(Number(m.slice(0, 4)), Number(m.slice(5)), 0)).toISOString().slice(0, 10)

@@ -47,6 +47,7 @@ import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
   seedUtilityMeter, seedUtilityBill,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { paymentsRouter } from '../routes/payments'
 import { balancesRouter } from '../routes/balances'
@@ -205,11 +206,15 @@ function expectAllAgree(all: Record<string, { balance: number; credit: number | 
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_balance_agreement'
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     SELECT 'card', 0.55, 3.5, 0.26, 0.7
-      WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL)`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 0.7,
+    notes: 'balanceAgreement.test.ts card rate',
+  })
 })
 
 describe('one household, one balance, one credit figure on every surface', () => {

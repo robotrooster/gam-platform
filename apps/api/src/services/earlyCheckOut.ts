@@ -127,7 +127,11 @@ export async function loadStay(q: Q, bookingId: string, opts: { lock?: boolean }
             COALESCE(b.total_amount, 0)::float AS total,
             (b.balance_paid_at IS NOT NULL) AS balance_paid, (b.deposit_paid_at IS NOT NULL) AS deposit_paid,
             b.deposit_amount::float AS deposit_amount,
-            COALESCE(p.short_term_tax_rate, 0)::float AS tax_pct, ${untaxedMonthStaySql('b')} AS month_stay,
+            -- 10/17 (Nic, "never reprice history"): the rate THIS stay was
+            -- priced at (stamped on the booking), and the property's rate
+            -- today only for a stay priced before stamping began. Giving money
+            -- back must take out the tax that was charged, not today's.
+            COALESCE(b.stay_tax_rate * 100, p.short_term_tax_rate, 0)::float AS tax_pct, ${untaxedMonthStaySql('b')} AS month_stay,
             COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly,
             COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly,
             COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly,

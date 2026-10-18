@@ -1039,8 +1039,13 @@ function ownBilledPartsSql(b: string): string {
  * deposit over (1 + rate). decisions #33: the stay is taxed by the length it
  * was SOLD for (registerStay soldCheckOutSql: the booked check-out), never by
  * an early check-out — which changes occupancy only, so a deposit counted in a
- * past month is not rewritten by it (§0.0). The booking keeps no record of the
- * rate it was quoted at, so the property's current rate stands in for it.
+ * past month is not rewritten by it (§0.0).
+ *
+ * 10/17 (Nic, one home for a tax rate): the booking now DOES keep the rate it
+ * was quoted at (unit_bookings.stay_tax_rate, stamped when it was priced), so
+ * that is what the reports read — a company changing its named "Lodging tax"
+ * no longer rewrites what a past month collected. The property's rate today
+ * still stands in for a stay quoted before stamping began.
  * `pr` is the booking's property.
  */
 function stayTaxPctSql(b: string, pr: string): string {
@@ -1050,8 +1055,8 @@ function stayTaxPctSql(b: string, pr: string): string {
   //  • a stay of exactly one calendar month (Feb 1 → Mar 1, 28 nights) only
   //    when the month's price won — its price is the monthly rate — and it was
   //    priced by the 10/6 rule (earlier ones were taxed, and past months'
-  //    reports are never rewritten). The booking keeps no record of the tax it
-  //    was charged; the current rate stands in, as above.
+  //    reports are never rewritten). The rate is the stay's own stamp where it
+  //    has one; the property's current rate stands in, as above.
   const x = a(b)
   return `(CASE WHEN (${soldCheckOutSql(x)} - ${x}.check_in) < 30
                  AND NOT ${untaxedMonthStaySql(x)}
@@ -1059,7 +1064,7 @@ function stayTaxPctSql(b: string, pr: string): string {
                           AND ${x}.created_at >= DATE '2026-10-06'
                           AND ABS(COALESCE(${x}.total_amount, 0) - COALESCE(
                                 (SELECT COALESCE(smu.monthly_rate, ${a(pr)}.monthly_rate) FROM units smu WHERE smu.id = ${x}.unit_id), -1)) < 0.005)
-            THEN COALESCE(${a(pr)}.short_term_tax_rate, 0) ELSE 0 END)`
+            THEN COALESCE(${x}.stay_tax_rate * 100, ${a(pr)}.short_term_tax_rate, 0) ELSE 0 END)`
 }
 
 /**

@@ -434,26 +434,33 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     // actor uuid from a session GUC; set it here so the row records
     // who initiated the change. Direct SQL writes leave the GUC unset
     // and the row records changed_by=NULL — by design.
-    await query(`SELECT set_config('gam.user_id', $1, true)`, [req.user!.userId])
-
+    //
+    // 10/17: and the GUC has to be set ON THE SAME CONNECTION, inside the
+    // transaction that does the write (writeAsActor). It was set through the
+    // pool, where a transaction-local setting is gone by the next statement,
+    // so every price change since S99 recorded changed_by = NULL. Same bug
+    // class the tax journal would have had.
     const newMargin = marginPct ?? (newCostPrice > 0 ? ((newSellPrice - newCostPrice) / newSellPrice) * 100 : item.margin_pct)
 
-    const updated = await queryOne<any>(`UPDATE pos_items SET
-      name=$1, category_id=$2, icon=$3, cost_price=$4, sell_price=$5, margin_pct=$6,
-      tax_rate=$7, charge_eligible=$8, stock_min=$9, stock_max=$10, vendor_id=$11,
-      is_active=$12, property_id=$13, tax_category_id=$15, stock_qty=$16, updated_at=NOW() WHERE id=$14 RETURNING *`,
-      [name??item.name, newCategoryId, icon??item.icon,
-       newCostPrice, newSellPrice, newMargin,
-       taxRate??item.tax_rate, chargeEligible??item.charge_eligible,
-       stockMin??item.stock_min, stockMax??item.stock_max,
-       newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId, newStockQty])
+    const updated = await writeAsActor(req.user!.userId, async (c) => {
+      const row = (await c.query<any>(`UPDATE pos_items SET
+        name=$1, category_id=$2, icon=$3, cost_price=$4, sell_price=$5, margin_pct=$6,
+        tax_rate=$7, charge_eligible=$8, stock_min=$9, stock_max=$10, vendor_id=$11,
+        is_active=$12, property_id=$13, tax_category_id=$15, stock_qty=$16, updated_at=NOW() WHERE id=$14 RETURNING *`,
+        [name??item.name, newCategoryId, icon??item.icon,
+         newCostPrice, newSellPrice, newMargin,
+         taxRate??item.tax_rate, chargeEligible??item.charge_eligible,
+         stockMin??item.stock_min, stockMax??item.stock_max,
+         newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId, newStockQty])).rows[0]
 
-    // Audit a manual stock correction made through the edit form.
-    if (newStockQty !== item.stock_qty) {
-      await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
-        VALUES ($1,$2,$3,'manual','Item edit form',$4,$5)`,
-        [item.id, posLandlordId(req), newStockQty - item.stock_qty, item.stock_qty, newStockQty])
-    }
+      // Audit a manual stock correction made through the edit form.
+      if (newStockQty !== item.stock_qty) {
+        await c.query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
+          VALUES ($1,$2,$3,'manual','Item edit form',$4,$5)`,
+          [item.id, posLandlordId(req), newStockQty - item.stock_qty, item.stock_qty, newStockQty])
+      }
+      return row
+    })
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -3604,11 +3611,60 @@ posRouter.patch('/items/:id/variants/:variantId', requirePerm('pos.manage_invent
 
 // ── TAX RATES ─────────────────────────────────────────────────
 
+// 10/17 (Nic) — THE ONE HOME FOR A TAX RATE.
+//
+// A lodging rate used to live in three places (the property's stay percentage,
+// the named tax here, the item's own rate) and they drifted: every stay was
+// taxed at 6.35% for three weeks after the named tax went to 6.6%. This list
+// is now the ONE home. A tax ticked "charged on a stay here" (on_stays) sets
+// what every door prices a stay with — the property's own percentage follows
+// it by trigger (migration 20261019120000), so there is no second screen that
+// can be left behind — and a stay is never taxed a second time in the cart
+// (services/posTax).
+//
+// WHO. Nic: "owner AND bookkeeper may change a rate." The owner passes
+// requirePerm by role; a bookkeeper reaches these four routes, and only these,
+// through the bookkeeper allowlist (lib/bookkeeperAccess), holding
+// 'taxes.edit'. Nobody else's staff hold it.
+//
+// EVERY CHANGE IS KEPT, with who and when (pos_tax_rate_changes), so a filing
+// traces to the rate that was in force — written by the journal trigger, which
+// reads the actor from the session setting writeAsActor puts there.
+
+import type { PoolClient } from 'pg'
+
+/** The permission a bookkeeper holds for the tax list (lib/bookkeeperAccess). */
+const TAXES_EDIT = 'taxes.edit'
+
+/**
+ * A write that a journal trigger has to be able to name a person for, in ONE
+ * transaction that first says who is making it: the trigger reads
+ * 'gam.user_id' (the tax journal here; pos_price_history on an item's price,
+ * S99). The setting is transaction-local, so the write has to share the
+ * connection — set on the pool, it is already gone by the next statement,
+ * which is why every price change since S99 recorded nobody.
+ */
+async function writeAsActor<T>(userId: string, fn: (c: PoolClient) => Promise<T>): Promise<T> {
+  const c = await getClient()
+  try {
+    await c.query('BEGIN')
+    await c.query(`SELECT set_config('gam.user_id', $1, true)`, [userId])
+    const out = await fn(c)
+    await c.query('COMMIT')
+    return out
+  } catch (e) {
+    await c.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    c.release()
+  }
+}
+
 // S217: optional ?propertyId= filter mirrors S192's pos_items shape.
 // When provided, returns (rates at that property) UNION (landlord-wide
 // rates with NULL property_id). When omitted, returns every rate
 // under the landlord — the configuration surface needs the full list.
-posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
+posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
     const propertyFilter = req.query.propertyId as string | undefined
     let rates: any[]
@@ -3646,9 +3702,12 @@ async function ownedTaxTargets(req: any, table: 'pos_categories' | 'pos_items',
   return uniq
 }
 
-posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+posRouter.post('/tax-rates', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
     const { name, rate, taxType, appliesTo, propertyId } = req.body
+    // 10/17 (Nic): is this tax charged on a stay here? That answer is the one
+    // home for the stay rate — the property's stay percentage follows it.
+    const onStays = req.body.onStays === true
     assertNonNeg([rate, 'Rate'])
 
     // S217: validate propertyId belongs to this landlord. NULL is the
@@ -3668,15 +3727,20 @@ posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, re
     const categoryIds = (await ownedTaxTargets(req, 'pos_categories', req.body.categoryIds)) ?? []
     const itemIds = (await ownedTaxTargets(req, 'pos_items', req.body.itemIds)) ?? []
     const targeted = categoryIds.length > 0 || itemIds.length > 0
-    const r = await queryOne<any>(`INSERT INTO pos_tax_rates (landlord_id,property_id,name,rate,tax_type,applies_to,category_ids,item_ids)
-      VALUES ($1,$2,$3,$4,$5,$6,$7::uuid[],$8::uuid[]) RETURNING *`,
+    // 10/17 (Nic): a tax made as a STAY tax, naming nothing it sells, is a stay
+    // tax and nothing else — "everything sold here" is not the default for one.
+    // (It can be both: tick the stay box AND choose everything, or a category.)
+    const reach = targeted ? [] : (appliesTo || (onStays ? [] : ['all']))
+    const r = await writeAsActor(req.user!.userId, async (c) => (await c.query<any>(
+      `INSERT INTO pos_tax_rates (landlord_id,property_id,name,rate,tax_type,applies_to,category_ids,item_ids,on_stays)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::uuid[],$8::uuid[],$9) RETURNING *`,
       [posLandlordId(req), propertyId||null, name, rate, taxType || 'sales',
-       targeted ? [] : (appliesTo || ['all']), categoryIds, itemIds])
+       reach, categoryIds, itemIds, onStays])).rows[0])
     res.status(201).json({ success: true, data: r })
   } catch (e) { next(e) }
 })
 
-posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
     const existing = await queryOne<any>(
       'SELECT * FROM pos_tax_rates WHERE id=$1 AND landlord_id=$2',
@@ -3705,22 +3769,59 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
 
     const categoryIds = await ownedTaxTargets(req, 'pos_categories', req.body.categoryIds)
     const itemIds = await ownedTaxTargets(req, 'pos_items', req.body.itemIds)
-    const r = await queryOne<any>(`UPDATE pos_tax_rates SET
-      name=COALESCE($1,name), rate=COALESCE($2,rate), tax_type=COALESCE($3,tax_type),
-      applies_to=COALESCE($4,applies_to), is_active=COALESCE($5,is_active),
-      property_id=$6,
-      category_ids=COALESCE($9::uuid[],category_ids), item_ids=COALESCE($10::uuid[],item_ids)
-      WHERE id=$7 AND landlord_id=$8 RETURNING *`,
+    // 10/17 (Nic): absent leaves the stay answer as it is; true or false moves
+    // the property's stay percentage with it, by trigger, in this transaction.
+    const onStays = typeof req.body.onStays === 'boolean' ? req.body.onStays : null
+    const r = await writeAsActor(req.user!.userId, async (c) => (await c.query<any>(
+      `UPDATE pos_tax_rates SET
+         name=COALESCE($1,name), rate=COALESCE($2,rate), tax_type=COALESCE($3,tax_type),
+         applies_to=COALESCE($4,applies_to), is_active=COALESCE($5,is_active),
+         property_id=$6,
+         category_ids=COALESCE($9::uuid[],category_ids), item_ids=COALESCE($10::uuid[],item_ids),
+         on_stays=COALESCE($11::boolean,on_stays)
+       WHERE id=$7 AND landlord_id=$8 RETURNING *`,
       [name, rate, taxType, appliesTo, isActive, newPropertyId, req.params.id, posLandlordId(req),
-       categoryIds ?? null, itemIds ?? null])
+       categoryIds ?? null, itemIds ?? null, onStays])).rows[0] ?? null)
     res.json({ success: true, data: r })
   } catch (e) { next(e) }
 })
 
-posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
   try {
-    await query('UPDATE pos_tax_rates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
+    // 10/17: turning a stay tax off stops taxing stays here — the property's
+    // percentage follows it down, in this transaction, and the journal keeps
+    // who turned it off.
+    await writeAsActor(req.user!.userId, (c) => c.query(
+      'UPDATE pos_tax_rates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)]))
     res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/17 (Nic): "journal every change with who and when so a filing traces to
+ * the rate in force." Every change to this company's named taxes, newest
+ * first — the rate before and after, whether it is charged on stays, and the
+ * person who changed it (a change GAM made itself carries no person). Owner
+ * and bookkeeper, read only.
+ */
+posRouter.get('/tax-rates/changes', requirePerm('pos.manage_inventory', TAXES_EDIT), async (req, res, next) => {
+  try {
+    const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
+    const params: any[] = [posLandlordId(req)]
+    const where = propertyId
+      ? `AND (c.property_id = $${params.push(propertyId)} OR c.property_id IS NULL)` : ''
+    const rows = await query<any>(
+      `SELECT c.id, c.rate_id, c.property_id, c.name,
+              c.old_rate::float AS old_rate, c.new_rate::float AS new_rate,
+              c.old_is_active, c.new_is_active, c.old_on_stays, c.new_on_stays,
+              c.changed_at, c.changed_by,
+              NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '') AS changed_by_name
+         FROM pos_tax_rate_changes c
+         LEFT JOIN users u ON u.id = c.changed_by
+        WHERE c.landlord_id = $1 ${where}
+        ORDER BY c.changed_at DESC, c.id DESC
+        LIMIT 200`, params)
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 

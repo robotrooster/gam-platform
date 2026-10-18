@@ -107,6 +107,7 @@ import {
   seedSecurityDeposit, seedDepositReturnDraft,
   seedRentPayment, seedUtilityMeter, seedUtilityBill,
   seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { todayIn } from '../lib/timezone'
 
@@ -2023,10 +2024,6 @@ describe('Step 9 review (fix pass 1): a security deposit paid by bank deposit co
 
 describe('Step 9 review (fix pass 2): the payment webhook settles a move-out balance charge', () => {
   beforeEach(() => { vi.clearAllMocks(); stripeMocks.made.length = 0 })
-  const addedRates: string[] = []
-  afterEach(async () => {
-    if (addedRates.length > 0) await db.query(`DELETE FROM platform_processing_rates WHERE id = ANY($1::uuid[])`, [addedRates.splice(0)])
-  })
 
   async function postSucceeded(intentId: string, metadata: Record<string, string>) {
     const express = (await import('express')).default
@@ -2051,20 +2048,19 @@ describe('Step 9 review (fix pass 2): the payment webhook settles a move-out bal
     const client = await getClient()
     try {
       await seedAllocationRule(client, { propertyId: stack.propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-      // Rates only if none is active: cleanupAllSchema keeps this table, and an
-      // earlier file in the same run may already have seeded an active rate
-      // (one active rate per method). Rows this test adds are removed at its
-      // end (afterEach), so a later file seeds its own. The test asserts no
-      // rate-specific figure.
-      for (const [method, flat, pct, costFlat, costPct] of [['card', 0.55, 3.5, 0.26, 2.9], ['ach', 6, 0, 0, 0.5]] as const) {
-        const added = await client.query<{ id: string }>(
-          `INSERT INTO platform_processing_rates
-             (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-           SELECT $1, $2, $3, $4, $5
-            WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = $1 AND effective_until IS NULL)
-           RETURNING id`,
-          [method, flat, pct, costFlat, costPct])
-        addedRates.push(...added.rows.map((r) => r.id))
+      // 10/17: the live rates, STATED. This used to insert only if none was open
+      // (one is open per method, and cleanupAllSchema leaves the rate card
+      // alone) and then delete its own rows again afterwards, so a later file
+      // would seed its own — every file states its own now, so there is nothing
+      // to take back.
+      for (const [paymentMethod, flat, pct, costFlat, costPct] of
+           [['card', 0.55, 3.5, 0.26, 2.9], ['ach', 6, 0, 0, 0.5]] as const) {
+        await setEffectiveProcessingRate(client, {
+          paymentMethod,
+          customerFacingFlat: flat, customerFacingPercent: pct,
+          stripeCostFlat: costFlat, stripeCostPercent: costPct,
+          notes: 'depositReturn.test.ts rate',
+        })
       }
     } finally { client.release() }
     const draft = await createOrFetchDraft(stack.leaseId)

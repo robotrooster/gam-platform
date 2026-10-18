@@ -2183,6 +2183,26 @@ adminRouter.get('/metrics/boundaries/:layer/:state?', requireSuperAdmin, async (
   } catch (e) { next(e) }
 })
 
+// GET /api/admin/metrics/census/:level — 10/17 (Nic): the census numbers the
+// Metrics map's saturation overlay divides GAM's footprint by ("we are
+// responsible for 30% of the population or 60% of the total rental units").
+// American Community Survey five-year estimates, cut into one file per map
+// level and kept in apps/api/census (services/platformCensus). Behind the same
+// login as the Metrics page — never on a public site or a CDN
+// (gam-nothing-public-rule). Fetched once per level, the first time the
+// overlay is turned on there; cached a day by the browser.
+adminRouter.get('/metrics/census/:level', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readCensus } = await import('../services/platformCensus')
+    const file = await readCensus(req.params.level, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There are no census numbers for that map level.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
+  } catch (e) { next(e) }
+})
+
 // GET /api/admin/metrics/lifetime — 10/13 (Nic): the Metrics page's money
 // billed and collected (rent, each utility, GAM's platform fees), tenants ever
 // on GAM, the landlords' default rate through GAM (by rent range) and ages.

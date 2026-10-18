@@ -42,6 +42,7 @@ import { webhooksRouter } from '../routes/webhooks'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule, seedLease, seedLeaseTenant,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import {
   disputeFeeReturnedOnWinCents, loadPlatformBalanceBook, marginForMonth, splitPlatformBalance, wonChargebackReturnSourceId, wonDisputeFeeReturnSourceId, type PlatformStripeLive,
@@ -94,11 +95,14 @@ beforeEach(async () => {
   process.env.STRIPE_SECRET_KEY = 'sk_test_mocked'
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mocked'
   // Card: 3.5% + $0.55 to the payer on top; Stripe's cost for the book, 1% + $0.26.
-  await db.query(`DELETE FROM platform_processing_rates WHERE payment_method = 'card'`)
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     VALUES ('card', 0.55, 3.5, 0.26, 1.0)`)
+  // STATED rather than deleted-and-reinserted: a rate row is effective-dated and
+  // is retired, never removed, and what an earlier file left open is irrelevant.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 1.0,
+    notes: 'stripeCosts.disputes.test.ts card rate',
+  })
   onBalance = 0
 })
 

@@ -39,13 +39,27 @@ const row = (o: Partial<GeoRow>): GeoRow => ({
   location_stale: false, units: 1, occupied: 1, money: '0', ...o,
 })
 const only = async (o: Partial<GeoRow>) => buildMapLevels([row(o)], MAP_STATE_FIPS)
+/** 10/17 (Nic): the United States' own levels, and the rest of the world's. */
+const US_LAYERS = ['place', 'cd', 'sldu', 'sldl', 'zcta'] as const
+const WORLD_LAYERS = ['country', 'adm1', 'adm2'] as const
 const placed = (levels: any) => Object.fromEntries(Object.entries(levels).map(([k, v]: any) =>
   [k, v.areas.length ? `${v.areas[0].fips} ${v.areas[0].name}` : v.missing.map((m: any) => m.reason).join(',')]))
 
 describe('the boundary files', () => {
   it('are on disk for every level, small, and say where they came from', () => {
     const index = JSON.parse(readFileSync(join(GEO_DIR, 'index.json'), 'utf8'))
-    for (const layer of METRICS_BOUNDARY_LAYERS) expect(index.layers[layer]?.edition, layer).toMatch(/Census/)
+    // 10/17 (Nic): the United States' levels are Census; the rest of the
+    // world's are Natural Earth and geoBoundaries, and geoBoundaries' licence
+    // has to be named — Nic: "Credit geoBoundaries on the map (CC BY 4.0)".
+    for (const layer of ['place', 'cd', 'sldu', 'sldl', 'zcta'] as const) {
+      expect(index.layers[layer]?.edition, layer).toMatch(/Census/)
+    }
+    for (const layer of ['country', 'adm1'] as const) {
+      expect(index.layers[layer]?.edition, layer).toMatch(/Natural Earth/)
+    }
+    expect(index.layers.adm2.edition).toMatch(/geoBoundaries/)
+    expect(index.layers.adm2.edition).toMatch(/CC BY 4\.0/)
+    for (const layer of METRICS_BOUNDARY_LAYERS) expect(index.layers[layer]?.edition, layer).toBeTruthy()
     expect(index.about).toMatch(/build-geo-boundaries\.mjs/)
     let bytes = 0
     const walk = (dir: string) => {
@@ -72,6 +86,42 @@ describe('the boundary files', () => {
     for (const layer of METRICS_MAP_STATE_LEVELS) {
       for (const s of index.layers[layer].states) expect(existsSync(join(GEO_DIR, layer, `${s}.json.gz`)), `${layer}/${s}`).toBe(true)
     }
+
+    // 10/17 (Nic): the rest of the world. Countries and provinces are one file
+    // each, drawn and placed in at the same detail; the level below a province
+    // is one file per country, so the page loads only the country on screen.
+    expect(index.layers.country).toMatchObject({ file: 'country.json.gz' })
+    expect(index.layers.adm1).toMatchObject({ file: 'adm1.json.gz' })
+    for (const f of ['country.json.gz', 'adm1.json.gz']) {
+      // Each is one fetch when a world level is opened, so each stays small.
+      expect(statSync(join(GEO_DIR, f)).size, f).toBeLessThan(1.5e6)
+    }
+    // Nic: "if they have counties within those provinces" — the countries that
+    // have that level have a file and the rest have none, which IS the rule.
+    expect(index.layers.adm2.countries.length).toBeGreaterThan(150)
+    expect(index.layers.adm2.countries).toEqual(expect.arrayContaining(['USA', 'CAN', 'MEX', 'BRA', 'GBR']))
+    expect(index.layers.adm2.countries).not.toContain('HKG')
+    for (const c of index.layers.adm2.countries) {
+      expect(/^[A-Z]{3}$/.test(c), c).toBe(true)
+      expect(existsSync(join(GEO_DIR, 'adm2', `${c}.json.gz`)), `adm2/${c}`).toBe(true)
+    }
+  })
+
+  it('the countries and provinces carry their country, so one file can name "Entre Ríos, Argentina"', () => {
+    const topo = JSON.parse(gunzipSync(readFileSync(join(GEO_DIR, 'adm1.json.gz'))).toString('utf8'))
+    const geoms = topo.objects.areas.geometries as Array<{ id: string; properties: any }>
+    expect(geoms.length).toBeGreaterThan(4000)
+    for (const g of geoms) {
+      expect(/^[A-Z]{3}$/.test(g.properties.country), g.id).toBe(true)
+      expect(g.properties.countryName, g.id).toBeTruthy()
+      expect(g.properties.name, g.id).toBeTruthy()
+    }
+    const entre = geoms.find(g => g.properties.name === 'Entre Ríos')
+    expect(entre?.properties).toMatchObject({ country: 'ARG', countryName: 'Argentina' })
+    // 10/17 (review): geoBoundaries writes Latin-1, and read as UTF-8 every
+    // accented district name came out broken.
+    const alb = JSON.parse(gunzipSync(readFileSync(join(GEO_DIR, 'adm2', 'ALB.json.gz'))).toString('utf8'))
+    expect(alb.objects.areas.geometries.map((g: any) => g.properties.name)).toContain('Malësi e Madhe')
   })
 
   it('every ZIP code file holds TopoJSON areas named by their codes', () => {
@@ -88,6 +138,18 @@ describe('the boundary files', () => {
     // 10/17: the globe's world land is served the same way, and takes no state.
     expect(await boundaryFile('world')).toBe(join(GEO_DIR, 'world.json.gz'))
     expect(await boundaryFile('world', '04')).toBeNull()
+    // 10/17 (Nic): the world's own levels. Countries and provinces take
+    // nothing; the level below a province takes a country code the index lists.
+    expect(await boundaryFile('country')).toBe(join(GEO_DIR, 'country.json.gz'))
+    expect(await boundaryFile('adm1')).toBe(join(GEO_DIR, 'adm1.json.gz'))
+    expect(await boundaryFile('adm2', 'USA')).toBe(join(GEO_DIR, 'adm2', 'USA.json.gz'))
+    expect(await boundaryFile('adm2')).toBeNull()            // per country: a country is needed
+    expect(await boundaryFile('adm1', 'USA')).toBeNull()     // one file for the world: no country
+    expect(await boundaryFile('adm2', 'HKG')).toBeNull()     // has no level below its districts
+    expect(await boundaryFile('adm2', 'usa')).toBeNull()
+    expect(await boundaryFile('adm2', '04')).toBeNull()
+    expect(await boundaryFile('adm2', '../../geo/index')).toBeNull()
+    expect(await boundaryFile('adm2', 'USA.json.gz')).toBeNull()
     expect(await boundaryFile('cd', '04')).toBeNull()        // national: no state
     expect(await boundaryFile('zcta')).toBeNull()            // per state: a state is needed
     expect(await boundaryFile('sldl', '31')).toBeNull()      // Nebraska has no state house
@@ -116,14 +178,19 @@ describe('buildMapLevels: where a property goes at each level', () => {
     expect(placed(await only({ state: 'AZ', city: 'Yarnell', zip: '85362', ...YARNELL_AZ }))).toEqual({
       place: '0484980 Yarnell', cd: '0402 Congressional District 2', sldu: '04001 State Senate District 1',
       sldl: '04001 State House District 1', zcta: '85362 ZIP 85362',
+      // 10/17 (Nic): the same property on the world's levels — a United States
+      // property is on the world map too, at whichever levels it reaches.
+      country: 'USA United States of America', adm1: 'USA-3520 Arizona', adm2: 'USA.1184 Yavapai',
     })
     expect(placed(await only({ state: 'AZ', city: 'Amado', zip: '85645-1234', ...AMADO_AZ }))).toEqual({
       place: '0401990 Amado', cd: '0407 Congressional District 7', sldu: '04021 State Senate District 21',
       sldl: '04021 State House District 21', zcta: '85645 ZIP 85645',
+      country: 'USA United States of America', adm1: 'USA-3520 Arizona', adm2: 'USA.2292 Santa Cruz',
     })
     expect(placed(await only({ state: 'il', city: 'mattoon', zip: '61938', ...MATTOON_IL }))).toEqual({
       place: '1747553 Mattoon', cd: '1715 Congressional District 15', sldu: '17051 State Senate District 51',
       sldl: '17101 State House District 101', zcta: '61938 ZIP 61938',
+      country: 'USA United States of America', adm1: 'USA-3546 Illinois', adm2: 'USA.2965 Coles',
     })
   })
 
@@ -166,7 +233,14 @@ describe('buildMapLevels: where a property goes at each level', () => {
     expect(ne.sldl.missing[0]).toMatchObject({ reason: 'no_layer', label: 'Census draws no state house districts for its state' })
 
     const unknown = await only({ state: 'ZZ', ...YARNELL_AZ })
-    for (const l of METRICS_BOUNDARY_LAYERS) expect(unknown[l].missing[0]).toMatchObject({ reason: 'unknown_state', properties: 1 })
+    for (const l of US_LAYERS) expect(unknown[l].missing[0]).toMatchObject({ reason: 'unknown_state', properties: 1 })
+    // 10/17 (Nic): the world's levels know nothing of U.S. states. A property
+    // whose state GAM does not recognize is still somewhere on the earth, and
+    // its map location says where — so it is placed, not named as a gap.
+    for (const l of WORLD_LAYERS) {
+      expect(unknown[l].missing, l).toEqual([])
+      expect(unknown[l].areas, l).toHaveLength(1)
+    }
 
     const orphan = await buildMapLevels([row({ property_id: null, state: null, units: 0, occupied: 0, money: '25' })], MAP_STATE_FIPS)
     for (const l of METRICS_BOUNDARY_LAYERS) expect(orphan[l].missing[0]).toMatchObject({ reason: 'no_property', properties: 0, money: 25 })
@@ -192,6 +266,111 @@ describe('buildMapLevels: where a property goes at each level', () => {
     // Arizona and Illinois, and nothing else — a level drawn nationally has no picker.
     for (const level of METRICS_MAP_STATE_LEVELS) expect(two[level].states, level).toEqual(['04', '17'])
     expect(two.cd.states).toEqual([])
+  })
+})
+
+// ─── 10/17 (Nic): the rest of the world ─────────────────────────────────────
+//
+// Nic: "that's only pertinent to the United States for now. Just break the
+// rest of the countries down by states or province and then possibly cities as
+// well or counties, if they have counties within those provinces." A property
+// lands on these by its map location alone — GAM holds a U.S. state on an
+// address, never a country.
+
+const TORONTO_ON = { lat: 43.6532, lng: -79.3832 }
+const MEXICO_CITY = { lat: 19.4326, lng: -99.1332 }
+const HONG_KONG = { lat: 22.3193, lng: 114.1694 }
+const MID_PACIFIC = { lat: 0, lng: -150 }
+
+describe('buildMapLevels: the world levels', () => {
+  it('places a property outside the United States in its country, province and district', async () => {
+    const l = await only({ state: 'ON', city: 'Toronto', zip: 'M5H 2N2', ...TORONTO_ON })
+    expect(l.country.areas[0]).toMatchObject({ fips: 'CAN', name: 'Canada', country: 'CAN', countryName: 'Canada', units: 1, properties: 1 })
+    expect(l.adm1.areas[0]).toMatchObject({ fips: 'CAN-682', name: 'Ontario', country: 'CAN', countryName: 'Canada' })
+    expect(l.adm2.areas[0]).toMatchObject({ name: 'Toronto', country: 'CAN', countryName: 'Canada' })
+    // A world area is drawn with its country, never a state.
+    for (const level of WORLD_LAYERS) expect(l[level].areas[0]).toMatchObject({ state: '', stateFips: '' })
+    // Ontario is not a U.S. state, so every United States level names it as a gap.
+    for (const level of US_LAYERS) expect(l[level].missing[0], level).toMatchObject({ reason: 'unknown_state' })
+  })
+
+  it('a province whose country has no level below it says so, instead of drawing nothing', async () => {
+    // 10/17 (review): the first cut piled a country's provinces into one shape
+    // and the simplifier dropped every piece under a pixel and a half — Mexico
+    // City came out as a hole punched through Mexico, inside no country at all.
+    const mx = await only({ state: 'CDMX', city: 'Ciudad de México', ...MEXICO_CITY })
+    expect(mx.country.areas[0]).toMatchObject({ fips: 'MEX', name: 'Mexico' })
+    expect(mx.adm1.areas[0]).toMatchObject({ name: 'Distrito Federal', country: 'MEX' })
+    expect(mx.adm2.areas[0]).toMatchObject({ name: 'Cuauhtémoc', country: 'MEX' })
+
+    // Hong Kong has provinces of its own and nothing below them.
+    const hk = await only({ state: 'HK', city: 'Hong Kong', ...HONG_KONG })
+    expect(hk.country.areas[0]).toMatchObject({ fips: 'HKG' })
+    expect(hk.adm1.areas).toHaveLength(1)
+    expect(hk.adm2.areas).toEqual([])
+    expect(hk.adm2.missing[0]).toMatchObject({
+      reason: 'no_districts',
+      label: 'its country has no counties and districts below its states and provinces',
+    })
+  })
+
+  it('names what it cannot place on the world map, in words', async () => {
+    // No map location: the world levels have nothing else to go on.
+    const noPoint = await only({ state: 'ON', city: 'Toronto', zip: 'M5H 2N2' })
+    for (const level of WORLD_LAYERS) {
+      expect(noPoint[level].areas, level).toEqual([])
+      expect(noPoint[level].missing[0], level).toMatchObject({ reason: 'no_location', properties: 1, units: 1 })
+    }
+    const stale = await only({ state: 'ON', ...TORONTO_ON, location_stale: true })
+    for (const level of WORLD_LAYERS) expect(stale[level].missing[0], level).toMatchObject({ reason: 'stale_location' })
+
+    // The middle of the Pacific is in no country.
+    const sea = await only({ state: 'HI', ...MID_PACIFIC })
+    expect(sea.country.missing[0]).toMatchObject({
+      reason: 'outside',
+      label: 'its map location is not inside any country on the world map, which draws a coastline straight',
+    })
+    expect(sea.adm1.missing[0]).toMatchObject({ reason: 'outside' })
+    expect(sea.adm2.missing[0]).toMatchObject({
+      reason: 'no_country',
+      label: 'its map location is not inside any country on the world map, which draws a coastline straight',
+    })
+
+    const orphan = await buildMapLevels([row({ property_id: null, state: null, units: 0, occupied: 0, money: '25' })], MAP_STATE_FIPS)
+    for (const level of WORLD_LAYERS) expect(orphan[level].missing[0]).toMatchObject({ reason: 'no_property', money: 25 })
+  })
+
+  it('the country picker offers the countries GAM is in, and only the level drawn that way has one', async () => {
+    const some = await buildMapLevels([
+      row({ state: 'AZ', city: 'Yarnell', zip: '85362', ...YARNELL_AZ }),
+      row({ state: 'ON', city: 'Toronto', ...TORONTO_ON }),
+      row({ state: 'HK', city: 'Hong Kong', ...HONG_KONG }),
+    ], MAP_STATE_FIPS)
+    // Hong Kong has no districts, so it is not a country this level can draw.
+    expect(some.adm2.countries).toEqual(['CAN', 'USA'])
+    // Countries and provinces are one file for the world: no picker.
+    expect(some.country.countries).toEqual([])
+    expect(some.adm1.countries).toEqual([])
+    for (const level of METRICS_MAP_STATE_LEVELS) expect(some[level].countries, level).toEqual([])
+    expect(some.country.areas.map(a => a.fips).sort()).toEqual(['CAN', 'HKG', 'USA'])
+  })
+
+  it('every level still adds up to the tiles, the world levels among them', async () => {
+    const rows = [
+      row({ state: 'AZ', city: 'Yarnell', zip: '85362', ...YARNELL_AZ, units: 10, occupied: 7, money: '100' }),
+      row({ state: 'ON', city: 'Toronto', ...TORONTO_ON, units: 4, occupied: 4, money: '50' }),
+      row({ state: 'HK', city: 'Hong Kong', ...HONG_KONG, units: 2, occupied: 1, money: '20' }),
+      row({ state: 'ON', city: 'Toronto', units: 3, occupied: 0, money: '5' }),   // no map location
+      row({ property_id: null, state: null, units: 0, occupied: 0, money: '25' }),
+    ]
+    const levels = await buildMapLevels(rows, MAP_STATE_FIPS)
+    const total = (xs: Array<{ units: number; occupied: number; money: number }>) => xs.reduce(
+      (t, x) => ({ units: t.units + x.units, occupied: t.occupied + x.occupied, money: t.money + x.money }),
+      { units: 0, occupied: 0, money: 0 })
+    for (const level of METRICS_BOUNDARY_LAYERS) {
+      const sum = total([...levels[level].areas, ...levels[level].missing])
+      expect(sum, level).toEqual({ units: 19, occupied: 12, money: 200 })
+    }
   })
 })
 

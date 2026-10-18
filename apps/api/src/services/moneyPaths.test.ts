@@ -81,7 +81,7 @@ vi.mock('./stripeConnect', async (orig) => ({
 import { processingFeeFor } from '@gam/shared'
 import { db, getClient } from '../db'
 import { webhooksRouter } from '../routes/webhooks'
-import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule, setEffectiveProcessingRate } from '../test/dbHelpers'
 import { generateInvoices } from '../jobs/invoiceGeneration'
 import { generateLateFeesForInvoice } from '../jobs/lateFees'
 import { runAutopayForTimezone } from '../jobs/autopayRunner'
@@ -236,13 +236,17 @@ async function desk(h: H, anchorId: string, o: Partial<Parameters<typeof settleM
 const ACH_FEE = processingFeeFor({ amount: 100, paymentMethod: 'ach' })
 
 beforeAll(async () => {
-  for (const [method, flat, pct, sflat, spct] of [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT $1, $2, $3, $4, $5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = $1 AND effective_until IS NULL)`,
-      [method, flat, pct, sflat, spct])
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  for (const [paymentMethod, flat, pct, sflat, spct] of
+       [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
+    await setEffectiveProcessingRate(db, {
+      paymentMethod,
+      customerFacingFlat: flat, customerFacingPercent: pct,
+      stripeCostFlat: sflat, stripeCostPercent: spct,
+      notes: 'moneyPaths.test.ts rate',
+    })
   }
 })
 

@@ -334,8 +334,10 @@ describe('GET /api/admin/metrics: the heat map', () => {
     const m = await metrics()
     const { levels, ...map } = m.map
     expect(map).toEqual({ states: [], counties: [], missing: [] })
-    // 10/13 (Nic): the city, district and ZIP code maps are empty too.
-    expect(Object.keys(levels).sort()).toEqual(['cd', 'place', 'sldl', 'sldu', 'zcta'])
+    // 10/13 (Nic): the city, district and ZIP code maps are empty too, and
+    // 10/17 (Nic) the rest of the world's — countries, their states and
+    // provinces, and their counties and districts.
+    expect(Object.keys(levels).sort()).toEqual(['adm1', 'adm2', 'cd', 'country', 'place', 'sldl', 'sldu', 'zcta'])
     for (const l of Object.values(levels) as any[]) {
       expect(l.areas).toEqual([])
       expect(l.missing).toEqual([])

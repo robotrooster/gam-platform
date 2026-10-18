@@ -63,20 +63,45 @@ describe('PATCH /properties/:id/booking-config', () => {
     expect(res.status).toBe(400)
   })
 
-  it('sets stay rates + short-term tax; preserves unmentioned rates', async () => {
+  it('sets stay rates; preserves unmentioned rates', async () => {
     const f = await seed()
     const a = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
-      .set('Authorization', `Bearer ${f.tokenA}`).send({ nightlyRate: 100, weeklyRate: 600, monthlyRate: 2000, shortTermTaxRate: 12 })
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ nightlyRate: 100, weeklyRate: 600, monthlyRate: 2000 })
     expect(a.status).toBe(200)
     expect(a.body.data.nightlyRate).toBe(100)
-    expect(a.body.data.shortTermTaxRate).toBe(12)
-    // touching only the nightly rate must keep weekly/monthly/tax intact
+    // touching only the nightly rate must keep weekly/monthly intact
     const b = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ nightlyRate: 125 })
     expect(b.body.data.nightlyRate).toBe(125)
     expect(b.body.data.weeklyRate).toBe(600)
     expect(b.body.data.monthlyRate).toBe(2000)
-    expect(b.body.data.shortTermTaxRate).toBe(12)
+  })
+
+  // 10/17 (Nic, one home for a tax rate): this screen had its own editable
+  // "Short-term tax rate %" box — one of the three places the lodging rate
+  // lived, and the one that actually priced a stay. It is read-only now: the
+  // figure follows the company's own named taxes, so a rate cannot be changed
+  // in one place and leave a stay priced at the old one.
+  it('will not set the stay tax, and says where the rate lives', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ shortTermTaxRate: 12 })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/list of taxes/i)
+    expect(res.body.error).toMatch(/Taxes screen/i)
+    const after = await request(buildApp()).get(`/api/properties/${f.propertyId}/booking-config`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(after.body.data.shortTermTaxRate).toBe(0)
+    expect(after.body.data.shortTermTaxNames).toEqual([])
+  })
+
+  // An old screen echoing back the figure it was shown saves everything else.
+  it('a screen that sends the figure unchanged still saves the rest', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ nightlyRate: 90, shortTermTaxRate: 0 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.nightlyRate).toBe(90)
   })
 
   it('enabling without a slug → 400', async () => {

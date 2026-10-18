@@ -6,8 +6,9 @@
  * stays clean between tests with no truncation cost.
  *
  * Seed helpers (`seedLandlord`, `seedProperty`, `seedUnit`,
- * `seedAllocationRule`, `seedProcessingRate`, `seedRentPayment`)
- * insert just-enough rows to exercise the allocation engine.
+ * `seedAllocationRule`, `seedRentPayment`) insert just-enough rows to exercise
+ * the allocation engine. The rate card the engine reads is STATED, not seeded:
+ * `setEffectiveProcessingRate`, and the note on it says why.
  * Defaults match the GAM pricing model documented in CLAUDE.md;
  * each helper accepts overrides for the fields that vary per test.
  */
@@ -73,63 +74,96 @@ const CLEANUP_KEEPS: readonly string[] = [
  * ONE ROUND TRIP, NOT ~190 (10/17).
  *
  * Nic, 10/14: "these deploys are taking longer and longer they used to take 10
- * or 15 minutes and now they're taking 45 minutes." This function is called in
- * `beforeEach` by nearly every file in the package, and it was ~190 separate
- * DELETE/TRUNCATE statements in hand-maintained foreign-key order — measured at
- * ~135 ms on an empty database and ~200 ms on a populated one, almost all of it
- * the round trips themselves, paid once per TEST. It is now a single statement:
- * ~5 ms empty, ~25 ms populated.
+ * or 15 minutes and now they're taking 45 minutes." This runs in `beforeEach`
+ * in nearly every file in the package — once per TEST — and it was ~190
+ * separate DELETE/TRUNCATE statements in hand-maintained foreign-key order,
+ * measured at ~135 ms on an empty database and ~200 ms on a populated one. It
+ * is now a single statement: ~1 ms, ~23 ms in the worst case measured (every
+ * table in the database holding pages).
  *
- * WHY TRUNCATE. It fires no row triggers, so the production guards that refuse
- * to delete a money row ("the log is the log", a credit use kept forever, the
- * append-only ledgers) stay exactly as they are in production while the fixture
- * still resets — the old code had already reached for TRUNCATE a dozen times
- * for that reason. It also means no delete cascades to order: the 600 lines of
- * "this child RESTRICTs that parent, so it goes first" that this function used
- * to be are not needed, and neither is remembering to add a new table in the
- * right place. Forgetting that was the recurring bug (S272/S275 and on), and
- * the cross-file leakage it leaves is exactly what makes a file pass alone and
- * fail in a suite.
+ * WHAT IT DOES. Turns off triggers for the transaction, empties every table
+ * that has anything in it, and lets the role revert. Nothing else.
  *
- * WHY CASCADE. A TRUNCATE must name every table that references one it empties.
- * CASCADE names them for us, and it cannot reach past the keep list above: no
- * table in that list is referenced by, or references, anything being emptied
- * (checked against pg_constraint — they are catalogs and FK-free fact tables).
+ * WHY session_replication_role. In 'replica' a session fires no triggers —
+ * including the system triggers that enforce foreign keys. That single line
+ * replaces the 600 lines this function used to be:
  *
- * WHY ONLY THE TABLES WITH PAGES. TRUNCATE rewrites a table's file even when it
- * is already empty, so doing all ~345 every time would trade the round trips
- * for file churn. pg_relation_size is a stat() call and a table cannot hold a
- * row in zero pages, so > 0 is an exact "may have rows" test, and because
- * TRUNCATE puts the size back to 0 the filter stays sharp: a typical call ends
- * up naming only what the test it follows actually wrote.
+ *   • NO ORDER TO MAINTAIN. Every "this child RESTRICTs that parent, so it
+ *     clears first" note is moot, and so is the recurring bug those notes were
+ *     written for: a new table added to the schema and not added here in the
+ *     right place, leaving rows behind for the next file (S272/S275 and on).
+ *     Cross-file leftovers are exactly what makes a file pass alone and fail in
+ *     a suite, which is what has been blocking deploys.
+ *   • THE PRODUCTION GUARDS STAY AS THEY ARE. A money row's BEFORE DELETE
+ *     trigger that refuses removal ("the log is the log", a credit use kept
+ *     forever, the append-only ledgers) is untouched in production and simply
+ *     does not fire in this session — which is the same thing the old code
+ *     reached for TRUNCATE a dozen times to get, and no weaker: TRUNCATE fires
+ *     no row trigger either.
+ *   • NOTHING IS LEFT DANGLING. Every table outside CLEANUP_KEEPS is emptied,
+ *     and the keeps hold no foreign key into what is emptied (they are catalogs
+ *     and FK-free fact tables — checked against pg_constraint). That invariant
+ *     is the one rule for adding a name to CLEANUP_KEEPS.
+ *
+ * It needs a superuser (the suite connects as postgres, as globalSetup.ts
+ * does); anything less raises on the set_config and the run fails loudly.
+ *
+ * WHY ONLY THE TABLES WITH PAGES. A row cannot live in zero pages, so
+ * pg_relation_size(c.oid) > 0 is an exact "may have rows" test — and it is one
+ * stat() per table rather than a planned DELETE per table, which is where the
+ * old 135 ms actually went (statement planning and a handful of
+ * information_schema lookups, not the round trips). A table that has pages but
+ * no rows is emptied for nothing, which costs microseconds; a table with no
+ * pages is skipped, which is almost all of them.
+ *
+ * WHAT THIS LEAVES BEHIND THAT THE OLD ONE DID NOT: nothing. Row counts for all
+ * 383 tables were taken after the old chain and after this one, on the same
+ * populated database. This empties six tables the old chain left standing:
+ * audit_row_changes, which it cleared halfway through and then wrote to again
+ * on its way down, and five whose rows survived a parent delete with their link
+ * set to NULL — platform_fee_config, rvs, agent_interaction_logs (seen in the
+ * comparison) and mobile_homes, analytics_data_gaps (same ON DELETE SET NULL
+ * shape, per pg_constraint; no test writes either). Every file that reads those
+ * cleared them by hand right after calling this already (platformFeeAccrual,
+ * platformFeeTopUp, billingGrace, platformFeeMonthStays, landlordAgentActivity,
+ * pmAgentActivity), and the journal assertions are all scoped to a table and a
+ * row.
  *
  * The *_test rail (S578) moved INTO the statement. It used to be a separate
  * SELECT current_database() — one more round trip, and a gap between the check
  * and the wipe. A connection to anything not named *_test now raises before a
- * single table is touched, in the same transaction, so nothing can slip past.
+ * single row is touched, in the same transaction, so nothing can slip past.
  */
 const WIPE_TEST_DATA = `
 DO $cleanup$
 DECLARE
-  targets text;
+  tbl text;
 BEGIN
   IF right(current_database(), 5) <> '_test' THEN
     RAISE EXCEPTION 'cleanupAllSchema REFUSED: connected to "%", not a *_test database. Tests must run with DB_NAME=gam_test (use "npm test" from apps/api). This guard exists because a stray run once wiped the dev DB.', current_database();
   END IF;
 
-  SELECT string_agg(quote_ident(c.relname), ', ')
-    INTO targets
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public'
-     AND c.relkind IN ('r', 'p')
-     AND NOT c.relispartition
-     AND c.relname <> ALL (ARRAY[${CLEANUP_KEEPS.map(t => `'${t}'`).join(', ')}])
-     AND (c.relkind = 'p' OR pg_relation_size(c.oid) > 0);
+  -- Transaction-scoped (the third argument): the role is back to 'origin' when
+  -- this statement ends, however it ends, so the pooled connection never
+  -- carries it into a test.
+  PERFORM set_config('session_replication_role', 'replica', true);
 
-  IF targets IS NOT NULL THEN
-    EXECUTE 'TRUNCATE ' || targets || ' CASCADE';
-  END IF;
+  FOR tbl IN
+    SELECT quote_ident(c.relname)
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'r'
+       AND c.relname <> ALL (ARRAY[${CLEANUP_KEEPS.map(t => `'${t}'`).join(', ')}])
+       AND pg_relation_size(c.oid) > 0
+     -- By name, so two of these running at once take their locks in the same
+     -- order and cannot deadlock with each other.
+     ORDER BY c.relname
+  LOOP
+    EXECUTE 'DELETE FROM ' || tbl;
+  END LOOP;
+
+  PERFORM set_config('session_replication_role', 'origin', true);
 END
 $cleanup$`
 
@@ -137,9 +171,31 @@ $cleanup$`
  * Empty every table a test wrote to, leaving the catalogs in CLEANUP_KEEPS
  * alone. Called in `beforeEach` across the package; see the two notes above for
  * what it does and why it is one statement.
+ *
+ * RETRIED ON A DEADLOCK (10/17). A few files leave work IN FLIGHT when a test
+ * ends — a request or a ledger drain the test did not await — and it is still
+ * writing when the next test's `beforeEach` starts. Two transactions then take
+ * row locks in opposite orders and Postgres kills one of them; which one is
+ * arbitrary, so the suite would go red in a place that has nothing to do with
+ * the test being run (routes/workTradeHoursPaidByHand.test.ts, 4 of its 12).
+ * The old 190-statement chain hit the same race but, deleting in one fixed
+ * order, it waited for the other transaction instead of deadlocking with it.
+ *
+ * A deadlock rolls this statement back whole, so a retry starts from where it
+ * started and the in-flight work has since finished. Only a deadlock
+ * (40P01) or a lock this session was not allowed to wait for (55P03) is
+ * retried: a real error still fails the test, loudly, on the first try.
  */
 export async function cleanupAllSchema(): Promise<void> {
-  await db.query(WIPE_TEST_DATA)
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await db.query(WIPE_TEST_DATA)
+      return
+    } catch (e: any) {
+      if ((e?.code !== '40P01' && e?.code !== '55P03') || attempt >= 5) throw e
+      await new Promise(resolve => setTimeout(resolve, 20 * attempt))
+    }
+  }
 }
 
 export async function withRollback<T>(
@@ -342,27 +398,6 @@ export async function seedAllocationRule(
   )
 }
 
-export async function seedProcessingRate(
-  client: PoolClient,
-  params: {
-    paymentMethod: 'ach' | 'card'
-    customerFacingFlat: number
-    customerFacingPercent: number
-    stripeCostFlat: number
-    stripeCostPercent: number
-  }
-): Promise<void> {
-  await client.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent,
-        stripe_cost_flat, stripe_cost_percent)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [params.paymentMethod,
-     params.customerFacingFlat, params.customerFacingPercent,
-     params.stripeCostFlat, params.stripeCostPercent]
-  )
-}
-
 /**
  * 10/17 — STATE THE RATE CARD A FILE'S NUMBERS WERE WORKED OUT ON.
  *
@@ -389,7 +424,9 @@ export async function seedProcessingRate(
  * (the window CHECK demands until > from).
  */
 export async function setEffectiveProcessingRate(
-  client: PoolClient,
+  // The pool or a checked-out client: the rate card is global, not per-lease, so
+  // a file with no transaction in hand states its rate straight on the pool.
+  client: Pick<PoolClient, 'query'>,
   params: {
     paymentMethod: 'ach' | 'card'
     customerFacingFlat: number

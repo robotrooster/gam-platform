@@ -14,6 +14,7 @@ import { db } from '../db'
 import {
   withRollback, seedLandlord, seedManager, seedTenant, seedProperty, seedUnit,
   seedAllocationRule, seedRentPayment, seedLease,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { executeRentAllocation } from './allocation'
 import { recordHeldItem } from './heldPayouts'
@@ -80,27 +81,25 @@ const NOT_JOURNALED: Record<string, string> = {
 
 beforeAll(async () => {
   // The rates the allocation figures below are worked out on (the same pair
-  // allocation.test.ts seeds): ACH 1.0% to the customer, card 3.25% + $0.30.
+  // allocation.test.ts states): ACH 1.0% to the customer, card 3.25% + $0.30.
+  // STATED, not seeded-if-missing — one row is open per method and
+  // cleanupAllSchema leaves the rate card alone, so an insert-if-missing took
+  // whatever an earlier file left open (this used to carry a hand-written
+  // retire-everything-that-is-not-these UPDATE for the same reason).
   const client = await db.connect()
   try {
-    await client.query(
-      `UPDATE platform_processing_rates SET effective_until = now()
-        WHERE effective_until IS NULL AND effective_from < now()
-          AND NOT (
-            (payment_method = 'ach' AND customer_facing_flat = 0 AND customer_facing_percent = 1.0
-              AND stripe_cost_flat = 0 AND stripe_cost_percent = 0.5)
-            OR (payment_method = 'card' AND customer_facing_flat = 0.30 AND customer_facing_percent = 3.25
-              AND stripe_cost_flat = 0.30 AND stripe_cost_percent = 2.9))
-              OR (effective_until IS NULL AND effective_from < now()
-                  AND (customer_facing_cap IS NOT NULL OR stripe_cost_cap IS NOT NULL))`)
-    await client.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 0, 1.0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
-    await client.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'card', 0.30, 3.25, 0.30, 2.9
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='card' AND effective_until IS NULL)`)
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 0, customerFacingPercent: 1.0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'ledgerSourceFacts.test.ts ACH rate',
+    })
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'card',
+      customerFacingFlat: 0.30, customerFacingPercent: 3.25,
+      stripeCostFlat: 0.30, stripeCostPercent: 2.9,
+      notes: 'ledgerSourceFacts.test.ts card rate',
+    })
   } finally {
     client.release()
   }
