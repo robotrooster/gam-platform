@@ -220,3 +220,45 @@ PARKED (weekly limit 98%): map levels + 3D globe, faster deploys, admin Metrics
 number answers 22-26 — `~/gam-parked/metrics-globe-deployspeed-1014/`.
 Open edge-case questions for after the reset: in the follow-up journal
 (wf_28a46c97-da9) and the Nic email of 10/14 evening.
+
+## 10/17-18: the deferred batch + the stay/pay-link cause (live ~7:00 am 10/18 Phoenix)
+
+Tokens reset, so everything parked went at once, in two workflow batches (23 agents).
+Shipped `042a36e`..`b96eafc`:
+- **The reservation problem was never the server.** SchedulePage's "+ Book" sent
+  neither sendDepositLink nor payAtRegister (withPayRoute(null)), so no reservation
+  ever made a link or a ticket; the save button was disabled without a PHONE though
+  the server needs only an email; and both handlers threw away the link/ticket result
+  so a success, a failure and a ticket all looked like a closed modal. All three fixed.
+  Pay links now hold a stay, GAM picks the site (chooseFreeSite) and the guest-facing
+  label no longer names it; a stay link with no site/dates is refused at the card page
+  and the counter. Andres Razo's booking source corrected to pay_link.
+- **Deploys: 14,219 tests in ~7 min** (was 30+). cleanupAllSchema 190 deletes/145 ms →
+  one statement/1-3 ms (38 tables named to KEEP, so a new table is cleaned by default);
+  27 test files no longer race for the processing rate.
+- **Nexus** reads GAM's revenue book with five line items + a transaction count:
+  AZ 2026 went $484.04 → $843.22 ($452.72 of card/ACH markup had been invisible),
+  IL $71.93. Combined total decides crossed/approaching; a per-state measure rule is
+  data. Two latent bugs fixed (money in a state absent from the catalog vanished; the
+  page would blank every January).
+- **Health** 67% → 92.4% at Mountain View ($18,502 invoiced, $17,087 paid, work trade
+  out of both sides, credit-settled bills counted paid); 84% across all properties.
+- **Books Sales & Tax page** (both portals): every item sold with quantity, each named
+  tax with its rate/base/collected/unpaid and the account holding it, a tie strip to
+  the ledger, spreadsheet export. Root cause found: a goods-only pay link recorded NO
+  tax name, so every future one would land on the generic account. Fixed in the write
+  path; the stray $0.87 named by script → 2040 $0.00, 2040-1 $21.53, 2042 $17.08.
+- **One home for a tax rate**: properties.short_term_tax_rate (6.35%, what actually
+  priced a stay), the named tax (6.6% since 9/25) and pos_items.tax_rate (6.35%) had
+  drifted; now one source, journaled (pos_tax_rate_changes), owner AND bookkeeper may
+  change it. Stays already charged keep their rate.
+- **Credit never sits while owing** (Nic 10/15), **world map** (admin-1 + cities +
+  geoBoundaries ADM2, 199 district files), **census saturation overlay** (three
+  denominators toggleable, footprint and occupied), **district concentration overlay**,
+  **403 flood stopped** (2,389/day).
+Migrations 20261019100000, 100100, 120000 on gam + gam_demo. Record:
+`~/gam-backups/deploy-1018/`. Credit sweep found nothing to apply. Assets:
+apps/api/geo 18 MB (199 adm2), apps/api/census 732 KB — committed, read from disk.
+Still open: a mistyped credit cannot be pulled back once applied; a reservation on the
+schedule has no "send the deposit link" button; Square money stays off GAM's books
+(Housley's $50 = the 10/1 Square deposit).
