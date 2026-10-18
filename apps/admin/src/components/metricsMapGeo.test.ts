@@ -4,7 +4,7 @@
  * house), and ZIP codes", beside states and counties) and the 3D globe ("click
  * and drag to rotate the earth ... zooming in and out").
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join, resolve } from 'path'
 import { gunzipSync } from 'zlib'
@@ -13,9 +13,11 @@ import { geoCentroid, geoPath } from 'd3-geo'
 import { feature } from 'topojson-client'
 import type { Topology } from 'topojson-specification'
 import {
-  DOT_BELOW_PX, H, MAX_ZOOM, MIN_ZOOM, US_VIEW, W, WORLD_VIEW, areaAt, areaCountry, areaName, buildLayer,
-  buildUsAtlas, buildWorld, dragRotate, flatCountry, flatNational, flatState, flatWorld, globeProjection, heat,
-  inBounds, mixRgb, nationalProjection, strength, viewFor, worldProjection, zoomBy,
+  DOT_BELOW_PX, H, HOME_VIEW, MAX_DEPTH, MAX_ZOOM, MIN_DEPTH, MIN_ZOOM, US_VIEW, W, WORLD_VIEW, areaAt,
+  areaCountry, areaName, buildLayer, buildUsAtlas, buildWorld, dotNeeded, dragRotate, flatCenterPoint, flatLook,
+  flatNational, flatPan, flatWorld, flatZoom, forgetLayers, globeProjection, globeViewOf, heat, homeView,
+  inBounds, layerKey, loadLayerGroups, mergeLayers, mixRgb, nationalProjection, strength, viewFor, viewOfArea,
+  viewOfGlobe, worldProjection, zoomBy,
 } from './metricsMapGeo'
 
 const require = createRequire(import.meta.url)
@@ -61,42 +63,68 @@ describe('the flat map', () => {
     expect(flat.borders).not.toBe('')
   })
 
-  it('draws one state filling the frame at the city, district and ZIP code levels', () => {
+  // 10/18 (Nic): "when I change it to the city view, I have to then select
+  // between Arizona and Illinois. I can't just see them all in the city
+  // breakdown, like all every state." Every state GAM is in, in one picture,
+  // in the same frame every other United States level is drawn in.
+  it('draws every state GAM is in at once at the city, district and ZIP code levels', () => {
     for (const level of ['zcta', 'place', 'sldu', 'sldl'] as const) {
-      const layer = buildLayer(level, '04', boundary(`${level}/04`))
-      const flat = flatState(us, '04', layer)!
+      const merged = mergeLayers(level, ['04', '17'], ['04', '17'].map(g => buildLayer(level, g, boundary(`${level}/${g}`))))
+      const flat = flatNational(us, level, merged)
       const drawn = flat.areas.filter(a => a.d)
-      expect(drawn.length, level).toBeGreaterThan(20)
-      expect(flat.nation, level).not.toBe('')   // Arizona's own outline
-      expect(flat.context, level).not.toBe('')  // its county lines
-    }
-    const zips = flatState(us, '04', buildLayer('zcta', '04', boundary('zcta/04')))!
-    expect(zips.areas.find(a => a.id === '85362')).toMatchObject({ name: 'ZIP 85362' })
-  })
-
-  it('fits Alaska across the date line, and Puerto Rico, into the frame', () => {
-    for (const st of ['02', '72', '11']) {
-      const layer = buildLayer('zcta', st, boundary(`zcta/${st}`))
-      const flat = flatState(us, st, layer)!
-      const box = (d: string) => {
-        const nums = d.match(/-?\d+(\.\d+)?/g)!.map(Number)
-        const xs = nums.filter((_, i) => i % 2 === 0), ys = nums.filter((_, i) => i % 2 === 1)
-        return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]
+      expect(drawn.length, level).toBeGreaterThan(50)
+      // Both states' own areas are on it, drawn where the national map puts them.
+      const az = drawn.filter(a => a.id.startsWith('04'))
+      const il = drawn.filter(a => a.id.startsWith('17'))
+      if (level !== 'zcta') {           // ZIP codes do not carry a state in their code
+        expect(az.length, level).toBeGreaterThan(10)
+        expect(il.length, level).toBeGreaterThan(10)
       }
-      const [x0, y0, x1, y1] = box(flat.nation)
-      expect(x0, st).toBeGreaterThanOrEqual(0); expect(y0, st).toBeGreaterThanOrEqual(0)
-      expect(x1, st).toBeLessThanOrEqual(W); expect(y1, st).toBeLessThanOrEqual(H)
-      expect(Math.max(x1 - x0, (y1 - y0) * (W / H)), st).toBeGreaterThan(W * 0.8)
+      expect(flat.states, level).not.toBe('')   // the state lines of the whole country
+      expect(flat.nation, level).not.toBe('')
+      // The faint lines underneath are the county lines of the states drawn —
+      // and of those states only, not all 3,100 counties.
+      expect(flat.context, level).not.toBe('')
+      const national = flatNational(us, 'county')
+      expect(flat.context.length, level).toBeLessThan(national.borders.length)
     }
+    const zips = flatNational(us, 'zcta', mergeLayers('zcta', ['04'], [buildLayer('zcta', '04', boundary('zcta/04'))]))
+    expect(zips.areas.find(a => a.id === '85362')).toMatchObject({ name: 'ZIP 85362' })
+    expect(zips.areas.find(a => a.id === '85362')!.d).not.toBe('')
   })
 
-  it('a place too small to see gets a marker; a big one does not', () => {
-    const flat = flatState(us, '04', buildLayer('place', '04', boundary('place/04')))!
-    const yarnell = flat.areas.find(a => a.id === '0484980')!   // a small town at the state view
+  it('draws Alaska\'s and Hawaii\'s own ZIP codes in the frame; Puerto Rico\'s go to the globe', () => {
+    // Albers USA insets Alaska and Hawaii and leaves the territories out, so a
+    // ZIP code follows its state exactly as the state level does — rather than
+    // each state having had its own frame to fill.
+    const merged = mergeLayers('zcta', ['02', '15', '72'], ['02', '15', '72'].map(g => buildLayer('zcta', g, boundary(`zcta/${g}`))))
+    const flat = flatNational(us, 'zcta', merged)
+    const inFrame = (d: string) => {
+      const nums = d.match(/-?\d+(\.\d+)?/g)!.map(Number)
+      const xs = nums.filter((_, i) => i % 2 === 0), ys = nums.filter((_, i) => i % 2 === 1)
+      return Math.min(...xs) >= -1 && Math.min(...ys) >= -1 && Math.max(...xs) <= W + 1 && Math.max(...ys) <= H + 1
+    }
+    const anchorage = flat.areas.find(a => a.id === '99501')!   // Anchorage
+    const honolulu = flat.areas.find(a => a.id === '96813')!    // Honolulu
+    expect(inFrame(anchorage.d)).toBe(true)
+    expect(inFrame(honolulu.d)).toBe(true)
+    // Puerto Rico is not in the Albers USA picture at all (the globe has it),
+    // and the page names anything with a number there under the map.
+    expect(flat.areas.find(a => a.id === '00901')!.d).toBe('')
+  })
+
+  it('a place too small to see gets a marker, until it has been zoomed in on', () => {
+    const flat = flatNational(us, 'place', mergeLayers('place', ['04'], [buildLayer('place', '04', boundary('place/04'))]))
+    const yarnell = flat.areas.find(a => a.id === '0484980')!   // a small town
     const phoenix = flat.areas.find(a => a.id === '0455000')!
     expect(yarnell.dot).toBeDefined()
     expect(phoenix.dot).toBeUndefined()
     expect(DOT_BELOW_PX).toBeGreaterThan(0)
+    // 10/18 (Nic): the marker stands in for a shape too small to see; zoomed
+    // in far enough the shape itself is there and the marker goes away.
+    expect(dotNeeded(yarnell, 1)).toBe(true)
+    expect(dotNeeded(yarnell, 1000)).toBe(false)
+    expect(dotNeeded(phoenix, 1)).toBe(false)
   })
 
   it('names areas the way each level does', () => {
@@ -135,15 +163,18 @@ describe('the flat map', () => {
     expect(flat.areas.find(a => a.name === 'Entre Ríos')?.d).not.toBe('')
   })
 
-  it('draws one country filling the frame at the county-or-district level', () => {
+  // 10/18 (Nic): the same rule as the states — every country GAM is in, drawn
+  // together on the one world picture, with nothing to pick.
+  it('draws every country GAM is in at the county-or-district level', () => {
     const countries = buildLayer('country', null, boundary('country'))
-    const districts = buildLayer('adm2', 'CAN', boundary('adm2/CAN'))
-    const outline = countries.areas.find(a => a.id === 'CAN')!
-    const flat = flatCountry(districts, outline)!
-    expect(flat.areas.length).toBeGreaterThan(50)
+    const districts = mergeLayers('adm2', ['CAN', 'USA'], ['CAN', 'USA'].map(c => buildLayer('adm2', c, boundary(`adm2/${c}`))))
+    const flat = flatWorld(districts, countries)
+    expect(districts.groups).toEqual(['CAN', 'USA'])
+    expect(flat.areas.length).toBeGreaterThan(3000)
     expect(flat.areas.find(a => a.name === 'Toronto')!.d).not.toBe('')
-    expect(flat.nation).not.toBe('')      // the country's own edge, around its districts
-    expect(flatCountry(districts, null)).toBeNull()
+    expect(flat.areas.find(a => a.id.startsWith('USA.'))!.d).not.toBe('')
+    // The country lines are drawn faintly under them, as they are under the provinces.
+    expect(flat.context).not.toBe('')
   })
 
   it('a province carries its country, so one file names "Entre Ríos, Argentina"', () => {
@@ -157,9 +188,13 @@ describe('the flat map', () => {
     expect(areaCountry('place', '0484980', { name: 'Yarnell' })).toBeNull()
     // The districts of one country are drawn from that country's own file, so
     // they carry nothing of their own.
+    // 10/18 (Nic): several countries' districts are drawn at once, so each
+    // district carries its own country — read off its code, since the file
+    // itself has nothing but the name.
     const districts = buildLayer('adm2', 'CAN', boundary('adm2/CAN'))
-    expect(districts.country.size).toBe(0)
-    expect(districts.state).toBe('CAN')
+    expect(districts.groups).toEqual(['CAN'])
+    expect(districts.country.get('CAN.0036')).toEqual({ code: 'CAN', name: 'CAN' })
+    expect(areaCountry('adm2', 'USA.1184', { name: 'Yavapai' })).toEqual({ code: 'USA', name: 'USA' })
   })
 
   it('the world is drawn in a world projection, not the United States frame', () => {
@@ -305,5 +340,171 @@ describe('the color', () => {
     // value past the top is full gold rather than running over it.
     expect(strength(211, 100)).toBe(1)
     expect(strength(106, 100)).toBe(1)
+  })
+})
+
+// ─── 10/18 (Nic): every state at once, and the view that stays ──────────────
+
+describe('loading a level a file at a time', () => {
+  /** A stand-in for the admin's API client: the API's own files, and a count of the asks. */
+  const stub = (fail: string[] = []) => {
+    const asked: string[] = []
+    return {
+      asked,
+      api: {
+        get: async (url: string) => {
+          asked.push(url)
+          const rel = url.replace('/admin/metrics/boundaries/', '')
+          if (fail.includes(rel)) throw new Error(`no file for ${rel}`)
+          return { data: boundary(rel) }
+        },
+      } as any,
+    }
+  }
+
+  beforeEach(() => forgetLayers())
+
+  it('asks for every state with data and joins them into one picture', async () => {
+    const { api, asked } = stub()
+    const layer = await loadLayerGroups(api, 'place', ['04', '17'])
+    expect(asked).toEqual(['/admin/metrics/boundaries/place/04', '/admin/metrics/boundaries/place/17'])
+    expect(layer.groups).toEqual(['04', '17'])
+    expect(layer.failed).toEqual([])
+    // Both files' cities, and both files' outlines, are in the one picture.
+    const one = buildLayer('place', '04', boundary('place/04'))
+    const two = buildLayer('place', '17', boundary('place/17'))
+    expect(layer.areas).toHaveLength(one.areas.length + two.areas.length)
+    expect(layer.borders.coordinates).toHaveLength(one.borders.coordinates.length + two.borders.coordinates.length)
+    expect(layer.areas.find(a => a.id === '0484980')?.name).toBe('Yarnell')
+    expect(layer.areas.find(a => a.id === '1747553')?.name).toMatch(/Mattoon/)
+    expect(layerKey('place', layer.groups)).toBe('place/04+17')
+
+    // Each file is its own cache entry: going back asks for nothing again,
+    // and adding a state asks only for the state that was added.
+    await loadLayerGroups(api, 'place', ['04', '17'])
+    expect(asked).toHaveLength(2)
+    const more = await loadLayerGroups(api, 'place', ['04', '06', '17'])
+    expect(asked).toEqual([...asked.slice(0, 2), '/admin/metrics/boundaries/place/06'])
+    expect(more.groups).toEqual(['04', '06', '17'])
+  })
+
+  it('one state\'s file failing does not take the others down, and is tried again', async () => {
+    const { api, asked } = stub(['place/17'])
+    const layer = await loadLayerGroups(api, 'place', ['04', '17'])
+    // Arizona is drawn; Illinois is named as missing instead of blanking the
+    // map. The picture is still the one that was asked for — both states — so
+    // nothing on the page sits waiting for a file that is not coming.
+    expect(layer.failed).toEqual(['17'])
+    expect(layer.groups).toEqual(['04', '17'])
+    expect(layerKey('place', layer.groups)).toBe('place/04+17')
+    expect(layer.areas.length).toBeGreaterThan(400)
+    expect(layer.areas.some(a => a.id.startsWith('04'))).toBe(true)
+    const flat = flatNational(us, 'place', layer)
+    expect(flat.areas.filter(a => a.d).length).toBeGreaterThan(400)
+    // A picture with a hole in it is not remembered, so asking again really
+    // asks again — which is what the Try again button under the map does.
+    asked.length = 0
+    await loadLayerGroups(api, 'place', ['04', '17'])
+    expect(asked).toEqual(['/admin/metrics/boundaries/place/17'])
+  })
+
+  it('every file failing is a map that could not be drawn', async () => {
+    const { api } = stub(['place/04', 'place/17'])
+    await expect(loadLayerGroups(api, 'place', ['04', '17'])).rejects.toThrow()
+  })
+
+  it('a level that comes in one national file is one fetch, with no states of its own', async () => {
+    const { api, asked } = stub()
+    const layer = await loadLayerGroups(api, 'cd', null)
+    expect(asked).toEqual(['/admin/metrics/boundaries/cd'])
+    expect(layer.groups).toEqual([])
+    expect(layerKey('cd', layer.groups)).toBe('cd')
+  })
+})
+
+describe('the view that stays put', () => {
+  const arizona = us.stateById.get('04')!
+
+  it('is the same view on the globe and on the flat map', () => {
+    // 10/18 (Nic): "I'd like it to stay — if I zoom in on a certain depth or
+    // whatever." A depth is a multiple of where the picture opens, so the
+    // globe and the flat map mean the same thing by it.
+    expect(homeView(false)).toEqual(US_VIEW)
+    expect(homeView(true)).toEqual(WORLD_VIEW)
+    expect(globeViewOf(HOME_VIEW, US_VIEW)).toEqual(US_VIEW)
+    expect(globeViewOf({ center: null, depth: 4 }, US_VIEW).zoom).toBeCloseTo(US_VIEW.zoom * 4, 6)
+    // Turning and zooming the globe, then reading it back, is lossless.
+    const turned = zoomBy(dragRotate(US_VIEW, 120, -40, W, H), 3)
+    const kept = viewOfGlobe(turned, US_VIEW)
+    expect(globeViewOf(kept, US_VIEW).rotate[0]).toBeCloseTo(turned.rotate[0], 6)
+    expect(globeViewOf(kept, US_VIEW).rotate[1]).toBeCloseTo(turned.rotate[1], 6)
+    expect(globeViewOf(kept, US_VIEW).zoom).toBeCloseTo(turned.zoom, 6)
+    // And the depth is held inside the globe's own limits.
+    expect(viewOfGlobe({ rotate: [0, 0], zoom: MAX_ZOOM * 10 }, US_VIEW).depth).toBe(MAX_DEPTH)
+    expect(viewOfGlobe({ rotate: [0, 0], zoom: 0 }, US_VIEW).depth).toBe(MIN_DEPTH)
+  })
+
+  it('zooms the flat picture about a point and keeps that point still', () => {
+    const p = nationalProjection()
+    // Nothing moved yet: the whole frame, as it has always been drawn.
+    expect(flatLook(p, HOME_VIEW)).toEqual({ k: 1, x: 0, y: 0 })
+    const phoenix = p([-112.07, 33.45])!
+    const inAt = flatZoom(p, HOME_VIEW, 6, [phoenix[0], phoenix[1]])
+    expect(inAt.depth).toBeCloseTo(6, 6)
+    const look = flatLook(p, inAt)
+    // Phoenix is where it was on screen, with everything around it six times bigger.
+    expect(look.k).toBeCloseTo(6, 6)
+    expect(phoenix[0] * look.k + look.x).toBeCloseTo(phoenix[0], 4)
+    expect(phoenix[1] * look.k + look.y).toBeCloseTo(phoenix[1], 4)
+    // Arizona now fills a good part of the frame — which is what the state
+    // picker's "one state filling the map" used to be for.
+    const [[x0, y0], [x1, y1]] = geoPath(p).bounds(arizona.feature)
+    expect((x1 - x0) * look.k).toBeGreaterThan(W * 0.5)
+    expect((y1 - y0) * look.k).toBeGreaterThan(H * 0.5)
+    // Zooming out comes back to where it started.
+    const out = flatZoom(p, inAt, 1 / 6, [phoenix[0], phoenix[1]])
+    expect(out.depth).toBeCloseTo(1, 6)
+    expect(flatCenterPoint(p, out)[0]).toBeCloseTo(W / 2, 2)
+    expect(flatCenterPoint(p, out)[1]).toBeCloseTo(H / 2, 2)
+  })
+
+  it('pans the flat picture with the pointer, and never off the edge of what it can draw', () => {
+    const p = nationalProjection()
+    const start = flatZoom(p, HOME_VIEW, 4)
+    const moved = flatPan(p, start, 60, -30)
+    expect(moved.depth).toBeCloseTo(4, 6)
+    const was = flatCenterPoint(p, start)
+    const now = flatCenterPoint(p, moved)
+    // The land moved right and up with the pointer, so the middle moved left and down.
+    expect(now[0]).toBeCloseTo(was[0] - 60 / 4, 2)
+    expect(now[1]).toBeCloseTo(was[1] + 30 / 4, 2)
+    // A drag that would carry the middle out past what Albers USA draws keeps
+    // the view it had, instead of snapping the map to nowhere.
+    const far = flatPan(p, moved, 1e6, 1e6)
+    expect(far).toEqual(moved)
+    // A depth is never past the limits either.
+    expect(flatZoom(p, HOME_VIEW, 1e9).depth).toBe(MAX_DEPTH)
+    expect(flatZoom(p, HOME_VIEW, 1e-9).depth).toBe(MIN_DEPTH)
+  })
+
+  it('keeps the middle and the depth as closely as two projections allow', () => {
+    // Switching between the flat map and the globe, and between a United
+    // States level and a world one, must not snap home.
+    const world = worldProjection()
+    const us48 = nationalProjection()
+    const onArizona = viewOfArea(arizona.feature, US_VIEW)
+    expect(onArizona.center![0]).toBeCloseTo(geoCentroid(arizona.feature)[0], 5)
+    expect(onArizona.depth).toBeGreaterThan(3)
+    // The world picture can draw Arizona, so it keeps both.
+    const worldLook = flatLook(world, onArizona)
+    expect(worldLook.k).toBeCloseTo(onArizona.depth, 6)
+    expect(worldLook).not.toEqual({ k: 1, x: 0, y: 0 })
+    // Albers USA cannot draw Argentina at all; that picture opens where it
+    // opens rather than showing nothing, and the kept view is untouched.
+    const onArgentina: typeof onArizona = { center: [-60, -32], depth: 9 }
+    expect(flatLook(us48, onArgentina)).toEqual({ k: 1, x: 0, y: 0 })
+    expect(flatLook(world, onArgentina).k).toBeCloseTo(9, 6)
+    // The globe faces it either way: a globe has no edge to fall off.
+    expect(globeViewOf(onArgentina, US_VIEW).rotate).toEqual([60, 32])
   })
 })

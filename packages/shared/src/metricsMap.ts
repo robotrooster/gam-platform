@@ -20,7 +20,12 @@ export type MetricsMapLevel = typeof METRICS_MAP_LEVELS[number]
 export const METRICS_BOUNDARY_LAYERS = ['place', 'cd', 'sldu', 'sldl', 'zcta', 'country', 'adm1', 'adm2'] as const
 export type MetricsBoundaryLayer = typeof METRICS_BOUNDARY_LAYERS[number]
 
-/** Levels drawn one state at a time — there are tens of thousands of them nationwide. */
+/**
+ * Levels whose boundary files come one per state — there are tens of thousands
+ * of these areas nationwide. 10/18 (Nic): the page loads a file for every
+ * state GAM has data in and draws them together ("I can't just see them all in
+ * the city breakdown, like all every state"); it is not one state at a time.
+ */
 export const METRICS_MAP_STATE_LEVELS: ReadonlyArray<MetricsBoundaryLayer> = ['place', 'sldu', 'sldl', 'zcta']
 
 /**
@@ -33,9 +38,11 @@ export const isMetricsWorldLevel = (l: MetricsMapLevel): boolean =>
   (METRICS_MAP_WORLD_LEVELS as readonly string[]).includes(l)
 
 /**
- * 10/17 (Nic): levels drawn one country at a time — "if they have counties
- * within those provinces". 199 countries have a level below their provinces
- * and the rest have none, so a country with no file simply has no such level.
+ * 10/17 (Nic): levels whose boundary files come one per country — "if they have
+ * counties within those provinces". 199 countries have a level below their
+ * provinces and the rest have none, so a country with no file simply has no
+ * such level. 10/18 (Nic): the page merges the countries GAM has data in, by
+ * the same rule as the states above.
  */
 export const METRICS_MAP_COUNTRY_LEVELS: ReadonlyArray<MetricsBoundaryLayer> = ['adm2']
 

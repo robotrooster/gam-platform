@@ -1,10 +1,14 @@
 /**
  * 10/13 (Nic) — the Metrics heat map card: the level toggle ("cities,
  * congressional districts, state legislative districts (senate and house), and
- * ZIP codes", beside state and county), one state at a time for the levels
- * that have tens of thousands of areas, and the globe ("a toggle back to the
+ * ZIP codes", beside state and county) and the globe ("a toggle back to the
  * flat map"). The shapes come from the API (behind admin login) — here from
  * the API's own files, through a stand-in for the admin's API client.
+ *
+ * 10/18 (Nic) — and the two things he asked for after using it: every state at
+ * once with no state to pick ("I can't just see them all in the city
+ * breakdown, like all every state"), and a view that survives every setting
+ * change ("I'd like it to stay — if I zoom in on a certain depth or whatever").
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act } from 'react'
@@ -14,7 +18,7 @@ import { join, resolve } from 'path'
 import { gunzipSync } from 'zlib'
 import { METRICS_MAP_LEVELS, METRICS_MAP_LEVEL_LABEL } from '@gam/shared'
 import { MetricsHeatMap, type PlatformMapData } from './MetricsHeatMap'
-import { forgetCensus, forgetWorld } from './metricsMapGeo'
+import { forgetCensus, forgetLayers, forgetWorld } from './metricsMapGeo'
 
 const GEO = resolve(__dirname, '../../../api/geo')
 /** 10/17 (Nic): the census numbers the saturation overlay divides by (apps/api/census). */
@@ -49,13 +53,18 @@ const DATA: PlatformMapData = {
     area('17029', 'Coles', 31, 2000, { state: 'IL' })],
   missing: [],
   levels: {
-    place: { states: ['04', '17'], missing: [], areas: [area('0484980', 'Yarnell', 29, 3000, { state: 'AZ', stateFips: '04' }),
-      area('1747553', 'Mattoon', 31, 2000, { state: 'IL', stateFips: '17' })] },
+    // 10/18 (Nic): `states` is where GAM has data (drawn together, by default)
+    // and `allStates` every state the Census files cover (the "Every state"
+    // choice, loaded on demand). Three here, so the two are told apart.
+    place: { states: ['04', '17'], allStates: ['04', '06', '17'], missing: [],
+      areas: [area('0484980', 'Yarnell', 29, 3000, { state: 'AZ', stateFips: '04' }),
+        area('1747553', 'Mattoon', 31, 2000, { state: 'IL', stateFips: '17' })] },
     cd: { states: [], missing: [], areas: [area('0402', 'Congressional District 2', 29, 3000, { state: 'AZ', stateFips: '04' })] },
-    sldu: { states: ['04', '17'], missing: [], areas: [] },
-    sldl: { states: ['04', '17'], areas: [area('04001', 'State House District 1', 29, 3000, { state: 'AZ', stateFips: '04' })],
+    sldu: { states: ['04', '17'], allStates: ['04', '06', '17'], missing: [], areas: [] },
+    sldl: { states: ['04', '17'], allStates: ['04', '06', '17'],
+      areas: [area('04001', 'State House District 1', 29, 3000, { state: 'AZ', stateFips: '04' })],
       missing: [{ reason: 'no_location', label: 'no map location on file for its address', properties: 1, units: 99, occupied: 50, money: 6000 }] },
-    zcta: { states: ['04', '06', '17'], missing: [], areas: [area('85362', 'ZIP 85362', 29, 3000, { state: 'AZ', stateFips: '04' }),
+    zcta: { states: ['04', '17'], allStates: ['04', '06', '17'], missing: [], areas: [area('85362', 'ZIP 85362', 29, 3000, { state: 'AZ', stateFips: '04' }),
       area('85645', 'ZIP 85645', 99, 6000, { state: 'AZ', stateFips: '04' }), area('61938', 'ZIP 61938', 31, 2000, { state: 'IL', stateFips: '17' })] },
     // 10/17 (Nic): the rest of the world. A world area carries its country
     // instead of a state, and the county-or-district level is drawn one
@@ -66,7 +75,7 @@ const DATA: PlatformMapData = {
     adm1: { states: [], countries: [], missing: [],
       areas: [world('USA-3520', 'Arizona', 128, 9000, 'USA', 'United States of America'),
         world('CAN-682', 'Ontario', 12, 400, 'CAN', 'Canada')] },
-    adm2: { states: [], countries: ['CAN', 'USA'], missing: [],
+    adm2: { states: [], countries: ['CAN', 'USA'], allCountries: ['CAN', 'MEX', 'USA'], missing: [],
       areas: [world('USA.1184', 'Yavapai', 29, 3000, 'USA', 'United States of America'),
         world('CAN.0036', 'Toronto', 12, 400, 'CAN', 'Canada')] },
   },
@@ -83,6 +92,9 @@ beforeEach(() => {
   // the page's life; start cold.
   forgetWorld()
   forgetCensus()
+  // 10/18 (Nic): so are the levels' own shapes, now that a level is several
+  // files — every test starts with nothing in hand and asks for what it needs.
+  forgetLayers()
   // jsdom has no canvas; the globe draws nothing there, which is all these tests need.
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null)
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host)
@@ -100,8 +112,16 @@ const render = async (data: PlatformMapData | null = DATA) => {
   await settle()
 }
 const levelSelect = () => host.querySelector('select[aria-label="Map level"]') as HTMLSelectElement
-const stateSelect = () => host.querySelector('select[aria-label="State on the map"]') as HTMLSelectElement | null
-const countrySelect = () => host.querySelector('select[aria-label="Country on the map"]') as HTMLSelectElement | null
+/** 10/18 (Nic): what is left where the state picker was — how far past GAM's footprint to draw. */
+const stateSelect = () => host.querySelector('select[aria-label="States on the map"]') as HTMLSelectElement | null
+const countrySelect = () => host.querySelector('select[aria-label="Countries on the map"]') as HTMLSelectElement | null
+/** The flat picture's zoom and pan, as it is drawn. */
+const flatTransform = () => host.querySelector('svg[role="img"] > g')?.getAttribute('transform') ?? ''
+const mapSvg = () => host.querySelector('svg[role="img"]') as SVGSVGElement
+const press = async (key: string) => {
+  await act(async () => { mapSvg().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true })) })
+}
+const click = async (text: string) => { await act(async () => { button(text).click() }); await settle() }
 const groups = () => [...host.querySelectorAll('select[aria-label="Map level"] optgroup')]
   .map(g => [g.getAttribute('label'), [...g.querySelectorAll('option')].map(o => o.value)])
 const measures = () => [...host.querySelectorAll('[role="group"][aria-label="What the color shows"] button')].map(b => b.textContent)
@@ -128,44 +148,90 @@ describe('MetricsHeatMap levels', () => {
     expect(listRows()).toEqual(['Arizona64 occupied units', 'Illinois16 occupied units'])
   })
 
-  it('ZIP codes: one state at a time, opening on the state with the most units, its file from the API', async () => {
+  // 10/18 (Nic): "when I change it to the city view, I have to then select
+  // between Arizona and Illinois. I can't just see them all in the city
+  // breakdown, like all every state."
+  it('ZIP codes: every state GAM is in at once, a file each, with no state to pick', async () => {
     await render()
     await choose(levelSelect(), 'zcta')
-    expect(stateSelect()!.value).toBe('04')
-    expect([...stateSelect()!.options].map(o => o.textContent)).toEqual(['Arizona', 'California', 'Illinois'])
-    expect(gets).toEqual(['/admin/metrics/boundaries/zcta/04'])
-    expect(host.querySelector('svg[role="img"]')?.getAttribute('aria-label')).toMatch(/^Map of Arizona by ZIP code/)
-    expect(host.querySelectorAll('path[data-fips]').length).toBeGreaterThan(300)
-    // The list is every ZIP code with a number, in any state.
+    // One fetch per state GAM has data in, and nothing for the 54 it does not.
+    expect(gets).toEqual(['/admin/metrics/boundaries/zcta/04', '/admin/metrics/boundaries/zcta/17'])
+    expect(host.querySelector('svg[role="img"]')?.getAttribute('aria-label')).toMatch(/^Map of the United States by ZIP code/)
+    // Both states' ZIP codes are drawn, in the one national picture.
+    expect(host.querySelector('path[data-fips="85362"]')).not.toBeNull()   // Arizona
+    expect(host.querySelector('path[data-fips="61938"]')).not.toBeNull()   // Illinois
+    expect(host.querySelectorAll('path[data-fips]').length).toBeGreaterThan(1700)
+    expect(caption()).toContain('ZIP codes are drawn for every state GAM has data in')
+    // What is left where the picker was says only how far past GAM to go.
+    expect([...stateSelect()!.options].map(o => o.textContent)).toEqual(['Where GAM is (2 states)', 'Every state'])
+    expect(stateSelect()!.value).toBe('data')
     expect(listRows()).toEqual(['ZIP 85645, Arizona50 occupied units', 'ZIP 61938, Illinois16 occupied units', 'ZIP 85362, Arizona15 occupied units'])
   })
 
-  it('a place picked from the list in another state draws that state', async () => {
+  it('"Every state" is loaded on demand, says it is loading, and keeps the files already in hand', async () => {
     await render()
     await choose(levelSelect(), 'place')
-    // Illinois has the most spaces at the city level here (Mattoon 31, Yarnell 29).
-    expect(stateSelect()!.value).toBe('17')
-    const yarnell = [...host.querySelectorAll('.mhm-row')].find(r => r.textContent?.startsWith('Yarnell'))! as HTMLButtonElement
-    await act(async () => { yarnell.click() })
-    await settle()
-    expect(stateSelect()!.value).toBe('04')
-    expect(gets).toEqual(['/admin/metrics/boundaries/place/17', '/admin/metrics/boundaries/place/04'])
-    expect(host.querySelector('.mhm-readout')!.textContent).toMatch(/Yarnell, Arizona · 15 occupied units/)
-    // Too small to see at the state view: a marker in its own color, outlined as the pick.
-    expect(host.querySelector('circle.mhm-dot.on[data-fips="0484980"]')).not.toBeNull()
+    expect(gets).toEqual(['/admin/metrics/boundaries/place/04', '/admin/metrics/boundaries/place/17'])
+    // The whole country is megabytes of shapes, so it is never fetched until asked for.
+    await choose(stateSelect()!, 'all')
+    expect(gets).toEqual([...gets.slice(0, 2), '/admin/metrics/boundaries/place/06'])
+    expect(host.querySelector('path[data-fips="0484980"]')).not.toBeNull()
+    expect(caption()).toContain('Cities are drawn for every state')
+    // And the answer is a setting like any other: changing the level keeps it.
+    await choose(levelSelect(), 'zcta')
+    expect(stateSelect()!.value).toBe('all')
+    expect(gets.filter(u => u.includes('/zcta/')).sort())
+      .toEqual(['/admin/metrics/boundaries/zcta/04', '/admin/metrics/boundaries/zcta/06', '/admin/metrics/boundaries/zcta/17'])
   })
 
-  it('a state with nothing in it says so, and points to the list', async () => {
+  it('a place picked from the list is outlined where it is, with no state to switch to', async () => {
     await render()
     await choose(levelSelect(), 'place')
-    await choose(stateSelect()!, '17')
+    const yarnell = [...host.querySelectorAll('.mhm-row')].find(r => r.textContent?.startsWith('Yarnell'))! as HTMLButtonElement
+    const before = flatTransform()
+    await act(async () => { yarnell.click() })
+    await settle()
+    expect(host.querySelector('.mhm-readout')!.textContent).toMatch(/Yarnell, Arizona · 15 occupied units/)
+    // Too small to see at this zoom: a marker in its own color, outlined as the pick.
+    expect(host.querySelector('circle.mhm-dot.on[data-fips="0484980"]')).not.toBeNull()
+    // Illinois is still drawn beside it — nothing was swapped out — and the
+    // flat map did not move under him.
+    expect(host.querySelector('path[data-fips="1747553"]')).not.toBeNull()
+    expect(flatTransform()).toBe(before)
+    expect(gets).toEqual(['/admin/metrics/boundaries/place/04', '/admin/metrics/boundaries/place/17'])
+  })
+
+  it('a level with nothing anywhere says so, and points to the list', async () => {
+    await render()
     await choose(levelSelect(), 'sldu')   // nothing at this level anywhere
     expect(host.querySelector('.mhm-empty')!.textContent).toBe('No units are occupied this month.')
-    await choose(levelSelect(), 'zcta')
-    expect(stateSelect()!.value).toBe('17')                  // the state picked stays picked
-    await choose(stateSelect()!, '06')
-    expect(host.querySelector('.mhm-empty')!.textContent).toBe(
-      'No occupied units in California — the list beside the map has every ZIP code with occupied units.')
+    await choose(levelSelect(), 'sldl')
+    expect(host.querySelector('.mhm-empty')).toBeNull()
+    expect(listRows()).toEqual(['State House District 1, Arizona15 occupied units'])
+  })
+
+  it('a state whose shapes will not load does not blank the others', async () => {
+    // 10/18 (Nic): the map is made of a file per state now, so one file
+    // failing must leave the rest of the country drawn and say which state is
+    // missing — not replace the whole map with an error.
+    const failing: any = {
+      get: async (url: string) => {
+        gets.push(url)
+        if (url.endsWith('/place/17')) throw new Error('no file for Illinois')
+        return api.get(url)
+      },
+    }
+    await act(async () => { root.render(<MetricsHeatMap data={DATA} api={failing}/>) })
+    await settle()
+    await choose(levelSelect(), 'place')
+    expect(host.textContent).not.toContain('The map could not be drawn just now.')
+    expect(host.querySelector('path[data-fips="0484980"]')).not.toBeNull()   // Arizona drawn
+    expect(host.querySelector('path[data-fips="1747553"]')).toBeNull()       // Illinois not
+    const named = [...host.querySelectorAll('.mhm-missing')].map(d => d.textContent).join(' ')
+    expect(named).toContain('Shapes that could not be loaded')
+    expect(named).toContain('Illinois')
+    // Its numbers are still in the list beside the map, and in the tiles above.
+    expect(listRows()).toEqual(['Mattoon, Illinois16 occupied units', 'Yarnell, Arizona15 occupied units'])
   })
 
   it('congressional districts: the whole country from one file; each level names what it could not place', async () => {
@@ -219,24 +285,31 @@ describe('MetricsHeatMap world levels', () => {
     expect(listRows()).toEqual(['Arizona, United States of America64 occupied units', 'Ontario, Canada6 occupied units'])
   })
 
-  it('draws counties and districts one country at a time, and credits geoBoundaries', async () => {
+  it('draws the counties and districts of every country GAM is in, and credits geoBoundaries', async () => {
+    // 10/18 (Nic): the same rule as the states — every country GAM has data
+    // in, together, with nothing to pick.
     await render()
     await choose(levelSelect(), 'adm2')
-    // It opens on the country with the most of GAM's spaces at this level.
-    expect(countrySelect()!.value).toBe('USA')
-    expect([...countrySelect()!.options].map(o => o.textContent)).toEqual(['Canada', 'United States of America'])
-    expect(gets).toContain('/admin/metrics/boundaries/adm2/USA')
+    expect(gets.filter(u => u.includes('/adm2/')))
+      .toEqual(['/admin/metrics/boundaries/adm2/CAN', '/admin/metrics/boundaries/adm2/USA'])
+    expect([...countrySelect()!.options].map(o => o.textContent)).toEqual(['Where GAM is (2 countries)', 'Every country'])
+    expect(host.querySelector('svg[role="img"]')?.getAttribute('aria-label')).toMatch(/^Map of the world by county or district/)
     // Nic: "Credit geoBoundaries on the map (CC BY 4.0)."
     expect(credit()).toBe('Shapes: geoBoundaries (geoboundaries.org), CC BY 4.0.')
     expect(listRows()).toEqual(['Yavapai, United States of America15 occupied units', 'Toronto, Canada6 occupied units'])
 
-    // A district picked from the list in another country draws that country.
+    // Both countries' districts are on the one map, so picking one from the
+    // list only names and outlines it.
     const toronto = [...host.querySelectorAll('.mhm-row')].find(r => r.textContent?.startsWith('Toronto'))! as HTMLButtonElement
     await act(async () => { toronto.click() })
     await settle()
-    expect(countrySelect()!.value).toBe('CAN')
-    expect(gets).toContain('/admin/metrics/boundaries/adm2/CAN')
     expect(readout()).toMatch(/Toronto, Canada · 6 occupied units/)
+    expect(host.querySelector('path[data-fips="CAN.0036"]')).not.toBeNull()
+    expect(host.querySelector('path[data-fips="USA.1184"]')).not.toBeNull()
+    expect(gets.filter(u => u.includes('/adm2/'))).toHaveLength(2)
+    // A district's country comes off its own code, so a district GAM has no
+    // number for still reads with its country.
+    expect(host.querySelectorAll('path[data-fips^="MEX."]').length).toBe(0)
   })
 
   it('offers no saturation or concentration overlay where there are no census numbers', async () => {
@@ -446,8 +519,7 @@ describe('MetricsHeatMap concentration overlay', () => {
 describe('MetricsHeatMap globe', () => {
   it('toggles to the globe and back to the flat map', async () => {
     await render()
-    await act(async () => { button('Globe').click() })
-    await settle()
+    await click('Globe')
     const canvas = host.querySelector('canvas.mhm-globe')!
     expect(canvas.getAttribute('role')).toBe('img')
     expect(canvas.getAttribute('aria-label')).toMatch(/^Globe of the United States by state.*Drag or use the arrow keys/)
@@ -479,10 +551,138 @@ describe('MetricsHeatMap globe', () => {
     expect(gets.filter(u => u.endsWith('/world'))).toHaveLength(1)
   })
 
-  it('every zoom and reset control is a gold action button', async () => {
+  it('every zoom and reset control is a gold action button, on both pictures', async () => {
     await render()
-    await act(async () => { button('Globe').click() })
-    await settle()
-    for (const b of host.querySelectorAll('.mhm-globe-tools button')) expect(b.className).toContain('btn-primary')
+    // 10/18 (Nic): the flat map zooms too, so the controls are the card's and
+    // they are there before the globe is ever opened.
+    expect(host.querySelectorAll('.mhm-tools button')).toHaveLength(3)
+    for (const b of host.querySelectorAll('.mhm-tools button')) expect(b.className).toContain('btn-primary')
+    await click('Globe')
+    expect(host.querySelectorAll('.mhm-tools button')).toHaveLength(3)
+    for (const b of host.querySelectorAll('.mhm-tools button')) expect(b.className).toContain('btn-primary')
+  })
+})
+
+// ─── 10/18 (Nic): "not having the map reset every time I change a setting" ───
+
+describe('MetricsHeatMap keeps the view', () => {
+  /** Zoom in and move off centre, the way he would before changing a setting. */
+  const zoomAndPan = async () => {
+    await click('+')
+    await press('ArrowLeft')
+    await press('ArrowUp')
+    const at = flatTransform()
+    expect(at).not.toBe('translate(0 0) scale(1)')
+    return at
+  }
+
+  it('survives every setting change: the level, units or money, occupied or all, the overlays', async () => {
+    await render()
+    const at = await zoomAndPan()
+    // Nic: "changing between state and county view leaves it the same" — and
+    // now so does every other change.
+    await choose(levelSelect(), 'county')
+    expect(flatTransform()).toBe(at)
+    await choose(levelSelect(), 'place')
+    expect(flatTransform()).toBe(at)
+    await choose(levelSelect(), 'zcta')
+    expect(flatTransform()).toBe(at)
+    await choose(levelSelect(), 'cd')
+    expect(flatTransform()).toBe(at)
+    await click('Money')
+    expect(flatTransform()).toBe(at)
+    await click('Units')
+    expect(flatTransform()).toBe(at)
+    await click('All spaces')
+    expect(flatTransform()).toBe(at)
+    await click('Occupied (billed)')
+    expect(flatTransform()).toBe(at)
+    await click('Concentration')
+    expect(flatTransform()).toBe(at)
+    await click('Saturation')
+    expect(flatTransform()).toBe(at)
+    // Each saturation denominator is its own view; none of them is a new map.
+    await click('All homes')
+    expect(flatTransform()).toBe(at)
+    await click('People')
+    expect(flatTransform()).toBe(at)
+    // And so is drawing more states than GAM is in.
+    await choose(levelSelect(), 'place')
+    expect(flatTransform()).toBe(at)
+    await choose(stateSelect()!, 'all')
+    expect(flatTransform()).toBe(at)
+  })
+
+  it('keeps the depth across the flat map and the globe, and across the world levels', async () => {
+    await render()
+    const at = await zoomAndPan()
+    const depth = Number(at.match(/scale\(([\d.]+)\)/)![1])
+    expect(depth).toBeGreaterThan(1)
+    // The globe cannot show the same picture, but it must not snap home: the
+    // depth and the middle come back when the flat map does.
+    await click('Globe')
+    expect(host.querySelector('canvas.mhm-globe')).not.toBeNull()
+    await click('Flat map')
+    expect(flatTransform()).toBe(at)
+    // A world level is a different projection; the depth still holds.
+    await choose(levelSelect(), 'country')
+    expect(Number(flatTransform().match(/scale\(([\d.]+)\)/)![1])).toBeCloseTo(depth, 6)
+    await choose(levelSelect(), 'state')
+    expect(flatTransform()).toBe(at)
+  })
+
+  it('scrolling over the flat map zooms it, and does not scroll the page with it', async () => {
+    await render()
+    const before = flatTransform()
+    let defaultPrevented = false
+    await act(async () => {
+      const e = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -240, clientX: 120, clientY: 90 })
+      mapSvg().dispatchEvent(e)
+      defaultPrevented = e.defaultPrevented
+    })
+    expect(flatTransform()).not.toBe(before)
+    expect(Number(flatTransform().match(/scale\(([\d.]+)\)/)![1])).toBeGreaterThan(1)
+    expect(defaultPrevented).toBe(true)
+  })
+
+  it('Reset is the one way back, and nothing else does it for him', async () => {
+    await render()
+    const at = await zoomAndPan()
+    await click('Reset')
+    expect(flatTransform()).toBe('translate(0 0) scale(1)')
+    // Zooming out past the opening framing is allowed on purpose (the globe
+    // pulls back to the whole earth that way), so "home" is not just depth 1.
+    await click('+')
+    expect(flatTransform()).not.toBe(at)
+    await press('0')
+    expect(flatTransform()).toBe('translate(0 0) scale(1)')
+  })
+
+  it('a click still picks a place, and a drag moves the map instead', async () => {
+    await render()
+    await choose(levelSelect(), 'county')
+    const santaCruz = () => host.querySelector('path[data-fips="04023"]')!
+    const at = (type: string, x: number, y: number) => {
+      // jsdom has no PointerEvent; a mouse event with the pointer fields on
+      // it is what React's pointer handlers read.
+      const e: any = new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, button: 0 })
+      e.pointerId = 1; e.pointerType = 'mouse'
+      return e
+    }
+    // Down and up in the same place: the county is picked, as it always was.
+    await act(async () => {
+      santaCruz().dispatchEvent(at('pointerdown', 100, 100))
+      santaCruz().dispatchEvent(at('pointerup', 100, 100))
+    })
+    expect(readout()).toMatch(/Santa Cruz, Arizona/)
+    const before = flatTransform()
+    // Down, moved, up: the map moved and nothing was picked.
+    await act(async () => {
+      santaCruz().dispatchEvent(at('pointerdown', 100, 100))
+      santaCruz().dispatchEvent(at('pointermove', 160, 130))
+      santaCruz().dispatchEvent(at('pointerup', 160, 130))
+    })
+    expect(flatTransform()).not.toBe(before)
+    expect(readout()).toMatch(/Santa Cruz, Arizona/)
   })
 })

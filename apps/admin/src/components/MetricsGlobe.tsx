@@ -6,11 +6,17 @@
  * goes back to the flat map.
  *
  * Drawn on a canvas (thousands of counties redrawn every frame of a drag would
- * stall an SVG): drag or swipe to turn it, scroll or pinch to zoom, the +/−
- * buttons or the keyboard (arrows turn it, + and − zoom, 0 goes back) do the
- * same. While it moves only the outlines that matter are drawn; the fine lines
- * come back when it stops. A tap picks a place; the far side of the earth is
- * never picked. Every number on it is also in the list beside the map.
+ * stall an SVG): drag or swipe to turn it, scroll or pinch to zoom, and the
+ * keyboard (arrows turn it, + and − zoom, 0 goes home) does the same. While it
+ * moves only the outlines that matter are drawn; the fine lines come back when
+ * it stops. A tap picks a place; the far side of the earth is never picked.
+ * Every number on it is also in the list beside the map.
+ *
+ * 10/18 (Nic): where it is facing is the CARD's, not its own — one kept view
+ * for the globe and the flat map, so "I'd like it to stay" holds through every
+ * setting change and through the toggle between the two pictures. It is given
+ * that view (`view`) and hands back where a turn or a zoom ended (`onView`);
+ * the zoom and Reset buttons live on the card beside both pictures.
  *
  * 10/17: the land around the United States is drawn under it (the countries
  * from the API's own world file — see metricsMapGeo loadWorld), so the earth
@@ -47,8 +53,20 @@ interface Props {
   /** Strength 0–1 of each area's gold, by id (only areas with a number). */
   shade: Map<string, number>
   focus: string | null
-  /** Where to face; a new object turns the globe there. */
-  target: GlobeView
+  /**
+   * 10/18 (Nic): where to face and how far in — the card's own kept view, so
+   * the globe comes back where it was left ("I'd like it to stay"). A new
+   * object turns the globe there.
+   */
+  view: GlobeView
+  /**
+   * 10/18 (Nic): and back the other way, once a turn or a zoom has settled, so
+   * the card keeps it and the flat map picks it up. Not every frame: the card
+   * would re-draw its whole picture under a drag.
+   */
+  onView: (view: GlobeView) => void
+  /** Reset: the card decides where home is, and the keyboard's 0 asks for it. */
+  onHome: () => void
   onHover: (id: string | null, x: number, y: number) => void
   onPick: (id: string | null) => void
   label: string
@@ -81,7 +99,10 @@ function makeColorReader() {
   }
 }
 
-export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLines = true, target, onHover, onPick, label, describedBy }: Props) {
+export function MetricsGlobe({
+  us, world, areas, borders, shade, focus, stateLines = true, view: target, onView, onHome,
+  onHover, onPick, label, describedBy,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const view = useRef<GlobeView>(target)
   const size = useRef({ w: 0, h: 0 })
@@ -92,8 +113,8 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLin
   /** The markers drawn last frame (places too small to see), for hover and tap. */
   const dots = useRef<Array<{ id: string; x: number; y: number }>>([])
   // The latest props, for the drawing loop and the pointer handlers.
-  const props = useRef({ areas, borders, shade, focus, stateLines, onHover, onPick })
-  props.current = { areas, borders, shade, focus, stateLines, onHover, onPick }
+  const props = useRef({ areas, borders, shade, focus, stateLines, onHover, onPick, onView })
+  props.current = { areas, borders, shade, focus, stateLines, onHover, onPick, onView }
 
   const paint = useCallback(() => {
     frame.current = null
@@ -170,15 +191,26 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLin
     if (frame.current == null) frame.current = requestAnimationFrame(paint)
   }, [paint])
 
-  /** While it moves: the light drawing now, the full one a moment after it stops. */
+  /**
+   * While it moves: the light drawing now, the full one a moment after it
+   * stops. 10/18 (Nic): and when it stops, the card is told where it ended up,
+   * so changing a setting (or going back to the flat map) keeps it.
+   */
   const moved = useCallback(() => {
     moving.current = true
     if (settle.current != null) window.clearTimeout(settle.current)
-    settle.current = window.setTimeout(() => { moving.current = false; settle.current = null; redraw() }, 160)
+    settle.current = window.setTimeout(() => {
+      moving.current = false; settle.current = null; redraw()
+      props.current.onView(view.current)
+    }, 160)
     redraw()
   }, [redraw])
 
-  // A new target (another level, another state, a place picked from the list) turns the globe there.
+  /** The same, at once, when a gesture ends — a toggle clicked a moment later must not lose it. */
+  const report = useCallback(() => { props.current.onView(view.current) }, [])
+
+  // A new view from the card (its own Reset, a place picked from the list, a
+  // level whose picture opens somewhere else) turns the globe there.
   useEffect(() => { view.current = target; redraw() }, [target, redraw])
   // New numbers or a new focus: draw again.
   useEffect(() => { redraw() }, [areas, borders, shade, focus, stateLines, redraw])
@@ -266,7 +298,7 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLin
     if (was === 1 && gesture.current.travel < 6) {
       const at = local(e)
       props.current.onPick(hitAt(at.x, at.y))
-    }
+    } else if (gesture.current.travel >= 6) report()
     if (pointers.current.size < 2) gesture.current.pinch = null
   }
 
@@ -281,26 +313,23 @@ export function MetricsGlobe({ us, world, areas, borders, shade, focus, stateLin
       ArrowLeft: () => turn(step, 0), ArrowRight: () => turn(-step, 0),
       ArrowUp: () => turn(0, step), ArrowDown: () => turn(0, -step),
       '+': () => zoom(1.4), '=': () => zoom(1.4), '-': () => zoom(1 / 1.4), _: () => zoom(1 / 1.4),
-      '0': () => { view.current = target; redraw() },
+      // 10/18 (Nic): home is the card's to decide now — the same thing the
+      // Reset button beside the globe does, for both pictures.
+      '0': () => onHome(),
     }
     const act = keys[e.key]
     if (act) { e.preventDefault(); act() }
   }
 
+  // 10/18 (Nic): the zoom and Reset buttons are the card's now (.mhm-tools) —
+  // the flat map zooms too, and both read the one kept view.
   return (
-    <>
-      <canvas ref={canvasRef} className="mhm-globe" role="img" tabIndex={0}
-        aria-label={`${label}. Drag or use the arrow keys to turn the globe; scroll, pinch, or plus and minus to zoom.`}
-        aria-describedby={describedBy}
-        onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
-        onPointerCancel={e => { pointers.current.delete(e.pointerId); gesture.current.pinch = null }}
-        onPointerLeave={e => { if (e.pointerType === 'mouse' && !pointers.current.size) props.current.onHover(null, 0, 0) }}
-        onKeyDown={onKeyDown}/>
-      <div className="mhm-globe-tools">
-        <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom in" onClick={() => zoom(1.5)}>+</button>
-        <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom out" onClick={() => zoom(1 / 1.5)}>−</button>
-        <button type="button" className="btn btn-primary btn-sm" onClick={() => { view.current = target; redraw() }}>Reset</button>
-      </div>
-    </>
+    <canvas ref={canvasRef} className="mhm-globe" role="img" tabIndex={0}
+      aria-label={`${label}. Drag or use the arrow keys to turn the globe; scroll, pinch, or plus and minus to zoom.`}
+      aria-describedby={describedBy}
+      onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
+      onPointerCancel={e => { pointers.current.delete(e.pointerId); gesture.current.pinch = null }}
+      onPointerLeave={e => { if (e.pointerType === 'mouse' && !pointers.current.size) props.current.onHover(null, 0, 0) }}
+      onKeyDown={onKeyDown}/>
   )
 }

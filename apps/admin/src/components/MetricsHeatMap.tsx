@@ -46,8 +46,9 @@
  * map. Each level's numbers come from the same endpoint (`map.levels`,
  * services/platformMetricsGeo) and add up to the tiles the same way; each has
  * its own "Not on this map" list. Cities, state legislative districts and ZIP
- * codes are drawn one state at a time (a state picker; it opens on the state
- * with the most of GAM's spaces) — tens of thousands of them nationwide.
+ * codes come one Census file per state — tens of thousands of them nationwide
+ * — and 10/18 (Nic) the page loads a file for every state GAM has data in and
+ * merges them, with "Every state" there for looking beyond GAM's footprint.
  * Their shapes are Census boundary files the API serves behind admin login,
  * never from an outside site; the flat map now projects the longitude /
  * latitude edition of us-atlas exactly as its own Albers file was drawn, so
@@ -67,13 +68,13 @@
  * province and then possibly cities as well or counties, if they have counties
  * within those provinces." So: countries, their states and provinces, and —
  * for the 199 countries that have a level below their provinces — that
- * country's counties or districts, drawn one country at a time the way a
- * state's cities are. Voting districts stay United States only. A property
- * lands on a world level by its map location alone: GAM holds a U.S. state on
- * an address, never a country, so there is nothing on an address to place one
- * by, and one with no map location is named under the map as always. The
- * shapes are Natural Earth and geoBoundaries, served by the API behind admin
- * login; geoBoundaries is CC BY 4.0 and the credit line under the map says so
+ * country's counties or districts, from a file per country the way a state's
+ * cities are. Voting districts stay United States only. A property lands on a
+ * world level by its map location alone: GAM holds a U.S. state on an address,
+ * never a country, so there is nothing on an address to place one by, and one
+ * with no map location is named under the map as always. The shapes are
+ * Natural Earth and geoBoundaries, served by the API behind admin login;
+ * geoBoundaries is CC BY 4.0 and the credit line under the map says so
  * whenever that level is drawn (METRICS_MAP_LEVEL_CREDIT).
  *
  * SATURATION — "overlay against census data and say, hey, look, we're in Santa
@@ -98,6 +99,29 @@
  * States only). The color is that district's share of every space GAM has
  * placed at that level — a share of GAM, not a share of the district, which
  * the caption says outright so it is never read as saturation.
+ *
+ * 10/18 (Nic): NO STATE TO PICK, AND THE VIEW STAYS PUT.
+ *
+ * "When I change it to the city view, I have to then select between Arizona
+ * and Illinois. I can't just see them all in the city breakdown, like all
+ * every state." So every level is one picture of the whole United States (or
+ * the whole earth): the fine levels load a file per state GAM has data in and
+ * merge them (loadLayerGroups), and the only choice left is whether to go
+ * beyond GAM's footprint to every state there is — on demand, because that is
+ * 3.1 MB of cities or 4.1 MB of ZIP codes, and the map says while it loads. A
+ * state whose file will not load is named under the map; the others still draw.
+ *
+ * "I would like to see about not having the map reset every time I change a
+ * setting. I'd like it to stay — if I zoom in on a certain depth or whatever.
+ * Changing between state and county view leaves it the same." So the card
+ * holds ONE view — where the middle is and how far in it is (MapView) — and
+ * every setting reads it: the level, units or money, occupied or all spaces,
+ * the saturation denominator, the overlays. Both pictures honor it, so the
+ * flat map / globe toggle keeps the middle and the depth as closely as the
+ * two projections allow instead of snapping home. The flat map zooms and pans
+ * for that reason: it is how a state gets looked at closely now that no level
+ * redraws the frame around one. Nothing resets the view on its own; the Reset
+ * button, which was already on the globe, is the one way back.
  */
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { AxiosInstance } from 'axios'
@@ -114,10 +138,11 @@ import {
   type MetricsBoundaryLayer, type MetricsCensusBasis, type MetricsMapLevel, type MetricsMapMeasure,
 } from '@gam/shared'
 import {
-  DOT_RADIUS, H, W, US_VIEW, WORLD_VIEW, flatCountry, flatNational, flatState, flatWorld, heat, loadCensus,
-  loadLayer, loadUsAtlas, loadWorld, strength, viewFor,
+  DOT_RADIUS, H, HOME_VIEW, W, atDepth, dotNeeded, flatLook, flatNational, flatPan, flatWorld, flatZoom,
+  globeViewOf, heat, homeView, layerKey, loadCensus, loadLayer, loadLayerGroups, loadUsAtlas, loadWorld,
+  nationalProjection, strength, viewOfArea, viewOfGlobe, worldProjection, zoomBy,
   type CensusLevel, type FlatPicture, type FlatShape, type GeoArea, type GlobeView, type LayerShapes,
-  type UsAtlas, type WorldLand,
+  type MapView, type UsAtlas, type WorldLand,
 } from './metricsMapGeo'
 import type { MetricsGlobe as MetricsGlobeView } from './MetricsGlobe'
 
@@ -151,7 +176,19 @@ export interface PlatformMapData {
    * and provinces, and the counties or districts of the countries that have them.
    */
   levels?: Partial<Record<MetricsBoundaryLayer, {
-    areas: LevelArea[]; missing: LevelMissing[]; states: string[]; countries?: string[]
+    areas: LevelArea[]
+    missing: LevelMissing[]
+    /** The states (FIPS) GAM has data in at this level — the states drawn by default. */
+    states: string[]
+    /** 10/17 (Nic): and the countries, for a level whose files come one per country. */
+    countries?: string[]
+    /**
+     * 10/18 (Nic): every state (or country) these files cover, for the "Every
+     * state" choice — "I can't just see them all". An API that does not send
+     * it yet simply does not offer that choice.
+     */
+    allStates?: string[]
+    allCountries?: string[]
   }>>
 }
 
@@ -166,6 +203,13 @@ type Spaces = 'occupied' | 'all'
 type Field = 'units' | 'occupied' | 'money'
 /** A place in the list: its numbers and the state (or country) it is drawn with. */
 type Listed = MapArea & { stateFips: string; country?: string; countryName?: string }
+/**
+ * 10/18 (Nic): how much of a level whose files come one per state (or country)
+ * to draw. Every state GAM has data in, which is the map he wants by default —
+ * "I can't just see them all in the city breakdown, like all every state" — or
+ * every state there is, for looking beyond GAM's footprint.
+ */
+type Scope = 'data' | 'all'
 
 const count = (n: number) => Math.round(n).toLocaleString('en-US')
 const unitsText = (n: number) => `${count(n)} ${n === 1 ? 'unit' : 'units'}`
@@ -230,10 +274,10 @@ function Toggle<T extends string>({ label, value, options, onChange }: {
 export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | undefined; api?: AxiosInstance }) {
   const [view, setView] = useState<View>('flat')
   const [level, setLevel] = useState<Level>('state')
-  // 10/13 (Nic): cities, state legislative districts and ZIP codes are drawn one state at a time.
-  const [chosenState, setChosenState] = useState<string | null>(null)
-  // 10/17 (Nic): and the world's counties or districts one country at a time.
-  const [chosenCountry, setChosenCountry] = useState<string | null>(null)
+  // 10/18 (Nic): no state to pick any more — every state GAM has data in is
+  // on the map. This is only how far past GAM's footprint to go, and it is a
+  // setting like any other: changing the level keeps it.
+  const [scope, setScope] = useState<Scope>('data')
   const [chosenMeasure, setMeasure] = useState<Measure>('units')
   const [spaces, setSpaces] = useState<Spaces>('occupied')
   // 10/17 (Nic): which census number the saturation overlay divides by.
@@ -252,7 +296,7 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   const [layer, setLayer] = useState<LayerShapes | null>(null)
   const [layerFailed, setLayerFailed] = useState(false)
   // 10/17 (Nic): the country shapes, for the world's levels — the lines under
-  // the provinces, and the outline around one country's own districts.
+  // the provinces and the districts.
   const [countryLayer, setCountryLayer] = useState<LayerShapes | null>(null)
   // 10/17 (Nic): this level's census numbers, fetched the first time the
   // saturation overlay is turned on for it.
@@ -268,7 +312,14 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   // 10/12 (Nic) review: the side list is the keyboard and screen-reader way to
   // every place's number, so it can show all of them, not only the top eight.
   const [showAll, setShowAll] = useState(false)
-  const [target, setTarget] = useState<GlobeView>(US_VIEW)
+  /**
+   * 10/18 (Nic): where the map is looking — "I'd like it to stay". ONE view
+   * for the flat map and the globe, held here so that nothing below (the
+   * level, the measure, the overlays, the picture itself) can reset it. The
+   * only things that move it are turning, dragging, zooming, picking a place
+   * from the list, and Reset.
+   */
+  const [viewAt, setViewAt] = useState<MapView>(HOME_VIEW)
   const boxRef = useRef<HTMLDivElement>(null)
   const listId = useId()
 
@@ -303,10 +354,12 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   useEffect(() => { setSelected(null); setHover(null) }, [level])
 
   const boundary: MetricsBoundaryLayer | null = level === 'state' || level === 'county' ? null : level
+  /** A level whose Census files come one per state (cities, ZIP codes, the two chambers). */
   const perState = !!boundary && METRICS_MAP_STATE_LEVELS.includes(boundary)
   // 10/17 (Nic): the world's own levels — placed by map location, drawn on the
-  // whole earth, and (at the county-or-district level) one country at a time.
+  // whole earth.
   const worldLevel = isMetricsWorldLevel(level)
+  /** 10/17 (Nic): and the level below a province, whose files come one per country. */
   const perCountry = !!boundary && METRICS_MAP_COUNTRY_LEVELS.includes(boundary)
   const levelData = boundary ? data?.levels?.[boundary] : undefined
 
@@ -316,58 +369,50 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
     return levelData?.areas ?? []
   }, [data, level, levelData])
 
-  // The state on screen at a one-state-at-a-time level: the one picked, else
-  // the one with the most of GAM's spaces at this level (steady while the
-  // Units / Money toggles change), else the one with the most spaces overall.
-  const stateOptions = useMemo(() => (perState ? levelData?.states ?? [] : []), [perState, levelData])
-  const defaultState = useMemo(() => {
-    if (!perState) return null
-    const totals = new Map<string, [number, number]>()
-    for (const a of areas) {
-      const t = totals.get(a.stateFips) ?? [0, 0]
-      totals.set(a.stateFips, [t[0] + a.units, t[1] + a.money])
-    }
-    const best = [...totals.entries()].filter(([s, t]) => stateOptions.includes(s) && (t[0] > 0 || t[1] > 0))
-      .sort((a, b) => b[1][0] - a[1][0] || b[1][1] - a[1][1])[0]?.[0]
-    if (best) return best
-    const byUnits = [...(data?.states ?? [])].filter(s => stateOptions.includes(s.fips)).sort((a, b) => b.units - a.units)[0]?.fips
-    return byUnits ?? stateOptions[0] ?? null
-  }, [perState, areas, stateOptions, data])
-  const drawnState = perState ? (chosenState && stateOptions.includes(chosenState) ? chosenState : defaultState) : null
-
-  // 10/17 (Nic): the country on screen at the world's county-or-district level
-  // — the one picked, else the one with the most of GAM's spaces there.
-  const countryOptions = useMemo(() => (perCountry ? levelData?.countries ?? [] : []), [perCountry, levelData])
-  const defaultCountry = useMemo(() => {
-    if (!perCountry) return null
-    const totals = new Map<string, number>()
-    for (const a of areas) if (a.country) totals.set(a.country, (totals.get(a.country) ?? 0) + a.units)
-    const best = [...totals.entries()].filter(([c]) => countryOptions.includes(c))
-      .sort((x, y) => y[1] - x[1])[0]?.[0]
-    return best ?? countryOptions[0] ?? null
-  }, [perCountry, areas, countryOptions])
-  const drawnCountry = perCountry ? (chosenCountry && countryOptions.includes(chosenCountry) ? chosenCountry : defaultCountry) : null
-  /** The file this level is drawn from: a state, a country, or the lot. */
-  const drawnGroup = perState ? drawnState : perCountry ? drawnCountry : null
+  /**
+   * 10/18 (Nic): the states (or countries) whose files this level is drawn
+   * from. By default every one GAM has data in there — "I can't just see them
+   * all in the city breakdown, like all every state" — and on the "Every
+   * state" choice every one the Census files cover. Null for a level that
+   * comes in one file for the lot, which needs no merging at all.
+   */
   const perGroup = perState || perCountry
+  const dataGroups = useMemo(() => (perState ? levelData?.states ?? []
+    : perCountry ? levelData?.countries ?? [] : []), [perState, perCountry, levelData])
+  const allGroups = useMemo(() => (perState ? levelData?.allStates ?? []
+    : perCountry ? levelData?.allCountries ?? [] : []), [perState, perCountry, levelData])
+  /** "Every state" is offered only when the API has said which states there are. */
+  const canShowAllGroups = perGroup && allGroups.length > 0
+  const groups = useMemo(() => {
+    if (!perGroup) return null
+    return scope === 'all' && canShowAllGroups ? allGroups : dataGroups
+  }, [perGroup, scope, canShowAllGroups, allGroups, dataGroups])
+  /** Every state at once is megabytes of shapes, so the map says while it loads. */
+  const loadingEverything = scope === 'all' && canShowAllGroups
 
-  // The level's shapes from the API (behind admin login): the state or country
-  // on screen's, or every congressional district, country or province at once.
+  // The level's shapes from the API (behind admin login): a file per state (or
+  // country), merged; or the one national file a level comes in.
+  //
+  // 10/18 (Nic): `groups` is depended on as a string, because a new array of
+  // the same states must not re-fetch — and `loadLayerGroups` keeps each file
+  // its own fetch, so moving from GAM's states to every state downloads only
+  // the ones it did not have.
+  const groupsKey = groups ? groups.join(',') : ''
   useEffect(() => {
     setLayer(null)
     setLayerFailed(false)
-    if (!boundary || (perGroup && !drawnGroup)) return
+    if (!boundary || (perGroup && !groups?.length)) return
     if (!api) { setLayerFailed(true); return }
     let live = true
-    loadLayer(api, boundary, perGroup ? drawnGroup : null)
+    loadLayerGroups(api, boundary, groups)
       .then(l => { if (live) setLayer(l) })
       .catch(() => { if (live) setLayerFailed(true) })
     return () => { live = false }
-  }, [api, boundary, perGroup, drawnGroup, attempt])
+  }, [api, boundary, perGroup, groupsKey, attempt])
 
   // 10/17 (Nic): the country shapes, for the world's levels only — the lines
-  // under the provinces, and the outline around one country's own districts.
-  // The country level draws them as its own areas, so it needs no second copy.
+  // under the provinces and the districts. The country level draws them as its
+  // own areas, so it needs no second copy.
   useEffect(() => {
     if (!worldLevel || level === 'country' || !api) return
     let live = true
@@ -396,7 +441,9 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
     return () => { live = false }
   }, [measure, level, api, census, attempt])
 
-  const layerReady = !boundary || (!!layer && layer.level === boundary && layer.state === (perGroup ? drawnGroup : null))
+  /** The shapes in hand are this level's, drawn from the files it asked for. */
+  const layerReady = !boundary
+    || (!!layer && layer.level === boundary && layerKey(layer.level, layer.groups) === layerKey(boundary, groups ?? []))
   // 10/17 (Nic): the world's provinces and districts also wait on the country
   // shapes they are drawn over, and the saturation overlay on its census numbers.
   const worldReady = !worldLevel || level === 'country' || !!countryLayer
@@ -404,35 +451,35 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   const ready = !!us && layerReady && worldReady && censusReady
   const geoAreas: GeoArea[] = useMemo(() => (!us || !layerReady ? []
     : level === 'state' ? us.states : level === 'county' ? us.counties : layer?.areas ?? []), [us, layerReady, level, layer])
-  /** 10/17: the country on screen's own shape, for the outline around its districts. */
-  const countryShape = useMemo(() => (drawnCountry && countryLayer
-    ? countryLayer.areas.find(a => a.id === drawnCountry) ?? null : null), [drawnCountry, countryLayer])
+  /**
+   * 10/18 (Nic): one picture per level, and the same frame for every level of
+   * the United States — so changing the level never changes the frame under
+   * the view. The world's levels are the whole earth, GAM's own the whole
+   * country, and a state is looked at closely by zooming in (flatLook).
+   */
   const flat = useMemo((): FlatPicture | null => {
     if (view !== 'flat' || !us || !layerReady || !worldReady) return null
     if (level === 'state' || level === 'county') return cachedFlat(us, level, () => flatNational(us, level))
     if (!layer) return null
-    if (level === 'cd') return cachedFlat(layer, 'cd', () => flatNational(us, 'cd', layer))
-    // 10/17 (Nic): the world. Countries and provinces fill the earth; a
-    // country's own districts fill the frame, as a state's cities do.
-    if (level === 'country' || level === 'adm1') return cachedFlat(layer, level, () => flatWorld(layer, countryLayer))
-    if (level === 'adm2') return drawnCountry ? cachedFlat(layer, drawnCountry, () => flatCountry(layer, countryShape)) : null
-    return drawnState ? cachedFlat(layer, drawnState, () => flatState(us, drawnState, layer)) : null
-  }, [view, us, layerReady, worldReady, level, layer, countryLayer, countryShape, drawnState, drawnCountry])
+    if (worldLevel) return cachedFlat(layer, level, () => flatWorld(layer, countryLayer))
+    return cachedFlat(layer, level, () => flatNational(us, level, layer))
+  }, [view, us, layerReady, worldReady, worldLevel, level, layer, countryLayer])
   const globeBorders: MultiLineString | null = !us ? null
     : level === 'county' ? us.countyBorders : boundary && layer ? layer.borders : null
 
-  // The globe faces the state or country on screen, the lower 48, or — at a
-  // world level — the whole earth; the flat map needs no turning.
-  useEffect(() => {
-    if (!us) return
-    if (worldLevel) { setTarget(countryShape ? viewFor(countryShape.feature) : WORLD_VIEW); return }
-    const s = perState && drawnState ? us.stateById.get(drawnState) : null
-    setTarget(s ? viewFor(s.feature) : US_VIEW)
-  }, [us, worldLevel, countryShape, perState, drawnState])
+  /**
+   * 10/18 (Nic): where this level's picture opens — the lower 48, or the whole
+   * earth at a world level. It is the thing `depth` is a multiple of, so one
+   * kept view means the same thing on either picture, and it no longer changes
+   * with the state or country on screen, because there is no longer one.
+   */
+  const home: GlobeView = useMemo(() => homeView(worldLevel), [worldLevel])
+  /** The flat picture's own frame, for turning a drag or a zoom into a view. */
+  const flatProjection = useMemo(() => (worldLevel ? worldProjection() : nationalProjection()), [worldLevel])
+  const look = useMemo(() => flatLook(flatProjection, viewAt), [flatProjection, viewAt])
+  /** The same kept view, as the globe takes it. */
+  const globeTarget = useMemo(() => globeViewOf(viewAt, home), [viewAt, home])
 
-  const onMap = useMemo(() => (perState ? areas.filter(a => a.stateFips === drawnState)
-    : perCountry ? areas.filter(a => a.country === drawnCountry) : areas),
-  [perState, perCountry, areas, drawnState, drawnCountry])
   const byFips = useMemo(() => new Map(areas.map(a => [a.fips, a])), [areas])
 
   /**
@@ -454,7 +501,7 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   const shown = (a: Listed): number => (share ? shareOf(a, field, a.fips) : valueOf(a, field))
   const shownText = (v: number) => (share ? formatShare(v) : valueText(field, v))
 
-  const max = useMemo(() => Math.max(0, ...onMap.map(shown)), [onMap, field, measure, basis, census, placedTotal])
+  const max = useMemo(() => Math.max(0, ...areas.map(shown)), [areas, field, measure, basis, census, placedTotal])
   /**
    * 10/17 (review): the top of the color scale. For a count it is the biggest
    * number on screen. For saturation it stops at 100% — as many spaces as the
@@ -466,9 +513,9 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   const scaleTop = measure === 'saturation' ? Math.min(max, METRICS_SATURATION_FULL) : max
   const shade = useMemo(() => {
     const m = new Map<string, number>()
-    for (const a of onMap) { const o = strength(shown(a), scaleTop); if (o > 0) m.set(a.fips, o) }
+    for (const a of areas) { const o = strength(shown(a), scaleTop); if (o > 0) m.set(a.fips, o) }
     return m
-  }, [onMap, field, measure, basis, census, placedTotal, scaleTop])
+  }, [areas, field, measure, basis, census, placedTotal, scaleTop])
   const shapeName = useMemo(() => new Map(geoAreas.map(a => [a.id, a.name])), [geoAreas])
 
   const stateNameOf = (fips: string) => us?.stateName.get(fips) ?? data?.states.find(s => s.fips === fips)?.name ?? fips
@@ -481,19 +528,22 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
     // 10/17 (Nic): outside the United States a place reads with its country —
     // "Entre Ríos, Argentina" — and inside it with its state.
     if (worldLevel) {
-      const c = a?.country ?? drawnCountry ?? layer?.country.get(fips)?.code
+      const c = a?.country ?? layer?.country.get(fips)?.code
       return c ? `${name}, ${countryNameOf(c)}` : name
     }
     // A territory has no shape on the flat map; the server's own state list names it.
-    const st = a?.stateFips ?? (perState ? drawnState : fips.slice(0, 2))
-    return st ? `${name}, ${stateNameOf(st)}` : name
+    // 10/18 (Nic): a city, county or district code starts with its state, so a
+    // shape GAM has no number for still reads with its state. A ZIP code does
+    // not — "ZIP 85362" says nothing about Arizona — so that one reads alone.
+    const st = a?.stateFips || fips.slice(0, 2)
+    return us?.stateName.has(st) ? `${name}, ${stateNameOf(st)}` : name
   }
 
   // Places with a number that the picture on screen has no shape for: the
   // territories on the flat map (Albers USA leaves them out; the globe has them).
   const drawnIds = useMemo(() => (flat ? new Set(flat.areas.filter(s => s.d).map(s => s.id))
     : view === 'globe' && ready ? new Set(geoAreas.map(a => a.id)) : null), [flat, view, ready, geoAreas])
-  const undrawn = drawnIds ? onMap.filter(a => valueOf(a, field) !== 0 && !drawnIds.has(a.fips)) : []
+  const undrawn = drawnIds ? areas.filter(a => valueOf(a, field) !== 0 && !drawnIds.has(a.fips)) : []
   const missing: Array<MapMissing | LevelMissing> = (level === 'state' ? (data?.missing ?? []).filter(x => x.offStateMap)
     : level === 'county' ? data?.missing ?? [] : levelData?.missing ?? [])
     .filter(x => valueOf(x, field) !== 0)
@@ -519,8 +569,9 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   const noun = METRICS_MAP_LEVEL_NOUN[level]
   const plural = METRICS_MAP_LEVEL_PLURAL[level]
   const what = field === 'money' ? 'rent' : field === 'occupied' ? 'occupied units' : 'units'
-  const nothingAnywhere = areas.every(a => !(shown(a) > 0))
-  const nothingHere = onMap.every(a => !(shown(a) > 0))
+  // 10/18 (Nic): every area at this level is on the one map now, so "nothing
+  // here" and "nothing anywhere" are the same question.
+  const nothingOnMap = areas.every(a => !(shown(a) > 0))
   // 10/12 (Nic) review: no `map` at all (an API that does not send it yet) is
   // not an empty map — it must not say "no units" beside tiles with real totals.
   const unavailable = data == null || (!!boundary && !levelData)
@@ -537,20 +588,14 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
           : `No ${what} could be placed on the ${noun} map.`
         : field === 'money' ? 'No rent has been logged yet.'
           : field === 'occupied' ? 'No units are occupied this month.' : 'No units under management yet.'
-  // 10/13 (Nic): a one-state map with nothing in that state, while other states have some.
-  const whereElse = perCountry ? (drawnCountry ? countryNameOf(drawnCountry) : 'this country')
-    : drawnState ? stateNameOf(drawnState) : 'this state'
-  const overlayText = nothingAnywhere ? emptyText
-    : share
-      ? `No ${noun} in ${whereElse} has a share to draw — the list beside the map has every ${noun} that does.`
-      : `No ${what} in ${whereElse} — the list beside the map has every ${noun} with ${what}.`
-
   // 10/12 (Nic) review: the color key, painted from the same strengths as the
   // map — the faint end is the smallest place's own color, the full end the
   // biggest's, and the steps between are even steps in value.
   // 10/17 (review): the full end is the scale's top, which for saturation is
   // 100% however far past it the biggest area goes (scaleTop).
-  const onMapRanked = onMap.filter(a => shown(a) > 0)
+  // 10/18 (Nic): every area at this level is on the one map now, so the key
+  // runs over all of them — there is no state on screen to narrow them to.
+  const onMapRanked = areas.filter(a => shown(a) > 0)
   const lowest = onMapRanked.length ? Math.min(...onMapRanked.map(shown)) : 0
   const keySteps = lowest > 0 && lowest < scaleTop
     ? [0, 1, 2, 3, 4].map(i => lowest + ((scaleTop - lowest) * i) / 4) : [scaleTop]
@@ -572,15 +617,110 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
     const fips = fipsAt(e)
     setSelected(cur => (fips && fips !== cur ? fips : null))
   }
-  // A place picked from the list: drawn with its own state or country, and faced on the globe.
+  /**
+   * A place picked from the list. On the globe it turns to face it, as it
+   * always has. 10/18 (Nic): on the flat map it does NOT move the view — the
+   * whole level is on screen now, so there is no state to switch to, and
+   * moving the map he has zoomed would be exactly the resetting he asked to
+   * be rid of. The pick is outlined and named under the map either way.
+   */
   const pickFromList = (a: Listed) => {
     const next = selected === a.fips ? null : a.fips
     setSelected(next)
-    if (!next) return
-    if (perState && a.stateFips !== drawnState) { setChosenState(a.stateFips); return }
-    if (perCountry && a.country && a.country !== drawnCountry) { setChosenCountry(a.country); return }
+    if (!next || view !== 'globe') return
     const shape = geoAreas.find(g => g.id === a.fips)
-    if (view === 'globe' && shape) setTarget(viewFor(shape.feature))
+    if (shape) setViewAt(viewOfArea(shape.feature, home))
+  }
+
+  /**
+   * 10/18 (Nic): zoom and pan on the flat map — "if I zoom in on a certain
+   * depth or whatever". It is one transform over the drawn picture, which is
+   * why the lines stay hairline (non-scaling-stroke) and the shapes never have
+   * to be re-drawn to look at a state closely.
+   *
+   * Dragging is for a mouse: on a phone the browser's own pinch and scroll
+   * stay in charge of the page (touch-action), and the buttons below do the
+   * zooming. A drag that goes nowhere is still a tap, so picking a place by
+   * clicking it works as before (TAP_SLOP).
+   */
+  const TAP_SLOP = 4
+  const drag = useRef<{ id: number; x: number; y: number; travel: number; held: boolean } | null>(null)
+  /** Screen pixels → the frame's own units (the picture is scaled to fit its box). */
+  const frameScale = () => W / (boxRef.current?.clientWidth || W)
+  const onFlatDown = (e: React.PointerEvent) => {
+    if (e.pointerType !== 'mouse' || e.button !== 0) return
+    drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, travel: 0, held: false }
+  }
+  const onFlatMove = (e: React.PointerEvent) => {
+    const d = drag.current
+    if (!d || d.id !== e.pointerId) { onMove(e); return }
+    const dx = e.clientX - d.x
+    const dy = e.clientY - d.y
+    d.travel += Math.abs(dx) + Math.abs(dy)
+    d.x = e.clientX; d.y = e.clientY
+    if (d.travel < TAP_SLOP) return
+    // Once it is a drag and not a click, the pointer is held: letting go
+    // outside the map must still end the drag, or the next move over the map
+    // would go on panning with no button down. Held only after the slop, so a
+    // click still reaches the shape under it.
+    if (!d.held) { d.held = true; (e.currentTarget as Element).setPointerCapture?.(e.pointerId) }
+    const s = frameScale()
+    setHover(null)
+    setViewAt(v => flatPan(flatProjection, v, dx * s, dy * s))
+  }
+  const onFlatUp = (e: React.PointerEvent) => {
+    const d = drag.current
+    drag.current = null
+    if (d && d.id === e.pointerId && d.travel < TAP_SLOP) onTap(e)
+  }
+
+  /**
+   * Scroll to zoom, about the pointer. A wheel listener that stops the page
+   * scrolling under it cannot be passive, and React's own onWheel is — so this
+   * one is attached by hand, exactly as the globe's is.
+   */
+  const svgRef = useRef<SVGSVGElement>(null)
+  useEffect(() => {
+    const svg = svgRef.current
+    if (view !== 'flat' || !svg) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const box = svg.getBoundingClientRect()
+      const s = W / (box.width || W)
+      const about: [number, number] = [(e.clientX - box.left) * s, (e.clientY - box.top) * s]
+      setViewAt(v => flatZoom(flatProjection, v, Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0018)), about))
+    }
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    return () => svg.removeEventListener('wheel', onWheel)
+  }, [view, flat, flatProjection])
+
+  /** The zoom and Reset buttons, which both pictures share. */
+  const zoomView = (factor: number) => setViewAt(v => {
+    if (view !== 'globe') return flatZoom(flatProjection, v, factor)
+    // The globe has its own limits, so the depth follows what it will really
+    // do rather than running past them and taking presses to come back.
+    const next = zoomBy(globeViewOf(v, home), factor)
+    return { center: v.center, depth: atDepth(next.zoom / home.zoom) }
+  })
+  const resetView = () => setViewAt(HOME_VIEW)
+
+  /**
+   * The same by keyboard as the globe has: the arrows move the map, + and −
+   * zoom, 0 goes home. The side list is still the way to every number.
+   */
+  const onFlatKeyDown = (e: React.KeyboardEvent) => {
+    const step = 60 * frameScale()
+    const keys: Record<string, () => void> = {
+      ArrowLeft: () => setViewAt(v => flatPan(flatProjection, v, step, 0)),
+      ArrowRight: () => setViewAt(v => flatPan(flatProjection, v, -step, 0)),
+      ArrowUp: () => setViewAt(v => flatPan(flatProjection, v, 0, step)),
+      ArrowDown: () => setViewAt(v => flatPan(flatProjection, v, 0, -step)),
+      '+': () => zoomView(1.4), '=': () => zoomView(1.4),
+      '-': () => zoomView(1 / 1.4), _: () => zoomView(1 / 1.4),
+      '0': () => resetView(),
+    }
+    const act = keys[e.key]
+    if (act) { e.preventDefault(); act() }
   }
 
   /**
@@ -601,7 +741,7 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
    * than its whole Census place — so when one is on screen the caption says
    * what it means instead of leaving a number that looks like a mistake.
    */
-  const anyOver = measure === 'saturation' && onMap.some(a => shown(a) > METRICS_SATURATION_FULL)
+  const anyOver = measure === 'saturation' && areas.some(a => shown(a) > METRICS_SATURATION_FULL)
 
   const readout = (fips: string) => {
     const a = byFips.get(fips)
@@ -642,12 +782,19 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
   // need no census numbers and must not go down with them.
   const failed = usFailed || layerFailed || (measure === 'saturation' && censusFailed)
     || (view === 'globe' && globeFailed)
-  const where = perState && drawnState ? stateNameOf(drawnState)
-    : perCountry && drawnCountry ? countryNameOf(drawnCountry)
-      : worldLevel ? 'the world' : 'the United States'
+  /** 10/18 (Nic): the states (or countries) whose shapes would not load, by name. */
+  const layerFailedGroups = (layerReady && layer ? layer.failed : [])
+    .map(g => (perCountry ? countryNameOf(g) : stateNameOf(g)))
+  const where = worldLevel ? 'the world' : 'the United States'
   const picture = `${view === 'globe' ? 'Globe' : 'Map'} of ${where} by ${noun}, colored by ${measureWord}`
-  const stateChoices = [...stateOptions].sort((a, b) => stateNameOf(a).localeCompare(stateNameOf(b)))
-  const countryChoices = [...countryOptions].sort((a, b) => countryNameOf(a).localeCompare(countryNameOf(b)))
+  /**
+   * 10/18 (Nic): the two words for how much of the map is drawn. "Where GAM
+   * is" names the states (or countries) by count, because that is the number
+   * he was being made to choose between one at a time.
+   */
+  const groupWord = perCountry ? { one: 'country', many: 'countries' } : { one: 'state', many: 'states' }
+  const scopeLabel = (s: Scope) => (s === 'all' ? `Every ${groupWord.one}`
+    : `Where GAM is (${count(dataGroups.length)} ${dataGroups.length === 1 ? groupWord.one : groupWord.many})`)
   /** 10/17 (Nic): the level menu in two groups — the United States, and the rest of the world. */
   const usLevels = METRICS_MAP_LEVELS.filter(l => !isMetricsWorldLevel(l))
 
@@ -670,16 +817,15 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
               {METRICS_MAP_WORLD_LEVELS.map(l => <option key={l} value={l}>{METRICS_MAP_LEVEL_LABEL[l]}</option>)}
             </optgroup>
           </select>
-          {perState && stateChoices.length > 0 && (
-            <select className="mhm-select" aria-label="State on the map" value={drawnState ?? ''}
-              onChange={e => { setChosenState(e.target.value); setSelected(null); setHover(null) }}>
-              {stateChoices.map(s => <option key={s} value={s}>{stateNameOf(s)}</option>)}
-            </select>
-          )}
-          {perCountry && countryChoices.length > 0 && (
-            <select className="mhm-select" aria-label="Country on the map" value={drawnCountry ?? ''}
-              onChange={e => { setChosenCountry(e.target.value); setSelected(null); setHover(null) }}>
-              {countryChoices.map(c => <option key={c} value={c}>{countryNameOf(c)}</option>)}
+          {/* 10/18 (Nic): "I can't just see them all in the city breakdown,
+              like all every state." There is no state to pick any more: every
+              state GAM has data in is drawn. This only says whether to go
+              beyond that, and it keeps its own answer across levels. */}
+          {canShowAllGroups && (
+            <select className="mhm-select"
+              aria-label={perCountry ? 'Countries on the map' : 'States on the map'} value={scope}
+              onChange={e => { setScope(e.target.value as Scope); setHover(null) }}>
+              {(['data', 'all'] as Scope[]).map(s => <option key={s} value={s}>{scopeLabel(s)}</option>)}
             </select>
           )}
           <Toggle label="What the color shows" value={measure} onChange={setMeasure}
@@ -704,8 +850,9 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
             rule are both said here, rather than left to be puzzled over. */}
         {anyOver && ` ${METRICS_CENSUS_OVER_MEANING}`}
         {worldLevel && ` ${METRICS_MAP_WORLD_NOTE}`}
-        {perState && ` ${capitalized(plural)} are drawn one state at a time.`}
-        {perCountry && ` ${capitalized(plural)} are drawn one country at a time.`}
+        {/* 10/18 (Nic): which states are on the map, now that they all are. */}
+        {perGroup && ` ${capitalized(plural)} are drawn for ${scope === 'all' && canShowAllGroups
+          ? `every ${groupWord.one}` : `every ${groupWord.one} GAM has data in`}; zoom in to look at one closely.`}
       </div>
 
       <div className="mhm-body">
@@ -716,45 +863,75 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
                 <div>The map could not be drawn just now.</div>
                 <button type="button" className="btn btn-primary btn-sm" onClick={() => setAttempt(n => n + 1)}>Try again</button>
               </div>
-            ) : boundary && (unavailable || (perGroup && !drawnGroup)) ? (
+            ) : boundary && (unavailable || (perGroup && !groups?.length)) ? (
               // Nothing to draw: an API that does not send this level yet, or
-              // no state (or country) to draw it for.
-              <div className="mhm-msg">{unavailable ? emptyText : `No ${plural} can be drawn just now.`}</div>
+              // no state (or country) that has a file to draw. 10/18 (Nic):
+              // GAM being in none of them is not the end of the map — every
+              // state is a choice away, so the message says so.
+              <div className="mhm-msg">{unavailable ? emptyText
+                : canShowAllGroups
+                  ? `GAM is in no ${groupWord.one} with ${plural} yet — choose "Every ${groupWord.one}" to see them all.`
+                  : `No ${plural} can be drawn just now.`}</div>
             ) : !ready || !us || (view === 'globe' && !GlobeView) ? (
-              <div className="mhm-msg"><span className="spinner"/> Drawing the map…</div>
+              // 10/18 (Nic): every state at once is megabytes of shapes — it
+              // says what it is doing rather than sitting on "Drawing the map".
+              <div className="mhm-msg">
+                <span className="spinner"/>
+                {loadingEverything && !layerReady
+                  ? ` Loading every ${groupWord.one}'s ${plural} — this one is big…`
+                  : ' Drawing the map…'}
+              </div>
             ) : view === 'flat' && !flat ? (
               // 10/17: everything is in hand and the flat picture still cannot
-              // be drawn — a state or country the flat map has no shape for.
-              // Say so, rather than leaving an empty box with no explanation.
+              // be drawn. Say so, rather than leaving an empty box with no
+              // explanation.
               <div className="mhm-msg">{`No ${plural} can be drawn flat just now — the globe draws them.`}</div>
             ) : (
               <>
                 {view === 'globe' && GlobeView ? (
                   <GlobeView us={us} world={world} areas={geoAreas} borders={globeBorders} shade={shade} focus={focus}
                     stateLines={!worldLevel}
-                    target={target} label={picture} describedBy={listId}
+                    view={globeTarget} onView={g => setViewAt(viewOfGlobe(g, home))} onHome={resetView}
+                    label={picture} describedBy={listId}
                     onHover={(fips, x, y) => setHover(fips ? { fips, x, y } : null)}
                     onPick={fips => setSelected(cur => (fips && fips !== cur ? fips : null))}/>
                 ) : flat ? (
                   // A picture to a screen reader; every number in it is in the list beside it.
-                  <svg viewBox={`0 0 ${W} ${H}`} role="img" onPointerMove={onMove} onClick={onTap}
-                    aria-label={picture} aria-describedby={listId}>
-                    {flat.context && <path d={flat.context} className="mhm-context-line" vectorEffect="non-scaling-stroke"/>}
-                    <AreaLayer shapes={flat.areas} shade={shade}/>
-                    {flat.borders && <path d={flat.borders} className={level === 'county' ? 'mhm-county-line' : 'mhm-area-line'} vectorEffect="non-scaling-stroke"/>}
-                    {flat.states && <path d={flat.states} className="mhm-state-line" vectorEffect="non-scaling-stroke"/>}
-                    {flat.nation && <path d={flat.nation} className="mhm-nation-line" vectorEffect="non-scaling-stroke"/>}
-                    {/* A place with a number that is too small to see gets a marker in its own color. */}
-                    {flat.areas.map(s => (s.dot && shade.get(s.id)
-                      ? <circle key={`dot-${s.id}`} cx={s.dot[0]} cy={s.dot[1]} r={DOT_RADIUS} data-fips={s.id}
-                          className={`mhm-dot${focus === s.id ? ' on' : ''}`} style={{ fill: heat(shade.get(s.id)!) }}/>
-                      : null))}
-                    {focusShape && <path d={focusShape.d} className="mhm-focus" vectorEffect="non-scaling-stroke"/>}
+                  <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} role="img" aria-label={picture} aria-describedby={listId}
+                    onPointerDown={onFlatDown} onPointerMove={onFlatMove} onPointerUp={onFlatUp}
+                    onPointerCancel={() => { drag.current = null }} onKeyDown={onFlatKeyDown} tabIndex={0}>
+                    {/* 10/18 (Nic): the zoom and the pan, as one transform over
+                        the whole picture — "if I zoom in on a certain depth or
+                        whatever". The lines keep their hairline width through
+                        it (non-scaling-stroke), and the markers their size. */}
+                    <g transform={`translate(${look.x} ${look.y}) scale(${look.k})`}>
+                      {flat.context && <path d={flat.context} className="mhm-context-line" vectorEffect="non-scaling-stroke"/>}
+                      <AreaLayer shapes={flat.areas} shade={shade}/>
+                      {flat.borders && <path d={flat.borders} className={level === 'county' ? 'mhm-county-line' : 'mhm-area-line'} vectorEffect="non-scaling-stroke"/>}
+                      {flat.states && <path d={flat.states} className="mhm-state-line" vectorEffect="non-scaling-stroke"/>}
+                      {flat.nation && <path d={flat.nation} className="mhm-nation-line" vectorEffect="non-scaling-stroke"/>}
+                      {/* A place with a number that is too small to see gets a
+                          marker in its own color — until it has been zoomed in
+                          on far enough to see the place itself. */}
+                      {flat.areas.map(s => (dotNeeded(s, look.k) && shade.get(s.id)
+                        ? <circle key={`dot-${s.id}`} cx={s.dot![0]} cy={s.dot![1]} r={DOT_RADIUS / look.k} data-fips={s.id}
+                            className={`mhm-dot${focus === s.id ? ' on' : ''}`} style={{ fill: heat(shade.get(s.id)!) }}/>
+                        : null))}
+                      {focusShape && <path d={focusShape.d} className="mhm-focus" vectorEffect="non-scaling-stroke"/>}
+                    </g>
                   </svg>
                 ) : null}
-                {nothingHere && (
+                {/* 10/18 (Nic): the zoom and Reset controls, the same on both
+                    pictures now that both read the one view. Reset is the only
+                    thing on the card that moves the view back home. */}
+                <div className="mhm-tools">
+                  <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom in" onClick={() => zoomView(1.5)}>+</button>
+                  <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom out" onClick={() => zoomView(1 / 1.5)}>−</button>
+                  <button type="button" className="btn btn-primary btn-sm" onClick={resetView}>Reset</button>
+                </div>
+                {nothingOnMap && (
                   <div className="mhm-empty">
-                    <span>{overlayText}</span>
+                    <span>{emptyText}</span>
                   </div>
                 )}
                 {tip && hover && (
@@ -783,11 +960,14 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
                 {pinned.sub ? ` · ${pinned.sub}` : ''}</>
               : <span style={{ color: 'var(--t3)' }}>
                 Hover or tap a {noun} to see its number, or pick one from the list.
-                {view === 'globe' && ' Drag to turn the globe; scroll or pinch to zoom.'}
+                {/* 10/18 (Nic): the flat map moves now too, so it says how. */}
+                {view === 'globe'
+                  ? ' Drag to turn the globe; scroll or pinch to zoom.'
+                  : ' Drag to move the map; scroll to zoom.'}
               </span>}
           </div>
 
-          {ready && !nothingHere && (
+          {ready && !nothingOnMap && (
             <div className="mhm-legend" aria-label="Color key">
               <span className="mhm-key"><span className="mhm-swatch" style={{ background: 'var(--heat-none)' }}/>None</span>
               <span className="mhm-key">
@@ -867,6 +1047,21 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
         </div>
       )}
 
+      {/* 10/18 (Nic): a state (or country) whose shapes would not load. Every
+          other one is still drawn — one file failing must never blank the map
+          — and its numbers are still in the list beside it and in the tiles
+          above, so this says what is missing from the PICTURE and nothing more. */}
+      {layerFailedGroups.length > 0 && (
+        <div className="mhm-missing">
+          <div className="kl" style={{ marginBottom: 4 }}>Shapes that could not be loaded</div>
+          <div className="ks">
+            {layerFailedGroups.join(', ')} — {layerFailedGroups.length === 1 ? 'its' : 'their'} {plural} are
+            not drawn. Every other {groupWord.one} is, and these numbers are still in the list beside the map.
+          </div>
+          <button type="button" className="btn btn-primary btn-sm mhm-more" onClick={() => setAttempt(n => n + 1)}>Try again</button>
+        </div>
+      )}
+
       {/* 10/17 (review): the areas GAM is in that the Census counts nothing
           in. They have no share, so they have no color and they are not in the
           list beside the map — and before this they were nowhere at all, which
@@ -902,12 +1097,17 @@ export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | u
         .mhm-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(200px, 1fr); gap: 16px; align-items: start; }
         @media (max-width: 900px) { .mhm-body { grid-template-columns: minmax(0, 1fr); } }
         .mhm-map { position: relative; width: 100%; aspect-ratio: ${W} / ${H}; }
-        .mhm-map svg { display: block; width: 100%; height: 100%; cursor: pointer; touch-action: manipulation; }
+        /* 10/18 (Nic): the flat map is dragged with a mouse; a phone keeps
+           the browser's own scroll and pinch (touch-action), so a finger
+           never traps the page — the zoom buttons are the way there. */
+        .mhm-map svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: manipulation; }
+        .mhm-map svg:active { cursor: grabbing; }
+        .mhm-map svg:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
         .mhm-globe { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; border-radius: 8px; }
         .mhm-globe:active { cursor: grabbing; }
         .mhm-globe:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
-        .mhm-globe-tools { position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; }
-        .mhm-globe-tools .btn { min-width: 32px; }
+        .mhm-tools { position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; z-index: 1; }
+        .mhm-tools .btn { min-width: 32px; }
         .mhm-county-line { fill: none; stroke: var(--bg2); stroke-width: .35px; stroke-opacity: .7; pointer-events: none; }
         .mhm-area-line { fill: none; stroke: var(--bg2); stroke-width: .5px; stroke-opacity: .8; pointer-events: none; }
         .mhm-context-line { fill: none; stroke: var(--b1); stroke-width: .5px; pointer-events: none; }

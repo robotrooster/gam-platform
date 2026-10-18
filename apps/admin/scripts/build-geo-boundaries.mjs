@@ -42,7 +42,7 @@
  * file to the browser as it is (Content-Encoding: gzip) and unzips it once for
  * itself, so the files stay small in the repository and on the wire.
  *   cd.json.gz                    every congressional district (the national map)
- *   place/<state FIPS>.json.gz    one file per state, so the page loads only the state on screen
+ *   place/<state FIPS>.json.gz    one file per state, so the page loads only the states it needs
  *   sldu/<state FIPS>.json.gz     the same for state senate districts
  *   sldl/<state FIPS>.json.gz     the same for state house districts
  *   zcta/<state FIPS>.json.gz     the same for ZIP code areas

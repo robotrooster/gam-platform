@@ -12,8 +12,9 @@
  * /api/admin/metrics/boundaries, gam-nothing-public-rule), so the page draws
  * the very shapes the server placed each property in. Cities, state
  * legislative districts and ZIP codes come one file per state (tens of
- * thousands of them nationwide; the page loads only the state on screen);
- * congressional districts are one national file.
+ * thousands of them nationwide; 10/18 (Nic): the page fetches a file for every
+ * state GAM has data in and draws them together, and every state there is on
+ * demand); congressional districts are one national file.
  *
  * WHERE A PROPERTY GOES, at each level (properties carry an address and,
  * usually, a map location — properties.latitude/longitude from the address
@@ -61,7 +62,7 @@ export const GEO_DIR = path.resolve(__dirname, '../../geo')
 interface GeoIndex {
   layers: Partial<Record<MetricsBoundaryLayer | typeof METRICS_WORLD_LAYER, {
     states?: string[]
-    /** 10/17: for a level drawn one country at a time, the ISO 3166 three-letter codes with a file. */
+    /** 10/17: for a level whose files come one per country, the ISO 3166 three-letter codes with a file. */
     countries?: string[]
     file?: string
   }>>
@@ -375,8 +376,7 @@ export interface LevelArea {
   /**
    * 10/17 (Nic): for an area outside the United States, the country it is in
    * (ISO 3166 three letters) and that country's name. A county or district
-   * level is drawn one country at a time, as a city level is drawn one state
-   * at a time.
+   * level's files come one per country, as a city level's come one per state.
    */
   country?: string
   countryName?: string
@@ -391,10 +391,18 @@ export interface LevelMissing { reason: LevelGap; label: string; properties: num
 export interface MapLevel {
   areas: LevelArea[]
   missing: LevelMissing[]
-  /** For a level drawn one state at a time: the states (FIPS) GAM has a property in at this level. */
+  /** For a level whose files come one per state: the states (FIPS) GAM has a property in at this level. */
   states: string[]
-  /** 10/17: for a level drawn one country at a time: the countries (ISO3) GAM has a property in. */
+  /** 10/17: for a level whose files come one per country: the countries (ISO3) GAM has a property in. */
   countries: string[]
+  /**
+   * 10/18 (Nic): every state (or country) there is a file for. The page draws
+   * the states GAM is in by default — "I can't just see them all in the city
+   * breakdown, like all every state" — and these are the rest, for the "Every
+   * state" choice it loads on demand.
+   */
+  allStates: string[]
+  allCountries: string[]
 }
 
 export type MapLevels = Record<MetricsBoundaryLayer, MapLevel>
@@ -645,16 +653,20 @@ export async function buildMapLevels(rows: readonly GeoRow[], stateFips: Readonl
     out[level] = {
       areas: placed,
       missing: [...missing.get(level)!.values()].map(m => ({ ...m, money: r2(m.money) })),
-      // 10/17 (review): the state picker offers the states GAM is actually in,
-      // not every state these files cover — it was offering all 56, 55 of them
-      // with nothing on the map (gam-scope-staff-no-choices: scope it here and
-      // the pointless choices are simply gone). A state whose properties could
-      // not be placed is named under the map by reason, as before.
+      // 10/17 (review): the states GAM is actually in, not every state these
+      // files cover (gam-scope-staff-no-choices). 10/18 (Nic): these are the
+      // states the page draws by default, all at once — it used to be a picker
+      // that made him choose one. A state whose properties could not be placed
+      // is named under the map by reason, as before.
       states: METRICS_MAP_STATE_LEVELS.includes(level) ? [...new Set(placed.map(a => a.stateFips))].sort() : [],
-      // 10/17 (Nic): and the same for the country picker on a level drawn one
-      // country at a time — the countries GAM is actually in, not all 199.
+      // 10/17 (Nic): and the same for a level whose files come one per country
+      // — the countries GAM is actually in, not all 199.
       countries: METRICS_MAP_COUNTRY_LEVELS.includes(level)
         ? [...new Set(placed.map(a => a.country ?? '').filter(Boolean))].sort() : [],
+      // 10/18 (Nic): and every state (or country) there is a file for, for
+      // "Every state" — looking beyond GAM's own footprint, on demand.
+      allStates: METRICS_MAP_STATE_LEVELS.includes(level) ? [...(await statesWith(level))].sort() : [],
+      allCountries: METRICS_MAP_COUNTRY_LEVELS.includes(level) ? [...(await countriesWith(level))].sort() : [],
     }
   }
   return out
