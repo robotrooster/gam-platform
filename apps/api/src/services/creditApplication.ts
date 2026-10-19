@@ -8,6 +8,11 @@
  * Nic (10/2, the rule that replaces both): credit applies by itself ONLY when it
  * covers the WHOLE bill. Otherwise the tenant chooses, at payment, "Use all $X"
  * or "Save it for later".
+ * Nic (10/15), which overtook that: credit never sits on an account while they
+ * still owe — it goes on the open balance by itself, oldest bill first, whole
+ * or in part. Nic (10/18): and oldest means oldest ACROSS every space they hold
+ * with that company, for a credit the landlord gave. Both live in the one
+ * allocation order (services/creditUse buildCreditPlan), never here.
  *
  * This file used to spend credit itself: it settled whatever open charges a
  * credit could fully cover, oldest first, and lowered amount_remaining by hand.

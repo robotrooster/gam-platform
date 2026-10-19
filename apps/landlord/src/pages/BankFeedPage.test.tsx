@@ -43,7 +43,13 @@ vi.mock('../lib/api', () => ({
   apiPatch: async () => ({}),
   apiDel: async () => ({}),
 }))
-vi.mock('../components/EntityPicker', () => ({ EntityPicker: () => null }))
+vi.mock('../components/EntityPicker', () => ({
+  EntityPicker: () => null,
+  // 10/19 (review): the feed tab no longer renders a pressable Connect feed
+  // with no company chosen. These tests drive a one-company account, where
+  // nothing is missing.
+  useCompanyMissing: () => false,
+}))
 vi.mock('../components/dialogs', () => {
   const toast = () => {}
   ;(toast as any).error = () => {}

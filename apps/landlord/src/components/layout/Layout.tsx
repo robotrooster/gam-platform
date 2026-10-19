@@ -131,17 +131,17 @@ const NAV_ITEMS: Array<{
   // items answering one question — "is my bank money right?" — because
   // reconciliation was built as the manual stand-in before the feed existed and
   // nobody merged them afterwards. Both routes still resolve, via redirects.
-  { to: '/bank',          icon: Landmark,         label: 'Bank',             section: null, hub: 'financials' },
-  // S168: managers see /banking only when their landlord has flipped their
-  // per-scope direct_deposit_enabled toggle on — special-cased in the filter.
-  // S605 (Nic): was "Banking", which sat confusingly beside the new "Bank" tab.
-  // He asked for "Disbursements" to match the dashboard's wording — but that
-  // name is already the payout LIST two tabs over, so this is the ACCOUNT those
-  // disbursements are sent to. Same vocabulary, no duplicate tab. (Merging it
-  // into /disbursements outright would leak payout setup to property managers,
-  // who only see this tab when direct deposit is switched on — see the filter
-  // special-case below.)
-  { to: '/banking',       icon: Landmark,         label: 'Disbursement Account', section: null, hub: 'financials', category: 'banking' },
+  //
+  // 10/19 (Nic): and "Disbursement Account" (/banking) is folded in as its Bank
+  // setup tab. "I don't know why there's two different fucking signups. It
+  // should all be in one flow." Two entries three letters apart — Bank and
+  // Banking — is what sent Blu Haws to the wrong screen on 10/5, where he typed
+  // a routing number into a form that never reached Stripe. ONE entry now; the
+  // old address redirects (main.tsx), and the page itself shows a staff member
+  // with direct deposit only their own payout account (BankPage), which is all
+  // /banking ever gave them. `category: 'banking'` carries the banking.view
+  // staff key over with it, so nobody loses a page they had.
+  { to: '/bank',          icon: Landmark,         label: 'Bank',             section: null, hub: 'financials', category: 'banking' },
   // S568/S575: investor-operator net + lot rent (homes-only parks). Owner-level;
   // the sub-tab is further gated on the landlord actually having a mobile-home unit.
   { to: '/lot-rent',      icon: Landmark,         label: 'Lot Rent & Net',   section: null, hub: 'financials' },
@@ -299,8 +299,9 @@ export function visibleNavItemsFor(user: NavUser) {
     }
     if (isOwner) return true                       // owners see everything
     // --- staff: driven purely by catalog permissions ---
-    // S168: /banking for property_manager — only when direct-deposit is on.
-    if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
+    // S168: the Bank entry for a property_manager — only when direct deposit is
+    // on. 10/19: it was /banking until the two bank sign-ups merged into /bank.
+    if (item.to === '/bank' && role === 'property_manager') return directDepositEnabled
     // 10/12 (Nic): the Rent Roll is for staff with "View all payments" — the
     // key its pages read (GET /balances/rent-roll/*); "View payments" alone shows
     // only unpaid bills, and the rent roll would refuse it.

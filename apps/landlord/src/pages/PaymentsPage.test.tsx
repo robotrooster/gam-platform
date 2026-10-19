@@ -53,6 +53,8 @@ const server = vi.hoisted(() => ({
   /** 10/15: GET /tenant-credits/owed — what the space picked still owes. */
   owed: { spaceOwed: 0, householdOwed: 0, creditOnAccount: 0, message: '' } as any,
   posts: [] as { url: string; body: any }[],
+  /** url → the `data` a POST answers with (10/18: the credit's id, so the notice can undo it). */
+  postData: {} as Record<string, any>,
   /** When set, a POST waits on it (in flight). */
   postHold: null as Promise<void> | null,
 }))
@@ -85,10 +87,19 @@ vi.mock('../lib/api', () => ({
   apiPost: vi.fn(async (url: string, body: any) => {
     server.posts.push({ url, body })
     if (server.postHold) await server.postHold
-    return { success: true, data: {} }
+    return { success: true, data: server.postData[url] ?? {} }
   }),
 }))
 vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: server.user }) }))
+// 10/18: the page asks before it undoes a credit (no native dialogs — the
+// in-app question). Each test says what the answer is.
+vi.mock('../components/dialogs', () => ({
+  toast: Object.assign(vi.fn(), { error: vi.fn() }),
+  appConfirm: vi.fn(async () => false),
+  appPrompt: vi.fn(async () => null),
+  appChoose: vi.fn(async () => null),
+  DialogHost: () => null,
+}))
 // The desk window and posting ahead are the existing way to log a payment
 // (tested on their own); here only what the page hands them is checked.
 vi.mock('../components/RecordPaymentWindow', async () => {
@@ -105,6 +116,7 @@ vi.mock('../components/RecordPaymentWindow', async () => {
 })
 
 import { PaymentsPage } from './PaymentsPage'
+import { appConfirm } from '../components/dialogs'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -172,7 +184,7 @@ beforeEach(() => {
   server.ledger = { month: '2026-10', months: ['2026-10'], payments: [], workTrade: [], stillOweHouseholds: null }
   server.gets = []; server.paymentRows = []; server.paymentPages = null
   server.user = { role: 'landlord', permissions: {} }
-  server.leases = []; server.posts = []; server.postHold = null
+  server.leases = []; server.posts = []; server.postData = {}; server.postHold = null
   host = document.createElement('div')
   document.body.appendChild(host)
   root = createRoot(host)
@@ -862,6 +874,39 @@ describe('Issue credit closes only from its own buttons', () => {
     await until(() => openMonthReads().length > before, 'the month read again')
   })
 
+  // 10/18 (Nic): "we need to undo credit." Caught where it was typed: the
+  // notice that says what the credit did offers Undo on that very credit.
+  it('the notice offers Undo on the credit just issued, asks first, and says what the undo did', async () => {
+    server.leases = [{ id: 'L1', status: 'active', unitNumber: 'MH 04', propertyName: 'Oak Park',
+                       tenants: [{ firstName: 'Glenda', lastName: 'Moss' }] }]
+    server.postData['/tenant-credits'] = { id: 'c9', message: '$25.00 of the credit went on their open balance, oldest bill first.' }
+    server.postData['/tenant-credits/c9/undo'] = { message: 'The $25.00 credit is undone. $25.00 it had paid is owed again (October Rent — MH 04).' }
+    await render()
+    await loaded()
+    await click(btn(/Issue credit/))
+    await until(() => !!host.querySelector('.modal-overlay'), 'the window')
+    await setValue(host.querySelector('.modal-overlay input.form-input') as HTMLInputElement, 'Glenda')
+    await until(() => !!btn(/^Glenda Moss · MH 04/), 'the match')
+    await click(btn(/^Glenda Moss · MH 04/))
+    await setValue(host.querySelector('.modal-overlay input.mono') as HTMLInputElement, '25')
+    await click(btn(/^Issue credit$/))
+    await until(() => text().includes('went on their open balance'), 'the result')
+    await until(() => !!btn(/^Undo the credit$/), 'the Undo')
+
+    // Asked before anything is taken back, and a no sends nothing.
+    ;(appConfirm as any).mockResolvedValueOnce(false)
+    await click(btn(/^Undo the credit$/))
+    expect((appConfirm as any).mock.calls.at(-1)[0]).toContain('goes back to owed')
+    expect(server.posts.some(p => p.url.includes('/undo'))).toBe(false)
+
+    ;(appConfirm as any).mockResolvedValueOnce(true)
+    await click(btn(/^Undo the credit$/))
+    await until(() => text().includes('is owed again (October Rent — MH 04)'), 'what the undo did')
+    expect(server.posts.at(-1)).toEqual({ url: '/tenant-credits/c9/undo', body: {} })
+    // Nothing left to undo: the button goes with the notice it was on.
+    expect(btn(/^Undo the credit$/)).toBeUndefined()
+  })
+
   // 10/15 (Nic): a credit goes on the open balance, so the box says what is
   // owed the moment a person is picked — never issuing blind to a $2,000
   // balance. The server writes the sentence; the box shows it as it came.
@@ -870,8 +915,10 @@ describe('Issue credit closes only from its own buttons', () => {
                        tenants: [{ firstName: 'Glenda', lastName: 'Moss' }] }]
     server.owed = {
       spaceOwed: 2000, householdOwed: 2000, creditOnAccount: 0,
-      message: 'MH 04 still owes $2000.00. A credit goes on that balance, oldest bill first — only what is over it stays on their account.'
-        + ' What goes on the balance is paid: voiding the credit later takes back only what is still on their account.',
+      // The sentence routes/tenantCredits writes (10/18).
+      message: 'MH 04 still owes $2000.00. A credit goes on that balance, oldest bill first.'
+        + ' Only what is over the whole balance stays on their account.'
+        + ' Typed the wrong amount? You can undo the credit for 30 days — what it paid goes back to owed.',
     }
     await render()
     await loaded()
@@ -884,8 +931,8 @@ describe('Issue credit closes only from its own buttons', () => {
     await click(btn(/^Glenda Moss · MH 04/))
     await until(() => text().includes('MH 04 still owes $2000.00'), 'what is owed')
     expect(text()).toContain('A credit goes on that balance, oldest bill first')
-    // Review fix (10/17): and that giving it is a one-way door.
-    expect(text()).toContain('voiding the credit later takes back only what is still on their account')
+    // 10/18: and the way back from a wrong amount — undo it, inside the window.
+    expect(text()).toContain('You can undo the credit for 30 days — what it paid goes back to owed')
     expect(server.gets).toContain('/tenant-credits/owed?leaseId=L1')
   })
 })

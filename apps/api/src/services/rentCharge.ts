@@ -86,7 +86,7 @@ import { payableRowSql, lockHousehold } from './moneyPredicates'
 import {
   householdQuote, holdCredit, settleFromCredit, supersedeScheduledRetry,
   cancelSupersededIntents, buildCreditPlan, paidAheadDrawnByMonth,
-  HOUSEHOLD_MEMBER_STATUSES,
+  HOUSEHOLD_MEMBER_STATUSES, creditStaysWithItsSpace,
   type CreditPlanLine, type QuoteRow, type QuoteCredit, type ScheduledRetry, type HouseholdQuote, type LeaseQuote,
 } from './creditUse'
 
@@ -754,7 +754,8 @@ interface ChargeCreditState {
   /** Every row of the household quote (its leases' and the no-lease rows). */
   rows: QuoteRow[]
   caps: Map<string, number | null>
-  tenantOnLease: Set<string>
+  /** Per tenant, the household leases they are on — every member, not only `tenantId` (10/18 review fix). */
+  memberLeases: Map<string, Set<string>>
   /** Paid-ahead drawn per lease and month as it stands, and as if that lease's own held credit were given back. */
   drawnStands: Map<string, number>
   drawnPaidNow: Map<string, number>
@@ -804,15 +805,24 @@ async function loadChargeCreditState(client: PoolClient, quote: HouseholdQuote, 
       withheldFromHeldCents: Math.max(0, rawHeld - toCents(c.releasable)),
     })
   }
-  const members = await client.query<{ lease_id: string }>(
-    `SELECT DISTINCT lease_id FROM lease_tenants
-      WHERE tenant_id = $1 AND lease_id = ANY($2::uuid[]) AND status = ANY($3::text[])`,
-    [tenantId, quote.leaseIds, [...HOUSEHOLD_MEMBER_STATUSES]])
+  // Every member of these leases, not only this household's tenant: a credit
+  // is planned onto the spaces of the person it was GIVEN to, and the credit
+  // ledger refuses any other row (10/18 review fix).
+  const members = await client.query<{ tenant_id: string; lease_id: string }>(
+    `SELECT DISTINCT tenant_id, lease_id FROM lease_tenants
+      WHERE lease_id = ANY($1::uuid[]) AND status = ANY($2::text[])`,
+    [quote.leaseIds, [...HOUSEHOLD_MEMBER_STATUSES]])
+  const memberLeases = new Map<string, Set<string>>()
+  for (const m of members.rows) {
+    const set = memberLeases.get(m.tenant_id) ?? new Set<string>()
+    set.add(m.lease_id)
+    memberLeases.set(m.tenant_id, set)
+  }
   return {
     tenantId,
     rows,
     caps: new Map(quote.leases.map(l => [l.leaseId, l.monthlyCap])),
-    tenantOnLease: new Set(members.rows.map(m => m.lease_id)),
+    memberLeases,
     drawnStands: await paidAheadDrawnByMonth(client, quote.leaseIds, false),
     drawnPaidNow: await paidAheadDrawnByMonth(client, quote.leaseIds, true),
     credits,
@@ -865,7 +875,7 @@ function chargeCreditPlan(st: ChargeCreditState, leaseId: string, o: { releaseAl
   for (const [k, v] of st.drawnPaidNow) if (own(k)) drawn.set(k, v)
   return buildCreditPlan({
     rows, credits, caps: st.caps, drawn,
-    tenantId: st.tenantId, tenantOnLease: st.tenantOnLease,
+    memberLeases: st.memberLeases,
     includeReleasable: true,
   })
 }
@@ -878,8 +888,11 @@ function chargeCreditPlan(st: ChargeCreditState, leaseId: string, o: { releaseAl
  *   - heldMore: held by another bill's bank payment beyond what this bill
  *     would use (the waiting figure names only that part);
  *   - elsewhere: free credit the household plan sends to another lease's bill
- *     (a general credit goes oldest bill first), plus what is left on a credit
- *     tied to another lease (it can pay only that lease's bills);
+ *     (credit goes oldest bill first across every space), plus what is left on
+ *     a credit that stays with another space — money paid ahead there, or
+ *     deposit interest on that lease (creditUse.creditStaysWithItsSpace; 10/18,
+ *     a credit the landlord GAVE is no longer one of those, so its leftover is
+ *     "later", not "elsewhere");
  *   - later: the rest of the free credit — more than this bill can take, the
  *     month's paid-ahead draw limit, a line credit cannot pay.
  *
@@ -900,7 +913,7 @@ function creditRest(
   for (const s of st.credits.values()) {
     const free = Math.max(0, s.freeCents + Math.max(0, (s.heldCents.get(leaseId) ?? 0) - s.withheldFromHeldCents))
     freeTotal += free
-    if (s.credit.leaseId !== null && s.credit.leaseId !== leaseId) tiedLeft += Math.max(0, free - (used.get(s.credit.id) ?? 0))
+    if (creditStaysWithItsSpace(s.credit) && s.credit.leaseId !== leaseId) tiedLeft += Math.max(0, free - (used.get(s.credit.id) ?? 0))
   }
   const heldOther = Math.max(0, a.onFileCents - freeTotal)
   const heldMoreCents = Math.max(0, heldOther - a.waitingCents)
@@ -1052,7 +1065,9 @@ export async function payAllRunCreditRest(
     const heldMore = Math.max(0, heldOther - waiting)
     const freeRest = Math.max(0, Math.min(freeLeft, onFile - heldOther - usable))
     // Where the household plan sends the free credit now: the bills of the
-    // leases outside the run, and credits tied to those leases.
+    // leases outside the run, and credit that stays with a space outside it
+    // (money paid ahead there, or that lease's deposit interest — 10/18, a
+    // credit the landlord gave crosses spaces, so it is not one of those).
     const runSet = new Set(run)
     const lines = chargeCreditPlan(st, '').filter(l => !runSet.has(l.leaseId))
     const used = new Map<string, number>()
@@ -1063,7 +1078,7 @@ export async function payAllRunCreditRest(
     }
     let tiedLeft = 0
     for (const x of st.credits.values()) {
-      if (x.credit.leaseId !== null && !runSet.has(x.credit.leaseId)) {
+      if (creditStaysWithItsSpace(x.credit) && !runSet.has(x.credit.leaseId!)) {
         tiedLeft += Math.max(0, Math.max(0, x.freeCents) - (used.get(x.credit.id) ?? 0))
       }
     }

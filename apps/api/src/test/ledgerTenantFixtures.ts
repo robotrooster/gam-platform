@@ -145,12 +145,24 @@ export async function paidAhead(co: TenantCo, o: {
   return r.rows[0].id
 }
 
-/** A landlord-issued (or deposit-interest) credit (committed). */
-export async function issuedCredit(co: TenantCo, o: { amount: number; category: string; leaseId?: string | null }): Promise<string> {
+/**
+ * A landlord-issued (or deposit-interest) credit (committed).
+ *
+ * `byLandlord` is what the Issue credit box sets: a credit the landlord typed
+ * himself, the only kind he can take back (10/18). Deposit interest is GAM's
+ * own and never is; pass false for the other credits GAM writes itself (a late
+ * fee cancelled or refunded, money paid ahead given back at lease end).
+ */
+export async function issuedCredit(
+  co: TenantCo,
+  o: { amount: number; category: string; leaseId?: string | null; byLandlord?: boolean },
+): Promise<string> {
   const r = await db.query<{ id: string }>(
-    `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, status)
-     VALUES ($1, $2, $3, $4, $4, $5, 'active') RETURNING id`,
-    [co.landlordId, co.tenantId, o.leaseId === undefined ? co.leaseId : o.leaseId, o.amount.toFixed(2), o.category])
+    `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, status,
+                                 issued_by_landlord)
+     VALUES ($1, $2, $3, $4, $4, $5, 'active', $6) RETURNING id`,
+    [co.landlordId, co.tenantId, o.leaseId === undefined ? co.leaseId : o.leaseId, o.amount.toFixed(2), o.category,
+     o.byLandlord !== false && o.category !== 'deposit_interest'])
   return r.rows[0].id
 }
 

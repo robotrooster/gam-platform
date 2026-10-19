@@ -2082,7 +2082,7 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'banking', label: 'Banking',
     sections: [{ label: 'Access', items: [
       { key: 'banking.view', label: 'View banking',
-        hint: 'Shows the Disbursement Account page for their own bank account, where any payouts to them land. It never shows or changes yours.' },
+        hint: 'Shows the Bank page for their own payout account, where any payouts to them land. It never shows or changes yours, and not your bank feed or reconciliation.' },
     ]}],
   },
   {
@@ -4486,6 +4486,53 @@ export function stayHoldWords(status: BookingStatus, depositPaid: boolean): stri
   return 'Reserved, not paid for — if the park fills up, a paying guest can take this site.'
 }
 
+/**
+ * 10/18 (Nic) — CAN THIS RESERVATION STILL BE ASKED FOR ITS DEPOSIT?
+ *
+ *   "yeah, let's add a button so that we can collect deposits from people that
+ *    haven't done it for their stays."
+ *
+ * The sentence above (stayHoldWords) tells the desk a reservation is not locked
+ * in. This says whether there is anything they can DO about it: a reservation
+ * still holding its site, with nobody's money on it and an email address to
+ * send to, can be asked for its deposit. Anything else is refused in words
+ * before a link is made, and nothing is sent.
+ *
+ * It is the same question on both sides — the schedule decides whether to offer
+ * the button with it, and the server refuses with it — so the screen can never
+ * offer something the server will turn down.
+ *
+ * What it deliberately does NOT answer is whether anything is OWED. A park that
+ * takes no deposit on a stay like this has nothing to ask for, and only the
+ * server can price that (services/propertyBooking quoteStayDeposit).
+ */
+export type StayDepositAsk = 'ask' | 'already_paid' | 'no_email' | 'no_longer_holding'
+
+export function stayDepositAsk(stay: {
+  status: BookingStatus
+  // A Date is what the database hands the server; a string is what the wire
+  // hands the browser. Both are read for presence only.
+  depositPaidAt?: string | Date | null
+  balancePaidAt?: string | Date | null
+  posTransactionId?: string | null
+  guestEmail?: string | null
+}): StayDepositAsk {
+  // Checked in, checked out, canceled, a no-show: the deposit question is over.
+  if (stay.status !== 'tentative' && stay.status !== 'confirmed') return 'no_longer_holding'
+  // Money on it already — a deposit, the whole stay, or a register sale.
+  if (stay.depositPaidAt || stay.balancePaidAt || stay.posTransactionId) return 'already_paid'
+  if (!stay.guestEmail || !stay.guestEmail.trim()) return 'no_email'
+  return 'ask'
+}
+
+/** Why the guest cannot be asked, in the words the desk is given. Nothing is sent in any of these. */
+export const STAY_DEPOSIT_ASK_REFUSAL: Record<Exclude<StayDepositAsk, 'ask'>, string> = {
+  already_paid: 'This reservation is already paid for, so there is nothing to ask the guest for. Nothing was sent.',
+  no_email: 'There is no email address on this reservation, so there is nowhere to send a link. '
+    + "Add the guest's email on the reservation, or take the deposit at the register. Nothing was sent.",
+  no_longer_holding: 'This reservation is not holding its site any more, so there is no deposit to ask for. Nothing was sent.',
+}
+
 // 10/6 (Nic): a stay is priced by ONE rule everywhere — the cheapest whole
 // months, weeks and nights that cover its nights (./stayPricing priceStay).
 // The old length-tiered, prorated rule (computeStayPrice: "a 10-night stay =
@@ -5842,7 +5889,14 @@ export * from './standaloneScroll'
 // === S617: one definition of how fast an agent reads and types ===
 export * from './chatCadence'
 export * from './paymentAllocation'
-export * from './creditAllocation'
+// 10/18 review fix — the one credit allocation rule lives in the API
+// (services/creditUse buildCreditPlan), with the credit ledger behind it.
+// './creditAllocation' used to export a SECOND rule from here, announcing
+// itself as "one rule, used by every place that shows credit against a
+// balance", whose first line was "a credit tied to a lease only ever reduces
+// that lease" — exactly what Nic reversed on 10/18. Nothing called it; it was
+// deleted rather than kept in step, because a second rule nobody runs is the
+// one a future session copies.
 export * from './moveInCharges'
 import { parseDueDay } from './moveInCharges'
 export * from './camelize'
@@ -6931,8 +6985,8 @@ export type BankAccountStatus = typeof BANK_ACCOUNT_STATUS_VALUES[number]
 
 /**
  * The old POST /api/bank-accounts payload. 10/12: that endpoint now refuses
- * new entries (payouts are set up with Stripe on the Disbursement Account
- * page); the shape is kept only as a record of what existing rows hold.
+ * new entries (payouts are set up with Stripe on the Bank page's Bank setup
+ * tab); the shape is kept only as a record of what existing rows hold.
  */
 export interface BankAccountInput {
   nickname: string

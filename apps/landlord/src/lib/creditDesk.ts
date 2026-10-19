@@ -1357,11 +1357,25 @@ export function tenantCreditHeadline(c: TenantCredit | null | undefined): string
 /** The one sentence on how credit is used, everywhere a landlord reads about it (decisions, 10/2). */
 export const CREDIT_USE_RULE =
   // 10/6 (Nic): "a credit against the entire balance", not line by line.
-  'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it. '
+  'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it, '
+  // 10/18 (Nic): "it does need to go on the October bill for the other spot" —
+  // but only for credit YOU give. Money they paid ahead stays with the space
+  // they paid it for.
+  + 'and only on the space they paid it for. '
   // 10/15 (Nic): "money gets applied to the most outstanding balance first" —
   // credit you give goes on the balance the same way, so none of it sits there
   // while they owe. Only what is over the whole balance waits for a next bill.
-  + 'Credit you give them goes on their balance the same way, so credit never sits on an account while they still owe.'
+  + 'Credit you give them goes on their oldest bill first across every space they hold with you, '
+  + 'so credit never sits on an account while they still owe.'
+
+/**
+ * Why part of the credit on an account cannot pay what is owed right now.
+ * 10/18: a credit you gave is no longer one of the reasons — it crosses spaces
+ * by due date now — so the line names the two kinds of money that do stay put.
+ */
+export const CREDIT_REST_NOT_USABLE =
+  ' The rest cannot pay these bills: money they paid ahead stops at its monthly limit and pays only the space they paid it for, '
+  + 'interest on a deposit pays only that space, and credit pays only your own rent, utilities, late fees and fees.'
 
 // ─── The Payments ledger (decisions #26, #29, #35.1, #36.A) ──────────────────
 

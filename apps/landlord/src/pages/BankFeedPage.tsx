@@ -27,8 +27,10 @@ import { useMemo, useState, useEffect } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { loadStripe } from '@stripe/stripe-js'
-import { EntityPicker } from '../components/EntityPicker'
+import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
+// 10/19 (Nic): one implementation of the read-only bank link, shared with the
+// Bank setup step and onboarding — there used to be three copies of this call.
+import { useLinkBankFeed, BANK_SETUP_PATH } from './BankSetup'
 import { apiGet, apiPost , apiPut } from '../lib/api'
 import {
   EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL,
@@ -40,9 +42,6 @@ import '../styles/bank-reconciliation.css'
 import { toast, appConfirm } from '../components/dialogs'
 import { PayoutBreakdown } from '../components/PayoutBreakdown'
 import { Landmark, RefreshCw, Check, X, Plus, Split } from 'lucide-react'
-
-const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY as string | undefined
-const stripePromise = STRIPE_PK ? loadStripe(STRIPE_PK) : null
 
 const fmt = (n: any) => {
   const v = Number(n)
@@ -113,11 +112,17 @@ const partCents = (raw: string): number | null => {
 
 // S605 (Nic): merged into a single "Bank" tab alongside reconciliation.
 // `embedded` renders this as a section of BankPage rather than its own screen.
-export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) {
+export function BankFeedPage({ embedded = false, onGoToSetup }: {
+  embedded?: boolean
+  /**
+   * 10/19: the Bank page hands this in so "Finish bank setup" switches to its
+   * Bank setup tab. Changing the address alone would not — the chosen tab is
+   * read off the address when the page opens (useUrlTab).
+   */
+  onGoToSetup?: () => void
+} = {}) {
   const navigate = useNavigate()
   const qc = useQueryClient()
-  const [linking, setLinking] = useState(false)
-  const [linkErr, setLinkErr] = useState<string | null>(null)
   // S652 (Nic): "that $4,154.89 is not showing up on the transactions tab."
   // It was there — imported at midnight and MATCHED to GAM's own payout, which
   // is exactly right (a payout landing is never income) — but no view showed
@@ -209,36 +214,14 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     setDrafts(d => ({ ...d, [id]: { ...draftFor(row), ...d[id], ...patch } }))
   }
 
-  const link = async () => {
-    setLinkErr(null)
-    if (!stripePromise) { setLinkErr('Bank linking is not configured (missing Stripe key).'); return }
-    setLinking(true)
-    try {
-      const stripe = await stripePromise
-      if (!stripe) throw new Error('Stripe failed to load')
-      // S637: send the company the picker is on. Without it the endpoint fell
-      // back to "which of your companies?" and refused, after the landlord had
-      // already answered that question on screen.
-      const { data: session } = await apiPost('/bank-feed/link-session', { entityId })
-      const { clientSecret, sessionId } = session
-      const result = await (stripe as any).collectFinancialConnectionsAccounts({ clientSecret })
-      if (result.error) throw new Error(result.error.message)
-      const accounts = result.financialConnectionsSession?.accounts ?? []
-      if (!accounts.length) { setLinking(false); return } // user closed the modal
-      await apiPost('/bank-feed/finalize', { sessionId, entityId })
-      qc.invalidateQueries('bank-connections')
-      qc.invalidateQueries(['bank-txns'])
-      toast('Bank linked. Syncing transactions…')
-    } catch (e: any) {
-      // S605: this read data.message, but the API's error shape is
-      // { success:false, error } — so it was ALWAYS undefined and every
-      // failure here degraded to axios's raw "Request failed with status
-      // code 400", hiding what Stripe actually said.
-      setLinkErr(e?.response?.data?.error || e?.response?.data?.message || e?.message || 'Could not link the bank.')
-    } finally {
-      setLinking(false)
-    }
-  }
+  // 10/19 (Nic): the link itself lives in BankSetup (useLinkBankFeed) so the
+  // Bank setup step, this page and onboarding all run the same call with the
+  // same error handling. The old copies here and in OnboardingPage drifted —
+  // one of them read the wrong error field for a whole session.
+  const { link, linking, error: linkErr } = useLinkBankFeed(entityId)
+  // S654: an account that owns several companies has not said which one yet. A
+  // bank belongs to ONE company, so there is nothing for Connect feed to act on.
+  const needsCompany = useCompanyMissing(entityId)
 
   // S605 (Nic): "when a landlord wants to onboard, say, October first, do we
   // wanna offer the option to not count previous transactions?" Linking pulls
@@ -519,18 +502,37 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       {/* S637: until the payout account exists there is nothing to show here and
           no button to press — the only bank worth connecting first is the one
           rent lands in. */}
-      {entityId && !connectStatusQ.isLoading && !payoutsReady ? (
+      {/* 10/19 (Nic): still the S637 order — the payout account first — but the
+          two steps now live together on the Bank setup tab, so this sends them
+          there instead of to a second page with its own sign-up. It is not a
+          dead end: step 2 is offered on that tab whether or not step 1 is done,
+          so nobody who came back months later is stranded here. */}
+      {/* 10/19 (review): the leading `entityId &&` on the next line meant that
+          with NO company chosen this fell through to the header below, which
+          renders a pressable "Connect feed" — and pressing it posted an empty
+          company and came back with "You own more than one company. Choose
+          which one this bank link belongs to", about a company this tab had not
+          asked for. That is S637's complaint word for word ("the adding a bank
+          button does nothing right now"). Bank setup's step 2 guards exactly
+          this and renders no button; so does this tab now. */}
+      {needsCompany ? (
+        <div className="card" style={{ marginTop: 20, padding: '18px 20px', fontSize: '.82rem', color: 'var(--text-2)' }}>
+          Choose a company above to see its transactions and link its bank.
+          Each company keeps its own bank account.
+        </div>
+      ) : entityId && !connectStatusQ.isLoading && !payoutsReady ? (
         <div className="card" style={{ marginTop: 20, padding: '18px 20px' }}>
           <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>
-            Set up your payout account first
+            Finish your bank setup first
           </div>
           <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
             This page reads your bank transactions so you can categorize spending — it doesn't move
-            any money. Before it's useful, connect the account your rent is deposited into.
-            Once that's live, you can turn this feed on here.
+            any money. Before it's useful, verify your business so rent can reach your bank, then
+            link that same account read-only. Both steps are on Bank setup.
           </div>
-          <button className="btn btn-primary" onClick={() => navigate('/banking')}>
-            Go to payout setup
+          <button className="btn btn-primary"
+                  onClick={() => (onGoToSetup ? onGoToSetup() : navigate(BANK_SETUP_PATH))}>
+            Finish bank setup
           </button>
         </div>
       ) : embedded ? (

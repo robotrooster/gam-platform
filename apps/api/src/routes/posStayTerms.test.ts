@@ -480,7 +480,10 @@ describe('links the schedule sends for the background check (A2)', () => {
     expect(await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 0, guestName: 'Dale', guestEmail: 'dale@t.dev' })).toBeNull()
     const one = await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 42.94, guestName: 'Dale', guestEmail: 'Dale@T.dev' })
     const again = await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 42.94, guestName: 'Dale', guestEmail: 'dale@t.dev' })
-    expect(again).toEqual(one)
+    // The same link back — and `emailed` false on it, because nothing was sent
+    // a second time (10/18: the caller must not record a fresh ask on an old
+    // link).
+    expect(again).toEqual({ ...one!, emailed: false })
     expect(h.emailPayLinkMock).toHaveBeenCalledTimes(1)
     expect(h.emailPayLinkMock.mock.calls[0][0]).toMatchObject({ to: 'dale@t.dev', amount: 42.94, neverExpires: true })
     expect(h.emailPayLinkMock.mock.calls[0][0].note).toMatch(/background check is required/)

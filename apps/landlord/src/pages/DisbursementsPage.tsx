@@ -346,7 +346,7 @@ function NextPayoutFlow({ companyId }: { companyId: string }) {
         {step(data.bankLinked ? `Sent to your bank ${when}` : 'Waiting for your bank', ready.total,
           data.bankLinked
             ? 'Paid out automatically on the next payout day (Tuesday and Friday through the 10th, then Tuesdays)'
-            : <>Link your bank at <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking</Link> and it goes out on the next run</>,
+            : <>Link your bank at <Link to="/bank?tab=setup" style={{ color: 'var(--gold)' }}>Bank setup</Link> and it goes out on the next run</>,
           'var(--green)', ready.rows.length > 0)}
       </div>
       {ready.rows.length > 0 && (

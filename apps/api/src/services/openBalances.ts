@@ -209,6 +209,15 @@ export interface CreditBeside {
    * the lease of the bill it would pay).
    */
   sharedUsableByLease: Map<string, number>
+  /**
+   * 10/18 (Nic): a credit the landlord gave pays the household's oldest bill
+   * whatever space it is on, so it can pay a bill on a space other than the one
+   * it was issued on. Keyed by the credit's lease (the dedupe key above), with
+   * the lease whose bill it pays — the Outstanding list shows the money beside
+   * that space when the credit's own space has no bill on the list at all
+   * (otherwise it would show nowhere).
+   */
+  sharedUsablePayingLease: Map<string, string>
   ownUsableByLease: Map<string, number>
   /** onFile split the same way: credit tied to a lease, by that lease; this person's own general credit. */
   sharedOnFileByLease: Map<string, number>
@@ -234,7 +243,8 @@ const dollars = (c: number) => Math.round(c) / 100
 
 function emptyCredit(): CreditBeside {
   return {
-    usable: 0, usableByLease: new Map(), sharedUsableByLease: new Map(), ownUsableByLease: new Map(),
+    usable: 0, usableByLease: new Map(), sharedUsableByLease: new Map(), sharedUsablePayingLease: new Map(),
+    ownUsableByLease: new Map(),
     sharedOnFileByLease: new Map(), ownOnFile: 0,
     onFile: 0, paidAhead: 0, fromLandlord: 0, depositInterest: 0, paidAheadRemaining: 0,
   }
@@ -246,11 +256,28 @@ function addQuote(into: CreditBeside, q: HouseholdQuote, leaseScope: Set<string>
   const creditLease = new Map(q.credits.map(c => [c.id, c.leaseId] as const))
   for (const line of planCredit(q)) {
     if (leaseScope && !leaseScope.has(line.leaseId)) continue
+    // A credit tied to a lease outside the viewer's scope is not theirs to see.
+    // 10/18: a credit the landlord gave can now pay a bill inside the scope
+    // from a space outside it — and it is still not this viewer's to see, so
+    // the figures stay inside their properties (and "available" never reads
+    // more than "on file", which skips it below).
+    if (leaseScope) {
+      const ownLease = creditLease.get(line.creditId)
+      if (ownLease != null && !leaseScope.has(ownLease)) continue
+    }
     bump(into.usableByLease, line.leaseId, cents(line.amount))
     into.usable = dollars(cents(into.usable) + cents(line.amount))
-    // A lease-tied credit pays only its own lease's bills (line.leaseId is that lease).
-    if (creditLease.get(line.creditId) === null) bump(into.ownUsableByLease, line.leaseId, cents(line.amount))
-    else bump(into.sharedUsableByLease, creditLease.get(line.creditId) ?? line.leaseId, cents(line.amount))
+    // Credit tied to a lease is that lease's people's, so it is counted under
+    // the credit's own lease (everyone on it sees the same money). 10/18: the
+    // bill it pays can be on another space of the household, which the line
+    // remembers for the Outstanding list's placement.
+    const own = creditLease.get(line.creditId)
+    if (own === null) bump(into.ownUsableByLease, line.leaseId, cents(line.amount))
+    else {
+      const key = own ?? line.leaseId
+      bump(into.sharedUsableByLease, key, cents(line.amount))
+      if (!into.sharedUsablePayingLease.has(key)) into.sharedUsablePayingLease.set(key, line.leaseId)
+    }
   }
   for (const c of q.credits) {
     // A credit tied to a lease outside the viewer's scope is not theirs to see.
@@ -712,6 +739,21 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
   // several lines gathers all of it onto one line as household credit
   // (showCreditOncePerHousehold, decisions #48.8).
   const creditSpot = new Map<string, { tenantId: string; spaceIdx: number; amount: number; owes: boolean; due: string }>()
+  // 10/18 (Nic): a credit the landlord gave on a space with NO bill on this
+  // list pays the household's oldest bill on another space. Its money is shown
+  // beside the space whose bill it pays — else the list would show it nowhere
+  // while the plan spends it. Still one figure per credit lease, so co-tenants
+  // see it once.
+  const onList = new Set<string>()
+  for (const { built } of listed) for (const b of built) if (b.space.lease_id) onList.add(b.space.lease_id)
+  const payingHere = (c: CreditBeside, leaseId: string): number => {
+    let extra = 0
+    for (const [creditLease, amt] of c.sharedUsableByLease) {
+      if (onList.has(creditLease)) continue
+      if (c.sharedUsablePayingLease.get(creditLease) === leaseId) extra += cents(amt)
+    }
+    return extra
+  }
   for (const { tenantId, built } of listed) {
     const c = credit.get(tenantId)
     if (!c) continue
@@ -719,7 +761,8 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
       const leaseId = b.space.lease_id
       if (!leaseId) return
       const cand = {
-        tenantId, spaceIdx, amount: c.sharedUsableByLease.get(leaseId) ?? 0,
+        tenantId, spaceIdx,
+        amount: dollars(cents(c.sharedUsableByLease.get(leaseId) ?? 0) + payingHere(c, leaseId)),
         owes: b.space.balance > 0, due: String(b.space.oldest_due_date),
       }
       const cur = creditSpot.get(leaseId)

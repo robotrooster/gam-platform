@@ -13,7 +13,7 @@ import { db, getClient } from '../db'
 import { runWorkTradeSettlement, settleAgreementOnEnd, runDueWorkTradeSettlements } from './workTradeSettlement'
 import { hourRateFor } from '../services/workTradeSettlement'
 import { loadWorkTradeStanding } from '../services/workTradeStanding'
-import { listOpenTenantBalances } from '../services/openBalances'
+import { listOpenTenantBalances, workTradeOpenRowSql } from '../services/openBalances'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease,
   seedLeaseTenant,
@@ -448,6 +448,21 @@ async function addPeriod(
   } finally { client.release() }
 }
 
+/**
+ * Another month on the same agreement, written the way the monthly run writes a
+ * covered one (S634): the line is suspended, so the bill total starts at zero.
+ */
+async function addSuspendedPeriod(
+  s: Stack, periodMonth: string, basis = 500, target = 80,
+): Promise<string> {
+  const invoiceId = await addPeriod(s, periodMonth, basis, target)
+  await db.query(
+    `UPDATE payments SET work_trade_suspended_at = NOW() WHERE invoice_id = $1 AND type = 'rent'`,
+    [invoiceId])
+  await db.query(`UPDATE invoices SET total_amount = 0 WHERE id = $1`, [invoiceId])
+  return invoiceId
+}
+
 const periodOf = async (s: Stack, periodMonth: string) => (await db.query(
   `SELECT status, hours_worked::float AS worked, hours_applied::float AS applied,
           credit_applied::float AS credit
@@ -525,7 +540,7 @@ describe('running the same month close again', () => {
 
   // S654 (Nic): his own trades are tracks_hours = false. A re-run is how a
   // September period the cron left open gets settled, so it must still work.
-  it('leaves a trade the landlord does not clock exactly as before', async () => {
+  it('an untracked trade: the re-run settles the month and counts none of its logged hours', async () => {
     const s = await buildStack({ target: 0, basis: 460, suspended: true, tracksHours: false })
     await logHours(s, '2026-09-10', 12)                 // logged anyway
     // The prod shape: the cron already stamped the close but left it open.
@@ -535,8 +550,17 @@ describe('running the same month close again', () => {
     const r = await runWorkTradeSettlement('2026-09-01')
     expect(r.errors).toEqual([])
     expect(r.periodsSettled).toBe(1)
+    // 10/18: `worked` is 0 where it used to be 12. A trade the landlord does
+    // not clock counts no hours at all (countsHours), so the 12 are neither
+    // recorded against the month nor banked — they used to BANK, which turned
+    // hours on a trade that asks for none into credit toward future months.
+    // Leaving them unrecorded also keeps them available: turning tracking back
+    // on counts them fresh instead of finding them already spent.
     expect(await periodOf(s, '2026-09-01')).toEqual(
-      { status: 'settled', worked: 12, applied: 0, credit: 460 })
+      { status: 'settled', worked: 0, applied: 0, credit: 460 })
+    expect(Number((await db.query(
+      `SELECT banked_hours::float AS b FROM work_trade_agreements WHERE id=$1`,
+      [s.agreementId])).rows[0].b)).toBe(0)
     expect(await invoiceOf(s.invoiceId)).toEqual({ total: 0, credit: 460, hours: 0 })
     expect(await openOnLease(s.leaseId)).toBe(0)
 
@@ -662,7 +686,7 @@ describe('approvals that land after their month closed', () => {
 
   // S654 (Nic): his own trades are tracks_hours = false: no hours, every month
   // covered. Hours logged on one anyway never become banked time.
-  it('leaves a trade the landlord does not clock exactly as before', async () => {
+  it("an untracked trade: October's close settles September too and banks neither month's hours", async () => {
     const s = await buildStack({ target: 0, basis: 460, suspended: true, tracksHours: false })
     await logHours(s, '2026-09-10', 12)
     // The prod shape: the cron stamped September's close and left it open.
@@ -888,7 +912,7 @@ describe('approvals that land after their month settled', () => {
 
   // S654 (Nic): his own trades are tracks_hours = false. A settled month that
   // asks for no hours never banks hours logged on it anyway.
-  it('leaves a trade the landlord does not clock exactly as before', async () => {
+  it('an untracked trade: hours approved after a settled month never reach the bank', async () => {
     const s = await buildStack({ target: 0, basis: 460, suspended: true, tracksHours: false })
     await runWorkTradeSettlement('2026-09-01')
     expect(await periodOf(s, '2026-09-01')).toEqual(
@@ -1291,5 +1315,227 @@ describe('extra hours at month close', () => {
       { periodMonth: '2026-09-01', hours: 6, how: 'banked', rate: null, amount: null, status: null }])
     expect(banked!.extraHours!.summary).toBe('6 extra hours in September — banked toward future months')
     expect(banked!.extraHours!.summary).not.toMatch(/\$/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10/18 (Nic) — A CLOSED MONTH'S WORK TRADE MUST SETTLE AND THEN BE GONE.
+//
+//   "Work trade is settled if the hours are met. It doesn't say, like, the
+//    $7,998.87 of work trade bills need to be zeroed out, because you're
+//    counting last month and this month, right? It can still kind of count for
+//    the open month, but once we're on to the next month and the old month
+//    settles out, like, it disappears. It's gone. It's forgotten. It's work
+//    trade is work trade, and it's done and over."
+//
+// What went wrong in production: the 2:15am close on 10/01 left eight of nine
+// September periods open with nothing credited, and their rent sat suspended
+// and pending for the whole of October — $4,383.11 of September plus $3,615.76
+// of October showing at once. The cause is below: the period froze an hour
+// target, the landlord then turned hour-tracking OFF ("my people are auto
+// complete work trade until I change it back"), and the close went on reading
+// the frozen number instead of the agreement.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Work-trade money still parked on this tenant, by the one production rule. */
+const suspendedWorkTrade = async (s: Stack) => Number((await db.query(
+  `SELECT COALESCE(SUM(p.amount), 0)::float AS held FROM payments p
+    WHERE p.tenant_id = $1 AND ${workTradeOpenRowSql('p')}`, [s.tenantId])).rows[0].held)
+
+describe('the landlord turns hour-tracking off after a period opened', () => {
+  // The exact production shape: agreement says "no hours", the September
+  // period still carries the 80 it was opened with.
+  it('settles the month at close and leaves nothing pending', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect(r.periodsSettled).toBe(1)
+
+    const st = await periodOf(s, '2026-09-01')
+    expect(st.status).toBe('settled')
+    expect(st.credit).toBe(460)
+
+    const rent = (await db.query(
+      `SELECT status, amount::float AS amount, work_trade_suspended_at,
+              work_trade_credit::float AS wt
+         FROM payments WHERE invoice_id=$1 AND type='rent'`, [s.invoiceId])).rows[0]
+    expect(rent.status).toBe('settled')
+    expect(rent.amount).toBe(0)
+    expect(rent.work_trade_suspended_at).toBeNull()
+    // The books read this column (ledgerProjectors/tenantCredits C5): with no
+    // credit written, 'left_out' has nothing to debit back and September's
+    // income stands uncovered.
+    expect(rent.wt).toBe(460)
+
+    const inv = await invoiceOf(s.invoiceId)
+    expect(inv.total).toBe(0)
+    expect(inv.credit).toBe(460)
+  })
+
+  it('is gone from every owed figure, and the open month is not', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+    await addSuspendedPeriod(s, '2026-10-01', 460)
+
+    // Before the close both months are parked — Nic's "counting last month and
+    // this month".
+    expect(await suspendedWorkTrade(s)).toBe(920)
+
+    await runWorkTradeSettlement('2026-09-01')
+
+    // September is forgotten; October is still the open month.
+    expect(await suspendedWorkTrade(s)).toBe(460)
+    expect(await balancesPageOwed(s)).toBe(0)
+    expect(await openOnLease(s.leaseId)).toBe(0)
+  })
+
+  it('does not credit the month twice when the close re-runs', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+    await runWorkTradeSettlement('2026-09-01')
+    const first = await invoiceOf(s.invoiceId)
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await invoiceOf(s.invoiceId)).toEqual(first)
+    expect((await periodOf(s, '2026-09-01')).credit).toBe(460)
+  })
+
+  // The half that must NOT change: an agreement that does count hours.
+  it('still settles a tracked month only when the hours are met', async () => {
+    const met = await buildStack({ basis: 500, suspended: true })
+    await logHours(met, '2026-09-15', 80)
+    await runWorkTradeSettlement('2026-09-01')
+    expect((await periodOf(met, '2026-09-01')).status).toBe('settled')
+    expect(await suspendedWorkTrade(met)).toBe(0)
+    expect(await openOnLease(met.leaseId)).toBe(0)
+
+    const short = await buildStack({ basis: 500, suspended: true })
+    await logHours(short, '2026-09-10', 60)
+    await runWorkTradeSettlement('2026-09-01')
+    const st = await periodOf(short, '2026-09-01')
+    expect(st.status).toBe('open')          // 20 hours carry forward
+    expect(st.credit).toBe(375)
+    expect(await openOnLease(short.leaseId)).toBe(125)   // the lapse, owed once
+  })
+
+  // A trade that asks no hours has no hours to bank or be paid for, whichever
+  // way the period was opened — and the month is covered outright anyway.
+  it('covers the month in full and banks nothing for hours logged on it', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+    await logHours(s, '2026-09-12', 30)
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    // THE MONEY, not just the bank: reading the period's frozen 80 hours
+    // credited 30 x $5.75 = $172.50 and left $287.50 owed on a month the
+    // agreement covers outright. Asserting only banked_hours could not tell the
+    // two versions apart — 30 hours against an 80-hour target banks nothing
+    // either way.
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 460 })
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await invoiceOf(s.invoiceId)).toEqual({ total: 0, credit: 460, hours: 0 })
+    expect(Number((await db.query(
+      `SELECT banked_hours::float AS b FROM work_trade_agreements WHERE id=$1`,
+      [s.agreementId])).rows[0].b)).toBe(0)
+  })
+
+  // The other reader of the same snapshot: a covered utility share released
+  // onto a bill already out (services/utilityBilling attachBillToOpenInvoice →
+  // bringLinesUnderTrade). A settled month covers it in full, so the tenant
+  // must be asked for nothing. Reading the period's frozen 80 hours instead
+  // priced the month at a rate nobody owes work at, credited the water $0 and
+  // left it on the tenant as money owed on a trade that covers water.
+  it('a charge released onto an untracked month it already settled is covered, not owed', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 460 })
+
+    const water = (await db.query(
+      `INSERT INTO payments
+         (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount,
+          status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'utility',50,'pending','2026-09-01','UTILITY')
+       RETURNING id`,
+      [s.invoiceId, s.unitId, s.leaseId, s.tenantId, s.landlordId])).rows[0].id
+
+    const { bringLinesUnderTrade } = await import('../services/workTradeCoverage')
+    const r = await bringLinesUnderTrade(db, s.agreementId, s.invoiceId, [{
+      id: water, invoice_id: s.invoiceId, amount: 50, type: 'utility',
+      tenant_id: s.tenantId, due_date: '2026-09-01',
+    }])
+    expect(r).toEqual({ outcome: 'covered', amount: 50 })
+
+    const row = (await db.query(
+      `SELECT status, amount::float AS amount FROM payments WHERE id=$1`, [water])).rows[0]
+    expect(row).toEqual({ status: 'settled', amount: 0 })
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ credit: 510 })
+  })
+
+  // Nic reads this on the tenant portal and the landlord reads the priced copy
+  // of it; the close reads the agreement. All three have to say the same thing
+  // about the same month, or the tenant is chasing hours nobody is asking for.
+  it('tells the tenant and the landlord the month asks for no hours', async () => {
+    const s = await buildStack({ basis: 460, suspended: true, tracksHours: false })
+    await addSuspendedPeriod(s, '2026-10-01', 460)
+
+    const tenant = await loadWorkTradeStanding(s.agreementId, '2026-10-01', 'tenant')
+    expect(tenant).toMatchObject({ currentMonthHours: 0, carriedHours: 0, catchUpHours: 0 })
+    expect(tenant!.summary).toBe("You're fully covered for this month.")
+
+    const landlord = await loadWorkTradeStanding(s.agreementId, '2026-10-01', 'landlord')
+    expect(landlord).toMatchObject({ carriedHours: 0, carriedValue: 0, nextBillingMonth: null })
+    expect(landlord!.summary).not.toContain('$')
+  })
+})
+
+// RV 50 and RV 51 at Mountain View: lease hibernation paused the agreement
+// (work_trade_agreements.paused_by_hibernation, S594) while their September
+// rent was already suspended under the trade. The close only ever looked at
+// `active` agreements, so their month was never closed at all and $589 each sat
+// parked with nothing on the calendar that would ever release it.
+describe('a paused agreement', () => {
+  it('settles a month its own terms already cover', async () => {
+    const s = await buildStack({ basis: 589, suspended: true, tracksHours: false })
+    await db.query(
+      `UPDATE work_trade_agreements SET status='paused', paused_by_hibernation=true WHERE id=$1`,
+      [s.agreementId])
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect((await periodOf(s, '2026-09-01')).status).toBe('settled')
+    expect(await suspendedWorkTrade(s)).toBe(0)
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    // Pausing is not ending: the agreement is still paused, not ended.
+    expect((await db.query(
+      `SELECT status FROM work_trade_agreements WHERE id=$1`, [s.agreementId])).rows[0].status)
+      .toBe('paused')
+  })
+
+  // A short month on a paused trade: the shortfall never ages out into a cash
+  // charge and never ends the trade, but the month still closes like any other
+  // — so READ WHAT THE TENANT OWES. Asserting only the run counters is why the
+  // $125 below went unnoticed: with the close looking at active agreements only
+  // the paused one was never processed at all, so periodsBilled was 0 and the
+  // carried rows were empty while the test did nothing.
+  it('closes a short month without ever aging it into a cash bill', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await logHours(s, '2026-09-10', 60)
+    await db.query(`UPDATE work_trade_agreements SET status='paused' WHERE id=$1`, [s.agreementId])
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    // carry_forward_months 0 would have billed an ACTIVE trade's lapse at this
+    // close and ended it. Paused, the window never runs out.
+    expect(r.periodsBilled).toBe(0)
+    expect(r.agreementsEnded).toBe(0)
+    expect(await carriedRows(s.leaseId)).toEqual([])
+    expect((await db.query(
+      `SELECT status FROM work_trade_agreements WHERE id=$1`, [s.agreementId])).rows[0].status)
+      .toBe('paused')
+    // The month closed: 60 of 80 hours credited $375, and the 20 unworked hours
+    // are the $125 lapse on September's own bill, exactly as an active trade's
+    // would be. This is the figure in the OPEN QUESTION at CLOSE_STATUSES —
+    // whether a dormant trade's lapse should sit owed or stay parked is Nic's
+    // call, and this assertion is where that decision lands.
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'open', applied: 60, credit: 375 })
+    expect(await openOnLease(s.leaseId)).toBe(125)
   })
 })

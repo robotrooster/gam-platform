@@ -13,12 +13,15 @@ import { geoCentroid, geoPath } from 'd3-geo'
 import { feature } from 'topojson-client'
 import type { Topology } from 'topojson-specification'
 import {
-  DOT_BELOW_PX, H, HOME_VIEW, MAX_DEPTH, MAX_ZOOM, MIN_DEPTH, MIN_ZOOM, US_VIEW, W, WORLD_VIEW, areaAt,
+  DOT_BELOW_PX, H, HOME_VIEW, LEAN_EVEN_RGB, LEAN_KEY_STEPS, LEAN_LEFT_RGB, LEAN_RIGHT_RGB,
+  MAX_DEPTH, MAX_ZOOM, MIN_DEPTH, MIN_ZOOM, US_VIEW, W, WORLD_VIEW, areaAt,
   areaCountry, areaName, buildLayer, buildUsAtlas, buildWorld, dotNeeded, dragRotate, flatCenterPoint, flatLook,
-  flatNational, flatPan, flatWorld, flatZoom, forgetLayers, globeProjection, globeViewOf, heat, homeView,
-  inBounds, layerKey, loadLayerGroups, mergeLayers, mixRgb, nationalProjection, strength, viewFor, viewOfArea,
+  flatNational, flatPan, flatWorld, flatZoom, forgetElections, forgetLayers, globeProjection, globeViewOf, heat,
+  homeView, inBounds, layerKey, leanColor, leanStrength, loadElections, loadLayerGroups, mergeLayers, mixRgb,
+  nationalProjection, strength, viewFor, viewOfArea,
   viewOfGlobe, worldProjection, zoomBy,
 } from './metricsMapGeo'
+import { METRICS_LEAN_FULL, marginMoveText, marginText } from '@gam/shared'
 
 const require = createRequire(import.meta.url)
 const us = buildUsAtlas(require('us-atlas/counties-10m.json') as Topology)
@@ -125,6 +128,22 @@ describe('the flat map', () => {
     expect(dotNeeded(yarnell, 1)).toBe(true)
     expect(dotNeeded(yarnell, 1000)).toBe(false)
     expect(dotNeeded(phoenix, 1)).toBe(false)
+  })
+
+  // 10/18 (Nic): the lean overlay marks EVERY area GAM is in, whatever its
+  // size, so every drawn shape carries its own middle — not only the ones too
+  // small to see.
+  it('every drawn shape carries its middle, for the lean overlay\'s markers', () => {
+    const flat = flatNational(us, 'county')
+    const drawn = flat.areas.filter(a => a.d)
+    expect(drawn.length).toBeGreaterThan(3000)
+    expect(drawn.every(a => !!a.at)).toBe(true)
+    const santaCruz = flat.areas.find(a => a.id === '04023')!   // big enough to see: no marker
+    expect(santaCruz.dot).toBeUndefined()
+    expect(santaCruz.at![0]).toBeGreaterThan(0)
+    expect(santaCruz.at![1]).toBeGreaterThan(0)
+    // A shape the picture cannot draw has no middle either (Puerto Rico).
+    expect(flat.areas.find(a => a.id === '72001')!.at).toBeUndefined()
   })
 
   it('names areas the way each level does', () => {
@@ -506,5 +525,75 @@ describe('the view that stays put', () => {
     expect(flatLook(world, onArgentina).k).toBeCloseTo(9, 6)
     // The globe faces it either way: a globe has no edge to fall off.
     expect(globeViewOf(onArgentina, US_VIEW).rotate).toEqual([60, 32])
+  })
+})
+
+// ─── 10/18 (Nic): how an area votes ─────────────────────────────────────────
+
+describe('the lean overlay', () => {
+  beforeEach(() => { forgetElections() })
+
+  it('is a diverging red/blue scale that is colour-blind safe and never black', () => {
+    // Nic asked for "a diverging red/blue scale that is colour-blind safe and
+    // legible in both themes". Red and blue (ColorBrewer's RdBu), not red and
+    // green, and both ends at a middling lightness so neither sinks into the
+    // dark page or the light one.
+    const [rr, rg, rb] = LEAN_RIGHT_RGB
+    const [lr, lg, lb] = LEAN_LEFT_RGB
+    expect(rr).toBeGreaterThan(rb)                 // the right end is red
+    expect(lb).toBeGreaterThan(lr)                 // the left end is blue
+    for (const c of [...LEAN_RIGHT_RGB, ...LEAN_LEFT_RGB, ...LEAN_EVEN_RGB]) {
+      expect(c).toBeGreaterThan(50)                // nothing near black
+      expect(c).toBeLessThan(230)                  // nothing near white
+    }
+    // Told apart without seeing red or green: the two ends differ in their
+    // blue channel alone by a wide margin.
+    expect(Math.abs(rb - lb)).toBeGreaterThan(60)
+    expect(rg).toBeLessThan(lg + 80)
+
+    // The scale runs from the even gray out to each end, and tops out there.
+    expect(leanColor(0)).toBe(mixRgb(LEAN_LEFT_RGB, LEAN_EVEN_RGB, 0))
+    expect(leanColor(METRICS_LEAN_FULL)).toBe(`rgb(${LEAN_RIGHT_RGB.join(', ')})`)
+    expect(leanColor(-METRICS_LEAN_FULL)).toBe(`rgb(${LEAN_LEFT_RGB.join(', ')})`)
+    // Past the top it holds, exactly as the gold scale does — a 92-point
+    // county is not drawn stronger than the end of the key.
+    expect(leanColor(92.5)).toBe(leanColor(METRICS_LEAN_FULL))
+    expect(leanStrength(0)).toBe(0)
+    expect(leanStrength(METRICS_LEAN_FULL / 2)).toBeCloseTo(0.5, 6)
+    expect(leanStrength(1e6)).toBe(1)
+    expect(leanStrength(NaN)).toBe(0)
+    // Every step of the key is its own colour, and the middle one is the gray.
+    const steps = LEAN_KEY_STEPS.map(leanColor)
+    expect(new Set(steps).size).toBe(LEAN_KEY_STEPS.length)
+    expect(steps[2]).toBe(leanColor(0))
+  })
+
+  it('says a margin and a swing in words, with the contest\'s own two sides', () => {
+    // Santa Cruz County, Arizona: Democratic +18.6 in 2024, Democratic +47.1
+    // in 2016 — a 28.5-point move toward the Republican side.
+    expect(marginText(-18.6, 'Republican', 'Democratic')).toBe('Democratic +18.6')
+    expect(marginText(18.65, 'Republican', 'Democratic')).toBe('Republican +18.7')
+    expect(marginText(0, 'Republican', 'Democratic')).toBe('Even')
+    expect(marginText(-4, 'Republican', 'Democratic')).toBe('Democratic +4')
+    // A ballot measure is the same shape with its own two sides.
+    expect(marginText(12.2, 'No', 'Yes')).toBe('No +12.2')
+    expect(marginMoveText(-47.1, -18.6, 'Republican', 'Democratic', '2016'))
+      .toBe('28.5 points toward the Republican side since 2016.')
+    expect(marginMoveText(-18.6, -47.1, 'Republican', 'Democratic', '2016'))
+      .toBe('28.5 points toward the Democratic side since 2016.')
+    expect(marginMoveText(-18.6, -18.6, 'Republican', 'Democratic', '2016')).toBe('No move since 2016.')
+  })
+
+  it('fetches a level\'s results once, and forgets a failure so it can be tried again', async () => {
+    const asked: string[] = []
+    const api: any = { get: async (url: string) => { asked.push(url); return { data: { level: 'county', contests: [], areas: {} } } } }
+    await loadElections(api, 'county')
+    await loadElections(api, 'county')
+    expect(asked).toEqual(['/admin/metrics/elections/county'])
+    const failing: any = { get: async (url: string) => { asked.push(url); throw new Error('no file') } }
+    forgetElections()
+    await expect(loadElections(failing, 'county')).rejects.toThrow()
+    await expect(loadElections(failing, 'county')).rejects.toThrow()
+    expect(asked).toHaveLength(3)
   })
 })

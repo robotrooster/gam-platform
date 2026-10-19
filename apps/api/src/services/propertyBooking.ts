@@ -180,9 +180,20 @@ export function depositForStay(
  * (minimum stay, maximum stay, no past check-in), and a staff reservation is
  * allowed to break all three — somebody standing at the desk can book one night
  * where the website requires two. Only the money is shared.
+ *
+ * 10/18 (review) — A STAY PRICED BY HAND IS STILL PRICED. A site with no rate
+ * on it anywhere prices at nothing, and the counter is allowed to take that
+ * reservation at a typed total (routes/units: the rate card, "falling back to a
+ * client-supplied total only when no rate is set"). Quoting the rate card alone
+ * then told the desk the guest "owes no deposit on this stay" as a fact about
+ * the park — on a park that does take one. So when the rate card prices this
+ * stay at nothing, the reservation's OWN price is what the percentage is taken
+ * of. `bookedTotal` is that price: the reservation form passes what it saved,
+ * and the schedule's deposit button passes what the reservation says.
  */
 export async function quoteStayDeposit(
   unitId: string, checkIn: string, checkOut: string,
+  opts: { bookedTotal?: number | null } = {},
 ): Promise<number> {
   const row = await queryOne<any>(
     `SELECT u.nightly_rate, u.weekly_rate, u.monthly_rate,
@@ -200,7 +211,8 @@ export async function quoteStayDeposit(
       weekly:  num(row.weekly_rate)  ?? num(row.p_weekly),
       monthly: monthlyRate },
     row.short_term_tax_rate, checkIn, nights)
-  return depositForStay(row, { total: price.total, nights, monthlyRate })
+  const total = price.total > 0 ? price.total : Math.max(0, round2(Number(opts.bookedTotal) || 0))
+  return depositForStay(row, { total, nights, monthlyRate })
 }
 
 /**

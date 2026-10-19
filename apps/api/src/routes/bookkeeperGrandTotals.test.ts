@@ -47,17 +47,28 @@ async function bookkeeper(first: string, landlordId: string, propertyIds: string
   return sign({ userId, role: 'bookkeeper', email: 'bk@t.dev', profileId: null, landlordId, permissions: { access_level: 'read_only' } })
 }
 
-/** An open bill on a space: an invoice due `due` with nothing paid on it. */
+/**
+ * An open bill on a space: an invoice due `due` with nothing paid on it, AND
+ * the rent charge that is its line — the real shape, where the bill is the
+ * cover and the payments rows are what is owed on it. 10/18: the Outstanding
+ * Balance reads those rows (lib/rentCollected outstandingBalanceOf), so a bill
+ * with no lines owes nothing, here as in production.
+ */
 async function openBill(unitId: string, landlordId: string, amount: number, due: string) {
   const c = await db.connect()
   try {
     const tenantId = await seedTenant(c)
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: amount })
     await seedLeaseTenant(c, { leaseId, tenantId })
-    await c.query(
+    const invoiceId = (await c.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7,'pending')`,
-      [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, due, amount])
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7,'pending') RETURNING id`,
+      [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, due, amount])).rows[0].id
+    await c.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                             due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',$6,'pending',$7::date,'RENT')`,
+      [invoiceId, unitId, leaseId, tenantId, landlordId, amount, due])
   } finally { c.release() }
 }
 

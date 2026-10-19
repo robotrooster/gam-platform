@@ -136,9 +136,33 @@ describe('landlord portal navigation for the owner', () => {
   it('keeps the owner-only financial tabs and gains Money In and Maintenance Costs', () => {
     const shown = new Set(paths({ role: 'landlord' }))
     for (const path of ['/payments', '/rent-roll', '/disbursements', '/reports', '/expenses',
-      '/income', '/maintenance-costs', '/bank', '/banking']) {
+      '/income', '/maintenance-costs', '/bank']) {
       expect(shown.has(path), `${path} should show for the owner`).toBe(true)
     }
+  })
+
+  // 10/19 (Nic): "I don't know why there's two different fucking signups. It
+  // should all be in one flow." Bank and Disbursement Account — two entries
+  // three letters apart for the same bank account — are ONE entry now. The old
+  // address still resolves (main.tsx redirects it into the Bank setup tab), but
+  // it is never offered in the menu again.
+  it('has ONE bank entry, and it is not called Disbursement Account', () => {
+    for (const u of [{ role: 'landlord' }, { role: 'admin' }, { role: 'super_admin' },
+      { role: 'property_manager', directDepositEnabled: true, permissions: { 'banking.view': true } }]) {
+      const items = visibleNavItemsFor(u)
+      expect(items.filter(i => i.to === '/bank' || i.to === '/banking').length, JSON.stringify(u)).toBe(1)
+      expect(items.some(i => i.to === '/banking'), JSON.stringify(u)).toBe(false)
+      expect(items.some(i => i.label === 'Disbursement Account'), JSON.stringify(u)).toBe(false)
+    }
+  })
+
+  // S168: the one case that is NOT the owner's own bank — a manager their
+  // landlord switched direct deposit on, who sets up their own payout account.
+  // That page was /banking; it is the Bank entry now, and nothing else changed:
+  // no direct deposit, no entry.
+  it('a manager sees the bank entry only with direct deposit on', () => {
+    expect(visibleNavItemsFor({ role: 'property_manager', directDepositEnabled: true }).some(i => i.to === '/bank')).toBe(true)
+    expect(visibleNavItemsFor({ role: 'property_manager', directDepositEnabled: false }).some(i => i.to === '/bank')).toBe(false)
   })
 
   // 10/13 (Nic): "REMOVE the Outstanding Balances tab."

@@ -27,13 +27,28 @@
  * and districts — the areas can be whole countries, so the United States' own
  * state lines are left off (`stateLines`): they would only cut a gold country
  * into pieces that mean nothing at that level.
+ *
+ * 10/18 (Nic): THE DIVISIONS. "The globe draws only the United States with a
+ * light gray-blue halo and black lines between states; nothing else on Earth
+ * has any division at all." So it now draws the same country borders and the
+ * same provinces the flat map draws (`countries`, `provinces` — the API's own
+ * files, fetched by the card the first time the globe is shown), and DECIDED
+ * (Nic asked, and he was told): every state and province boundary is drawn in
+ * the same light gray-blue, so Alaska and Hawaii stop looking like a different
+ * kind of thing from Arizona. Black lines read as cracks on a dark globe, so
+ * no boundary on it is black any more — a country's edge is the same color, a
+ * shade heavier, which is the only hierarchy the globe needs.
+ *
+ * 10/18 (Nic): and the lean overlay (`lean`) — an area's color is how it VOTED
+ * there, on a diverging red/blue scale, with GAM's own number as the gold
+ * marker on top of it. Gold on this globe always means GAM.
  */
 import React, { useCallback, useEffect, useRef } from 'react'
 import { geoGraticule10, geoPath } from 'd3-geo'
 import type { MultiLineString } from 'geojson'
 import {
-  DOT_BELOW_PX, DOT_RADIUS, areaAt, dragRotate, globeProjection, mixRgb, zoomBy,
-  type GeoArea, type GlobeView, type UsAtlas, type WorldLand,
+  DOT_BELOW_PX, DOT_RADIUS, areaAt, dragRotate, globeProjection, leanColor, mixRgb, zoomBy,
+  type GeoArea, type GlobeView, type LayerShapes, type UsAtlas, type WorldLand,
 } from './metricsMapGeo'
 
 interface Props {
@@ -50,8 +65,23 @@ interface Props {
    * the state lines would only cut it up.
    */
   stateLines?: boolean
+  /**
+   * 10/18 (Nic): the country shapes and the provinces, for the lines between
+   * them — the same files the flat map draws. Null until they arrive, or if
+   * they cannot be fetched, in which case the globe draws the coarse country
+   * lines it has from the world file and nothing else changes.
+   */
+  countries?: LayerShapes | null
+  provinces?: LayerShapes | null
   /** Strength 0–1 of each area's gold, by id (only areas with a number). */
   shade: Map<string, number>
+  /**
+   * 10/18 (Nic): the lean overlay — each area's voting margin by id, positive
+   * for the contest's right. When it is given, an area's COLOR is its vote and
+   * every area with a gold number is marked whatever its size; an area with no
+   * result published is left uncolored rather than painted as if it were even.
+   */
+  lean?: Map<string, number> | null
   focus: string | null
   /**
    * 10/18 (Nic): where to face and how far in — the card's own kept view, so
@@ -100,7 +130,8 @@ function makeColorReader() {
 }
 
 export function MetricsGlobe({
-  us, world, areas, borders, shade, focus, stateLines = true, view: target, onView, onHome,
+  us, world, countries, provinces, areas, borders, shade, lean, focus, stateLines = true,
+  view: target, onView, onHome,
   onHover, onPick, label, describedBy,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -113,8 +144,8 @@ export function MetricsGlobe({
   /** The markers drawn last frame (places too small to see), for hover and tap. */
   const dots = useRef<Array<{ id: string; x: number; y: number }>>([])
   // The latest props, for the drawing loop and the pointer handlers.
-  const props = useRef({ areas, borders, shade, focus, stateLines, onHover, onPick, onView })
-  props.current = { areas, borders, shade, focus, stateLines, onHover, onPick, onView }
+  const props = useRef({ areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView })
+  props.current = { areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView }
 
   const paint = useCallback(() => {
     frame.current = null
@@ -144,41 +175,67 @@ export function MetricsGlobe({
     }
     const fill = (geo: any, color: string) => { ctx.beginPath(); path(geo); ctx.fillStyle = color; ctx.fill() }
 
-    // The sea is the card; the earth is gray line art, the U.S. gray land with gold where GAM is.
+    // The sea is the card; the earth is gray line art, the land gray with gold
+    // where GAM is. 10/18 (Nic): every boundary on it — a state's, a
+    // province's, a country's — is the one light gray-blue, a country's a
+    // shade heavier. Nothing on the globe is drawn in black.
+    const line = rgb('--b2')
     stroke(graticule, rgb('--b1'), 0.5, 0.8)
     // 10/17: the rest of the world's land first, so the United States sits on
     // top of it. Its coastlines come back when the globe stops moving, as the
     // other fine lines do; while it turns, the fill alone shows the land.
-    if (world) {
-      fill(world.land, rgb('--heat-none'))
-      if (!fast) stroke(world.borders, rgb('--bg2'), 0.5, 0.7)
-    }
+    if (world) fill(world.land, rgb('--heat-none'))
     fill(us.land, rgb('--heat-none'))
     for (const a of p.areas) {
+      // 10/18 (Nic): the lean overlay colors an area by its vote; everywhere
+      // else the color is GAM's own number, in gold.
+      if (p.lean) {
+        const margin = p.lean.get(a.id)
+        if (margin != null) fill(a.feature, leanColor(margin))
+        continue
+      }
       const o = p.shade.get(a.id)
       if (o) fill(a.feature, mixRgb(hi, base, o))
     }
-    if (p.borders && !fast) stroke(p.borders, rgb('--bg2'), 0.5, 0.7)
-    if (p.stateLines) stroke(us.stateBorders, rgb('--bg2'), 1)
-    stroke(us.nation, rgb('--b2'), 1)
-    stroke(sphere, rgb('--b2'), 1)
+    if (p.borders && !fast) stroke(p.borders, line, 0.5, 0.7)
+    // 10/18 (Nic): the world's own divisions, over the colors — the country
+    // lines from the same file the flat map draws (the coarse world file's
+    // coastlines until it arrives), and the provinces inside them. Both are
+    // thousands of shapes, so they are drawn when the globe is still, as the
+    // other fine lines are.
+    if (!fast) {
+      // A province is the same kind of thing as a state, so it is drawn
+      // exactly like one — same color, same weight. That is the whole point of
+      // Nic's decision: "Alaska and Hawaii stop looking like a different kind
+      // of thing from Arizona."
+      if (provinces) stroke(provinces.borders, line, 0.7)
+      if (countries) stroke(countries.borders, line, 1)
+      else if (world) stroke(world.borders, line, 1)
+    }
+    if (p.stateLines) stroke(us.stateBorders, line, 0.7)
+    stroke(us.nation, line, 1)
+    stroke(sphere, line, 1)
     const f = p.focus ? p.areas.find(a => a.id === p.focus) : null
     if (f) stroke(f.feature, rgb('--t0'), 1.6)
 
-    // A place with a number too small to see at this zoom gets a marker in its own color (as on the flat map).
+    // A place with a number too small to see at this zoom gets a marker in its
+    // own color (as on the flat map). 10/18 (Nic): in the lean overlay EVERY
+    // area GAM is in is marked, whatever its size — the area's own color is
+    // its vote there, so the marker is the only thing saying GAM is in it.
     dots.current = []
     for (const a of p.areas) {
       const o = p.shade.get(a.id)
       if (!o) continue
       const [[x0, y0], [x1, y1]] = path.bounds(a.feature)
       const [cx, cy] = path.centroid(a.feature)
-      if (!(x1 - x0 < DOT_BELOW_PX && y1 - y0 < DOT_BELOW_PX) || !Number.isFinite(cx) || !Number.isFinite(cy)) continue
+      if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue
+      if (!p.lean && !(x1 - x0 < DOT_BELOW_PX && y1 - y0 < DOT_BELOW_PX)) continue
       ctx.beginPath(); ctx.arc(cx, cy, DOT_RADIUS, 0, 2 * Math.PI)
       ctx.fillStyle = mixRgb(hi, base, o); ctx.fill()
       ctx.lineWidth = a.id === p.focus ? 2 : 1; ctx.strokeStyle = rgb(a.id === p.focus ? '--t0' : '--t1'); ctx.stroke()
       dots.current.push({ id: a.id, x: cx, y: cy })
     }
-  }, [us, world, colorOf])
+  }, [us, world, countries, provinces, colorOf])
 
   /** The place under a point: a marker first (they sit on top), then the shapes. */
   const hitAt = (x: number, y: number): string | null => {
@@ -213,7 +270,7 @@ export function MetricsGlobe({
   // level whose picture opens somewhere else) turns the globe there.
   useEffect(() => { view.current = target; redraw() }, [target, redraw])
   // New numbers or a new focus: draw again.
-  useEffect(() => { redraw() }, [areas, borders, shade, focus, stateLines, redraw])
+  useEffect(() => { redraw() }, [areas, borders, shade, lean, focus, stateLines, redraw])
 
   // Fit the canvas to its box, and keep it fitted.
   useEffect(() => {

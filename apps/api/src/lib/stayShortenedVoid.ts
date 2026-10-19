@@ -59,15 +59,36 @@ const EDIT_LABEL = permissionLabel('schedule.edit_reservation', 'Edit / move / c
 const RECORD_LABEL = permissionLabel('take_payment', 'Record a cash / check payment')
 const RING_LABEL = permissionLabel('pos.ring_sale', 'Ring sales')
 
+/**
+ * The four boxes of "that pair", in the words the Team page uses — so every
+ * refusal built on this rule names the same toggles (10/18 review: the deposit
+ * ask had copied the catalog read as well as the rule).
+ */
+export const SCHEDULE_AND_PAYMENT_LABELS = {
+  create: CREATE_LABEL, edit: EDIT_LABEL, record: RECORD_LABEL, ring: RING_LABEL,
+} as const
+
 type Who = Pick<AuthPayload, 'role' | 'permissions'> | null | undefined
 
-/** May this person take off the charges of a shortened stay? */
-export function mayVoidShortenedCharges(user: Who): boolean {
+/**
+ * "Anyone who can schedule reservations and take payments" (10/14, Nic) — the
+ * pair itself, with no act named: a reservation permission AND a way to take
+ * payments, and the owner always.
+ *
+ * ONE answer, wherever that pair is asked for. 10/18: the schedule's "Ask for
+ * the deposit" button asks for exactly this pair and had its own copy of the
+ * rule, including its own hardcoded list of owner roles — so the next change to
+ * who counts as an owner would have reached one of them and not the other.
+ */
+export function mayScheduleAndTakePayments(user: Who): boolean {
   if (!user) return false
   if (OWNER_ROLES.includes(user.role)) return true
   const holds = (key: string) => user.permissions?.[key] === true
   return SHORTENED_VOID_SCHEDULE_PERMISSIONS.some(holds) && SHORTENED_VOID_PAYMENT_PERMISSIONS.some(holds)
 }
+
+/** May this person take off the charges of a shortened stay? That pair, named for the act. */
+export const mayVoidShortenedCharges = mayScheduleAndTakePayments
 
 /** The words for somebody who may not take them off. */
 export const SHORTENED_VOID_REFUSAL =

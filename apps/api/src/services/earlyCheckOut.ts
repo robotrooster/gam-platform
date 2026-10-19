@@ -7,11 +7,32 @@
  *
  *   - they still owe for the stay → "Keep the price as booked" or "Charge only
  *     the nights stayed". The nights stayed are priced the way the stay was
- *     (scheduleStayPrice) and never cost more than the booked price (#38 Q7).
+ *     (priceNightsStayed: the cheapest of the ladder and, for a guest who has
+ *     been here whole months, those months plus a prorated share of the one
+ *     they left part-way into — 10/18) and never cost more than the booked
+ *     price (#38 Q7).
  *   - they paid more than the nights stayed are worth (even when that is less
  *     than the booked price, #38 Q1) → "No refund (keep the price as booked)",
  *     "Refund the unused nights ($X)" or "Refund a different amount" (up to
  *     what they paid; that is also how a full refund is done).
+ *
+ * 10/18 (Nic): BOTH OF THOSE ARE THE PROPERTY'S CALL. "the difference for the
+ * refund if the landlord does refunds at all at that property ... the only way
+ * it is different is for longer term people for rent pro ration. moving in or
+ * out at the middle of a month and also only if the landlord allows the pro
+ * rate. these should all be property level settings." So:
+ *   - a property with early_departure_refunds off is never asked the second
+ *     question at all: the price as booked stands, the desk is told so in
+ *     plain words (`noRefunds`), rent paid past the day they left stays on the
+ *     resident's account as money paid ahead, and the guest is still checked
+ *     out with their lease still ending that day. It does NOT change what a
+ *     guest who has not paid is charged — "charge only the nights stayed" is
+ *     pricing, not giving money back.
+ *   - a property with prorates_mid_month_rent off prices a departing
+ *     long-stay guest's last days straight off the ladder: a whole month is a
+ *     whole month.
+ * Both default to what every property did before the settings existed, so a
+ * landlord who answers nothing sees no change.
  *
  * A refund re-prices NOTHING — no new total, no recalculated lodging tax, no
  * fee of any kind (GAM has no per-stay fee) — and the stay closes with nothing
@@ -70,15 +91,19 @@ import type { PoolClient } from 'pg'
 import crypto from 'crypto'
 import {
   EARLY_CHECKOUT_CHOICES, EARLY_CHECKOUT_CHOICE_LABEL, EARLY_CHECKOUT_REFUND_CHOICES,
-  type EarlyCheckoutChoice, type StayRefundPartKind,
+  priceNightsStayed, type EarlyCheckoutChoice, type StayRefundPartKind,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn, addDaysTo } from '../lib/timezone'
-import { scheduleStayPrice, nightsBetween, stayTaxRate, taxInside, reservationDue, untaxedMonthStaySql } from './registerStay'
+import { nightsBetween, stayTaxRate, taxInside, reservationDue, untaxedMonthStaySql } from './registerStay'
 import { recordHeldItem } from './heldPayouts'
 import { recordBookingEvent } from './bookingEvents'
+// 10/18 (Nic): the property's two departure answers, read so a check-out works
+// whether or not migration 20261020120000 has landed on this database yet.
+// services/departureRules is the one place that knows.
+import { departureRuleSql } from './departureRules'
 
 type Q = Pick<PoolClient, 'query'>
 /** The pool, in the shape a quote reads with (outside any transaction). */
@@ -115,8 +140,13 @@ export interface StayRow {
   tax_pct: number; nightly: number | null; weekly: number | null; monthly: number | null
   /** 10/6: the first month of a 30+ night stay booked online — untaxed. */
   month_stay?: boolean
+  /** 10/18 (Nic): does this property give money back when someone leaves early? */
+  early_departure_refunds: boolean
+  /** 10/18 (Nic): does it prorate rent when a long-term resident moves in or out mid-month? */
+  prorates_mid_month_rent: boolean
   lease_id: string | null; lease_status: string | null; lease_end: string | null
 }
+
 
 export async function loadStay(q: Q, bookingId: string, opts: { lock?: boolean } = {}): Promise<StayRow | null> {
   if (!/^[0-9a-f-]{36}$/i.test(String(bookingId ?? ''))) return null
@@ -135,6 +165,8 @@ export async function loadStay(q: Q, bookingId: string, opts: { lock?: boolean }
             COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly,
             COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly,
             COALESCE(u.monthly_rate, p.monthly_rate)::float AS monthly,
+            ${departureRuleSql('early_departure_refunds')} AS early_departure_refunds,
+            ${departureRuleSql('prorates_mid_month_rent')} AS prorates_mid_month_rent,
             l.id AS lease_id, l.status AS lease_status, to_char(l.end_date, 'YYYY-MM-DD') AS lease_end
        FROM unit_bookings b
        JOIN units u ON u.id = b.unit_id
@@ -501,6 +533,13 @@ export interface Quote {
   waitsForRefund: string | null
   /** For staff without "Check guests out" on a guest who still owes: someone who can check guests out decides. */
   waitsForCheckOut: string | null
+  /**
+   * 10/18 (Nic): this property does not give money back when someone leaves
+   * early, and someone here paid more than the days they stayed are worth — so
+   * there is no question to answer. The plain sentence that says so; null
+   * whenever a refund was never in question.
+   */
+  noRefunds: string | null
   decision: DecisionView | null
   quoteToken: string
 }
@@ -545,6 +584,30 @@ export const waitsForRefundWords = (guest: string, extra: number) =>
   `${guest} paid ${money(extra)} more than the nights they stayed are worth. You can check them out now; `
   + 'what to do with that money waits on the stay for someone who can issue refunds, and the owner gets a to-do.'
 
+// 10/18 (Nic): "the difference for the refund IF THE LANDLORD DOES REFUNDS AT
+// ALL AT THAT PROPERTY." Where they do not, the desk is told plainly — in the
+// words a clerk can read to the guest — instead of being offered choices this
+// park does not honor, or shown a question with no answers in it.
+// 10/19 (review): "paid more than the nights stayed are worth" is not the same
+// as "paid in full" — a guest can be over against the days they used and still
+// short against the price as booked (a $589 month, 14 nights stayed worth
+// $572.16, $580 paid: $7.84 over, $9.00 still owed). Where that is so, the
+// sentence says the figure and does NOT tell the clerk the stay closes, because
+// it does not: the price as booked stands, and standing means the rest is still
+// owed.
+export const noStayRefundWords = (guest: string, extra: number, booked: number, stillOwed = 0) =>
+  `${guest} paid ${money(extra)} more than the nights they stayed are worth, but this property does not `
+  + `give money back when a guest leaves early — so nothing goes back and the price as booked, ${money(booked)}, `
+  + 'stands. '
+  + (stillOwed > 0.005
+    ? `${money(stillOwed)} of that price is still owed and stays on the stay after they are checked out.`
+    : 'Check them out and the stay closes.')
+  + ' The property\'s settings are where that changes.'
+export const noLeaseRefundWords = (guest: string, ahead: number) =>
+  `${guest} had paid ${money(ahead)} of rent past the day they left. This property does not give money back `
+  + 'when someone leaves early, so it stays on their account as money paid ahead and pays their final bill '
+  + 'first. The property\'s settings are where that changes.'
+
 /**
  * The money question for checking this stay out on `leftOn` (default: the
  * property's today) — or, for a stay already checked out whose question is
@@ -582,7 +645,26 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
   // What the nights stayed are worth: priced the way the stay was, never more
   // than the booked price (#38 Q7). A site with no rate to price them leaves
   // the booked price.
-  const priced = early ? scheduleStayPrice({ nightly: s.nightly, weekly: s.weekly, monthly: s.monthly }, s.tax_pct, s.check_in, stayedOut).total : B
+  //
+  // 10/18 (Nic): "if somebody stays for, I don't know, six months or so, and
+  // they're at the monthly rate, when they go to move out, I want that
+  // prorated amount to be divided by the 30 days or whatever ... not
+  // calculated off the weekly rate. Because I don't want to do that to people
+  // that are, you know, long-term good customers." So the days a guest who has
+  // been here whole months actually stayed are those months plus a PRORATED
+  // share of the one they left part-way into, whenever that comes to less than
+  // the ladder's weeks and nights (shared priceNightsStayed). A stay that
+  // never reached a whole month prices exactly as it did.
+  //
+  // 10/18 (Nic, same answer): "moving in or out at the middle of a month and
+  // also only if the landlord allows the pro rate. these should all be property
+  // level settings." A guest months in who leaves part-way through another month
+  // IS that case, so this tail is the property's call. A park that says a whole
+  // month is a whole month gets the ladder, untouched.
+  const priced = early
+    ? priceNightsStayed({ nightly: s.nightly, weekly: s.weekly, monthly: s.monthly }, s.tax_pct, s.check_in, stayedNights,
+        { proratesMidMonth: s.prorates_mid_month_rent }).total
+    : B
   let S = early && priced > 0 ? round2(Math.min(priced, B)) : B
 
   const isLease = !!s.lease_id
@@ -592,16 +674,40 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
   let question: Quote['question'] = 'none'
   let unused = 0
   let maxRefund = 0
+  // 10/18 (Nic): where the property does not give money back, the overpaid
+  // question is never RAISED — so nothing waits on the stay, no owner to-do is
+  // made, and the decide path refuses a refund choice on its own (the answers
+  // it accepts come from this question).
+  //
+  // A question ALREADY OPEN is a different thing and is never retracted: it was
+  // asked while the property did give money back, or by a clerk without "Issue
+  // refunds" on a stay that was then answered No. Turning the setting off must
+  // not strand money GAM already told the owner to decide, so that question
+  // stays answerable — with its REAL figures, and with "No refund" as the only
+  // answer, since this park gives nothing back (maxRefund 0). The owner clears
+  // their to-do, no money moves, and nothing on screen reads $0.00 beside a
+  // sentence quoting what the guest actually overpaid (10/19 review: it did).
+  const givesMoneyBack = s.early_departure_refunds
+  const questionOpen = d?.status === 'pending'
+  let noRefunds: string | null = null
 
   if (isLease) {
     // #38 Q8: the check-out ends the lease that day; rent paid past it becomes
     // money paid ahead, and THAT gets the refund choices.
     sources = await leaseSources(q, s)
     if (!checkedOut) {
+      // 10/19 (review): the last sentence is the property's answer, not a
+      // promise. At a park that gives no money back the very next screen says
+      // the opposite (noLeaseRefundWords), and the clerk had already read the
+      // guest a refund that was never coming.
       lease = {
         id: s.lease_id!, endsOn: stayedOut,
         words: `Checking ${guest === 'This guest' ? 'them' : guest} out ends their lease on ${longDay(stayedOut)}, the day they left, `
-          + 'and their final bill is made. Rent already paid past that day can be refunded next.',
+          + 'and their final bill is made. '
+          + (givesMoneyBack
+            ? 'Rent already paid past that day can be refunded next.'
+            : 'Rent already paid past that day stays on their account as money paid ahead and pays that bill first — '
+              + 'this property does not give money back when someone leaves early.'),
       }
       P = round2(sources.reduce((a, x) => a + x.paid, 0))
       S = P
@@ -611,10 +717,20 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
       P = fromDecision ? d!.paid : ahead.total
       S = 0
       if (!fromDecision && ahead.total > 0.005) {
-        question = 'overpaid'
-        unused = ahead.total
-        // Never more than the rent payments it came from can take back.
-        maxRefund = round2(Math.min(ahead.total, sources.reduce((a, x) => a + x.refundable, 0)))
+        if (!givesMoneyBack) {
+          // It stays on their account as money paid ahead, which is where it
+          // already is — and pays their final bill first.
+          noRefunds = noLeaseRefundWords(guest, ahead.total)
+          // A question already open stays answerable, "No refund" its only
+          // answer — otherwise the pending row and the owner's to-do could
+          // never be cleared by anybody (10/19 review).
+          if (questionOpen) { question = 'overpaid'; unused = ahead.total; maxRefund = 0 }
+        } else {
+          question = 'overpaid'
+          unused = ahead.total
+          // Never more than the rent payments it came from can take back.
+          maxRefund = round2(Math.min(ahead.total, sources.reduce((a, x) => a + x.refundable, 0)))
+        }
       }
     }
   } else {
@@ -638,16 +754,25 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
     if (d?.status === 'decided') { S = d.stayed_worth }
     if (early && B > 0 && !(d?.status === 'decided')) {
       if (P > S + 0.005) {
-        question = 'overpaid'
-        unused = round2(P - S)
-        maxRefund = round2(sources.reduce((a, x) => a + (x.kind === 'unrecorded' ? 0 : x.refundable), 0))
+        const extra = round2(P - S)
+        if (!givesMoneyBack) {
+          // The price as booked stands. What they paid stays with the landlord;
+          // anything still short of the booked price stays owed, and the
+          // sentence says so (noStayRefundWords takes the figure).
+          noRefunds = noStayRefundWords(guest, extra, B, round2(Math.max(0, B - P)))
+          if (questionOpen) { question = 'overpaid'; unused = extra; maxRefund = 0 }
+        } else {
+          question = 'overpaid'
+          unused = extra
+          maxRefund = round2(sources.reduce((a, x) => a + (x.kind === 'unrecorded' ? 0 : x.refundable), 0))
+        }
       } else if (S < B - 0.005) {
         question = 'owes'
       }
     }
     // A question the PATCH (or a check-out without "Issue refunds") left
     // pending keeps the figures it was asked on.
-    if (d?.status === 'pending' && question === 'none') question = d.question
+    if (questionOpen && question === 'none') question = d!.question
   }
 
   const owedAsBooked = isLease ? 0 : round2(Math.max(0, B - P))
@@ -691,6 +816,11 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
   }
 
   const view = await decisionView(q, d)
+  // 10/18: both departure settings are already inside this hash through the
+  // figures they move — turning refunds off takes `question` from 'overpaid' to
+  // 'none', and turning proration off changes S — so a window opened before the
+  // landlord answered differently is refused with the fresh numbers, the same
+  // as any other change under it. Named here so nobody has to re-derive that.
   const token = crypto.createHash('sha256').update(JSON.stringify([
     s.status, s.check_in, s.check_out, s.sold_check_out, B, S, P, leftOn, question, unused, maxRefund,
     sources.map((x) => [x.key, x.refundable]), d ? [d.id, d.status] : null,
@@ -704,7 +834,7 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
     paid: P, owedAsBooked, lease,
     sources: sources.map((x) => ({ key: x.key, kind: x.kind, label: x.label, paid: x.paid, refundable: x.refundable })),
     question, unused, maxRefund, choices, canRefund: opts.canRefund, canCheckOut, waitsForRefund, waitsForCheckOut,
-    decision: view, quoteToken: token,
+    noRefunds, decision: view, quoteToken: token,
   }
 }
 
@@ -712,6 +842,15 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
 export async function previewRefund(q: Q, bookingId: string, amount: number): Promise<{ parts: ChoiceView['refund'] }> {
   const s = await loadStay(q, bookingId)
   if (!s) throw new AppError(404, 'That reservation is not on the schedule any more.')
+  // 10/18 (Nic): a park that does not give money back is never shown a refund
+  // to type into. The screen offers no such choice there, so reaching this is a
+  // stale window or a hand-made call — and quoting a figure a clerk could read
+  // to a guest, for a refund the decide path will refuse, is worse than saying
+  // so now.
+  if (!s.early_departure_refunds) {
+    throw new AppError(409, 'This property does not give money back when someone leaves early, '
+      + 'so there is nothing to refund. Close this window and check them out — the price as booked stands.')
+  }
   const sources = s.lease_id ? await leaseSources(q, s) : await staySources(q, s)
   const parts = planRefund(sources, amount)
   return { parts: { amount: round2(amount), cost: landlordCostWords(parts),
@@ -1090,6 +1229,15 @@ export async function decideEarlyCheckOut(input: DecideInput): Promise<DecideRes
       decisionId = r.decisionId
       closedLinks = r.closedLinks
       handBack = r.handBack
+    } else if (!s.lease_id && quote.noRefunds) {
+      // 10/19 (review): where the property gives no money back there is no
+      // question and so no decision, which means syncPaidFlags — the one thing
+      // that stops the stay's paid flags counting money a register refund
+      // already sent back — never ran. The price as booked STANDS at this
+      // property, so whatever is still short of it has to be askable at the
+      // counter and on a pay link. It does nothing unless the flags really do
+      // claim more than is still with the landlord.
+      await syncPaidFlags(client, s.id, quote)
     }
     await client.query('COMMIT')
   } catch (e) {
@@ -1438,6 +1586,24 @@ async function syncPaidFlags(client: PoolClient, bookingId: string, quote: Quote
             balance_paid_at = CASE WHEN $2::numeric >= COALESCE(total_amount, 0) - 0.005 THEN balance_paid_at ELSE NULL END,
             updated_at = NOW()
       WHERE id = $1`, [bookingId, quote.paid.toFixed(2)])
+}
+
+/**
+ * syncPaidFlags on its own connection, for a check-out that reached here
+ * outside a transaction (the booking PATCH). Best-effort: the check-out stands
+ * either way and the next quote asks again; a failure is logged, never silent.
+ */
+async function keepNoRefundFlagsHonest(bookingId: string, quote: Quote): Promise<void> {
+  const c = await getClient()
+  try {
+    await c.query('BEGIN')
+    await syncPaidFlags(c, bookingId, quote)
+    await c.query('COMMIT')
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => {})
+    logger.error({ err, bookingId },
+      '[early-checkout] could not put the stay\'s paid flags in step at a property that gives no money back')
+  } finally { c.release() }
 }
 
 /** Stamp the stay billed and paid in full (nothing left for the register or the arrival-day bill). True when this stamped it. */
@@ -2367,6 +2533,10 @@ export async function afterPatchEarlyCheckOut(bookingId: string, actorUserId: st
   // and the owner) and tried again by healLeaseEnd; the response says so.
   if (s.lease_id && !(await endLeaseOnLeftDay(bookingId))) return LEASE_NOT_ENDED_WORDS
   const quote = await quoteEarlyCheckOut(poolQ, bookingId, { canRefund: true })
+  // 10/19 (review): the same repair the window's path makes — a property that
+  // gives no money back raises no question here either, and the flags would
+  // keep counting money a register refund already sent back.
+  if (!s.lease_id && quote.noRefunds) await keepNoRefundFlagsHonest(bookingId, quote)
   if (quote.question === 'none' || quote.decision) return null
   const c = await getClient()
   let created = false

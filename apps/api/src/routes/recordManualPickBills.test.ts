@@ -15,8 +15,10 @@
  *      unless the property takes part payments;
  *   3. within one space the oldest bill is paid first (October waits for
  *      September); different spaces are independent;
- *   4. credit pays only the bills picked, and a space's own credit never pays
- *      another space's bill;
+ *   4. credit pays only the bills picked. 10/18 (Nic): a credit the landlord
+ *      GAVE pays whichever of them it is asked to — it is the household's,
+ *      whatever space it was issued on — while money the tenant PAID AHEAD
+ *      still pays only the space they paid it for;
  *   5. money kept over the bills picked stays on that space.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
@@ -296,14 +298,24 @@ describe('credit pays only the bills picked', () => {
     expect(await usesOn([...b.rv34Sep.ids, ...b.rv34Oct.ids, ...b.rv35Oct.ids])).toBe('0')
   })
 
-  it('credit tied to one space never pays the other space\'s bill — two spaces, two households', async () => {
+  // 10/18 (Nic): a credit the landlord gave is the household's — the space it
+  // was issued on records where he gave it, not a fence — so it is offered on
+  // whichever picked bill. Money the tenant paid ahead is not: they paid it for
+  // that space (10/17).
+  it('a credit the landlord gave is offered on either space\'s picked bill; money paid ahead stays on its own space', async () => {
     const s = await stack()
     const b = await billysBills(s)
     await issueCredit({ landlordId: s.landlordId, tenantId: s.tenantId, leaseId: s.rv34.leaseId, amount: 50, category: 'goodwill', reason: 'test' })
-    const rv35 = (await quote(s, b.rv35Sep.ids[0], [b.rv35Sep.invoiceId])).body.data
-    expect(rv35.creditAvailable).toBe(0)
-    const rv34 = (await quote(s, b.rv35Sep.ids[0], [b.rv34Sep.invoiceId])).body.data
-    expect(rv34.creditAvailable).toBe(50)
+    expect((await quote(s, b.rv35Sep.ids[0], [b.rv35Sep.invoiceId])).body.data.creditAvailable).toBe(50)
+    expect((await quote(s, b.rv35Sep.ids[0], [b.rv34Sep.invoiceId])).body.data.creditAvailable).toBe(50)
+
+    // The same $50 as money paid ahead on RV 34: RV 35's bill cannot touch it.
+    await db.query(`UPDATE tenant_credits SET status = 'void', voided_at = now() WHERE tenant_id = $1`, [s.tenantId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1,$2,50,50,'landlord', now())`, [s.rv34.leaseId, s.tenantId])
+    expect((await quote(s, b.rv35Sep.ids[0], [b.rv35Sep.invoiceId])).body.data.creditAvailable).toBe(0)
+    expect((await quote(s, b.rv35Sep.ids[0], [b.rv34Sep.invoiceId])).body.data.creditAvailable).toBe(50)
   })
 })
 

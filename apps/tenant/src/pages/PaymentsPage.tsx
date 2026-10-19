@@ -621,13 +621,19 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           {other > 0 && (
             <CreditKindRow label="Credit from your landlord" amount={other} />
           )}
-          {/* S655 (Nic, 10/2): other credit is the tenant's to use or save — it
-              pays a bill by itself only when it covers the whole bill. 10/6
-              (Nic): money paid ahead goes on the balance by itself, whole or in
-              part, oldest bill first. */}
+          {/* 10/6 (Nic): money paid ahead goes on the balance by itself, whole
+              or in part, oldest bill first. 10/15 (Nic): so does credit from
+              the landlord — credit never sits on an account while they still
+              owe, so the old "only when it covers a whole bill" line was wrong
+              from that day. 10/18 (Nic): and WHICH BILL differs by the kind of
+              money, which is a promise to the payer, so the page says it:
+              money they paid ahead stays with the space they paid it for, a
+              credit from the landlord crosses every space, and interest on a
+              deposit goes back with that deposit. */}
           <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
-            {prepaid > 0 ? 'Money you paid ahead goes on your bill by itself, oldest bill first. ' : ''}
-            {interest > 0 || other > 0 ? 'Other credit you can use when you pay; it is applied by itself only when it covers a whole bill.' : ''}
+            {prepaid > 0 ? 'Money you paid ahead goes on your bill by itself, oldest bill first, and stays with the space you paid it for. ' : ''}
+            {other > 0 ? 'Credit from your landlord goes on your balance by itself too, oldest bill first — across every space you rent from them. ' : ''}
+            {interest > 0 ? 'Interest on your deposit stays with that space, and comes back to you with that deposit.' : ''}
           </div>
         </div>)
       })()}

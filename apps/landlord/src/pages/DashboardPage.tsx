@@ -10,6 +10,11 @@ import { PropertySelect } from '../components/ListControls'
 // and the property-health card show Charged, Received and Owed side by side.
 import {
   moneyCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
+  // 10/18 (Nic): the health block's own figures, printed as the subtraction
+  // they are, and the words that keep the money table beside them from reading
+  // as its parts (see the helper for the Mountain View figures).
+  rentHealthFigures, allMoneyHeading, moneyColumns,
+  MONEY_COLUMNS_DO_NOT_SUBTRACT, HEALTH_TRACE_NOTE,
   activeCategories, categoryLabel, categoryThree, sumThree, reportErrorText, monthToDate,
   type IncomeCardData, type CategoryRow, type RentHealthData,
 } from '../lib/incomeBasis'
@@ -75,14 +80,26 @@ interface DashStats {
    * sides, a bill paid once settled whatever settled it. Its `owed` is this
    * month's RENT left to collect, which is NOT the Outstanding card's figure
    * (every open charge, every month) — the note under the card says so.
+   * 10/18: the Outstanding card really does count every open charge now; it
+   * summed unpaid invoice balances, which dropped the late fees (routes/landlords).
    */
   rentHealth?: RentHealthData
-  /** S655 (decision #4): this month's income by category — the property report's own totals. */
+  /**
+   * S655 (decision #4): this month's income by category — the property
+   * report's own totals. A DIFFERENT question from rentHealth above: every kind
+   * of money, not just rent, and its Owed column is what tenants still owed at
+   * the END of the month, every bill of every month included once the company's
+   * books are live (`source` says which words the columns get). 10/18 (Nic):
+   * the card says all of that on screen, because $26,211.02 charged beside
+   * $19,483.98 received beside $9,683.87 owed reads as a subtraction and is not
+   * one.
+   */
   propertyHealth?: {
     period: string
     categories: CategoryRow[]
     lines: Array<{ line: string; label: string; amount: number }>
     total: number
+    source?: 'ledger' | 'records'
   }
   trend?: TrendMonth[]
 }
@@ -354,7 +371,14 @@ export function DashboardPage() {
           </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
-          <div className="kpi-label">This month</div>
+          {/* 10/18 (Nic): the label says what the card covers. Three figures in
+              a row read as a subtraction, and these do not subtract: Received is
+              money on the day it arrived, Charged is this month's bills, Owed is
+              what is still unpaid of them. The notes under them say how Charged
+              ties; Reports labels each figure separately ("Received this month",
+              "Owed of this month's bills") and this card had only "This month"
+              for all three, beside a rent percentage that counts neither. */}
+          <div className="kpi-label">This month — every kind of money</div>
           {/* 10/12 (Nic): Charged, Received and Owed side by side, from the same
               facts as Reports. S642 (Nic): money in flight is shown — still
               clearing, never inside Received. */}
@@ -373,8 +397,18 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
-          {/* S650 (Nic): no small print about work-trade balances here. */}
-          <div className="kpi-sub">unpaid invoice balances</div>
+          {/* S650 (Nic): no small print about work-trade balances here.
+              10/18 (Nic): "outstanding in the top KPI card only shows $1,415"
+              — beside a block counting this month's rent and a table counting
+              the balance at month end. It says which months it covers now, the
+              way Reports does ("every month still owed").
+              It also says WHAT it covers, because that changed with it: the
+              figure was unpaid INVOICE balances, which left out every accrued
+              late fee (they sit outside invoices.total_amount by design), and
+              it now reads the one shared open-charge rule the balances page
+              this card opens reads — the words RENT_HEALTH_SCOPE_NOTE already
+              uses of this card, "every open charge of every month". */}
+          <div className="kpi-sub">every open charge, every month</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
         <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>
@@ -801,8 +835,12 @@ function PropertyHealthMonitor({ months, health, thisMonth, stale }: {
   // which read held rent as owed and credit-paid rent as unpaid. Red → green →
   // gold (no amber — it'd read as the gold at a glance).
   const rate = rentBillsPaidRate(health)
-  const pct = rate == null ? null : Math.round(rate * 100)
   const hs = healthStatus(rate)
+  // 10/18 (Nic): the same two figures the percentage divides, as the figures
+  // and the subtraction under the meter — one helper, so the meter and the
+  // numbers beneath it cannot come apart. The meter reads its percentage off
+  // the same block rather than rounding the rate a second time.
+  const healthFigs = rentHealthFigures(health, fmt)
   const status = {
     label: HEALTH_STATUS_LABEL[hs],
     color: hs === 'full' ? 'var(--gold)' : hs === 'healthy' ? 'var(--green)' : hs === 'attention' ? 'var(--red)' : 'var(--text-3)',
@@ -836,7 +874,7 @@ function PropertyHealthMonitor({ months, health, thisMonth, stale }: {
         {hoverIdx == null ? (
           <div className="phm-readout">
             <span className="phm-readout-label">rent bills paid · this month</span>
-            <span className="phm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
+            <span className="phm-readout-value" style={{ color: status.color }}>{healthFigs ? `${healthFigs.pct}%` : '—'}</span>
           </div>
         ) : (
           <div className="phm-tip" style={{ left: `clamp(62px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 62px))` }}>
@@ -887,26 +925,62 @@ function PropertyHealthMonitor({ months, health, thisMonth, stale }: {
           {data.map((m, i) => <span key={i}>{m.month}</span>)}
         </div>
       </div>
-      {/* 10/17: the parts of the percentage, so it can be checked by eye. It
-          names THIS MONTH'S RENT on purpose: the Outstanding card above counts
-          every open charge of every month, so the two are different numbers
-          answering different questions and must not read as one claim.
-          Work trade is named without a figure — S650 keeps work-trade balances
-          off these cards, and Nic's rule is only that it stays out until an
-          invoice really generates. */}
-      {health && Number(health.invoiced) > 0 && (
-        <div className="phm-health-note">
-          {fmt(health.paid)} of {fmt(health.invoiced)} in this month's rent bills paid
-          {Number(health.owed) ? `, ${fmt(health.owed)} of it left to collect` : ''}.
-          {Number(health.workTradeHeld)
-            ? ' Rent covered by work trade is not counted here — it is not billed unless the hours fall short.'
-            : ''}
+      {/* 10/18 (Nic): "we're showing only 19,483 for October versus 20,298 for
+          September. I have had more people come in this month and pay this
+          month than last month." Both figures are the money that ARRIVED that
+          month, every kind — October really is lower, because work-trade rent
+          never arrives as money, $1,415 is still owed, and money paid in late
+          September for October's bills counted in September. The beats said
+          none of that while a rent percentage sat on top of them, so the trace
+          says what it is. */}
+      <div className="phm-trace-note">{HEALTH_TRACE_NOTE}</div>
+      {/* ── 10/18 (Nic): THE THREE FIGURES UNDER THE METER TIE ─────────────
+          "$26,211.02 minus the received calculation of 19,483.98 in no way
+           close equals 9,683.87. You're pulling numbers from different spots
+           here. So that is a huge problem for a landlord to see incorrect
+           numbers."
+          Invoiced, paid and still owed, all three off the one helper the
+          percentage divides, so the subtraction a landlord does by eye comes
+          out — and it is printed, with the percentage, rather than left to be
+          done. It names THIS MONTH'S RENT on purpose: the Outstanding card
+          above counts every open charge of every month. Work trade is named
+          without a figure — S650 keeps work-trade balances off these cards,
+          and Nic's rule is only that it stays out until an invoice really
+          generates. */}
+      {healthFigs && (
+        <div className="phm-health">
+          <div className="phm-health-figs">
+            {healthFigs.figures.map(f => (
+              <div key={f.key}>
+                <span className="phm-health-fig-label">{f.label}</span>
+                <span className={`phm-health-fig-value${f.key === 'owed' && f.amount ? ' amber' : ''}`}>
+                  {fmt(f.amount)}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="phm-health-note">{healthFigs.tieText} · {healthFigs.rateText}.</div>
+          <div className="phm-health-note">{healthFigs.scopeNote}</div>
+          {healthFigs.workTradeNote && <div className="phm-health-note">{healthFigs.workTradeNote}</div>}
         </div>
       )}
+      {/* ── 10/18 (Nic): THIS TABLE SAYS WHAT IT ANSWERS ──────────────────
+          The figures were right and silent. Charged is the month's bills of
+          EVERY kind (work-trade-held bills included — the books charge them on
+          their due day), Received is money on the day it arrived whatever month
+          it was billed for, and Owed, on the books, is what tenants still owed
+          at the END of the month: every bill of every month, which is why
+          Mountain View reads $9,683.87 against $1,415 of October rent. Three
+          figures in a row invite a subtraction, so the heading names the
+          window, a line says they do not subtract, and each column carries the
+          shared plain words every report prints (@gam/shared
+          MONEY_COLUMN_NOTE / MONEY_COLUMN_NOTE_LEDGER — the same sentences on
+          Reports, so the two pages cannot describe one column two ways). */}
       {(cats.length > 0 || otherLines.length > 0) && (
         <div className="phm-cats">
+          <div className="phm-cats-title">{allMoneyHeading(thisMonth?.period)}</div>
           <div className="phm-cats-head phm-cats-three">
-            <span>This month by category</span>
+            <span>By category</span>
             <span>{MONEY_COLUMN_LABEL.received}</span>
             <span>{MONEY_COLUMN_LABEL.charged}</span>
             <span>{MONEY_COLUMN_LABEL.owed}</span>
@@ -933,10 +1007,34 @@ function PropertyHealthMonitor({ months, health, thisMonth, stale }: {
             <span>{fmt(catTotals.charged)}</span>
             <span>{fmt(catTotals.owed)}</span>
           </div>
+          <div className="phm-cats-notes">
+            <div className="phm-health-note">{MONEY_COLUMNS_DO_NOT_SUBTRACT}</div>
+            {moneyColumns(thisMonth?.source === 'ledger').map(c => (
+              <div key={c.key} className="phm-health-note">
+                <strong>{c.label}</strong> — {c.note}
+              </div>
+            ))}
+          </div>
         </div>
       )}
       <style>{`
         .phm-cats-three { display: grid !important; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 6px; }
+        /* 10/18: the health block and the money table's own words. Kept here,
+           beside .phm-cats-three, because they are this card's alone — the
+           shared financial stylesheet (financials/reports-basis.css) is a
+           by-hand copy in two apps, and a rule only the dashboard draws has no
+           business being kept in sync in two places. */
+        .phm-trace-note { font-size: .66rem; color: var(--text-3); margin-top: 6px; }
+        .phm-health { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-0); }
+        .phm-health-figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 6px; }
+        .phm-health-figs > div { display: flex; flex-direction: column; min-width: 0; }
+        .phm-health-fig-label { font-size: .6rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; }
+        .phm-health-fig-value { font-family: var(--font-mono); font-size: 1.02rem; font-weight: 700; color: var(--text-0); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .phm-health-fig-value.amber { color: var(--amber); }
+        .phm-cats-title { font-size: .72rem; font-weight: 700; color: var(--text-2); padding-top: 10px; border-top: 1px solid var(--border-0); }
+        .phm-cats-title + .phm-cats-head { margin-top: 8px; }
+        .phm-cats-notes { margin-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+        .phm-cats-notes strong { color: var(--text-2); font-weight: 600; }
         .dash-three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 4px 0 2px; }
         .dash-three > div { display: flex; flex-direction: column; min-width: 0; }
         .dash-three-label { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; }

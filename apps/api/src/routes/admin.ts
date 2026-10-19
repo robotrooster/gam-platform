@@ -2203,6 +2203,29 @@ adminRouter.get('/metrics/census/:level', requireSuperAdmin, async (req, res, ne
   } catch (e) { next(e) }
 })
 
+// GET /api/admin/metrics/elections/:level — 10/18 (Nic): the election results
+// the Metrics map's lean overlay colors an area by ("the overlay to show which
+// way those certain districts vote, and where our strong areas tend to be in
+// Democratic areas or Republican areas"). Official county returns, cut into
+// one file per map level and kept in apps/api/elections
+// (services/platformElections). Only the county level has one — results are
+// published county by county, and the page says so plainly at every other
+// level rather than carrying a district margin nobody reported. Behind the
+// same login as the Metrics page — never on a public site or a CDN
+// (gam-nothing-public-rule). Fetched once per level, the first time the
+// overlay is turned on there; cached a day by the browser.
+adminRouter.get('/metrics/elections/:level', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readElections } = await import('../services/platformElections')
+    const file = await readElections(req.params.level, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There are no election results for that map level.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
+  } catch (e) { next(e) }
+})
+
 // GET /api/admin/metrics/lifetime — 10/13 (Nic): the Metrics page's money
 // billed and collected (rent, each utility, GAM's platform fees), tenants ever
 // on GAM, the landlords' default rate through GAM (by rent range) and ages.

@@ -2,7 +2,8 @@ import { Router } from 'express'
 // 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
 import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
 import { z } from 'zod'
-import { collectedRentMtd, incomeCardFrom, rentHealthMtd } from '../lib/rentCollected'
+// 10/18: Outstanding is ONE helper shared with the dashboard card — see below.
+import { collectedRentMtd, incomeCardFrom, rentHealthMtd, outstandingBalanceOf } from '../lib/rentCollected'
 import {
   occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, MAINTENANCE_CATEGORY_LABEL,
   MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, MONEY_COLUMN_NOTE_LEDGER, MONTHLY_REPORT_MAX_EXTRA_EMAILS,
@@ -436,7 +437,9 @@ reportsRouter.get('/ledger-status', async (req, res, next) => {
 //                      the same money as `outstanding`, which counts every
 //                      open charge of every month while this is the month's
 //                      rent; see rentHealthMtd.
-//   outstanding      — sum of unsettled invoice amounts (pending + partial)
+//   outstanding      — every open charge of every month, the one shared rule
+//                      (lib/rentCollected outstandingBalanceOf), the same
+//                      figure the dashboard's Outstanding card shows. 10/18.
 //   occupancyRate    — round(100 × active / total) across landlord's units
 //   monthly[]        — last 6 months: charged / received / owed and the net
 //                      on each (10/12), collected (= received), rent,
@@ -574,23 +577,31 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     const collectedMtd = basis === 'received' ? rentCard.collected : rentCard.billed.collected
     const collectedMtdClearing = basis === 'received' ? rentCard.inFlight : rentCard.billed.clearing
 
-    // Outstanding = invoice total minus settled payments matched to that invoice.
-    // pending|partial invoices only — settled invoices net to zero.
-    // S640 (Nic): work-trade charges are suspended, not owed — they settle in
-    // hours at month close. Netted here for the same reason as on the dashboard
-    // and the balances page: this figure and those two are the same claim about
-    // the same money, and Reports is where a landlord goes to check the others.
-    const OUTSTANDING_PAID = `
-              SELECT invoice_id,
-                     SUM(amount) FILTER (WHERE status IN ('settled', 'processing')) AS paid,
-                     SUM(amount) FILTER (WHERE status NOT IN ('settled', 'processing')
-                                           AND work_trade_suspended_at IS NOT NULL) AS traded
-                FROM payments WHERE invoice_id IS NOT NULL
-               GROUP BY invoice_id`
-    // S654: suspended lines sit OUTSIDE total_amount (the S634 shape, every
-    // writer); subtracting `traded` again clamped a partly covered bill to $0.
-    const OUTSTANDING_SUM =
-      `COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0), 0)), 0)::numeric AS amount`
+    // ── 10/18 (Nic): THIS CARD AND THE DASHBOARD'S ARE ONE FIGURE ─────────
+    //
+    //   "You're pulling numbers from different spots here. So that is a huge
+    //    problem for a landlord to see incorrect numbers."
+    //
+    // This card ("Outstanding Balance / every month still owed") and the
+    // dashboard's Outstanding card answer the same question, and the dashboard
+    // card is where a landlord lands before clicking through to here. Each used
+    // to sum its own copy of the same defective SQL — an invoice's total_amount
+    // less what was paid against it — which drops every accrued late fee and
+    // takes a settled one off a total it was never in. Measured read-only
+    // against production 10/18, the two cards would have printed $13,070.08 and
+    // $11,970.08 under the same words.
+    //
+    // One helper now, read by both: lib/rentCollected outstandingBalanceOf,
+    // which reads the ONE shared open-charge rule (services/openBalances) that
+    // the balances page this card opens, the tenant portal, Pay Now, the 7am
+    // overdue digest and the agents already read. The defect in dollars, what
+    // the rule leaves out, and why GAM's own fees are not a landlord's
+    // receivable are all written there.
+    //
+    // A bookkeeper's cutoffs ride along (10/12: a former property's bills due
+    // by the day they left); the dashboard passes none, because that endpoint
+    // is the account owner's and an admin's.
+    //
     // decisions #25 (Nic, 10/3): a GRAND TOTAL of what everyone owes is for
     // account owners and property managers only — left out of the reply for
     // anyone else (front desk / on-site staff with "View all payments"), not
@@ -601,23 +612,8 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     // card would say nobody owes anything. The card is left out for them.
     const keepsNoPropertyMoney = req.user!.role === 'bookkeeper' && Array.isArray(scopedIds) && scopedIds.length === 0
     const showOutstanding = seesTotals && !keepsNoPropertyMoney
-    const outstandingRow = !showOutstanding ? null : isAdmin
-      ? await queryOne<any>(`
-          SELECT ${OUTSTANDING_SUM}
-            FROM invoices i
-            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
-           WHERE i.status IN ('pending', 'partial')
-        `)
-      : await queryOne<any>(`
-          SELECT ${OUTSTANDING_SUM}
-            FROM invoices i
-            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
-           WHERE i.landlord_id = ANY($1::uuid[]) AND i.status IN ('pending', 'partial')
-             AND ($2::uuid[] IS NULL OR i.unit_id IN (SELECT id FROM units WHERE property_id = ANY($2::uuid[])))
-             -- 10/12: a bookkeeper's former property: its bills due by the day it left.
-             AND ${withinCutoffsSql('(SELECT ou.property_id FROM units ou WHERE ou.id = i.unit_id)', 'i.due_date', '$3')}
-        `, [landlordIds, scopedIds, cutoffsParam(cutoffs)])
-    const outstanding = parseFloat(outstandingRow?.amount ?? '0')
+    const outstanding = !showOutstanding ? 0
+      : (await outstandingBalanceOf(isAdmin ? null : landlordIds, scopedIds, { cutoffs })).outstanding
 
     // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
     // bookings as well" — and excludes service points, which are a neighbor's

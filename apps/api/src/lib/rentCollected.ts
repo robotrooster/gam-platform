@@ -36,6 +36,10 @@ import { query } from '../db'
 import { todayIn, monthStartOf } from './timezone'
 import { incomeEvents, summarize, ledgerOwedDay, landlordIncomeSql, type IncomeEvent } from '../services/incomeBasis'
 import { withinCutoffsSql, cutoffsParam, type PropertyCutoff } from './bookkeeperScope'
+// 10/18: the ONE rule for what is owed, row by row off the charges — the same
+// fragments the balances page, the tenant portal, Pay Now, the 7am overdue
+// digest and the agents read (services/openBalances).
+import { openBalanceSql, openAmountSql, workTradeOpenRowSql } from '../services/openBalances'
 
 /** Rent the tenant has SENT — landed, or debited and still clearing. */
 export const RENT_RECEIVED_STATUSES = ['settled', 'processing', 'paid_via_deposit'] as const
@@ -298,4 +302,110 @@ export async function rentHealthMtd(
   const invoiced = round2(Number(r?.invoiced ?? 0))
   const paid = round2(Number(r?.paid ?? 0))
   return { invoiced, paid, owed: round2(invoiced - paid), workTradeHeld: round2(Number(r?.work_trade_held ?? 0)) }
+}
+
+// ─── What residents still owe, one definition ────────────────────────────────
+
+/**
+ * 10/18 (Nic): "You're pulling numbers from different spots here. So that is a
+ * huge problem for a landlord to see incorrect numbers."
+ *
+ * The Outstanding figure, read ONCE for both screens that print it: the
+ * dashboard's Outstanding card (routes/landlords) and the Reports page's
+ * Outstanding Balance card (routes/reports). Both labeled it "every month
+ * still owed", both kept their own copy of the SQL, and both copies were the
+ * same defective sum — an invoice's total_amount less what was paid against
+ * that bill.
+ *
+ * A late fee is kept OUT of total_amount on purpose: the trigger
+ * fn_invoice_late_fee_subtotal_rollup_single carries it in subtotal_late_fees
+ * beside the total, and workTradeCoverage.BILL_TOTAL_SQL leaves type='late_fee'
+ * out of the total every writer computes. So both cards dropped every accrued
+ * late fee, and worse, still counted a PAID late fee on the paid side, taking
+ * it off a total it had never been in. Measured read-only against production
+ * 10/18: Mountain View $1,415.00 -> $1,685.00, Country Acres $2,200.65 ->
+ * $2,450.65, Oak Park $8,354.43 -> $8,934.43 — $1,100 of real money a landlord
+ * could not see, and the two cards are one figure again.
+ *
+ * So it stops summing invoices. It reads the ONE shared rule, row by row off
+ * the charges (openBalanceSql / openAmountSql), which already leaves out a
+ * payment in flight, a 'returned' original, a settled row, a work-trade line,
+ * GAM's FlexPay pull and rent past a booking-draft lease's end, and counts only
+ * what is left of a row after a credit applied to it.
+ *
+ * GAM'S OWN MONEY IS NOT IN IT. A revenue_owner 'gam' charge is a GAM fee the
+ * tenant pays GAM, not a receivable of the landlord's: the $1 declined-card fee
+ * routes/webhooks adds on every refused attempt, a failed FlexDeposit or
+ * FlexCredit pull, and the rows a never-moved-in close deliberately leaves open
+ * (lib/unwindIssuedLease keptThroughNeverMovedInSql, 'gam_fee'). A landlord
+ * reading "what my residents owe me" must not be shown it (decisions #10,
+ * audience isolation). The old invoice rule could not see them at all —
+ * nothing recomputes invoices.total_amount, so a fee row added to an existing
+ * bill was never inside the total it subtracted from — and reading the charges
+ * directly would have quietly added them, so the rule says so out loud.
+ * Production carries no such row today (0 with revenue_owner 'gam'); the next
+ * declined card writes one.
+ *
+ * NOT the same question as the balances page's grand total, which is why that
+ * page can print a bigger figure: GET /api/balances adds every open one-time
+ * POS pay link and every open register ticket to meta.totals.owed (routes/
+ * balances) — money owed by someone who may have no lease at all. On 10/18 one
+ * open ticket at Mountain View ($22.47) made the Front Desk read $13,092.55
+ * against these cards' $13,070.08. The charge rows themselves tie exactly;
+ * those two categories are the whole of the difference.
+ */
+export interface OutstandingBalance {
+  /** Every open charge of every month, credit already spent on it taken off. */
+  outstanding: number
+  /**
+   * Charges work trade is covering, reported alongside: they settle in hours at
+   * month close (S624), so they are neither added into `outstanding` nor taken
+   * off it. S654: suspended lines sit OUTSIDE invoices.total_amount, and
+   * subtracting them clamped a partly covered bill (rent traded, water owed)
+   * to $0 owed.
+   */
+  workTradeSuspended: number
+}
+
+/**
+ * @param landlordIds null/undefined = platform-wide (admin lens); [] = nothing
+ * @param property    one property (the dashboard's picker), a list (a team
+ *                    member's properties), or null for every one
+ * @param opts.cutoffs a bookkeeper's clean cut at a sale (lib/bookkeeperScope)
+ */
+export async function outstandingBalanceOf(
+  landlordIds?: string[] | null,
+  property?: string | readonly string[] | null,
+  opts: { cutoffs?: readonly PropertyCutoff[] } = {},
+): Promise<OutstandingBalance> {
+  const propertyIds = property == null ? null : typeof property === 'string' ? [property] : [...property]
+  if (landlordIds?.length === 0 || propertyIds?.length === 0) {
+    return { outstanding: 0, workTradeSuspended: 0 }
+  }
+  const OPEN = openBalanceSql('p')
+  const TRADED = workTradeOpenRowSql('p')
+  // The company and the property are the CHARGE's own, the way the balances
+  // page reads them (openBalances OUTSTANDING_FROM) — not its bill's. On a
+  // converged invoice (S616) a neighbor company's utility rides this
+  // household's bill, and summing invoice totals put that neighbor's money in
+  // this account's receivable; row by row, each dollar counts for the company
+  // that is owed it. A charge with no unit has no property, so it is in the
+  // blended figure and in no single property's — never silently in both, never
+  // silently in neither.
+  const [r] = await query<{ outstanding: number; work_trade_suspended: number }>(`
+    SELECT COALESCE(SUM(CASE WHEN ${OPEN} THEN ${openAmountSql('p')} END), 0)::float AS outstanding,
+           COALESCE(SUM(CASE WHEN ${TRADED} THEN p.amount END), 0)::float AS work_trade_suspended
+      FROM payments p
+      LEFT JOIN units u ON u.id = p.unit_id
+     WHERE ($1::uuid[] IS NULL OR p.landlord_id = ANY($1::uuid[]))
+       -- GAM's own fee is GAM's money, never the landlord's receivable.
+       AND p.revenue_owner <> 'gam'
+       AND (${OPEN} OR ${TRADED})
+       AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+       AND ${withinCutoffsSql('u.property_id', 'p.due_date', '$3')}`,
+    [landlordIds ?? null, propertyIds, cutoffsParam(opts.cutoffs)])
+  return {
+    outstanding: round2(Number(r?.outstanding ?? 0)),
+    workTradeSuspended: round2(Number(r?.work_trade_suspended ?? 0)),
+  }
 }

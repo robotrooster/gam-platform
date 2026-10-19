@@ -101,6 +101,21 @@ describe('C2 / C3 / C4: credits spent on a bill', () => {
     expect(await activeLines('credit_use', use)).toEqual([])
     expect(await bal(co.landlordId, 'credits_given')).toBe(0)
   })
+
+  // 10/18 (Nic): a credit the landlord gave, undone because it was typed by
+  // mistake — the books take it back off themselves, the same way.
+  it('a credit undone re-projects to nothing: Credits given goes back to zero', async () => {
+    const co = await tenantCo()
+    const rent = await bill(co, { amount: 400, due: '2026-09-01' })
+    const credit = await issuedCredit(co, { amount: 100, category: 'goodwill' })
+    const use = await spend(co, { paymentId: rent, tenantCreditId: credit, amount: 100, appliedAt: '2026-09-01T15:00:00Z', settle: false })
+    await drain()
+    expect(await bal(co.landlordId, 'credits_given')).toBe(10000)
+    await db.query(`UPDATE credit_uses SET status = 'released', released_at = now(), release_reason = 'credit_undone' WHERE id = $1`, [use])
+    await drain()
+    expect(await activeLines('credit_use', use)).toEqual([])
+    expect(await bal(co.landlordId, 'credits_given')).toBe(0)
+  })
 })
 
 describe('C5: work-trade hours, by the owner\'s choice (L12)', () => {

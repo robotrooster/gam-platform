@@ -544,21 +544,25 @@ describe('the whole-bill rule', () => {
 // ─── Spend order and the monthly cap ─────────────────────────────────────────
 
 describe('spend order', () => {
-  it('order: paid-ahead, then lease credit and deposit interest, then general credit, oldest rows first', async () => {
+  // 10/18 (Nic): the two kinds that stay with their space are spent first, so
+  // a credit the landlord gave — which can go anywhere in the household — is
+  // never spent where narrower money could have paid. Among the credits he
+  // gave, the oldest goes first, whichever space it was issued on.
+  it('order: paid-ahead, then deposit interest, then the credit the landlord gave (oldest first), oldest rows first', async () => {
     const h = await house()
-    const general = await issued(h, 100, { leaseId: null })              // created first, spent last
+    const general = await issued(h, 100, { leaseId: null })              // created first of the two he gave
     const interest = await issued(h, 20, { leaseId: null, category: 'deposit_interest' })
-    const leaseCredit = await issued(h, 30)
+    const leaseCredit = await issued(h, 30)                              // issued on the lease, created last
     const ahead = await paidAhead(h, 40)
     const sep = await charge(h, { amount: 50, type: 'utility', due: '2026-09-01' })
     const oct = await charge(h, { amount: 460, due: '2026-10-01' })
     const q = await quote(h)
     expect(q.plan.map(l => [l.creditId, l.paymentId, l.amount])).toEqual([
       [ahead, sep, 40],          // paid ahead first, on the oldest row
-      [interest, sep, 10],       // tier two, by age: interest was created before the lease credit
+      [interest, sep, 10],       // then deposit interest, oldest row first
       [interest, oct, 10],
+      [general, oct, 100],       // then what the landlord gave, oldest credit first
       [leaseCredit, oct, 30],
-      [general, oct, 100],       // the tenant's general credit last
     ])
     expect(q.plan.find(l => l.creditId === interest)!.creditKind).toBe('deposit_interest')
   })
@@ -626,9 +630,42 @@ describe('spend order', () => {
     const plan = buildCreditPlan({
       rows: [row('a', 100, '2026-09-01'), row('b', 50, '2026-10-01')],
       credits: [credit('c1', 'paid_ahead', 120, 'L'), credit('c2', 'issued', 500, null)],
-      caps: new Map([['L', null]]), drawn: new Map(), tenantId: 'T', tenantOnLease: new Set(['L']), includeReleasable: true,
+      caps: new Map([['L', null]]), drawn: new Map(), memberLeases: new Map([['T', new Set(['L'])]]), includeReleasable: true,
     })
     expect(plan.map(l => [l.creditId, l.paymentId, l.amount])).toEqual([['c1', 'a', 100], ['c1', 'b', 20], ['c2', 'b', 30]])
+  })
+
+  // 10/18 review fix: a credit crosses to the bills of the person it was GIVEN
+  // to — theirs, or a space they are on. On a shared space a co-resident's
+  // credit is in the household's figures, but it never reaches a space that
+  // resident does not hold: the credit ledger refuses that row outright, so
+  // planning it would kill the household's whole draw.
+  it('buildCreditPlan: a co-resident\'s credit stays on the spaces that resident is on; the household tenant\'s crosses both', () => {
+    const row = (id: string, leaseId: string, tenantId: string, amount: number, due: string): QuoteRow => ({
+      id, leaseId, scopeLeaseId: leaseId, invoiceId: null, landlordId: 'X', tenantId, type: 'rent',
+      entryDescription: 'RENT', revenueOwner: 'landlord', status: 'pending', amount, dueDate: due,
+      createdAt: '2026-09-01T00:00:00.000Z', billingMonth: `${due.slice(0, 7)}-01`, stripePaymentIntentId: null,
+      nextRetryAt: null, payable: true, inFlight: false, required: true, bankPayable: true, creditEligible: true,
+      carried: false, gamOwned: false, neighbor: false, retryScheduled: false, heldOnRow: 0, appliedOnRow: 0,
+      pastStayEnd: false,
+    })
+    const credit = (id: string, tenantId: string, amt: number, leaseId: string | null) => ({
+      kind: 'issued' as const, id, leaseId, tenantId, amountRemaining: amt, releasable: 0, disputed: 0,
+      createdAt: '2026-08-01T00:00:00.000Z', fundedBy: null, gamHeld: false, category: 'goodwill',
+    })
+    // A (RV 34) is T's alone; B (RV 35) is T and the co-resident X.
+    const memberLeases = new Map([['T', new Set(['A', 'B'])], ['X', new Set(['B'])]])
+    const rows = [row('sepA', 'A', 'T', 400, '2026-09-01'), row('sepB', 'B', 'T', 400, '2026-09-01')]
+    // X's credit, issued on the space they share, pays only that space's bill.
+    expect(buildCreditPlan({
+      rows, credits: [credit('cx', 'X', 800, 'B')],
+      caps: new Map(), drawn: new Map(), memberLeases, includeReleasable: true,
+    }).map(l => [l.paymentId, l.amount])).toEqual([['sepB', 400]])
+    // T's credit, issued on the same space, clears BOTH Septembers.
+    expect(buildCreditPlan({
+      rows, credits: [credit('ct', 'T', 800, 'B')],
+      caps: new Map(), drawn: new Map(), memberLeases, includeReleasable: true,
+    }).map(l => [l.paymentId, l.amount])).toEqual([['sepA', 400], ['sepB', 400]])
   })
 })
 
@@ -1225,7 +1262,7 @@ describe('decisions #48.7: a bill a dispute reopened may be paid with the credit
         credit('P', 'paid_ahead', 200, 'L', '2026-08-01T00:00:00.000Z'),
         credit('Q', 'issued', 500, null, '2026-06-01T00:00:00.000Z'),
       ],
-      caps: new Map([['L', null]]), drawn: new Map(), tenantId: 'T', tenantOnLease: new Set(['L']), includeReleasable: true,
+      caps: new Map([['L', null]]), drawn: new Map(), memberLeases: new Map([['T', new Set(['L'])]]), includeReleasable: true,
     })
     expect(plan.map(l => [l.creditId, l.paymentId, l.amount])).toEqual([['R', 'b', 30], ['P', 'reopened', 50]])
   })

@@ -3,16 +3,25 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
-import { useEntities } from '../components/EntityPicker'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
+// 10/19 (Nic): "Merge it all so it's one flow for any other landlords that
+// onboard." The two bank steps below render the SAME components as the Bank
+// setup tab (pages/BankSetup.tsx), so there is one implementation of each step
+// and the wizard can never drift from the page a landlord comes back to.
+import {
+  PayoutVerifyStep, BankFeedLinkStep, useConnectStatus, payoutsLive,
+} from './BankSetup'
 import { companiesMissingPayouts, payoutsReadyFor, type PayoutCompany } from '../lib/payoutReadiness'
 import {
   Check, Building2, CreditCard, FileText, User,
-  ChevronRight, ChevronLeft, AlertTriangle,
+  ChevronRight, ChevronLeft,
   Landmark, Plus, LayoutGrid
 } from 'lucide-react'
 import {
   PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT,
   UNIT_TYPES, UNIT_TYPE_LABEL,
+  EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT,
+  MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT,
 } from '@gam/shared'
 
 const STEPS = [
@@ -66,17 +75,47 @@ export function OnboardingPage() {
   // Profile form
   const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
   // Property form
-  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential', firstBillingCycle: (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` })() })
+  // 10/18 (Nic): the two departure answers start at Yes — the way every
+  // property on GAM already works — so a landlord who skips past them is set up
+  // the same as everyone else, and only a deliberate No changes anything.
+  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential', refundsEarlyDeparture: true, proratesMidMonth: true, firstBillingCycle: (() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` })() })
   const [errors, setErrors] = useState<Record<string, string>>({})
+
+  // S637 (Nic, DIRECTIVE): "Get Paid" means the STRIPE CONNECT ACCOUNT, and
+  // nothing else counts as done. (The long note on why lives below, at
+  // bankReady.) Resolved here, ABOVE the feed read, because the feed read needs
+  // to say which company's bank it is asking about.
+  const { data: entities = [] } = useEntities()
+  const ownedEntities = (entities as Array<PayoutCompany & { isOwner?: boolean }>)
+    .filter(e => e.isOwner)
+  const payoutEntityId = ownedEntities.length === 1 ? ownedEntities[0].id : ''
+  // 10/19 (Nic): an account that owns several companies can say which one here,
+  // the same way the Bank page does, instead of being sent off to pick on
+  // another screen. One company needs no choosing (EntityPicker renders
+  // nothing), so a fresh signup sees no extra control.
+  const [bankEntityId, setBankEntityId] = useState('')
+  const bankEntity = bankEntityId || payoutEntityId
 
   // S637: the bank-account CATALOG no longer gates onboarding — "Get Paid" is
   // answered by the Stripe Connect account (payoutsReady below). 10/12 (Nic):
   // and the catalog's add form is gone from this page and the Banking page.
   // S605: the operating-bank feed. Polls while the landlord is on that step so
   // the screen flips to "connected" the moment Stripe's window closes.
+  //
+  // 10/19 (review): THIS READ NAMED NO COMPANY, and the API cannot answer
+  // "which of your companies?" — it returns 400 for an account that owns two or
+  // more (routes/bankFeed.ts scope → lib/landlordScope.resolveLandlordTarget).
+  // So for anyone in Blu's position the list came back empty forever: the link
+  // really happened (step 2 does send the company), the wizard kept reading
+  // "Not done", Continue stayed greyed out and Sign Agreement stayed locked.
+  // A dead end on the one screen that activates the account.
+  //
+  // The SAME query key the Bank page uses, so linking on either screen
+  // refreshes both (BankSetup.useLinkBankFeed invalidates 'bank-connections').
   const { data: feedConnections = [], refetch: refetchFeed } = useQuery<any[]>(
-    'onboarding-bank-connections', () => apiGet('/bank-feed/connections'),
-    { refetchInterval: step === 4 ? 4000 : false },
+    ['bank-connections', bankEntity],
+    () => apiGet(`/bank-feed/connections?entityId=${encodeURIComponent(bankEntity)}`),
+    { enabled: !!bankEntity, refetchInterval: step === 4 ? 4000 : false },
   )
   const feedLinked = feedConnections.some((c: any) => c.status === 'active')
   // 10/12 (Nic): the feed is step 4. This marked 3 — Get Paid — so linking the
@@ -84,31 +123,6 @@ export function OnboardingPage() {
   // payouts behind it: the same feed-for-payouts mix-up S637 describes. Left
   // over from S649 inserting Add Your Units at index 2.
   useEffect(() => { if (feedLinked) setCompleted(prev => new Set([...prev, 4])) }, [feedLinked])
-  const [feedErr, setFeedErr] = useState<string | null>(null)
-  const [feedBusy, setFeedBusy] = useState(false)
-
-  const linkOperatingBank = async () => {
-    setFeedErr(null); setFeedBusy(true)
-    try {
-      // Mirrors BankFeedPage.link() exactly — same endpoints, same shapes.
-      const { loadStripe } = await import('@stripe/stripe-js')
-      const pk = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY
-      if (!pk) throw new Error('Bank linking is not configured (missing Stripe key).')
-      const stripe = await loadStripe(pk)
-      if (!stripe) throw new Error('Stripe failed to load')
-      const { data: session } = await apiPost('/bank-feed/link-session', {})
-      const { clientSecret, sessionId } = session
-      const result = await (stripe as any).collectFinancialConnectionsAccounts({ clientSecret })
-      if (result.error) throw new Error(result.error.message)
-      const accounts = result.financialConnectionsSession?.accounts ?? []
-      if (!accounts.length) { setFeedBusy(false); return }   // user closed the window
-      await apiPost('/bank-feed/finalize', { sessionId })
-      await refetchFeed()
-    } catch (e: any) {
-      setFeedErr(e?.response?.data?.error || e?.message || 'Could not link the bank.')
-    } finally { setFeedBusy(false) }
-  }
-
   // S637 (Nic, DIRECTIVE): "Get Paid" means the STRIPE CONNECT ACCOUNT, and
   // nothing else counts as done.
   //
@@ -126,30 +140,21 @@ export function OnboardingPage() {
   //
   // 10/12: and the COMPANY's Connect account. This asked about entity=user —
   // the account's own user-level Connect id — but since S554 an owner verifies
-  // the landlord company (the Banking page this step sends them to onboards
-  // entity=landlord), so a landlord who finished Stripe there was still told
-  // "Set up payouts" here. Ask about the company this account owns. With one
-  // owned company (every fresh signup) that is its live Stripe status; with
-  // several, the same rule as the owner to-do list (/landlords/me/todos).
+  // the landlord company (entity=landlord), so a landlord who finished Stripe
+  // was still told "Set up payouts" here. Ask about the company this account
+  // owns. With one owned company (every fresh signup) that is its live Stripe
+  // status; with several, the same rule as the owner to-do list
+  // (/landlords/me/todos).
   // 10/12 (Nic): that rule is now "every company with a property can be paid"
   // (lib/payoutReadiness.ts) — "any of them can be paid" let a paid company
   // answer for one that holds a property and has no Stripe account.
-  const { data: entities = [] } = useEntities()
-  const ownedEntities = (entities as Array<PayoutCompany & { isOwner?: boolean }>)
-    .filter(e => e.isOwner)
-  const payoutEntityId = ownedEntities.length === 1 ? ownedEntities[0].id : ''
-  const connectStatusQ = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
-    ['onboarding-connect-status', payoutEntityId],
-    () => apiGet(`/stripe/connect/status?entity=landlord&entityId=${payoutEntityId}`),
-    { enabled: !!payoutEntityId, refetchInterval: 15000 },
-  )
-  const payoutsReady = payoutEntityId
-    ? !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+  // 10/19: the SAME query key the Bank page and the feed use, so one answer
+  // drives the wizard's green check and the step's own panel.
+  const connectStatusQ = useConnectStatus(bankEntity, true, { refetchInterval: 15000 })
+  const payoutsReady = bankEntity
+    ? payoutsLive(connectStatusQ.data)
     : payoutsReadyFor(ownedEntities)
-  // Where "Set up payouts" goes: straight to the one company that needs it.
   const unpaidOwned = companiesMissingPayouts(ownedEntities)
-  const payoutSetupHref = !payoutEntityId && unpaidOwned.length === 1
-    ? `/banking?entity=${unpaidOwned[0].id}` : '/banking'
   const bankReady = payoutsReady
   // 10/12 (Nic): Get Paid is step 3. This marked 2 (Add Your Units), the same
   // S649 off-by-one as the feed marker above.
@@ -282,8 +287,9 @@ export function OnboardingPage() {
         setStep(4)
       }
     } else if (step === 4) {
-      // Advances only once a bank is actually linked — see the disabled rule.
-      if (feedLinked) {
+      // Advances once a bank is linked, or once the step has been skipped —
+      // see the disabled rule on the Continue button.
+      if (feedLinked || completed.has(4)) {
         setCompleted(prev => new Set([...prev, 4]))
         setStep(5)
       }
@@ -494,6 +500,39 @@ export function OnboardingPage() {
                   </div>
                 </div>
 
+                {/* 10/18 (Nic): "these should all be property level settings."
+                    Every landlord choice belongs in this one form, so the two
+                    departure answers are asked here, where the property is
+                    made — not left to be found on a settings page later. Both
+                    start at Yes, the way every property already works. */}
+                <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 16, marginBottom: 14 }}>
+                  <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 12 }}>When someone leaves early</div>
+                  {([
+                    { key: 'refundsEarlyDeparture' as const, q: EARLY_DEPARTURE_REFUNDS_QUESTION, hint: EARLY_DEPARTURE_REFUNDS_HINT },
+                    { key: 'proratesMidMonth' as const, q: MID_MONTH_PRORATION_QUESTION, hint: MID_MONTH_PRORATION_HINT },
+                  ]).map((row, i) => {
+                    const on = property[row.key]
+                    return (
+                      <div key={row.key} style={{ marginBottom: i === 0 ? 16 : 0 }}>
+                        <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 7 }}>{row.q}</div>
+                        <div style={{ display: 'flex', gap: 10 }}>
+                          {[true, false].map(v => (
+                            <button key={String(v)} type="button" onClick={() => setProperty(p => ({ ...p, [row.key]: v }))}
+                              style={{ flex: 1, textAlign: 'center', padding: '9px 14px', borderRadius: 10, cursor: 'pointer',
+                                fontSize: '.82rem', fontWeight: 700,
+                                color: on === v ? 'var(--gold)' : 'var(--text-1)',
+                                background: on === v ? 'rgba(201,162,39,.1)' : 'var(--bg-1)',
+                                border: on === v ? '1.5px solid var(--gold)' : '1px solid var(--border-0)' }}>
+                              {v ? 'Yes' : 'No'}
+                            </button>
+                          ))}
+                        </div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>{row.hint[on ? 'yes' : 'no']}</div>
+                      </div>
+                    )
+                  })}
+                </div>
+
                 {addPropertyMut.isError && (
                   <div style={{ color: 'var(--red)', fontSize: '.75rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
                     Failed to add property. Please try again.
@@ -576,71 +615,28 @@ export function OnboardingPage() {
             {/* S649: this was `step === 4` — the Bank Feed step's index — since
                 Add Your Units was inserted ahead of it, so Get Paid rendered an
                 empty screen with Next disabled (Nicholas Fausett, stuck). */}
+            {/* 10/19 (Nic): "Merge it all so it's one flow." This step used to
+                be a pitch with a button that navigated AWAY to the Disbursement
+                Account page to do the actual Stripe verification — the second
+                sign-up Nic was asking about. It renders the real step now, the
+                same component as the Bank setup tab, so the landlord finishes
+                here without leaving and the two screens cannot drift. */}
             {step === 3 && (
               <div>
-                {payoutsReady ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: 12 }}>
-                    <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <Check size={28} style={{ color: 'var(--green)' }} />
-                    </div>
-                    <div style={{ textAlign: 'center' }}>
-                      <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
-                        Payouts are live
-                      </div>
-                      <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-                        {/* 10/12 (Nic): this also said each property could be
-                            routed to a different account from the Properties
-                            page — that routing never moved a payout and is
-                            removed. Rent lands in the bank verified with Stripe. */}
-                        Rent collected through GAM is deposited to the bank you verified with Stripe.
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div>
-                    <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 20, marginBottom: 20 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-                        <div style={{ width: 44, height: 44, borderRadius: 10, background: 'rgba(201,162,39,.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                          <Landmark size={20} style={{ color: 'var(--gold)' }} />
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '.88rem', fontWeight: 700, color: 'var(--text-0)' }}>Set up your payout account</div>
-                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>The account your rent is deposited into.</div>
-                        </div>
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-                        {[
-                          'Verifies your business so rent can legally be paid to you',
-                          'US checking or savings — personal or business (LLC)',
-                          'You can enter your routing and account number by hand; no bank login is required',
-                          'Handled by Stripe. GAM never sees your bank login',
-                        ].map(item => (
-                          <div key={item} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.78rem', color: 'var(--text-2)' }}>
-                            <Check size={12} style={{ color: 'var(--green)', flexShrink: 0 }} /> {item}
-                          </div>
-                        ))}
-                      </div>
-                      {connectStatusQ.data?.exists && !payoutsReady && (
-                        <div style={{ background: 'rgba(255,184,32,.06)', border: '1px solid rgba(255,184,32,.2)', borderRadius: 8, padding: '8px 12px', fontSize: '.72rem', color: 'var(--amber)', display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
-                          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-                          Started but not finished — pick up where you left off.
-                        </div>
-                      )}
-                      <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }}
-                        onClick={() => navigate(payoutSetupHref)}>
-                        {connectStatusQ.data?.exists ? 'Continue payout setup' : 'Set up payouts'}
-                      </button>
-                    </div>
-                    <div style={{ textAlign: 'center' }}>
-                      {/* Skipping payouts also skips the bank feed — the feed is
-                          only useful once money is actually moving, and offering
-                          it first is what let people link the read-only feed
-                          believing they had set up payouts. */}
-                      <button className="btn btn-ghost btn-sm"
-                        onClick={() => { setCompleted(prev => new Set([...prev, 3, 4])); setStep(5) }}>
-                        Skip for now — finish payout setup later
-                      </button>
-                    </div>
+                <EntityPicker value={bankEntity} onChange={setBankEntityId} label="Bank setup for"
+                  note="Each company has its own bank account — both bank steps are done once per company." />
+                <PayoutVerifyStep entityId={bankEntity} isOwner
+                  otherUnpaid={unpaidOwned.filter(e => e.id !== bankEntity)} />
+                {!payoutsReady && (
+                  <div style={{ textAlign: 'center', marginBottom: 8 }}>
+                    {/* Skipping payouts also skips the bank feed — the feed is
+                        only useful once money is actually moving, and offering
+                        it first is what let people link the read-only feed
+                        believing they had set up payouts. */}
+                    <button className="btn btn-ghost btn-sm"
+                      onClick={() => { setCompleted(prev => new Set([...prev, 3, 4])); setStep(5) }}>
+                      Skip for now — finish bank setup later
+                    </button>
                   </div>
                 )}
 
@@ -674,38 +670,42 @@ export function OnboardingPage() {
 
             {/* ── STEP 4: CONNECT YOUR BANK (read-only feed) ── */}
             {/* S605: required step — a landlord without this has no expense side
-                to their P&L. Read-only; it cannot move money. */}
+                to their P&L. Read-only; it cannot move money.
+                10/19 (Nic): the same component as step 2 of Bank setup on the
+                Bank page — one implementation, so the copy that explains why a
+                read-only link is a SEPARATE bank permission from the payout
+                account exists in one place. */}
             {step === 4 && (
               <div>
-                <h2 style={{ fontSize: '1.15rem', marginBottom: 6 }}>Connect your operating bank</h2>
-                <p style={{ color: 'var(--text-2)', fontSize: '.85rem', marginBottom: 18, lineHeight: 1.6 }}>
-                  This is the account you actually run the business from — the one repairs, supplies and
-                  utilities get paid out of. GAM reads it <strong>read-only</strong> so your spending
-                  becomes expenses automatically. Without it your P&amp;L only shows income.
-                </p>
-
-                {feedLinked ? (
-                  <div className="alert alert-success" style={{ marginBottom: 16 }}>
-                    <Check size={16} />
-                    <div>
-                      <strong>Bank connected.</strong> Your transactions will start syncing — deposits we
-                      already sent you are matched automatically, and the rest is yours to categorize.
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div style={{ padding: 14, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 16 }}>
-                      <ul style={{ margin: 0, paddingLeft: 18, fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.8 }}>
-                        <li><strong>Read-only.</strong> Nothing can move money from this connection.</li>
-                        <li>You sign in to your bank through Stripe — GAM never sees your bank login.</li>
-                        <li>Rent payouts we already sent you are hidden automatically, so nothing double-counts.</li>
-                      </ul>
-                    </div>
-                    {feedErr && <div className="alert alert-danger" style={{ marginBottom: 14 }}>{feedErr}</div>}
-                    <button className="btn btn-primary" onClick={linkOperatingBank} disabled={feedBusy}>
-                      {feedBusy ? <span className="spinner" /> : <><Landmark size={16} /> Connect a bank</>}
+                {/* 10/19 (review): the step said "Choose the company above to
+                    link its bank read-only" and there was nothing above it —
+                    the picker was rendered only inside step 3. A landlord who
+                    reached this step with several companies and none chosen
+                    (Continue from step 3 is allowed when every company's
+                    payouts are already live) read an instruction they could not
+                    follow. Same control, same wording, both steps. */}
+                <EntityPicker value={bankEntity} onChange={setBankEntityId} label="Bank setup for"
+                  note="Each company has its own bank account — both bank steps are done once per company." />
+                <BankFeedLinkStep entityId={bankEntity} linked={feedLinked}
+                  needsCompany={!bankEntity}
+                  linkedName={feedConnections.find((c: any) => c.status === 'active')?.displayName ?? null}
+                  payoutBank={connectStatusQ.data?.payoutBank ?? null}
+                  step1Done={payoutsReady}
+                  onLinked={() => { refetchFeed() }} />
+                {!feedLinked && (
+                  <div style={{ textAlign: 'center', marginBottom: 8 }}>
+                    {/* 10/19 (review): the same escape step 3 already offers,
+                        reachable from the step somebody is actually stuck on.
+                        Without it, a landlord whose bank Stripe cannot reach had
+                        a greyed-out Continue, a locked Sign Agreement and no way
+                        to activate the account at all. The feed is still not
+                        optional — the Bank page says so on every tab until it is
+                        done, and the owner to-do list keeps asking. */}
+                    <button className="btn btn-ghost btn-sm"
+                      onClick={() => { setCompleted(prev => new Set([...prev, 4])); setStep(5) }}>
+                      Skip for now — finish bank setup later
                     </button>
-                  </>
+                  </div>
                 )}
               </div>
             )}
@@ -815,7 +815,7 @@ export function OnboardingPage() {
               <button
                 className="btn btn-primary"
                 onClick={handleNext}
-                disabled={addPropertyMut.isLoading || completeMut.isLoading || addUnitsMut.isLoading || (step === 2 && unitCount === 0) || (step === 3 && !bankReady && !completed.has(3)) || (step === 4 && !feedLinked)}
+                disabled={addPropertyMut.isLoading || completeMut.isLoading || addUnitsMut.isLoading || (step === 2 && unitCount === 0) || (step === 3 && !bankReady && !completed.has(3)) || (step === 4 && !feedLinked && !completed.has(4))}
                 style={{ padding: '10px 24px' }}
               >
                 {addPropertyMut.isLoading || completeMut.isLoading ? <span className="spinner" /> :

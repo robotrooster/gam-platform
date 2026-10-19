@@ -54,6 +54,64 @@ describe('S648 due days', () => {
   })
 })
 
+/**
+ * 10/18 (Nic): "the only way it is different is for longer term people for rent
+ * pro ration. MOVING IN OR OUT at the middle of a month and also only if the
+ * landlord allows the pro rate. these should all be property level settings."
+ *
+ * The move-IN half (properties.prorates_mid_month_rent). Answering No on the
+ * property card used to change nothing at all for a move-in, while the card's
+ * own words promised "a whole month is a whole month, moving in and moving out
+ * alike" (10/19 review).
+ */
+describe("a park where a whole month is a whole month bills the month they moved into", () => {
+  it('No: the whole month, on the same line the proration was on', () => {
+    // Rent $1,000 due the 1st, moving in October 15. A park that prorates
+    // bills $548.39 for Oct 15–31; a park that does not bills all of October.
+    expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: false })).toEqual({ firstMonthRent: 0, proration: 548.39 })
+    expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: false, proratesMidMonth: false })).toEqual({ firstMonthRent: 0, proration: 1000 })
+  })
+
+  it('No, where the property also collects the next month up front: two whole months', () => {
+    expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: true, proratesMidMonth: false })).toEqual({ firstMonthRent: 1000, proration: 1000 })
+  })
+
+  it('left out, or Yes, is the proration every property has always had', () => {
+    const prorated = { firstMonthRent: 0, proration: 548.39 }
+    expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: false, proratesMidMonth: true })).toEqual(prorated)
+    expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: false })).toEqual(prorated)
+  })
+
+  it('the answer changes nothing where there was never a part month to cut', () => {
+    for (const proratesMidMonth of [true, false]) {
+      // Moving in ON the due day: the first full period starts that day.
+      expect(moveInDefaults({ rent: 1000, startIso: '2026-10-01', existingTenancy: false,
+        collectsNextPeriod: false, proratesMidMonth }), `on the due day, ${proratesMidMonth}`)
+        .toEqual({ firstMonthRent: 1000, proration: 0 })
+      // Anniversary billing.
+      expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+        collectsNextPeriod: false, dueDay: 15, mode: 'move_in_day', proratesMidMonth }))
+        .toEqual({ firstMonthRent: 1000, proration: 0 })
+      // An onboarding resident: their move-in charges were paid years ago and
+      // page 8 is locked to the month's rent either way.
+      expect(moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: true,
+        collectsNextPeriod: true, proratesMidMonth })).toEqual({ firstMonthRent: 1000, proration: 0 })
+    }
+  })
+
+  it('page 8 adds up to the same total it shows, either answer', () => {
+    const whole = moveInDefaults({ rent: 1000, startIso: '2026-10-15', existingTenancy: false,
+      collectsNextPeriod: false, proratesMidMonth: false })
+    expect(moveInTotalDue({ firstMonthRent: whole.firstMonthRent, proration: whole.proration,
+      depositMirror: 500, moveInFees: ['250.00'] })).toBe(1750)
+  })
+})
+
 describe('a typed 29th, 30th or 31st is due on the 1st (Nic: "we don\'t want any skips")', () => {
   it('reads the 29th through the 31st as the 1st', () => {
     expect(parseDueDay('29th')).toBe(1)

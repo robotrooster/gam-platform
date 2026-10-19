@@ -112,6 +112,23 @@ async function invoiceEach(paymentIds: readonly string[]): Promise<void> {
   }
 }
 
+/**
+ * ONE bill carrying several lines, its total their sum — the real shape when a
+ * resident's water and their propane installment land on the same monthly bill
+ * (one invoice per lease per due date, ux_invoices_lease_due_date).
+ */
+async function invoiceTogether(paymentIds: readonly string[]): Promise<string> {
+  const first = paymentIds[0]
+  const r = await db.query<{ id: string }>(
+    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount)
+     SELECT landlord_id, tenant_id, lease_id, unit_id, 'INV-' || left($3::text, 8), due_date,
+            (SELECT SUM(amount) FROM payments WHERE id = ANY($2::uuid[]))
+       FROM payments WHERE id = $1::uuid RETURNING id`, [first, [...paymentIds], first])
+  await db.query(
+    `UPDATE payments SET invoice_id = $2 WHERE id = ANY($1::uuid[])`, [[...paymentIds], r.rows[0].id])
+  return r.rows[0].id
+}
+
 describe('the payment-health percentage reads invoiced against paid', () => {
   it('rent on hold for work trade is in NEITHER figure — it is named on its own', async () => {
     const w = await world()
@@ -257,9 +274,9 @@ describe('the dashboard hands the card its own figure', () => {
    * 10/17 (review): the health card's "left to collect" and the Outstanding
    * card sit side by side on one screen and are NOT the same money — a fact
    * worth a test, because the tempting "fix" is to make one of them match the
-   * other. Outstanding is every open invoice balance of every month and every
-   * charge; this is the month's rent. Oak Park reads $3,300 against $8,354.43
-   * on 10/17 for exactly the reason this fixture does.
+   * other. Outstanding is every open CHARGE of every month and every charge
+   * type; this is the month's rent. Oak Park reads $3,300 against $8,934.43
+   * on 10/18 for exactly the reason this fixture does.
    */
   it('the Outstanding card counts other months and other charges; this figure does not', async () => {
     const w = await world({ due: THIS_MONTH_FIRST })
@@ -285,8 +302,150 @@ describe('the dashboard hands the card its own figure', () => {
  * cannot drift. Nothing on the Reports page draws the percentage today — this
  * holds the figure and its gate in place until something does.
  */
+/**
+ * ── 10/18 (Nic): THREE NUMBERS ON ONE SCREEN, EACH RIGHT ──────────────────
+ *
+ *   "We have a major problem because underneath the property health it's still
+ *    showing that 9,683 is owed when I filter to Mountain View, but outstanding
+ *    in the top KPI card only shows $1,415. It's only three invoices that are
+ *    outstanding... $26,211.02 minus the received calculation of 19,483.98 in
+ *    no way close equals 9,683.87. You're pulling numbers from different spots
+ *    here."
+ *
+ * He is right about the screen and every figure was right about its own
+ * question. Measured on Mountain View's October:
+ *
+ *   $1,415.00   the month's RENT still owed — the health block's own figure,
+ *               bills on hold for work trade out of both sides
+ *   $9,683.87   the money table's Owed: on the books, what tenants still owed
+ *               at the END of October — every charge of every month, the
+ *               work-trade-held bills among them
+ *   $1,685.00   the Outstanding card: every open CHARGE of every month, all
+ *               charge types. It read $1,415.00 — the same as the health
+ *               figure, which is what made the screen look self-contradictory
+ *               — because it summed invoice totals, and the $270 of late fees
+ *               added after those bills were written sit outside
+ *               invoices.total_amount by design. Oak Park reads $3,300 of
+ *               October rent against $8,934.43 outstanding.
+ *
+ * So the three must not be made to match, and the health block's own three must
+ * tie to the cent and to the percentage. This is that month in miniature, with
+ * everything that pulls the other two figures away present at once: a
+ * work-trade-held bill, a charge on an installment plan, last month's rent, and
+ * a utility.
+ */
+describe('the health figures tie, and the figures beside them stay their own', () => {
+  /** A charge on an agreed plan: scheduled, not overdue (S641, v_installment_payments). */
+  async function onInstallmentPlan(w: World, unitId: string, leaseId: string, paymentId: string): Promise<void> {
+    const fill = (await db.query<{ id: string }>(
+      `INSERT INTO propane_fills (property_id, landlord_id, unit_id, lease_id, tenant_id, fill_date, gallons,
+                                  price_per_gallon, total_amount, installment_count)
+       VALUES ($1, $2, $3, $4, $5, $6, 40, 4, 160, 4) RETURNING id`,
+      [w.propertyId, w.landlordId, unitId, leaseId, w.tenantId, w.due])).rows[0].id
+    await db.query(
+      `INSERT INTO propane_fill_installments (fill_id, installment_number, amount, billing_cycle_month, payment_id)
+       VALUES ($1, 2, 40, $2::date, $3)`, [fill, w.due, paymentId])
+  }
+
+  /**
+   * The month in miniature: $1,000 paid in cash, $589 settled by an account
+   * credit, $460 still owed, $460 on hold for work trade — plus the money that
+   * pulls the OTHER two figures away: last month's $500 rent, this month's $120
+   * water, and $40 of propane on a four-month plan.
+   */
+  async function monthInMiniature(): Promise<{ w: World; propane: string }> {
+    const w = await world({ due: THIS_MONTH_FIRST })
+    const fifth = await addLease(w, w.propertyId)
+    const lastMonthRent = await bill(
+      w, { amount: 500, due: monthBefore(w.due), unitId: fifth.unitId, leaseId: fifth.leaseId })
+    const water = await bill(
+      w, { amount: 120, due: w.due, type: 'utility', unitId: fifth.unitId, leaseId: fifth.leaseId })
+    const propane = await bill(
+      w, { amount: 40, due: w.due, type: 'fee', unitId: fifth.unitId, leaseId: fifth.leaseId })
+    await onInstallmentPlan(w, fifth.unitId, fifth.leaseId, propane)
+    await drain()
+    // Every bill that carries an invoiced balance (a held bill carries none).
+    // The water and the propane installment ride ONE bill, as they do in life.
+    await invoiceEach([w.paid, w.byCredit, w.owed, lastMonthRent])
+    await invoiceTogether([water, propane])
+    return { w, propane }
+  }
+
+  const dash = async (w: World) => {
+    const r = await request(buildApp(['/api/landlords', landlordsRouter]))
+      .get(`/api/landlords/me/dashboard?propertyId=${w.propertyId}`).set('Authorization', `Bearer ${pass(w)}`)
+    expect(r.status).toBe(200)
+    return r.body.data
+  }
+
+  it("invoiced less paid is owed to the cent, and none of the other money moves it", async () => {
+    const { w } = await monthInMiniature()
+    const d = await dash(w)
+    expect(d.rentHealth).toEqual({ invoiced: 2049, paid: 1589, owed: 460, workTradeHeld: 460 })
+    // The one claim the block makes, exactly: invoiced − paid = owed.
+    expect(d.rentHealth.invoiced - d.rentHealth.paid).toBe(d.rentHealth.owed)
+    // And the percentage divides those same two figures and nothing else.
+    expect(Math.round((d.rentHealth.paid / d.rentHealth.invoiced) * 100)).toBe(78)
+  })
+
+  it('the money table beside it is a different question, and says which one it read', async () => {
+    const { w } = await monthInMiniature()
+    const d = await dash(w)
+    const owedOf = (c: string) => d.propertyHealth.categories.find((x: any) => x.category === c)
+    // Charged: the month's bills of EVERY kind, the work-trade-held one
+    // included — the books charge it on its due day (services/ledgerParity).
+    expect(owedOf('space_rent').charged).toBe(2509)
+    expect(owedOf('utility_other').charged).toBe(120)
+    expect(owedOf('other_fees').charged).toBe(40)
+    // Owed: what tenants still owed at the END of the month, every bill of
+    // every month. $460 of this month's rent, the $460 on hold, last month's
+    // $500, the $120 water and the $40 on the plan.
+    const sumOf = (k: 'charged' | 'received' | 'owed') =>
+      Math.round(d.propertyHealth.categories.reduce((s: number, c: any) => s + c[k], 0) * 100) / 100
+    expect(sumOf('owed')).toBe(1580)
+    expect(owedOf('space_rent').owed).toBe(1420)
+    // Mountain View's three figures in miniature: $2,669 charged, $1,000
+    // received, $1,580 owed — and no two of them subtract to the third, which
+    // is the whole reason the card now says so in words.
+    expect(sumOf('charged')).toBe(2669)
+    expect(sumOf('received')).toBe(1000)
+    expect(d.propertyHealth.total).toBe(1000)
+    expect(sumOf('charged') - sumOf('received')).not.toBe(sumOf('owed'))
+    // And its Owed is NOT the health figure, and must never be bent into it.
+    expect(sumOf('owed')).not.toBe(d.rentHealth.owed)
+    // The card prints the Owed column's plain words off this, and on the books
+    // they are "what tenants still owed at the end of the period" — the reason
+    // the two figures differ (@gam/shared MONEY_COLUMN_NOTE_LEDGER).
+    expect(d.propertyHealth.source).toBe('ledger')
+    expect(d.propertyHealth.period).toBe(THIS_MONTH_FIRST.slice(0, 7))
+  })
+
+  it('and the Outstanding card is a third number, every open charge', async () => {
+    const { w } = await monthInMiniature()
+    const d = await dash(w)
+    // $460 rent + $500 last month + $120 water + $40 of propane. The held bill
+    // is owed by nobody yet; a charge on a plan is still owed (that card counts
+    // open charges, not delinquency — units_owing is the one that excludes a
+    // plan). No late fee here, so the old invoice sum came to $1,120 too.
+    expect(d.outstanding).toBe(1120)
+    expect(d.outstanding).not.toBe(d.rentHealth.owed)
+    // The installment charge is not evidence of anybody being behind (S641).
+    expect(d.unitsOwing).toBe(2)
+  })
+
+  it('reads the same three ways with no books, and still ties', async () => {
+    const w = await world({ due: THIS_MONTH_FIRST, live: false })
+    const d = await dash(w)
+    expect(d.rentHealth).toEqual({ invoiced: 2049, paid: 1589, owed: 460, workTradeHeld: 460 })
+    expect(d.rentHealth.invoiced - d.rentHealth.paid).toBe(d.rentHealth.owed)
+    // Off the money records the Owed column means "what is still unpaid of
+    // those bills today", so the card gets those words instead.
+    expect(d.propertyHealth.source).toBe('records')
+  })
+})
+
 describe('Reports sends the same figure, gated like its Outstanding card', () => {
-  it('carries the dashboard\'s rentHealth, to the cent', async () => {
+  it('carries the dashboard\'s rentHealth, to the cent, and it ties on both', async () => {
     const w = await world({ due: THIS_MONTH_FIRST })
     const app = buildApp(['/api/landlords', landlordsRouter], ['/api/reports', reportsRouter])
     const tok = pass(w)
@@ -295,6 +454,10 @@ describe('Reports sends the same figure, gated like its Outstanding card', () =>
     expect(rep.status).toBe(200)
     expect(rep.body.data.rentHealth).toEqual({ invoiced: 2049, paid: 1589, owed: 460, workTradeHeld: 460 })
     expect(rep.body.data.rentHealth).toEqual(dash.body.data.rentHealth)
+    // 10/18 (Nic): invoiced less paid is owed, on whichever page reads it.
+    for (const h of [dash.body.data.rentHealth, rep.body.data.rentHealth]) {
+      expect(Math.round((h.invoiced - h.paid) * 100) / 100).toBe(h.owed)
+    }
   })
 
   // decisions #25: `owed` is a grand total of what everyone owes, so it goes

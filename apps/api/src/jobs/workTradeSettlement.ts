@@ -100,6 +100,59 @@ async function recordExtraHours(
       WHERE id = $1`, [periodId, result.extraHours.toFixed(2)])
 }
 
+/**
+ * 10/18 — WHAT A PAUSED AGREEMENT'S MONTH DOES.
+ *
+ * The close used to look at `active` agreements only. RV 50 and RV 51 at
+ * Mountain View were paused by lease hibernation (S594) with their September
+ * rent already suspended under the trade, so their month was never closed at
+ * all and $589 each sat parked with nothing on the calendar that would ever
+ * release it. Nic, 10/18: "once we're on to the next month and the old month
+ * settles out, like, it disappears. It's gone. It's forgotten."
+ *
+ * A paused agreement's month therefore closes, and it closes exactly the way an
+ * active one's does: the hours worked credit the month's own bill, and whatever
+ * they did not cover is owed on that bill, because the month is over (the S634
+ * rule — "at the end of the month, if they don't hit their hours, the rent for
+ * that month is prorated to cover any lapse").
+ *
+ * What pausing changes is only the AGING. A paused shortfall never runs out of
+ * leniency, so it is never written off as a cash charge and the trade is never
+ * ended over it (carryMonthsFor returns an endless window, as
+ * carry_forward_indefinite does). Pausing is not ending; the landlord's lever
+ * for ending it is ending it by hand, which bills immediately —
+ * settleAgreementOnEnd. So a paused month settles when it owes no hours, and
+ * otherwise stays open and carrying until the trade resumes or ends.
+ *
+ * OPEN QUESTION FOR NIC (10/19, not decided — do not settle it in code): a
+ * paused agreement that TRACKS hours and worked part of its last month leaves
+ * that lapse owed on the month's bill. A snowbird who worked 60 of 80 hours and
+ * then hibernated for the season owes the uncovered part while the trade is
+ * dormant. The two live paused agreements are both tracks_hours = false, so
+ * nothing is owed today, and the alternative — leaving the lapse parked and
+ * suspended until the trade resumes — is the "charge pending forever" shape
+ * 10/18 just took out. It is Nic's money call either way.
+ */
+const CLOSE_STATUSES = `('active','paused')`
+
+/** A paused shortfall never ages out into a cash bill: see CLOSE_STATUSES. */
+function carryMonthsFor(a: { carry_forward_indefinite?: boolean; carry_forward_months?: number; status?: string }): number {
+  if (a.status === 'paused' || a.carry_forward_indefinite) return Number.POSITIVE_INFINITY
+  return Number(a.carry_forward_months)
+}
+
+/**
+ * 10/18: a trade the landlord does not count hours on banks nothing and is paid
+ * for nothing — hours logged on it anyway were never banked time (the rule
+ * countLateApprovals and bankSettledLateApprovals already state). Its months are
+ * covered outright by the agreement, so there is no target for an hour to meet
+ * and no hour left over to be "extra". Nothing is recorded against the period
+ * either, so turning tracking back on counts those approved hours fresh.
+ */
+function countsHours(a: ExtraHoursTerms): boolean {
+  return a.tracks_hours !== false
+}
+
 export interface SettlementRunResult {
   agreementsProcessed: number
   periodsSettled: number
@@ -127,27 +180,52 @@ const CREDITABLE_ROW = `p.type IN ('rent','utility','fee')
 // that is the month label itself, so nothing changes for calendar tenants; a
 // tenant due on the 15th can have two periods labeled with one month (the
 // move-in stub and the first full period), and the start tells them apart.
+/**
+ * 10/18 — THE AGREEMENT SAYS WHETHER HOURS COUNT, NOT THE NUMBER THE PERIOD
+ * FROZE WHEN IT OPENED.
+ *
+ * `target_hours` is a snapshot taken when the month's bill was written. Whether
+ * a trade counts hours at all is a setting on the AGREEMENT, and the landlord
+ * can change it any day — Nic did, on 10/01: "Work trade people are on work
+ * trade. There's no bills going out to those people. My people at my properties
+ * are auto complete work trade until I change it back."
+ *
+ * The 2:15am close that morning had already run. It read the snapshot — 80 hours
+ * asked, none logged — and left eight of nine September months open with nothing
+ * credited and their rent suspended and pending. The directive landed at 9:07
+ * and had to hand-patch `target_hours = 0` onto every open period
+ * (scripts/oct1_billing_repair step 4a) precisely because the close had no way
+ * to notice. September then sat as receivable for the whole of October: Nic,
+ * 10/18 — "you're counting last month and this month."
+ *
+ * So the close asks the agreement. A trade that does not count hours asks for
+ * none, whatever its periods were opened with, and periodCredit covers such a
+ * month outright — which is what the agreement says it does. Turning tracking
+ * back on restores the target by the same rule (services/workTradeCoverage
+ * re-asks the agreement for a month left at 0), so the switch works both ways.
+ */
 async function loadOpenPeriods(
   client: PoolClient, agreementId: string, throughMonth: string,
   throughStart: string | null = null,
 ): Promise<Array<SettlementPeriod & { id: string; invoiceId: string | null; label: string }>> {
   const { rows } = await client.query(
-    `SELECT id, invoice_id, to_char(period_start,'YYYY-MM-DD') AS period_month,
-            to_char(period_month,'YYYY-MM-DD') AS label,
-            target_hours::float  AS target_hours,
-            hours_applied::float AS hours_applied,
-            basis_amount::float  AS basis_amount,
-            hour_rate::float     AS hour_rate,
+    `SELECT ws.id, ws.invoice_id, to_char(ws.period_start,'YYYY-MM-DD') AS period_month,
+            to_char(ws.period_month,'YYYY-MM-DD') AS label,
+            (CASE WHEN wta.tracks_hours THEN ws.target_hours ELSE 0 END)::float AS target_hours,
+            (CASE WHEN wta.tracks_hours THEN ws.hour_rate    ELSE 0 END)::float AS hour_rate,
+            ws.hours_applied::float AS hours_applied,
+            ws.basis_amount::float  AS basis_amount,
             -- How many closes this period has already survived. Derived from the
             -- calendar rather than stored as a counter, so a missed or re-run
             -- job cannot drift it.
-            GREATEST(0, (DATE_PART('year',  $2::date) - DATE_PART('year',  period_month)) * 12
-                      + (DATE_PART('month', $2::date) - DATE_PART('month', period_month)) - 1
+            GREATEST(0, (DATE_PART('year',  $2::date) - DATE_PART('year',  ws.period_month)) * 12
+                      + (DATE_PART('month', $2::date) - DATE_PART('month', ws.period_month)) - 1
             )::int AS aged_closes
-       FROM work_trade_settlements
-      WHERE agreement_id = $1 AND status = 'open' AND period_month <= $2::date
-        AND ($3::date IS NULL OR period_start <= $3::date)
-      ORDER BY period_start`,
+       FROM work_trade_settlements ws
+       JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
+      WHERE ws.agreement_id = $1 AND ws.status = 'open' AND ws.period_month <= $2::date
+        AND ($3::date IS NULL OR ws.period_start <= $3::date)
+      ORDER BY ws.period_start`,
     [agreementId, throughMonth, throughStart])
   return rows.map((r: any) => ({
     id: r.id, invoiceId: r.invoice_id, label: r.label,
@@ -267,7 +345,12 @@ async function bankSettledLateApprovals(
                        WHERE l.agreement_id = ws.agreement_id AND l.status = 'approved'
                          AND l.work_date BETWEEN ws.period_start AND ws.period_end), 0)::float AS approved
        FROM work_trade_settlements ws
-      WHERE ws.agreement_id = $1 AND ws.status = 'settled' AND ws.target_hours > 0
+       JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
+      WHERE ws.agreement_id = $1 AND ws.status = 'settled'
+        -- 10/18: "asks for hours" is the agreement's answer, not the period's
+        -- frozen snapshot (loadOpenPeriods). A trade the landlord stopped
+        -- counting banks nothing: hours logged on it were never banked time.
+        AND wta.tracks_hours AND ws.target_hours > 0
         AND ($2::uuid IS NULL OR ws.id <> $2::uuid)
       ORDER BY ws.period_start`,
     [agreementId, skipId])
@@ -508,7 +591,15 @@ async function persist(
       : out.creditTotal
     // S654: a billed period runs through here even with nothing to credit, so
     // its suspension lifts and the lapse is owed on its own bill (billDeficit).
-    if (row.invoiceId && (creditNow > 0 || out.status === 'billed')) {
+    //
+    // 10/18 (Nic): "once we're on to the next month and the old month settles
+    // out, like, it disappears. It's gone. It's forgotten." A SETTLED period
+    // runs through here for the same reason, whatever the money came to: a
+    // month that is finished with must leave no suspended line behind, or the
+    // charge sits pending forever and reads as a receivable on a month nobody
+    // owes anything for. (A month covered outright with a zero basis is the
+    // case: nothing to credit, and still nothing left parked.)
+    if (row.invoiceId && (creditNow > 0 || out.status !== 'open')) {
       await creditInvoice(client, row.invoiceId, creditNow, out.hoursAppliedNow)
     }
 
@@ -584,7 +675,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
   const client = await getClient()
   try {
     const { rows: agreements } = await client.query(
-      `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
+      `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id, wta.status,
               wta.banked_hours::float AS banked_hours,
               wta.carry_forward_months, wta.carry_forward_indefinite,
               ${EXTRA_HOURS_COLS},
@@ -599,7 +690,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
                   AND lt.status = 'active'
                 ORDER BY l.start_date DESC LIMIT 1) AS lease_id
          FROM work_trade_agreements wta
-        WHERE wta.status = 'active'
+        WHERE wta.status IN ${CLOSE_STATUSES}
           AND EXISTS (SELECT 1 FROM work_trade_settlements ws
                        WHERE ws.agreement_id = wta.id AND ws.status = 'open'
                          AND ws.period_month <= $1::date)
@@ -649,10 +740,15 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
           [a.id, periodMonth])
         const own = ownRows[0] as { id: string; status: WorkTradeSettlementStatus; counted: number } | undefined
         const counted = own ? round2h(Number(own.counted)) : 0
-        const uncounted = own ? Math.max(0, round2h(approved - counted)) : approved
+        const tracks = countsHours(a)
+        const uncounted = !tracks ? 0
+          : own ? Math.max(0, round2h(approved - counted)) : approved
         // What the month's own period has counted after this run.
         const countedNow = round2h(counted + uncounted)
-        const hoursWorkedByMonth = new Map<string, number>([[periodMonth, countedNow]])
+        // 10/18: an untracked month records nothing (countsHours).
+        const hoursWorkedByMonth = tracks
+          ? new Map<string, number>([[periodMonth, countedNow]])
+          : new Map<string, number>()
 
         // S654: older open months' late approvals first, on their own periods.
         const late = await countLateApprovals(
@@ -669,8 +765,9 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
           hoursWorked: uncounted,
           lateSurplusHours: round2h(late.banked + settledLate),
           bankedHours: round2h(Number(a.banked_hours)),
-          // S652: a landlord floating the shortfall indefinitely never has it billed.
-          carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
+          // S652: a landlord floating the shortfall indefinitely never has it
+          // billed. 10/18: nor is a paused agreement's (carryMonthsFor).
+          carryForwardMonths: carryMonthsFor(a),
           // 10/12: only hours the month's own record counted (once) are ever
           // paid. A month with no period of its own (no bill that month) has
           // nothing recording what was counted — `uncounted` is all its
@@ -689,7 +786,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         // S654: a month whose own period already closed is not in `ordered`, so
         // persist does not record its late approvals; record them here, or the
         // next run would count them again.
-        if (own && own.status !== 'open' && countedNow > counted) {
+        if (tracks && own && own.status !== 'open' && countedNow > counted) {
           await client.query(
             `UPDATE work_trade_settlements SET hours_worked = $2, updated_at = NOW() WHERE id = $1`,
             [own.id, countedNow.toFixed(2)])
@@ -737,7 +834,8 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
               to_char(ws.period_end,'YYYY-MM-DD') AS period_end,
               to_char(ws.period_month,'YYYY-MM-DD') AS period_month
          FROM work_trade_settlements ws
-         JOIN work_trade_agreements wta ON wta.id = ws.agreement_id AND wta.status = 'active'
+         JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
+                                       AND wta.status IN ${CLOSE_STATUSES}
         WHERE ws.close_run_at IS NULL
           AND ws.period_start <> ws.period_month
           AND ws.period_end < $1::date
@@ -749,7 +847,7 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
       try {
         await client.query('BEGIN')
         const { rows } = await client.query(
-          `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
+          `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id, wta.status,
                   wta.banked_hours::float AS banked_hours, wta.carry_forward_months, wta.carry_forward_indefinite,
                   ${EXTRA_HOURS_COLS},
                   (SELECT l.id FROM leases l
@@ -757,7 +855,8 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
                     WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
                       AND lt.status = 'active'
                     ORDER BY l.start_date DESC LIMIT 1) AS lease_id
-             FROM work_trade_agreements wta WHERE wta.id = $1 AND wta.status = 'active'`,
+             FROM work_trade_agreements wta
+            WHERE wta.id = $1 AND wta.status IN ${CLOSE_STATUSES}`,
           [c.agreement_id])
         const a = rows[0]
         const periods = a ? await loadOpenPeriods(client, a.id, c.period_month, c.period_start) : []
@@ -774,7 +873,8 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
             WHERE agreement_id = $1 AND status = 'approved'
               AND work_date BETWEEN $2::date AND $3::date`,
           [a.id, c.period_start, c.period_end])
-        const worked = round2h(Number(hrs[0]?.h ?? 0))
+        // 10/18: an untracked trade counts none of them (countsHours).
+        const worked = countsHours(a) ? round2h(Number(hrs[0]?.h ?? 0)) : 0
         // S654: COUNT EACH APPROVED HOUR ONCE, as the calendar close does. A
         // period whose own close failed once had its hours counted as late at
         // the next period's close (countLateApprovals wrote its hours_worked);
@@ -787,7 +887,9 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         // S654: older open periods' late approvals first, on their own periods.
         const late = await countLateApprovals(client, a.id, ordered, c.id)
         // The record only rises: hours un-approved after a close are not taken back.
-        const hoursWorkedByMonth = new Map<string, number>([[c.period_start, round2h(counted + uncounted)]])
+        const hoursWorkedByMonth = countsHours(a)
+          ? new Map<string, number>([[c.period_start, round2h(counted + uncounted)]])
+          : new Map<string, number>()
         for (const [k, v] of late.hoursWorked) if (!hoursWorkedByMonth.has(k)) hoursWorkedByMonth.set(k, v)
         // S654: settled periods' late approvals go to the bank. 10/12: as new
         // work — needs first, then banked or paid (see the calendar close).
@@ -797,8 +899,9 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
           hoursWorked: uncounted,
           lateSurplusHours: round2h(late.banked + settledLate),
           bankedHours: round2h(Number(a.banked_hours)),
-          // S652: a landlord floating the shortfall indefinitely never has it billed.
-          carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
+          // S652: a landlord floating the shortfall indefinitely never has it
+          // billed. 10/18: nor is a paused agreement's (carryMonthsFor).
+          carryForwardMonths: carryMonthsFor(a),
           extraHours: extraHoursMode(a),
         }), late.appliedNow)
         await persist(client, a, late.periods, hoursWorkedByMonth, result, run)
@@ -862,8 +965,11 @@ export async function settleAgreementOnEnd(agreementId: string): Promise<Settlem
                          WHERE l.agreement_id = ws.agreement_id AND l.status = 'approved'
                            AND l.work_date BETWEEN ws.period_start AND ws.period_end), 0)::float AS approved
          FROM work_trade_settlements ws
+         JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
         WHERE ws.agreement_id = $1 AND ws.status = 'open'
-          AND ws.target_hours > 0          -- an untracked trade asks for none`, [agreementId])
+          -- An untracked trade asks for none. 10/18: that is the AGREEMENT's
+          -- answer, not the number the period froze (loadOpenPeriods).
+          AND wta.tracks_hours AND ws.target_hours > 0`, [agreementId])
     const uncounted: Record<string, number> = {}
     const hoursWorked = new Map<string, number>()
     for (const h of hrs) {

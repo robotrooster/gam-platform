@@ -145,13 +145,24 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     expect(special).toEqual({ lease_id: f.renewalId, r: '50.00' })
     expect(ahead).toEqual({ lease_id: f.renewalId, r: '410.00' })
 
-    // ...and it is usable on the lease they are on: October's $460 bill on the
-    // renewal is covered in full by the $460 that came back, and pays itself.
+    // ...and it is spent on what the household owes, oldest bill first. The
+    // bank turning that payment down left September owed again, so (10/18,
+    // Nic) the $50 the landlord GAVE goes there — never to a later month while
+    // an earlier one is open. The $410 the tenant PAID AHEAD stays with the
+    // space it was moved to (10/17) and pays October. Neither bill is covered
+    // in full, so neither settles; each owes the rest.
     await db.query(`UPDATE leases SET status = 'active' WHERE id = $1`, [f.renewalId])
     await db.query(`UPDATE leases SET status = 'expired' WHERE id = $1`, [f.oldLeaseId])
     const october = await charge(f, { leaseId: f.renewalId, amount: 460, due: '2026-10-01' })
-    await runWholeBillCheckAfterCommit({ tenantId: f.tenantId, landlordId: f.landlordId, onlyLeaseIds: [f.renewalId] })
-    expect((await db.query<{ status: string }>(`SELECT status FROM payments WHERE id = $1`, [october])).rows[0].status).toBe('settled')
+    await runWholeBillCheckAfterCommit({ tenantId: f.tenantId, landlordId: f.landlordId })
+    const on = async (id: string) => (await db.query<{ status: string; a: string }>(
+      `SELECT p.status, (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u
+                          WHERE u.payment_id = p.id AND u.status = 'applied')::text AS a
+         FROM payments p WHERE p.id = $1`, [id])).rows[0]
+    expect(await on(x.rent)).toEqual({ status: 'failed', a: '50.00' })
+    expect(await on(october)).toEqual({ status: 'pending', a: '410.00' })
+    expect(Number((await leaseOf('tenant_credits', x.special)).r)).toBe(0)
+    expect(Number((await leaseOf('lease_prepaid_credits', x.ahead)).r)).toBe(0)
   })
 
   it('money already spent stays with the old lease as its history; a withdrawn credit stays put', async () => {
@@ -250,14 +261,18 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
   // household (the desk, "Pay all" with the retrying bill first) replaces the
   // old lease's retry and gives it back, so the figure the payer is shown is
   // the same before and after that replacing.
-  it('while the old lease\'s bank retry still holds a moved credit, the household still counts it as the renewal\'s', async () => {
+  // 10/18 (Nic): and it goes on the OLDEST bill — September, on the space they
+  // are leaving — not the renewal's October. "They can't pay one for October
+  // and then pay that same one for November."
+  it('while the old lease\'s bank retry still holds a moved credit, the household counts it and spends it on September, not October', async () => {
     const f = await fixture()
-    await movedCreditHeldByOldRetry(f)
+    const { special, sept } = await movedCreditHeldByOldRetry(f)
     await tx(async c => {
       await lockHousehold(c, f.tenantId, f.landlordId)
       const quote = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId, lock: true })
-      expect(quote.leases.find(l => l.leaseId === f.renewalId)!.usableCredit).toBe(50)
-      expect(planCredit(quote, f.oldLeaseId)).toEqual([])
+      expect(planCredit(quote, f.oldLeaseId).map(l => [l.creditId, l.paymentId, l.amount])).toEqual([[special, sept, 50]])
+      expect(planCredit(quote, f.renewalId)).toEqual([])
+      expect(quote.leases.find(l => l.leaseId === f.renewalId)!.usableCredit).toBe(0)
       // Paying September now (which replaces the retry) frees it.
       expect(quote.leases.find(l => l.leaseId === f.oldLeaseId)!.heldReleasable).toBe(50)
       // The household's credit on file still shows the moved money.
@@ -288,7 +303,11 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
 
   // 10/4 (was "the renewal's credit figure is the same before and after paying
   // the old bill replaces its retry"): the figure is the credit free right now.
-  it('the renewal\'s credit figure is the free credit: $0 while the old lease\'s retry holds the $50, $50 once paying the old bill replaces that retry ("Pay all", old bill first)', async () => {
+  // 10/18 (Nic): and once it is free it belongs to the OLDEST open bill —
+  // September — so October's own charge still carries none of it. That is the
+  // point of the rule: a later month on one space never takes money an earlier
+  // month on another space is still owed.
+  it('the renewal\'s credit figure stays $0: held by September\'s retry, then free but owed to September itself', async () => {
     const f = await fixture()
     const { special, sept } = await movedCreditHeldByOldRetry(f)
     // One transaction, as a payment would run it, rolled back at the end.
@@ -302,12 +321,16 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
       const after = await planLeaseCharge(c, { tenantId: f.tenantId, scope: { kind: 'lease', leaseId: f.renewalId }, lock: true })
       expect(before.usableCredit).toBe(0)
       expect(before.creditStillHeldElsewhere).toBe(50)
-      // Once September's retry is replaced, the $50 is free and the renewal's.
-      expect(after.usableCredit).toBe(50)
+      // Once September's retry is replaced the $50 is free — and the household
+      // plan puts it on September, the oldest bill, so October's charge takes
+      // none of it and nothing is left waiting on a bank payment.
+      expect(after.usableCredit).toBe(0)
       expect(after.creditStillHeldElsewhere).toBe(0)
       expect(after.creditWaitingNote).toBeNull()
       expect(after.creditWaitingHeldBy).toEqual([])
-      expect(after.creditPlan.map(l => [l.creditId, l.amount])).toEqual([[special, 50]])
+      expect(after.creditPlan).toEqual([])
+      const household = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId, lock: true })
+      expect(planCredit(household, f.oldLeaseId).map(l => [l.creditId, l.paymentId, l.amount])).toEqual([[special, sept, 50]])
     } finally {
       await c.query('ROLLBACK').catch(() => {})
       c.release()
@@ -330,8 +353,11 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     const old = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.oldLeaseId, useCredit: true, paymentMethodType: 'ach' })
     const renewal = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.renewalId, useCredit: true, paymentMethodType: 'ach' })
     expect(old.creditOnFile).toBe(150)
-    // Paying September now replaces its retry: it is the bill being charged, and the oldest.
-    expect(old.usableCredit).toBe(100)
+    // Paying September now replaces its retry: it is the bill being charged,
+    // and the oldest. 10/18: both credits go on it — the free $100 and the $50
+    // its own retry was holding (a credit the landlord gave is the
+    // household's, whichever space it was issued on).
+    expect(old.usableCredit).toBe(150)
     expect(old.creditStillHeldElsewhere).toBe(0)
     // October charged alone (autopay, its own Pay button): September's retry
     // never uses credit, so the free $100 pays October. The special's $50 is
@@ -343,11 +369,11 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     expect(renewal.creditWaitingNote).toBe('$50.00 of your credit is set aside for an earlier bank payment that has not cleared yet. If that payment clears, the credit goes toward that earlier bill. If it does not, the credit comes back to your account.')
     expect(renewal.creditWaitingHeldBy).toEqual([f.oldLeaseId])
 
-    // "Pay all": September first (it takes the $100; replacing its retry
-    // frees the special's $50), then October with what is left — every dollar
-    // offered once, nothing waiting.
+    // "Pay all": September first (the oldest bill takes all $150 — the free
+    // $100 and the $50 replacing its retry frees), then October with what is
+    // left, which is nothing. Every dollar offered once, nothing waiting.
     const after = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.renewalId, useCredit: true, paymentMethodType: 'ach', afterLeaseIds: [f.oldLeaseId] })
-    expect(after.usableCredit).toBe(50)
+    expect(after.usableCredit).toBe(0)
     expect(after.creditStillHeldElsewhere).toBe(0)
     expect(after.creditWaitingNote).toBeNull()
     expect(old.usableCredit + after.usableCredit).toBe(old.creditOnFile)
@@ -460,7 +486,10 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     expect(after.creditWaitingNote).toBeNull()
   })
 
-  it('when the old lease\'s retry finally fails, the credit it held comes back to the account and the renewal may use it', async () => {
+  // 10/18 (Nic): once it comes back it goes on the OLDEST open bill — the
+  // September one on the space they left, which is owed again — not on the
+  // renewal's October.
+  it('when the old lease\'s retry finally fails, the credit it held comes back and goes on September, which is owed again', async () => {
     const f = await fixture()
     const { special, sept, rem } = await movedCreditHeldByOldRetry(f)
     await db.query(`UPDATE payments SET next_retry_at = NULL WHERE id = $1`, [sept])
@@ -468,9 +497,17 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
 
     expect(await leaseOf('tenant_credits', special)).toEqual({ lease_id: f.renewalId, r: '50.00' })
     const after = await tx(c => planLeaseCharge(c, { tenantId: f.tenantId, scope: { kind: 'lease', leaseId: f.renewalId } }))
-    expect(after.usableCredit).toBe(50)
+    expect(after.usableCredit).toBe(0)
     expect(after.creditStillHeldElsewhere).toBe(0)
     expect(after.creditWaitingNote).toBeNull()
+    // It is the September bill's, and the tenant's own Pay screen says so.
+    await tx(async c => {
+      const household = await householdQuote(c, { tenantId: f.tenantId, landlordId: f.landlordId })
+      expect(planCredit(household, f.oldLeaseId).map(l => [l.creditId, l.paymentId, l.amount])).toEqual([[special, sept, 50]])
+    })
+    const q = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.renewalId, useCredit: true, paymentMethodType: 'ach' })
+    expect(q.creditKeptElsewhere).toBe(50)
+    expect(q.creditRestNote).toBe('$50.00 of your credit is kept for a bill on another lease.')
   })
 
   it('the desk window and the desk settle agree when a moved credit is held by the old lease\'s retry: Save', async () => {
@@ -505,12 +542,14 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     const st = await statuses([sept, oct])
     expect(st.get(sept)).toBe('settled')
     expect(st.get(oct)).toBe('settled')
-    // Used once, on October: September was paid in full in money.
+    // Used once, and on the OLDEST bill — September (10/18) — so October was
+    // the one paid in full in money. The desk's figures are the same either
+    // way: the payer chose to use the credit, never which bill it lands on.
     expect(Number((await leaseOf('tenant_credits', special)).r)).toBe(0)
     expect(await heldUses(special)).toBe(0)
     const applied = (await db.query<{ payment_id: string; amount: string }>(
       `SELECT payment_id, amount::text AS amount FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'applied'`, [special])).rows
-    expect(applied).toEqual([{ payment_id: oct, amount: '50.00' }])
+    expect(applied).toEqual([{ payment_id: sept, amount: '50.00' }])
   })
 
   describe('the portal Pay Now path (10/4)', () => {
@@ -585,22 +624,27 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
       expect(await heldOn(special)).toEqual([{ payment_id: sept, amount: '50.00' }])
     })
 
-    // Fix pass 3: the review's example — $100 on file: $30 can pay October,
-    // $50 is held by September's retry, and the other $20 (a credit tied to
-    // the old lease, whose only bill is the retrying one) used to go unsaid.
-    it('every dollar on file is explained on one bill: $30 pays it, $50 waits on the old retry, $20 is kept for a bill on another lease', async () => {
+    // Fix pass 3: the review's example — $100 on file: $30 can pay October and
+    // $50 is held by September's retry. 10/18 (Nic): the other $20, a credit
+    // the landlord gave on the old space, is no longer fenced there — its own
+    // space's only bill is the retrying one, which the charge leaves alone, so
+    // it pays October instead of sitting unsaid.
+    it('every dollar on file is explained on one bill: $50 pays it, $50 waits on the old retry', async () => {
       const f = await fixture()
       await movedCreditHeldByOldRetry(f, { amount: 80 })
       await tx(c => createIssuedCredit(c, {
         landlordId: f.landlordId, tenantId: f.tenantId, leaseId: f.oldLeaseId, amount: 20, category: 'goodwill', reason: 'old lease', createdBy: f.userId }))
       const q = await quoteLeaseCharge({ tenantId: f.tenantId, leaseId: f.renewalId, useCredit: true, paymentMethodType: 'ach' })
       expect(q.creditOnFile).toBe(100)
-      expect(q.usableCredit).toBe(30)
+      expect(q.usableCredit).toBe(50)
       expect(q.creditStillHeldElsewhere).toBe(50)
-      expect(q.creditKeptElsewhere).toBe(20)
+      expect(q.creditKeptElsewhere).toBe(0)
       expect(q.creditKeptForLater).toBe(0)
       expect(q.creditAlsoHeld).toBe(0)
-      expect(q.creditRestNote).toBe('$20.00 of your credit is kept for a bill on another lease.')
+      expect(q.creditRestNote).toBeNull()
+      // Every dollar on file is still accounted for on this one bill.
+      expect(q.usableCredit + q.creditStillHeldElsewhere + q.creditAlsoHeld + q.creditKeptElsewhere + q.creditKeptForLater)
+        .toBe(q.creditOnFile)
     })
 
     // A bill the free credit covers in full never needs the held $50, so the

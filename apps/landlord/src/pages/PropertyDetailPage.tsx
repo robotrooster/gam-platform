@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, type ProcessingFeeChoice } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT, MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -219,6 +219,7 @@ export function PropertyDetailPage() {
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <DepartureRulesCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -811,6 +812,64 @@ export function TenantsDepositAtBankCard({ property, onSaved }: { property: any;
         {TENANTS_DEPOSIT_AT_BANK_LABEL}
       </label>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{TENANTS_DEPOSIT_AT_BANK_HINT}</div>
+    </div>
+  )
+}
+
+// 10/18 (Nic): WHAT HAPPENS WHEN SOMEBODY LEAVES EARLY — TWO ANSWERS, PER PROPERTY.
+//   "refunds are pro rated to the next price down. people pay for a week they
+//    stay 4 days. the 4 day rate against the weekly rate is the difference for
+//    the refund if the landlord does refunds at all at that property. the only
+//    way it is different is for longer term people for rent pro ration. moving
+//    in or out at the middle of a month and also only if the landlord allows
+//    the pro rate. these should all be property level settings."
+// Both read as questions a landlord answers, not as flags. Both default to Yes
+// — the way every property already works — so a landlord who never opens this
+// card sees no change; a missing answer from an older cached page reads Yes too.
+export function DepartureRulesCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (b: { refundsEarlyDeparture?: boolean; proratesMidMonth?: boolean }) =>
+      apiPatch(`/properties/${property.id}/departure-rules`, b),
+    // 10/19 (review): say what the server said. It has a plain sentence for the
+    // one case this can really fail in — GAM part-way through an update, where
+    // the answer cannot be stored yet — and "Could not save that answer" sent
+    // the landlord back to press the same button again with nothing to go on.
+    { onSuccess: onSaved,
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that answer') })
+  const refunds = property.earlyDepartureRefunds !== false
+  const prorates = property.proratesMidMonthRent !== false
+  const busy = save.isLoading
+  const YesNo = ({ on, onPick }: { on: boolean; onPick: (v: boolean) => void }) => (
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+        onClick={() => !on && onPick(true)}>Yes</button>
+      <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+        onClick={() => on && onPick(false)}>No</button>
+    </div>
+  )
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When someone leaves early</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 14 }}>
+        Applies to check-outs and move-outs from now on. A refund already sent and a month already
+        billed are not revisited.
+      </div>
+
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {EARLY_DEPARTURE_REFUNDS_QUESTION}
+      </div>
+      <YesNo on={refunds} onPick={v => save.mutate({ refundsEarlyDeparture: v })} />
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8, marginBottom: 16 }}>
+        {EARLY_DEPARTURE_REFUNDS_HINT[refunds ? 'yes' : 'no']}
+      </div>
+
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {MID_MONTH_PRORATION_QUESTION}
+      </div>
+      <YesNo on={prorates} onPick={v => save.mutate({ proratesMidMonth: v })} />
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8 }}>
+        {MID_MONTH_PRORATION_HINT[prorates ? 'yes' : 'no']}
+      </div>
     </div>
   )
 }

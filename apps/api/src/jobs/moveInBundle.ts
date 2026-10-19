@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon'
 import { prorateMoveInRent, nextDueDateAfter, dayBefore, LEASE_COLUMN_LABEL } from '@gam/shared'
+import { departureRuleSql } from '../services/departureRules'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
@@ -112,6 +113,10 @@ export function moveInRentAmount(
   // S648: the lease's due day. Proration runs to the NEXT due date, which is
   // the 1st of next month only when rent is due on the 1st.
   dueDay = 1,
+  // 10/18 (Nic): "moving in or out at the middle of a month and also only if
+  // the landlord allows the pro rate." False = a whole month is a whole month.
+  // Left out means yes, which is what every property has always done.
+  proratesMidMonth = true,
 ): number {
   assertIsoDate(startDate, 'moveInRentAmount')
   // An existing tenancy always owes a whole month — the cycle it lands on is
@@ -119,6 +124,9 @@ export function moveInRentAmount(
   if (isExistingTenancy) return roundHalfEvenCents(rentAmount)
   const dt = DateTime.fromISO(startDate, { zone: 'utc' })
   if (dt.day === dueDay) return roundHalfEvenCents(rentAmount)
+  // The park that does not cut months bills the whole one they moved into —
+  // the mirror of finalMonthRentOnMoveOut on the way out.
+  if (proratesMidMonth === false) return roundHalfEvenCents(rentAmount)
   if (dueDay !== 1) return prorateMoveInRent(rentAmount, startDate, dueDay)
   const dim = daysInMonth(dt.year, dt.month)
   const daysRemaining = dim - dt.day + 1
@@ -275,6 +283,8 @@ export async function generateMoveInInvoice(
     onboarding_late_fee_waiver: boolean
     move_in_first_month_rent: string | null; move_in_proration: string | null
     rent_due_day: number
+    /** 10/18 (Nic): the property's mid-month proration answer. */
+    prorates_mid_month_rent: boolean
     property_added_on: string | null
     lease_start_date: string; property_tz: string
     source_booking_id: string | null
@@ -287,6 +297,10 @@ export async function generateMoveInInvoice(
             l.move_in_first_month_rent::text AS move_in_first_month_rent,
             l.move_in_proration::text AS move_in_proration,
             COALESCE(l.rent_due_day, 1) AS rent_due_day,
+            -- 10/18 (Nic): does this property prorate a mid-month move? Read
+            -- through services/departureRules so this works whether or not
+            -- 20261020120000 has landed on the database yet.
+            ${departureRuleSql('prorates_mid_month_rent')} AS prorates_mid_month_rent,
             -- S652: the day the property was added to GAM, in its own time zone.
             to_char((COALESCE(p.onboarding_started_at, p.created_at)
                      AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
@@ -314,7 +328,7 @@ export async function generateMoveInInvoice(
         && leaseMeta?.move_in_proration != null)
       ? roundHalfEvenCents(Number(leaseMeta.move_in_first_month_rent) + Number(leaseMeta.move_in_proration))
       : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy,
-          leaseMeta?.rent_due_day ?? 1)
+          leaseMeta?.rent_due_day ?? 1, leaseMeta?.prorates_mid_month_rent !== false)
 
   // ── 10/3 (decisions #15): A RESERVATION'S DEPOSIT COMES OFF THE LEASE'S FIRST BILL ──
   //

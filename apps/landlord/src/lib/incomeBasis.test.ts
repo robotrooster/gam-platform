@@ -11,6 +11,8 @@ import { MONEY_COLUMNS, MONEY_COLUMN_LABEL } from '@gam/shared'
 import {
   moneyColumns, moneyCardView, billedPartsAddUp, sumThree, threeAddUp, tieAddsUp, netsOf,
   rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
+  rentHealthFigures, rentHealthTies, allMoneyHeading, monthName,
+  MONEY_COLUMNS_DO_NOT_SUBTRACT, HEALTH_TRACE_NOTE, RENT_HEALTH_SCOPE_NOTE,
   activeCategories, categoryLabel, categoryThree,
   expenseLines, expenseCategoryLabel, incomeLineLabel, INCOME_LINES_ORDER,
   localDay, partsText, noChargeRemainder, sumAmounts, linesAddUp,
@@ -142,6 +144,71 @@ describe('the property-health card', () => {
     expect(healthStatus(0.85)).toBe('healthy')
     expect(healthStatus(0.84)).toBe('attention')
     expect(HEALTH_STATUS_LABEL.attention).toBe('Needs attention')
+  })
+})
+
+/**
+ * 10/18 (Nic): "$26,211.02 minus the received calculation of 19,483.98 in no
+ * way close equals 9,683.87. You're pulling numbers from different spots here."
+ *
+ * The block makes one claim and it is a subtraction, so the figures it prints
+ * are the subtraction: invoiced, paid, and invoiced less paid — with the
+ * percentage that divides the first two printed beside them.
+ */
+describe('the health block\'s figures tie, and say which money they count', () => {
+  // Mountain View's October, measured 10/18 on production.
+  const MV = { invoiced: 18502, paid: 17087, owed: 1415, workTradeHeld: 3478 }
+
+  it('prints invoiced, paid and still owed, and the percentage of the first two', () => {
+    const b = rentHealthFigures(MV)!
+    expect(b.figures).toEqual([
+      { key: 'invoiced', label: 'Rent invoiced this month', amount: 18502 },
+      { key: 'paid', label: 'Rent paid', amount: 17087 },
+      { key: 'owed', label: 'Still owed', amount: 1415 },
+    ])
+    expect(b.tieText).toBe('$18,502.00 invoiced − $17,087.00 paid = $1,415.00 still owed')
+    expect(b.rateText).toBe("92% of this month's rent bills paid")
+    expect(b.pct).toBe(92)
+  })
+
+  it('owed is the subtraction, not the reply\'s own number — the three cannot come apart', () => {
+    // A reply whose `owed` disagrees (an older build, a rounding slip) does not
+    // get to print a row of figures that will not come out on screen.
+    const b = rentHealthFigures({ ...MV, owed: 9683.87 })!
+    expect(b.figures[2].amount).toBe(1415)
+    expect(b.tieText).toContain('= $1,415.00 still owed')
+    expect(rentHealthTies({ ...MV, owed: 9683.87 })).toBe(false)
+    expect(rentHealthTies(MV)).toBe(true)
+    expect(rentHealthTies(undefined)).toBe(false)
+  })
+
+  it('names this month\'s rent against the Outstanding card, and work trade with no figure', () => {
+    const b = rentHealthFigures(MV)!
+    expect(b.scopeNote).toBe(RENT_HEALTH_SCOPE_NOTE)
+    expect(b.scopeNote).toContain("this month's rent bills only")
+    expect(b.scopeNote).toContain('every open charge of every month')
+    // S650: the fact that work trade is out, never what it is worth.
+    expect(b.workTradeNote).toContain('not counted here')
+    expect(JSON.stringify(b)).not.toContain('3478')
+    expect(rentHealthFigures({ ...MV, workTradeHeld: 0 })!.workTradeNote).toBeNull()
+  })
+
+  it('has nothing to print before anything is invoiced', () => {
+    expect(rentHealthFigures({ invoiced: 0, paid: 0, owed: 0 })).toBeNull()
+    expect(rentHealthFigures(undefined)).toBeNull()
+  })
+
+  // The money table beside it: a different window and every kind of money, so
+  // it says so above the columns rather than leaving three figures in a row to
+  // be subtracted.
+  it('the money table names its window, and says the three do not subtract', () => {
+    expect(monthName('2026-10')).toBe('October')
+    expect(monthName('2026-13')).toBe('')
+    expect(monthName(null)).toBe('')
+    expect(allMoneyHeading('2026-10')).toBe('All money in October — every kind, not just rent')
+    expect(allMoneyHeading(null)).toBe('All money this month — every kind, not just rent')
+    expect(MONEY_COLUMNS_DO_NOT_SUBTRACT).toContain('do not subtract to each other')
+    expect(HEALTH_TRACE_NOTE).toContain('all the money received that month')
   })
 })
 

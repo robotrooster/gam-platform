@@ -6,10 +6,11 @@ import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { useAuth } from '../context/AuthContext'
 import { PostPaymentForm } from '../components/RecordPaymentWindow'
 import {
   money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay,
-  CREDIT_USE_RULE, serverMessage, type TenantCredit,
+  CREDIT_USE_RULE, CREDIT_REST_NOT_USABLE, serverMessage, type TenantCredit,
 } from '../lib/creditDesk'
 import { healthColor, healthWord, healthText } from '../lib/paymentStamps'
 import '../styles/credit-desk.css'
@@ -359,7 +360,7 @@ export function TenantDetailPage() {
 
           <PhotosAndNoticesCard tenantId={id!} />
 
-          <CreditCard credit={data.credit ?? null} />
+          <CreditCard credit={data.credit ?? null} tenantId={id!} />
           <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} name={`${tenant.firstName ?? ''} ${tenant.lastName ?? ''}`.trim() || 'this tenant'} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
@@ -619,16 +620,67 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
 
 /**
  * S655 (Nic, 10/2): "ALL the credit on their account, and what of it would pay
- * their bills right now" — they differ (paid-ahead money stops at a monthly
- * draw limit, credit pays only your own rent, utilities and fees, and credit
- * tied to one lease pays only that lease). The balance itself is never netted;
- * the credit is used when they (or the desk, for them) say so, and pays a bill
- * by itself only when it covers that whole bill. Only a viewer who may see
- * payments, or the desk that takes them, is sent these figures (tenants.ts).
+ * their bills right now" — they differ (money paid ahead stops at a monthly
+ * draw limit and pays only the space it was paid for, deposit interest only
+ * that space, and credit pays only your own rent, utilities and fees). The
+ * balance itself is never netted; the credit is used when they (or the desk,
+ * for them) say so, and pays a bill by itself only when it covers that whole
+ * bill. Only a viewer who may see payments, or the desk that takes them, is
+ * sent these figures (tenants.ts).
+ *
+ * 10/18 (Nic): "we need to undo credit, but no undoing payments that were
+ * actually real money handed over." Under the figures, every credit this
+ * company gave this person, with Undo on each one that can still be taken back
+ * — the owner or a property manager only, and the server refuses in plain
+ * words the moment real money has landed on a bill the credit paid.
  */
-function CreditCard({ credit }: { credit: TenantCredit | null }) {
+/** One credit this company gave this person, as the credits list serves it. */
+interface GivenCredit {
+  id: string
+  amountOriginal: number | string
+  createdAt: string
+  reason: string | null
+  canUndo: boolean
+}
+
+function CreditCard({ credit, tenantId }: { credit: TenantCredit | null; tenantId: string }) {
   const headline = tenantCreditHeadline(credit)
-  if (!credit || !headline) return null
+  const { isOwner } = usePerms()
+  const { user } = useAuth()
+  // The same authority as issuing one (routes/tenantCredits): owner or property
+  // manager. A bookkeeper never acts on a tenant's account (10/12, Nic).
+  const canUndoHere = isOwner || user?.role === 'property_manager'
+  const given = useQuery<GivenCredit[]>(['tenant-credits-given', tenantId],
+    () => apiGet<GivenCredit[]>(`/tenant-credits?tenantId=${tenantId}`),
+    { enabled: canUndoHere, retry: false })
+  const undoable = (given.data ?? []).filter(c => c.canUndo === true)
+  // 10/18 review fix: the credit that MOST needs undoing is the one that is
+  // gone — since 10/15 a credit lands on the open balance the moment it is
+  // given, so a credit that paid bills leaves nothing on the account. The
+  // figures card hides itself when nothing is left; the list of credits you
+  // gave must not hide with it, or the only way back is the green notice on
+  // the Payments page and it is gone as soon as you navigate away.
+  return (
+    <>
+      {credit && headline && <AccountCreditFigures credit={credit} headline={headline} />}
+      {undoable.length > 0 && (
+        <div className="card cd-credit-card" style={{ marginBottom: 16 }}>
+          <div className="card-title" style={{ marginBottom: 10 }}>Credit you gave</div>
+          <div className="cd-note" style={{ marginBottom: 8 }}>
+            Taking one back puts whatever it has already paid back to owed. It is refused if real money has
+            landed on any of those bills.
+          </div>
+          {undoable.map(c => (
+            <UndoCreditRow key={c.id} credit={c} onDone={() => { void given.refetch() }} />
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+/** The figures themselves: all the credit on the account, and what of it could pay a bill now. */
+function AccountCreditFigures({ credit, headline }: { credit: TenantCredit; headline: string }) {
   const lines = tenantCreditLines(credit)
   // Part of it can pay their bills and part cannot: say why the rest cannot.
   const someNotUsable = toCents(credit.usable) > 0 && toCents(credit.usable) < toCents(credit.total)
@@ -644,8 +696,50 @@ function CreditCard({ credit }: { credit: TenantCredit | null }) {
       ))}
       <div className="cd-note" style={{ marginTop: 10 }}>
         {CREDIT_USE_RULE}
-        {someNotUsable && ' The rest cannot pay these bills: paid-ahead money stops at its monthly limit, credit pays only your own rent, utilities and fees, and credit tied to one lease pays only that lease.'}
+        {someNotUsable && CREDIT_REST_NOT_USABLE}
       </div>
+    </div>
+  )
+}
+
+/**
+ * One credit the landlord gave, with Undo. 10/18 (Nic): the whole credit comes
+ * back or none of it does, so there is one button and no amount box — and the
+ * question names what it will do, because what the credit already paid goes
+ * back to owed.
+ */
+function UndoCreditRow({ credit, onDone }: { credit: GivenCredit; onDone: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const undo = async () => {
+    const ok = await appConfirm(
+      `Undo the ${money(credit.amountOriginal)} credit? `
+      + 'Whatever it has already paid goes back to owed, and those bills are late from their own due dates again — '
+      + 'as if the credit had never been given. It is refused if real money has landed on any of them.',
+      { title: 'Undo this credit', confirmLabel: 'Undo the credit', danger: true },
+    )
+    if (!ok) return
+    setBusy(true)
+    try {
+      const r = await apiPost<any>(`/tenant-credits/${credit.id}/undo`, {})
+      toast(r?.data?.message ?? 'The credit was undone.')
+      onDone()
+    } catch (e) {
+      toast.error(serverMessage(e, 'Could not undo the credit.'))
+    } finally { setBusy(false) }
+  }
+  const reason = String(credit.reason ?? '').trim()
+  return (
+    <div className="data-row">
+      <span className="data-key">
+        {dayWord(calendarDay(credit.createdAt), '')}
+        {reason ? ` — ${reason}` : ''}
+      </span>
+      <span className="data-val" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <span className="mono">{money(credit.amountOriginal)}</span>
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void undo() }}>
+          {busy ? 'Undoing…' : 'Undo'}
+        </button>
+      </span>
     </div>
   )
 }

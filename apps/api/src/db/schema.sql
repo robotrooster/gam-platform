@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict yyIt9lkpDk6QHjhPcwNj7BFTCSAhdfg5GIWdtUrHOK3KF7g9KnX0A9Ze4ycO5Sb
+\restrict zUKSTdBDAp6aWvqz6MGENyUhYTBgxrcYDsS16Ceqj4fAv08MVtGfKghaboe0cs1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1659,7 +1659,12 @@ BEGIN
     IF NOT (   (OLD.status = 'held'    AND NEW.status IN ('applied','released'))
             OR (OLD.status = 'applied' AND NEW.status = 'reversed')
             OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'stay_shortened')
-            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'late_fee_credit_withdrawn')) THEN
+            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'late_fee_credit_withdrawn')
+            -- 10/18 (Nic): "we need to undo credit, but no undoing payments
+            -- that were actually real money handed over." A credit the
+            -- landlord gave, taken back whole: what it paid comes back off
+            -- every bill it paid (services/creditUse undoIssuedCredit).
+            OR (OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'credit_undone')) THEN
       RAISE EXCEPTION 'A credit use cannot go from % to %', OLD.status, NEW.status USING ERRCODE = '23514';
     END IF;
     -- Spent credit given back because a shortened stay no longer has the nights
@@ -1682,6 +1687,22 @@ BEGIN
             OR (SELECT tc.category FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id) IS DISTINCT FROM 'late_fee_refund'
             OR (SELECT p.type FROM payments p WHERE p.id = NEW.payment_id) IS DISTINCT FROM 'late_fee') THEN
       RAISE EXCEPTION 'Only a late-fee credit on its own late fee is taken back this way'
+        USING ERRCODE = '23514';
+    END IF;
+    -- 10/18 (Nic): a credit the landlord gave, taken back because it was
+    -- typed by mistake — only a credit HE TYPED (issued_by_landlord: never
+    -- deposit interest, which the tenant is owed by law; never money the
+    -- tenant paid ahead; and never a credit GAM wrote itself to cancel or
+    -- refund a fee, which is not his to take back), and only off a bill. The
+    -- route refuses it the moment real money is on that bill
+    -- (routes/tenantCredits), and the whole credit comes back or none of it
+    -- does.
+    IF OLD.status = 'applied' AND NEW.status = 'released' AND NEW.release_reason = 'credit_undone'
+       AND (NEW.tenant_credit_id IS NULL OR NEW.payment_id IS NULL
+            OR NOT COALESCE((SELECT tc.issued_by_landlord FROM tenant_credits tc
+                              WHERE tc.id = NEW.tenant_credit_id), false)
+            OR (SELECT tc.category FROM tenant_credits tc WHERE tc.id = NEW.tenant_credit_id) = 'deposit_interest') THEN
+      RAISE EXCEPTION 'Only a credit the landlord typed himself, spent on a bill, is taken back this way'
         USING ERRCODE = '23514';
     END IF;
     -- Undoing a spend keeps the day it was spent.
@@ -1821,9 +1842,21 @@ BEGIN
       SELECT l.landlord_id INTO lease_owner FROM leases l WHERE l.id = NEW.lease_id;
       -- Every comparison below is NULL-safe: a missing tenant or landlord on
       -- either side refuses the use, it never lets it through.
-      IF cr.lease_id IS NOT NULL THEN
+      --
+      -- 10/18 (Nic): "if a person has two households, right, two spaces, two
+      -- bills for October, they can't pay one for October and then pay that
+      -- same one for November. It does need to go on the October bill for the
+      -- other spot." A credit the landlord GAVE is the household's: the space
+      -- it was issued on records where he gave it, it is not a fence. So it
+      -- pays any bill of that person with that company, and the app walks
+      -- those bills by DUE DATE, oldest first, across every space
+      -- (creditUse.buildCreditPlan). Deposit interest still stays on its own
+      -- lease: GAM owes it back with THAT deposit at move-out. Money the
+      -- tenant paid ahead stays with the space they paid it for, above.
+      IF cr.category = 'deposit_interest' AND cr.lease_id IS NOT NULL THEN
         IF cr.lease_id IS DISTINCT FROM NEW.lease_id THEN
-          RAISE EXCEPTION 'This credit belongs to another lease' USING ERRCODE = '23514';
+          RAISE EXCEPTION 'Deposit interest belongs to another lease: it goes back with that deposit'
+            USING ERRCODE = '23514';
         END IF;
         IF cr.landlord_id IS DISTINCT FROM lease_owner THEN
           RAISE EXCEPTION 'This credit was given by another landlord, not the landlord on this lease'
@@ -1833,7 +1866,7 @@ BEGIN
          OR NOT (COALESCE(pay.tenant_id = cr.tenant_id, false) OR EXISTS (
                    SELECT 1 FROM lease_tenants lt
                     WHERE lt.lease_id = NEW.lease_id AND lt.tenant_id = cr.tenant_id)) THEN
-        RAISE EXCEPTION 'A general credit pays only its own tenant''s bills with the landlord who gave it'
+        RAISE EXCEPTION 'A credit pays only its own tenant''s bills with the landlord who gave it'
           USING ERRCODE = '23514';
       END IF;
     END IF;
@@ -10878,7 +10911,7 @@ CREATE TABLE public.credit_uses (
     CONSTRAINT credit_uses_reversed_is_paid_ahead CHECK (((status <> 'reversed'::text) OR ((prepaid_credit_id IS NOT NULL) AND (payment_id IS NOT NULL)))),
     CONSTRAINT credit_uses_source_check CHECK ((source = ANY (ARRAY['portal'::text, 'autopay'::text, 'front_desk_reader'::text, 'desk'::text, 'landlord_agent'::text, 'whole_bill'::text, 'move_out'::text, 'reversal'::text, 'backfill'::text, 'refund'::text, 'paid_ahead_choice'::text, 'late_fee_credit'::text]))),
     CONSTRAINT credit_uses_status_check CHECK ((status = ANY (ARRAY['held'::text, 'applied'::text, 'released'::text, 'reversed'::text]))),
-    CONSTRAINT credit_uses_status_stamps CHECK ((((status = 'held'::text) AND (applied_at IS NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'applied'::text) AND (applied_at IS NOT NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'released'::text) AND (applied_at IS NULL) AND (released_at IS NOT NULL) AND (release_reason = ANY (ARRAY['payment_failed'::text, 'payment_canceled'::text, 'superseded'::text]))) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'stay_shortened'::text)) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'late_fee_credit_withdrawn'::text)) OR ((status = 'reversed'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'funding_reversed'::text))))
+    CONSTRAINT credit_uses_status_stamps CHECK ((((status = 'held'::text) AND (applied_at IS NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'applied'::text) AND (applied_at IS NOT NULL) AND (released_at IS NULL) AND (release_reason IS NULL)) OR ((status = 'released'::text) AND (applied_at IS NULL) AND (released_at IS NOT NULL) AND (release_reason = ANY (ARRAY['payment_failed'::text, 'payment_canceled'::text, 'superseded'::text]))) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'stay_shortened'::text)) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'late_fee_credit_withdrawn'::text)) OR ((status = 'released'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'credit_undone'::text)) OR ((status = 'reversed'::text) AND (applied_at IS NOT NULL) AND (released_at IS NOT NULL) AND (release_reason = 'funding_reversed'::text))))
 );
 
 
@@ -17081,6 +17114,8 @@ CREATE TABLE public.properties (
     meter_photo_required boolean DEFAULT false NOT NULL,
     accept_partial_payments boolean DEFAULT false NOT NULL,
     tenants_deposit_at_bank boolean DEFAULT false NOT NULL,
+    early_departure_refunds boolean DEFAULT true NOT NULL,
+    prorates_mid_month_rent boolean DEFAULT true NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -17233,6 +17268,20 @@ COMMENT ON COLUMN public.properties.accept_partial_payments IS '10/5 (Nic): a pa
 --
 
 COMMENT ON COLUMN public.properties.tenants_deposit_at_bank IS '10/6 (Nic): tenants may deposit rent directly at the landlord''s bank. ON: the tenant may report a bank deposit, the landlord may record a "Bank deposit", and the bank feed matches bank lines to tenants'' bills here by itself (the bank''s date decides late fees). OFF (default): all three are refused; the office''s own deposit slips still match.';
+
+
+--
+-- Name: COLUMN properties.early_departure_refunds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.early_departure_refunds IS '10/18 (Nic): does this property give money back when someone leaves early? "the difference for the refund if the landlord does refunds at all at that property." FALSE = the price as booked stands: the check-out window offers no refund and says so, and rent paid past the day they left stays on the resident''s account as money paid ahead. Never gates checking the guest out, ending their lease, or what an unpaid stay is charged. Default TRUE = what every property did before this column existed.';
+
+
+--
+-- Name: COLUMN properties.prorates_mid_month_rent; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.prorates_mid_month_rent IS '10/18 (Nic): does this property prorate rent when a long-term resident moves in or out mid-month? "only if the landlord allows the pro rate." FALSE = a whole month is a whole month both ways: the month moved into is billed whole on page 8 and the move-in invoice, and the month moved out of is owed whole. TRUE = the days are counted against the ACTUAL days in that month, via the one proration GAM has (shared moveInCharges prorateMoveInRent) — never a flat 30. Also governs the prorated tail of a long stay whose guest leaves part-way into another month (shared stayPricing priceNightsStayed), which is NEW on 10/18 and arrives switched on at every property by this default, deliberately; move-in proration is what every property already did.';
 
 
 --
@@ -19385,11 +19434,35 @@ CREATE TABLE public.tenant_credits (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     voided_at timestamp with time zone,
+    undone_at timestamp with time zone,
+    undone_by uuid,
+    issued_by_landlord boolean DEFAULT false NOT NULL,
     CONSTRAINT tenant_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
     CONSTRAINT tenant_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric)),
     CONSTRAINT tenant_credits_category_check CHECK ((category = ANY (ARRAY['screening_cap'::text, 'late_fee_refund'::text, 'overcharge'::text, 'goodwill'::text, 'deposit_interest'::text, 'other'::text]))),
     CONSTRAINT tenant_credits_status_check CHECK ((status = ANY (ARRAY['active'::text, 'void'::text])))
 );
+
+
+--
+-- Name: COLUMN tenant_credits.undone_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_credits.undone_at IS '10/18 (Nic): when this credit was taken back whole (what it had paid went back to owed). NULL on a plain void.';
+
+
+--
+-- Name: COLUMN tenant_credits.undone_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_credits.undone_by IS '10/18 (Nic): who took the credit back.';
+
+
+--
+-- Name: COLUMN tenant_credits.issued_by_landlord; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_credits.issued_by_landlord IS '10/18 (Nic): true only for a credit a landlord typed in the Issue credit box — the only kind he can undo. Credits GAM writes itself (a late fee cancelled or refunded, money paid ahead given back at lease end, deposit interest) are false. Not backfilled: credits from before the Undo existed read false.';
 
 
 --
@@ -19993,6 +20066,9 @@ CREATE TABLE public.unit_bookings (
     returning_guest_at timestamp with time zone,
     returning_guest_by uuid,
     stay_tax_rate numeric(7,4),
+    deposit_link_sent_at timestamp with time zone,
+    deposit_link_sent_by uuid,
+    deposit_pay_link_id uuid,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -20062,6 +20138,27 @@ COMMENT ON COLUMN public.unit_bookings.returning_guest_by IS '10/6 (Nic): who at
 --
 
 COMMENT ON COLUMN public.unit_bookings.stay_tax_rate IS '10/17 (Nic, "never reprice history"): the lodging tax rate (a fraction) in force when this stay was priced, stamped by trg_unit_bookings_stamp_stay_tax. Every payment toward the stay records its share of THIS rate, so a later change never re-rates a stay already sold. NULL on stays priced before 10/17 — they read the property''s rate, as they did before.';
+
+
+--
+-- Name: COLUMN unit_bookings.deposit_link_sent_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.deposit_link_sent_at IS '10/18 (Nic): when this reservation''s deposit link was last emailed to the guest — by the reservation form, or by the schedule''s Ask for the deposit button. Paces a second press (nothing is emailed again within the hour) and tells the schedule the guest has been asked. NULL = never asked.';
+
+
+--
+-- Name: COLUMN unit_bookings.deposit_link_sent_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.deposit_link_sent_by IS '10/18 (Nic): who asked. NULL for a link GAM sent itself (the booking site).';
+
+
+--
+-- Name: COLUMN unit_bookings.deposit_pay_link_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.deposit_pay_link_id IS '10/18 (Nic): the pay link that was made as THIS reservation''s deposit (routes/posPayLinks createBookingDepositLink). Beside balance_pay_link_id, which is the arrival-day balance link. A reservation can also carry the link that created it, or an Add-a-month link; those ask for other money and are never handed back as the deposit.';
 
 
 --
@@ -42687,6 +42784,14 @@ ALTER TABLE ONLY public.tenant_credits
 
 
 --
+-- Name: tenant_credits tenant_credits_undone_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_undone_by_fkey FOREIGN KEY (undone_by) REFERENCES public.users(id);
+
+
+--
 -- Name: tenant_declared_deposits tenant_declared_deposits_bank_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43076,6 +43181,22 @@ ALTER TABLE ONLY public.unit_booking_waitlists
 
 ALTER TABLE ONLY public.unit_bookings
     ADD CONSTRAINT unit_bookings_balance_pay_link_id_fkey FOREIGN KEY (balance_pay_link_id) REFERENCES public.pos_pay_links(id);
+
+
+--
+-- Name: unit_bookings unit_bookings_deposit_link_sent_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_deposit_link_sent_by_fkey FOREIGN KEY (deposit_link_sent_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_bookings unit_bookings_deposit_pay_link_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_deposit_pay_link_id_fkey FOREIGN KEY (deposit_pay_link_id) REFERENCES public.pos_pay_links(id);
 
 
 --
@@ -43915,5 +44036,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict yyIt9lkpDk6QHjhPcwNj7BFTCSAhdfg5GIWdtUrHOK3KF7g9KnX0A9Ze4ycO5Sb
+\unrestrict zUKSTdBDAp6aWvqz6MGENyUhYTBgxrcYDsS16Ceqj4fAv08MVtGfKghaboe0cs1
 

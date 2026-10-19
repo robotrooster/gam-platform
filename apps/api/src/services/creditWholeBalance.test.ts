@@ -597,40 +597,40 @@ describe('8. credit the landlord gave goes on the balance too', () => {
  * paid (because the oldest bill of all was in another park), where nothing
  * could ever spend it.
  */
+/** Another park of the same company. */
+const park = (s: Stack) => tx(async c => {
+  const propertyId = await seedProperty(c, {
+    landlordId: s.landlordId, ownerUserId: s.ownerUserId, managedByUserId: s.ownerUserId,
+  })
+  await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+  await c.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [propertyId, TZ])
+  return propertyId
+})
+
+/** Another space for the same resident, with its own unit and lease. */
+const space = (s: Stack, propertyId: string, unitNumber: string, rent: number) => tx(async c => {
+  const unitId = await seedUnit(c, { propertyId, landlordId: s.landlordId, rentAmount: rent })
+  await c.query(`UPDATE units SET unit_number = $2 WHERE id = $1`, [unitId, unitNumber])
+  const leaseId = await seedLease(c, { unitId, landlordId: s.landlordId, rentAmount: rent, startDate: '2026-09-05' })
+  await seedLeaseTenant(c, { leaseId, tenantId: s.tenantId, role: 'primary' })
+  return { unitId, leaseId }
+})
+
+/** A rent bill on one space. */
+async function billOn(s: Stack, sp: { unitId: string; leaseId: string }, due: string, amount: number) {
+  const inv = (await db.query<{ id: string }>(
+    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7,'pending',$8::timestamptz) RETURNING id`,
+    [s.landlordId, s.tenantId, sp.leaseId, sp.unitId, `INV-${Math.random().toString(36).slice(2, 9)}`, due, amount,
+     `${due}T14:00:00Z`])).rows[0].id
+  const id = (await db.query<{ id: string }>(
+    `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, created_at)
+     VALUES ($1,$2,$3,$4,'rent',$5,'pending','RENT',$6::date,$7,$8::timestamptz) RETURNING id`,
+    [s.landlordId, s.tenantId, sp.unitId, sp.leaseId, amount, due, inv, `${due}T14:00:00Z`])).rows[0].id
+  return { invoiceId: inv, id }
+}
+
 describe('9. money kept at the desk sits where it can be spent', () => {
-  /** Another park of the same company. */
-  const park = (s: Stack) => tx(async c => {
-    const propertyId = await seedProperty(c, {
-      landlordId: s.landlordId, ownerUserId: s.ownerUserId, managedByUserId: s.ownerUserId,
-    })
-    await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    await c.query(`UPDATE properties SET timezone = $2 WHERE id = $1`, [propertyId, TZ])
-    return propertyId
-  })
-
-  /** Another space for the same resident, with its own unit and lease. */
-  const space = (s: Stack, propertyId: string, unitNumber: string, rent: number) => tx(async c => {
-    const unitId = await seedUnit(c, { propertyId, landlordId: s.landlordId, rentAmount: rent })
-    await c.query(`UPDATE units SET unit_number = $2 WHERE id = $1`, [unitId, unitNumber])
-    const leaseId = await seedLease(c, { unitId, landlordId: s.landlordId, rentAmount: rent, startDate: '2026-09-05' })
-    await seedLeaseTenant(c, { leaseId, tenantId: s.tenantId, role: 'primary' })
-    return { unitId, leaseId }
-  })
-
-  /** A rent bill on one space. */
-  async function billOn(s: Stack, sp: { unitId: string; leaseId: string }, due: string, amount: number) {
-    const inv = (await db.query<{ id: string }>(
-      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$7,'pending',$8::timestamptz) RETURNING id`,
-      [s.landlordId, s.tenantId, sp.leaseId, sp.unitId, `INV-${Math.random().toString(36).slice(2, 9)}`, due, amount,
-       `${due}T14:00:00Z`])).rows[0].id
-    const id = (await db.query<{ id: string }>(
-      `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id, created_at)
-       VALUES ($1,$2,$3,$4,'rent',$5,'pending','RENT',$6::date,$7,$8::timestamptz) RETURNING id`,
-      [s.landlordId, s.tenantId, sp.unitId, sp.leaseId, amount, due, inv, `${due}T14:00:00Z`])).rows[0].id
-    return { invoiceId: inv, id }
-  }
-
   const record = (s: Stack, anchor: string, body: Record<string, unknown>) =>
     request(app()).post(`/api/payments/${anchor}/record-manual`).set('Authorization', `Bearer ${s.token}`).send(body)
   const keptCredit = async (creditId: string) => (await db.query<{ lease_id: string; left: number }>(
@@ -689,5 +689,162 @@ describe('9. money kept at the desk sits where it can be spent', () => {
     expect(credit.left).toBe(0)
     expect(await appliedOn(owing.id)).toBe('50.00')
     expect(await appliedOn(retrying.id)).toBe('0')
+  })
+})
+
+/**
+ * 10. 10/18 (Nic), correcting what shipped — A CREDIT GOES ON THE HOUSEHOLD'S
+ * OLDEST BILL, WHATEVER SPACE IT IS ON.
+ *
+ *   "If a person has two households, right, two spaces, two bills for October,
+ *    they can't pay one for October and then pay that same one for November. It
+ *    does need to go on the October bill for the other spot."
+ *
+ * Billy Jose Miranda holds RV 34 and RV 35 at Oak Park, each with a September
+ * and an October bill. A credit the landlord gives him must clear BOTH
+ * Septembers before either October — it used to be fenced to the space it was
+ * issued on, so it could clear one space's September AND October while the
+ * other space's September sat open.
+ *
+ * Two things do not move. Money the tenant PAID AHEAD stays with the space they
+ * paid it for (10/17): a promise to the payer, which due-date order never
+ * overrides. So does statutory interest on a deposit — GAM owes it back with
+ * THAT deposit. Where that leaves credit sitting while they owe, the sweep says
+ * why in plain words.
+ */
+describe("10. credit crosses both of a household's spaces by due date", () => {
+  const issuedOnSpace = (s: Stack, leaseId: string, amount: number, category = 'goodwill') => tx(c => createIssuedCredit(c, {
+    landlordId: s.landlordId, tenantId: s.tenantId, leaseId, amount, category, reason: 'test', createdBy: s.ownerUserId,
+  }))
+  const appliedOn = async (id: string) => Number((await db.query<{ a: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS a FROM credit_uses WHERE payment_id = $1 AND status = 'applied'`, [id])).rows[0].a)
+
+  /** Billy: two spaces in one park, each with a September and an October bill. */
+  async function billy() {
+    const s = await stack()
+    await db.query(`UPDATE users SET first_name = 'Billy Jose', last_name = 'Miranda' WHERE id = $1`, [s.tenantUserId])
+    const oakPark = await park(s)
+    const rv34 = await space(s, oakPark, 'RV 34', 400)
+    const rv35 = await space(s, oakPark, 'RV 35', 400)
+    return {
+      s, rv34, rv35,
+      sep34: await billOn(s, rv34, '2026-09-01', 400),
+      sep35: await billOn(s, rv35, '2026-09-01', 400),
+      oct34: await billOn(s, rv34, '2026-10-01', 400),
+      oct35: await billOn(s, rv35, '2026-10-01', 400),
+    }
+  }
+
+  it('an $800 credit issued on RV 35 clears BOTH Septembers, not RV 35’s September and October', async () => {
+    const b = await billy()
+    const credit = await issuedOnSpace(b.s, b.rv35.leaseId, 800)
+    await wholeBalance(b.s)
+    expect(await appliedOn(b.sep34.id)).toBe(400)
+    expect(await appliedOn(b.sep35.id)).toBe(400)
+    expect(await appliedOn(b.oct34.id)).toBe(0)
+    expect(await appliedOn(b.oct35.id)).toBe(0)
+    expect(Number((await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM tenant_credits WHERE id = $1`, [credit])).rows[0].r)).toBe(0)
+    expect(await owedNow(b.s)).toBe(800)
+  })
+
+  it('$1,200 pays both Septembers and then the older October: RV 34 is clear, RV 35’s October is still owed', async () => {
+    const b = await billy()
+    // RV 34's October is the older of the two Octobers by its own row (same due
+    // date, so the one allocation order decides) — the point is that neither
+    // October is touched until both Septembers are paid.
+    await issuedOnSpace(b.s, b.rv35.leaseId, 1200)
+    await wholeBalance(b.s)
+    expect(await appliedOn(b.sep34.id)).toBe(400)
+    expect(await appliedOn(b.sep35.id)).toBe(400)
+    expect(await appliedOn(b.oct34.id) + await appliedOn(b.oct35.id)).toBe(400)
+    expect(await owedNow(b.s)).toBe(400)
+  })
+
+  // The whole-bill rule must not settle one space's bill over another space's
+  // older one: there is only enough credit for the Septembers.
+  it('neither space’s whole bill is settled while the other space’s September is open', async () => {
+    const b = await billy()
+    await issuedOnSpace(b.s, b.rv35.leaseId, 800)
+    await wholeBalance(b.s)
+    const status = async (id: string) => (await db.query<{ s: string }>(`SELECT status AS s FROM payments WHERE id = $1`, [id])).rows[0].s
+    expect(await status(b.sep34.id)).toBe('settled')
+    expect(await status(b.sep35.id)).toBe('settled')
+    expect(await status(b.oct34.id)).toBe('pending')
+    expect(await status(b.oct35.id)).toBe('pending')
+  })
+
+  // 10/17 (Nic): money paid ahead is the payer's, for the space they paid it
+  // for. Due-date order never moves it to the other space.
+  it('money paid ahead on RV 35 pays RV 35’s bills even though RV 34’s September is older', async () => {
+    const b = await billy()
+    const money = await tx(c => createPaidAhead(c, {
+      leaseId: b.rv35.leaseId, tenantId: b.s.tenantId, amount: 800, fundedBy: 'landlord', receivedAt: '2026-09-22T18:00:00Z',
+    }))
+    await wholeBalance(b.s)
+    expect(await appliedOn(b.sep35.id)).toBe(400)
+    expect(await appliedOn(b.oct35.id)).toBe(400)
+    expect(await appliedOn(b.sep34.id)).toBe(0)
+    expect(await creditLeft(money)).toBe(0)
+  })
+
+  // And where that leaves money sitting on a space that owes nothing, the sweep
+  // says why in plain words instead of guessing.
+  it('money paid ahead on a space that owes nothing is left alone, and the sweep says why', async () => {
+    const b = await billy()
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = ANY($1::uuid[])`,
+      [[b.sep35.id, b.oct35.id]])
+    await tx(c => createPaidAhead(c, {
+      leaseId: b.rv35.leaseId, tenantId: b.s.tenantId, amount: 500, fundedBy: 'landlord', receivedAt: '2026-09-22T18:00:00Z',
+    }))
+    const swept = await tx(c => sweepCreditSittingWhileOwing(c))
+    expect(swept).toHaveLength(1)
+    expect(swept[0].leftSitting).toMatch(/money they paid ahead on a space that does not owe/)
+    expect(await appliedOn(b.sep34.id)).toBe(0)
+  })
+
+  // 10/18 review fix: the household's figures pool the credits of everyone on a
+  // shared space, but a credit is still the credit of the ONE person it was
+  // given to. A co-resident of RV 35 who does not hold RV 34 has no claim on RV
+  // 34's bills, and the credit ledger refuses that row outright — so sending it
+  // there did not just misplace the credit, it killed the whole draw (the bill
+  // stayed open, the credit stayed unspent, and GAM got an alert).
+  it('a co-resident’s credit pays the space they share, never the oldest bill on a space they do not hold — and the draw still runs', async () => {
+    const b = await billy()
+    // The oldest bill of all is on RV 34, which the co-resident does not hold.
+    const aug34 = await billOn(b.s, b.rv34, '2026-08-01', 400)
+    const mate = await tx(async c => {
+      const id = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId: b.rv35.leaseId, tenantId: id, role: 'co_tenant' })
+      return id
+    })
+    // The co-resident's credit is given first, so it is spent first.
+    const mateCredit = await tx(c => createIssuedCredit(c, {
+      landlordId: b.s.landlordId, tenantId: mate, leaseId: b.rv35.leaseId, amount: 400,
+      category: 'goodwill', reason: 'test', createdBy: b.s.ownerUserId,
+    }))
+    const billyCredit = await issuedOnSpace(b.s, b.rv35.leaseId, 400)
+    await wholeBalance(b.s)
+    // The co-resident's credit paid the space they share; Billy's own paid the
+    // older bill on the space only he holds.
+    expect(await appliedOn(b.sep35.id)).toBe(400)
+    expect(await appliedOn(aug34.id)).toBe(400)
+    expect(await appliedOn(b.sep34.id)).toBe(0)
+    const spentOn = async (creditId: string) => (await db.query<{ lease_id: string }>(
+      `SELECT lease_id FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'applied'`, [creditId])).rows
+      .map(r => r.lease_id)
+    expect(await spentOn(mateCredit)).toEqual([b.rv35.leaseId])
+    expect(await spentOn(billyCredit)).toEqual([b.rv34.leaseId])
+  })
+
+  it('statutory interest on RV 35’s deposit pays only RV 35', async () => {
+    const b = await billy()
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = ANY($1::uuid[])`,
+      [[b.sep35.id, b.oct35.id]])
+    const interest = await issuedOnSpace(b.s, b.rv35.leaseId, 24, 'deposit_interest')
+    await wholeBalance(b.s)
+    expect(await appliedOn(b.sep34.id)).toBe(0)
+    expect(Number((await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM tenant_credits WHERE id = $1`, [interest])).rows[0].r)).toBe(24)
   })
 })

@@ -519,48 +519,154 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
 
 // ── S548: pull-out meter reads (Nic) ─────────────────────────────────
 //
-// The final read MUST happen on the pull-out date: it closes the departing
-// guest's bill (same-day settlement) AND sets the baseline that protects
-// the NEXT arrival from inheriting usage — RV sites turn over same-day in
-// season. Every morning this finds today's departures on submetered sites
-// and prompts the landlord + reading-capable staff, one notification per
-// property, idempotent per day.
-export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
-  const departures = await query<{
-    property_id: string; property_name: string; landlord_id: string
-    unit_number: string; who: string | null
-  }>(`
-    SELECT DISTINCT p.id AS property_id, p.name AS property_name, p.landlord_id,
-           u.unit_number, x.who
-      FROM (
+// The final read MUST happen at the pull-out: it closes the departing guest's
+// bill (same-day settlement) AND sets the baseline that protects the NEXT
+// arrival from inheriting usage — RV sites turn over same-day in season. Every
+// morning this finds the departures on submetered spots whose closing read is
+// still missing and prompts the landlord + reading-capable staff, one
+// notification per property, idempotent per day.
+//
+// 10/18 (Nic): "if there was a final bill and somebody moved out, the system
+// did not alert us to do a meter read. Um, speaking of that, my RV spaces 10
+// and 11, Victor Cardoza and Nemesio Rivera, they paid for a month. They both
+// left early, so I need to get those meter reads."
+//
+// This used to ask who is leaving TODAY — a lease whose end date is today, a
+// stay whose booked check-out is today and that has not checked out yet. Leave
+// early and you fall out of that question twice over: the stay is already
+// checked out, and its check-out date has moved back to the day the person
+// actually drove off. So the read was never asked for on the one day it was
+// asked for, and never asked for again. Victor and Nemesio left early, and
+// nobody at Mountain View was ever told to read RV 10 or RV 11.
+//
+// It now asks what the front desk's own reads-due list asks — which departures
+// still have no closing read — so the prompt comes back every morning until
+// somebody reads the meter, whether they left on their booked day or a week
+// early.
+
+/**
+ * The ONE definition of a departure whose closing read is still outstanding:
+ * a lease whose last day has passed, or a stay that has checked out (or has
+ * sat past its check-out), inside the ~60-day window this product works in.
+ * The morning prompt, the front-desk reads-due list (getReadsDue) and the
+ * check-in block (unitPendingReads) all build on this, so a departure one of
+ * them sees can never be a departure another one misses.
+ *
+ * A household's last day is the earlier of the day the lease says it ends and
+ * the day the lease was actually ended — the same rule the utility bills
+ * themselves run on (utilityBilling.ts: leaseInForceOn,
+ * LEASE_LAST_DAY_ON_SPACE_SQL). Both exits have to land here, because they
+ * leave different marks: writing down a leaving day moves the end date and the
+ * lease stays active (moveOutNotice.ts), while buying out of the lease stamps
+ * the day it was ended and leaves the end date alone (leaseTermination.ts).
+ * Reading only the end date meant a household that paid to leave in October
+ * was invisible until the following August — the next rig pulls onto the spot
+ * on an unread meter and their power lands on the new arrival's bill, which is
+ * the exact loss this read exists to prevent. A lease that was ended before
+ * anybody ever lived under it is void, not a departure — Mountain View RV 01,
+ * a draft thrown away with no ending day stamped at all, and RV 09, ended
+ * before its start day. Nobody was ever on the spot, so there is nothing to
+ * read and nothing to ask the front desk for every morning.
+ *
+ * confirmed_gone separates "they are gone" from "the desk has not checked them
+ * out yet". A rig still showing as checked in a day past its check-out is
+ * routine at an RV park, so the notice must never tell the landlord somebody
+ * left when they are still parked out front.
+ *
+ * stay_bills carries 10/5 (Nic): a stay of 30+ nights with no lease pays its
+ * own spot's utilities, so its check-out read bills it the way a departing
+ * lease's does. The two scope clauses narrow the sweep — one property, one
+ * spot, or every property for the morning prompt — and leave the caller's own
+ * placeholder numbering alone.
+ */
+function departuresCte(leaseScope: string, bookingScope: string): string {
+  return `departures AS (
+      SELECT * FROM (
         SELECT l.unit_id,
+               -- The earlier of what the lease says and what actually happened.
+               -- A month-to-month lease with no end date and no ending day is
+               -- still running, and 'infinity' drops it at the window below.
+               LEAST(COALESCE(l.end_date, 'infinity'::date),
+                     COALESCE(timezone(p.timezone, l.terminated_at)::date, 'infinity'::date)) AS departed_on,
+               l.id AS lease_id, FALSE AS stay_bills, TRUE AS confirmed_gone,
                (SELECT us.first_name || ' ' || us.last_name
                   FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
                   JOIN users us ON us.id = t.user_id
                  WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS who
-          FROM leases l
-         WHERE l.status = 'active' AND l.end_date = CURRENT_DATE
-        UNION
-        SELECT b.unit_id, b.guest_name AS who
-          FROM unit_bookings b
-         WHERE b.status IN ('confirmed', 'checked_in') AND b.check_out = CURRENT_DATE
-      ) x
-      JOIN units u ON u.id = x.unit_id
-      JOIN properties p ON p.id = u.property_id
-     WHERE EXISTS (
-        SELECT 1 FROM utility_meter_units mu
-          JOIN utility_meters m ON m.id = mu.meter_id AND m.billing_method = 'submeter'
-         WHERE mu.unit_id = u.id)
-     ORDER BY p.id, u.unit_number`)
+          FROM leases l JOIN units u ON u.id = l.unit_id
+                        JOIN properties p ON p.id = u.property_id
+         WHERE ${leaseScope}
+           AND l.status IN ('active','expired','terminated')
+           -- Ended before it ever started, or ended with no day stamped at
+           -- all: a draft nobody ever lived under. NULL fails this test, which
+           -- is what drops it.
+           AND (l.status <> 'terminated'
+                OR timezone(p.timezone, l.terminated_at)::date >= l.start_date)
+      ) ld
+       WHERE ld.departed_on <= CURRENT_DATE
+         AND ld.departed_on >= CURRENT_DATE - INTERVAL '60 days'
+      UNION ALL
+      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id,
+             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills,
+             b.status = 'checked_out' AS confirmed_gone,
+             b.guest_name AS who
+        FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+       WHERE ${bookingScope}
+         AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
+         AND (b.status = 'checked_out'
+              OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
+    )`
+}
+
+type ClosingReadDue = {
+  property_id: string; property_name: string; landlord_id: string
+  unit_number: string; who: string | null
+  departed_on: string; left_today: boolean; confirmed_gone: boolean
+}
+
+export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
+  const departures = await query<ClosingReadDue>(`
+    WITH ${departuresCte('TRUE', 'TRUE')},
+    outstanding AS (
+      -- One row per spot: a lease ending and a stay checking out on the same
+      -- spot are the same walk to the same meter. Somebody leaving TODAY takes
+      -- the row — that read has to happen at the pull-out, and the notice has
+      -- to name the guest driving off now, not one from two weeks ago. An
+      -- older unread departure on the same spot used to win the row and talk
+      -- the notice out of its own urgency. Past that, oldest first, so the
+      -- notice names the one that has been waiting longest.
+      SELECT DISTINCT ON (u.id)
+             p.id AS property_id, p.name AS property_name, p.landlord_id,
+             u.unit_number, d.who, d.departed_on, d.confirmed_gone
+        FROM departures d
+        JOIN units u ON u.id = d.unit_id
+        JOIN properties p ON p.id = u.property_id
+        JOIN utility_meter_units mu ON mu.unit_id = d.unit_id
+        JOIN utility_meters m ON m.id = mu.meter_id
+             AND m.billing_method = 'submeter' AND m.out_of_service = false
+       WHERE NOT EXISTS (
+          SELECT 1 FROM utility_meter_readings r
+           WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+       ORDER BY u.id, (d.departed_on = CURRENT_DATE) DESC, d.departed_on
+    )
+    SELECT property_id, property_name, landlord_id, unit_number, who, confirmed_gone,
+           to_char(departed_on, 'YYYY-MM-DD') AS departed_on,
+           departed_on = CURRENT_DATE AS left_today
+      FROM outstanding
+     ORDER BY property_id, unit_number`)
   if (departures.length === 0) return { prompted: 0 }
 
   // Group by property.
-  const byProperty = new Map<string, typeof departures>()
+  const byProperty = new Map<string, ClosingReadDue[]>()
   for (const d of departures) {
     const arr = byProperty.get(d.property_id) ?? []
     arr.push(d)
     byProperty.set(d.property_id, arr)
   }
+
+  const spot = (r: ClosingReadDue) => `${r.unit_number}${r.who ? ` (${r.who})` : ''}`
+  const short = (iso: string) => new Date(iso + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
 
   let prompted = 0
   for (const [propertyId, rows] of byProperty) {
@@ -574,11 +680,41 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
     if (already) continue
 
     const prop = rows[0]
-    const siteList = rows.map(r => `${r.unit_number}${r.who ? ` (${r.who})` : ''}`).join(', ')
-    const body =
-      `${rows.length} site${rows.length === 1 ? ' is' : 's are'} pulling out today: ${siteList}. ` +
-      `Read each meter AT checkout — the final bill lands on the departing guest and settles the same day, ` +
-      `and the read is the baseline that keeps their usage off the next arrival's bill.`
+    const todayRows = rows.filter(r => r.left_today)
+    const gone = rows.filter(r => !r.left_today && r.confirmed_gone)
+    // Past their check-out and NOT checked out: the rig is very likely still
+    // sitting there. Saying they left would be a plain untruth in an email to
+    // the landlord and every staffer on the property, so it says what the desk
+    // actually has on the books.
+    const stillOn = rows.filter(r => !r.left_today && !r.confirmed_gone)
+    const parts: string[] = []
+    if (todayRows.length) {
+      parts.push(
+        `${todayRows.length} site${todayRows.length === 1 ? ' is' : 's are'} pulling out today: ` +
+        `${todayRows.map(spot).join(', ')}. ` +
+        `Read each meter AT checkout — the final bill lands on the departing guest and settles the same day, ` +
+        `and the read is the baseline that keeps their usage off the next arrival's bill.`)
+    }
+    if (gone.length) {
+      parts.push(
+        `${gone.length} site${gone.length === 1 ? ' has' : 's have'} already left with no closing read: ` +
+        `${gone.map(r => `${spot(r)} — left ${short(r.departed_on)}`).join('; ')}. ` +
+        `Read ${gone.length === 1 ? 'that meter' : 'those meters'} now: the read closes their final bill, ` +
+        `and until it is taken their usage rolls onto whoever pulls in next.`)
+    }
+    if (stillOn.length) {
+      parts.push(
+        `${stillOn.length} site${stillOn.length === 1 ? ' is' : 's are'} past checkout and not checked out yet, ` +
+        `with no closing read: ` +
+        `${stillOn.map(r => `${spot(r)} — due out ${short(r.departed_on)}`).join('; ')}. ` +
+        `Read ${stillOn.length === 1 ? 'that meter' : 'those meters'} and check ` +
+        `${stillOn.length === 1 ? 'the stay' : 'the stays'} out: until the read is taken their usage rolls onto ` +
+        `whoever pulls in next.`)
+    }
+    const body = parts.join(' ')
+    const title = todayRows.length
+      ? `Pull-out meter reads due today — ${prop.property_name}`
+      : `Closing meter reads still due — ${prop.property_name}`
 
     const landlord = await queryOne<{ user_id: string; email: string }>(
       `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
@@ -609,12 +745,12 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
       await createNotification({
         userId: r.user_id, landlordId: prop.landlord_id,
         type: 'moveout_meter_reads_due',
-        title: `Pull-out meter reads due today — ${prop.property_name}`,
+        title,
         body,
         data: { propertyId, unitNumbers: rows.map(x => x.unit_number) },
         actionUrl: `/utilities?propertyId=${propertyId}`,
         sendEmail: true, emailTo: r.email,
-        emailSubject: `Pull-out meter reads due today — ${prop.property_name}`,
+        emailSubject: title,
         emailHtml: body,
       })
     }
@@ -751,30 +887,7 @@ export async function promptTenantDateMeterReads(
 // read, extending the stay, or canceling all drop the row on the next fetch.
 export async function getReadsDue(propertyId: string) {
   return query<any>(`
-    WITH departures AS (
-      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills,
-             (SELECT us.first_name || ' ' || us.last_name
-                FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
-                JOIN users us ON us.id = t.user_id
-               WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS who
-        FROM leases l JOIN units u ON u.id = l.unit_id
-       WHERE u.property_id = $1 AND l.end_date IS NOT NULL
-         AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
-         AND l.status IN ('active','ended','expired')
-      UNION ALL
-      -- 10/5 (Nic, prepaid stays — M7): a stay of 30+ nights with no lease
-      -- pays its site's utilities (a utility service agreement tied to the
-      -- stay). Its check-out read is a move-out read that bills its last
-      -- stretch, the same as a departing lease's.
-      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id,
-             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills,
-             b.guest_name AS who
-        FROM unit_bookings b JOIN units u ON u.id = b.unit_id
-       WHERE u.property_id = $1
-         AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
-         AND (b.status = 'checked_out'
-              OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
-    )
+    WITH ${departuresCte('u.property_id = $1', 'u.property_id = $1')}
     SELECT d.unit_id, u.unit_number, d.departed_on, d.lease_id, d.who,
            m.id AS meter_id, m.label AS meter_label, m.utility_type,
            CASE WHEN (d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills
@@ -799,23 +912,7 @@ export async function getReadsDue(propertyId: string) {
 // comparables and need no read. Empty array = clear to check in.
 export async function unitPendingReads(unitId: string) {
   return query<any>(`
-    WITH departures AS (
-      SELECT l.end_date AS departed_on, l.id AS lease_id, FALSE AS stay_bills
-        FROM leases l
-       WHERE l.unit_id = $1 AND l.end_date IS NOT NULL
-         AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
-         AND l.status IN ('active','ended','expired')
-      UNION ALL
-      -- 10/5 (M7): a stay that pays its site's utilities is read out with a
-      -- move-out read that bills it (see getReadsDue).
-      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id,
-             EXISTS (SELECT 1 FROM utility_service_agreements sa WHERE sa.booking_id = b.id) AS stay_bills
-        FROM unit_bookings b
-       WHERE b.unit_id = $1
-         AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
-         AND (b.status = 'checked_out'
-              OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
-    )
+    WITH ${departuresCte('l.unit_id = $1', 'b.unit_id = $1')}
     -- 10/3: one row per meter (two departures used to ask for the same meter
     -- twice). A billing move-out wins over a turnover; its lease rides along
     -- so the read bills that household.

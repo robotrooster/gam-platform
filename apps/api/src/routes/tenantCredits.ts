@@ -7,7 +7,8 @@ import { canManageLandlordResource } from '../middleware/scope'
 import { TENANT_CREDIT_CATEGORIES } from '@gam/shared'
 import { lockHousehold } from '../services/moneyPredicates'
 import {
-  createIssuedCredit, householdQuote, runWholeBillCheckAfterCommit,
+  createIssuedCredit, householdQuote, runWholeBillCheckAfterCommit, undoIssuedCredit,
+  CREDIT_UNDO_WINDOW_DAYS, creditUndoableSql,
 } from '../services/creditUse'
 
 // ============================================================
@@ -79,11 +80,17 @@ async function householdCredit(tenantId: string, landlordId: string): Promise<{ 
 /**
  * GET /api/tenant-credits/owed?leaseId= — what the Issue-credit box says before
  * anything is given away (10/15, Nic: never issuing credit blind to a $2,000
- * balance). `spaceOwed` is what THIS space still owes that a credit may pay —
- * where the credit will land, oldest bill first. `householdOwed` is the same
- * across every space this person holds with this company (one person + one
- * company = one balance): a credit issued on this space can only pay this
- * space's bills, so the box says when the rest of the balance is elsewhere.
+ * balance). `householdOwed` is everything this person owes this company that a
+ * credit may pay, across every space they hold (one person + one company = one
+ * balance); `spaceOwed` is the part of it on this space.
+ *
+ * 10/18 (Nic), correcting what shipped: "if a person has two households, right,
+ * two spaces, two bills for October, they can't pay one for October and then pay
+ * that same one for November. It does need to go on the October bill for the
+ * other spot." So the credit lands on the household's OLDEST bill first
+ * whatever space it is on, and the box says so — it used to say a credit issued
+ * here could not pay their other spaces, which is exactly what Nic reversed.
+ *
  * Rent, utilities, late fees and fees only: a home payment, a GAM fee and a
  * deposit are never credit's to pay, so they are not counted.
  */
@@ -106,16 +113,25 @@ tenantCreditsRouter.get('/owed', async (req, res, next) => {
         `SELECT un.unit_number FROM leases l LEFT JOIN units un ON un.id = l.unit_id WHERE l.id = $1`,
         [lease.id]))?.unit_number
       const who = space ? space : 'This space'
-      const message = spaceOwed > 0
-        ? `${who} still owes ${money(spaceOwed)}. A credit goes on that balance, oldest bill first — only what is over it stays on their account.`
-          + (elsewhere > 0 ? ` They owe another ${money(elsewhere)} on their other spaces; a credit issued here cannot pay that.` : '')
-          // Review fix (10/17): since the credit lands on the balance at once,
-          // a wrong amount is not undone by voiding it — the box says so
-          // before he gives anything away, in the same plain words.
-          + ' What goes on the balance is paid: voiding the credit later takes back only what is still on their account.'
+      // 10/18: one balance, oldest bill first, across every space — and the
+      // landlord is told he can take the credit back if he types it wrong
+      // (POST /:id/undo), which is now the honest answer to "what if I get
+      // the amount wrong" (the 10/17 line told him a void takes back only the
+      // leftover, which was true and useless).
+      const undoSaid = ` Typed the wrong amount? You can undo the credit for ${CREDIT_UNDO_WINDOW_DAYS} days — what it paid goes back to owed.`
+      const leftOver = ' Only what is over the whole balance stays on their account.'
+      const message = (
+        spaceOwed > 0 && elsewhere > 0
+          ? `${who} still owes ${money(spaceOwed)}, and another ${money(elsewhere)} on their other spaces — `
+            + `${money(householdOwed)} in all. A credit goes on the oldest bill first across every space, not just this one.`
+            + leftOver
+        : spaceOwed > 0
+          ? `${who} still owes ${money(spaceOwed)}. A credit goes on that balance, oldest bill first.` + leftOver
         : elsewhere > 0
-          ? `${who} owes nothing right now, but they still owe ${money(elsewhere)} on their other spaces. A credit issued here can only pay ${who}'s bills.`
-          : `${who} owes nothing right now, so the credit waits on their account for their next bill.`
+          ? `${who} owes nothing right now, but they owe ${money(elsewhere)} on their other spaces. `
+            + 'A credit goes there instead — on their oldest bill first.' + leftOver
+        : `${who} owes nothing right now, so the credit waits on their account for their next bill.`
+      ) + undoSaid
       res.json({
         success: true,
         data: { spaceOwed, householdOwed, creditOnAccount: q.totals.creditOnFile, message },
@@ -159,6 +175,11 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
         landlordId: lease.landlord_id, tenantId: lease.tenant_id, leaseId: lease.id,
         amount: body.amount, category: body.category, reason: body.reason ?? null,
         createdBy: req.user!.userId,
+        // The one box that gives a credit away by hand, and so the only credit
+        // the landlord can take back (10/18 review fix: GAM's own credits —
+        // a late fee cancelled or refunded, money paid ahead given back — are
+        // not his to undo).
+        issuedByLandlord: true,
       })
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
@@ -195,9 +216,13 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
     const message = (paidBill
       ? `The credit paid the tenant's whole open bill (${money(paidBill.creditUsed)}). ${leftSaid}`
       : spentCents > 0
+        // 10/18 (Nic): oldest bill first across every space they hold, not
+        // only the one the credit was issued on.
         ? `${money(spentCents / 100)} of the credit went on their open balance, oldest bill first. ${leftSaid}`
         : `The credit is on the tenant's account: ${money(credit.onAccount)} in all. They owe nothing it can pay right now, so it waits for their next bill.`)
       + otherSaid
+      // 10/18: the way back from a wrong amount, said where he has just typed it.
+      + ` Wrong amount? Undo it within ${CREDIT_UNDO_WINDOW_DAYS} days and what it paid goes back to owed.`
 
     res.status(201).json({
       success: true,
@@ -236,7 +261,15 @@ tenantCreditsRouter.get('/', async (req, res, next) => {
 
     const rows = await query<any>(
       `SELECT tc.id, tc.landlord_id, tc.tenant_id, tc.lease_id, tc.amount_original, tc.amount_remaining,
-              tc.category, tc.reason, tc.status, tc.created_at, tc.voided_at,
+              tc.category, tc.reason, tc.status, tc.created_at, tc.voided_at, tc.undone_at,
+              -- 10/18: is the Undo offered on this credit? The cheap facts
+              -- only — a live credit the LANDLORD typed himself, inside the
+              -- window (creditUndoableSql, the same expression the undo itself
+              -- checks, so the button and the action can never disagree).
+              -- Whether real money has landed on a bill it paid is the undo's
+              -- own answer, which names the bill (POST /:id/undo); asking it
+              -- for every credit in a list would read every bill's money.
+              ${creditUndoableSql('tc')} AS can_undo,
               -- What can still be spent. A void keeps its leftover recorded in
               -- amount_remaining (only the credit ledger moves that figure),
               -- but none of it can be used: a screen shows a void credit as
@@ -258,6 +291,82 @@ tenantCreditsRouter.get('/', async (req, res, next) => {
       .filter(r => canManageLandlordResource(req.user, r.landlord_id, ['property_manager']))
       .map(({ landlord_id: _landlord, ...r }) => r)
     res.json({ success: true, data: visible })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenant-credits/:id/undo — take a credit back whole, including what
+// it has already paid.
+//
+// 10/18 (Nic): "We need to undo credit, but no undoing payments that were
+// actually real money handed over ... refunds of real money are only at the
+// property setting by that individual landlord."
+//
+// Since 10/15 a credit lands on the open balance the moment it is issued, so a
+// void takes back only the leftover — nothing, usually. This is the way back
+// from a credit typed by mistake: every bill it settled is owed again, the
+// credit is gone, and who did it and when are kept on it
+// (services/creditUse undoIssuedCredit, which holds the household lock and
+// refuses, in plain words, the moment real money is on one of those bills).
+//
+// WHO. The same authority as issuing it — the owner, or a property manager who
+// manages that company. Never a bookkeeper (canManageLandlordResource never
+// matches one: 10/12, Nic — "never tenant-account actions") and never the
+// tenant.
+tenantCreditsRouter.post('/:id/undo', async (req, res, next) => {
+  try {
+    if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Credit not found')
+    const credit = await queryOne<any>(
+      'SELECT id, landlord_id, tenant_id FROM tenant_credits WHERE id=$1', [req.params.id])
+    if (!credit) throw new AppError(404, 'Credit not found')
+    if (!canManageLandlordResource(req.user, credit.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
+
+    const client = await getClient()
+    let undone: Awaited<ReturnType<typeof undoIssuedCredit>>
+    try {
+      await client.query('BEGIN')
+      undone = await undoIssuedCredit(client, { creditId: credit.id, undoneBy: req.user!.userId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
+    finally { client.release() }
+    await undone.afterCommit()
+
+    // The household's bills are open again, so credit still on their account
+    // goes on them — the standing rule that credit never sits while they owe
+    // (10/15). The credit just undone is void and can never be one of them.
+    const wb = await runWholeBillCheckAfterCommit({ tenantId: undone.tenantId, landlordId: undone.landlordId })
+    const sweptCents = wb ? wb.leases.reduce((t, l) => t + cents(l.creditUsed), 0) : 0
+
+    // What it had paid is owed again — every bill it was on, and separately
+    // whether any of them went from PAID back to owed (that is the part that
+    // draws late fees again, so it is said in its own sentence).
+    const backToOwed = undone.rows.filter(r => r.owedAgain)
+    const owedSaid = undone.rows.length === 0
+      ? 'It had not paid anything, so no bill changed.'
+      : `${money(undone.takenBackFromBills)} it had paid is owed again (${undone.rows.map(r => r.what).join(', ')}).`
+    const creditLeft = await householdCredit(undone.tenantId, undone.landlordId)
+    const message = `The ${money(undone.amount)} credit is undone. ${owedSaid}`
+      // Said plainly, because it is the part a landlord will not expect: GAM
+      // does not backdate lateness away, and waiving a fee is his own call.
+      + (backToOwed.length > 0 ? ' Those bills are late from their own due dates again, as if the credit had never been given.' : '')
+      + (sweptCents > 0 ? ` Credit still on their account went on the open balance (${money(sweptCents / 100)}).` : '')
+      + (creditLeft.onAccount > 0 ? ` ${money(creditLeft.onAccount)} of credit is left on their account.` : '')
+
+    res.json({
+      success: true,
+      data: {
+        id: undone.creditId, status: 'void',
+        amount: undone.amount,
+        /** What the credit had paid, now owed again. */
+        takenBackFromBills: undone.takenBackFromBills,
+        /** Every bill the credit had paid, in plain words; backToOwed: it went from paid to owed. */
+        billsOwedAgain: undone.rows.map(r => ({ what: r.what, amount: r.amount, backToOwed: r.owedAgain })),
+        creditOnAccount: creditLeft.onAccount,
+        creditAvailable: creditLeft.usableNow,
+        message,
+      },
+    })
   } catch (e) { next(e) }
 })
 
@@ -313,11 +422,13 @@ tenantCreditsRouter.post('/:id/void', async (req, res, next) => {
     // Review fix (10/17): since 10/15 a credit goes on the open balance the
     // moment it is issued, so a void often finds nothing left — and "Nothing
     // was left on this credit" read as if the void had undone it. Say what the
-    // credit already paid and that it stays paid: a void takes back only what
-    // is still on the account, and the way back from a wrong amount is to bill
-    // that money again.
+    // credit already paid and that it stays paid.
+    // 10/18: and point at the thing that DOES take it back — Undo, which puts
+    // every bill it paid back to owed (POST /:id/undo). A void is now only for
+    // taking the leftover off an account.
     const spentSaid = spent > 0
-      ? ` ${money(spent)} of it had already gone on their open balance, and that stays paid — bill it again if it should not have.`
+      ? ` ${money(spent)} of it had already gone on their open balance, and that stays paid. `
+        + 'To take that back as well, undo the credit instead of voiding it.'
       : ''
     res.json({
       success: true,

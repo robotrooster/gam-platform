@@ -2928,9 +2928,10 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
 
     // S655 (Nic, 10/2): ALL the credit on their account, and what of it would
     // pay their bills right now. They differ: paid-ahead money stops at a
-    // monthly draw cap, credit pays only the landlord's own rent, utilities and
-    // fees (never a GAM fee, a home payment or a neighbor's utility), and
-    // credit tied to one lease pays only that lease. Usable is the household
+    // monthly draw cap and pays only the space it was paid for, deposit
+    // interest only its own space (10/18), and credit pays only the landlord's
+    // own rent, utilities and fees (never a GAM fee, a home payment or a
+    // neighbor's utility). Usable is the household
     // plan the tenant's Pay Now and the desk offer ("credit available $X"); the
     // balance itself is never netted. Same money rule as seesPaidAhead above: only
     // a viewer who may see payments, or the desk that takes them. A

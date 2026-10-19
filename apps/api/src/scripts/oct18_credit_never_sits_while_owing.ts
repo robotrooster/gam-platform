@@ -30,10 +30,12 @@
  *      written (alerts: false), and nothing is invented: the money lands where
  *      the one credit service puts it.
  *
- * Paid-ahead money pays only its own space's bills (the credit ledger's rule),
- * so a household owing on a space whose credit sits on ANOTHER space is listed
- * with that said — the sweep cannot move it, and moving money between spaces
- * is Nic's call.
+ * 10/18 (Nic): a credit the landlord GAVE now goes on the household's oldest
+ * bill whatever space it is on, so the sweep reaches those. Money the tenant
+ * PAID AHEAD still pays only the space they paid it for, and deposit interest
+ * only its own deposit's lease — a household owing on one space while that
+ * money sits on another is listed with that said. The sweep cannot move it,
+ * and moving a payer's money between spaces is Nic's call.
  *
  * Read-only unless told otherwise: everything runs in one transaction that is
  * rolled back. --apply commits. Idempotent — run it twice and the second run
@@ -155,12 +157,13 @@ export async function sweepCreditSittingWhileOwing(client: PoolClient): Promise<
       creditHeldAfter: toDollars(heldAfter), owedAfter: toDollars(owedAfter),
       settledIds: r.settledIds,
       // Credit still on the account with money still owed: the rule left it
-      // alone on purpose and a person has to look. The three reasons it can
-      // happen, in Nic's words, are a bank pull already on its way for that
-      // bill, rent on a space the stay no longer covers, and money paid ahead
-      // on one space while another space is the one that owes.
+      // alone on purpose and a person has to look. The reasons it can happen,
+      // in Nic's words, are a bank pull already on its way for that bill, rent
+      // on a space the stay no longer covers, and (10/18: no longer a credit
+      // the landlord gave, which now crosses spaces) money the tenant paid
+      // ahead on one space, or deposit interest, while another space owes.
       leftSitting: heldAfter > 0 && owedAfter > 0
-        ? `${money(heldAfter)} of credit is still on the account with ${money(owedAfter)} owed — the credit is on a space that does not owe, or that bill has a bank payment on its way. Look before moving anything.`
+        ? `${money(heldAfter)} of credit is still on the account with ${money(owedAfter)} owed — it is money they paid ahead on a space that does not owe, or interest on that space's deposit, or that bill has a bank payment on its way. Look before moving anything.`
         : null,
     })
   }

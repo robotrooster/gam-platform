@@ -15,6 +15,8 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const server = vi.hoisted(() => ({
   profile: null as any,
+  /** The credits this company gave this person (GET /tenant-credits?tenantId=). */
+  credits: [] as any[],
   gets: [] as string[],
   posts: [] as { url: string; body: any }[],
   /** When set, a POST waits on it (in flight). */
@@ -25,6 +27,7 @@ vi.mock('../lib/api', () => ({
   apiGet: async (url: string) => {
     server.gets.push(url)
     if (url === '/tenants/t1/profile' || url.startsWith('/tenants/t1/profile?')) return JSON.parse(JSON.stringify(server.profile))
+    if (url.startsWith('/tenant-credits?')) return JSON.parse(JSON.stringify(server.credits))
     return []
   },
   apiPost: async (url: string, body: any) => {
@@ -62,7 +65,7 @@ const profile = (over: any = {}) => ({
 let host: HTMLDivElement
 let root: Root
 beforeEach(() => {
-  server.gets = []; server.posts = []; server.postHold = null; server.profile = profile()
+  server.gets = []; server.posts = []; server.postHold = null; server.profile = profile(); server.credits = []
   auth.user = { role: 'landlord', permissions: {} }
   host = document.createElement('div')
   document.body.appendChild(host)
@@ -125,6 +128,98 @@ describe('the account credit card', () => {
   it('is left out when there is no credit', async () => {
     await render()
     expect(host.querySelector('.cd-credit-card')).toBeNull()
+  })
+
+  // 10/18 (Nic): which money crosses spaces and which does not, on the card.
+  it('says a credit you gave crosses every space and money they paid ahead does not', async () => {
+    server.profile = profile({ credit: { total: 300, usable: 120, paidAhead: 200, fromLandlord: 100, depositInterest: 0 } })
+    await render()
+    const card = host.querySelector('.cd-credit-card')!
+    expect(card.textContent).toContain('only on the space they paid it for')
+    expect(card.textContent).toContain('oldest bill first across every space they hold with you')
+    // Part of it cannot pay these bills: the card says which money stays put.
+    expect(card.textContent).toContain('pays only the space they paid it for')
+    expect(card.textContent).toContain('interest on a deposit pays only that space')
+  })
+})
+
+/**
+ * 10/18 (Nic): "we need to undo credit, but no undoing payments that were
+ * actually real money handed over." Under the figures, the credits this company
+ * gave, each with Undo while it can still be taken back.
+ */
+describe('undoing a credit the landlord gave', () => {
+  const credit = (over: any = {}) => ({
+    id: 'c1', amountOriginal: '50.00', amountRemaining: '0.00', amountUsable: '0.00', category: 'goodwill',
+    reason: 'typed by mistake', status: 'active', createdAt: '2026-10-17T18:00:00.000Z', voidedAt: null,
+    undoneAt: null, canUndo: true, ...over,
+  })
+  const withCredit = { total: 300, usable: 120, paidAhead: 200, fromLandlord: 100, depositInterest: 0 }
+
+  /** Every credit card on the page: the figures, and the credits you gave. */
+  const cards = () => [...host.querySelectorAll('.cd-credit-card')].map(c => c.textContent ?? '').join(' | ')
+
+  it('offers Undo on a credit that can still be taken back, and says what it will do before doing it', async () => {
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit()]
+    await render()
+    await until(() => !!btn(/^Undo$/), 'the Undo button')
+    expect(cards()).toContain('typed by mistake')
+    // Asked first, in words that say the bills go back to owed — and nothing
+    // is sent while the answer is no.
+    ;(appConfirm as any).mockResolvedValueOnce(false)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    const asked = (appConfirm as any).mock.calls.at(-1)
+    expect(asked[0]).toContain('Whatever it has already paid goes back to owed')
+    expect(asked[0]).toContain('late from their own due dates again')
+    expect(asked[0]).toContain('refused if real money has landed on any of them')
+    expect(asked[1]).toMatchObject({ confirmLabel: 'Undo the credit', danger: true })
+    expect(server.posts.filter(p => p.url.includes('/undo'))).toEqual([])
+
+    ;(appConfirm as any).mockResolvedValueOnce(true)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    await until(() => server.posts.some(p => p.url === '/tenant-credits/c1/undo'), 'the undo')
+  })
+
+  /**
+   * 10/18 review fix: the credit that MOST needs undoing is the one that is
+   * gone. Since 10/15 a credit lands on the open balance the moment it is
+   * given, so a credit that paid bills leaves NOTHING on the account — and the
+   * figures card hides itself when nothing is left. The list of credits you
+   * gave used to live inside that card, so the normal case had no Undo at all
+   * once you left the green notice on the Payments page.
+   */
+  it('is reachable when the credit has spent itself and nothing is left on the account', async () => {
+    server.profile = profile()
+    server.credits = [credit({ amountRemaining: '0.00' })]
+    await render()
+    await until(() => !!btn(/^Undo$/), 'the Undo button')
+    expect(cards()).toContain('Credit you gave')
+    expect(cards()).toContain('typed by mistake')
+    // The figures card itself stays away: there is no credit to show.
+    expect(cards()).not.toContain('on their account')
+    ;(appConfirm as any).mockResolvedValueOnce(true)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    await until(() => server.posts.some(p => p.url === '/tenant-credits/c1/undo'), 'the undo')
+  })
+
+  it('shows no Undo on a credit the server says cannot be taken back', async () => {
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit({ canUndo: false }), credit({ id: 'c2', canUndo: false, category: 'deposit_interest' })]
+    await render()
+    await until(() => (host.querySelector('.cd-credit-card')?.textContent ?? '').includes('on their account'), 'the card')
+    expect(btn(/^Undo$/)).toBeUndefined()
+  })
+
+  // A bookkeeper never acts on a tenant's account (10/12, Nic), and the route
+  // refuses anyone else — so the list is not even asked for.
+  it('a bookkeeper is not offered it, and the credits are never read for them', async () => {
+    auth.user = { role: 'bookkeeper', permissions: {} }
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit()]
+    await render()
+    expect(btn(/^Undo$/)).toBeUndefined()
+    expect(server.gets.some(u => u.startsWith('/tenant-credits?'))).toBe(false)
   })
 })
 

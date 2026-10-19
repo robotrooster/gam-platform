@@ -492,9 +492,19 @@ export function SignPage() {
       // Proration follows the start date and rent until the landlord types
       // their own figure over it (a special) — then it is theirs. Billed on
       // the move-in day, there is nothing to prorate.
+      //
+      // 10/18 (Nic): "moving in or out at the middle of a month and also only
+      // if the landlord allows the pro rate." A park that answers No bills the
+      // WHOLE month they moved into on this same line (it is the line for the
+      // move-in day up to the next due date) — the mirror of the whole month
+      // charged on the way out. Same arithmetic as the server's page-8
+      // defaults and the move-in bill (shared moveInDefaults), so the page and
+      // the invoice cannot tell different stories.
+      const prorates = data.proratesMidMonthRent !== false
       const current = val('move_in_proration')
       const auto = !start ? null
         : (moveInDay || Number(start.slice(8, 10)) === dueDay) ? '0.00'
+        : !prorates ? rent.toFixed(2)
         : prorateMoveInRent(rent, start, dueDay).toFixed(2)
       if (auto != null && (current == null || current === autoProration.current)) {
         want['move_in_proration'] = auto

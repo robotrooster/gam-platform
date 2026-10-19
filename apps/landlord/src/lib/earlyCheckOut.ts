@@ -56,6 +56,12 @@ export interface CheckoutQuote {
   waitsForRefund: string | null
   /** For staff without "Check guests out" on a guest who still owes. */
   waitsForCheckOut?: string | null
+  /**
+   * 10/18 (Nic): this property does not give money back when someone leaves
+   * early, and someone here paid more than the days they stayed are worth — so
+   * the server asked no question. The plain sentence that says why.
+   */
+  noRefunds?: string | null
   decision: null | {
     id: string; status: 'pending' | 'decided'; choice: CheckoutChoice | null; choiceLabel: string | null
     leftOn: string; decidedBy: string | null; decidedAt: string | null; refundTotal: number; priceAfter: number | null
@@ -136,12 +142,17 @@ export function confirmLabel(q: CheckoutQuote, choice: CheckoutChoice | null, ty
   return what.charAt(0).toUpperCase() + what.slice(1)
 }
 
-/** What the window says under the question when the money waits for someone else (who can refund, or who can check guests out). */
+/**
+ * What the window says under the question when there are no choices to make:
+ * the money waits for someone else (who can refund, or who can check guests
+ * out) — or, 10/18 (Nic), this property does not give money back when someone
+ * leaves early, so the price as booked stands and there was never a question.
+ */
 export function waitLine(q: CheckoutQuote): string | null {
   if (!q.checkedOut && q.canCheckOut === false) return q.waitsForCheckOut ?? null
   if (q.question === 'overpaid' && !q.canRefund) return q.waitsForRefund
   if (q.question === 'owes' && q.canCheckOut === false) return q.waitsForCheckOut ?? null
-  return null
+  return q.noRefunds ?? null
 }
 
 /** The done screen's lines: cash to hand back first and plain, then the rest (the server orders them). */

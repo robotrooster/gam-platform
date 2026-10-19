@@ -17,9 +17,18 @@
  * Readiness is the shared rule in lib/payoutReadiness.ts — every company with
  * a property can be paid — and the companies that can't are named, so the
  * agent can say which one (Blu: TruBlu Management LLC, not Oak Park).
+ *
+ * 10/19 (review): THE SECOND BANK STEP WAS MISSING ENTIRELY. Bank setup is two
+ * steps for one bank account — Stripe verifies the business so rent can reach
+ * it, then the same account is linked READ-ONLY so spending becomes expenses
+ * (S605, Nic, DIRECTIVE: "No landlord is gonna be able to get their PNLs
+ * accurate if they can't reconcile the bank transactions"). This tool knew only
+ * about the first, so it told a landlord with step 1 done and step 2 untouched
+ * that their setup was complete. It is asked per company, by the same rule as
+ * payouts, so one company's linked feed never answers for another's.
  */
 
-import { queryOne } from '../../../db'
+import { query, queryOne } from '../../../db'
 import { payoutReadiness } from '../../../lib/payoutReadiness'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
@@ -27,6 +36,37 @@ interface CountsRow {
   properties: string
   units: string
   active_leases: string
+}
+
+interface FeedRow {
+  business_name: string | null
+  has_property: boolean
+  linked: boolean
+}
+
+/**
+ * Is the read-only bank feed linked for every company that has a property?
+ * Deliberately NOT "does any company in scope have one" — that is the exact
+ * collapse payoutReadiness was rewritten per-company to fix, where Oak Park's
+ * linked bank answered for TruBlu's missing one.
+ */
+async function feedReadiness(landlordIds: string[]) {
+  if (landlordIds.length === 0) return { ready: false, unlinked: [] as string[] }
+  const rows = await query<FeedRow>(
+    `SELECT l.business_name,
+            EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = l.id) AS has_property,
+            EXISTS (SELECT 1 FROM bank_connections bc
+                     WHERE bc.landlord_id = l.id AND bc.status = 'active') AS linked
+       FROM landlords l
+      WHERE l.id = ANY($1::uuid[])
+      ORDER BY l.created_at, l.id`,
+    [landlordIds])
+  const unlinked = rows
+    .filter(r => r.has_property && !r.linked)
+    .map(r => r.business_name || 'Unnamed company')
+  // Same shape as payoutReadiness: with no property anywhere, any one company's
+  // link is enough, so a co-owner's empty company is never the reason for a nag.
+  return { ready: unlinked.length === 0 && rows.some(r => r.linked), unlinked }
 }
 
 export const getSetupProgress: AgentTool = {
@@ -42,6 +82,7 @@ export const getSetupProgress: AgentTool = {
   async execute(_args, actor: AgentActor) {
     const ids = actorLandlordIds(actor)
     const payouts = await payoutReadiness(ids)
+    const feed = await feedReadiness(ids)
     const counts = await queryOne<CountsRow>(
       `SELECT
          (SELECT COUNT(*) FROM properties WHERE landlord_id = ANY($1::uuid[])) AS properties,
@@ -56,7 +97,8 @@ export const getSetupProgress: AgentTool = {
     const hasTenant = Number(counts?.active_leases ?? 0) > 0
 
     const steps = [
-      { step: 'Set up payouts — verify your business with Stripe on the Disbursement Account page (so you can get paid)', done: bankConnected },
+      { step: 'Set up payouts — step 1 of bank setup: verify your business with Stripe on the Bank page, Bank setup tab (so rent can reach your bank)', done: bankConnected },
+      { step: 'Connect your bank read-only — step 2 of bank setup, on the same tab (so your spending becomes expenses and the month reconciles)', done: feed.ready },
       { step: 'Add your first property', done: hasProperty },
       { step: 'Add units to your property', done: hasUnits },
       { step: 'Add a tenant and create their lease', done: hasTenant },
@@ -74,6 +116,8 @@ export const getSetupProgress: AgentTool = {
       // extra signals the agent can mention if helpful
       canGetPaid: payouts.ready,
       companiesThatCannotBePaid: payouts.unpaid.map((c) => c.businessName || 'Unnamed company'),
+      bankFeedLinked: feed.ready,
+      companiesWithNoBankFeed: feed.unlinked,
     }
   },
 }

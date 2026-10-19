@@ -9,6 +9,7 @@ import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
 import { X, CheckCircle, Gift, ChevronRight } from 'lucide-react'
+import { appConfirm } from '../components/dialogs'
 import { money, toCents, monthTitle, serverStatus, serverMessage, dayWord, CREDIT_USE_RULE } from '../lib/creditDesk'
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
 import { OpenMonthDetail, StayDetail, SpaceDetail } from '../components/payments/OpenMonthDetail'
@@ -140,7 +141,7 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // first" — so the box names what is still owed the moment a person is picked.
 // Giving the credit is still the landlord's call; being blind to a $2,000
 // balance while he gives $1,000 away is not.
-function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (msg: string) => void }) {
+function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (msg: string, creditId: string | null) => void }) {
   const { data: leases = [] } = useQuery<any[]>('leases', () => apiGet('/leases'))
   const activeLeases = (leases as any[]).filter((l: any) => l.status === 'active')
   const [leaseId, setLeaseId] = useState('')
@@ -170,7 +171,12 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
     () => apiPost('/tenant-credits', { leaseId, amount: Number(amount), category, reason: reason || null }),
     // The server says what the credit did (paid the whole open bill, or is on
     // their account and how much in all); the old line stays as the fallback.
-    { onSuccess: (r: any) => onDone(r?.data?.message ?? r?.message ?? `Credit of ${money(Number(amount))} issued. ${CREDIT_USE_RULE}`),
+    // 10/18 (Nic): the credit id comes back with the message, so "Undo" is
+    // right there on the notice — a credit typed wrong is caught at the moment
+    // it is typed, and what it already paid goes back to owed.
+    { onSuccess: (r: any) => onDone(
+        r?.data?.message ?? r?.message ?? `Credit of ${money(Number(amount))} issued. ${CREDIT_USE_RULE}`,
+        r?.data?.id ?? null),
       onError: (e: any) => setError(serverMessage(e, 'Could not issue the credit')) })
   const valid = leaseId && amount !== '' && Number(amount) > 0
   // Like the desk window: only its own buttons close it, and not while the
@@ -303,6 +309,9 @@ export function PaymentsPage() {
   const [posting, setPosting] = useState<{ tenantId: string; name: string } | null>(null)
   const [creditOpen, setCreditOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  // 10/18: the credit the last notice is about, so it can be undone from there.
+  const [noticeUndo, setNoticeUndo] = useState<{ creditId: string } | null>(null)
+  const [undoing, setUndoing] = useState(false)
   const recorded = useRef<string | null>(null)
   const refresh = () => { void qc.invalidateQueries('payments-ledger') }
   const openRecord = (row: OpenMonthRow) => {
@@ -345,16 +354,46 @@ export function PaymentsPage() {
       </div>
     </div>
   )
+  // 10/18 (Nic): "we need to undo credit." The whole credit comes back or none
+  // of it does, so one button, and the question says that what it already paid
+  // goes back to owed. The server refuses in plain words if real money has
+  // landed on one of those bills.
+  const undoCredit = async (creditId: string) => {
+    const ok = await appConfirm(
+      'Undo this credit? Whatever it has already paid goes back to owed, and those bills are late from their own '
+      + 'due dates again — as if the credit had never been given. It is refused if real money has landed on any of them.',
+      { title: 'Undo this credit', confirmLabel: 'Undo the credit', danger: true },
+    )
+    if (!ok) return
+    setUndoing(true)
+    try {
+      const r = await apiPost<any>(`/tenant-credits/${creditId}/undo`, {})
+      setNoticeUndo(null)
+      setNotice(r?.data?.message ?? 'The credit was undone.')
+      refresh()
+    } catch (e) {
+      setNotice(serverMessage(e, 'Could not undo the credit.'))
+    } finally { setUndoing(false) }
+  }
   const noticeBar = notice && (
     <div className="alert alert-success cd-notice" role="status">
       <CheckCircle size={15} />
       <span>{notice}</span>
-      <button className="btn btn-ghost btn-sm" aria-label="Dismiss" onClick={() => setNotice(null)}><X size={13} /></button>
+      {noticeUndo && (
+        <button className="btn btn-ghost btn-sm" disabled={undoing}
+          onClick={() => { void undoCredit(noticeUndo.creditId) }}>
+          {undoing ? 'Undoing…' : 'Undo the credit'}
+        </button>
+      )}
+      <button className="btn btn-ghost btn-sm" aria-label="Dismiss"
+        onClick={() => { setNotice(null); setNoticeUndo(null) }}><X size={13} /></button>
     </div>
   )
   const creditModal = creditOpen && (
     <IssueCreditModal onClose={() => setCreditOpen(false)}
-      onDone={(msg) => { setCreditOpen(false); setNotice(msg); refresh() }} />
+      onDone={(msg, creditId) => {
+        setCreditOpen(false); setNotice(msg); setNoticeUndo(creditId ? { creditId } : null); refresh()
+      }} />
   )
 
   if (!seesMonth || refused) {

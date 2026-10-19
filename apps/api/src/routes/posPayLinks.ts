@@ -1583,6 +1583,12 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
  *
  * Idempotent per booking: the row is claimed on `deposit_amount IS NULL`, so a
  * double-click never sends two links or bills two deposits.
+ *
+ * 10/18 (review): `emailed` says whether the guest really got the email. A send
+ * that fails is logged and the link still comes back — the link is the point,
+ * and the desk can read it down the phone — but the caller must not then record
+ * that the guest was ASKED, or the schedule says somebody was emailed who never
+ * was and nobody ever asks them again.
  */
 export async function createBookingDepositLink(opts: {
   bookingId: string; landlordId: string; propertyId: string
@@ -1596,7 +1602,7 @@ export async function createBookingDepositLink(opts: {
    * (createScreeningFeeLink).
    */
   screeningFee?: number | null
-}): Promise<{ id: string; url: string } | null> {
+}): Promise<{ id: string; url: string; emailed: boolean } | null> {
   const fee = round2(Number(opts.screeningFee) || 0)
   if (!(opts.amount > 0)) {
     if (!(fee > 0)) return null
@@ -1643,15 +1649,18 @@ export async function createBookingDepositLink(opts: {
   // held site and a guest holding a dead URL, and somebody has to notice.
   const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
   const { emailPayLink } = await import('../services/email')
-  await emailPayLink({
+  const emailed = await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
     label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
     neverExpires: true,
     note: await linkEmailNote(link),
     // 10/5: replies reach the people who run this property (services/replyRouting).
     ctx: { landlordId: opts.landlordId, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
-  }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[deposit-link] email failed'))
-  return { id: link.id, url: payLinkUrl(link.token) }
+  }).then(() => true).catch((e: unknown) => {
+    logger.error({ err: e, payLinkId: link.id }, '[deposit-link] email failed')
+    return false
+  })
+  return { id: link.id, url: payLinkUrl(link.token), emailed }
 }
 
 /**
@@ -1694,11 +1703,14 @@ function screeningLinkLine(fee: number, bookingId?: string): Record<string, unkn
  * Idempotent per booking: an unpaid fee-only link already out for the stay is
  * returned, never a second one; a stay whose check is already paid for gets
  * none (null). Null when amount <= 0.
+ *
+ * 10/18 (review): `emailed` is false for a link handed back — nothing was sent
+ * a second time — so the caller never records a fresh ask on an old link.
  */
 export async function createScreeningFeeLink(opts: {
   bookingId: string; landlordId: string; propertyId: string
   amount: number; guestName: string | null; guestEmail: string
-}): Promise<{ id: string; url: string } | null> {
+}): Promise<{ id: string; url: string; emailed: boolean } | null> {
   const amount = round2(Number(opts.amount) || 0)
   if (!(amount > 0)) return null
   if (!(await connectIdFor(opts.landlordId))) throw new AppError(409, 'Card payments are not set up for this property yet — finish payout setup under Banking first.')
@@ -1719,7 +1731,7 @@ export async function createScreeningFeeLink(opts: {
           AND items @> $2::jsonb
         ORDER BY created_at LIMIT 1`,
       [opts.landlordId, JSON.stringify([{ screening: true, bookingId: opts.bookingId }])])).rows[0]
-    if (open) { await client.query('ROLLBACK'); return { id: open.id, url: payLinkUrl(open.token) } }
+    if (open) { await client.query('ROLLBACK'); return { id: open.id, url: payLinkUrl(open.token), emailed: false } }
     // Already paid for this stay (the counter, a deposit link, the booking site): nothing to send.
     if (await screeningPaidForStay(opts.bookingId)) { await client.query('ROLLBACK'); return null }
     const prop = (await client.query<{ name: string; register_card_fee_payer: CardFeePayer }>(
@@ -1749,13 +1761,16 @@ export async function createScreeningFeeLink(opts: {
   // No expiry: check-in waits on the check, so the link stays good until it is paid or closed.
   const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
   const { emailPayLink } = await import('../services/email')
-  await emailPayLink({
+  const emailed = await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
     label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
     neverExpires: true, note: await linkEmailNote(link),
     ctx: { landlordId: opts.landlordId, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
-  }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[screening-link] email failed'))
-  return { id: link.id, url: payLinkUrl(link.token) }
+  }).then(() => true).catch((e: unknown) => {
+    logger.error({ err: e, payLinkId: link.id }, '[screening-link] email failed')
+    return false
+  })
+  return { id: link.id, url: payLinkUrl(link.token), emailed }
 }
 
 /**

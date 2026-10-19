@@ -38,6 +38,12 @@ import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { resolveLeaseSigner } from '../services/leaseSigner'
 import { initiateTransfer, confirmTransfer, declineTransfer, listIncomingTransfers } from '../services/propertyTransfer'
+// 10/18 (Nic): the two departure answers. services/departureRules is the one
+// place that knows whether migration 20261020120000 has landed on this
+// database yet — an UPDATE naming a column that is not there raises 42703 as
+// Postgres plans it, and inside the property-creation transaction that took
+// the whole property down with it.
+import { departureRulesStored, DEPARTURE_RULES_NOT_STORED_YET } from '../services/departureRules'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -112,6 +118,13 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       // 10/5: where residents' and guests' replies go (services/replyRouting).
       // Optional — until set, replies go to whoever runs the property.
       officeEmail: z.string().trim().toLowerCase().email().max(200).nullable().optional().or(z.literal('')),
+      // 10/18 (Nic): the two departure answers, asked in the onboarding form
+      // with every other property choice. Optional, and written only when the
+      // caller actually answered, so the column defaults (money back, and
+      // proration — what every property does today) stand for anything that
+      // creates a property without asking.
+      refundsEarlyDeparture: z.boolean().optional(),
+      proratesMidMonth: z.boolean().optional(),
       // 16a: allocation rule required on every property creation.
       // S116: three independent fee toggles replace bankingFeePayer.
       // Legacy callers passing bankingFeePayer auto-mirror into ACH+card.
@@ -282,6 +295,40 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     if (body.officeEmail) {
       await client.query(`UPDATE properties SET office_email = $2 WHERE id = $1`, [prop.id, body.officeEmail])
       prop.office_email = body.officeEmail
+    }
+    // 10/18 (Nic): the departure answers from the onboarding form. Written
+    // only when they were given — an unanswered property keeps the column
+    // defaults, so nothing that creates a property without asking changes.
+    //
+    // 10/19 (review): and only when the columns are THERE. The form now sends
+    // both answers in every body, so this ran on every property creation; on a
+    // database the migration has not reached, the UPDATE raised 42703 inside
+    // this transaction, the catch below rolled the whole thing back, and a
+    // landlord pressing Next on step 2 of onboarding got a 500 and no property.
+    // A property matters more than an answer that is still at its default
+    // either way, so the property is created and the answer is simply not
+    // claimed: `prop` carries what is actually in effect (money back, and
+    // proration), which is what the card will show, so the landlord can answer
+    // again and see it stick.
+    if (body.refundsEarlyDeparture !== undefined || body.proratesMidMonth !== undefined) {
+      if (await departureRulesStored(client)) {
+        const set = await client.query<any>(
+          `UPDATE properties
+              SET early_departure_refunds = COALESCE($2, early_departure_refunds),
+                  prorates_mid_month_rent = COALESCE($3, prorates_mid_month_rent)
+            WHERE id = $1
+            RETURNING early_departure_refunds, prorates_mid_month_rent`,
+          [prop.id, body.refundsEarlyDeparture ?? null, body.proratesMidMonth ?? null])
+        prop.early_departure_refunds = set.rows[0].early_departure_refunds
+        prop.prorates_mid_month_rent = set.rows[0].prorates_mid_month_rent
+      } else {
+        prop.early_departure_refunds = true
+        prop.prorates_mid_month_rent = true
+        logger.warn({ propertyId: prop.id, refundsEarlyDeparture: body.refundsEarlyDeparture,
+                      proratesMidMonth: body.proratesMidMonth },
+          '[properties] the departure answers were given at creation but 20261020120000 is not applied yet — '
+          + 'the property is created and behaves as money back + proration until it is')
+      }
     }
 
     // S579: open the property's onboarding window. While it's open the landlord
@@ -1160,6 +1207,50 @@ propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit')
     await query(`UPDATE properties SET move_in_collects_next_period = $2, updated_at = NOW() WHERE id = $1`,
       [req.params.id, collectsNextPeriod])
     res.json({ success: true, data: { propertyId: req.params.id, moveInCollectsNextPeriod: collectsNextPeriod } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/departure-rules — 10/18 (Nic): "refunds are pro
+// rated to the next price down ... if the landlord does refunds at all at that
+// property. the only way it is different is for longer term people for rent pro
+// ration. moving in or out at the middle of a month and also only if the
+// landlord allows the pro rate. these should all be property level settings."
+//
+// Two answers, each sent on its own as the landlord gives it (the card saves one
+// at a time), so a body naming neither is a mistake worth refusing rather than a
+// silent no-op. Both default TRUE in the database — what every property did
+// before the columns existed — so an unanswered property keeps behaving as it
+// does today. Takes effect from the next check-out; a refund already sent, and
+// a month already billed, are history and are not revisited.
+propertiesRouter.patch('/:id/departure-rules', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      refundsEarlyDeparture: z.boolean().optional(),
+      proratesMidMonth: z.boolean().optional(),
+    }).refine(b => b.refundsEarlyDeparture !== undefined || b.proratesMidMonth !== undefined,
+      'Say whether this property gives money back when someone leaves early, or whether it prorates a mid-month move')
+      .parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/19 (review): on a database 20261020120000 has not reached, this UPDATE
+    // cannot run at all (42703 as Postgres plans it). The landlord is told so
+    // in plain words rather than shown "Could not save that answer" over a
+    // 500 — or, worse, a 200 for an answer that was never kept.
+    if (!(await departureRulesStored())) throw new AppError(503, DEPARTURE_RULES_NOT_STORED_YET)
+    const row = await queryOne<{ early_departure_refunds: boolean; prorates_mid_month_rent: boolean }>(
+      `UPDATE properties
+          SET early_departure_refunds = COALESCE($2, early_departure_refunds),
+              prorates_mid_month_rent = COALESCE($3, prorates_mid_month_rent),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING early_departure_refunds, prorates_mid_month_rent`,
+      [req.params.id, body.refundsEarlyDeparture ?? null, body.proratesMidMonth ?? null])
+    res.json({ success: true, data: {
+      propertyId: req.params.id,
+      earlyDepartureRefunds: row!.early_departure_refunds,
+      proratesMidMonthRent: row!.prorates_mid_month_rent,
+    } })
   } catch (e) { next(e) }
 })
 

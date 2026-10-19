@@ -1,13 +1,17 @@
 import { describe, it, expect } from 'vitest'
 import {
   CENSUS_BASIS_SLOT, METRICS_BOUNDARY_LAYERS, METRICS_CENSUS_BASES, METRICS_CENSUS_BASIS_LABEL,
-  METRICS_CENSUS_BASIS_MEANING, METRICS_CENSUS_BASIS_NOUN, METRICS_CENSUS_LEVELS, METRICS_CENSUS_OVER_MEANING,
-  METRICS_CONCENTRATION_LEVELS,
-  METRICS_CONCENTRATION_MEANING, METRICS_MAP_COUNTRY_LEVELS, METRICS_MAP_LEVELS, METRICS_MAP_LEVEL_CREDIT,
-  METRICS_MAP_LEVEL_LABEL, METRICS_MAP_LEVEL_NOUN, METRICS_MAP_LEVEL_PLURAL, METRICS_MAP_MEASURES,
-  METRICS_MAP_MEASURE_LABEL, METRICS_MAP_STATE_LEVELS, METRICS_MAP_WORLD_LEVELS, METRICS_MAP_WORLD_NOTE,
-  METRICS_SATURATION_FULL, censusCountsNothing, formatShare, hasCensus,
-  hasConcentration, isMetricsBoundaryLayer, isMetricsWorldLevel, sharePercent,
+  METRICS_CENSUS_BASIS_MEANING, METRICS_CENSUS_BASIS_NOUN, METRICS_CENSUS_LEVELS,
+  METRICS_CENSUS_OVER_MEANING, METRICS_CONCENTRATION_LEVELS, METRICS_CONCENTRATION_MEANING,
+  METRICS_ELECTION_LEVELS, METRICS_ELECTION_OFFICES, METRICS_ELECTION_OFFICE_LABEL,
+  METRICS_LEAN_FULL, METRICS_LEAN_MEANING, METRICS_MAP_COUNTRY_LEVELS, METRICS_MAP_LEVELS,
+  METRICS_MAP_LEVEL_CREDIT, METRICS_MAP_LEVEL_LABEL, METRICS_MAP_LEVEL_NOUN,
+  METRICS_MAP_LEVEL_PLURAL, METRICS_MAP_MEASURES, METRICS_MAP_MEASURE_LABEL,
+  METRICS_MAP_STATE_LEVELS, METRICS_MAP_WORLD_LEVELS, METRICS_MAP_WORLD_NOTE,
+  METRICS_SATURATION_FULL, METRICS_WINDOW_CENSUS, METRICS_WINDOW_GAM, METRICS_WINDOW_SHARE,
+  METRICS_WINDOW_VOTES, censusCountsNothing, censusNoRowHere, censusNotAtLevel, formatShare,
+  hasCensus, hasConcentration, hasElections, isMetricsBoundaryLayer, isMetricsWorldLevel,
+  leanNoResult, leanNotAtLevel, leanStateGap, marginMoveText, marginText, offersLean, sharePercent
 } from './metricsMap'
 
 /**
@@ -65,9 +69,11 @@ describe('the map levels', () => {
   })
 })
 
-describe('the two overlays', () => {
-  it('offers Units, Money and the two overlays, each with its own name', () => {
-    expect(METRICS_MAP_MEASURES).toEqual(['units', 'money', 'saturation', 'concentration'])
+describe('the overlays', () => {
+  it('offers Units, Money and the three overlays, each with its own name', () => {
+    // 10/18 (Nic): `lean` is the third — "the overlay to show which way those
+    // certain districts vote".
+    expect(METRICS_MAP_MEASURES).toEqual(['units', 'money', 'saturation', 'concentration', 'lean'])
     for (const m of METRICS_MAP_MEASURES) {
       expect(METRICS_MAP_MEASURE_LABEL[m], m).toBeTruthy()
       expect(METRICS_MAP_MEASURE_LABEL[m], m).not.toBe(m)
@@ -179,5 +185,70 @@ describe('the two overlays', () => {
     expect(new Set([by('renter'), by('homes'), by('people')]).size).toBe(3)
     // The numerator both ways: every space, and the spaces occupied this month.
     expect(formatShare(sharePercent(910, census[CENSUS_BASIS_SLOT.renter]))).toBe('2.3%')
+  })
+})
+
+// ─── 10/18 (Nic): how an area votes ─────────────────────────────────────────
+
+describe('the election layer', () => {
+  it('is a contest at a level, not a presidency — any office drops into the same shape', () => {
+    // Nic: "I don't only want presidential stuff, I want mayor data, governor
+    // data, city council data, voting on public policy, whether it's
+    // left-leaning or conservative. I want the data at every level that we can
+    // get it."
+    expect(METRICS_ELECTION_OFFICES).toContain('president')
+    for (const o of ['governor', 'senate', 'state_senate', 'state_house', 'mayor', 'city_council', 'measure'] as const) {
+      expect(METRICS_ELECTION_OFFICES, o).toContain(o)
+      // No raw enums on screen (gam-no-raw-enums-in-ui).
+      expect(METRICS_ELECTION_OFFICE_LABEL[o], o).toBeTruthy()
+      expect(METRICS_ELECTION_OFFICE_LABEL[o], o).not.toBe(o)
+    }
+  })
+
+  it('ONLY COUNTIES ARE EXACT, and every other level says so instead of deriving one', () => {
+    // Nic: "there is no equally free keyless source for congressional or
+    // legislative districts, so on those levels say plainly that the lean is
+    // not available for districts yet rather than deriving a number from
+    // county votes — a made-up district margin is worse than none."
+    expect(METRICS_ELECTION_LEVELS).toEqual(['county'])
+    expect(hasElections('county')).toBe(true)
+    for (const level of ['cd', 'sldu', 'sldl', 'state', 'place', 'zcta'] as const) {
+      expect(hasElections(level), level).toBe(false)
+      // Still offered there — that is where the plain sentence is read.
+      expect(offersLean(level), level).toBe(true)
+      expect(leanNotAtLevel(METRICS_MAP_LEVEL_NOUN[level], METRICS_MAP_LEVEL_PLURAL[level]), level)
+        .toMatch(/^No election results are published by .+ They are published county by county/)
+    }
+    // The returns are the United States'; the world's levels never offer it.
+    for (const level of METRICS_MAP_WORLD_LEVELS) expect(offersLean(level), level).toBe(false)
+  })
+
+  it('says a margin, a missing one and a swing in plain words, in the contest\'s own terms', () => {
+    expect(marginText(-18.6, 'Republican', 'Democratic')).toBe('Democratic +18.6')
+    expect(marginText(33.9, 'Republican', 'Democratic')).toBe('Republican +33.9')
+    expect(marginText(0.01, 'Republican', 'Democratic')).toBe('Even')
+    // A ballot measure is the same shape with its own two sides named.
+    expect(marginText(-7.5, 'No', 'Yes')).toBe('Yes +7.5')
+    expect(leanNoResult('county')).toBe('No result is published for this county in that contest.')
+    expect(leanStateGap('Alaska', 'this state reported it by "State House District 1" and the like, not by county'))
+      .toBe('No result for this area: Alaska — this state reported it by "State House District 1" and the like, not by county.')
+    expect(marginMoveText(-47.1, -18.6, 'Republican', 'Democratic', '2016'))
+      .toBe('28.5 points toward the Republican side since 2016.')
+    // The color's own sentence says what it is, and never claims a GAM number.
+    expect(METRICS_LEAN_MEANING).toMatch(/share of every vote cast/)
+    expect(METRICS_LEAN_MEANING).toMatch(/marker shows where GAM has spaces/)
+    expect(METRICS_LEAN_FULL).toBe(60)
+  })
+
+  it('the window has one set of headings, and a plain sentence where a count is missing', () => {
+    // Nic: "In plain words throughout, never a raw code ... Where a level has
+    // no census match, say so plainly rather than showing a blank or a zero."
+    for (const h of [METRICS_WINDOW_CENSUS, METRICS_WINDOW_GAM, METRICS_WINDOW_SHARE, METRICS_WINDOW_VOTES]) {
+      expect(h).toBeTruthy()
+      expect(h).not.toMatch(/_/)
+    }
+    expect(censusNotAtLevel('state or province'))
+      .toBe('The U.S. Census counts the United States only, so there is no census number for a state or province here.')
+    expect(censusNoRowHere('ZIP code')).toBe('The Census has no row for this ZIP code, so there is no share to work out.')
   })
 })

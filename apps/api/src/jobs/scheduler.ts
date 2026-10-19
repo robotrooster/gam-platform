@@ -2562,9 +2562,9 @@ export function schedulerInit() {
       logger.error({ err: e }, '[tenant-date-reads] fatal')
     }
     // S548 (Nic): every morning — not just month-end — prompt for meter
-    // reads on submetered sites whose guests pull out TODAY. The at-checkout
-    // read closes the departing guest's bill same-day and baselines the
-    // meter for the next arrival.
+    // reads on submetered spots whose closing read is still missing, whether
+    // the guest pulled out today or left early (10/18, RV 10 and RV 11). The
+    // read closes their bill and baselines the meter for the next arrival.
     try {
       const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
       const r = await promptMoveOutMeterReads()

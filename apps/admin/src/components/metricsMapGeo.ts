@@ -52,7 +52,8 @@ import type { Topology, GeometryCollection } from 'topojson-specification'
 import type { Feature, MultiLineString } from 'geojson'
 import type { AxiosInstance } from 'axios'
 import {
-  METRICS_WORLD_LAYER, zipAreaName, type MetricsBoundaryLayer, type MetricsMapLevel,
+  METRICS_LEAN_FULL, METRICS_WORLD_LAYER, zipAreaName,
+  type MetricsBoundaryLayer, type MetricsElectionFile, type MetricsMapLevel,
 } from '@gam/shared'
 
 /** The flat picture's size: us-atlas's own Albers USA frame (scale 1300, centered). */
@@ -368,6 +369,13 @@ export interface FlatShape {
   id: string
   name: string
   d: string
+  /**
+   * 10/18 (Nic): the middle of the shape, on every shape that was drawn — the
+   * lean overlay marks EVERY area GAM has spaces in, whatever its size, so a
+   * big county's gold marker sits on top of its own voting color ("where our
+   * strong areas tend to be in Democratic areas or Republican areas").
+   */
+  at?: [number, number]
   dot?: [number, number]
   /**
    * 10/18 (Nic): how wide the shape is in the frame's own units, on a shape
@@ -418,7 +426,8 @@ function draw(path: ReturnType<typeof geoPath>, areas: GeoArea[]): FlatShape[] {
     if (d) {
       const [[x0, y0], [x1, y1]] = path.bounds(a.feature)
       const c = path.centroid(a.feature)
-      if (x1 - x0 < DOT_BELOW_PX && y1 - y0 < DOT_BELOW_PX && Number.isFinite(c[0]) && Number.isFinite(c[1])) {
+      if (Number.isFinite(c[0]) && Number.isFinite(c[1])) shape.at = [c[0], c[1]]
+      if (x1 - x0 < DOT_BELOW_PX && y1 - y0 < DOT_BELOW_PX && shape.at) {
         shape.dot = [c[0], c[1]]
         shape.span = Math.max(x1 - x0, y1 - y0)
       }
@@ -685,3 +694,59 @@ export function mixRgb(a: [number, number, number], b: [number, number, number],
   const c = (i: number) => Math.round(a[i] * o + b[i] * (1 - o))
   return `rgb(${c(0)}, ${c(1)}, ${c(2)})`
 }
+
+// ── 10/18 (Nic): how an area votes ──────────────────────────────────────────
+
+/**
+ * 10/18 (Nic): the election results behind the lean overlay — "the overlay to
+ * show which way those certain districts vote, and where our strong areas tend
+ * to be in Democratic areas or Republican areas". Fetched once per level the
+ * first time that overlay is turned on there (GET
+ * /admin/metrics/elections/:level, services/platformElections), and only for a
+ * level that has a file: counties are the only level these are published by,
+ * and the page says so at the others rather than inventing a district margin.
+ *
+ * It holds CONTESTS, not a presidency — Nic also asked for "mayor data,
+ * governor data, city council data, voting on public policy" — so each result
+ * sits under its contest's id and each contest names its own two sides.
+ */
+const electionsCache = new Map<string, Promise<MetricsElectionFile>>()
+export function loadElections(api: AxiosInstance, level: MetricsMapLevel): Promise<MetricsElectionFile> {
+  let p = electionsCache.get(level)
+  if (!p) {
+    p = api.get<MetricsElectionFile>(`/admin/metrics/elections/${level}`).then(r => r.data)
+    electionsCache.set(level, p)
+    p.catch(() => electionsCache.delete(level))
+  }
+  return p
+}
+
+/** Forgets the election results, as reloading the page does — so a test can start cold. */
+export function forgetElections(): void { electionsCache.clear() }
+
+/**
+ * THE DIVERGING SCALE. Red for the right, blue for the left, a neutral gray
+ * between them — the two ends are ColorBrewer's RdBu middle stops, which are
+ * the colour-blind-safe pair for exactly this (red and green would not be),
+ * and both sit at a middling lightness so they read on the dark page and on
+ * the light one without either end turning into the background.
+ *
+ * It is NOT the gold scale and must never be confused with it: gold on this
+ * map always means GAM's own number, so in this overlay the area's color is
+ * its vote and GAM's footprint is the gold marker on top of it.
+ */
+export const LEAN_RIGHT_RGB: [number, number, number] = [214, 96, 77]
+export const LEAN_LEFT_RGB: [number, number, number] = [67, 147, 195]
+export const LEAN_EVEN_RGB: [number, number, number] = [138, 146, 158]
+
+/** How far along the scale a margin sits, 0 (dead even) to 1 (the top, or past it). */
+export const leanStrength = (margin: number): number =>
+  (Number.isFinite(margin) ? Math.min(Math.abs(margin) / METRICS_LEAN_FULL, 1) : 0)
+
+/** An area's color for its margin: positive is the contest's right, negative its left. */
+export const leanColor = (margin: number): string =>
+  mixRgb(margin > 0 ? LEAN_RIGHT_RGB : LEAN_LEFT_RGB, LEAN_EVEN_RGB, leanStrength(margin))
+
+/** The color key's own steps, left to right: the top of one side, through even, to the other. */
+export const LEAN_KEY_STEPS: readonly number[] =
+  [-METRICS_LEAN_FULL, -METRICS_LEAN_FULL / 2, 0, METRICS_LEAN_FULL / 2, METRICS_LEAN_FULL]

@@ -283,9 +283,12 @@ describe('buildMapLevels: where a property goes at each level', () => {
     }
   })
 
-  it('the state picker offers the states GAM is in, not every state the files cover', async () => {
-    // 10/17 (review): it used to offer every state a Census file exists for —
-    // all 56, 55 of them with nothing on the map (gam-scope-staff-no-choices).
+  it('names the states GAM is in, and separately every state the files cover', async () => {
+    // 10/17 (review): the state picker used to offer every state a Census file
+    // exists for — all 56, 55 of them with nothing on the map
+    // (gam-scope-staff-no-choices). 10/18 (Nic): there is no picker at all
+    // now; `states` is what the page draws together by default and `allStates`
+    // is the "Every state" choice it loads on demand.
     const none = await buildMapLevels([], MAP_STATE_FIPS)
     for (const level of METRICS_BOUNDARY_LAYERS) {
       expect(none[level].areas).toEqual([])
@@ -296,9 +299,26 @@ describe('buildMapLevels: where a property goes at each level', () => {
       row({ state: 'AZ', city: 'Yarnell', zip: '85362', ...YARNELL_AZ }),
       row({ state: 'IL', city: 'Mattoon', zip: '61938', ...MATTOON_IL }),
     ], MAP_STATE_FIPS)
-    // Arizona and Illinois, and nothing else — a level drawn nationally has no picker.
+    // Arizona and Illinois, and nothing else — a level that comes in one
+    // national file has no states of its own either way.
     for (const level of METRICS_MAP_STATE_LEVELS) expect(two[level].states, level).toEqual(['04', '17'])
     expect(two.cd.states).toEqual([])
+    expect(two.cd.allStates).toEqual([])
+
+    // Every state with a file, whether or not GAM is in it — and every one of
+    // them is a file the boundaries route will actually serve.
+    for (const level of METRICS_MAP_STATE_LEVELS) {
+      const all = two[level].allStates
+      expect(all.length, level).toBeGreaterThan(40)
+      expect(all, level).toEqual(expect.arrayContaining(['04', '17']))
+      expect(all, level).toEqual([...all].sort())
+      for (const st of all) expect(await boundaryFile(level, st), `${level}/${st}`).not.toBeNull()
+    }
+    // Nebraska has no lower chamber, so no state house file: "every state"
+    // means every state there IS a file for, never a file that is not there.
+    expect(two.sldl.allStates).not.toContain('31')
+    expect(two.sldu.allStates).toContain('31')
+    expect(none.place.allStates).toEqual(two.place.allStates)
   })
 })
 
@@ -436,6 +456,12 @@ describe('buildMapLevels: the world levels', () => {
     ], MAP_STATE_FIPS)
     // Hong Kong has no districts, so it is not a country this level can draw.
     expect(some.adm2.countries).toEqual(['CAN', 'USA'])
+    // 10/18 (Nic): and every country there is a file for, for "Every country".
+    expect(some.adm2.allCountries.length).toBeGreaterThan(150)
+    expect(some.adm2.allCountries).toEqual(expect.arrayContaining(['CAN', 'MEX', 'USA']))
+    expect(some.adm2.allCountries).not.toContain('HKG')
+    expect(some.adm1.allCountries).toEqual([])
+    expect(some.place.allCountries).toEqual([])
     // Countries and provinces are one file for the world: no picker.
     expect(some.country.countries).toEqual([])
     expect(some.adm1.countries).toEqual([])

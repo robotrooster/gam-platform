@@ -2216,6 +2216,247 @@ describe('S548 pull-out meter read prompt', () => {
     const r = await promptMoveOutMeterReads()
     expect(r.prompted).toBe(0)
   })
+
+  // 10/18 (Nic): "if there was a final bill and somebody moved out, the system
+  // did not alert us to do a meter read. Um, speaking of that, my RV spaces 10
+  // and 11, Victor Cardoza and Nemesio Rivera, they paid for a month. They both
+  // left early, so I need to get those meter reads."
+  //
+  // Leaving early used to make a departure invisible twice over: the stay is
+  // already checked out, and its check-out date has moved back to the day they
+  // drove off. Asking "who leaves today" found nobody, on the only day it asked.
+  it('guest who left EARLY is prompted, and stays prompted until the read lands', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    // Paid stay, lease draft never signed — the stay is the whole story.
+    await db.query(`UPDATE leases SET status='pending' WHERE id=$1`, [s.leaseId])
+    // Booked out to January; drove off 3 days ago, so the stay closed that day.
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_out', check_out=CURRENT_DATE - 3 WHERE id=$1`,
+      [s.bookingId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const first = await promptMoveOutMeterReads()
+    expect(first.prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows).toHaveLength(1)
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain('already left with no closing read')
+    expect(n.rows[0].body).toContain('Sched Guest')
+
+    // Same morning, second cron tick → no duplicate.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+
+    // Next morning and still no read → asked again. The row stays where it is
+    // and the clock moves instead, so the one-per-day guard is being asked
+    // about YESTERDAY's notice, which is what happens in production.
+    await db.query(
+      `UPDATE notifications SET created_at = created_at - INTERVAL '1 day'
+        WHERE type='moveout_meter_reads_due'`)
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+  })
+
+  it('lease that ended days ago with no closing read is prompted', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE - 5, status='expired' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const unit = await db.query<any>(`SELECT unit_number FROM units WHERE id=$1`, [s.unitId])
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain(unit.rows[0].unit_number)
+  })
+
+  // The read is the ONLY thing that stops this notice — otherwise it goes out
+  // every morning for 60 days. So one test watches it stop: asked for while the
+  // read is missing, silent once the read is in.
+  it('closing read entered → prompt stops', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE - 5, status='expired' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // No read yet → asked for.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+
+    // Read taken on the day they left — that read closes them out. (Yesterday's
+    // notice is out of the way so the per-day guard is not what answers.)
+    await db.query(`DELETE FROM notifications WHERE type='moveout_meter_reads_due'`)
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, CURRENT_DATE - 5, 10400, date_trunc('month', CURRENT_DATE)::date, $2, 'move_out_final')`,
+      [meterId!, s.userId])
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+  })
+  // 10/18 (Nic): the same loss through the other door out of a lease. Writing
+  // down a leaving day moves the lease's end date; paying the fee to get out
+  // early does not — it stamps the day it ended and leaves the end date where
+  // it was. A household that bought its way out of a lease running to next
+  // August was invisible until next August, and the next rig pulled onto the
+  // spot on an unread meter.
+  it('lease ended early with its end date untouched is prompted, and the next check-in is blocked', async () => {
+    const { promptMoveOutMeterReads, getReadsDue, unitPendingReads } =
+      await import('../services/utilityReadingRuns')
+    const s = await seedStack({ bookingSourced: false })   // no stay behind it: the lease is the whole story
+    // Exactly what the buy-out does (services/leaseTermination.ts): end date
+    // stays in January 2027.
+    await db.query(
+      `UPDATE leases SET status='terminated', terminated_at = NOW() - INTERVAL '3 days' WHERE id=$1`,
+      [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1, 'electric', TRUE)`, [s.leaseId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const unit = await db.query<any>(`SELECT unit_number FROM units WHERE id=$1`, [s.unitId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain('already left with no closing read')
+    expect(n.rows[0].body).toContain(unit.rows[0].unit_number)
+    expect(n.rows[0].body).toContain('Test Tenant')
+
+    // The front desk's own list and the check-in block see the same departure —
+    // and it bills the household that left, not the next arrival.
+    const due = await getReadsDue(s.propertyId)
+    expect(due).toHaveLength(1)
+    expect(due[0].meter_id).toBe(meterId!)
+    expect(due[0].reason).toBe('move_out_final')
+    const pending = await unitPendingReads(s.unitId)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].reason).toBe('move_out_final')
+    expect(pending[0].lease_id).toBe(s.leaseId)
+  })
+
+  // Mountain View RV 01 and RV 09: a draft thrown away, and a lease ended
+  // before its start day. Nobody was ever on the spot, so there is no closing
+  // read to take and no reason to ask for one every morning.
+  it('a lease ended before anybody lived under it is not a departure', async () => {
+    const { promptMoveOutMeterReads, unitPendingReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack({ bookingSourced: false })
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // Thrown away: terminated with no day stamped at all.
+    await db.query(`UPDATE leases SET status='terminated', terminated_at=NULL WHERE id=$1`, [s.leaseId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+    expect(await unitPendingReads(s.unitId)).toHaveLength(0)
+
+    // Ended the day before it would have started.
+    await db.query(
+      `UPDATE leases SET start_date = CURRENT_DATE - 2, terminated_at = (CURRENT_DATE - 3)::timestamptz
+        WHERE id=$1`, [s.leaseId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+    expect(await unitPendingReads(s.unitId)).toHaveLength(0)
+  })
+
+  // One spot, two departures: a guest who left two weeks ago with no read, and
+  // the household driving off this morning. One walk reads the one meter, so
+  // the notice carries one line for the spot — and it has to be TODAY's line.
+  // Naming the guest from two weeks ago and dropping "read it at checkout" is
+  // how the read gets missed on the one day it can still be taken at the pole.
+  it('an older unread departure does not silence the pull-out happening today', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_out', check_out=CURRENT_DATE - 14 WHERE id=$1`,
+      [s.bookingId])
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE, status='active' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Pull-out meter reads due today')
+    expect(n.rows[0].body).toContain('pulling out today')
+    expect(n.rows[0].body).toContain('Test Tenant')
+    expect(n.rows[0].body).not.toContain('Sched Guest')
+  })
+
+  // A rig still parked out front whose stay nobody has checked out yet. The
+  // read is still due, but the email must not tell the landlord and every
+  // staffer on the property that somebody left when they have not.
+  it('a stay past checkout that nobody has checked out is not reported as having left', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET status='pending' WHERE id=$1`, [s.leaseId])
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_in', check_out=CURRENT_DATE - 1 WHERE id=$1`,
+      [s.bookingId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].body).toContain('past checkout and not checked out yet')
+    expect(n.rows[0].body).toContain('due out')
+    expect(n.rows[0].body).not.toContain('already left')
+    expect(n.rows[0].body).toContain('Sched Guest')
+  })
+
 })
 
 describe('S548 move-out walkthrough scheduling', () => {

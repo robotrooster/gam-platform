@@ -9,6 +9,7 @@ import { healthByHousehold, householdsOf } from '../services/householdMonths'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
 import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
+import { stayDepositAsk, STAY_DEPOSIT_ASK_REFUSAL } from '@gam/shared'
 import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
 import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
@@ -21,6 +22,7 @@ import { recordBookingEvent, recordBookingChange } from '../services/bookingEven
 import {
   stayNeeds, markScreeningRequired, chooseStayTerms, draftLeaseFromStay, syncStayUtilityAgreement, checkInBlock,
   continuousStayNights, canAttestReturningGuest, attestReturningGuest, planStayGuestAccount,
+  screeningPaidForStay,
   RETURNING_GUEST_NOT_ALLOWED, type StayNeeds, type CheckInBlock,
 } from '../services/stayTerms'
 import {
@@ -34,7 +36,10 @@ import {
   type PastEndAttempted,
 } from '../services/bookingLeaseBilling'
 import { type StayShortenedChargeChoice } from '@gam/shared'
-import { shortenedChoicesFor, assertMayAnswerShortened } from '../lib/stayShortenedVoid'
+import {
+  shortenedChoicesFor, assertMayAnswerShortened,
+  mayScheduleAndTakePayments, SCHEDULE_AND_PAYMENT_LABELS,
+} from '../lib/stayShortenedVoid'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
 import { scheduleStayPrice, stayExtensionQuote, extendStayByMonth, SCREENING_LINE_NAME, type StayExtension } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
@@ -570,6 +575,130 @@ export function screeningFeeTicketLine(amount: number): Record<string, unknown> 
   return { id: null, name: SCREENING_LINE_NAME, qty: 1, price: amount, tax: 0, [SCREENING_FEE_LINE_FLAG]: true }
 }
 
+/**
+ * A permission's name as the Team page shows it, read from the catalog, so
+ * every refusal below names the toggle the person is actually missing.
+ */
+const permissionLabel = (key: string, fallback: string): string => PERMISSION_CATALOG
+  .flatMap(g => g.sections.flatMap(s => s.items))
+  .find(i => i.key === key)?.label ?? fallback
+
+/**
+ * 10/18 (Nic) — THE ONE WAY A RESERVATION'S DEPOSIT LINK IS MADE AND EMAILED.
+ *
+ *   "yeah, let's add a button so that we can collect deposits from people that
+ *    haven't done it for their stays."
+ *
+ * Two doors reach this: the reservation form at the moment a stay is booked
+ * (sendDepositLink), and the schedule's "Ask for the deposit" button on a stay
+ * that was taken without one. Both ask for the SAME number — the deposit the
+ * booking site would have quoted for these nights on this site — because a
+ * guest who phones and a guest who books online are buying the same thing
+ * (services/propertyBooking quoteStayDeposit).
+ *
+ * The background check's fee rides on the link as its own fixed line the payer
+ * cannot take off (10/5, R8/A2) — the server's figure, never the guest's — and
+ * a $0 deposit with a fee still makes a link, for the fee alone.
+ *
+ * `nothingOwed` is read from the AMOUNTS, not from the absence of a link: a
+ * null link also comes back when the deposit on this reservation was already
+ * claimed by an earlier link (createBookingDepositLink claims
+ * `deposit_amount IS NULL`), and reading the null would tell the desk a guest
+ * owes no deposit while one is outstanding.
+ *
+ * The stamp is what the schedule reads to say the guest HAS been asked, and
+ * what paces a second press (the route below).
+ */
+async function sendStayDepositLink(args: {
+  bookingId: string; landlordId: string; propertyId: string; unitId: string
+  checkIn: string; checkOut: string
+  guestName: string | null; guestEmail: string
+  /** 10/6: a work trade covering rent leaves only the check's fee to send. */
+  rentTraded: boolean
+  screeningFee: number | null
+  byUserId: string | null
+  /**
+   * 10/18 (review): the price THIS reservation was taken at, for a site with no
+   * rate on it anywhere — a stay the counter priced by hand. Without it the
+   * quote comes back $0 and the desk is told the park asks no deposit
+   * (services/propertyBooking quoteStayDeposit).
+   */
+  bookedTotal: number | null
+}): Promise<{
+  link: { id: string; url: string } | null
+  amount: number
+  nothingOwed: boolean
+  /** Did the guest really get the email? A send that failed is not an ask. */
+  emailed: boolean
+}> {
+  const { quoteStayDeposit } = await import('../services/propertyBooking')
+  const amount = args.rentTraded ? 0
+    : await quoteStayDeposit(args.unitId, args.checkIn, args.checkOut, { bookedTotal: args.bookedTotal })
+  const { createBookingDepositLink } = await import('./posPayLinks')
+  const link = await createBookingDepositLink({
+    bookingId: args.bookingId, landlordId: args.landlordId, propertyId: args.propertyId,
+    amount, guestName: args.guestName, guestEmail: args.guestEmail,
+    ...(args.screeningFee ? { screeningFee: args.screeningFee } : {}),
+  })
+  if (link) {
+    // WHICH LINK IS THIS RESERVATION'S DEPOSIT — written always, because a
+    // reservation can carry other links that ask for other money (the one that
+    // created it from the register, an "Add a month" link, the arrival-day
+    // balance link). 10/18 (review): without this the button handed back a
+    // link for the WHOLE stay and called it the deposit, so the figure read
+    // down the phone was five times the deposit and the deposit was never
+    // asked for.
+    //
+    // The "asked" stamp is written only when the email really went out: a send
+    // that failed is not an ask, and recording one would tell the schedule a
+    // guest was emailed who never was — the very thing the stamp exists to
+    // stop ("so nobody asks the same person four times").
+    //
+    // Best-effort either way: the link is out, and a reservation the schedule
+    // cannot say "asked" about beats one the guest never got.
+    await query(
+      `UPDATE unit_bookings
+          SET deposit_pay_link_id = $2,
+              deposit_link_sent_at = CASE WHEN $4::boolean THEN NOW() ELSE deposit_link_sent_at END,
+              deposit_link_sent_by = CASE WHEN $4::boolean THEN $3 ELSE deposit_link_sent_by END,
+              updated_at = NOW()
+        WHERE id = $1`, [args.bookingId, link.id, args.byUserId, link.emailed])
+      .catch((err) => logger.error({ err, bookingId: args.bookingId }, '[booking] deposit link sent-stamp failed'))
+  }
+  return {
+    link, amount, emailed: !!link?.emailed,
+    nothingOwed: !(amount > 0) && !(Number(args.screeningFee) > 0),
+  }
+}
+
+/**
+ * 10/18 — WHO MAY ASK A GUEST FOR THEIR DEPOSIT.
+ *
+ * The same pair the shortened-stay void asks for (10/14, Nic: "anyone who can
+ * schedule reservations and take payments") — a reservation permission AND a
+ * way to take payments — and for the same reason: this is putting money on a
+ * reservation. Somebody who can only look at the schedule does not email a
+ * guest a bill, and somebody who takes payments all day but cannot touch a
+ * reservation has no business changing what one is holding.
+ *
+ * The RULE itself lives in lib/stayShortenedVoid (mayScheduleAndTakePayments)
+ * so there is one answer to "that pair" — 10/18 (review): this file had copied
+ * it, owner roles and all, so the next change to who counts as an owner would
+ * have reached the shortened-stay void and not this.
+ *
+ * The route asks the rule ITSELF instead of standing behind a permission gate,
+ * so that EVERYBODY short of the pair hears which boxes they are missing. The
+ * gate answered "Insufficient permissions" to a clerk who takes payments all
+ * day but holds no reservation box — half the people this refusal is written
+ * for. The names come from the permissions catalog, so they match the toggles
+ * on the Team page.
+ */
+const DEPOSIT_LINK_REFUSAL =
+  `Asking a guest for their deposit needs "${SCHEDULE_AND_PAYMENT_LABELS.create}" `
+  + `or "${SCHEDULE_AND_PAYMENT_LABELS.edit}", together with `
+  + `"${SCHEDULE_AND_PAYMENT_LABELS.record}" or "${SCHEDULE_AND_PAYMENT_LABELS.ring}". `
+  + 'Ask someone who has both, or take the deposit at the register. Nothing was sent.'
+
 /** The lease drafted from this stay that still runs (pending or active), if any. */
 async function stayLeaseOf(bookingId: string): Promise<{ id: string; status: string; openEnded: boolean } | null> {
   const l = await queryOne<{ id: string; status: string; open_ended: boolean }>(
@@ -669,9 +798,7 @@ const screeningPendingBody = (block: CheckInBlock) => ({
 // "Check guests in" / "Check guests out" for the act itself is checked before.
 // The edit permission's name is read from the permissions catalog, so the
 // words match the toggle on the Team page.
-const EDIT_RESERVATION_LABEL = PERMISSION_CATALOG
-  .flatMap(g => g.sections.flatMap(s => s.items))
-  .find(i => i.key === 'schedule.edit_reservation')?.label ?? 'Edit / move / cancel reservations'
+const EDIT_RESERVATION_LABEL = permissionLabel('schedule.edit_reservation', 'Edit / move / cancel reservations')
 
 function deskOnlyRefusal(
   booking: {
@@ -2682,39 +2809,32 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // deposit is the one the booking site would have quoted for these nights on
     // this site — a guest who phones and a guest who books online are buying
     // the same thing and are told the same number.
-    let depositLink: { id: string; url: string } | null = null
+    let depositLink: { id: string; url: string; emailed: boolean } | null = null
     // 10/17 (Nic): no link went out because this property asks no deposit on
     // this stay — not because sending one failed. Read below.
     let depositNothingOwed = false
     if (wantsDeposit && routedToPay) {
       try {
-        const { quoteStayDeposit } = await import('../services/propertyBooking')
-        // 10/6: a work trade covering rent leaves only the check's fee to send.
-        const depositAmount = rentTraded ? 0 : await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
-        const { createBookingDepositLink } = await import('./posPayLinks')
-        // 10/5 (R8, A2): the background check's fee goes on the link as its own
-        // fixed line (`screeningFee`, the server's figure) — a $0 deposit still
-        // makes a link for the fee alone; the link records the prepaid
-        // screening when it is paid (routes/posPayLinks).
-        depositLink = await createBookingDepositLink({
+        // 10/18: ONE function makes a reservation's deposit link, here and on
+        // the schedule's own button (sendStayDepositLink).
+        const sent = await sendStayDepositLink({
           bookingId: booking.id, landlordId: unit.landlord_id, propertyId: unit.property_id,
-          amount: depositAmount, guestName: booking.guest_name, guestEmail: booking.guest_email,
-          ...(screeningFee ? { screeningFee } : {}),
+          unitId: unit.id, checkIn: body.checkIn, checkOut: body.checkOut,
+          guestName: booking.guest_name, guestEmail: booking.guest_email,
+          rentTraded, screeningFee, byUserId: req.user!.userId,
+          // 10/18 (review): the price this reservation was just taken at, for a
+          // site with no rate on it — what the deposit is a percentage of.
+          bookedTotal: total,
         })
+        // 10/18 (review): the screen is told whether the guest really got the
+        // email, so a send that broke never reads as "Emailed to …".
+        depositLink = sent.link ? { ...sent.link, emailed: sent.emailed } : null
         // 10/17 (Nic): nothing to ask the guest for is not a failure — a park
         // that takes no deposit on a stay like this, with no background check
         // to collect either, never had a link to send. The screen has to tell
         // that apart from a send that broke, or it reports "no link went out"
         // as an error on a park that deliberately takes none.
-        //
-        // Read from the AMOUNTS, not from the absence of a link: a null link
-        // means "no link was made", which is also what comes back when the
-        // deposit on this reservation was already claimed by an earlier link
-        // (createBookingDepositLink claims `deposit_amount IS NULL`). That
-        // cannot happen on a booking inserted a moment ago, but reading the
-        // null would have the schedule tell the desk a guest owes no deposit
-        // while one is outstanding, the first time a second link is possible.
-        depositNothingOwed = !(depositAmount > 0) && !(Number(screeningFee) > 0)
+        depositNothingOwed = sent.nothingOwed
       } catch (err) {
         // The reservation is real and on the board; only the link failed. Say
         // so on the response rather than rolling back a site the counter has
@@ -2794,6 +2914,250 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       depositNothingOwed,
     }
     res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId, stay } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/bookings/:bookingId/deposit-link
+//
+// 10/18 (Nic) — ASK A RESERVATION THAT IS ALREADY ON THE SCHEDULE FOR ITS DEPOSIT.
+//
+//   "yeah, let's add a button so that we can collect deposits from people that
+//    haven't done it for their stays."
+//
+// Until now a deposit link could only go out at the ONE moment a reservation
+// was made (the route above, sendDepositLink). Every reservation taken without
+// one — the phone calls, the soft holds somebody wrote down — had no way to be
+// asked afterwards, so the desk could never turn a soft hold into a locked-in
+// one, which is the only thing that stops a paying guest taking the site
+// (S652, services/holdDisplacement).
+//
+// It asks for the same number, through the same function the reservation form
+// uses (sendStayDepositLink). There is no second way of making a link.
+//
+// PRESSING IT TWICE DOES NOT COST THE GUEST A SECOND EMAIL OR A SECOND LINK.
+// A link already out for this reservation is handed back as it is — the desk is
+// usually mid-phone-call and wants the URL, not another send — named for what
+// it ASKS FOR, because a reservation can already be carrying a link for the
+// whole stay or for a month added to it, and reading one of those out as "the
+// deposit" quotes the guest the wrong number. When there is nothing to hand
+// back but one went out minutes ago, it is refused for the hour, the way the
+// lease signing Remind button paces itself (routes/esign /documents/:id/remind:
+// "was reminded within the last hour").
+//
+// AND AFTER THAT HOUR IT ASKS AGAIN. A deposit link the guest's card declined
+// on, which the clerk then closed, leaves nothing out — so a fresh link goes,
+// at today's quote. That is the whole point of the button: "people that haven't
+// done it for their stays" includes everybody one card failure later.
+//
+// A deposit paid against the link locks the reservation in. Nothing here does
+// that: it is the rule that already exists — a stay with deposit_paid_at is
+// never displaced, and paying a link stamps it (routes/posPayLinks
+// settleLinkBooking) — and the test for this route proves it rather than
+// repeating it.
+unitsRouter.post('/:id/bookings/:bookingId/deposit-link', async (req, res, next) => {
+  try {
+    const booking = await queryOne<any>(
+      `SELECT b.id, b.unit_id, b.landlord_id, b.tenant_id, b.status, b.guest_name, b.guest_email,
+              to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+              COALESCE(b.total_amount, 0)::float AS total_amount,
+              b.deposit_paid_at, b.balance_paid_at, b.pos_transaction_id,
+              b.deposit_pay_link_id, b.deposit_link_sent_at, b.hold_expires_at,
+              u.property_id, u.unit_number
+         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND b.unit_id = $2`, [req.params.bookingId, req.params.id])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, booking.property_id)
+    // The pair, in plain words rather than "Insufficient permissions" — asked
+    // here, not at the door, so everybody short of it hears which boxes.
+    if (!mayScheduleAndTakePayments(req.user)) throw new AppError(403, DEPOSIT_LINK_REFUSAL)
+    const guest = booking.guest_name || 'This guest'
+
+    // Already paid, no email to send to, or not holding a site any more —
+    // the one rule the schedule offers the button by (@gam/shared stayDepositAsk).
+    const ask = stayDepositAsk({
+      status: booking.status, depositPaidAt: booking.deposit_paid_at,
+      balancePaidAt: booking.balance_paid_at, posTransactionId: booking.pos_transaction_id,
+      guestEmail: booking.guest_email,
+    })
+    if (ask !== 'ask') throw new AppError(409, STAY_DEPOSIT_ASK_REFUSAL[ask])
+
+    // 10/18 (review): A BOOKING-SITE CHECKOUT HOLD IS NOT A RESERVATION THE
+    // DESK TOOK. `hold_expires_at` is written by the booking site alone
+    // (services/propertyBooking bookStay — a counter reservation deliberately
+    // has none, "nobody's reservation quietly evaporates"), and it means the
+    // guest is on the website's own card page right now, being asked for this
+    // same deposit. Asking again from here is a second way to pay one stay,
+    // and it would reprice the deposit the website's checkout was built with.
+    if (booking.hold_expires_at) {
+      const stillPaying = new Date(booking.hold_expires_at).getTime() > Date.now()
+      throw new AppError(409, stillPaying
+        ? `${guest} is paying for this reservation on the booking site right now. Give them a few minutes — `
+          + 'if they do not finish, the site is let go. Nothing was sent.'
+        : `${guest} never finished paying on the booking site, so this reservation is being let go. `
+          + 'Take the reservation again on the schedule if they still want the site. Nothing was sent.')
+    }
+
+    // S652: this stay is already written up at the till. Ringing that ticket up
+    // takes its money, so a link beside it is two open ways to pay one
+    // reservation — which is how a guest pays twice.
+    const ticket = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_open_tickets WHERE booking_id = $1 AND status = 'open' LIMIT 1`, [booking.id])
+    if (ticket) throw new AppError(409,
+      `${guest} is already written up at the register for site ${booking.unit_number}. `
+      + 'Ring that ticket up to take the money, or void it first. Nothing was sent.')
+
+    // ── WHAT IS ALREADY OUT FOR THIS RESERVATION ──────────────────────────
+    //
+    // A reservation can carry more than one link in its life, and they ask for
+    // DIFFERENT MONEY: the link that created it from the register's Send link
+    // (the whole stay), an "Add a month" link (that month), the arrival-day
+    // balance link (what is left), and its deposit link. 10/18 (review): this
+    // used to take "any open link that is not the balance one" for the deposit
+    // link, so a week held by an unpaid $286 pay link handed that URL back and
+    // called it the guest's $57 deposit — five times the figure, read down the
+    // phone as the deposit, and the deposit never asked for at all.
+    //
+    // So the deposit link is the one that was MADE as the deposit
+    // (deposit_pay_link_id). Anything else that is still open is handed back as
+    // what it actually is — the desk wants the URL mid-phone-call either way —
+    // and nothing new is emailed beside it.
+    //
+    // An EXPIRED link is not out: the public card page refuses it with a closed
+    // page (routes/posPayLinks), so a lapsed 14-day link must not be handed
+    // back as something a guest can pay (the same test the left-owed notice
+    // uses, `expires_at IS NULL OR expires_at > NOW()`). A link for the
+    // background check alone (createScreeningFeeLink, a stay whose site costs
+    // nothing) names the stay on its line rather than on the link.
+    const linksOut = () => query<{ id: string; token: string; total: number; label: string; never_expires: boolean }>(
+      `SELECT id, token, total::float AS total, label, (expires_at IS NULL) AS never_expires
+         FROM pos_pay_links
+        WHERE status = 'open' AND kind = 'one_time' AND landlord_id = $2
+          AND (expires_at IS NULL OR expires_at > NOW())
+          AND (booking_id = $1 OR (booking_id IS NULL AND items @> $3::jsonb))
+        ORDER BY created_at`,
+      [booking.id, booking.landlord_id,
+       JSON.stringify([{ [SCREENING_FEE_LINE_FLAG]: true, bookingId: booking.id }])])
+    const handBack = async (open: { id: string; token: string; total: number; label: string; never_expires: boolean },
+                            isDeposit: boolean) => {
+      const { payLinkUrl } = await import('./posPayLinks')
+      res.json({ success: true, data: {
+        link: {
+          id: open.id, url: payLinkUrl(open.token), label: open.label,
+          amount: Number(open.total), isDeposit, neverExpires: open.never_expires,
+        },
+        sentTo: booking.guest_email, guestName: booking.guest_name,
+        emailedNow: false,
+        // 10/18 (review): its deposit link is out but no ask was ever recorded
+        // — the email failed when it was made. The window must not then say
+        // "already emailed": nobody was. The desk reads the URL out, or sends
+        // it again from Pay Links.
+        emailFailed: isDeposit && !booking.deposit_link_sent_at,
+      } })
+    }
+    const outNow = async () => {
+      const out = await linksOut()
+      const mine = out.find(l => l.id === booking.deposit_pay_link_id)
+      // Its own deposit link first; otherwise the oldest other one out.
+      return mine ? { link: mine, isDeposit: true } : out.length ? { link: out[0], isDeposit: false } : null
+    }
+    const already = await outNow()
+    if (already) { await handBack(already.link, already.isDeposit); return }
+
+    // Nothing to hand back and one went out minutes ago: the link was closed,
+    // or the guest is on its card page right now. Either way a second email
+    // inside the hour is noise (routes/esign remind).
+    if (booking.deposit_link_sent_at
+        && Date.now() - new Date(booking.deposit_link_sent_at).getTime() < 60 * 60 * 1000) {
+      throw new AppError(429,
+        `${guest} was emailed a deposit link within the last hour. Give them a little time, `
+        + 'or take the deposit at the register. Nothing was sent.')
+    }
+
+    // ── A DEPOSIT THAT WAS ASKED FOR AND NOBODY PAID ──────────────────────
+    //
+    // 10/18 (review): the link maker claims the reservation on
+    // `deposit_amount IS NULL`, and a card that declines leaves that claim
+    // behind when the clerk closes the link. The second ask then answered "sent
+    // earlier and is no longer waiting" FOREVER, and pointed at two doors of
+    // which only the register works — to exactly the people Nic asked the
+    // button for, one card failure later.
+    //
+    // So with nothing paid and nothing out, the claim is let go and the
+    // reservation is asked again at today's quote. Nothing paid is what makes
+    // this safe: the amount is only what was ASKED for, and every reader of it
+    // (the register's reservationDue, the arrival-day run) reads it against a
+    // deposit that was stamped paid.
+    await query(
+      `UPDATE unit_bookings
+          SET deposit_amount = NULL, deposit_pay_link_id = NULL, updated_at = NOW()
+        WHERE id = $1 AND deposit_amount IS NOT NULL
+          AND deposit_paid_at IS NULL AND balance_paid_at IS NULL AND pos_transaction_id IS NULL
+          AND hold_expires_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pos_pay_links l
+             WHERE l.booking_id = unit_bookings.id AND l.kind = 'one_time' AND l.status = 'open'
+               AND (l.expires_at IS NULL OR l.expires_at > NOW()))`, [booking.id])
+
+    // 10/5 (R8/A2): the background check's fee rides on the link when the stay
+    // needs one and nothing is on file — and only when nothing else of this
+    // continuous stay already carries it, or has already paid it. One fee per
+    // stay, never two.
+    const needs = await stayNeeds({
+      landlordId: booking.landlord_id, propertyId: booking.property_id, bookingId: booking.id,
+      tenantId: booking.tenant_id, email: booking.guest_email,
+      checkIn: booking.check_in, checkOut: booking.check_out,
+    })
+    const feeDue = needs.screening === 'fee_due' && (needs.screeningFee?.amount ?? 0) > 0
+      && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id])
+        .catch(() => false))
+      // 10/18 (review): a check already paid for on this stay is not due again
+      // — and a link for it would come back null, which reads as a failure.
+      && !(await screeningPaidForStay(booking.id).catch(() => false))
+    const screeningFee = feeDue ? needs.screeningFee!.amount : null
+
+    const sent = await sendStayDepositLink({
+      bookingId: booking.id, landlordId: booking.landlord_id, propertyId: booking.property_id,
+      unitId: booking.unit_id, checkIn: booking.check_in, checkOut: booking.check_out,
+      guestName: booking.guest_name, guestEmail: booking.guest_email,
+      // 10/6: a work trade covering the site leaves only the check's fee to ask for.
+      rentTraded: await stayRentCovered(booking.id), screeningFee,
+      // 10/18 (review): a site with no rate was priced by hand when it was
+      // taken; that price is what the deposit is a percentage of.
+      bookedTotal: booking.total_amount,
+      byUserId: req.user!.userId,
+    })
+    // 10/17 (Nic): a park that takes no deposit on a stay like this has nothing
+    // to ask for — said as the fact it is, not as a send that broke.
+    if (sent.nothingOwed) throw new AppError(409,
+      `${guest} owes no deposit on this stay, so there is nothing to ask them for. `
+      + 'The site is still held for them. Nothing was sent.')
+    // Something IS owed and no link came back: another clerk pressed in the
+    // same second and claimed the deposit (createBookingDepositLink claims
+    // `deposit_amount IS NULL`). Their link is the one that is out, so look
+    // again and hand that back rather than blaming a link the guest can pay.
+    if (!sent.link) {
+      const raced = await outNow()
+      if (raced) { await handBack(raced.link, raced.isDeposit); return }
+      throw new AppError(409,
+        `Somebody else asked ${guest} for this deposit a second ago. `
+        + 'Close this and open the reservation again to read their link. Nothing was sent.')
+    }
+
+    res.status(201).json({ success: true, data: {
+      link: {
+        id: sent.link.id, url: sent.link.url, isDeposit: true,
+        label: screeningFee ? 'Reservation deposit and background check' : 'Reservation deposit',
+        amount: Math.round((sent.amount + (screeningFee ?? 0)) * 100) / 100, neverExpires: true,
+      },
+      sentTo: booking.guest_email, guestName: booking.guest_name,
+      // 10/18 (review): the truth about the email. A send that failed leaves
+      // the link open and payable — the desk reads the URL out, or sends it
+      // again from Pay Links — but it is not an ask, so it is not recorded as
+      // one and the screen does not claim the guest was emailed.
+      emailedNow: sent.emailed, emailFailed: !sent.emailed,
+      amount: sent.amount, screeningFee,
+    } })
   } catch (e) { next(e) }
 })
 

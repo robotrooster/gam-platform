@@ -65,6 +65,9 @@ import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType }
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
+// 10/18 (Nic): the property's mid-month proration answer, read whether or not
+// migration 20261020120000 has landed on this database yet.
+import { departureRuleSql } from '../services/departureRules'
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
 import { NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
 
@@ -970,9 +973,14 @@ export async function createDocumentRecord(client: any, opts: {
           // S648: page 8's rent lines start from the lease's own terms. The
           // deposit copy and the total are stamped after the fields exist
           // (restampMoveInBoxes, below).
+          // 10/18 (Nic): and the property's mid-month proration answer — page 8
+          // IS the move-in invoice, so a park where "a whole month is a whole
+          // month, moving in and moving out alike" must not have a cut month
+          // printed on its leases.
           const prop = await client.query(
-            `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode FROM units u
-               JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
+            `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode,
+                    ${departureRuleSql('prorates_mid_month_rent')} AS prorates_mid_month_rent
+               FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
             .then((r: any) => r.rows[0])
           // A renewal's page 8 bills no rent: the nightly run bills it on the
           // household's own due dates (restampMoveInBoxes keeps it at $0).
@@ -983,6 +991,7 @@ export async function createDocumentRecord(client: any, opts: {
             existingTenancy, collectsNextPeriod: prop?.on === true,
             dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
             mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
+            proratesMidMonth: prop?.prorates_mid_month_rent !== false,
           })
           if (prefillValues.move_in_first_month_rent == null)
             prefillValues.move_in_first_month_rent = d.firstMonthRent.toFixed(2)
@@ -6340,13 +6349,20 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     const existing_tenancy = doc.document_type === 'original_lease'
       ? await isExistingTenancyDocument({ query: async (t: string, v: any[]) => ({ rows: await query<any>(t, v) }) }, doc.id)
       : false
-    // S648: how this property sets due days, so the page can follow the start date.
-    const rent_due_mode = doc.unit_id
-      ? (await queryOne<{ m: string }>(
-          `SELECT p.rent_due_mode AS m FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
-          [doc.unit_id]))?.m ?? 'fixed_day'
-      : 'fixed_day'
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, closedReason, packageDocs } })
+    // S648: how this property sets due days, so the page can follow the start
+    // date. 10/18 (Nic): and whether it prorates a mid-month move at all —
+    // "moving in or out at the middle of a month and also only if the landlord
+    // allows the pro rate" — so page 8's rent line follows the same answer the
+    // move-in bill will. Read through services/departureRules, which works
+    // whether or not 20261020120000 has landed on this database yet.
+    const propRule = doc.unit_id
+      ? await queryOne<{ m: string; prorates: boolean }>(
+          `SELECT p.rent_due_mode AS m, ${departureRuleSql('prorates_mid_month_rent')} AS prorates
+             FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [doc.unit_id])
+      : null
+    const rent_due_mode = propRule?.m ?? 'fixed_day'
+    const prorates_mid_month_rent = propRule?.prorates !== false
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, prorates_mid_month_rent, readOnly, waitingOn, closedReason, packageDocs } })
   } catch (e) { next(e) }
 })
 

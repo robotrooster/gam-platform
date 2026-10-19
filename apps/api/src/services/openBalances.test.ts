@@ -395,6 +395,30 @@ describe('S655 the full balance, with credit beside it', () => {
     expect(rows.reduce((sum, r) => sum + r.credit_on_account, 0)).toBe(25)
   })
 
+  // 10/18 (Nic): "it does need to go on the October bill for the other spot."
+  // A credit the landlord gave on a space with nothing owed pays the
+  // household's open bill on the other space — so the list shows it beside
+  // that space instead of showing it nowhere, and once.
+  it('a credit given on a space that owes nothing is shown beside the space whose bill it pays', async () => {
+    const p = await park()
+    const t = await resident('Billy Miranda')
+    const owing = await space(p, 'RV 34')
+    const clear = await space(p, 'RV 35')
+    await inTx(async c => {
+      await seedLeaseTenant(c, { leaseId: owing.leaseId, tenantId: t, role: 'primary' })
+      await seedLeaseTenant(c, { leaseId: clear.leaseId, tenantId: t, role: 'primary' })
+    })
+    await bill(p, t, owing, daysAgo(10), [['rent', 400]])
+    await generalCredit(p, t, 120, clear.leaseId)            // issued on the space that owes nothing
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows).toHaveLength(1)
+    expect(rows[0].balance).toBe('400.00')
+    expect(rows[0].credit_available).toBe(120)
+    expect(rows[0].credit_on_account).toBe(120)
+    // Once: the space that owes carries it, and the spaces add up to the line.
+    expect(rows[0].spaces.reduce((sum, sp) => sum + Number(sp.credit_available), 0)).toBe(120)
+  })
+
   it('two people on two different leases are still two households', async () => {
     const p = await park()
     const a = await resident('Ann Apart')

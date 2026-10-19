@@ -226,6 +226,159 @@ export const HEALTH_STATUS_LABEL: Record<HealthStatus, string> = {
   attention: 'Needs attention',
 }
 
+// ─── The health block's own figures, printed as the subtraction they are ─────
+
+/**
+ * 10/18 (Nic): "We have a major problem because underneath the property health
+ * it's still showing that 9,683 is owed when I filter to Mountain View, but
+ * outstanding in the top KPI card only shows $1,415... $26,211.02 minus the
+ * received calculation of 19,483.98 in no way close equals 9,683.87. You're
+ * pulling numbers from different spots here. So that is a huge problem for a
+ * landlord to see incorrect numbers."
+ *
+ * Measured on Mountain View's October the morning he said it, every figure was
+ * right for its own question and nothing on the screen said which question it
+ * answered:
+ *
+ *   92%             the month's RENT BILLS, the ones on hold for work trade
+ *                   left out of both sides — $17,087 paid of $18,502 invoiced
+ *                   (the API's rentHealth, lib/rentCollected rentHealthMtd)
+ *   $9,683.87       the books' receivables balance at the end of October:
+ *                   every charge of every month still unpaid, work-trade-held
+ *                   bills included (MONEY_COLUMN_NOTE_LEDGER.owed)
+ *   $26,211.02 and  all money, every kind — October's bills, and the money
+ *   $19,483.98      that arrived in October whatever month it was billed for
+ *
+ * So the health figures are now printed as the subtraction they are, all four
+ * off one helper: invoiced, paid, still owed, and the percentage that divides
+ * the first two. The money table beside them says in words what it answers and
+ * that its three columns do not subtract to each other. Neither figure is bent
+ * to the other — "Money received" and "Money billed" keep their meanings, which
+ * the books' parity check leans on (services/ledgerParity).
+ */
+export const RENT_HEALTH_FIGURE_LABEL = {
+  invoiced: 'Rent invoiced this month',
+  paid: 'Rent paid',
+  owed: 'Still owed',
+} as const
+
+export type RentHealthFigureKey = keyof typeof RENT_HEALTH_FIGURE_LABEL
+
+export interface RentHealthFigures {
+  /** The three figures in reading order: invoiced, paid, still owed. */
+  figures: Array<{ key: RentHealthFigureKey; label: string; amount: number }>
+  /** The subtraction: "$18,502.00 invoiced − $17,087.00 paid = $1,415.00 still owed". */
+  tieText: string
+  /** Where the percentage comes from: "92% of this month's rent bills paid". */
+  rateText: string
+  /** 0–100, the same number the meter prints. */
+  pct: number
+  /** Named, never with a figure (S650 keeps work-trade balances off these cards). */
+  workTradeNote: string | null
+  /** Which months and which charges — the Outstanding card beside it counts others. */
+  scopeNote: string
+}
+
+/**
+ * 10/17: the health figures count THIS MONTH'S RENT and the Outstanding card
+ * sits above them counting every open charge of every month. Mountain View
+ * reads $1,415 either way today because nothing else of its is open; Oak Park's
+ * October rent owes $3,300 against $8,354.43 outstanding. Two numbers on one
+ * screen that must not read as one claim, so each says what it counts.
+ */
+export const RENT_HEALTH_SCOPE_NOTE =
+  "This counts this month's rent bills only. The Outstanding card above counts every open charge of every month, so the two are different numbers."
+
+/**
+ * Invoiced less paid is still owed, to the cent. An assertion helper, like
+ * billedPartsAddUp and threeAddUp above it: `rentHealthFigures` derives `owed`
+ * from the other two, so the screen cannot print a row that fails this — this
+ * is what the tests hold the API's reply to.
+ */
+export function rentHealthTies(health: RentHealthData | null | undefined): boolean {
+  if (!health) return false
+  const invoiced = Number(health.invoiced) || 0
+  const paid = Number(health.paid) || 0
+  const owed = Number(health.owed) || 0
+  return Math.abs(round2(invoiced - paid) - round2(owed)) < 0.005
+}
+
+/**
+ * The health block, in the words a landlord reads. null when nothing is
+ * invoiced yet (the meter says "Awaiting data" and there is nothing to tie).
+ */
+export function rentHealthFigures(
+  health: RentHealthData | null | undefined,
+  // To the cent: a subtraction printed on screen has to visibly come out.
+  fmt: (n: number) => string = money,
+): RentHealthFigures | null {
+  const rate = rentBillsPaidRate(health)
+  if (rate == null || !health) return null
+  const invoiced = round2(Number(health.invoiced) || 0)
+  const paid = round2(Number(health.paid) || 0)
+  // Read off the same two figures rather than taken from the reply, so the
+  // number printed is the number the subtraction leaves.
+  const owed = round2(invoiced - paid)
+  const pct = Math.round(rate * 100)
+  return {
+    figures: [
+      { key: 'invoiced', label: RENT_HEALTH_FIGURE_LABEL.invoiced, amount: invoiced },
+      { key: 'paid', label: RENT_HEALTH_FIGURE_LABEL.paid, amount: paid },
+      { key: 'owed', label: RENT_HEALTH_FIGURE_LABEL.owed, amount: owed },
+    ],
+    tieText: `${fmt(invoiced)} invoiced − ${fmt(paid)} paid = ${fmt(owed)} still owed`,
+    rateText: `${pct}% of this month's rent bills paid`,
+    pct,
+    workTradeNote: Number(health.workTradeHeld)
+      ? 'Rent covered by work trade is not counted here — it is not billed unless the hours fall short.'
+      : null,
+    scopeNote: RENT_HEALTH_SCOPE_NOTE,
+  }
+}
+
+// ─── The money table beside it ───────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const
+
+/** 'YYYY-MM' as its month's name — read as a calendar month, never shifted by a zone. */
+export function monthName(period: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})/.exec(String(period ?? ''))
+  const n = m ? Number(m[2]) : 0
+  return n >= 1 && n <= 12 ? MONTH_NAMES[n - 1] : ''
+}
+
+/**
+ * 10/18 (Nic): the money table's own heading, so it cannot be read as the parts
+ * of the percentage above it. It answers a different question — every kind of
+ * money, not only rent — over a window of its own.
+ */
+export function allMoneyHeading(period: string | null | undefined): string {
+  const m = monthName(period)
+  return m
+    ? `All money in ${m} — every kind, not just rent`
+    : 'All money this month — every kind, not just rent'
+}
+
+/**
+ * 10/18 (Nic): "$26,211.02 minus the received calculation of 19,483.98 in no
+ * way close equals 9,683.87." It never did and it never will: Received is money
+ * on the day it arrived, Charged is the month's bills, and Owed is what was
+ * still unpaid at the end of it, every bill included. Said on the screen, above
+ * each column's own note, because three figures in a row invite a subtraction.
+ */
+export const MONEY_COLUMNS_DO_NOT_SUBTRACT =
+  'Different questions, so these three do not subtract to each other:'
+
+/**
+ * What the trace's beats are. The figure a hover prints is all the money
+ * received that month — which is where "19,483 for October versus 20,298 for
+ * September" came from, beside a percentage that counts neither.
+ */
+export const HEALTH_TRACE_NOTE = 'Each beat is all the money received that month, every kind.'
+
 // ─── Income by category (decision #4) ───────────────────────────────────────
 
 export interface CategoryRow {

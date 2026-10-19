@@ -12,7 +12,7 @@ import { payoutReadiness } from '../lib/payoutReadiness'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
-import { rentCollectedFrom, incomeCardFrom, rentHealthMtd } from '../lib/rentCollected'
+import { rentCollectedFrom, incomeCardFrom, rentHealthMtd, outstandingBalanceOf } from '../lib/rentCollected'
 import { parseIncomeBasis, basisMeta, incomeEvents, byMonth, breakdownFrom } from '../services/incomeBasis'
 import { todayIn as todayInZone } from '../lib/timezone'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
@@ -876,12 +876,24 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     })
     // The property-health card: this month's category totals, the same figures
     // the property report shows for the same month and switch.
+    //
+    // 10/18 (Nic): "You're pulling numbers from different spots here." The
+    // figures are right — they answer a different question from the health
+    // percentage beside them — so the card has to SAY which question, and the
+    // Owed column's plain words depend on where the money was read from: off
+    // the money records it is "what is still unpaid of those bills today", and
+    // off the company's books it is the receivables balance at the end of the
+    // period, every bill of every month included (@gam/shared
+    // MONEY_COLUMN_NOTE_LEDGER — the $9,683.87 Mountain View reads). The card
+    // could not tell the two apart, so it printed neither. `source` is the same
+    // test rentCollectedFrom makes: a ledger fact among the month's own facts.
     const thisMonth = trendBreakdowns[trendBreakdowns.length - 1]
     const propertyHealth = {
       period: thisMonth.ym,
       categories: thisMonth.b.categories,
       lines: thisMonth.b.lines,
       total: thisMonth.b.total,
+      source: (billedByMonth.get(thisMonth.ym) ?? []).some(e => !!e.ledger) ? 'ledger' as const : 'records' as const,
     }
 
     // Real maintenance stats
@@ -962,13 +974,15 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const platformFeeUnits = billedUnits && billedUnits.props === feeProps.length && feeMonth.length === 1
       ? billedUnits.n : null
 
-    // Rent KPIs that reconcile with the Reports page (/reports/summary) — same
-    // SQL definitions, so the Dashboard's Collected/Outstanding cards agree with
-    // Reports. Distinct from monthly_rent_volume above, which is CONTRACTED rent
-    // on active units (the "Expected" capacity number), not collected cash.
+    // Rent KPIs that reconcile with the Reports page (/reports/summary) — one
+    // shared HELPER each, not a copied query, so the Dashboard's Collected and
+    // Outstanding cards cannot say a different number from Reports. Distinct
+    // from monthly_rent_volume above, which is CONTRACTED rent on active units
+    // (the "Expected" capacity number), not collected cash.
     //   collected_mtd — rent the tenant has SENT this month (settled + ACH
     //                   clearing), matching the admin overview. S642.
-    //   outstanding   — unpaid (pending+partial) invoice balances
+    //   outstanding   — every open charge of every month, the one shared rule
+    //                   (lib/rentCollected outstandingBalanceOf). 10/18.
     // S642 (Nic): one shared definition with the admin overview and Reports —
     // settled PLUS ACH still clearing. See lib/rentCollected.
     // S655: the rent card follows the switch — rent that ARRIVED this month
@@ -1003,12 +1017,23 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // collect.
     //
     // It is NOT the Outstanding figure below, and must not be read as it: that
-    // one sums every open invoice balance, all charge types, every month, so it
-    // is a running receivables number. Mountain View happens to match it today
-    // ($1,415 either way) because nothing else of its is open; Oak Park's
-    // October rent owes $3,300 against $8,354.43 outstanding, the rest being
-    // September rent and utilities that really are owed. The card names which
-    // months and which charges each number counts (apps/landlord DashboardPage).
+    // one counts every open charge, all charge types, every month, so it is a
+    // running receivables number. Mountain View 10/18: $1,415 of this month's
+    // rent left against $1,685 outstanding; Oak Park's October rent owes $3,300
+    // against $8,934.43 outstanding, the rest being September rent, utilities
+    // and accrued late fees that really are owed. The card names which months
+    // and which charges each number counts (apps/landlord DashboardPage).
+    //
+    // 10/18 (Nic): the three figures a landlord reads under the meter are these
+    // and only these — invoiced, paid, and invoiced less paid — so the
+    // percentage and the subtraction beside it cannot come apart. The money
+    // table under them answers "all money, every kind" over a window of its
+    // own and now says so (propertyHealth above).
+    //
+    // No cutoffs: this endpoint is the account owner's and an admin's
+    // (canViewLandlordFinances refuses every team role), and a cutoff is a
+    // bookkeeper's clean cut at a sale. Reports passes them because a
+    // bookkeeper reads that page.
     const rentHealth = await rentHealthMtd(scopeIds, propertyFilter, { month: `${thisMonth.ym}-01` })
     // ── S640 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT OUTSTANDING ───────
     //
@@ -1021,28 +1046,43 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // out since S634 — this card did not, so the dashboard and the page it
     // links to disagreed by the full value of the trades, and the disagreement
     // always read in the direction of "your residents owe you more than they
-    // do". Same subquery the balances page uses, so they cannot drift again.
+    // do".
     //
-    // `traded` is reported alongside rather than thrown away: what the trades
-    // are worth this month is a real number a landlord should be able to see.
-    const [outstandingRow] = await query<any>(`
-      -- S654: suspended lines sit OUTSIDE total_amount (the S634 shape, every
-      -- writer), so they are reported alongside and no longer subtracted — that
-      -- clamped a partly covered bill (rent traded, water owed) to $0 owed.
-      SELECT COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0), 0)), 0)::float AS outstanding,
-             COALESCE(SUM(COALESCE(p.traded, 0)), 0)::float AS work_trade_suspended
-        FROM invoices i
-        LEFT JOIN (
-          SELECT invoice_id,
-                 SUM(amount) FILTER (WHERE status IN ('settled', 'processing')) AS paid,
-                 SUM(amount) FILTER (WHERE status NOT IN ('settled', 'processing')
-                                       AND work_trade_suspended_at IS NOT NULL) AS traded
-            FROM payments WHERE invoice_id IS NOT NULL
-           GROUP BY invoice_id
-        ) p ON p.invoice_id = i.id
-       WHERE i.landlord_id = ANY($1) AND i.status IN ('pending', 'partial')
-         AND ($2::uuid IS NULL OR i.unit_id IN (
-               SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
+    // S654: suspended lines sit OUTSIDE invoices.total_amount (the S634 shape,
+    // every writer), so they are reported alongside and not subtracted —
+    // subtracting them clamped a partly covered bill (rent traded, water owed)
+    // to $0 owed.
+    //
+    // ── 10/18 (Nic): LATE FEES SIT OUTSIDE IT TOO, SO THIS CARD READ LOW ──
+    //
+    //   "underneath the property health, it's still showing that 9,683 is owed
+    //    when I filtered a Mountain View, but outstanding in the top KPI card
+    //    only shows $1,415. You're, you're pulling numbers from different spots
+    //    here. So that is a huge problem for a landlord to see incorrect
+    //    numbers."
+    //
+    // The card stopped summing invoices. Both the whole of WHY and the rule
+    // itself now live in ONE place, lib/rentCollected outstandingBalanceOf,
+    // which the Reports page's Outstanding Balance card reads too — two copies
+    // of this figure drifting apart is the whole of this bug, and the fix is
+    // not a second corrected copy. Read that helper for the late-fee defect in
+    // dollars (Mountain View $1,415 → $1,685, Country Acres $2,200.65 →
+    // $2,450.65, Oak Park $8,354.43 → $8,934.43), for why GAM's own fees stay
+    // out of a landlord's receivable, and for the two categories the balances
+    // page's grand total carries that no charge row can (an open register
+    // ticket, an open one-time pay link).
+    //
+    // Mountain View's three open bills are where the late fees were hiding:
+    // INV-2026-00062 $460 with $90 of late fees open ($550 really owed), 00076
+    // $495 with $90, 00087 $460 with $90. Country Acres INV-2026-00026 is the
+    // other half: a $100 home payment is all that is open on it, and the card
+    // read $50, because its settled $50 late fee came off the rest of the bill.
+    //
+    // work_trade_suspended is reported alongside rather than thrown away: what
+    // the trades are worth is a real number a landlord should be able to see,
+    // and the shared rule keeps it out of `outstanding` either way. No cutoffs
+    // here, for the reason given with rentHealthMtd above.
+    const outstandingRow = await outstandingBalanceOf(scopeIds, propertyFilter)
 
     // ── S640 (Nic): "SIX DELINQUENT UNITS, LATE FEES ACCRUING" WAS FALSE ────
     //
@@ -1228,7 +1268,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow?.outstanding||0,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow.outstanding,
       // S655: the rent card's other figures, both ways, and the income card.
       rent_card: { basis, received: { amount: collected.collected, clearing: collected.inFlight }, billed: collected.billed },
       // 10/17 (Nic): the health card's own figure — invoiced against paid, work
@@ -1238,7 +1278,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       income_card: incomeCard,
       property_health: propertyHealth,
       basis: basisMeta(basis),
-      work_trade_suspended: outstandingRow?.work_trade_suspended||0,
+      work_trade_suspended: outstandingRow.workTradeSuspended,
       // S640: what is actually going out on the next weekly run, and what is
       // still clearing behind it.
       // S650: register and pay-link card sales are held for the same weekly

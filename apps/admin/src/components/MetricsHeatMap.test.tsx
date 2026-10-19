@@ -18,18 +18,20 @@ import { join, resolve } from 'path'
 import { gunzipSync } from 'zlib'
 import { METRICS_MAP_LEVELS, METRICS_MAP_LEVEL_LABEL } from '@gam/shared'
 import { MetricsHeatMap, type PlatformMapData } from './MetricsHeatMap'
-import { forgetCensus, forgetLayers, forgetWorld } from './metricsMapGeo'
+import { forgetCensus, forgetElections, forgetLayers, forgetWorld, leanColor } from './metricsMapGeo'
 
 const GEO = resolve(__dirname, '../../../api/geo')
 /** 10/17 (Nic): the census numbers the saturation overlay divides by (apps/api/census). */
 const CENSUS = resolve(__dirname, '../../../api/census')
+/** 10/18 (Nic): and the election results the lean overlay colors by (apps/api/elections). */
+const ELECTIONS = resolve(__dirname, '../../../api/elections')
 const gets: string[] = []
 const api: any = {
   get: async (url: string) => {
     gets.push(url)
-    const census = url.startsWith('/admin/metrics/census/')
-    const dir = census ? CENSUS : GEO
-    const rel = url.replace(/^\/admin\/metrics\/(boundaries|census)\//, '')
+    const dir = url.startsWith('/admin/metrics/census/') ? CENSUS
+      : url.startsWith('/admin/metrics/elections/') ? ELECTIONS : GEO
+    const rel = url.replace(/^\/admin\/metrics\/(boundaries|census|elections)\//, '')
     return { data: JSON.parse(gunzipSync(readFileSync(join(dir, `${rel}.json.gz`))).toString('utf8')) }
   },
 }
@@ -92,6 +94,7 @@ beforeEach(() => {
   // the page's life; start cold.
   forgetWorld()
   forgetCensus()
+  forgetElections()
   // 10/18 (Nic): so are the levels' own shapes, now that a level is several
   // files — every test starts with nothing in hand and asks for what it needs.
   forgetLayers()
@@ -184,7 +187,10 @@ describe('MetricsHeatMap levels', () => {
       .toEqual(['/admin/metrics/boundaries/zcta/04', '/admin/metrics/boundaries/zcta/06', '/admin/metrics/boundaries/zcta/17'])
   })
 
-  it('a place picked from the list is outlined where it is, with no state to switch to', async () => {
+  // 10/18 (Nic, correcting the morning's pass): "if I click a row in the list,
+  // it should snap to it. That's fine." The flat map moves to the place now,
+  // the way the globe always did — it is a click, not a setting.
+  it('a place picked from the list snaps the flat map to it, with no state to switch to', async () => {
     await render()
     await choose(levelSelect(), 'place')
     const yarnell = [...host.querySelectorAll('.mhm-row')].find(r => r.textContent?.startsWith('Yarnell'))! as HTMLButtonElement
@@ -192,13 +198,25 @@ describe('MetricsHeatMap levels', () => {
     await act(async () => { yarnell.click() })
     await settle()
     expect(host.querySelector('.mhm-readout')!.textContent).toMatch(/Yarnell, Arizona · 15 occupied units/)
-    // Too small to see at this zoom: a marker in its own color, outlined as the pick.
-    expect(host.querySelector('circle.mhm-dot.on[data-fips="0484980"]')).not.toBeNull()
+    // Zoomed in on it, the town is big enough to see, so it is outlined as the
+    // pick rather than standing in as a marker (dotNeeded).
+    expect(host.querySelector('path.mhm-focus')).not.toBeNull()
+    expect(host.querySelector('.mhm-row.on')!.textContent).toMatch(/^Yarnell/)
     // Illinois is still drawn beside it — nothing was swapped out — and the
-    // flat map did not move under him.
+    // view has moved in on the place he clicked.
     expect(host.querySelector('path[data-fips="1747553"]')).not.toBeNull()
-    expect(flatTransform()).toBe(before)
-    expect(gets).toEqual(['/admin/metrics/boundaries/place/04', '/admin/metrics/boundaries/place/17'])
+    expect(flatTransform()).not.toBe(before)
+    expect(Number(flatTransform().match(/scale\(([\d.]+)\)/)![1])).toBeGreaterThan(1)
+    // Clicking the same row again lets it go, and moves nothing further.
+    const snapped = flatTransform()
+    await act(async () => { yarnell.click() })
+    await settle()
+    expect(host.querySelector('.mhm-row.on')).toBeNull()
+    expect(flatTransform()).toBe(snapped)
+    // The shapes for the two states GAM is in, and the census numbers the
+    // window reads — no state's file was swapped, and nothing else was asked for.
+    expect(gets).toEqual(['/admin/metrics/boundaries/place/04', '/admin/metrics/boundaries/place/17',
+      '/admin/metrics/census/place'])
   })
 
   it('a level with nothing anywhere says so, and points to the list', async () => {
@@ -312,17 +330,21 @@ describe('MetricsHeatMap world levels', () => {
     expect(host.querySelectorAll('path[data-fips^="MEX."]').length).toBe(0)
   })
 
-  it('offers no saturation or concentration overlay where there are no census numbers', async () => {
+  it('offers no saturation, concentration or lean overlay where there is nothing behind them', async () => {
     await render()
-    expect(measures()).toEqual(['Units', 'Money', 'Saturation'])
+    // 10/18 (Nic): "How it votes" is offered at every level of the United
+    // States, including the ones with no results published — at those it says
+    // so on screen, which is the answer he asked for.
+    expect(measures()).toEqual(['Units', 'Money', 'Saturation', 'How it votes'])
     await choose(levelSelect(), 'cd')
-    expect(measures()).toEqual(['Units', 'Money', 'Saturation', 'Concentration'])
+    expect(measures()).toEqual(['Units', 'Money', 'Saturation', 'Concentration', 'How it votes'])
     for (const level of ['country', 'adm1', 'adm2'] as const) {
       await choose(levelSelect(), level)
-      // U.S. Census counts say nothing about Ontario, and voting districts are
-      // United States only.
+      // U.S. Census counts say nothing about Ontario; voting districts and
+      // U.S. election returns are the United States only.
       expect(measures(), level).toEqual(['Units', 'Money'])
       expect(gets.filter(u => u.includes('/census/')), level).toEqual([])
+      expect(gets.filter(u => u.includes('/elections/')), level).toEqual([])
     }
   })
 })
@@ -491,6 +513,8 @@ describe('MetricsHeatMap concentration overlay', () => {
     await settle()
     expect(caption()).toContain("each congressional district's share of every space GAM has placed at this level")
     expect(caption()).toContain('It is a share of GAM, not a share of the district.')
+    // Nothing was fetched to color it.
+    expect(gets.filter(u => u.includes('/census/') || u.includes('/elections/'))).toEqual([])
     // The one district with anything in it holds all of it, whichever of the
     // two numerators is read — and they are different numbers here.
     expect(listRows()).toEqual(['Congressional District 2, Arizona100% · 100%'])
@@ -498,8 +522,10 @@ describe('MetricsHeatMap concentration overlay', () => {
     await act(async () => { row.click() })
     await settle()
     expect(readout()).toContain("15 of GAM's 15 at this level")
-    // No census numbers are needed for a share of GAM.
-    expect(gets.filter(u => u.includes('/census/'))).toEqual([])
+    // 10/18 (Nic): the color still needs no census numbers — a share of GAM is
+    // GAM's own arithmetic. The window the click opened does read them, which
+    // is why they are fetched only once something is picked.
+    expect(gets.filter(u => u.includes('/census/'))).toEqual(['/admin/metrics/census/cd'])
   })
 
   it('falls back to Units on a level that has no concentration, and remembers the pick', async () => {
@@ -611,6 +637,41 @@ describe('MetricsHeatMap keeps the view', () => {
     expect(flatTransform()).toBe(at)
     await choose(stateSelect()!, 'all')
     expect(flatTransform()).toBe(at)
+    // 10/18 (Nic): and the lean overlay, and which contest it shows — both are
+    // filters, so neither moves the map either.
+    await choose(levelSelect(), 'county')
+    expect(flatTransform()).toBe(at)
+    await click('How it votes')
+    expect(flatTransform()).toBe(at)
+    await choose(host.querySelector('select[aria-label="Which contest"]') as HTMLSelectElement, 'president-2016')
+    expect(flatTransform()).toBe(at)
+  })
+
+  // 10/18 (Nic, correcting the morning's pass): "It's just when I'm moving the
+  // globe and I toggle the settings, the filters of the map that I'm looking
+  // at, that I don't want it to move. But clicking the row, if I want to see
+  // that, should snap to that area." One test for both halves of that rule.
+  it('a setting change never moves it; a click on a row snaps to the area', async () => {
+    await render()
+    await choose(levelSelect(), 'county')
+    const at = await zoomAndPan()
+    // Settings: nothing moves.
+    await click('All spaces')
+    await click('Money')
+    await click('Saturation')
+    await click('People')
+    expect(flatTransform()).toBe(at)
+    // A row: it snaps to the county he clicked, and the row is marked as the pick.
+    await pickRow('Santa Cruz')
+    const snapped = flatTransform()
+    expect(snapped).not.toBe(at)
+    expect(Number(snapped.match(/scale\(([\d.]+)\)/)![1])).toBeGreaterThan(Number(at.match(/scale\(([\d.]+)\)/)![1]))
+    expect(host.querySelector('.mhm-row.on')!.textContent).toMatch(/^Santa Cruz/)
+    // And from there a setting change still leaves the view where the click
+    // put it — which is the whole of the rule.
+    await click('All homes')
+    await click('Units')
+    expect(flatTransform()).toBe(snapped)
   })
 
   it('keeps the depth across the flat map and the globe, and across the world levels', async () => {
@@ -684,5 +745,440 @@ describe('MetricsHeatMap keeps the view', () => {
     })
     expect(flatTransform()).not.toBe(before)
     expect(readout()).toMatch(/Santa Cruz, Arizona/)
+  })
+})
+
+// ─── 10/18 (Nic): the window a click pulls up ───────────────────────────────
+
+/** The window over the map, and its text as one string. */
+const windowBox = () => host.querySelector('.mhm-window') as HTMLElement | null
+const windowText = () => windowBox()?.textContent ?? ''
+/** One row of the window's census table: what it counts, how many, GAM's share both ways. */
+const windowRow = (what: string) => [...host.querySelectorAll('.mhm-window-table tbody tr')]
+  .find(r => r.textContent?.startsWith(what))!
+  .querySelectorAll('td')
+const pickRow = async (name: string) => {
+  const row = [...host.querySelectorAll('.mhm-row')].find(r => r.textContent?.startsWith(name))! as HTMLButtonElement
+  await act(async () => { row.click() })
+  await settle()
+}
+
+describe('MetricsHeatMap the window', () => {
+  it('pulls up the census count, GAM\'s own numbers, the share both ways and how it votes', async () => {
+    // Nic: "if I click on Santa Cruz County in Arizona, I'd like it to pull up
+    // a little window and say, hey, at the last census this many people lived
+    // in this county, people renting on GAM are a certain percentage of the
+    // total population." Santa Cruz County, Arizona at the 2019–2023 ACS:
+    // 48,209 people, 18,997 housing units, 5,318 renter-occupied homes. GAM
+    // has 99 spaces there, 50 of them occupied — the 1.9% and 0.9% he has
+    // already seen and liked.
+    await render()
+    await choose(levelSelect(), 'county')
+    expect(windowBox()).toBeNull()
+    await pickRow('Santa Cruz')
+    const box = windowBox()!
+    expect(box.getAttribute('role')).toBe('dialog')
+    expect(box.getAttribute('aria-label')).toBe('Santa Cruz, Arizona, the numbers for this county')
+    // In plain words throughout — the area, not a code.
+    expect(windowText()).toContain('Santa Cruz, Arizona')
+    expect(windowText()).not.toContain('04023')
+
+    // GAM's own numbers here.
+    expect(windowText()).toContain('99 spaces under management')
+    expect(windowText()).toContain('50 occupied units this month')
+    expect(windowText()).toContain('$6,000.00 rent logged through GAM')
+    expect(windowText()).toContain('1 property')
+
+    // What the last census counted, and GAM's share of each of the three,
+    // both ways — the same saturation maths the overlay colors by.
+    expect(windowText()).toContain('At the last census')
+    expect([...windowRow('people')].map(c => c.textContent)).toEqual(['48,209', '0.2% · 0.1%'])
+    expect([...windowRow('housing units')].map(c => c.textContent)).toEqual(['18,997', '0.5% · 0.3%'])
+    expect([...windowRow('renter-occupied homes')].map(c => c.textContent)).toEqual(['5,318', '1.9% · 0.9%'])
+    expect(windowText()).toContain("GAM's share here")
+    expect(windowText()).toContain('all spaces · occupied')
+
+    // How it votes, every contest the level has, newest first, with the swing.
+    expect(windowText()).toContain('2024 presidential margin · Democratic +18.6')
+    expect(windowText()).toContain('Republican 7,699 · Democratic 11,265 of 19,121 votes cast')
+    expect(windowText()).toContain('2020 presidential margin · Democratic +35.5')
+    expect(windowText()).toContain('2016 presidential margin · Democratic +47.1')
+    expect(windowText()).toContain('28.5 points toward the Republican side since 2016.')
+  })
+
+  it('opens from a click on the map itself, and closes without moving it', async () => {
+    await render()
+    await choose(levelSelect(), 'county')
+    const santaCruz = () => host.querySelector('path[data-fips="04023"]')!
+    const at = (type: string, x: number, y: number) => {
+      const e: any = new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, button: 0 })
+      e.pointerId = 1; e.pointerType = 'mouse'
+      return e
+    }
+    const before = flatTransform()
+    await act(async () => {
+      santaCruz().dispatchEvent(at('pointerdown', 100, 100))
+      santaCruz().dispatchEvent(at('pointerup', 100, 100))
+    })
+    await settle()
+    expect(windowText()).toContain('Santa Cruz, Arizona')
+    // 10/18 (Nic): "do not move the map when the window opens".
+    expect(flatTransform()).toBe(before)
+    // Close puts it away and still moves nothing.
+    await act(async () => { button('Close').click() })
+    await settle()
+    expect(windowBox()).toBeNull()
+    expect(flatTransform()).toBe(before)
+    // And Escape closes it the same way.
+    await act(async () => {
+      santaCruz().dispatchEvent(at('pointerdown', 100, 100))
+      santaCruz().dispatchEvent(at('pointerup', 100, 100))
+    })
+    await settle()
+    expect(windowBox()).not.toBeNull()
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
+    expect(windowBox()).toBeNull()
+  })
+
+  it('says so plainly where a level or an area has no census count and no result', async () => {
+    // 10/18 (Nic): "Where a level has no census match, say so plainly rather
+    // than showing a blank or a zero", and the same for the vote.
+    await render()
+    await choose(levelSelect(), 'adm1')          // a world level: neither reaches it
+    await pickRow('Ontario')
+    expect(windowText()).toContain('The U.S. Census counts the United States only, so there is no census number for a state or province here.')
+    expect(windowText()).toContain('No election results are published by state or province')
+    expect(host.querySelector('.mhm-window-table')).toBeNull()
+    expect(gets.filter(u => u.includes('/census/') || u.includes('/elections/'))).toEqual([])
+
+    // A congressional district HAS census numbers; only the vote is missing
+    // there, and that is said rather than worked out from county votes.
+    await choose(levelSelect(), 'cd')
+    await pickRow('Congressional District 2')
+    expect(windowText()).toContain('At the last census')
+    expect(host.querySelector('.mhm-window-table')).not.toBeNull()
+    expect(windowText()).toContain('No election results are published by congressional district, so there is no lean to draw for congressional districts. They are published county by county — switch to the county level to see them.')
+    expect(gets.filter(u => u.includes('/elections/'))).toEqual([])
+  })
+
+  it('works for an area GAM is not in at all, which is most of the map', async () => {
+    // The overlay's whole point is comparing GAM's places with places it is
+    // not in yet, so a click on an empty county has to answer too.
+    await render()
+    await choose(levelSelect(), 'county')
+    const maricopa = host.querySelector('path[data-fips="04013"]')!   // Phoenix: no GAM spaces here
+    const at = (type: string) => {
+      const e: any = new MouseEvent(type, { bubbles: true, clientX: 200, clientY: 200, button: 0 })
+      e.pointerId = 2; e.pointerType = 'mouse'
+      return e
+    }
+    await act(async () => { maricopa.dispatchEvent(at('pointerdown')); maricopa.dispatchEvent(at('pointerup')) })
+    await settle()
+    expect(windowText()).toContain('Maricopa, Arizona')
+    expect(windowText()).toContain('GAM has no spaces here.')
+    // The census count is still there, with no share to show for it.
+    expect([...windowRow('people')].map(c => c.textContent)).toEqual(['4,491,987', '—'])
+    expect(windowText()).toContain('2024 presidential margin · Republican +3.5')
+  })
+})
+
+// ─── 10/18 (Nic): how an area votes ─────────────────────────────────────────
+
+describe('MetricsHeatMap lean overlay', () => {
+  const leanButton = () => button('How it votes')
+  const openLean = async () => {
+    await choose(levelSelect(), 'county')
+    await act(async () => { leanButton().click() })
+    await settle()
+  }
+  const fillOf = (fips: string) =>
+    (host.querySelector(`path[data-fips="${fips}"]`) as SVGPathElement).style.fill
+  const contestSelect = () => host.querySelector('select[aria-label="Which contest"]') as HTMLSelectElement
+
+  it('colors every county by the 2024 margin, labels it honestly, and credits the votes', async () => {
+    // Nic: "the overlay to show which way those certain districts vote, and
+    // where our strong areas tend to be in Democratic areas or Republican
+    // areas, for the landlord onboarding process and total unit count."
+    await render()
+    await openLean()
+    expect(gets).toContain('/admin/metrics/elections/county')
+    expect(caption()).toContain('The color is 2024 presidential margin.')
+    expect(caption()).toContain("A marker shows where GAM has spaces")
+    // Santa Cruz County, Arizona voted Democratic by 18.6 points; Yavapai
+    // County, Republican by 33.9. The two are opposite sides of the scale.
+    expect(fillOf('04023')).toBe(leanColor(-18.6))
+    expect(fillOf('04025')).toBe(leanColor(33.9))
+    // Every county is colored, not only the ones GAM is in — that is the point.
+    expect(host.querySelectorAll('path[data-fips]').length).toBeGreaterThan(3000)
+    // The key is the diverging scale, named by the contest's own two sides.
+    const key = host.querySelector('.mhm-legend')!.textContent ?? ''
+    expect(key).toContain('Democratic +60 or more')
+    expect(key).toContain('Republican +60 or more')
+    expect(key).toContain('Even in the middle')
+    expect(key).toContain('Where GAM has spaces')
+    // Nic: "credit the source under the map the way geoBoundaries is credited."
+    expect(credit()).toContain('Votes: Official county presidential returns (public data).')
+  })
+
+  it('marks every county GAM is in, whatever its size, and splits GAM\'s spaces by side', async () => {
+    await render()
+    await openLean()
+    // A marker for each of the three counties GAM has spaces in — the area's
+    // own color is its vote, so the marker is what says "GAM is here".
+    expect([...host.querySelectorAll('circle.mhm-dot')].map(c => c.getAttribute('data-fips')).sort())
+      .toEqual(['04023', '04025', '17029'])
+    // "where our strong areas tend to be in Democratic areas or Republican
+    // areas": GAM has 50 occupied units in Santa Cruz (Democratic), 15 in
+    // Yavapai and 16 in Coles (both Republican) — 81 in all.
+    const side = host.querySelector('.mhm-side')!.textContent ?? ''
+    expect(side).toContain('Of the 81 occupied units GAM has at this level, 38.3% sit where Republican led and 61.7% where Democratic led. Ranked by occupied units.')
+    // Each row carries GAM's own number and how that county voted.
+    expect(listRows()).toEqual([
+      'Santa Cruz, Arizona50 occupied unitsDemocratic +18.6',
+      'Coles, Illinois16 occupied unitsRepublican +28.5',
+      'Yavapai, Arizona15 occupied unitsRepublican +33.9',
+    ])
+  })
+
+  it('names the vote beside GAM\'s own number when a county is picked', async () => {
+    // The color is the vote, so the number behind it has to be readable
+    // without opening the window.
+    await render()
+    await openLean()
+    await pickRow('Santa Cruz')
+    expect(readout()).toContain('Santa Cruz, Arizona · 50 occupied units · Democratic +18.6')
+  })
+
+  it('reads the swing by picking another contest, and only re-colors the map', async () => {
+    // Nic: "the 2024 lean, with 2020 and 2016 available so the swing can be read".
+    await render()
+    await openLean()
+    expect([...contestSelect().options].map(o => o.textContent))
+      .toEqual(['2024 presidential margin', '2020 presidential margin', '2016 presidential margin'])
+    const before = flatTransform()
+    await choose(contestSelect(), 'president-2016')
+    expect(caption()).toContain('The color is 2016 presidential margin.')
+    expect(fillOf('04023')).toBe(leanColor(-47.1))
+    expect(listRows()[0]).toBe('Santa Cruz, Arizona50 occupied unitsDemocratic +47.1')
+    // A setting change, so the view does not move and nothing is re-fetched.
+    expect(flatTransform()).toBe(before)
+    expect(gets.filter(u => u.includes('/elections/'))).toEqual(['/admin/metrics/elections/county'])
+  })
+
+  it('says the lean is not available for districts instead of inventing one', async () => {
+    // 10/18 (Nic): "ONLY COUNTIES ARE EXACT ... a made-up district margin is
+    // worse than none." The overlay is still offered there, and this is what
+    // it says.
+    await render()
+    for (const level of ['cd', 'sldu', 'sldl', 'state', 'place', 'zcta'] as const) {
+      await choose(levelSelect(), level)
+      await act(async () => { leanButton().click() })
+      await settle()
+      expect(measures(), level).toContain('How it votes')
+      expect(caption(), level).toContain('No election results are published by')
+      expect(caption(), level).toContain('They are published county by county — switch to the county level to see them.')
+      expect(host.querySelector('.mhm-empty')!.textContent, level).toMatch(/^No election results are published by/)
+      // Nothing is drawn in a voting color — and no gold map quietly stands
+      // in for one, which would look like an answer. GAM's own spaces are
+      // still marked over the uncolored map.
+      expect(host.querySelector('.mhm-legend'), level).toBeNull()
+      const anyArea = host.querySelector('path[data-fips]') as SVGPathElement
+      expect(anyArea.style.fill, level).toBe('var(--heat-none)')
+      if (listRows().length > 0) expect(host.querySelectorAll('circle.mhm-dot').length, level).toBeGreaterThan(0)
+      expect(gets.filter(u => u.includes('/elections/')), level).toEqual([])
+      expect(host.querySelector('select[aria-label="Which contest"]'), level).toBeNull()
+    }
+  })
+
+  it('a county with no result published is left uncolored and named, not drawn as even', async () => {
+    // Alaska reports its presidential vote by state house district, so no
+    // borough has a result — and the District of Columbia's 2024 rows are its
+    // wards. Those are the two the builder left out, and the window says why.
+    await render()
+    await openLean()
+    expect(fillOf('02013')).toBe('var(--heat-none)')     // Aleutians East Borough
+    expect(fillOf('11001')).toBe('var(--heat-none)')     // the District of Columbia
+    const bethel = host.querySelector('path[data-fips="02050"]')!
+    const at = (type: string) => {
+      const e: any = new MouseEvent(type, { bubbles: true, clientX: 60, clientY: 120, button: 0 })
+      e.pointerId = 3; e.pointerType = 'mouse'
+      return e
+    }
+    await act(async () => { bethel.dispatchEvent(at('pointerdown')); bethel.dispatchEvent(at('pointerup')) })
+    await settle()
+    expect(windowText()).toContain('No result for this area: Alaska — this state reported it by "State House District 1" and "State House District 2" and the like, not by county.')
+  })
+
+  it('a results file that cannot be fetched stops the overlay only, and Units comes straight back', async () => {
+    const failing: any = {
+      get: async (url: string) => {
+        if (url.includes('/metrics/elections/')) { gets.push(url); throw new Error('no results file beside the API') }
+        return api.get(url)
+      },
+    }
+    await act(async () => { root.render(<MetricsHeatMap data={DATA} api={failing}/>) })
+    await settle()
+    await choose(levelSelect(), 'county')
+    await act(async () => { leanButton().click() })
+    await settle()
+    expect(gets).toContain('/admin/metrics/elections/county')
+    expect(host.textContent).toContain('The map could not be drawn just now.')
+    await act(async () => { button('Units').click() })
+    await settle()
+    expect(host.textContent).not.toContain('The map could not be drawn just now.')
+    expect(listRows()).toEqual(['Santa Cruz, Arizona50 occupied units', 'Coles, Illinois16 occupied units', 'Yavapai, Arizona15 occupied units'])
+  })
+})
+
+// ─── 10/18 (Nic): the globe's divisions ─────────────────────────────────────
+
+/**
+ * jsdom has no canvas, so the globe is given a stand-in that records what it
+ * painted: every fill's color, and every stroke with its color, its width and
+ * how many line commands went into it. The stand-in also answers the globe's
+ * own color reader (which asks a 1×1 canvas what a CSS color comes out as), so
+ * the colors recorded here are the colors it really used.
+ */
+const THEME: Record<string, string> = {
+  // The dark theme's own values (main.tsx), so this reads what he sees.
+  '--b1': 'rgb(34, 42, 56)',          // #222a38
+  '--b2': 'rgb(42, 53, 71)',          // #2a3547 — the light gray-blue
+  '--bg2': 'rgb(18, 21, 25)',         // #121519 — what the state lines used to be
+  '--heat-none': 'rgb(24, 28, 34)',   // #181c22 — the land
+  '--heat-hi': 'rgb(201, 162, 39)',   // the gold
+  '--heat-base': 'rgb(18, 21, 25)',
+  '--t0': 'rgb(238, 240, 246)',
+  '--t1': 'rgb(184, 196, 216)',
+}
+const rgbOf = (css: string): [number, number, number] | null => {
+  const m = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(css.trim())
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])]
+  const hex = /^#([0-9a-f]{6})$/i.exec(css.trim())
+  if (hex) return [0, 2, 4].map(i => parseInt(hex[1].slice(i, i + 2), 16)) as [number, number, number]
+  return null
+}
+
+function recordCanvas() {
+  const fills: string[] = []
+  const strokes: Array<{ color: string; width: number; lines: number }> = []
+  const arcs: Array<[number, number]> = []
+  let lines = 0
+  let fillStyle = '#808080'
+  let painted = '#808080'
+  const ctx: any = {
+    strokeStyle: '', lineWidth: 0, globalAlpha: 1,
+    setTransform() {}, clearRect() {},
+    // The color reader's own 1×1 probe: a real canvas keeps the last VALID
+    // color, so an unknown one (a theme variable that is not set) reads as the
+    // gray it was given first.
+    fillRect() { painted = fillStyle },
+    getImageData: () => ({ data: rgbOf(painted) ?? [128, 128, 128] }),
+    beginPath() { lines = 0 },
+    moveTo() { lines++ }, lineTo() { lines++ }, closePath() {},
+    arc(x: number, y: number) { lines++; arcs.push([x, y]) },
+    fill() { fills.push(fillStyle) },
+    stroke() { strokes.push({ color: String(ctx.strokeStyle), width: Number(ctx.lineWidth), lines }) },
+  }
+  Object.defineProperty(ctx, 'fillStyle', {
+    get: () => fillStyle,
+    set: (v: string) => { if (rgbOf(v)) fillStyle = v },
+  })
+  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx)
+  vi.spyOn(HTMLCanvasElement.prototype, 'getBoundingClientRect').mockReturnValue({
+    width: 975, height: 610, top: 0, left: 0, right: 975, bottom: 610, x: 0, y: 0, toJSON: () => ({}),
+  })
+  /**
+   * The theme's variables, which jsdom has no stylesheet for — set on the
+   * canvas itself, then the globe is asked to draw again the way a theme
+   * change asks it to (it watches the page's own theme attribute).
+   */
+  const dress = async () => {
+    const canvas = host.querySelector('canvas.mhm-globe') as HTMLCanvasElement | null
+    for (const [k, v] of Object.entries(THEME)) canvas?.style.setProperty(k, v)
+    fills.length = 0; strokes.length = 0; arcs.length = 0
+    await act(async () => {
+      document.documentElement.setAttribute('data-theme', 'dark')
+      await new Promise(r => setTimeout(r, 400))
+    })
+  }
+  return { fills, strokes, arcs, dress }
+}
+
+describe('MetricsHeatMap globe divisions', () => {
+  it('fetches the same country borders and provinces the flat map draws, once each', async () => {
+    // 10/18 (Nic): "The globe draws only the United States ... nothing else on
+    // Earth has any division at all." The assets were already beside the API;
+    // the globe now asks for them, the first time it is shown.
+    await render()
+    expect(gets.filter(u => u.endsWith('/boundaries/country') || u.endsWith('/boundaries/adm1'))).toEqual([])
+    await click('Globe')
+    expect(gets).toContain('/admin/metrics/boundaries/country')
+    expect(gets).toContain('/admin/metrics/boundaries/adm1')
+    // Lazily, and once: the flat map of the United States never pays for them,
+    // and going back and forth does not fetch them again.
+    await click('Flat map')
+    await click('Globe')
+    expect(gets.filter(u => u.endsWith('/boundaries/country'))).toHaveLength(1)
+    expect(gets.filter(u => u.endsWith('/boundaries/adm1'))).toHaveLength(1)
+    // They are the SAME files the flat map's world levels draw, so opening
+    // those levels afterwards costs nothing.
+    await click('Flat map')
+    await choose(levelSelect(), 'adm1')
+    expect(gets.filter(u => u.endsWith('/boundaries/adm1'))).toHaveLength(1)
+  })
+
+  it('draws every state, province and country boundary in the one light gray-blue, and nothing in black', async () => {
+    // 10/18 (Nic, DECIDED and told): "every state and province boundary uses
+    // that same light gray-blue, so Alaska and Hawaii stop looking like a
+    // different kind of thing from Arizona — black lines read as cracks on a
+    // dark globe."
+    const painted = recordCanvas()
+    await render()
+    await click('Globe')
+    await painted.dress()
+
+    // At the state level the only heavy lines on it are the world's own: the
+    // provinces (4,367 lines) and the country borders (204 of them). Before
+    // this neither was drawn at all.
+    const drawn = painted.strokes.filter(s => s.lines > 0)
+    // The two heaviest lines on the globe are the world's own, which were not
+    // drawn at all before this: the provinces and the borders between
+    // countries. Everything else on it is a few thousand points at most.
+    const heavy = [...drawn].sort((a, b) => b.lines - a.lines)
+    expect(heavy[0].lines).toBeGreaterThan(100000)
+    expect(heavy[1].lines).toBeGreaterThan(100000)
+    // Every one of them is the light gray-blue, and the near-black the state
+    // lines used to be drawn in is nowhere on the globe. The faint grid is the
+    // only other color on it, so every BOUNDARY is the one color.
+    const colors = new Set(drawn.map(s => s.color))
+    expect(colors.has(THEME['--b2'])).toBe(true)
+    expect(colors.has(THEME['--bg2'])).toBe(false)
+    expect([...colors].sort()).toEqual([THEME['--b1'], THEME['--b2']].sort())
+    // A province line and a state line are drawn exactly alike — same color,
+    // same weight; a country's edge is the same color, a shade heavier.
+    const stateLine = drawn.find(s => s !== heavy[0] && s.width === 0.7)!
+    expect(heavy[0].width).toBe(0.7)
+    expect(stateLine.color).toBe(heavy[0].color)
+    expect(heavy[1].width).toBe(1)
+    expect(new Set(drawn.filter(s => s.color === THEME['--b2']).map(s => s.width))).toEqual(new Set([0.7, 1]))
+  })
+
+  it('paints the lean overlay on the globe in the same colors as the flat map', async () => {
+    const painted = recordCanvas()
+    await render()
+    await choose(levelSelect(), 'county')
+    await act(async () => { button('How it votes').click() })
+    await settle()
+    await click('Globe')
+    await painted.dress()
+    // Santa Cruz County, Arizona at Democratic +18.6 and Yavapai at
+    // Republican +33.9 — the same two colors the flat map gives them.
+    expect(painted.fills).toContain(leanColor(-18.6))
+    expect(painted.fills).toContain(leanColor(33.9))
+    // And a gold marker for each county GAM is in, whatever its size, because
+    // the county's own color is its vote.
+    expect(painted.arcs.length).toBeGreaterThanOrEqual(3)
+    expect(painted.fills.some(f => f === `rgb(${[201, 162, 39].join(', ')})`
+      || /^rgb\(\d+, \d+, \d+\)$/.test(f))).toBe(true)
   })
 })

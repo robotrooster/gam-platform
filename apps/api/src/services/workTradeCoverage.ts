@@ -234,6 +234,13 @@ export async function bringLinesUnderTrade(
   const period = await periodFor(run, agreementId, invoiceId)
   if (!period || period.status === 'billed') return { outcome: 'not_reached', amount: w }
   const uncredited = period.status === 'open' && period.hours_applied === 0 && period.credit_applied === 0
+  // 10/19 — THE AGREEMENT SAYS WHETHER HOURS COUNT, NOT THE NUMBER THE PERIOD
+  // FROZE. Read once here, because BOTH branches below need the answer: the
+  // month close reads it the same way now (jobs/workTradeSettlement
+  // loadOpenPeriods), and a reader still trusting the snapshot is how a month
+  // the close covered outright hands the tenant a bill for the charge that
+  // arrived a minute later.
+  const h = hours ?? await agreementHours(run, agreementId)
 
   if (uncredited) {
     // Parked exactly as the monthly run writes a covered line.
@@ -248,7 +255,6 @@ export async function bringLinesUnderTrade(
     // periodCredit read it as "covered outright": the month was waived with no
     // hours worked, and in pay mode every hour of it was paid as extra. An
     // agreement that does not count hours asks none, as when it was billed.
-    const h = hours ?? await agreementHours(run, agreementId)
     const target = period.target_hours === 0 && h.tracks_hours && h.monthly_hours_target > 0
       ? Number(h.monthly_hours_target) : period.target_hours
     const basis = await parkedBasis(run, invoiceId)
@@ -265,7 +271,15 @@ export async function bringLinesUnderTrade(
   // value against a RENT change (S624); this is different — the landlord
   // widened what the month's hours pay for.
   const basis = round2(period.basis_amount + w)
-  const target = period.target_hours
+  // 10/19: a trade the landlord stopped counting hours on asks for NONE,
+  // whatever number its period froze when its bill was written — so
+  // periodCredit covers the wider month outright, which is what this file's own
+  // header promises ("A settled month covers them in full") and what the close
+  // now does with that same month. Reading the frozen 80 instead priced the
+  // month at a rate nobody owes work at, credited the new charge $0, and left
+  // it on the tenant as money owed on a trade that covers it: the exact
+  // frozen-snapshot bug 10/18 took out of the close, one reader over.
+  const target = h.tracks_hours ? period.target_hours : 0
   const rate = target > 0 ? hourRateFor(basis, target) : 0
   const credit = periodCredit(basis, target, period.hours_applied, rate)
   let delta = round2(Math.min(w, Math.max(0, credit - period.credit_applied)))

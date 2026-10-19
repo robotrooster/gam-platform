@@ -46,11 +46,23 @@
 //     desk or the rest of the month pays the rest of the same row); a row is
 //     never cut in two.
 //   - Order: money paid ahead first (oldest credit first, within the month's
-//     draw cap), then credit tied to the lease and deposit interest, then the
-//     tenant's general credit. Each pays the oldest eligible bills in the one
-//     allocation order (compareForAllocation).
+//     draw cap), then deposit interest, then the credit the landlord gave.
+//     Each pays the oldest eligible bills in the one allocation order
+//     (compareForAllocation).
+//   - BY DUE DATE ACROSS THE WHOLE HOUSEHOLD. 10/18 (Nic): "if a person has
+//     two households, right, two spaces, two bills for October, they can't pay
+//     one for October and then pay that same one for November. It does need to
+//     go on the October bill for the other spot." So a credit the landlord
+//     gave walks every space's open bills oldest first and never reaches a
+//     later month on one space while an earlier month is open on another.
+//     Money the tenant PAID AHEAD stays with the space they paid it for
+//     (10/17) and statutory deposit interest with its own deposit's lease —
+//     if due-date order would move either across spaces, it does not move
+//     (creditStaysWithItsSpace), and the screens say so in plain words.
+//     A DESK PAYMENT is untouched by all of this: the person picks which bills
+//     their cash pays (10/14), and `planOnly` keeps the plan to those bills.
 //   - Credit pays only the landlord's own rent, utilities, late fees and fees on
-//     the credit's lease: never a GAM fee, a FlexPay pull, a home payment, a
+//     a lease of this household: never a GAM fee, a FlexPay pull, a home payment, a
 //     deposit or move-out row, a neighbor landlord's utility, a work-trade row
 //     or a row reopened after a dispute (creditEligibleRowSql = the trigger),
 //     and never rent the lease no longer owes (rent past a shortened stay's
@@ -74,11 +86,12 @@ import {
   type CreditUseHeldReleaseReason,
   type PrepaidFundedBy,
 } from '@gam/shared'
-import { getClient } from '../db'
+import { getClient, query } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import {
   payableRowSql, bankPayableRowSql, creditEligibleRowSql, creditEligibleRowForCreditSql, lockHousehold,
+  lockPaymentRowsById,
 } from './moneyPredicates'
 import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } from './allocation'
 import { afterRowsSettled } from './settleHooks'
@@ -349,6 +362,38 @@ async function householdLeases(client: PoolClient, tenantId: string, landlordId:
 }
 
 /**
+ * Who is on each of these leases, by tenant: the leases EVERY member of the
+ * household is on, not only the household's own tenant.
+ *
+ * 10/18 review fix: a credit is still the credit of the ONE person it was given
+ * to. A shared space pools its residents' credits into the household's figures
+ * (readCredits), so a credit given to a co-resident is in the household pool —
+ * but it may only pay a bill billed to THEM or a bill on a space THEY are on.
+ * The database says the same thing and refuses anything else (the credit
+ * ledger's trigger), so the plan has to be built on the credit's own owner's
+ * spaces, never on the household tenant's.
+ *
+ * HOUSEHOLD_MEMBER_STATUSES only: a resident who has left does not reach the
+ * remaining resident's bills (S655), which is narrower than the database
+ * allows and deliberately so.
+ */
+async function memberLeasesByTenant(client: PoolClient, leaseIds: string[]): Promise<Map<string, Set<string>>> {
+  const by = new Map<string, Set<string>>()
+  if (leaseIds.length === 0) return by
+  const r = await client.query<{ tenant_id: string; lease_id: string }>(
+    `SELECT DISTINCT lt.tenant_id, lt.lease_id
+       FROM lease_tenants lt
+      WHERE lt.lease_id = ANY($1::uuid[]) AND lt.status IN (${MEMBER_STATUS_SQL})`,
+    [leaseIds])
+  for (const x of r.rows) {
+    const s = by.get(x.tenant_id) ?? new Set<string>()
+    s.add(x.lease_id)
+    by.set(x.tenant_id, s)
+  }
+  return by
+}
+
+/**
  * Rent the lease no longer owes: a rent row (alias `p`) due on or after the
  * end of its own lease (alias `l`, joined on p.lease_id) when that lease bills
  * on the booking schedule (services/bookingLeaseBilling isBookingScheduleLease:
@@ -485,11 +530,14 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
 
   const credits = await readCredits(client, { tenantId, landlordId, leaseIds: hl.ids, memberLeaseIds: [...hl.tenantOnLease], includeReleasable })
   const drawn = await paidAheadDrawnByMonth(client, hl.ids, includeReleasable)
+  // Every household member's spaces, so each credit is planned onto the spaces
+  // of the person it was given to (10/18 review fix).
+  const memberLeases = await memberLeasesByTenant(client, hl.ids)
 
   // 10/14: the bills being paid now, when the caller picked them (planOnly).
   const planRows = opts.planOnly ? rows.filter(opts.planOnly) : rows
   const plan = buildCreditPlan({
-    rows: planRows, credits, caps: hl.caps, drawn, tenantId, tenantOnLease: hl.tenantOnLease, includeReleasable,
+    rows: planRows, credits, caps: hl.caps, drawn, memberLeases, includeReleasable,
   })
   // Only to tell GAM a bill is waiting on rent the lease no longer owes: the
   // plan as it would be if credit could pay that rent. Never spent.
@@ -498,7 +546,7 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
       ? { ...r, required: true, creditEligible: true } : r
   const planIfPastEndPayable = pastEndEligible.size === 0 ? plan : buildCreditPlan({
     rows: planRows.map(asIfOwed),
-    credits, caps: hl.caps, drawn, tenantId, tenantOnLease: hl.tenantOnLease, includeReleasable,
+    credits, caps: hl.caps, drawn, memberLeases, includeReleasable,
   })
   const covers = (required: QuoteRow[], lines: CreditPlanLine[], eligible: (r: QuoteRow) => boolean): boolean => {
     const covered = new Map<string, number>()
@@ -686,10 +734,33 @@ function sortRows<T extends QuoteRow>(rows: readonly T[]): T[] {
     { id: b.id, amount: b.amount, due_date: b.dueDate, type: b.type, entry_description: b.entryDescription, created_at: b.createdAt }))
 }
 
-/** Spend order: paid ahead, then lease-tied credit and deposit interest, then general credit. */
+/**
+ * Does this credit stay with the space it belongs to?
+ *
+ * Money the tenant PAID AHEAD does (10/17, Nic): they paid it for that space,
+ * so it pays that space's bills and no other — a promise to the payer, which
+ * due-date order never overrides. Statutory interest on a deposit does too:
+ * GAM owes it back with THAT deposit when the tenant moves out.
+ *
+ * 10/18 (Nic): a credit the landlord GAVE does NOT. "If a person has two
+ * households, right, two spaces, two bills for October, they can't pay one for
+ * October and then pay that same one for November. It does need to go on the
+ * October bill for the other spot." The space it was issued on records where he
+ * gave it; the credit itself is the household's, and walks every space's open
+ * bills by due date, oldest first. The database agrees (migration
+ * 20261020100000).
+ */
+export function creditStaysWithItsSpace(c: Pick<QuoteCredit, 'kind' | 'leaseId'>): boolean {
+  return c.leaseId !== null && (c.kind === 'paid_ahead' || c.kind === 'deposit_interest')
+}
+
+/** Spend order: paid ahead, then deposit interest, then credit the landlord gave. */
 function creditTier(c: QuoteCredit): number {
   if (c.kind === 'paid_ahead') return 0
-  if (c.leaseId !== null || c.kind === 'deposit_interest') return 1
+  // The two that stay with their space are spent before the one that can go
+  // anywhere, so a credit the landlord gave is never spent where narrower
+  // money could have paid instead.
+  if (c.kind === 'deposit_interest') return 1
   return 2
 }
 
@@ -700,9 +771,14 @@ export interface BuildPlanInput {
   caps: Map<string, number | null>
   /** Paid-ahead drawn per `${leaseId}|${month}`. */
   drawn: Map<string, number>
-  /** The household's tenant: a general credit pays a row of theirs, or any row on a lease they are on. */
-  tenantId: string
-  tenantOnLease: Set<string>
+  /**
+   * Per tenant, the household leases they are on (memberLeasesByTenant). A
+   * credit that can go anywhere pays a row billed to the person it was GIVEN
+   * to, or any row on a space THEY are on — the credit's own owner, not the
+   * household's tenant (10/18 review fix; the credit ledger refuses anything
+   * else).
+   */
+  memberLeases: Map<string, Set<string>>
   includeReleasable: boolean
 }
 
@@ -751,9 +827,21 @@ export function buildCreditPlan(input: BuildPlanInput): CreditPlanLine[] {
     // credit that same dispute gave back, up to what it gave back of it.
     const mayPay = (r: QuoteRow) => (r.disputeCredits?.length ?? 0) === 0
       || (c.kind === 'paid_ahead' && (r.disputeCredits ?? []).some(d => d.creditId === c.id))
-    const candidates = (c.leaseId !== null
+    // 10/18: a credit the landlord gave sees the WHOLE household's bills, in
+    // the one allocation order (`eligible` is sorted by due date across every
+    // space), so it never reaches a later month on one space while an earlier
+    // month is open on another. Money paid ahead and deposit interest see only
+    // their own space's bills (creditStaysWithItsSpace).
+    //
+    // "The household's bills" means the bills of the person the credit was
+    // GIVEN to: billed to them, or on a space they are on. On a shared space a
+    // co-resident's credit is in the household's figures, but it never reaches
+    // a space that resident does not hold — the credit ledger refuses that row
+    // outright, so planning it would kill the whole draw (10/18 review fix).
+    const ownerSpaces = input.memberLeases.get(c.tenantId)
+    const candidates = (creditStaysWithItsSpace(c)
       ? eligible.filter(r => r.leaseId === c.leaseId)
-      : eligible.filter(r => r.tenantId === c.tenantId || input.tenantOnLease.has(r.leaseId!))).filter(mayPay)
+      : eligible.filter(r => r.tenantId === c.tenantId || ownerSpaces?.has(r.leaseId!) === true)).filter(mayPay)
     for (const r of candidates) {
       if (left <= 0) break
       const need = open.get(r.id) ?? 0
@@ -2133,10 +2221,16 @@ export async function createPaidAhead(
 /**
  * A credit the landlord gives (or deposit interest GAM credits). Settles
  * nothing: the caller runs the whole-bill check after its own commit.
+ *
+ * `issuedByLandlord` says a LANDLORD typed this credit in the Issue credit box,
+ * which is the only kind he can take back (undoIssuedCredit). Every credit GAM
+ * writes itself leaves it off: a late fee cancelled or refunded, money paid
+ * ahead given back at the end of a lease, interest on a deposit. Default off,
+ * so a new writer is never undoable by accident (10/18 review fix).
  */
 export async function createIssuedCredit(
   client: PoolClient,
-  c: { landlordId: string; tenantId: string; leaseId?: string | null; amount: number; category: string; reason?: string | null; createdBy?: string | null },
+  c: { landlordId: string; tenantId: string; leaseId?: string | null; amount: number; category: string; reason?: string | null; createdBy?: string | null; issuedByLandlord?: boolean },
 ): Promise<string> {
   const cents = toCents(c.amount)
   if (!(cents > 0)) throw new AppError(400, 'A credit has to be more than zero.')
@@ -2149,10 +2243,12 @@ export async function createIssuedCredit(
   }
   const r = await client.query<{ id: string }>(
     `INSERT INTO tenant_credits
-       (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_by)
-     VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+       (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_by,
+        issued_by_landlord)
+     VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)
      RETURNING id`,
-    [c.landlordId, c.tenantId, c.leaseId ?? null, toDollars(cents).toFixed(2), c.category, c.reason ?? null, c.createdBy ?? null])
+    [c.landlordId, c.tenantId, c.leaseId ?? null, toDollars(cents).toFixed(2), c.category, c.reason ?? null, c.createdBy ?? null,
+     c.issuedByLandlord === true])
   return r.rows[0].id
 }
 
@@ -2176,6 +2272,378 @@ export async function voidPaidAhead(client: PoolClient, creditId: string, reason
   await client.query(
     `UPDATE lease_prepaid_credits SET voided_at = now(), void_reason = $2, updated_at = now() WHERE id = $1`,
     [creditId, reason.trim()])
+}
+
+/**
+ * 10/18 (Nic) — UNDOING A CREDIT TYPED BY MISTAKE.
+ *
+ *   "We need to undo credit, but no undoing payments that were actually real
+ *    money handed over ... refunds of real money are only at the property
+ *    setting by that individual landlord."
+ *
+ * A credit the landlord GAVE is taken back whole, including what it has already
+ * paid: every bill it settled goes back to owed, the credit is gone from the
+ * account, and who did it and when are kept on the credit itself. Since 10/15 a
+ * credit lands on the open balance the moment it is issued, so an undo that
+ * only took back the leftover would take back nothing — which is why this
+ * exists at all.
+ *
+ * WHOLE OR NOTHING. Either the entire credit comes back or none of it does
+ * (Nic: never silently partial). The moment real money is on a bill it paid —
+ * a payment, a receipt, a bank match, a card charge, money the tenant paid
+ * ahead, interest GAM credited, a refund, a dispute — nothing is undone and
+ * the refusal names the bill.
+ *
+ * THE WINDOW: CREDIT_UNDO_WINDOW_DAYS. Past it the way back is to bill the
+ * money again, not to undo (the reason is on the constant).
+ *
+ * What it puts back, the way the deposit-match Undo does
+ * (bankDepositConfirm.undoDepositMatch):
+ *   - every bill the credit settled is owed again exactly as it was — pending,
+ *     or failed where a bank or card charge had already been tried on it;
+ *   - a bill the credit only paid PART of keeps standing and simply owes that
+ *     part again (nothing was settled to put back);
+ *   - a late fee the credit netted to zero is owed again (it is one of those
+ *     bills), so the tenant's history still shows that month paid late;
+ *   - each bill's one payment mark is judged again now the money is off it
+ *     (creditLedgerEmitters.syncBillMarksAfterSettle), and their payment
+ *     history is re-scored after the commit;
+ *   - the books un-post themselves: a released use projects to nothing
+ *     (ledgerProjectors/tenantCredits).
+ * Late fees are NOT backdated away: the bills are owed again as if the credit
+ * had never been given, so the nightly run charges what they would have
+ * charged. The landlord is told that in the answer, and waiving a fee is his
+ * own call (he has the tool for it).
+ *
+ * Runs inside the caller's transaction, which must already hold nothing: it
+ * takes the household lock itself. Nothing is emailed; afterCommit() tells the
+ * tenant in the app and re-scores their history.
+ */
+export const CREDIT_UNDO_WINDOW_DAYS = 30
+
+/**
+ * Why 30 days (my call, 10/18 — Nic asked for the window and the reason):
+ * putting a paid bill back as owed makes the nightly late-fee run charge every
+ * day it was late, and re-judges the tenant's mark for that bill. Inside a
+ * month that is the same bill the landlord is still looking at. Past a month
+ * his books have moved on, the next bills have gone out, and the resident has
+ * been told twice that the month was paid — so an older mistake is corrected
+ * by billing the money again, where the tenant can see the charge, not by
+ * quietly reopening a closed month.
+ */
+export const CREDIT_UNDO_WINDOW_WORDS =
+  `This credit is more than ${CREDIT_UNDO_WINDOW_DAYS} days old, so it can no longer be undone — late fees, `
+  + 'their payment history and your books have all moved on since. Bill the money again instead, so the tenant '
+  + 'sees the charge.'
+
+/**
+ * Is a credit (alias `tc`) still inside the undo window? ONE expression, so the
+ * Undo button a list offers and the undo itself can never disagree — they used
+ * to, by up to a day, because the list compared an interval and the undo
+ * counted whole elapsed days (10/18 review fix).
+ */
+export const creditInUndoWindowSql = (alias = 'tc'): string =>
+  `${alias}.created_at > now() - make_interval(days => ${CREDIT_UNDO_WINDOW_DAYS})`
+
+/**
+ * Can this credit (alias `tc`) still be taken back? The cheap facts only — a
+ * live credit the LANDLORD typed himself, inside the window. Whether real money
+ * has landed on a bill it paid is the undo's own answer, which names the bill.
+ */
+export const creditUndoableSql = (alias = 'tc'): string =>
+  `(${alias}.status = 'active' AND ${alias}.issued_by_landlord`
+  + ` AND ${alias}.category <> 'deposit_interest' AND ${creditInUndoWindowSql(alias)})`
+
+/** One bill a credit had paid, as the undo leaves it. */
+export interface CreditUndoneRow {
+  paymentId: string
+  /** Plain words: "October rent — RV 35". */
+  what: string
+  /** Dollars of the credit that were on it. */
+  amount: number
+  /** It had been settled by the credit and is owed again (false: it was only part paid, and stayed open). */
+  owedAgain: boolean
+}
+
+export interface CreditUndoResult {
+  creditId: string
+  tenantId: string
+  landlordId: string
+  /** The whole credit, off the account. */
+  amount: number
+  /** What it had already paid, owed again. */
+  takenBackFromBills: number
+  rows: CreditUndoneRow[]
+  /** Bills that went from paid back to owed. */
+  owedAgainIds: string[]
+  /** Call once after COMMIT. Never throws. */
+  afterCommit: () => Promise<void>
+}
+
+interface UndoRowFacts {
+  id: string
+  status: string
+  type: string
+  entry_description: string
+  notes: string | null
+  /** The columns chargeLabelColumnsSql adds, so the bill is named in plain words. */
+  utility_type: string | null
+  fee_type: string | null
+  fee_description: string | null
+  origin_notes: string | null
+  amount: string
+  due_date: string
+  unit_number: string | null
+  manual_method: string | null
+  platform_held: boolean
+  flexpay_advance_id: string | null
+  stripe_payment_intent_id: string | null
+  money_part: string
+  paid_ahead_credit: string
+  deposit_interest_credit: string
+  reopened: boolean
+  other_receipt: boolean
+  banked_ahead: boolean
+  on_it: string
+}
+
+/**
+ * "October Rent — RV 35" (10/18: a refusal has to name a bill the person can
+ * find). `label` is the charge's own plain name (services/invoiceNotice
+ * chargeLabel — "Rent", "Electric", "Late fee"), which the caller reads with
+ * that file's columns.
+ */
+function billWords(r: UndoRowFacts, label: string): string {
+  const month = new Date(`${r.due_date.slice(0, 10)}T12:00:00Z`)
+    .toLocaleString('en-US', { month: 'long', timeZone: 'UTC' })
+  return `${month} ${label}${r.unit_number ? ` — ${r.unit_number}` : ''}`
+}
+
+/**
+ * Take a credit the landlord gave back off the account, whole, and put back
+ * every bill it paid. See the block above. Throws AppError(409) with words a
+ * landlord can act on, and changes nothing, whenever it cannot.
+ */
+export async function undoIssuedCredit(
+  client: PoolClient,
+  opts: { creditId: string; undoneBy: string | null },
+): Promise<CreditUndoResult> {
+  const head = (await client.query<{
+    tenant_id: string; landlord_id: string; category: string; status: string
+    amount_original: string; issued_by_landlord: boolean; in_window: boolean
+  }>(
+    `SELECT tenant_id, landlord_id, category, status, amount_original::text AS amount_original,
+            issued_by_landlord, ${creditInUndoWindowSql('tenant_credits')} AS in_window
+       FROM tenant_credits WHERE id = $1`, [opts.creditId])).rows[0]
+  if (!head) throw new AppError(404, 'That credit was not found.')
+  // Statutory interest on a deposit is GAM's payment to the tenant, owed by
+  // law — never the landlord's to take back (the same rule as a void).
+  if (head.category === 'deposit_interest') {
+    throw new AppError(409, "This is interest on the tenant's security deposit, which they are owed by law, so it can't be undone.")
+  }
+  // 10/18 review fix: only a credit a LANDLORD typed. GAM writes credits of its
+  // own here — a late fee cancelled because the bank shows rent arrived on
+  // time, late fees refunded, money paid ahead given back at the end of a lease
+  // — and none of those is his to take back. Undoing the fee-cancelling one put
+  // back a fee the system had already decided was never owed.
+  if (!head.issued_by_landlord) {
+    throw new AppError(409,
+      'GAM wrote this credit itself — to cancel or refund a charge, or to give money back — so it is not a credit '
+      + 'to undo. Nothing was undone. If the charge itself is wrong, change the charge.')
+  }
+  // The same expression the Undo button is offered on, so the button and the
+  // action never disagree.
+  if (!head.in_window) throw new AppError(409, CREDIT_UNDO_WINDOW_WORDS)
+
+  // Every writer of this household's money waits here; then the charges by id,
+  // then the credit — the order the credit ledger's trigger takes them in.
+  await lockHousehold(client, head.tenant_id, head.landlord_id)
+
+  const uses = (await client.query<{
+    id: string; payment_id: string | null; status: string; amount: string
+    deposit_return_id: string | null; refund_part_id: string | null; paid_ahead_choice_id: string | null
+  }>(
+    `SELECT id, payment_id, status, amount::text AS amount, deposit_return_id, refund_part_id, paid_ahead_choice_id
+       FROM credit_uses
+      WHERE tenant_credit_id = $1 AND status IN ('held', 'applied', 'reversed')
+      ORDER BY id`, [opts.creditId])).rows
+
+  const held = uses.filter(u => u.status === 'held')
+  if (held.length > 0) {
+    const cents = held.reduce((s, u) => s + toCents(u.amount), 0)
+    throw new AppError(409,
+      `$${toDollars(cents).toFixed(2)} of this credit is set aside for a payment that is still going through, so it can't be undone yet. `
+      + 'Try again once that payment clears or fails — a bank payment takes a few business days.')
+  }
+  const applied = uses.filter(u => u.status === 'applied')
+  // Anything else live on this credit (the database allows none today) is not
+  // this undo's to move: say so rather than leaving part of it behind.
+  const notOnABill = uses.filter(u => u.status !== 'held' && u.status !== 'applied')
+    .concat(applied.filter(u => u.payment_id === null || u.deposit_return_id !== null
+      || u.refund_part_id !== null || u.paid_ahead_choice_id !== null))
+  if (notOnABill.length > 0) {
+    throw new AppError(409,
+      'Part of this credit went somewhere an undo cannot reach — a move-out, a refund or money kept at the end of a lease. '
+      + 'Nothing was undone. Ask GAM support to look at it.')
+  }
+
+  await lockPaymentRowsById(client, applied.map(u => u.payment_id!))
+  const cur = (await client.query<{ status: string; amount_remaining: string }>(
+    `SELECT status, amount_remaining::text AS amount_remaining FROM tenant_credits WHERE id = $1 FOR UPDATE`,
+    [opts.creditId])).rows[0]
+  if (cur.status !== 'active') throw new AppError(409, 'This credit was already voided or undone, so there is nothing to undo.')
+
+  // Dynamic: invoiceNotice reads the open balances, which read this file.
+  const { chargeLabel, chargeLabelColumnsSql } = await import('./invoiceNotice')
+  const rowFacts = applied.length === 0 ? [] : (await client.query<UndoRowFacts>(
+    `SELECT p.id, p.status, p.type, p.entry_description, p.notes, p.amount::text AS amount,
+            ${chargeLabelColumnsSql('p')},
+            p.due_date::text AS due_date, un.unit_number, p.manual_method, p.platform_held,
+            p.flexpay_advance_id, p.stripe_payment_intent_id,
+            vm.money_part::text AS money_part,
+            vm.paid_ahead_credit::text AS paid_ahead_credit,
+            vm.deposit_interest_credit::text AS deposit_interest_credit,
+            EXISTS (SELECT 1 FROM payment_reversals pr WHERE pr.payment_id = p.id) AS reopened,
+            EXISTS (SELECT 1 FROM remittance_applications ra JOIN tenant_remittances r ON r.id = ra.remittance_id
+                     WHERE ra.payment_id = p.id AND r.status <> 'failed') AS other_receipt,
+            EXISTS (SELECT 1 FROM lease_prepaid_credits c
+                     WHERE c.source_payment_id = p.id AND c.voided_at IS NULL) AS banked_ahead,
+            (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u
+              WHERE u.payment_id = p.id AND u.tenant_credit_id = $2 AND u.status = 'applied')::text AS on_it
+       FROM payments p
+       JOIN v_payment_money vm ON vm.payment_id = p.id
+       LEFT JOIN units un ON un.id = p.unit_id
+      WHERE p.id = ANY($1::uuid[])
+      ORDER BY p.due_date, p.id`,
+    [applied.map(u => u.payment_id!), opts.creditId])).rows
+  const byId = new Map(rowFacts.map(r => [r.id, r]))
+  const words = (r: UndoRowFacts) => billWords(r, chargeLabel(r))
+
+  // ── Is real money on any of these bills? ────────────────────────────────────
+  // Nothing is undone unless every bill the credit paid is still paid by credit
+  // alone. The refusal names the bill, so the landlord knows which one to look at.
+  const stop = (r: UndoRowFacts, why: string) => new AppError(409,
+    `${words(r)} ${why} Nothing was undone — the credit stands as it is. `
+    + 'Money that was really handed over is only given back as a refund, which is the landlord\'s own to make.')
+  for (const u of applied) {
+    const r = byId.get(u.payment_id!)
+    if (!r) throw new AppError(409, 'A bill this credit paid no longer exists, so nothing was undone. Ask GAM support to look at it.')
+    if (r.reopened) throw stop(r, 'was disputed or returned since.')
+    if (r.other_receipt) throw stop(r, 'has a payment on it.')
+    if (r.banked_ahead) throw stop(r, 'became money paid ahead when the stay was shortened.')
+    if (r.status === 'settled') {
+      if (toCents(r.money_part) !== 0) throw stop(r, `has ${`$${toDollars(toCents(r.money_part)).toFixed(2)}`} of real money on it.`)
+      if (toCents(r.paid_ahead_credit) > 0) throw stop(r, 'was paid with money the tenant paid ahead.')
+      if (toCents(r.deposit_interest_credit) > 0) throw stop(r, 'was paid with interest on their deposit.')
+      if (r.manual_method !== null) throw stop(r, 'has a payment recorded on it.')
+      if (r.platform_held) throw stop(r, 'has money GAM is holding for it.')
+      if (r.flexpay_advance_id !== null) throw stop(r, 'was covered by FlexPay.')
+    } else if (r.status !== 'pending' && r.status !== 'failed') {
+      throw stop(r, 'has money going through on it right now.')
+    }
+  }
+
+  // ── Put it all back ─────────────────────────────────────────────────────────
+  const day = new Date().toISOString().slice(0, 10)
+  const useIds = applied.map(u => u.id)
+  if (useIds.length > 0) {
+    const r = await client.query(
+      `UPDATE credit_uses
+          SET status = 'released', released_at = now(), release_reason = 'credit_undone'
+        WHERE id = ANY($1::uuid[]) AND status = 'applied'`, [useIds])
+    if ((r.rowCount ?? 0) !== useIds.length) {
+      throw new AppError(409, 'This credit changed while it was being undone. Nothing was undone — please look again.')
+    }
+  }
+  // Owed again as it was: pending, or failed where a bank or card charge had
+  // been tried on it (the credit ledger only ever lets credit pay one of those
+  // two, so the charge's own intent tells the two apart). A bank retry this
+  // settle replaced was canceled then, so it is not scheduled again.
+  // One id per BILL, not per use: a credit can have two spends on the same bill
+  // (a second draw after other credit on that row was given back), and counting
+  // the bill twice made the row count below disagree with itself — the undo
+  // then refused a perfectly good credit, blaming a change that never happened
+  // (10/18 review fix).
+  const owedAgainIds = [...new Set(applied.map(u => u.payment_id!))]
+    .filter(id => byId.get(id)?.status === 'settled')
+  if (owedAgainIds.length > 0) {
+    const back = await client.query(
+      `UPDATE payments
+          SET status = CASE WHEN stripe_payment_intent_id IS NULL THEN 'pending' ELSE 'failed' END,
+              settled_at = NULL, next_retry_at = NULL,
+              notes = COALESCE(notes || ' — ', '') || $2
+        WHERE id = ANY($1::uuid[]) AND status = 'settled'`,
+      [owedAgainIds, `Credit undone ${day} — owed again`])
+    if ((back.rowCount ?? 0) !== owedAgainIds.length) {
+      throw new AppError(409, 'A bill this credit paid changed while it was being undone. Nothing was undone — please look again.')
+    }
+  }
+  // The credit is gone from the account, with who undid it and when on it.
+  await client.query(
+    `UPDATE tenant_credits
+        SET status = 'void', voided_at = now(), undone_at = now(), undone_by = $2, updated_at = now()
+      WHERE id = $1 AND status = 'active'`, [opts.creditId, opts.undoneBy])
+
+  // 10/12 (Nic): "one mark per invoice." The bills are judged again now the
+  // credit is off them — a month that read paid now reads what it is.
+  const subjects = new Set<string>()
+  if (owedAgainIds.length > 0) {
+    const { syncBillMarksAfterSettle } = await import('./creditLedgerEmitters')
+    for (const ch of await syncBillMarksAfterSettle(client, owedAgainIds)) ch.subjectIds.forEach(s => subjects.add(s))
+  }
+
+  const rows: CreditUndoneRow[] = rowFacts.map(r => ({
+    paymentId: r.id,
+    what: words(r),
+    amount: toDollars(toCents(r.on_it)),
+    owedAgain: owedAgainIds.includes(r.id),
+  }))
+  const takenBack = applied.reduce((s, u) => s + toCents(u.amount), 0)
+  logger.info({ creditId: opts.creditId, undoneBy: opts.undoneBy, takenBack, owedAgain: owedAgainIds.length },
+    '[credit-undo] a credit the landlord gave was taken back whole')
+
+  let ran = false
+  return {
+    creditId: opts.creditId,
+    tenantId: head.tenant_id,
+    landlordId: head.landlord_id,
+    amount: toDollars(toCents(head.amount_original)),
+    takenBackFromBills: toDollars(takenBack),
+    rows,
+    owedAgainIds,
+    afterCommit: async () => {
+      if (ran) return
+      ran = true
+      for (const s of subjects) {
+        const { recomputeAndSnapshot } = await import('./creditScore')
+        await recomputeAndSnapshot(s).catch(err =>
+          logger.error({ err, subjectId: s }, '[credit-undo] score recompute failed; the nightly run picks it up'))
+      }
+      // The tenant was told their bill was paid with their account credit, so
+      // they are told it is owed again — in the app, like the deposit-match
+      // undo. No email: nothing was charged and nothing was refunded.
+      if (owedAgainIds.length > 0) {
+        try {
+          const who = (await query<{ user_id: string }>(
+            `SELECT user_id FROM tenants WHERE id = $1`, [head.tenant_id]))[0]?.user_id
+          if (who) {
+            const { createNotification } = await import('./notifications')
+            await createNotification({
+              userId: who,
+              type: 'payment_recorded',
+              title: 'A credit is no longer on your bill',
+              body: `Your landlord took back a $${toDollars(takenBack).toFixed(2)} credit that had paid `
+                + `${owedAgainIds.length === 1 ? 'a bill' : `${owedAgainIds.length} bills`} on your account, `
+                + 'so that amount is owed again. If you think this is a mistake, tell your landlord.',
+              actionUrl: '/payments',
+            })
+          }
+        } catch (e) {
+          logger.error({ err: e, creditId: opts.creditId }, '[credit-undo] could not tell the tenant')
+        }
+      }
+    },
+  }
 }
 
 // ─── Disputes and returns ─────────────────────────────────────────────────────

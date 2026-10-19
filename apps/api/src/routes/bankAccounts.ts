@@ -45,7 +45,7 @@ bankAccountsRouter.get('/', async (req, res, next) => {
 // ── 10/12 (Nic): "Remove the old form." NEW ENTRIES ARE REFUSED ─────────────
 //
 // This catalog predates Stripe Connect. Rent pays out ONLY through the Connect
-// account a landlord verifies on the Disbursement Account page
+// account a landlord verifies in step 1 of Bank setup
 // (jobs/autoPayouts.ts fires stripe.payouts.create against it and never reads
 // this table), so a row added here never set up payouts and never reached
 // Stripe at all — no verification, no microdeposits. It did, though, flip
@@ -59,7 +59,11 @@ bankAccountsRouter.get('/', async (req, res, next) => {
 // entries with the place payouts are actually set up. Existing rows stay
 // (keep-everything): GET still lists them, archive still works, and the
 // historical ledger joins still read them.
-const REFUSAL = 'Payouts are set up with Stripe on the Disbursement Account page.'
+// 10/19 (Nic): the Disbursement Account page no longer exists — its Stripe step
+// is step 1 of Bank setup on the Bank page, and /banking redirects there. A
+// refusal that names a page the landlord cannot find is worse than no refusal,
+// so it names where they should actually go.
+const REFUSAL = 'Payouts are set up with Stripe on the Bank page, under Bank setup.'
 
 bankAccountsRouter.post('/', async (_req, _res, next) => {
   next(new AppError(410, REFUSAL))

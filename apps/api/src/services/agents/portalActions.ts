@@ -1185,7 +1185,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'the fees at Oak Street". The fees are ONE choice for card and bank alike (achFeePayer sets ' +
       'both). The platform fee is always the landlord\u2019s; if they ask to move it, say so plainly. ' +
       'Cash, check and money order carry no fee. Rent pays out to the bank the company verified with ' +
-      'Stripe on the Disbursement Account page; there is no per-property payout account to set.',
+      'Stripe on the Bank page, Bank setup tab; there is no per-property payout account to set.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       achFeePayer: { type: 'string', description: 'landlord (cover the card and bank fees) or tenant (pass them on).' },
@@ -1991,7 +1991,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Rename one of the bank accounts already on their old GAM bank list, so they can tell them ' +
       'apart. Use for "call that one Operating". This changes the LABEL only — nothing about the ' +
       'account itself. That list does not receive payouts and takes no new accounts: rent pays out ' +
-      'to the bank they verify with Stripe on the Disbursement Account page, which they enter ' +
+      'to the bank they verify with Stripe on the Bank page, Bank setup tab, which they enter ' +
       'themselves inside Stripe\u2019s form, never through you.',
     params: {
       accountId: { type: 'string', description: 'The bank account id, from a lookup.' },
@@ -2007,7 +2007,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Archive one of the bank accounts on their old GAM bank list. Use for "we closed that ' +
       'account".\n' +
       'That list never received payouts — rent pays out to the bank verified with Stripe on the ' +
-      'Disbursement Account page — so archiving one changes no payout.',
+      'Bank page, Bank setup tab — so archiving one changes no payout.',
     params: { accountId: { type: 'string', description: 'The bank account id, from a lookup.' } },
     required: ['accountId'],
     confirmFirst: true,
@@ -4259,6 +4259,38 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'that already has a lease drafted keeps that one.',
     params: {
       unitId: { type: 'string', description: 'The unit the stay is on, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+  },
+  // 10/18 (Nic): "let's add a button so that we can collect deposits from
+  // people that haven't done it for their stays." The ask the desk can make
+  // from the schedule, so the assistant can make it from a phone call.
+  // No discretion in it: the amount is the server's quote, the words of every
+  // refusal are the server's, and pressing it twice sends nothing again.
+  {
+    id: 'send_reservation_deposit_link',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/bookings/:bookingId/deposit-link',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Email a guest the deposit link for a reservation already on the schedule. Use for "send the ' +
+      'Hendersons their deposit link" or "they never paid a deposit on spot 7".\n' +
+      'A reservation with no deposit paid still holds its site, but a guest who pays can take that site ' +
+      'when the park fills up — paying the deposit is what locks it in. That is what to tell the landlord.\n' +
+      'You do not choose the amount: it is the deposit the booking site would quote for those nights on ' +
+      'that site, and a background check this stay needs rides on the same link. Read the amount and the ' +
+      'address it went to back from the reply.\n' +
+      'Sending it again does NOT email the guest twice: whatever link is already out for the reservation ' +
+      'comes back instead, and the reply says which link it is and what it asks for \u2014 only read out an ' +
+      'amount the reply gives you, never call another link the deposit. If the earlier link was closed ' +
+      'unpaid, a fresh one is emailed. It is refused, with nothing sent, when the reservation is already ' +
+      'paid for, has no email address, is no longer holding its site, is already written up at the ' +
+      'register, is being paid for on the booking site right now, or when the park asks no deposit on a ' +
+      'stay like this. Pass the refusal\u2019s words on and do not try again.',
+    params: {
+      unitId: { type: 'string', description: 'The unit the reservation is on, from a lookup.' },
       bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
     },
     required: ['unitId', 'bookingId'],

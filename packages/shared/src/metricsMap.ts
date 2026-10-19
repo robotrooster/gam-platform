@@ -153,7 +153,13 @@ export const zipAreaName = (zip: string): string => `ZIP ${zip}`
  * saturation is GAM's share of THAT AREA's market, concentration is that
  * area's share of EVERYTHING GAM manages.
  */
-export const METRICS_MAP_MEASURES = ['units', 'money', 'saturation', 'concentration'] as const
+/**
+ * 10/18 (Nic): `lean` is the election overlay — "the overlay to show which way
+ * those certain districts vote, and where our strong areas tend to be in
+ * Democratic areas or Republican areas". The color is the area's own vote, not
+ * a GAM number at all; GAM's footprint is marked over it.
+ */
+export const METRICS_MAP_MEASURES = ['units', 'money', 'saturation', 'concentration', 'lean'] as const
 export type MetricsMapMeasure = typeof METRICS_MAP_MEASURES[number]
 
 export const METRICS_MAP_MEASURE_LABEL: Readonly<Record<MetricsMapMeasure, string>> = {
@@ -161,6 +167,7 @@ export const METRICS_MAP_MEASURE_LABEL: Readonly<Record<MetricsMapMeasure, strin
   money: 'Money',
   saturation: 'Saturation',
   concentration: 'Concentration',
+  lean: 'How it votes',
 }
 
 /**
@@ -277,3 +284,170 @@ export function formatShare(percent: number): string {
   const r = Math.round(percent * 10) / 10
   return `${r % 1 === 0 ? r.toFixed(0) : r.toFixed(1)}%`
 }
+
+// ── 10/18 (Nic): how an area votes, and the window beside the map ────────────
+
+/**
+ * 10/18 (Nic): "the overlay to show which way those certain districts vote,
+ * and where our strong areas tend to be in Democratic areas or Republican
+ * areas, for the landlord onboarding process and total unit count."
+ *
+ * And, the same day: "I don't only want presidential stuff, I want mayor data,
+ * governor data, city council data, voting on public policy, whether it's
+ * left-leaning or conservative. I want the data at every level that we can get
+ * it... get what you can for now. Any missing data, we can always add it in
+ * later. This is just building the foundation for things I'm going to be
+ * looking at in the future."
+ *
+ * So this is a general election-results layer, not a presidential one. One
+ * contest is an office and a year with its two sides NAMED — "Republican" and
+ * "Democratic", or "No" and "Yes" on a ballot measure — so nothing on the page
+ * ever assumes which words to use. A governor's race, a mayor, a city council
+ * seat or a vote on a policy drops in as another contest in the same shape
+ * (apps/admin/scripts/build-election-results.mjs).
+ */
+export const METRICS_ELECTION_OFFICES = [
+  'president', 'governor', 'senate', 'state_senate', 'state_house',
+  'mayor', 'city_council', 'measure',
+] as const
+export type MetricsElectionOffice = typeof METRICS_ELECTION_OFFICES[number]
+
+/** What each kind of contest is called on the page. */
+export const METRICS_ELECTION_OFFICE_LABEL: Readonly<Record<MetricsElectionOffice, string>> = {
+  president: 'President',
+  governor: 'Governor',
+  senate: 'U.S. Senate',
+  state_senate: 'State senate',
+  state_house: 'State house',
+  mayor: 'Mayor',
+  city_council: 'City council',
+  measure: 'Ballot measure',
+}
+
+/** One contest in a level's election file, as the builder writes it. */
+export interface MetricsElectionContest {
+  /** "president-2024" — the key each area's result is under. */
+  id: string
+  office: MetricsElectionOffice
+  year: number
+  /** What it was, in words: "2024 presidential margin". */
+  label: string
+  /** What the two sides were called. A positive margin is `right`. */
+  right: string
+  left: string
+  /** Where the votes came from, for the credit line under the map. */
+  source: string
+  /** How many areas have a result in this contest — a measure sits in one city, a presidency in every county. */
+  areas?: number
+  /**
+   * The states this contest has no figures for at this level, by state FIPS,
+   * each with the reason in words — a state that reported by ward or by
+   * district, or one figure for the whole state. The page says it rather than
+   * drawing a number nobody reported.
+   */
+  gaps?: Record<string, { name: string; why: string }>
+}
+
+/** One area's result in one contest: the margin, and the votes behind it. */
+export interface MetricsElectionResult {
+  /** The margin in percentage points — positive is the contest's `right`. */
+  m: number
+  /** Votes on the right, votes on the left, and every vote cast. */
+  r?: number
+  l?: number
+  t?: number
+}
+
+/** One map level's election file (apps/api/elections, served per level). */
+export interface MetricsElectionFile {
+  level: string
+  contests: MetricsElectionContest[]
+  /** area code → contest id → that area's result. Sparse: a contest can cover one city. */
+  areas: Record<string, Record<string, MetricsElectionResult>>
+}
+
+/**
+ * The levels with an election file beside the API. ONLY COUNTIES ARE EXACT
+ * today: presidential returns are published county by county, and there is no
+ * free keyless source for a congressional or legislative district — so a
+ * district says plainly that no result is published for it instead of carrying
+ * a margin worked out from county votes, which would be a number nobody
+ * reported. A new level is added here when its own file lands.
+ */
+export const METRICS_ELECTION_LEVELS: ReadonlyArray<MetricsMapLevel> = ['county']
+export const hasElections = (l: MetricsMapLevel): boolean =>
+  (METRICS_ELECTION_LEVELS as readonly string[]).includes(l)
+
+/**
+ * Where the overlay is OFFERED: every level of the United States, whose
+ * returns these are. It is offered at the levels that have no file on purpose
+ * — Nic asked for the districts, and the honest answer there is the overlay
+ * saying so on screen rather than the choice quietly not being there.
+ */
+export const offersLean = (l: MetricsMapLevel): boolean => !isMetricsWorldLevel(l)
+
+/**
+ * Where the lean color tops out, in percentage points. Half of all counties
+ * voted by more than 42 points in 2024 and a tenth by more than 70, so a
+ * scale that ended at 40 would paint half the country one flat color; 60
+ * keeps the gradation where the counties actually are, and the key says the
+ * end means "60 points or more".
+ */
+export const METRICS_LEAN_FULL = 60
+
+/** The overlay's own sentence: what the color is, and what the dots are. */
+export const METRICS_LEAN_MEANING =
+  'The color is how an area voted in the contest shown — the winning side\'s lead as a share of every vote cast. A marker shows where GAM has spaces, so a strong area can be read against the way it votes.'
+
+/** A level with no election file: said on screen, instead of a number nobody reported. */
+export const leanNotAtLevel = (noun: string, plural: string): string =>
+  `No election results are published by ${noun}, so there is no lean to draw for ${plural}. They are published county by county — switch to the county level to see them.`
+
+/** A state that reported a contest some other way, in words, for an area in it. */
+export const leanStateGap = (stateName: string, why: string): string =>
+  `No result for this area: ${stateName} — ${why}.`
+
+/** An area with no row in the chosen contest. */
+export const leanNoResult = (noun: string): string => `No result is published for this ${noun} in that contest.`
+
+/** A margin in words: "Republican +18.6", "Democratic +4", "Even". */
+export function marginText(margin: number, right: string, left: string): string {
+  if (!Number.isFinite(margin) || Math.abs(margin) < 0.05) return 'Even'
+  const points = Math.abs(Math.round(margin * 10) / 10)
+  const text = points % 1 === 0 ? points.toFixed(0) : points.toFixed(1)
+  return `${margin > 0 ? right : left} +${text}`
+}
+
+/**
+ * How far an area has moved between two contests, in words — the swing Nic
+ * reads 2016 against 2024 for. Positive is toward the contest's `right`.
+ */
+export function marginMoveText(from: number, to: number, right: string, left: string, fromLabel: string): string {
+  const move = Math.round((to - from) * 10) / 10
+  if (Math.abs(move) < 0.05) return `No move since ${fromLabel}.`
+  const points = Math.abs(move)
+  const text = points % 1 === 0 ? points.toFixed(0) : points.toFixed(1)
+  return `${text} ${points === 1 ? 'point' : 'points'} toward the ${move > 0 ? right : left} side since ${fromLabel}.`
+}
+
+/**
+ * 10/18 (Nic): THE WINDOW. "I just like the actual counties to be clickable
+ * and have it pull up in a separate little window... if I click on Santa Cruz
+ * County in Arizona, I'd like it to pull up a little window and say, hey, at
+ * the last census this many people lived in this county, people renting on GAM
+ * are a certain percentage of the total population."
+ *
+ * The headings it reads under, so the same words are used on every level.
+ */
+export const METRICS_WINDOW_CENSUS = 'At the last census'
+export const METRICS_WINDOW_GAM = 'GAM here'
+export const METRICS_WINDOW_SHARE = "GAM's share here"
+export const METRICS_WINDOW_VOTES = 'How it votes'
+
+/** No census numbers reach this level at all — the world's own levels. */
+export const censusNotAtLevel = (noun: string): string =>
+  `The U.S. Census counts the United States only, so there is no census number for a ${noun} here.`
+
+/** The Census has no row for this one area, at a level it otherwise covers. */
+export const censusNoRowHere = (noun: string): string =>
+  `The Census has no row for this ${noun}, so there is no share to work out.`

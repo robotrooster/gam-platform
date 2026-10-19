@@ -145,13 +145,13 @@ describe('POST /api/bank-accounts', () => {
     accountNumber: '1234567890',
   })
 
-  it('refuses a complete, valid entry with the Disbursement Account message — no row written', async () => {
+  it('refuses a complete, valid entry by naming Bank setup — no row written', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
       .send(happyPayload())
     expect(res.status).toBe(410)
-    expect(res.body.error).toBe('Payouts are set up with Stripe on the Disbursement Account page.')
+    expect(res.body.error).toBe('Payouts are set up with Stripe on the Bank page, under Bank setup.')
     const { rows } = await db.query(`SELECT 1 FROM user_bank_accounts WHERE user_id=$1`, [f.userA])
     expect(rows).toHaveLength(0)
   })
@@ -162,7 +162,7 @@ describe('POST /api/bank-accounts', () => {
       .set('Authorization', `Bearer ${f.userATok}`)
       .send({})
     expect(res.status).toBe(410)
-    expect(res.body.error).toMatch(/Disbursement Account page/)
+    expect(res.body.error).toMatch(/Bank setup/)
   })
 
   it('leaves rows that already exist exactly as they were', async () => {

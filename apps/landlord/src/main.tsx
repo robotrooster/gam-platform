@@ -94,7 +94,9 @@ import { BankActivityPage } from './financials/BankActivityPage'
 import { PayoutsPage } from './financials/PayoutsPage'
 import { MyManagersPage } from './pages/MyManagersPage'
 import { BankPage } from './pages/BankPage'
-import { BankingPage }      from './pages/BankingPage'
+// 10/19 (Nic): the Disbursement Account page is gone — its Stripe Connect step
+// is step 1 of Bank setup on /bank, and its address redirects there.
+import { BankSetupRedirect } from './pages/BankSetup'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
 import { TenantPhotosPage } from './pages/TenantPhotosPage'
@@ -358,11 +360,19 @@ function App() {
                 <Route path="payouts"        element={<PayoutsPage />} />
                 <Route path="my-managers"    element={<MyManagersPage />} />
                 {/* S605: one Bank tab. The old paths redirect so existing
-                    links and bookmarks don't 404. */}
+                    links and bookmarks don't 404.
+                    10/19 (Nic): and /banking — the old Disbursement Account
+                    address — opens the Bank setup tab, carrying its ?entity=
+                    through so a to-do still lands on the company it names.
+                    Blu has that address bookmarked; it keeps working.
+                    10/19 (review): each old address names the tab it meant. Sent
+                    to a bare /bank they got the Bank setup tab instead, because
+                    the page opens there when setup is unfinished and nothing in
+                    a bare address says otherwise. */}
                 <Route path="bank"           element={<BankPage />} />
-                <Route path="bank-feed"      element={<Navigate to="/bank" replace />} />
-                <Route path="bank-reconciliation" element={<Navigate to="/bank" replace />} />
-                <Route path="banking"        element={<BankingPage />} />
+                <Route path="bank-feed"      element={<Navigate to="/bank?tab=feed" replace />} />
+                <Route path="bank-reconciliation" element={<Navigate to="/bank?tab=reconcile" replace />} />
+                <Route path="banking"        element={<BankSetupRedirect />} />
                 <Route path="lot-rent"       element={<LotRentPage />} />
               </Route>
               {/* 10/12 (Nic): Bookkeeping — GAM Books' pages inside the portal,

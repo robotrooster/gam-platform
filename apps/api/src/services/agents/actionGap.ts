@@ -38,6 +38,18 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/19: a policy answer and an undo, both the owner's own press ────────
+  // Nic, 10/18: refunds on an early departure and mid-month proration are
+  // "property level settings" — a standing answer about his own money that a
+  // park gives once, not something to decide mid-conversation on a phone call.
+  // And undoing a credit puts a bill that reads PAID back to owed, which makes
+  // the nightly run charge every late day since its due date and re-scores the
+  // resident's payment mark. Both are a deliberate press on a screen showing
+  // what is about to change, by a person who can be asked "are you sure".
+  'properties PATCH /:id/departure-rules':
+    'sets whether a property gives money back when someone leaves early and whether it prorates a mid-month move (Nic 10/18: "these should all be property level settings"). A standing policy answer about the landlord\'s own money, given once on the property\'s page — never an assistant\'s call in the middle of a conversation.',
+  'tenantCredits POST /:id/undo':
+    'takes back a credit whole: every bill it settled goes back to owed, so the late-fee run charges the days since each due date and the resident\'s payment history is re-scored. The owner\'s or a property manager\'s press, with the bills it reopens on screen; an assistant makes no money decision (#38 Q6).',
   // ── 10/4: move-out money, check-outs, and a card waiting on its bank ───────
   // Every one of these moves money or says where money went, and each is a
   // press on a screen that read the figures fresh at that moment (a 409 reads
@@ -239,8 +251,8 @@ const DELIBERATE = new Map(Object.entries({
   'landlords DELETE /pos-customers/:id': 'POS is its own product and stays isolated',
   'landlords POST /pos-customers/:id/send-onboarding': 'POS is its own product and stays isolated',
   // 10/12 (Nic): the endpoint refuses every new entry — payouts are set up
-  // with Stripe on the Disbursement Account page, inside Stripe's own form.
-  'bankAccounts POST /': 'refuses every new entry (10/12): the payout bank is entered inside Stripe\'s verification on the Disbursement Account page, by the person',
+  // with Stripe on the Bank page's Bank setup tab, inside Stripe's own form.
+  'bankAccounts POST /': 'refuses every new entry (10/12): the payout bank is entered inside Stripe\'s verification on the Bank page\'s Bank setup tab, by the person',
   'properties POST /units/:id/photos': 'unit photos are files the landlord uploads',
   'properties DELETE /units/:id/photos/:photoId': 'removing a photo is done looking at it',
   'documents POST /': 'a document is a file the person uploads',

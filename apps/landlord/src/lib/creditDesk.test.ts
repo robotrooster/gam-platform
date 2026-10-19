@@ -758,7 +758,7 @@ describe('10/5: part payments, where the property takes them', () => {
 // ─── 10/6 (Nic): credit against the whole balance; no credit talk on a part payment ──
 
 import {
-  partPaymentLines, backdatedLateFeeText, deskBillBalance, CREDIT_USE_RULE,
+  partPaymentLines, backdatedLateFeeText, deskBillBalance, CREDIT_USE_RULE, CREDIT_REST_NOT_USABLE,
 } from './creditDesk'
 import { placePartPayment } from '@gam/shared'
 
@@ -868,8 +868,18 @@ describe('10/6 (Nic): credit goes on the bill, never held back by the pay-in-ful
     expect(deskBillBalance({ currentTotal: 300, creditAlreadyApplied: 282.36 })).toEqual({ charges: 30000, creditApplied: 28236, stillOwed: 1764 })
     expect(deskBillBalance({ currentTotal: 460, creditAlreadyApplied: 0 })).toEqual({ charges: 46000, creditApplied: 0, stillOwed: 46000 })
   })
-  it('the rule as landlords read it: paid-ahead money goes on by itself, part of a bill allowed', () => {
-    expect(CREDIT_USE_RULE).toMatch(/^Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it\./)
+  // 10/18 (Nic): and which money crosses spaces. Money they paid ahead stays
+  // on the space they paid it for; a credit the landlord gives goes on the
+  // oldest bill across every space they hold with him.
+  it('the rule as landlords read it: paid-ahead money goes on by itself on its own space, credit given crosses spaces', () => {
+    expect(CREDIT_USE_RULE).toBe(
+      'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay '
+      + 'all of it, and only on the space they paid it for. Credit you give them goes on their oldest bill first across '
+      + 'every space they hold with you, so credit never sits on an account while they still owe.')
+    expect(CREDIT_REST_NOT_USABLE).toBe(
+      ' The rest cannot pay these bills: money they paid ahead stops at its monthly limit and pays only the space they '
+      + 'paid it for, interest on a deposit pays only that space, and credit pays only your own rent, utilities, late '
+      + 'fees and fees.')
   })
 })
 

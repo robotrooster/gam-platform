@@ -214,19 +214,31 @@ export async function loadWorkTradeStanding(
   if (!ag) return null
 
   const rows = await query<any>(
-    `SELECT to_char(period_month,'YYYY-MM-DD') AS period_month,
-            target_hours::float  AS target_hours,
-            hours_applied::float AS hours_applied,
-            hour_rate::float     AS hour_rate,
+    `SELECT to_char(ws.period_month,'YYYY-MM-DD') AS period_month,
+            -- 10/19: THE AGREEMENT SAYS WHETHER HOURS COUNT, not the number the
+            -- period froze when its bill was written. The landlord can turn
+            -- tracking off any day — Nic did, on 10/01 — and the month close
+            -- reads it off the agreement from then on (jobs/workTradeSettlement
+            -- loadOpenPeriods). Read the snapshot instead and the tenant is told
+            -- "80 hours covers this month, and 80 hours is still owed from
+            -- earlier" about a month the close is about to cover outright, and
+            -- the landlord is quoted a price for the same phantom hours. A
+            -- tenant seeing one number and a landlord seeing another is how a
+            -- work-trade argument starts (routes/workTrade); a tenant and the
+            -- close disagreeing is worse, and it stands for a month.
+            (CASE WHEN wta.tracks_hours THEN ws.target_hours ELSE 0 END)::float AS target_hours,
+            (CASE WHEN wta.tracks_hours THEN ws.hour_rate    ELSE 0 END)::float AS hour_rate,
+            ws.hours_applied::float AS hours_applied,
             -- Closes this period has already survived. Mirrors the settlement
             -- job's derivation exactly so the two can never disagree about when
             -- something bills.
-            GREATEST(0, (DATE_PART('year',  $2::date) - DATE_PART('year',  period_month)) * 12
-                      + (DATE_PART('month', $2::date) - DATE_PART('month', period_month)) - 1
+            GREATEST(0, (DATE_PART('year',  $2::date) - DATE_PART('year',  ws.period_month)) * 12
+                      + (DATE_PART('month', $2::date) - DATE_PART('month', ws.period_month)) - 1
             )::int AS aged_closes
-       FROM work_trade_settlements
-      WHERE agreement_id = $1 AND status = 'open' AND period_month <= $2::date
-      ORDER BY period_month`,
+       FROM work_trade_settlements ws
+       JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
+      WHERE ws.agreement_id = $1 AND ws.status = 'open' AND ws.period_month <= $2::date
+      ORDER BY ws.period_month`,
     [agreementId, month])
 
   const current = rows.find((r: any) => r.period_month === month)

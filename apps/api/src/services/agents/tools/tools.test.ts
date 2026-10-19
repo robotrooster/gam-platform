@@ -643,20 +643,42 @@ describe('read tools scope to the actor', () => {
     it('get_setup_progress reads payouts and counts by the account’s companies, and finds the next step', async () => {
       ;(mockQuery as any)
         .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: true, has_property: true }]) // companies
+        // 10/19 (review): bank setup is TWO steps and the tool knew only the
+        // first, so a landlord with payouts live and no read-only feed was told
+        // their setup was complete. Second read: the feed, per company.
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: true }])
       ;(mockQueryOne as any)
         .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0' }) // counts (by landlord_id)
       const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
       expect((mockQuery as any).mock.calls[0][0]).toMatch(/FROM landlords l/)
       expect((mockQuery as any).mock.calls[0][1]).toEqual([['L1']]) // payouts by the account's companies
+      expect((mockQuery as any).mock.calls[1][0]).toMatch(/FROM bank_connections bc/)
+      expect((mockQuery as any).mock.calls[1][1]).toEqual([['L1']]) // the feed, by the same companies
       expect((mockQueryOne as any).mock.calls[0][1]).toEqual([['L1']]) // counts by the account's companies
       expect(res.complete).toBe(false)
-      expect(res.completedSteps).toBe(2) // payouts + property
+      expect(res.completedSteps).toBe(3) // payouts + bank feed + property
       expect(res.nextStep).toMatch(/units/i) // next incomplete step
+    })
+
+    // 10/19 (review): the step that was missing entirely.
+    it('get_setup_progress: payouts live with no read-only feed is not complete', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: true, has_property: true }])
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: false }])
+      ;(mockQueryOne as any)
+        .mockResolvedValueOnce({ properties: '1', units: '2', active_leases: '1' })
+      const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
+      expect(res.canGetPaid).toBe(true)
+      expect(res.bankFeedLinked).toBe(false)
+      expect(res.companiesWithNoBankFeed).toEqual(['TruBlu'])
+      expect(res.complete).toBe(false)
+      expect(res.nextStep).toMatch(/read-only/i)
     })
 
     it('get_setup_progress: details submitted without live payouts is not "can get paid"', async () => {
       ;(mockQuery as any)
         .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: false, has_property: true }])
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: true }])
       ;(mockQueryOne as any)
         .mockResolvedValueOnce({ properties: '1', units: '2', active_leases: '1' })
       const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
