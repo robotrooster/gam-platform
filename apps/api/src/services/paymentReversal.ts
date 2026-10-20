@@ -465,15 +465,31 @@ export async function writeRowReversal(
     newPaymentId = (await client.query<{ id: string }>(
       `INSERT INTO payments
          (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-          entry_description, due_date, invoice_id, notes, reversal_id, revenue_owner, lease_fee_id, is_remainder)
+          entry_description, due_date, invoice_id, notes, reversal_id, revenue_owner, lease_fee_id, is_remainder,
+          -- 10/19 (Nic): a reopened carried space-rent balance is still the same
+          -- claim. Without the link the claim would read as paid off while the
+          -- bank has taken the money back, and the departing resident's record
+          -- would say settled on a day nothing settled.
+          space_carryforward_id)
        VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8::date,$9,$10,$11,$12,$13,
-               $5 = 'rent' AND EXISTS (
+               ($5 = 'rent' AND EXISTS (
                  SELECT 1 FROM payments q
                   WHERE q.type = 'rent' AND NOT q.is_remainder AND q.id <> $14::uuid AND q.due_date = $8::date
                     AND ((q.lease_id = $2::uuid AND q.status IN ('pending', 'processing', 'settled'))
                          -- 10/12: the rows ux_payments_unit_rent_due_date_active
                          -- holds the month for (a voided row does not).
                          OR (q.unit_id = $1::uuid AND q.status NOT IN ('failed', 'returned', 'voided')))))
+               -- 10/19 (Nic): a reopened CARRIED space-rent balance is never the
+               -- claim's original charge — the close-out wrote that one, once, and
+               -- ux_payments_one_space_carryforward_charge holds that slot for it
+               -- for good. This row is the money owed again, which is the same
+               -- thing a part payment's leftover is, so it carries the same flag
+               -- and stays outside the one-charge rule. Without it the reopen
+               -- collided with the row it replaces (or, on a bounced part
+               -- payment, with the settled slice beside it) and the whole
+               -- reversal rolled back with the bank's money already gone.
+               OR (SELECT q3.space_carryforward_id FROM payments q3 WHERE q3.id = $14::uuid) IS NOT NULL,
+               (SELECT q2.space_carryforward_id FROM payments q2 WHERE q2.id = $14::uuid))
        RETURNING id`,
       [r.unit_id, r.lease_id, r.tenant_id, r.landlord_id, r.type, toDollars(owedAgain).toFixed(2),
        r.entry_description, r.due_date, r.invoice_id, reopenedNotes(r.notes), reversalId,

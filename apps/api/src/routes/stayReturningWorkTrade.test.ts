@@ -694,7 +694,11 @@ describe('review fixes', () => {
     const made = await create(f, { guestEmail: g.email, checkIn: '2027-03-01', checkOut: '2027-03-08', workTrade: {} })
     const id = made.body.data.id
     const tradeId = (await tradeOf(id)).id
-    const paused = await request(app()).patch(`/api/work-trade/${tradeId}`).set(auth(f.token)).send({ status: 'paused' })
+    // 10/19: pausing says whether the space is still being used — the camper is
+    // on the site here, so hours keep counting. Setup only; what this test is
+    // about is that the pause survives a change to the stay.
+    const paused = await request(app()).patch(`/api/work-trade/${tradeId}`).set(auth(f.token))
+      .send({ status: 'paused', spaceOccupiedWhilePaused: true })
     expect(paused.status, JSON.stringify(paused.body)).toBe(200)
     expect((await patch(f, id, { checkOut: '2027-03-10' })).status).toBe(200)
     expect(await tradeOf(id)).toMatchObject({ status: 'paused', end_date: '2027-03-10' })

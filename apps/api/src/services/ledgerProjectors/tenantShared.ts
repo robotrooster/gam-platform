@@ -161,6 +161,16 @@ export interface PaymentFacts {
   reversalId: string | null
   flexpayAdvanceId: string | null
   workTradeSettlementId: string | null
+  /**
+   * 10/19 (Nic): the carried space-rent claim this row belongs to — set on the
+   * one carried_balance charge, on its part-payment remainders, and on the rent
+   * rows it was carried from. It decides the charge posting two ways
+   * (tenantCharges A8b): the carried balance moves a RECEIVABLE instead of
+   * booking income (the park already earned that rent, in its own months), and
+   * the voided rent rows it names keep their own charges, so a park's real
+   * September and October income stays in September and October.
+   */
+  spaceCarryforwardId: string | null
   homeSaleInstallmentId: string | null
   invoiceId: string | null
   leaseFeeId: string | null
@@ -235,7 +245,7 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
      SELECT b.id, b.landlord_id, b.unit_id, b.lease_id, b.tenant_id, b.type, b.entry_description, b.status,
             (b.voided_at IS NOT NULL OR b.status = 'voided') AS voided,
             b.due_date::text AS due_date, ${localDaySql('b.settled_at', 'z.tz')} AS settled_day,
-            b.manual_method, b.revenue_owner, b.reversal_id, b.flexpay_advance_id, b.work_trade_settlement_id,
+            b.manual_method, b.revenue_owner, b.reversal_id, b.flexpay_advance_id, b.work_trade_settlement_id, b.space_carryforward_id,
             b.home_sale_installment_id, b.invoice_id, b.lease_fee_id, b.fee_type, b.deposit_collected_by,
             b.prop AS property_id, z.tz,
             ${cSql('b.amount')} AS amount_c, ${cSql('b.work_trade_credit')} AS wtc_c,
@@ -269,7 +279,7 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
       id: x.id, landlordId: x.landlord_id, unitId: x.unit_id, leaseId: x.lease_id, tenantId: x.tenant_id,
       type: x.type, entryDescription: x.entry_description, status: x.status, voided: !!x.voided,
       dueDate: x.due_date, settledDay: x.settled_day, manualMethod: x.manual_method, revenueOwner: x.revenue_owner,
-      reversalId: x.reversal_id, flexpayAdvanceId: x.flexpay_advance_id, workTradeSettlementId: x.work_trade_settlement_id,
+      reversalId: x.reversal_id, flexpayAdvanceId: x.flexpay_advance_id, workTradeSettlementId: x.work_trade_settlement_id, spaceCarryforwardId: x.space_carryforward_id,
       homeSaleInstallmentId: x.home_sale_installment_id, invoiceId: x.invoice_id, leaseFeeId: x.lease_fee_id,
       feeType: x.fee_type, depositCollectedBy: x.deposit_collected_by, propertyId: x.property_id, tz: x.tz,
       amountCents, workTradeCents, creditCents,

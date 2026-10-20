@@ -19,7 +19,7 @@ import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningR
 import { replyToProperty } from '../services/replyRouting'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
-import { applyScreeningWaive, listOnboardingWindowsForLandlord, openOnboardingWindow, approvedCheckForAccountSql, screeningWaivedByAccountSql } from '../services/onboardingWindow'
+import { applyScreeningWaive, isExistingTenancyInvite, listOnboardingWindowsForLandlord, openOnboardingWindow, approvedCheckForAccountSql, screeningWaivedByAccountSql } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
 import { resolveIntent, accountTiedElsewhere, NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
 import { parse as parseCsv } from 'csv-parse/sync'
@@ -2882,14 +2882,16 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
 
     // W-27: validate the bound unit belongs to this landlord and isn't
     // already held by another open intent.
+    let unitPropertyId: string | null = null
     if (unitId) {
       const owned = await queryOne<any>(
-        'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [unitId, landlordId])
+        'SELECT id, property_id FROM units WHERE id=$1 AND landlord_id=$2', [unitId, landlordId])
       // Unreachable now that landlordId is derived FROM this unit — kept as a
       // belt-and-braces assertion rather than deleted, so a future change that
       // reintroduces a guessed entity fails here instead of writing a tenant
       // into the wrong company's books.
       if (!owned) throw new AppError(400, 'unitId does not belong to this landlord')
+      unitPropertyId = owned.property_id ?? null
       // S537 gate: pending intents bound to a unit require a late-fee
       // decision for that unit's class (unbound intents gate at resolve).
       await assertLateFeeDecisionForUnit(unitId)
@@ -2898,6 +2900,28 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       if (held) throw new AppError(409, 'That unit is already held by another pending tenant')
     }
 
+    // 10/19 (Nic): "Fix invite flag overridden in first 28 days."
+    //
+    // Whether this invite papers a tenancy that ALREADY EXISTS decides real
+    // money. An existing resident's first bill is one whole month's rent and
+    // nothing else: no prorated stretch, no security deposit, no pet or
+    // utility deposit, no move-in fee — because nothing about their tenancy
+    // started the day they signed, only the paperwork did, and they already
+    // paid the landlord for that month off-platform.
+    //
+    // This route used to leave the answer to a database trigger that looked
+    // only at how old the landlord's account was. The trigger only ever forced
+    // the flag ON, so for an account's first 28 days it overwrote the
+    // landlord's explicit "this is a genuine new move-in" with "they already
+    // live here" and zeroed that money — the one answer on this screen nobody
+    // could put back. The trigger is gone (migration 20261021160000) and the
+    // landlord's own answer decides, checked the same way the new-lease invite
+    // checks it (services/onboardingWindow.isExistingTenancyInvite): they have
+    // to attest it AND the onboarding window has to be open. It needs the unit,
+    // because the window that matters most is the unit's property's.
+    const existingTenancy = req.body?.existingResident === true && unitId
+      ? await isExistingTenancyInvite(landlordId, unitPropertyId)
+      : false
 
     await client.query('BEGIN')
 
@@ -2944,8 +2968,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
          (landlord_id, tenant_id, parser_status, unit_id,
           is_work_trade, work_trade_hours_target, work_trade_duties,
           work_trade_tracks_hours, home_sale_terms, package_template_ids, rent_due_day,
-          work_trade_covered_charges)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9, $10, $11::text[])
+          work_trade_covered_charges, is_existing_tenancy)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9, $10, $11::text[], $12)
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
@@ -2959,7 +2983,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        homeSaleTerms, packageTemplateIds,
        // S652: their own due day, when the landlord stated one.
        unitId ? rentDueDay : null,
-       workTradeCovered]
+       workTradeCovered,
+       // 10/19: the landlord's own answer, gated on the onboarding window.
+       existingTenancy]
     ).catch(async (err: any) => {
       if (err?.code !== '23505') throw err
       await client.query('ROLLBACK TO SAVEPOINT pending_intent').catch(() => {})

@@ -68,6 +68,7 @@ import { leasesRouter }       from './routes/leases'
 import { paidAheadChoiceRouter } from './routes/paidAheadChoice'
 import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
+import { spaceCarryforwardRouter } from './routes/spaceCarryforward'
 import { lotRentRouter }      from './routes/lotRent'
 import { expensesRouter }     from './routes/expenses'
 import { financialsRouter }   from './routes/financials'
@@ -404,6 +405,9 @@ app.use('/api/leases',        paidAheadChoiceRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)
+// 10/19 (Nic): what a SPACE carries, for the moment there is no lease yet to
+// ask it by — the invite screen with a unit picked.
+app.use('/api/space-carryforward', spaceCarryforwardRouter)
 app.use('/api/lot-rent',      lotRentRouter)
 app.use('/api/expenses',      expensesRouter)
 // 10/11: the shared financial pages (landlord portal + GAM Books), owner and bookkeeper.

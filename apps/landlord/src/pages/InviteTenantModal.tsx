@@ -1,11 +1,22 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { HomeSaleToggle, homeSalePayload, homeSaleComplete, PacketChecklist, tickedIds, type HomeSaleForm } from './TenantOnboardingPage'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { X, Mail, DoorOpen, Check, ChevronRight, ChevronLeft } from 'lucide-react'
+import { X, Mail, DoorOpen, Check, ChevronRight, ChevronLeft, Scale } from 'lucide-react'
+import { SPACE_CARRYFORWARD_INVITE_QUESTION, SPACE_CARRYFORWARD_INVITE_DECLINED_NOTE,
+         SPACE_CARRYFORWARD_NO_LATE_FEE_NOTE, EXISTING_RESIDENT_ATTESTATION_TITLE,
+         EXISTING_RESIDENT_MONEY_NOTE, EXISTING_RESIDENT_SKIPS_SCREENING_NOTE,
+         EXISTING_RESIDENT_STILL_SCREENS_NOTE } from '@gam/shared'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { reachedBy, unitInviteFallbackLine, screeningInviteLine, inviteResultTitle } from '../lib/inviteOutcome'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+// A 'YYYY-MM-DD' day as a person reads it. Parsed by parts, never new Date(s),
+// which reads a bare date as UTC and prints the day before in Phoenix.
+const sayDay = (s: string | null | undefined) => {
+  if (!s) return '—'
+  const [y, m, d] = s.split('-').map(Number)
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })
+}
 
 interface Props { onClose: () => void }
 
@@ -48,7 +59,7 @@ export function InviteTenantModal({ onClose }: Props) {
     email: string; name: string; inviteSent: boolean; alreadyOnPlatform: boolean; needsOwnSignature: boolean
     notified: 'email' | 'notice' | null
   }
-  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; drafted: boolean; draftBlocked: string[] } | null>(null)
+  const [inviteResult, setInviteResult] = useState<{ screened: boolean; sent: InviteOutcome[]; drafted: boolean; draftBlocked: string[]; balanceRecorded?: boolean; balanceOwed?: number | null } | null>(null)
   // S579: a person invited to a vacant unit is a NEW applicant by default — they
   // create an account + complete a background check before a unit is assigned
   // (property-level invite). Uncheck only for someone who doesn't need screening.
@@ -84,19 +95,118 @@ export function InviteTenantModal({ onClose }: Props) {
   // roster form applies exactly the same rule. Behavior here is unchanged.
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
   const units = (allUnits as any[]).filter(canInviteToUnit)
+  const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
+
+  // 10/19 (Nic, "Fix invite flag overridden in first 28 days"): which of the
+  // three doors this space can offer.
+  //
+  // "Already lives here" was gated on the PROPERTY'S window alone, but the
+  // server's rule for it is that window OR the landlord's own 28 days (S631,
+  // services/onboardingWindow.isExistingTenancyInvite). Between a property's
+  // window closing on day 14 and the account's 28th day the option therefore
+  // disappeared from this screen while the server would still have accepted
+  // it — so a sitting resident papered in that band was billed the full
+  // new-move-in packet (deposit, pet deposit, utility deposit, move-in fee and
+  // a prorated part-month) with no box anywhere to say they already live there.
+  //
+  // Skipping the BACKGROUND CHECK is still the property's window alone (S579,
+  // and it never reopens): in that band they are papered as a sitting resident
+  // and screen anyway, which is what the copy says.
+  const win = (windows as any[]).find((w: any) => w.propertyId === selectedUnit?.propertyId)
+  const sittingOffered = win?.existingTenancyOpen === true
+  const sittingSkipsScreening = !!win?.open
+  const returningOffered = win?.returningAllowanceLeft !== 0
+  // Reset a door the chosen space cannot offer. In an effect, not in render:
+  // this ran mid-JSX, which is a setState during render and re-renders the
+  // modal an extra time on every pass.
+  useEffect(() => {
+    if (!form.unitId) return
+    if (!sittingOffered && screenMode === 'sitting') setScreenMode('screen')
+    if (!returningOffered && screenMode === 'returning') setScreenMode('screen')
+  }, [form.unitId, sittingOffered, returningOffered, screenMode])
+
+  // ── 10/19 (Nic): THE QUESTION THIS SCREEN HAS TO ASK ──────────────────────
+  //
+  //   "I want to see how that carry forward balance flow goes. I want to see
+  //    what triggers, what actually asks the landlord, hey, is your new tenant
+  //    carrying forward this balance from this spot?"
+  //
+  // Inviting somebody onto a space that carries unpaid space rent cannot be
+  // done in silence. The landlord is the one who answers, because it is a
+  // CONDITION OF MOVING IN and not a request: "If Jacob declines, he's not
+  // moving into the park. ... he can buy the trailer all he wants, but he
+  // doesn't get to move in without following the rules of the park, without
+  // paying the bills."
+  //
+  // `followsToNextLease` comes from the server and is the SAME gate the
+  // database trigger uses, so this screen can never ask the question on a space
+  // where the balance would not in fact move (an RV spot, or a home the park
+  // has since taken over). The money needs nothing from this answer — the
+  // trigger moves the charge when the lease drafts — so what is recorded is
+  // that the landlord was shown the figure and whose it was, and put the
+  // condition on named people on a day.
+  const spaceBalanceQ = useQuery<any>(
+    ['space-carryforward-unit', form.unitId],
+    () => apiGet(`/space-carryforward/unit/${form.unitId}`),
+    { enabled: !!form.unitId, retry: false },
+  )
+  const spaceBalance = spaceBalanceQ.data ?? null
+  const carries = spaceBalance && spaceBalance.followsToNextLease && spaceBalance.stillOwed > 0
+    ? spaceBalance : null
+  // THE QUESTION MUST NOT FAIL OPEN (fix pass, 10/19). `carries` is null while
+  // this read is in the air and null again if it fails, and both guards below
+  // read `carries &&` — so Next used to walk straight past the question on the
+  // one space that has one. Two live doors into it: the read 403s for a team
+  // role outside the property-scope table, or the landlord picks the space and
+  // presses Next before it answers (retry is off, and the list read behind it
+  // issues one query per claim, so it is not instant). Either way the invite
+  // went, the lease drafted, the database trigger moved the $880 onto it, and
+  // nothing recorded that the condition was ever put on anybody — the money
+  // moves whatever this screen does. So an unanswered read STOPS the step: it
+  // is the one thing on this screen that is a condition of moving in.
+  //
+  // Only on a MOBILE HOME space, which is the only kind a balance can exist on
+  // (previewSpaceRentCarryforward refuses every other type outright, in Nic's
+  // words: "tenant-owned mobile homes is the only place that should be having
+  // this kind of workflow"). An apartment or an RV spot can carry nothing, so
+  // a slow or refused read there is nothing to hold an invite up for.
+  const couldCarry = selectedUnit?.unitType === 'mobile_home'
+  const balanceUnknown = !!form.unitId && couldCarry
+    && (spaceBalanceQ.isError || spaceBalanceQ.isLoading || spaceBalanceQ.isIdle)
+  const [assumes, setAssumes] = useState<'taking' | 'declining' | null>(null)
 
   // S655: a household invited to a UNIT goes in one call — its lease drafts
   // once with everyone on it and waits for your signature; nobody is emailed
   // until you sign. Applicants invited to a PROPERTY (they screen first) are
   // invited one at a time and get their invite email now.
+  // 10/19: the landlord's answer, written on the balance once the invite has
+  // actually gone. AFTER, deliberately — recording a condition on somebody who
+  // was never invited would be a lie in the record. Best-effort: the money does
+  // not depend on it (the trigger moves the charge when the lease drafts), so a
+  // failure here says so on the result screen and never loses the invite.
+  const recordAssumption = async (people: Array<{ firstName: string; lastName: string; email: string }>) => {
+    if (!carries || assumes !== 'taking') return true
+    try {
+      await apiPost(`/space-carryforward/${carries.id}/assumption`, {
+        residents: people.map(p => ({
+          name: [p.firstName, p.lastName].filter(Boolean).join(' ') || null,
+          email: p.email || null,
+        })),
+      })
+      return true
+    } catch { return false }
+  }
+
   const inviteMut = useMutation(
     async (req: { unit: any | null; property: any[] | null }) => {
       if (req.unit) {
         const res: any = await apiPost('/tenants/invite', req.unit)
         const d = res?.data ?? {}
         const people: any[] = Array.isArray(d.people) ? d.people : []
+        const balanceRecorded = await recordAssumption(req.unit.residents ?? [])
         return {
           drafted: d.leaseDrafted === true,
+          balanceRecorded,
           draftBlocked: Array.isArray(d.draftBlocked) ? d.draftBlocked : [],
           sent: people.map(p => ({
             email: p.email, name: p.name || p.email, inviteSent: p.inviteSent === true,
@@ -122,14 +232,17 @@ export function InviteTenantModal({ onClose }: Props) {
           throw new Error(`${payload.email}: ${msg}${i > 0 ? ` (${i} invite${i > 1 ? 's' : ''} already sent)` : ''}`)
         }
       }
-      return { drafted: false, draftBlocked: [] as string[], sent: out }
+      return { drafted: false, balanceRecorded: await recordAssumption(req.property ?? []), draftBlocked: [] as string[], sent: out }
     },
     {
       onSuccess: (r) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
         qc.invalidateQueries('vacant-units')
-        setInviteResult({ screened: requireScreening, sent: r.sent, drafted: r.drafted, draftBlocked: r.draftBlocked })
+        qc.invalidateQueries('space-carryforwards')
+        qc.invalidateQueries(['space-carryforward-unit', form.unitId])
+        setInviteResult({ screened: requireScreening, sent: r.sent, drafted: r.drafted, draftBlocked: r.draftBlocked,
+                          balanceRecorded: r.balanceRecorded, balanceOwed: carries ? carries.stillOwed : null })
       },
       onError: (e: any) => setErrors(er => ({ ...er, submit: e?.message || 'Could not send the invites' })),
     }
@@ -138,6 +251,9 @@ export function InviteTenantModal({ onClose }: Props) {
   const set = (key: string, val: string) => {
     setForm(f => ({ ...f, [key]: val }))
     setErrors(e => ({ ...e, [key]: '' }))
+    // The answer belongs to ONE space's balance. Picking a different space
+    // throws it away rather than carrying a yes across to another figure.
+    if (key === 'unitId') setAssumes(null)
   }
   const setResident = (i: number, key: keyof Resident, val: string) => {
     setResidents(rs => rs.map((r, idx) => idx === i ? { ...r, [key]: val } : r))
@@ -146,15 +262,17 @@ export function InviteTenantModal({ onClose }: Props) {
   const addResident = () => setResidents(rs => [...rs, blankResident()])
   const removeResident = (i: number) => setResidents(rs => rs.filter((_, idx) => idx !== i))
 
-  const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
   // S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home.
   const [homeSale, setHomeSale] = useState<HomeSaleForm | null>(null)
   const [packet, setPacket] = useState<Record<string, boolean> | null>(null)
   const askSale = selectedUnit?.dwellingOwnership === 'landlord' && selectedUnit?.unitType === 'mobile_home'
 
-  const validateStep = () => {
+  // `which` so the invite press can re-run the UNIT step's checks before it
+  // sends: a read that failed after the step was passed must not let a silent
+  // inheritance through on the last button.
+  const validateStep = (which: number = step) => {
     const errs: Record<string, string> = {}
-    if (step === 0) {
+    if (which === 0) {
       const seen = new Set<string>()
       residents.forEach((r, i) => {
         if (!r.firstName.trim()) errs[`r${i}_firstName`] = 'First name required'
@@ -167,8 +285,23 @@ export function InviteTenantModal({ onClose }: Props) {
         else seen.add(email)
       })
     }
-    if (step === 1 && !form.unitId) errs.unitId = 'Select a unit'
-    if (step === 1 && askSale && !homeSaleComplete(homeSale)) errs.unitId = 'Fill in the home sale terms, or untick the box'
+    if (which === 1 && !form.unitId) errs.unitId = 'Select a unit'
+    if (which === 1 && askSale && !homeSaleComplete(homeSale)) errs.unitId = 'Fill in the home sale terms, or untick the box'
+    // 10/19: not skippable in silence. An unread balance stops the step, no
+    // answer stops the step, and "no" stops it outright, because then they do
+    // not move onto this space.
+    if (which === 1 && balanceUnknown) {
+      errs.assumes = spaceBalanceQ.isError
+        ? 'This space\u2019s unpaid space rent could not be read, so nobody can be asked to take it on yet. '
+          + 'Try again \u2014 if it keeps failing, open the space\u2019s balance from the Leases page.'
+        : 'Checking what this space carries\u2026 one moment.'
+    }
+    if (which === 1 && carries && assumes === null) {
+      errs.assumes = 'Answer whether they are taking the space\u2019s unpaid balance on.'
+    }
+    if (which === 1 && carries && assumes === 'declining') {
+      errs.assumes = SPACE_CARRYFORWARD_INVITE_DECLINED_NOTE
+    }
     setErrors(errs)
     return Object.keys(errs).length === 0
   }
@@ -177,6 +310,11 @@ export function InviteTenantModal({ onClose }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
+    // The unit step again, at the moment of sending. A read that errored or
+    // was still in the air when Next was pressed sends the landlord back to
+    // the step that says so, rather than inviting somebody onto a balance
+    // nobody was asked about.
+    if (!validateStep(1)) { setStep(1); return }
     const people = residents.map(r => ({
       email: r.email.trim(),
       firstName: r.firstName.trim(),
@@ -254,6 +392,20 @@ export function InviteTenantModal({ onClose }: Props) {
             )}
           </div>
 
+          {/* 10/19: what happens to the balance, said once, plainly. */}
+          {r.balanceOwed != null && (
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 12, lineHeight: 1.6 }}>
+              The space&apos;s <strong style={{ color: 'var(--text-0)' }}>{fmt(r.balanceOwed)}</strong> of unpaid
+              space rent moves onto their lease as its own line the moment it is drafted. No late fees, and it is
+              not part of their payment history.
+              {r.balanceRecorded === false && (
+                <div style={{ color: 'var(--amber, #d97706)', marginTop: 4 }}>
+                  The invite went out, but the note that they are taking it on did not save. Add it from the
+                  lease&apos;s &ldquo;What this space carries&rdquo; window.
+                </div>
+              )}
+            </div>
+          )}
           <div style={{ fontSize: '.75rem', color: 'var(--text-3)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 20, lineHeight: 1.6 }}>
             {r.screened
               ? <>They&apos;ll set up an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
@@ -430,16 +582,91 @@ export function InviteTenantModal({ onClose }: Props) {
                 Not shown: {hiddenReasons.join(', ')}.
               </div>
             )}
+            {/* ── 10/19 (Nic): the space carries a balance. Ask. ──────────────
+                The figure and whose it was sit in front of the landlord, and
+                neither answer lets the invite through quietly: no answer stops
+                the step, and "no" stops it outright, because then they do not
+                move onto this space. */}
+            {/* The read has not answered. Said here, where the question itself
+                would be, because Next refuses until it has. */}
+            {balanceUnknown && (
+              <div style={{ marginTop: 14, padding: '10px 12px', borderRadius: 10, fontSize: '.76rem', lineHeight: 1.6,
+                background: spaceBalanceQ.isError ? 'rgba(239,68,68,.08)' : 'var(--bg-2)',
+                border: `1px solid ${spaceBalanceQ.isError ? 'rgba(239,68,68,.3)' : 'var(--border-0)'}`,
+                color: spaceBalanceQ.isError ? 'var(--red)' : 'var(--text-3)' }}>
+                {spaceBalanceQ.isError
+                  ? <>This space&apos;s unpaid space rent could not be read. A mobile home space can carry a balance
+                      the new resident has to take on as a condition of moving in, so the invite waits until this
+                      answers. <button className="btn btn-primary btn-sm" style={{ marginLeft: 6 }}
+                        onClick={() => { setErrors(e => ({ ...e, assumes: '' })); spaceBalanceQ.refetch() }}>Try again</button></>
+                  : <>Checking whether this space carries unpaid space rent&hellip;</>}
+              </div>
+            )}
+            {!carries && errors.assumes && (
+              <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, fontSize: '.75rem', lineHeight: 1.6,
+                // Waiting on a read is not a mistake the landlord made; a
+                // failed one is something they have to act on.
+                background: spaceBalanceQ.isError ? 'rgba(239,68,68,.08)' : 'var(--bg-3)',
+                border: `1px solid ${spaceBalanceQ.isError ? 'rgba(239,68,68,.3)' : 'var(--border-0)'}`,
+                color: spaceBalanceQ.isError ? 'var(--red)' : 'var(--text-2)' }}>
+                {errors.assumes}
+              </div>
+            )}
+            {carries && (
+              <div style={{ marginTop: 14, padding: '12px 14px', borderRadius: 10,
+                background: 'rgba(201,162,39,.06)', border: '1px solid var(--gold)' }}>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                  <Scale size={15} style={{ color: 'var(--gold)', flexShrink: 0, marginTop: 2 }} />
+                  <div>
+                    <div style={{ fontSize: '.84rem', fontWeight: 800, color: 'var(--text-0)' }}>
+                      {carries.spaceName} carries {fmt(carries.stillOwed)} of unpaid space rent
+                    </div>
+                    <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.6, marginTop: 3 }}>
+                      Left on this space by <strong>{carries.owedByName || 'the previous owner of the home'}</strong>,
+                      who stays liable for it until it is paid. Rent owed since {sayDay(carries.oldestDueDate)}.
+                      It lands on the new lease as its own line — never folded into their rent.
+                    </div>
+                  </div>
+                </div>
+                <div style={{ fontSize: '.78rem', fontWeight: 700, color: 'var(--text-1)', margin: '10px 0 6px' }}>
+                  {SPACE_CARRYFORWARD_INVITE_QUESTION}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {([
+                    ['taking', `Yes — ${fmt(carries.stillOwed)} is theirs to clear as a condition of moving in`,
+                      SPACE_CARRYFORWARD_NO_LATE_FEE_NOTE],
+                    ['declining', 'No — they are not taking it on',
+                      'Then they do not move onto this space.'],
+                  ] as Array<['taking' | 'declining', string, string]>).map(([v, title, body]) => (
+                    <label key={v} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer',
+                      padding: '10px 12px', borderRadius: 8,
+                      background: assumes === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                      border: `1px solid ${assumes === v ? 'var(--gold)' : 'var(--border-0)'}` }}>
+                      <input type="radio" name="assumes" checked={assumes === v}
+                        onChange={() => { setAssumes(v); setErrors(e => ({ ...e, assumes: '' })) }}
+                        style={{ marginTop: 2, flexShrink: 0 }} />
+                      <div>
+                        <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-0)' }}>{title}</div>
+                        <div style={{ fontSize: '.73rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 2 }}>{body}</div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+                {errors.assumes && (
+                  <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8,
+                    background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)',
+                    color: 'var(--red)', fontSize: '.75rem', lineHeight: 1.6 }}>
+                    {errors.assumes}
+                  </div>
+                )}
+              </div>
+            )}
             {/* S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home. */}
             {askSale && <div style={{ marginTop: 12 }}><HomeSaleToggle sale={homeSale} setSale={setHomeSale} /></div>}
             {form.unitId && <div style={{ marginTop: 12 }}><PacketChecklist unitId={form.unitId} sale={askSale && !!homeSale} ticked={packet} setTicked={setPacket} /></div>}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
 
             {form.unitId && (() => {
-              const win = (windows as any[]).find((w: any) => w.propertyId === selectedUnit?.propertyId)
-              const windowOpen = !!win?.open
-              if (!windowOpen && screenMode === 'sitting') setScreenMode('screen')
-              if (win?.returningAllowanceLeft === 0 && screenMode === 'returning') setScreenMode('screen')
               const opt = (mode: 'screen' | 'returning' | 'sitting', title: string, body: string) => (
                 <label key={mode} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', padding: '10px 12px', background: screenMode === mode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)', border: `1px solid ${screenMode === mode ? 'var(--gold)' : 'var(--border-0)'}`, borderRadius: 8 }}>
                   <input type="radio" checked={screenMode === mode} onChange={() => setScreenMode(mode)} style={{ marginTop: 2, flexShrink: 0 }} />
@@ -452,12 +679,13 @@ export function InviteTenantModal({ onClose }: Props) {
               return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
                   {opt('screen', 'New applicant — background check first', 'They create an account and complete a background check before you assign the space.')}
-                  {win?.returningAllowanceLeft === 0
+                  {!returningOffered
                     ? <div style={{ padding: '10px 12px', border: '1px solid var(--border-0)', borderRadius: 8, opacity: .6, fontSize: '.78rem', color: 'var(--text-3)' }}>
                         <b style={{ color: 'var(--text-1)' }}>Returning resident</b> — not available at this property right now. New residents complete a background check.
                       </div>
                     : opt('returning', 'Returning resident — lived here before', 'You are attesting this person has lived at this property before. No background check. GAM records the attestation.')}
-                  {windowOpen && opt('sitting', 'Already lives here', 'A resident who was here when this property came onto GAM. Onboarding window is open.')}
+                  {sittingOffered && opt('sitting', EXISTING_RESIDENT_ATTESTATION_TITLE,
+                    `${EXISTING_RESIDENT_MONEY_NOTE} ${sittingSkipsScreening ? EXISTING_RESIDENT_SKIPS_SCREENING_NOTE : EXISTING_RESIDENT_STILL_SCREENS_NOTE}`)}
                 </div>
               )
             })()}
@@ -503,6 +731,22 @@ export function InviteTenantModal({ onClose }: Props) {
                 </div>
               )}
 
+              {/* 10/19: the condition they are moving in on, on the review screen
+                  too — a landlord signing a lease ought to see it twice. */}
+              {carries && (
+                <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                  <Scale size={14} style={{ color: 'var(--gold)', flexShrink: 0, marginTop: 2 }} />
+                  <div>
+                    <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-0)' }}>
+                      Taking on {fmt(carries.stillOwed)} of unpaid space rent
+                    </div>
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 2 }}>
+                      Left on {carries.spaceName} by {carries.owedByName || 'the previous owner of the home'} — its own
+                      line on their bill, no late fees, outside their payment history.
+                    </div>
+                  </div>
+                </div>
+              )}
               {/* What happens next — S647: you sign first, then they get one email. */}
               {(requireScreening ? [
                 'An invite email goes to each of them now',

@@ -11,7 +11,7 @@ import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
-import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
+import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL, type BookingStatus } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { db, query, queryOne, getClient } from '../db'
 import type { PoolClient } from 'pg'
@@ -1063,6 +1063,13 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
   try {
     const checks = await query<any>(`
       SELECT bc.id, bc.status, bc.first_name, bc.last_name, bc.ssn_last4, bc.date_of_birth,
+        -- 10/19 (Nic): "I can't choose my property on the background check page.
+        -- I can't go to the Oak Park ones, I guess." The list is account-wide,
+        -- so it mixes Mountain View RV Park Ranch LLC and Oak Park Motel and RV
+        -- LLC in one undifferentiated run of names. Which COMPANY a screening
+        -- belongs to was never sent, so the page had nothing to narrow by; the
+        -- property it belongs to comes back below as property_id.
+        bc.landlord_id,
         bc.street1, bc.city, bc.state, bc.zip,
         bc.employment_status, bc.employer_name, bc.employer_phone, bc.monthly_income,
         bc.prev_landlord_name, bc.prev_landlord_phone, bc.prev_landlord_email,
@@ -1105,7 +1112,9 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         -- guest's approval clears check-in; it is not waiting on a lease.
         st.booking_id AS stay_booking_id, st.stay_terms,
         st.check_in AS stay_check_in, st.check_out AS stay_check_out,
-        st.lease_id AS stay_lease_id
+        -- Whether that stay is behind them. The page prints it; it does not
+        -- work it out from the browser's own clock.
+        st.stay_over, st.lease_id AS stay_lease_id
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
       LEFT JOIN LATERAL (${stayForCheckSql('bc', 'u.email')}) st ON TRUE
@@ -1212,34 +1221,108 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 // The stay a check was run for, as a LATERAL subquery on `bc` (the check) and
 // `userEmail` (the applicant's email):
 //   · the stay whose prepaid screening this check used, whatever its status; or
-//   · a live stay of this person at this account that needs screening, on the
-//     site the check names — or, for a check naming no site, one made before
-//     the check was.
+//   · a stay of this person at this account that needs screening, on the site
+//     the check names — or, for a check naming no site, at the park it names,
+//     having begun by the week after they screened and not having ended before
+//     they screened (the three tests are spelled out below).
 // A check run for a different site (the guest applying for a lease elsewhere)
 // is not the stay's.
+//
+// ── 10/19 (Nic): A STAY THAT IS OVER IS STILL THEIR STAY ───────────────────
+//
+// "I just want the background checks because they were approved and I had the
+//  people here for a month. I want them off of the list of doing something with
+//  them. I don't want to click not moving in for now because they did move in
+//  and then they left. So what the hell is the right situation for that?"
+//
+// There is no button to click, and there should not be: a check that found its
+// stay is already filed as done. The match was just too narrow to find one.
+// Victor Cardoza (RV 10) and Nemesio Rivera (RV 11) came to Mountain View on
+// 10-04, stayed 14 nights and checked out 10-18, and their approved checks sat
+// on his attention list asking which space the two of them were taking.
+//
+// It missed them twice over. Their bookings had gone to 'checked_out', which was
+// not on the status list — so a stay stopped counting the moment it finished,
+// which is backwards: a stay that ran to the end is the strongest evidence the
+// screening was for it. And they were walk-ups who screened at the counter
+// before a site was picked, so their checks named no unit and fell to a
+// created_at test that required the booking to EXIST BEFORE the check. Their
+// bookings were written two days after they screened. That ordering says
+// nothing about whose stay it is — screening first and booking minutes later is
+// the normal counter sequence — so it is gone.
+//
+// What replaces it keeps the match tight rather than loosening it. A check that
+// names no space has to clear three tests, and all three are about the stay
+// itself rather than about which row was typed first:
+//
+//   · the park. The check must NAME one (a QR scan carries a park even when it
+//     carries no space) and the stay must be at it. A check carrying neither a
+//     space nor a park — a hand-keyed counter screening with no scan, no invite
+//     and no prior application — matches no stay here at all, because "anywhere
+//     this person ever stayed" spans every company on the account, so a month
+//     at Mountain View would file an Oak Park screening as done.
+//   · the stay had not already ended. check_out is the DEPARTURE day, not a
+//     night (10-04 → 10-18 is 14 nights), so a stay whose check-out IS the day
+//     they screened is over: somebody screening the afternoon they leave is
+//     starting something new. Without this a guest's old finished stay would
+//     quietly clear the NEW check they run years later wanting a lease.
+//   · the stay had started, or was about to. Nothing else bounds the FUTURE,
+//     and a screening taken to get a LEASE must not be swallowed by whatever
+//     stay that person takes next (every stay over three weeks needs screening,
+//     so there is always a candidate). Anastacio Erreguin screened on 09-04 and
+//     is still waiting on a space; park him on a site for a month and his
+//     screening would file itself as done and the lease button would 409.
+//
+// A stay booked further ahead than that window carried its screening fee on the
+// sale that booked it, so its check is joined to it by the prepayment above —
+// by the receipt, not by a date — and none of this applies to it.
+const STAY_HAPPENED_STATUSES: BookingStatus[] = ['tentative', 'confirmed', 'checked_in', 'checked_out']
+// 'cancelled' and 'no_show' are deliberately NOT here. Those stays did not
+// happen, so nothing was screened for — the applicant still needs a space and
+// the check still needs somebody to act on it.
+
+// How long before a stay begins the counter screens for it: a walk-up screens
+// the day they pull in or in the days just before. Deliberately short. Too wide
+// and a later stay claims a lease screening (the silent failure above); too
+// narrow and the check simply stays on the attention list, where the landlord
+// can still draft the lease, set it aside, or check the guest in from the
+// schedule — a visible state, not a wrong one.
+const STAY_SCREENED_AHEAD_DAYS = 7
 const stayForCheckSql = (bc: string, userEmail: string) => `
   SELECT sb.id AS booking_id, sb.unit_id, sb.stay_terms,
          sb.check_in::text AS check_in, sb.check_out::text AS check_out,
+         -- 10/19 (Nic): "they did move in and then they left." Whether that
+         -- stay has run its course is answered HERE, off the database's own
+         -- date, and sent to the page. It used to be worked out in the browser
+         -- from the viewer's clock, so a manager looking from a laptop set to
+         -- another timezone could be told a guest's stay was finished and
+         -- nothing was waiting on them hours before the guest had even left.
+         (sb.check_out <= CURRENT_DATE) AS stay_over,
          -- A8: the stay's own draft lease, when the stay chose one.
          (SELECT sl.id FROM leases sl
            WHERE sl.source_booking_id = sb.id AND sl.status IN ('pending', 'active')
            ORDER BY sl.created_at DESC LIMIT 1) AS lease_id
     FROM unit_bookings sb
+    LEFT JOIN units sbu ON sbu.id = sb.unit_id
    WHERE sb.landlord_id IN (SELECT public.account_companies(${bc}.landlord_id))
      AND (EXISTS (SELECT 1 FROM screening_prepayments sp
                    WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id)
           OR (sb.screening_required
-              AND sb.status IN ('tentative', 'confirmed', 'checked_in')
+              AND sb.status IN (${STAY_HAPPENED_STATUSES.map(s => `'${s}'`).join(', ')})
               AND (sb.tenant_id IN (SELECT t.id FROM tenants t WHERE t.user_id = ${bc}.user_id)
                    OR (sb.guest_email IS NOT NULL AND LOWER(sb.guest_email) = LOWER(${userEmail})))
+              AND sb.check_out > ${bc}.created_at::date
+              AND sb.check_in <= ${bc}.created_at::date + ${STAY_SCREENED_AHEAD_DAYS}
               AND (sb.unit_id = ${bc}.unit_id
-                   OR (${bc}.unit_id IS NULL AND sb.created_at <= ${bc}.created_at))))
+                   -- A check naming no park matches nothing here: a NULL
+                   -- property compares to nothing, which is the intent.
+                   OR (${bc}.unit_id IS NULL AND sbu.property_id = ${bc}.property_id))))
    ORDER BY EXISTS (SELECT 1 FROM screening_prepayments sp
                      WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id) DESC,
             sb.check_in DESC
    LIMIT 1`
 
-interface CheckStay { booking_id: string; unit_id: string; stay_terms: string | null; check_in: string; check_out: string; lease_id: string | null }
+interface CheckStay { booking_id: string; unit_id: string; stay_terms: string | null; check_in: string; check_out: string; stay_over: boolean; lease_id: string | null }
 
 /** What a decision on a stay guest's check answers with: the stay, cleared, and its own lease when it chose one. */
 const stayAnswer = (st: CheckStay) => ({

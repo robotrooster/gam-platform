@@ -17,6 +17,7 @@
  * `gam-screening-grandfather-onboarding-window`.
  */
 import { query, queryOne, getClient } from '../db'
+import { logger } from '../lib/logger'
 import { AppError } from '../middleware/errorHandler'
 import { MIGRATION_WINDOW_DAYS, ONBOARDING_LATE_MONTH_DAY, ONBOARDING_FIRST_BILL_NEAR_DAYS } from '@gam/shared'
 import { todayIn, addDaysTo } from '../lib/timezone'
@@ -58,6 +59,29 @@ export async function openOnboardingWindow(propertyId: string, client?: Runner):
 export interface OnboardingWindowState {
   propertyId: string
   open: boolean
+  /**
+   * 10/19 (Nic, "Fix invite flag overridden in first 28 days"): the landlord's
+   * OWN 28 days, which run from the day their account was created and are the
+   * ones the published terms cite. Separate from `open`, which is this
+   * property's.
+   */
+  accountWindowOpen: boolean
+  /**
+   * 10/19: may an invite here say "this person already lives here"? THE SAME
+   * ANSWER the server will give (isExistingTenancyInvite): either window is
+   * enough. Every screen that offers the attestation reads this field and
+   * never re-derives it from `open`, because that answer decides real money —
+   * an existing resident's first bill is one month's rent and nothing else —
+   * and the two rules drifting apart meant the same resident, invited the same
+   * day through two different doors, was billed hundreds of dollars apart.
+   *
+   * Not the same question as the background check: that one is `open` alone
+   * (S579 — the property's window is the only thing that waives screening, and
+   * it can never be reopened). Between a property's window closing and the
+   * landlord's 28th day, a sitting resident can be papered as a sitting
+   * resident AND still has to screen.
+   */
+  existingTenancyOpen: boolean
   startedAt: Date | null
   until: Date | null
   completedAt: Date | null
@@ -72,11 +96,13 @@ export async function getOnboardingWindow(propertyId: string): Promise<Onboardin
     onboarding_started_at: string | null
     onboarding_completed_at: string | null
     unit_count: number
+    account_window_open: boolean | null
   }>(
     `SELECT p.onboarding_started_at, p.onboarding_completed_at,
-            (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count
-       FROM properties p WHERE p.id = $1`,
-    [propertyId],
+            (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count,
+            (now() < l.created_at + ($2::int * INTERVAL '1 day')) AS account_window_open
+       FROM properties p JOIN landlords l ON l.id = p.landlord_id WHERE p.id = $1`,
+    [propertyId, MIGRATION_WINDOW_DAYS],
   )
   if (!row) throw new Error('Property not found')
   const unitCount = row.unit_count || 0
@@ -91,7 +117,9 @@ export async function getOnboardingWindow(propertyId: string): Promise<Onboardin
     open = Date.now() < until.getTime()
     daysRemaining = open ? Math.ceil((until.getTime() - Date.now()) / DAY_MS) : 0
   }
-  return { propertyId, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining }
+  const accountWindowOpen = row.account_window_open === true
+  return { propertyId, open, accountWindowOpen, existingTenancyOpen: open || accountWindowOpen,
+           startedAt, until, completedAt, windowDays, unitCount, daysRemaining }
 }
 
 /** True iff a sitting tenant may be grandfathered (screening waived) right now. */
@@ -165,6 +193,7 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
     onboarding_completed_at: string | null
     unit_count: number
     onboarding_late_fee_waiver: boolean | null
+    account_window_open: boolean | null
     timezone: string | null
     rent_due_mode: string | null
     rent_due_day: number | null
@@ -172,12 +201,14 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
   }>(
     `SELECT p.id, p.name, p.onboarding_started_at, p.onboarding_completed_at,
             p.onboarding_late_fee_waiver, p.timezone, p.rent_due_mode, p.rent_due_day,
+            (now() < l.created_at + ($2::int * INTERVAL '1 day')) AS account_window_open,
             (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count,
             (SELECT COUNT(*)::int FROM tenant_roster_drafts r
               WHERE r.property_id = p.id AND r.confirmed_at IS NULL AND r.discarded_at IS NULL) AS draft_roster_count
-       FROM properties p WHERE p.landlord_id = ANY($1::uuid[])
-       ORDER BY p.created_at DESC`,
-    [landlordIds],
+       FROM properties p JOIN landlords l ON l.id = p.landlord_id
+      WHERE p.landlord_id = ANY($1::uuid[])
+      ORDER BY p.created_at DESC`,
+    [landlordIds, MIGRATION_WINDOW_DAYS],
   )
   const left = new Map<string, number>()
   for (const r of rows) left.set(r.id, (await returningResidentAllowance(r.id)).left)
@@ -195,7 +226,10 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
       daysRemaining = open ? Math.ceil((until.getTime() - Date.now()) / DAY_MS) : 0
     }
     const late = onboardingLateInMonth(todayIn(r.timezone), r.rent_due_mode, r.rent_due_day)
-    return { returningAllowanceLeft: left.get(r.id) ?? 0, propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver,
+    const accountWindowOpen = r.account_window_open === true
+    return { returningAllowanceLeft: left.get(r.id) ?? 0, propertyId: r.id, propertyName: r.name, open,
+             accountWindowOpen, existingTenancyOpen: open || accountWindowOpen,
+             startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver,
              draftRosterCount: r.draft_roster_count ?? 0, lateInMonth: late.lateInMonth, nextRentDueDate: late.nextRentDueDate }
   })
 }
@@ -548,14 +582,34 @@ export async function isExistingTenancyInvite(
   propertyId: string | null,
 ): Promise<boolean> {
   try {
-    if (propertyId && (await getOnboardingWindow(propertyId)).open) return true
-    const l = await queryOne<{ within: boolean }>(
-      `SELECT (now() < created_at + ($2::int * INTERVAL '1 day')) AS within
-         FROM landlords WHERE id = $1`,
-      [landlordId, MIGRATION_WINDOW_DAYS],
-    )
-    return !!l?.within
-  } catch {
+    if (propertyId) return (await getOnboardingWindow(propertyId)).existingTenancyOpen
+    return await accountMigrationWindowOpen(landlordId)
+  } catch (err) {
+    // 10/19: SAY SO. This used to be a bare `catch { return false }`, written
+    // when the caller only decided whether to skip a background check. It now
+    // decides move-in money, so a dropped connection or a statement timeout on
+    // the read above is the difference between a sitting resident being billed
+    // one month's rent and being billed the deposit, the pet deposit, the
+    // utility deposit, the move-in fee and a prorated stretch — on a lease
+    // nothing in the product can correct afterwards. Silence made that
+    // indistinguishable from a landlord answering "genuine new move-in".
+    logger.error({ err, landlordId, propertyId },
+      '[EXISTING-TENANCY] could not read the onboarding window; treating this invite as a genuine new move-in (move-in money WILL be billed)')
     return false
   }
+}
+
+/**
+ * The landlord's own 28-day migration window — platform-wide, running from the
+ * day the account was created, and the one the published terms cite. Used on
+ * its own only for an invite with no property yet; otherwise it is one half of
+ * `existingTenancyOpen` above.
+ */
+export async function accountMigrationWindowOpen(landlordId: string): Promise<boolean> {
+  const l = await queryOne<{ within: boolean }>(
+    `SELECT (now() < created_at + ($2::int * INTERVAL '1 day')) AS within
+       FROM landlords WHERE id = $1`,
+    [landlordId, MIGRATION_WINDOW_DAYS],
+  )
+  return !!l?.within
 }

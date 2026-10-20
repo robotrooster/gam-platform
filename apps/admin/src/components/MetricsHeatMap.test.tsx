@@ -917,7 +917,11 @@ describe('MetricsHeatMap lean overlay', () => {
     expect(key).toContain('Even in the middle')
     expect(key).toContain('Where GAM has spaces')
     // Nic: "credit the source under the map the way geoBoundaries is credited."
-    expect(credit()).toContain('Votes: Official county presidential returns (public data).')
+    // 10/19: and it credits them as what they are — "the election credit line
+    // now says these are news-compiled returns rather than official canvasses"
+    // (10/19 commit). The line is the data file's own `source`, so this reads
+    // what the map really prints under itself.
+    expect(credit()).toContain('Votes: County presidential margins compiled by tonmcg from news-outlet returns — not official canvasses.')
   })
 
   it('marks every county GAM is in, whatever its size, and splits GAM\'s spaces by side', async () => {

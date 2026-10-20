@@ -466,7 +466,12 @@ describe('voiding a lease the landlord already signed', () => {
 
   it('puts released utility back on hold, and a re-signed lease picks it up again', async () => {
     const f = await fixture()
-    await openInvite(f)
+    // S649: a held pre-lease share releases onto an ONBOARDING resident's lease
+    // — they lived there during the cycle. For a genuine new move-in it is
+    // somebody else's usage and is closed out instead, so this scenario has to
+    // say which it is. It used to be left to the 28-day trigger (dropped
+    // 10/19 — it was overriding the landlord's own answer on an invite).
+    await openInvite(f, { is_existing_tenancy: true })
     const m = await db.query<{ id: string }>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method)
        VALUES ($1,'electric','E','submeter') RETURNING id`, [f.propertyId])
@@ -512,15 +517,25 @@ describe('voiding a lease the landlord already signed', () => {
 // skipped any meter that did not move.
 describe('a stuck meter when the lease is signed', () => {
   async function stuckMeter(f: Fixture, opts: { existing: boolean }) {
-    // An invite inside a landlord's first 28 days is an onboarding (existing)
-    // tenancy by trigger. A genuine new move-in needs a landlord past that.
-    if (!opts.existing) {
-      await db.query(`UPDATE landlords SET created_at = NOW() - INTERVAL '90 days' WHERE id=$1`,
-        [f.landlordId])
-    }
+    // 10/19: the invite says which kind of tenancy this is — the landlord's own
+    // answer, and nothing else, decides it (migration 20261021160000 drops the
+    // trigger that used to override it for a landlord's first 28 days).
+    //
+    // The flag is INSERTed and then written again. That reads redundant and is
+    // not: the trigger it replaces is BEFORE INSERT, so until the migration
+    // reaches production and schema.sql is re-dumped, the suite's own database
+    // still has it and still forces this row TRUE for a fresh landlord. This
+    // file is about stuck meters, so it pins the value it means instead of
+    // depending on which side of that deploy you are running on — and it keeps
+    // passing, unchanged, once the trigger is gone. (The earlier version aged
+    // the landlord 90 days to dodge the trigger; that stopped being the lever
+    // the moment the route started writing the flag itself.)
     await db.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
        VALUES ($1,$2,$3,$4,$5)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId, opts.existing])
+    await db.query(
+      `UPDATE pending_tenant_intents SET is_existing_tenancy = $2 WHERE unit_id = $1`,
+      [f.unitId, opts.existing])
     // S648: estimating is the landlord's per-property choice.
     await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id=$1`, [f.propertyId])
     await db.query(

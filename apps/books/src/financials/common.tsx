@@ -6,6 +6,7 @@
  */
 import { useState, type ReactNode } from 'react'
 import { useQuery } from 'react-query'
+import { RENT_ROLL_STAY_UNITS, stayQuantityText, type RentRollStayUnit } from '@gam/shared'
 import { finGet } from './adapter'
 import './financials.css'
 
@@ -58,6 +59,28 @@ export function instantDay(ts: string | null | undefined): string {
   const d = new Date(ts)
   return isNaN(d.getTime()) ? '—' : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
+/**
+ * 10.6 → "10.6", 4 → "4". How many went out: gallons and kilowatt-hours come
+ * with decimals, so three of them are kept and trailing zeros are not printed.
+ */
+export function count(n: unknown): string {
+  const v = Number(n)
+  if (n == null || !isFinite(v)) return '—'
+  return v.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 3 })
+}
+
+/**
+ * How many of a sold item went out: "3 months" for something sold by the night,
+ * week or month, "10.6" for anything sold by a quantity of its own. 10/19: on
+ * both pages that print what was sold (Sales & tax, and Money in), so an item
+ * reads the same way on each.
+ */
+export function soldQuantity(qty: number, unit: string | null): string {
+  return unit && (RENT_ROLL_STAY_UNITS as readonly string[]).includes(unit)
+    ? stayQuantityText(qty, unit as RentRollStayUnit)
+    : count(qty)
+}
+
 const pad = (n: number) => String(n).padStart(2, '0')
 const ymdOf = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 

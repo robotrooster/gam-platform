@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { runWorkTradeSettlement, settleAgreementOnEnd, runDueWorkTradeSettlements } from './workTradeSettlement'
 import { hourRateFor } from '../services/workTradeSettlement'
-import { loadWorkTradeStanding } from '../services/workTradeStanding'
+import { loadWorkTradeStanding, hoursCountedFor } from '../services/workTradeStanding'
 import { listOpenTenantBalances, workTradeOpenRowSql } from '../services/openBalances'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease,
@@ -1537,5 +1537,393 @@ describe('a paused agreement', () => {
     // call, and this assertion is where that decision lands.
     expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'open', applied: 60, credit: 375 })
     expect(await openOnLease(s.leaseId)).toBe(125)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10/19 (Nic) — A PAUSED WORK TRADE: DOES THE CAMPER STILL OCCUPY THE SPACE?
+//
+// "A paused work trade that counts hours should continue to count hours. If, I
+// mean, basically the landlord needs to have a way to set whether they occupy
+// the spot or not. Because if somebody wants to work more hours in the winter
+// but leave their camper occupying the space in the summer, that's one
+// situation. If people take their camper home for the summer with them and it's
+// not occupying the spot, then there would be no reason for it to continue to
+// track hours. So that's another thing you're asking me about, which needs to
+// be an individual landlord decision."
+//
+// These need migration 20261021150000, which is not on production yet:
+//   DB_NAME=<yours>_test TEST_APPLY_MIGRATIONS_AFTER=20261020125959 npx vitest run
+// (the package script's DB_NAME=gam_test builds from schema.sql alone).
+describe('a paused work trade and whether the space is still being used', () => {
+  const answer = (s: Stack, occupied: boolean | null) => db.query(
+    `UPDATE work_trade_agreements SET paused_space_occupied = $2 WHERE id = $1`,
+    [s.agreementId, occupied])
+  const pause = (s: Stack) => db.query(
+    `UPDATE work_trade_agreements SET status='paused' WHERE id=$1`, [s.agreementId])
+  const resume = (s: Stack) => db.query(
+    `UPDATE work_trade_agreements SET status='active' WHERE id=$1`, [s.agreementId])
+  const occupancyOf = async (s: Stack) => (await db.query(
+    `SELECT paused_space_occupied FROM work_trade_agreements WHERE id=$1`,
+    [s.agreementId])).rows[0].paused_space_occupied
+
+  // Nic's first situation: the camper stays on the spot over the summer while
+  // they work more hours in the winter. Nothing about the month changes.
+  it('occupied: hours keep counting and the month behaves exactly as before', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await logHours(s, '2026-09-10', 60)                        // 20 of 80 short
+    await pause(s)
+    await answer(s, true)
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    // The same figures the pre-10/19 close produced for a paused short month:
+    // 60 hours credited $375, the 20 unworked hours owed as $125 on September's
+    // own bill, the period still open and carrying, nothing aged into cash.
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'open', applied: 60, credit: 375 })
+    expect(await openOnLease(s.leaseId)).toBe(125)
+    expect(r.periodsBilled).toBe(0)
+    expect(r.agreementsEnded).toBe(0)
+    expect(await carriedRows(s.leaseId)).toEqual([])
+  })
+
+  // Nic's second situation: "if people take their camper home for the summer
+  // with them and it's not occupying the spot, then there would be no reason for
+  // it to continue to track hours."
+  //
+  // THE CHOICE, stated: the month ASKS NOTHING AND SETTLES, rather than never
+  // opening. A month that never opens leaves its suspended rent line parked with
+  // nothing on the calendar to release it — the exact $589 RV 50 and RV 51 were
+  // stuck in before 10/18. Settling lets the landlord and the tenant read the
+  // same true sentence, which is the test below this one.
+  it('empty: the month asks for no hours, settles, and nobody owes anything new', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await logHours(s, '2026-09-10', 60)
+    await pause(s)
+    await answer(s, false)
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    // Covered outright, the way a trade that never counted hours covers a month.
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 500 })
+    // Nothing invented and nothing left parked: no charge, no carried balance,
+    // no suspended line sitting pending for ever.
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await suspendedWorkTrade(s)).toBe(0)
+    expect(await carriedRows(s.leaseId)).toEqual([])
+    expect(await balancesPageOwed(s)).toBe(0)
+    expect(r.periodsBilled).toBe(0)
+    expect(r.agreementsEnded).toBe(0)
+    // Hours logged while nobody is counting are not banked — they were never
+    // banked time (the tracks_hours rule). They are not thrown away either: the
+    // period records no hours_worked, so they count fresh when counting resumes.
+    expect(Number((await db.query(
+      `SELECT banked_hours::float AS h FROM work_trade_agreements WHERE id=$1`,
+      [s.agreementId])).rows[0].h)).toBe(0)
+    expect((await periodOf(s, '2026-09-01')).worked).toBe(0)
+  })
+
+  // What the tenant is told has to match what the close actually did, in both
+  // answers. A tenant seeing one number and the close doing another is the
+  // argument this whole subsystem exists to prevent.
+  it('says the same true thing to both sides, under both answers', async () => {
+    const occ = await buildStack({ basis: 500, suspended: true })
+    await logHours(occ, '2026-09-10', 60)
+    await pause(occ)
+    await answer(occ, true)
+    await runWorkTradeSettlement('2026-09-01')
+    // Still counting. The close credited 60 hours and left the other 20 owed as
+    // $125 on September's own bill — and the sentence says the same 20 hours.
+    // (Read after the close: the standing counts hours APPLIED to a period, and
+    // a month's approved hours are applied when it closes.)
+    expect(await openOnLease(occ.leaseId)).toBe(125)
+    const told = await loadWorkTradeStanding(occ.agreementId, '2026-09-01', 'tenant')
+    expect(told).toMatchObject({ currentMonthHours: 20, hoursNotCounted: false })
+    expect(told!.summary).toContain('20 hours')
+    // 10/19 (Nic, "Show it while paused") — AND IT SAYS IT IS PAUSED WHILE
+    // SAYING THAT. The tenant portal shows a paused agreement now, and these
+    // figures are word-for-word a running agreement's: without the sentence, a
+    // snowbird reads the 20 hours as a target nobody is holding them to, and
+    // then finds the $125 asserted above on September's bill.
+    expect(told).toMatchObject({ paused: true, hoursCounted: true })
+    expect(told!.summary).toContain('paused, but the space is still being used')
+    expect(told!.summary).toContain('your hours keep counting')
+
+    const gone = await buildStack({ basis: 500, suspended: true })
+    await logHours(gone, '2026-09-10', 60)
+    await pause(gone)
+    await answer(gone, false)
+    // Not counting: no target to fail, and the sentence says WHY rather than a
+    // clean "you're fully covered" they could not tell from having worked it.
+    const toldGone = await loadWorkTradeStanding(gone.agreementId, '2026-09-01', 'tenant')
+    expect(toldGone).toMatchObject({ currentMonthHours: 0, catchUpHours: 0, hoursNotCounted: true })
+    expect(toldGone!.summary).toContain('no hours are being counted')
+    // 10/19 (review): the months ALREADY BILLED under the trade are covered at
+    // the next close — which is what this stack has — and a month billed during
+    // the pause is not. The earlier wording promised the second as well, and
+    // the billing run does not do it (services/workTradeCredit asks for an
+    // ACTIVE agreement).
+    expect(toldGone!.summary).toContain('covered at the next month close')
+    expect(toldGone!.summary).toContain('not covered by the trade')
+    expect(toldGone!.summary).not.toContain('not billed while it is paused')
+    // The two answers never blur into each other: this one must not also claim
+    // hours are counting (10/19).
+    expect(toldGone).toMatchObject({ paused: true, hoursCounted: false })
+    expect(toldGone!.summary).not.toContain('keep counting')
+    // The landlord reads the same sentence, and still gets no dollar figure
+    // attached to trade hours (S643).
+    const landlordSees = await loadWorkTradeStanding(gone.agreementId, '2026-09-01', 'landlord')
+    expect(landlordSees!.summary).toBe(toldGone!.summary)
+    expect(landlordSees!.summary).not.toContain('$')
+    // And the close does what the sentence said.
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await openOnLease(gone.leaseId)).toBe(0)
+    expect((await periodOf(gone, '2026-09-01')).status).toBe('settled')
+  })
+
+  // 10/19 (Nic, "Show it while paused") — THE UNANSWERED PAUSE IS THE COMMON ONE.
+  //
+  // Lease hibernation and a lease expiring with no successor both pause an
+  // agreement with no landlord in front of a screen, so an unanswered pause is
+  // the normal state of a freshly paused trade — and it keeps counting hours.
+  // That is the case where showing the tenant nothing was worst: their tab
+  // disappeared while their hours went on counting.
+  it('unanswered: the tenant is told hours keep counting, and why nobody has said otherwise', async () => {
+    const s = await buildStack({ basis: 500, suspended: true })
+    await logHours(s, '2026-09-10', 60)
+    await pause(s)
+    const told = await loadWorkTradeStanding(s.agreementId, '2026-09-01', 'tenant')
+    expect(told).toMatchObject({ paused: true, hoursCounted: true })
+    expect(told!.summary).toContain('your hours keep counting')
+    expect(told!.summary).toContain('says whether the space is still being used')
+    // And the close agrees: the month still asks for its hours.
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await openOnLease(s.leaseId)).toBe(125)
+  })
+
+  // "A camper can leave later." The answer is read live at each close, never
+  // frozen onto the period, so a change takes effect from then on.
+  it('the answer can be changed while still paused, and takes effect from then on', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 3 })
+    await logHours(s, '2026-09-10', 60)
+    await pause(s)
+    await answer(s, true)
+
+    // September closes while the camper is still on the spot: 20 hours short.
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'open', applied: 60 })
+    expect(await openOnLease(s.leaseId)).toBe(125)
+
+    // The camper leaves. October opens its own month and bill.
+    await answer(s, false)
+    await addPeriod(s, '2026-10-01', 500)
+    await runWorkTradeSettlement('2026-10-01')
+
+    // October asked for nothing and settled. September's still-open month is
+    // covered outright by the same rule — stopping the count covers every month
+    // still open, exactly as turning hours off entirely does (the 10/18 rule),
+    // so the $125 carried catch-up is cleared rather than left owed on a trade
+    // nobody is counting. The work-trade window prices that for the landlord
+    // before they answer.
+    expect(await periodOf(s, '2026-10-01')).toMatchObject({ status: 'settled' })
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled' })
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await carriedRows(s.leaseId)).toEqual([])
+  })
+
+  // The two live paused agreements (RV 50 and RV 51 at Mountain View) are this
+  // shape, which is why 10/19 moves no money today.
+  it('a trade that never counted hours is unaffected by either answer', async () => {
+    for (const occupied of [true, false, null]) {
+      const s = await buildStack({ basis: 589, suspended: true, tracksHours: false })
+      await pause(s)
+      await answer(s, occupied)
+
+      const r = await runWorkTradeSettlement('2026-09-01')
+      expect(r.errors).toEqual([])
+      expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 589 })
+      expect(await openOnLease(s.leaseId)).toBe(0)
+      expect(await suspendedWorkTrade(s)).toBe(0)
+      const told = await loadWorkTradeStanding(s.agreementId, '2026-09-01', 'tenant')
+      // It never counted hours, so it is not the trade that STOPPED counting —
+      // it keeps its own words ("No hours are tracked on this agreement").
+      expect(told).toMatchObject({ hoursNotCounted: false })
+    }
+  })
+
+  // Pausing is not a one-way door, and the answer belongs to the pause it was
+  // given during: the trigger in 20261021150000 forgets it on the way back.
+  it('unpausing returns it to normal whichever answer was given', async () => {
+    for (const occupied of [true, false]) {
+      const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+      await logHours(s, '2026-09-10', 60)
+      await pause(s)
+      await answer(s, occupied)
+      await resume(s)
+
+      // The answer belonged to that pause, and the pause is over.
+      expect(await occupancyOf(s)).toBeNull()
+      const r = await runWorkTradeSettlement('2026-09-01')
+      expect(r.errors).toEqual([])
+      // Figure for figure the ordinary active short month at the top of this
+      // file ('a short month leaves the balance owing and the period open'):
+      // 60 of 80 credited $375, the 20 unworked hours owed as $125 on the
+      // month's own bill, the period still open and carrying. Whichever answer
+      // was given while it slept leaves no trace.
+      expect(await periodOf(s, '2026-09-01')).toMatchObject({
+        status: 'open', applied: 60, worked: 60, credit: 375 })
+      expect(await openOnLease(s.leaseId)).toBe(125)
+      const told = await loadWorkTradeStanding(s.agreementId, '2026-09-01', 'tenant')
+      expect(told).toMatchObject({ currentMonthHours: 20, hoursNotCounted: false })
+    }
+  })
+
+  // Ending by hand bills "any percentage of hours unpaid or uncompleted" — and
+  // on a trade nobody was counting, none are uncompleted. The rule reads 'ended'
+  // as well as 'paused' precisely because the route writes the status before it
+  // settles, so reading 'paused' alone would bill the season on the way out.
+  it('ending a dormant trade on an empty space bills nothing', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await pause(s)
+    await answer(s, false)
+    await db.query(`UPDATE work_trade_agreements SET status='ended', end_date=CURRENT_DATE WHERE id=$1`,
+      [s.agreementId])
+
+    const r = await settleAgreementOnEnd(s.agreementId)
+    expect(r.errors).toEqual([])
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 500 })
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await carriedRows(s.leaseId)).toEqual([])
+  })
+
+  // ── 10/19 (review) — THE THIRD READER OF "ARE HOURS COUNTING" ───────────────
+  //
+  // A charge ticked onto a month the close has already covered goes through
+  // services/workTradeCoverage, not through the close. That reader asked only
+  // tracks_hours, so the two switches that both mean "no hours are counted"
+  // gave OPPOSITE answers about the same $75 of water: a trade that never
+  // counted hours covered it (the test above this block), and a paused trade on
+  // an empty space priced the month at its frozen 80 hours, credited the water
+  // $0, and left it owed on a September that was settled in full — while the
+  // work-trade window told the tenant those charges "are not billed while it is
+  // paused."
+  it('a charge released onto a settled month of a dormant trade is covered, not owed', async () => {
+    const s = await buildStack({ basis: 589, suspended: true })   // tracks_hours TRUE, 80 hours
+    await pause(s)
+    await answer(s, false)
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 589 })
+
+    // The water bill lands a minute later (a share released onto a bill already
+    // out, or the landlord ticking Water on the roster row).
+    const water = (await db.query(
+      `INSERT INTO payments
+         (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount,
+          status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'utility',75,'pending','2026-09-01','UTILITY')
+       RETURNING id`,
+      [s.invoiceId, s.unitId, s.leaseId, s.tenantId, s.landlordId])).rows[0].id
+
+    const { bringLinesUnderTrade } = await import('../services/workTradeCoverage')
+    const r = await bringLinesUnderTrade(db, s.agreementId, s.invoiceId, [{
+      id: water, invoice_id: s.invoiceId, amount: 75, type: 'utility',
+      tenant_id: s.tenantId, due_date: '2026-09-01',
+    }])
+    expect(r).toEqual({ outcome: 'covered', amount: 75 })
+    expect((await db.query(
+      `SELECT status, amount::float AS amount FROM payments WHERE id=$1`, [water])).rows[0])
+      .toEqual({ status: 'settled', amount: 0 })
+    expect(await openOnLease(s.leaseId)).toBe(0)
+    expect(await balancesPageOwed(s)).toBe(0)
+    // And the month is left whole: the wider basis and the credit on it agree,
+    // so there is no $75 hole on a settled period that nothing would ever heal
+    // (loadOpenPeriods only ever reopens an `open` month).
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'settled', credit: 664 })
+    expect(Number((await db.query(
+      `SELECT basis_amount::float AS b FROM work_trade_settlements WHERE agreement_id=$1`,
+      [s.agreementId])).rows[0].b)).toBe(664)
+  })
+
+  // The same money whichever switch stopped the count. Nic set one rule — "no
+  // hours are counted" — and a landlord cannot be expected to know that reaching
+  // it two different ways charges the tenant two different amounts.
+  it('bills the same whether hours stopped by the switch or by the empty space', async () => {
+    const amounts: number[] = []
+    for (const how of ['never counted', 'paused and empty'] as const) {
+      const s = await buildStack({
+        basis: 589, suspended: true, tracksHours: how === 'never counted' ? false : true })
+      if (how === 'paused and empty') { await pause(s); await answer(s, false) }
+      await runWorkTradeSettlement('2026-09-01')
+
+      const extra = (await db.query(
+        `INSERT INTO payments
+           (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount,
+            status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,$5,'utility',75,'pending','2026-09-01','UTILITY')
+         RETURNING id`,
+        [s.invoiceId, s.unitId, s.leaseId, s.tenantId, s.landlordId])).rows[0].id
+      const { bringLinesUnderTrade } = await import('../services/workTradeCoverage')
+      await bringLinesUnderTrade(db, s.agreementId, s.invoiceId, [{
+        id: extra, invoice_id: s.invoiceId, amount: 75, type: 'utility',
+        tenant_id: s.tenantId, due_date: '2026-09-01',
+      }])
+      amounts.push(await openOnLease(s.leaseId))
+    }
+    expect(amounts).toEqual([0, 0])
+  })
+
+  // 10/19 (review): the answer belongs to a pause, and the trigger in migration
+  // 20261021150000 states that as "an ACTIVE agreement never carries one" rather
+  // than as a rule about transitions. Written while the trade was already
+  // running, an answer used to sit there unread until the next hibernation
+  // paused the lease — and then stopped counting hours on a pause nobody had
+  // been asked about, clearing every open month.
+  it('an answer written onto a running trade is forgotten, not stored for the next pause', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await logHours(s, '2026-09-10', 60)
+    await answer(s, false)                      // still ACTIVE: no pause to answer about
+    expect(await occupancyOf(s)).toBeNull()
+
+    // And the next pause therefore behaves as an unanswered one: hours keep
+    // counting, which is what every paused agreement did before 10/19.
+    await pause(s)
+    expect(await occupancyOf(s)).toBeNull()
+    await runWorkTradeSettlement('2026-09-01')
+    expect(await periodOf(s, '2026-09-01')).toMatchObject({ status: 'open', applied: 60, credit: 375 })
+    expect(await openOnLease(s.leaseId)).toBe(125)
+  })
+
+  // 10/19 (review): the standing's sentence is about a pause, so it is only said
+  // on one. hoursCountedSql reads 'ended' as well (the end-by-hand path writes
+  // the status before it settles) and the migration keeps the answer through
+  // paused → ended by design — so an ended trade used to tell both sides it "is
+  // paused and the space is empty" and that its charges "are not billed while it
+  // is paused", about an agreement that will never bill or cover anything again.
+  it('an ended trade is never described as paused, to either side', async () => {
+    const s = await buildStack({ basis: 500, suspended: true, carryForwardMonths: 0 })
+    await pause(s)
+    await answer(s, false)
+    await db.query(`UPDATE work_trade_agreements SET status='ended', end_date=CURRENT_DATE WHERE id=$1`,
+      [s.agreementId])
+    await settleAgreementOnEnd(s.agreementId)
+
+    for (const audience of ['tenant', 'landlord'] as const) {
+      const told = await loadWorkTradeStanding(s.agreementId, '2026-09-01', audience)
+      expect(told).toMatchObject({ hoursNotCounted: false })
+      expect(told!.summary).not.toContain('paused')
+      expect(told!.summary).not.toContain('space is empty')
+    }
+    // 10/19 (review): and the landlord's ROSTER reads the same target the
+    // window does for that agreement — hoursCountedFor says 0 on an ended trade
+    // whose last pause said the space was empty, so the row must not print the
+    // stored 80 against it (apps/landlord WorkTradePage countsHours).
+    const onRoster = await db.query(
+      `SELECT status, tracks_hours, paused_space_occupied, monthly_hours_target
+         FROM work_trade_agreements WHERE id = $1`, [s.agreementId])
+    expect(onRoster.rows[0]).toMatchObject({ status: 'ended', paused_space_occupied: false })
+    expect(hoursCountedFor(onRoster.rows[0])).toBe(false)
+    // The money the ending already did is untouched: nothing was billed on the
+    // way out, which is the rule the kept answer exists for.
+    expect(await openOnLease(s.leaseId)).toBe(0)
   })
 })

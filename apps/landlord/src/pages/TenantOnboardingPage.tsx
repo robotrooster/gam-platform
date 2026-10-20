@@ -8,7 +8,9 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut, apiPatch, apiDelete } from '../lib/api'
-import { UNIT_TYPE_LABEL, humanize, dueDayLabel } from '@gam/shared'
+import { UNIT_TYPE_LABEL, humanize, dueDayLabel,
+         EXISTING_RESIDENT_ATTESTATION_TITLE, EXISTING_RESIDENT_MONEY_NOTE,
+         EXISTING_RESIDENT_SKIPS_SCREENING_NOTE, EXISTING_RESIDENT_STILL_SCREENS_NOTE } from '@gam/shared'
 
 // S655: what checking a tenant file returns (POST /onboard-tenants-csv/validate).
 type RosterIssue = { severity: 'block' | 'warn'; field?: string; message: string }
@@ -518,6 +520,21 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
   const selectable = inProperty.filter(canInviteToUnit)
   const hiddenReasons = hiddenUnitReasons(inProperty)
 
+  // 10/19 (Nic, "Fix invite flag overridden in first 28 days"): the page reads
+  // the windows ITSELF, for every property at once, instead of each card
+  // asking separately. The send button and the box the landlord ticks have to
+  // be looking at the same answer: when the card never rendered the box and the
+  // send button still sent "yes", the same resident invited through this door
+  // and through "Add one tenant" on the same day was billed hundreds apart.
+  // Same query key as the page above, so react-query serves it from cache.
+  const { data: windows = [] } = useQuery<any[]>('onboarding-windows', () => apiGet('/landlords/me/onboarding-windows'))
+  const windowFor = (unitId: string) => {
+    const pid = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
+    return (windows as any[]).find(w => w.propertyId === pid) ?? null
+  }
+  /** May this unit's invite say "they already live here"? The server's own answer. */
+  const mayAttest = (unitId: string) => windowFor(unitId)?.existingTenancyOpen === true
+
   const [rosters, setRosters] = useState<Record<string, Person[]>>({})
   const [attest, setAttest] = useState<Record<string, boolean>>({})
   // S652 (Nic): "are you adding a home to the sale?" — per unit, on the invite,
@@ -538,6 +555,9 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
 
   const rosterFor = (id: string) => rosters[id] ?? [blankPerson()]
   const setRoster = (id: string, next: Person[]) => setRosters(p => ({ ...p, [id]: next }))
+  // The box as it stands for one unit: ticked unless the landlord unticked it,
+  // and never "ticked" on a unit that was never asked.
+  const existingAnswer = (id: string) => mayAttest(id) && attest[id] !== false
 
   const complete = (p: Person) => !!(p.firstName && p.lastName && p.email)
   const untouched = (p: Person) => !p.firstName && !p.lastName && !p.email && !p.phone
@@ -578,8 +598,15 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       try {
         const r: any = await apiPost<any>('/landlords/me/onboard-new-lease-tenant', {
           unitId: u.id, people,
-          existingResident: attest[u.id] !== false,
-          rentDueDay: attest[u.id] !== false && dueDay[u.id] ? Number(dueDay[u.id]) : undefined,
+          // 10/19: only what the landlord was actually SHOWN and left ticked.
+          // This read `attest[u.id] !== false`, which is true when the box was
+          // never rendered at all — so a unit whose property could not offer
+          // the attestation still sent "they already live here" and zeroed the
+          // deposits. Where the box IS offered it is ticked by default (S631:
+          // mid-migration, everyone on the roster is a sitting resident), and
+          // that default lives in one place now.
+          existingResident: existingAnswer(u.id),
+          rentDueDay: existingAnswer(u.id) && dueDay[u.id] ? Number(dueDay[u.id]) : undefined,
           homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined,
           packageTemplateIds: tickedIds(packet[u.id] ?? null),
         })
@@ -716,7 +743,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
                   onClose={() => { setOpen(prev => ({ ...prev, [u.id]: false })); setRoster(u.id, [blankPerson()]) }}
                   people={rosterFor(u.id)}
                   setPeople={next => setRoster(u.id, next)}
-                  attest={attest[u.id] !== false}
+                  win={windowFor(u.id)}
+                  attest={existingAnswer(u.id)}
                   setAttest={v => setAttest(prev => ({ ...prev, [u.id]: v }))}
                   sale={sale[u.id] ?? null}
                   setSale={v => setSale(prev => ({ ...prev, [u.id]: v }))}
@@ -778,20 +806,21 @@ export function DueDayPicker({ value, onChange }: { value: string; onChange: (v:
 
 /** S629: one unit's roster. Presentational — the page owns the data so a
  *  single send can see every unit at once. */
-function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, packet, setPacket, dueDay, setDueDay, error }: {
+function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, win, attest, setAttest, sale, setSale, packet, setPacket, dueDay, setDueDay, error }: {
   unit: any; open: boolean; onOpen: () => void; onClose: () => void
   dueDay: string; setDueDay: (v: string) => void
   people: Person[]; setPeople: (next: Person[]) => void
+  win: any
   attest: boolean; setAttest: (v: boolean) => void
   sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void
   packet: Record<string, boolean> | null; setPacket: (v: Record<string, boolean>) => void
   error: string | null
 }) {
-  const { data: obWindow } = useQuery<any>(
-    ['ob-window', unit.propertyId],
-    () => apiGet(`/properties/${unit.propertyId}/onboarding-window`),
-    { enabled: open && !!unit.propertyId, staleTime: 60_000 })
-  const windowOpen = !!obWindow?.open
+  // 10/19: handed down by the page, which reads every property's window in one
+  // call — so the box shown here and the payload the send button builds can
+  // never disagree.
+  const windowOpen = !!win?.open                 // screening waive (S579: this property only)
+  const mayAttest = win?.existingTenancyOpen === true  // the money answer (S631: either window)
 
   const setField = (i: number, k: keyof Person, v: string) =>
     setPeople(people.map((p, idx) => idx === i ? { ...p, [k]: v } : p))
@@ -819,21 +848,25 @@ function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest
         <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }} onClick={onClose}>Clear</button>
       </div>
 
-      {obWindow && (windowOpen ? (
+      {win && (mayAttest ? (
         <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: 10 }}>
           <input type="checkbox" checked={attest} onChange={e => setAttest(e.target.checked)} style={{ marginTop: 3 }} />
           <span style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-            <strong style={{ color: 'var(--text-1)' }}>Existing residents — skip background check.</strong>{' '}
-            They already live here and will sign the new lease without screening.
-            {typeof obWindow.daysRemaining === 'number' && <> Window closes in {obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}.</>}
+            <strong style={{ color: 'var(--text-1)' }}>{EXISTING_RESIDENT_ATTESTATION_TITLE}.</strong>{' '}
+            {EXISTING_RESIDENT_MONEY_NOTE}
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+              {windowOpen ? EXISTING_RESIDENT_SKIPS_SCREENING_NOTE : EXISTING_RESIDENT_STILL_SCREENS_NOTE}
+              {windowOpen && typeof win.daysRemaining === 'number' && <> Window closes in {win.daysRemaining} day{win.daysRemaining === 1 ? '' : 's'}.</>}
+            </div>
           </span>
         </label>
       ) : (
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
-          Onboarding window closed — everyone invited here completes a background check before portal access.
+          Onboarding window closed — everyone invited here completes a background check before portal access,
+          and is billed as a new move-in.
         </div>
       ))}
-      {windowOpen && attest && <DueDayPicker value={dueDay} onChange={setDueDay} />}
+      {mayAttest && attest && <DueDayPicker value={dueDay} onChange={setDueDay} />}
 
       {/* S652 (Nic): asked only for a park-owned home — a tenant-owned home,
           an RV site or a bare lot never asks. */}
@@ -897,7 +930,15 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
     ['ob-window', propertyIdForWindow],
     () => apiGet(`/properties/${propertyIdForWindow}/onboarding-window`),
     { enabled: !!propertyIdForWindow, staleTime: 60_000 })
-  const windowOpen = !!obWindow?.open
+  const windowOpen = !!obWindow?.open                        // screening waive (S579: this property only)
+  // 10/19 (Nic, "Fix invite flag overridden in first 28 days"): whether the
+  // landlord may say "they already live here" is the SERVER'S answer, which is
+  // this property's window OR the landlord's own 28 days (S631). Gated on
+  // `windowOpen` alone, this box vanished between a property's window closing
+  // on day 14 and the account's 28th day — so a sitting resident papered in
+  // that band was billed the whole new-move-in packet with no way to say
+  // otherwise, which is the same bug, pointing the other way.
+  const mayAttestExisting = obWindow?.existingTenancyOpen === true
   const [attestExisting, setAttestExisting] = useState(true)
   const [ownDueDay, setOwnDueDay] = useState('')   // S652
   // S631 (Nic, DIRECTIVE): "Let's flag on invite so that no matter when they
@@ -920,8 +961,8 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       phone: f.phone || undefined,
       unitId: unitId || undefined,
       landlordId: !unitId && landlordId ? landlordId : undefined,
-      existingResident: !!unitId && windowOpen && attestExisting,
-      rentDueDay: unitId && windowOpen && attestExisting && ownDueDay ? Number(ownDueDay) : undefined,
+      existingResident: !!unitId && mayAttestExisting && attestExisting,
+      rentDueDay: unitId && mayAttestExisting && attestExisting && ownDueDay ? Number(ownDueDay) : undefined,
       // Work trade is per unit — it trades labor for THAT tenancy's rent.
       isWorkTrade: !!unitId && isWorkTrade,
       ...(isWorkTrade ? (() => {
@@ -1079,24 +1120,28 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
           </div>
 
           {/* S579: grandfather — only when a unit is bound (per-occupied-unit). */}
-          {unitId && obWindow && (windowOpen ? (
+          {unitId && obWindow && (mayAttestExisting ? (
             <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 8, padding: '12px 14px', marginBottom: 16 }}>
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
                 <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
                 <div>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing resident — skip background check</div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{EXISTING_RESIDENT_ATTESTATION_TITLE}</div>
                   <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
-                    I attest this person already lives in this unit.
-                    {typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
+                    I attest this person already lives in this unit. {EXISTING_RESIDENT_MONEY_NOTE}
                   </div>
-                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — this tenant will complete a background check.</div>}
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>
+                    {windowOpen ? EXISTING_RESIDENT_SKIPS_SCREENING_NOTE : EXISTING_RESIDENT_STILL_SCREENS_NOTE}
+                    {windowOpen && typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
+                  </div>
+                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unticked — billed as a new move-in{windowOpen ? ', and this tenant completes a background check' : ''}.</div>}
                 </div>
               </label>
               {attestExisting && <div style={{ marginTop: 10 }}><DueDayPicker value={ownDueDay} onChange={setOwnDueDay} /></div>}
             </div>
           ) : (
             <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-              Onboarding window closed — this tenant will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access.
+              Onboarding window closed — this tenant will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before
+              portal access, and is billed as a new move-in.
             </div>
           ))}
 

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict zUKSTdBDAp6aWvqz6MGENyUhYTBgxrcYDsS16Ceqj4fAv08MVtGfKghaboe0cs1
+\restrict SjXyHs86hehNEd2pJWh7GniwbjrTnhyG5haWS7vnPLqojDoFD9ao02a4X1m3KXx
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2389,6 +2389,130 @@ END $$;
 
 
 --
+-- Name: fn_space_rent_carryforward_assumed_by(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_space_rent_carryforward_assumed_by() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE cf_id uuid;
+BEGIN
+  UPDATE space_rent_carryforwards
+     SET assumed_tenant_id = NEW.tenant_id, updated_at = now()
+   WHERE assumed_lease_id = NEW.lease_id
+     AND assumed_tenant_id IS NULL
+     AND status = 'open'
+  RETURNING id INTO cf_id;
+  IF cf_id IS NULL THEN RETURN NULL; END IF;
+
+  UPDATE payments
+     SET tenant_id = NEW.tenant_id
+   WHERE space_carryforward_id = cf_id
+     AND type = 'carried_balance'
+     AND status IN ('pending', 'failed');
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: fn_space_rent_carryforward_follows_the_space(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_space_rent_carryforward_follows_the_space() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE cf_id uuid;
+BEGIN
+  IF NEW.status NOT IN ('pending', 'active') THEN RETURN NULL; END IF;
+  SELECT c.id INTO cf_id
+    FROM space_rent_carryforwards c
+    JOIN units u ON u.id = c.unit_id
+   WHERE c.unit_id = NEW.unit_id
+     AND c.status = 'open'
+     AND c.origin_lease_id <> NEW.id
+     AND c.landlord_id = NEW.landlord_id
+     AND u.dwelling_ownership = 'tenant'
+   LIMIT 1;
+  IF cf_id IS NULL THEN RETURN NULL; END IF;
+
+  UPDATE space_rent_carryforwards
+     SET assumed_lease_id = NEW.id,
+         -- The residents are added to lease_tenants after the lease row, so the
+         -- second trigger stamps who took it on, and moves the charge to them.
+         assumed_tenant_id = NULL,
+         assumed_at = now(),
+         updated_at = now()
+   WHERE id = cf_id;
+
+  UPDATE payments
+     SET lease_id = NEW.id
+   WHERE space_carryforward_id = cf_id
+     AND type = 'carried_balance'
+     AND status IN ('pending', 'failed');
+
+  RETURN NULL;
+END $$;
+
+
+--
+-- Name: fn_space_rent_carryforward_rollup(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_space_rent_carryforward_rollup() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  cf_id      uuid;
+  still_owed numeric;
+  paid       numeric;
+  taken_off  numeric;
+  last_day   date;
+  was        text;
+  becomes    text;
+BEGIN
+  cf_id := COALESCE(NEW.space_carryforward_id, OLD.space_carryforward_id);
+  IF cf_id IS NULL THEN RETURN NULL; END IF;
+
+  SELECT c.status INTO was FROM space_rent_carryforwards c WHERE c.id = cf_id;
+  IF was IS NULL THEN RETURN NULL; END IF;
+
+  SELECT COALESCE(SUM(p.amount) FILTER (WHERE p.status IN ('pending', 'processing', 'failed')), 0),
+         COALESCE(SUM(p.amount) FILTER (WHERE p.status IN ('settled', 'paid_via_deposit')), 0),
+         COALESCE(SUM(p.amount) FILTER (WHERE p.status = 'voided'), 0),
+         MAX((p.settled_at AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date)
+           FILTER (WHERE p.status IN ('settled', 'paid_via_deposit'))
+    INTO still_owed, paid, taken_off, last_day
+    FROM payments p
+    LEFT JOIN units u     ON u.id = p.unit_id
+    LEFT JOIN properties pr ON pr.id = u.property_id
+   WHERE p.space_carryforward_id = cf_id
+     AND p.type = 'carried_balance';
+
+  becomes := CASE
+    -- Taken off by hand (services/spaceRentCarryforward takeOffCarryforward)
+    -- and never un-taken-off by a later payment landing.
+    WHEN was = 'voided'                THEN 'voided'
+    WHEN still_owed > 0                THEN 'open'
+    WHEN taken_off > 0                 THEN 'voided'
+    WHEN paid > 0                      THEN 'settled'
+    -- Nothing owed, nothing paid, nothing written off: a claim whose charge is
+    -- gone some other way (a bank return whose money came back off a GAM
+    -- balance instead of a new row). Still owed in substance, so still open,
+    -- and the landlord can take it off.
+    ELSE 'open' END;
+
+  UPDATE space_rent_carryforwards c
+     SET settled_amount = paid,
+         status = becomes,
+         settled_on = CASE WHEN becomes = 'settled' THEN COALESCE(last_day, CURRENT_DATE) END,
+         updated_at = now()
+   WHERE c.id = cf_id;
+
+  RETURN NULL;
+END $$;
+
+
+--
 -- Name: fn_unit_bookings_stamp_cancelled_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2456,25 +2580,6 @@ BEGIN
      WHERE unit_id = NEW.id AND effective_to IS NULL;
     INSERT INTO unit_number_history (unit_id, unit_number, building, effective_from)
     VALUES (NEW.id, NEW.unit_number, NEW.building, now());
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
-
---
--- Name: intent_default_existing_tenancy(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.intent_default_existing_tenancy() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-  IF NEW.is_existing_tenancy IS NOT TRUE THEN
-    SELECT (now() < l.created_at + (28 * INTERVAL '1 day'))
-      INTO NEW.is_existing_tenancy
-      FROM landlords l WHERE l.id = NEW.landlord_id;
-    NEW.is_existing_tenancy := COALESCE(NEW.is_existing_tenancy, false);
   END IF;
   RETURN NEW;
 END;
@@ -5061,7 +5166,7 @@ CREATE FUNCTION public.ledger_capture_payments_del() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id
+  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id,space_carryforward_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_old r
@@ -5080,7 +5185,7 @@ CREATE FUNCTION public.ledger_capture_payments_ins() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id
+  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id,space_carryforward_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM ledger_new r
@@ -5099,14 +5204,14 @@ CREATE FUNCTION public.ledger_capture_payments_upd() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id
+  -- ledger columns: landlord_id,unit_id,lease_id,tenant_id,type,amount,status,due_date,settled_at,entry_description,lease_fee_id,invoice_id,reversal_id,revenue_owner,manual_method,voided_at,home_sale_installment_id,flexpay_advance_id,is_remainder,sublease_markup_amount,gam_supersedence_amount,payment_channel,issued_credit_amount,deposit_collected_by,work_trade_credit,work_trade_settlement_id,space_carryforward_id
   INSERT INTO ledger_outbox (source_type, source_id, owner_id)
   SELECT DISTINCT k.source_type, k.source_id, k.owner_id
     FROM (SELECT o.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.unit_id::text, o.lease_id::text, o.tenant_id::text, o.type::text, o.amount::text, o.status::text, o.due_date::text, o.settled_at::text, o.entry_description::text, o.lease_fee_id::text, o.invoice_id::text, o.reversal_id::text, o.revenue_owner::text, o.manual_method::text, o.voided_at::text, o.home_sale_installment_id::text, o.flexpay_advance_id::text, o.is_remainder::text, o.sublease_markup_amount::text, o.gam_supersedence_amount::text, o.payment_channel::text, o.issued_credit_amount::text, o.deposit_collected_by::text, o.work_trade_credit::text, o.work_trade_settlement_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.unit_id::text, n.lease_id::text, n.tenant_id::text, n.type::text, n.amount::text, n.status::text, n.due_date::text, n.settled_at::text, n.entry_description::text, n.lease_fee_id::text, n.invoice_id::text, n.reversal_id::text, n.revenue_owner::text, n.manual_method::text, n.voided_at::text, n.home_sale_installment_id::text, n.flexpay_advance_id::text, n.is_remainder::text, n.sublease_markup_amount::text, n.gam_supersedence_amount::text, n.payment_channel::text, n.issued_credit_amount::text, n.deposit_collected_by::text, n.work_trade_credit::text, n.work_trade_settlement_id::text)
+           WHERE ROW(o.landlord_id::text, o.unit_id::text, o.lease_id::text, o.tenant_id::text, o.type::text, o.amount::text, o.status::text, o.due_date::text, o.settled_at::text, o.entry_description::text, o.lease_fee_id::text, o.invoice_id::text, o.reversal_id::text, o.revenue_owner::text, o.manual_method::text, o.voided_at::text, o.home_sale_installment_id::text, o.flexpay_advance_id::text, o.is_remainder::text, o.sublease_markup_amount::text, o.gam_supersedence_amount::text, o.payment_channel::text, o.issued_credit_amount::text, o.deposit_collected_by::text, o.work_trade_credit::text, o.work_trade_settlement_id::text, o.space_carryforward_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.unit_id::text, n.lease_id::text, n.tenant_id::text, n.type::text, n.amount::text, n.status::text, n.due_date::text, n.settled_at::text, n.entry_description::text, n.lease_fee_id::text, n.invoice_id::text, n.reversal_id::text, n.revenue_owner::text, n.manual_method::text, n.voided_at::text, n.home_sale_installment_id::text, n.flexpay_advance_id::text, n.is_remainder::text, n.sublease_markup_amount::text, n.gam_supersedence_amount::text, n.payment_channel::text, n.issued_credit_amount::text, n.deposit_collected_by::text, n.work_trade_credit::text, n.work_trade_settlement_id::text, n.space_carryforward_id::text)
           UNION ALL
           SELECT n.* FROM ledger_old o JOIN ledger_new n ON n.id = o.id
-           WHERE ROW(o.landlord_id::text, o.unit_id::text, o.lease_id::text, o.tenant_id::text, o.type::text, o.amount::text, o.status::text, o.due_date::text, o.settled_at::text, o.entry_description::text, o.lease_fee_id::text, o.invoice_id::text, o.reversal_id::text, o.revenue_owner::text, o.manual_method::text, o.voided_at::text, o.home_sale_installment_id::text, o.flexpay_advance_id::text, o.is_remainder::text, o.sublease_markup_amount::text, o.gam_supersedence_amount::text, o.payment_channel::text, o.issued_credit_amount::text, o.deposit_collected_by::text, o.work_trade_credit::text, o.work_trade_settlement_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.unit_id::text, n.lease_id::text, n.tenant_id::text, n.type::text, n.amount::text, n.status::text, n.due_date::text, n.settled_at::text, n.entry_description::text, n.lease_fee_id::text, n.invoice_id::text, n.reversal_id::text, n.revenue_owner::text, n.manual_method::text, n.voided_at::text, n.home_sale_installment_id::text, n.flexpay_advance_id::text, n.is_remainder::text, n.sublease_markup_amount::text, n.gam_supersedence_amount::text, n.payment_channel::text, n.issued_credit_amount::text, n.deposit_collected_by::text, n.work_trade_credit::text, n.work_trade_settlement_id::text)) r
+           WHERE ROW(o.landlord_id::text, o.unit_id::text, o.lease_id::text, o.tenant_id::text, o.type::text, o.amount::text, o.status::text, o.due_date::text, o.settled_at::text, o.entry_description::text, o.lease_fee_id::text, o.invoice_id::text, o.reversal_id::text, o.revenue_owner::text, o.manual_method::text, o.voided_at::text, o.home_sale_installment_id::text, o.flexpay_advance_id::text, o.is_remainder::text, o.sublease_markup_amount::text, o.gam_supersedence_amount::text, o.payment_channel::text, o.issued_credit_amount::text, o.deposit_collected_by::text, o.work_trade_credit::text, o.work_trade_settlement_id::text, o.space_carryforward_id::text) IS DISTINCT FROM ROW(n.landlord_id::text, n.unit_id::text, n.lease_id::text, n.tenant_id::text, n.type::text, n.amount::text, n.status::text, n.due_date::text, n.settled_at::text, n.entry_description::text, n.lease_fee_id::text, n.invoice_id::text, n.reversal_id::text, n.revenue_owner::text, n.manual_method::text, n.voided_at::text, n.home_sale_installment_id::text, n.flexpay_advance_id::text, n.is_remainder::text, n.sublease_markup_amount::text, n.gam_supersedence_amount::text, n.payment_channel::text, n.issued_credit_amount::text, n.deposit_collected_by::text, n.work_trade_credit::text, n.work_trade_settlement_id::text, n.space_carryforward_id::text)) r
     CROSS JOIN LATERAL (SELECT 'payment'::text, r.id::text, r.landlord_id
       UNION ALL SELECT 'remittance', ra.remittance_id::text, r.landlord_id FROM remittance_applications ra WHERE ra.payment_id = r.id) k(source_type, source_id, owner_id)
    WHERE k.source_id IS NOT NULL;
@@ -7279,6 +7384,9 @@ BEGIN
   -- 10/12 (Nic): late from the first late day — the later of the due date and
   -- the day GAM wrote the bill, + GREATEST(grace, 1), the day late fees start
   -- (services/lateness lateCountsFromSql / writtenAtSql / pastGraceSql).
+  -- 10/19: the grace comes from the LEASE, where the real policy is stamped
+  -- when the lease is drafted (property_unit_type_late_fees -> the lease), with
+  -- the same 5 behind it the property column held for every property.
   SELECT COALESCE(SUM(p.amount), 0) INTO owed
     FROM payments p
     JOIN units u ON u.id = p.unit_id
@@ -7322,7 +7430,7 @@ BEGIN
      AND p.work_trade_suspended_at IS NULL
      AND p.amount > 0
      AND d.today >= GREATEST(p.due_date, COALESCE(d.written_day, p.due_date))
-                    + GREATEST(COALESCE(l.late_fee_grace_days, pr.late_fee_grace_days, 5), 1);
+                    + GREATEST(COALESCE(l.late_fee_grace_days, 5), 1);
   IF owed > 0 THEN
     UPDATE units SET status = 'delinquent', updated_at = NOW()
      WHERE id = target_unit AND status = 'active';
@@ -7542,6 +7650,22 @@ END $$;
 --
 
 COMMENT ON FUNCTION public.work_trade_hours_follow_their_expense() IS '10/12 (Nic, ledger P7): a work trader''s extra hours paid as a contractor (1099) are paid when the contractor expense they became is paid in full, and waiting again when it no longer is.';
+
+
+--
+-- Name: work_trade_pause_answer_follows_the_pause(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.work_trade_pause_answer_follows_the_pause() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.status = 'active' THEN
+    NEW.paused_space_occupied := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
 
 
 --
@@ -15082,6 +15206,7 @@ CREATE TABLE public.payments (
     deposit_collected_by text,
     work_trade_credit numeric(12,2) DEFAULT 0 NOT NULL,
     work_trade_settlement_id uuid,
+    space_carryforward_id uuid,
     CONSTRAINT payments_deposit_collected_by_check CHECK (((deposit_collected_by IS NULL) OR (deposit_collected_by = ANY (ARRAY['gam'::text, 'landlord'::text])))),
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
@@ -15214,6 +15339,13 @@ COMMENT ON COLUMN public.payments.work_trade_credit IS '10/12 (ledger P1): dolla
 --
 
 COMMENT ON COLUMN public.payments.work_trade_settlement_id IS '10/12 (ledger P1): set on the carried-balance row a work-trade period''s unworked hours were billed on when no bill carried them (jobs/workTradeSettlement billDeficit).';
+
+
+--
+-- Name: COLUMN payments.space_carryforward_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.space_carryforward_id IS '10/19 (Nic): the carried space-rent claim this row belongs to — the one carried_balance charge that is the debt, its part-payment remainders, and the voided rent rows it was carried from.';
 
 
 --
@@ -15501,7 +15633,7 @@ COMMENT ON COLUMN public.pending_tenant_intents.cancelled_at IS 'Set when a land
 -- Name: COLUMN pending_tenant_intents.is_existing_tenancy; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.pending_tenant_intents.is_existing_tenancy IS 'S631: the landlord is papering an existing resident rather than inviting a new move-in. Copied onto the lease at signing.';
+COMMENT ON COLUMN public.pending_tenant_intents.is_existing_tenancy IS 'S631: the landlord is papering an existing resident rather than inviting a new move-in. Copied onto the lease at signing. 10/19: set by the app only — the landlord attests it and the onboarding window must be open (services/onboardingWindow.isExistingTenancyInvite). The old 28-day trigger that forced it TRUE is gone; it overrode the landlord''s own answer during a new account''s first 28 days.';
 
 
 --
@@ -17044,13 +17176,6 @@ CREATE TABLE public.properties (
     timezone text DEFAULT 'America/Phoenix'::text NOT NULL,
     late_fee_enabled boolean DEFAULT true NOT NULL,
     late_fee_grace_days integer DEFAULT 5 NOT NULL,
-    late_fee_initial_amount numeric DEFAULT 15.00 NOT NULL,
-    late_fee_initial_type text DEFAULT 'flat'::text NOT NULL,
-    late_fee_accrual_amount numeric,
-    late_fee_accrual_type text,
-    late_fee_accrual_period text,
-    late_fee_cap_amount numeric,
-    late_fee_cap_type text,
     deposit_handling_mode text DEFAULT 'landlord_held'::text NOT NULL,
     deposit_interest_rate_annual numeric,
     deposit_interest_accrual_method text,
@@ -17116,6 +17241,13 @@ CREATE TABLE public.properties (
     tenants_deposit_at_bank boolean DEFAULT false NOT NULL,
     early_departure_refunds boolean DEFAULT true NOT NULL,
     prorates_mid_month_rent boolean DEFAULT true NOT NULL,
+    late_fee_initial_amount numeric(10,2),
+    late_fee_initial_type text,
+    late_fee_accrual_amount numeric(10,2),
+    late_fee_accrual_type text,
+    late_fee_accrual_period text,
+    late_fee_cap_amount numeric(10,2),
+    late_fee_cap_type text,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -17126,10 +17258,6 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_deposit_interest_payment_cadence_check CHECK ((deposit_interest_payment_cadence = ANY (ARRAY['annual'::text, 'at_return'::text, 'on_anniversary'::text]))),
     CONSTRAINT properties_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
     CONSTRAINT properties_flex_charge_finance_pct_check CHECK (((flex_charge_finance_pct >= (0)::numeric) AND (flex_charge_finance_pct <= 0.06))),
-    CONSTRAINT properties_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
-    CONSTRAINT properties_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
-    CONSTRAINT properties_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
-    CONSTRAINT properties_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT properties_propane_markup_sane CHECK (((propane_markup_per_gallon >= (0)::numeric) AND (propane_markup_per_gallon <= (10)::numeric))),
     CONSTRAINT properties_propane_split_four_gte_min_check CHECK ((propane_split_four_min_gallons >= propane_split_min_gallons)),
     CONSTRAINT properties_propane_split_min_gallons_check CHECK ((propane_split_min_gallons > 0)),
@@ -17282,6 +17410,13 @@ COMMENT ON COLUMN public.properties.early_departure_refunds IS '10/18 (Nic): doe
 --
 
 COMMENT ON COLUMN public.properties.prorates_mid_month_rent IS '10/18 (Nic): does this property prorate rent when a long-term resident moves in or out mid-month? "only if the landlord allows the pro rate." FALSE = a whole month is a whole month both ways: the month moved into is billed whole on page 8 and the move-in invoice, and the month moved out of is owed whole. TRUE = the days are counted against the ACTUAL days in that month, via the one proration GAM has (shared moveInCharges prorateMoveInRent) — never a flat 30. Also governs the prorated tail of a long stay whose guest leaves part-way into another month (shared stayPricing priceNightsStayed), which is NEW on 10/18 and arrives switched on at every property by this default, deliberately; move-in proration is what every property already did.';
+
+
+--
+-- Name: COLUMN properties.late_fee_initial_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.late_fee_initial_amount IS '10/19 (Nic): no default here, ever. A real late-fee policy lives in property_unit_type_late_fees per unit type and is stamped onto the lease; this is read only by the state-law warning on the property page and is NULL until somebody deliberately sets it.';
 
 
 --
@@ -18370,6 +18505,105 @@ CREATE TABLE public.sleeve_coverings (
     evidence text,
     CONSTRAINT sleeve_coverings_source_check CHECK ((source = ANY (ARRAY['auto'::text, 'manual'::text])))
 );
+
+
+--
+-- Name: space_carryforward_installments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.space_carryforward_installments (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    carryforward_id uuid NOT NULL,
+    due_date date NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    status text DEFAULT 'asked'::text NOT NULL,
+    asked_on date NOT NULL,
+    met_on date,
+    applied_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT space_carryforward_installments_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT space_carryforward_installments_met_stamped CHECK (((status = 'met'::text) = (met_on IS NOT NULL))),
+    CONSTRAINT space_carryforward_installments_status_check CHECK ((status = ANY (ARRAY['asked'::text, 'met'::text, 'missed'::text])))
+);
+
+
+--
+-- Name: TABLE space_carryforward_installments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.space_carryforward_installments IS '10/19 (Nic): what a payment arrangement asked for against a carried space-rent balance each cycle. A record, never a second charge, and a missed one carries no late fee.';
+
+
+--
+-- Name: space_rent_carryforwards; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.space_rent_carryforwards (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    origin_lease_id uuid NOT NULL,
+    origin_tenant_id uuid NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    settled_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    late_fees_waived numeric(12,2) DEFAULT 0 NOT NULL,
+    opened_on date NOT NULL,
+    oldest_due_date date NOT NULL,
+    opened_by uuid,
+    assumed_lease_id uuid,
+    assumed_tenant_id uuid,
+    assumed_at timestamp with time zone,
+    status text DEFAULT 'open'::text NOT NULL,
+    settled_on date,
+    taken_off_by uuid,
+    taken_off_on date,
+    assumption_recorded_at timestamp with time zone,
+    assumption_recorded_by uuid,
+    arrangement_amount numeric(12,2),
+    arrangement_day integer,
+    arrangement_started_on date,
+    arrangement_set_by uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT space_rent_carryforwards_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT space_rent_carryforwards_arrangement_amount_check CHECK (((arrangement_amount IS NULL) OR (arrangement_amount > (0)::numeric))),
+    CONSTRAINT space_rent_carryforwards_arrangement_day_check CHECK (((arrangement_day IS NULL) OR ((arrangement_day >= 1) AND (arrangement_day <= 28)))),
+    CONSTRAINT space_rent_carryforwards_arrangement_whole CHECK ((num_nonnulls(arrangement_amount, arrangement_day, arrangement_started_on) = ANY (ARRAY[0, 3]))),
+    CONSTRAINT space_rent_carryforwards_settled_stamped CHECK (((status = 'settled'::text) = (settled_on IS NOT NULL))),
+    CONSTRAINT space_rent_carryforwards_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'voided'::text]))),
+    CONSTRAINT space_rent_carryforwards_taken_off_stamped CHECK (((status = 'voided'::text) OR ((taken_off_on IS NULL) AND (taken_off_by IS NULL))))
+);
+
+
+--
+-- Name: TABLE space_rent_carryforwards; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.space_rent_carryforwards IS '10/19 (Nic): unpaid SPACE RENT left behind on a tenant-owned home, carried by the space. The departing resident stays liable (origin_tenant_id) and the space''s next lease carries it (assumed_lease_id); one charge row serves both, so it can never be collected twice.';
+
+
+--
+-- Name: COLUMN space_rent_carryforwards.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.space_rent_carryforwards.unit_id IS 'The space, not the trailer. Nic: "for simplicity, we just want to attach the debt to the spot."';
+
+
+--
+-- Name: COLUMN space_rent_carryforwards.late_fees_waived; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.space_rent_carryforwards.late_fees_waived IS 'Late fees voided at close-out. Nic: "Jacob, it was not possible for him to be late ... we drop the late fees." Never moved and never left on the departing resident.';
+
+
+--
+-- Name: COLUMN space_rent_carryforwards.assumption_recorded_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.space_rent_carryforwards.assumption_recorded_at IS '10/19 (Nic): when a landlord was shown this balance and put it on a named person as a condition of moving in. NULL beside an assumed_lease_id means the balance moved onto a resident in silence — a lease drafted from a door that does not ask.';
 
 
 --
@@ -21470,6 +21704,7 @@ CREATE TABLE public.work_trade_agreements (
     extra_hours_mode text DEFAULT 'bank'::text NOT NULL,
     extra_hours_rate numeric(10,2),
     extra_hours_pay_method text,
+    paused_space_occupied boolean,
     CONSTRAINT work_trade_agreements_extra_hours_mode_check CHECK ((extra_hours_mode = ANY (ARRAY['bank'::text, 'pay'::text]))),
     CONSTRAINT work_trade_agreements_extra_hours_pay_method_check CHECK (((extra_hours_pay_method IS NULL) OR (extra_hours_pay_method = ANY (ARRAY['payroll_w2'::text, 'contractor_1099'::text])))),
     CONSTRAINT work_trade_agreements_extra_hours_pay_needs_terms CHECK (((extra_hours_mode = 'bank'::text) OR ((extra_hours_rate IS NOT NULL) AND (extra_hours_pay_method IS NOT NULL)))),
@@ -21545,6 +21780,13 @@ COMMENT ON COLUMN public.work_trade_agreements.extra_hours_rate IS '10/12: the h
 --
 
 COMMENT ON COLUMN public.work_trade_agreements.extra_hours_pay_method IS '10/12: how paid extra hours are paid — payroll_w2 (Payroll (W-2)) or contractor_1099 (Contractor payment (1099)).';
+
+
+--
+-- Name: COLUMN work_trade_agreements.paused_space_occupied; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.paused_space_occupied IS 'While this agreement is paused, is the space still being used? TRUE keeps counting hours (the month behaves as normal), FALSE asks for no hours, NULL means the landlord has not been asked and reads as TRUE. Read only while the trade is not running (paused, or ended straight out of a pause) and forgotten the moment it resumes. Nic 10/19.';
 
 
 --
@@ -24849,6 +25091,22 @@ ALTER TABLE ONLY public.state_landlord_tenant_acts
 
 ALTER TABLE ONLY public.state_landlord_tenant_acts
     ADD CONSTRAINT slta_unique UNIQUE (state_code, act_key, effective_year);
+
+
+--
+-- Name: space_carryforward_installments space_carryforward_installments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_carryforward_installments
+    ADD CONSTRAINT space_carryforward_installments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_pkey PRIMARY KEY (id);
 
 
 --
@@ -28541,6 +28799,13 @@ CREATE INDEX idx_payments_reversal_id ON public.payments USING btree (reversal_i
 
 
 --
+-- Name: idx_payments_space_carryforward; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_space_carryforward ON public.payments USING btree (space_carryforward_id) WHERE (space_carryforward_id IS NOT NULL);
+
+
+--
 -- Name: idx_payments_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -29469,6 +29734,27 @@ CREATE INDEX idx_slst_state_category ON public.state_law_section_texts USING btr
 --
 
 CREATE INDEX idx_slta_lookup ON public.state_landlord_tenant_acts USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_space_rent_carryforwards_assumed_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_space_rent_carryforwards_assumed_lease ON public.space_rent_carryforwards USING btree (assumed_lease_id) WHERE (assumed_lease_id IS NOT NULL);
+
+
+--
+-- Name: idx_space_rent_carryforwards_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_space_rent_carryforwards_landlord ON public.space_rent_carryforwards USING btree (landlord_id, status);
+
+
+--
+-- Name: idx_space_rent_carryforwards_origin_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_space_rent_carryforwards_origin_tenant ON public.space_rent_carryforwards USING btree (origin_tenant_id);
 
 
 --
@@ -31824,6 +32110,13 @@ CREATE UNIQUE INDEX ux_payments_one_flexpay_pull_per_advance ON public.payments 
 
 
 --
+-- Name: ux_payments_one_space_carryforward_charge; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_one_space_carryforward_charge ON public.payments USING btree (space_carryforward_id) WHERE ((space_carryforward_id IS NOT NULL) AND (type = 'carried_balance'::text) AND (is_remainder = false) AND (status <> ALL (ARRAY['voided'::text, 'returned'::text])));
+
+
+--
 -- Name: ux_payments_rent_idempotent; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -31898,6 +32191,20 @@ CREATE UNIQUE INDEX ux_slip_items_pos_live ON public.bank_deposit_slip_items USI
 --
 
 CREATE UNIQUE INDEX ux_slip_items_remittance_live ON public.bank_deposit_slip_items USING btree (remittance_id) WHERE ((remittance_id IS NOT NULL) AND (voided_at IS NULL));
+
+
+--
+-- Name: ux_space_carryforward_installment_per_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_space_carryforward_installment_per_cycle ON public.space_carryforward_installments USING btree (carryforward_id, due_date);
+
+
+--
+-- Name: ux_space_rent_carryforward_open_per_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_space_rent_carryforward_open_per_unit ON public.space_rent_carryforwards USING btree (unit_id) WHERE (status = 'open'::text);
 
 
 --
@@ -33165,6 +33472,20 @@ CREATE TRIGGER audit_service_interruptions AFTER DELETE OR UPDATE ON public.serv
 --
 
 CREATE TRIGGER audit_shifts AFTER DELETE OR UPDATE ON public.shifts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: space_carryforward_installments audit_space_carryforward_installments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_space_carryforward_installments AFTER DELETE OR UPDATE ON public.space_carryforward_installments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: space_rent_carryforwards audit_space_rent_carryforwards; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_space_rent_carryforwards AFTER DELETE OR UPDATE ON public.space_rent_carryforwards FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -35002,13 +35323,6 @@ CREATE TRIGGER trg_generated_routes_updated_at BEFORE UPDATE ON public.generated
 
 
 --
--- Name: pending_tenant_intents trg_intent_default_existing_tenancy; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_intent_default_existing_tenancy BEFORE INSERT ON public.pending_tenant_intents FOR EACH ROW EXECUTE FUNCTION public.intent_default_existing_tenancy();
-
-
---
 -- Name: invoices trg_invoices_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -35352,6 +35666,27 @@ CREATE TRIGGER trg_security_deposits_voided_is_a_record BEFORE UPDATE ON public.
 
 
 --
+-- Name: lease_tenants trg_space_rent_carryforward_assumed_by; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_space_rent_carryforward_assumed_by AFTER INSERT ON public.lease_tenants FOR EACH ROW EXECUTE FUNCTION public.fn_space_rent_carryforward_assumed_by();
+
+
+--
+-- Name: leases trg_space_rent_carryforward_follows_the_space; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_space_rent_carryforward_follows_the_space AFTER INSERT ON public.leases FOR EACH ROW EXECUTE FUNCTION public.fn_space_rent_carryforward_follows_the_space();
+
+
+--
+-- Name: payments trg_space_rent_carryforward_rollup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_space_rent_carryforward_rollup AFTER INSERT OR UPDATE OF status, amount, space_carryforward_id ON public.payments FOR EACH ROW WHEN ((new.space_carryforward_id IS NOT NULL)) EXECUTE FUNCTION public.fn_space_rent_carryforward_rollup();
+
+
+--
 -- Name: users trg_stamp_tenant_invite_sent; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -35517,6 +35852,13 @@ CREATE TRIGGER trg_work_trade_settlements_voided_is_a_record BEFORE UPDATE ON pu
 --
 
 CREATE TRIGGER work_trade_hours_follow_their_expense AFTER INSERT OR UPDATE OF amount, voided_at ON public.landlord_expense_payments FOR EACH ROW EXECUTE FUNCTION public.work_trade_hours_follow_their_expense();
+
+
+--
+-- Name: work_trade_agreements work_trade_pause_answer_resets; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER work_trade_pause_answer_resets BEFORE INSERT OR UPDATE ON public.work_trade_agreements FOR EACH ROW EXECUTE FUNCTION public.work_trade_pause_answer_follows_the_pause();
 
 
 --
@@ -40256,6 +40598,14 @@ ALTER TABLE ONLY public.payments
 
 
 --
+-- Name: payments payments_space_carryforward_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_space_carryforward_id_fkey FOREIGN KEY (space_carryforward_id) REFERENCES public.space_rent_carryforwards(id);
+
+
+--
 -- Name: payments payments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -42312,6 +42662,102 @@ ALTER TABLE ONLY public.state_law_provisions
 
 
 --
+-- Name: space_carryforward_installments space_carryforward_installments_carryforward_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_carryforward_installments
+    ADD CONSTRAINT space_carryforward_installments_carryforward_id_fkey FOREIGN KEY (carryforward_id) REFERENCES public.space_rent_carryforwards(id) ON DELETE CASCADE;
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_arrangement_set_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_arrangement_set_by_fkey FOREIGN KEY (arrangement_set_by) REFERENCES public.users(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_assumed_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_assumed_lease_id_fkey FOREIGN KEY (assumed_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_assumed_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_assumed_tenant_id_fkey FOREIGN KEY (assumed_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_assumption_recorded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_assumption_recorded_by_fkey FOREIGN KEY (assumption_recorded_by) REFERENCES public.users(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_opened_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_opened_by_fkey FOREIGN KEY (opened_by) REFERENCES public.users(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_origin_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_origin_lease_id_fkey FOREIGN KEY (origin_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_origin_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_origin_tenant_id_fkey FOREIGN KEY (origin_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_taken_off_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_taken_off_by_fkey FOREIGN KEY (taken_off_by) REFERENCES public.users(id);
+
+
+--
+-- Name: space_rent_carryforwards space_rent_carryforwards_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.space_rent_carryforwards
+    ADD CONSTRAINT space_rent_carryforwards_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
 -- Name: stay_checkout_decisions stay_checkout_decisions_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -44036,5 +44482,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict zUKSTdBDAp6aWvqz6MGENyUhYTBgxrcYDsS16Ceqj4fAv08MVtGfKghaboe0cs1
+\unrestrict SjXyHs86hehNEd2pJWh7GniwbjrTnhyG5haWS7vnPLqojDoFD9ao02a4X1m3KXx
 

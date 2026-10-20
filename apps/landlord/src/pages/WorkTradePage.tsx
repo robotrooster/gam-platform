@@ -12,6 +12,53 @@ import { WORK_TRADE_COVERABLE, WORK_TRADE_COVERABLE_LABEL } from '@gam/shared'
 const STATUS_MAP: Record<string, string> = { active: 'badge-green', paused: 'badge-amber', ended: 'badge-muted' }
 // 10/12: the status in words, never the raw value.
 const STATUS_LABEL: Record<string, string> = { active: 'Active', paused: 'Paused', ended: 'Ended' }
+
+/**
+ * 10/19 (Nic): a paused trade is one of two different things, and the roster has
+ * to say which — "if somebody wants to work more hours in the winter but leave
+ * their camper occupying the space in the summer, that's one situation. If people
+ * take their camper home for the summer with them and it's not occupying the
+ * spot, then there would be no reason for it to continue to track hours."
+ *
+ * Unanswered is its own word, because it is the live default (lease hibernation
+ * pauses an agreement with nobody in front of a screen) and it needs an answer
+ * rather than looking already settled.
+ */
+const PAUSED_SPACE_LABEL = {
+  used: 'Paused · space in use',
+  empty: 'Paused · space empty',
+  unanswered: 'Paused · space?',
+}
+function pausedStatusLabel(a: any): string {
+  if (a.status !== 'paused') return STATUS_LABEL[a.status] ?? '—'
+  if (a.tracksHours === false) return STATUS_LABEL.paused
+  if (a.pausedSpaceOccupied === true) return PAUSED_SPACE_LABEL.used
+  if (a.pausedSpaceOccupied === false) return PAUSED_SPACE_LABEL.empty
+  return PAUSED_SPACE_LABEL.unanswered
+}
+
+/**
+ * 10/19 (review) — THE ROW AND THE WINDOW READ ONE RULE, OR THEY READ TWO.
+ *
+ * Whether a trade is counting hours is `hoursCountedFor` on the server
+ * (services/workTradeStanding), and it deliberately reads status IN
+ * ('paused','ended'): the landlord's end-by-hand path writes 'ended' BEFORE it
+ * settles, and migration 20261021150000 deliberately keeps the space answer
+ * through paused → ended so a season nobody counted is never billed on the way
+ * out. So an agreement ended straight out of an empty-space pause has target 0
+ * in the window — "0 hrs of 0 hrs", "Bill covered 100%".
+ *
+ * This cell only looked at 'paused', so that same agreement printed the full
+ * stored target in the roster: "0.0 / 80 hrs" on the row, nothing asked for in
+ * the window. One agreement, two screens, two different targets — and the row is
+ * the one a landlord reads first. Same shape as the server's rule, in the one
+ * place the row needs it.
+ */
+export function countsHours(a: any): boolean {
+  if (a.tracksHours === false) return false
+  const dormant = a.status === 'paused' || a.status === 'ended'
+  return !(dormant && a.pausedSpaceOccupied === false)
+}
 const DOC_STATUS_LABEL: Record<string, string> = { pending: 'Draft', draft: 'Draft', sent: 'Awaiting signature', in_progress: 'Awaiting signature', completed: 'On file', voided: 'Voided', execution_failed: 'Needs attention' }
 
 // W-56 (Nic): targets are PER PERSON (edited inline on each agreement row
@@ -121,9 +168,19 @@ export function WorkTradePage() {
                   <td style={{ fontWeight: 500, color: 'var(--gold)' }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{a.unitNumber || '—'}</td>
                   <td>{a.propertyName || '—'}</td>
+                  {/*
+                    10/19: a trade on an empty space asks for no hours, so the
+                    roster must not print a target against it either — the window
+                    and the row have to read the same (countsHours), including
+                    after it is ended straight out of that pause.
+                  */}
                   <td className="mono">{a.tracksHours === false
                     ? <span style={{ color:'var(--text-3)' }}>Trusted — no hours</span>
-                    : `${Number(a.hoursThisMonth || 0).toFixed(1)} / ${a.target} hrs`}</td>
+                    : !countsHours(a)
+                      ? <span style={{ color:'var(--text-3)' }}>
+                          {a.status === 'paused' ? 'Paused — no hours counted' : 'No hours counted'}
+                        </span>
+                      : `${Number(a.hoursThisMonth || 0).toFixed(1)} / ${a.target} hrs`}</td>
                   <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)}
                     tracksHours={a.tracksHours !== false} /></td>
                   <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} indefinite={a.carryForwardIndefinite === true} /></td>
@@ -132,7 +189,7 @@ export function WorkTradePage() {
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
                     : <span style={{ color: 'var(--text-3)' }}>0</span>}</td>
                   <td className="mono">{a.startDate ? new Date(a.startDate).toLocaleDateString() : '—'}</td>
-                  <td><span className={`badge ${STATUS_MAP[a.status] || 'badge-muted'}`}>{STATUS_LABEL[a.status] ?? '—'}</span></td>
+                  <td><span className={`badge ${STATUS_MAP[a.status] || 'badge-muted'}`}>{pausedStatusLabel(a)}</span></td>
                   <td onClick={e => e.stopPropagation()}><AddendumCell agreement={a} templates={addendumTemplates as any[]} /></td>
                 </tr>
               )) : (

@@ -6,7 +6,7 @@ import { query, queryOne, getClient } from '../db'
 import type { PoolClient } from 'pg'
 import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES,
          RENT_COMPONENT_KINDS } from '@gam/shared'
-import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
@@ -300,7 +300,12 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name,
+          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type,
+          -- 10/19: who owns the home on the space. The page offers the
+          -- space-rent close-out from this plus unit_type, and says plainly why
+          -- it does not apply where it does not, rather than hiding it.
+          u.dwelling_ownership,
+          p.id AS property_id, p.name AS property_name,
           -- S655: a household's new lease whose lease before it ENDED EARLY,
           -- with nobody in the household signed: it never starts and is being
           -- canceled. The Leases page says so, instead of "it takes over on its
@@ -2880,6 +2885,188 @@ leasesRouter.get('/:id/carried-balance', async (req, res, next) => {
     if (!canAccessLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
+})
+
+/**
+ * 10/19: the LEASE a space-rent route works on, with the caller's right to it —
+ * their company owns it AND, for a team member locked to some properties, this
+ * lease's property is one of theirs.
+ *
+ * Checked on the LEASE and before the balance is looked at, which is the order
+ * that matters: resolving the balance first answered "this lease carries no
+ * space-rent balance" to a staffer at another park, which is a door that is
+ * only shut while it happens to be empty. Same shape as depositReturnLease
+ * above, for the same reason.
+ */
+async function spaceRentLease(req: any, mode: 'read' | 'write'): Promise<{
+  id: string; landlord_id: string; property_id: string
+}> {
+  const lease = await queryOne<{ id: string; landlord_id: string; property_id: string }>(
+    `SELECT l.id, l.landlord_id, u.property_id
+       FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+  if (!lease) throw new AppError(404, 'Lease not found')
+  const allowed = mode === 'read'
+    ? canAccessLandlordResource(req.user, lease.landlord_id)
+    : canManageLandlordResource(req.user, lease.landlord_id)
+  if (!allowed) throw new AppError(403, 'Forbidden')
+  await assertPropertyInScope(req.user, lease.property_id)
+  return lease
+}
+
+// ── 10/19 (Nic): UNPAID SPACE RENT FOLLOWS THE SPACE ─────────────────────────
+//
+// "The rent is owed by the trailer because it was the same trailer there. It
+// doesn't matter how many people cycle in and out." Only on a TENANT-OWNED
+// home: a park-owned rental going vacant has no next owner to inherit it.
+// See services/spaceRentCarryforward for the whole decision set.
+
+// What the close-out would do, in dollars, changing nothing. The screen the
+// landlord decides from: space rent that leaves with the space, utilities that
+// stay the departing resident's, late fees that disappear.
+leasesRouter.get('/:id/space-carryforward/preview', async (req, res, next) => {
+  try {
+    // A debt on a space is money, and a staff member locked to one park has no
+    // business reading one at another. The company-level check alone passes for
+    // every team role of the company, so without the property scope an on-site
+    // manager at one park could read — and, below, close out and write off — a
+    // space at another.
+    await spaceRentLease(req, 'read')
+    const { previewSpaceRentCarryforward } = await import('../services/spaceRentCarryforward')
+    const pv = await previewSpaceRentCarryforward(req.params.id)
+    res.json({ success: true, data: pv })
+  } catch (e) { next(e) }
+})
+
+// Do it. Ends the lease, so it needs the permission that ends a lease.
+leasesRouter.post('/:id/space-carryforward/close-out', requirePerm('leases.terminate'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      notes:   z.string().max(500).optional(),
+      // 10/19: the figure the LANDLORD SAW. The screen shows what the space
+      // will carry and he presses on that number; if a payment landed in
+      // between, closing out on the new one silently is the thing the desk rule
+      // forbids (S655: "a figure that moved under the desk's answer is asked
+      // again IN PLACE, never sent silently"). Optional, so a caller that has
+      // no screen behind it (a job, a test) is unaffected.
+      expectedCarried: z.number().nonnegative().optional(),
+    }).parse(req.body ?? {})
+    await spaceRentLease(req, 'write')
+    const { previewSpaceRentCarryforward, closeOutWithCarryforward, carriedFigureMoved, carriedFigureDiffers } =
+      await import('../services/spaceRentCarryforward')
+    const pv = await previewSpaceRentCarryforward(req.params.id)
+    // Answered here when it is already wrong, so the usual case costs no
+    // transaction — but this read is OUTSIDE the household lock, so it is not
+    // the check that holds. The one that holds is inside
+    // closeOutWithCarryforward, against the locked read, because a desk payment
+    // landing in between holds that same lock and therefore completes first:
+    // this guard would compare 880 against a stale 880, pass, and the claim
+    // would then be created for 440 — closed out silently on a figure the
+    // landlord never saw, which is what the guard exists to prevent.
+    if (body.expectedCarried != null && carriedFigureDiffers(body.expectedCarried, pv.carriesTotal)) {
+      throw new AppError(409, carriedFigureMoved(body.expectedCarried, pv.carriesTotal))
+    }
+
+    await client.query('BEGIN')
+    const result = await closeOutWithCarryforward(client, {
+      leaseId: req.params.id,
+      byUserId: req.user.userId,
+      endDate: body.endDate ?? null,
+      notes: body.notes ?? null,
+      expectedCarried: body.expectedCarried ?? null,
+    })
+    await client.query('COMMIT')
+    res.status(201).json({ success: true, data: result })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
+// What this lease carries: the balance it took on with the space (or, for the
+// lease that left it behind, the one it created). The landlord must be able to
+// see that the new resident took it on.
+leasesRouter.get('/:id/space-carryforward', async (req, res, next) => {
+  try {
+    await spaceRentLease(req, 'read')
+    const { carryforwardForLease } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) return res.json({ success: true, data: null })
+    // The BALANCE's own property too: a claim written before a property changed
+    // hands still belongs to the property it was written on.
+    if (!canAccessLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+    res.json({ success: true, data: cf })
+  } catch (e) { next(e) }
+})
+
+// Take it off. The undo of a close-out, and what the refusal on the preview
+// means by "Settle or take off the existing one first" — a close-out run on
+// the wrong resident was otherwise permanent, because one open balance per
+// space refuses every later close-out there. Nothing is erased: the charge
+// rows are voided with their reason, what was really paid stays recorded, and
+// the claim keeps saying whose debt it was. It writes money off, so it takes
+// the same permission as the close-out that created it.
+leasesRouter.post('/:id/space-carryforward/take-off', requirePerm('leases.terminate'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {})
+    await spaceRentLease(req, 'write')
+    const { carryforwardForLease, takeOffCarryforward } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) throw new AppError(404, 'This lease carries no space-rent balance.')
+    if (!canManageLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+
+    await client.query('BEGIN')
+    const result = await takeOffCarryforward(client, {
+      carryforwardId: cf.id,
+      byUserId: req.user.userId,
+      reason: body.reason ?? null,
+    })
+    await client.query('COMMIT')
+    res.json({ success: true, data: result })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
+// The payment arrangement. Nic: "to help landlords not forget about it and
+// stuff, we need to do, you know, payment arrangements on carry forward
+// balances. So what, even if it's $50 or $100 or whatever." Send nulls to stop
+// asking. Nothing is fined when a cycle is missed.
+leasesRouter.put('/:id/space-carryforward/arrangement', requirePerm('leases.bill_fee'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      amount:     z.number().positive().max(1_000_000).nullable(),
+      dayOfMonth: z.number().int().min(1).max(28).nullable(),
+      startOn:    z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }).parse(req.body)
+    await spaceRentLease(req, 'write')
+    const { carryforwardForLease, setArrangement } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) throw new AppError(404, 'This lease carries no space-rent balance.')
+    if (!canManageLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+
+    await client.query('BEGIN')
+    await setArrangement(client, {
+      carryforwardId: cf.id,
+      amount: body.amount,
+      dayOfMonth: body.dayOfMonth,
+      byUserId: req.user.userId,
+      startOn: body.startOn ?? null,
+    })
+    await client.query('COMMIT')
+    const after = await carryforwardForLease(req.params.id)
+    res.json({ success: true, data: after })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
 })
 
 

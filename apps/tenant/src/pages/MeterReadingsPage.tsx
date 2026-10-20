@@ -20,11 +20,16 @@ export function MeterReadingsPage() {
   const qc = useQueryClient()
   const { data: agreement, isLoading } = useQuery<any>('work-trade-nav', () => apiGet('/tenants/work-trade'))
   const canRead = Array.isArray(agreement?.fieldPermissions) && agreement.fieldPermissions.includes('read_meters')
+  // 10/19 (Nic, "Show it while paused"): this page asks the same endpoint as the
+  // Work Trade tab, and that endpoint answers a PAUSED agreement now. Field work
+  // is not paused work, so a paused trade reads the plain reason below rather
+  // than being offered a reading walk its landlord is not expecting.
+  const running = agreement?.status === 'active'
   const propertyId = agreement?.propertyId as string | undefined
   const { data: runs = [] } = useQuery<any[]>(
     ['reading-runs', propertyId],
     () => apiGet(`/utility/reading-runs?propertyId=${propertyId}`),
-    { enabled: !!propertyId && canRead },
+    { enabled: !!propertyId && canRead && running },
   )
   const [walkRun, setWalkRun] = useState<any | null>(null)
   const openRun = (runs as any[]).find(r => r.status === 'open' || r.status === 'double_check') || null
@@ -38,6 +43,12 @@ export function MeterReadingsPage() {
   if (!agreement || !canRead) {
     return <div className="card" style={{ padding: 18, fontSize: '.85rem', color: 'var(--t2)' }}>
       Reading meters is not part of your work trade agreement.
+    </div>
+  }
+  if (!running) {
+    return <div className="card" style={{ padding: 18, fontSize: '.85rem', color: 'var(--t2)' }}>
+      Your work trade is paused, so there are no meter readings to take right now.
+      Your Work Trade page shows where your agreement stands while it is paused.
     </div>
   }
   const done = (runs as any[]).filter(r => r.status === 'completed').slice(0, 6)

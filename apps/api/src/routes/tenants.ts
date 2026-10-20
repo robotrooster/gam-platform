@@ -3499,18 +3499,72 @@ tenantsRouter.get('/lease/addendums', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/19 (Nic) — A TENANT CAN SEE THEIR WORK TRADE WHILE IT IS PAUSED.
+ *
+ * Asked whether a paused agreement should still appear in the tenant portal,
+ * Nic chose to show it while paused: the tab stays up and says plainly which
+ * situation they are in — hours still counting, or nothing being counted.
+ *
+ * This one route is what FOUR tenant surfaces ask (the nav tab, the Work Trade
+ * page, the Meter Readings page, and — through its own tool — the tenant
+ * assistant), and it used to answer `status = 'active'` only. So a paused
+ * agreement came back empty, the tab vanished, and the honest sentence the
+ * window and the standing had been written to say never reached anybody. The
+ * one a snowbird most needs — "your hours keep counting while this is paused" —
+ * was the one nobody could read.
+ *
+ * ACTIVE AND PAUSED, and deliberately not ended. Pausing is not ending (the
+ * month close says the same thing: CLOSE_STATUSES is `('active','paused')`), so
+ * a paused trade is a live arrangement whose hours may still be counting and
+ * whose charges are still being covered. An ENDED one is finished with — its
+ * hours were billed when it ended — and bringing dead trades back into the
+ * portal would be a different change nobody asked for.
+ *
+ * 10/19 (review) — AND "PAUSED" IS NOT THE SAME AS "STILL LIVING HERE." Leaving
+ * 'ended' out was not enough: a move-out does not produce 'ended'. A lease
+ * reaching its end_date with no signed successor PAUSES the work trade
+ * (jobs/scheduler) and nothing ever ends it, so this route on its own would hand
+ * a former resident their Work Trade tab back a month after they left, reading
+ * "your hours keep counting". The status word cannot tell the two pauses apart,
+ * so the tenancy itself is the test — liveTenancySql, shared with both
+ * assistants' tools so a tab and an assistant can never disagree.
+ *
+ * `hours_counted` rides along so every surface can be honest without
+ * re-deriving the rule: it is the same expression the close and the standing
+ * read (hoursCountedSql), which is what stops a tenant being shown a target the
+ * close is about to waive.
+ *
+ * Preferring ACTIVE over paused matters for a tenant who has both — a paused
+ * seasonal trade on one space and a running one on another. The live
+ * arrangement is the one their portal is about.
+ */
 tenantsRouter.get('/work-trade', requireAuth, async (req, res, next) => {
   try {
     const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
+    const { HOURS_COUNTED_COL, liveTenancySql } = await import('../services/workTradeStanding')
     const agreement = await queryOne<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id
+      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id,
+             ${HOURS_COUNTED_COL}
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id
-      WHERE wta.tenant_id=$1 AND wta.status='active'
-      ORDER BY wta.created_at DESC LIMIT 1`, [tenant.id])
-    res.json({ success: true, data: agreement || null })
+      WHERE wta.tenant_id=$1 AND wta.status IN ('active','paused')
+        -- 10/19 (review): and a PAUSED one only while the tenancy is still
+        -- there. A lease ending with no successor pauses the trade and nothing
+        -- ever ends it, so without this a resident who moved out a month ago
+        -- gets their Work Trade tab back (liveTenancySql).
+        AND ${liveTenancySql()}
+      ORDER BY (wta.status = 'active') DESC, wta.created_at DESC LIMIT 1`, [tenant.id])
+    // 10/12 (Nic): a rate kept from an earlier setting is not the tenant's to
+    // read — the extra-hours rate is theirs only while their agreement PAYS
+    // extra hours. The panel's own fetch has always done this
+    // (routes/workTrade agreementForTenant); this route handed over the whole
+    // row, so the one number a tenant must never be shown beside an hour count
+    // was reachable here. Same helper, so the two cannot drift.
+    const { agreementForTenant } = await import('./workTrade')
+    res.json({ success: true, data: agreement ? agreementForTenant(agreement) : null })
   } catch (e) { next(e) }
 })
 

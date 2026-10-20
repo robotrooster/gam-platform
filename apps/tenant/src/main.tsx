@@ -673,6 +673,11 @@ function Layout() {
   // Conditional nav (Nic): Work Trade only appears once the tenant is actually
   // in a work-trade agreement; Amenities only when their property has something
   // reservable. Otherwise these are dead/empty tabs.
+  //
+  // 10/19 (Nic, "Show it while paused"): the endpoint answers a PAUSED
+  // agreement too, so the tab stays up through a season away instead of
+  // vanishing — which is what used to happen, taking the honest sentence about
+  // whether their hours were still counting with it.
   const { data: workTradeNav } = useQuery('work-trade-nav', () =>
     fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/work-trade', {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
@@ -752,7 +757,12 @@ function Layout() {
             {hasAmenities && <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}><CalendarClock size={16}/>Amenities</NavLink>}
             {hasWorkTrade && <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}><HeartHandshake size={16}/>Work Trade</NavLink>}
             {/* S652: a work trader whose agreement carries "Read meters" takes the property's reading walk from here. */}
-            {hasWorkTrade && Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
+            {/* 10/19: field work is not paused work. The Work Trade tab stays up
+                while a trade is paused, but nobody is reading meters for a
+                landlord while their agreement sleeps — the panel's own meter
+                card has always been active-only, and this matches it. */}
+            {hasWorkTrade && (workTradeNav as any)?.status === 'active' &&
+              Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
               <NavLink to="/meter-readings" className={({isActive})=>`ni${isActive?' active':''}`}><Gauge size={16}/>Meter Readings</NavLink>}
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}

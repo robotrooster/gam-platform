@@ -239,6 +239,30 @@ export const BOOKS_OTHER_INCOME_NO_CATEGORY_LABEL = 'No category'
 export const BOOKS_OTHER_INCOME_NO_TAX_NOTE =
   'This money was logged as a lump, so no tax was recorded inside it. Any lodging or sales tax it contains is not in the tax table below — work it out from the original receipts before you file.'
 
+/**
+ * 10/19 (Nic): the Money in page carries the same lists, under the rows that
+ * hold the money, so a bookkeeper reading what came in does not have to leave
+ * the page to find out what it was. Two sentences only that page needs:
+ *
+ * NOT_ITEMIZABLE — a lump filed as other money in cannot be broken down from
+ * inside GAM. GAM holds the amount and the words whoever logged it used; what
+ * was inside it lives wherever the money was taken. Saying so plainly is the
+ * honest answer, and better than a guessed split: at Mountain View one of these
+ * lumps is propane AND overnight stays together, and nothing on record says how
+ * much of it was which.
+ *
+ * COUNTER_NOT_METERED — a register category is the company's own word for what
+ * it sells, and a company may well call counter propane "Utilities". That is
+ * its data and GAM does not rename it; this says what the page must not let it
+ * imply, because a metered utility billed to a space and a bottle of propane
+ * sold over the counter are collected under different rules and forwarded to
+ * different agencies.
+ */
+export const BOOKS_OTHER_INCOME_NOT_ITEMIZABLE_NOTE =
+  'A lump is one entry: GAM holds the amount and the words whoever logged it, not the items inside it, so it cannot be broken down in here. The detail is wherever the money was taken.'
+export const BOOKS_SOLD_COUNTER_NOT_METERED_NOTE =
+  'These are the register’s own names for what it sells. Goods sold over the counter are not the metered utilities billed to a space — those are their own rows above, and their tax is not the same tax.'
+
 /** GET /api/books/tax/sales-breakdown. */
 export interface BooksSalesAndTax {
   period: { start: string; end: string; label: string }

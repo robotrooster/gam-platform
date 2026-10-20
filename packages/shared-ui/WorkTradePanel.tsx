@@ -31,6 +31,54 @@ export type PanelApi = {
   patch: (url: string, body?: any) => Promise<any>
 }
 
+/**
+ * 10/19 (Nic) — THE PAUSE QUESTION, IN WORDS ABOUT A CAMPER.
+ *
+ * "The landlord needs to have a way to set whether they occupy the spot or not.
+ * Because if somebody wants to work more hours in the winter but leave their
+ * camper occupying the space in the summer, that's one situation. If people take
+ * their camper home for the summer with them and it's not occupying the spot,
+ * then there would be no reason for it to continue to track hours."
+ *
+ * Worded for a mobile home and an apartment too — a trade is not always an RV
+ * spot — so it asks whether the SPACE is still being used rather than naming a
+ * camper, and the help text gives the camper as the example it came from.
+ */
+const SPACE_IN_USE = 'Still being used'
+const SPACE_EMPTY = 'The space is empty'
+/** What each answer actually does, said once. */
+const SPACE_ANSWER_MEANS = {
+  used: 'Hours keep counting, and the months already billed under the trade work exactly as they normally do.',
+  empty: 'No hours are counted while this is paused, and the months already billed under the trade are covered at the next month close.',
+}
+/**
+ * 10/19 (review) — AND THE ONE THING NEITHER ANSWER DOES.
+ *
+ * These two sentences used to promise that a paused trade's charges "are not
+ * billed" and that its month "works exactly as it normally does". Both are true
+ * of the months ALREADY BILLED under the trade — their settlement periods are
+ * open and the month close reads the live answer. Neither is true of a month
+ * billed DURING the pause: the billing run only covers a RUNNING agreement
+ * (services/workTradeCredit loadWorkTradeCreditContext), so while a trade is
+ * paused the new month opens no period, nothing is suspended, and the bill goes
+ * out at its full amount — and no hour worked that month can credit it either.
+ *
+ * Pausing by hand is what made that reachable: until the button below existed, a
+ * pause only came from lease hibernation or a lease expiring, and neither bills
+ * anything. Whether a paused month SHOULD be covered is a money decision and
+ * Nic's to make. Until he answers, the landlord doing the pausing reads what
+ * actually happens instead of a promise the billing run does not keep.
+ */
+/*
+  Phrased CONDITIONALLY — "a bill that goes out", not "a bill goes out" —
+  because a pause does not always mean a bill. Both work trades paused at
+  Mountain View today sit on HIBERNATING leases, and a hibernating lease bills
+  nothing at all (jobs/invoiceGeneration gates on is_hibernating), so promising
+  a full bill there would be its own false sentence in the other direction.
+  Same wording as the server's (services/workTradeStanding PAUSED_NEW_BILLS).
+*/
+const PAUSED_NEW_BILLS = 'A bill that goes out while it stays paused is not covered by the trade — it is owed in full, like any other bill.'
+
 const card: React.CSSProperties = { padding: 14, marginBottom: 12 }
 const label: React.CSSProperties = { fontSize: '.64rem', fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: 6 }
 const fmtH = (n: any) => `${Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })} hrs`
@@ -76,6 +124,8 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const [logging, setLogging] = useState(false)
   const [form, setForm] = useState({ workDate: new Date().toISOString().slice(0, 10), hours: '', description: '' })
   const [ending, setEnding] = useState(false)
+  // 10/19: the landlord is pausing, and has not answered the space question yet.
+  const [pausing, setPausing] = useState(false)
   const [finishing, setFinishing] = useState<{ id: string; hours: string; note: string } | null>(null)
   // S652 (Nic): "Curtis needs to be able to do and initiate the meter reading."
   // The same walk the front desk takes, from the tenant portal, when the
@@ -100,8 +150,15 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
         say(v.act === 'take' ? 'Job taken' : v.act === 'done' ? 'Marked done' : 'Confirmed') },
       onError: (e: any) => say(e?.message || 'Could not do that', 'error') })
 
+  // 10/19 (review): a REFUSED save re-reads the agreement too. This window's
+  // controls are drawn from the row it fetched, so a trade resumed elsewhere (a
+  // lease woken in another tab) leaves the pause's "The space is empty" button
+  // on screen for a trade that is running again. The server refuses the answer
+  // in that state; re-reading here takes the stale control away instead of
+  // leaving it there to be clicked again.
   const patch = useMutation((body: any) => api.patch(`/work-trade/${agreementId}`, body),
-    { onSuccess: () => { refresh(); setDuties(null) }, onError: (e: any) => say(e?.message || 'Could not save that', 'error') })
+    { onSuccess: () => { refresh(); setDuties(null) },
+      onError: (e: any) => { refresh(); say(e?.message || 'Could not save that', 'error') } })
   const review = useMutation(({ id, action, reason }: any) => api.patch(`/work-trade/logs/${id}`, { action, rejectionReason: reason }),
     { onSuccess: () => { refresh(); setDenying(null) }, onError: (e: any) => say(e?.message || 'Could not save that', 'error') })
   const logHours = useMutation(() => api.post(`/work-trade/${agreementId}/logs`, {
@@ -114,11 +171,46 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const asleep = a.status === 'paused'
   const statusText = a.status === 'active' ? 'Active' : asleep ? 'Asleep for the season' : 'Ended'
   const tracks = a.tracksHours !== false
+  // 10/19 (Nic): while this is paused, is the space still being used? undefined
+  // or null means nobody has been asked — two paths pause an agreement with no
+  // landlord in front of a screen (lease hibernation, and a lease expiring with
+  // no successor), and unanswered keeps counting hours, which is what a paused
+  // agreement has always done.
+  const spaceOccupied: boolean | null = a.pausedSpaceOccupied ?? null
+  const spaceEmpty = asleep && spaceOccupied === false
+  // The one fact the screen hangs off: are hours being counted right now? Two
+  // switches can turn it off, and the server answers the same question the same
+  // way (services/workTradeStanding hoursCountedSql) so neither side of the
+  // trade can be shown a target the month close is about to waive.
+  const counting = tracks && !spaceEmpty
   const loggedHours = logs.filter(l => l.status === 'pending').reduce((s, l) => s + Number(l.hours), 0)
   const covers: string[] = a.coveredCharges?.length ? a.coveredCharges : Object.keys(WORK_TRADE_COVERABLE_LABEL)
   const skills: string[] = a.skills ?? []
   const fieldPerms: string[] = a.fieldPermissions ?? []
-  const canLog = a.status === 'active' && tracks
+  // 10/19: hours can only be turned in against a month somebody is counting.
+  // Said as `counting` rather than `tracks` because that is the actual rule —
+  // and the server holds the same line (routes/workTrade POST /:id/logs refuses
+  // an agreement that is not active), so the button and the route agree.
+  const canLog = a.status === 'active' && counting
+  /*
+    10/19 (review) — SAY WHAT THE ANSWER WAIVES BEFORE IT IS GIVEN, ON BOTH CARDS.
+    Stopping the count covers every month still OPEN outright, not just this one:
+    loadOpenPeriods applies the live answer to each open period, so August's and
+    September's targets read 0 too and periodCredit covers them. That clears a
+    catch-up the landlord is owed, and it is effectively irreversible — the next
+    close settles those periods, and loadOpenPeriods only ever reopens `open`
+    ones. It was priced on the already-paused card and not on the pause-now one,
+    which is the card where the answer is given for the first time. Written once
+    here so the two cannot drift again.
+  */
+  const carriedWaiverNote = Number(standing?.carriedHours ?? 0) > 0 ? (
+    <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
+      They are {fmtH(standing?.carriedHours)} behind from earlier months
+      {standing?.carriedValue != null && Number(standing.carriedValue) > 0
+        ? `, worth $${Number(standing.carriedValue).toFixed(2)}` : ''}.
+      Saying the space is empty covers those months too, and that catch-up is cleared.
+    </div>
+  ) : null
   const readsMeters = side === 'tenant' && a.status === 'active' && fieldPerms.includes('read_meters') && !!a.propertyId
 
   return (
@@ -138,12 +230,56 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
           </span>
           {onClose && <button className="btn btn-ghost btn-sm" onClick={onClose} title="Close"><X size={14} /></button>}
         </div>
-        {asleep && <div style={{ marginTop: 8, fontSize: '.78rem', color: 'var(--text-2)' }}>
-          Their spot is hibernating, so nothing is owed and nothing is billed until they are back.</div>}
+        {/*
+          10/19 — THIS USED TO SAY THE SAME THING WHATEVER WAS TRUE.
+          "Their spot is hibernating, so nothing is owed and nothing is billed
+          until they are back" was shown on every paused agreement, including one
+          that counts hours — whose month still closes and still leaves the
+          unworked part owed on its own bill (jobs/workTradeSettlement
+          CLOSE_STATUSES). A tenant read "nothing is owed" and then got a bill.
+          So the banner now says which of Nic's two situations this is.
+        */}
+        {asleep && (
+          <div style={{ marginTop: 8, fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            {!tracks
+              ? (isLandlord
+                ? 'Paused. No hours are counted on this agreement either way, so the months already billed under it are covered at the next month close.'
+                : 'Your work trade is paused. No hours are counted on it either way, so the months already billed under it are covered at the next month close.')
+              : spaceEmpty
+                ? (isLandlord
+                  ? 'Paused, and the space is empty — no hours are being counted, and the months already billed under this trade are covered at the next month close.'
+                  : 'Your work trade is paused and your space is empty, so no hours are being counted. The months already billed under it are covered at the next month close.')
+                : spaceOccupied === true
+                  ? (isLandlord
+                    ? 'Paused, and the space is still being used — hours keep counting and the months already billed under it work exactly as they normally do.'
+                    : 'Your work trade is paused, but your space is still being used, so your hours keep counting and the months already billed under it work as they normally do.')
+                  : (isLandlord
+                    ? 'Paused. Hours are still counting, because nobody has said yet whether the space is still being used — answer that below.'
+                    : 'Your work trade is paused, and your hours are still counting for now. Your landlord has not said yet whether your space counts as still being used.')}
+            {/*
+              10/19 (review): and the part no answer changes — a month billed
+              while this stays paused is not covered by the trade at all. Said to
+              both sides, because the tenant is the one who gets that bill.
+
+              NOT on a trade that lease hibernation paused: their spot is asleep
+              and nothing bills on it at all (jobs/invoiceGeneration gates on
+              is_hibernating), so a sentence about an uncovered bill would be the
+              same mistake pointing the other way. Both paused trades at
+              Mountain View today are exactly this.
+            */}
+            {a.pausedByHibernation !== true && <>{' '}{PAUSED_NEW_BILLS}</>}
+          </div>
+        )}
       </div>
 
       {/* ── this month ── */}
-      {tracks ? (
+      {/*
+        10/19: gated on `counting`, not on `tracks`. A paused trade on an empty
+        space asks for no hours, and showing "0 of 80 hrs" and "Bill covered 0%"
+        to somebody who is six states away for the summer is a target they are
+        failing at a job nobody asked them to do.
+      */}
+      {counting ? (
         <div className="card" style={card}>
           <div style={label}>This month</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
@@ -165,12 +301,15 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
         </div>
       ) : (
         <div className="card" style={{ ...card, fontSize: '.82rem', color: 'var(--text-2)' }}>
-          No hours are tracked on this agreement. The charges it covers are simply not billed.
+          {tracks
+            ? 'No hours are being counted while this is paused and the space is empty. There is no target to meet, and nothing falls behind.'
+            : 'No hours are tracked on this agreement. The charges it covers are simply not billed.'}
         </div>
       )}
 
       {/* ── 10/12: extra hours — beyond what the trade needs ── */}
-      {tracks && (isLandlord ? (
+      {/* 10/19: nothing can be "beyond what the trade needs" while it needs nothing. */}
+      {counting && (isLandlord ? (
         <div className="card" style={card}>
           <ExtraHoursSetting key={`${a.extraHoursMode}-${a.extraHoursRate}-${a.extraHoursPayMethod}`}
             agreement={a} api={api} onSaved={refresh} notify={say} />
@@ -298,7 +437,18 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
       {/* ── jobs ── */}
       <div className="card" style={card}>
         <div style={label}><Wrench size={11} style={{ verticalAlign: '-1px' }} /> Jobs</div>
-        {side === 'tenant' ? (
+        {/*
+          10/19 (Nic, "Show it while paused"): their tab stays up while the
+          trade is paused, so this board has to say why it is empty. The jobs
+          endpoint only serves a running agreement (services/workTradeJobs), so
+          without this a tenant away for the season read "Nothing open right
+          now" and an invitation to take a job that would be refused.
+        */}
+        {side === 'tenant' ? (asleep ? (
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            Jobs are paused along with your agreement — there is nothing to take or turn in while it is paused.
+          </div>
+        ) : (
           <>
             {[['Yours', myJobs?.mine ?? [], 'mine'], ['Open — take one', myJobs?.available ?? [], 'open'],
               ...(a.trusted ? [['Finished work to confirm', myJobs?.toCheck ?? [], 'check']] : [])].map(([title, list, kind]: any) => (
@@ -336,7 +486,7 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
               </div>
             ))}
           </>
-        ) : (
+        )) : (
           <>
             {(data?.jobs ?? []).length === 0 && <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>No jobs taken or finished lately.</div>}
             {(data?.jobs ?? []).map((j: any) => (
@@ -411,6 +561,125 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* ── 10/19: while this is paused, is the space still being used? ── */}
+      {/*
+        Nic: "which needs to be an individual landlord decision. We're going for
+        flexibility and transparency and honesty on both sides."
+        Changeable while it stays paused, because a camper can leave later — the
+        close and the standing both read the live answer, so a change takes
+        effect from the next month close on.
+      */}
+      {isLandlord && asleep && tracks && (
+        <div className="card" style={card}>
+          <div style={label}>While this is paused</div>
+          <div style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 4 }}>
+            Is the space still being used?
+          </div>
+          <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.5 }}>
+            A camper left parked on the spot over the summer is still using it. One taken home for the season is not.
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <button className={`btn btn-sm ${spaceOccupied === true ? 'btn-primary' : 'btn-ghost'}`}
+              disabled={patch.isLoading}
+              onClick={() => spaceOccupied !== true && patch.mutate({ spaceOccupiedWhilePaused: true })}>
+              {spaceOccupied === true && <Check size={11} />} {SPACE_IN_USE}
+            </button>
+            <button className={`btn btn-sm ${spaceOccupied === false ? 'btn-primary' : 'btn-ghost'}`}
+              disabled={patch.isLoading}
+              onClick={() => spaceOccupied !== false && patch.mutate({ spaceOccupiedWhilePaused: false })}>
+              {spaceOccupied === false && <Check size={11} />} {SPACE_EMPTY}
+            </button>
+          </div>
+          <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginTop: 8, lineHeight: 1.5 }}>
+            {spaceOccupied === null
+              ? `Nobody has answered yet, so hours are still counting — that is what a paused trade has always done. ${SPACE_ANSWER_MEANS.used}`
+              : spaceOccupied ? SPACE_ANSWER_MEANS.used : SPACE_ANSWER_MEANS.empty}
+            {a.pausedByHibernation !== true && <>{' '}{PAUSED_NEW_BILLS}</>}
+          </div>
+          {/*
+            10/19 — SAY WHAT THE ANSWER WAIVES BEFORE IT IS GIVEN.
+            Stopping the count covers every month still open outright, which is
+            the same thing turning hours off entirely does (the 10/18 rule in
+            jobs/workTradeSettlement loadOpenPeriods). That is correct — a work
+            trade's coverage is never turned into a debt — but it CLEARS hours
+            carried over from months when the space was in use, and that is the
+            landlord's money. So it is priced here, in front of them, while they
+            can still pick the other answer.
+          */}
+          {spaceOccupied !== false && carriedWaiverNote}
+        </div>
+      )}
+
+      {/* ── 10/19: pause it (landlord), asking about the space in the same step ── */}
+      {isLandlord && a.status === 'active' && (
+        <div style={{ marginTop: 4, marginBottom: 12 }}>
+          {!pausing ? (
+            <button className="btn btn-ghost btn-sm" onClick={() => setPausing(true)}>Pause this agreement</button>
+          ) : (
+            <div className="card" style={card}>
+              <div style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 4 }}>
+                Pause it? Jobs they have taken go back on the board, and nothing is ended — any hours still owed stay owed.
+              </div>
+              <div style={{ fontSize: '.84rem', color: 'var(--text-1)', marginBottom: 4 }}>
+                While it is paused, is the space still being used?
+              </div>
+              <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.5 }}>
+                A camper left parked on the spot over the summer is still using it. One taken home for the season is not.
+                {tracks ? '' : ' No hours are counted on this agreement either way.'}
+              </div>
+              {/*
+                10/19 (review): priced HERE, before the answer is given — this is
+                the card where "The space is empty" gets picked for the first
+                time, and picking it clears the catch-up from every month still
+                open. See carriedWaiverNote.
+              */}
+              {tracks && carriedWaiverNote}
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+                <button className="btn btn-primary btn-sm" disabled={patch.isLoading}
+                  onClick={() => { setPausing(false); patch.mutate({ status: 'paused', spaceOccupiedWhilePaused: true }) }}>
+                  {SPACE_IN_USE}
+                </button>
+                <button className="btn btn-primary btn-sm" disabled={patch.isLoading}
+                  onClick={() => { setPausing(false); patch.mutate({ status: 'paused', spaceOccupiedWhilePaused: false }) }}>
+                  {SPACE_EMPTY}
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => setPausing(false)}>Cancel</button>
+              </div>
+              <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginTop: 8, lineHeight: 1.5 }}>
+                {tracks && <>{SPACE_IN_USE}: {SPACE_ANSWER_MEANS.used} {SPACE_EMPTY}: {SPACE_ANSWER_MEANS.empty}{' '}</>}
+                {PAUSED_NEW_BILLS}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── 10/19: start it again (landlord) ── */}
+      {/*
+        NOT offered on a trade that lease hibernation paused. Waking the trade
+        while its lease sleeps would leave it counting hours against a month that
+        bills nothing, and `paused_by_hibernation` would still be set, so the
+        lease waking up later would expect to be the thing that resumes it. The
+        lease is the switch there, and this says so instead of pretending.
+      */}
+      {isLandlord && asleep && (
+        <div style={{ marginTop: 4, marginBottom: 12 }}>
+          {a.pausedByHibernation === true ? (
+            <div style={{ fontSize: '.76rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+              This paused when their spot went to sleep for the season. Waking the lease back up starts the work trade again too.
+            </div>
+          ) : (
+            <>
+              <button className="btn btn-primary btn-sm" disabled={patch.isLoading}
+                onClick={() => patch.mutate({ status: 'active' })}>Start this agreement again</button>
+              <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 6 }}>
+                Hours count again from here, and the space answer is forgotten — the next pause asks it fresh.
+              </div>
+            </>
+          )}
         </div>
       )}
 

@@ -62,6 +62,7 @@ import type { PoolClient } from 'pg'
 import { WORK_TRADE_COVERABLE, type WorkTradeCoverageRemovalChoice } from '@gam/shared'
 import { round2 } from './workTradeCredit'
 import { hourRateFor, periodCredit } from './workTradeSettlement'
+import { HOURS_COUNTED_COL } from './workTradeStanding'
 import { syncBillMarksAfterSettle } from './creditLedgerEmitters'
 
 type Q = Pick<PoolClient, 'query'>
@@ -159,13 +160,40 @@ export interface TradeLine {
 type Line = TradeLine
 
 /** What the agreement asks of a month, read once per change. */
-interface AgreementHours { monthly_hours_target: number; tracks_hours: boolean }
+interface AgreementHours {
+  monthly_hours_target: number
+  tracks_hours: boolean
+  /**
+   * 10/19 (Nic) — IS THIS TRADE COUNTING HOURS RIGHT NOW? tracks_hours is only
+   * half of that answer, and reading only that half is what this file's own
+   * header warns about one reader over.
+   *
+   * Two landlord switches stop the count, and the close and the tenant's
+   * standing both read them as ONE expression (services/workTradeStanding
+   * hoursCountedSql): the trade is not clocked at all, OR it is dormant and the
+   * landlord said the space is empty — "if people take their camper home for
+   * the summer with them and it's not occupying the spot, then there would be
+   * no reason for it to continue to track hours."
+   *
+   * Asking only tracks_hours made the two switches behave OPPOSITELY on
+   * identical landlord input: a charge ticked onto a paused trade whose space
+   * is empty was priced against the month's frozen 80 hours, credited $0 and
+   * left owed — on a month the close had already covered outright, and while
+   * the window told the tenant those charges "are not billed while it is
+   * paused." Read through the shared expression there is one answer and one
+   * behavior.
+   */
+  hours_counted: boolean
+}
 
 async function agreementHours(run: Q, agreementId: string): Promise<AgreementHours> {
   const r = (await run.query<AgreementHours>(
-    `SELECT monthly_hours_target::float AS monthly_hours_target, tracks_hours
-       FROM work_trade_agreements WHERE id = $1`, [agreementId])).rows[0]
-  return r ?? { monthly_hours_target: 0, tracks_hours: false }
+    `SELECT wta.monthly_hours_target::float AS monthly_hours_target, wta.tracks_hours,
+            ${HOURS_COUNTED_COL}
+       FROM work_trade_agreements wta WHERE wta.id = $1`, [agreementId])).rows[0]
+  // No such agreement: nothing can be parked under it anyway (periodFor finds
+  // no month), and "no hours asked" is the answer that can never invent a debt.
+  return r ?? { monthly_hours_target: 0, tracks_hours: false, hours_counted: false }
 }
 
 /**
@@ -255,7 +283,13 @@ export async function bringLinesUnderTrade(
     // periodCredit read it as "covered outright": the month was waived with no
     // hours worked, and in pay mode every hour of it was paid as extra. An
     // agreement that does not count hours asks none, as when it was billed.
-    const target = period.target_hours === 0 && h.tracks_hours && h.monthly_hours_target > 0
+    // 10/19: "now that something is" means now that something is covered AND
+    // hours are being counted. `hours_counted`, not tracks_hours: handing an
+    // 80-hour target back to a month on a paused trade whose space is empty
+    // would be a target nobody was asked to work, and answering "the space is
+    // in use" again would then turn it into a real shortfall on a month that
+    // was priced as covered.
+    const target = period.target_hours === 0 && h.hours_counted && h.monthly_hours_target > 0
       ? Number(h.monthly_hours_target) : period.target_hours
     const basis = await parkedBasis(run, invoiceId)
     await run.query(
@@ -279,7 +313,16 @@ export async function bringLinesUnderTrade(
   // month at a rate nobody owes work at, credited the new charge $0, and left
   // it on the tenant as money owed on a trade that covers it: the exact
   // frozen-snapshot bug 10/18 took out of the close, one reader over.
-  const target = h.tracks_hours ? period.target_hours : 0
+  //
+  // BOTH switches, through the one expression (hours_counted) — not tracks_hours
+  // alone. A paused trade on an empty space is "no hours are counted" just as
+  // plainly as a trade that never counted them, and on 10/19 the two gave
+  // opposite answers about the same $75 of water: the paused one left it owed
+  // on a September the close had settled in full, and the period was then
+  // rewritten to a wider basis with the old credit still on it, so the month
+  // carried a hole nothing would ever heal (loadOpenPeriods only reopens
+  // `open` months).
+  const target = h.hours_counted ? period.target_hours : 0
   const rate = target > 0 ? hourRateFor(basis, target) : 0
   const credit = periodCredit(basis, target, period.hours_applied, rate)
   let delta = round2(Math.min(w, Math.max(0, credit - period.credit_applied)))

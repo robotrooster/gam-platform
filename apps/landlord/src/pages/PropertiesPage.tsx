@@ -1176,11 +1176,21 @@ function ConnectReadinessBanner() {
 // path that any landlord can just reach so they don't need to ask
 // Claude for help."
 //
-// The code encodes {slug}.gam.biz/apply for THIS property. Because the
-// slug is the property's public identity, an application filed through
-// it is stamped with the property — and the applicant's later
-// background check inherits it, so a walk-up who never had a unit or an
-// invite still lands under the right park.
+// 10/19: this used to say the code encodes {slug}.gam.biz/apply. It does
+// not, and has not since S636 — that path does not exist on the booking
+// sites (the storefront's own page list has no 'apply', so it would have
+// quietly served the property's booking home instead). Reading this
+// comment, I told Nic the wrong thing about his own QR code.
+//
+// What it actually encodes is the screening page itself, with the
+// property and the landlord in the query string:
+//   {tenant app}/background-check?landlordId=…&propertyId=…
+// which is Nic's S636 instruction verbatim — "nothing about that link
+// should take them anywhere on the Gold Asset Management page. It should
+// take them straight into the Checkr flow." The binding rides in the URL,
+// so a walk-up who never had a unit or an invite still lands under the
+// right park. The one source of truth is the API that builds it
+// (routes/properties GET /:id/apply-link).
 //
 // The API renders the PNG rather than the browser, so print, text, and
 // email all get the identical image and there is no QR library in the

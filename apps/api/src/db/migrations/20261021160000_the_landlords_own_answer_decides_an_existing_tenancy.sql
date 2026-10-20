@@ -1,0 +1,101 @@
+-- 10/19 (Nic): "Fix invite flag overridden in first 28 days."
+--
+-- WHAT WAS WRONG. Two different rules decided whether an invite means "this
+-- resident already lives here". That answer is money: an existing resident's
+-- first bill is one whole month's rent and nothing else — no prorated stretch,
+-- no security deposit, no pet or utility deposit, no move-in fee — because
+-- nobody moved in the day they signed, only the paperwork happened, and the
+-- month they signed in was settled with the landlord off-platform.
+--
+-- The right rule lives in the app (services/newLeaseInvite +
+-- services/onboardingWindow): the landlord has to ATTEST that the person is a
+-- sitting resident, AND the property's onboarding window — or the landlord's
+-- own 28 days — has to be open. Both halves matter. The attestation is the
+-- landlord telling us which kind of tenancy this is; the window is what stops
+-- the answer being available forever.
+--
+-- The rule being removed here is a leftover from S631, before the app rule
+-- existed. It was a database trigger that looked only at the landlord's age:
+--
+--     IF NEW.is_existing_tenancy IS NOT TRUE THEN
+--       SELECT (now() < l.created_at + 28 days) INTO NEW.is_existing_tenancy ...
+--
+-- It only ever forced the flag ON, which was meant to make it harmless. It was
+-- not. The column is NOT NULL DEFAULT false, so the trigger cannot tell "the
+-- landlord said this is a genuine new move-in" from "nobody said anything" —
+-- both arrive as false. For the first 28 days of a landlord's account it
+-- therefore OVERWROTE an explicit "new move-in" with "they already live here",
+-- threw away the answer the landlord gave on the screen, and zeroed the
+-- move-in money on that lease. Nothing in the product could put it back, and
+-- the proration box on the signing page was locked earlier today, so a clerk
+-- can no longer type over it either.
+--
+-- Nobody has been bitten yet: every landlord account on the platform is well
+-- past 28 days (the oldest is two months), so both rules currently read false
+-- and Kay Howard and Clint Cook were correctly billed $323. The next landlord
+-- who signs up is the one it would hit, on their very first week — which is
+-- exactly when a wrong answer is hardest to notice and most expensive.
+--
+-- WHAT THIS DOES. Removes the trigger and its function, leaving the app rule as
+-- the single source. The landlord's answer is now authoritative.
+--
+-- BEFORE DROPPING, THE DATABASE WAS ASKED, not just the TypeScript: pg_proc for
+-- the function (one, public.intent_default_existing_tenancy, nothing else by
+-- that name), pg_trigger for triggers (this one only — the table's other
+-- trigger is the change journal, audit_pending_tenant_intents, untouched),
+-- pg_depend for anything depending on the function (the one trigger),
+-- pg_get_viewdef over pg_class for views and matviews (none mention the
+-- function or the column), pg_constraint, pg_index expressions, pg_policies and
+-- column defaults / generated columns (none). The only thing the function
+-- backed is the trigger being dropped with it.
+--
+-- EVERY WRITER WAS CHECKED. Eight code paths insert pending_tenant_intents,
+-- and they fall into four groups. Counted one by one, because the next person
+-- to re-audit this drop will trust these numbers:
+--
+--   FOUR state the flag themselves and never needed the trigger:
+--     services/newLeaseInvite (the app rule), routes/landlords 'Add one
+--     tenant' (which WAS relying on the trigger and gets the app rule written
+--     into it explicitly in this same change, rather than being left as a path
+--     that silently stops working), and the two Mattoon load scripts, which
+--     set it TRUE deliberately.
+--
+--   THREE — not four — write rows the flag cannot reach, because they carry no
+--     unit and every reader of this flag is scoped to a unit (routes/esign):
+--     the screening waiver row (services/onboardingWindow) and the
+--     property-level screening invite (routes/tenants) are both unit-less, and
+--     seedDemo's row has neither unit nor property.
+--
+--   ONE is reached by the flag and is FIXED by this drop, not merely unaffected:
+--     the marketplace packet draft (services/householdPacketDraft) inserts
+--     WITH unit_id and property_id and states no flag, so the trigger did
+--     reach it. That path is a genuinely new applicant off a listing, and the
+--     trigger would have flagged them as a sitting resident inside the
+--     landlord's first 28 days — zeroing the deposit prefill on the first bill
+--     of somebody who really is moving in. Dropping it fixes that path.
+--     (An earlier draft of this header filed this one under "the flag cannot
+--     reach" and counted four there. It was three, and this is the fourth
+--     group. Anybody re-auditing a marketplace applicant's first bill has to
+--     know this flag governs its deposit prefill.)
+--
+-- STICKY-ONCE-TRUE IS DELIBERATE AND UNTOUCHED. newLeaseInvite's ON CONFLICT
+-- keeps `existing OR excluded`: once a landlord has attested a sitting
+-- resident, re-inviting them to the same unit does not quietly turn them into a
+-- new move-in and bill them move-in money.
+--
+-- EXPAND-ONLY. Nothing is added, nothing is backfilled, no column changes
+-- shape, and no existing row is touched — the trigger fired on INSERT only, so
+-- every flag already recorded stays exactly as it is. Idempotent: both drops
+-- are IF EXISTS, so applying this twice is a no-op the second time.
+--
+-- ORDERING NOTE for whoever applies it: this goes out with the code change
+-- beside it. Applied on its own, ahead of the code, a landlord inside their
+-- first 28 days using "Add one tenant" would stop getting the flag until the
+-- code lands. Nobody is inside that window today, so the gap is theoretical,
+-- but ship them together anyway.
+
+DROP TRIGGER IF EXISTS trg_intent_default_existing_tenancy ON pending_tenant_intents;
+DROP FUNCTION IF EXISTS intent_default_existing_tenancy();
+
+COMMENT ON COLUMN pending_tenant_intents.is_existing_tenancy IS
+  'S631: the landlord is papering an existing resident rather than inviting a new move-in. Copied onto the lease at signing. 10/19: set by the app only — the landlord attests it and the onboarding window must be open (services/onboardingWindow.isExistingTenancyInvite). The old 28-day trigger that forced it TRUE is gone; it overrode the landlord''s own answer during a new account''s first 28 days.';

@@ -554,6 +554,18 @@ export const INCOME_REPORT_VIEW_LABEL: Record<IncomeReportView, string> = {
 export const LEDGER_INCOME_NOT_ITEMIZED_LABEL = 'Not itemized'
 
 /**
+ * 10/19 (Nic): "We need to make the books actually display the right way. So
+ * that she can see it if she needs to go back to it later." The Money in page
+ * lists the itemized lines as rows of their own, so the part of a group no line
+ * itemizes cannot be printed under its group the way the monthly report prints
+ * it — it needs a row that says what it is: "Lot/space rent — not itemized".
+ * One definition, so the two reports say it the same way.
+ */
+export function ledgerIncomeNotItemizedLabel(groupLabel: string): string {
+  return `${groupLabel} — ${LEDGER_INCOME_NOT_ITEMIZED_LABEL.toLowerCase()}`
+}
+
+/**
  * The effective_from of a role's first map row — "from the beginning". Every
  * later repoint is dated the day it is made (never inside a closed month).
  */
@@ -762,7 +774,13 @@ export const LEDGER_CAPTURE_COLUMNS = {
     'gam_supersedence_amount', 'payment_channel', 'issued_credit_amount', 'deposit_collected_by',
     // 10/12 (Nic, ledger P4): the charge posts at amount + work_trade_credit and
     // the shortfall row is space rent (design A1, A9, C5).
-    'work_trade_credit', 'work_trade_settlement_id'],
+    'work_trade_credit', 'work_trade_settlement_id',
+    // 10/19 (Nic): the carried space-rent claim decides the charge posting two
+    // ways (design A8b) — a carried_balance row that names one moves a
+    // receivable and earns nothing (without one it is a balance from before GAM,
+    // A8), and a VOIDED rent row that names one keeps its charge, because the
+    // park earned that month's rent whoever ends up owing it.
+    'space_carryforward_id'],
   tenant_remittances: ['landlord_id', 'tenant_id', 'lease_id', 'amount', 'applied_amount', 'unapplied_amount',
     'gross_amount', 'processing_fee_amount', 'status', 'payment_method', 'settled_at', 'undone_at'],
   remittance_applications: ['remittance_id', 'payment_id', 'amount_applied'],
@@ -999,6 +1017,9 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   connect_disputes: "Stripe's dispute record; the money posts through payment_reversals and held_payout_items (design E1, E2, F4)",
   tenant_declared_deposits: "a tenant's report of a bank deposit; the money posts when a bank line or receipt is matched",
   work_trade_settlements: "a month's work-trade close; its money is on the payment rows it settles (design A9, C5)",
+  // 10/19 (Nic): unpaid space rent carried by a space on a tenant-owned home.
+  space_rent_carryforwards: 'whose unpaid space rent it is and the day it was paid off; the money is the one carried_balance payments row it holds (space_carryforward_id)',
+  space_carryforward_installments: 'what a payment arrangement asked for each cycle; it bills nothing of its own — the whole balance is already the carried_balance payments row',
   maintenance_requests: "a repair's cost posts only through its expense, never by itself (design I3)",
   purchase_requests: 'a request to buy; what is bought posts as an expense',
   pos_purchase_orders: 'an order to a supplier; a received order becomes an expense (design F8)',

@@ -517,22 +517,48 @@ async function otherMoneyIn(s: LedgerScope, start: string, end: string): Promise
   }
 }
 
+/**
+ * 10/19 (Nic): "i need the books breakdown for september mountain view. it
+ * still looks the same for betty she doesnt see any new information."
+ *
+ * The two lists that say WHAT the money was, without the tax tables: what was
+ * sold item by item (with the bridge to the Register sales account), and the
+ * money filed as other income instead of rung up. The Money in page
+ * (services/incomePools) reads this so the item detail sits under the rows that
+ * hold the money, where the person reading what came in already is — the SAME
+ * read as the Sales & tax page, off the same postings, so the two pages cannot
+ * tell different stories.
+ */
+export async function booksSoldDetail(s: LedgerScope, start: string, end: string): Promise<SoldDetail> {
+  return soldDetailOf(s, start, end, await postedSourceIds(s, 'pos_sale', start, end))
+}
+
+type SoldDetail = Pick<BooksSalesAndTax, 'sales' | 'otherIncome'>
+
+/** The two lists, for sales already looked up (so one caller never looks them up twice). */
+async function soldDetailOf(s: LedgerScope, start: string, end: string, saleIds: string[]): Promise<SoldDetail> {
+  const [categories, tie, otherIncome] = await Promise.all([
+    soldItems(saleIds),
+    salesTie(s, start, end, saleIds),
+    otherMoneyIn(s, start, end),
+  ])
+  return { sales: { categories, tie, salesCount: saleIds.length }, otherIncome }
+}
+
 /** What was sold and what tax was collected over `start`…`end`, for the filing. */
 export async function booksSalesAndTax(s: LedgerScope, start: string, end: string, label: string): Promise<BooksSalesAndTax> {
   const [saleIds, refundIds] = await Promise.all([
     postedSourceIds(s, 'pos_sale', start, end),
     postedSourceIds(s, 'pos_refund', start, end),
   ])
-  const [categories, tie, otherIncome, taxes] = await Promise.all([
-    soldItems(saleIds),
-    salesTie(s, start, end, saleIds),
-    otherMoneyIn(s, start, end),
+  const [sold, taxes] = await Promise.all([
+    soldDetailOf(s, start, end, saleIds),
     taxesCollected(s, start, end, saleIds, refundIds),
   ])
   return {
     period: { start: ymd(start), end: ymd(end), label },
-    sales: { categories, tie, salesCount: saleIds.length },
-    otherIncome,
+    sales: sold.sales,
+    otherIncome: sold.otherIncome,
     taxes,
   }
 }

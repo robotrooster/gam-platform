@@ -38,6 +38,9 @@ const server = vi.hoisted(() => ({
   postAnswer: null as null | Record<string, unknown>,
   // What POST /leases/:id/discard answers, as the server sends it (null: the ordinary 'terminated').
   discardAnswer: null as null | Record<string, unknown>,
+  // 10/19: GET /space-carryforward?all=1 — what every space carries, settled
+  // and taken-off ones included. Server-shaped.
+  spaceCarried: [] as any[],
 }))
 const httpError = (status: number, error: string, code?: string) =>
   Object.assign(new Error(error), { response: { status, data: { success: false, error, ...(code ? { code } : {}) } } })
@@ -48,6 +51,9 @@ vi.mock('../lib/api', async () => {
   return {
     apiGet: async (url: string) => {
       if (url === '/leases') { server.leaseGets++; return camel(server.leases) }
+      // 10/19: the page also reads which spaces carry an unpaid space-rent
+      // balance (for the row badge and the Change-menu item).
+      if (url.startsWith('/space-carryforward')) return camel(server.spaceCarried)
       if (!url.endsWith('/never-moved-in')) throw new Error(`unexpected GET ${url}`)
       const a = server.answers[Math.min(server.gets, server.answers.length - 1)]
       server.gets++
@@ -105,6 +111,7 @@ let closed = 0
 beforeEach(() => {
   server.answers = [applies()]; server.gets = 0; server.posts = []; server.postFail = null; server.hold = null; server.postAnswer = null
   server.discardAnswer = null
+  server.spaceCarried = []
   server.leases = []; server.leaseGets = 0; perms.keys = null
   toasts.length = 0; closed = 0
   host = document.createElement('div')
@@ -626,5 +633,72 @@ describe('the Leases list: which way out a waiting lease offers', () => {
     await openList()
     expect(rowButtons('RV 2')).not.toContain('Void on the GoldSign page')
     expect(rowButtons('RV 2')).not.toContain('Discard')
+  })
+})
+
+// ── 10/19: the badge for a space that carries unpaid space rent ──────────────
+
+describe('a space that carries unpaid space rent', () => {
+  /** A claim as GET /space-carryforward?all=1 sends it. */
+  const claim = (o: Record<string, unknown>) => ({
+    id: 'cf?', unit_id: 'u-mh09', space_name: 'MH 09', property_name: 'Oak Park',
+    amount: '880.00', settled_amount: '0.00', still_owed: 880, late_fees_waived: '95.00',
+    status: 'open', opened_on: '2026-10-19', oldest_due_date: '2026-09-01',
+    settled_on: null, taken_off_on: null, owed_by_name: 'Rashawn Bump',
+    assumed_by_name: null, assumed_lease_id: null, arrangement: null, installments: [],
+    ...o,
+  })
+  beforeEach(() => {
+    server.leases = [leaseRow({ id: 'mh09', unit_number: 'MH 09', unit_id: 'u-mh09', status: 'active' })]
+  })
+  // openList above waits for an 'RV' row; this park's space is a mobile home.
+  async function openMhList() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await cacheOffscreenPages(qc)
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter>
+            <LeasesPage />
+          </MemoryRouter>
+        </QueryClientProvider>)
+    })
+    await until(() => text().includes('MH 09'), 'the list')
+  }
+
+  it('shows what the space still carries, and names who left it', async () => {
+    server.spaceCarried = [claim({ id: 'cf-1', still_owed: 880 })]
+    await openMhList()
+    expect(text()).toContain('Space carries $880.00')
+    expect(rowOf('MH 09').querySelector('.badge-amber')?.getAttribute('title')).toContain('Rashawn Bump')
+  })
+
+  /**
+   * THE ONE THAT WAS WRONG. A space can carry more than one claim over its
+   * life: one settled or taken off, and a live one from a later close-out. The
+   * page built its lookup with `new Map(list.map(c => [c.unitId, c]))`, and a
+   * Map keeps the LAST entry for a repeated key — so the closed claim
+   * overwrote the open one and the row said nothing at all. Live shape: MH 09
+   * carries $880, the next resident clears it, he later leaves owing $500 of
+   * his own space rent.
+   */
+  it('shows the OPEN claim when the space has been through this twice — whichever order they arrive in', async () => {
+    const open500 = claim({ id: 'cf-b', still_owed: 500, amount: '500.00', opened_on: '2026-11-20' })
+    const settled880 = claim({ id: 'cf-a', still_owed: 0, settled_amount: '880.00',
+      status: 'settled', settled_on: '2026-10-25', opened_on: '2026-10-19' })
+    for (const list of [[open500, settled880], [settled880, open500]]) {
+      server.spaceCarried = list
+      await openMhList()
+      expect(text()).toContain('Space carries $500.00')
+      expect(text()).not.toContain('Space carries $0.00')
+      await act(() => { root.unmount() })
+      root = createRoot(host)
+    }
+  })
+
+  it('says nothing on a space whose balance is settled', async () => {
+    server.spaceCarried = [claim({ still_owed: 0, status: 'settled', settled_on: '2026-10-25', settled_amount: '880.00' })]
+    await openMhList()
+    expect(text()).not.toContain('Space carries')
   })
 })

@@ -36,14 +36,19 @@
  *       Cr the same principal and interest lines, counted as received
  *   A8  an opening carried balance                  Cr 3900 opening balance
  *       equity (an old balance, never this company's income in GAM's books)
+ *   A8b unpaid space rent carried to the space      Dr receivables (whoever is
+ *       asked for it now) / Cr receivables (the resident who left it): the
+ *       receivable changes hands, and nothing is earned — the rent rows it was
+ *       carried from keep their own charges, in their own months (10/19, Nic)
  *   A9  a work-trade shortfall billed with no bill  Cr 4010 space rent (the
  *       work was not done, so it is rent owed — under either work-trade choice)
  *
- * Never a charge here: a voided row (its charge reverses — a correction), a
- * row whose amount is $0, GAM's rows and the FlexPay pull, FlexDeposit
- * installment rows, the move-out refund row, a row a dispute reopened (its
- * charge is the reversal's, tenantReversals E1) and the move-out balance row
- * (the move-out's, tenantDeposits D3).
+ * Never a charge here: a voided row (its charge reverses — a correction;
+ * EXCEPT a rent row carried to the space, A8b, where the void moves a debt and
+ * does not undo a bill), a row whose amount is $0, GAM's rows and the FlexPay
+ * pull, FlexDeposit installment rows, the move-out refund row, a row a dispute
+ * reopened (its charge is the reversal's, tenantReversals E1) and the move-out
+ * balance row (the move-out's, tenantDeposits D3).
  */
 import type { PoolClient } from 'pg'
 import type { DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
@@ -57,12 +62,34 @@ import {
 /**
  * Bumped when a family-A rule changes (metadata only; the fingerprint decides).
  * 2 — 10/14 (Nic I1-I7): rent books to its space's line (incomeLines).
+ * 3 — 10/19 (Nic): unpaid space rent carried to the space when the previous
+ *     owner of a tenant-owned home left MOVES A RECEIVABLE; it earns nothing
+ *     twice. The month's rent keeps its own charge in its own month, and the
+ *     one carried balance books as the receivable changing hands (A8b).
  */
-export const TENANT_CHARGES_RULE_VERSION = 2
+export const TENANT_CHARGES_RULE_VERSION = 3
+
+/**
+ * 10/19 (Nic) — A RENT ROW THE CLOSE-OUT CARRIED TO THE SPACE.
+ *
+ * services/spaceRentCarryforward voids the departing resident's unpaid rent
+ * rows and stamps the claim on them, then bills the whole thing as ONE
+ * carried_balance charge. The rows are voided so nobody is billed twice — but
+ * the park DID earn that rent, in the month it was billed for, and "charges
+ * recorded when billed" (Nic 10/12) does not stop being true because the debt
+ * changed hands. So this void is not a correction and it does not take the
+ * income back: Oak Park's September rent stays September's $440 and October's
+ * stays October's $440. (Booking the $880 as income on the carried charge
+ * instead would have erased October and backdated it into a month the park has
+ * already reported — six months of run-up would all land in month one.)
+ */
+export function carriedToTheSpace(f: PaymentFacts): boolean {
+  return f.spaceCarryforwardId !== null && f.type === 'rent'
+}
 
 /** Why a row has no charge posting of its own (null: it has one). */
 export function chargeSkipReason(f: PaymentFacts): string | null {
-  if (f.voided) return 'voided'
+  if (f.voided && !carriedToTheSpace(f)) return 'voided'
   if (f.exclusion) return f.exclusion
   if (f.reversalId) return 'reopened_by_reversal'
   if (f.isMoveOutGap) return 'move_out_balance'
@@ -84,6 +111,28 @@ async function installmentOf(client: PoolClient, f: PaymentFacts): Promise<{ amo
     [f.homeSaleInstallmentId, f.id, f.tenantId, f.invoiceId, f.dueDate])
   const row = r.rows[0]
   return row ? { amount: centsOf(row.a), principal: centsOf(row.p), interest: centsOf(row.i) } : null
+}
+
+/**
+ * Whose receivable a carried space-rent balance came OFF (design A8b): the
+ * claim's origin — the resident who left the space rent behind and the lease he
+ * left it on. Both are stamped once, when the landlord closes him out, and
+ * never change, so a rebuild reads the same answer in a year as it does today
+ * (the claim's assumed_* columns, which do move, are nobody's business here —
+ * where the balance is owed NOW is the charge row's own lease and tenant).
+ */
+async function carryforwardOriginOf(
+  client: PoolClient, f: PaymentFacts,
+): Promise<{ unitId: string; leaseId: string; tenantId: string }> {
+  const r = await client.query<{ unit_id: string; lease_id: string; tenant_id: string }>(
+    `SELECT unit_id, origin_lease_id AS lease_id, origin_tenant_id AS tenant_id
+       FROM space_rent_carryforwards WHERE id = $1`, [f.spaceCarryforwardId])
+  const row = r.rows[0]
+  if (!row) {
+    throw new LedgerSourceError('missing_fact',
+      `Carried balance ${f.id} names a space-rent claim that is not there, so whose receivable it moved is unknown.`)
+  }
+  return { unitId: row.unit_id, leaseId: row.lease_id, tenantId: row.tenant_id }
 }
 
 /** Principal and interest of `gross` cents billed on an installment (in proportion when the row is not the whole installment). */
@@ -109,11 +158,32 @@ export async function projectCharge(client: PoolClient, f: PaymentFacts, co: Com
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'space_rent' })
     for (const p of incomePartsFor({ ...f, category: 'space_rent' }, gross)) L.cr(p.role, p.cents, { ...d, reportCategory: 'space_rent', sub: p.sub })
     memo = 'Work-trade hours not completed, billed as rent'
-  } else if (f.type === 'carried_balance') {
+  } else if (f.type === 'carried_balance' && f.spaceCarryforwardId === null) {
     // A8 — a balance from before GAM: owed to the company, never income here.
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'balances_collected' })
     L.cr('opening_balance_equity', gross, { ...d, reportCategory: 'opening', memo: 'Balance carried over from before GAM' })
     memo = 'Balance carried over'
+  } else if (f.type === 'carried_balance') {
+    // A8b — 10/19 (Nic): unpaid SPACE RENT carried to the space. The money was
+    // already earned and already reported, in its own months, by the rent rows
+    // this was carried from (carriedToTheSpace above keeps their charges). What
+    // this row does is move the RECEIVABLE: off the resident who left it, onto
+    // whoever the desk asks for it now. So it books receivable to receivable
+    // and no income at all — "The rent is owed by the trailer ... It doesn't
+    // matter how many people cycle in and out" is a statement about who owes
+    // it, not about the park earning it a second time.
+    //
+    // The two tags are what each side IS: taken back off the space rent it was
+    // billed as, put on as the carried balance it is now (the same thing
+    // services/incomeBasis has always called it), so the Owed column shows
+    // nothing left on the departing resident and $880 on the space's lease.
+    const o = await carryforwardOriginOf(client, f)
+    L.dr('ar_tenants', gross, { ...d, reportCategory: 'balances_collected' })
+    L.cr('ar_tenants', gross, {
+      propertyId: f.propertyId, unitId: o.unitId, leaseId: o.leaseId, tenantId: o.tenantId, paymentId: f.id,
+      reportCategory: 'space_rent', memo: 'Unpaid space rent carried to the space',
+    })
+    memo = 'Unpaid space rent carried to the space'
   } else if (f.type === 'deposit') {
     // A4 — a refundable deposit: owed back to the tenant, never income.
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'deposits' })

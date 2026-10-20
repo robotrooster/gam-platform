@@ -3484,10 +3484,26 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       '"pause Danny\u2019s trade while he is away".\n' +
       'This changes what somebody owes each month. Read back the hours, what they cover, and from ' +
       'when. Ending it means their rent goes back to being paid in full — say that in those words, ' +
-      'because it is the part that gets missed.',
+      'because it is the part that gets missed.\n' +
+      'PAUSING ALWAYS NEEDS spaceOccupiedWhilePaused. Ask the landlord whether the space is still ' +
+      'being used and send their answer; the pause is refused without it, because the answer decides ' +
+      'whether the months still ask for hours.',
     params: {
       agreementId: { type: 'string', description: 'The agreement id, from get_work_trade_status.' },
       status: { type: 'string', description: 'active, paused or ended.' },
+      // 10/19 (Nic): "the landlord needs to have a way to set whether they
+      // occupy the spot or not" while a trade is paused. routes/workTrade
+      // REFUSES a pause without this, so an assistant that could pause a trade
+      // and could not send it was a permanent 400 with no parameter to fix it.
+      // Never guessed: "empty" covers every open month outright and clears the
+      // carried catch-up, and "still used" keeps billing a lapse — the landlord
+      // is the only one who knows which, and it is their money either way.
+      spaceOccupiedWhilePaused: { type: 'boolean', description:
+        'Required when pausing, and changeable while it stays paused: is the space still being used ' +
+        'while this is paused? true (a camper left on the spot over the summer) keeps hours counting ' +
+        'and each month works as normal; false (they took the camper home) asks for no hours, so the ' +
+        'charges the trade covers are not billed and any carried catch-up is cleared. ASK the ' +
+        'landlord — never assume either answer.' },
       endDate: { type: 'string', description: 'When it ends, YYYY-MM-DD.' },
       monthlyHoursTarget: { type: 'integer', description: 'Hours a month the work is worth.' },
       coveredCharges: { type: 'array', description: 'Which kinds of charge the work offsets.' },

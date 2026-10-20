@@ -2853,6 +2853,35 @@ export function schedulerInit() {
     // S654: 04:25 Phoenix, so the run and its Phoenix month agree on any host.
   }, { timezone: 'America/Phoenix' })
 
+  // 10/19 (Nic): PAYMENT ARRANGEMENTS ON A CARRIED SPACE-RENT BALANCE.
+  //
+  //   "there's nothing that automatically bills for it right now. The regular
+  //    monthly bill comes out every month and the carry forward balance is kept
+  //    track of, but it's at the tenant's discretion to actually make any sort
+  //    of payment against that. So, to help landlords not forget about it and
+  //    stuff, we need to do, you know, payment arrangements on carry forward
+  //    balances. So what, even if it's $50 or $100 or whatever."
+  //
+  // Asks for the arrangement's amount on its day of the property's month and
+  // judges the previous ask by the money that actually landed. It writes no
+  // charge (the whole balance is already one charge row, so a second would bill
+  // the same debt twice) and no late fee, ever — Nic dropped late fees on a
+  // carried balance outright. Idempotent by (carryforward_id, due_date), so the
+  // daily cadence is safe whatever the property's timezone.
+  cron.schedule('35 4 * * *', async () => {
+    const client = await getClient()
+    try {
+      const { runCarryforwardArrangements } = await import('../services/spaceRentCarryforward')
+      await client.query('BEGIN')
+      const r = await runCarryforwardArrangements(client)
+      await client.query('COMMIT')
+      if (r.asked || r.met || r.missed) logger.info(r, '[carryforward-arrangements]')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      logger.error({ err: e }, '[carryforward-arrangements] fatal')
+    } finally { client.release() }
+  }, { timezone: 'America/Phoenix' })
+
   cron.schedule('45 1 * * *', async () => {
     try {
       const { processRouteCleanup } = await import('./routeCleanup')

@@ -781,6 +781,70 @@ export const HOME_OWNERSHIP_ACQUIRED_VIA_LABEL: Record<HomeOwnershipAcquiredVia,
   recorded: 'Recorded', sale: 'Sale', transfer: 'Transfer', financed_payoff: 'Financed payoff',
 }
 
+// 10/19 (Nic): unpaid SPACE RENT left behind on a tenant-owned home is carried
+// by the SPACE. "The rent is owed by the trailer because it was the same
+// trailer there. It doesn't matter how many people cycle in and out." Tied to
+// the spot rather than the home, because "there's no VIN numbers that the
+// landlord is going to have access to". Backs space_rent_carryforwards.status
+// (migration 20261021100000).
+export const SPACE_CARRYFORWARD_STATUSES = ['open', 'settled', 'voided'] as const
+export type SpaceCarryforwardStatus = typeof SPACE_CARRYFORWARD_STATUSES[number]
+export const SPACE_CARRYFORWARD_STATUS_LABEL: Record<SpaceCarryforwardStatus, string> = {
+  open:    'Still owed',
+  settled: 'Paid off',
+  voided:  'Taken off',
+}
+
+// What an arrangement asked for in one cycle. Nothing is fined when it is
+// missed — Nic dropped late fees on a carried balance outright, and the ask is
+// a record rather than a second charge.
+export const SPACE_CARRYFORWARD_INSTALLMENT_STATUSES = ['asked', 'met', 'missed'] as const
+export type SpaceCarryforwardInstallmentStatus = typeof SPACE_CARRYFORWARD_INSTALLMENT_STATUSES[number]
+export const SPACE_CARRYFORWARD_INSTALLMENT_STATUS_LABEL: Record<SpaceCarryforwardInstallmentStatus, string> = {
+  asked:  'Asked for this month',
+  met:    'Paid',
+  missed: 'Not paid (no late fee)',
+}
+
+/**
+ * What the one carried charge is CALLED on the new resident's bill. Nic: it
+ * must be "plainly attributable to the previous owner of the home" and never
+ * folded into their rent.
+ */
+export const SPACE_CARRYFORWARD_CHARGE_NOTE =
+  'Unpaid space rent left on this space by the previous owner of the home'
+
+/**
+ * 10/19 (Nic): what every screen showing a carried balance must say about it,
+ * in one place so the three surfaces cannot drift. Two promises were decided
+ * outright and a resident reading the line has to be able to rely on both:
+ *
+ *   "Jacob, it was not possible for him to be late. So I would say on a carry
+ *    forward balance like that, just in the nature of being reasonable, we drop
+ *    the late fees."
+ *   "Don't count it on his, you know, payment health history, his late fees …
+ *    that's carried forward as Rashawn's."
+ *
+ * Both are true by construction rather than by copy — the charge is on no
+ * invoice, so jobs/lateFees cannot reach it, and a carried_balance is outside
+ * payment health by type (householdMonths BASE_CHARGE_TYPES) — and this is the
+ * sentence that tells a landlord so before he sets an arrangement on it.
+ */
+export const SPACE_CARRYFORWARD_NO_LATE_FEE_NOTE =
+  'This balance never gets a late fee, and it is not part of the resident\'s payment history.'
+
+/**
+ * The question at the invite, which is a CONDITION OF MOVING IN and not a
+ * request. Nic: "If Jacob declines, he's not moving into the park. ... he can
+ * buy the trailer all he wants, but he doesn't get to move in without
+ * following the rules of the park, without paying the bills."
+ */
+export const SPACE_CARRYFORWARD_INVITE_QUESTION =
+  'Is the new resident taking this balance on?'
+export const SPACE_CARRYFORWARD_INVITE_DECLINED_NOTE =
+  'Then they do not move onto this space. Space rent owed on a space is paid before anyone new lives on it — '
+  + 'buying the home does not settle it. Take the balance off first if you have decided to eat it.'
+
 export const RENT_COMPONENT_KINDS = ['space', 'trailer', 'other'] as const
 export type RentComponentKind = typeof RENT_COMPONENT_KINDS[number]
 export const RENT_COMPONENT_KIND_LABEL: Record<RentComponentKind, string> = {
@@ -6264,6 +6328,35 @@ export const CARD_DECLINE_FEE = 1.00
  * after the backfill therefore had screening silently disabled for life.
  */
 export const MIGRATION_WINDOW_DAYS = 28
+
+/**
+ * 10/19 (Nic): "Fix invite flag overridden in first 28 days."
+ *
+ * The existing-resident box on an invite answers a MONEY question, and until
+ * today it only said "skip background check" — so nobody reading it knew that
+ * ticking it zeroes the security deposit, the pet and utility deposits, the
+ * move-in fee and the prorated part-month. It has to say what it costs, in the
+ * same words on every door that offers it, because a signed lease cannot be
+ * corrected afterwards (the proration box on the signing page is locked).
+ *
+ * The two halves are separate rules and the copy keeps them separate:
+ *   - skipping the background check needs THIS PROPERTY'S onboarding window
+ *     (S579, and it can never be reopened);
+ *   - "their tenancy started before today" needs that window OR the landlord's
+ *     own 28 days (S631). In the band between the two, a sitting resident is
+ *     still papered as sitting AND still screens.
+ */
+export const EXISTING_RESIDENT_ATTESTATION_TITLE =
+  'They already live here — their tenancy started before today'
+export const EXISTING_RESIDENT_MONEY_NOTE =
+  'Their first bill is one whole month\u2019s rent and nothing else: no prorated part-month, no security '
+  + 'deposit, no pet or utility deposit, no move-in fee. Leave it unticked for anybody genuinely moving in '
+  + '\u2014 once the lease is signed this cannot be changed.'
+export const EXISTING_RESIDENT_SKIPS_SCREENING_NOTE =
+  'They also sign without a background check, because this property is still inside its onboarding window.'
+export const EXISTING_RESIDENT_STILL_SCREENS_NOTE =
+  'This property\u2019s onboarding window has closed, so they still complete a background check before portal '
+  + 'access. Ticking this only says their tenancy started before today.'
 
 export const PRIOR_ARRANGEMENT_METHOD = 'prior_arrangement' as const
 export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21

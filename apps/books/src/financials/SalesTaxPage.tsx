@@ -37,13 +37,13 @@ import { useQuery } from 'react-query'
 import {
   BOOKS_OTHER_INCOME_NO_TAX_NOTE,
   BOOKS_SALES_TIE_TERMS, BOOKS_SALES_TIE_TERM_LABEL, BOOKS_SALES_TIE_TERM_NOTE, BOOKS_SALES_TIE_TERM_SIGN,
-  RENT_ROLL_STAY_UNITS, RENT_ROLL_STAY_UNIT_LABEL, stayQuantityText,
+  RENT_ROLL_STAY_UNITS, RENT_ROLL_STAY_UNIT_LABEL,
   type BooksSalesAndTax, type BooksSalesTieTerm, type RentRollStayUnit,
 } from '@gam/shared'
 import { finGet } from './adapter'
 import { StayTaxCard } from './StayTaxCard'
 import {
-  useFinancialsScope, usePeriod, money, dayName, errorWords, downloadCsv,
+  useFinancialsScope, usePeriod, money, dayName, errorWords, downloadCsv, count, soldQuantity,
   PropertyPicker, PeriodPicker, PageHead, Notice,
 } from './common'
 
@@ -57,17 +57,9 @@ function percent(rate: number): string {
   return `${s}%`
 }
 
-/** 10.6 → "10.6", 4 → "4" (gallons and kilowatt-hours come with decimals). */
-const count = (n: number): string =>
-  Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 3 })
-
 /** Is this what a stay item is sold by (a night, a week, a month)? */
 const isStayUnit = (u: string | null): u is RentRollStayUnit =>
   !!u && (RENT_ROLL_STAY_UNITS as readonly string[]).includes(u)
-
-/** How many went out: "3 months" for a stay item, "10.6" for gallons. */
-const quantity = (qty: number, unit: string | null): string =>
-  isStayUnit(unit) ? stayQuantityText(qty, unit) : count(qty)
 
 /** What a stay item is sold by, in words ("months"); nothing for anything else. */
 const soldBy = (unit: string | null): string =>
@@ -204,7 +196,7 @@ export function SalesTaxPage() {
                     ...c.items.map(i => (
                       <tr key={`${c.label}-${i.name}`}>
                         <td style={{ paddingLeft: 28 }}>{i.name}</td>
-                        <td className="fin-num">{quantity(i.qty, i.unit)}</td>
+                        <td className="fin-num">{soldQuantity(i.qty, i.unit)}</td>
                         <td className="fin-num">{money(i.sales)}</td>
                         <td className="fin-num fin-muted">{count(i.salesCount)}</td>
                       </tr>

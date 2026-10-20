@@ -1396,9 +1396,11 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
       [sp.row.id, toDollars(sliceC).toFixed(2), toDollars(restC).toFixed(2)])
     const rest = await client.query<{ id: string }>(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id,
-                             type, amount, status, due_date, entry_description, notes, is_remainder, revenue_owner)
+                             type, amount, status, due_date, entry_description, notes, is_remainder, revenue_owner,
+                             space_carryforward_id)
        SELECT unit_id, lease_id, tenant_id, landlord_id, invoice_id,
-              type, $2::numeric, 'pending', due_date, entry_description, $3, TRUE, revenue_owner
+              type, $2::numeric, 'pending', due_date, entry_description, $3, TRUE, revenue_owner,
+              space_carryforward_id
          FROM payments WHERE id = $1
        RETURNING id`,
       [sp.row.id, toDollars(restC).toFixed(2), PART_PAYMENT_REST_NOTE])
@@ -1440,11 +1442,18 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
           WHERE id = $1`,
         [r.id, toDollars(take).toFixed(2), toDollars(rowOwed - take).toFixed(2)])
       await client.query(
+        // 10/19 (Nic): space_carryforward_id comes with it. A carried space-rent
+        // balance is ONE settlement, and the claim reads its own charge rows to
+        // know whether anything is still owed — a remainder that forgot the link
+        // would make a $100 payment on an $880 balance look like the end of it,
+        // and the departing resident's record would show it paid off.
         `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id,
-                               type, amount, status, due_date, entry_description, notes, is_remainder, revenue_owner)
+                               type, amount, status, due_date, entry_description, notes, is_remainder, revenue_owner,
+                               space_carryforward_id)
          SELECT unit_id, lease_id, tenant_id, landlord_id, invoice_id,
                 type, $2::numeric, 'pending', due_date, entry_description,
-                'What is left of the old balance after a part payment', TRUE, revenue_owner
+                'What is left of the old balance after a part payment', TRUE, revenue_owner,
+                space_carryforward_id
            FROM payments WHERE id = $1`,
         [r.id, toDollars(rowOwed - take).toFixed(2)])
     }

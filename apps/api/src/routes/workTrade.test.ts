@@ -33,6 +33,16 @@
  *     work_trade_logs; subsequent approval bumps ytd_value on the
  *     stranger landlord's books). Fix: require own-tenant OR
  *     own-landlord-scope.
+ *
+ * 10/19 — PART OF THIS FILE NEEDS A MIGRATION PRODUCTION HAS NOT HAD YET.
+ * The PATCH /:id space-question tests read work_trade_agreements
+ * .paused_space_occupied (migration 20261021150000), and schema.sql is
+ * production's schema, so the package script's plain DB_NAME=gam_test build
+ * does not have the column and those cases fail with a 500/503. Until the
+ * migration is applied, run this file as:
+ *   DB_NAME=<yours>_test TEST_APPLY_MIGRATIONS_AFTER=20261020125959 npx vitest run routes/workTrade.test
+ * Everything else in here, including the paused-agreement cases added when the
+ * tenant portal started showing one, passes either way.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -338,6 +348,72 @@ describe('POST /:id/logs — S397 scope fix', () => {
       .send({ workDate: '2026-06-01', hours: 2, description: 'tenant called in' })
     expect(res.status).toBe(200)
   })
+
+  // 10/19 (Nic, "Show it while paused"): the tenant portal shows a PAUSED
+  // agreement now, so this refusal is what keeps the screen honest — a paused
+  // trade must not look actionable. The window hides the Log hours button on
+  // one (shared-ui/WorkTradePanel, canLog), and the route is the line that
+  // holds whatever a stale tab or a hand-made request tries.
+  it('a paused agreement takes no hours, and writes no row', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    const res = await request(buildApp())
+      .post(`/api/work-trade/${agId}/logs`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+      .send({ workDate: '2026-06-01', hours: 4, description: 'mowed lawn' })
+    expect(res.status).toBe(400)
+    const logs = await db.query(`SELECT id FROM work_trade_logs WHERE agreement_id=$1`, [agId])
+    expect(logs.rows).toHaveLength(0)
+  })
+
+  it('an ended agreement takes no hours either', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'ended')
+    const res = await request(buildApp())
+      .post(`/api/work-trade/${agId}/logs`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+      .send({ workDate: '2026-06-01', hours: 4, description: 'mowed lawn' })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────
+// 10/19 (Nic) — the paused agreement a tenant can now open
+// ───────────────────────────────────────────────────────────────────
+
+describe('GET /:id on a paused agreement', () => {
+  // Their tab stays up while it is paused, so the window it opens has to load
+  // for them — and it has to quote no target while nobody is counting hours
+  // (the same rule the close reads: hoursCountedFor).
+  it('the tenant can read their own paused agreement', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    const res = await request(buildApp())
+      .get(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.agreement.status).toBe('paused')
+  })
+
+  it('a stranger tenant still cannot', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    const res = await request(buildApp())
+      .get(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tenantBToken}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('quotes no hours target on a paused trade nobody clocks', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    await db.query(`UPDATE work_trade_agreements SET tracks_hours=false WHERE id=$1`, [agId])
+    const res = await request(buildApp())
+      .get(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.stats.target).toBe(0)
+  })
 })
 
 // ───────────────────────────────────────────────────────────────────
@@ -468,15 +544,141 @@ describe('PATCH /:id  (status update)', () => {
     expect(res.status).toBe(403)
   })
 
-  it('happy: status=paused', async () => {
+  // 10/19 (Nic): "the landlord needs to have a way to set whether they occupy
+  // the spot or not." Asked AT the moment of pausing, because the answer decides
+  // whether the month still asks for hours and there is no default that is not a
+  // guess about somebody's money. This used to pause on `{ status: 'paused' }`
+  // alone; it is refused now, and the work-trade window always sends both.
+  it('pausing without saying whether the space is still used → 400', async () => {
     const f = await seed()
     const agId = await seedAgreement(f)
     const res = await request(buildApp())
       .patch(`/api/work-trade/${agId}`)
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ status: 'paused' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/space is still being used/i)
+    expect((await db.query(`SELECT status FROM work_trade_agreements WHERE id=$1`, [agId]))
+      .rows[0].status).toBe('active')
+  })
+
+  it('happy: status=paused with the space still in use — hours keep counting', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused', spaceOccupiedWhilePaused: true })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('paused')
+    expect(res.body.data.paused_space_occupied).toBe(true)
+  })
+
+  it('happy: status=paused with the space empty — no hours are asked for', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused', spaceOccupiedWhilePaused: false })
+    expect(res.status).toBe(200)
+    expect(res.body.data.paused_space_occupied).toBe(false)
+  })
+
+  // "A camper can leave later" — so the answer is editable while it stays paused,
+  // on its own, without re-sending the status.
+  it('the answer can be changed while still paused', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    await request(buildApp()).patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused', spaceOccupiedWhilePaused: true })
+    const res = await request(buildApp()).patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ spaceOccupiedWhilePaused: false })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('paused')
+    expect(res.body.data.paused_space_occupied).toBe(false)
+  })
+
+  // The answer belongs to the pause it was given during. A snowbird's trade
+  // pauses and resumes every year, and last winter's "they took the camper home"
+  // must not be sitting there stopping hours on a running agreement.
+  it('resuming forgets the answer, so the next pause asks it fresh', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    await request(buildApp()).patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused', spaceOccupiedWhilePaused: false })
+    const res = await request(buildApp()).patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'active' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.paused_space_occupied).toBeNull()
+    // And pausing again has to be answered again.
+    const again = await request(buildApp()).patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused' })
+    expect(again.status).toBe(400)
+  })
+
+  // Pausing an ALREADY paused agreement is not the moment of pausing, so it is
+  // not the moment to insist on an answer (a status re-send must not 400).
+  it('re-sending paused on an already paused agreement needs no new answer', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'paused' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.paused_space_occupied).toBeNull()
+  })
+
+  // 10/19 (review): THE ANSWER IS ONLY ACCEPTED ON A PAUSE.
+  //
+  // The work-trade window draws its "The space is empty" button from the
+  // agreement it fetched, so a lease resumed in another tab (routes/leases
+  // resume, or a lease expiring on the scheduler) leaves that button on screen
+  // for a trade that is running again. Clicking it used to write the answer onto
+  // an ACTIVE agreement, where nothing reads it and nothing clears it — until
+  // the next hibernation paused the lease and it silently stopped counting
+  // hours on a pause nobody had been asked about.
+  it('answering the space question on a running trade → 400, and nothing is saved', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ spaceOccupiedWhilePaused: false })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no pause to answer about/i)
+    expect((await db.query(
+      `SELECT status, paused_space_occupied FROM work_trade_agreements WHERE id=$1`, [agId])).rows[0])
+      .toMatchObject({ status: 'active', paused_space_occupied: null })
+  })
+
+  it('answering it on an ended trade → 400', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'ended')
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ spaceOccupiedWhilePaused: true })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/has ended/i)
+  })
+
+  // Resuming and answering in one call is the same mistake with the status
+  // attached: the agreement is running when the answer would land.
+  it('resuming and answering in the same call → 400', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f, f.landlordAId, f.tenantAId, f.unitAId, 'paused')
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/${agId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'active', spaceOccupiedWhilePaused: false })
+    expect(res.status).toBe(400)
   })
 })
 

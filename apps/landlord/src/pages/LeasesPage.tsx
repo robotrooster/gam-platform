@@ -11,6 +11,8 @@ import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { NewLeaseForEveryoneModal } from '../components/NewLeaseForEveryoneModal'
 import { LeavingModal, type LeavingLease } from '../components/LeavingModal'
+import { CloseOutSpaceModal } from '../components/CloseOutSpaceModal'
+import { SpaceCarriedBalanceModal } from '../components/SpaceCarriedBalanceModal'
 import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null
@@ -37,6 +39,36 @@ function ordinalDay(n: number): string {
 
 export function LeasesPage() {
   const { data: leases = [], isLoading } = useQuery<any[]>('leases', () => apiGet('/leases'))
+  // 10/19 (Nic): which SPACES carry an unpaid space-rent balance. Read by
+  // space, not by lease, because the balance outlives both leases involved:
+  // the one that left it behind is terminated and the one that takes it on
+  // does not exist yet. ?all=1 keeps a settled or taken-off balance visible,
+  // so a landlord looking back at a space sees it was dealt with rather than
+  // nothing at all. Failing quietly: a landlord with no mobile homes gets an
+  // empty list, and the page must not break if the read does.
+  const { data: spaceCarried = [] } = useQuery<any[]>(
+    'space-carryforwards', () => apiGet('/space-carryforward?all=1'), { retry: false })
+  // ONE claim per space, and it must be the OPEN one where there is one.
+  //
+  // This was `new Map(spaceCarried.map(c => [c.unitId, c]))`, and a JS Map
+  // keeps the LAST entry for a repeated key — so on a space that has been
+  // through this twice (a balance settled or taken off, and a new one opened by
+  // a later close-out) the older, closed claim overwrote the live one, the
+  // amber badge vanished (stillOwed 0) and the Change menu lost the figure.
+  // Live shape: MH 09 carries $880, Jacob clears it, Jacob later leaves owing
+  // $500 of his own — the row for the next lease said nothing at all.
+  const carriedBySpace = new Map<string, any>()
+  for (const c of spaceCarried as any[]) {
+    const held = carriedBySpace.get(c.unitId)
+    // Open wins; between two of the same kind the one opened later wins. Said
+    // here rather than taken from the server's ordering, because a list read
+    // for a badge should not depend on an ORDER BY in another file.
+    const better = !held
+      || (c.status === 'open' && held.status !== 'open')
+      || (((c.status === 'open') === (held.status === 'open'))
+          && String(c.openedOn ?? '') > String(held.openedOn ?? ''))
+    if (better) carriedBySpace.set(c.unitId, c)
+  }
   const [modalOpen, setModalOpen] = useState(false)
   const [editingLeaseId, setEditingLeaseId] = useState<string | undefined>(undefined)
   // S511 #15: confirmed leases open read-only (terms locked once signed); only
@@ -56,6 +88,15 @@ export function LeasesPage() {
   const [leavingLease, setLeavingLease] = useState<LeavingLease | null>(null)
   // S653: how much paid-ahead credit a month may use.
   const [drawLease, setDrawLease] = useState<any | null>(null)
+  // 10/19 (Nic): the departing resident on a tenant-owned home — "I want to go
+  // through and mark Rashawn as moved out in the system when it's time to do
+  // that". The window shows the four figures first and writes nothing until the
+  // landlord presses.
+  const [closeOutLease, setCloseOutLease] = useState<any | null>(null)
+  // 10/19: what the SPACE carries, where the arrangement is set and the balance
+  // can be taken off. Opened by lease id — the claim reads from either end (the
+  // lease that left it behind, or the one that took it on).
+  const [carriedSpaceLeaseId, setCarriedSpaceLeaseId] = useState<string | null>(null)
   // 10/4 (decisions #46.4): "They never moved in — end the lease".
   const [neverMovedInLease, setNeverMovedInLease] = useState<any | null>(null)
   // Fix pass 2 (review): why the window opened when it opened from Discard
@@ -483,6 +524,17 @@ export function LeasesPage() {
                       {l.isHibernating && (
                         <span className="badge badge-amber" title="Seasonally paused — no rent billed, deposit held, spot bookable off-season" style={{ marginLeft: 4 }}>Hibernating</span>
                       )}
+                      {/* 10/19 (Nic): a space carrying unpaid space rent says so on
+                          the row, so a landlord does not have to open a menu to find
+                          out. It names whose it was, because the whole point is that
+                          it is "plainly attributable to the previous owner of the
+                          home" and never read as this resident's own rent. */}
+                      {carriedBySpace.has(l.unitId) && carriedBySpace.get(l.unitId).stillOwed > 0 && (
+                        <span className="badge badge-amber" style={{ marginLeft: 4 }}
+                          title={`${fmt(carriedBySpace.get(l.unitId).stillOwed)} of unpaid space rent left on this space by ${carriedBySpace.get(l.unitId).owedByName || 'a previous owner of the home'}. It never gets a late fee and is not part of this resident's payment history.`}>
+                          Space carries {fmt(carriedBySpace.get(l.unitId).stillOwed)}
+                        </span>
+                      )}
                       {l.status === 'active' && l.moveOutNoticeAt && l.endDate && (
                         <span className="badge badge-gold" title={l.moveOutNoticeNote ? `They said: ${l.moveOutNoticeNote}` : 'Written down at the front desk'} style={{ marginLeft: 4 }}>
                           Leaving {new Date(l.endDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
@@ -651,6 +703,33 @@ export function LeasesPage() {
                                 ? { label: 'Resume from hibernation', hint: 'Restart billing', onClick: () => hibernateMut.mutate({ id: l.id, action: 'resume' }) }
                                 : { label: 'Hibernate for the season', hint: 'Pause billing, hold the spot, deposit stays', onClick: () => hibernateMut.mutate({ id: l.id, action: 'hibernate' }) },
                             ] : []),
+                            // 10/19 (Nic): the resident of a TENANT-OWNED home has gone
+                            // and the home was sold privately. "I want to go through and
+                            // mark Rashawn as moved out in the system when it's time to
+                            // do that."
+                            //
+                            // Offered on any space where a landlord could reasonably
+                            // expect it — the home is tenant-owned (an RV spot included,
+                            // which is the one that surprises people) or it is a mobile
+                            // home at all — and NOT hidden where it does not apply. The
+                            // window says why in the service's own words instead: an RV
+                            // leaves with its owner, and a park-owned home has no next
+                            // owner to inherit anything.
+                            ...(can('leases.terminate') && l.status === 'active'
+                                && (l.dwellingOwnership === 'tenant' || l.unitType === 'mobile_home') ? [
+                              { label: 'They left — close them out',
+                                hint: 'The home sold and they are gone: unpaid space rent follows the space, their own bills stay theirs',
+                                onClick: () => setCloseOutLease({ ...l, tenantName }) },
+                            ] : []),
+                            // What the SPACE carries: the balance, the arrangement, and
+                            // the door for a landlord who decides to eat it.
+                            ...(carriedBySpace.has(l.unitId) ? [
+                              { label: 'What this space carries…',
+                                hint: `${carriedBySpace.get(l.unitId).stillOwed > 0
+                                  ? `${fmt(carriedBySpace.get(l.unitId).stillOwed)} of unpaid space rent`
+                                  : 'Space rent left by a previous owner'} — set a payment arrangement or take it off`,
+                                onClick: () => setCarriedSpaceLeaseId(l.id) },
+                            ] : []),
                           ]} />
                         )}
                       </div>
@@ -726,6 +805,24 @@ export function LeasesPage() {
         <MoneyAddonModal
           lease={addonLease}
           onClose={() => setAddonLease(null)}
+        />
+      )}
+      {/* 10/19 (Nic): the home sold and the owner left. The four figures, then
+          the press; on the way out it opens what the space now carries. */}
+      {closeOutLease && (
+        <CloseOutSpaceModal
+          lease={{ id: closeOutLease.id, unitNumber: closeOutLease.unitNumber,
+                   propertyName: closeOutLease.propertyName, names: closeOutLease.tenantName }}
+          onClose={() => setCloseOutLease(null)}
+          onClosedOut={() => { const id = closeOutLease.id; setCloseOutLease(null); setCarriedSpaceLeaseId(id) }}
+        />
+      )}
+      {carriedSpaceLeaseId && (
+        <SpaceCarriedBalanceModal
+          leaseId={carriedSpaceLeaseId}
+          canArrange={can('leases.bill_fee')}
+          canTakeOff={can('leases.terminate')}
+          onClose={() => setCarriedSpaceLeaseId(null)}
         />
       )}
     </div>

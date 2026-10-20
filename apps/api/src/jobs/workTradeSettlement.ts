@@ -22,7 +22,9 @@ import {
 import { round2 } from '../services/workTradeCredit'
 import { syncBillMarksAfterSettle } from '../services/creditLedgerEmitters'
 import { BILL_TOTAL_SQL } from '../services/workTradeCoverage'
-import { extraHoursSchemaReady } from '../services/workTradeStanding'
+import {
+  extraHoursSchemaReady, hoursCountedSql, HOURS_COUNTED_COL,
+} from '../services/workTradeStanding'
 import type { WorkTradeSettlementStatus } from '@gam/shared'
 
 /**
@@ -44,15 +46,24 @@ interface ExtraHoursTerms {
   extra_hours_rate?: number | null
   extra_hours_pay_method?: string | null
   tracks_hours?: boolean | null
+  /**
+   * 10/19: whether hours are counting at all right now — tracks_hours, and
+   * (paused) whether the space is still being used. Computed in SQL by
+   * HOURS_COUNTED_COL, which every agreement query here selects.
+   */
+  hours_counted?: boolean | null
 }
 
 /**
  * 'pay' only when the landlord set it AND gave a rate and a pay method, and the
- * agreement tracks hours: "when they work more hours than the agreement needs"
- * means nothing on a trade that asks for no hours.
+ * agreement is counting hours: "when they work more hours than the agreement
+ * needs" means nothing on a trade that asks for no hours — whether it never
+ * counted them (tracks_hours) or has stopped for the season because the space
+ * is empty (10/19, Nic). Nobody is paid wages for a month nothing was asked of
+ * them.
  */
 function extraHoursMode(a: ExtraHoursTerms): 'bank' | 'pay' {
-  return a.extra_hours_mode === 'pay' && a.tracks_hours !== false
+  return a.extra_hours_mode === 'pay' && countsHours(a)
     && Number(a.extra_hours_rate) > 0 && !!a.extra_hours_pay_method ? 'pay' : 'bank'
 }
 
@@ -124,14 +135,38 @@ async function recordExtraHours(
  * settleAgreementOnEnd. So a paused month settles when it owes no hours, and
  * otherwise stays open and carrying until the trade resumes or ends.
  *
- * OPEN QUESTION FOR NIC (10/19, not decided — do not settle it in code): a
- * paused agreement that TRACKS hours and worked part of its last month leaves
- * that lapse owed on the month's bill. A snowbird who worked 60 of 80 hours and
- * then hibernated for the season owes the uncovered part while the trade is
- * dormant. The two live paused agreements are both tracks_hours = false, so
- * nothing is owed today, and the alternative — leaving the lapse parked and
- * suspended until the trade resumes — is the "charge pending forever" shape
- * 10/18 just took out. It is Nic's money call either way.
+ * 10/19 — ANSWERED. The open question here was whether a paused agreement that
+ * TRACKS hours should leave the unworked part of its last month owed while the
+ * person is away for the season. Nic: "A paused work trade that counts hours
+ * should continue to count hours. If, I mean, basically the landlord needs to
+ * have a way to set whether they occupy the spot or not. Because if somebody
+ * wants to work more hours in the winter but leave their camper occupying the
+ * space in the summer, that's one situation. If people take their camper home
+ * for the summer with them and it's not occupying the spot, then there would be
+ * no reason for it to continue to track hours. So that's another thing you're
+ * asking me about, which needs to be an individual landlord decision."
+ *
+ * So it is not a rule GAM picks. The landlord answers one question per
+ * agreement — is the space still being used while this is paused? — and:
+ *
+ *   still used    everything above holds unchanged. Hours keep counting, and a
+ *                 lapse is owed on its own month's bill, which is what he said
+ *                 should happen.
+ *   empty         no hours are asked for (hoursCountedSql returns false, the
+ *                 same answer tracks_hours = false gives), so periodCredit
+ *                 covers the month outright and it SETTLES. Nothing new is owed
+ *                 and nothing is invented: work-trade coverage is never turned
+ *                 into a debt, and the month is finished with rather than left
+ *                 parked, which is the "charge pending forever" shape 10/18
+ *                 took out.
+ *   unanswered    still used. A column arriving must not move a bill on its own.
+ *
+ * Why SETTLES and not "the month never opens": a month that does not open leaves
+ * its suspended rent line parked with nothing on the calendar to release it —
+ * exactly the $589 RV 50 and RV 51 were stuck in. A month that asks nothing and
+ * settles lets the landlord and the tenant read the same true sentence (see
+ * services/workTradeStanding): no hours are being counted, and the charges the
+ * trade covers are not billed while it is paused.
  */
 const CLOSE_STATUSES = `('active','paused')`
 
@@ -148,8 +183,18 @@ function carryMonthsFor(a: { carry_forward_indefinite?: boolean; carry_forward_m
  * covered outright by the agreement, so there is no target for an hour to meet
  * and no hour left over to be "extra". Nothing is recorded against the period
  * either, so turning tracking back on counts those approved hours fresh.
+ *
+ * 10/19 (Nic): and neither does a PAUSED trade whose space is empty, for all the
+ * same reasons — including the last one, which is what makes the answer
+ * reversible. Hours logged while the camper is away are not thrown away: the
+ * close records nothing against the period, so saying the space is occupied
+ * again, or resuming the trade, counts them fresh at the next close.
+ *
+ * `hours_counted` is the SQL expression (HOURS_COUNTED_COL); the tracks_hours
+ * fallback keeps this honest for a caller that did not select it.
  */
 function countsHours(a: ExtraHoursTerms): boolean {
+  if (a.hours_counted != null) return a.hours_counted !== false
   return a.tracks_hours !== false
 }
 
@@ -203,6 +248,10 @@ const CREDITABLE_ROW = `p.type IN ('rent','utility','fee')
  * month outright — which is what the agreement says it does. Turning tracking
  * back on restores the target by the same rule (services/workTradeCoverage
  * re-asks the agreement for a month left at 0), so the switch works both ways.
+ *
+ * 10/19: the same question, same answer, for a paused trade whose space is empty
+ * — hoursCountedSql is the one expression both switches live in, shared with the
+ * standing the tenant reads.
  */
 async function loadOpenPeriods(
   client: PoolClient, agreementId: string, throughMonth: string,
@@ -211,8 +260,8 @@ async function loadOpenPeriods(
   const { rows } = await client.query(
     `SELECT ws.id, ws.invoice_id, to_char(ws.period_start,'YYYY-MM-DD') AS period_month,
             to_char(ws.period_month,'YYYY-MM-DD') AS label,
-            (CASE WHEN wta.tracks_hours THEN ws.target_hours ELSE 0 END)::float AS target_hours,
-            (CASE WHEN wta.tracks_hours THEN ws.hour_rate    ELSE 0 END)::float AS hour_rate,
+            (CASE WHEN ${hoursCountedSql()} THEN ws.target_hours ELSE 0 END)::float AS target_hours,
+            (CASE WHEN ${hoursCountedSql()} THEN ws.hour_rate    ELSE 0 END)::float AS hour_rate,
             ws.hours_applied::float AS hours_applied,
             ws.basis_amount::float  AS basis_amount,
             -- How many closes this period has already survived. Derived from the
@@ -350,7 +399,8 @@ async function bankSettledLateApprovals(
         -- 10/18: "asks for hours" is the agreement's answer, not the period's
         -- frozen snapshot (loadOpenPeriods). A trade the landlord stopped
         -- counting banks nothing: hours logged on it were never banked time.
-        AND wta.tracks_hours AND ws.target_hours > 0
+        -- 10/19: a paused trade on an empty space has stopped counting too.
+        AND ${hoursCountedSql()} AND ws.target_hours > 0
         AND ($2::uuid IS NULL OR ws.id <> $2::uuid)
       ORDER BY ws.period_start`,
     [agreementId, skipId])
@@ -678,7 +728,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
       `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id, wta.status,
               wta.banked_hours::float AS banked_hours,
               wta.carry_forward_months, wta.carry_forward_indefinite,
-              ${EXTRA_HOURS_COLS},
+              ${EXTRA_HOURS_COLS}, ${HOURS_COUNTED_COL},
               -- A lease has no tenant_id: tenancy lives in lease_tenants, which
               -- is what makes co-tenants and mid-term changes expressible. The
               -- agreement's tenant must be an ACTIVE party to the lease for it
@@ -849,7 +899,7 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         const { rows } = await client.query(
           `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id, wta.status,
                   wta.banked_hours::float AS banked_hours, wta.carry_forward_months, wta.carry_forward_indefinite,
-                  ${EXTRA_HOURS_COLS},
+                  ${EXTRA_HOURS_COLS}, ${HOURS_COUNTED_COL},
                   (SELECT l.id FROM leases l
                      JOIN lease_tenants lt ON lt.lease_id = l.id
                     WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
@@ -939,7 +989,7 @@ export async function settleAgreementOnEnd(agreementId: string): Promise<Settlem
     const { rows } = await client.query(
       `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
               wta.banked_hours::float AS banked_hours,
-              ${EXTRA_HOURS_COLS},
+              ${EXTRA_HOURS_COLS}, ${HOURS_COUNTED_COL},
               -- A lease has no tenant_id: tenancy lives in lease_tenants, which
               -- is what makes co-tenants and mid-term changes expressible. The
               -- agreement's tenant must be an ACTIVE party to the lease for it
@@ -968,8 +1018,9 @@ export async function settleAgreementOnEnd(agreementId: string): Promise<Settlem
          JOIN work_trade_agreements wta ON wta.id = ws.agreement_id
         WHERE ws.agreement_id = $1 AND ws.status = 'open'
           -- An untracked trade asks for none. 10/18: that is the AGREEMENT's
-          -- answer, not the number the period froze (loadOpenPeriods).
-          AND wta.tracks_hours AND ws.target_hours > 0`, [agreementId])
+          -- answer, not the number the period froze (loadOpenPeriods). 10/19:
+          -- so is a paused trade whose space is empty (hoursCountedSql).
+          AND ${hoursCountedSql()} AND ws.target_hours > 0`, [agreementId])
     const uncounted: Record<string, number> = {}
     const hoursWorked = new Map<string, number>()
     for (const h of hrs) {

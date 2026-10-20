@@ -38,6 +38,25 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/19: a mobile home changing hands with a debt on the spot ────────────
+  // Every one of these moves money between two people, and the whole design is
+  // that the landlord sees four figures BEFORE anything is written (what
+  // carries, what stays the departing resident's, what late fees are dropped,
+  // and that the lease closes). An assistant pressing any of them would be
+  // making exactly the money decision those screens exist to put in front of a
+  // person. Nic's rule for the last one is sharper still — taking the balance
+  // on is a condition of moving in, not a request ("If Jacob declines, he's not
+  // moving into the park"), so it is the landlord's call on the landlord's
+  // screen, never a thing settled mid-conversation. The read-only preview is
+  // reachable; only the writes are named here.
+  'leases POST /:id/space-carryforward/close-out':
+    'closes a departing resident out of a tenant-owned mobile home space: moves the unpaid space rent onto the space, voids the late fees, and ends the lease. Four figures the owner reads first, on a screen that writes nothing until pressed (services/spaceRentCarryforward); the assistant makes no money decision (#38 Q6).',
+  'leases POST /:id/space-carryforward/take-off':
+    'writes off a space\'s carried balance — the landlord deciding to eat somebody else\'s unpaid rent. A deliberate press with the figure and whose debt it was on screen, and what was already paid stays recorded.',
+  'leases PUT /:id/space-carryforward/arrangement':
+    'sets what a resident is asked for each month against a carried balance ($50, $100, whatever the landlord lands on). A payment plan on a debt that is not even theirs — the owner\'s judgment about a person, not an assistant\'s.',
+  'spaceCarryforward POST /:id/assumption':
+    'records that the incoming resident is taking on the balance left on the space, by name and date. Nic 10/19: it is a condition of moving in, so it is answered on the invite with the amount and the previous owner\'s name in front of the landlord — never agreed to on their behalf.',
   // ── 10/19: a policy answer and an undo, both the owner's own press ────────
   // Nic, 10/18: refunds on an early departure and mid-month proration are
   // "property level settings" — a standing answer about his own money that a

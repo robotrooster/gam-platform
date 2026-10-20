@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { toast } from '../components/dialogs'
 
 // S527 W-6: the real applicant list is GET /background (not /background-checks).
@@ -27,6 +28,19 @@ const RESULTS_PENDING = new Set(['submitted', 'processing'])
 // that chose a lease already has its own draft on the Leases page.
 const stayDay = (ymd: string | null | undefined) =>
   ymd ? new Date(String(ymd).slice(0, 10) + 'T00:00:00').toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }) : null
+// 10/19 (Nic): "they did move in and then they left." Until now a check only
+// ever found a stay that was still ahead or running, so every one of these said
+// "they can be checked in from the schedule" — which reads as a to-do, and is
+// the opposite of true for two guests who left yesterday. A stay that is behind
+// them says so instead.
+//
+// Whether it is behind them is the SERVER's answer (stayOver), not a comparison
+// against this browser's clock. The same row decides which list it sits on and
+// whether it is still cleared for check-in, and all of that is settled on the
+// database's date — so a manager working from a laptop set to another timezone
+// reads the same thing as the front desk, instead of being told a guest had
+// finished their stay hours before the guest had packed up.
+const stayIsOver = (c: any) => !!c?.stayOver
 
 type Cra = { name: string; address: string; phone: string; website: string | null }
 
@@ -40,8 +54,47 @@ export function BackgroundChecksPage() {
   const [tab, setTab] = useUrlTab('tab', 'attention', ['attention','past'] as const)
   const [q, setQ] = useState('')
   const term = q.trim().toLowerCase()
-  const attention = (checks as any[]).filter(c => c.bucket !== 'past')
-  const past = (checks as any[]).filter(c => c.bucket === 'past')
+
+  // ── 10/19 (Nic): NARROW THE LIST BY COMPANY AND BY PARK ──────────────────
+  //
+  // "I can't choose my property on the background check page. I can't go to the
+  //  Oak Park ones, I guess. … So we need a way to filter that."
+  //
+  // Nothing was hidden — the list is the whole account — but two companies and
+  // five parks arrive as one run of names with no way to say which ones he is
+  // looking at. The company choice is the same control the bank and front-desk
+  // pages use, so there is one way to pick a company in this portal, and it
+  // renders nothing at all for an account that owns one.
+  //
+  // Both filters only ever NARROW: they sift the rows the server already
+  // decided this login may read, and the park list is built from those same
+  // rows, so choosing one can never reach a park whose screenings were not sent
+  // in the first place. A staff login scoped to one park gets no company
+  // control (the entities list is the owner's) and only its own park to choose.
+  const [companyId, setCompanyId] = useState('')
+  const [propertyId, setPropertyId] = useState('')
+  const { data: entities = [] } = useEntities()
+  // One company is not a choice — the picker auto-selects it and hides itself,
+  // and a row must never drop out of a list that offers nothing to filter by.
+  const byCompany = entities.length > 1 ? companyId : ''
+  const ofCompany = useMemo(
+    () => (checks as any[]).filter(c => !byCompany || c.landlordId === byCompany),
+    [checks, byCompany])
+
+  // The parks that actually have screenings, in the chosen company.
+  const parks = useMemo(() => Array.from(
+    new Map(ofCompany.filter(c => c.propertyId)
+      .map(c => [c.propertyId as string, String(c.propertyName || 'Unnamed property')])).entries(),
+  ).sort((a, b) => a[1].localeCompare(b[1])), [ofCompany])
+  // Switching company drops a park that company does not own, rather than
+  // leaving a filter set to something no longer on the list and an empty table.
+  useEffect(() => {
+    if (propertyId && !parks.some(([id]) => id === propertyId)) setPropertyId('')
+  }, [parks, propertyId])
+
+  const scoped = ofCompany.filter(c => !propertyId || c.propertyId === propertyId)
+  const attention = scoped.filter(c => c.bucket !== 'past')
+  const past = scoped.filter(c => c.bucket === 'past')
   const shown = (tab === 'attention' ? attention : past).filter(c => !term ||
     [c.firstName, c.lastName, c.email, c.unitNumber, c.propertyName].some(v => String(v ?? '').toLowerCase().includes(term)))
 
@@ -52,13 +105,21 @@ export function BackgroundChecksPage() {
           {attention.length} need{attention.length === 1 ? 's' : ''} attention · {past.length} past
         </p></div>
       </div>
-      <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12}}>
+      <EntityPicker value={companyId} onChange={setCompanyId} label="Company"
+        note="Choose one to see only its applicants." />
+      <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
         <button type="button" className={`btn btn-sm ${tab === 'attention' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('attention')}>
           Needs attention ({attention.length})
         </button>
         <button type="button" className={`btn btn-sm ${tab === 'past' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('past')}>
           Past ({past.length})
         </button>
+        {parks.length > 1 && (
+          <select className="input" style={{maxWidth:260}} value={propertyId} onChange={e => setPropertyId(e.target.value)}>
+            <option value="">All properties</option>
+            {parks.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        )}
         <input className="input" style={{marginLeft:'auto',maxWidth:280}} placeholder="Name, email, space…" value={q} onChange={e => setQ(e.target.value)} />
       </div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
@@ -95,7 +156,9 @@ export function BackgroundChecksPage() {
                   </td>
                   <td>
                     <span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span>
-                    {c.status === 'approved' && c.clearedForStay && <span className="badge badge-muted" style={{marginLeft:4}} title="Screened for their stay — they can be checked in">Cleared for their stay</span>}
+                    {c.status === 'approved' && c.clearedForStay && (stayIsOver(c)
+                      ? <span className="badge badge-muted" style={{marginLeft:4}} title="Screened for their stay — they stayed and checked out">Stay finished</span>
+                      : <span className="badge badge-muted" style={{marginLeft:4}} title="Screened for their stay — they can be checked in">Cleared for their stay</span>)}
                     {c.status === 'approved' && !c.clearedForStay && c.housed && <span className="badge badge-muted" style={{marginLeft:4}} title="A lease exists for them">Housed</span>}
                     {c.status === 'approved' && !c.clearedForStay && !c.housed && c.parkedAt && <span className="badge badge-muted" style={{marginLeft:4}} title={c.parkedNote || 'Set aside — not moving in for now'}>Not moving in for now</span>}
                     {c.status === 'approved' && !c.clearedForStay && !c.housed && !c.parkedAt && <span className="badge badge-gold" style={{marginLeft:4}} title="Approved — pick a space and draft the lease">Needs a lease</span>}
@@ -104,7 +167,9 @@ export function BackgroundChecksPage() {
                 </tr>
               )) : (
                 <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>
-                  {term ? 'Nobody matches that.' : tab === 'attention' ? 'Nobody needs anything from you right now.' : 'Nothing here yet.'}
+                  {term ? 'Nobody matches that.'
+                    : propertyId || byCompany ? 'No screenings here.'
+                    : tab === 'attention' ? 'Nobody needs anything from you right now.' : 'Nothing here yet.'}
                 </td></tr>
               )}
             </tbody>
@@ -167,6 +232,8 @@ function ReviewModal({ check, onClose, onDecided }: {
   const isApproved = check.status === 'approved' || approvedNow
   // A guest screened for a stay: their check only clears check-in (R10/A8).
   const forStay = !!check.stayBookingId
+  // 10/19 (Nic): and once that stay is behind them, not even that.
+  const over = forStay && stayIsOver(check)
   const needsUnit = isApproved && !check.unitId && !forStay
   const { data: vacants = [] } = useQuery<any[]>(
     ['vacant-units', check.propertyId],
@@ -407,12 +474,15 @@ function ReviewModal({ check, onClose, onDecided }: {
 
           {forStay && (
             <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.5}}>
-              {isApproved
-                ? 'Cleared for their stay'
+              {over ? 'They stayed'
+                : isApproved ? 'Cleared for their stay'
                 : 'Screened for their stay'}
               {check.stayCheckIn ? ` — check-in ${stayDay(check.stayCheckIn)}` : ''}
               {check.stayCheckOut ? `, check-out ${stayDay(check.stayCheckOut)}` : ''}.
-              {isApproved ? ' They can be checked in from the schedule.'
+              {/* 10/19 (Nic): a finished stay is not a to-do. Nothing to check
+                  in, nothing to set aside, nothing to draft. */}
+              {over ? ' That stay is finished — nothing here is waiting on you.'
+                : isApproved ? ' They can be checked in from the schedule.'
                 : check.status === 'denied' ? ' You can still check them in from the schedule if you choose to.'
                 : check.status === 'complete' ? ' Check-in waits for your decision.'
                 : ' Check-in waits for the results and your decision.'}

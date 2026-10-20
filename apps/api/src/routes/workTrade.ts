@@ -31,7 +31,7 @@ const coveredChargesSchema = z.array(z.enum(WORK_TRADE_COVERABLE))
  * amount" for paid extra hours); a rate kept from an earlier setting is not
  * theirs to read. Nothing on the row prices a trade hour.
  */
-function agreementForTenant<T extends Record<string, any> | null>(row: T): T {
+export function agreementForTenant<T extends Record<string, any> | null>(row: T): T {
   if (!row || row.extra_hours_mode === 'pay') return row
   return { ...row, extra_hours_rate: null }
 }
@@ -548,7 +548,13 @@ workTradeRouter.get('/:id', async (req, res, next) => {
     // S637: tracks_hours is the parent switch — a trusted agreement asks for no
     // hours, so its effective target is 0 and workTradeFraction reads that as
     // fully covered.
-    const target = agreement.tracks_hours === false ? 0 : Number(agreement.target)
+    //
+    // 10/19 (Nic): and so does a PAUSED trade whose space is empty. Same rule as
+    // the month close and the standing (hoursCountedFor), so this cannot quote a
+    // target the close is about to waive — a tenant seeing one number and the
+    // close doing another is how a work-trade argument starts.
+    const { hoursCountedFor } = await import('../services/workTradeStanding')
+    const target = hoursCountedFor(agreement) ? Number(agreement.target) : 0
     const approvedThisMonth = logs.filter(l => l.status === 'approved' && inThisMonth(l.work_date))
     const hoursApprovedThisMonth = approvedThisMonth.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
     const pendingLogs = logs.filter(l => l.status === 'pending')
@@ -792,7 +798,8 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
   try {
     const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths,
             trusted, skills, duties, carryForwardIndefinite, fieldPermissions,
-            openCoveredCharges, extraHours, extraHoursRate, extraHoursPayMethod } = z.object({
+            openCoveredCharges, extraHours, extraHoursRate, extraHoursPayMethod,
+            spaceOccupiedWhilePaused } = z.object({
       // S652: trusted or monitored, what they can fix, and the duties in words.
       trusted: z.boolean().optional(),
       skills: z.array(z.enum(WORK_TRADE_SKILLS as unknown as [string, ...string[]])).optional(),
@@ -813,6 +820,13 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         .multipleOf(0.01, 'Set the rate in dollars and cents.').optional(),
       extraHoursPayMethod: z.enum(WORK_TRADE_EXTRA_PAY_METHODS).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
+      // 10/19 (Nic): "the landlord needs to have a way to set whether they
+      // occupy the spot or not" while a work trade is paused. True keeps hours
+      // counting; false asks for none, because "if people take their camper home
+      // for the summer with them and it's not occupying the spot, then there
+      // would be no reason for it to continue to track hours." Sent with the
+      // pause, and changeable afterwards — a camper can leave later.
+      spaceOccupiedWhilePaused: z.boolean().optional(),
       endDate: z.string().optional(),
       // W-56: per-person target is editable on the agreement.
       monthlyHoursTarget: z.number().int().positive().optional(),
@@ -837,6 +851,55 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
     if ((extraHours ?? before.extra_hours_mode) === 'pay'
         && (!(Number(extraHoursRate ?? before.extra_hours_rate) > 0) || !(extraHoursPayMethod ?? before.extra_hours_pay_method))) {
       throw new AppError(400, 'To pay extra hours, set the hourly rate and how they are paid (payroll or a contractor payment).')
+    }
+
+    // ── 10/19: PAUSING ASKS ABOUT THE SPACE ───────────────────────────────────
+    //
+    // Nic: "the landlord needs to have a way to set whether they occupy the spot
+    // or not." Asked AT the moment of pausing, because the answer decides
+    // whether this month still asks for hours, and nobody but the landlord knows
+    // whether the camper is still sitting there. There is no default to fall
+    // back on that is not a guess about somebody's money.
+    //
+    // Only this route asks. Lease hibernation and a lease expiring with no
+    // successor pause an agreement with no landlord in front of a screen; those
+    // land unanswered on purpose, keep today's behavior, and the work-trade
+    // window prompts for the answer while it stays that way.
+    const pausingNow = status === 'paused' && before.status !== 'paused'
+    if (pausingNow && spaceOccupiedWhilePaused === undefined) {
+      throw new AppError(400, 'Say whether the space is still being used while this is paused.')
+    }
+    // ── 10/19 (review): AND THE ANSWER IS ONLY ACCEPTED ON A PAUSE ────────────
+    //
+    // The answer belongs to THIS pause, not to the agreement for ever
+    // (migration 20261021150000). The trigger there forgets it on the way back
+    // to active, which covers a pause that ends — but an answer written while
+    // the trade was already RUNNING is no transition at all, so nothing would
+    // clear it, and nothing would look wrong either: the close only reads it on
+    // a dormant trade. It would sit there silently until the next hibernation
+    // paused the lease, and then stop counting hours on a pause nobody was ever
+    // asked about — every open month covered outright, the carried catch-up
+    // cleared, and the window telling the tenant their space is empty with the
+    // camper possibly still on the spot.
+    //
+    // That is reachable without anybody doing anything odd: the work-trade
+    // window computes its buttons from the agreement it fetched, so a lease
+    // resumed in another tab (routes/leases resume, or the scheduler) leaves
+    // "The space is empty" on screen for a trade that is running again. So the
+    // state is checked here, where it is current, rather than trusted from the
+    // screen — and the landlord is told plainly instead of saving a wrong fact.
+    const pausedAfterThis = (status ?? before.status) === 'paused'
+    if (spaceOccupiedWhilePaused !== undefined && !pausedAfterThis) {
+      throw new AppError(400, before.status === 'ended'
+        ? 'This work trade has ended, so there is no pause to answer about the space.'
+        : 'This work trade is running, so there is no pause to answer about the space. Open it again to see where it stands.')
+    }
+    // The column arrives one release ahead of this code (expand, then contract).
+    // In the window where it has not, say so plainly instead of a 500 — and save
+    // nothing, so the landlord is never told a pause took an answer it dropped.
+    if (spaceOccupiedWhilePaused !== undefined
+        && !(await (await import('../services/workTradeStanding')).pausedOccupancySchemaReady())) {
+      throw new AppError(503, 'That answer cannot be saved just yet — the update that adds it is still going out. Try again shortly.')
     }
 
     // One transaction: the new terms, and (10/12) what a change of coverage
@@ -865,6 +928,11 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
           extra_hours_mode=COALESCE($14,extra_hours_mode),
           extra_hours_rate=COALESCE($15,extra_hours_rate),
           extra_hours_pay_method=COALESCE($16,extra_hours_pay_method),
+          -- 10/19: the pause's own answer. COALESCE, so not sending it leaves
+          -- the answer alone — and the trigger in migration 20261021150000
+          -- clears it on the way back to active, because it belongs to THIS
+          -- pause and not to the agreement for ever.
+          paused_space_occupied=COALESCE($17,paused_space_occupied),
           -- 10/6 (review): a work trade made on a reservation that the landlord
           -- ENDS here no longer follows the stay — a later change to the stay
           -- (a drag, an edit, Add a month) must not bring it back.
@@ -874,7 +942,8 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
          coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null,
          trusted ?? null, skills ?? null, duties !== undefined, duties ?? null, carryForwardIndefinite ?? null,
-         fieldPermissions ?? null, extraHours ?? null, extraHoursRate ?? null, extraHoursPayMethod ?? null]
+         fieldPermissions ?? null, extraHours ?? null, extraHoursRate ?? null, extraHoursPayMethod ?? null,
+         spaceOccupiedWhilePaused ?? null]
       )).rows[0]
 
       // 10/12 (Nic, Curtis Clabough): a change of coverage used to reach only

@@ -8,9 +8,12 @@
  * Drawn on a canvas (thousands of counties redrawn every frame of a drag would
  * stall an SVG): drag or swipe to turn it, scroll or pinch to zoom, and the
  * keyboard (arrows turn it, + and − zoom, 0 goes home) does the same. While it
- * moves only the outlines that matter are drawn; the fine lines come back when
- * it stops. A tap picks a place; the far side of the earth is never picked.
- * Every number on it is also in the list beside the map.
+ * moves it draws the land, every place GAM is in, the faint grid, the edge of
+ * the globe, and the outline of whatever place is picked. What it leaves off is
+ * every BOUNDARY, and those come and go together (10/19) — the United States'
+ * own lines with everyone else's — all of them back a moment after it stops. A
+ * tap picks a place; the far side of the earth is never picked. Every number on
+ * it is also in the list beside the map.
  *
  * 10/18 (Nic): where it is facing is the CARD's, not its own — one kept view
  * for the globe and the flat map, so "I'd like it to stay" holds through every
@@ -197,13 +200,43 @@ export function MetricsGlobe({
       const o = p.shade.get(a.id)
       if (o) fill(a.feature, mixRgb(hi, base, o))
     }
-    if (p.borders && !fast) stroke(p.borders, line, 0.5, 0.7)
-    // 10/18 (Nic): the world's own divisions, over the colors — the country
-    // lines from the same file the flat map draws (the coarse world file's
-    // coastlines until it arrives), and the provinces inside them. Both are
-    // thousands of shapes, so they are drawn when the globe is still, as the
-    // other fine lines are.
+    /**
+     * 10/19 (Nic): "how come all of the other countries lines go away when I'm
+     * clicking and holding to drag? But the United States ones all stay there.
+     * When I stop dragging, everything else lights up for boundaries."
+     *
+     * So every boundary is on the one gate now: while the globe is moving the
+     * whole line art is skipped, and all of it comes back together when it
+     * stops. The United States' own lines used to sit outside this gate — the
+     * state lines and the country's outline stayed up through a drag while
+     * every other country's vanished, which is the half-drawn earth he saw.
+     *
+     * Which way to make them agree was MEASURED, not guessed (10/19, one frame
+     * at the county level, 975×610, the 3,000-county fill): the fills, the grid
+     * and the rim cost 27ms on their own; the boundaries on top of them cost
+     * another 130ms — the provinces 78ms, the lines between countries 46ms, the
+     * county lines 5ms — against 2ms for the two United States layers. Drawing
+     * them all through a drag would be six frames a second, so the consistent
+     * answer is the fast one: during a drag NO boundary is drawn. The land is
+     * still there (it is filled, not outlined), so is every place GAM is in,
+     * and the lines are back a moment after the globe stops.
+     *
+     * What a drag still shows of the United States is its COASTLINE: the world
+     * file holds every country except the United States (metricsMapGeo
+     * loadWorld), so the land it fills stops where the country starts and the
+     * sea is the card behind it. The United States' lines that do go are its
+     * land edges with Canada and Mexico — and they go with every other
+     * country's land edges, which is the whole of what he asked for. Putting
+     * either one back on its own is the half-drawn earth again.
+     *
+     * 10/18 (Nic): the world's own divisions, over the colors — the country
+     * lines from the same file the flat map draws (until it arrives, the coarse
+     * world file's own lines between countries: that file's mesh is the shared
+     * edges only, so no coastline is in it either way — a coast is where the
+     * land fill stops), and the provinces inside them.
+     */
     if (!fast) {
+      if (p.borders) stroke(p.borders, line, 0.5, 0.7)
       // A province is the same kind of thing as a state, so it is drawn
       // exactly like one — same color, same weight. That is the whole point of
       // Nic's decision: "Alaska and Hawaii stop looking like a different kind
@@ -211,10 +244,14 @@ export function MetricsGlobe({
       if (provinces) stroke(provinces.borders, line, 0.7)
       if (countries) stroke(countries.borders, line, 1)
       else if (world) stroke(world.borders, line, 1)
+      if (p.stateLines) stroke(us.stateBorders, line, 0.7)
+      stroke(us.nation, line, 1)
     }
-    if (p.stateLines) stroke(us.stateBorders, line, 0.7)
-    stroke(us.nation, line, 1)
+    // The earth's rim is not a boundary — it is the edge of the globe, one
+    // circle, and a turning globe with no rim has no shape at all.
     stroke(sphere, line, 1)
+    // Nor is the outline of the place that is picked: it is the marker saying
+    // which one it is, so it stays up through a drag like the gold does.
     const f = p.focus ? p.areas.find(a => a.id === p.focus) : null
     if (f) stroke(f.feature, rgb('--t0'), 1.6)
 
@@ -244,9 +281,36 @@ export function MetricsGlobe({
     return areaAt(props.current.areas, globeProjection(view.current, size.current.w, size.current.h), x, y)?.id ?? null
   }
 
+  /**
+   * 10/19 (Nic): "there's an issue with the globe view of the map. It's not
+   * displaying right. It's offset from the view when I am hovering over
+   * Nevada. It's saying Florida. … When I try to drag it, nothing changes on
+   * the screen, but now Florida is off the coast of California."
+   *
+   * The drawing was frozen while the hit-test kept following the drag, so the
+   * picture on screen and the place under the pointer were two different
+   * rotations of the earth. Cause: this used to bail out whenever a frame was
+   * already pending (`if (frame.current == null)`), and the effect below
+   * CANCELLED a pending frame without clearing the ref. That effect re-runs
+   * every time `paint` changes identity — which is every time one of the
+   * globe's boundary layers finishes downloading on first open. So the first
+   * layer to land mid-frame cancelled the pending draw, left a dead frame id
+   * in the ref, and from then on every redraw was a silent no-op: the canvas
+   * never painted again, while `view.current` kept turning under it.
+   *
+   * Cancel and reschedule instead of bailing. A pending frame can no longer
+   * wedge the canvas, and the newest `paint` always wins — which also fixes a
+   * quieter version of the same thing, where a frame scheduled before a layer
+   * arrived drew with the closure that did not have it yet.
+   */
   const redraw = useCallback(() => {
-    if (frame.current == null) frame.current = requestAnimationFrame(paint)
+    if (frame.current != null) cancelAnimationFrame(frame.current)
+    frame.current = requestAnimationFrame(paint)
   }, [paint])
+
+  /** The newest `redraw`, for a timer armed earlier in a gesture to call. */
+  const latestRedraw = useRef(redraw)
+  latestRedraw.current = redraw
 
   /**
    * While it moves: the light drawing now, the full one a moment after it
@@ -257,7 +321,10 @@ export function MetricsGlobe({
     moving.current = true
     if (settle.current != null) window.clearTimeout(settle.current)
     settle.current = window.setTimeout(() => {
-      moving.current = false; settle.current = null; redraw()
+      // The NEWEST draw, not the one this gesture started with: a boundary
+      // file can land between the last move and this timer, and the frame that
+      // puts the lines back has to be the one that knows about it.
+      moving.current = false; settle.current = null; latestRedraw.current()
       props.current.onView(view.current)
     }, 160)
     redraw()
@@ -265,6 +332,18 @@ export function MetricsGlobe({
 
   /** The same, at once, when a gesture ends — a toggle clicked a moment later must not lose it. */
   const report = useCallback(() => { props.current.onView(view.current) }, [])
+
+  /**
+   * 10/19: the end of a gesture is the GESTURE's to clean up, so the settle
+   * timer is cleared on the way out and nowhere else. It used to be cleared by
+   * the effect below as well — which re-runs every time `paint` changes
+   * identity, so a boundary file landing in the 160ms after the last move of a
+   * drag cancelled the END of that drag. The globe stayed in its moving state,
+   * which now means with none of its lines on it, until the next touch.
+   */
+  useEffect(() => () => {
+    if (settle.current != null) { window.clearTimeout(settle.current); settle.current = null }
+  }, [])
 
   // A new view from the card (its own Reset, a place picked from the list, a
   // level whose picture opens somewhere else) turns the globe there.
@@ -291,8 +370,9 @@ export function MetricsGlobe({
     return () => {
       ro?.disconnect(); mo?.disconnect()
       if (!ro) window.removeEventListener('resize', fit)
-      if (frame.current != null) cancelAnimationFrame(frame.current)
-      if (settle.current != null) window.clearTimeout(settle.current)
+      // Clearing the ref is the load-bearing half: a cancelled frame id left
+      // behind used to block every later redraw (see `redraw` above).
+      if (frame.current != null) { cancelAnimationFrame(frame.current); frame.current = null }
     }
   }, [redraw])
 
@@ -344,6 +424,16 @@ export function MetricsGlobe({
       gesture.current.travel += 10
     } else {
       gesture.current.travel += Math.abs(at.x - prev.x) + Math.abs(at.y - prev.y)
+      /**
+       * 10/19: a wobble under a click is not a drag. Under the same 6px that
+       * tells a tap from a turn below, the earth does not move and nothing is
+       * redrawn — so a click with a shaky hand no longer takes every line off
+       * the globe for a sixth of a second and puts them back (which is the
+       * flicker the one gate above would otherwise have handed him on a plain
+       * click). A gesture that stays under it is a tap, and a tap picks a
+       * place; it would be two answers at once for it to also turn the earth.
+       */
+      if (gesture.current.travel < 6) return
       view.current = dragRotate(view.current, at.x - prev.x, at.y - prev.y, size.current.w, size.current.h)
       props.current.onHover(null, 0, 0)
     }

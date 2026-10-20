@@ -27,6 +27,7 @@ import {
   FEE_TYPES,
   FEE_TYPE_META, MONEY_KINDS, isMoneyBoxColumn,
   moveInDefaults,
+  moneyBoxValue,
   leaseDueDay,
   dueDayLabel,
   parseDueDay,
@@ -515,6 +516,58 @@ function leaseFieldDate(raw: string | null | undefined): string | null {
 }
 
 /**
+ * 10/19 — WHICH DAY RENT IS DUE, READ IN ONE PLACE.
+ *
+ * A lease form usually carries no "rent is due on the ___" box: every one of
+ * the six templates that prints a prorated-rent line has none. So the day the
+ * proration is measured to has to come from the property — and there were
+ * four separate readings of it. The draft's and the one that writes the lease
+ * at issuance asked the property; the signing page and the sign-time check
+ * quietly fell back to the 1st.
+ *
+ * A park that answers "the 15th" in its own When-rent-is-due dropdown drafted
+ * the right figure, had the page overwrite it with the one for the 1st, and
+ * then billed the resident on the 15th as though the stretch up to the 15th
+ * had already been paid. The month between was billed by nothing at all. With
+ * the box locked there was no longer even a way to type the right number in.
+ *
+ * The order is the one the draft has always used, most specific first:
+ *   1. the day the landlord stated on the INVITE (S652) — a park that bills
+ *      each household on its own date onboards residents already on those days
+ *   2. an onboarding resident keeps the property's fixed day: their GAM start
+ *      date is not the day they moved in
+ *   3. otherwise the property's own rule — a fixed day, or each tenant's
+ *      move-in day
+ */
+async function dueDayRuleForUnit(
+  exec: { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> },
+  unitId: string | null | undefined,
+  startIso: string | null,
+): Promise<number> {
+  if (!unitId) return 1
+  const rule = (await exec.query(
+    `SELECT p.rent_due_mode, p.rent_due_day,
+            EXISTS (SELECT 1 FROM pending_tenant_intents i WHERE i.unit_id = u.id
+                      AND i.cancelled_at IS NULL AND i.resolved_at IS NULL
+                      AND COALESCE(i.is_existing_tenancy, false)) AS existing,
+            (SELECT MAX(i.rent_due_day) FROM pending_tenant_intents i WHERE i.unit_id = u.id
+                AND i.cancelled_at IS NULL AND i.resolved_at IS NULL) AS invite_day
+       FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+    [unitId])).rows[0]
+  // leaseDueDay in both branches so a stored 29th-31st lands on the 1st, the
+  // one structural rule ("not every month has those days and we don't want
+  // any skips").
+  if (rule?.invite_day != null) {
+    return leaseDueDay({ mode: 'fixed_day', propertyDay: Number(rule.invite_day), startIso: null })
+  }
+  return leaseDueDay({
+    mode: rule?.existing ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
+    propertyDay: rule?.rent_due_day ?? 1,
+    startIso,
+  })
+}
+
+/**
  * S652 — a lease cannot be issued already over.
  *
  * Blu signed Country Acres MH 06 with an end date of 8/1/2026 and MH 17 with
@@ -734,22 +787,13 @@ export async function createDocumentRecord(client: any, opts: {
     // household is due — a park that bills each tenant on their own date
     // onboards with residents who are already on those dates. That day wins
     // over both rules.
+    //
+    // 10/19: this reading moved into dueDayRuleForUnit, which the signing page
+    // and the sign-time proration check now ask too — they used to fall back
+    // to the 1st and disagree with what the draft stamped.
     if (pv.rent_due_day == null || pv.rent_due_day === '') {
-      const rule = await client.query(
-        `SELECT p.rent_due_mode, p.rent_due_day,
-                EXISTS (SELECT 1 FROM pending_tenant_intents i WHERE i.unit_id = u.id
-                          AND i.cancelled_at IS NULL AND i.resolved_at IS NULL
-                          AND COALESCE(i.is_existing_tenancy, false)) AS existing,
-                (SELECT MAX(i.rent_due_day) FROM pending_tenant_intents i WHERE i.unit_id = u.id
-                    AND i.cancelled_at IS NULL AND i.resolved_at IS NULL) AS invite_day
-           FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
-        [opts.unitId]).then((r: any) => r.rows[0])
-      pv.rent_due_day = dueDayLabel(rule?.invite_day != null ? Number(rule.invite_day) : leaseDueDay({
-        mode: rule?.existing ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
-        propertyDay: rule?.rent_due_day ?? 1,
-        // S654: a caller-supplied start can be M/D/YYYY — read it as a calendar day.
-        startIso: leaseFieldDate(pv.start_date),
-      }))
+      // S654: a caller-supplied start can be M/D/YYYY — read it as a calendar day.
+      pv.rent_due_day = dueDayLabel(await dueDayRuleForUnit(client, opts.unitId, leaseFieldDate(pv.start_date)))
     }
   }
 
@@ -989,7 +1033,10 @@ export async function createDocumentRecord(client: any, opts: {
             // S654: document dates are M/D/YYYY, which parseIso can't read.
             startIso: leaseFieldDate(prefillValues.start_date),
             existingTenancy, collectsNextPeriod: prop?.on === true,
-            dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
+            // The box when the form has one, otherwise the property's rule —
+            // the same answer the page and the sign-time check now reach.
+            dueDay: parseDueDay(prefillValues.rent_due_day)
+              ?? await dueDayRuleForUnit(client, opts.unitId, leaseFieldDate(prefillValues.start_date)),
             mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
             proratesMidMonth: prop?.prorates_mid_month_rent !== false,
           })
@@ -6345,10 +6392,12 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     const packageDocs = doc.package_group_id ? await packageSiblings(doc.id, signer.user_id) : []
 
     // S648: page 8 locks differently for an onboarding resident.
-    const { isExistingTenancyDocument } = await import('../services/moveInBoxes')
-    const existing_tenancy = doc.document_type === 'original_lease'
-      ? await isExistingTenancyDocument({ query: async (t: string, v: any[]) => ({ rows: await query<any>(t, v) }) }, doc.id)
-      : false
+    // 10/19: through the shared read, because the sign-time proration check
+    // asks the same question and the two now have to agree exactly — the page
+    // writes the derived figure and the server refuses any other.
+    const { documentExistingTenancy } = await import('../services/moveInBoxes')
+    const docExec = { query: async (t: string, v: any[]) => ({ rows: await query<any>(t, v) }) }
+    const existing_tenancy = await documentExistingTenancy(docExec, doc)
     // S648: how this property sets due days, so the page can follow the start
     // date. 10/18 (Nic): and whether it prorates a mid-month move at all —
     // "moving in or out at the middle of a month and also only if the landlord
@@ -6362,7 +6411,14 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       : null
     const rent_due_mode = propRule?.m ?? 'fixed_day'
     const prorates_mid_month_rent = propRule?.prorates !== false
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, prorates_mid_month_rent, readOnly, waitingOn, closedReason, packageDocs } })
+    // 10/19: and WHICH DAY rent is due when the form has no box for it, which
+    // is every template that prints a prorated-rent line. The page used to
+    // fall back to the 1st and overwrite the right figure the draft stamped.
+    const rent_due_day_rule = await dueDayRuleForUnit(
+      docExec, doc.unit_id,
+      leaseFieldDate((fields as any[]).find(f => f.lease_column === 'start_date'
+        && f.value != null && String(f.value).trim() !== '')?.value))
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, prorates_mid_month_rent, rent_due_day_rule, readOnly, waitingOn, closedReason, packageDocs } })
   } catch (e) { next(e) }
 })
 
@@ -6622,6 +6678,103 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       if (billing) {
         throw new AppError(409,
           'This home already has an installment contract that is billing. Void that contract (or cancel the financed sale on the unit) first, then sign this one.')
+      }
+    }
+
+    // ── 10/19 (Nic): THE PRORATED RENT IS CALCULATED, NEVER TYPED ────────────
+    //
+    //   "Just lock the box so it's not typable. The prorated box. Yeah, we want
+    //    the deposit and pet deposit to be typable. The proration is derived
+    //    from a mid-month start. That's based on their lease amount. It should
+    //    be auto-calculated. That doesn't need to be, that one does not need to
+    //    be typable."
+    //
+    // The page gives the landlord nothing to type into that box. A page is one
+    // door, and this value lands through here — so a submit carrying a
+    // proration that disagrees with the start date is refused, whatever drew
+    // the form that sent it. Kay Howard (RV 21) and Clint Cook (RV 18) both
+    // signed $323.00 — the 17 days from the day the forms were filled out, not
+    // from the day either of them arrived — and nothing said a word.
+    //
+    // Only the landlord's pass can write it (the field UPDATE below matches on
+    // signer_role), and the arithmetic is shared moveInDefaults: the same
+    // function that drafted the box, the same one the move-in bill runs on, so
+    // the page, the paper and the invoice cannot tell three stories.
+    const prorationRows = allFields.filter((f: any) =>
+      f.lease_column === 'move_in_proration' && f.signer_role === signer.role)
+    if (signer.role === 'landlord' && prorationRows.length > 0) {
+      // 10/19: the SAME read the page used to draw the box (GET /sign), not a
+      // second expression that happens to agree. The page writes the figure
+      // and this refuses any other, so a disagreement between the two is a
+      // document nobody can sign.
+      const { documentExistingTenancy } = await import('../services/moveInBoxes')
+      const asExec = { query: async (t: string, v: any[]) => ({ rows: (await client.query(t, v)).rows }) }
+      const renewal = !!doc.renews_lease_id
+      const existingTenancy = await documentExistingTenancy(asExec, doc)
+      // The terms the proration is worked out FROM, as this submit leaves them.
+      // A submitted value counts only where this signer may actually write it —
+      // their own role's box, the same rule the field UPDATE below applies —
+      // because otherwise a crafted submit could hand this check a start date it
+      // will never store and have the proration measured against that.
+      const effCol = (col: string): string | null => {
+        const typed = allFields.find((x: any) =>
+          x.lease_column === col && submittedById.has(x.id) && x.signer_role === signer.role)
+        if (typed) return submittedById.get(typed.id)!
+        const stored = allFields.find((x: any) =>
+          x.lease_column === col && x.value != null && String(x.value).trim() !== '')
+        return stored ? String(stored.value) : null
+      }
+      // 10/18 (Nic): and whether this property cuts a mid-month move into days
+      // at all. Read through departureRuleSql so it works whether or not
+      // migration 20261020120000 has landed on this database yet.
+      const prop = doc.unit_id
+        ? (await client.query(
+            `SELECT p.rent_due_mode, p.move_in_collects_next_period AS collects,
+                    ${departureRuleSql('prorates_mid_month_rent')} AS prorates
+               FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+            [doc.unit_id])).rows[0]
+        : null
+      const startIso = leaseFieldDate(effCol('start_date'))
+      // 10/19: the day rent is due comes off the form when the form has a box
+      // for it, and otherwise from the property — the same reading the draft
+      // stamped the box with. A flat 1st here refused the correct figure by
+      // name on every park not due on the 1st, and the box has no editor.
+      const dueDay = parseDueDay(effCol('rent_due_day'))
+        ?? await dueDayRuleForUnit(asExec, doc.unit_id, startIso)
+      // A renewal bills no rent on page 8 at all — the nightly run bills it on
+      // the household's own due dates (restampMoveInBoxes holds it at $0).
+      const expected = renewal ? 0 : moveInDefaults({
+        rent: moneyBoxValue(effCol('rent_amount')),
+        startIso,
+        existingTenancy,
+        collectsNextPeriod: prop?.collects === true,
+        dueDay,
+        mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
+        proratesMidMonth: prop?.prorates !== false,
+      }).proration
+      // WHAT TO FIX, which is not always the start date. On a renewal or for a
+      // resident who already lives here the line is $0 because of who they are,
+      // and at a park that bills a whole month as a whole month it is the whole
+      // month because of the property's own answer — moving the start date
+      // does nothing in any of the three. Telling a clerk to fix the start date
+      // in those cases sends them changing dates on somebody's lease.
+      const lever = renewal
+        ? 'This lease follows one the household already has, so no rent bills on this page at all.'
+        : existingTenancy
+          ? 'This resident is on the lease as already living here, so there is no move-in to prorate.'
+          : prop?.rent_due_mode === 'move_in_day'
+            ? "This property bills each tenant on their own move-in day, so a first whole month starts whichever day they arrive and there is nothing to prorate."
+            : prop?.prorates === false
+              ? 'This property bills a whole month as a whole month, so the month they move into is charged in full.'
+              : 'If the amount is wrong, the start date is what to fix.'
+      for (const row of prorationRows) {
+        const submitted = effVal(row)
+        if (submitted == null) continue
+        if (Math.round(moneyBoxValue(submitted) * 100) === Math.round(expected * 100)) continue
+        throw new AppError(400,
+          `The prorated rent on this lease reads $${moneyBoxValue(submitted).toFixed(2)}, and from this lease's `
+          + `start date, rent and due day it is $${expected.toFixed(2)}. That line is calculated, never typed — `
+          + `reload the lease and it fills itself in. ${lever}`)
       }
     }
 
