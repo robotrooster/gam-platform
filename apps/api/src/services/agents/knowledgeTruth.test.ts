@@ -279,3 +279,57 @@ describe('S655 credit is described the way it works', () => {
     expect(text).toMatch(/only verified bank[^.]*\. The same goes while you're on FlexPay or a FlexPay payment is still owed/)
   })
 })
+
+/**
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff."
+ *
+ * The articles were the one state-law surface no test could reach. They are
+ * ingested into agent_knowledge_chunks, which the test DB keeps between runs
+ * (CLEANUP_KEEPS in test/dbHelpers), so a sentence promising a warning sits in
+ * the retrieval corpus and every suite still passes. The landlord entry-request
+ * article promised exactly that -- "GAM surfaces general warnings" -- in the
+ * area the warning had just been taken out of, which is two wrong answers in
+ * one sentence: a landlord waits for a banner that will never appear, and GAM
+ * has volunteered that it holds a view on his notice period.
+ *
+ * Switching the warnings back on is one row and no deploy, so this guards the
+ * CLAIM, not the flag: an article may say what the law depends on and tell the
+ * reader to go read it, and must not say GAM reads it for them.
+ */
+describe('the knowledge base never promises a state-law warning', () => {
+  const LAW = /\b(local|state)\s+(law|laws|rule|rules)\b|\bstatut/i
+  /** GAM as the one doing the warning/flagging/comparing -- not "check your
+   *  local laws", which is the reader's job and stays. */
+  const GAM_WEIGHS_IN = new RegExp(
+    [
+      String.raw`\b(GAM|we)\b[^.]{0,80}?\b(warns?|warning|warnings|flags?|flagged|alerts?|surfaces?)\b`,
+      String.raw`\b(GAM|we)\b[^.]{0,80}?\b(checks?|compares?|measures?)\b[^.]{0,40}?\bagainst\b`,
+      String.raw`\b(warns?|warning|warnings|flags?|alerts?)\b[^.]{0,40}?\byour (local|state)\b`,
+    ].join('|'),
+    'i',
+  )
+
+  it('no article says GAM warns, flags or weighs anything against local or state law', () => {
+    const offenders = ARTICLES.flatMap((a) =>
+      a.text.split(/(?<=[.!?])\s+|\n/)
+        .map((s) => s.trim())
+        .filter((s) => LAW.test(s) && GAM_WEIGHS_IN.test(s))
+        .map((s) => `${a.path}: ${s.slice(0, 140)}`))
+    expect(offenders, offenders.join('\n')).toEqual([])
+  })
+
+  it('would catch the sentence that was there, so this is not a regex that passes on anything', () => {
+    const was = 'How much notice is required, and your rights around entry, depend on your local law \u2014 GAM surfaces general warnings, but check your local rules for your property.'
+    expect(LAW.test(was) && GAM_WEIGHS_IN.test(was)).toBe(true)
+  })
+
+  it('still tells a landlord the entry-notice period is his local law to read', () => {
+    // The inverse risk: scrubbing the sentence until the article stops saying
+    // the thing that IS true, and the agent answers an entry-notice question
+    // with nothing at all.
+    const text = ARTICLES.find((a) => a.path === 'landlord/entry-requests-and-notice.md')!.text
+    expect(text).toMatch(/depend on your local law/)
+    expect(text).toMatch(/leaves the law itself to you/)
+  })
+})

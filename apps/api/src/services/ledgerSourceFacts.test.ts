@@ -30,7 +30,12 @@ const AUDITED_MONEY_TABLES = [
   'bank_deposit_allocations', 'lease_prepaid_credit_draws', 'paid_ahead_choices',
   'payment_reversals', 'connect_disputes', 'lease_rent_components',
   'lot_rent_charges', 'propane_fills', 'suspended_utility_charges',
-  'utility_owner_use_absorptions', 'security_deposit_interest_accruals',
+  // 10/20: utility_owner_use_absorptions became the TABLE
+  // utility_absorbed_charges (one record of utility billed to nobody, whatever
+  // the reason) plus a view of the owner-use slice under the old name. The
+  // trigger belongs on the table; a view cannot carry one.
+  'utility_absorbed_charges', 'early_departure_washes', 'utility_wash_holds',
+  'security_deposit_interest_accruals',
   'sublessor_credit_balances', 'work_trade_settlements',
   'user_balance_ledger', 'held_payout_items', 'platform_transfer_intents',
   'connect_payouts', 'landlord_instant_margins',

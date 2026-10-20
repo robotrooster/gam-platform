@@ -176,6 +176,11 @@ describe('chargeHeldByRecordSql — the rows a delete was refused on', () => {
       'common_area_reservations.fee_payment_id': 'kept on purpose: the reservation names its voided fee, marked fee_voided',
       'credit_uses.payment_id': 'only a released use can be on a voided charge; left as it is',
       'connect_disputes.payment_id': 'a dispute is on a paid charge, never one still owed',
+      // 10/20 (Nic): a utility bill collected on a pay link records which charge
+      // the collection took off the payer's invoice, and keeps naming it after the
+      // void so the bill's story stays readable — billed on an invoice, then
+      // collected on a link, and that charge voided so nobody was asked twice.
+      'utility_pay_link_settlements.payment_id': 'kept on purpose: the settlement names the charge its collection voided',
     }
     const fks = (await db.query<{ k: string }>(
       `SELECT regexp_replace(c.conrelid::regclass::text, '^public\\.', '') || '.' || a.attname AS k

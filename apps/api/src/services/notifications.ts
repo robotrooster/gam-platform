@@ -2,7 +2,7 @@ import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
 import { replyToProperty, type ReplyTo } from './replyRouting'
 import { logger } from '../lib/logger'
-import { isCriticalNotificationType } from '@gam/shared'
+import { isCriticalNotificationType, type NotificationType } from '@gam/shared'
 import { portalLink } from '../lib/portalUrls'
 
 // S536 (Nic): SMS is REMOVED platform-wide — notifications and
@@ -37,8 +37,15 @@ export function emailTemplate(title: string, body: string, cta?: { label: string
   </div></body></html>`
 }
 
+/**
+ * 10/20 (Nic): `type` is `NotificationType`, not `string` — the union derived
+ * from the one notification catalog in @gam/shared. A notification whose type is
+ * not in that catalog DOES NOT COMPILE, which is the whole reason the settings
+ * page can no longer be missing a type. Adding a notification means adding its
+ * catalog entry (label, when-it-fires, audience, group) first.
+ */
 export async function createNotification(p: {
-  userId: string; landlordId?: string; type: string; title: string; body: string; data?: any
+  userId: string; landlordId?: string; type: NotificationType; title: string; body: string; data?: any
   // S527 W-1: in-app deep-link — clicking the notification lands on the
   // SPECIFIC item (e.g. '/leases?open=<id>'), not a generic page. Optional;
   // the bell falls back to a per-type route when absent.
@@ -54,9 +61,16 @@ export async function createNotification(p: {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
     // S570 (Nic): critical types (e.g. failed rent payment) always email — the
-    // pref can't turn it off (UI locks it too). Missing these causes real harm.
-    const emailOk = isCriticalNotificationType(p.type) ? true : (prefs ? prefs.email_enabled : true)
-    const inAppOk = prefs ? prefs.in_app_enabled : true
+    // pref can't turn it off (the page shows the box locked with the reason).
+    // Missing these causes real harm.
+    const critical = isCriticalNotificationType(p.type)
+    const emailOk = critical ? true : (prefs ? prefs.email_enabled : true)
+    // 10/20: and the in-app copy of a critical notice is forced on for the same
+    // reason. The comment here used to say "in-app is always on already", which
+    // was not true: in_app_enabled is a real stored column that the agent tool
+    // and a hand-written row can set FALSE, and this line honored it — so the
+    // one notice that must not be missed could be suppressed in both channels.
+    const inAppOk = critical ? true : (prefs ? prefs.in_app_enabled : true)
 
     // Capture the inserted notification id so the post-send flag updates can
     // target this exact row instead of the previously-broken

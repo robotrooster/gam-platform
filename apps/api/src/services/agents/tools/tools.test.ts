@@ -99,12 +99,29 @@ const GUEST_ACTOR: AgentActor = { userId: 'tok1', role: 'guest', profileId: 'bk1
 describe('tool allowlist', () => {
   it('gives tenant profiles the tenant tools, landlord profiles the landlord tools', () => {
     const t = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
-    for (const name of ['file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_lease', 'get_my_inspections', 'get_my_entry_requests', 'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read'])
+    for (const name of ['file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_lease', 'get_my_inspections', 'get_my_entry_requests', 'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_applicable_laws', 'search_state_law', 'get_my_notifications', 'mark_notifications_read'])
       expect(t).toContain(name)
 
     const l = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
-    for (const name of ['get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations', 'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'get_applicable_laws', 'check_against_law', 'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_my_notifications', 'mark_notifications_read'])
+    for (const name of ['get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations', 'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'get_applicable_laws', 'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_my_notifications', 'mark_notifications_read'])
       expect(l).toContain(name)
+  })
+
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the system."
+  it('offers no profile the figure-comparison tool while the warnings are hidden', () => {
+    // Hidden, not demolished: check_against_law is still registered and still
+    // has its own tests below. What changed is that no model is handed a
+    // description offering to compare someone's number against a statute, and
+    // then a refusal when it takes the offer up.
+    expect(getTool('check_against_law')).toBeTruthy()
+    for (const profileId of ['tenant_entry', 'tenant_escalation', 'landlord_entry', 'landlord_escalation'])
+      expect(getToolsForProfile(requireProfile(profileId)).map((x) => x.name), profileId)
+        .not.toContain('check_against_law')
+    // Statute RETRIEVAL stays on both sides - asked what the law says, an agent
+    // still answers from the catalog.
+    for (const profileId of ['tenant_entry', 'landlord_entry'])
+      expect(getToolsForProfile(requireProfile(profileId)).map((x) => x.name), profileId)
+        .toContain('search_state_law')
   })
 
   it('surfaces the agent inspection write-tools to landlord profiles (entry + escalation), never to tenants', () => {
@@ -511,24 +528,140 @@ describe('read tools scope to the actor', () => {
     })
   })
 
+  /**
+   * 10/20 (Nic): the tool used to edit ONLY rows that already existed, and its
+   * answer to a landlord who had never opened the settings page was "No
+   * notification preferences are set yet" — which is everyone, for most types,
+   * because a row is only written when somebody answers. "Stop emailing me
+   * about maintenance" did nothing for the person most likely to say it. It
+   * writes the row for any type in the catalog now, and it speaks the human
+   * label rather than the stored string (memory: gam-no-raw-enums-in-ui).
+   */
   describe('update_notification_preference (scoped to actor.userId)', () => {
-    it('updates an existing type, keeping unspecified channels', async () => {
+    it('writes the row from the human label, keeping the unspecified channel', async () => {
       ;(query as any)
-        .mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
-        .mockResolvedValueOnce([]) // the UPDATE
-      const res: any = await updateNotificationPreference.execute({ type: 'rent_due', emailEnabled: false }, TENANT_ACTOR)
+        .mockResolvedValueOnce([{ type: 'maintenance_updated', email_enabled: true, in_app_enabled: true }])
+        .mockResolvedValueOnce([]) // the upsert
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'Updates on your requests', emailEnabled: false }, TENANT_ACTOR)
       expect((query as any).mock.calls[0][1]).toEqual(['u1']) // read scoped to userId
-      const updateParams = (query as any).mock.calls[1][1]
-      expect(updateParams[0]).toBe('u1') // update scoped to userId
+      const writeParams = (query as any).mock.calls[1][1]
+      expect(writeParams[0]).toBe('u1')           // write scoped to userId
+      // A text[] since 10/20: one upsert covers one type or all of them
+      // (applyToAll), so the write is set-based either way.
+      expect(writeParams[1]).toEqual(['maintenance_updated'])
       expect(res).toMatchObject({ ok: true, email: false, inApp: true })
+      expect(res.notification).toBe('Updates on your requests')
     })
 
-    it('lists current types when the requested type is unknown', async () => {
-      ;(query as any).mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
+    it('writes a row for a type that has never been answered', async () => {
+      ;(query as any)
+        .mockResolvedValueOnce([])  // nothing stored for this user at all
+        .mockResolvedValueOnce([])  // the upsert still happens
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'maintenance_updated', emailEnabled: false }, TENANT_ACTOR)
+      expect(res.ok).toBe(true)
+      expect((query as any).mock.calls[1][1][1]).toEqual(['maintenance_updated'])
+      // Default was on; only email was named, so in-app keeps GAM's default.
+      expect(res).toMatchObject({ email: false, inApp: true })
+    })
+
+    it('refuses to switch off one of the five GAM always sends, and says why', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'payment_failed', emailEnabled: false }, TENANT_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.alwaysOn).toBe(true)
+      expect(res.message).toContain('always sends')
+      expect((query as any)).toHaveBeenCalledTimes(1) // no write issued
+    })
+
+    it('lists what can be changed, in words, when the name does not match', async () => {
+      ;(query as any).mockResolvedValueOnce([])
       const res: any = await updateNotificationPreference.execute({ type: 'nonexistent' }, TENANT_ACTOR)
       expect(res.needsType).toBe(true)
-      expect(res.types[0].type).toBe('rent_due')
-      expect((query as any)).toHaveBeenCalledTimes(1) // no UPDATE issued
+      expect(res.notifications.length).toBeGreaterThan(20)
+      // Labels, never the stored enum.
+      for (const n of res.notifications) expect(n.notification).not.toMatch(/_/)
+      expect((query as any)).toHaveBeenCalledTimes(1) // no write issued
+    })
+
+    /**
+     * ── 10/20: "STOP EMAILING ME ABOUT MY INSPECTIONS" ──────────────────────
+     *
+     * The loose match picked the FIRST of many and reported success. One
+     * sentence switched off a single row and left the other five emailing, and
+     * the landlord had been told it was done, so he would not ask again. It
+     * narrows and confirms now (memory: gam-agent-goal-narrow-then-resolve).
+     *
+     * ('maintenance' on its own is NOT the example to use: it is an exact
+     * catalog type — "Other maintenance notices" — so it resolves to one row
+     * and always did. The ambiguity is in the ordinary phrasings around it.)
+     */
+    it('narrows instead of guessing when the words match several, and writes nothing', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'inspection', emailEnabled: false }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.needsChoice).toBe(true)
+      expect(res.matches.length).toBe(6)
+      for (const m of res.matches) expect(m.notification).not.toMatch(/_/)
+      expect(res.message).toContain('all of them')
+      expect((query as any)).toHaveBeenCalledTimes(1) // the read only — nothing written
+    })
+
+    it('a maintenance-request phrasing matches three and still asks', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'maintenance request', emailEnabled: false }, LANDLORD_ACTOR)
+      expect(res.needsChoice).toBe(true)
+      expect(res.matches.map((m: any) => m.notification).length).toBe(3)
+      expect((query as any)).toHaveBeenCalledTimes(1)
+    })
+
+    it('switches all of them off in one statement once they have confirmed', async () => {
+      ;(query as any)
+        .mockResolvedValueOnce([])  // nothing answered yet
+        .mockResolvedValueOnce([])  // the upsert
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'inspection', emailEnabled: false, applyToAll: true }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(true)
+      const writeParams = (query as any).mock.calls[1][1]
+      expect(writeParams[0]).toBe('u2')
+      expect([...writeParams[1]].sort()).toEqual([
+        'inspection_finalized', 'inspection_flagged_suspicious',
+        'inspection_scheduled_reminder', 'inspection_submitted',
+        'inspection_tenant_signed', 'moveout_inspection_due',
+      ])
+      expect(writeParams[2]).toEqual([false, false, false, false, false, false])
+      expect(res.changed.length).toBe(6)
+      expect(res.message).toContain('6 notifications')
+    })
+
+    it('an all-of-them sweep leaves the locked ones on and says which', async () => {
+      ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'payment', emailEnabled: false, applyToAll: true }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(true)
+      // Six matched; 'A scheduled payment failed' is one of Nic's five.
+      expect((query as any).mock.calls[1][1][1]).not.toContain('autopay_failed')
+      expect((query as any).mock.calls[1][1][1].length).toBe(5)
+      expect(res.alwaysOnSkipped).toEqual(['A scheduled payment failed'])
+      expect(res.message).toContain('GAM always sends')
+    })
+
+    it('one or two characters is a coincidence, not a name — nothing is written', async () => {
+      // 'a' used to substring-match 'A payment was recorded for you' and switch
+      // that off while reporting success.
+      for (const said of ['a', 'of']) {
+        ;(query as any).mockReset()
+        ;(query as any).mockResolvedValueOnce([])
+        const res: any = await updateNotificationPreference.execute(
+          { type: said, emailEnabled: false }, TENANT_ACTOR)
+        expect(res.ok, said).toBe(false)
+        expect(res.needsType, said).toBe(true)
+        expect((query as any), said).toHaveBeenCalledTimes(1) // no write issued
+      }
     })
   })
 
@@ -764,15 +897,44 @@ describe('read tools scope to the actor', () => {
       expect((query as any).mock.calls[0][0]).not.toMatch(/INSERT/i)
     })
 
-    it('send_bulk_message inserts one notification per tenant when confirmed', async () => {
-      ;(query as any).mockResolvedValueOnce([{ id: 'a' }, { id: 'b' }, { id: 'c' }]) // INSERT ... RETURNING
+    it('send_bulk_message sends one notification per tenant when confirmed', async () => {
+      // 10/20: it reads the recipients and then goes through createNotification
+      // for each, instead of one raw set-based INSERT. That is what makes the
+      // blast honor the resident's in-app answer, store the right type
+      // ('bulk_message', not the one-to-one 'landlord_message'), and stay
+      // visible to the completeness scanner. The old insert also put the uuid[]
+      // of companies straight into the uuid landlord_id column, so a confirmed
+      // blast threw instead of sending — the landlord_id now comes off the lease.
+      ;(query as any).mockResolvedValueOnce([
+        { user_id: 'u1', landlord_id: 'L1' },
+        { user_id: 'u2', landlord_id: 'L1' },
+        { user_id: 'u3', landlord_id: 'L1' },
+      ])
       const res: any = await sendBulkMessage.execute({ message: 'Water shutoff Tuesday', confirmed: true }, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
-      expect(sql).toMatch(/INSERT INTO notifications/i)
+      expect(sql).toMatch(/SELECT DISTINCT t\.user_id/i)
       expect(sql).toMatch(/l\.landlord_id = ANY\(\$1/) // recipients scoped to the landlord
+      expect(sql).not.toMatch(/INSERT/i)
       expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
+      expect(createNotification).toHaveBeenCalledTimes(3)
+      expect(createNotification).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'u1', landlordId: 'L1', type: 'bulk_message', body: 'Water shutoff Tuesday',
+      }))
       expect(res.ok).toBe(true)
       expect(res.sent).toBe(3)
+    })
+
+    it('send_bulk_message reaches a resident who rents from two companies once', async () => {
+      // One person, two leases on the same account. The preview counted people,
+      // so the send has to too — a blast arriving twice reads as a bug.
+      ;(query as any).mockResolvedValueOnce([
+        { user_id: 'u1', landlord_id: 'L1' },
+        { user_id: 'u1', landlord_id: 'L2' },
+        { user_id: 'u2', landlord_id: 'L1' },
+      ])
+      const res: any = await sendBulkMessage.execute({ message: 'Gate code changes Friday', confirmed: true }, LANDLORD_ACTOR)
+      expect(createNotification).toHaveBeenCalledTimes(2)
+      expect(res.sent).toBe(2)
     })
 
     it('get_background_check_status scopes by landlord and exposes no SSN/DOB/PII', async () => {
@@ -868,6 +1030,38 @@ describe('read tools scope to the actor', () => {
       const res: any = await draftTenantNotice.execute({ tenant: 'Nobody', notice: 'hello', confirmed: true }, LANDLORD_ACTOR)
       expect(res.ok).toBe(false)
       expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    // 10/20 (Nic): no state-law warnings anywhere. The S630 caution — that a
+    // notice may have to be served in person or by certified mail depending on
+    // local law — is one, so it waits for the switch. What the landlord is
+    // told either way is what GAM actually DID with the notice, so nobody is
+    // left thinking GAM served it.
+    it('draft_tenant_notice: the service caution waits for the switch; what GAM did is always said', async () => {
+      const match = [{ user_id: 'tenantUser', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }]
+      const args = { tenant: 'Jane', subject: 'Entry Notice', notice: 'We will enter Thursday.' }
+
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
+      const off: any = await draftTenantNotice.execute(args, LANDLORD_ACTOR)
+      expect(off.alsoTellThem).toMatch(/on the record in GAM/i)
+      expect(off.alsoTellThem).not.toMatch(/certified mail|legal service|local requirements|their state/i)
+
+      vi.clearAllMocks()
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue({ enabled: true })
+      const on: any = await draftTenantNotice.execute(args, LANDLORD_ACTOR)
+      expect(on.alsoTellThem).toMatch(/certified mail/i)
+      expect(on.alsoTellThem).toMatch(/not the same as legal service/i)
+
+      // And the same rule on the delivered answer, not only the draft.
+      vi.clearAllMocks()
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue(undefined)
+      const sent: any = await draftTenantNotice.execute({ ...args, confirmed: true }, LANDLORD_ACTOR)
+      expect(sent.sent).toBe(true)
+      expect(sent.alsoTellThem).not.toMatch(/certified mail|legal service/i)
+      mockQueryOne.mockReset()
     })
 
     it('draft_tenant_notice asks which one when several tenants match', async () => {
@@ -1169,16 +1363,37 @@ describe('get_my_landlord_patterns (tenant transparency, scoped to own data)', (
     expect(res.flags).toBeUndefined() // 1pm/2pm are normal hours
   })
 
-  it('flags an objectively odd-hour entry (e.g. a midnight inspection) factually', async () => {
-    ;(query as any).mockResolvedValueOnce([
-      { reason_category: 'inspection', local_hour: 0, notice_window_hours: 24, ymd: '2026-03-01', local_at: 'Mar 01, 2026 at 12:00am' },
-    ])
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the
+  // system. At least not right now. Just hide all that stuff." The midnight
+  // entry is still named — that is the transparency he asked for in S442 — but
+  // the sentence about what entry laws require is a state-law caution and
+  // waits for the same switch every other warning waits for.
+  const ODD_HOUR_ROW = { reason_category: 'inspection', local_hour: 0, notice_window_hours: 24, ymd: '2026-03-01', local_at: 'Mar 01, 2026 at 12:00am' }
+
+  it('flags an objectively odd-hour entry factually, with no state-law caution while the switch is off', async () => {
+    ;(query as any).mockResolvedValueOnce([ODD_HOUR_ROW])
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
     const res: any = await getMyLandlordPatterns.execute({}, TENANT_ACTOR)
     expect(res.flags).toHaveLength(1)
     expect(res.flags[0]).toMatch(/outside typical daytime hours/i)
-    expect(res.flags[0]).toMatch(/reasonable times/i)
-    // factual + points to local law, no legal conclusion
+    expect(res.flags[0]).toMatch(/ask your landlord/i)
+    // The whole answer, not just the flag: no law talk anywhere in it.
+    expect(JSON.stringify(res)).not.toMatch(/reasonable times|local law|entry laws/i)
+    // factual, no legal conclusion
     expect(JSON.stringify(res)).not.toMatch(/illegal|violation|not allowed/i)
+  })
+
+  it('switch ON: the same flag carries the entry-law caution back', async () => {
+    ;(query as any).mockResolvedValueOnce([ODD_HOUR_ROW])
+    mockQueryOne.mockResolvedValue({ enabled: true })
+    const res: any = await getMyLandlordPatterns.execute({}, TENANT_ACTOR)
+    expect(res.flags[0]).toMatch(/outside typical daytime hours/i)
+    expect(res.flags[0]).toMatch(/reasonable times/i)
+    expect(JSON.stringify(res)).not.toMatch(/illegal|violation|not allowed/i)
+    // vi.clearAllMocks() clears CALLS, not implementations, so a switch left
+    // on here would silently turn the warnings on for every test after this
+    // one. Put it back.
+    mockQueryOne.mockReset()
   })
 
   it('returns a clean note when there’s no entry history', async () => {
@@ -1207,14 +1422,32 @@ describe('tenant contact + entry-notice (read, scoped + compliant)', () => {
         { reason: 'inspection', reason_category: 'inspection', status: 'pending', notice_given_at: 'd', notice_window_hours: 48, proposed_entry_window_start: 's', proposed_entry_window_end: 'e', entry_actual_at: null },
       ]) // requests
       .mockResolvedValueOnce([{ default_entry_notice_hours: 24 }]) // landlord policy
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
     const res: any = await getMyEntryRequests.execute({}, TENANT_ACTOR)
     expect((query as any).mock.calls[0][1][0]).toBe('t1') // requests scoped to tenant
     expect((query as any).mock.calls[1][1]).toEqual(['t1']) // policy scoped to tenant
     expect(res.entryRequests[0].noticeHours).toBe(48)
     expect(res.landlordNoticePolicyHours).toBe(24)
-    // Compliant: no state-specific legal assertion — a neutral "check local laws" pointer.
+    // 10/20: the landlord's own notice setting is a fact and stays; the line
+    // telling the tenant that required notice varies by state and to go read
+    // their local law is a state-law caution and is gone while the switch is
+    // off (queryOne returns no system_features row here).
+    expect(res.noticeDisclaimer).toBeUndefined()
+    expect(JSON.stringify(res)).not.toMatch(/local laws|varies by state/i)
+    expect(JSON.stringify(res)).not.toMatch(/required by law|legally required|statute|§/i)
+  })
+
+  it('get_my_entry_requests brings the local-law pointer back when the switch is on', async () => {
+    ;(query as any)
+      .mockResolvedValueOnce([
+        { reason: 'inspection', reason_category: 'inspection', status: 'pending', notice_given_at: 'd', notice_window_hours: 48, proposed_entry_window_start: 's', proposed_entry_window_end: 'e', entry_actual_at: null },
+      ])
+      .mockResolvedValueOnce([{ default_entry_notice_hours: 24 }])
+    mockQueryOne.mockResolvedValue({ enabled: true })
+    const res: any = await getMyEntryRequests.execute({}, TENANT_ACTOR)
     expect(res.noticeDisclaimer).toMatch(/check your local laws/i)
     expect(JSON.stringify(res)).not.toMatch(/required by law|legally required|statute|§/i)
+    mockQueryOne.mockReset()
   })
 })
 
@@ -1425,9 +1658,35 @@ describe('get_my_landlord_renewal_tendency (tenant transparency)', () => {
 })
 
 describe('check_against_law (objective numeric/timeline mismatch, both audiences)', () => {
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the
+  // system." This tool's whole answer is a warning, so it stands down while
+  // the switch in services/stateLaw is off — and must NOT fall through to a
+  // "your number is within the figure" all-clear, which would be a worse lie
+  // than the banner. The tests that exercise the comparison turn the switch
+  // on; the first one holds the hidden behavior.
+  const SWITCH_ON = { enabled: true }
+  /** system_features reads through queryOne; the lease-state lookup does too,
+   *  so answer by statement rather than by call order. */
+  const switchOnAndLeaseState = (state: string | null) =>
+    mockQueryOne.mockImplementation(async (sql: string) =>
+      /system_features/.test(String(sql)) ? SWITCH_ON : (state ? { state } : undefined))
+
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('landlord: flags a late fee above the statutory $5/day, factually + cited (not advice)', async () => {
+  it('hidden 10/20: declines the comparison instead of giving a false all-clear', async () => {
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
+    const res: any = await checkAgainstLaw.execute({ topic: 'late_fee', value: 100, state: 'AZ' }, LANDLORD_ACTOR)
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/not comparing figures against state law/i)
+    expect(res.error).toMatch(/search_state_law/)
+    // Crucially: no verdict either way, and the catalog was never opened.
+    expect(res.mismatch).toBeUndefined()
+    expect(res.message).toBeUndefined()
+    expect(query as any).not.toHaveBeenCalled()
+  })
+
+  it('switch ON — landlord: flags a late fee above the statutory $5/day, factually + cited (not advice)', async () => {
+    mockQueryOne.mockResolvedValue(SWITCH_ON)
     ;(query as any)
       .mockResolvedValueOnce([{ topic: 'late_fee', rule_kind: 'max', threshold_numeric: '5', threshold_unit: 'dollars per day', summary: 'cap', statute_citation: 'A.R.S. § 33-2105', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision (tool)
       .mockResolvedValueOnce([{ topic: 'late_fee', rule_kind: 'max', threshold_numeric: '5', threshold_unit: 'dollars per day', summary: 'cap', statute_citation: 'A.R.S. § 33-2105', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision (checkAgainstStatute)
@@ -1438,18 +1697,20 @@ describe('check_against_law (objective numeric/timeline mismatch, both audiences
     expect(res.statute).toMatchObject({ citation: 'A.R.S. § 33-2105', figure: 5 })
   })
 
-  it('tenant: resolves state from lease; value within the figure → no mismatch', async () => {
-    mockQueryOne.mockResolvedValueOnce({ state: 'AZ' }) // lease state
+  it('switch ON — tenant: resolves state from lease; value within the figure → no mismatch', async () => {
+    switchOnAndLeaseState('AZ')
     ;(query as any)
       .mockResolvedValueOnce([{ topic: 'deposit_max_months', rule_kind: 'max', threshold_numeric: '1.5', threshold_unit: 'months of rent', summary: 'cap', statute_citation: 'A.R.S. § 33-1321', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision
       .mockResolvedValueOnce([{ topic: 'deposit_max_months', rule_kind: 'max', threshold_numeric: '1.5', threshold_unit: 'months of rent', summary: 'cap', statute_citation: 'A.R.S. § 33-1321', source_url: 'u', source_date: '2026-06-09' }]) // checkAgainstStatute
     const res: any = await checkAgainstLaw.execute({ topic: 'deposit_max_months', value: 1 }, TENANT_ACTOR)
-    expect(mockQueryOne.mock.calls[0][1]).toEqual(['t1'])
+    const leaseLookup = mockQueryOne.mock.calls.find((c: any[]) => !/system_features/.test(String(c[0])))
+    expect(leaseLookup?.[1]).toEqual(['t1'])
     expect(res.mismatch).toBe(false)
     expect(res.message).toMatch(/within the 1.5/i)
   })
 
-  it('clean note when the topic isn’t on file for the state', async () => {
+  it('switch ON — clean note when the topic isn’t on file for the state', async () => {
+    mockQueryOne.mockResolvedValue(SWITCH_ON)
     ;(query as any).mockResolvedValueOnce([]) // getLatestProvision → none
     const res: any = await checkAgainstLaw.execute({ topic: 'late_fee', value: 50, state: 'NV' }, LANDLORD_ACTOR)
     expect(res.ok).toBe(true)

@@ -2,10 +2,13 @@
 /**
  * 10/13 (Nic): "emailing tenants on their birthday and saying, Hey, happy
  * birthday from GAM." The tenant's switch for that email is on Profile →
- * Notifications: a Birthday Email row whose Email box is on by default, shows
- * a saved "off", and saves email-off for type 'birthday' when unticked (the
- * job skips anyone with that off). Nothing is posted in the app for it, so the
- * In-App cell says "—" instead of the always-on check.
+ * Notifications: its Email box is on by default, shows a saved "off", and saves
+ * email-off for type 'birthday' when unticked (the job skips anyone with that
+ * off). Nothing is posted in the app for it, so the In-app cell says "—"
+ * instead of a switch that would do nothing.
+ *
+ * 10/20: the tab renders the one shared component off the one catalog, so the
+ * row's words are the catalog's and the cells are table cells.
  *
  * 10/14 afternoon (Nic): "Tenant profile shows the birthday read-only, 'ask
  * your landlord to fix it'." Profile → Profile shows the birthday on file as
@@ -71,22 +74,22 @@ async function open() {
   })
   await until(() => !!labelCell(), 'the Birthday Email row')
 }
-/** The grid's label cell for the birthday row; its next two siblings are In-App and Email. */
-const labelCell = () => [...host.querySelectorAll('div')]
-  .find(d => d.firstElementChild?.textContent === 'Birthday Email') as HTMLDivElement | undefined
-const inAppCell = () => labelCell()!.nextElementSibling as HTMLDivElement
-const emailBox = () => (labelCell()!.nextElementSibling!.nextElementSibling as HTMLDivElement)
+/** The birthday row's label cell; its next two siblings are In-app and Email. */
+const labelCell = () => [...host.querySelectorAll('td')]
+  .find(d => d.firstElementChild?.textContent === 'Happy birthday from GAM') as HTMLTableCellElement | undefined
+const inAppCell = () => labelCell()!.nextElementSibling as HTMLTableCellElement
+const emailBox = () => (labelCell()!.nextElementSibling!.nextElementSibling as HTMLTableCellElement)
   .querySelector('input[type="checkbox"]') as HTMLInputElement | null
 
-describe('the Birthday Email row on the tenant Profile → Notifications tab', () => {
+describe('the happy-birthday row on the tenant Profile → Notifications tab', () => {
   it('is there, says what it is, and its Email box is on by default', async () => {
     await open()
-    expect(labelCell()!.textContent).toContain('A happy-birthday note from GAM on your birthday')
+    expect(labelCell()!.textContent).toContain('a note from GAM')
     expect(emailBox()).not.toBeNull()
     expect(emailBox()!.checked).toBe(true)
   })
 
-  it('the In-App cell reads "—" (email only), not the always-on check', async () => {
+  it('the In-app cell reads "—" (email only), not a switch that would do nothing', async () => {
     await open()
     expect(inAppCell().textContent).toBe('—')
     expect(inAppCell().querySelector('input')).toBeNull()

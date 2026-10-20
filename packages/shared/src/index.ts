@@ -755,23 +755,50 @@ export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
 export const BANK_FILING_SCOPES = [...MERCHANT_RULE_SCOPES, 'split_by_units'] as const
 export type BankFilingScope = typeof BANK_FILING_SCOPES[number]
 
-// S570 (Nic): notification types that are too important to silence. Email is
-// FORCED on for these regardless of the user's preference (they can't toggle it
-// off in the UI), because missing them causes real harm (a failed rent payment
-// slipping to a late fee / eviction clock). In-app is always on already.
-// S609: a failed AUTOPAY pull belongs here for the same reason. The tenant
-// believes their rent is handled and has no reason to check — silence is the
-// worst possible outcome, and it ends in a late fee they never saw coming.
-// S655 (decisions #35.7(c)): FlexPay's money notices always send too — FlexPay
-// ended (the next bill is the tenant's own), FlexPay paid the bill (and what is
-// still due on it), and a FlexPay collection being tried again (have the money
-// in the account by that day).
-export const CRITICAL_NOTIFICATION_TYPES = [
-  'payment_failed', 'autopay_failed', 'flexpay_ended', 'flexpay_bill_covered', 'flexpay_pull_retry',
-] as const
-export type CriticalNotificationType = typeof CRITICAL_NOTIFICATION_TYPES[number]
-export const isCriticalNotificationType = (t: string): boolean =>
-  (CRITICAL_NOTIFICATION_TYPES as readonly string[]).includes(t)
+// 10/20 (Nic): "We need a way to link the bank account once and have it be
+// everything." Where a linked bank CAME FROM, because it decides what GAM may
+// do with it and what the Bank page is allowed to claim.
+//   landlord_link       the landlord signed in to their bank on the Bank page.
+//                       Held by GAM's platform customer, so GAM reads it
+//                       directly and can mint the fee-debit method from it.
+//   connect_onboarding  the link came from step one, inside Stripe's Connect
+//                       onboarding. Held by the CONNECTED ACCOUNT: every Stripe
+//                       read of it must carry the Stripe-Account header, and the
+//                       platform cannot build a payment method from it. Step two
+//                       must not ask for it again.
+// Backs bank_connections.source (migration 20261021190000).
+export const BANK_CONNECTION_SOURCES = ['landlord_link', 'connect_onboarding'] as const
+export type BankConnectionSource = typeof BANK_CONNECTION_SOURCES[number]
+
+// The Financial Connections permissions GAM asks for, and the one that decides
+// whether a link can serve the feed at all. Stripe fixes permissions AT LINK
+// TIME — "account data accessible to you is limited to the data you specified in
+// this parameter" — so a link made without `transactions` can never be read for
+// them, however long GAM waits. It has to be granted again.
+export const FC_TRANSACTIONS_PERMISSION = 'transactions'
+export const FC_BALANCES_PERMISSION = 'balances'
+export const FC_PAYMENT_METHOD_PERMISSION = 'payment_method'
+
+/** Can the feed read transactions through this link? */
+export function fcCanReadTransactions(permissions: readonly string[] | null | undefined): boolean {
+  return (permissions ?? []).includes(FC_TRANSACTIONS_PERMISSION)
+}
+
+// 10/20: every notification GAM can send, with its label, its one-line "when it
+// fires", the audience whose settings page it belongs on, and which five are
+// too important to silence — all in ONE list. CRITICAL_NOTIFICATION_TYPES used
+// to live here as a hand-kept array beside hand-kept settings pages; it is now
+// derived from that catalog so the page, the delivery decision and the list of
+// locked types cannot drift apart again.
+export * from './notificationCatalog'
+
+// 10/20 (Nic): the OTHER road out. Every email in GAM goes through one send()
+// in services/email.ts, and about fifty of its callers never touch
+// createNotification — so the notification catalog alone left them with no
+// switch anywhere. Each category is declared in emailCategories as either a
+// notification the recipient can decline or a transactional email with the
+// reason it always goes, and send() reads that declaration.
+export * from './emailCategories'
 
 // S568 (Nic): home-ownership tracking (who owns a tenant-owned home/RV — the
 // economic sublessor). Backs home_ownerships (migration 20260730210000).
@@ -8754,4 +8781,8 @@ export * from './rentRoll'
 
 // 10/13 (Nic): the admin Metrics map's levels (cities, districts, ZIP codes) — one list for the API and the page.
 export * from './metricsMap'
+
+// 10/20 (Nic): "this looks like the same person" — the signals, the confidence and the
+// sentences for both, shared by the matcher that scores a pair and the screen that asks.
+export * from './duplicatePeople'
 

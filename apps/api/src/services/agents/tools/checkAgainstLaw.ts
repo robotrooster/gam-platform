@@ -10,10 +10,17 @@
  * direction of the mismatch, hedged + dated, and tells the person to check the
  * current law and consult an attorney. A tenant's state comes from their
  * lease; a landlord passes the state.
+ *
+ * 10/20 (Nic): NO PROFILE OFFERS THIS TOOL any more — see LAW_TOOLS in
+ * services/agents/profiles.ts for why, since a tool the model can see is a tool
+ * it offers, and an offer followed by the refusal below is worse than not
+ * offering. The refusal stays as the belt: anything that reaches execute() by
+ * another road still gets no verdict, in either direction. Bringing the
+ * comparison back is the flag AND that list.
  */
 
 import { queryOne } from '../../../db'
-import { checkAgainstStatute, getLatestProvision, STATE_LAW_TOPICS, buildDisclaimer } from '../../stateLaw'
+import { checkAgainstStatute, getLatestProvision, STATE_LAW_TOPICS, buildDisclaimer, stateLawWarningsEnabled } from '../../stateLaw'
 import type { StateLawTopic } from '../../stateLaw'
 import type { AgentTool, AgentActor } from './types'
 
@@ -40,6 +47,24 @@ export const checkAgainstLaw: AgentTool = {
   audiences: ['tenant', 'landlord'],
 
   async execute(args, actor: AgentActor) {
+    // 10/20 (Nic): "There should be no state law warnings anywhere in the
+    // system." This tool's entire output IS a warning — a verdict on someone's
+    // number against a statute — so it stands down while the switch in
+    // services/stateLaw is off, and comes back with it. Stopping here matters:
+    // if it fell through, checkAgainstStatute would return no flag and the
+    // answer would read "your number is within the figure in state law", which
+    // is a false all-clear and worse than the banner we just took away.
+    // Statute RETRIEVAL is untouched — search_state_law and
+    // get_applicable_laws still pull the text when a person asks for it.
+    if (!(await stateLawWarningsEnabled())) {
+      return {
+        ok: false,
+        error:
+          'GAM is not comparing figures against state law right now, so I can’t tell you ' +
+          'whether that number lines up. I can pull the statute text itself with ' +
+          'search_state_law so you can read it and decide, or talk to an attorney in your state.',
+      }
+    }
     const topic = String(args.topic ?? '') as StateLawTopic
     const value = Number(args.value)
     let state = String(args.state ?? '').trim().toUpperCase()

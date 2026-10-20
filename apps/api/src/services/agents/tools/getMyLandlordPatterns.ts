@@ -8,12 +8,21 @@
  * day off). It also flags OBJECTIVELY odd-hour entries (a midnight inspection)
  * factually. This is the tenant's own relationship data (entries into THEIR
  * unit), hard-scoped to actor.profileId — not private, not cross-tenant, not a
- * comparison to other landlords. No legal interpretation: an odd-hour flag
- * states the time + that entry laws commonly require "reasonable times," and
- * points the tenant to check their local law / consult an attorney.
+ * comparison to other landlords.
+ *
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff." The odd-hour flag used to
+ * end with a sentence about what entry laws commonly require and a nudge to go
+ * read the local one. That is a state-law caution, so it is behind the same
+ * switch as every other one (services/stateLaw STATE_LAW_WARNINGS_FEATURE) and
+ * comes back with it. What stays either way is the FACT: an entry was scheduled
+ * at 9:30pm, and the tenant can ask their landlord about it. The fact is the
+ * transparency Nic asked for; the law sentence was GAM volunteering an opinion
+ * about a statute.
  */
 
 import { query } from '../../../db'
+import { stateLawWarningsEnabled } from '../../stateLaw'
 import type { AgentTool, AgentActor } from './types'
 
 interface EntryRow {
@@ -109,10 +118,17 @@ export const getMyLandlordPatterns: AgentTool = {
       return { activity: ACTIVITY[cat] ?? cat, count: list.length, howOften, usualTime, usualNotice }
     })
 
-    // Objective odd-hour flags (before 8am or 8pm-or-later, local time).
+    // Objective odd-hour flags (before 8am or 8pm-or-later, local time). The
+    // time itself is a fact and always shown; the sentence about what entry
+    // laws require is a state-law caution and waits for the switch (see the
+    // header).
+    const sayTheLaw = await stateLawWarningsEnabled()
     const flags = rows
       .filter((r) => Number.isFinite(r.local_hour) && (r.local_hour < 8 || r.local_hour >= 20))
-      .map((r) => `An entry was scheduled for ${r.local_at} — outside typical daytime hours (8am–8pm). Entry laws commonly require entry at "reasonable times," so you may want to check your local law or ask your landlord about it.`)
+      .map((r) => `An entry was scheduled for ${r.local_at} — outside typical daytime hours (8am–8pm).`
+        + (sayTheLaw
+          ? ' Entry laws commonly require entry at "reasonable times," so you may want to check your local law or ask your landlord about it.'
+          : ' You may want to ask your landlord about it.'))
 
     return {
       ok: true,

@@ -2147,9 +2147,21 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       [poolMatchLandlordId]
     )
 
+    // 10/20: 'match_interest' is written to tenant_notifications — a SECOND
+    // notification table the renter-pool portal reads — and it ignored
+    // in_app_enabled, which no other notification does. The type had no entry
+    // in the catalog or the retired list either, so there was no switch for it
+    // on any settings page and no way for a pool member to decline it. It is in
+    // the catalog now (residents, resident page) and the email beside this goes
+    // through the same answer (emailCategories: pool_match_interest). The
+    // WHERE NOT EXISTS is the same reading createNotification uses: a missing
+    // row means on, an explicit FALSE means off.
     await query(`
       INSERT INTO tenant_notifications (user_id, type, title, body, data)
-      VALUES ($1, 'match_interest', 'A landlord is interested in you', $2, $3)`,
+      SELECT $1, 'match_interest', 'A landlord is interested in you', $2, $3
+       WHERE NOT EXISTS (SELECT 1 FROM notification_preferences
+                          WHERE user_id = $1 AND type = 'match_interest'
+                            AND in_app_enabled = FALSE)`,
       [
         entry.user_id,
         `${landlordUser?.first_name || ''} ${landlordUser?.last_name || ''}`.trim() +

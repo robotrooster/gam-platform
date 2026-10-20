@@ -22,7 +22,7 @@ import type { PoolClient } from 'pg'
 import crypto from 'crypto'
 import QRCode from 'qrcode'
 import { z } from 'zod'
-import { cardFeeSplit, isNamedAgencyTax, scaleNamedTaxes, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
+import { cardFeeSplit, isNamedAgencyTax, scaleNamedTaxes, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms, type NotificationType } from '@gam/shared'
 import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -44,6 +44,14 @@ import { reservationDue, checkOutFor, releaseReservationTickets, ticketCarriesSt
   priceWholeStay, leaseDepositFor, stayExtensionQuote, extendStayByMonth, undoStayExtension, SCREENING_LINE_NAME,
   type ReservationDue } from '../services/registerStay'
 import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, continuousStayNights, syncStayUtilityAgreement, screeningPaidForStay, canAttestReturningGuest, attestReturningGuest, RETURNING_GUEST_NOT_ALLOWED, type ScreeningCollectedBy } from '../services/stayTerms'
+// 10/20 (Nic): "A utility bill can be sent as a paylink, and a paylink's utility
+// line settles the bill and counts as recovery." This module decides all of it;
+// the route only carries the money.
+import {
+  utilityBillsSendable, utilityBillsForSending, openUtilityPayLinkSettlements,
+  utilityBillsNotPayable, recordUtilityPayLinkSettlement, releaseUtilityPayLinkSettlements,
+  payLinkLineForBill, isUtilityBillLine, utilityBillIdsOnLink, type UtilityBillForLink,
+} from '../services/utilityPayLink'
 
 export const posPayLinksRouter = Router()
 posPayLinksRouter.use(requireAuth)
@@ -743,7 +751,10 @@ export function linkExtendLine(link: any): LinkExtend | null {
  * sent back come without the server's marks, so they are put back here.
  */
 export function keepLinkServerLines(link: any, items: any[], press: string): any[] {
-  const own = (Array.isArray(link?.items) ? link.items : []).filter((l: any) => !l?.id && (l?.screening === true || l?.extend))
+  // 10/20 (Nic): a line raised from a utility bill is the server's own too —
+  // the bill it closes out is named ON the line, so a clerk who retyped its
+  // amount would collect one figure and close out another.
+  const own = (Array.isArray(link?.items) ? link.items : []).filter((l: any) => !l?.id && (l?.screening === true || l?.extend || isUtilityBillLine(l)))
   if (!own.length) return items
   const out = items.map((i) => ({ ...i }))
   for (const l of own) {
@@ -752,11 +763,14 @@ export function keepLinkServerLines(link: any, items: any[], press: string): any
     if (!hit || Number(hit.qty) !== Number(l.qty)) {
       throw new AppError(400, l.screening
         ? `This link carries the guest's background check (${money(Number(l.price) || 0)}) — it stays on the link as it is. Put that line back, then press ${press} again.`
+        : isUtilityBillLine(l)
+        ? `This link is their ${l.name} bill (${money(Number(l.price) || 0)}) — that line is the bill itself and stays as it is. Put it back the way it was, then press ${press} again; to stop asking for it, close the link.`
         : `This link adds a month to their stay ("${l.name}") — that line stays as it is. Put it back, then press ${press} again; to give up the month, close the link.`)
     }
     if (l.screening) hit.screening = true
     if (l.screening && l.bookingId) hit.bookingId = l.bookingId
     if (l.extend) hit.extend = l.extend
+    if (isUtilityBillLine(l)) hit.utilityBillId = l.utilityBillId
   }
   return out
 }
@@ -1303,7 +1317,12 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
       const priced = await priceWholeStay(db, stayUnitId, stayLine.stayUnit, stayLine.qty, body.stay.checkIn,
         (unit, word) => `Site ${unit} has no ${word} rate set, so this stay cannot be priced — nothing was sent. `
           + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
-      needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, email, checkIn: body.stay.checkIn,
+      // 10/20: the name goes with the address. A derived returning waiver is
+      // corroborated against it (services/stayTerms samePersonName), because a
+      // mailbox is shared and an address alone proves how to reach somebody
+      // rather than who they are. The link already collects the guest's name.
+      needs = await stayNeeds({ landlordId: prop.landlord_id, propertyId: prop.id, email,
+        guestName: body.stay.guestName ?? body.customer?.name ?? null, checkIn: body.stay.checkIn,
         checkOut: priced.checkOut, stayTerms: body.stay.stayTerms ?? null, returning })
       stayTerms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
       staySiteId = stayUnitId
@@ -1826,6 +1845,152 @@ export async function createStayBalanceLink(opts: {
   return { id: link.id }
 }
 
+/**
+ * 10/20 (Nic) — A UTILITY BILL, SENT AS A PAY LINK.
+ *
+ *   "A lot of people that move out are going to get their final electric bill
+ *    as a pay link anyway... There's no way to just charge somebody for electric
+ *    when on move out. Like, how would you do that?... So it has to come from,
+ *    or should be able to come from, the point of sale as well. The point of
+ *    sale is just an extension of things."
+ *
+ * The door he asked for. Today a utility bill becomes a line on the resident's
+ * portal invoice, which is no use at all to somebody who has already gone; this
+ * takes the bill as it stands and emails it as a link they can pay by card.
+ *
+ * It is NOT a cart. The clerk picks bills, not amounts: every figure comes off
+ * the bill itself (its charge, its own tax rate, its cycle and its space), so a
+ * final bill cannot be sent for a penny more or less than what was billed. That
+ * is also why this is a server-written link like the deposit and the stay
+ * balance (createBookingDepositLink, createStayBalanceLink) rather than a trip
+ * through createPayLink's register rules — there is no price for a cashier to
+ * set and nothing to discount.
+ *
+ * NO EXPIRY. A final electric bill that quietly died in fourteen days would
+ * leave the money owed, the bill open and nobody told — the same reason a
+ * deposit link never expires.
+ *
+ * ONE EMAIL FOR THE LOT. Several bills (August and September electric, say) ride
+ * one link and one email: "one email per thing", and the thing here is what they
+ * owe, not each meter read.
+ */
+export async function createUtilityBillPayLink(req: any, body: {
+  propertyId: string; billIds: string[]
+  customer?: { name?: string; email?: string }
+}): Promise<{ id: string; url: string; emailed: boolean; total: number; cardFee: number; bills: number }> {
+  const press = 'Send bill'
+  const prop = await propertyFor(req, body.propertyId)
+  if (!(await connectIdFor(prop.landlord_id))) {
+    throw new AppError(409, 'Card payments are not set up for this property yet — finish payout setup under Banking first.')
+  }
+  const client = await getClient()
+  let link: any
+  let bills: UtilityBillForLink[]
+  try {
+    await client.query('BEGIN')
+    // Read and refused under the bills' own locks: what goes out and what it
+    // asks for are decided on one picture of the bills.
+    bills = await utilityBillsForSending(client, {
+      landlordId: prop.landlord_id, propertyId: prop.id, billIds: body.billIds, press,
+    })
+    // Who it goes to. The address typed in wins — somebody who moved out leaves
+    // a forwarding address — and otherwise it is the payer on the bill, which is
+    // one person for the whole link (the gate above). With neither, nothing is
+    // sent: a link with nowhere to go is worse than a refusal, because the bill
+    // then reads as asked for.
+    const email = (body.customer?.email ?? bills.find(b => b.payerEmail)?.payerEmail ?? '').trim().toLowerCase()
+    if (!email) {
+      throw new AppError(400, 'There is no email address on file for whoever owes this bill — type the address to send it to, then press '
+        + `${press} again.`)
+    }
+    const name = (body.customer?.name ?? bills.find(b => b.payerName)?.payerName ?? null) || null
+    const subtotal = round2(bills.reduce((n, b) => n + b.charge, 0))
+    const tax = round2(bills.reduce((n, b) => n + b.tax, 0))
+    const total = round2(subtotal + tax)
+    if (!(total > 0)) throw new AppError(400, `Those bills come to $0.00, so there is nothing to ask for. Press Cancel.`)
+    const label = (bills.length === 1 ? bills[0].lineName : `${bills.length} utility bills`).slice(0, 120)
+    link = (await client.query(
+      `INSERT INTO pos_pay_links
+         (token, landlord_id, property_id, created_by, kind, label, items,
+          subtotal, tax_amount, discount_amount, total,
+          customer_name, customer_email, tenant_id, booking_id, card_fee_on_top, expires_at)
+       VALUES ($1,$2,$3,$4,'one_time',$5,$6::jsonb,$7,$8,0,$9,$10,$11,$12,NULL,$13,NULL)
+       RETURNING *`,
+      [crypto.randomBytes(24).toString('hex'), prop.landlord_id, prop.id, req.user.userId,
+       label, JSON.stringify(bills.map(payLinkLineForBill)),
+       subtotal.toFixed(2), tax.toFixed(2), total.toFixed(2), name, email,
+       // The payer, so the sale lands on them the way a counter sale would.
+       // There is exactly ONE: utilityBillsForSending refuses a link carrying
+       // more than one person's bills, because paying it would void the other
+       // person's charge off their bill as though they had paid it. A person
+       // holding two spaces here names the tenancy the first bill is on — the
+       // same person's register history either way, and the settle locks every
+       // household the bills name (recordUtilityPayLinkSettlement).
+       bills[0].tenantId,
+       prop.register_card_fee_payer === 'customer'])).rows[0]
+    // The link and the bills it holds commit together: a link that collects
+    // money nothing can close out, or bills held by a link that was never
+    // written, are each worse than neither.
+    await openUtilityPayLinkSettlements(client, {
+      payLinkId: link.id, bills, createdBy: req.user.userId,
+    })
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { emailPayLink } = await import('../services/email')
+  const emailed = await emailPayLink({
+    to: link.customer_email, name: link.customer_name, propertyName: prop.name,
+    label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
+    neverExpires: true,
+    note: bills.length === 1
+      ? 'This is your utility bill for the reading period shown. Paying it here settles it in full.'
+      : 'These are your utility bills for the reading periods shown. Paying this settles all of them in full.',
+    // 10/5: replies reach the people who run this property (services/replyRouting).
+    ctx: { landlordId: prop.landlord_id, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
+  }).then(() => true).catch((e: unknown) => {
+    logger.error({ err: e, payLinkId: link.id }, '[utility-bill-link] email failed')
+    return false
+  })
+  return { id: link.id, url: payLinkUrl(link.token), emailed, total: Number(link.total), cardFee: customerFee, bills: bills.length }
+}
+
+// GET /api/pos/pay-links/utility-bills?propertyId= — 10/20 (Nic): the utility
+// bills at this property that could be sent as a link. Owed, worth something,
+// and not already out on one.
+posPayLinksRouter.get('/utility-bills', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = parseForStaff(z.string().uuid(), req.query.propertyId, {}, LINK_PROPERTY_FIRST)
+    const prop = await propertyFor(req, propertyId)
+    const bills = await utilityBillsSendable(db, { landlordId: prop.landlord_id, propertyId })
+    res.json({ success: true, data: bills })
+  } catch (e) { next(e) }
+})
+
+// POST /api/pos/pay-links/utility-bills — 10/20 (Nic): "Paylink closes out
+// electric. Yeah, do that." Send the picked bills as one emailed link.
+posPayLinksRouter.post('/utility-bills', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = parseForStaff(z.object({
+      propertyId: z.string().uuid(),
+      billIds: z.array(z.string().uuid()).min(1).max(24),
+      customer: z.object({
+        name: z.string().max(120).optional(),
+        email: z.string().email().optional(),
+      }).optional(),
+    }), req.body, {
+      propertyId: LINK_PROPERTY_FIRST,
+      billIds: 'Pick between one and 24 utility bills to send, then press Send bill again.',
+      'customer.email': 'That email does not look right — check it, then press Send bill again.',
+      'customer.name': 'That name is too long — shorten it, then press Send bill again.',
+    }, 'The bill could not be sent — check the address, then press Send bill again.')
+    res.json({ success: true, data: await createUtilityBillPayLink(req, body) })
+  } catch (e) { next(e) }
+})
+
 // GET /api/pos/pay-links/people?propertyId=&q= — S649 (Nic): who to send a bill to.
 //
 // 10/2: the register's own search (services/posPeople searchPeople), so a pay
@@ -2172,6 +2337,10 @@ posPayLinksRouter.post('/:id/cancel', requirePerm('pos.ring_sale'), async (req, 
       // month nobody paid for goes back on the board with the link. Only while
       // nothing was paid toward it and the stay still ends where the month
       // left it (a stay changed on the schedule since is left as it is).
+      // 10/20 (Nic): a link closed before it was paid lets go of the utility
+      // bills it was out for, so another one can be raised for them. The bills
+      // themselves are untouched — still owed, exactly as before it was sent.
+      await releaseUtilityPayLinkSettlements(client, link.id)
       if (extend) {
         monthGivenBack = await undoStayExtension(client, extend)
         if (!monthGivenBack) logger.warn({ payLinkId: link.id, bookingId: extend.bookingId }, '[pay-link] closed link\'s added month was not given back — the stay changed since it was sent')
@@ -2691,6 +2860,18 @@ export async function finalizePayLink(session: {
         (heldId) => tellLandlordPaidTwice({ link, heldId, paymentIntentId: session.payment_intent!, amount: paid, payer, why: 'screening', due: null }),
         'background check already paid')
     }
+    // 10/20 (Nic): a utility bill this link was raised for was paid some other
+    // way while the payer had the card page open — settled at the desk, paid on
+    // their portal bill, collected on another link. Paying it again is the same
+    // money twice, so it is HELD for the landlord to refund and never recorded
+    // as a sale that closes out a bill somebody else already closed. Read under
+    // the bills' own locks, before anything is written.
+    const utilityGone = await utilityBillsNotPayable(client, link)
+    if (utilityGone) {
+      return await holdAndTell('paid_twice', utilityGone.note,
+        (heldId) => tellLandlordPaidTwice({ link, heldId, paymentIntentId: session.payment_intent!, amount: paid, payer, why: 'utility_bill', due: null }),
+        'utility bill already settled')
+    }
     const { toward, stay, rest, restSubtotal, restTax } = await linkPaidToward(client, link)
     // 10/3 (review): whether Close on this link would cancel the guest's stay —
     // the same test the Pay Links row and Close itself use (stayCloseCancels:
@@ -2834,6 +3015,13 @@ export async function finalizePayLink(session: {
       screeningOnly: !link.booking_id && isFeeOnlyLink(link),
     })
     await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, link.id])
+    // 10/20 (Nic): "a paylink's utility line settles the bill and counts as
+    // recovery." The bills this link named are closed out now, in the sale's own
+    // transaction, and every utility line on the sale is written down as money
+    // given back — read from each line's own recovers_utility snapshot, never
+    // from what it is called. A bill-raised line also takes the charge off the
+    // payer's invoice so nobody is asked twice.
+    const utilitySettled = await recordUtilityPayLinkSettlement(client, { link, saleId: tx.id })
     if (link.kind === 'one_time') {
       await client.query(
         `UPDATE pos_pay_links SET status = 'paid', paid_at = NOW(), pos_transaction_id = $2, updated_at = NOW()
@@ -2852,6 +3040,14 @@ export async function finalizePayLink(session: {
     }
     screeningAfterCommit = screening?.afterCommit ?? null
     await client.query('COMMIT')
+    // 10/20 (review): a utility charge another record points at (account credit
+    // on it, a bank match in flight) could not be voided off the payer's bill,
+    // so it is still showing as owed while the money is in. Never silent: the
+    // bill is paid and the charge needs a human.
+    if (utilitySettled.chargesHeld.length) {
+      logger.error({ linkId, saleId: tx.id, charges: utilitySettled.chargesHeld },
+        '[pay-link] a utility bill was paid on a link but its charge could not be taken off the payer\'s bill — it still reads as owed')
+    }
     await expireClosedLinks(closedWithIt)
     if (screeningAfterCommit) await screeningAfterCommit()
     // 10/5 (Nic, R2/R11): its lease-or-stay answer is carried out now that it is paid.
@@ -2896,7 +3092,7 @@ const HELD_REFUND_STEP = 'GAM is holding it: it was not recorded as a sale and i
  * never reached the drawer — so it is not refunded there.
  */
 async function tellLandlordPaidTwice(o: {
-  link: any; heldId: string; paymentIntentId: string; amount: number; payer: string | null; why: 'link' | 'reservation' | 'screening'
+  link: any; heldId: string; paymentIntentId: string; amount: number; payer: string | null; why: 'link' | 'reservation' | 'screening' | 'utility_bill'
   due: ReservationDue | null
 }): Promise<void> {
   const who = o.payer || o.link.customer_name || 'A customer'
@@ -2904,6 +3100,10 @@ async function tellLandlordPaidTwice(o: {
     ? 'after it had already been paid (at the counter, or on another card page)'
     : o.why === 'screening'
     ? 'after the guest\'s background check had already been paid another way'
+    // 10/20 (Nic): the utility bill this link was their final bill for had
+    // already been closed out — at the desk, on their own bill, or on another link.
+    : o.why === 'utility_bill'
+    ? 'after the utility bill it was for had already been paid another way'
     : o.due?.leaseBillsRest ? (o.due.paid > 0.005
       ? 'after the deposit on the reservation it was for had already been paid (its lease bills the rest)'
       : 'for a reservation with nothing due at the register (its lease bills the stay)')
@@ -3071,7 +3271,7 @@ export async function tellLandlordIfLeftOwed(o: { link: any; saleId: string; pai
  * more than once; the account holder hears about it once (keyed on the
  * payment and the kind of notice).
  */
-async function tellLandlordOnce(link: any, paymentIntentId: string, type: string,
+async function tellLandlordOnce(link: any, paymentIntentId: string, type: NotificationType,
                                 n: { title: string; body: string; data?: Record<string, unknown>; actionUrl?: string }): Promise<void> {
   const already = await queryOne(
     `SELECT 1 FROM notifications WHERE type = $2 AND data->>'paymentIntentId' = $1 LIMIT 1`, [paymentIntentId, type])

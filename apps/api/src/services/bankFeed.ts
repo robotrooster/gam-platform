@@ -84,6 +84,33 @@ export function namesAPayer(normalized: string | null | undefined): boolean {
   return words.some(w => !BANK_BOILERPLATE_WORDS.has(w))
 }
 
+/**
+ * WHICH STRIPE ACCOUNT HOLDS THIS LINK — the one thing every Stripe read of a
+ * bank link has to get right.
+ *
+ * 10/20 (Nic): "We need a way to link the bank account once and have it be
+ * everything." A bank a landlord linked on the Bank page belongs to GAM's
+ * platform customer and reads directly. A bank they granted inside Connect
+ * onboarding belongs to the CONNECTED ACCOUNT, and Stripe will not admit it
+ * exists unless the call carries that account id — verified live on 10/20:
+ * retrieving TruBlu's link without the header is a 404 "No such account", with
+ * it reads fine.
+ *
+ * So this is the single place that answers the question, and every FC call below
+ * takes its result. One path that knows which shape it is holding, rather than
+ * two copies of the feed.
+ */
+export function fcAcct(conn: { stripe_connect_account_id?: string | null } | null | undefined):
+  { stripeAccount: string } | undefined {
+  const acct = conn?.stripe_connect_account_id
+  return acct ? { stripeAccount: acct } : undefined
+}
+
+/** Is this link held by GAM's platform customer (and so usable for the fee debit)? */
+export function isPlatformHeld(conn: { stripe_connect_account_id?: string | null } | null | undefined): boolean {
+  return !conn?.stripe_connect_account_id
+}
+
 // ── Stripe FC account-holder customer (one per landlord, reused) ────────────
 export async function getOrCreateFcCustomer(landlordId: string): Promise<string> {
   const row = await queryOne<{ stripe_fc_customer_id: string | null; email: string | null; business_name: string | null }>(
@@ -185,17 +212,24 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
     } catch { /* older links have no balances consent; balance simply stays unknown */ }
 
     const inst = acct.institution_name ?? acct.display_name ?? 'Bank'
+    // 10/20: record the permissions Stripe says this link carries. They are
+    // fixed at link time and never widen, so this is the honest answer to "what
+    // can GAM do with this bank" — the Bank page and the fee debit read it
+    // instead of guessing from when the link was made.
     const conn = await queryOne<any>(
       `INSERT INTO bank_connections
          (landlord_id, provider, stripe_fc_account_id, stripe_fc_session_id,
-          institution_name, account_last4, account_type, display_name)
-       VALUES ($1,'stripe_fc',$2,$3,$4,$5,$6,$7)
+          institution_name, account_last4, account_type, display_name,
+          source, fc_permissions)
+       VALUES ($1,'stripe_fc',$2,$3,$4,$5,$6,$7,'landlord_link',$8)
        ON CONFLICT (stripe_fc_account_id) WHERE stripe_fc_account_id IS NOT NULL
        DO UPDATE SET status='active', stripe_fc_session_id=EXCLUDED.stripe_fc_session_id,
-                     institution_name=EXCLUDED.institution_name, updated_at=now()
+                     institution_name=EXCLUDED.institution_name,
+                     fc_permissions=EXCLUDED.fc_permissions, updated_at=now()
        RETURNING *`,
       [landlordId, acct.id, sessionId, inst, acct.last4 ?? null,
-       acct.subcategory ?? acct.category ?? null, `${inst}${acct.last4 ? ' ••' + acct.last4 : ''}`])
+       acct.subcategory ?? acct.category ?? null, `${inst}${acct.last4 ? ' ••' + acct.last4 : ''}`,
+       Array.isArray(acct.permissions) ? acct.permissions : null])
     out.push(conn)
     // S652 (Nic, relinking PNC): "now it's showing my bank account twice."
     // Stripe issues a fresh account id per link, so a relink of the SAME bank
@@ -899,7 +933,11 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
   const stripe = getStripe()
   const rows: FeedRow[] = []
   try {
-    const list = stripe.financialConnections.transactions.list({ account: conn.stripe_fc_account_id, limit: 100 })
+    // 10/20: `fcAcct` is the whole difference between a bank the landlord
+    // linked on the Bank page and the same bank granted inside onboarding —
+    // same feed, same loop, one options argument.
+    const list = stripe.financialConnections.transactions.list(
+      { account: conn.stripe_fc_account_id, limit: 100 }, fcAcct(conn))
     let count = 0
     for await (const t of (list as any)) {
       const unix = t.transacted_at ?? t.status_transitions?.posted_at
@@ -932,6 +970,21 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
                 last_sync_error = 'Stripe is still fetching your history — this can take a few minutes on a new connection.'
           WHERE id = $1`, [connectionId])
       return { inserted: 0, pending: true }
+    }
+    // 10/20: a link whose `transactions` permission is gone. Stripe's words are
+    // "This account was not created with the required permissions
+    // (`transactions`) to perform this operation" (seen live against a link that
+    // only carries payment_method). Permissions are fixed at link time, so no
+    // amount of retrying fixes this — the bank has to be granted again. Say
+    // that, and mark the link as needing attention so the Bank page asks.
+    if (/required permissions/i.test(msg)) {
+      await query(
+        `UPDATE bank_connections
+            SET status = 'error',
+                last_sync_error = 'This bank was connected without permission to read its transactions. Connect it once more and GAM can read them.'
+          WHERE id = $1`, [connectionId])
+      throw new AppError(409,
+        'This bank was connected without permission to read its transactions. Connect it once more and GAM can read them.')
     }
     await query('UPDATE bank_connections SET last_sync_error=$2, status=$3 WHERE id=$1',
       [connectionId, msg.slice(0, 500), 'error'])
@@ -968,6 +1021,11 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
  */
 export async function refreshBalance(conn: any): Promise<void> {
   if (conn.provider !== 'stripe_fc' || !conn.stripe_fc_account_id) return
+  // 10/20: every refresh is a billable Stripe call, and a link that was never
+  // granted `balances` can only ever answer with an error. When the row records
+  // what the link carries (links made from 10/20 on), don't make the call.
+  // A row with nothing recorded is the pre-10/20 shape — ask, as before.
+  if (Array.isArray(conn.fc_permissions) && !conn.fc_permissions.includes('balances')) return
   const stripe = getStripe()
 
   // S652 (Nic): "it shows September 18th, four days behind, but the sync
@@ -979,19 +1037,19 @@ export async function refreshBalance(conn: any): Promise<void> {
   try {
     acct = await stripe.financialConnections.accounts.refresh(conn.stripe_fc_account_id, {
       features: ['balance'],
-    })
+    }, fcAcct(conn))
     const startedAt = Number(acct?.balance?.as_of ?? 0)
     for (let i = 0; i < 8; i++) {
       const st = acct?.balance_refresh?.status
       const fresh = Number(acct?.balance?.as_of ?? 0) > startedAt
       if (st && st !== 'pending' && (fresh || i > 1)) break
       await new Promise(r => setTimeout(r, 1500))
-      acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+      acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id, fcAcct(conn))
     }
   } catch {
     // Refresh is a nicety — an account Stripe already has a balance for still
     // reports it on a plain retrieve, so fall back rather than giving up.
-    acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+    acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id, fcAcct(conn))
   }
 
   const bal = acct?.balance
@@ -2577,8 +2635,16 @@ export async function ignoreTransaction(landlordId: string, txnId: string) {
  */
 async function debitCapability(conn: any): Promise<'yes' | 'no' | 'unknown'> {
   if (conn.provider !== 'stripe_fc' || !conn.stripe_fc_account_id) return 'no'
+  // 10/20: a link held by the CONNECTED account can never be debited by GAM,
+  // whatever permissions it carries. GAM's fee debit is a platform-side
+  // payment method (createDebitPaymentMethod below, no Stripe-Account header),
+  // and the platform cannot build one out of a bank account that belongs to
+  // somebody else's Stripe account — it cannot even see it without the header.
+  // So this is 'no' without asking Stripe, and the "last debit-capable link"
+  // guard below correctly does not count it.
+  if (!isPlatformHeld(conn)) return 'no'
   try {
-    const acct: any = await getStripe().financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+    const acct: any = await getStripe().financialConnections.accounts.retrieve(conn.stripe_fc_account_id, fcAcct(conn))
     const perms: string[] = acct?.permissions ?? []
     if (acct?.status && acct.status !== 'active') return 'no'
     return perms.includes('payment_method') ? 'yes' : 'no'
@@ -2698,7 +2764,8 @@ export async function listConnections(landlordId: string) {
   const rows = await query<any>(
     `SELECT id, provider, institution_name, account_last4, account_type, display_name,
             status, last_synced_at, last_sync_error, created_at,
-            current_balance, balance_currency, balance_as_of, stripe_fc_account_id
+            current_balance, balance_currency, balance_as_of, stripe_fc_account_id,
+            source, fc_permissions, stripe_connect_account_id
        FROM bank_connections
       WHERE landlord_id = $1 AND status <> 'disconnected'
       ORDER BY created_at DESC`, [landlordId])
@@ -2707,14 +2774,33 @@ export async function listConnections(landlordId: string) {
   for (const r of rows) {
     r.debit_ready = false; r.debit_problem = null
     if (!r.stripe_fc_account_id) { r.debit_problem = 'This link has no Stripe account behind it — link it again.'; continue }
+    // 10/20: a link granted inside Connect onboarding is read-only to GAM and
+    // that is the end of it — no Stripe call can change the answer, so none is
+    // made. The words are the ones the landlord needs: their bank IS connected
+    // for the feed, and collecting GAM's fees from it is a separate permission
+    // on the same account that the onboarding link does not carry.
+    if (!isPlatformHeld(r)) {
+      // 10/20 (review): the second sentence used to offer this as a preference
+      // ("...and GAM can, instead of debiting your rent payouts"). S651: the fee
+      // debit is mandatory and the portal discloses it, it does not ask. So this
+      // says what is missing and why it is needed — netting only works in a
+      // month there is a payout to net from.
+      r.debit_problem = 'Connected during your business verification, so GAM can read it but cannot collect its fees from it. '
+        + 'Fees are netted from your rent payouts, so GAM needs this same account connected once here for the months there is no payout to net from.'
+      delete r.stripe_fc_account_id; delete r.stripe_connect_account_id
+      r.connect_held = true
+      continue
+    }
+    r.connect_held = false
     try {
-      const acct: any = await stripe.financialConnections.accounts.retrieve(r.stripe_fc_account_id)
+      const acct: any = await stripe.financialConnections.accounts.retrieve(r.stripe_fc_account_id, fcAcct(r))
       const perms: string[] = acct?.permissions ?? []
       if (acct?.status && acct.status !== 'active') r.debit_problem = `This link is ${acct.status} at the bank — link it again.`
       else if (!perms.includes('payment_method')) r.debit_problem = 'Linked before GAM asked for permission to debit — link this account once more.'
       else r.debit_ready = true
     } catch (e: any) { r.debit_problem = `Stripe could not read this link: ${e?.message ?? e}` }
     delete r.stripe_fc_account_id
+    delete r.stripe_connect_account_id
   }
   return rows
 }
@@ -2905,17 +2991,25 @@ export async function listTransactions(landlordId: string, opts: {
 }
 
 /**
- * S605: sync every active connection. Stripe backfills a newly linked account
+ * S605: sync every live connection. Stripe backfills a newly linked account
  * asynchronously, so the sync fired at link time usually returns nothing and
  * reports "refresh is still pending". Without a retry the landlord would have
- * to keep pressing Sync by hand until Stripe caught up. Runs hourly.
+ * to keep pressing Sync by hand until Stripe caught up. Runs four times a day.
  *
  * Per-connection failures are swallowed: one landlord's revoked bank must never
  * stop everyone else's sync.
+ *
+ * 10/20 (review): errored links are swept too, and that is the point. `status`
+ * goes to 'error' on ANY Stripe exception — one 502 or socket timeout in a
+ * 06:00 run parked a working link forever, because the only other thing that
+ * syncs it is the landlord pressing Sync by hand on a page that gives them no
+ * reason to. A permanently broken link (its `transactions` permission never
+ * granted) simply fails again and keeps saying so; a transient one heals itself
+ * and goes back to 'active'. Deliberately removed links are never touched.
  */
 export async function syncAllActiveConnections(): Promise<{ synced: number; inserted: number; failed: number }> {
   const conns = await query<{ id: string }>(
-    `SELECT id FROM bank_connections WHERE status = 'active'`)
+    `SELECT id FROM bank_connections WHERE status <> 'disconnected'`)
   let inserted = 0, failed = 0, synced = 0
   for (const c of conns) {
     try {
@@ -3042,12 +3136,29 @@ export async function setBooksStartDate(
  * bank has to be linked once more so the new permission is granted.
  */
 export async function debitLinkProblem(landlordId: string): Promise<string> {
+  // 10/20: only a PLATFORM-held link can ever serve the debit, so this looks at
+  // the newest of those — the same row createDebitPaymentMethod picks. A
+  // landlord whose only bank came from Connect onboarding has a working feed
+  // and no debit, and the sentence below has to say exactly that rather than
+  // blaming their bank.
   const conn = await queryOne<any>(
-    `SELECT * FROM bank_connections WHERE landlord_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1`, [landlordId])
-  if (!conn) return 'No bank is linked under Settings → Bank feed.'
+    `SELECT * FROM bank_connections
+      WHERE landlord_id = $1 AND status = 'active' AND stripe_connect_account_id IS NULL
+      ORDER BY created_at DESC LIMIT 1`, [landlordId])
+  if (!conn) {
+    const onboarding = await queryOne<any>(
+      `SELECT institution_name, account_last4 FROM bank_connections
+        WHERE landlord_id = $1 AND status = 'active' AND stripe_connect_account_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1`, [landlordId])
+    if (onboarding) {
+      return `The ${onboarding.institution_name ?? 'bank'} ****${onboarding.account_last4 ?? ''} account was connected during business verification, `
+        + 'which lets GAM read it but not collect its fees from it. Connect the same account once under Bank → Bank setup and GAM can.'
+    }
+    return 'No bank is linked under Settings → Bank feed.'
+  }
   if (!conn.stripe_fc_account_id) return `The ${conn.institution_name ?? 'bank'} link has no Stripe account behind it — link it again.`
   try {
-    const acct: any = await getStripe().financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+    const acct: any = await getStripe().financialConnections.accounts.retrieve(conn.stripe_fc_account_id, fcAcct(conn))
     const perms: string[] = acct?.permissions ?? []
     if (!perms.includes('payment_method')) {
       return `The ${conn.institution_name ?? 'bank'} ****${conn.account_last4 ?? ''} link was made without permission to debit. Link the same account once more under Settings → Bank feed; the new link asks for it.`
@@ -3063,10 +3174,18 @@ export async function createDebitPaymentMethod(
   landlordId: string,
   bankConnectionId?: string,
 ): Promise<{ paymentMethodId: string; last4: string | null; bankName: string | null } | null> {
+  // 10/20: PLATFORM-HELD ONLY, and this filter is load-bearing. GAM's fee debit
+  // is a platform payment method; Stripe will not build one from a bank account
+  // that belongs to a connected account (the platform cannot even retrieve it
+  // without that account's header — a flat 404). Without the filter, a landlord
+  // whose newest link came from onboarding would have had their working fee
+  // debit quietly replaced by one that cannot be made.
   const conn = await queryOne<any>(
     bankConnectionId
-      ? `SELECT * FROM bank_connections WHERE id = $2 AND landlord_id = $1 AND status = 'active'`
-      : `SELECT * FROM bank_connections WHERE landlord_id = $1 AND status = 'active'
+      ? `SELECT * FROM bank_connections
+          WHERE id = $2 AND landlord_id = $1 AND status = 'active' AND stripe_connect_account_id IS NULL`
+      : `SELECT * FROM bank_connections
+          WHERE landlord_id = $1 AND status = 'active' AND stripe_connect_account_id IS NULL
           ORDER BY created_at DESC LIMIT 1`,
     bankConnectionId ? [landlordId, bankConnectionId] : [landlordId])
   if (!conn?.stripe_fc_account_id) return null

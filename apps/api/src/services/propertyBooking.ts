@@ -9,14 +9,14 @@ import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import {
-  WAITLIST_CLAIM_WINDOW_MINUTES, priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT,
+  WAITLIST_CLAIM_WINDOW_MINUTES, priceStay,
   SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, stayHeldWords, longCalendarDate,
   STAY_LEASE_CHOICE_NIGHTS, type CardFeePayer, type StayTerms,
 } from '@gam/shared'
 import {
   stayNeeds, chooseStayTerms, recordScreeningPrepayment, type StayNeeds, type RecordedPrepayment,
 } from './stayTerms'
-import { LEASE_OR_STAY_WORDS, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
+import { LEASE_OR_STAY_WORDS, depositForStay, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
 import { activateBillingForMoneyMoved } from './billingActivation'
 
 // ============================================================
@@ -147,31 +147,13 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
 }
 
 /**
- * The deposit on a stay, from the property's own two settings.
- *
- * A flat amount for a stay of 30+ nights (S547: the percentage is for short
- * stays only) — hard-capped at one month's rent regardless of what the flat
- * setting says. Everything shorter is a percentage of the taxed total.
- * 10/6: decided by the stay's LENGTH, not by the rate it is charged at — a
- * 25-night stay charged at the monthly rate (the lower price) is still a short
- * stay and owes the percentage.
- *
- * S652: pulled out of quoteStay so a reservation taken at the COUNTER quotes
- * the same deposit the booking site would have. A guest who phones and a guest
- * who books online are buying the same nights on the same site and must not be
- * told two different numbers. (memory: gam-register-price-is-its-own-thing)
+ * The deposit on a stay — services/propertyBookingQuote's `depositForStay`,
+ * re-exported because this is where every door that is not the booking site
+ * has always imported it from. 10/20 (review): it moved next to the booking
+ * site's own quote, which had been carrying a second copy of the same
+ * arithmetic, and the two had drifted on a site with no monthly rate on it.
  */
-export function depositForStay(
-  prop: { booking_deposit_pct: string | number; booking_monthly_deposit: string | number | null },
-  stay: { total: number; nights: number; monthlyRate: number | null },
-): number {
-  if (stay.nights >= STAY_LEASE_CHOICE_NIGHTS && stay.monthlyRate != null && stay.monthlyRate > 0) {
-    const flat = prop.booking_monthly_deposit != null
-      ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
-    return Math.round(Math.min(flat, stay.monthlyRate) * 100) / 100
-  }
-  return Math.round(stay.total * (Number(prop.booking_deposit_pct) / 100) * 100) / 100
-}
+export { depositForStay } from './propertyBookingQuote'
 
 /**
  * What deposit to ask for on a reservation the counter just took.
@@ -274,7 +256,19 @@ export async function chooseFreeSite(
   client: Pick<PoolClient, 'query'>,
   opts: { propertyId: string; landlordId: string; checkIn: string; checkOut: string
           /** What one of quantity buys — the site needs a rate for it. */
-          stayUnit: 'night' | 'week' | 'month' },
+          stayUnit: 'night' | 'week' | 'month'
+          /**
+           * 10/20 — SPACES THE CALLER HAS ALREADY HAD TO REFUSE.
+           *
+           * The ranking below reads the pool, so asking twice in one
+           * transaction scores both tries against the same board and hands
+           * back the same space again. A caller that takes the space and finds
+           * it gone (services/reservationImport's placement retry) says so
+           * here, and the next ask looks past it instead of spinning on it and
+           * then telling a guest the park is full with spaces still empty.
+           * Empty by default: nothing else's behavior changes.
+           */
+          excludeUnitIds?: string[] },
 ): Promise<{ id: string; unitNumber: string } | null> {
   const { bookableUnits } = await import('./propertyBookingQuote')
   const { rankUnitsBestFit } = await import('./scheduleCompression')
@@ -301,8 +295,9 @@ export async function chooseFreeSite(
     `SELECT id, unit_number FROM units
       WHERE id = ANY($1::uuid[]) AND landlord_id = $2
         AND retired_at IS NULL AND status = 'vacant'
+        AND NOT (id = ANY($3::uuid[]))
       ORDER BY unit_number`,
-    [bookable.map((u: any) => u.id), opts.landlordId])
+    [bookable.map((u: any) => u.id), opts.landlordId, opts.excludeUnitIds ?? []])
   const numberById = new Map(open.rows.map(r => [r.id, r.unit_number]))
   const ranked = await rankUnitsBestFit([...numberById.keys()], { checkIn: opts.checkIn, checkOut: opts.checkOut })
   for (const id of ranked) {
@@ -433,11 +428,15 @@ interface StayPlan {
  */
 async function planStay(
   prop: PropertyRow, unit: UnitRow,
-  o: { checkIn: string; checkOut: string; email: string; stayTerms?: StayTerms | null },
+  o: { checkIn: string; checkOut: string; email: string; guestName?: string | null; stayTerms?: StayTerms | null },
 ): Promise<StayPlan> {
   const quote = quoteStay(unit, prop, o.checkIn, o.checkOut)
   const ask = (checkOut: string, stayTerms: StayTerms | null) => stayNeeds({
-    landlordId: prop.landlord_id, propertyId: prop.id, email: o.email,
+    // 10/20 (review): the name they booked under travels with the address. A
+    // returning guest is derived from GAM's own record of their stays, and an
+    // address on its own is a mailbox two people share — the name is what says
+    // which of them this is (services/stayTerms samePersonName).
+    landlordId: prop.landlord_id, propertyId: prop.id, email: o.email, guestName: o.guestName ?? null,
     checkIn: o.checkIn, checkOut, stayTerms,
   })
   let needs = await ask(o.checkOut, o.stayTerms ?? null)
@@ -467,6 +466,26 @@ async function planStay(
     heldWords: terms === 'stay' ? stayHeldWords(checkOut) : null,
   }
 }
+
+/**
+ * 10/20 (review, R9): does this stay's check-in WAIT on a background check?
+ *
+ * The flag used to be `screening !== 'not_needed'`, which marked a RETURNING
+ * guest as waiting on a check nobody was ever going to run. For the landlord's
+ * attested returning guest it only looked harmless (attestReturningGuest
+ * clears the flag a moment later); for one GAM derived from its own records it
+ * was the blocker — nothing is written for a derived waiver, so nothing ever
+ * cleared the mark, and check-in refused a guest who was standing at the gate
+ * having paid, with no button on the screen that could let them in.
+ *
+ * 'on_file' still waits: there IS a check, and R9 waits for its result and the
+ * landlord's decision. 'fee_due' waits: the check has to happen. 'returning'
+ * and 'not_needed' never wait, because there is no check to wait for.
+ * (checkInBlock derives the same answer again at the gate rather than trusting
+ * this flag, so a stay sold before today is admitted too.)
+ */
+const screeningWaits = (needs: StayNeeds): boolean =>
+  needs.screening === 'on_file' || needs.screening === 'fee_due'
 
 /**
  * 10/6: a booking-site stay's lease_type from its length (as the schedule's
@@ -534,7 +553,8 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
   const prop = await resolvePropertyBySlug(opts.slug)
   const unit = await resolveUnit(prop.id, opts.unitId)
   const plan = await planStay(prop, unit, {
-    checkIn: opts.checkIn, checkOut: opts.checkOut, email: opts.guestEmail, stayTerms: opts.stayTerms,
+    checkIn: opts.checkIn, checkOut: opts.checkOut, email: opts.guestEmail,
+    guestName: opts.guestName, stayTerms: opts.stayTerms,
   })
   const connect = await landlordConnect(prop.landlord_id)
   // S547 dev-mock: demo landlords have no Connect account, so outside
@@ -574,7 +594,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
        opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none',
        opts.note?.trim() || null,
        // R2: the answer is saved with the stay; R9: check-in waits on screening.
-       plan.terms, plan.needs.screening !== 'not_needed'])
+       plan.terms, screeningWaits(plan.needs)])
     const bookingId = ins.rows[0].id
     await client.query('COMMIT')
 
@@ -659,7 +679,7 @@ export async function claimQuote(token: string): Promise<null | {
   if (!w) return null
   const prop = await resolvePropertyBySlug(w.booking_slug)
   const unit = await resolveUnit(prop.id, w.unit_id)
-  const o = { checkIn: w.check_in_ymd, checkOut: w.check_out_ymd, email: w.guest_email }
+  const o = { checkIn: w.check_in_ymd, checkOut: w.check_out_ymd, email: w.guest_email, guestName: w.guest_name }
   try {
     const plain = await planStay(prop, unit, o)
     return {
@@ -964,7 +984,7 @@ async function emailClaimLink(w: any, token: string): Promise<void> {
   // 10/5 (Nic): what a long stay asks of them before they pay — the background
   // check's fee (R8, from stayNeeds) and the lease-or-stay choice (R2).
   const needs = await stayNeeds({
-    landlordId: slugRow.landlord_id, propertyId: w.property_id, email: w.guest_email,
+    landlordId: slugRow.landlord_id, propertyId: w.property_id, email: w.guest_email, guestName: w.guest_name,
     checkIn: w.check_in_ymd, checkOut: w.check_out_ymd,
   }).catch(err => { logger.error({ err, waitlist_id: w.id }, '[waitlist] long-stay rules for the claim email failed'); return null })
   const longStay = [

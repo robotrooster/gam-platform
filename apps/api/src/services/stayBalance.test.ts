@@ -48,6 +48,97 @@ async function seedStay(opts: { checkIn?: string; checkOut?: string; payer?: 'cu
   } finally { c.release() }
 }
 
+/**
+ * 10/20 — A SEASON IS NOT A BILL.
+ *
+ * Nic's own numbers, off the schedule he is bringing over from the old system:
+ * 92 nights at Mountain View, March 6 to June 6, $1,767 for the season, $150
+ * handed over in cash long before GAM existed. The confirmation quotes him the
+ * FIRST MONTH, $589 (services/bookingConfirmation — "if they're seasonal and
+ * going to be here more than the 30 days, I just want it to tell them the first
+ * month's rate"). Before the fix, arrival morning emailed him a card page for
+ * $1,617 — the whole season less his deposit — and nobody had pressed anything.
+ */
+async function seedSeason(
+  opts: { total?: number; deposit?: number; checkOut?: string; bookedCheckOut?: string | null } = {},
+) {
+  const c = await getClient()
+  try {
+    const { userId, landlordId } = await seedLandlord(c)
+    await c.query(`UPDATE users SET stripe_connect_account_id = 'acct_season' WHERE id = $1`, [userId])
+    const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    // Mountain View's own rate card: $49 a night, $269 a week, $589 a month.
+    await c.query(
+      `UPDATE properties
+          SET name = 'Mountain View RV Park', timezone = 'America/Phoenix',
+              booking_card_fee_payer = 'customer', short_term_tax_rate = 6.6,
+              nightly_rate = 49, weekly_rate = 269, monthly_rate = 589
+        WHERE id = $1`, [propertyId])
+    const unitId = await seedUnit(c, { propertyId, landlordId, unitType: 'rv_spot' })
+    await c.query(`UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [unitId])
+    const checkOut = opts.checkOut ?? '2027-06-06'
+    const { rows: [b] } = await c.query<{ id: string }>(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, guest_email, lease_type,
+                                  check_in, check_out, booked_check_out, nights,
+                                  total_amount, deposit_amount, deposit_paid_at, status, source)
+       VALUES ($1, $2, 'Hal Brenner', 'hal@guest.dev', 'month_to_month',
+               '2027-03-06', $3::date, $4::date, ($3::date - '2027-03-06'::date),
+               $5, $6, NOW(), 'confirmed', 'direct')
+       RETURNING id`,
+      [unitId, landlordId, checkOut,
+       opts.bookedCheckOut === undefined ? checkOut : opts.bookedCheckOut,
+       opts.total ?? 1767, opts.deposit ?? 150])
+    return { landlordId, propertyId, unitId, bookingId: b.id }
+  } finally { c.release() }
+}
+
+/** Arrival morning at Mountain View — 8am March 6, Phoenix (UTC-7 all year). */
+const SEASON_ARRIVAL = new Date('2027-03-06T15:00:00Z')
+
+describe('a seasonal stay owes its first month on arrival, not the season', () => {
+  it('bills the first month less the deposit, never the whole season', async () => {
+    const s = await seedSeason()
+    expect((await billStayBalances(SEASON_ARRIVAL)).billed).toBe(1)
+    expect(emailPayLinkMock).toHaveBeenCalledTimes(1)
+    // $589 for March 6 → April 6, less the $150 he already handed over. NOT
+    // $1,617, which is what the whole season less the deposit comes to.
+    expect(emailPayLinkMock.mock.calls[0][0]).toMatchObject({ to: 'hal@guest.dev', amount: 439 })
+    // And it says so, so the card page cannot read as the whole stay.
+    expect(emailPayLinkMock.mock.calls[0][0].label).toContain('First month')
+    expect(emailPayLinkMock.mock.calls[0][0].label).toContain('April 6, 2027')
+    const { rows: [link] } = await db.query<any>(
+      `SELECT total::float AS total FROM pos_pay_links WHERE booking_id = $1`, [s.bookingId])
+    expect(link.total).toBe(439)
+  })
+
+  it('never asks for more than the season was sold for', async () => {
+    // A season Nic priced himself, flat, under the rate card's month. The rate
+    // card does not get to charge more than the stay costs in total.
+    await seedSeason({ total: 400, deposit: 40 })
+    expect((await billStayBalances(SEASON_ARRIVAL)).billed).toBe(1)
+    expect(emailPayLinkMock.mock.calls[0][0]).toMatchObject({ amount: 360 })
+  })
+
+  it('reads the stored check-out when nothing says what it was sold for', async () => {
+    // booked_check_out empty: the length is the stored check-out
+    // (registerStay soldCheckOutSql reads NULL as check_out), so this is still
+    // a 92-night stay and still owes one month.
+    await seedSeason({ bookedCheckOut: null })
+    expect((await billStayBalances(SEASON_ARRIVAL)).billed).toBe(1)
+    expect(emailPayLinkMock.mock.calls[0][0]).toMatchObject({ amount: 439 })
+  })
+
+  it('a site with no rate card to price a month by is not billed the season instead', async () => {
+    const s = await seedSeason()
+    await db.query(`UPDATE units SET nightly_rate = NULL, weekly_rate = NULL, monthly_rate = NULL WHERE id = $1`, [s.unitId])
+    await db.query(`UPDATE properties SET nightly_rate = NULL, weekly_rate = NULL, monthly_rate = NULL WHERE id = $1`, [s.propertyId])
+    expect((await billStayBalances(SEASON_ARRIVAL)).billed).toBe(0)
+    expect(emailPayLinkMock).not.toHaveBeenCalled()
+    const { rows: [b] } = await db.query<any>(`SELECT balance_billed_at FROM unit_bookings WHERE id = $1`, [s.bookingId])
+    expect(b.balance_billed_at).toBeNull()
+  })
+})
+
 describe('the rest of a short stay, on arrival day', () => {
   it('emails the guest a link for the balance on arrival day, once', async () => {
     const s = await seedStay()

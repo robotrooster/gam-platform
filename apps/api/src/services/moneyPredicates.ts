@@ -64,6 +64,38 @@ export function payableRowSql(a = 'p'): string {
 }
 
 /**
+ * THE OTHER QUESTION ABOUT A CHARGE, and the one nothing asked before 10/20:
+ * is the money on it ALREADY TAKEN, OR ON ITS WAY? TRUE when it is —
+ *
+ *   IN FLIGHT. An intent is attached and it has not landed: 'pending' with an
+ *     intent, or 'processing'. An ACH takes three to five business days, so
+ *     this is a state a row sits in for most of a week.
+ *   TAKEN. 'settled', or swept from the security deposit at move-out
+ *     ('paid_via_deposit', services/depositReturn).
+ *   PAID WITH HOURS, NOT MONEY. Suspended under work trade — "work trade is
+ *     hours, not wages", so there is no cash to ask anybody for.
+ *
+ * This is NOT the opposite of payableRowSql, and must not be read as one. A
+ * voided, failed or returned row is neither payable nor taken: its money came
+ * back or never went, so it is owed again and a fresh ask is right. A $0 row
+ * and GAM's FlexPay pull are not payable either and have nothing moving on
+ * them. They are two different questions about the same row, and the gap
+ * between them is where "owed again" lives.
+ *
+ * Asked wherever a SECOND door could collect money a charge has already
+ * answered for — the pay-link utility door (services/utilityPayLink) is the
+ * first, because utility_bills.status only follows a charge reaching 'settled'
+ * and so reads 'billed' through the whole in-flight week and for good after a
+ * deposit sweep.
+ */
+export function moneyTakenOrMovingRowSql(a = 'p'): string {
+  const x = alias(a)
+  return `(${x}.status IN ('processing','settled','paid_via_deposit')
+      OR (${x}.status = 'pending'
+          AND (${x}.stripe_payment_intent_id IS NOT NULL OR ${x}.work_trade_suspended_at IS NOT NULL)))`
+}
+
+/**
  * The portal and autopay pay-in-full set for ONE lease: every payable row of
  * the lease, plus every payable row on the lease's invoices (a neighbor
  * landlord's utility on a converged invoice, S616; GAM's own fees), but never a
@@ -264,6 +296,7 @@ export interface MoneyRowFacts {
 
 const PAYABLE_COLUMNS = ['status', 'amount', 'stripe_payment_intent_id', 'work_trade_suspended_at', 'entry_description'] as const
 const BANK_PAYABLE_COLUMNS = [...PAYABLE_COLUMNS, 'revenue_owner'] as const
+const TAKEN_OR_MOVING_COLUMNS = ['status', 'stripe_payment_intent_id', 'work_trade_suspended_at'] as const
 const DEPOSIT_ROW_COLUMNS = ['entry_description', 'lease_fee_id'] as const
 const CREDIT_ELIGIBLE_COLUMNS = [
   ...PAYABLE_COLUMNS, 'revenue_owner', 'type', 'lease_fee_id', 'reversal_id', 'unit_id', 'lease_id',
@@ -285,6 +318,14 @@ export function isPayableRow(r: MoneyRowFacts): boolean {
     && r.work_trade_suspended_at === null
     && r.entry_description !== 'FLEXPAY'
     && Number(r.amount) > 0
+}
+
+/** moneyTakenOrMovingRowSql over a row already read. */
+export function isMoneyTakenOrMovingRow(r: MoneyRowFacts): boolean {
+  requireColumns(r, TAKEN_OR_MOVING_COLUMNS, 'isMoneyTakenOrMovingRow')
+  return r.status === 'processing' || r.status === 'settled' || r.status === 'paid_via_deposit'
+    || (r.status === 'pending'
+        && (r.stripe_payment_intent_id !== null || r.work_trade_suspended_at !== null))
 }
 
 export function isBankPayableRow(r: MoneyRowFacts): boolean {

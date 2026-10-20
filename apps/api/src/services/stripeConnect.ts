@@ -928,6 +928,36 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
       await tryReconcileForLandlordUserId(landlordUserId)
     }
   }
+
+  // 10/20 (Nic, ONE BANK LINK): "We need a way to link the bank account once and
+  // have it be everything." The moment Stripe says a company's details are in,
+  // ask that company's account which bank links it holds — because the bank the
+  // landlord just signed into IS the feed now, and the Bank page should already
+  // show step two as done the first time they look at it rather than offering
+  // them a second sign-in to the same bank.
+  //
+  // Best-effort and last: this is a webhook, and a landlord's bank feed is never
+  // worth failing the capability sync that gates their rent over.
+  //
+  // 10/20 (review): the owner lookup used to be `SELECT id FROM landlords WHERE
+  // stripe_connect_account_id = $1`, which cannot see an account anchored on the
+  // USER — the legacy shape S554 still allows, and the one the comment at the
+  // top of this block calls a no-op today. Zero rows came back and nothing was
+  // adopted, so that landlord was left in front of a step that was already
+  // done. `landlordsForConnectAccount` is the SAME resolution the adoption
+  // itself uses (COALESCE entity, user), so the webhook and the page can never
+  // disagree about whose account this is.
+  if (details) {
+    try {
+      const { ensureOnboardingBankLink, landlordsForConnectAccount } = await import('./connectBankLink')
+      for (const landlordId of await landlordsForConnectAccount(account.id)) {
+        await ensureOnboardingBankLink(landlordId, { force: true })
+      }
+    } catch (e) {
+      logger.warn({ err: e, stripe_account_id: account.id },
+        '[one-bank-link] could not adopt the onboarding bank on account.updated')
+    }
+  }
 }
 
 // ── BUSINESS INVOICE CHECKOUT (S494) ──────────────────────────────────────

@@ -210,13 +210,13 @@ describe('GET /api/notifications/preferences', () => {
     const f = await seed()
     await db.query(
       `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
-       VALUES ($1, 'rent_due', TRUE, FALSE)`,
+       VALUES ($1, 'rent_collected', TRUE, FALSE)`,
       [f.landlordUserId])
     const res = await request(buildApp()).get('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
-    expect(res.body.data[0].type).toBe('rent_due')
+    expect(res.body.data[0].type).toBe('rent_collected')
     expect(res.body.data[0].email_enabled).toBe(true)
   })
 
@@ -232,7 +232,7 @@ describe('GET /api/notifications/preferences', () => {
     const f = await seed()
     await db.query(
       `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
-       VALUES ($1, 'rent_due', TRUE, TRUE)`,
+       VALUES ($1, 'rent_collected', TRUE, TRUE)`,
       [f.otherUserId])
     const res = await request(buildApp()).get('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -243,17 +243,20 @@ describe('GET /api/notifications/preferences', () => {
 
 // ─── PATCH /api/notifications/preferences ───────────────────
 
+// 10/20: these used a made-up type ('rent_due'). The route checks the one
+// notification catalog now — a preference row for something GAM cannot send is a
+// row nobody can act on — so they use a real one.
 describe('PATCH /api/notifications/preferences', () => {
   it('upsert: inserts new pref row on first call', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: false, inAppEnabled: true })
+      .send({ type: 'rent_collected', emailEnabled: false, inAppEnabled: true })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
       `SELECT email_enabled, in_app_enabled FROM notification_preferences
-        WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_due'])
+        WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_collected'])
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({
       email_enabled: false, in_app_enabled: true,
@@ -265,15 +268,15 @@ describe('PATCH /api/notifications/preferences', () => {
     await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: true, inAppEnabled: true })
+      .send({ type: 'rent_collected', emailEnabled: true, inAppEnabled: true })
     const res = await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: false, inAppEnabled: false })
+      .send({ type: 'rent_collected', emailEnabled: false, inAppEnabled: false })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
       `SELECT email_enabled, in_app_enabled FROM notification_preferences
-        WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_due'])
+        WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_collected'])
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({
       email_enabled: false, in_app_enabled: false,

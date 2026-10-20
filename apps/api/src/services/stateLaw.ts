@@ -1,9 +1,17 @@
 /**
- * State landlord/tenant law — compliance-warning engine (S442, Nic-authorized).
+ * State landlord/tenant law — catalog lookup + comparison engine (S442).
  *
- * Powers hedged "this may not comply with the laws of <state>" warnings for
- * BOTH landlord and tenant, keyed off a property's state + the unit type.
- * Reads the SOURCED, DATED catalog in state_landlord_tenant_acts /
+ * THE WARNINGS ARE OFF as of 10/20 (Nic) — see STATE_LAW_WARNINGS_FEATURE
+ * below for the switch and the reasoning. What stays live is statute
+ * RETRIEVAL: the acts and provisions a person can ask for, and the verbatim
+ * section text the agents search. What is hidden is GAM volunteering a
+ * comparison it was not asked for.
+ *
+ * It used to power hedged "this may not comply with the laws of <state>"
+ * warnings for BOTH landlord and tenant, keyed off a property's state + the
+ * unit type.
+ *
+ * It reads the SOURCED, DATED catalog in state_landlord_tenant_acts /
  * state_law_provisions (see the migration header for why this is a
  * sanctioned extension of the no-state-legal rule). The engine NEVER asserts
  * the law as fact — every result carries the source date + a "may be newer
@@ -16,7 +24,96 @@
  */
 
 import { query } from '../db'
+import { isFeatureEnabled } from './systemFeatures'
 import { LAW_CATEGORY_VALUES, type LawCategory, type PropertyTaxTopic } from '@gam/shared'
+
+/**
+ * THE ONE SWITCH — every state-law WARNING is off (10/20, Nic).
+ *
+ * "There should be no state law warnings anywhere in the system. At least not
+ * right now. Just hide all that stuff." He said it while we were about to
+ * repoint the property-page warning at the per-unit-type late-fee policy (the
+ * only place a real late fee lives now that the properties.late_fee_* columns
+ * are written by nothing). The answer was not to repoint it. It was to stop
+ * showing it.
+ *
+ * That is also the right call on the merits, not just an instruction to
+ * follow. GAM is a national platform that gives no legal advice and no
+ * state-specific guidance (CLAUDE.md, "No state-specific legal logic"), and it
+ * accommodates rather than blocks. A banner telling a landlord their late fee
+ * sits above a Nevada figure is GAM volunteering an opinion about a statute,
+ * which is the one thing that rule forbids. And where it fires on the property
+ * late-fee columns it has nothing to read anyway.
+ *
+ * HIDDEN, NOT DEMOLISHED. "At least not right now" means this knowledge comes
+ * back. The sourced catalog stays (state_landlord_tenant_acts,
+ * state_law_provisions, state_law_section_texts), so does the statute
+ * RETRIEVAL the agents do when a person actually asks a question
+ * (search_state_law, get_applicable_laws, the property-tax facts), and so does
+ * the comparison code below, with its tests.
+ *
+ * ONE PLACE, not a hunt — and the list is longer than the banners. Everything
+ * that asks this flag first:
+ *   - checkAgainstStatute and checkLeaseAgainstStateLaw at the bottom of this
+ *     file (the property, lease and entry-request banners).
+ *   - the check_against_law agent tool, whose whole output is a verdict on
+ *     someone's number, so it stands down rather than return a false all-clear.
+ *   - 10/20: three agent cautions the first pass missed, each of which
+ *     volunteered a legal-adjacent line of its own and never read this flag:
+ *     get_my_landlord_patterns (what entry laws commonly require),
+ *     draft_tenant_notice (what may have to be served in person or by
+ *     certified mail), get_my_entry_requests (that required notice varies by
+ *     state). Each now shows the FACT — the hour of the entry, what GAM's
+ *     delivery actually does, the landlord's own notice setting — and holds the
+ *     law sentence back until the flag is on.
+ *   - 10/20: routes/entryRequests' own outside-typical-hours notice, which
+ *     carried the same "entry laws commonly require reasonable times — check
+ *     your local law" tail on screen while the state-law banner beside it was
+ *     already hidden. The hour still shows; the law sentence waits.
+ * The flag is only honest if it is the whole switch, and it was not.
+ *
+ * NOT this flag's business, and deliberately so: the generic "check your local
+ * laws" hedging the no-state-specific-legal rule REQUIRES on landlord-
+ * configurable legal-adjacent fields (the eviction-mode notes, the lease PDF's
+ * governing-law line, the knowledge base, PARTIAL_PAYMENTS_LAW_NOTE). Those
+ * name no statute and compare nothing — they are GAM declining to give advice,
+ * which is the opposite of a warning. Hiding them would breach the rule, not
+ * serve it.
+ *
+ * The routes still send a (now always empty) state_law_warnings field and
+ * every page still renders it, on purpose: flipping the flag brings the
+ * banners back with no code change.
+ *
+ * TURNING IT BACK ON is one row and no deploy — Admin -> system features, or
+ *   UPDATE system_features SET enabled = TRUE
+ *    WHERE key = 'state_law_warnings_enabled';
+ * Before anyone does: settle what started this. The property-page check reads
+ * properties.late_fee_initial_amount / _type / late_fee_grace_days, which
+ * nothing writes any more; the real policy is property_unit_type_late_fees per
+ * unit type, stamped onto each lease. A warning pointed at the dead columns
+ * would come back toothless.
+ *
+ * DELIBERATELY NOT behind this switch, because they are obligations GAM
+ * accommodates rather than warnings it issues (the CLAUDE.md S177
+ * hard-compliance carve-out): state_deposit_interest_rates (what a landlord
+ * owes a tenant on a held deposit) and state_tax_forms (which form is due
+ * when). Both keep running untouched.
+ */
+export const STATE_LAW_WARNINGS_FEATURE = 'state_law_warnings_enabled'
+
+/**
+ * The single gate for every state-law warning. A missing flag row reads as OFF
+ * (systemFeatures closes by default), so the warnings are hidden whether or not
+ * the seed migration has been applied yet. Never throws: if the flag can't be
+ * read, warnings stay hidden rather than appearing by accident.
+ */
+export async function stateLawWarningsEnabled(): Promise<boolean> {
+  try {
+    return await isFeatureEnabled(STATE_LAW_WARNINGS_FEATURE)
+  } catch {
+    return false
+  }
+}
 
 /** Canonical unit + label per known topic. The catalog's `topic` strings
  *  match these keys; a value passed to checkCompliance must be in this unit. */
@@ -393,6 +490,10 @@ export async function checkAgainstStatute(
   topic: StateLawTopic,
   value: number
 ): Promise<LawFlag | null> {
+  // Hidden 10/20 (Nic) — see STATE_LAW_WARNINGS_FEATURE at the top of this
+  // file. Checked before the catalog is read so a hidden warning costs one
+  // flag lookup and nothing else.
+  if (!(await stateLawWarningsEnabled())) return null
   const p = await getLatestProvision(stateCode, topic)
   if (!p || p.threshold_numeric == null) return null
   if (p.rule_kind !== 'min' && p.rule_kind !== 'max') return null // only directional figures
@@ -443,6 +544,10 @@ export async function checkLeaseAgainstStateLaw(args: {
 }): Promise<LawFlag[]> {
   const out: LawFlag[] = []
   if (!args.stateCode) return out
+  // Hidden 10/20 (Nic) — see STATE_LAW_WARNINGS_FEATURE at the top of this
+  // file. After the free stateCode check so a lease with no state still costs
+  // no query at all.
+  if (!(await stateLawWarningsEnabled())) return out
   const state = args.stateCode
 
   // Deposit: dollars → months-of-rent ratio.

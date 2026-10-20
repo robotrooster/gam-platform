@@ -161,7 +161,14 @@ export function screeningHistorySentence(ctx: GuestScreeningContext): string {
  * day on — the stay's price for those nights, by night, out of what was paid.
  * Credited once, on that first bill (dated the lease's start, today).
  */
-const PAID_TOWARD_SQL =
+// 10/20: and the confirmation email reads it too (services/bookingConfirmation
+// confirmationPaid). A guest who had paid his whole $286.75 was told that "your
+// deposit of $28.68 is paid" and that the balance was due on arrival, because
+// that email had worked out for itself what had been paid — from the property's
+// deposit percentage, which is not money anybody handed over. There is one
+// definition of what a reservation has been paid and this is it, so exported
+// rather than copied.
+export const PAID_TOWARD_SQL =
   `(CASE WHEN b.balance_paid_at IS NOT NULL THEN b.total_amount
          WHEN b.deposit_paid_at IS NOT NULL THEN COALESCE(b.deposit_amount, b.total_amount)
     END)`

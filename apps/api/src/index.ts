@@ -120,6 +120,7 @@ import { scopesRouter, invitationsRouter } from './routes/scopes'
 import { pmRouter } from './routes/pm'
 import { creditRouter }       from './routes/credit'
 import { bookingsRouter }     from './routes/bookings'
+import { duplicatePeopleRouter } from './routes/duplicatePeople'
 import { inspectionsRouter }  from './routes/inspections'
 import { commonAreasRouter }  from './routes/commonAreas'
 import { serviceInterruptionsRouter } from './routes/serviceInterruptions'
@@ -483,6 +484,8 @@ app.use('/api/pm',             pmRouter)
 app.use('/api/pm/:pmCompanyId/agent-activity', pmAgentActivityRouter)
 app.use('/api/credit',         creditRouter)
 app.use('/api/bookings',       bookingsRouter)
+// 10/20 (Nic): "this looks like the same person" — proposals a landlord answers.
+app.use('/api/duplicate-people', duplicatePeopleRouter)
 app.use('/api/inspections',    inspectionsRouter)
 app.use('/api/common-areas',   commonAreasRouter)
 app.use('/api/service-interruptions', serviceInterruptionsRouter)

@@ -16,7 +16,10 @@ import { logger } from '../lib/logger'
 import type { CsvImportPlatform } from '../lib/csvImportMappings'
 import { createAdminNotification } from './adminNotifications'
 
-export type ImportType = 'tenant' | 'property' | 'payment'
+// 10/20: 'reservation' joins them — the old system's schedule of arrivals
+// (services/reservationImport). Same queue, same columns, same super-admin
+// review: a fourth queue would be a fourth place to remember to look.
+export type ImportType = 'tenant' | 'property' | 'payment' | 'reservation'
 
 interface RecordValidateInput {
   landlordId:   string

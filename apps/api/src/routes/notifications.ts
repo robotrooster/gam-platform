@@ -5,6 +5,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { sendBulkNotification } from '../services/notifications'
 import { landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
+import { isKnownNotificationType, isCriticalNotificationType } from '@gam/shared'
 
 export const notificationsRouter = Router()
 notificationsRouter.use(requireAuth)
@@ -63,25 +64,63 @@ notificationsRouter.get('/preferences', async (req, res, next) => {
 })
 
 // PATCH /api/notifications/preferences
-// S409 (S402 finding): pre-fix had no validation on body. Type could be
-// any string of any length, and the bool flags were trusted as-is.
-// Codebase has 15+ notification types and growing, so a hard allow-list
-// would be brittle — soft format validation (snake_case, max 64 chars)
-// catches the realistic abuse (random spam) without locking us into
-// per-type maintenance.
-const prefsPatchSchema = z.object({
+//
+// S409 (S402 finding): pre-fix had no validation on body at all — type could be
+// any string of any length. The note then said an allow-list would be brittle
+// because the type list was hand-kept and growing.
+//
+// 10/20: there IS one list now (@gam/shared notificationCatalog), the compiler
+// enforces it on the send side, and so this route checks against it. A type
+// nobody can send is a row nobody can act on.
+const prefUpdateSchema = z.object({
   type:          z.string().regex(/^[a-z][a-z0-9_]{0,63}$/, 'type must be snake_case, ≤64 chars'),
   emailEnabled:  z.boolean(),
   inAppEnabled:  z.boolean(),
 })
+// One answer, or the whole page's worth at once. "Turn every optional email
+// off" has to record an answer for all 100-plus types, and 100-plus round trips
+// is how half of them end up unanswered.
+const prefsPatchSchema = z.union([
+  prefUpdateSchema,
+  z.object({ updates: z.array(prefUpdateSchema).min(1).max(300) }),
+])
 notificationsRouter.patch('/preferences', async (req, res, next) => {
   try {
-    const { type, emailEnabled, inAppEnabled } = prefsPatchSchema.parse(req.body)
-    await query(`INSERT INTO notification_preferences (user_id,type,email_enabled,in_app_enabled)
-      VALUES ($1,$2,$3,$4)
-      ON CONFLICT (user_id,type) DO UPDATE SET email_enabled=$3,in_app_enabled=$4`,
-      [req.user!.userId, type, emailEnabled, inAppEnabled])
-    res.json({ success: true })
+    const parsed  = prefsPatchSchema.parse(req.body)
+    const updates = 'updates' in parsed ? parsed.updates : [parsed]
+
+    const unknown = updates.map(u => u.type).filter(t => !isKnownNotificationType(t))
+    if (unknown.length) {
+      throw new AppError(400, `GAM does not send: ${[...new Set(unknown)].join(', ')}`)
+    }
+
+    // 10/20 (Nic): the critical ones "are the ones that they're still going to
+    // get." The page shows their boxes locked, and the stored row is written to
+    // match what delivery actually does — a row reading email-off for a type
+    // that emails anyway is the exact lie that made a landlord think he had
+    // turned something off.
+    const rows = new Map<string, { email: boolean; inApp: boolean }>()
+    for (const u of updates) {
+      rows.set(u.type, isCriticalNotificationType(u.type)
+        ? { email: true, inApp: true }
+        : { email: u.emailEnabled, inApp: u.inAppEnabled })
+    }
+    const types = [...rows.keys()]
+    await query(`
+      INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+      SELECT $1, t, e, a
+        FROM unnest($2::text[], $3::boolean[], $4::boolean[]) AS s(t, e, a)
+      ON CONFLICT (user_id, type)
+      DO UPDATE SET email_enabled  = EXCLUDED.email_enabled,
+                    in_app_enabled = EXCLUDED.in_app_enabled,
+                    updated_at     = NOW()`,
+      [req.user!.userId, types,
+       types.map(t => rows.get(t)!.email), types.map(t => rows.get(t)!.inApp)])
+
+    res.json({
+      success: true,
+      data: { saved: types.length, alwaysOn: types.filter(isCriticalNotificationType) },
+    })
   } catch (e) { next(e) }
 })
 

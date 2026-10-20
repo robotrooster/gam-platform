@@ -42,7 +42,13 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
     }
     const fills = await query<any>(
       `SELECT f.*, u.unit_number,
-              us.first_name || ' ' || us.last_name AS tenant_name,
+              -- 10/20: a fill names whichever occupancy was on the space, and a
+              -- stay guest may be nothing but a name on a booking (migration
+              -- 20261022090100). These were INNER joins through tenants, so the
+              -- first fill delivered to an RV site held by a stay would have
+              -- vanished from the landlord's own list — money recorded and
+              -- invisible, which is worse than refusing it.
+              COALESCE(us.first_name || ' ' || us.last_name, NULLIF(TRIM(b.guest_name), '')) AS tenant_name,
               (SELECT COUNT(*)::int FROM propane_fill_installments i
                  JOIN payments p ON p.id = i.payment_id
                 WHERE i.fill_id = f.id AND p.status IN ('settled','paid_via_deposit')) AS installments_paid,
@@ -52,8 +58,9 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
                   AND (i.payment_id IS NULL OR p.status NOT IN ('settled','paid_via_deposit'))) AS balance_remaining
          FROM propane_fills f
          JOIN units u ON u.id = f.unit_id
-         JOIN tenants t ON t.id = f.tenant_id
-         JOIN users us ON us.id = t.user_id
+         LEFT JOIN tenants t ON t.id = f.tenant_id
+         LEFT JOIN users us ON us.id = t.user_id
+         LEFT JOIN unit_bookings b ON b.id = f.booking_id
         WHERE f.property_id = $1 AND ($2::uuid IS NULL OR f.unit_id = $2)
         ORDER BY f.fill_date DESC, f.created_at DESC
         LIMIT 50`,

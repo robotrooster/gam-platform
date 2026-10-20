@@ -20,6 +20,24 @@
  * Threshold: 90 days. Tighter than calendar-quarter (which would be
  * ~91 days) — gives the admin a clear "started > 1 quarter ago" gate.
  *
+ * 10/20: WHAT THE FRESHNESS IS STILL FOR. Nic took the state-law warnings off
+ * the product ("There should be no state law warnings anywhere in the system.
+ * At least not right now"), and this notification's copy was still telling GAM
+ * staff to go re-read statute sites by hand so that the warnings on the lease
+ * and entry-request paths stay fresh. Those warnings cannot display at all now
+ * (services/stateLaw STATE_LAW_WARNINGS_FEATURE), so as written it was asking
+ * for work with no consumer — which is how a real alert turns into noise
+ * nobody reads.
+ *
+ * It is NOT switched off with the warnings, because the catalog does still
+ * have a live reader: statute RETRIEVAL. get_applicable_laws hands a tenant or
+ * landlord who asks the provisions for their act — the figure, its citation
+ * and its source date — and search_state_law serves the verbatim section text.
+ * A stale figure there is a stale figure recited to a real person, which is
+ * worse than a hidden banner. So the notification stays and the copy now names
+ * the reader it actually has, and says the banners are off so whoever picks it
+ * up knows the scope.
+ *
  * Pre-launch posture: state_law_provisions today is loaded from
  * migrations stamped 2026-06-09, so as of any run this year the
  * notification will be expected. Once a refresh happens, the rows
@@ -115,9 +133,13 @@ export async function processStateLawRefreshCheck(
     title:    `State-law KB refresh needed — ${staleProvisionCount} provision(s) across ${staleStateCount} state(s)`,
     body:
       `${staleProvisionCount} provision(s) across ${staleStateCount} state(s) ` +
-      `have source_date older than ${thresholdDays} days. The catalog powers ` +
-      `hedged factual warnings on lease and entry-request write paths; stale ` +
-      `figures risk surfacing outdated statute values.\n\n` +
+      `have source_date older than ${thresholdDays} days. What reads them now ` +
+      `is statute RETRIEVAL — get_applicable_laws hands a tenant or landlord ` +
+      `who asks the figure, its citation and its source date, and ` +
+      `search_state_law serves the section text — so a stale row is a stale ` +
+      `figure recited to a real person. The state-law WARNING banners are ` +
+      `switched off (system_features.state_law_warnings_enabled, 10/20), so ` +
+      `nothing is being flagged against these figures on any write path.\n\n` +
       `Top stale states: ${oldestSummary}${stale.length > 10 ? `, +${stale.length - 10} more` : ''}.\n\n` +
       `Refresh process: see project_state_law_kb memory — re-run the ` +
       `state-law-research-batch workflow per state, generate a seed ` +

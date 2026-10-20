@@ -11,7 +11,7 @@ import {
   LayoutDashboard, Building2, DoorOpen, Users, CreditCard,
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
-  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
+  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus, UsersRound,
   Landmark, ClipboardCheck, MessageSquare,
   Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt } from 'lucide-react'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
@@ -75,6 +75,11 @@ const NAV_ITEMS: Array<{
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
   { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
+  // 10/20 (Nic): "this looks like the same person... always have the landlord
+  // check that the customer is the same." Sits under Tenants because it is the
+  // same book of people, read a different way — and because the moment it
+  // matters is right after a schedule has been brought in.
+  { to: '/duplicate-people', icon: UsersRound,   label: 'Possible Duplicates', section: null,       category: 'tenants' },
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
   // S639 (Nic): "I need my front desk person to go to one page, see all the
   // people that need to be contacted, and what phase they're in." Sits with

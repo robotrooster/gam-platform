@@ -14,6 +14,10 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
+// 10/20 (Nic): the departure side of the recovery report. washPairing is the
+// ONE place a departure's money kept and power absorbed are put beside each
+// other; the report reads it rather than re-deriving either half.
+import { washPairing } from '../services/earlyDepartureWash'
 import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
@@ -1133,21 +1137,21 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
-// Which metered utility a register / pay-link line is, or NULL when it is not
-// one. The register has no utility column — a line is utility billed back when
-// it sits in the Utilities category AND names a metered utility. Propane there
-// is the pump price, a retail sale, and deliberately matches nothing.
-function registerUtilityType(catExpr: string, nameExpr: string): string {
-  return `SELECT CASE
-            WHEN COALESCE(${catExpr}, '') NOT ILIKE 'utilit%' THEN NULL
-            WHEN ${nameExpr} ~* '\\melectric' THEN 'electric'
-            WHEN ${nameExpr} ~* '\\mwater'    THEN 'water'
-            WHEN ${nameExpr} ~* '\\msewer'    THEN 'sewer'
-            WHEN ${nameExpr} ~* '\\m(trash|garbage)' THEN 'trash'
-            WHEN ${nameExpr} ~* '\\mgas\\M' THEN 'gas'
-          END AS utility_type`
-}
-
+// 10/20 (Nic) — THE TWO FREE-TEXT STRINGS ARE GONE FROM THIS REPORT.
+//
+// `registerUtilityType(cat, name)` used to decide whether a register or
+// pay-link line was utility money given back by grepping a category name for
+// 'utilit%' and an item name for electric / water / sewer / trash / gas. Both
+// strings arrived from the request body, so what money WAS could be set by text
+// a register posted — and Mountain View's "Propane" at $3.30/gal sits in a
+// category literally named "Utilities", safe only because the word "Propane"
+// matches none of the patterns. Rename that button "Propane gas" and $328 of
+// TPT-taxed fuel revenue reads as gas bill-back.
+//
+// A line now says what it is: pos_items.recovers_utility on the catalog button,
+// snapshotted onto pos_transaction_items at sale time (10/20). NULL means
+// PRODUCT — an answer, not a missing value — so dispensed propane can never
+// reach this report whatever anyone names or categorizes it.
 // GET /api/utility/recovery?propertyId=&from=&to= — S613 (Nic).
 //
 // "Unbilled utility tracking would just be the difference between an owner
@@ -1158,11 +1162,82 @@ function registerUtilityType(catExpr: string, nameExpr: string): string {
 //
 // Exactly that, and no new ledger for it: what the property SPENT is its utility
 // expenses, what it RECOVERED is the bills it sent, and the gap is the answer.
-// The one slice that can be named without guessing is the owner-occupied share,
-// because that is recorded as it happens. Everything else in the gap — common
-// areas, a nightly stay with power in the rate, a vacant space, a lease that
-// doesn't pass it through — is reported together as "not recovered", because
-// attributing it would mean inventing a number rather than reading one.
+// The slices that can be named without guessing are the ones recorded as they
+// happen. Everything else in the gap — common areas, a lease that doesn't pass
+// it through — is reported together as unattributed, because attributing it
+// would mean inventing a number rather than reading one.
+//
+// 10/20 (Nic) — AND THE GAP SPLITS THREE WAYS, BECAUSE TWO OF THEM ARE NOT THE
+// SAME QUESTION AT ALL.
+//
+//   "I know we already have a utilities not build back, but it needs to be
+//    separated between stuff that the property just generally uses, the
+//    property's own consumption, versus what somebody used that didn't get
+//    billed back. There's a distinction there that I want to make, and that
+//    distinction needs to be applied against money that could have been
+//    prorated back that wasn't."
+//
+//   THE PROPERTY USED IT — the office, the shop, irrigation, a vacant site's
+//     base charge, and an owner-occupied space's power. On the last one he was
+//     explicit: "owner-occupied power would be considering the property to have
+//     used it." A cost of doing business, and never in the gap.
+//   RECOVERED — from THREE sources, where this report counted only the first:
+//     a utility bill; a register or pay-link sale; and power that was inside a
+//     nightly or weekly rate all along. A delivered propane fill is the fourth
+//     shape of the first — propane's bill is the fill, billed back in
+//     installments, because utility_bills cannot hold propane at all.
+//   SOMEBODY'S USAGE, NEVER RECOVERED — a wash, a resident GAM could not bill,
+//     a stay with no agreement. THIS is the gap number, and the ONLY one the
+//     money-kept figure is set against.
+//
+// So each line carries `propertyUsed` and `somebodysUsage` beside the whole gap,
+// and the comparison at the bottom sets money kept against `somebodysUsage`
+// alone. Setting it against the whole gap would charge the departing guests for
+// the office lights.
+//
+// WHAT IS STILL NOT SPLIT, SAID OUT LOUD. The park's own general use is a
+// RESIDUAL: no record says "the shop used $40 of power", so it falls into
+// `unattributed` along with anything else nobody wrote down. Nic is right that
+// most of it is the property's own — but moving it there on that hunch would be
+// the invented number this report exists to avoid, so it stays its own figure
+// and the screen says what it mostly is.
+//
+// 10/20 (Nic) — AND THE EARLY DEPARTURES, BOTH HALVES OF THEM.
+//
+//   "I would like to keep track of money that wasn't refunded versus electric
+//    that should have been billed that wasn't charged to see how close we
+//    actually get to evening out. You know, because people leave at various
+//    times and we try to be generous with it, but I want to make sure that it's
+//    somewhat fair."
+//
+// A wash's power was swallowed into the unattributed gap along with the common
+// areas and the vacant spaces, which is exactly why he could not see it. It is
+// named now, the way the owner-occupied share already was.
+//
+// THE GAP IS NOT AN ADDITION SUM, and that matters more than anything else
+// here. `notRecovered` is the whole gap — spent minus billed back — and every
+// named slice lives INSIDE it. So each line also carries `unattributed`, the
+// part no record accounts for, and they reconcile exactly:
+//
+//     notRecovered = propertyUsed + somebodysUsage + unattributed
+//     propertyUsed = ownerOccupied + vacantSpaces
+//     somebodysUsage = earlyDepartureWash
+//
+// Nic's standing rule is that every dollar is counted exactly once. A report
+// that showed the absorbed power as its own slice AND left it inside the gap
+// would be adding the same dollar twice, and routes/utilityRecovery.test.ts
+// asserts that identity rather than trusting it.
+//
+// TWO WINDOWS, deliberately, because the two questions are asked on different
+// axes and pretending otherwise would make one of them wrong:
+//   - the per-utility-type slice is scoped by BILLING CYCLE MONTH, like the
+//     bills and the owner-use rows it has to reconcile against; and
+//   - the comparison in `earlyDepartures` is scoped by the DAY SOMEBODY LEFT
+//     and paired per departure (washPairing), because the money kept and the
+//     power eaten belong to a person, not to a month. They coincide except at
+//     the edge of a window, where a December departure's final read bills in
+//     January — which is what `awaitingClosingRead` is there to say out loud
+//     instead of quietly reading as a park that came out ahead.
 utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
@@ -1221,14 +1296,21 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       -- instead of a lease. That is utility billed back exactly like a bill
       -- on an invoice, so it is counted the same: an open link is still owed,
       -- and a utility line rung up and paid (a paid link is a register sale)
-      -- is paid. Only lines in the register's Utilities category that name a
-      -- metered utility count — propane at the pump is a retail sale.
+      -- is paid.
+      --
+      -- 10/20 (Nic): three sources, and a "source" column says which, because
+      -- one "billed back" number meaning three different things is how a
+      -- report stops being readable. A line is utility money only when its own
+      -- row says so (pos_items.recovers_utility) — never a name, never a
+      -- category.
       billed AS (
+        -- SOURCE 1: A UTILITY BILL on somebody's invoice.
         SELECT ub.utility_type,
                (ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
                CASE WHEN wt.covered THEN 'work_trade'
                     WHEN ub.status = 'paid' THEN 'paid'
-                    ELSE 'owed' END AS bucket
+                    ELSE 'owed' END AS bucket,
+               'bill' AS source
           FROM utility_bills ub
           JOIN units u ON u.id = ub.unit_id
           LEFT JOIN payments pay ON pay.id = ub.payment_id
@@ -1243,45 +1325,159 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
            AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                           AND date_trunc('month', $3::date)::date
         UNION ALL
-        SELECT k.utility_type,
+        -- SOURCE 1, THE PROPANE SHAPE OF IT. A DELIVERED fill is propane's
+        -- bill: utility_bills' own CHECK holds five types and propane is not
+        -- one, so a tank filled on the space can never be a utility_bills row.
+        -- It bills back as installments on the resident's invoice, and
+        -- total_amount already carries the fill's propane tax and its share
+        -- of the delivery charge, so the installments sum to it exactly
+        -- (services/propaneFill) and nothing is added on top here.
+        --
+        -- DISPENSED propane — a bottle filled at the counter — is a PRODUCT and
+        -- is not in this report at any point: it has no fill row, and its
+        -- register line's recovers_utility is NULL by the item's own say-so.
+        SELECT 'propane' AS utility_type,
+               i.amount::numeric AS amount,
+               CASE WHEN pwt.covered THEN 'work_trade'
+                    WHEN ppay.status = 'settled' THEN 'paid'
+                    ELSE 'owed' END AS bucket,
+               'bill' AS source
+          FROM propane_fills f
+          JOIN propane_fill_installments i ON i.fill_id = f.id
+          LEFT JOIN payments ppay ON ppay.id = i.payment_id
+          CROSS JOIN LATERAL (
+            SELECT COALESCE(
+              (ppay.status = 'pending' AND ppay.work_trade_suspended_at IS NOT NULL)
+              OR (ppay.status = 'settled' AND ppay.amount = 0 AND ppay.notes ILIKE '%work-trade credit%'),
+              false) AS covered
+          ) pwt
+         WHERE f.property_id = $1 AND f.landlord_id = $4::uuid
+           AND i.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
+        UNION ALL
+        -- SOURCE 2a: a utility line on an OPEN pay link — billed back, not paid
+        -- yet. The line's catalog item is what says it is a utility, joined by
+        -- the id the link carries.
+        --
+        -- A line RAISED FROM A BILL is deliberately invisible here: it has no
+        -- item id (services/utilityPayLink writes id: null with utilityBillId)
+        -- so it joins no item, and its bill is already counted by source 1.
+        -- Counting the link too would bill the same kilowatts twice.
+        SELECT pi.recovers_utility AS utility_type,
                ROUND((it->>'qty')::numeric * (it->>'price')::numeric
                      * (1 + COALESCE((it->>'tax')::numeric, 0)), 2) AS amount,
-               'owed' AS bucket
+               'owed' AS bucket,
+               'sale' AS source
           FROM pos_pay_links l
           CROSS JOIN LATERAL jsonb_array_elements(l.items) it
-          CROSS JOIN LATERAL (${registerUtilityType(`it->>'cat'`, `it->>'name'`)}) k
+          -- The id is read through a shape check before it is cast. A line
+          -- with no item (id null, or a hand-typed ad-hoc line) is the normal
+          -- case and must land as "no item", not as a 22P02 that takes the
+          -- landlord's whole money report down with it.
+          CROSS JOIN LATERAL (
+            SELECT CASE WHEN it->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN (it->>'id')::uuid END AS item_id
+          ) iid
+          JOIN pos_items pi ON pi.id = iid.item_id
          WHERE l.property_id = $1
            AND l.kind = 'one_time' AND l.status = 'open'
            AND (l.expires_at IS NULL OR l.expires_at > NOW())
-           AND k.utility_type IS NOT NULL
+           AND pi.recovers_utility IS NOT NULL
            AND date_trunc('month', l.created_at)::date BETWEEN date_trunc('month', $2::date)::date
                                                            AND date_trunc('month', $3::date)::date
         UNION ALL
-        SELECT k.utility_type,
+        -- SOURCE 2b: a utility line RUNG UP — at the register or by a pay link
+        -- being paid. Read off the sale line's own snapshot, which posSale
+        -- writes from the item's DB row and never from the request body, so a
+        -- rename or a recategorize cannot restate a settled month.
+        --
+        -- status = 'completed' leaves out a sale that was refunded in whole or
+        -- in part, which is Nic's own rule on the wash applied here: "any
+        -- refund, even partial, means no wash." Money handed back is money not
+        -- recovered, and apportioning a part refund across a sale's lines would
+        -- be inventing a number.
+        SELECT ti.recovers_utility AS utility_type,
                ROUND(ti.subtotal * (1 + COALESCE(ti.tax_rate, 0)), 2) AS amount,
-               'paid' AS bucket
+               'paid' AS bucket,
+               'sale' AS source
           FROM pos_transaction_items ti
           JOIN pos_transactions t ON t.id = ti.transaction_id
-          CROSS JOIN LATERAL (${registerUtilityType('ti.item_category', 'ti.item_name')}) k
          WHERE t.property_id = $1
            AND t.status = 'completed'
-           AND k.utility_type IS NOT NULL
+           AND ti.recovers_utility IS NOT NULL
            AND date_trunc('month', t.created_at)::date BETWEEN date_trunc('month', $2::date)::date
                                                            AND date_trunc('month', $3::date)::date
+        UNION ALL
+        -- SOURCE 3: POWER THAT WAS INSIDE THE RATE ALL ALONG. A nightly or
+        -- weekly guest's electric is not billed back because the rate already
+        -- charged for it, so the money came in with the stay. Recorded as it
+        -- happens on the one book for utility billed to nobody, and counted
+        -- here as recovered rather than left in the gap — "power inside a
+        -- nightly or weekly rate" is the third source Nic named.
+        --
+        -- Already collected by definition: the stay was paid for at its rate.
+        SELECT a.utility_type,
+               (a.charge_amount + a.tax_amount)::numeric AS amount,
+               'paid' AS bucket,
+               'in_rate' AS source
+          FROM utility_absorbed_charges a
+          JOIN units u ON u.id = a.unit_id
+         WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason = 'short_stay_in_rate'
+           AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
       ),
       recovered AS (
         SELECT b.utility_type,
                SUM(b.amount)::numeric AS amount,
                SUM(b.amount) FILTER (WHERE b.bucket = 'work_trade')::numeric AS work_trade,
-               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected
+               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected,
+               SUM(b.amount) FILTER (WHERE b.source = 'bill')::numeric AS from_bills,
+               SUM(b.amount) FILTER (WHERE b.source = 'sale')::numeric AS from_sales,
+               SUM(b.amount) FILTER (WHERE b.source = 'in_rate')::numeric AS in_the_rate
           FROM billed b
          GROUP BY 1
       ),
-      owner_use AS (
-        SELECT a.utility_type, SUM(a.charge_amount)::numeric AS amount
-          FROM utility_owner_use_absorptions a
+      -- THE PROPERTY'S OWN USE, as far as anything is recorded: an
+      -- owner-occupied space's share ("owner-occupied power would be
+      -- considering the property to have used it") and an empty space's base
+      -- charge. Both read off utility_absorbed_charges by reason — the one book
+      -- — and never off the compatibility view beside it, which shows owner-use
+      -- rows only on purpose.
+      property_use AS (
+        SELECT a.utility_type,
+               SUM(a.charge_amount + a.tax_amount) FILTER (WHERE a.reason = 'owner_use')::numeric AS owner_use,
+               SUM(a.charge_amount + a.tax_amount) FILTER (WHERE a.reason = 'vacant')::numeric AS vacant
+          FROM utility_absorbed_charges a
           JOIN units u ON u.id = a.unit_id
          WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason IN ('owner_use', 'vacant')
+           AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
+         GROUP BY 1
+      ),
+      -- 10/20: the stub a departing guest was never billed because the landlord
+      -- kept their money. Read off utility_absorbed_charges by reason — the one
+      -- book for utility billed to nobody — and NOT off the compatibility view
+      -- beside it, which shows owner-use rows only on purpose so that column
+      -- cannot quietly start swallowing washes.
+      --
+      -- Tax is in it, because the billed side counts tax too; a stub absorbed
+      -- with its tax and compared against a recovered figure that includes tax
+      -- is the only way the two sides are the same measurement.
+      --
+      -- Landlord-scoped as well as property-scoped. The property is already
+      -- authorized above and its units cannot belong to anyone else, so this is
+      -- belt and braces on a money figure rather than the only gate.
+      early_wash AS (
+        SELECT a.utility_type, SUM(a.charge_amount + a.tax_amount)::numeric AS amount
+          FROM utility_absorbed_charges a
+          JOIN units u ON u.id = a.unit_id
+         WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason = 'early_departure_wash'
            AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                          AND date_trunc('month', $3::date)::date
          GROUP BY 1
@@ -1289,47 +1485,149 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       SELECT t.utility_type,
              COALESCE(s.amount, 0)::float  AS spent,
              COALESCE(r.amount, 0)::float  AS recovered,
+             COALESCE(r.from_bills, 0)::float  AS from_bills,
+             COALESCE(r.from_sales, 0)::float  AS from_sales,
+             COALESCE(r.in_the_rate, 0)::float AS in_the_rate,
              COALESCE(r.collected, 0)::float AS collected,
              COALESCE(r.work_trade, 0)::float AS work_trade,
-             COALESCE(o.amount, 0)::float  AS owner_occupied
+             COALESCE(o.owner_use, 0)::float AS owner_occupied,
+             COALESCE(o.vacant, 0)::float  AS vacant_spaces,
+             COALESCE(w.amount, 0)::float  AS early_departure_wash
         FROM (SELECT utility_type FROM spent
               UNION SELECT utility_type FROM recovered
-              UNION SELECT utility_type FROM owner_use) t
-        LEFT JOIN spent s     ON s.utility_type = t.utility_type
-        LEFT JOIN recovered r ON r.utility_type = t.utility_type
-        LEFT JOIN owner_use o ON o.utility_type = t.utility_type
+              UNION SELECT utility_type FROM property_use
+              UNION SELECT utility_type FROM early_wash) t
+        LEFT JOIN spent s        ON s.utility_type = t.utility_type
+        LEFT JOIN recovered r    ON r.utility_type = t.utility_type
+        LEFT JOIN property_use o ON o.utility_type = t.utility_type
+        LEFT JOIN early_wash w   ON w.utility_type = t.utility_type
        ORDER BY 2 DESC
     `, [propertyId, from, to, property.landlord_id])
 
-    const lines = rows.map((r: any) => ({
-      utilityType: r.utility_type,
-      spent: Number(r.spent),
-      recovered: Number(r.recovered),
-      collected: Number(r.collected),
-      workTrade: Number(r.work_trade),
-      stillOwed: Math.round((Number(r.recovered) - Number(r.collected) - Number(r.work_trade)) * 100) / 100,
-      ownerOccupied: Number(r.owner_occupied),
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    const lines = rows.map((r: any) => {
+      const spent = Number(r.spent)
+      const ownerOccupied = Number(r.owner_occupied)
+      const vacantSpaces = Number(r.vacant_spaces)
+      const earlyDepartureWash = Number(r.early_departure_wash)
+      // 10/20 (Nic), the first of the three: "stuff that the property just
+      // generally uses, the property's own consumption." A cost of doing
+      // business, so it is named and taken out before anything is compared
+      // against money somebody did not get back.
+      const propertyUsed = round2(ownerOccupied + vacantSpaces)
+      // And the third: "what somebody used that didn't get billed back." The
+      // only one the money-kept figure is set against. Today the single
+      // recorded shape of it is a wash; a resident GAM could not bill and a
+      // stay with no agreement join it the day either is written down.
+      const somebodysUsage = earlyDepartureWash
       // Only meaningful where the landlord recorded what he SPENT. Without the
       // bill on the expense side there is nothing to subtract from, so this
       // reports null rather than implying the whole recovery was a shortfall.
-      notRecovered: Number(r.spent) > 0
-        ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
-        : null,
-    }))
-    const sum = (k: 'spent' | 'recovered' | 'collected' | 'workTrade' | 'stillOwed' | 'ownerOccupied') =>
-      Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
+      const notRecovered = spent > 0 ? round2(spent - Number(r.recovered)) : null
+      return {
+        utilityType: r.utility_type,
+        spent,
+        recovered: Number(r.recovered),
+        // The three sources, so "billed back" is never one number meaning
+        // three things: a bill (a propane fill among them), a register or
+        // pay-link sale, and power that was inside a nightly or weekly rate.
+        fromBills: Number(r.from_bills),
+        fromSales: Number(r.from_sales),
+        inTheRate: Number(r.in_the_rate),
+        collected: Number(r.collected),
+        workTrade: Number(r.work_trade),
+        stillOwed: round2(Number(r.recovered) - Number(r.collected) - Number(r.work_trade)),
+        propertyUsed,
+        ownerOccupied,
+        vacantSpaces,
+        somebodysUsage,
+        earlyDepartureWash,
+        notRecovered,
+        // What is left of the gap once the recorded slices come out of it. Null
+        // for the same reason notRecovered is: there is no gap to divide up.
+        //
+        // Mostly the park's own general use — the office, the shop, irrigation
+        // — but NOTHING ON FILE SAYS SO, so it is not moved into propertyUsed
+        // on that reasoning. It also holds a lease that never passed the
+        // utility through.
+        //
+        // It can come out NEGATIVE, and it is deliberately not clamped. That
+        // means more utility is recorded as absorbed than the recorded spend
+        // leaves room for — which says the expense side is short, and clamping
+        // it to zero would hide the one thing worth knowing.
+        unattributed: notRecovered == null
+          ? null
+          : round2(notRecovered - propertyUsed - somebodysUsage),
+      }
+    })
+    const sum = (k: 'spent' | 'recovered' | 'fromBills' | 'fromSales' | 'inTheRate' | 'collected'
+      | 'workTrade' | 'stillOwed' | 'propertyUsed' | 'ownerOccupied' | 'vacantSpaces'
+      | 'somebodysUsage' | 'earlyDepartureWash') =>
+      round2(lines.reduce((n: number, l: any) => n + l[k], 0))
     // The gap is only a number where a spend was recorded — summed over those
     // utilities alone, so a utility with no bill entered cannot make the
     // total claim a shortfall (or a surplus) that nobody measured.
+    //
+    // ONE CONSEQUENCE, AND IT IS DELIBERATE: the three-way identity holds on
+    // every LINE, and on the totals only when every utility has a spend
+    // recorded. A park that entered its electric bill but not its water one
+    // still gets water's recorded owner-use and washes in the totals — those
+    // are real figures, recorded as they happened — while water's gap is a
+    // dash. Dropping them from the totals to make the subtraction come out
+    // even would hide money that was actually written down, which is the
+    // worse of the two.
     const measured = lines.filter((l: any) => l.notRecovered != null)
+    const measuredSum = (k: 'notRecovered' | 'unattributed') => measured.length
+      ? round2(measured.reduce((n: number, l: any) => n + l[k], 0))
+      : null
+
+    // 10/20 — THE MONEY SIDE, which is money and not a utility type, so it sits
+    // in the summary rather than on a per-utility line. Paired per departure by
+    // the service that owns the rule; this handler adds nothing up that the
+    // service has not already put side by side.
+    const departures = await washPairing(property.landlord_id, { propertyId, from, to })
+    // 10/20 (Nic): the money figure is NET of the short-term lodging tax a
+    // re-priced stay would owe — "even though they weren't charged the tax
+    // needs to be factored in" — because the landlord remits that out of his
+    // own pocket if he ever squares it up. The service prices it per departure
+    // (earlyDepartureWash repricedStayTax); the gross and the tax come up too,
+    // so the screen can show the subtraction rather than a figure that dropped
+    // $35.51 a departure with no explanation.
+    const moneyKept = round2(departures.reduce((n, d) => n + d.moneyKept, 0))
+    const moneyKeptBeforeTax = round2(departures.reduce((n, d) => n + d.moneyKeptBeforeTax, 0))
+    const lodgingTaxOwed = round2(departures.reduce((n, d) => n + d.lodgingTaxOwed, 0))
+    const utilityAbsorbed = round2(departures.reduce((n, d) => n + d.utilityAbsorbed, 0))
     res.json({ success: true, data: {
       from, to, lines,
       totals: {
         spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), workTrade: sum('workTrade'), stillOwed: sum('stillOwed'),
+        fromBills: sum('fromBills'), fromSales: sum('fromSales'), inTheRate: sum('inTheRate'),
+        propertyUsed: sum('propertyUsed'),
         ownerOccupied: sum('ownerOccupied'),
-        notRecovered: measured.length
-          ? Math.round(measured.reduce((n: number, l: any) => n + l.notRecovered, 0) * 100) / 100
-          : null,
+        vacantSpaces: sum('vacantSpaces'),
+        somebodysUsage: sum('somebodysUsage'),
+        earlyDepartureWash: sum('earlyDepartureWash'),
+        notRecovered: measuredSum('notRecovered'),
+        unattributed: measuredSum('unattributed'),
+        earlyDepartures: {
+          departures: departures.length,
+          moneyKept,
+          moneyKeptBeforeTax,
+          lodgingTaxOwed,
+          utilityAbsorbed,
+          // Which way it leans, signed: positive means the money kept covered
+          // the power and then some, negative means the power cost more than
+          // was kept. NOT clamped and NOT labelled good or bad — Nic asked
+          // whether it is fair, and a number that only ever reads as a win
+          // would not answer that.
+          evenedOutBy: round2(moneyKept - utilityAbsorbed),
+          // Departures whose closing read has not landed, so their power is not
+          // in `utilityAbsorbed` yet and the comparison leans generous until it
+          // is. Said out loud so nobody reads a half-measured window as even.
+          awaitingClosingRead: departures.filter(d => !d.closingReadsIn).length,
+          // Final stubs computed but parked on an unanswered money question.
+          heldStubs: departures.reduce((n, d) => n + d.heldStubs, 0),
+        },
       },
     } })
   } catch (e) { next(e) }

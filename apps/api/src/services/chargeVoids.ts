@@ -61,6 +61,12 @@
  *     it is, naming the charge it was once set against;
  *   - connect_disputes.payment_id — a dispute is on a paid charge, never on
  *     one still owed, so none can be on a row voided here.
+ *   - utility_pay_link_settlements.payment_id — 10/20 (Nic): a utility bill
+ *     collected on a pay link records which charge the collection took off the
+ *     payer's invoice, and keeps naming it after the void, the way the common
+ *     area's reservation does. The void itself happens THERE
+ *     (services/utilityPayLink), because the money came in through a register
+ *     sale and a settled charge would accrue the same income twice.
  */
 import { AppError } from '../middleware/errorHandler'
 

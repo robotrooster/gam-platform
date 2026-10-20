@@ -2024,8 +2024,41 @@ async function checkServiceDue() {
 // reveals confirmed same-day arrivals once 6:30am local has passed. The stamp
 // (site_reveal_sent_at) is THE movement fence — once sent, the booking can't be
 // re-sited. Tentative (unpaid) holds are never revealed.
+//
+// ── 10/20 (Nic) — AND NEVER TO A GUEST GAM HAS NOT SPOKEN TO ────────────────
+//
+//   "The import does not send the emails because one, you're going to be
+//    sending emails to people that don't need them... They may have already
+//    gotten a confirmation on a space number. Our system with compression and
+//    expansion is going to kind of screw that up if they think they're locked
+//    to a specific site already. So I don't want the import to do anything."
+//
+// The import obeys that to the letter — it sends nothing (services/
+// reservationImport). This job was quietly undoing it. A reservation brought in
+// from the old system is written status 'confirmed', with the guest's email and
+// no reveal stamp, which is THIS QUERY'S SHAPE EXACTLY — so bringing the season
+// file in at 2pm emailed a site number to every guest arriving that day, inside
+// fifteen minutes, with nobody pressing anything. "The import sends nothing" is
+// worth nothing if a cron sends it an hour later.
+//
+// And on an imported row with no space named in the file there is nothing
+// holding it still, so the number sent is whatever the nightly packer settled
+// on — not the space Nic promised by text. "Head straight there when you
+// arrive" pointing at somebody else's rig is the arrival he described.
+//
+// So ONE RULE, and it is about who GAM has spoken to rather than about imports:
+// GAM reveals a site only to a guest it has told about this reservation itself.
+// Either the reservation was taken here (migrated_at IS NULL — every row on the
+// board before today), or a person deliberately sent the confirmation
+// (confirmation_sent_at, routes/bookings). A migrated guest hears from GAM when
+// somebody decides they should, and their site follows on arrival morning like
+// anybody else's; until then GAM is silent, which is exactly what the schedule
+// screen tells Nic it is.
 const SITE_REVEAL_LOCAL_TIME = '06:30'
-export async function revealTodaysSites() {
+// The clock is an argument so a test can stand at a known minute of a known
+// day rather than depending on what time the suite happens to run, the same
+// way the arrival-day balance run takes one (services/stayBalance).
+export async function revealTodaysSites(now: Date = new Date()) {
   try {
     const due = await query<any>(`
       SELECT b.id, b.guest_name, b.guest_email, b.landlord_id,
@@ -2035,11 +2068,13 @@ export async function revealTodaysSites() {
         JOIN units u ON u.id = b.unit_id
         JOIN properties p ON p.id = u.property_id
        WHERE b.status = 'confirmed'
-         AND b.check_in = (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
+         AND b.check_in = ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
          AND b.site_reveal_sent_at IS NULL
          AND b.guest_email IS NOT NULL
-         AND (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
-             >= $1::time`, [SITE_REVEAL_LOCAL_TIME])
+         -- Taken here, or told by a person. See the note above this function.
+         AND (b.migrated_at IS NULL OR b.confirmation_sent_at IS NOT NULL)
+         AND ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
+             >= $1::time`, [SITE_REVEAL_LOCAL_TIME, now])
     for (const b of due) {
       try {
         const { emailBookingSiteAssignment } = await import('../services/email')
@@ -3923,7 +3958,9 @@ export function schedulerInit() {
       }
     } catch (e) { logger.error({ err: e }, '[SCHEDULER] schedule compression') }
   }, { timezone: 'America/Phoenix' })
-  cron.schedule('*/15 * * * *', revealTodaysSites)
+  // Wrapped rather than passed by name: node-cron hands a task its own trigger
+  // date, and this job reads the clock itself.
+  cron.schedule('*/15 * * * *', () => revealTodaysSites())
 
   // W-44 (S531): hourly private-event sweep — announce paid events,
   // auto-release unpaid ones at start time.

@@ -77,6 +77,7 @@ import { UnitDetailPage }  from './pages/UnitDetailPage'
 import { TenantsPage }     from './pages/TenantsPage'
 import { TenantDetailPage } from './pages/TenantDetailPage'
 import { TenantPaymentReportPage } from './pages/TenantPaymentReportPage'
+import DuplicatePeoplePage from './pages/DuplicatePeoplePage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
 import { RentRollPage }    from './pages/RentRollPage'
@@ -324,6 +325,9 @@ function App() {
               {/* 10/12 (Nic): the household's payment report, printable — opened
                   from a name on the Rent Roll or from the tenant profile. */}
               <Route path="tenants/:id/report" element={<TenantPaymentReportPage />} />
+              {/* 10/20 (Nic): "this looks like the same person" — the pairs GAM
+                  noticed, for a person to answer. */}
+              <Route path="duplicate-people" element={<DuplicatePeoplePage />} />
               <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
               {/* S639: the front counter's call list — same people as the
                   pending pool, shaped as "who do I ring and what do I say". */}

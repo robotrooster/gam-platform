@@ -22,7 +22,7 @@ import { recordBookingEvent, recordBookingChange } from '../services/bookingEven
 import {
   stayNeeds, markScreeningRequired, chooseStayTerms, draftLeaseFromStay, syncStayUtilityAgreement, checkInBlock,
   continuousStayNights, canAttestReturningGuest, attestReturningGuest, planStayGuestAccount,
-  screeningPaidForStay,
+  screeningFeeToCarry,
   RETURNING_GUEST_NOT_ALLOWED, type StayNeeds, type CheckInBlock,
 } from '../services/stayTerms'
 import {
@@ -520,36 +520,12 @@ function screeningFeeRouteBody(needs: StayNeeds, hasEmail: boolean) {
 const fmtMoney = (n: number) => `$${(Math.round(n * 100) / 100).toFixed(2)}`
 
 /**
- * Is the background check's fee already on its way for this continuous stay —
- * on an open register ticket or an unpaid pay link of any stay in it (R7), or
- * already paid? Then a longer stay is not sent a second fee (M3): one fee per
- * stay, never two.
+ * 10/20 (review): "is this stay's check fee already out, and what is left to
+ * ask for" moved to services/stayTerms screeningFeeToCarry, which is where the
+ * rest of the long-stay rules live. This file had three near-copies of the
+ * question and the confirmation had none, so one reservation could be quoted
+ * two different amounts of money — see the note on screeningFeeToCarry.
  */
-async function screeningFeeAlreadyCarried(bookingIds: string[]): Promise<boolean> {
-  if (!bookingIds.length) return false
-  const carried = await queryOne<{ x: number }>(
-    `SELECT 1 AS x FROM pos_open_tickets t
-      WHERE t.booking_id = ANY($1::uuid[]) AND t.status = 'open'
-        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
-                      CASE WHEN jsonb_typeof(t.items) = 'array' THEN t.items ELSE '[]'::jsonb END) i
-                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true')
-     UNION ALL
-     SELECT 1 AS x FROM pos_pay_links l
-      WHERE l.status = 'open'
-        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
-                      CASE WHEN jsonb_typeof(l.items) = 'array' THEN l.items ELSE '[]'::jsonb END) i
-                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true'
-                       -- a deposit link names the stay on the link; a link for
-                       -- the check alone (createScreeningFeeLink) names it on its line.
-                       AND (l.booking_id = ANY($1::uuid[])
-                            OR (l.booking_id IS NULL AND i->>'bookingId' = ANY($1::text[]))))
-     UNION ALL
-     -- already paid for this continuous stay: nothing more to carry.
-     SELECT 1 AS x FROM screening_prepayments sp
-      WHERE sp.booking_id = ANY($1::uuid[]) AND sp.status <> 'void'
-     LIMIT 1`, [bookingIds])
-  return !!carried
-}
 
 /** The answer to the R2 question in a request body, or null. A value that is not one is refused in words. */
 function stayTermsIn(raw: unknown): StayTerms | null {
@@ -1043,6 +1019,111 @@ async function endLeaseOnDayLeftSteps(
 export function avoidedSiteWords(guestName: string | null | undefined, unitNumber: string): string {
   const who = guestName && guestName.trim() ? guestName.trim() : 'This guest'
   return `${who} asked not to be on ${unitNumber}. Move them there anyway?`
+}
+
+// ── 10/20 (Nic, his own catch): MOVING A STAY OFF THE SPACE IT WAS PROMISED ──
+//
+//   "They may have already gotten a confirmation on a space number. Our system
+//    with compression and expansion is going to kind of screw that up if they
+//    think they're locked to a specific site already."
+//
+// unit_bookings.lock_reason says WHY a stay cannot be moved off its site, and
+// the two reasons that exist both mean the same dangerous thing: a space NUMBER
+// is already in the guest's hands. This third value is what a hand move leaves
+// behind, so no screen afterwards calls the new site promised. See the
+// migration of the same name.
+const MOVED_OFF_PROMISED_SITE = 'moved_off_promised_site'
+/**
+ * The two reasons that mean somebody told the guest a space number. The same
+ * two the migration's CHECK allows beside the third one, and the only two a
+ * hand move rewrites.
+ */
+const PROMISED_LOCK_REASONS = ['promised_before_gam', 'promised_at_the_counter']
+
+/** Why this stay is pinned to its site, in the clause the refusal reads out. */
+function lockHeldBecause(lockReason: string | null | undefined): string {
+  if (lockReason === 'promised_before_gam') return 'was promised this space before GAM, in the old system'
+  if (lockReason === 'promised_at_the_counter') return 'was promised this space at the desk'
+  if (lockReason === MOVED_OFF_PROMISED_SITE) return 'was already moved here by hand, off the space they were promised'
+  return 'is pinned to this space by hand'
+}
+
+/**
+ * The question asked before a person moves a LOCKED stay to another site.
+ *
+ * It is one question, not a warning, and it carries the three things the
+ * person pressing needs: that a space number is already in this guest's hands,
+ * which space it is, and what GAM will do about it. A rig arriving to find
+ * somebody parked on its site is the failure the lock exists to prevent, and
+ * the only thing standing between the two is whether the guest hears about the
+ * move — so the question says plainly whether GAM can tell them.
+ */
+export function lockedSiteWords(o: {
+  guestName: string | null | undefined
+  lockReason: string | null | undefined
+  fromUnitNumber: string
+  toUnitNumber: string
+  canEmailGuest: boolean
+}): string {
+  const who = o.guestName && o.guestName.trim() ? o.guestName.trim() : 'This guest'
+  const tell = o.canEmailGuest
+    ? `We will email them that their site is now ${o.toUnitNumber}.`
+    : 'We have no email address for them, so somebody has to call them — GAM cannot tell them.'
+  return `${who} ${lockHeldBecause(o.lockReason)}, so ${o.fromUnitNumber} is the number they have. `
+    + `Moving them to ${o.toUnitNumber} means ${o.fromUnitNumber} is no longer theirs. ${tell} `
+    + 'Move them anyway?'
+}
+
+/**
+ * The whole refusal, as both the places that raise it send it: the early one
+ * that answers before a transaction is opened, and the one inside the save that
+ * catches a stay pinned while this move was already on its way.
+ */
+export function lockedSiteBody(o: {
+  guestName: string | null | undefined
+  lockReason: string | null | undefined
+  fromUnitNumber: string | null | undefined
+  toUnitNumber: string
+  canEmailGuest: boolean
+}) {
+  return {
+    success: false as const,
+    code: 'locked_site' as const,
+    error: lockedSiteWords({ ...o, fromUnitNumber: o.fromUnitNumber || 'its site' }),
+    unitNumber: o.toUnitNumber,
+    fromUnitNumber: o.fromUnitNumber ?? null,
+    lockReason: o.lockReason ?? null,
+    // The confirm says what the move does; this is the same fact in a field,
+    // so the screen never has to parse the sentence for it.
+    willEmailGuest: o.canEmailGuest,
+  }
+}
+
+/**
+ * What the save says it did, once the move has gone through. The desk pressed
+ * a confirm that promised the guest would be emailed; this is the sentence
+ * that says it happened — or that nothing went out and a call is owed.
+ */
+export function lockedSiteMovedWords(o: {
+  guestName: string | null | undefined
+  fromUnitNumber: string
+  toUnitNumber: string
+  told: 'emailed' | 'no_address' | 'send_failed'
+  emailedTo?: string | null
+  /** True when the stay had been promised a space, so its reason was rewritten. */
+  wasPromised: boolean
+}): string {
+  const who = o.guestName && o.guestName.trim() ? o.guestName.trim() : 'This guest'
+  const stillHas = `${who} still has ${o.fromUnitNumber} — ring them.`
+  const tell = o.told === 'emailed'
+    ? `We emailed ${o.emailedTo} their new site.`
+    : o.told === 'no_address'
+      ? `Nothing was emailed: there is no address on this reservation, so ${stillHas}`
+      : `The email did not go out, so ${stillHas}`
+  return `${who} moved from ${o.fromUnitNumber} to ${o.toUnitNumber}. ${tell}`
+    + (o.wasPromised
+      ? ` ${o.toUnitNumber} is not a space anybody promised them, and the reservation says so now.`
+      : ` The stay is still pinned to its site, now ${o.toUnitNumber}.`)
 }
 
 // S653: the avoid list is body-supplied ids. Keep only units that exist at the
@@ -2624,6 +2705,11 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     const needs = await stayNeeds({
       landlordId: unit.landlord_id, propertyId: unit.property_id,
       tenantId: body.tenantId ?? null, email: body.guestEmail ?? null,
+      // 10/20 (review): who the desk says this is. A returning guest is
+      // derived from GAM's own record of their stays, and an address alone is
+      // a mailbox a couple shares — the name is what says which of them booked
+      // (services/stayTerms samePersonName).
+      guestName: body.guestName ?? null,
       checkIn: body.checkIn, checkOut: body.checkOut, stayTerms: stayTermsGiven,
       returning: returningGuest, offerReturning: canAttestReturningGuest(req.user),
     })
@@ -2638,8 +2724,8 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // a stay confirmed straight onto the schedule (screeningFeeRouteBody).
     // One fee per continuous stay (M3): a back-to-back leg whose ticket or link
     // already carries it (or that already paid it) is not charged it again.
-    const feeDue = needs.screening === 'fee_due' && (needs.screeningFee?.amount ?? 0) > 0
-      && !(needs.chain.bookingIds.length && await screeningFeeAlreadyCarried(needs.chain.bookingIds).catch(() => false))
+    const screeningFeeOwed = await screeningFeeToCarry(needs)
+    const feeDue = screeningFeeOwed != null
     if (feeDue && !wantsDeposit && !wantsRegister) {
       return void res.status(409).json(screeningFeeRouteBody(needs, !!body.guestEmail))
     }
@@ -2791,8 +2877,9 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // 10/6 (review): the guest's way into their account, for the work trade.
     await sendStayWorkTradeInvite(booking.id, wtInvite)
     // R8: nothing on file → the check's fee rides on the payment this stay is
-    // handed to below (the schedule takes no money itself).
-    const screeningFee = feeDue && needs.screeningFee ? needs.screeningFee.amount : null
+    // handed to below (the schedule takes no money itself). The same figure the
+    // refusal above quoted, because it is the same answer, asked once.
+    const screeningFee = screeningFeeOwed
 
     // Booking guests with no GAM account get a stay-assistant link by email
     // (a host can also issue a QR from the booking). Best-effort — a missing
@@ -3108,13 +3195,10 @@ unitsRouter.post('/:id/bookings/:bookingId/deposit-link', async (req, res, next)
       tenantId: booking.tenant_id, email: booking.guest_email,
       checkIn: booking.check_in, checkOut: booking.check_out,
     })
-    const feeDue = needs.screening === 'fee_due' && (needs.screeningFee?.amount ?? 0) > 0
-      && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id])
-        .catch(() => false))
-      // 10/18 (review): a check already paid for on this stay is not due again
-      // — and a link for it would come back null, which reads as a failure.
-      && !(await screeningPaidForStay(booking.id).catch(() => false))
-    const screeningFee = feeDue ? needs.screeningFee!.amount : null
+    // 10/18 (review): a check already paid for on this stay is not due again —
+    // and a link for it would come back null, which reads as a failure.
+    // screeningFeeToCarry asks that too, over the same stays.
+    const screeningFee = await screeningFeeToCarry(needs, booking.id)
 
     const sent = await sendStayDepositLink({
       bookingId: booking.id, landlordId: booking.landlord_id, propertyId: booking.property_id,
@@ -3161,7 +3245,7 @@ unitsRouter.post('/:id/bookings/:bookingId/deposit-link', async (req, res, next)
   } catch (e) { next(e) }
 })
 
-// GET /api/units/:id/returning-guest?email=&checkIn=&checkOut=&bookingId= —
+// GET /api/units/:id/returning-guest?email=&name=&checkIn=&checkOut=&bookingId= —
 // 10/6 (Nic): what the reservation form shows beside the background check for
 // a stay on this site: does it need one (22+ continuous nights, nothing on
 // file), and may "Returning guest — they've stayed with us before" be used —
@@ -3180,10 +3264,15 @@ unitsRouter.get('/:id/returning-guest', requirePerm('schedule.create_reservation
     if (!checkIn || !checkOut || checkOut <= checkIn) throw new AppError(400, 'Pick the arrival and leaving days first.')
     const email = typeof req.query.email === 'string' && req.query.email.trim() ? req.query.email.trim() : null
     const bookingId = typeof req.query.bookingId === 'string' && /^[0-9a-f-]{36}$/i.test(req.query.bookingId) ? req.query.bookingId : null
+    // 10/20 (review): the name the form has typed in so far. A derived
+    // returning guest is their address AND their name (services/stayTerms
+    // samePersonName), so without it this preview reads the fee as due on a
+    // guest the save then waives — pessimistic, never the other way round.
+    const name = typeof req.query.name === 'string' && req.query.name.trim() ? req.query.name.trim() : null
     const offered = canAttestReturningGuest(req.user)
     const needs = await stayNeeds({
-      landlordId: unit.landlord_id, propertyId: unit.property_id, bookingId, email, checkIn, checkOut,
-      offerReturning: offered,
+      landlordId: unit.landlord_id, propertyId: unit.property_id, bookingId, email, guestName: name,
+      checkIn, checkOut, offerReturning: offered,
     })
     res.json({ success: true, data: {
       nights: needs.nights,
@@ -3455,8 +3544,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     }
     // Property-locked workers may only edit reservations at their properties.
     // The property's time zone decides what "today" is for an early check-out.
+    // 10/20: the site's number as well — a move off a locked site names the
+    // space the guest already has in its refusal, and the move's own history
+    // event names both spaces.
     const bookingUnit = await queryOne<any>(
-      `SELECT u.property_id, p.timezone
+      `SELECT u.property_id, u.unit_number, p.timezone
          FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id=$1`, [booking.unit_id])
     await assertPropertyInScope(req.user, bookingUnit?.property_id)
@@ -3962,6 +4054,31 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     const keepsEarlyCheckOut = !!early && !checkOutChanged && !checkOutMoved && !checkOutRestored
 
     let newUnitId = unitId || booking.unit_id
+
+    // ── 10/20 (Nic): WHAT A CONFIRMED HAND MOVE OFF A LOCKED SITE LEAVES ─────
+    //
+    // The refusal above has been answered (overrideLocked), so this move is a
+    // person's deliberate choice. Two things follow from it.
+    //
+    // The stay stays LOCKED. It was pinned because its space was not the
+    // board's to pick, and the desk has now picked this one for them by hand —
+    // compression has even less business shuffling them off it than before.
+    //
+    // But the REASON can no longer say "promised", because nobody promised
+    // this space. Keeping the old sentence is how the panel ended up reading
+    // "Locked to RV 09 — Promised this space before GAM" about a space nobody
+    // ever mentioned, and the one fact that mattered — that the number in the
+    // guest's hand is now wrong — went off the screen. Clearing it to NULL
+    // reads "Locked to this space by hand", which is true and useless: it
+    // erases the promise, and GAM never erases. So it becomes the third
+    // reason, which keeps both halves (migration
+    // 20261022140000_a_hand_moved_stay_stops_claiming_it_was_promised).
+    //
+    // Both of those are decided from the stay's OWN ROW inside the save, with
+    // the row locked — not from the read at the top of this handler. Pinning a
+    // stay is one UPDATE on one column and changes nothing stayChangedSince
+    // looks at, so the read at the top can be stale by the time the write runs.
+
     // Every date in this handler is plain 'YYYY-MM-DD' text — the request's day
     // or the stored day read as text above. pg hands DATE columns back as JS
     // Dates, and the stay pricing slices its dates: a
@@ -4103,6 +4220,36 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
             unitNumber: targetUnit.unit_number,
           })
         }
+
+        // ── 10/20 (Nic, his own catch): A LOCKED STAY MOVES BY HAND, NEVER
+        // QUIETLY
+        //
+        //   "They may have already gotten a confirmation on a space number. Our
+        //    system with compression and expansion is going to kind of screw
+        //    that up if they think they're locked to a specific site already."
+        //
+        // locked_to_unit is what stops that, and every path GAM drives honors
+        // it: compression (services/scheduleCompression), the extension
+        // relocations, out-of-order repacking, an unpaid hold moved aside for a
+        // payer. A PERSON is not one of those paths. The landlord knows things
+        // the board cannot — the guest agreed to another space on the phone,
+        // the site flooded, the rig turned out too long — so the move is
+        // allowed and this is deliberately not a refusal with no way through.
+        //
+        // What it may not be is SILENT, because the cost of silence is a rig
+        // pulling in to find somebody parked on the space in its confirmation.
+        // So the first send is refused with the promise named and what GAM will
+        // do about it; the second, carrying overrideLocked, goes through. The
+        // screen is not the guard: a stale page that never knew the stay was
+        // locked, and a hand-made call, get the same answer and the same
+        // second press.
+        if (booking.locked_to_unit === true && req.body?.overrideLocked !== true) {
+          return void res.status(409).json(lockedSiteBody({
+            guestName: booking.guest_name, lockReason: booking.lock_reason,
+            fromUnitNumber: bookingUnit?.unit_number, toUnitNumber: targetUnit.unit_number,
+            canEmailGuest: !!((typeof guestEmail === 'string' && guestEmail.trim()) || booking.guest_email),
+          }))
+        }
       }
 
       // Shared predicate (services/unitAvailability): bookings + active
@@ -4144,6 +4291,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         const hasLease = !!(await stayLeaseOf(booking.id))
         stayAsk = await stayNeeds({
           landlordId: booking.landlord_id, propertyId: targetUnit.property_id, bookingId: booking.id,
+          // 10/20 (review): a save that corrects the guest's name is asked
+          // under the corrected one; otherwise the stay's own answers.
+          guestName: typeof guestName === 'string' && guestName.trim() ? guestName : null,
           checkIn: newCheckIn, checkOut: newCheckOut,
           stayTerms: stayTermsGiven ?? (hasLease ? 'lease' : null),
           returning: returningGuest && !hasLease, offerReturning: canAttestReturningGuest(req.user),
@@ -4233,6 +4383,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (returningGuest && !stayAsk && SITE_HOLDING_STATUSES.includes(status || booking.status)) {
       returningNow = await stayNeeds({
         landlordId: booking.landlord_id, propertyId: targetUnit?.property_id ?? bookingUnit!.property_id, bookingId: booking.id,
+        guestName: typeof guestName === 'string' && guestName.trim() ? guestName : null,
         checkIn: newCheckIn, checkOut: newCheckOut, returning: true,
       })
     }
@@ -4401,8 +4552,20 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // in / Checked out is written to the stay's history inside the save
     // (below), so the after-commit history diff leaves it out.
     let statusRecordedInSave = false
+    // 10/20 (Nic): a hand move off a locked site writes its own 'moved' event
+    // inside the save — both space numbers, and the promise it breaks — so the
+    // after-commit diff must not add a second, wordless one on top of it.
+    let moveRecordedInSave = false
     let changedBySomeoneElse = false
     let screeningBlockedInSave: CheckInBlock | null = null
+    // 10/20 (Nic): the stay was pinned to its site while this move was already
+    // on its way — the refusal the save itself found, answered after the
+    // rollback (below) in the same words the early one uses.
+    let lockedInSave: { lockReason: string | null } | null = null
+    // 10/20 (Nic): whether the stay was pinned to its site, and why, read
+    // inside the save with its row locked. The refusal, the history event and
+    // the guest's email all go by this rather than the read at the top.
+    let pinnedBeforeSave: { locked_to_unit: boolean; lock_reason: string | null } | null = null
     let failure: unknown = null
     // 10/3 (review, fix pass 2): a write the database ended to break a
     // deadlock did nothing, so it runs again from the top, like a reservation
@@ -4415,7 +4578,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       leaseClosedOnCancel = null
       stopAfterCancel = []
       statusRecordedInSave = false
+      moveRecordedInSave = false
       screeningBlockedInSave = null
+      lockedInSave = null
+      pinnedBeforeSave = null
       const tx = await getClient()
       try {
         await tx.query('BEGIN')
@@ -4454,6 +4620,23 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         if (bringsBackClosedStay) {
           const closedNow = await closedLeaseOfStay(booking.id, tx)
           if (closedNow) throw new AppError(409, closedStayRefusal(guest, booking.status as 'cancelled' | 'no_show', closedNow.billZeroed))
+        }
+        // 10/20 (Nic): whether the stay is pinned to its site, read here, with
+        // its row locked. Pinning one is a single UPDATE on a single column —
+        // the Lock to site button, or the import's own write — which changes
+        // nothing stayChangedSince looks at, so the read at the top of this
+        // handler can be stale by now. A stay pinned while this move was on its
+        // way used to be moved anyway: nobody asked, and the panel went
+        // straight back to claiming the new space was promised. What this read
+        // says is what the refusal, the history event and the guest's email all
+        // go by.
+        if (unitChanged) {
+          pinnedBeforeSave = (await tx.query<{ locked_to_unit: boolean; lock_reason: string | null }>(
+            `SELECT locked_to_unit, lock_reason FROM unit_bookings WHERE id = $1`, [booking.id])).rows[0] ?? null
+          if (pinnedBeforeSave?.locked_to_unit === true && req.body?.overrideLocked !== true) {
+            lockedInSave = { lockReason: pinnedBeforeSave.lock_reason }
+            throw new AppError(409, 'This reservation is pinned to its site.')
+          }
         }
         if (siteClaims.length) {
           await lockSitesForStays(tx, claimedSites)
@@ -4606,6 +4789,18 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
               required_site_layout=COALESCE($13,required_site_layout),
               required_amp_service=COALESCE($14,required_amp_service),
               locked_to_unit=COALESCE($15,locked_to_unit),
+              -- 10/20 (Nic): a confirmed hand move off a promised space stops
+              -- the stay claiming the new one was promised. Read off the row
+              -- itself ($19 is only "the caller asked for another site"): these
+              -- SET expressions see the values as they are NOW, under the row's
+              -- lock, so the rewrite cannot disagree with what the stay says. A
+              -- lock with no promise behind it (a snowbird the landlord pinned)
+              -- keeps its reason, because "pinned here by hand" is still
+              -- exactly what it is.
+              lock_reason = CASE
+                WHEN $19::boolean AND locked_to_unit AND unit_id <> $3
+                     AND lock_reason = ANY($20::text[]) THEN $21
+                ELSE lock_reason END,
               avoided_unit_ids=COALESCE($16::uuid[],avoided_unit_ids),
               -- 10/3 (decisions #33): the length the stay is sold for. A
               -- deliberate change of the check-out ($17) is a new length. An
@@ -4638,7 +4833,41 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
            avoidedFinal,
            checkOutChanged || endsLease ? newCheckOut : null,
            checkOutMoved ? (bookedForEvent ?? booking.check_out_day) : checkOutRestored ? checkOutRestored.to : null,
+           unitChanged, PROMISED_LOCK_REASONS, MOVED_OFF_PROMISED_SITE,
           ])).rows[0]
+
+        // ── 10/20 (Nic): THE MOVE OFF A PROMISED SPACE IS ITS OWN RECORD ─────
+        //
+        // The generic diff after the commit writes "Dale Carter moved to
+        // another unit" and two ids, which is no use to the person asked three
+        // weeks later why Dale is not on 14. This one names both spaces and the
+        // promise, and it is written WITH the save — the stay and the reason it
+        // no longer calls itself promised land together or not at all.
+        if (pinnedBeforeSave?.locked_to_unit === true && updated.unit_id !== booking.unit_id) {
+          const who = booking.guest_name || 'Guest'
+          const toSite = targetUnit?.unit_number ?? 'another site'
+          const fromSite = bookingUnit?.unit_number ?? 'its site'
+          // True whenever the reservation now says nobody promised this space —
+          // rewritten by this save, or by an earlier hand move.
+          const movedOffPromisedSite = updated.lock_reason === MOVED_OFF_PROMISED_SITE
+          await recordBookingEvent({
+            client: tx, bookingId: booking.id, unitId: updated.unit_id,
+            landlordId: booking.landlord_id, actorUserId: req.user!.userId,
+            eventType: 'moved',
+            summary: movedOffPromisedSite
+              ? `${who} moved by hand from ${fromSite} to ${toSite} — ${fromSite} is the space they were promised, `
+                + `so ${toSite} is no longer recorded as promised`
+              : `${who} moved by hand from ${fromSite} to ${toSite} — the stay was pinned to ${fromSite}`,
+            detail: {
+              from_unit_id: booking.unit_id, to_unit_id: updated.unit_id,
+              from_unit_number: fromSite, to_unit_number: toSite,
+              locked_to_unit: true, lock_reason_before: pinnedBeforeSave.lock_reason ?? null,
+              lock_reason_after: updated.lock_reason ?? null,
+              moved_by_hand: true,
+            },
+          })
+          moveRecordedInSave = true
+        }
 
         if (checkOutMoved || checkOutRestored) {
           const from = { check_in: booking.check_in_day, check_out: booking.check_out_day }
@@ -4781,6 +5010,21 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       }
       return void res.status(409).json(screeningPendingBody(screeningBlockedInSave))
     }
+    // 10/20 (Nic): pinned while this move was on its way. Same question, same
+    // words, and the second send (overrideLocked) still carries it through.
+    if (failure && lockedInSave) {
+      if (relocated.length) {
+        const moved = relocated
+        relocated = []
+        await putRelocatedBack(moved)
+      }
+      return void res.status(409).json(lockedSiteBody({
+        guestName: booking.guest_name, lockReason: lockedInSave.lockReason,
+        fromUnitNumber: bookingUnit?.unit_number,
+        toUnitNumber: targetUnit?.unit_number ?? 'the new site',
+        canEmailGuest: !!((typeof guestEmail === 'string' && guestEmail.trim()) || booking.guest_email),
+      }))
+    }
     // Still deadlocked after every try: nothing was written. (The catch below
     // puts back a reservation an extension moved for this save.)
     if (isDeadlock(failure)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
@@ -4838,10 +5082,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // collected.
     let screeningFeeLink: { id: string; url: string } | null = null
     let screeningFeeUncollected = false
-    const feeNow = stayAsk && stayAsk.screening === 'fee_due' ? stayAsk.screeningFee?.amount ?? 0 : 0
-    if (stayAsk && feeNow > 0 && SITE_HOLDING_STATUSES.includes(updated.status)
-        && !(await screeningFeeAlreadyCarried(stayAsk.chain.bookingIds.length ? stayAsk.chain.bookingIds : [booking.id])
-          .catch(() => false))) {
+    const feeNow = stayAsk ? await screeningFeeToCarry(stayAsk, booking.id) : null
+    if (stayAsk && feeNow && SITE_HOLDING_STATUSES.includes(updated.status)) {
       const to = (typeof updated.guest_email === 'string' && updated.guest_email.trim()) || stayAsk.chain.email
       if (!to) {
         screeningFeeUncollected = true
@@ -4902,8 +5144,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       const datesBefore = keepsEarlyCheckOut && checkInChanged
         ? { ...booking, check_in: updated.check_in, check_out: updated.check_out }
         : booking
-      // A status change the save already wrote (above) is not diffed again.
-      const before = statusRecordedInSave ? { ...datesBefore, status: updated.status } : datesBefore
+      // A status change the save already wrote (above) is not diffed again —
+      // nor the hand move off a locked site, which wrote its own 'moved' event
+      // with both space numbers in it (10/20).
+      const statusBefore = statusRecordedInSave ? { ...datesBefore, status: updated.status } : datesBefore
+      const before = moveRecordedInSave ? { ...statusBefore, unit_id: updated.unit_id } : statusBefore
       recordBookingChange(before, updated, req.user!.userId).catch(err =>
         logger.error({ err, bookingId: booking.id }, '[booking] change event record failed'))
     }
@@ -4978,8 +5223,61 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // (services/agents/portalDispatch), and today the agent is the one way a
     // stay is checked out. Only the ones that are set, so a plain edit's row
     // reads exactly as before.
+    // ── 10/20 (Nic): THE GUEST HEARS IT FROM US, NOT FROM A RIG ON THEIR SITE
+    //
+    // emailBookingSiteChanged exists so a moved guest "hears it from us before
+    // they arrive and find somebody else parked there" (S652), and until today
+    // only GAM's own hold displacement ever sent it. A desk move off a LOCKED
+    // site is the same news to the same person — and it is the one move where
+    // GAM knows for a fact that a space number is already in the guest's hands,
+    // because that is what the lock means. An unlocked stay compression
+    // shuffles has told the guest nothing yet; this one has. So the email goes
+    // out here too: one message, at the moment the number went stale.
+    //
+    // It is not a tick box. The desk read "We will email them that their site
+    // is now RV 09" before it pressed, so pressing IS the choice. A desk that
+    // has just rung the guest loses nothing by an email that agrees with the
+    // call; a desk that has NOT rung them is the entire reason this exists, and
+    // asking would let that one click past. Where there is no address nothing
+    // is invented — the save says a phone call is owed, in those words.
+    let siteMovedNote: string | null = null
+    if (pinnedBeforeSave?.locked_to_unit === true && updated.unit_id !== booking.unit_id) {
+      const fromSite = bookingUnit?.unit_number ?? 'their old site'
+      const toSite = targetUnit?.unit_number ?? 'their new site'
+      const to = (typeof updated.guest_email === 'string' && updated.guest_email.trim()) || null
+      const propertyId = targetUnit?.property_id ?? bookingUnit!.property_id
+      let told: 'emailed' | 'no_address' | 'send_failed' = 'no_address'
+      if (to) {
+        // The move is already committed, so nothing in here may fail the save:
+        // a park name that cannot be read, or a mail client that will not load,
+        // would otherwise answer 500 for a stay that really did move, and the
+        // desk would try again. It says the email did not go out instead, which
+        // is the truth and names the step that follows (ring them).
+        try {
+          const prop = await queryOne<{ name: string }>(`SELECT name FROM properties WHERE id = $1`, [propertyId])
+          const { emailBookingSiteChanged } = await import('../services/email')
+          await emailBookingSiteChanged(
+            to, updated.guest_name ?? null, prop?.name ?? 'the property', fromSite, toSite,
+            // 10/5: replies reach the people who run this property (services/replyRouting).
+            { landlordId: booking.landlord_id, replyTo: { kind: 'property', propertyId } },
+          )
+          told = 'emailed'
+        } catch (err) {
+          logger.error({ err, bookingId: booking.id }, '[booking] a hand-moved guest could not be emailed their new site')
+          told = 'send_failed'
+        }
+      }
+      siteMovedNote = lockedSiteMovedWords({
+        guestName: updated.guest_name, fromUnitNumber: fromSite, toUnitNumber: toSite,
+        told, emailedTo: to, wasPromised: updated.lock_reason === MOVED_OFF_PROMISED_SITE,
+      })
+    }
+
     const notices = {
       ...(extendedGuestMovedTo ? { extendedGuestMovedTo } : {}),
+      // 10/20 (Nic): a locked stay moved by hand — what became of the space
+      // number the guest already had, and whether GAM has told them.
+      ...(siteMovedNote ? { siteMoved: siteMovedNote } : {}),
       ...(checkOutMoved ? { checkOutMoved } : {}),
       ...(checkOutRestored ? { checkOutRestored } : {}),
       ...(leaseNote ? { leaseNote } : {}),
@@ -5149,9 +5447,7 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
 
     // One fee per continuous stay (M3): not when an open ticket or unpaid link
     // of the stay already carries it, or it is already paid.
-    const screeningFee = needs.screening === 'fee_due' && needs.screeningFee
-      && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id]).catch(() => false))
-      ? needs.screeningFee.amount : null
+    const screeningFee = await screeningFeeToCarry(needs, booking.id)
     let ticketId: string | null = null
     // 10/6 (review): closes the card pages of links whose check fee came off (returning guest).
     let returningAfterCommit: (() => Promise<void>) | null = null

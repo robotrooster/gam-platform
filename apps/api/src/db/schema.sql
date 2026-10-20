@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SjXyHs86hehNEd2pJWh7GniwbjrTnhyG5haWS7vnPLqojDoFD9ao02a4X1m3KXx
+\restrict Zciwpjex1scNg6O06mYhNwiplyAUpUF48GVfewwvCHbTic5aSCep2nW4tgWXBan
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8294,7 +8294,11 @@ CREATE TABLE public.bank_connections (
     current_balance numeric(14,2),
     balance_currency text,
     balance_as_of timestamp with time zone,
+    stripe_connect_account_id text,
+    source text DEFAULT 'landlord_link'::text NOT NULL,
+    fc_permissions text[],
     CONSTRAINT bank_connections_provider_check CHECK ((provider = ANY (ARRAY['stripe_fc'::text, 'csv'::text]))),
+    CONSTRAINT bank_connections_source_check CHECK ((source = ANY (ARRAY['landlord_link'::text, 'connect_onboarding'::text]))),
     CONSTRAINT bank_connections_status_check CHECK ((status = ANY (ARRAY['active'::text, 'disconnected'::text, 'error'::text])))
 );
 
@@ -8311,6 +8315,27 @@ COMMENT ON TABLE public.bank_connections IS 'S570: a landlord''s linked operatin
 --
 
 COMMENT ON COLUMN public.bank_connections.current_balance IS 'S605: cached account balance from Stripe FC, refreshed on sync. NULL = the link has no balances consent (pre-S605 links) or none reported.';
+
+
+--
+-- Name: COLUMN bank_connections.stripe_connect_account_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_connections.stripe_connect_account_id IS '10/20: the connected account that HOLDS this Financial Connections link, when the landlord granted it inside Connect onboarding. Every Stripe read of such a link must carry it in the Stripe-Account header or Stripe answers 404. NULL = held by GAM''s platform customer (every link made before 10/20).';
+
+
+--
+-- Name: COLUMN bank_connections.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_connections.source IS '10/20: landlord_link = the landlord signed in to their bank on the Bank page. connect_onboarding = the link came from step one, so step two must not ask again.';
+
+
+--
+-- Name: COLUMN bank_connections.fc_permissions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bank_connections.fc_permissions IS '10/20: the permissions the link actually carries, as Stripe reported them at link time. Fixed at link time and never widened, so this is what decides whether GAM can read transactions, read a balance, or do neither.';
 
 
 --
@@ -11130,7 +11155,7 @@ CREATE TABLE public.csv_import_attempts (
     reviewed_by uuid,
     reviewed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT csv_import_attempts_import_type_check CHECK ((import_type = ANY (ARRAY['tenant'::text, 'property'::text, 'payment'::text]))),
+    CONSTRAINT csv_import_attempts_import_type_check CHECK ((import_type = ANY (ARRAY['tenant'::text, 'property'::text, 'payment'::text, 'reservation'::text]))),
     CONSTRAINT csv_import_attempts_status_check CHECK ((status = ANY (ARRAY['validated'::text, 'committed'::text, 'reviewed'::text])))
 );
 
@@ -11531,6 +11556,117 @@ CREATE TABLE public.dump_locations (
     CONSTRAINT dump_locations_dump_minutes_positive CHECK ((typical_dump_minutes > 0)),
     CONSTRAINT dump_locations_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
 );
+
+
+--
+-- Name: duplicate_person_proposals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.duplicate_person_proposals (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    pair_key text NOT NULL,
+    side_a_kind text NOT NULL,
+    side_a_user_id uuid,
+    side_a_booking_id uuid,
+    side_b_kind text NOT NULL,
+    side_b_user_id uuid,
+    side_b_booking_id uuid,
+    signals text[] DEFAULT '{}'::text[] NOT NULL,
+    confidence text NOT NULL,
+    score integer DEFAULT 0 NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    snapshot jsonb,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    decided_at timestamp with time zone,
+    decided_by uuid,
+    keeper_side text,
+    merge_outcome jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT dpp_confidence_check CHECK ((confidence = ANY (ARRAY['strong'::text, 'likely'::text, 'possible'::text]))),
+    CONSTRAINT dpp_decided_shape CHECK (((status = 'open'::text) = (decided_at IS NULL))),
+    CONSTRAINT dpp_keeper_side_check CHECK (((keeper_side IS NULL) OR (keeper_side = ANY (ARRAY['a'::text, 'b'::text])))),
+    CONSTRAINT dpp_side_a_shape CHECK ((((side_a_kind = 'account'::text) AND (side_a_user_id IS NOT NULL) AND (side_a_booking_id IS NULL)) OR ((side_a_kind = 'guest'::text) AND (side_a_booking_id IS NOT NULL) AND (side_a_user_id IS NULL)))),
+    CONSTRAINT dpp_side_b_shape CHECK ((((side_b_kind = 'account'::text) AND (side_b_user_id IS NOT NULL) AND (side_b_booking_id IS NULL)) OR ((side_b_kind = 'guest'::text) AND (side_b_booking_id IS NOT NULL) AND (side_b_user_id IS NULL)))),
+    CONSTRAINT dpp_sides_differ CHECK (((side_a_user_id IS DISTINCT FROM side_b_user_id) OR (side_a_booking_id IS DISTINCT FROM side_b_booking_id))),
+    CONSTRAINT dpp_status_check CHECK ((status = ANY (ARRAY['open'::text, 'merged'::text, 'not_duplicate'::text])))
+);
+
+
+--
+-- Name: TABLE duplicate_person_proposals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.duplicate_person_proposals IS '10/20 (Nic): "this looks like the same person... but have it be always have the landlord check that the customer is the same." A question GAM raises and a person answers. Nothing here merges anybody.';
+
+
+--
+-- Name: COLUMN duplicate_person_proposals.pair_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.duplicate_person_proposals.pair_key IS 'The two identities, sorted: u:<user uuid> for an account, g:<earliest booking uuid> for a reservation guest. Unique per company — this is what makes a dismissal stick.';
+
+
+--
+-- Name: COLUMN duplicate_person_proposals.signals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.duplicate_person_proposals.signals IS 'What made us ask (@gam/shared DUPLICATE_SIGNALS). Same name alone is never one of the reasons a row exists: two Smiths at an RV park are two people.';
+
+
+--
+-- Name: COLUMN duplicate_person_proposals.snapshot; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.duplicate_person_proposals.snapshot IS 'Both people as they read at the last scan, so a decided proposal can still say who it was about.';
+
+
+--
+-- Name: early_departure_washes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.early_departure_washes (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid,
+    lease_id uuid,
+    booking_id uuid,
+    checkout_decision_id uuid,
+    departed_on date NOT NULL,
+    paid_through date NOT NULL,
+    amount_kept numeric(12,2) NOT NULL,
+    refund_given boolean DEFAULT false NOT NULL,
+    refund_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    unwound_at timestamp with time zone,
+    unwound_reason text,
+    recorded_by uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT early_departure_washes_departure_check CHECK (((lease_id IS NOT NULL) OR (booking_id IS NOT NULL))),
+    CONSTRAINT early_departure_washes_left_early_check CHECK ((departed_on < paid_through)),
+    CONSTRAINT early_departure_washes_money_check CHECK (((amount_kept >= (0)::numeric) AND (refund_amount >= (0)::numeric))),
+    CONSTRAINT early_departure_washes_refund_shape CHECK (((refund_amount > (0)::numeric) = refund_given)),
+    CONSTRAINT early_departure_washes_unwound_shape CHECK (((unwound_at IS NULL) = (unwound_reason IS NULL)))
+);
+
+
+--
+-- Name: TABLE early_departure_washes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.early_departure_washes IS '10/20 (Nic): the money side of a wash — "money that wasn''t refunded versus electric that should have been billed that wasn''t charged, to see how close we actually get to evening out." One row per early departure (a lease move-out or a stay check-out): the day they left, the day they had paid through, what stayed with the landlord and whether any refund went back. A refund of any size means it is not a wash and the final utility stub bills normally. The power side is utility_absorbed_charges rows pointing back at wash_id, one per meter, because a site with two submeters absorbs two stubs against one kept amount.';
+
+
+--
+-- Name: COLUMN early_departure_washes.unwound_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.early_departure_washes.unwound_at IS 'The check-out was undone, or a refund was issued after the fact. The row is kept and stops counting toward money kept (GAM never erases); the absorbed stubs pointing at it are taken back off the book and become billable again.';
 
 
 --
@@ -13306,6 +13442,7 @@ CREATE TABLE public.landlords (
     books_register_stock_from date,
     books_repair_bills text,
     books_company_costs_from timestamp with time zone,
+    connect_bank_checked_at timestamp with time zone,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_books_close_by_check CHECK ((books_close_by = ANY (ARRAY['owner'::text, 'owner_or_bookkeeper'::text]))),
     CONSTRAINT landlords_books_company_costs_method_check CHECK (((books_company_costs_method IS NULL) OR (books_company_costs_method = ANY (ARRAY['company_bucket'::text, 'split_by_units'::text])))),
@@ -13541,6 +13678,13 @@ COMMENT ON COLUMN public.landlords.books_repair_bills IS '10/12 (Nic, L6): what 
 --
 
 COMMENT ON COLUMN public.landlords.books_company_costs_from IS '10/13 (Nic): the moment books_company_costs_method was picked, when the books had already posted — the method applies to company-level costs recorded from then on; costs recorded before stay in the Company column (the default while not chosen). NULL = the method applies to every cost.';
+
+
+--
+-- Name: COLUMN landlords.connect_bank_checked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.connect_bank_checked_at IS '10/20: when GAM last asked this landlord''s connected account which bank links it holds. Bounds the Stripe calls — the answer itself is a bank_connections row, not this column.';
 
 
 --
@@ -15658,6 +15802,56 @@ COMMENT ON COLUMN public.pending_tenant_intents.rent_due_day IS 'S652: the day o
 
 
 --
+-- Name: person_merges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.person_merges (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    proposal_id uuid,
+    keeper_key text NOT NULL,
+    keeper_kind text NOT NULL,
+    keeper_user_id uuid,
+    keeper_booking_id uuid,
+    loser_key text NOT NULL,
+    loser_kind text NOT NULL,
+    loser_user_id uuid,
+    loser_booking_id uuid,
+    email_moved text,
+    email_retired_to text,
+    reservations_repointed integer DEFAULT 0 NOT NULL,
+    emails_filled integer DEFAULT 0 NOT NULL,
+    detail jsonb,
+    merged_at timestamp with time zone DEFAULT now() NOT NULL,
+    merged_by uuid,
+    CONSTRAINT pm_keeper_shape CHECK ((((keeper_kind = 'account'::text) AND (keeper_user_id IS NOT NULL) AND (keeper_booking_id IS NULL)) OR ((keeper_kind = 'guest'::text) AND (keeper_booking_id IS NOT NULL) AND (keeper_user_id IS NULL)))),
+    CONSTRAINT pm_loser_shape CHECK ((((loser_kind = 'account'::text) AND (loser_user_id IS NOT NULL) AND (loser_booking_id IS NULL)) OR ((loser_kind = 'guest'::text) AND (loser_booking_id IS NOT NULL) AND (loser_user_id IS NULL)))),
+    CONSTRAINT pm_sides_differ CHECK ((keeper_key <> loser_key))
+);
+
+
+--
+-- Name: TABLE person_merges; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.person_merges IS '10/20 (Nic): one row per person the landlord said was already in the book. A merge keeps BOTH records and points them at one person — GAM never erases. The matcher reads this so an answered pair is never asked again.';
+
+
+--
+-- Name: COLUMN person_merges.email_retired_to; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.person_merges.email_retired_to IS 'The duplicate-<id>@invalid address the folded account now answers to (RFC 2606 — can never receive mail). The row itself stays, and stays findable by name and phone.';
+
+
+--
+-- Name: COLUMN person_merges.emails_filled; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.person_merges.emails_filled IS 'Reservations that carried NO email and now carry the person''s. The stay chain matches on tenant_id OR guest_email (services/stayTerms), so this is what makes two halves of one guest read as one.';
+
+
+--
 -- Name: platform_announcements; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -16413,6 +16607,8 @@ CREATE TABLE public.pos_items (
     category_id uuid NOT NULL,
     tax_category_id uuid,
     stay_unit text,
+    recovers_utility text,
+    CONSTRAINT pos_items_recovers_utility_check CHECK (((recovers_utility IS NULL) OR (recovers_utility = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))),
     CONSTRAINT pos_items_stay_unit_check CHECK (((stay_unit IS NULL) OR (stay_unit = ANY (ARRAY['night'::text, 'week'::text, 'month'::text])))),
     CONSTRAINT pos_items_stock_qty_nonneg CHECK ((stock_qty >= (0)::numeric))
 );
@@ -16430,6 +16626,13 @@ COMMENT ON COLUMN public.pos_items.property_id IS 'Property this POS item belong
 --
 
 COMMENT ON COLUMN public.pos_items.stay_unit IS 'S651: non-NULL marks this item as a STAY sold at the counter, and says what one unit of quantity buys — a night, a week, or a calendar month. Selling one requires a site and a check-in date, and writes a unit_bookings row so the stay appears on the Master Schedule. NULL = an ordinary item.';
+
+
+--
+-- Name: COLUMN pos_items.recovers_utility; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_items.recovers_utility IS '10/20: which metered utility a sale of this item gives back, or NULL when it is a PRODUCT (dispensed propane, firewood, a dump-station fee) whose money is sales revenue and must never be swept as utility recovery. Explicit on the item — never inferred from the category name, the item name or the unit type. Same values as @gam/shared UTILITY_TYPES.';
 
 
 --
@@ -16958,8 +17161,17 @@ CREATE TABLE public.pos_transaction_items (
     tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
     subtotal numeric(10,2) NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pos_transaction_items_qty_pos CHECK ((qty > (0)::numeric))
+    recovers_utility text,
+    CONSTRAINT pos_transaction_items_qty_pos CHECK ((qty > (0)::numeric)),
+    CONSTRAINT pos_transaction_items_recovers_utility_check CHECK (((recovers_utility IS NULL) OR (recovers_utility = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text]))))
 );
+
+
+--
+-- Name: COLUMN pos_transaction_items.recovers_utility; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_transaction_items.recovers_utility IS '10/20: what this line was when it was sold — which utility it gives back, or NULL for a product. Snapshotted from the item at sale time (services/posSale), never from the request body, so a renamed button cannot restate a settled month and a typed category cannot invent recovery.';
 
 
 --
@@ -17103,8 +17315,8 @@ CREATE TABLE public.propane_fills (
     property_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
     unit_id uuid NOT NULL,
-    lease_id uuid NOT NULL,
-    tenant_id uuid NOT NULL,
+    lease_id uuid,
+    tenant_id uuid,
     fill_date date DEFAULT CURRENT_DATE NOT NULL,
     gallons numeric(8,2) NOT NULL,
     price_per_gallon numeric(8,4) NOT NULL,
@@ -17120,11 +17332,21 @@ CREATE TABLE public.propane_fills (
     markup_per_gallon numeric(8,4),
     invoice_total numeric(12,2),
     invoice_gallons numeric(12,2),
+    service_agreement_id uuid,
+    booking_id uuid,
     CONSTRAINT propane_fills_delivery_fee_share_check CHECK ((delivery_fee_share >= (0)::numeric)),
     CONSTRAINT propane_fills_gallons_check CHECK ((gallons > (0)::numeric)),
     CONSTRAINT propane_fills_installment_count_check CHECK ((installment_count = ANY (ARRAY[1, 2, 4]))),
+    CONSTRAINT propane_fills_names_an_occupancy CHECK (((lease_id IS NOT NULL) OR (service_agreement_id IS NOT NULL) OR (booking_id IS NOT NULL))),
     CONSTRAINT propane_fills_price_per_gallon_check CHECK ((price_per_gallon >= (0)::numeric))
 );
+
+
+--
+-- Name: COLUMN propane_fills.lease_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.lease_id IS '10/20: the lease that was on the space, when there was one. Nullable since delivered propane reaches RV sites held by a stay or a serviced agreement.';
 
 
 --
@@ -17153,6 +17375,20 @@ COMMENT ON COLUMN public.propane_fills.true_cost_per_gallon IS 'S632: the delive
 --
 
 COMMENT ON COLUMN public.propane_fills.invoice_total IS 'S632: the whole supplier invoice for the delivery this fill came from — kept so a margin can be re-derived years later without the paper.';
+
+
+--
+-- Name: COLUMN propane_fills.service_agreement_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.service_agreement_id IS '10/20: the utility service agreement that was on the space — the occupant who owes for what they used without signing a lease.';
+
+
+--
+-- Name: COLUMN propane_fills.booking_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.booking_id IS '10/20: the stay that was on the space. A stay guest may have no tenant row at all, which is why tenant_id is nullable beside this.';
 
 
 --
@@ -20303,7 +20539,23 @@ CREATE TABLE public.unit_bookings (
     deposit_link_sent_at timestamp with time zone,
     deposit_link_sent_by uuid,
     deposit_pay_link_id uuid,
+    confirmation_sent_at timestamp with time zone,
+    confirmation_sent_by uuid,
+    migrated_at timestamp with time zone,
+    migrated_by uuid,
+    migrated_door text,
+    migration_key text,
+    told_outside_gam boolean DEFAULT false NOT NULL,
+    lock_reason text,
+    deposit_off_platform_method text,
+    deposit_off_platform_ref text,
+    import_extra_data jsonb,
+    folded_into_person_merge_id uuid,
+    CONSTRAINT unit_bookings_deposit_off_platform_method_check CHECK (((deposit_off_platform_method IS NULL) OR (deposit_off_platform_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'bank_deposit'::text, 'other'::text])))),
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
+    CONSTRAINT unit_bookings_lock_reason_check CHECK (((lock_reason IS NULL) OR (lock_reason = ANY (ARRAY['promised_before_gam'::text, 'promised_at_the_counter'::text, 'moved_off_promised_site'::text])))),
+    CONSTRAINT unit_bookings_migrated_door_check CHECK (((migrated_door IS NULL) OR (migrated_door = ANY (ARRAY['file'::text, 'hand'::text])))),
+    CONSTRAINT unit_bookings_migration_shape CHECK (((migrated_at IS NULL) = (migrated_door IS NULL))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT unit_bookings_status_check CHECK ((status = ANY (ARRAY['tentative'::text, 'confirmed'::text, 'checked_in'::text, 'checked_out'::text, 'cancelled'::text, 'no_show'::text]))),
@@ -20393,6 +20645,69 @@ COMMENT ON COLUMN public.unit_bookings.deposit_link_sent_by IS '10/18 (Nic): who
 --
 
 COMMENT ON COLUMN public.unit_bookings.deposit_pay_link_id IS '10/18 (Nic): the pay link that was made as THIS reservation''s deposit (routes/posPayLinks createBookingDepositLink). Beside balance_pay_link_id, which is the arrival-day balance link. A reservation can also carry the link that created it, or an Add-a-month link; those ask for other money and are never handed back as the deposit.';
+
+
+--
+-- Name: COLUMN unit_bookings.confirmation_sent_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.confirmation_sent_at IS 'When a person chose to email this guest their reservation confirmation. NULL = never told. Never set by a job or a hook — see services/bookingConfirmation.';
+
+
+--
+-- Name: COLUMN unit_bookings.confirmation_sent_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.confirmation_sent_by IS 'Who pressed send on the confirmation.';
+
+
+--
+-- Name: COLUMN unit_bookings.migrated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.migrated_at IS 'When this reservation was brought in from the old system or a text thread. NULL = taken in GAM.';
+
+
+--
+-- Name: COLUMN unit_bookings.migrated_door; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.migrated_door IS 'file = the old system''s export (booked first, sites already promised); hand = typed in off a text thread afterwards.';
+
+
+--
+-- Name: COLUMN unit_bookings.migration_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.migration_key IS 'Identity of the row in its source, so re-importing the same file adds nobody twice. See lib/reservationImportColumns.';
+
+
+--
+-- Name: COLUMN unit_bookings.told_outside_gam; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.told_outside_gam IS 'The guest was already told they have this reservation, outside GAM. The confirmation endpoint will not email them again without a deliberate second ask.';
+
+
+--
+-- Name: COLUMN unit_bookings.lock_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.lock_reason IS 'Why this stay cannot be moved off its site. promised_before_gam = the old system gave them this space number; promised_at_the_counter = the desk did; moved_off_promised_site = a person moved them off the space they were promised, so nothing here may call this one promised.';
+
+
+--
+-- Name: COLUMN unit_bookings.deposit_off_platform_method; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.deposit_off_platform_method IS 'How a deposit that never came through GAM was handed over. Set = this money moved somewhere GAM was not; GAM owes the landlord nothing for it.';
+
+
+--
+-- Name: COLUMN unit_bookings.folded_into_person_merge_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.folded_into_person_merge_id IS '10/20 (Nic): the landlord said this reservation''s guest is somebody already in the book (person_merges). The row stays on the board exactly as booked; the matcher stops asking about it.';
 
 
 --
@@ -21000,6 +21315,65 @@ COMMENT ON COLUMN public.users.date_of_birth IS '10/13 (Nic): a landlord''s own 
 
 
 --
+-- Name: utility_absorbed_charges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_absorbed_charges (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    utility_type text NOT NULL,
+    billing_cycle_month date NOT NULL,
+    allocation_method text,
+    allocation_basis numeric(12,4),
+    charge_amount numeric(12,2) NOT NULL,
+    base_fee_share numeric(12,2) DEFAULT 0 NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    reason text DEFAULT 'owner_use'::text NOT NULL,
+    wash_id uuid,
+    lease_id uuid,
+    booking_id uuid,
+    tenant_id uuid,
+    departed_on date,
+    tax_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    usage_amount numeric(14,4),
+    rate_per_unit numeric(12,6),
+    reading_start numeric(14,4),
+    reading_end numeric(14,4),
+    reading_start_date date,
+    reading_end_date date,
+    CONSTRAINT utility_absorbed_charges_amount_check CHECK ((charge_amount >= (0)::numeric)),
+    CONSTRAINT utility_absorbed_charges_reason_check CHECK ((reason = ANY (ARRAY['owner_use'::text, 'early_departure_wash'::text, 'short_stay_in_rate'::text, 'vacant'::text]))),
+    CONSTRAINT utility_absorbed_charges_tax_check CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT utility_absorbed_charges_wash_shape CHECK (((reason = 'early_departure_wash'::text) = (wash_id IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE utility_absorbed_charges; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.utility_absorbed_charges IS '10/20 (Nic): the one book for utility cost GAM billed to NOBODY, whatever the reason — an owner-occupied unit''s share of a RUBS pool (S609, the original purpose), a departing guest''s final stub called a wash, power inside a nightly rate, a vacant space. "If we''re keeping track of electric that''s not billed back, we need to count that there, but it doesn''t need to get attached to anything." Was utility_owner_use_absorptions, generalized rather than joined by a second table, because the first report that forgets to add the two together is the day the number stops being trustworthy. A wash row points at its departure in early_departure_washes.';
+
+
+--
+-- Name: COLUMN utility_absorbed_charges.reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_absorbed_charges.reason IS 'Why this cost was billed to nobody: owner_use (an owner-occupied unit''s share), early_departure_wash (they left early, kept no refund, so GAM ate the final stub), short_stay_in_rate (a nightly guest whose power is in the rate), vacant. Single source: ABSORBED_CHARGE_REASONS in services/earlyDepartureWash.ts.';
+
+
+--
+-- Name: COLUMN utility_absorbed_charges.wash_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_absorbed_charges.wash_id IS 'The departure this stub belonged to (early_departure_washes). Set for exactly the early_departure_wash rows, and the thing the per-departure unique index keys on — one absorbed stub per departure per meter, however many months the reads straddle.';
+
+
+--
 -- Name: utility_bills; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21241,32 +21615,101 @@ COMMENT ON COLUMN public.utility_meters.zero_use_stops_flat_charge IS '10/13 (Ni
 
 
 --
--- Name: utility_owner_use_absorptions; Type: TABLE; Schema: public; Owner: -
+-- Name: utility_owner_use_absorptions; Type: VIEW; Schema: public; Owner: -
 --
 
-CREATE TABLE public.utility_owner_use_absorptions (
+CREATE VIEW public.utility_owner_use_absorptions AS
+ SELECT id,
+    meter_id,
+    unit_id,
+    landlord_id,
+    utility_type,
+    billing_cycle_month,
+    allocation_method,
+    allocation_basis,
+    charge_amount,
+    base_fee_share,
+    notes,
+    reason,
+    created_at,
+    updated_at
+   FROM public.utility_absorbed_charges
+  WHERE (reason = 'owner_use'::text)
+  WITH CASCADED CHECK OPTION;
+
+
+--
+-- Name: VIEW utility_owner_use_absorptions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.utility_owner_use_absorptions IS '10/20: the old name for utility_absorbed_charges, kept so the owner-use writers and readers work either side of the rename. Owner-use rows only. Drop it once nothing names it.';
+
+
+--
+-- Name: utility_pay_link_settlements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_pay_link_settlements (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    meter_id uuid NOT NULL,
-    unit_id uuid NOT NULL,
+    pay_link_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    utility_bill_id uuid,
+    unit_id uuid,
+    meter_id uuid,
+    billing_cycle_month date,
     utility_type text NOT NULL,
-    billing_cycle_month date NOT NULL,
-    allocation_method text,
-    allocation_basis numeric(12,4),
     charge_amount numeric(12,2) NOT NULL,
-    base_fee_share numeric(12,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    pos_transaction_id uuid,
+    pos_transaction_item_id uuid,
+    payment_id uuid,
+    settled_at timestamp with time zone,
+    refunded_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    created_by uuid,
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT utility_owner_use_absorptions_amount_check CHECK ((charge_amount >= (0)::numeric))
+    CONSTRAINT upls_amount_check CHECK ((charge_amount >= (0)::numeric)),
+    CONSTRAINT upls_cancelled_is_stamped CHECK (((cancelled_at IS NOT NULL) = (status = 'cancelled'::text))),
+    CONSTRAINT upls_no_bill_means_a_sale CHECK (((utility_bill_id IS NOT NULL) OR (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
+    CONSTRAINT upls_refunded_is_stamped CHECK (((refunded_at IS NOT NULL) = (status = 'refunded'::text))),
+    CONSTRAINT upls_sale_shape CHECK (((pos_transaction_id IS NOT NULL) = (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
+    CONSTRAINT upls_settled_is_stamped CHECK (((settled_at IS NOT NULL) = (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
+    CONSTRAINT upls_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'refunded'::text, 'cancelled'::text]))),
+    CONSTRAINT upls_tax_check CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT upls_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
 
 
 --
--- Name: TABLE utility_owner_use_absorptions; Type: COMMENT; Schema: public; Owner: -
+-- Name: TABLE utility_pay_link_settlements; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.utility_owner_use_absorptions IS 'S609: utility cost a landlord absorbed on their OWN occupied units. An owner-occupied unit takes a real share of a RUBS pool — so the tenants stop paying for the owner''s usage — and that share is then billed to nobody. This is the provable record that it was held back rather than passed through, which is the question a RUBS audit asks.';
+COMMENT ON TABLE public.utility_pay_link_settlements IS '10/20 (Nic): the one book for utility money collected on a PAY LINK — "a paylink''s utility line settles the bill and counts as recovery". One row per utility line on a link: with utility_bill_id, the bill that line closes out (the bill stays the record of what was billed back, so this row adds no second figure); without one, a line rung up by hand for somebody''s power that no bill was ever cut for — which is the only kind that is itself a figure, and is what happened to Andres Razo''s $163.17 of August and September electric. Which utility comes from the bill or from pos_items.recovers_utility, never from an item name.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.utility_bill_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.utility_bill_id IS 'The utility bill this line settles, or NULL when there was never one. NULL is an answer — "collected, and no bill existed" — not a missing value: a bill invented after the fact for usage nobody read into a cycle would be a worse record than the gap it filled.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.status IS 'open (a link is out for this bill), settled (paid), refunded (the WHOLE sale went back, so the bill is owed again and this stops counting as recovery), cancelled (the link was closed before it was paid). A PART refund leaves the row settled with a note: short of the whole sale going back, nothing says which line the money came off, and re-billing the full amount would ask the payer for money the landlord is still holding.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.payment_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.payment_id IS 'The charge row on the payer''s invoice that this collection took care of. The charge is VOIDED when the link is paid (services/chargeVoids — "a charge nobody owes is voided, never deleted"), because the money came in through the register sale and the charge accruing the same income twice would double the revenue in the books. Kept here after the void so the bill''s story stays readable.';
 
 
 --
@@ -21406,6 +21849,64 @@ COMMENT ON COLUMN public.utility_service_agreements.moveout_notice_at IS 'S616: 
 --
 
 COMMENT ON COLUMN public.utility_service_agreements.moveout_expected_on IS 'S616: the date the payer expects to be gone. Drives the final billing period and tells the landlord when to read the meter.';
+
+
+--
+-- Name: utility_wash_holds; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_wash_holds (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    lease_id uuid,
+    booking_id uuid,
+    tenant_id uuid,
+    departed_on date NOT NULL,
+    billing_cycle_month date NOT NULL,
+    utility_type text NOT NULL,
+    usage_amount numeric(14,4),
+    allocation_method text,
+    allocation_basis numeric(14,4),
+    rate_per_unit numeric(12,6),
+    base_fee_share numeric(12,2) DEFAULT 0 NOT NULL,
+    charge_amount numeric(12,2) NOT NULL,
+    tax_rate_pct numeric(6,3),
+    tax_amount numeric(12,2),
+    sewer_rate_per_unit numeric(12,6),
+    reading_start numeric(14,4),
+    reading_end numeric(14,4),
+    reading_start_date date,
+    reading_end_date date,
+    notes text,
+    absorbed_at timestamp with time zone,
+    absorbed_charge_id uuid,
+    released_at timestamp with time zone,
+    released_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    released_bill_id uuid,
+    CONSTRAINT utility_wash_holds_absorbed_shape CHECK (((absorbed_at IS NULL) = (absorbed_charge_id IS NULL))),
+    CONSTRAINT utility_wash_holds_amount_check CHECK ((charge_amount >= (0)::numeric)),
+    CONSTRAINT utility_wash_holds_departure_check CHECK (((lease_id IS NOT NULL) OR (booking_id IS NOT NULL))),
+    CONSTRAINT utility_wash_holds_outcome_check CHECK ((NOT ((absorbed_at IS NOT NULL) AND (released_at IS NOT NULL)))),
+    CONSTRAINT utility_wash_holds_released_shape CHECK (((released_at IS NULL) = (released_reason IS NULL)))
+);
+
+
+--
+-- Name: TABLE utility_wash_holds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.utility_wash_holds IS '10/20 (Nic): a departing payer''s final utility stub, parked because the money question is not answered yet — the closing read came in first, or the clerk who checked them out could not answer it without "Issue refunds". Reported to the billing engine as NOT billed, the same as the invite hold it is shaped after (suspended_utility_charges, S629), because billing it and then learning it was a wash means reversing a charge the guest may already have seen. Its own table and not suspended_utility_charges: that table''s nightly sweep closes every open hold when a property''s onboarding window shuts, with a reason that would be untrue of somebody who drove away. A hold is not an absorption and is never counted as one.';
+
+
+--
+-- Name: COLUMN utility_wash_holds.released_bill_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_wash_holds.released_bill_id IS 'The utility_bills row this parked stub was billed onto when its hold was released — a refund went out, or the check-out was undone, so it is owed after all. Null while the hold is still waiting, null on a hold the billing run itself billed in the same breath as releasing it (its own numbers are fresher than the parked copy''s), and null when nobody is set up to be billed for utilities on that space, in which case released_reason says so. Mirrors suspended_utility_charges.released_bill_id.';
 
 
 --
@@ -23038,6 +23539,22 @@ ALTER TABLE ONLY public.dump_locations
 
 
 --
+-- Name: duplicate_person_proposals duplicate_person_proposals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: early_departure_washes early_departure_washes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: email_send_log email_send_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24091,6 +24608,14 @@ ALTER TABLE ONLY public.pending_lease_drafts
 
 ALTER TABLE ONLY public.pending_tenant_intents
     ADD CONSTRAINT pending_tenant_intents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: person_merges person_merges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_pkey PRIMARY KEY (id);
 
 
 --
@@ -25670,6 +26195,14 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: utility_absorbed_charges utility_absorbed_charges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: utility_bills utility_bills_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25702,11 +26235,11 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
--- Name: utility_owner_use_absorptions utility_owner_use_absorptions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.utility_owner_use_absorptions
-    ADD CONSTRAINT utility_owner_use_absorptions_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_pkey PRIMARY KEY (id);
 
 
 --
@@ -25739,6 +26272,14 @@ ALTER TABLE ONLY public.utility_reading_runs
 
 ALTER TABLE ONLY public.utility_service_agreements
     ADD CONSTRAINT utility_service_agreements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_pkey PRIMARY KEY (id);
 
 
 --
@@ -26374,6 +26915,20 @@ CREATE INDEX disclosure_library_lookup ON public.disclosure_library_documents US
 --
 
 CREATE INDEX document_sleeves_state ON public.document_sleeves USING btree (state_code) WHERE (retired_at IS NULL);
+
+
+--
+-- Name: duplicate_person_proposals_open_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX duplicate_person_proposals_open_idx ON public.duplicate_person_proposals USING btree (landlord_id, status, score DESC);
+
+
+--
+-- Name: duplicate_person_proposals_pair_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX duplicate_person_proposals_pair_idx ON public.duplicate_person_proposals USING btree (landlord_id, pair_key);
 
 
 --
@@ -27609,6 +28164,20 @@ CREATE INDEX idx_dump_locations_business ON public.dump_locations USING btree (b
 
 
 --
+-- Name: idx_early_departure_wash_landlord_departed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_early_departure_wash_landlord_departed ON public.early_departure_washes USING btree (landlord_id, departed_on);
+
+
+--
+-- Name: idx_early_departure_wash_property_departed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_early_departure_wash_property_departed ON public.early_departure_washes USING btree (property_id, departed_on);
+
+
+--
 -- Name: idx_email_send_log_bad_delivery; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -28673,13 +29242,6 @@ CREATE INDEX idx_otp_advances_tenant ON public.otp_advances USING btree (tenant_
 
 
 --
--- Name: idx_owner_use_absorption_landlord_cycle; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_owner_use_absorption_landlord_cycle ON public.utility_owner_use_absorptions USING btree (landlord_id, billing_cycle_month);
-
-
---
 -- Name: idx_paid_ahead_choices_lease; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -29436,10 +29998,24 @@ CREATE INDEX idx_pos_vendors_landlord ON public.pos_vendors USING btree (landlor
 
 
 --
+-- Name: idx_propane_fills_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_propane_fills_booking ON public.propane_fills USING btree (booking_id) WHERE (booking_id IS NOT NULL);
+
+
+--
 -- Name: idx_propane_fills_property; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_propane_fills_property ON public.propane_fills USING btree (property_id, fill_date DESC);
+
+
+--
+-- Name: idx_propane_fills_service_agreement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_propane_fills_service_agreement ON public.propane_fills USING btree (service_agreement_id) WHERE (service_agreement_id IS NOT NULL);
 
 
 --
@@ -30535,6 +31111,27 @@ CREATE INDEX idx_users_tenant_invite_token ON public.users USING btree (tenant_i
 
 
 --
+-- Name: idx_utility_absorbed_charge_landlord_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_absorbed_charge_landlord_cycle ON public.utility_absorbed_charges USING btree (landlord_id, billing_cycle_month);
+
+
+--
+-- Name: idx_utility_absorbed_charge_landlord_reason; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_absorbed_charge_landlord_reason ON public.utility_absorbed_charges USING btree (landlord_id, reason, billing_cycle_month);
+
+
+--
+-- Name: idx_utility_absorbed_charge_wash; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_absorbed_charge_wash ON public.utility_absorbed_charges USING btree (wash_id) WHERE (wash_id IS NOT NULL);
+
+
+--
 -- Name: idx_utility_bills_landlord_cycle; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -30637,6 +31234,27 @@ CREATE INDEX idx_utility_service_agreements_landlord ON public.utility_service_a
 --
 
 CREATE INDEX idx_utility_service_agreements_tenant ON public.utility_service_agreements USING btree (tenant_id);
+
+
+--
+-- Name: idx_utility_wash_hold_departure; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_wash_hold_departure ON public.utility_wash_holds USING btree (COALESCE(booking_id, lease_id));
+
+
+--
+-- Name: idx_utility_wash_hold_open_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_wash_hold_open_landlord ON public.utility_wash_holds USING btree (landlord_id, departed_on) WHERE ((absorbed_at IS NULL) AND (released_at IS NULL));
+
+
+--
+-- Name: idx_utility_wash_hold_released_bill; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_wash_hold_released_bill ON public.utility_wash_holds USING btree (released_bill_id) WHERE (released_bill_id IS NOT NULL);
 
 
 --
@@ -31389,6 +32007,20 @@ CREATE UNIQUE INDEX pending_tenant_intents_tenant_unit_live_key ON public.pendin
 
 
 --
+-- Name: person_merges_keeper_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX person_merges_keeper_idx ON public.person_merges USING btree (landlord_id, keeper_key);
+
+
+--
+-- Name: person_merges_loser_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX person_merges_loser_idx ON public.person_merges USING btree (landlord_id, loser_key);
+
+
+--
 -- Name: platform_fee_config_one_active; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -31844,6 +32476,27 @@ CREATE UNIQUE INDEX unit_applications_background_check_uniq ON public.unit_appli
 
 
 --
+-- Name: unit_bookings_folded_person_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX unit_bookings_folded_person_idx ON public.unit_bookings USING btree (folded_into_person_merge_id) WHERE (folded_into_person_merge_id IS NOT NULL);
+
+
+--
+-- Name: unit_bookings_migrated_door_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX unit_bookings_migrated_door_idx ON public.unit_bookings USING btree (unit_id, migrated_door) WHERE (migrated_door IS NOT NULL);
+
+
+--
+-- Name: unit_bookings_migration_key_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX unit_bookings_migration_key_idx ON public.unit_bookings USING btree (landlord_id, migration_key) WHERE (migration_key IS NOT NULL);
+
+
+--
 -- Name: unit_bookings_pos_transaction_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -31862,6 +32515,41 @@ CREATE INDEX unit_bookings_unpaid_hold_idx ON public.unit_bookings USING btree (
 --
 
 CREATE UNIQUE INDEX units_property_building_number_uniq ON public.units USING btree (property_id, lower(btrim(COALESCE(building, ''::text))), lower(btrim(unit_number)));
+
+
+--
+-- Name: upls_by_link; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX upls_by_link ON public.utility_pay_link_settlements USING btree (pay_link_id);
+
+
+--
+-- Name: upls_by_property_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX upls_by_property_cycle ON public.utility_pay_link_settlements USING btree (property_id, utility_type, billing_cycle_month);
+
+
+--
+-- Name: upls_one_open_link_per_bill; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX upls_one_open_link_per_bill ON public.utility_pay_link_settlements USING btree (utility_bill_id) WHERE ((status = 'open'::text) AND (utility_bill_id IS NOT NULL));
+
+
+--
+-- Name: upls_one_row_per_sale_line; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX upls_one_row_per_sale_line ON public.utility_pay_link_settlements USING btree (pos_transaction_item_id) WHERE (pos_transaction_item_id IS NOT NULL);
+
+
+--
+-- Name: upls_one_settlement_per_bill; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX upls_one_settlement_per_bill ON public.utility_pay_link_settlements USING btree (utility_bill_id) WHERE ((status = 'settled'::text) AND (utility_bill_id IS NOT NULL));
 
 
 --
@@ -31977,6 +32665,20 @@ CREATE UNIQUE INDEX ux_document_packages_default ON public.document_packages USI
 
 
 --
+-- Name: ux_early_departure_wash_per_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_early_departure_wash_per_booking ON public.early_departure_washes USING btree (booking_id) WHERE (booking_id IS NOT NULL);
+
+
+--
+-- Name: ux_early_departure_wash_per_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_early_departure_wash_per_lease ON public.early_departure_washes USING btree (lease_id) WHERE ((booking_id IS NULL) AND (lease_id IS NOT NULL));
+
+
+--
 -- Name: ux_home_ownership_active_per_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -32051,13 +32753,6 @@ CREATE UNIQUE INDEX ux_monthly_fee_accruals_property_month ON public.monthly_fee
 --
 
 CREATE UNIQUE INDEX ux_notification_preferences_user_type ON public.notification_preferences USING btree (user_id, type);
-
-
---
--- Name: ux_owner_use_absorption_per_cycle; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX ux_owner_use_absorption_per_cycle ON public.utility_owner_use_absorptions USING btree (meter_id, unit_id, billing_cycle_month);
 
 
 --
@@ -32299,10 +32994,38 @@ CREATE UNIQUE INDEX ux_users_tenant_invite_token ON public.users USING btree (te
 
 
 --
+-- Name: ux_utility_absorbed_charge_owner_use_per_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_utility_absorbed_charge_owner_use_per_cycle ON public.utility_absorbed_charges USING btree (meter_id, unit_id, billing_cycle_month) WHERE (reason = 'owner_use'::text);
+
+
+--
+-- Name: ux_utility_absorbed_charge_per_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_utility_absorbed_charge_per_cycle ON public.utility_absorbed_charges USING btree (meter_id, unit_id, billing_cycle_month, reason) WHERE (wash_id IS NULL);
+
+
+--
+-- Name: ux_utility_absorbed_charge_per_departure; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_utility_absorbed_charge_per_departure ON public.utility_absorbed_charges USING btree (wash_id, meter_id) WHERE (wash_id IS NOT NULL);
+
+
+--
 -- Name: ux_utility_service_agreement_live; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX ux_utility_service_agreement_live ON public.utility_service_agreements USING btree (unit_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: ux_utility_wash_hold_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_utility_wash_hold_open ON public.utility_wash_holds USING btree (meter_id, unit_id, COALESCE(booking_id, lease_id)) WHERE ((absorbed_at IS NULL) AND (released_at IS NULL));
 
 
 --
@@ -32695,6 +33418,20 @@ CREATE TRIGGER audit_deposit_returns AFTER DELETE OR UPDATE ON public.deposit_re
 --
 
 CREATE TRIGGER audit_disbursements AFTER DELETE OR UPDATE ON public.disbursements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: duplicate_person_proposals audit_duplicate_person_proposals; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_duplicate_person_proposals AFTER DELETE OR UPDATE ON public.duplicate_person_proposals FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: early_departure_washes audit_early_departure_washes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_early_departure_washes AFTER DELETE OR UPDATE ON public.early_departure_washes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -33115,6 +33852,13 @@ CREATE TRIGGER audit_payroll_runs AFTER DELETE OR UPDATE ON public.payroll_runs 
 --
 
 CREATE TRIGGER audit_pending_tenant_intents AFTER DELETE OR UPDATE ON public.pending_tenant_intents FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: person_merges audit_person_merges; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_person_merges AFTER DELETE OR UPDATE ON public.person_merges FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -33657,6 +34401,13 @@ CREATE TRIGGER audit_users AFTER DELETE OR UPDATE ON public.users FOR EACH ROW E
 
 
 --
+-- Name: utility_absorbed_charges audit_utility_absorbed_charges; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_absorbed_charges AFTER DELETE OR UPDATE ON public.utility_absorbed_charges FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
 -- Name: utility_bills audit_utility_bills; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -33678,10 +34429,10 @@ CREATE TRIGGER audit_utility_meters AFTER DELETE OR UPDATE ON public.utility_met
 
 
 --
--- Name: utility_owner_use_absorptions audit_utility_owner_use_absorptions; Type: TRIGGER; Schema: public; Owner: -
+-- Name: utility_pay_link_settlements audit_utility_pay_link_settlements; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER audit_utility_owner_use_absorptions AFTER DELETE OR UPDATE ON public.utility_owner_use_absorptions FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+CREATE TRIGGER audit_utility_pay_link_settlements AFTER DELETE OR UPDATE ON public.utility_pay_link_settlements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -33689,6 +34440,13 @@ CREATE TRIGGER audit_utility_owner_use_absorptions AFTER DELETE OR UPDATE ON pub
 --
 
 CREATE TRIGGER audit_utility_service_agreements AFTER DELETE OR UPDATE ON public.utility_service_agreements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: utility_wash_holds audit_utility_wash_holds; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_wash_holds AFTER DELETE OR UPDATE ON public.utility_wash_holds FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -35096,6 +35854,13 @@ CREATE TRIGGER pos_reader_order_costs_no_edit BEFORE DELETE OR UPDATE ON public.
 --
 
 CREATE TRIGGER pos_tax_rate_changes_append_only BEFORE DELETE OR UPDATE ON public.pos_tax_rate_changes FOR EACH ROW EXECUTE FUNCTION public.pos_tax_rate_changes_append_only();
+
+
+--
+-- Name: duplicate_person_proposals set_updated_at_duplicate_person_proposals; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER set_updated_at_duplicate_person_proposals BEFORE UPDATE ON public.duplicate_person_proposals FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -38334,6 +39099,118 @@ ALTER TABLE ONLY public.dump_locations
 
 
 --
+-- Name: duplicate_person_proposals duplicate_person_proposals_decided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: duplicate_person_proposals duplicate_person_proposals_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: duplicate_person_proposals duplicate_person_proposals_side_a_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_side_a_booking_id_fkey FOREIGN KEY (side_a_booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: duplicate_person_proposals duplicate_person_proposals_side_a_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_side_a_user_id_fkey FOREIGN KEY (side_a_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: duplicate_person_proposals duplicate_person_proposals_side_b_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_side_b_booking_id_fkey FOREIGN KEY (side_b_booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: duplicate_person_proposals duplicate_person_proposals_side_b_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.duplicate_person_proposals
+    ADD CONSTRAINT duplicate_person_proposals_side_b_user_id_fkey FOREIGN KEY (side_b_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_checkout_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_checkout_decision_id_fkey FOREIGN KEY (checkout_decision_id) REFERENCES public.stay_checkout_decisions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_recorded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_recorded_by_fkey FOREIGN KEY (recorded_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: early_departure_washes early_departure_washes_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.early_departure_washes
+    ADD CONSTRAINT early_departure_washes_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: email_send_log email_send_log_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -40822,6 +41699,62 @@ ALTER TABLE ONLY public.pending_tenant_intents
 
 
 --
+-- Name: person_merges person_merges_keeper_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_keeper_booking_id_fkey FOREIGN KEY (keeper_booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: person_merges person_merges_keeper_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_keeper_user_id_fkey FOREIGN KEY (keeper_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: person_merges person_merges_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: person_merges person_merges_loser_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_loser_booking_id_fkey FOREIGN KEY (loser_booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: person_merges person_merges_loser_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_loser_user_id_fkey FOREIGN KEY (loser_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: person_merges person_merges_merged_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_merged_by_fkey FOREIGN KEY (merged_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: person_merges person_merges_proposal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.person_merges
+    ADD CONSTRAINT person_merges_proposal_id_fkey FOREIGN KEY (proposal_id) REFERENCES public.duplicate_person_proposals(id) ON DELETE SET NULL;
+
+
+--
 -- Name: platform_claim_promotions platform_claim_promotions_promoted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -41870,6 +42803,14 @@ ALTER TABLE ONLY public.propane_fill_installments
 
 
 --
+-- Name: propane_fills propane_fills_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id);
+
+
+--
 -- Name: propane_fills propane_fills_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -41899,6 +42840,14 @@ ALTER TABLE ONLY public.propane_fills
 
 ALTER TABLE ONLY public.propane_fills
     ADD CONSTRAINT propane_fills_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: propane_fills propane_fills_service_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_service_agreement_id_fkey FOREIGN KEY (service_agreement_id) REFERENCES public.utility_service_agreements(id);
 
 
 --
@@ -43630,6 +44579,14 @@ ALTER TABLE ONLY public.unit_bookings
 
 
 --
+-- Name: unit_bookings unit_bookings_confirmation_sent_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_confirmation_sent_by_fkey FOREIGN KEY (confirmation_sent_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: unit_bookings unit_bookings_deposit_link_sent_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43654,11 +44611,27 @@ ALTER TABLE ONLY public.unit_bookings
 
 
 --
+-- Name: unit_bookings unit_bookings_folded_into_person_merge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_folded_into_person_merge_id_fkey FOREIGN KEY (folded_into_person_merge_id) REFERENCES public.person_merges(id) ON DELETE SET NULL;
+
+
+--
 -- Name: unit_bookings unit_bookings_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.unit_bookings
     ADD CONSTRAINT unit_bookings_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: unit_bookings unit_bookings_migrated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_migrated_by_fkey FOREIGN KEY (migrated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
@@ -44086,6 +45059,62 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: utility_absorbed_charges utility_absorbed_charges_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_absorbed_charges utility_absorbed_charges_wash_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_absorbed_charges
+    ADD CONSTRAINT utility_absorbed_charges_wash_id_fkey FOREIGN KEY (wash_id) REFERENCES public.early_departure_washes(id) ON DELETE CASCADE;
+
+
+--
 -- Name: utility_bills utility_bills_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -44190,27 +45219,83 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
--- Name: utility_owner_use_absorptions utility_owner_use_absorptions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.utility_owner_use_absorptions
-    ADD CONSTRAINT utility_owner_use_absorptions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
-
-
---
--- Name: utility_owner_use_absorptions utility_owner_use_absorptions_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.utility_owner_use_absorptions
-    ADD CONSTRAINT utility_owner_use_absorptions_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
--- Name: utility_owner_use_absorptions utility_owner_use_absorptions_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.utility_owner_use_absorptions
-    ADD CONSTRAINT utility_owner_use_absorptions_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_pay_link_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_pay_link_id_fkey FOREIGN KEY (pay_link_id) REFERENCES public.pos_pay_links(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_pos_transaction_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_pos_transaction_item_id_fkey FOREIGN KEY (pos_transaction_item_id) REFERENCES public.pos_transaction_items(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_utility_bill_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_utility_bill_id_fkey FOREIGN KEY (utility_bill_id) REFERENCES public.utility_bills(id) ON DELETE RESTRICT;
 
 
 --
@@ -44323,6 +45408,70 @@ ALTER TABLE ONLY public.utility_service_agreements
 
 ALTER TABLE ONLY public.utility_service_agreements
     ADD CONSTRAINT utility_service_agreements_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_absorbed_charge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_absorbed_charge_id_fkey FOREIGN KEY (absorbed_charge_id) REFERENCES public.utility_absorbed_charges(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_released_bill_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_released_bill_id_fkey FOREIGN KEY (released_bill_id) REFERENCES public.utility_bills(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_wash_holds utility_wash_holds_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_wash_holds
+    ADD CONSTRAINT utility_wash_holds_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
 
 
 --
@@ -44482,5 +45631,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SjXyHs86hehNEd2pJWh7GniwbjrTnhyG5haWS7vnPLqojDoFD9ao02a4X1m3KXx
+\unrestrict Zciwpjex1scNg6O06mYhNwiplyAUpUF48GVfewwvCHbTic5aSCep2nW4tgWXBan
 

@@ -1,3 +1,11 @@
+// NEEDS MIGRATION 20261021190000 (one bank link), which is not on production
+// yet, because disconnectConnection now reads bank_connections.stripe_connect_
+// account_id to tell a platform-held link from one the connected account holds:
+//   DB_NAME=gam_test TEST_APPLY_MIGRATIONS_AFTER=20261021170000 npx vitest run services/bankFeed.test
+// Without it, "the last bank GAM can collect its fees from cannot be
+// disconnected" fails with `column "stripe_connect_account_id" does not exist`.
+// Drop the variable once the migration is applied.
+//
 // S570: bank feed — idempotent sync, auto-match to GAM disbursements, categorize
 // → expense + merchant memory, suggestion recall, outflow-only guard, ignore.
 // Pure-DB paths (no Stripe): the Stripe boundary is only createLinkSession /

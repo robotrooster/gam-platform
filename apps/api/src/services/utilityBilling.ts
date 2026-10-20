@@ -3,10 +3,14 @@ import { db, query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { createNotification } from './notifications'
-import { UTILITY_TYPE_LABEL, UTILITY_UNIT_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel, type UtilityType } from '@gam/shared'
+import { UTILITY_TYPE_LABEL, UTILITY_UNIT_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel, type UtilityType, type NotificationType } from '@gam/shared'
 import { PAUSED_CYCLE_NOTE, PAUSED_CYCLE_MARKER_SQL } from './utilityPausedCycle'
 // 10/13 (Nic): "Works, nobody using it" on a flat-rate meter may stop its flat charge.
 import { ZERO_USE_CLEARED_SET, flatChargeStopped } from './meterRepair'
+// 10/20 (Nic): the ONE module that decides whether a departing payer's final
+// utility is a wash. This file asks; it does not re-decide.
+import { settleFinalStubForDeparture, washCoversAllocationMethod, type DepartureRef } from './earlyDepartureWash'
+import { STAY_SHORTENED_CREDIT_NOTE } from './bookingLeaseBilling'
 
 // S90: utility bill generation engine.
 //
@@ -287,7 +291,8 @@ export async function flagBrokenMeter(
     + `${UTILITY_USAGE_NOUN[m.utility_type as UtilityType] ?? what.toLowerCase()}, `
     + `choose "${meterWorksNoUseLabel(m.utility_type)}" there instead: zero use then bills $0 until the meter moves.`
   const notice = {
-    userId: w.user_id as string, landlordId: w.landlord_id as string, type: 'utility_meter_broken',
+    userId: w.user_id as string, landlordId: w.landlord_id as string,
+    type: 'utility_meter_broken' as NotificationType,
     title: `${what} meter not reading — ${where}`,
     body: `The ${what.toLowerCase()} meter for ${where} read the same number twice while the space was occupied, `
       + billedInstead + worksNoUse,
@@ -1040,6 +1045,54 @@ async function allocationBases(
   return out
 }
 
+/**
+ * 10/20 — IS MIGRATION 20261021210000 ON THIS DATABASE YET?
+ *
+ * That migration generalizes the absorption book (utility_owner_use_absorptions
+ * becomes utility_absorbed_charges behind a view of the same name, gaining a
+ * `reason`) and adds the two tables a wash needs. GAM applies a migration to
+ * production ahead of the code that uses it, and a rollback puts the old code
+ * back on the new schema — so this file has to be right in BOTH directions, the
+ * same reason services/departureRules exists.
+ *
+ * Two things hang off the answer: which conflict clause the owner-use write can
+ * name (below), and whether the wash question can be asked at all. Both come
+ * from the one migration, so one question answers both; `reason` is checked
+ * through the name that exists either way, the table before and the view after.
+ *
+ * True once seen: expand-only migrations never take a column back.
+ */
+let absorptionBookGeneralized = false
+async function washSchemaReady(): Promise<boolean> {
+  if (absorptionBookGeneralized) return true
+  const r = await queryOne<{ ready: boolean }>(`
+    SELECT (to_regclass('public.early_departure_washes') IS NOT NULL
+            AND to_regclass('public.utility_wash_holds') IS NOT NULL
+            AND EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = 'public'
+                           AND table_name = 'utility_owner_use_absorptions'
+                           AND column_name = 'reason')) AS ready`)
+  absorptionBookGeneralized = r?.ready === true
+  return absorptionBookGeneralized
+}
+
+/**
+ * The conflict clause an OWNER-USE absorption write names, for the schema in
+ * front of it. Not cosmetic: before 20261021210000 the unique key is a plain
+ * three-column index on the table; after it, the only unique index on those
+ * three columns is partial (`WHERE reason = 'owner_use'`), because a DEPARTURE's
+ * absorbed stub is keyed per departure instead — two guests can leave one site
+ * in one month, and the old key could only hold one of them. Postgres infers a
+ * partial index only when the statement repeats the predicate, so the predicate
+ * has to come and go with the schema.
+ */
+async function ownerUseAbsorptionConflictSql(): Promise<string> {
+  const cols = '(meter_id, unit_id, billing_cycle_month)'
+  return await washSchemaReady()
+    ? `ON CONFLICT ${cols} WHERE reason = 'owner_use' DO UPDATE`
+    : `ON CONFLICT ${cols} DO UPDATE`
+}
+
 export async function generateBillsForMeter(
   meterId: string,
   cycleMonth: Date,  // 1st of month
@@ -1144,7 +1197,7 @@ export async function generateBillsForMeter(
         (meter_id, unit_id, landlord_id, utility_type, billing_cycle_month,
          allocation_method, allocation_basis, charge_amount, base_fee_share, notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      ON CONFLICT (meter_id, unit_id, billing_cycle_month) DO UPDATE
+      ${await ownerUseAbsorptionConflictSql()}
         SET charge_amount = EXCLUDED.charge_amount,
             allocation_basis = EXCLUDED.allocation_basis,
             base_fee_share = EXCLUDED.base_fee_share,
@@ -1930,7 +1983,7 @@ export async function generateBillsForMeter(
           (meter_id, unit_id, landlord_id, utility_type, billing_cycle_month,
            allocation_method, allocation_basis, charge_amount, base_fee_share, notes)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        ON CONFLICT (meter_id, unit_id, billing_cycle_month) DO UPDATE
+        ${await ownerUseAbsorptionConflictSql()}
           SET charge_amount   = EXCLUDED.charge_amount,
               allocation_basis = EXCLUDED.allocation_basis,
               base_fee_share  = EXCLUDED.base_fee_share,
@@ -2494,6 +2547,200 @@ async function reportUsageNobodyToBill(args: InsertBillArgs, why: 'nobody' | 'pa
   }
 }
 
+/**
+ * ── 10/20 (Nic) — WHOSE EARLY DEPARTURE IS THIS PAYER'S, AND WHEN DID THEY GO?
+ *
+ * Null unless the payer tryInsertBill just settled on left EARLY with money
+ * still in the landlord's hands — the only situation a wash can arise from.
+ * This matters more than it looks: earlyDepartureWash answers 'undecided' for
+ * any departure whose money question is simply unanswered, and 'undecided'
+ * parks the stub. Asked about every move-out, it would park the final stub of
+ * every ordinary lease that ever ended, none of which has anything to wait for.
+ * So the gate asks only where there is genuinely something on the table:
+ *
+ *   - A STAY: the booking says it, on the booking. They checked out before the
+ *     day they booked through (the same GREATEST(booked_check_out, check_out)
+ *     expression earlyCheckOut prices against — an early check-out moves
+ *     check_out back to the day they left and keeps the day they bought).
+ *   - A LEASE: rent paid past a SHORTENED end is sitting there — a
+ *     'reclassified' lease_prepaid_credits row, unvoided, with something left
+ *     on it, carrying bookingLeaseBilling's STAY_SHORTENED_CREDIT_NOTE. The day
+ *     a lease was paid through is stored nowhere, so its presence is the fact;
+ *     the amount is earlyDepartureWash's to read, not this file's to guess.
+ *
+ *     THE NOTE IS THE WHOLE TEST, not 'reclassified' on its own. There are two
+ *     kinds of reclassified credit and only one of them says anybody left
+ *     early. The other is a reservation deposit's leftover (moveInBundle
+ *     STAY_DEPOSIT_CREDIT_NOTE) — a deposit that came to more than the arrival
+ *     month's rent, banked for the WHOLE tenancy on the day it was drafted. It
+ *     says nothing about how the tenancy ended, and reading it as paid-ahead
+ *     money made the gate hand the final stub of an ORDINARY full-term lease to
+ *     the wash service, which has no money answer to find and so parks it:
+ *     never billed, never absorbed, nowhere on the report, and nothing in the
+ *     app to release it. At a 114-submeter park that is every such lease's last
+ *     electric bill, lost silently. A lease that ran to its own last day has no
+ *     stay-shortened credit, so it is never asked about.
+ *
+ * WHEN A DEPARTURE HAS A BOOKING, THE BOOKING IS THE DEPARTURE — so a lease
+ * drafted from a stay hands over both ids and normalizeDeparture keys it on the
+ * booking, the same way the check-out window recorded it. Keying one departure
+ * two ways is how the double count this whole feature exists to prevent gets in.
+ *
+ * The day they left is the end of the TENANCY, deliberately not the day a
+ * resident moved to another space (lease_unit_history.effective_to). Moving
+ * sites is not leaving; the money side would be empty anyway, and treating a
+ * move as a departure is how the old space's stub would get parked for somebody
+ * who is still living in the park.
+ */
+async function earlyDepartureForPayer(
+  payer: { leaseId: string | null; serviceAgreementId: string | null },
+): Promise<{ ref: DepartureRef; leftOn: string } | null> {
+  if (payer.leaseId) {
+    const r = await queryOne<{
+      booking_id: string | null; left_on: string | null
+      left_early: boolean; paid_ahead: boolean
+    }>(`
+      SELECT l.source_booking_id AS booking_id,
+             to_char(NULLIF(LEAST(
+                 COALESCE(l.end_date, 'infinity'::date),
+                 COALESCE(timezone(p.timezone, l.terminated_at)::date, 'infinity'::date),
+                 -- The reservation's own check-out day counts as the day they
+                 -- left ONLY if they left it early. A year lease drafted from a
+                 -- reservation runs long past that reservation's check-out, and
+                 -- reading that day as "the day they left" would make every
+                 -- later cycle of a perfectly ordinary tenancy look like the
+                 -- final one the moment any paid-ahead money appeared.
+                 CASE WHEN b.check_out < GREATEST(COALESCE(b.booked_check_out, b.check_out), b.check_out)
+                      THEN b.check_out ELSE 'infinity'::date END),
+               'infinity'::date), 'YYYY-MM-DD') AS left_on,
+             COALESCE(b.check_out < GREATEST(COALESCE(b.booked_check_out, b.check_out), b.check_out), FALSE) AS left_early,
+             EXISTS (SELECT 1 FROM lease_prepaid_credits c
+                      WHERE c.lease_id = l.id AND c.funded_by = 'reclassified'
+                        AND c.note = $2
+                        AND c.voided_at IS NULL AND c.amount_remaining > 0) AS paid_ahead
+        FROM leases l
+        JOIN units u ON u.id = l.unit_id
+        JOIN properties p ON p.id = u.property_id
+        LEFT JOIN unit_bookings b ON b.id = l.source_booking_id
+       WHERE l.id = $1`, [payer.leaseId, STAY_SHORTENED_CREDIT_NOTE])
+    if (!r?.left_on || !(r.left_early || r.paid_ahead)) return null
+    return { ref: { leaseId: payer.leaseId, bookingId: r.booking_id }, leftOn: r.left_on }
+  }
+  if (payer.serviceAgreementId) {
+    // The JOIN is what excludes a SERVICED space — the apartment and the three
+    // trash cans next door (S614). Its agreement carries no booking because
+    // nobody is staying on it, and it never leaves early.
+    const r = await queryOne<{ booking_id: string; left_on: string; left_early: boolean }>(`
+      SELECT sa.booking_id, to_char(b.check_out, 'YYYY-MM-DD') AS left_on,
+             (b.check_out < GREATEST(COALESCE(b.booked_check_out, b.check_out), b.check_out)) AS left_early
+        FROM utility_service_agreements sa
+        JOIN unit_bookings b ON b.id = sa.booking_id
+       WHERE sa.id = $1`, [payer.serviceAgreementId])
+    if (!r?.left_early) return null
+    return { ref: { bookingId: r.booking_id }, leftOn: r.left_on }
+  }
+  return null
+}
+
+/**
+ * ── 10/20 (Nic) — CALL IT A WASH. ─────────────────────────────────────────────
+ *
+ *   "So what we do when people leave early is we'll usually call it a wash. We
+ *    don't refund the money, but we also don't bill them a final electric bill
+ *    ... it doesn't need to get attached to anything."
+ *
+ * True means this stub is billed to NOBODY — absorbed onto the book with its
+ * reason, or parked until somebody answers the money question. The caller
+ * returns false, so the space lands in unitsSkipped, which is accurate: it was
+ * skipped for billing. Exactly what a held invite share already does
+ * (holdChargeForPendingUnit). The landlord is NOT told "nobody to bill" for a
+ * parked stub — there is a payer, the answer is just not in yet, and that
+ * notice would be both wrong and alarming.
+ *
+ * ONLY THE FINAL STUB. A departing payer's earlier cycles bill as they always
+ * have. The final stub is the one whose read span RUNS TO OR PAST the day they
+ * left: usage from their last billed read through the closing read. RV 10 left
+ * 10/18 having booked through 11/4 — September's span (9/4→10/4) ends before
+ * they left and bills; the 10/18 closing read's span ends on the day they left
+ * and is the one that washes. A month read entered after they had gone is the
+ * same stub by this test, which is right: with no separate closing read it IS
+ * the final one, and it folds in the gap days exactly as S548 describes.
+ *
+ * ONLY THEIR OWN METERED STUB. A flat charge and a pooled RUBS share bill
+ * normally, and this is a decision rather than an oversight:
+ *   - A flat charge is not usage. It is the price of the month the lease sets,
+ *     like rent, and the money side of a wash is already the price-as-booked
+ *     money they were not given back. Eating it as well would hand the same
+ *     thing over twice.
+ *   - A pooled share is a slice of a master nobody read for this space, so
+ *     there is no closing read to make a stub final, and a stay's share is
+ *     already cut down to the days it was there (10/5). Absorbing a share that
+ *     a neighbor split was computed against would also quietly change what
+ *     every other resident on the pool was billed for.
+ * An ESTIMATE on a broken meter does wash, because it stands in for their own
+ * read: a meter that stopped turning is not a reason the departing guest's
+ * final bill lands on them after all.
+ *
+ * NEVER THE NEXT ARRIVAL. The departure comes from the payer this span was
+ * already resolved to, never from "a departure happened on this space" — which
+ * is the S548 / S641 bug class in this function, and the one that bites hardest
+ * at an RV park where a site turns over the same day. The arrival's own ref is
+ * their own booking: they have not left, so nothing of theirs is final, so
+ * their usage bills. The guest before them keeps their own wash.
+ */
+async function departingPayersFinalStubBillsNobody(
+  args: InsertBillArgs,
+  payer: { leaseId: string | null; serviceAgreementId: string | null; tenantId: string | null },
+): Promise<boolean> {
+  // Before migration 20261021210000 there is nowhere to record a wash. Billing
+  // carries on exactly as it did rather than throwing mid-run and leaving a
+  // whole property unbilled.
+  if (!await washSchemaReady()) return false
+  // The list lives in the module that owns the rule, because the void of an
+  // already-sent bill (earlyDepartureWash voidBilledFinalStubs) reads the same
+  // one. Spelled out in both places it drifted, and a pooled share came off a
+  // resident this gate had deliberately billed.
+  if (args.pooledShare) return false
+  if (!washCoversAllocationMethod(args.allocationMethod)) return false
+
+  const departure = await earlyDepartureForPayer(payer)
+  if (!departure) return false
+
+  const spanEnd = isoDay(args.readingEndDate) ?? lastDayOfCycle(args.cycleMonth)
+  if (spanEnd < departure.leftOn) return false
+
+  const settled = await settleFinalStubForDeparture({
+    landlordId: args.landlordId,
+    meterId: args.meterId,
+    unitId: args.unitId,
+    utilityType: args.utilityType,
+    cycleMonth: args.cycleMonth,
+    chargeAmount: round2(args.chargeAmount),
+    baseFeeShare: round2(args.baseFeeShare ?? 0),
+    // The same tax the bill would have carried, so what was absorbed equals
+    // what they would have been charged — the whole point of the number.
+    taxAmount: args.taxAmount ?? Math.round(args.chargeAmount * args.taxRatePct) / 100,
+    taxRatePct: args.taxRatePct,
+    usageAmount: args.usageAmount,
+    allocationMethod: args.allocationMethod,
+    allocationBasis: args.allocationBasis,
+    ratePerUnit: args.ratePerUnit,
+    sewerRatePerUnit: args.sewerRatePerUnit ?? null,
+    readingStart: args.readingStart ?? null,
+    readingEnd: args.readingEnd ?? null,
+    readingStartDate: isoDay(args.readingStartDate),
+    readingEndDate: isoDay(args.readingEndDate),
+    ref: departure.ref,
+    tenantId: payer.tenantId,
+  })
+  if (settled.outcome === 'bill_normally') return false
+  logger.info({
+    meterId: args.meterId, unitId: args.unitId, cycle: args.cycleMonth,
+    leftOn: departure.leftOn, outcome: settled.outcome, amount: args.chargeAmount,
+  }, `utility billing: departing payer's final stub — ${settled.why}`)
+  return true
+}
+
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
 // tenant not responsible for this utility type, or bill already exists).
 export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
@@ -2793,6 +3040,15 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     // Tenant responsibility gate — leases only. See the S610 handoff §1a.
     if (!await tenantOwesUtility(lt.lease_id, args.utilityType, args.meterId)) return false
   }
+
+  // 10/20 (Nic) — CALL IT A WASH. The payer for this span is settled, which is
+  // the first point at which this question can be asked honestly: everything
+  // above answers WHOSE usage this is, and only now can we ask whether that
+  // person's final bill is one the landlord eats because they left early and
+  // were never given their money back. See the comment on the function.
+  if (await departingPayersFinalStubBillsNobody(args, {
+    leaseId: lt.lease_id ?? null, serviceAgreementId, tenantId: lt.tenant_id ?? null,
+  })) return false
 
   try {
     await query(`

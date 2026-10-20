@@ -95,9 +95,9 @@ describe('createNotification — prefs gates', () => {
 
   it('email_enabled=false → no email call even when sendEmail+emailTo set', async () => {
     const { userId, email } = await seedUser()
-    await setPrefs(userId, 'payout_failed', { email: false, inApp: true })
+    await setPrefs(userId, 'connect_payout_failed', { email: false, inApp: true })
     await createNotification({
-      userId, type: 'payout_failed', title: 'Payout failed', body: 'Stripe error',
+      userId, type: 'connect_payout_failed', title: 'Payout failed', body: 'Stripe error',
       sendEmail: true, emailTo: email,
     })
     expect(sendNotificationEmailMock).not.toHaveBeenCalled()
@@ -112,7 +112,7 @@ describe('createNotification — sendEmail / emailTo gating', () => {
   it('p.sendEmail=false → no email call (even if prefs + emailTo both set)', async () => {
     const { userId, email } = await seedUser()
     await createNotification({
-      userId, type: 'silent_inapp', title: 'In-app only', body: 'X',
+      userId, type: 'books_month_close', title: 'In-app only', body: 'X',
       sendEmail: false, emailTo: email,
     })
     expect(sendNotificationEmailMock).not.toHaveBeenCalled()
@@ -121,7 +121,7 @@ describe('createNotification — sendEmail / emailTo gating', () => {
   it('no emailTo → no email call (even if sendEmail=true)', async () => {
     const { userId } = await seedUser()
     await createNotification({
-      userId, type: 'partial', title: 'No recipient', body: 'X',
+      userId, type: 'bank_deposit_voided', title: 'No recipient', body: 'X',
       sendEmail: true,  // but no emailTo
     })
     expect(sendNotificationEmailMock).not.toHaveBeenCalled()
@@ -190,7 +190,7 @@ describe('createNotification — JSONB data + custom email HTML', () => {
   it('data JSONB roundtrip — stored as object, readable as object', async () => {
     const { userId } = await seedUser()
     await createNotification({
-      userId, type: 'inspection_due', title: 'T', body: 'B',
+      userId, type: 'service_due', title: 'T', body: 'B',
       data: { inspectionId: 'abc', dueAt: '2026-06-01', severity: 3 },
     })
     const row = await db.query<{ data: any }>(
@@ -202,7 +202,7 @@ describe('createNotification — JSONB data + custom email HTML', () => {
     const { userId, email } = await seedUser()
     const customHtml = '<div>Custom marketing HTML</div>'
     await createNotification({
-      userId, type: 'custom', title: 'X', body: 'Y',
+      userId, type: 'bulk_message', title: 'X', body: 'Y',
       sendEmail: true, emailTo: email,
       emailHtml: customHtml,
     })
@@ -213,7 +213,7 @@ describe('createNotification — JSONB data + custom email HTML', () => {
   it('emailSubject override → custom subject used (not p.title)', async () => {
     const { userId, email } = await seedUser()
     await createNotification({
-      userId, type: 'rent', title: 'Default would be this', body: 'Y',
+      userId, type: 'rent_collected', title: 'Default would be this', body: 'Y',
       sendEmail: true, emailTo: email,
       emailSubject: 'Custom subject line',
     })
@@ -240,7 +240,7 @@ describe('createNotification — best-effort error swallow', () => {
   it('INSERT fails (bad user_id FK) → caught, function returns without throwing', async () => {
     await expect(createNotification({
       userId: randomUUID(),  // not in users table
-      type: 'orphan', title: 'X', body: 'Y',
+      type: 'rent_collected', title: 'X', body: 'Y',
     })).resolves.toBeUndefined()
   })
 })

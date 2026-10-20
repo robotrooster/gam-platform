@@ -538,7 +538,10 @@ export function PayoutVerifyStep({ entityId, isOwner, otherUnpaid = [], ownAccou
  * S605 (Nic, DIRECTIVE): not optional. "No landlord is gonna be able to get
  * their PNLs accurate if they can't reconcile the bank transactions."
  */
-export function BankFeedLinkStep({ entityId, linked, linkedName, payoutBank, onLinked, step1Done, needsCompany = false }: {
+export function BankFeedLinkStep({
+  entityId, linked, linkedName, payoutBank, onLinked, step1Done, needsCompany = false,
+  fromOnboarding = false, permissions = null, feeCollectionNeedsALink = false,
+}: {
   entityId: string
   /** The parent owns "is a bank linked" — the destination and onboarding each already ask. */
   linked: boolean
@@ -554,25 +557,97 @@ export function BankFeedLinkStep({ entityId, linked, linkedName, payoutBank, onL
    * an empty company and get back the question the screen already asked.
    */
   needsCompany?: boolean
+  /**
+   * 10/20 (Nic, ONE BANK LINK): the linked bank came from step one. The step is
+   * done and nobody signs in to the same bank twice — but it has to SAY that,
+   * because a step that silently went green is a step a landlord does not trust.
+   */
+  fromOnboarding?: boolean
+  /** What GAM can see through the link, as Stripe reported it at link time. */
+  permissions?: string[] | null
+  /** No linked bank can serve GAM's fee debit. Said out loud rather than implied away. */
+  feeCollectionNeedsALink?: boolean
 }) {
   const { link, linking, error } = useLinkBankFeed(entityId, onLinked)
   const named = payoutBank?.last4
     ? `${payoutBank.bankName ?? 'your bank'} ••${payoutBank.last4}`
     : null
+  // Only ever describes what Stripe actually granted. A link with no recorded
+  // permissions is a pre-10/20 one; it reads transactions and that is all this
+  // step ever claimed for it.
+  const canSee = permissions?.length
+    ? [
+        permissions.includes('transactions') ? 'the transactions on it' : null,
+        permissions.includes('balances') ? 'its balance' : null,
+        permissions.includes('ownership') ? 'whose name it is in' : null,
+      ].filter(Boolean) as string[]
+    : ['the transactions on it']
 
   return (
-    <StepShell n={2} title={STEP_2_TITLE} sub={STEP_2_SUB} done={linked}>
+    <StepShell n={2} title={STEP_2_TITLE} sub={STEP_2_SUB} done={linked}
+      status={linked && fromOnboarding ? { text: 'Done in step 1', tone: 'green' } : undefined}>
       {needsCompany ? (
         <div style={{ fontSize: '.82rem', color: 'var(--text-2)' }}>
           Choose the company above to link its bank read-only.
         </div>
       ) : linked ? (
         <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
-          <strong style={{ color: 'var(--text-0)' }}>
-            {linkedName || 'Your bank'} is linked, read-only.
-          </strong>{' '}
-          Your spending lands in your P&amp;L, and the rent GAM already sent you is matched
-          automatically so nothing is counted twice.
+          {fromOnboarding ? (
+            <>
+              {/* 10/20 (Nic): "We need a way to link the bank account once and
+                  have it be everything." It is one link now — so this says the
+                  bank is already connected and exactly what GAM can see through
+                  it, instead of handing the landlord a second sign-in to the
+                  bank they just signed in to. */}
+              <strong style={{ color: 'var(--text-0)' }}>
+                {linkedName || 'Your bank'} is already connected, read-only — you did this in step 1.
+              </strong>{' '}
+              Nothing to sign in to again. GAM can read {canSee.length === 1 ? canSee[0] : canSee.slice(0, -1).join(', ') + ' and ' + canSee[canSee.length - 1]},
+              so your spending becomes expenses by itself and the rent GAM already sent you is matched
+              automatically — nothing is counted twice.
+            </>
+          ) : (
+            <>
+              <strong style={{ color: 'var(--text-0)' }}>
+                {linkedName || 'Your bank'} is linked, read-only.
+              </strong>{' '}
+              Your spending lands in your P&amp;L, and the rent GAM already sent you is matched
+              automatically so nothing is counted twice.
+            </>
+          )}
+          {/* 10/20: do NOT let one link imply it did everything. GAM collecting
+              its fees from this bank is a separate Stripe object on the same
+              account — one the onboarding link cannot be turned into — so when
+              that is the situation it is stated, not glossed.
+
+              10/20 (review): and it is NOT offered as a preference. This card
+              used to end "it is optional, and your payouts and your feed both
+              work either way", which is the one thing S651 forbids — Nic:
+              "That's not a landlord choice to fucking pay us. What the fuck?
+              It's mandatory." A landlord who read "optional" and skipped it, at
+              a park that takes its rent in cash, has no payout to net from and
+              no bank GAM can debit; the fees pile up and the same portal that
+              called it optional eventually suspends them for it. So this
+              DISCLOSES what is still needed and why, and the button is the only
+              answer on offer. */}
+          {feeCollectionNeedsALink && (
+            <div style={{ marginTop: 10, padding: 10, background: 'var(--bg-2)', borderRadius: 6,
+                          fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+              <strong style={{ color: 'var(--gold)' }}>Fee collection needs this bank too.</strong>{' '}
+              GAM&apos;s fees come out of your rent payouts. {linkedName || 'This connection'} can be
+              read but not debited, so a month the rent comes in as cash leaves no payout to take
+              them from and the balance stays owed. Connect the same account once here and GAM
+              collects what it is owed straight from it.
+              <div style={{ marginTop: 8 }}>
+                <button className="btn btn-primary btn-sm" onClick={link} disabled={linking}>
+                  <Landmark size={14} /> {linking ? 'Connecting…' : 'Connect for fee collection'}
+                </button>
+              </div>
+              {error && (
+                <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #dc4c4c)' }}>{error}</div>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <>
@@ -628,11 +703,42 @@ export function useBankSetupState(entityId: string, isOwner: boolean) {
   const active = (connections as any[]).filter(c => c.status === 'active')
   const step1Done = payoutsLive(statusQ.data)
   const step2Done = active.length > 0
+  /**
+   * 10/20 (Nic, ONE BANK LINK): did step one already do step two? The bank a
+   * landlord signs into while verifying their business is readable now, and the
+   * API records which link came from there (bank_connections.source). This is
+   * what lets step two collapse to done with wording that is actually TRUE —
+   * "you did this in step one" for a link GAM adopted, and the normal "your
+   * bank is linked" for one they signed in for on this page.
+   */
+  // Tied to the SAME row the step names (`linkedName`), so the three sentences
+  // on that card — which bank, where it came from, what GAM can see — are
+  // always about one bank. A landlord with two linked banks gets the newest
+  // described, not a mix of both.
+  const named = active[0] ?? null
   return {
     step1Done, step2Done,
     bothDone: step1Done && step2Done,
     payoutBank: statusQ.data?.payoutBank ?? null,
-    linkedName: active[0]?.displayName || active[0]?.institutionName || null,
+    linkedName: named?.displayName || named?.institutionName || null,
+    /** The link came from onboarding, so nobody is asked for this bank twice. */
+    linkedFromOnboarding: named?.source === 'connect_onboarding',
+    /** What GAM can actually see through the linked bank, as Stripe reported it. */
+    linkedPermissions: (named?.fcPermissions ?? null) as string[] | null,
+    /**
+     * True when no linked bank can serve GAM's fee debit — said plainly, never
+     * implied away.
+     *
+     * 10/20 (review): this asked `active.every(c => c.connectHeld)`, which is a
+     * different question and the wrong one. Mountain View's live shape is a
+     * PLATFORM-held link carrying balances and transactions but no
+     * payment_method, so it is not debit-ready and not connect-held: one row
+     * like that made `every` false and silenced the notice completely, on a
+     * company GAM has no debitable bank for at all. The question is whether ANY
+     * linked bank is debit-ready — which is the one fact listConnections
+     * already answers per row.
+     */
+    feeCollectionNeedsALink: step2Done && !active.some(c => c.debitReady),
     /** Nothing claimed until the status for a named company is in. */
     known: isOwner && !!entityId && !statusQ.isLoading,
   }
@@ -699,7 +805,9 @@ export function BankSetupFlow({ surface }: { surface: BankSetupSurface }) {
 
       <PayoutVerifyStep entityId={entityId} isOwner={isOwner} otherUnpaid={otherUnpaid} />
       <BankFeedLinkStep entityId={entityId} linked={s.step2Done} linkedName={s.linkedName}
-        payoutBank={s.payoutBank} step1Done={s.step1Done} needsCompany={isOwner && !entityId} />
+        payoutBank={s.payoutBank} step1Done={s.step1Done} needsCompany={isOwner && !entityId}
+        fromOnboarding={s.linkedFromOnboarding} permissions={s.linkedPermissions}
+        feeCollectionNeedsALink={s.feeCollectionNeedsALink} />
     </div>
   )
 }

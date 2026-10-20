@@ -117,7 +117,8 @@ export function OnboardingPage() {
     () => apiGet(`/bank-feed/connections?entityId=${encodeURIComponent(bankEntity)}`),
     { enabled: !!bankEntity, refetchInterval: step === 4 ? 4000 : false },
   )
-  const feedLinked = feedConnections.some((c: any) => c.status === 'active')
+  const activeFeedConnections = feedConnections.filter((c: any) => c.status === 'active')
+  const feedLinked = activeFeedConnections.length > 0
   // 10/12 (Nic): the feed is step 4. This marked 3 — Get Paid — so linking the
   // read-only feed put a green check and "Complete" on Get Paid with no Stripe
   // payouts behind it: the same feed-for-payouts mix-up S637 describes. Left
@@ -691,6 +692,19 @@ export function OnboardingPage() {
                   linkedName={feedConnections.find((c: any) => c.status === 'active')?.displayName ?? null}
                   payoutBank={connectStatusQ.data?.payoutBank ?? null}
                   step1Done={payoutsReady}
+                  /* 10/20 (Nic, ONE BANK LINK): a landlord finishing onboarding
+                     TODAY linked their bank in the Get Paid step, so this step
+                     is already done by the time they reach it. Same component,
+                     same three facts, so the wizard and the Bank page can never
+                     say different things about the same bank. */
+                  fromOnboarding={activeFeedConnections[0]?.source === 'connect_onboarding'}
+                  permissions={activeFeedConnections[0]?.fcPermissions ?? null}
+                  /* 10/20 (review): "is every link connect-held" was the wrong
+                     question — one platform-held link that cannot serve the debit
+                     (Mountain View's: balances and transactions, no payment_method)
+                     made the answer false and silenced the notice entirely. The
+                     question is whether ANY linked bank is debit-ready. */
+                  feeCollectionNeedsALink={feedLinked && !activeFeedConnections.some((c: any) => c.debitReady)}
                   onLinked={() => { refetchFeed() }} />
                 {!feedLinked && (
                   <div style={{ textAlign: 'center', marginBottom: 8 }}>

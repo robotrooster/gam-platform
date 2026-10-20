@@ -1,11 +1,20 @@
 /**
  * S483 — tenant GET /lease state-law warnings.
  *
- * Recompute-on-read posture mirrors S478 (entry-request GET).
- * Tenant sees the same hedged factual notices the landlord saw at
- * lease PATCH time. Schema.sql is schema-only so state-law seed
- * migrations don't survive the snapshot; this file seeds AZ
- * deposit_max_months inline.
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff." So the tenant sees
+ * nothing, even on a lease the catalog would have flagged — the first test
+ * below is the one that proves it on the real route, with the AZ deposit cap
+ * seeded and a deposit at 2× rent.
+ *
+ * It is HIDDEN, not deleted, so the last test flips the one switch
+ * (system_features.state_law_warnings_enabled) and shows the same request
+ * producing the same warning again. cleanupAllSchema empties system_features
+ * between tests, so the row never leaks into another case.
+ *
+ * Recompute-on-read posture mirrors S478 (entry-request GET). Schema.sql is
+ * schema-only so state-law seed migrations don't survive the snapshot; this
+ * file seeds AZ deposit_max_months inline.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -106,21 +115,27 @@ async function seedFixture(opts: {
   finally { client.release() }
 }
 
+/** The one switch, turned on for a single test. */
+async function showStateLawWarnings(): Promise<void> {
+  await db.query(
+    `INSERT INTO system_features (key, enabled, description)
+     VALUES ('state_law_warnings_enabled', TRUE, 'on for this test')
+     ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+}
+
 describe('GET /api/tenants/lease — S483 state-law warnings', () => {
-  it('AZ deposit 2.0× rent → state_law_warnings flag visible to tenant', async () => {
+  it('hidden 10/20: AZ deposit 2.0× rent (over the seeded 1.5mo cap) → nothing shown', async () => {
     await seedAzDepositCap()
     const f = await seedFixture({ rentAmount: 1500, depositAmount: 3000 })
     const res = await request(buildApp())
       .get('/api/tenants/lease')
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
+    // The field stays on the response so flipping the switch restores the
+    // banner with no code change — it is simply always empty while hidden.
     expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    const flag = res.body.data.state_law_warnings[0]
-    expect(flag.topic).toBe('deposit_max_months')
-    expect(flag.message).toMatch(/above the 1\.5/)
-    expect(flag.message).toMatch(/AZ/)
-    expect(flag.disclaimer).toMatch(/may be out of date/i)
+    expect(res.body.data.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|A\.R\.S\./i)
   })
 
   it('AZ deposit 1.0× rent → state_law_warnings empty', async () => {
@@ -150,5 +165,21 @@ describe('GET /api/tenants/lease — S483 state-law warnings', () => {
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('switch flipped ON → the same lease flags again (hidden, not deleted)', async () => {
+    await seedAzDepositCap()
+    await showStateLawWarnings()
+    const f = await seedFixture({ rentAmount: 1500, depositAmount: 3000 })
+    const res = await request(buildApp())
+      .get('/api/tenants/lease')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    const flag = res.body.data.state_law_warnings[0]
+    expect(flag.topic).toBe('deposit_max_months')
+    expect(flag.message).toMatch(/above the 1\.5/)
+    expect(flag.message).toMatch(/AZ/)
+    expect(flag.disclaimer).toMatch(/may be out of date/i)
   })
 })

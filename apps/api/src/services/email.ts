@@ -1,6 +1,11 @@
 import { Resend } from 'resend'
 import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
+import {
+  emailGateFor, emailCategoryLabel, isCriticalNotificationType,
+  EMAIL_DECLINED_BY_PREFERENCE,
+} from '@gam/shared'
 import { TEAM_INVITATION_TTL_HOURS } from '@gam/shared'
+import { longCalendarDate } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { portalLink } from '../lib/portalUrls'
@@ -8,6 +13,8 @@ import { replyAddressesFor, type ReplyTo } from './replyRouting'
 import { buildDemoBookingIcs } from './demoCalendar'
 // S651: read before every send — see the comment at the send decision below.
 import { suppressionFor } from './emailSuppressions'
+// 10/20: an email another email in this same action is already carrying.
+import { withheldBecause } from './emailWithheld'
 
 // S630: no key, no sender. The Resend constructor throws on a missing key, at
 // IMPORT time, which took the whole API down rather than degrading — and the
@@ -116,6 +123,67 @@ export interface EmailAttachment {
   content:  Buffer | string | Uint8Array
 }
 
+/**
+ * ── 10/20 (Nic): THE SECOND GATE. THIS IS THE ROOT OF THE COMPLAINT. ───────
+ *
+ * Blu Haws sat down and answered every box on his settings page — 90 rows,
+ * every optional email off, read out of `gam`. The 7am overdue digest, the
+ * monthly bill, every payment receipt, the signing request, up to four signing
+ * reminders and the monthly property report all kept arriving, because not one
+ * of them goes through `createNotification`. They come straight here, and this
+ * function's only suppression check was the mail provider's bounce list.
+ *
+ * So every category is declared once, in packages/shared/src/emailCategories.ts,
+ * as either a notification the recipient may decline (with the type whose row on
+ * their settings page does it) or a transactional email with the reason it always
+ * goes. This reads that declaration.
+ *
+ * Returns the sentence to write on the log row when the email must NOT go, or
+ * null when it may.
+ *
+ * Three deliberate choices:
+ *   · The critical five are never declined here, the same as createNotification.
+ *   · The recipient is matched by ADDRESS (users.email is unique, lower-cased
+ *     index), because these senders take an address, not a user. A guest or a
+ *     prospect has no row, so nothing is declined and the mail goes — which is
+ *     right: they were never asked and have no page to answer on.
+ *   · A failed lookup FAILS OPEN. Losing mail because a query timed out would
+ *     be a worse bug than the one being fixed.
+ */
+async function declinedByPreference(to: string, category: string | null | undefined): Promise<string | null> {
+  const gate = emailGateFor(category)
+  if (gate.kind === 'undeclared') {
+    // Drift, the same shape as the twenty-two types with no switch. The test in
+    // services/notificationCatalog.test.ts fails naming the category; at run
+    // time the mail still goes rather than vanishing on a missing declaration.
+    logger.error({ category: category ?? null },
+      '[EMAIL UNDECLARED CATEGORY] nobody has said whether the recipient may decline this one. '
+      + 'Declare it in packages/shared/src/emailCategories.ts — `gate` with a notification type '
+      + 'whose row on the settings page switches it off, or `always` with the reason it cannot be. '
+      + 'Sending it this time.')
+    return null
+  }
+  if (gate.kind !== 'preference') return null
+  if (isCriticalNotificationType(gate.type)) return null
+  try {
+    const rows = await query<{ one: number }>(
+      `SELECT 1 AS one
+         FROM notification_preferences np
+         JOIN users u ON u.id = np.user_id
+        WHERE lower(u.email) = lower($1)
+          AND np.type = $2
+          AND np.email_enabled = FALSE
+        LIMIT 1`,
+      [to, gate.type])
+    if (!rows.length) return null
+    return `${EMAIL_DECLINED_BY_PREFERENCE} (“${emailCategoryLabel(category)}”).`
+  } catch (e) {
+    logger.error({ err: e, to, category: category ?? null },
+      '[EMAIL PREF LOOKUP FAILED] could not read the recipient’s notification settings — sending rather than losing it')
+    return null
+  }
+}
+
 async function send(
   to: string,
   subject: string,
@@ -124,6 +192,21 @@ async function send(
   from: SenderKind = 'noreply',
   attachments: EmailAttachment[] | undefined = undefined,
 ): Promise<string | null> {
+  // 10/20 (review) — SOMETHING ELSE IN THIS SAME ACTION IS SAYING THIS.
+  //
+  // A confirmation has to make the deposit card page before it can offer it,
+  // and the link maker emails the guest the moment it makes one — so the guest
+  // got a bare "Reservation deposit: $28.39" and then, moments later, the
+  // actual confirmation. Nic's rule is one email per thing, so the carrying
+  // email withholds the one it is carrying (services/emailWithheld.ts has the
+  // whole why, and why this is not a mute switch). First thing checked: a
+  // withheld send does no work, writes no log row and never reaches Resend.
+  const withheld = withheldBecause(ctx.category)
+  if (withheld) {
+    logger.info({ to, subject, category: ctx.category ?? null, because: withheld },
+      '[EMAIL WITHHELD] another email in this same action carries this one')
+    return null
+  }
   // S536/S553 (Nic): only PRODUCTION (or an explicit EMAIL_SEND_LIVE=1
   // override) actually hits Resend. This now covers NODE_ENV=test too —
   // the prior `nodeEnv !== 'test'` carve-out let any test with an UNMOCKED
@@ -173,7 +256,18 @@ async function send(
   // row says who would have heard back.
   const routedReplyTo = ctx.replyTo ? await replyAddressesFor(ctx.replyTo) : null
   if (routedReplyTo) ctx = { ...ctx, metadata: { ...(ctx.metadata ?? {}), reply_to: routedReplyTo } }
-  const suppressed = willSend ? await suppressionFor(to) : null
+  // 10/20: the recipient's own answer, read before the provider's bounce list —
+  // an email somebody switched off is not sent to a dead address either, and the
+  // reason on the row has to be theirs, not the provider's. See
+  // declinedByPreference above for why this exists at all.
+  const declined = await declinedByPreference(to, ctx.category)
+  if (declined) {
+    status = 'suppressed'
+    errorMessage = declined
+    logger.info({ to, subject, category: ctx.category ?? null },
+      '[EMAIL DECLINED] the recipient switched this one off in their notification settings')
+  }
+  const suppressed = (willSend && !declined) ? await suppressionFor(to) : null
   if (suppressed) {
     status = 'undeliverable'
     errorMessage = `Address is on the mail provider suppression list (${suppressed.origin}`
@@ -181,7 +275,7 @@ async function send(
       + ' — nothing sent. Correct the address; resending to this one cannot work.'
     logger.warn({ to, subject, origin: suppressed.origin },
       '[EMAIL UNDELIVERABLE] provider suppresses this address — not sent')
-  } else if (willSend) {
+  } else if (willSend && !declined) {
     try {
       // S322: optional attachments via Resend's documented attachments[]
       // field. Unset for the existing callers — only the new
@@ -217,7 +311,7 @@ async function send(
       errorMessage = e instanceof Error ? e.message : String(e)
       logger.error({ err: e }, '[EMAIL FAILED]')
     }
-  } else {
+  } else if (!declined) {
     // S641: the log must not claim we sent something we did not. This row is
     // the answer to "did the tenant get their notice?", and a record that
     // cannot tell "delivered" from "never left the machine" is worse than no
@@ -363,9 +457,218 @@ export async function emailBookingSiteChanged(
         + `from site <strong style="color:#eef1f8">${fromSite}</strong> to site `
         + `<strong style="color:#eef1f8">${toSite}</strong>.`) +
       p('Your dates have not changed and nothing else about your reservation is different.') +
-      p('If that site does not suit you, just reply to this email or give us a ring and we will sort it out.')
+      // 10/20: "give us a ring" was a British idiom sitting in live guest mail
+      // (memory: feedback-american-spelling). Same sentence, American.
+      p('If that site does not work for you, just reply to this email or call us and we will fix it.')
     ),
     { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
+  )
+}
+
+// ── THE RESERVATION CONFIRMATION ──────────────────────────────────────────
+
+/**
+ * 10/20 (Nic) — THE HONEST TRADE, IN WORDS A PERSON WROTE.
+ *
+ *   "paying the deposit guarantees the spot, not paying the deposit risks the
+ *    site being given away by other people that have paid ahead, and there are
+ *    no refunds on deposits. So I don't know the best way to word that, but the
+ *    tenant or the customer basically has to gamble."
+ *
+ * He asked for this wording himself, so here it is, in one place, as four short
+ * lines rather than a paragraph of disclaimers. The rules it has to carry, and
+ * nothing beyond them:
+ *
+ *   - paying is the guest's choice, not a requirement;
+ *   - paid, the site is held for them;
+ *   - unpaid, a guest who HAS paid can be given it — which is literally true:
+ *     an unpaid hold is exactly what GAM moves aside for money
+ *     (services/holdDisplacement), so this is not a sales line;
+ *   - a deposit is not refundable.
+ *
+ * What it deliberately does NOT do is threaten. "Pay now or lose your spot" is
+ * a different email from the one Nic described, and the refund sentence only
+ * reads as fair sitting next to "only if you are sure" — the guest is making a
+ * judgment call with their eyes open, which is the whole point of offering it
+ * rather than requiring it.
+ */
+
+/**
+ * 10/20 (review) — THE ONE LINE ON THAT PAGE THE GUEST DOES NOT GET TO CHOOSE.
+ *
+ * A stay of more than three weeks needs a background check before check-in
+ * (R8), and when nothing is on file its fee rides on this same card page as a
+ * line the payer cannot take off. So the sentences below — "paying the deposit
+ * is your choice" — would be read across the whole total unless the email says
+ * which part of it is not a choice. It says it in the words the pay link's own
+ * email already uses, because it is the same fee and the same check.
+ */
+export const confirmationScreeningWords = (amount: string): string =>
+  'Your stay comes to more than three weeks, so a background check is required before check-in. '
+  + `Its ${amount} is included above. Once it is paid we email you the link to fill it out, `
+  + 'and you are not charged for it again.'
+
+export const DEPOSIT_CHOICE_WORDS: readonly string[] = [
+  'Paying the deposit is your choice.',
+  'Pay it and the site is held for you — we will not give it to anyone else.',
+  'Leave it unpaid and we still keep your dates on the schedule, but if the park fills up, '
+    + 'a guest who has paid can be given the site.',
+  'A deposit is not refundable, so pay it only if you are sure of your plans.',
+]
+
+/**
+ * 10/20 (Nic) — A GUEST'S CONFIRMATION: THEIR DATES, THEIR PRICE, AND THE
+ * DEPOSIT OFFERED RATHER THAN DEMANDED.
+ *
+ *   "the confirmation actually says that they have a reservation on these
+ *    dates. I'd like it to tell them a grand total if it's a short-term stay
+ *    ... If they're seasonal and going to be here more than the 30 days, I just
+ *    want it to tell them the first month's rate. I also want it to tell them a
+ *    deposit of 10% or whatever that property's deposit rate is. Have it
+ *    display that as available to pay now. But I also want it to not be
+ *    required"
+ *
+ * NEVER SENT BY ANYTHING BUT A PERSON. There is no hook on booking creation and
+ * no sweep for unsent confirmations — see services/bookingConfirmation for why
+ * that matters more than usual right now.
+ *
+ * THE SUBJECT DOES NOT SAY "CONFIRMED". With the deposit unpaid the site is
+ * genuinely not guaranteed, and an email headed "confirmed" would contradict
+ * its own middle paragraph.
+ *
+ * THE CARD FEE IS ON THE PAGE BEFORE THEY PAY, never discovered afterwards —
+ * as a figure, not as a rate: GAM does not read a processor's rate card out to
+ * a customer.
+ */
+export async function emailBookingConfirmation(args: {
+  to: string
+  guestName: string | null
+  propertyName: string
+  /** 'YYYY-MM-DD' */
+  checkIn: string
+  checkOut: string
+  nights: number
+  /** 30 nights or more: `amount` is the FIRST MONTH and the email says so. */
+  firstMonthOnly: boolean
+  amount: number
+  /** The first month's last day, for a 30+ stay. */
+  firstMonthThrough: string | null
+  /** The lodging tax inside `amount`, or null to not break it out. */
+  tax: number | null
+  /** R13's held-through sentence, for a 30+ stay with no lease. */
+  heldThrough: string | null
+  /** The property's own deposit rate, for the sentence that names it. */
+  depositPct: number
+  /** What the card page charges, line by line. Null when this park asks no deposit on a stay like this. */
+  deposit: {
+    deposit: number; screening: number; cardFee: number; total: number; url: string | null
+  } | null
+  /**
+   * Money is already in. Most of Nic's board is in this state right now —
+   * guests who paid him in the old system — and asking one of them for it
+   * again, under a sentence about the site being given away, is the worst
+   * version of this email. Set, it REPLACES the offer.
+   *
+   * 10/20 (defect): WHICH money, because the two read differently to the
+   * person holding the receipt. A deposit is in and the rest is owed on
+   * arrival; the whole stay is in and nothing is. This email used to know only
+   * "something is paid", call it a deposit, quote the property's percentage for
+   * it, and tell a guest who had paid in full that the balance was due at the
+   * gate. `amount` is null where the reservation cannot say what came in — then
+   * no figure is quoted, because a figure nobody paid is worse than none.
+   */
+  paid?: { kind: 'deposit' | 'stay'; amount: number | null } | null
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
+}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const strong = (s: string) => `<strong style="color:#eef1f8">${s}</strong>`
+  const night = (n: number) => `${n} night${n === 1 ? '' : 's'}`
+  const inDay = longCalendarDate(args.checkIn)
+  const outDay = longCalendarDate(args.checkOut)
+  // A clerk types the guest's name and a landlord types the property's, so
+  // both are somebody's free text arriving in an HTML document.
+  const park = escapeHtml(args.propertyName)
+  const who = escapeHtml(args.guestName || 'there')
+
+  // What they owe: the whole stay, or the first month said plainly as the first
+  // month. A guest down for the season must not read one month's rate as the
+  // price of six.
+  //
+  // AND WHAT IS LEFT OF IT. 10/20 (defect): this paragraph used to end "The
+  // balance is due when you arrive." on every short stay, whatever had been
+  // paid — so a guest who had handed over the whole $286.75 on the card page
+  // read that he owed it again on the day. What is still owed is one answer
+  // (`paid`, from services/bookingConfirmation confirmationPaid), read here and
+  // again below, so the price paragraph and the paid paragraph say the same
+  // thing as each other. Paid in full, neither this sentence nor the promise to
+  // bill each month belongs in the email at all: nothing more is coming.
+  const paidWhole = args.paid?.kind === 'stay'
+  const whatIsLeft = paidWhole ? ''
+    : args.paid?.kind === 'deposit' ? ' The rest is due when you arrive.'
+    : ' The balance is due when you arrive.'
+  const priceLines = args.firstMonthOnly
+    ? p(`${strong(`Your first month is ${money(args.amount)}`)}`
+        + (args.firstMonthThrough ? ` — ${inDay} through ${longCalendarDate(args.firstMonthThrough)}.` : '.')
+        + ' That is the first month only, not the whole stay.'
+        + (paidWhole ? '' : ' We bill each month as it comes.'))
+      + (args.heldThrough ? p(escapeHtml(args.heldThrough)) : '')
+    : p(`${strong(`Your stay comes to ${money(args.amount)}`)}`
+        + (args.tax != null && args.tax > 0 ? `, including ${money(args.tax)} of lodging tax.` : '.')
+        + whatIsLeft)
+
+  // The deposit, offered. Its lines are the card page's own, so the email and
+  // the page can never quote two different numbers.
+  const d = args.deposit
+  const pct = Number.isFinite(args.depositPct) && args.depositPct > 0
+    ? `${String(args.depositPct).replace(/\.00?$/, '')}%` : null
+  // ALREADY PAID BEATS THE OFFER, and says which of the two things happened.
+  // The "deposit" sentence on a guest who paid for everything is the sentence
+  // that told Dale his $28.68 was in when he had paid $286.75.
+  const paidBlock = !args.paid ? ''
+    : args.paid.kind === 'stay'
+    ? p(`${strong('Your stay is paid in full')}`
+        + (args.paid.amount != null ? ` — we have your ${money(args.paid.amount)}.` : '.')
+        + ' There is nothing to pay when you arrive, and your site is held for you'
+        + ' — we will not give it to anyone else.')
+    : p(`${strong(args.paid.amount != null ? `Your deposit of ${money(args.paid.amount)} is paid` : 'Your deposit is paid')}`
+        + ' — your site is held for you and we will not give it to anyone else.')
+  const depositBlock = args.paid
+    ? paidBlock
+    : !d ? '' :
+    p(`${strong(`A deposit of ${money(d.deposit)}`)}`
+      + (pct && !args.firstMonthOnly ? ` — ${pct} of your stay —` : '')
+      + ' holds your site.')
+    + p([
+        `${strong('Deposit:')} ${money(d.deposit)}`,
+        d.screening > 0 ? `${strong('Background check:')} ${money(d.screening)}` : '',
+        d.cardFee > 0 ? `${strong('Card processing fee:')} ${money(d.cardFee)}` : '',
+        `${strong('Total to pay by card:')} ${money(d.total)}`,
+      ].filter(Boolean).join('<br>'))
+    + (d.screening > 0 ? p(escapeHtml(confirmationScreeningWords(money(d.screening)))) : '')
+    + DEPOSIT_CHOICE_WORDS.map(w => p(escapeHtml(w))).join('')
+    + (d.url
+        ? btnWithLink('Pay the deposit', d.url)
+        : p('Call the office and we can take the deposit by card.'))
+
+  await send(args.to,
+    `Your reservation at ${args.propertyName} — ${inDay} to ${outDay}`,
+    base(
+      h(`Your reservation at ${park}`) +
+      p(`Hi ${who},`) +
+      p(`You have a reservation at ${strong(park)} from ${strong(inDay)} to ${strong(outDay)}`
+        + ` — ${night(args.nights)}.`) +
+      priceLines +
+      depositBlock +
+      p('If anything above looks wrong, reply to this email or call us and we will fix it.')
+    ),
+    {
+      category: 'booking_confirmation',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'unit_booking',
+      relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
+    },
+    'support',
   )
 }
 

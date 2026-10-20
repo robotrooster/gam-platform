@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'r
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
-import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check, PowerOff } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
@@ -433,6 +433,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             )}
           </div>
           </>)}
+          {/* ── SEND A BILL ────────────────────────────────── */}
+          <SendUtilityBillCard propertyId={propertyId} canSend={canReview} />
+
           {/* ── PROPANE (tank fills — gas for RVs) ─────────── */}
           <PropaneSection propertyId={propertyId} property={(properties as any[]).find((p:any)=>p.id===propertyId)} units={units as any[]} onChanged={invalidate} />
 
@@ -1325,6 +1328,151 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
   )
 }
 
+/**
+ * SEND A BILL — 10/20 (Nic): "a lot of people that move out are going to get
+ * their final electric bill as a pay link anyway... to send somebody a pay link
+ * for their final bill, you would have to do it through the point of sale,
+ * right? ... The point of sale is just an extension of things."
+ *
+ * The routes to do it (GET/POST /pos/pay-links/utility-bills) shipped with
+ * nothing calling them. This is the button, and it belongs HERE rather than in
+ * the register: this is the screen where a landlord already looks at what the
+ * meters billed, and a final bill is not a sale somebody rings up — every
+ * figure comes off the bill itself, so there is no price for a cashier to set.
+ *
+ * It sends ONE link and ONE email for everything ticked, which is the
+ * one-email-per-thing rule (S652): a household leaving with power and water
+ * owed gets a single bill to pay, not two.
+ *
+ * Nothing here can change an amount. The server takes bill IDs, never figures.
+ */
+export function SendUtilityBillCard({ propertyId, canSend }: { propertyId: string; canSend: boolean }) {
+  const qc = useQueryClient()
+  const [picked, setPicked] = useState<Record<string, boolean>>({})
+  const [to, setTo] = useState('')
+
+  const { data: bills = [], isLoading } = useQuery(
+    ['utility-bills-sendable', propertyId],
+    () => apiGet(`/pos/pay-links/utility-bills?propertyId=${propertyId}`),
+    { enabled: !!propertyId && canSend }
+  )
+
+  const rows = bills as any[]
+  const chosen = rows.filter(b => picked[b.billId])
+  const total = chosen.reduce((t, b) => t + Number(b.amount || 0), 0)
+
+  // Everything ticked has to go to one person — one household, one balance.
+  const payers = new Set(chosen.map(b => (b.payerEmail || '').toLowerCase()).filter(Boolean))
+  const tooManyPayers = payers.size > 1
+  const suggested = chosen.find(b => b.payerEmail)?.payerEmail || ''
+  const address = to.trim() || suggested
+
+  const send = useMutation(
+    () => apiPost('/pos/pay-links/utility-bills', {
+      propertyId,
+      billIds: chosen.map(b => b.billId),
+      ...(to.trim() ? { customer: { email: to.trim() } } : {}),
+    }),
+    {
+      onSuccess: () => {
+        toast(`Bill sent to ${address} — ${fmt(total)}`)
+        setPicked({}); setTo('')
+        qc.invalidateQueries(['utility-bills-sendable', propertyId])
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'The bill could not be sent.'),
+    }
+  )
+
+  if (!canSend) return null
+
+  return (
+    <>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12, marginTop:4 }}>
+        <div>
+          <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Send a bill</h2>
+          <p style={{ fontSize:'.76rem', color:'var(--text-3)', margin:'4px 0 0' }}>
+            Email somebody a link to pay what their meters came to — a final bill for a household that has
+            left, or any bill they'd rather pay online. Paying it closes the bill out.
+          </p>
+        </div>
+      </div>
+      <div className="card" style={{ padding:0, marginBottom:28 }}>
+        {isLoading ? (
+          <div style={{ padding:28, fontSize:'.82rem', color:'var(--text-3)' }}>Looking for bills…</div>
+        ) : rows.length === 0 ? (
+          <div className="empty-state" style={{ padding:40 }}>
+            <Receipt size={36}/><h3>Nothing to send</h3>
+            <p>Every utility bill at this property is either paid or already out on a link. A bill shows up here once its meters are read.</p>
+          </div>
+        ) : (
+          <>
+            <div style={{ overflowX:'auto' }}>
+              <table style={{ width:'100%', borderCollapse:'collapse', minWidth:520 }}>
+                <thead>
+                  <tr>
+                    <th style={{ width:34 }}></th>
+                    <th style={{ textAlign:'left' }}>Bill</th>
+                    <th style={{ textAlign:'left' }}>Who</th>
+                    <th style={{ textAlign:'right' }}>Amount</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((b:any) => (
+                    <tr key={b.billId}>
+                      <td style={{ textAlign:'center' }}>
+                        <input
+                          id={`sendbill-${b.billId}`}
+                          type="checkbox"
+                          checked={!!picked[b.billId]}
+                          onChange={e => setPicked(p => ({ ...p, [b.billId]: e.target.checked }))}
+                        />
+                      </td>
+                      <td style={{ fontSize:'.82rem' }}>{b.lineName}</td>
+                      <td style={{ fontSize:'.8rem', color:'var(--text-2)' }}>
+                        {b.payerName || <span style={{ color:'var(--text-3)' }}>nobody on file</span>}
+                        {b.payerEmail && <span style={{ color:'var(--text-3)', fontSize:'.74rem' }}> · {b.payerEmail}</span>}
+                      </td>
+                      <td className="mono" style={{ textAlign:'right', fontSize:'.82rem' }}>{fmt(b.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ borderTop:'1px solid var(--border)', padding:14, display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
+              <input
+                id="sendbill-to"
+                type="email"
+                value={to}
+                placeholder={suggested ? `Send to ${suggested}` : 'Email address'}
+                onChange={e => setTo(e.target.value)}
+                style={{ flex:'1 1 16rem', minWidth:0, fontSize:'.84rem', padding:'7px 9px' }}
+              />
+              <span className="mono" style={{ fontSize:'.84rem' }}>{chosen.length ? fmt(total) : '—'}</span>
+              <button
+                className="btn btn-primary btn-sm"
+                disabled={!chosen.length || (!address) || tooManyPayers || send.isLoading}
+                onClick={() => send.mutate()}
+              >
+                {send.isLoading ? 'Sending…' : `Send bill${chosen.length > 1 ? ` (${chosen.length})` : ''}`}
+              </button>
+            </div>
+            {tooManyPayers && (
+              <div style={{ padding:'0 14px 14px', fontSize:'.78rem', color:'var(--amber)' }}>
+                Those bills belong to different people. One link is one person's bill — tick one person's at a time.
+              </div>
+            )}
+            {!!chosen.length && !address && !tooManyPayers && (
+              <div style={{ padding:'0 14px 14px', fontSize:'.78rem', color:'var(--text-3)' }}>
+                Nobody's email is on file for that bill — type where it should go.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  )
+}
+
 function TaxRatesCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
   const { data: rates = [] } = useQuery<any[]>(
@@ -1385,16 +1533,51 @@ function methodLabel(m: any): string {
  * wanna see that... that way we can measure how much utility wasn't billed back."
  *
  * Spent is what the property recorded paying for utilities; recovered is what it
- * billed out. The gap is the number. The owner-occupied slice is called out
- * because it is recorded as it happens — the rest of the gap (common areas, a
- * nightly stay with power in the rate, a vacancy, a lease that never passed it
- * through) is left unattributed rather than guessed at.
+ * billed out. The gap is the number.
  *
  * A utility with no expense recorded shows a dash, not a shortfall: with nothing
  * on the spent side there is nothing to subtract from, and printing the whole
  * recovery as "not recovered" would be a lie in the landlord's own report.
+ *
+ * 10/20 (Nic) — AND THE GAP IS SHOWN SPLIT THREE WAYS, because two of them are
+ * not the same question: "it needs to be separated between stuff that the
+ * property just generally uses, the property's own consumption, versus what
+ * somebody used that didn't get billed back."
+ *
+ *   The park used it — your own spaces, empty spaces. A cost of running the
+ *     place, and never what the kept money is measured against.
+ *   Somebody used it and was never billed — THE number, and the only one the
+ *     early-departure comparison faces.
+ *   Not accounted for — mostly the office, the shop, irrigation. The screen
+ *     says that is what it mostly is and also says nothing on file proves it,
+ *     because moving it into the park's column on a hunch would be the invented
+ *     number this whole report exists to avoid.
+ *
+ * And "billed to tenants" says which of the three doors it came through: a
+ * bill, a sale at the register or on a pay link, or a nightly rate that had the
+ * power in it all along.
+ *
+ * 10/20 (Nic): "I would like to keep track of money that wasn't refunded versus
+ * electric that should have been billed that wasn't charged to see how close we
+ * actually get to evening out... we try to be generous with it, but I want to
+ * make sure that it's somewhat fair." So the two halves of an early departure
+ * sit side by side here, and the leaning is shown signed rather than as a win —
+ * "you came out ahead" and "you came out short" are both printed plainly,
+ * because only one of them answers the question he asked.
+ *
+ * The money kept is shown NET of the short-term lodging tax that re-pricing
+ * those stays would owe — "even though they weren't charged the tax needs to be
+ * factored in" — with the subtraction spelled out underneath, because a figure
+ * that quietly dropped $35.51 a departure would look like a bug. On the two
+ * live Mountain View departures that is $102.00 in the till, $71.02 of tax, and
+ * $30.98 really ahead.
+ *
+ * The named slices live INSIDE the gap, never beside it. Each is a part of
+ * "charged but never billed", not an addition to it; the API carries the
+ * remainder as its own figure so they reconcile exactly and no dollar is
+ * counted twice.
  */
-function RecoveryCard({ propertyId }: { propertyId: string }) {
+export function RecoveryCard({ propertyId }: { propertyId: string }) {
   const thisYear = new Date().getFullYear()
   const [year, setYear] = useState(thisYear)
   const { data } = useQuery<any>(
@@ -1404,7 +1587,12 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
   )
   const lines: any[] = data?.lines ?? []
   const t = data?.totals
-  if (!t || (t.spent === 0 && t.recovered === 0)) return null
+  const ed = t?.earlyDepartures
+  // 10/20: a park can have early departures and nothing else — RV 10 and RV 11
+  // at Mountain View have no utility bill and no recorded expense between them,
+  // which is exactly the case this feature exists for. Hiding the card on an
+  // empty spent-and-billed pair would hide the only figures it has.
+  if (!t || (t.spent === 0 && t.recovered === 0 && !(ed?.departures > 0))) return null
   // S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
   // $1,588.65… I want to fix this table so it's not confusing on anything."
   // Four plain numbers, in the order the money moves: what the utility charged
@@ -1419,6 +1607,15 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
     </div>
   )
   const th: React.CSSProperties = { textAlign: 'right' }
+  // 10/20 (Nic): three ways utility money comes back, named under the total so
+  // one number never silently means three different things. Only the ones that
+  // actually happened are listed — a park that has never rung a utility line up
+  // should not be told about a door it has never used.
+  const sourceHint = [
+    t.fromBills > 0 ? `${fmt(t.fromBills)} on bills` : null,
+    t.fromSales > 0 ? `${fmt(t.fromSales)} at the register or on a pay link` : null,
+    t.inTheRate > 0 ? `${fmt(t.inTheRate)} inside nightly and weekly rates` : null,
+  ].filter(Boolean).join(' · ') || undefined
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
@@ -1430,14 +1627,78 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
       </div>
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
-          {stat('Billed to tenants', fmt(t.recovered))}
+          {stat('Billed to tenants', fmt(t.recovered), undefined, sourceHint)}
           {stat('Tenants have paid', fmt(t.collected), 'var(--green)')}
           {t.workTrade > 0 && stat('Covered by work trade', fmt(t.workTrade), undefined, 'worked off, not owed')}
           {stat('Tenants still owe', fmt(t.stillOwed), t.stillOwed > 0 ? 'var(--gold)' : undefined)}
           {stat('The utility charged you', t.spent > 0 ? fmt(t.spent) : '—', undefined, t.spent > 0 ? undefined : 'none recorded yet')}
-          {t.notRecovered != null && stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)), t.notRecovered > 0 ? 'var(--gold)' : undefined)}
-          {t.ownerOccupied > 0 && stat('Of that, your own units', fmt(t.ownerOccupied))}
         </div>
+        {/*
+          10/20 (Nic): the gap, split. The three parts are indented under the
+          whole so it reads as a breakdown and not as four more numbers to add
+          up — they live INSIDE "charged but never billed", they are not beside
+          it. Each one says plainly what it is for somebody who does not work
+          here.
+        */}
+        {t.notRecovered != null && (
+          <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginBottom: 14 }}>
+            <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              {stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)),
+                t.notRecovered > 0 ? 'var(--gold)' : undefined,
+                'what the utility charged you and nobody was billed for')}
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap',
+                borderLeft: '2px solid var(--border-0)', paddingLeft: 18 }}>
+                {stat('The park used it', fmt(t.propertyUsed), undefined,
+                  'your own spaces and empty ones — a cost of running the place')}
+                {stat('Somebody used it, never billed', fmt(t.somebodysUsage),
+                  t.somebodysUsage > 0 ? 'var(--gold)' : undefined,
+                  'the part the money you kept is measured against')}
+                {stat('Not accounted for', t.unattributed == null ? '—' : fmt(t.unattributed), undefined,
+                  'mostly common areas, the office, the shop, watering — nothing on file says which')}
+              </div>
+            </div>
+          </div>
+        )}
+        {ed?.departures > 0 && (
+          <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginBottom: 14 }}>
+            <div style={{ fontSize: '.8rem', fontWeight: 600, marginBottom: 2 }}>
+              When someone leaves early and you keep the money
+            </div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 10 }}>
+              {ed.departures === 1 ? 'One person left' : `${ed.departures} people left`} before the day they had
+              paid through. You kept what they had paid ahead, and you never sent them a final utility bill.
+              Here is how close the two came to evening out.
+            </div>
+            <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+              {stat('Money you kept', fmt(ed.moneyKept), undefined,
+                ed.lodgingTaxOwed > 0
+                  ? `${fmt(ed.moneyKeptBeforeTax)} left in the till, less ${fmt(ed.lodgingTaxOwed)} of lodging tax`
+                  : undefined)}
+              {stat('Utilities you never billed them', fmt(ed.utilityAbsorbed))}
+              {stat(
+                ed.evenedOutBy === 0 ? 'It evened out exactly'
+                  : ed.evenedOutBy > 0 ? 'You came out ahead by' : 'You came out short by',
+                fmt(Math.abs(ed.evenedOutBy)),
+                ed.evenedOutBy < 0 ? 'var(--gold)' : undefined,
+              )}
+            </div>
+            {ed.lodgingTaxOwed > 0 && (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 8 }}>
+                A stay of a month or more pays no short-term lodging tax, but the shorter stay they
+                actually used does. If you ever go back and log these as the shorter stays they were,
+                that tax comes out of your pocket &mdash; so it is taken off here rather than counted
+                as money you kept.
+              </div>
+            )}
+            {ed.awaitingClosingRead > 0 && (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 8 }}>
+                {ed.awaitingClosingRead === 1
+                  ? 'One of these is still waiting on its final utility amount, so it is not in these figures yet.'
+                  : `${ed.awaitingClosingRead} of these are still waiting on their final utility amount, so they are not in these figures yet.`}
+              </div>
+            )}
+          </div>
+        )}
         <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
@@ -1448,6 +1709,8 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
               <th style={th}>Still owed</th>
               <th style={th}>Utility charged you</th>
               <th style={th}>Never billed</th>
+              {t.propertyUsed > 0 && <th style={th}>The park used it</th>}
+              {t.somebodysUsage > 0 && <th style={th}>Somebody used it</th>}
             </tr>
           </thead>
           <tbody>
@@ -1465,16 +1728,30 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
                 <td className="mono" style={{ ...th, color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
                   {l.notRecovered == null ? '—' : fmt(Math.max(0, l.notRecovered))}
                 </td>
+                {t.propertyUsed > 0 && (
+                  <td className="mono" style={th}>{l.propertyUsed ? fmt(l.propertyUsed) : '—'}</td>
+                )}
+                {t.somebodysUsage > 0 && (
+                  <td className="mono" style={th}>{l.somebodysUsage ? fmt(l.somebodysUsage) : '—'}</td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
-          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices and utility lines sent on a pay link or rung
-          up at the register. &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
-          this property. Until a bill is recorded there, the last two columns show a dash — there is nothing to
-          compare against. &ldquo;Never billed&rdquo; is common areas, stays with utilities in the rate, vacancies, and
-          anything a lease doesn&apos;t pass through.
+          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices, utility lines sent on a pay link or rung
+          up at the register, a delivered propane fill, and power that was already inside a nightly or weekly
+          rate. Propane sold at the pump is a product, not a utility, so it is nowhere in this table.
+          &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
+          this property. Until a bill is recorded there, the gap columns show a dash — there is nothing to
+          compare against.
+          {t.propertyUsed > 0 && <> &ldquo;The park used it&rdquo; is your own spaces and empty ones: a cost of
+          running the place, not money anyone owed you.</>}
+          {t.somebodysUsage > 0 && <> &ldquo;Somebody used it&rdquo; is power a person used that never reached a
+          bill &mdash; mostly somebody who moved out before the day they had paid through, where you kept their
+          money instead of refunding it and called it a wash. That is the one the comparison above is set
+          against.</>}
+          {' '}Both are already counted inside &ldquo;never billed&rdquo;, not added on top of it.
         </div>
       </div>
     </div>
@@ -1729,6 +2006,13 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
 }) {
   const [label, setLabel] = useState('')
   const [serviceAddress, setServiceAddress] = useState('')
+  // 10/20: WHAT KIND OF SPACE IT IS, which is what picks the late fee the
+  // space's unpaid bill takes — the property's policy for that class, the same
+  // one a lease for that class is drafted with. The type classifies, it never
+  // prices. This screen used to send nothing, so every space was written as an
+  // apartment, and a park whose recorded policies are for RV sites and mobile
+  // homes handed its neighbor an agreement with no late fee at all.
+  const [unitType, setUnitType] = useState('apartment')
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
@@ -1745,6 +2029,7 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
     () => apiPost('/utility/service-agreements', {
       propertyId,
       label: label.trim(),
+      unitType,
       serviceAddress: serviceAddress.trim() || undefined,
       billingDueDay: Number(billingDueDay) || 1,
       householdSize: Number(householdSize) || 1,
@@ -1785,6 +2070,19 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
         <input className="form-input" value={serviceAddress} maxLength={200}
           placeholder="1442 W Second St"
           onChange={e => setServiceAddress(e.target.value)} />
+
+        <label style={{ ...lbl, marginTop: 10 }}>What kind of space is it</label>
+        <select className="form-select" value={unitType}
+          onChange={e => setUnitType(e.target.value)}>
+          {UNIT_TYPES.map(t => (
+            <option key={t} value={t}>{UNIT_TYPE_LABEL[t]}</option>
+          ))}
+        </select>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+          This picks the late fee their unpaid bill takes — your policy for that kind of space at
+          this property, the same one a lease for it would use. If you haven&apos;t set a policy for
+          that kind of space, their bill carries no late fee.
+        </div>
 
         <div style={{ marginTop: 16, marginBottom: 8, fontWeight: 700, fontSize: '.82rem', color: 'var(--text-0)' }}>
           Who pays the bill

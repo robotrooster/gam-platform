@@ -158,7 +158,12 @@ const OAK_PARK = { id: 'OP', businessName: 'Oak Park Motel and RV LLC', isOwner:
 const TRUBLU   = { id: 'TB', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }
 const LIVE     = { connectAccountId: 'acct_1', exists: true, payoutsEnabled: true, detailsSubmitted: true,
                    payoutBank: { bankName: 'First Mid Bank', last4: '8944' } }
-const LINKED   = [{ id: 'bc1', status: 'active', displayName: 'First Mid Bank ••8944' }]
+// A hand-linked bank as the API really answers for one: debit_ready is a field
+// on every row (bankFeed.listConnections), and for a platform-held link that
+// carries payment_method it is true. A fixture without it reads as "GAM cannot
+// collect from this bank", which is a different landlord.
+const LINKED   = [{ id: 'bc1', status: 'active', displayName: 'First Mid Bank ••8944',
+                    source: 'landlord_link', connectHeld: false, debitReady: true, debitProblem: null }]
 
 /** Where each step's heading sits in the page, to prove the order on screen. */
 const stepPos = () => {
@@ -310,6 +315,164 @@ describe('Bank setup — one destination, two steps', () => {
     await render(<BankPage />, '/bank')
     expect(text()).toContain('Your spending')
     expect(text()).not.toContain('Bank setup · step 1 of 2')
+  })
+})
+
+// ── ONE BANK LINK ───────────────────────────────────────────────────────────
+//
+// 10/20 (Nic): "We need a way to link the bank account once and have it be
+// everything. It needs to do the feed. It needs to do the deposits or whatever
+// one flow needs to be the whole thing and it boggles my mind that Stripe being
+// one of the biggest payment processors in the world has no functionality for
+// that."
+//
+// On the morning of 10/20 he turned on financial-data access for balances,
+// account ownership details and transactions under Settings > Connect >
+// Payouts > External accounts. So the bank a landlord signs into in step one is
+// readable, the API adopts it as their feed (services/connectBankLink), and
+// step two has nothing left to ask. The two populations below are the whole
+// point: nobody is asked for the same bank twice, and nobody who onboarded
+// before this morning is asked for it twice either.
+
+/** A bank adopted from step one: held by the connected account, read-only to GAM. */
+const FROM_ONBOARDING = [{
+  id: 'bc_ob', status: 'active', source: 'connect_onboarding', connectHeld: true,
+  displayName: 'First Mid Bank ••8944', institutionName: 'First Mid Bank',
+  fcPermissions: ['payment_method', 'balances', 'transactions', 'ownership'],
+  debitReady: false,
+  debitProblem: 'Connected during your business verification, so GAM can read it but cannot collect its fees from it.',
+}]
+/** A bank the landlord signed into on the Bank page: platform-held, debitable. */
+const LINKED_BY_HAND = [{
+  id: 'bc1', status: 'active', source: 'landlord_link', connectHeld: false,
+  displayName: 'First Mid Bank ••8944', fcPermissions: ['transactions', 'balances', 'payment_method'],
+  debitReady: true, debitProblem: null,
+}]
+
+describe('one bank link — onboarded from today on', () => {
+  it('step two reads as done in step 1, and never offers a second sign-in', async () => {
+    server.status = LIVE
+    server.feed = FROM_ONBOARDING
+    await render(<BankPage />, '/bank?tab=setup')
+
+    expect(stepDone(1)).toBe(true)
+    expect(stepDone(2)).toBe(true)
+    // The badge is not a bare "Done" — it says where it got done, because a
+    // step that silently went green is a step nobody trusts.
+    expect(stepCard(2)!.textContent).toContain('Done in step 1')
+    expect(text()).toContain('First Mid Bank ••8944 is already connected, read-only — you did this in step 1.')
+    expect(text()).toContain('Nothing to sign in to again.')
+    // And it is specific about what GAM can see, from the permissions Stripe
+    // actually granted — never a blanket claim.
+    expect(text()).toContain('the transactions on it, its balance and whose name it is in')
+    expect(text()).toContain('Bank setup is complete.')
+    expect(text()).not.toContain("isn't finished")
+    // No "Connect feed" anywhere: that button IS the second bank sign-in.
+    expect(btn(/^.*Connect feed/)).toBeUndefined()
+  })
+
+  // 10/20 (review): this card used to end "it is optional, and your payouts and
+  // your feed both work either way" — the one framing S651 forbids. Nic: "That's
+  // not a landlord choice to fucking pay us. What the fuck? It's mandatory."
+  // A landlord at a cash park who believed it has no payout to net from and no
+  // bank GAM can debit, and the same portal that called it optional eventually
+  // suspends them over the balance.
+  it('discloses that fee collection still needs this bank, and never calls it optional', async () => {
+    server.status = LIVE
+    server.feed = FROM_ONBOARDING
+    await render(<BankPage />, '/bank?tab=setup')
+    expect(text()).toContain('Fee collection needs this bank too.')
+    expect(text()).toContain("GAM's fees come out of your rent payouts.")
+    // Why it matters to them, in their own terms — not a threat, and not a hedge.
+    expect(text()).toContain('a month the rent comes in as cash leaves no payout to take them from')
+    expect(text()).toContain('Connect the same account once here')
+    expect(btn(/Connect for fee collection/)).toBeTruthy()
+    // No choice offered anywhere on the step.
+    expect(text()).not.toMatch(/optional/i)
+    expect(text()).not.toMatch(/if you would rather/i)
+    expect(text()).not.toMatch(/either way/i)
+  })
+
+  // 10/20 (review): the notice asked "is EVERY link connect-held", which is a
+  // different question. Mountain View's live shape is a PLATFORM-held link with
+  // permissions ["balances","transactions"] and no payment_method — not
+  // debit-ready, not connect-held — so one row like that made the answer false
+  // and the landlord was told nothing at all, on a company GAM has no debitable
+  // bank for.
+  it('shows it for a platform link that cannot be debited either', async () => {
+    server.status = LIVE
+    server.feed = [
+      { id: 'bc_ob', status: 'active', source: 'connect_onboarding', connectHeld: true,
+        displayName: 'First Mid Bank ••8944', fcPermissions: ['payment_method', 'transactions'],
+        debitReady: false, debitProblem: 'Connected during your business verification…' },
+      { id: 'bc_mv', status: 'active', source: 'landlord_link', connectHeld: false,
+        displayName: 'Wells Fargo ••8739', fcPermissions: ['balances', 'transactions'],
+        debitReady: false, debitProblem: 'Linked before GAM asked for permission to debit — link this account once more.' },
+    ]
+    await render(<BankPage />, '/bank?tab=setup')
+    expect(stepDone(2)).toBe(true)
+    expect(text()).toContain('Fee collection needs this bank too.')
+    expect(btn(/Connect for fee collection/)).toBeTruthy()
+  })
+
+  it('a bank the landlord linked by hand says nothing about a missing debit', async () => {
+    server.status = LIVE
+    server.feed = LINKED_BY_HAND
+    await render(<BankPage />, '/bank?tab=setup')
+    expect(stepDone(2)).toBe(true)
+    expect(text()).toContain('First Mid Bank ••8944 is linked, read-only.')
+    expect(stepCard(2)!.textContent).not.toContain('Done in step 1')
+    expect(text()).not.toContain('Fee collection needs this bank too.')
+    expect(btn(/Connect for fee collection/)).toBeUndefined()
+  })
+})
+
+describe('one bank link — onboarded before the switch', () => {
+  // Blu Haws finished step one at 18:24 on 10/19, before the switch. His link
+  // carries payment_method only — verified against live Stripe on 10/20
+  // (fca_1USLR9…, permissions ["payment_method"]) — and Stripe fixes
+  // permissions at link time, so it can never be read for transactions. He
+  // still does step two. Nic: "he still only has to do step two either way,
+  // right?" Yes, and this pins that it is once, not twice.
+  it('still gets step two, offered exactly once', async () => {
+    server.status = LIVE
+    server.feed = []
+    await render(<BankPage />, '/bank?tab=setup')
+
+    expect(stepDone(1)).toBe(true)
+    expect(stepDone(2)).toBe(false)
+    expect(stepCard(2)!.textContent).not.toContain('Done in step 1')
+    // ONE button for it, on ONE screen — not one per Stripe product.
+    const asks = [...host.querySelectorAll('button')].filter(b => /Connect feed/.test(b.textContent ?? ''))
+    expect(asks).toHaveLength(1)
+    expect(asks[0].disabled).toBe(false)
+    // And it names the bank from step one rather than asking him to find it again.
+    expect(text()).toContain('same bank account')
+    expect(text()).toContain('First Mid Bank ••8944')
+    expect(text()).toContain("Your bank setup isn't finished.")
+  })
+
+  it('once he does it, it is done and nothing asks again', async () => {
+    server.status = LIVE
+    server.feed = LINKED_BY_HAND
+    await render(<BankPage />, '/bank?tab=setup')
+    expect(stepDone(2)).toBe(true)
+    expect(text()).toContain('Bank setup is complete.')
+    expect(btn(/Connect feed/)).toBeUndefined()
+  })
+
+  it('a landlord with no Stripe account at all sees step one first, as now', async () => {
+    server.status = { connectAccountId: null, exists: false }
+    server.feed = []
+    await render(<BankPage />, '/bank')
+    expect(text()).toContain('Bank setup · step 1 of 2')
+    const { one, two } = stepPos()
+    expect(one).toBeGreaterThan(-1)
+    expect(two).toBeGreaterThan(one)
+    expect(stepDone(1)).toBe(false)
+    expect(stepDone(2)).toBe(false)
+    expect(btn(/Connect account for payouts/)!.disabled).toBe(false)
+    expect(text()).toContain('neither is done')
   })
 })
 

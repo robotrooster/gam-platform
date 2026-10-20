@@ -18,6 +18,7 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+import { NotificationPreferences } from '../../../packages/shared-ui/NotificationPreferences'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { BackgroundCheckPage } from './pages/BackgroundCheckPage'
 import { TenantNotificationsPage } from './pages/TenantNotificationsPage'
@@ -4088,50 +4089,15 @@ function HardshipModal({ onClose }: { onClose: () => void }) {
 }
 
 // ── NOTIFICATION PREFERENCES ─────────────────────────────────
-const TENANT_NOTIFICATION_TYPES: { type: string; label: string }[] = [
-  { type: 'rent_collected',                  label: 'Rent collected' },
-  { type: 'rent_failed',                     label: 'Rent failed' },
-  { type: 'ach_retry_scheduled',             label: 'ACH retry scheduled' },
-  { type: 'ach_retries_exhausted',           label: 'ACH retries exhausted' },
-  { type: 'maintenance_updated',             label: 'Maintenance status update' },
-  { type: 'inspection_ready',                label: 'Inspection ready to sign' },
-  { type: 'inspection_finalized',            label: 'Inspection finalized' },
-  { type: 'inspection_scheduled_reminder',   label: 'Inspection scheduled reminder' },
-  { type: 'entry_request_new',               label: 'New entry request' },
-  { type: 'entry_recorded',                  label: 'Entry recorded by landlord' },
-  { type: 'dispute_resolved',                label: 'Dispute resolved' },
-  { type: 'work_trade_reminder',             label: 'Work trade reminder' },
-  { type: 'amenity_unavailable',             label: 'Amenity unavailable / reserved' },
-  { type: 'reservation_decision',            label: 'Reservation approved / declined' },
-  { type: 'service_interruption',            label: 'Utility outage / service interruption' },
-]
-
+/**
+ * 10/20 (Nic): the fifteen hand-typed rows that used to live here are gone, and
+ * so is the second, shorter list on Profile → Notifications. Both render the one
+ * component (packages/shared-ui/NotificationPreferences) off the one catalog in
+ * @gam/shared, so neither can be missing a type GAM sends — and three of the
+ * rows that were here ('Rent failed', 'Work trade reminder' and the old
+ * 'Disbursement sent' on the landlord side) had no sender behind them at all.
+ */
 function NotificationPrefsPage() {
-  const qc = useQueryClient()
-  const { data: prefs = [], isLoading } = useQuery<any[]>('notification-prefs', () =>
-    get<any[]>('/notifications/preferences'),
-  )
-  const prefMap = new Map<string, any>()
-  for (const p of (prefs as any[])) prefMap.set(p.type, p)
-
-  const update = useMutation(
-    (body: { type: string; emailEnabled: boolean; inAppEnabled: boolean }) =>
-      api.patch('/notifications/preferences', body).then(r => r.data),
-    {
-      onSuccess: () => qc.invalidateQueries('notification-prefs'),
-    },
-  )
-
-  const toggle = (type: string, currentVal: boolean) => {
-    // S554 (button-sweep bug #4): responses are camelized, so an existing
-    // pref lands as emailEnabled/inAppEnabled. The default MUST use the
-    // same camelCase keys — a snake-case default left inAppEnabled
-    // undefined on the (common) no-existing-row path, and the API's
-    // zod .boolean() then 400'd the PATCH, so no pref ever saved.
-    const current = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
-    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled ?? true })
-  }
-
   return (
     <div>
       <div className="ph">
@@ -4140,37 +4106,13 @@ function NotificationPrefsPage() {
           <p className="ps">Choose how GAM contacts you</p>
         </div>
       </div>
-      <div className="alert a-blue" style={{ marginBottom: 16 }}>
-        ℹ️ In-app notifications always show in your dashboard. Email is an
-        optional channel per notification type.
-      </div>
-      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-        {isLoading ? (
-          <div style={{ padding: 32, color: 'var(--t3)', textAlign: 'center' }}>Loading…</div>
-        ) : (
-          <table className="tbl" style={{ minWidth: 480 }}>
-            <thead>
-              <tr>
-                <th>Notification</th>
-                <th style={{ textAlign: 'center' }}>Email</th>
-              </tr>
-            </thead>
-            <tbody>
-              {TENANT_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
-                return (
-                  <tr key={type}>
-                    <td style={{ color: 'var(--t0)' }}>{label}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, p.emailEnabled)} />
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      <NotificationPreferences
+        audience="tenant"
+        api={{
+          get:   (url) => get<any[]>(url),
+          patch: (url, body) => api.patch(url, body).then(r => r.data),
+        }}
+      />
     </div>
   )
 }

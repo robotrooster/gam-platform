@@ -66,7 +66,12 @@ function cartFromTicket(t: any): CartItem[] {
     tax: Number(i.tax) || 0, cat: i.cat || '', icon: '📦', chargeEligible: true, stayUnit: null,
     reservation: !!i.reservation,
     // 10/5 (Nic, R8): a link's background check stays on it — it cannot be taken off.
-    fixed: !!i.screening,
+    // 10/20 (Nic): nor is a utility bill's line the counter's to change. Settling
+    // the link closes that bill out at the BILL'S figure, so a retyped or
+    // deleted line would take one amount and mark another collected — the
+    // server refuses it (assertUtilityBillLinesKept) and the register does not
+    // offer it. To stop asking for it, close the link under Pay Links.
+    fixed: !!i.screening || !!i.utilityBillId,
     ...(i.reservation && Number(i.nights) > 0 ? { nights: Number(i.nights) } : {}),
   }))
 }

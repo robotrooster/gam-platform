@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { insertPosSale } from '../services/posSale'
 import { recordSaleTowardStay } from '../services/stayPayments'
+import { UTILITY_TYPES, type UtilityType } from '@gam/shared'
 import { cardFeeSplit, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -27,6 +28,10 @@ import {
 import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor,
   priceWholeStay, wholeStayPrice, leaseDepositFor, stayExtensionQuote, extendStayByMonth, payTowardStay, SCREENING_LINE_NAME,
   type ReservationDue, type StayExtension } from '../services/registerStay'
+import {
+  utilityBillsNotPayable, recordUtilityPayLinkSettlement, assertUtilityBillLinesKept,
+  type UtilitySettlementRecorded,
+} from '../services/utilityPayLink'
 import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, screeningCollectedBy, continuousStayNights, screeningPaidForStay, canAttestReturningGuest, attestReturningGuest, RETURNING_GUEST_NOT_ALLOWED, type StayNeeds } from '../services/stayTerms'
 import {
   LINK_PAID_ONLINE, LINK_PAGE_STUCK, reservationNoDiscountWords, reservationPaidWords, reservationWhat, reservationLineName,
@@ -129,6 +134,33 @@ async function salesScope(req: any): Promise<{ propertyId: string | null; scoped
 // guards on POSPage so a negative can't slip in via a direct API call. Optional
 // fields (undefined/null/'') pass through untouched; a present value must parse
 // finite and ≥ 0, else 400. Each entry is [value, human-readable field name].
+// 10/20 (Nic) — WHAT A BUTTON IS, SAID OUT LOUD.
+//
+//   "Propane needs to not be in the utilities category. It needs to be as a
+//    product... That's not a bill back thing. That's a, we charge it at the time
+//    of dispensing... We charge sales tax on it. It's two separate things."
+//
+// pos_items.recovers_utility is the item's own answer: NULL means it is a
+// PRODUCT (dispensed propane, firewood, a dump-station fee) and nothing that
+// sweeps utilities may count its money; a utility type means a sale of it gives
+// back spend on that utility. Before this column the answer was guessed from the
+// category name plus the item name, so renaming Mountain View's "Propane" button
+// to "Propane gas" would have turned $3.30/gal of taxable fuel revenue into gas
+// bill-back recovery.
+//
+// undefined preserves on a PATCH; null clears it back to a product; a string has
+// to be one of the six utilities, because a typo silently stored would be a
+// button that quietly stopped being a product.
+function parseRecoversUtility(raw: unknown): UtilityType | null {
+  if (raw === null || raw === '') return null
+  const v = String(raw)
+  if (!(UTILITY_TYPES as readonly string[]).includes(v)) {
+    throw new AppError(400,
+      `recoversUtility must be one of ${UTILITY_TYPES.join(', ')} — or empty, which means this item is a product, not a utility bill-back`)
+  }
+  return v as UtilityType
+}
+
 function assertNonNeg(...fields: [unknown, string][]): void {
   for (const [val, name] of fields) {
     if (val === undefined || val === null || val === '') continue
@@ -313,7 +345,9 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
   try {
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
             chargeEligible, stockQty, stockMin, stockMax, vendorId, shelfLabelEnabled,
-            propertyId, taxCategoryId } = req.body
+            propertyId, taxCategoryId, recoversUtility } = req.body
+    // 10/20: a new button is a PRODUCT unless the landlord says otherwise.
+    const newRecoversUtility = recoversUtility === undefined ? null : parseRecoversUtility(recoversUtility)
 
     if (!categoryId) {
       throw new AppError(400, 'categoryId is required')
@@ -344,11 +378,11 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
     }
 
     const item = await queryOne<any>(`INSERT INTO pos_items
-      (landlord_id,property_id,name,category_id,icon,cost_price,sell_price,margin_pct,tax_rate,charge_eligible,stock_qty,stock_min,stock_max,vendor_id,shelf_label_enabled,tax_category_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      (landlord_id,property_id,name,category_id,icon,cost_price,sell_price,margin_pct,tax_rate,charge_eligible,stock_qty,stock_min,stock_max,vendor_id,shelf_label_enabled,tax_category_id,recovers_utility)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
       [posLandlordId(req), propertyId, name, categoryId, icon||'📦', costPrice||0, sellPrice,
        margin, taxRate||0, chargeEligible??true, stockQty||0, stockMin||5, stockMax||50,
-       vendorId||null, shelfLabelEnabled??true, taxCategoryId||null])
+       vendorId||null, shelfLabelEnabled??true, taxCategoryId||null, newRecoversUtility])
 
     res.status(201).json({ success: true, data: item })
   } catch (e) { next(e) }
@@ -362,7 +396,13 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     if (!item) throw new AppError(404, 'Item not found')
 
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
-            chargeEligible, stockQty, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId } = req.body
+            chargeEligible, stockQty, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId,
+            recoversUtility } = req.body
+    // 10/20: undefined preserves, null/'' makes it a product, a utility type
+    // makes it that utility's bill-back line.
+    const newRecoversUtility = recoversUtility !== undefined
+      ? parseRecoversUtility(recoversUtility)
+      : (item.recovers_utility as UtilityType | null)
     assertNonNeg([costPrice, 'Cost price'], [sellPrice, 'Sell price'], [marginPct, 'Margin'],
       [taxRate, 'Tax rate'], [stockQty, 'Stock qty'], [stockMin, 'Stock min'], [stockMax, 'Stock max'])
     // S554 (button-sweep bug #12): the item-edit modal sends stockQty but the
@@ -446,12 +486,14 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
       const row = (await c.query<any>(`UPDATE pos_items SET
         name=$1, category_id=$2, icon=$3, cost_price=$4, sell_price=$5, margin_pct=$6,
         tax_rate=$7, charge_eligible=$8, stock_min=$9, stock_max=$10, vendor_id=$11,
-        is_active=$12, property_id=$13, tax_category_id=$15, stock_qty=$16, updated_at=NOW() WHERE id=$14 RETURNING *`,
+        is_active=$12, property_id=$13, tax_category_id=$15, stock_qty=$16,
+        recovers_utility=$17, updated_at=NOW() WHERE id=$14 RETURNING *`,
         [name??item.name, newCategoryId, icon??item.icon,
          newCostPrice, newSellPrice, newMargin,
          taxRate??item.tax_rate, chargeEligible??item.charge_eligible,
          stockMin??item.stock_min, stockMax??item.stock_max,
-         newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId, newStockQty])).rows[0]
+         newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId, newStockQty,
+         newRecoversUtility])).rows[0]
 
       // Audit a manual stock correction made through the edit form.
       if (newStockQty !== item.stock_qty) {
@@ -911,6 +953,18 @@ interface CounterStayAt {
   checkIn: string | null
   /** 10/5 (Nic, R7): the guest's email — whose back-to-back stays add up, and where a paid background check goes. */
   guestEmail: string | null
+  /**
+   * 10/20: the name on the ticket. A returning guest is waived their background
+   * check off their own history, and an ADDRESS alone can never prove who
+   * somebody is — a couple shares a mailbox — so stayNeeds corroborates an
+   * email match against the name (services/stayTerms samePersonName). Without
+   * it a returning guest with no GAM account was charged the $42.94 at the
+   * counter while the same guest booking online was waived, which is the kind
+   * of difference a front-desk person cannot explain to anybody.
+   *
+   * The register has always sent it; the counter just never read it.
+   */
+  guestName: string | null
   /** 10/5 (Nic, R2): the counter's answer for a stay of 30+ nights — lease or no lease. */
   stayTerms: StayTerms | null
   /** 10/5 (Nic, R6): "Add a month" — the stay here now that the month lengthens. */
@@ -951,6 +1005,7 @@ function counterStayAt(items: any[], stay: unknown): CounterStayAt | null {
   return {
     unitId, checkIn, extendBookingId,
     guestEmail: strOrNull(s?.guestEmail) ?? strOrNull(line?.stayEmail),
+    guestName: strOrNull(s?.guestName) ?? strOrNull(line?.stayName),
     stayTerms: (STAY_TERMS as readonly string[]).includes(terms) ? terms as StayTerms : null,
     screeningFee: fee == null || fee === '' || !Number.isFinite(Number(fee)) ? null : Number(fee),
     returningGuest: s?.returningGuest === true || line?.stayReturning === true,
@@ -1138,7 +1193,8 @@ async function priceCounterStay(landlordId: string, propertyId: string | null, i
     const priced = await priceWholeStay(db, at.unitId, stayUnit, qty, at.checkIn,
       (unit, word) => `Site ${unit} has no ${word} rate set, and neither does the property, so this stay cannot be priced — nothing was charged. `
         + `Set the site's ${word} rate (or the property's), then press ${press} again.`)
-    const needs = await stayNeeds({ landlordId, propertyId, email: at.guestEmail, checkIn: at.checkIn, checkOut: priced.checkOut, stayTerms: at.stayTerms,
+    const needs = await stayNeeds({ landlordId, propertyId, email: at.guestEmail, guestName: at.guestName,
+      checkIn: at.checkIn, checkOut: priced.checkOut, stayTerms: at.stayTerms,
       returning: at.returningGuest, offerReturning: opts.offerReturning })
     const terms = needs.leaseChoice === 'lease' || needs.leaseChoice === 'stay' ? needs.leaseChoice : null
     // R2/R4: a lease is paid its deposit now; its lease bills the rest (and prorates, by the property's setting).
@@ -2313,6 +2369,11 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       }
     }
     const linkStay = linkRes?.stay ?? null
+    // 10/20 (Nic): "a paylink's utility line settles the bill and counts as
+    // recovery." Settling it here closes the bill out at the BILL'S figure, so
+    // the bill's own line is not the cashier's to reprice, shrink, untax or
+    // leave out — the same refusal Adjust gives, before anything is priced.
+    if (payLink) assertUtilityBillLinesKept(payLink, items, 'Charge')
     // 10/2: a pay link's own lines are its bill, and a stay balance or a
     // one-off sent from a lease carries no register item. Settling THAT link
     // at the counter may charge those lines — only the link's own (same name,
@@ -2636,6 +2697,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // Links the sale closes (its reservation paid in full); their card pages are closed once it commits.
     let closedWithSale: ClosedLink[] = []
     let linkScreeningAfterCommit: (() => Promise<void>) | null = null
+    // What settling this link's utility bills did — read once the sale commits.
+    let utilitySettled: UtilitySettlementRecorded | null = null
 
     // 10/5 (Nic, A5) — THE BACKGROUND CHECK IS GAM'S MONEY, NEVER BOTH WAYS.
     // A card (the reader, a card on file) lands on GAM's balance: the check's
@@ -2782,6 +2845,28 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         }
       }
 
+      // 10/20 (Nic): a utility bill on this link that was paid some other way
+      // since the link went out — settled at another register, paid on their
+      // portal bill, collected on another link — is the same money twice. The
+      // card page HOLDS such a payment for the landlord to refund, because the
+      // card was already charged (finalizePayLink). At the counter nothing has
+      // been taken yet, so it is refused instead: read under the bills' own
+      // locks, before the sale is written and before a card authorization is
+      // captured, so a second register settling the same link waits here and
+      // then loses rather than closing the bill out twice.
+      if (payLink) {
+        const utilityGone = await utilityBillsNotPayable(client, payLink)
+        if (utilityGone) {
+          // 10/20 (review): the step has to be one that WORKS. Opening the
+          // link again would show the same link asking for the same settled
+          // bill and refuse again — a loop at the front desk. The link is
+          // still open, so Close is reachable, and closing it lets go of the
+          // bill (releaseUtilityPayLinkSettlements) rather than holding it.
+          throw new AppError(409, `${utilityGone.note} Nothing was charged here. `
+            + 'Press Clear; to stop asking for it, close the link under Pay Links.')
+        }
+      }
+
       let tx: any
       try {
         // S648: the writes live in services/posSale so a paid pay link records
@@ -2822,6 +2907,17 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             throw new AppError(409, 'That pay link was paid a moment ago — nothing was charged here. Press Clear; it is no longer owed.')
           }
           await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, payLink.id])
+          // 10/20 (Nic): "a paylink's utility line settles the bill and counts as
+          // recovery" — AT THE COUNTER TOO. "A lot of people that move out are
+          // going to get their final electric bill as a pay link anyway", and
+          // plenty of them walk in with cash instead of paying the card page.
+          // Same call as the card page (finalizePayLink), in the sale's own
+          // transaction: the bills this link named are closed out, the charge
+          // comes off the payer's invoice so nobody is asked for the same
+          // kilowatts twice, and every utility line on the sale is written down
+          // as money given back. Left out, the till took the money and the bill
+          // stayed owed — and the link could never be closed to let go of it.
+          utilitySettled = await recordUtilityPayLinkSettlement(client, { link: payLink, saleId: tx.id })
           // 10/2 (review): paid at the desk is paid — the link's reservation is
           // the guest's, exactly as when it is paid online (settleLinkBooking):
           // confirmed and no longer an unpaid hold another payer can take.
@@ -3086,6 +3182,14 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const chosen = await chooseStayTerms(stayBooking.bookingId, stayPlan.terms, { byUserId: req.user!.userId })
           .catch((e) => { logger.error({ err: e, bookingId: stayBooking!.bookingId, saleId: tx.id }, '[POS] the lease-or-stay answer could not be carried out after the sale'); return null })
         leaseId = chosen?.leaseId ?? null
+      }
+      // 10/20 (review): a utility charge another record points at (an account
+      // credit against it, a bank match in flight) could not be taken off the
+      // payer's bill, so the bill is paid and the charge still reads as owed.
+      // Never silent: it needs a human. (Same answer as the card page.)
+      if (utilitySettled?.chargesHeld.length) {
+        logger.error({ payLinkId: payLink?.id, saleId: tx.id, charges: utilitySettled.chargesHeld },
+          '[POS] a utility bill was paid at the counter but its charge could not be taken off the payer\'s bill — it still reads as owed')
       }
       // A pay link settled here: its background check, and its lease-or-stay answer, the same as paid online.
       if (linkScreeningAfterCommit) await linkScreeningAfterCommit()
@@ -4066,6 +4170,9 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     // guest paid on top, and this refund can hand that back too. Its share is
     // stored as the card fee given back (earlyCheckOut.saleRefundCardFeeShare)
     // and left out of the tax — it was never the sale's income or its tax.
+    // 10/20: utility bills this refund put back on the books, told to the
+    // account holder once the refund has committed.
+    let utilityRefund: Awaited<ReturnType<typeof import('../services/utilityPayLink').reopenUtilityPayLinkSettlements>> | null = null
     const { saleRefundTax, saleRefundCardFeeShare } = await import('../services/earlyCheckOut')
     const cardFeeBack = await saleRefundCardFeeShare(client, tx.id, refundAmt)
     const taxRefunded = await saleRefundTax(client, tx.id, refundAmt, cardFeeBack)
@@ -4077,6 +4184,35 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     await client.query(`UPDATE pos_transactions SET
       status=$1, refund_amount=$2, refunded_at=NOW() WHERE id=$3`,
       [isFullRefund ? 'refunded' : 'partial_refund', cumulativeRefunded, tx.id])
+
+    // 10/20 (Nic) — WHAT A REFUND DOES TO UTILITY COLLECTED ON A PAY LINK.
+    //
+    // If this sale had closed out somebody's utility bill on a pay link, a
+    // refund of the WHOLE sale means that money was not recovered after all:
+    // the bill is owed again and the settlement stops counting
+    // (services/utilityPayLink).
+    //
+    // 10/20 (fix): a PART refund does not. The first build reopened every bill
+    // on the sale for a refund of any size, so a $5 goodwill refund on a $44.94
+    // electric bill asked the resident for $44.94 again while $39.94 of their
+    // money was in the bank — and on a two-bill link it reopened the bill
+    // nobody had refunded a cent of. Short of the whole refundable sale going
+    // back, nothing says WHICH of the sale's lines the money came off, so GAM
+    // re-bills nobody and tells the account holder instead. `isFullRefund` is
+    // that test, and it is computed here because this is where the sale's money
+    // arithmetic lives (it is already net of a background check, which is GAM's
+    // and is never handed back).
+    //
+    // Inside the refund's own transaction either way: a bill left reading paid
+    // after every dollar of its money went back is the one outcome worse than a
+    // refund that fails.
+    const { reopenUtilityPayLinkSettlements } = await import('../services/utilityPayLink')
+    utilityRefund = await reopenUtilityPayLinkSettlements(client, {
+      saleId: tx.id,
+      reason: `Refunded $${refundAmt.toFixed(2)} on ${new Date().toISOString().slice(0, 10)}`,
+      refundedAmount: refundAmt,
+      fullyRefunded: isFullRefund,
+    })
 
     if (resolvedMethod === 'charge' && flexChargeAccountId) {
       const { postFlexChargeRefund } = await import('../services/flexCharge')
@@ -4090,6 +4226,17 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
 
     await client.query('COMMIT')
     txnOpen = false
+
+    // 10/20 (Nic): somebody has to know — after the commit, and never able to
+    // fail the refund. Either the bill is owed again, or it is still closed out
+    // and a person has to say whether the part refund was the utility.
+    if (utilityRefund?.owedAgain.length) {
+      const { tellLandlordUtilityOwedAgain } = await import('../services/utilityPayLink')
+      await tellLandlordUtilityOwedAgain(utilityRefund.owedAgain)
+    } else if (utilityRefund?.partRefund) {
+      const { tellLandlordUtilityPartRefund } = await import('../services/utilityPayLink')
+      await tellLandlordUtilityPartRefund(utilityRefund.partRefund)
+    }
 
     // 10/3 (review, decisions #23): a refund never touches a reservation — the
     // schedule is where stays change. Say so, so the clerk cancels it there

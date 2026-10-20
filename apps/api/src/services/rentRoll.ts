@@ -573,6 +573,13 @@ export interface RegisterSale {
     stayUnit?: string | null
     /** The line's own tax rate (pos_transaction_items.tax_rate, a fraction); absent when none. */
     taxRate?: string | number | null
+    /**
+     * 10/20: what the line WAS when it sold (pos_transaction_items.recovers_utility)
+     * — which utility it gives back, or null for a product. Absent only when the
+     * query did not read the column, in which case the old name/category guess
+     * stands in.
+     */
+    recoversUtility?: UtilityType | string | null
   }>
   /** The sale's tax, and its named taxes when the register wrote them (pos_transactions.tax_breakdown). */
   tax?: string | number
@@ -591,8 +598,41 @@ export interface RegisterSale {
  * utility. Propane sold at the counter names none: it is a sale, not a
  * bill-back (S635, Nic: delivered to the unit = utility; sold at the counter =
  * the register's price).
+ *
+ * 10/20 (Nic) — `recoversUtility` IS THE ANSWER WHENEVER THE LINE CARRIES IT.
+ *
+ *   "Propane needs to not be in the utilities category. It needs to be as a
+ *    product... That's not a bill back thing."
+ *
+ * The two strings were never a safe way to decide what money is. A category is
+ * free text the landlord renames, the item name is free text too, and both came
+ * off the request body until 10/20 — so "Propane" under a category named
+ * "Utilities" was a product only by luck of spelling, and "Propane gas" would
+ * have read as gas recovery. pos_transaction_items.recovers_utility now says it
+ * outright, snapshotted from the item when the sale was rung up: a utility type,
+ * or NULL meaning a PRODUCT.
+ *
+ * So: pass the column and it decides, NULL included — a line that says it is a
+ * product is a product and no name is consulted. Leave it off (undefined) and
+ * the old strings answer, which is what a caller with no column to hand gets.
+ * BEWARE the difference: a SELECT that forgets to list recovers_utility hands
+ * this undefined and quietly falls back to guessing.
+ *
+ * The open-month query below deliberately does NOT read the column yet. The
+ * breakdown's "Electric bill-back" label is held to the string rule by tests
+ * that insert pos_transaction_items rows by hand without it, and a column these
+ * fixtures leave NULL would read as "product" and blank the label. Switching the
+ * query over is one line plus those fixtures, and belongs with whoever owns the
+ * recovery report — see the matching registerUtilityType in routes/utility.ts.
  */
-export function registerBillBackOf(category: string | null | undefined, name: string | null | undefined): UtilityType | null {
+export function registerBillBackOf(
+  category: string | null | undefined,
+  name: string | null | undefined,
+  recoversUtility?: UtilityType | string | null,
+): UtilityType | null {
+  if (recoversUtility !== undefined) {
+    return recoversUtility ? (recoversUtility as UtilityType) : null
+  }
   if (!/^utilit/i.test(String(category ?? ''))) return null
   const n = String(name ?? '')
   if (/\belectric/i.test(n)) return 'electric'
@@ -624,7 +664,7 @@ export function saleParts(s: RegisterSale, o: { shareC: number; screeningC: numb
   const parts: OpenMonthSalePart[] = []
   const lines = s.lines ?? []
   for (const l of lines) {
-    const billBack = registerBillBackOf(l.category, l.name)
+    const billBack = registerBillBackOf(l.category, l.name, l.recoversUtility)
     parts.push({
       kind: 'item', label: String(l.name ?? '').trim() || 'Item',
       what: billBack ? `${UTILITY_TYPE_LABEL[billBack]} bill-back` : l.stayUnit ? 'Site rent' : null,

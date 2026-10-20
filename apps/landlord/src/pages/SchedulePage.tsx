@@ -14,6 +14,7 @@ import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
 import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, workTradeTermsFrom, workTradeLine, workTradeEditPayload, type WorkTradeTerms } from '../components/WorkTradeTermsFields'
 import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RETURNING_GUEST_DETAIL, type ReturningOffer } from '../components/ReturningGuestChoice'
 import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
+import { ReservationImportModal, MIGRATED_DOOR_LABEL, stayLockWords } from './ReservationImport'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -444,6 +445,82 @@ export function isScheduleBarLocked(booking: any): boolean {
   return kind === 'lease' || kind === 'checked_out' || kind === 'no_show'
 }
 
+/**
+ * 10/20 (Nic, his own catch) — THE SITE IS LOCKED EVEN THOUGH THE DATES ARE NOT.
+ *
+ *   "They may have already gotten a confirmation on a space number. Our system
+ *    with compression and expansion is going to kind of screw that up if they
+ *    think they're locked to a specific site already."
+ *
+ * A pinned stay is a different kind of locked from the one above. Its DATES are
+ * still the calendar's to change — a snowbird adds a month all the time — so it
+ * is not isScheduleBarLocked and its bar still drags. What is not the board's to
+ * change is its SPACE, because a space number is already in the guest's hands.
+ * So a cross-site drop asks first (commitDrag) and the server refuses an
+ * unconfirmed one outright (routes/units, code 'locked_site').
+ */
+export function isScheduleBarSiteLocked(booking: any): boolean {
+  return scheduleBarKind(booking) !== 'lease' && booking?.lockedToUnit === true
+}
+
+/**
+ * 10/20 (Nic) — WHAT THE PANEL SAYS ABOUT A STAY SOMEBODY MOVED BY HAND.
+ *
+ * A stay moved off a promised space is still pinned, but nobody promised the
+ * space it is on now, so the import's two reasons no longer describe it (the
+ * booking PATCH rewrites the stored reason the moment the move goes through —
+ * see migration 20261022140000). These are the words for that third reason;
+ * they live here because this screen is the only place that causes it, and the
+ * fact they have to carry is the one the desk needs: there is a stale space
+ * number out there, and somebody may still have to say so.
+ */
+export const SITE_MOVED_BY_HAND_REASON = 'moved_off_promised_site'
+export const SITE_MOVED_BY_HAND_WORDS =
+  'Moved here by hand, off the space they were promised — the space in their confirmation is no longer theirs'
+export const scheduleStayLockWords = (lockReason: string | null | undefined): string =>
+  lockReason === SITE_MOVED_BY_HAND_REASON ? SITE_MOVED_BY_HAND_WORDS : stayLockWords(lockReason)
+
+// ── 10/20 (Nic, his own catch): MOVING A STAY OFF THE SPACE IT WAS PROMISED ──
+//
+//   "They may have already gotten a confirmation on a space number. Our system
+//    with compression and expansion is going to kind of screw that up if they
+//    think they're locked to a specific site already."
+//
+// Every move GAM makes itself refuses a pinned stay. A person may move one —
+// the guest agreed on the phone, the site flooded, the rig is too long — but
+// never quietly, because the cost of quiet is a rig pulling in to find somebody
+// parked on the space in its confirmation.
+/** Why the stay is pinned, in the clause the question reads out. */
+const LOCK_HELD_BECAUSE: Record<string, string> = {
+  promised_before_gam: 'was promised this space before GAM, in the old system',
+  promised_at_the_counter: 'was promised this space at the desk',
+  [SITE_MOVED_BY_HAND_REASON]: 'was already moved here by hand, off the space they were promised',
+}
+/** A lock with no reason recorded: somebody ticked the box (S547's snowbird). */
+const LOCK_HELD_FALLBACK = 'is pinned to this space by hand'
+
+/**
+ * The question asked before a person drags a pinned stay to another space.
+ *
+ * The server refuses an unconfirmed move (409 'locked_site') and sends these
+ * same words back, so a page that loaded before the stay was pinned gets the
+ * question too — the screen is not the guard. Asking here as well means a drag
+ * the screen can already see coming is answered in one press, not two.
+ *
+ * Three things, because all three decide whether a rig arrives at the right
+ * space: which number is in the guest's hand, where they are going, and
+ * whether GAM can tell them it changed.
+ */
+export function promisedSiteWords(b: any, toUnitNumber: string): string {
+  const who = (b?.guestName || '').trim() || 'This guest'
+  const from = b?.unitNumber || 'their site'
+  const tell = (b?.guestEmail || '').trim()
+    ? `We will email them that their site is now ${toUnitNumber}.`
+    : 'We have no email address for them, so somebody has to call them — GAM cannot tell them.'
+  return `${who} ${LOCK_HELD_BECAUSE[b?.lockReason as string] || LOCK_HELD_FALLBACK}, so ${from} is the number they have. `
+    + `Moving them to ${toUnitNumber} means ${from} is no longer theirs. ${tell}`
+}
+
 export function SchedulePage() {
   const qc = useQueryClient()
   const { can } = usePerms()
@@ -478,6 +555,8 @@ export function SchedulePage() {
   const [typeForm, setTypeForm] = useState<any>({})
   const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
+  // 10/20: the "Bring in reservations" door (./ReservationImport).
+  const [importOpen, setImportOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
   // 10/5 (Nic, R2): lease or no lease — asked when a save makes a stay 30+
   // nights in a row. The answer rides on the same save, sent again.
@@ -1231,6 +1310,14 @@ export function SchedulePage() {
   }
   const avoidedWords = (b: any, unitNumber: string) =>
     `${(b?.guestName || '').trim() || 'This guest'} asked not to be on ${unitNumber}.`
+  // The same question when the server is the one that asked it — a page that
+  // loaded before the stay was pinned, or an Edit that changed the site.
+  const askLockedIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'locked_site') return false
+    appConfirm(body.error, { confirmLabel: 'Move them there' }).then(ok => { if (ok) resend() })
+    return true
+  }
   // 10/12 (Nic, G6): a shorter stay past rent a payment was tried on — the
   // landlord chooses here, at the moment: take those charges off (anything
   // paid on them goes back to the guest as credit), or keep them owed. The
@@ -1250,18 +1337,27 @@ export function SchedulePage() {
   }
 
   const moveBookingMut = useMutation(
-    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean; pastEndAttempted?: string}) =>
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean; overrideLocked?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
         unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
         ...(payload.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/20 (Nic): confirmed after "… so RV 14 is the number they have" (askLockedIf).
+        ...(payload.overrideLocked ? { overrideLocked: true } : {}),
         ...(payload.pastEndAttempted ? { pastEndAttempted: payload.pastEndAttempted } : {}),
       }),
     {
       // 10/5 (M3): a drag that made the stay need a background check says what was sent.
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); sayStaySaved(r?.stay) },
+      onSuccess: (r: any) => {
+        qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+        sayStaySaved(r?.stay)
+        // 10/20 (Nic): a pinned stay moved by hand — whether the guest has
+        // been told their space number changed, or a call is owed.
+        if (r?.siteMoved) toast(r.siteMoved)
+      },
       onError: (e: any, payload) => {
         if (takeLatestIfChanged(e)) return
         if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
+        if (askLockedIf(e, () => moveBookingMut.mutate({ ...payload, overrideLocked: true }))) return
         if (askAvoidedIf(e, () => moveBookingMut.mutate({ ...payload, overrideAvoided: true }))) return
         if (askShortenedIf(e, (choice) => moveBookingMut.mutate({ ...payload, pastEndAttempted: choice }))) return
         toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
@@ -1417,7 +1513,7 @@ export function SchedulePage() {
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
   const editBookingMut = useMutation(
-    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean; pastEndAttempted?: string}) =>
+    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean; overrideLocked?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${vars.orig.unitId}/bookings/${vars.orig.id}`, {
         guestName: vars.form.guestName.trim() || null,
         guestEmail: vars.form.guestEmail.trim() || null,
@@ -1437,6 +1533,8 @@ export function SchedulePage() {
         ...withTerms(),
         // 10/6: confirmed after "They asked not to be on …" (askAvoidedIf).
         ...(vars.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/20 (Nic): confirmed after "… so RV 14 is the number they have" (askLockedIf).
+        ...(vars.overrideLocked ? { overrideLocked: true } : {}),
         // 10/12 (G6): the landlord's answer for rent a payment was tried on (askShortenedIf).
         ...(vars.pastEndAttempted ? { pastEndAttempted: vars.pastEndAttempted } : {}),
         // 10/6 (Nic): returning guest, and the stay's work trade — ticked,
@@ -1460,10 +1558,14 @@ export function SchedulePage() {
         sayStaySaved(b?.stay)
         // 10/6 (review): a returning guest's check fee that had already gone out came off.
         if (b?.returningFeeNote) toast(b.returningFeeNote)
+        // 10/20 (Nic): the Edit form changes the site too, so it says the same
+        // thing a drag does about a pinned stay that just moved.
+        if (b?.siteMoved) toast(b.siteMoved)
       },
       onError: (e:any, vars) => {
         if (takeLatestIfChanged(e, { inForm: true })) return
         if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
+        if (askLockedIf(e, () => editBookingMut.mutate({ ...vars, overrideLocked: true }))) return
         if (askAvoidedIf(e, () => editBookingMut.mutate({ ...vars, overrideAvoided: true }))) return
         if (askShortenedIf(e, (choice) => editBookingMut.mutate({ ...vars, pastEndAttempted: choice }))) return
         setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
@@ -1820,11 +1922,23 @@ export function SchedulePage() {
     if (oooOverlaps(tUnitId, newCheckIn, newCheckOut)) { toast.error('That site is out of order for those dates.'); return }
     // 10/6 (Nic): a site the guest asked not to have is a plain question, never a quiet move.
     const avoided = !sameUnit && ((b.avoidedUnitIds || []) as string[]).includes(tUnitId)
+    // 10/20 (Nic, his own catch): and neither is a space the guest was already
+    // promised. The server refuses this move without overrideLocked, so the
+    // question is asked here rather than sending a drag out to be rejected.
+    const siteLocked = !sameUnit && isScheduleBarSiteLocked(b)
     const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut,
-      ...(avoided ? { overrideAvoided: true } : {}) })
+      ...(avoided ? { overrideAvoided: true } : {}),
+      ...(siteLocked ? { overrideLocked: true } : {}) })
     const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
+    // Everything the person pressing needs to know, in the order it matters:
+    // the promised space first (a rig arrives at the wrong one), then the space
+    // they asked not to have, then whether the site even fits the rig.
+    const lockedAsk = siteLocked ? promisedSiteWords(b, targetUnit.unitNumber) : ''
     if (mismatchReasons.length) {
-      appConfirm(`${avoided ? `${avoidedWords(b, targetUnit.unitNumber)}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+      const asks = [lockedAsk, avoided ? avoidedWords(b, targetUnit.unitNumber) : ''].filter(Boolean)
+      appConfirm(`${asks.length ? `${asks.join('\n\n')}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided || siteLocked ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided || siteLocked ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+    } else if (siteLocked) {
+      appConfirm(`${lockedAsk}${avoided ? `\n\n${avoidedWords(b, targetUnit.unitNumber)}` : ''}\n\nMove them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else if (avoided) {
       appConfirm(`${avoidedWords(b, targetUnit.unitNumber)} Move them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else {
@@ -2034,6 +2148,14 @@ export function SchedulePage() {
           <RequiredPropertySelect value={schedulePropertyId} onChange={setSchedulePropertyId}
             properties={schedulePropertyOptions} />
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} reservations</span>
+          {/* 10/20 (Nic): the reservations that ALREADY EXIST — the old system's
+              schedule first, then the ones out of his text threads. Its own
+              door, beside this one, because nothing about it is a new
+              reservation: the guest has been told, may have paid, and may have
+              been promised a space. Nobody is emailed by it. */}
+          {can('schedule.create_reservation') && schedulePropertyId && (
+            <button className="btn btn-primary btn-sm" onClick={()=>setImportOpen(true)}>Bring in reservations</button>
+          )}
           {can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>}
         </div>
       </div>
@@ -2164,6 +2286,10 @@ export function SchedulePage() {
                     // scheduleBarKind above. Finished history locks like a lease.
                     const barKind = booking ? scheduleBarKind(booking) : 'reserved'
                     const barLocked = !!booking && isScheduleBarLocked(booking)
+                    // 10/20 (Nic): pinned to its space. Its dates still drag —
+                    // that is why this is not barLocked — but dropping it on
+                    // another site asks first (commitDrag).
+                    const barSiteLocked = !!booking && isScheduleBarSiteLocked(booking)
                     const isStart = booking && (dayOnly(booking.checkIn) === d || dayOnly(booking.startDate) === d)
                     // Last cell of this reservation within the grid, so the bar
                     // rounds only at its true ends. S527 W-21: conventions differ —
@@ -2261,6 +2387,10 @@ export function SchedulePage() {
                                 data-bar-id={booking.id}
                                 data-bar-kind={barKind}
                                 data-bar-locked={barLocked ? 'true' : 'false'}
+                                // 10/20 (Nic): the space is pinned even when
+                                // the dates are not, so the board says which
+                                // bars a cross-site drop will stop to ask about.
+                                data-bar-site-locked={barSiteLocked ? 'true' : 'false'}
                                 // 10/3 (fix pass 2): moving or stretching a stay is an edit. A desk
                                 // person who may only check guests in or out does not get a bar
                                 // that drags only to be refused.
@@ -3189,6 +3319,58 @@ export function SchedulePage() {
                     </div>
                   )}
                 </div>
+                {/* 10/20 (Nic): WHY THIS STAY CANNOT BE MOVED, where the desk
+                    reads the stay. "They may have already gotten a confirmation
+                    on a space number. Our system with compression and expansion
+                    is going to kind of screw that up if they think they're
+                    locked to a specific site already." A lock with no reason on
+                    screen is a lock somebody unlocks to free up a space, and
+                    then a guest who was promised 14 arrives to find a rig on
+                    it. */}
+                {/* 10/20 (Nic, his own catch): and never a reason that lies.
+                    This read "Locked to RV 09 — Promised this space before GAM"
+                    after somebody dragged Dale off RV 14 — a sentence about a
+                    promise nobody made, with the one fact that mattered (the
+                    number in his hand is wrong now) nowhere on the screen.
+                    scheduleStayLockWords reads the reason the move itself
+                    wrote. */}
+                {!isLease && d.lockedToUnit && (
+                  <><div style={{color:'var(--text-3)'}}>Locked to {d.unitNumber}</div>
+                  <div data-testid="stay-lock-reason" style={{color:'var(--gold)',lineHeight:1.45}}>{scheduleStayLockWords(d.lockReason)}</div></>
+                )}
+                {/* Where this reservation came from, when it was not taken here.
+                    The guest has already been told, so GAM does not confirm
+                    them again (routes/bookings) — and the desk can see why no
+                    confirmation has gone out. */}
+                {!isLease && d.migratedDoor && (
+                  <><div style={{color:'var(--text-3)'}}>Came from</div>
+                  <div style={{lineHeight:1.45}}>
+                    {MIGRATED_DOOR_LABEL[d.migratedDoor] ?? 'Brought in from somewhere else'}
+                    {/* 10/20: what GAM has and has not sent this guest. This said
+                        GAM had not emailed them while the morning-of site reveal
+                        was emailing them a site number anyway; the reveal now
+                        reads the same fact this line reports (jobs/scheduler
+                        revealTodaysSites), so the two can no longer disagree. */}
+                    {d.confirmationSentAt ? (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        We emailed them their confirmation on{' '}
+                        {new Date(d.confirmationSentAt).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
+                        {' '}— their site follows on the morning they arrive.
+                      </div>
+                    ) : (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        {d.toldOutsideGam ? 'Already told they have this reservation, so' : ''}
+                        GAM has emailed them nothing — not even their site on the morning
+                        they arrive — until somebody sends the confirmation.
+                      </div>
+                    )}
+                    {d.depositOffPlatformMethod && (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        Their deposit was paid outside GAM — written down here, never processed by us.
+                      </div>
+                    )}
+                  </div></>
+                )}
                 {/* 10/18 (Nic): the guest HAS been asked, so nobody asks them a
                     fourth time — and the desk can see the ask went out even
                     though the deposit has not landed. */}
@@ -3334,6 +3516,18 @@ export function SchedulePage() {
         </div>
         )
       })()}
+
+      {/* 10/20 (Nic): bringing in the old system's schedule, and the texted ones
+          after it. It sends nothing; the schedule simply refetches when it is
+          done so the new bars appear. */}
+      {importOpen && schedulePropertyId && (
+        <ReservationImportModal
+          propertyId={schedulePropertyId}
+          propertyName={schedulePropertyOptions.find((p: any) => p.id === schedulePropertyId)?.name || 'this park'}
+          onClose={() => setImportOpen(false)}
+          onDone={() => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setImportOpen(false) }}
+        />
+      )}
 
       {cancelFor && (
         <CancelReservationModal booking={cancelFor}

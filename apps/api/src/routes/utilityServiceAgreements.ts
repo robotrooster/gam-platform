@@ -10,6 +10,8 @@ import { replyToProperty } from '../services/replyRouting'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { portalLink } from '../lib/portalUrls'
 import { accountTiedElsewhere, NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
+import { resolveLateFeePolicyForUnit, lateFeePolicyToAgreementStamp } from '../services/lateFeePolicy'
+import { UNIT_TYPES, UNIT_TYPE_LABEL } from '@gam/shared'
 
 const PLACEHOLDER_HASH = '$2b$10$placeholder_invite_pending'
 
@@ -95,6 +97,13 @@ const createBody = z.object({
   propertyId:   z.string().uuid(),
   /** How the landlord refers to the space. Shows on the invoice. */
   label:        z.string().trim().min(1).max(40),
+  /** 10/20: what the space IS — and so which of the property's per-unit-type
+   *  late-fee policies this agreement inherits. A type classifies, it never
+   *  prices: every figure still comes from the policy row for that class.
+   *  Left out (the landlord page does not ask yet) the space is an apartment,
+   *  which is what every unit in GAM starts as and the case this door was
+   *  built for — "the apartment on your meter". */
+  unitType:     z.enum(UNIT_TYPES).optional(),
   serviceAddress: z.string().trim().max(200).optional(),
   note:         z.string().trim().max(500).optional(),
   billingDueDay: z.number().int().min(1).max(31).default(1),
@@ -121,13 +130,15 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       const body = createBody.parse(req.body)
       const emailNorm = body.payer.email.toLowerCase()
 
+      // 10/20: NO late-fee columns read here any more. properties.late_fee_*
+      // held a $15 flat fee that came from a schema DEFAULT nobody chose (Nic,
+      // 10/19: "I never set $5 or $15 flat. It's the leases are right ... I
+      // don't know how the $15 ever came to be"), the defaults are gone, and
+      // every property now reads empty. The real policy is per (property, unit
+      // type) and is resolved below, from the same resolver that stamps a
+      // lease.
       const property = await queryOne<any>(
-        `SELECT id, landlord_id, name, street1, city, state, zip,
-                late_fee_enabled, late_fee_grace_days,
-                late_fee_initial_amount, late_fee_initial_type,
-                late_fee_accrual_amount, late_fee_accrual_type,
-                late_fee_accrual_period,
-                late_fee_cap_amount, late_fee_cap_type
+        `SELECT id, landlord_id, name, street1, city, state, zip
            FROM properties WHERE id = $1`, [body.propertyId])
       if (!property) throw new AppError(404, 'Property not found')
       if (!canAccessLandlordResource(req.user, property.landlord_id)) {
@@ -186,13 +197,21 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       //    carry meter assignments, a trash-can quantity and a RUBS share like
       //    any other — marked utility_service so nothing treats it as rentable,
       //    listable or bookable. No rent: there is no tenancy to charge for.
+      //    10/20: it carries a unit_type, because that is what selects the
+      //    late-fee policy below (and the lease template, if the space is ever
+      //    leased). COALESCE rather than a bare parameter: a space whose type
+      //    nobody stated keeps the same 'apartment' every other unit in GAM
+      //    starts as, instead of being written NULL — which would resolve no
+      //    policy at all and read as a deliberate "no late fee".
       const unitRes = await client.query<{ id: string }>(
         `INSERT INTO units (property_id, landlord_id, unit_number, status,
                             rent_amount, security_deposit, bedrooms, bathrooms,
-                            owner_household_size, is_bookable)
-         VALUES ($1, $2, $3, 'utility_service', 0, 0, 0, 0, $4, false)
+                            owner_household_size, is_bookable, unit_type)
+         VALUES ($1, $2, $3, 'utility_service', 0, 0, 0, 0, $4, false,
+                 COALESCE($5::text, 'apartment'))
          RETURNING id`,
-        [body.propertyId, landlordId, body.label, body.householdSize])
+        [body.propertyId, landlordId, body.label, body.householdSize,
+         body.unitType ?? null])
       const unitId = unitRes.rows[0].id
 
       // 2. The payer's account. Same shape the tenant invite flow uses — the
@@ -248,10 +267,52 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
         tenantId = t.rows[0].id
       }
 
-      // 3. The agreement, with the property's late-fee policy STAMPED onto it.
+      // 3. THE LATE-FEE TERMS — THE SAME ONES A LEASE WOULD BE DRAFTED WITH.
+      //
+      //    10/20 (Nic), on this inheriting nothing: "Yeah, fucking fix it."
+      //
+      //    This used to copy the figures off the PROPERTY row. Nothing ever
+      //    wrote those columns: the $15 flat with a 5-day grace that the two
+      //    agreements made on 10/6 still carry came from a schema default.
+      //    With those defaults gone every property reads empty, so the copy
+      //    wrote a NULL into late_fee_initial_type, which is NOT NULL: adding
+      //    a serviced space was a 500 on every property, and had it got past
+      //    that it would have handed a utility customer a bill that could
+      //    never go late. One source of truth for a late fee in GAM: the per
+      //    (property, unit type) policy, resolved by the resolver a lease
+      //    uses, for the space this agreement is attached to.
+      //
+      //    NO POLICY FOR THAT CLASS → NO LATE FEE, AND THE ANSWER SAYS SO.
+      //    It does not refuse. A lease is still drafted in that state (S577
+      //    retired the forced-decision gate: assertLateFeeDecision is a no-op,
+      //    and a class with no row simply has no late fee), and GAM
+      //    accommodates rather than blocks — refusing here would stop a
+      //    landlord billing the neighbor's electric at all over an unanswered
+      //    late-fee question. What it must never do is invent a figure, so it
+      //    writes the switch off with every figure empty and reports
+      //    lateFee.source = 'none', which is the honest state.
+      //
+      //    SAID PLAINLY, because the earlier wording here claimed more than
+      //    the code does: recording a policy for that class AFTERWARDS does
+      //    NOT give this agreement a fee. The stamp is read once, here, and
+      //    nothing re-reads it — PATCH below writes the service address, the
+      //    note, the due day, the status and the end date, and no late-fee
+      //    column anywhere. That is the same deal a lease gets (a lease
+      //    drafted for a class with no policy carries no fee for its whole
+      //    term and only picks the policy up at renewal), except an agreement
+      //    has no renewal to pick it up at. So the way to have a fee on this
+      //    space is to record the class's policy BEFORE adding the space — and
+      //    to say which class the space is, which is what unitType above is
+      //    for. Whether an agreement should be able to take a policy recorded
+      //    later is a product question for Nic, not something to decide here:
+      //    bills already issued under no fee would be the first thing it
+      //    touched.
+      //
       //    Read once, here, and never again — S558's rule that the instrument
       //    is the charge. A policy change next March must not silently reprice
       //    a bill this person already agreed to.
+      const policy = await resolveLateFeePolicyForUnit(unitId, client)
+      const lateFee = lateFeePolicyToAgreementStamp(policy)
       const saRes = await client.query<{ id: string }>(
         `INSERT INTO utility_service_agreements (
            landlord_id, unit_id, tenant_id, service_address, note,
@@ -259,22 +320,21 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
            late_fee_enabled, late_fee_grace_days,
            late_fee_initial_amount, late_fee_initial_type,
            late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period,
-           late_fee_cap_amount, late_fee_cap_type,
+           late_fee_accrual_from, late_fee_cap_amount, late_fee_cap_type,
            payer_attested_at, payer_attested_by, payer_attestation_note
          ) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::date, CURRENT_DATE),$8,
-                   $9,$10,$11,$12,$13,$14,$15,$16,$17,
-                   CASE WHEN $18::boolean THEN NOW() ELSE NULL END,
-                   CASE WHEN $18::boolean THEN $8::uuid ELSE NULL END,
-                   $19)
+                   $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                   CASE WHEN $19::boolean THEN NOW() ELSE NULL END,
+                   CASE WHEN $19::boolean THEN $8::uuid ELSE NULL END,
+                   $20)
          RETURNING id`,
         [landlordId, unitId, tenantId, body.serviceAddress ?? null,
          body.note ?? null, body.billingDueDay, body.startDate ?? null,
          req.user!.userId,
-         property.late_fee_enabled, property.late_fee_grace_days,
-         property.late_fee_initial_amount, property.late_fee_initial_type,
-         property.late_fee_accrual_amount, property.late_fee_accrual_type,
-         property.late_fee_accrual_period,
-         property.late_fee_cap_amount, property.late_fee_cap_type,
+         lateFee.enabled, lateFee.graceDays,
+         lateFee.initialAmount, lateFee.initialType,
+         lateFee.accrualAmount, lateFee.accrualType, lateFee.accrualPeriod,
+         lateFee.accrualFrom, lateFee.capAmount, lateFee.capType,
          body.payerAlreadyAgreed ?? false, body.payerAgreementNote ?? null])
 
       await client.query('COMMIT')
@@ -300,9 +360,37 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
       }
 
       // S654: the response never carries a link.
+      // 10/20: it does carry the late fee the agreement was stamped with, so
+      // the page can tell the landlord what this space's overdue bill will
+      // cost — including, plainly, when the answer is nothing because the
+      // property has no policy recorded for that class of space.
       res.status(201).json({
         success: true,
-        data: { id: saRes.rows[0].id, unitId, tenantId },
+        data: {
+          id: saRes.rows[0].id, unitId, tenantId,
+          lateFee: {
+            source: policy ? 'unit_type_policy' : 'none',
+            unitType: body.unitType ?? 'apartment',
+            // The printable name, so nothing downstream has to humanize an
+            // enum value on screen.
+            unitTypeLabel: UNIT_TYPE_LABEL[body.unitType ?? 'apartment'],
+            enabled: lateFee.enabled,
+            graceDays: lateFee.graceDays,
+            initialAmount: lateFee.initialAmount,
+            initialType: lateFee.initialType,
+            accrualAmount: lateFee.accrualAmount,
+            // 10/20: every amount ships with the TYPE that gives it meaning.
+            // Without these two, $5 a day and 5% of rent a day are the same
+            // number on the wire, and the screen this is for would print
+            // "$5 a day" for a percentage. Every policy recorded today is
+            // flat, so nothing is wrong on screen yet — the contract was.
+            accrualType: lateFee.accrualType,
+            accrualPeriod: lateFee.accrualPeriod,
+            accrualFrom: lateFee.accrualFrom,
+            capAmount: lateFee.capAmount,
+            capType: lateFee.capType,
+          },
+        },
       })
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})

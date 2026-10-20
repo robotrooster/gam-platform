@@ -273,23 +273,27 @@ describe('GET /api/properties/:id', () => {
       })
   }
 
-  it('S486: NV property with 10% percent-of-rent default → state_law_warnings flag', async () => {
+  it('hidden 10/20: NV property 10% over the seeded cap → the detail page gets nothing', async () => {
+    // Nic, 10/20: "There should be no state law warnings anywhere in the
+    // system. At least not right now. Just hide all that stuff." This is the
+    // property-detail banner — the one that started the conversation, since it
+    // reads the properties.late_fee_* columns nothing writes any more.
     const f = await seedPropsFixture()
     await seedNvLateFeeCap()
     const prop = await createNvProperty(f)
-    // Patch to set the late-fee config above the NV cap.
     await request(buildApp())
       .patch(`/api/properties/${prop.body.data.id}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
-    // GET should recompute and surface the warning.
     const res = await request(buildApp())
       .get(`/api/properties/${prop.body.data.id}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
+    // Field kept (always empty) so the one switch restores the banner without
+    // a code change — proven both ways in services/stateLaw.test.ts.
     expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    expect(res.body.data.state_law_warnings[0].topic).toBe('late_fee_max_pct')
+    expect(res.body.data.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|NRS /i)
   })
 
   it('S486: AZ property with 10% percent-of-rent → empty (no late_fee_max_pct seeded)', async () => {
@@ -513,7 +517,8 @@ describe('PATCH /api/properties/:id — late-fee accrual all-or-nothing', () => 
       })
   }
 
-  it('S481: NV late fee 10% (above 5% cap) → state_law_warnings flag', async () => {
+  it('hidden 10/20: NV late fee 10% over the seeded cap → the save says nothing about it', async () => {
+    // The landlord's edit still saves; what is gone is GAM's opinion about it.
     const f = await seedPropsFixture()
     await seedNvLateFeeCap()
     const prop = await createNvProperty(f)
@@ -522,12 +527,10 @@ describe('PATCH /api/properties/:id — late-fee accrual all-or-nothing', () => 
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
     expect(res.status).toBe(200)
+    expect(Number(res.body.data.late_fee_initial_amount)).toBe(10)
     expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    const flag = res.body.data.state_law_warnings[0]
-    expect(flag.topic).toBe('late_fee_max_pct')
-    expect(flag.message).toMatch(/above the 5/)
-    expect(flag.message).toMatch(/NV/)
+    expect(res.body.data.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|NRS /i)
   })
 
   it('S481: NV late fee 4% (within 5% cap) → state_law_warnings empty', async () => {

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Bell, CheckCheck, ExternalLink } from 'lucide-react'
-import { humanize } from '@gam/shared'
+import { notificationLabel } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 
 type Notification = {
@@ -19,31 +19,12 @@ type Notification = {
   emailSentAt: string | null
 }
 
-const TYPE_LABEL: Record<string, string> = {
-  rent_collected:                'Rent collected',
-  rent_failed:                   'Rent failed',
-  ach_retry_scheduled:           'ACH retry scheduled',
-  ach_retries_exhausted:         'ACH retries exhausted',
-  disbursement_sent:             'Disbursement sent',
-  maintenance_submitted:         'Maintenance request',
-  inspection_tenant_signed:      'Tenant signed inspection',
-  inspection_finalized:          'Inspection finalized',
-  inspection_scheduled_reminder: 'Inspection reminder',
-  entry_request_responded:       'Entry response',
-  lease_expiring:                'Lease expiring',
-  low_stock:                     'Low POS stock',
-  tenant_invite_accepted:        'Tenant accepted invite',
-  dispute_resolved:              'Dispute resolved',
-  // S651: mail to somebody is not arriving. humanize() would render this
-  // 'Email undeliverable', which is jargon for the one notice that has to be
-  // read and acted on. (memory: gam-no-raw-enums-in-ui)
-  email_undeliverable:           'Email not arriving',
-  // 10/12 (Nic): the morning home-sale start (services/homeSale
-  // tellLandlordSaleStarted / tellOnceSaleNotStarted). humanize() read them as
-  // 'Home sale started' — the notice is about the buyer's home PAYMENTS.
-  home_sale_started:             'Home payments started',
-  home_sale_not_started:         'Home payments not started',
-}
+// 10/20 (Nic): the feed's label map is gone. It was a hand-kept subset that
+// fell back to humanize(), so a type nobody had added read as its own enum with
+// the underscores opened up — the same drift that left the settings page short
+// twenty-two types. notificationLabel() reads the one catalog, so the words in
+// the feed and the words on the settings page are the same words, and a retired
+// type still reads in plain English.
 
 // Types whose place is a page, not a record in `data` (the home-sale notices
 // carry the agreement's documentId, which has no page of its own: the signed
@@ -156,7 +137,7 @@ export function NotificationsPage() {
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
                       <strong style={{ color: 'var(--text-0)' }}>{n.title}</strong>
                       <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{new Date(n.createdAt).toLocaleString()}</span>
-                      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>· {TYPE_LABEL[n.type] || humanize(n.type)}</span>
+                      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>· {notificationLabel(n.type)}</span>
                     </div>
                     <div style={{ fontSize: '.85rem', color: 'var(--text-2)', lineHeight: 1.45 }}>{n.body}</div>
                     <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>

@@ -24,6 +24,7 @@ import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedUtilityMeter,
 } from '../test/dbHelpers'
 import { generateBillsForMeter, billMoveOutRead } from './utilityBilling'
+import { generateLateFeesForTimezone } from '../jobs/lateFees'
 import { getReadsDue } from './utilityReadingRuns'
 import { generateServiceAgreementInvoices } from '../jobs/serviceAgreementInvoices'
 import {
@@ -512,6 +513,151 @@ describe('syncStayUtilityAgreement (R11)', () => {
     expect((await syncStayUtilityAgreement(b)).action).toBe('ended')
     const { rows: [ended] } = await db.query(`SELECT status, end_date::text AS e FROM utility_service_agreements WHERE booking_id = $1`, [b])
     expect(ended).toEqual({ status: 'ended', e: await day(40) })
+  })
+
+  /*
+   * 10/20 — THE LATE FEE ON A STAY'S UTILITY AGREEMENT.
+   *
+   * Nic, told it was inheriting the dead property columns: "Yeah, fucking fix
+   * it." This is the door that actually made both live agreements (RV 10 and
+   * RV 11 at Mountain View on 10/6), and both still carry a $15 flat fee with
+   * a 5-day grace that came from a schema default nobody chose.
+   *
+   * The park's recorded policy for an RV site is nothing to start and $5 a day
+   * counted from the due date itself. The property's own late_fee_* figures are
+   * set to junk here on purpose: if $99 or an 11-day grace reaches an
+   * agreement, it read the dead columns.
+   */
+  async function rvSite(opts: { policyFor?: string | null } = {}) {
+    const w = await world()
+    await db.query(
+      `UPDATE properties SET timezone = 'America/Phoenix', late_fee_enabled = true,
+                             late_fee_grace_days = 11, late_fee_initial_amount = 99,
+                             late_fee_initial_type = 'flat'
+        WHERE id = $1`, [w.propertyId])
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const siteId = await seedUnit(c, {
+        propertyId: w.propertyId, landlordId: w.landlordId, rentAmount: 900, unitType: 'rv_spot',
+      })
+      if (opts.policyFor) {
+        await c.query(
+          `INSERT INTO property_unit_type_late_fees
+             (property_id, unit_type, late_fee_grace_days,
+              late_fee_initial_amount, late_fee_initial_type,
+              late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period,
+              late_fee_accrual_from)
+           VALUES ($1, $2, 5, 0, 'flat', 5, 'flat', 'daily', 'due_date_inclusive')`,
+          [w.propertyId, opts.policyFor])
+      }
+      await c.query('COMMIT')
+      return { ...w, siteId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const stamp = async (bookingId: string) => (await db.query<any>(
+    `SELECT late_fee_enabled, late_fee_grace_days,
+            late_fee_initial_amount::text AS initial, late_fee_initial_type,
+            late_fee_accrual_amount::text AS accrual, late_fee_accrual_type,
+            late_fee_accrual_period, late_fee_accrual_from,
+            late_fee_cap_amount, late_fee_cap_type
+       FROM utility_service_agreements WHERE booking_id = $1`, [bookingId])).rows[0]
+
+  it('gets NO late fee even where the site HAS a policy — a stay already paid', async () => {
+    // 10/20 (Nic), asked whether to re-stamp RV 10 and RV 11 with Mountain
+    // View's real RV policy instead of the $15 they carry: "they paid when they
+    // arrived, so why would there ever be a late fee? Stays are paid ahead of
+    // time, so they should never have late fees. It's not the same as a lease.
+    // Stays are paid for the duration at the time they show up."
+    //
+    // So the answer was not the right fee, it was no fee. This site's recorded
+    // policy is $0 then $5 a day — what a LEASE here would be drafted with —
+    // and the stay takes none of it.
+    const w = await rvSite({ policyFor: 'rv_spot' })
+    const b = await booking(w, w.siteId, { from: 0, to: 35, email: email('rvfee'), terms: 'stay' })
+    expect((await syncStayUtilityAgreement(b, { byUserId: w.userId })).action).toBe('created')
+
+    const sa = await stamp(b)
+    expect(sa).toMatchObject({
+      late_fee_enabled: false,
+      late_fee_grace_days: null,
+      late_fee_accrual_type: null,
+      late_fee_accrual_period: null,
+      late_fee_cap_amount: null,
+      late_fee_cap_type: null,
+    })
+    expect(sa.initial).toBeNull()
+    expect(sa.accrual).toBeNull()
+  })
+
+  it('a site whose class has no policy recorded gets NO late fee, not an invented one', async () => {
+    // The park has an apartment policy and no RV-site one — the state both of
+    // Nic's parks are in for some class of space.
+    const w = await rvSite({ policyFor: 'apartment' })
+    const b = await booking(w, w.siteId, { from: 0, to: 35, email: email('nofee'), terms: 'stay' })
+    expect((await syncStayUtilityAgreement(b, { byUserId: w.userId })).action).toBe('created')
+
+    const sa = await stamp(b)
+    expect(sa).toMatchObject({
+      late_fee_enabled: false,
+      late_fee_grace_days: null,
+      late_fee_accrual_type: null,
+      late_fee_accrual_period: null,
+      late_fee_cap_amount: null,
+      late_fee_cap_type: null,
+    })
+    expect(sa.initial).toBeNull()
+    expect(sa.accrual).toBeNull()
+    // The one column that cannot be empty (NOT NULL) carries a type with no
+    // amount behind it, which is inert — the engine writes nothing without an
+    // initial amount. That is what the old code relied on by accident; here it
+    // is the deliberate no-fee stamp.
+    expect(sa.late_fee_initial_type).toBe('flat')
+  })
+
+  it('and the engine charges NOTHING on it — a $60 bill 21 days unpaid stays $60', async () => {
+    const w = await rvSite({ policyFor: 'rv_spot' })
+    const b = await booking(w, w.siteId, { from: -25, to: 35, email: email('rvmoney'), terms: 'stay' })
+    const r = await syncStayUtilityAgreement(b, { byUserId: w.userId })
+    expect(r.action).toBe('created')
+    const agreementId = (r as { agreementId: string }).agreementId
+    const { rows: [sa] } = await db.query<{ tenant_id: string }>(
+      `SELECT tenant_id FROM utility_service_agreements WHERE id = $1`, [agreementId])
+
+    // Its utility bill, due 20 days ago and never paid. Written 3 days BEFORE
+    // its due date, so lateness counts from the due date rather than the day
+    // GAM wrote it (jobs/lateFees lateCountsFrom).
+    const TZ = 'America/Phoenix'
+    const { rows: [d] } = await db.query<{ due: string }>(
+      `SELECT ((NOW() AT TIME ZONE $1)::date - 20)::text AS due`, [TZ])
+    const { rows: [inv] } = await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, unit_id, service_agreement_id,
+                             invoice_number, due_date, subtotal_utilities, total_amount,
+                             status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6::date,60,60,'pending',
+               ($6::date - 3 + TIME '12:00') AT TIME ZONE $7)
+       RETURNING id`,
+      [w.landlordId, sa.tenant_id, w.siteId, agreementId,
+       `INV-${randomUUID().slice(0, 8)}`, d.due, TZ])
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, tenant_id, landlord_id, type, amount,
+                             status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'utility',60,'pending',$5::date,'UTILITY')`,
+      [inv.id, w.siteId, sa.tenant_id, w.landlordId, d.due])
+
+    await generateLateFeesForTimezone(TZ)
+
+    const { rows: fees } = await db.query<{ amount: string }>(
+      `SELECT amount::text AS amount FROM payments
+        WHERE invoice_id = $1 AND type = 'late_fee'`, [inv.id])
+    // THE MONEY PROOF of the rule above. A guest three weeks past due on their
+    // final $60 of power owes $60, not $165. They paid for their whole stay the
+    // day they pulled in; the power that follows them out is a bill the desk
+    // sends, not a debt to penalize. A LEASE on this same site, with this same
+    // policy, would be charged the $5 a day — that is the distinction, and it
+    // is tested on the lease side.
+    expect(fees).toHaveLength(0)
   })
 
   it('a lease chosen later ends it — the lease pays the utilities', async () => {

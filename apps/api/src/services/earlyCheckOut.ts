@@ -92,6 +92,7 @@ import crypto from 'crypto'
 import {
   EARLY_CHECKOUT_CHOICES, EARLY_CHECKOUT_CHOICE_LABEL, EARLY_CHECKOUT_REFUND_CHOICES,
   priceNightsStayed, type EarlyCheckoutChoice, type StayRefundPartKind,
+  type NotificationType, UTILITY_TYPE_LABEL, type UtilityType,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
@@ -104,6 +105,11 @@ import { recordBookingEvent } from './bookingEvents'
 // whether or not migration 20261020120000 has landed on this database yet.
 // services/departureRules is the one place that knows.
 import { departureRuleSql } from './departureRules'
+// 10/20 (Nic): "I would like to call it a wash." ONE module decides whether a
+// departure's final utility is eaten or billed and holds the money kept beside
+// it (services/earlyDepartureWash). This file RECORDS the consequence of the
+// money answer it already made; it never decides the money a second time.
+import { recordMoneyKeptOnDeparture, repricedStayTaxForBooking, unwindWash } from './earlyDepartureWash'
 
 type Q = Pick<PoolClient, 'query'>
 /** The pool, in the shape a quote reads with (outside any transaction). */
@@ -595,18 +601,64 @@ export const waitsForRefundWords = (guest: string, extra: number) =>
 // sentence says the figure and does NOT tell the clerk the stay closes, because
 // it does not: the price as booked stands, and standing means the rest is still
 // owed.
-export const noStayRefundWords = (guest: string, extra: number, booked: number, stillOwed = 0) =>
+export const noStayRefundWords = (guest: string, extra: number, booked: number, stillOwed = 0, washed = '') =>
   `${guest} paid ${money(extra)} more than the nights they stayed are worth, but this property does not `
   + `give money back when a guest leaves early — so nothing goes back and the price as booked, ${money(booked)}, `
   + 'stands. '
   + (stillOwed > 0.005
     ? `${money(stillOwed)} of that price is still owed and stays on the stay after they are checked out.`
     : 'Check them out and the stay closes.')
+  + (washed ? ` ${washed}` : '')
   + ' The property\'s settings are where that changes.'
-export const noLeaseRefundWords = (guest: string, ahead: number) =>
+export const noLeaseRefundWords = (guest: string, ahead: number, washed = '') =>
   `${guest} had paid ${money(ahead)} of rent past the day they left. This property does not give money back `
   + 'when someone leaves early, so it stays on their account as money paid ahead and pays their final bill '
-  + 'first. The property\'s settings are where that changes.'
+  + 'first.'
+  + (washed ? ` ${washed}` : '')
+  + ' The property\'s settings are where that changes.'
+
+// 10/20 (Nic) — CALL IT A WASH, SAID AT THE DESK.
+//
+//   "We don't refund the money, but we also don't bill them a final electric
+//    bill. We need to still get the meter reads to close it out."
+//
+// A clerk who keeps a guest's money has to be able to tell them the whole trade
+// in one breath, so the sentence that says the money stays says the power does
+// not follow them either. The guest's own account shows nothing about it —
+// "it doesn't need to get attached to anything" — which is exactly why the
+// desk has to say it out loud: nothing else ever will.
+/** The sentence that goes with the money staying here. */
+export const washKeptWords = (utilities: string): string =>
+  `Because that money stayed here, their final ${utilities} bill is a wash: the closing read is still taken `
+  + 'to close the space out, but nothing is billed to them for it.'
+/** The same trade in the one line a choice shows. */
+export const washChoiceWords = (utilities: string): string =>
+  `Their final ${utilities} bill is a wash — nothing is billed to them for it.`
+
+/**
+ * What this space's OWN meters bill whoever lives on it, in plain words
+ * ("electric", "electric and water"), or null where nothing does.
+ *
+ * Nic's standing rule is that the meter and unit setup decides what bills, not
+ * the lease — so this asks the setup. Submetered only, and never trash: the
+ * wash covers the usage between their last billed read and the CLOSING READ,
+ * and a flat monthly charge or a pooled RUBS share has no read of their own to
+ * close. Where a space has none, the desk is told nothing about a final utility
+ * bill, because there is no bill to not send and a clerk reading "no final
+ * electric bill" on a site with no meter would rightly ask what bill.
+ */
+async function submeteredUtilitiesOn(q: Q, unitId: string): Promise<string | null> {
+  const rows = (await q.query<{ utility_type: string }>(
+    `SELECT DISTINCT m.utility_type
+       FROM utility_meter_units mu
+       JOIN utility_meters m ON m.id = mu.meter_id
+      WHERE mu.unit_id = $1 AND m.billing_method = 'submeter'
+        AND m.utility_type <> 'trash' AND NOT m.out_of_service
+      ORDER BY 1`, [unitId])).rows
+  const names = rows.map((r) => (UTILITY_TYPE_LABEL[r.utility_type as UtilityType] ?? r.utility_type).toLowerCase())
+  if (!names.length) return null
+  return names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
 
 /**
  * The money question for checking this stay out on `leftOn` (default: the
@@ -667,6 +719,14 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
     : B
   let S = early && priced > 0 ? round2(Math.min(priced, B)) : B
 
+  // 10/20 (Nic) — read once, here, because both the no-money-back sentence and
+  // the "No refund" choice carry it, and they are built in different branches
+  // below. Only on an early departure: nobody who left on their booked day is
+  // told anything about a wash.
+  const washUtil = early ? await submeteredUtilitiesOn(q, s.unit_id) : null
+  const washKept = washUtil ? washKeptWords(washUtil) : ''
+  const washChoice = washUtil ? washChoiceWords(washUtil) : ''
+
   const isLease = !!s.lease_id
   let sources: MoneySource[]
   let P: number
@@ -707,7 +767,8 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
           + (givesMoneyBack
             ? 'Rent already paid past that day can be refunded next.'
             : 'Rent already paid past that day stays on their account as money paid ahead and pays that bill first — '
-              + 'this property does not give money back when someone leaves early.'),
+              + 'this property does not give money back when someone leaves early.'
+              + (washKept ? ` ${washKept}` : '')),
       }
       P = round2(sources.reduce((a, x) => a + x.paid, 0))
       S = P
@@ -720,7 +781,7 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
         if (!givesMoneyBack) {
           // It stays on their account as money paid ahead, which is where it
           // already is — and pays their final bill first.
-          noRefunds = noLeaseRefundWords(guest, ahead.total)
+          noRefunds = noLeaseRefundWords(guest, ahead.total, washKept)
           // A question already open stays answerable, "No refund" its only
           // answer — otherwise the pending row and the owner's to-do could
           // never be cleared by anybody (10/19 review).
@@ -759,7 +820,7 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
           // The price as booked stands. What they paid stays with the landlord;
           // anything still short of the booked price stays owed, and the
           // sentence says so (noStayRefundWords takes the figure).
-          noRefunds = noStayRefundWords(guest, extra, B, round2(Math.max(0, B - P)))
+          noRefunds = noStayRefundWords(guest, extra, B, round2(Math.max(0, B - P)), washKept)
           if (questionOpen) { question = 'overpaid'; unused = extra; maxRefund = 0 }
         } else {
           question = 'overpaid'
@@ -793,9 +854,13 @@ export async function quoteEarlyCheckOut(q: Q, bookingId: string, opts: {
       result: owesNights > 0.005 ? `They will owe ${money(owesNights)}` : 'Nothing more is owed' })
   } else if (question === 'overpaid') {
     if (opts.canRefund) {
+      // 10/20 (Nic): choosing this IS the wash, so the choice says what it
+      // costs the landlord as well as what it keeps.
+      const nothingBack = isLease
+        ? `The ${money(unused)} stays on their account as money paid ahead — it pays their final bill first`
+        : owedAsBooked > 0.005 ? `Nothing goes back, and they still owe ${money(owedAsBooked)}` : 'Nothing goes back'
       choices.push({ choice: 'no_refund', label: EARLY_CHECKOUT_CHOICE_LABEL.no_refund,
-        result: isLease ? `The ${money(unused)} stays on their account as money paid ahead — it pays their final bill first`
-          : owedAsBooked > 0.005 ? `Nothing goes back, and they still owe ${money(owedAsBooked)}` : 'Nothing goes back' })
+        result: washChoice ? `${nothingBack}. ${washChoice}` : nothingBack })
       const refundable = Math.min(unused, maxRefund)
       if (refundable > 0.005) {
         const parts = planRefund(sources, refundable)
@@ -1238,6 +1303,14 @@ export async function decideEarlyCheckOut(input: DecideInput): Promise<DecideRes
       // counter and on a pay link. It does nothing unless the flags really do
       // claim more than is still with the landlord.
       await syncPaidFlags(client, s.id, quote)
+      // 10/20 (Nic): nobody was asked, but the money stayed here all the same,
+      // so the wash is recorded with the check-out rather than waiting on a
+      // meter read that may be weeks out — or never come, on a site with no
+      // meter, where the money kept is still half of what Nic wants to see.
+      await recordWashFromQuote(client, s, quote, {
+        recordedBy: input.actor.userId,
+        notes: 'This property does not give money back when someone leaves early, so nobody was asked.',
+      })
     }
     await client.query('COMMIT')
   } catch (e) {
@@ -1283,6 +1356,9 @@ export async function decideEarlyCheckOut(input: DecideInput): Promise<DecideRes
     const ended = await endLeaseOnLeftDay(input.bookingId)
     const leading = ended ? [] : [LEASE_NOT_ENDED_WORDS]
     if (ended) await askPaidAheadQuestion(input.bookingId, input.actor.userId, { tellOwner: !input.actor.canRefund })
+    // 10/20 (Nic): and where the park asks nobody, the rent that stayed behind
+    // is the wash — now that the sync has banked it as money paid ahead.
+    if (ended) await recordWashNobodyWasAsked(input.bookingId, input.actor.userId)
     return checkedOutResult(input.bookingId, input.actor, leading)
   }
 
@@ -1418,6 +1494,109 @@ async function askPaidAheadQuestion(bookingId: string, actorUserId: string, opts
   } finally { c.release() }
   // A to-do for the owner only when the person here cannot decide it.
   if (created && opts.tellOwner) await tellOwnerMoneyWaits(bookingId).catch(() => {})
+}
+
+/**
+ * 10/20 (Nic) — CALL IT A WASH: THE MONEY THAT STAYED HERE, RECORDED.
+ *
+ *   "I would like to keep track of money that wasn't refunded versus electric
+ *    that should have been billed that wasn't charged to see how close we
+ *    actually get to evening out."
+ *
+ * The money the guest handed over comes from the quote the person at the desk
+ * was looking at, and the worth it is set against comes from the wash module's
+ * own pricer — because the row holds a PRE-TAX cash fact and the desk's figure
+ * is priced tax in (see the note on the subtraction below). No money is decided
+ * again either way; the answer is already made and this writes down what it
+ * cost.
+ *
+ * THE DAY THEY HAD PAID THROUGH IS PASSED, and it has to be: checking a long
+ * stay out moves booked_check_out to the day they left (writeCheckOut, #38 Q8),
+ * so the day they had booked survives only in the schedule's history event —
+ * which this quote has already read (bookedDayBeforeEarlyCheckOut). Left to
+ * read the booking's own columns, the wash service sees somebody who left on
+ * the very day they booked through and records nothing at all.
+ */
+async function recordWashFromQuote(client: PoolClient, s: StayRow, quote: Quote, o: {
+  decisionId?: string | null; recordedBy: string; notes?: string | null
+}): Promise<void> {
+  if (!quote.early) return
+  // 10/20 (review) — THE LODGING TAX COMES OFF ONCE, AND NOT HERE.
+  //
+  // What the desk was shown is priced TAX IN, at the rate stamped on this
+  // booking: 14 nights of the RV 10 shape are worth $572.16, not $538.00. The
+  // wash row holds what the till is actually up — $589.00 − $538.00 = $51.00 —
+  // because the report prices the tax a re-logged two-week stay would owe when
+  // it READS the row (washPairing, at the property's rate today) and takes it
+  // off there. Subtracting the quote's tax-in worth here took the tax twice:
+  // $16.84 stamped, less $35.51 priced on the way out, and the landlord's card
+  // read "Money you kept $0.00" on a departure Nic worked by hand as $15.49.
+  //
+  // So the pre-tax worth comes from the ONE place that defines it, the wash
+  // module's own pricer — the same function, the same rates, the same
+  // proration answer the reader uses — and the two writers of amount_kept
+  // finally agree whichever of them gets there first.
+  //
+  // A LONG stay is the other shape and takes nothing off: checking one out
+  // ends its lease, so what is on the table is the RENT paid past that day
+  // (#38 Q8) and the quote's worth is 0 on purpose. Pricing the nights they
+  // did stay against that rent took two weeks of stay off money that was never
+  // a stay charge — and a departure with less rent behind it than the nights
+  // are worth came to nothing and got no row at all, while its power was
+  // absorbed anyway.
+  const rst = await repricedStayTaxForBooking(client, s.id, quote.leftOn, { leased: !!s.lease_id })
+  // No rates on the space (or rent rather than a stay price), so nothing can be
+  // re-priced: the quote's own worth is all there is, which is what the reader
+  // falls back to as well.
+  const worth = rst.pretaxWorth ?? quote.stayed.worth
+  const kept = round2(Math.max(0, quote.paid - worth))
+  if (!(kept > 0)) return
+  await recordMoneyKeptOnDeparture({
+    landlordId: s.landlord_id,
+    ref: { bookingId: s.id, leaseId: s.lease_id },
+    propertyId: s.property_id, unitId: s.unit_id,
+    checkoutDecisionId: o.decisionId ?? null,
+    departedOn: quote.leftOn, paidThrough: quote.booked.checkOut,
+    amountKept: kept, refundGiven: false, refundAmount: 0,
+    recordedBy: o.recordedBy, notes: o.notes ?? null,
+    client,
+  })
+}
+
+/**
+ * A property that does not give money back puts NO question to the desk
+ * (`noRefunds`, 10/18), so there is no decision to hang the wash on — but real
+ * money stayed here, and without this row somebody is billed for power they
+ * would not have used.
+ *
+ * On its own transaction after the check-out, because a long stay's paid-ahead
+ * money does not exist until the lease sync has banked it. Best-effort like the
+ * rest of the work out here: the check-out stands either way and a failure is
+ * logged. A SHORT stay is also caught by the billing gate, which reads the same
+ * property setting; a long stay is not, which is the reason this runs.
+ */
+async function recordWashNobodyWasAsked(bookingId: string, actorUserId: string,
+                                        read?: Quote): Promise<void> {
+  try {
+    // The caller's own quote when it has one, so the two never disagree.
+    const quote = read ?? await quoteEarlyCheckOut(poolQ, bookingId, { canRefund: true })
+    if (!quote.noRefunds || !quote.early) return
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const s = await loadStay(c, bookingId, { lock: true })
+      if (s) {
+        await recordWashFromQuote(c, s, quote, { recordedBy: actorUserId,
+          notes: 'This property does not give money back when someone leaves early, so nobody was asked.' })
+      }
+      await c.query('COMMIT')
+    } catch (e) {
+      await c.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { c.release() }
+  } catch (err) {
+    logger.error({ err, bookingId }, '[early-checkout] could not record the money kept on this departure')
+  }
 }
 
 async function upsertPending(client: PoolClient, s: StayRow, quote: Quote, userId: string, key: string | null): Promise<string> {
@@ -1558,6 +1737,29 @@ async function applyDecision(client: PoolClient, s: StayRow, quote: Quote, live:
       WHERE id = $1`,
     [decisionId, choice, priceAfter == null ? null : priceAfter.toFixed(2), refundTotal.toFixed(2), stampedPaid, input.actor.userId,
      S.toFixed(2)])
+  // 10/20 (Nic) — CALL IT A WASH, recorded with the answer that made it one,
+  // in this same transaction: the money side cannot land without the decision
+  // it came from, and the decision cannot land without it.
+  //
+  //   - "No refund" on an overpaid guest IS the wash: the whole unused amount
+  //     stayed with the landlord, so their final utility bills nobody.
+  //   - ANY refund takes it back off — at the desk, this is where "a refund
+  //     issued after the fact" happens too, because a question answered No and
+  //     later refunded comes through here.
+  //   - "Keep the price as booked" and "Charge only the nights stayed" answer
+  //     the OTHER question, a guest who still owed. Nothing was kept, so there
+  //     is nothing to wash: money kept is the question, not money never
+  //     collected.
+  if (quote.early) {
+    if (choice === 'no_refund') {
+      await recordWashFromQuote(client, s, quote, { decisionId, recordedBy: input.actor.userId })
+    } else if (refundTotal > 0) {
+      await unwindWash({
+        landlordId: s.landlord_id, ref: { bookingId: s.id, leaseId: s.lease_id },
+        reason: 'refund_issued', refundAmount: refundTotal, client,
+      })
+    }
+  }
   await recordBookingEvent({
     client, bookingId: s.id, unitId: s.unit_id, landlordId: s.landlord_id, actorUserId: input.actor.userId,
     eventType: 'money_settled', summary,
@@ -2353,7 +2555,7 @@ export async function stripeRefundFailed(refund: { id: string; status?: string |
 // ─── The owner's to-do ───────────────────────────────────────────────────────
 
 async function tellOwner(landlordId: string, n: {
-  type: string; title: string; body: string; bookingId: string | null; unitId: string | null
+  type: NotificationType; title: string; body: string; bookingId: string | null; unitId: string | null
   /** Where the notice opens, when it is not the stay on the schedule (a paid-ahead screen part). */
   actionUrl?: string; data?: Record<string, unknown>
 }): Promise<void> {
@@ -2499,12 +2701,11 @@ export async function onCheckOutUndone(client: PoolClient, bookingId: string,
   const d = (await client.query<{ id: string; status: string; choice: string | null; booked_price: string; stamped_paid: boolean }>(
     `SELECT id, status, choice, booked_price::text, stamped_paid FROM stay_checkout_decisions
       WHERE booking_id = $1 AND status IN ('pending', 'decided') FOR UPDATE`, [bookingId])).rows[0]
-  if (!d) return
-  if (ask) {
+  if (d && ask) {
     const refusal = await checkOutChangeRefusal(bookingId, ask.change, ask.guest, client)
     if (refusal) throw new AppError(409, refusal)
   }
-  if (d.status === 'decided' && d.choice === 'nights_only') {
+  if (d?.status === 'decided' && d.choice === 'nights_only') {
     await client.query(
       `UPDATE unit_bookings
           SET total_amount = $2::numeric,
@@ -2513,8 +2714,30 @@ export async function onCheckOutUndone(client: PoolClient, bookingId: string,
               updated_at = NOW()
         WHERE id = $1`, [bookingId, d.booked_price, d.stamped_paid])
   }
-  await client.query(
-    `UPDATE stay_checkout_decisions SET status = 'undone', undone_at = NOW() WHERE id = $1`, [d.id])
+  if (d) {
+    await client.query(
+      `UPDATE stay_checkout_decisions SET status = 'undone', undone_at = NOW() WHERE id = $1`, [d.id])
+  }
+  // 10/20 (Nic) — THE WASH GOES WITH IT. Putting the booked day back means
+  // they did not leave early after all, so the money kept stops counting and
+  // the final utility is owed again (services/earlyDepartureWash unwindWash:
+  // the wash row is kept and stamped, the absorbed lines come off the book, and
+  // a stub parked on the old answer goes back to normal billing).
+  //
+  // Outside the `d` guard above on purpose: a park that gives no money back
+  // asks nobody, so its washes have no decision row — and those are exactly
+  // the ones that would otherwise be left standing on a departure that no
+  // longer exists.
+  const b = (await client.query<{ landlord_id: string; lease_id: string | null }>(
+    `SELECT b.landlord_id,
+            (SELECT l.id FROM leases l WHERE l.source_booking_id = b.id ORDER BY l.created_at DESC LIMIT 1) AS lease_id
+       FROM unit_bookings b WHERE b.id = $1`, [bookingId])).rows[0]
+  if (b) {
+    await unwindWash({
+      landlordId: b.landlord_id, ref: { bookingId, leaseId: b.lease_id },
+      reason: 'checkout_undone', client,
+    })
+  }
 }
 
 /**
@@ -2537,6 +2760,9 @@ export async function afterPatchEarlyCheckOut(bookingId: string, actorUserId: st
   // gives no money back raises no question here either, and the flags would
   // keep counting money a register refund already sent back.
   if (!s.lease_id && quote.noRefunds) await keepNoRefundFlagsHonest(bookingId, quote)
+  // 10/20 (Nic): and the same wash — this path raises no question either where
+  // the park gives nothing back, so nothing else would ever record it.
+  if (quote.noRefunds) await recordWashNobodyWasAsked(bookingId, actorUserId, quote)
   if (quote.question === 'none' || quote.decision) return null
   const c = await getClient()
   let created = false

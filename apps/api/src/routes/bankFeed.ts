@@ -146,7 +146,42 @@ bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) =>
 // GET /api/bank-feed/connections
 bankFeedRouter.get('/connections', requireBankViewer, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await listConnections(scope(req)) })
+    const landlordId = scope(req)
+    // 10/20 (Nic, ONE BANK LINK): before answering "is a bank linked", find out
+    // whether the landlord already linked one in step one. From this morning on,
+    // the bank they sign into while verifying their business can be read for
+    // transactions, so there is nothing for step two to collect — and this is
+    // what makes the page say so instead of asking again.
+    //
+    // SAY WHAT THIS IS, because it is not a read. On the one request per
+    // landlord that finds a bank to adopt, this GET writes: a bank_connections
+    // row, two Financial Connections subscribes at Stripe, the
+    // connect_bank_checked_at stamp, and a first transaction import. Every
+    // other request short-circuits before Stripe is touched — once a row
+    // exists, and inside ten minutes of an ask that found nothing.
+    //
+    // 10/20 (review): and it is serialized, which it had to be. OnboardingPage
+    // polls this endpoint every four seconds while the landlord sits on step 4,
+    // and the adopting request can take longer than four seconds, so the second
+    // poll used to start the whole adoption again — four subscribes at Stripe
+    // and two transaction imports contending on one connection, with whatever
+    // they collided over swallowed below. ensureOnboardingBankLink now claims
+    // the ask atomically and holds an advisory lock for the adoption, so a
+    // second caller is told `in_flight` and does nothing.
+    //
+    // Nobody who may only READ can reach this: bookkeeper_scopes.access_level is
+    // NOT NULL DEFAULT 'read_write' and bookkeeperMayWrite is true for both
+    // levels, so there is no actor that passes requireBankViewer and would fail
+    // requireBankFiler. If a read-only level is ever added, this call moves.
+    try {
+      const { ensureOnboardingBankLink } = await import('../services/connectBankLink')
+      await ensureOnboardingBankLink(landlordId)
+    } catch (e) {
+      // The list is the answer the page needs; a failed look-up must never be
+      // the reason a landlord cannot see the bank they already have.
+      logger.warn({ err: e, landlordId }, '[bank-feed] onboarding bank look-up failed')
+    }
+    res.json({ success: true, data: await listConnections(landlordId) })
   } catch (e) { next(e) }
 })
 

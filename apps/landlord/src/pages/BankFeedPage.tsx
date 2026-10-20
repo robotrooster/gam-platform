@@ -607,7 +607,29 @@ export function BankFeedPage({ embedded = false, onGoToSetup }: {
                     </div>
                     {/* S652 (Nic): linking a bank authorizes payouts AND debits. A link
                         GAM cannot pull from says so here, with the fix beside it. */}
-                    {c.debitReady
+                    {/* 10/20 (Nic, ONE BANK LINK): a bank connected during
+                        business verification is NOT a broken link, so it does
+                        not get the word "cannot" and an amber warning as if the
+                        landlord had done something wrong. It reads their
+                        transactions, which is what this page is for; collecting
+                        GAM's fees from it is a different Stripe permission on
+                        the same account.
+
+                        10/20 (review): and it is said ONCE. This line used to
+                        hand-write "Connected when you verified your business —
+                        GAM reads it, and takes its fees out of your rent
+                        payouts." and then print c.debitProblem, which is the
+                        API's own two-sentence version of the same fact
+                        (bankFeed.listConnections) — so the landlord read it
+                        twice, with the first half claiming the fees come out of
+                        this account's payouts and the second saying GAM cannot
+                        collect from it, on one line. The API owns the sentence. */}
+                    {c.connectHeld
+                      ? <div style={{ fontSize: '.7rem', color: 'var(--text-2)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <span>{c.debitProblem}</span>
+                          <button className="btn btn-primary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }} onClick={link} disabled={linking}>{linking ? 'Connecting…' : 'Connect for fee collection'}</button>
+                        </div>
+                      : c.debitReady
                       ? <div style={{ fontSize: '.7rem', color: 'var(--green)', marginTop: 2 }}>GAM can pay out to and debit this account.</div>
                       : <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                           <span>GAM cannot debit this account: {c.debitProblem || 'unknown reason'}</span>
@@ -627,7 +649,12 @@ export function BankFeedPage({ embedded = false, onGoToSetup }: {
                           </div>
                         </>
                       : <div style={{ fontSize: '.68rem', color: 'var(--text-3)', maxWidth: 150 }}>
-                          Balance needs a quick re-link
+                          {/* 10/20: a link that was never granted the balance
+                              permission will never report one, so do not send
+                              somebody to re-link the same bank for it. */}
+                          {c.connectHeld && Array.isArray(c.fcPermissions) && !c.fcPermissions.includes('balances')
+                            ? 'Balance isn’t shared through this connection'
+                            : 'Balance needs a quick re-link'}
                         </div>}
                   </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => sync.mutate(c.id)} disabled={sync.isLoading}>
