@@ -646,7 +646,13 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
              AND m.billing_method = 'submeter' AND m.out_of_service = false
        WHERE NOT EXISTS (
           SELECT 1 FROM utility_meter_readings r
-           WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+           WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on
+             -- 10/20: a read HELD for the landlord's double-check closed nothing
+             -- out. A digit dropped at a pull-out used to make this to-do vanish as
+             -- though the walk were done, so nobody went back to the meter and the
+             -- departing guest's power was billed to nobody at all. It stays on the
+             -- list until the number is settled (see billMoveOutRead).
+             AND r.needs_review = false)
        ORDER BY u.id, (d.departed_on = CURRENT_DATE) DESC, d.departed_on
     )
     SELECT property_id, property_name, landlord_id, unit_number, who, confirmed_gone,
@@ -901,7 +907,13 @@ export async function getReadsDue(propertyId: string) {
              ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
      WHERE NOT EXISTS (
         SELECT 1 FROM utility_meter_readings r
-         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on
+           -- 10/20: a read HELD for the landlord's double-check closed nothing
+           -- out. A digit dropped at a pull-out used to make this to-do vanish as
+           -- though the walk were done, so nobody went back to the meter and the
+           -- departing guest's power was billed to nobody at all. It stays on the
+           -- list until the number is settled (see billMoveOutRead).
+           AND r.needs_review = false)
      ORDER BY d.departed_on, u.unit_number, m.label`, [propertyId])
 }
 
@@ -929,7 +941,13 @@ export async function unitPendingReads(unitId: string) {
              ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
      WHERE NOT EXISTS (
         SELECT 1 FROM utility_meter_readings r
-         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on
+           -- 10/20: a read HELD for the landlord's double-check closed nothing
+           -- out. A digit dropped at a pull-out used to make this to-do vanish as
+           -- though the walk were done, so nobody went back to the meter and the
+           -- departing guest's power was billed to nobody at all. It stays on the
+           -- list until the number is settled (see billMoveOutRead).
+           AND r.needs_review = false)
      ORDER BY m.id,
               ((d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills) DESC,
               d.departed_on DESC`,

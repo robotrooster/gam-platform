@@ -2,7 +2,8 @@
  * maintenance-portal route slice — S348.
  *
  * Pins admin-side maintenance staff routes: shifts (clock-in/out),
- * daily tasks, parts inventory, purchase requests, scheduled
+ * the retired landlord-wide task list (10/20 — read only now, see below),
+ * parts inventory, purchase requests, scheduled
  * maintenance. Owner-role JWT (landlord) bypasses each requirePerm
  * gate via OWNER_ROLES; tests exercise the underlying SQL + landlord
  * scope rather than the per-permission allowlist.
@@ -14,6 +15,8 @@
  *   - F2: PATCH /tasks/:id/complete, /parts/:id, /purchases/:id/approve,
  *         /purchases/:id/deny returned 200 with data:null when the row
  *         didn't exist or belonged to another landlord. Now 404.
+ *         (/tasks/:id/complete was removed outright on 10/20 with the tab it
+ *         served — one task list, not two. The pin became "it is gone".)
  *
  * Surfaces not exercised here (mechanical SELECTs with landlord-scoped
  * WHERE, same pattern as the covered POSTs; per-surface tests would be
@@ -106,44 +109,46 @@ describe('POST /api/maintenance-portal/shifts/clock-in + clock-out', () => {
   })
 })
 
-describe('PATCH /api/maintenance-portal/tasks/:id/complete', () => {
-  it('stamps completed_by + completed_at on landlord-scoped row', async () => {
+describe('the old landlord-wide task list is retired (10/20, Nic)', () => {
+  // These two pinned the S348 F2 fix on PATCH /tasks/:id/complete. The endpoint
+  // is GONE now, along with POST /tasks and the "Tasks" tab they fed: Blu's
+  // per-property task list replaced that list, and Nic's answer to two task
+  // lists was the same as his answer to the other duplicated surface that
+  // evening — "that doesn't need to be its own tab, that's kind of ridiculous."
+  // The rows are kept and still readable (GET /tasks); the fold onto the parks
+  // and the record each row keeps are held in routes/oneTaskList.test.ts.
+  it('neither write endpoint exists, and the rows are untouched by trying', async () => {
     const f = await seedMPFixture()
     const created = await request(buildApp())
       .post('/api/maintenance-portal/tasks')
       .set('Authorization', `Bearer ${f.token}`)
       .send({ title: 'Sweep lobby' })
-    expect(created.status).toBe(200)
-    const taskId = created.body.data.id
+    expect(created.status).toBe(404)
+    expect((await db.query(`SELECT id FROM daily_tasks`)).rows.length).toBe(0)
 
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO daily_tasks (landlord_id, title) VALUES ($1, 'Sweep lobby') RETURNING id`,
+      [f.landlordId])
     const done = await request(buildApp())
-      .patch(`/api/maintenance-portal/tasks/${taskId}/complete`)
+      .patch(`/api/maintenance-portal/tasks/${t.rows[0].id}/complete`)
       .set('Authorization', `Bearer ${f.token}`).send({})
-    expect(done.status).toBe(200)
-    expect(done.body.data.completed).toBe(true)
-    expect(done.body.data.completed_by).toBe(f.landlordUserId)
-    expect(done.body.data.completed_at).not.toBeNull()
+    expect(done.status).toBe(404)
+    const row = await db.query<{ completed: boolean }>(
+      `SELECT completed FROM daily_tasks WHERE id = $1`, [t.rows[0].id])
+    expect(row.rows[0].completed).toBe(false)
   })
 
-  it('S348 F2: cross-landlord task id → 404 (was 200 data:null pre-fix)', async () => {
+  it('the record still reads, and only this landlord\'s rows', async () => {
     const a = await seedMPFixture()
     const b = await seedMPFixture()
-    const bTask = await request(buildApp())
-      .post('/api/maintenance-portal/tasks')
-      .set('Authorization', `Bearer ${b.token}`)
-      .send({ title: "b's task" })
-    const bTaskId = bTask.body.data.id
-
-    // a tries to complete b's task
+    await db.query(
+      `INSERT INTO daily_tasks (landlord_id, title) VALUES ($1, 'a task'), ($2, 'b task')`,
+      [a.landlordId, b.landlordId])
     const res = await request(buildApp())
-      .patch(`/api/maintenance-portal/tasks/${bTaskId}/complete`)
-      .set('Authorization', `Bearer ${a.token}`).send({})
-    expect(res.status).toBe(404)
-
-    // b's task untouched
-    const row = await db.query<{ completed: boolean }>(
-      `SELECT completed FROM daily_tasks WHERE id = $1`, [bTaskId])
-    expect(row.rows[0].completed).toBe(false)
+      .get('/api/maintenance-portal/tasks')
+      .set('Authorization', `Bearer ${a.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((t: any) => t.title)).toEqual(['a task'])
   })
 })
 

@@ -85,6 +85,7 @@ import type { ZodTypeAny, output as ZodOutput } from 'zod'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { mergePosCustomers, nameFromCard, cardLabel, MERGE_MOVED_TABLES, type CardIdentity, type MergeRecord } from './posCustomerCards'
+import { inBook, notInBook, askingAs, type BookCaller } from './registerBook'
 
 type Q = Pick<PoolClient, 'query'>
 
@@ -99,21 +100,31 @@ const sameText = (a?: string | null, b?: string | null) =>
   String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase()
 
 /**
- * SQL: tenant `t` is tied to company `l` in ANY way — a lease of any status, an
- * invite (resolved, cancelled or still open), a booking, an earlier register
- * sale, ticket or pay link, or a register record carrying them. 10/2 (Nic, the
- * Scott Duffy ticket): a person at the register is never gated on residency.
- * Two cancelled invites and no lease is still somebody this company knows.
+ * SQL: tenant `t` is tied to the account behind company `l` in ANY way — a
+ * lease of any status, an invite (resolved, cancelled or still open), a
+ * booking, an earlier register sale, ticket or pay link, or a register record
+ * carrying them. 10/2 (Nic, the Scott Duffy ticket): a person at the register
+ * is never gated on residency. Two cancelled invites and no lease is still
+ * somebody this company knows.
+ *
+ * 10/20 (review): every clause reads the ACCOUNT's companies (inBook), not the
+ * one `landlords` row. Nic's two parks are two LLCs, so keyed on the row alone
+ * his Oak Park resident was a stranger at the Mountain View counter and picking
+ * him minted a second record for the same man. See services/registerBook.
+ *
+ * `w` is the placeholder holding WHO IS ASKING (askingAs). The account's
+ * companies are a fact; how far into them this caller may read is not, and a
+ * co-owner of one of them reads that one. See services/registerBook.
  */
-export const tenantOfCompanySql = (t: string, l: string) => `(
+export const tenantOfCompanySql = (t: string, l: string, w: string) => `(
   EXISTS (SELECT 1 FROM lease_tenants lt_c JOIN leases l_c ON l_c.id = lt_c.lease_id
-           WHERE lt_c.tenant_id = ${t} AND l_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM pending_tenant_intents pi_c WHERE pi_c.tenant_id = ${t} AND pi_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM unit_bookings b_c WHERE b_c.tenant_id = ${t} AND b_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM pos_transactions x_c WHERE x_c.tenant_id = ${t} AND x_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM pos_open_tickets k_c WHERE k_c.tenant_id = ${t} AND k_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM pos_pay_links p_c WHERE p_c.tenant_id = ${t} AND p_c.landlord_id = ${l})
-  OR EXISTS (SELECT 1 FROM pos_customers r_c WHERE r_c.tenant_id = ${t} AND r_c.landlord_id = ${l}))`
+           WHERE lt_c.tenant_id = ${t} AND ${inBook('l_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pending_tenant_intents pi_c WHERE pi_c.tenant_id = ${t} AND ${inBook('pi_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM unit_bookings b_c WHERE b_c.tenant_id = ${t} AND ${inBook('b_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pos_transactions x_c WHERE x_c.tenant_id = ${t} AND ${inBook('x_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pos_open_tickets k_c WHERE k_c.tenant_id = ${t} AND ${inBook('k_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pos_pay_links p_c WHERE p_c.tenant_id = ${t} AND ${inBook('p_c.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pos_customers r_c WHERE r_c.tenant_id = ${t} AND ${inBook('r_c.landlord_id', l, w)}))`
 
 /**
  * SQL: tenant `t` has dealt on GAM with some company OTHER than `l` — a place
@@ -122,16 +133,18 @@ export const tenantOfCompanySql = (t: string, l: string) => `(
  * with is kept on their account). Anything on their account may have come from
  * there.
  */
-export const tenantTiedElsewhereSql = (t: string, l: string) => `(
+export const tenantTiedElsewhereSql = (t: string, l: string, w: string) => `(
   EXISTS (SELECT 1 FROM lease_tenants lt_e JOIN leases l_e ON l_e.id = lt_e.lease_id
-           WHERE lt_e.tenant_id = ${t} AND l_e.landlord_id <> ${l})
-  OR EXISTS (SELECT 1 FROM pending_tenant_intents pi_e WHERE pi_e.tenant_id = ${t} AND pi_e.landlord_id <> ${l})
-  OR EXISTS (SELECT 1 FROM unit_bookings b_e WHERE b_e.tenant_id = ${t} AND b_e.landlord_id <> ${l})
+           WHERE lt_e.tenant_id = ${t} AND ${notInBook('l_e.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM pending_tenant_intents pi_e WHERE pi_e.tenant_id = ${t} AND ${notInBook('pi_e.landlord_id', l, w)})
+  OR EXISTS (SELECT 1 FROM unit_bookings b_e WHERE b_e.tenant_id = ${t} AND ${notInBook('b_e.landlord_id', l, w)})
   OR EXISTS (SELECT 1 FROM tenants tn_e JOIN unit_applications a_e ON a_e.applicant_user_id = tn_e.user_id
               LEFT JOIN properties pr_e ON pr_e.id = a_e.property_id
-             WHERE tn_e.id = ${t} AND COALESCE(a_e.landlord_id, pr_e.landlord_id) IS DISTINCT FROM ${l})
+             WHERE tn_e.id = ${t}
+               AND (COALESCE(a_e.landlord_id, pr_e.landlord_id) IS NULL
+                 OR ${notInBook('COALESCE(a_e.landlord_id, pr_e.landlord_id)', l, w)}))
   OR EXISTS (SELECT 1 FROM tenants tn_s JOIN background_checks bc_e ON bc_e.user_id = tn_s.user_id
-              WHERE tn_s.id = ${t} AND bc_e.landlord_id <> ${l}))`
+              WHERE tn_s.id = ${t} AND ${notInBook('bc_e.landlord_id', l, w)}))`
 
 /**
  * The places that are CURRENT: on the lease now, or on their way off it. On a
@@ -171,12 +184,12 @@ export const CURRENT_LEASE_STATUSES = ['pending', 'active'] as const
  *     account's contact is wherever they live now — it is not the old
  *     company's to read, search or print on a receipt.
  */
-export const tenantLivesHereSql = (t: string, l: string) => `EXISTS (
+export const tenantLivesHereSql = (t: string, l: string, w: string) => `EXISTS (
   SELECT 1 FROM lease_tenants lt_h JOIN leases l_h ON l_h.id = lt_h.lease_id
-   WHERE lt_h.tenant_id = ${t} AND l_h.landlord_id = ${l}
+   WHERE lt_h.tenant_id = ${t} AND ${inBook('l_h.landlord_id', l, w)}
      AND lt_h.status IN (${CURRENT_LEASE_PLACES.map((s) => `'${s}'`).join(', ')})
      AND l_h.status IN (${CURRENT_LEASE_STATUSES.map((s) => `'${s}'`).join(', ')})
-     AND (l_h.signed_by_tenant = TRUE OR NOT ${tenantTiedElsewhereSql(t, l)}))`
+     AND (l_h.signed_by_tenant = TRUE OR NOT ${tenantTiedElsewhereSql(t, l, w)}))`
 
 /**
  * SQL: the email and phone a register record shows — the ones on the
@@ -185,8 +198,8 @@ export const tenantLivesHereSql = (t: string, l: string) => `EXISTS (
  * account's contact). `c` is the pos_customers alias, `u` their account's
  * users row.
  */
-export const recordContactSql = (c: string, u: string) => {
-  const lives = tenantLivesHereSql(`${c}.tenant_id`, `${c}.landlord_id`)
+export const recordContactSql = (c: string, u: string, w: string) => {
+  const lives = tenantLivesHereSql(`${c}.tenant_id`, `${c}.landlord_id`, w)
   return {
     email: `COALESCE(CASE WHEN ${lives} THEN ${u}.email END, ${c}.email)`,
     phone: `COALESCE(CASE WHEN ${lives} THEN ${u}.phone END, ${c}.phone)`,
@@ -194,9 +207,11 @@ export const recordContactSql = (c: string, u: string) => {
 }
 
 /** Is this tenant tied to this company in any way (tenantOfCompanySql)? */
-async function tenantTiedTo(q: Q, landlordId: string, tenantId: string): Promise<boolean> {
+async function tenantTiedTo(q: Q, landlordId: string, tenantId: string, caller: BookCaller): Promise<boolean> {
   if (!UUID.test(tenantId)) return false
-  return !!(await q.query(`SELECT 1 FROM tenants tn WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2')}`, [tenantId, landlordId])).rows[0]
+  const p: unknown[] = [tenantId, landlordId]
+  const w = askingAs(p, caller)
+  return !!(await q.query(`SELECT 1 FROM tenants tn WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2', w)}`, p)).rows[0]
 }
 
 // ── Who a sale names ─────────────────────────────────────────────────────
@@ -208,30 +223,34 @@ export interface SalePerson { name: string | null; tenantId: string | null; cust
  * register customers, or a tenant tied to it in any way (tenantOfCompanySql) —
  * and their name is what the reader shows. A name-less card record shows none.
  */
-export async function salePerson(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<SalePerson | null> {
+export async function salePerson(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }, caller: BookCaller): Promise<SalePerson | null> {
   const tenantId = typeof ids.tenantId === 'string' && ids.tenantId ? ids.tenantId : null
   const posCustomerId = typeof ids.posCustomerId === 'string' && ids.posCustomerId ? ids.posCustomerId : null
   if (tenantId && posCustomerId) throw new AppError(400, 'A sale is for one person — remove the customer (×) and pick just one.')
   if (posCustomerId) {
+    const p: unknown[] = [posCustomerId, landlordId]
+    const w = askingAs(p, caller)
     const c = UUID.test(posCustomerId) ? await queryOne<any>(
       `SELECT c.id, c.tenant_id, c.first_name, c.last_name, u.first_name AS t_first, u.last_name AS t_last
          FROM pos_customers c
          LEFT JOIN tenants tn ON tn.id = c.tenant_id
          LEFT JOIN users u ON u.id = tn.user_id
-        WHERE c.id = $1 AND c.landlord_id = $2 AND c.archived_at IS NULL`,
-      [posCustomerId, landlordId]) : null
+        WHERE c.id = $1 AND ${inBook('c.landlord_id', '$2', w)} AND c.archived_at IS NULL`,
+      p) : null
     if (!c) throw new AppError(404, NOT_ON_REGISTER)
     const name = c.tenant_id ? fullName(c.t_first, c.t_last)
       : isCardCustomer(c.first_name, c.last_name) ? '' : fullName(c.first_name, c.last_name)
     return { name: name || null, tenantId: c.tenant_id ?? null, customerId: c.id }
   }
   if (tenantId) {
+    const p: unknown[] = [tenantId, landlordId]
+    const w = askingAs(p, caller)
     const t = UUID.test(tenantId) ? await queryOne<any>(
       `SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS name,
-              (SELECT c.id FROM pos_customers c WHERE c.landlord_id = $2 AND c.tenant_id = tn.id AND c.archived_at IS NULL) AS customer_id
+              (SELECT c.id FROM pos_customers c WHERE ${inBook('c.landlord_id', '$2', w)} AND c.tenant_id = tn.id AND c.archived_at IS NULL) AS customer_id
          FROM tenants tn JOIN users u ON u.id = tn.user_id
-        WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2')}`,
-      [tenantId, landlordId]) : null
+        WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2', w)}`,
+      p) : null
     if (!t) throw new AppError(404, NOT_ON_REGISTER)
     return { name: t.name, tenantId, customerId: t.customer_id ?? null }
   }
@@ -242,8 +261,8 @@ export async function salePerson(landlordId: string, ids: { tenantId?: unknown; 
 export const NOT_ON_REGISTER = 'That person is not on this register — remove them (×), then type their name and pick them again, or add them as a new customer.'
 
 /** The name a sale shows (or null) — refuses anyone who is not this company's. */
-export async function personOnSale(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<string | null> {
-  return (await salePerson(landlordId, ids))?.name ?? null
+export async function personOnSale(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }, caller: BookCaller): Promise<string | null> {
+  return (await salePerson(landlordId, ids, caller))?.name ?? null
 }
 
 /**
@@ -251,8 +270,8 @@ export async function personOnSale(landlordId: string, ids: { tenantId?: unknown
  * taking it down) NEVER fails over the person — somebody who cannot be named
  * here simply shows no name. The sale itself still checks who it names.
  */
-export async function nameForReader(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<string | null> {
-  try { return await personOnSale(landlordId, ids) } catch { return null }
+export async function nameForReader(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }, caller: BookCaller): Promise<string | null> {
+  try { return await personOnSale(landlordId, ids, caller) } catch { return null }
 }
 
 /**
@@ -260,9 +279,11 @@ export async function nameForReader(landlordId: string, ids: { tenantId?: unknow
  * linked to a sale. The caller has already established the tenant is this
  * company's. Safe under a race: the partial unique index decides.
  */
-export async function residentRecord(q: Q, landlordId: string, tenantId: string): Promise<string> {
+export async function residentRecord(q: Q, landlordId: string, tenantId: string, caller: BookCaller): Promise<string> {
+  const p: unknown[] = [landlordId, tenantId]
+  const w = askingAs(p, caller)
   const found = await q.query<{ id: string }>(
-    `SELECT id FROM pos_customers WHERE landlord_id = $1 AND tenant_id = $2 AND archived_at IS NULL`, [landlordId, tenantId])
+    `SELECT id FROM pos_customers WHERE ${inBook('landlord_id', '$1', w)} AND tenant_id = $2 AND archived_at IS NULL`, p)
   if (found.rows[0]) return found.rows[0].id
   const u = await q.query<{ first_name: string; last_name: string }>(
     `SELECT u.first_name, u.last_name FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])
@@ -275,7 +296,7 @@ export async function residentRecord(q: Q, landlordId: string, tenantId: string)
     [landlordId, u.rows[0].first_name || '', u.rows[0].last_name || '', tenantId])
   if (made.rows[0]) return made.rows[0].id
   const again = await q.query<{ id: string }>(
-    `SELECT id FROM pos_customers WHERE landlord_id = $1 AND tenant_id = $2 AND archived_at IS NULL`, [landlordId, tenantId])
+    `SELECT id FROM pos_customers WHERE ${inBook('landlord_id', '$1', w)} AND tenant_id = $2 AND archived_at IS NULL`, p)
   return again.rows[0].id
 }
 
@@ -291,8 +312,11 @@ export async function residentRecord(q: Q, landlordId: string, tenantId: string)
  */
 export async function applicantRegisterRecord(
   q: Q, landlordId: string, tenantId: string, legal: { firstName?: string | null; lastName?: string | null },
+  caller: BookCaller,
 ): Promise<string> {
-  const id = await residentRecord(q, landlordId, tenantId)
+  const id = await residentRecord(q, landlordId, tenantId, caller)
+  const p: unknown[] = [id, landlordId, String(legal.firstName ?? '').trim(), String(legal.lastName ?? '').trim()]
+  const w = askingAs(p, caller)
   await q.query(
     `UPDATE pos_customers c
         SET first_name = CASE WHEN COALESCE(c.first_name, '') = '' THEN $3 ELSE c.first_name END,
@@ -301,11 +325,11 @@ export async function applicantRegisterRecord(
               SELECT lower(u.email) FROM tenants t JOIN users u ON u.id = t.user_id
                WHERE t.id = c.tenant_id
                  AND NOT EXISTS (SELECT 1 FROM pos_customers o
-                                  WHERE o.landlord_id = c.landlord_id AND o.id <> c.id
+                                  WHERE ${inBook('o.landlord_id', 'c.landlord_id', w)} AND o.id <> c.id
                                     AND o.archived_at IS NULL AND lower(o.email) = lower(u.email)))),
             updated_at = NOW()
       WHERE c.id = $1 AND c.landlord_id = $2`,
-    [id, landlordId, String(legal.firstName ?? '').trim(), String(legal.lastName ?? '').trim()])
+    p)
   return id
 }
 
@@ -387,12 +411,13 @@ async function salesBeside(q: Q, customerId: string, sale: SaleRef | null): Prom
  * links. Not when the card carries somebody else's printed name: then the
  * person paid with another person's card, and only the sale in hand moves.
  */
-async function foldStandIn(q: Q, landlordId: string, x: RecordState, into: { id: string; lastName: string }, sale: SaleRef | null): Promise<CardOutcome> {
+async function foldStandIn(q: Q, landlordId: string, x: RecordState, into: { id: string; lastName: string }, sale: SaleRef | null,
+                           caller: BookCaller): Promise<CardOutcome> {
   if (x.printedName && !sameText(x.lastName, into.lastName)) {
     return { kind: 'printed_other', card: x.card, ownerName: fullName(x.firstName, x.lastName) }
   }
   const counts = await salesBeside(q, x.id, sale)
-  const fold = await mergePosCustomers(q as PoolClient, { landlordId, loserId: x.id, into: into.id })
+  const fold = await mergePosCustomers(q as PoolClient, { landlordId, loserId: x.id, into: into.id, caller })
   return { kind: 'folded', card: x.card, ...counts, fold }
 }
 
@@ -406,7 +431,8 @@ async function foldStandIn(q: Q, landlordId: string, x: RecordState, into: { id:
  * resident's register record is made only when there is something to fold.
  */
 export async function foldStandInInto(q: Q, landlordId: string, x: StandIn,
-                                      into: { customerId?: string; tenantId?: string }): Promise<CardOutcome> {
+                                      into: { customerId?: string; tenantId?: string },
+                                      caller: BookCaller): Promise<CardOutcome> {
   const lastName = into.customerId
     ? (await recordState(q, into.customerId))?.lastName ?? ''
     : (await q.query<{ last_name: string | null }>(
@@ -414,9 +440,9 @@ export async function foldStandInInto(q: Q, landlordId: string, x: StandIn,
   if (x.printedName && !sameText(x.lastName, lastName)) {
     return { kind: 'printed_other', card: x.card, ownerName: fullName(x.firstName, x.lastName) }
   }
-  const id = into.customerId ?? await residentRecord(q, landlordId, into.tenantId!)
+  const id = into.customerId ?? await residentRecord(q, landlordId, into.tenantId!, caller)
   if (id === x.id) return { kind: 'none' }
-  return foldStandIn(q, landlordId, x, { id, lastName }, null)
+  return foldStandIn(q, landlordId, x, { id, lastName }, null, caller)
 }
 
 /**
@@ -426,11 +452,15 @@ export async function foldStandInInto(q: Q, landlordId: string, x: StandIn,
  */
 export async function applyCardToPerson(q: Q, opts: {
   landlordId: string; card: CardIdentity; person: { id: string; lastName: string }; sale?: SaleRef | null
+  caller: BookCaller
 }): Promise<CardOutcome> {
   const label = cardLabel(opts.card)
+  const find: unknown[] = [opts.landlordId, opts.card.fingerprint]
+  const wf = askingAs(find, opts.caller)
   const row = (await q.query<any>(
     `SELECT k.pos_customer_id, p.archived_at FROM pos_customer_cards k JOIN pos_customers p ON p.id = k.pos_customer_id
-      WHERE k.landlord_id = $1 AND k.fingerprint = $2`, [opts.landlordId, opts.card.fingerprint])).rows[0]
+      WHERE ${inBook('k.landlord_id', '$1', wf)} AND k.fingerprint = $2
+      ORDER BY (p.archived_at IS NOT NULL), k.last_seen_at DESC LIMIT 1`, find)).rows[0]
   if (!row) {
     await q.query(
       `INSERT INTO pos_customer_cards (landlord_id, pos_customer_id, fingerprint, brand, last4, cardholder_name)
@@ -438,18 +468,23 @@ export async function applyCardToPerson(q: Q, opts: {
       [opts.landlordId, opts.person.id, opts.card.fingerprint, opts.card.brand, opts.card.last4, opts.card.cardholderName])
     return { kind: 'attached', card: label, attach: { fingerprint: opts.card.fingerprint, prevOwner: null, on: opts.person.id } }
   }
-  const seen = () => q.query(
-    `UPDATE pos_customer_cards SET last_seen_at = NOW(), last4 = COALESCE($3, last4), brand = COALESCE($4, brand)
-      WHERE landlord_id = $1 AND fingerprint = $2`, [opts.landlordId, opts.card.fingerprint, opts.card.last4, opts.card.brand])
+  const seen = () => {
+    const p: unknown[] = [opts.landlordId, opts.card.fingerprint, opts.card.last4, opts.card.brand]
+    const w = askingAs(p, opts.caller)
+    return q.query(
+      `UPDATE pos_customer_cards SET last_seen_at = NOW(), last4 = COALESCE($3, last4), brand = COALESCE($4, brand)
+        WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2`, p)
+  }
   if (row.pos_customer_id === opts.person.id) { await seen(); return { kind: 'already', card: label } }
   if (row.archived_at) {
-    await q.query(`UPDATE pos_customer_cards SET pos_customer_id = $3, last_seen_at = NOW() WHERE landlord_id = $1 AND fingerprint = $2`,
-      [opts.landlordId, opts.card.fingerprint, opts.person.id])
+    const p: unknown[] = [opts.landlordId, opts.card.fingerprint, opts.person.id]
+    const w = askingAs(p, opts.caller)
+    await q.query(`UPDATE pos_customer_cards SET pos_customer_id = $3, last_seen_at = NOW() WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2`, p)
     return { kind: 'attached', card: label, attach: { fingerprint: opts.card.fingerprint, prevOwner: row.pos_customer_id, on: opts.person.id } }
   }
   await seen()
   const owner = await recordState(q, row.pos_customer_id)
-  if (owner?.standIn) return foldStandIn(q, opts.landlordId, owner, opts.person, opts.sale ?? null)
+  if (owner?.standIn) return foldStandIn(q, opts.landlordId, owner, opts.person, opts.sale ?? null, opts.caller)
   const ownerName = owner && !isCardCustomer(owner.firstName, owner.lastName) ? fullName(owner.firstName, owner.lastName) : ''
   return { kind: 'other_person', card: label, ownerName: ownerName || 'another customer' }
 }
@@ -498,24 +533,30 @@ export function cardOutcomeSentence(o: CardOutcome): string | null {
  * An email or phone this company already has is that person. A register
  * customer's email or phone, or a resident's account email.
  */
-export async function findSamePerson(q: Q, landlordId: string, email: string | null | undefined, phone: string | null | undefined): Promise<{ customerId?: string; tenantId?: string } | null> {
+export async function findSamePerson(q: Q, landlordId: string, email: string | null | undefined, phone: string | null | undefined,
+                                     caller: BookCaller): Promise<{ customerId?: string; tenantId?: string } | null> {
   const e = email ? email.trim().toLowerCase() : ''
   if (e) {
+    const p: unknown[] = [landlordId, e]
+    const w = askingAs(p, caller)
     const c = (await q.query<{ id: string; archived_at: Date | null }>(
-      `SELECT id, archived_at FROM pos_customers WHERE landlord_id = $1 AND lower(email) = $2`, [landlordId, e])).rows[0]
+      `SELECT id, archived_at FROM pos_customers WHERE ${inBook('landlord_id', '$1', w)} AND lower(email) = $2
+        ORDER BY (archived_at IS NOT NULL), created_at LIMIT 1`, p)).rows[0]
     if (c && !c.archived_at) return { customerId: c.id }
     if (c) throw new AppError(409, 'That email is on a customer record that was closed — use a different email or leave it blank, then press Add customer again.')
     const r = (await q.query<{ id: string }>(
       `SELECT t.id FROM tenants t JOIN users u ON u.id = t.user_id
-        WHERE lower(u.email) = $2 AND ${tenantOfCompanySql('t.id', '$1')} LIMIT 1`, [landlordId, e])).rows[0]
+        WHERE lower(u.email) = $2 AND ${tenantOfCompanySql('t.id', '$1', w)} LIMIT 1`, p)).rows[0]
     if (r) return { tenantId: r.id }
   }
   const d = digitsOf(phone)
   if (d.length >= 7) {
+    const p: unknown[] = [landlordId, d]
+    const w = askingAs(p, caller)
     const c = (await q.query<{ id: string }>(
       `SELECT id FROM pos_customers
-        WHERE landlord_id = $1 AND archived_at IS NULL AND right(${phoneSql('phone')}, 10) = right($2, 10)
-        ORDER BY created_at LIMIT 1`, [landlordId, d])).rows[0]
+        WHERE ${inBook('landlord_id', '$1', w)} AND archived_at IS NULL AND right(${phoneSql('phone')}, 10) = right($2, 10)
+        ORDER BY created_at LIMIT 1`, p)).rows[0]
     if (c) return { customerId: c.id }
   }
   return null
@@ -535,11 +576,11 @@ function cleanNew(p: NewPerson): { first: string; last: string; email: string | 
  * "Add new customer": a first name is enough; an email or phone this company
  * already has picks that person instead of making a second record.
  */
-export async function addCustomer(q: Q, landlordId: string, p: NewPerson): Promise<{ customerId: string; tenantId: string | null; existing: boolean }> {
+export async function addCustomer(q: Q, landlordId: string, p: NewPerson, caller: BookCaller): Promise<{ customerId: string; tenantId: string | null; existing: boolean }> {
   const n = cleanNew(p)
-  const same = await findSamePerson(q, landlordId, n.email, n.phone)
+  const same = await findSamePerson(q, landlordId, n.email, n.phone, caller)
   if (same?.customerId) return { customerId: same.customerId, tenantId: await tenantOfRecord(q, same.customerId), existing: true }
-  if (same?.tenantId) return { customerId: await residentRecord(q, landlordId, same.tenantId), tenantId: same.tenantId, existing: true }
+  if (same?.tenantId) return { customerId: await residentRecord(q, landlordId, same.tenantId, caller), tenantId: same.tenantId, existing: true }
   const row = (await q.query<{ id: string }>(
     `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone, created_from)
      VALUES ($1, $2, $3, $4, $5, 'manual') RETURNING id`,
@@ -565,32 +606,40 @@ async function tenantOfRecord(q: Q, customerId: string): Promise<string | null> 
  *     or phone the clerk typed in full. Nothing else crosses — no contact they
  *     did not type, no tenancy link, nothing of the other company's.
  */
-export async function customerFromElsewhere(q: Q, landlordId: string, userId: string, pick: string): Promise<{ customerId: string; tenantId: string | null; existing: boolean }> {
+export async function customerFromElsewhere(q: Q, landlordId: string, userId: string, pick: string,
+                                            caller: BookCaller): Promise<{ customerId: string; tenantId: string | null; existing: boolean }> {
   const c = openPick(pick)
   if (!c || c.l !== landlordId || c.u !== userId || c.x < Date.now()) throw new AppError(404, PICK_GONE)
+  const elsewhere: unknown[] = [c.id, landlordId]
+  const we = askingAs(elsewhere, caller)
   const src = c.s === 'u'
     ? (await q.query<any>(
         `SELECT u.first_name, u.last_name, u.email, u.phone, tn.id AS tenant_id
            FROM users u JOIN tenants tn ON tn.user_id = u.id WHERE u.id = $1 AND u.role = 'tenant'`, [c.id])).rows[0]
     : (await q.query<any>(
         `SELECT first_name, last_name, email, phone, NULL::uuid AS tenant_id FROM pos_customers
-          WHERE id = $1 AND landlord_id <> $2 AND archived_at IS NULL`, [c.id, landlordId])).rows[0]
+          WHERE id = $1 AND ${notInBook('landlord_id', '$2', we)} AND archived_at IS NULL`, elsewhere)).rows[0]
   if (!src) throw new AppError(404, PICK_GONE)
 
-  if (src.tenant_id && await tenantTiedTo(q, landlordId, src.tenant_id)) {
-    return { customerId: await residentRecord(q, landlordId, src.tenant_id), tenantId: src.tenant_id, existing: true }
+  if (src.tenant_id && await tenantTiedTo(q, landlordId, src.tenant_id, caller)) {
+    return { customerId: await residentRecord(q, landlordId, src.tenant_id, caller), tenantId: src.tenant_id, existing: true }
   }
-  const same = await findSamePerson(q, landlordId, src.email, src.phone).catch(() => null)
+  const same = await findSamePerson(q, landlordId, src.email, src.phone, caller).catch(() => null)
   if (same?.customerId) return { customerId: same.customerId, tenantId: await tenantOfRecord(q, same.customerId), existing: true }
-  if (same?.tenantId) return { customerId: await residentRecord(q, landlordId, same.tenantId), tenantId: same.tenantId, existing: true }
+  if (same?.tenantId) return { customerId: await residentRecord(q, landlordId, same.tenantId, caller), tenantId: same.tenantId, existing: true }
 
   const ref = `${c.s}:${c.id}`
+  const byRef: unknown[] = [landlordId, ref]
+  const wr = askingAs(byRef, caller)
   const before = (await q.query<{ id: string; tenant_id: string | null }>(
-    `SELECT id, tenant_id FROM pos_customers WHERE landlord_id = $1 AND elsewhere_ref = $2 AND archived_at IS NULL`, [landlordId, ref])).rows[0]
+    `SELECT id, tenant_id FROM pos_customers WHERE ${inBook('landlord_id', '$1', wr)} AND elsewhere_ref = $2 AND archived_at IS NULL
+      ORDER BY created_at LIMIT 1`, byRef)).rows[0]
   if (before) return { customerId: before.id, tenantId: before.tenant_id ?? null, existing: true }
 
   // Only what the clerk typed in full — and an address only one record here may hold.
-  const typedEmail = c.e && !(await q.query(`SELECT 1 FROM pos_customers WHERE landlord_id = $1 AND lower(email) = $2`, [landlordId, c.e])).rows[0]
+  const byEmail: unknown[] = [landlordId, c.e]
+  const wm = askingAs(byEmail, caller)
+  const typedEmail = c.e && !(await q.query(`SELECT 1 FROM pos_customers WHERE ${inBook('landlord_id', '$1', wm)} AND lower(email) = $2`, byEmail)).rows[0]
     ? c.e : null
   const made = (await q.query<{ id: string }>(
     `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone, created_from, elsewhere_ref)
@@ -600,7 +649,8 @@ export async function customerFromElsewhere(q: Q, landlordId: string, userId: st
     [landlordId, String(src.first_name ?? '').trim() || 'Customer', String(src.last_name ?? '').trim(), typedEmail, c.p ?? null, ref])).rows[0]
   if (made) return { customerId: made.id, tenantId: null, existing: false }
   const raced = (await q.query<{ id: string }>(
-    `SELECT id FROM pos_customers WHERE landlord_id = $1 AND elsewhere_ref = $2 AND archived_at IS NULL`, [landlordId, ref])).rows[0]
+    `SELECT id FROM pos_customers WHERE ${inBook('landlord_id', '$1', wr)} AND elsewhere_ref = $2 AND archived_at IS NULL
+      ORDER BY created_at LIMIT 1`, byRef)).rows[0]
   if (!raced) throw new AppError(409, 'They could not be added just now — type their name again and pick them.')
   return { customerId: raced.id, tenantId: null, existing: true }
 }
@@ -645,8 +695,10 @@ export interface LinkResult {
  */
 export async function linkSaleToPerson(client: Q, opts: {
   landlordId: string; saleId: string; target: LinkTarget; saleCard?: CardIdentity | null; userId?: string
+  caller: BookCaller
 }): Promise<LinkResult> {
   const L = opts.landlordId
+  const who = opts.caller
   const sale = (await client.query<any>(
     `SELECT id, tenant_id, pos_customer_id, payment_method, created_at
        FROM pos_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [opts.saleId, L])).rows[0]
@@ -668,17 +720,21 @@ export async function linkSaleToPerson(client: Q, opts: {
 
   const t = opts.target
   if (t.kind === 'customer') {
+    const p: unknown[] = [t.posCustomerId, L]
+    const w = askingAs(p, who)
     const c = UUID.test(t.posCustomerId) ? (await client.query<{ id: string }>(
-      `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`, [t.posCustomerId, L])).rows[0] : null
+      `SELECT id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', w)} AND archived_at IS NULL`, p)).rows[0] : null
     if (!c) throw new AppError(404, NOT_ON_REGISTER)
     personId = c.id
   } else if (t.kind === 'resident') {
+    const p: unknown[] = [t.tenantId, L]
+    const w = askingAs(p, who)
     const ok = UUID.test(t.tenantId) ? (await client.query(
-      `SELECT 1 FROM tenants tn WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2')}`, [t.tenantId, L])).rows[0] : null
+      `SELECT 1 FROM tenants tn WHERE tn.id = $1 AND ${tenantOfCompanySql('tn.id', '$2', w)}`, p)).rows[0] : null
     if (!ok) throw new AppError(404, NOT_ON_REGISTER)
-    personId = await residentRecord(client, L, t.tenantId)
+    personId = await residentRecord(client, L, t.tenantId, who)
   } else if (t.kind === 'elsewhere') {
-    const r = await customerFromElsewhere(client, L, t.userId, t.pick)
+    const r = await customerFromElsewhere(client, L, t.userId, t.pick, who)
     personId = r.customerId
     if (!r.existing) made = r.customerId
   } else {
@@ -687,9 +743,9 @@ export async function linkSaleToPerson(client: Q, opts: {
     // every sale on that card is theirs. Not when the card is printed with a
     // different last name — that is someone else's card.
     const n = cleanNew(t.person)
-    const same = await findSamePerson(client, L, n.email, n.phone)
+    const same = await findSamePerson(client, L, n.email, n.phone, who)
     if (same?.customerId) personId = same.customerId
-    else if (same?.tenantId) personId = await residentRecord(client, L, same.tenantId)
+    else if (same?.tenantId) personId = await residentRecord(client, L, same.tenantId, who)
     else if (prev?.standIn && (!prev.printedName || sameText(prev.lastName, n.last))) {
       const before = (await client.query<any>(
         `SELECT first_name, last_name, email, phone FROM pos_customers WHERE id = $1`, [prev.id])).rows[0]
@@ -722,10 +778,10 @@ export async function linkSaleToPerson(client: Q, opts: {
   if (renamedPrev) {
     outcome = { kind: 'named', card: prev!.card, ...(await salesBeside(client, personId, sale)) }
   } else if (prev && prev.id !== personId && prev.standIn) {
-    outcome = await withSavepoint(client, () => foldStandIn(client, L, prev, into, sale), notMoved(prev.card))
+    outcome = await withSavepoint(client, () => foldStandIn(client, L, prev, into, sale, who), notMoved(prev.card))
   } else if (!prevId && !sale.tenant_id && (sale.payment_method === 'card' || sale.payment_method === 'card_on_file') && opts.saleCard) {
     const card = opts.saleCard
-    outcome = await withSavepoint(client, () => applyCardToPerson(client, { landlordId: L, card, person: into, sale }), notMoved(cardLabel(card)))
+    outcome = await withSavepoint(client, () => applyCardToPerson(client, { landlordId: L, card, person: into, sale, caller: who }), notMoved(cardLabel(card)))
   }
 
   // 4. A resident's sales say so.
@@ -835,14 +891,16 @@ async function recordHoldsNothing(q: Q, customerId: string): Promise<boolean> {
  * next record (a closed record holding an address would otherwise refuse it),
  * and an open cart that named it names nobody.
  */
-async function closeEmptyRecord(q: Q, landlordId: string, customerId: string, why: string): Promise<boolean> {
+async function closeEmptyRecord(q: Q, landlordId: string, customerId: string, why: string, caller: BookCaller): Promise<boolean> {
   if (!(await recordHoldsNothing(q, customerId))) return false
+  const p: unknown[] = [customerId, landlordId, why]
+  const w = askingAs(p, caller)
   const closed = await q.query(
     `UPDATE pos_customers
         SET archived_at = NOW(), updated_at = NOW(), email = NULL, phone = NULL,
             notes = TRIM(COALESCE(notes, '') || ' ' || $3 || COALESCE(' (email ' || email || ')', '') || COALESCE(' (phone ' || phone || ')', ''))
-      WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL AND tenant_id IS NULL RETURNING id`,
-    [customerId, landlordId, why])
+      WHERE id = $1 AND ${inBook('landlord_id', '$2', w)} AND archived_at IS NULL AND tenant_id IS NULL RETURNING id`,
+    p)
   if (!closed.rows.length) return false
   await q.query(`UPDATE pos_sessions SET pos_customer_id = NULL, updated_at = NOW() WHERE pos_customer_id = $1 AND status = 'open'`, [customerId])
   return true
@@ -856,23 +914,26 @@ async function closeEmptyRecord(q: Q, landlordId: string, customerId: string, wh
  * Clear) before anything was written against them, that record goes again:
  * only a record made from a pick, only an empty one, only this company's.
  */
-export async function letGoOfPick(q: Q, landlordId: string, customerId: string): Promise<boolean> {
+export async function letGoOfPick(q: Q, landlordId: string, customerId: string, caller: BookCaller): Promise<boolean> {
   if (!UUID.test(customerId)) return false
+  const p: unknown[] = [customerId, landlordId]
+  const w = askingAs(p, caller)
   const c = (await q.query<{ id: string }>(
-    `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL
-        AND elsewhere_ref IS NOT NULL AND tenant_id IS NULL FOR UPDATE`, [customerId, landlordId])).rows[0]
+    `SELECT id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', w)} AND archived_at IS NULL
+        AND elsewhere_ref IS NOT NULL AND tenant_id IS NULL FOR UPDATE`, p)).rows[0]
   if (!c) return false
-  return closeEmptyRecord(q, landlordId, c.id, 'Picked at the register and taken off again before anything was sold.')
+  return closeEmptyRecord(q, landlordId, c.id, 'Picked at the register and taken off again before anything was sold.', caller)
 }
 
 /** Put a link back (see LinkUndo). Runs on the caller's open transaction. */
-export async function undoLink(client: Q, opts: { landlordId: string; userId: string; saleId: string; token: unknown }): Promise<LinkResult> {
+export async function undoLink(client: Q, opts: { landlordId: string; userId: string; saleId: string; token: unknown; caller: BookCaller }): Promise<LinkResult> {
   const u = unseal(UNDO_LABEL, opts.token, UNDO_MAX) as LinkUndo | null
   if (!u || u.l !== opts.landlordId || u.u !== opts.userId || typeof u.x !== 'number' || u.x < Date.now()
       || u.sale?.id !== opts.saleId) {
     throw new AppError(409, UNDO_GONE)
   }
   const L = opts.landlordId
+  const who = opts.caller
   const sale = (await client.query<any>(
     `SELECT id, pos_customer_id FROM pos_transactions WHERE id = $1 AND landlord_id = $2 FOR UPDATE`, [opts.saleId, L])).rows[0]
   if (!sale) throw new AppError(404, SALE_GONE)
@@ -882,10 +943,14 @@ export async function undoLink(client: Q, opts: { landlordId: string; userId: st
   // The card record folded in comes back, with everything that moved with it.
   if (u.fold) {
     const f = u.fold
+    const lp: unknown[] = [f.loserId, L]
+    const wl = askingAs(lp, who)
     const loser = (await client.query<{ id: string }>(
-      `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NOT NULL FOR UPDATE`, [f.loserId, L])).rows[0]
+      `SELECT id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', wl)} AND archived_at IS NOT NULL FOR UPDATE`, lp)).rows[0]
+    const sp: unknown[] = [f.into, L]
+    const ws = askingAs(sp, who)
     const survivor = (await client.query<{ id: string }>(
-      `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL FOR UPDATE`, [f.into, L])).rows[0]
+      `SELECT id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', ws)} AND archived_at IS NULL FOR UPDATE`, sp)).rows[0]
     if (!loser || !survivor) throw new AppError(409, UNDO_GONE)
     // The survivor gives back what it took (an address first: one live record per address).
     await client.query(
@@ -910,20 +975,26 @@ export async function undoLink(client: Q, opts: { landlordId: string; userId: st
   if (u.attach) {
     const a = u.attach
     if (a.prevOwner) {
+      const p: unknown[] = [L, a.fingerprint, a.prevOwner, a.on]
+      const w = askingAs(p, who)
       await client.query(
-        `UPDATE pos_customer_cards SET pos_customer_id = $3 WHERE landlord_id = $1 AND fingerprint = $2 AND pos_customer_id = $4`,
-        [L, a.fingerprint, a.prevOwner, a.on])
+        `UPDATE pos_customer_cards SET pos_customer_id = $3 WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2 AND pos_customer_id = $4`,
+        p)
     } else {
       // Only the bare row this link wrote: never a card kept on file since.
+      const p: unknown[] = [L, a.fingerprint, a.on]
+      const w = askingAs(p, who)
       await client.query(
-        `DELETE FROM pos_customer_cards WHERE landlord_id = $1 AND fingerprint = $2 AND pos_customer_id = $3 AND stripe_payment_method_id IS NULL`,
-        [L, a.fingerprint, a.on])
+        `DELETE FROM pos_customer_cards WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2 AND pos_customer_id = $3 AND stripe_payment_method_id IS NULL`,
+        p)
     }
   }
   if (u.renamed) {
+    const p: unknown[] = [u.renamed.id, u.renamed.first, u.renamed.last, u.renamed.email, u.renamed.phone, L]
+    const w = askingAs(p, who)
     await client.query(
-      `UPDATE pos_customers SET first_name = $2, last_name = $3, email = $4, phone = $5, updated_at = NOW() WHERE id = $1 AND landlord_id = $6`,
-      [u.renamed.id, u.renamed.first, u.renamed.last, u.renamed.email, u.renamed.phone, L])
+      `UPDATE pos_customers SET first_name = $2, last_name = $3, email = $4, phone = $5, updated_at = NOW() WHERE id = $1 AND ${inBook('landlord_id', '$6', w)}`,
+      p)
   }
   if (u.stamped.length) {
     await client.query(`UPDATE pos_transactions SET tenant_id = NULL WHERE id = ANY($1::uuid[]) AND id <> $2`, [u.stamped, u.sale.id])
@@ -931,7 +1002,7 @@ export async function undoLink(client: Q, opts: { landlordId: string; userId: st
   // The sale names whom it named before.
   await client.query(`UPDATE pos_transactions SET pos_customer_id = $2, tenant_id = $3 WHERE id = $1`, [u.sale.id, u.sale.c, u.sale.t])
   // A record this link made, with nothing left on it, goes again.
-  if (u.made && u.made !== u.sale.c) await closeEmptyRecord(client, L, u.made, 'Made by a link that was undone.')
+  if (u.made && u.made !== u.sale.c) await closeEmptyRecord(client, L, u.made, 'Made by a link that was undone.', who)
 
   const now = u.sale.c ? await recordState(client, u.sale.c) : null
   const name = now ? (fullName(now.firstName, now.lastName) || null) : null
@@ -1016,10 +1087,11 @@ function elsewhereTokens(words: string[]): string[] {
  * let the hit-or-miss of each search rebuild the rest one character at a time
  * (review, 10/2: "bob 77@gmail.com" hit, "bob 177@gmail.com" missed). So "bob"
  * finds every Bob, "zqprivate77@gmail.com" or "602 555 0199" finds its owner,
- * and "gmail.com", "7@gmail.com" or "550199" lists nobody. This company's own
- * people — its register customers, and anybody who lives under one of its
- * leases, at any of its parks — keep the looser wordFilter (a former resident
- * does not: decisions #10).
+ * and "gmail.com", "7@gmail.com" or "550199" lists nobody. The ACCOUNT's own
+ * people — its register customers, and everybody with a place or an invite at
+ * any property of any of its companies — are searched by the looser wordFilter
+ * instead, in searchPeople, because they are never looked for down here at all
+ * (10/20: they are the account's, not strangers).
  */
 function elsewhereFilter(words: string[], cols: { first: string; last: string; email: string; phone: string }, params: any[]): string {
   const tokens = elsewhereTokens(words)
@@ -1292,56 +1364,71 @@ const ELSEWHERE_LIMIT = 8
  * on file" — the last digits of a phone only when the clerk typed it whole) and
  * nothing else — no company, no site, no "resident", no lease, balance or
  * payment history, no ids, not even their real email or phone. Up to eight.
- * Not listed: anyone this register already lists as its own (this property's
- * residents and invitees, this company's register customers — by record, by
- * email or by phone), unconfirmed card records, and records that are themselves
- * picks from elsewhere (the person they copy is listed instead). Picking one
- * goes through customerFromElsewhere: a record in THIS company only.
+ * Not listed: anyone this register already lists as its own, which since
+ * 10/20 means EVERY resident and invitee of every property this ACCOUNT owns
+ * (searchPeople, below) and every register customer in its book — by record, by
+ * email or by phone — plus unconfirmed card records and records that are
+ * themselves picks from elsewhere (the person they copy is listed instead).
+ * Picking one goes through customerFromElsewhere: a record in THIS company only.
  * Widening or narrowing the rule is a change to this function only.
+ *
+ * 10/20 (Nic) — WHOSE PEOPLE GET THE MASKED TREATMENT: "The landlord at each
+ * property can't see what the other one does" is about a DIFFERENT LANDLORD.
+ * Both of Nic's parks are his, under one account, so his Oak Park resident
+ * walking up to the Mountain View counter is not a stranger — he was drawn as
+ * one, name plus "b•••@elsewhere.dev", with no site and nothing to confirm he
+ * was the right man. The exclusions below therefore read the whole account
+ * (inBook), not one property of one company, and the branch that used to hand
+ * the looser name/email/phone filter to somebody who lives under one of these
+ * leases is gone with them: they are listed above by name and site, which is
+ * what Nic asked for, so there is nothing left down here for them to match.
  */
-async function searchElsewhere(opts: { landlordId: string; propertyId: string; userId: string; typed: string; words: string[] }): Promise<PersonHit[]> {
-  const { landlordId: L, propertyId: P, words } = opts
-  const mine = (col: { email: string; phone: string }) => `EXISTS (
-       SELECT 1 FROM pos_customers m WHERE m.landlord_id = $1 AND m.archived_at IS NULL
+async function searchElsewhere(opts: { landlordId: string; userId: string; typed: string; words: string[]; caller: BookCaller }): Promise<PersonHit[]> {
+  const { landlordId: L, words } = opts
+  // Both legs below read the book, so `w` is the SECOND parameter of each —
+  // pushed before the ranking and filter helpers take theirs.
+  const mine = (col: { email: string; phone: string }, w: string) => `EXISTS (
+       SELECT 1 FROM pos_customers m WHERE ${inBook('m.landlord_id', '$1', w)} AND m.archived_at IS NULL
           AND ((${col.email} IS NOT NULL AND m.email IS NOT NULL AND lower(m.email) = lower(${col.email}))
             OR (length(${phoneSql(col.phone)}) >= 7 AND right(${phoneSql('m.phone')}, 10) = right(${phoneSql(col.phone)}, 10))))`
 
-  const up: any[] = [L, P]
+  const up: any[] = [L]
+  const wu = askingAs(up, opts.caller)
   const accounts = await query<any>(
     `SELECT u.id, u.first_name, u.last_name, u.email, u.phone,
             ${rankSql(words, { first: 'u.first_name', last: 'u.last_name' }, up)} AS rnk
        FROM users u JOIN tenants tn ON tn.user_id = u.id
       WHERE u.role = 'tenant'
         AND TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) <> ''
-        -- Somebody who LIVES under THIS company's leases (at its other park,
-        -- say) is this company's own: any part of their email or phone finds
-        -- them. Anyone else on GAM — a former resident of this company included
-        -- (decisions #10) — only by the stricter rule (elsewhereFilter).
-        AND (CASE WHEN ${tenantLivesHereSql('tn.id', '$1')}
-                  THEN ${wordFilter(words, { first: 'u.first_name', last: 'u.last_name', email: 'u.email', phone: 'u.phone' }, up)}
-                  ELSE ${elsewhereFilter(words, { first: 'u.first_name', last: 'u.last_name', email: 'u.email', phone: 'u.phone' }, up)} END)
-        AND NOT EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id JOIN units un ON un.id = l.unit_id
-                         WHERE lt.tenant_id = tn.id AND l.landlord_id = $1 AND un.property_id = $2 AND lt.status <> 'void')
+        -- Everyone down here is somebody else's: the stricter rule, always.
+        AND ${elsewhereFilter(words, { first: 'u.first_name', last: 'u.last_name', email: 'u.email', phone: 'u.phone' }, up)}
+        -- A place or an invite ANYWHERE on this account (inBook, any property of
+        -- any of its companies) means the list above already has them by name,
+        -- status and site — a former resident of it included (decisions #10:
+        -- listed by name, contact from this book's own record only).
+        AND NOT EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
+                         WHERE lt.tenant_id = tn.id AND ${inBook('l.landlord_id', '$1', wu)} AND lt.status <> 'void')
         AND NOT EXISTS (SELECT 1 FROM pending_tenant_intents i
-                         WHERE i.tenant_id = tn.id AND i.landlord_id = $1 AND i.property_id = $2 AND i.cancelled_at IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM pos_customers m WHERE m.landlord_id = $1 AND m.archived_at IS NULL
+                         WHERE i.tenant_id = tn.id AND ${inBook('i.landlord_id', '$1', wu)} AND i.cancelled_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM pos_customers m WHERE ${inBook('m.landlord_id', '$1', wu)} AND m.archived_at IS NULL
                          AND (m.tenant_id = tn.id OR m.elsewhere_ref = 'u:' || u.id::text))
-        AND NOT ${mine({ email: 'u.email', phone: 'u.phone' })}
+        AND NOT ${mine({ email: 'u.email', phone: 'u.phone' }, wu)}
       ORDER BY rnk, u.last_name, u.first_name
       LIMIT 40`, up)
 
   const cp: any[] = [L]
+  const wc = askingAs(cp, opts.caller)
   const customers = await query<any>(
     `SELECT c.id, c.first_name, c.last_name, c.email, c.phone,
             ${rankSql(words, { first: 'c.first_name', last: 'c.last_name' }, cp)} AS rnk
        FROM pos_customers c
-      WHERE c.landlord_id <> $1 AND c.archived_at IS NULL AND c.tenant_id IS NULL AND c.elsewhere_ref IS NULL
+      WHERE ${notInBook('c.landlord_id', '$1', wc)} AND c.archived_at IS NULL AND c.tenant_id IS NULL AND c.elsewhere_ref IS NULL
         AND NOT (c.first_name = 'Card' AND c.last_name = 'Customer')
         AND NOT (c.created_from = 'card_reader' AND c.email IS NULL AND c.phone IS NULL)
         AND TRIM(COALESCE(c.first_name, '') || ' ' || COALESCE(c.last_name, '')) <> ''
         AND ${elsewhereFilter(words, { first: 'c.first_name', last: 'c.last_name', email: 'c.email', phone: 'c.phone' }, cp)}
-        AND NOT EXISTS (SELECT 1 FROM pos_customers m WHERE m.landlord_id = $1 AND m.archived_at IS NULL AND m.elsewhere_ref = 'c:' || c.id::text)
-        AND NOT ${mine({ email: 'c.email', phone: 'c.phone' })}
+        AND NOT EXISTS (SELECT 1 FROM pos_customers m WHERE ${inBook('m.landlord_id', '$1', wc)} AND m.archived_at IS NULL AND m.elsewhere_ref = 'c:' || c.id::text)
+        AND NOT ${mine({ email: 'c.email', phone: 'c.phone' }, wc)}
         -- A GAM account with the same email is that person: they are listed (or left out) as the account.
         AND NOT (c.email IS NOT NULL AND EXISTS (SELECT 1 FROM users u2 WHERE u2.role = 'tenant' AND lower(u2.email) = lower(c.email)))
       ORDER BY rnk, c.last_name, c.first_name
@@ -1381,14 +1468,26 @@ async function searchElsewhere(opts: { landlordId: string; propertyId: string; u
 }
 
 /**
- * The register's type-ahead. Under two characters, nothing. Up to eight of
- * this property's residents and this company's register customers, then up to
- * eight people from elsewhere on GAM (searchElsewhere — name and a masked hint
- * only). Explicit columns only: no balances, rent, lease dates or payment
- * history ever leave here. `q` is read through normalizePeopleQuery — the same
- * reading the limit on looking elsewhere counts.
+ * The register's type-ahead. Under two characters, nothing. Up to eight of the
+ * ACCOUNT's own people — every resident and invitee of every property it owns,
+ * and every register customer in its book — then up to eight people from
+ * elsewhere on GAM (searchElsewhere — name and a masked hint only). Explicit
+ * columns only: no balances, rent, lease dates or payment history ever leave
+ * here. `q` is read through normalizePeopleQuery — the same reading the limit
+ * on looking elsewhere counts.
+ *
+ * 10/20 (Nic), asked for his customer list combined: "that could be people from
+ * my other property could be customers at this property for propane. I
+ * shouldn't have to toggle." His two parks are two LLCs under one account, and
+ * this search was scoped to ONE property of ONE of them, so the propane buyer
+ * he described — his Oak Park resident, at the Mountain View counter — came
+ * back from searchElsewhere drawn as a stranger: a name and a masked hint, no
+ * site, nothing for the desk to confirm he was the right man. He is NAMED here
+ * now, with the status and the site he is named by at his own park, because he
+ * is Nic's customer; the masked treatment is for another ACCOUNT's people.
+ * Where a sale rings is still one property — this list is not about a location.
  */
-export async function searchPeople(opts: { landlordId: string; propertyId: string; userId: string; q: unknown; allowElsewhere: boolean }): Promise<PersonHit[]> {
+export async function searchPeople(opts: { landlordId: string; propertyId: string; userId: string; q: unknown; allowElsewhere: boolean; caller: BookCaller }): Promise<PersonHit[]> {
   const typed = normalizePeopleQuery(opts.q)
   if (typed.length < 2) return []
   const words = wordsOf(typed)
@@ -1396,56 +1495,85 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
   const L = opts.landlordId, P = opts.propertyId
 
   // 10/2 (review): the email and phone on somebody's own GAM account are read
-  // — shown, and searched — only while they LIVE under one of this company's
-  // leases (tenantLivesHereSql). An invite, a place a landlord drafted for
-  // them (pending_add), or a tenancy that has ended (decisions #10: a former
-  // resident) lists them by name — with whatever this company's own register
-  // record holds for them, merged in below.
-  const lives = tenantLivesHereSql('t.id', '$1')
+  // — shown, and searched — only while they LIVE under one of this ACCOUNT's
+  // leases (tenantLivesHereSql, which reads its companies since 10/20). An
+  // invite, a place a landlord drafted for them (pending_add), or a tenancy
+  // that has ended (decisions #10: a former resident) lists them by name —
+  // with whatever this book's own register record holds for them, merged in
+  // below.
+  // $3 in every leg below: each builds its params as [L, P] and then asks who
+  // is at the keyboard, so the placeholder is the same for all of them and the
+  // `acct` columns above can be shared.
+  const W = '$3'
+  const lives = tenantLivesHereSql('t.id', '$1', W)
   const acct = { first: 'u.first_name', last: 'u.last_name',
                  email: `(CASE WHEN ${lives} THEN u.email END)`, phone: `(CASE WHEN ${lives} THEN u.phone END)` }
 
+  // WHICH PLACE OF THEIRS THE DESK IS SHOWN, when somebody holds more than one
+  // across the account: the one they are actually living on, and this park's
+  // before another park's. `l.id` last so the site and its park label are read
+  // off the SAME lease and cannot drift apart between two aggregates.
+  const thePlace = `(l.status IN ('pending', 'active') AND lt.status IN ('active', 'pending_remove')) DESC,
+                    (un.property_id = $2) DESC, l.created_at DESC, l.id`
+
   const rp: any[] = [L, P]
+  if (askingAs(rp, opts.caller) !== W) throw new AppError(500, 'The register could not read its customer list just now — try again.')
   const residents = await query<any>(
     `SELECT t.id AS tenant_id, u.first_name, u.last_name, ${acct.email} AS email, ${acct.phone} AS phone,
             bool_or(l.status IN ('pending', 'active') AND lt.status IN ('active', 'pending_remove')) AS current,
             -- A place drafted for them that they have not taken yet (an addendum
             -- adding them): they are on their way in, not a resident yet.
             bool_or(l.status IN ('pending', 'active') AND lt.status = 'pending_add') AS adding,
-            (array_agg(un.unit_number ORDER BY (l.status IN ('pending', 'active')) DESC, l.created_at DESC))[1] AS site,
+            -- Somebody with a place at THIS park sorts above somebody with one
+            -- at another of the account's — the desk's own residents first.
+            bool_or(un.property_id = $2) AS here,
+            (array_agg(un.unit_number ORDER BY ${thePlace}))[1] AS site,
+            -- The park named only when it is NOT the one the register is
+            -- standing in: "Site 12" at the wrong park is worse than no site.
+            (array_agg(CASE WHEN un.property_id = $2 THEN NULL ELSE pr.name END ORDER BY ${thePlace}))[1] AS park,
             ${rankSql(words, { first: 'u.first_name', last: 'u.last_name' }, rp)} AS rnk,
-            (SELECT MAX(x.created_at) FROM pos_transactions x WHERE x.landlord_id = $1 AND x.tenant_id = t.id) AS last_purchase
+            (SELECT MAX(x.created_at) FROM pos_transactions x WHERE ${inBook('x.landlord_id', '$1', W)} AND x.tenant_id = t.id) AS last_purchase
        FROM tenants t
        JOIN users u ON u.id = t.user_id
        JOIN lease_tenants lt ON lt.tenant_id = t.id
        JOIN leases l ON l.id = lt.lease_id
        JOIN units un ON un.id = l.unit_id
-      WHERE l.landlord_id = $1 AND un.property_id = $2
+       -- LEFT: the park is a LABEL. A row that cannot find one shows the site
+       -- without it; nobody drops out of the desk's list over a name.
+       LEFT JOIN properties pr ON pr.id = un.property_id
+      WHERE ${inBook('l.landlord_id', '$1', W)}
         AND lt.status <> 'void'   -- a voided place was never theirs
         AND ${wordFilter(words, acct, rp)}
       GROUP BY t.id, u.first_name, u.last_name, u.email, u.phone
-      ORDER BY rnk, last_purchase DESC NULLS LAST, u.last_name, u.first_name
+      ORDER BY rnk, here DESC, last_purchase DESC NULLS LAST, u.last_name, u.first_name
       LIMIT 40`, rp)
 
   const ip: any[] = [L, P]
+  askingAs(ip, opts.caller)
   const invited = await query<any>(
     `SELECT * FROM (
        SELECT DISTINCT ON (t.id) t.id AS tenant_id, u.first_name, u.last_name, ${acct.email} AS email, ${acct.phone} AS phone,
               un.unit_number AS site,
+              CASE WHEN i.property_id = $2 THEN NULL ELSE pr.name END AS park,
+              (i.property_id = $2) AS here,
               ${rankSql(words, { first: 'u.first_name', last: 'u.last_name' }, ip)} AS rnk
          FROM pending_tenant_intents i
          JOIN tenants t ON t.id = i.tenant_id
          JOIN users u ON u.id = t.user_id
          LEFT JOIN units un ON un.id = i.unit_id
-        WHERE i.landlord_id = $1 AND i.property_id = $2 AND i.cancelled_at IS NULL
+         LEFT JOIN properties pr ON pr.id = i.property_id
+        WHERE ${inBook('i.landlord_id', '$1', W)} AND i.cancelled_at IS NULL
           AND ${wordFilter(words, acct, ip)}
-        ORDER BY t.id, i.created_at DESC
+        ORDER BY t.id, (i.property_id = $2) DESC, i.created_at DESC
      ) v
-     ORDER BY v.rnk, v.last_name, v.first_name
+     ORDER BY v.rnk, v.here DESC, v.last_name, v.first_name
      LIMIT 20`, ip)
 
-  // An unnamed card record ("Card Customer") has no name to rank by.
+  // An unnamed card record ("Card Customer") has no name to rank by. This leg
+  // names no property, so it asks who-is-asking at $2 of its own and reads
+  // nothing from the shared `acct` columns above.
   const cp: any[] = [L]
+  const wc = askingAs(cp, opts.caller)
   const customers = await query<any>(
     `SELECT p.*,
             CASE WHEN p.tenant_id IS NULL AND p.first_name = 'Card' AND p.last_name = 'Customer' THEN 2
@@ -1455,32 +1583,36 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
               COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
               -- 10/2 (review): the account's own email and phone only for
               -- somebody who lives here now (recordContactSql).
-              ${recordContactSql('c', 'u').email} AS email, ${recordContactSql('c', 'u').phone} AS phone,
+              ${recordContactSql('c', 'u', wc).email} AS email, ${recordContactSql('c', 'u', wc).phone} AS phone,
               c.email AS own_email, c.phone AS own_phone,
               (SELECT k.last4 FROM pos_customer_cards k WHERE k.pos_customer_id = c.id ORDER BY k.last_seen_at DESC LIMIT 1) AS card_last4,
               (SELECT MAX(x.created_at) FROM pos_transactions x WHERE x.pos_customer_id = c.id) AS last_purchase
          FROM pos_customers c
          LEFT JOIN tenants tn ON tn.id = c.tenant_id
          LEFT JOIN users u ON u.id = tn.user_id
-        WHERE c.landlord_id = $1 AND c.archived_at IS NULL
+        WHERE ${inBook('c.landlord_id', '$1', wc)} AND c.archived_at IS NULL
      ) p
      WHERE NOT (p.tenant_id IS NULL AND p.first_name = 'Card' AND p.last_name = 'Customer' AND p.own_email IS NULL AND p.own_phone IS NULL)
        AND ${wordFilter(words, { first: 'p.first_name', last: 'p.last_name', email: 'p.email', phone: 'p.phone' }, cp)}
      ORDER BY rnk, p.last_purchase DESC NULLS LAST, p.last_name, p.first_name
      LIMIT 40`, cp)
 
-  type Ranked = PersonHit & { rank: number; lastPurchase: number }
+  type Ranked = PersonHit & { rank: number; lastPurchase: number; here: boolean }
   const byTenant = new Map<string, Ranked>()
   const hits: Ranked[] = []
   const ts = (v: any) => (v ? new Date(v).getTime() : 0)
+  // 10/20: status, then the park when it is another of the account's, then the
+  // site — "resident · Oak Park Motel and RV · Site 12". The park is dropped
+  // for the register's own property, where it would be on every row.
+  const placeHint = (status: string, park: unknown, site: unknown) =>
+    [status, String(park ?? '').trim() || null, site ? `Site ${site}` : null].filter(Boolean).join(' · ')
   for (const r of residents) {
-    const site = r.site ? `Site ${r.site}` : null
     const h: Ranked = {
       key: `t:${r.tenant_id}`, kind: 'resident', tenantId: r.tenant_id, customerId: null,
       name: fullName(r.first_name, r.last_name) || 'Resident',
-      hint: [r.current ? 'resident' : r.adding ? 'invited' : 'former resident', site].filter(Boolean).join(' · '),
+      hint: placeHint(r.current ? 'resident' : r.adding ? 'invited' : 'former resident', r.park, r.site),
       firstName: r.first_name ?? '', lastName: r.last_name ?? '', email: r.email ?? null, phone: r.phone ?? null,
-      rank: Number(r.rnk), lastPurchase: ts(r.last_purchase),
+      rank: Number(r.rnk), lastPurchase: ts(r.last_purchase), here: r.here !== false,
     }
     byTenant.set(r.tenant_id, h); hits.push(h)
   }
@@ -1489,9 +1621,9 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
     const h: Ranked = {
       key: `t:${r.tenant_id}`, kind: 'resident', tenantId: r.tenant_id, customerId: null,
       name: fullName(r.first_name, r.last_name) || 'Resident',
-      hint: ['invited', r.site ? `Site ${r.site}` : null].filter(Boolean).join(' · '),
+      hint: placeHint('invited', r.park, r.site),
       firstName: r.first_name ?? '', lastName: r.last_name ?? '', email: r.email ?? null, phone: r.phone ?? null,
-      rank: Number(r.rnk), lastPurchase: 0,
+      rank: Number(r.rnk), lastPurchase: 0, here: r.here !== false,
     }
     byTenant.set(r.tenant_id, h); hits.push(h)
   }
@@ -1515,17 +1647,20 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
       hint: d.length >= 4 ? `phone ••${d.slice(-4)}` : c.email ? String(c.email) : c.card_last4 ? `card ••${c.card_last4}` : null,
       firstName: placeholder ? '' : (c.first_name ?? ''), lastName: placeholder ? '' : (c.last_name ?? ''),
       email: c.email ?? null, phone: c.phone ?? null,
-      rank: Number(c.rnk), lastPurchase: ts(c.last_purchase),
+      // A register record has no property of its own — the book is the
+      // account's — so nothing puts one of them behind another.
+      rank: Number(c.rnk), lastPurchase: ts(c.last_purchase), here: true,
     })
   }
 
-  // Each source arrived already in this order (rankSql); merged, the same order.
-  hits.sort((a, b) => a.rank - b.rank || b.lastPurchase - a.lastPurchase || a.name.localeCompare(b.name))
-  const own: PersonHit[] = hits.slice(0, OWN_LIMIT).map(({ rank: _r, lastPurchase: _lp, ...h }) => h)
+  // Each source arrived already in this order (rankSql); merged, the same order,
+  // with the register's own property's people ahead of the other park's.
+  hits.sort((a, b) => a.rank - b.rank || Number(b.here) - Number(a.here) || b.lastPurchase - a.lastPurchase || a.name.localeCompare(b.name))
+  const own: PersonHit[] = hits.slice(0, OWN_LIMIT).map(({ rank: _r, lastPurchase: _lp, here: _h, ...h }) => h)
 
   if (opts.allowElsewhere) {
     const words = elsewhereWords(typed)
-    if (words.length) own.push(...await searchElsewhere({ landlordId: L, propertyId: P, userId: opts.userId, typed, words }))
+    if (words.length) own.push(...await searchElsewhere({ landlordId: L, userId: opts.userId, typed, words, caller: opts.caller }))
   }
   return own
 }

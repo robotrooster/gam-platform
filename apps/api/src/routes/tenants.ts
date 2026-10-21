@@ -549,6 +549,48 @@ tenantsRouter.use(requireAuth)
 // Do not reintroduce either endpoint. If a tenant genuinely cannot pay, the
 // reason will be about THEIR payment method, and it belongs in that error.
 
+// ── 10/20 — "THE LEASE WAITING ON THEM" HAS TO BE A LEASE ────────────────
+//
+// GET /me asks this one question four times: which document is waiting
+// (pending_lease_document_id), whether it takes the portal over
+// (pending_lease_locks), who it is waiting on (sig) and the whole roster
+// (roster). Four copies of one sentence, so they are written once, here.
+//
+// The sentence has to name the document TYPE, and none of the four did. Any
+// open document the person was a signer on became "their lease" — which the
+// day the resident-page signing door shipped turned into this: Blu opens
+// Curtis's file at Mattoon, sends the Mattoon Maintenance Agreement, signs his
+// own box first — and Curtis, a resident of two years with rent due, logs in
+// to a signing page with no nav and no way out, titled "Sign your lease". He
+// cannot reach Payments until he signs a maintenance agreement. Nobody wrote
+// that rule; it fell out of a missing filter.
+//
+// A LEASE is what holds the portal, because a lease is the thing you cannot
+// live there without. Everything else — a work-trade agreement, a contract, an
+// add-a-roommate addendum, a packet disclosure — is paper that waits on the
+// Documents screen while they go on paying their rent. The tenant app has said
+// exactly that in prose since S655 (apps/tenant/src/lib/pendingLease.ts: "any
+// other unsigned document ... is not that"); this is the server finally saying
+// it too, with the same test every other door uses (routes/landlords.ts:
+// d.document_type = 'original_lease').
+//
+// Reads `u.id` from the enclosing query — every one of the four sites has the
+// users row joined in.
+//
+// S655 still holds: a NEW lease for the home they already live in
+// (renews_lease_id) is not this either. It comes back as pending_renewal_* and
+// shows as a banner, never the lock-in.
+const PENDING_LEASE_DOC_ID = `
+  SELECT d.id
+    FROM lease_document_signers lds
+    JOIN lease_documents d ON d.id = lds.document_id
+   WHERE lds.user_id = u.id
+     AND d.document_type = 'original_lease'
+     AND d.status IN ('sent','in_progress')
+     AND d.renews_lease_id IS NULL
+   ORDER BY d.created_at DESC
+   LIMIT 1`
+
 tenantsRouter.get('/me', async (req, res, next) => {
   try {
     // S655: a new lease whose lease before it ended early, nobody signed — not theirs to sign.
@@ -569,12 +611,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
         -- S655: a NEW LEASE for the home they already live in (renews_lease_id)
         -- is not this. It comes back as pending_renewal_* below and shows as a
         -- banner — never the signing lock-in, which stays for new tenants.
-        (SELECT d.id FROM lease_document_signers lds
-           JOIN lease_documents d ON d.id = lds.document_id
-          WHERE lds.user_id = u.id
-            AND d.status IN ('sent','in_progress')
-            AND d.renews_lease_id IS NULL
-          ORDER BY d.created_at DESC LIMIT 1) AS pending_lease_document_id,
+        (${PENDING_LEASE_DOC_ID}) AS pending_lease_document_id,
         -- S655 (Nic, 10/2): their new lease, signed by the landlord and waiting
         -- on them. They keep paying rent and using the portal meanwhile.
         nlw.document_id AS pending_renewal_document_id,
@@ -703,12 +740,8 @@ tenantsRouter.get('/me', async (req, res, next) => {
                   SELECT 1 FROM utility_service_agreements lks
                    WHERE lks.tenant_id = t.id AND lks.status = 'active'
                      AND lks.landlord_id NOT IN (SELECT public.account_companies(lkd.landlord_id)))
-           FROM lease_document_signers lkds
-           JOIN lease_documents lkd ON lkd.id = lkds.document_id
-          WHERE lkds.user_id = u.id
-            AND lkd.status IN ('sent','in_progress')
-            AND lkd.renews_lease_id IS NULL
-          ORDER BY lkd.created_at DESC LIMIT 1) AS pending_lease_locks,
+           FROM lease_documents lkd
+          WHERE lkd.id = (${PENDING_LEASE_DOC_ID})) AS pending_lease_locks,
         -- S639 (Nic): "does the middle tenant project their name onto the first
         -- and third tenant so that everybody can know full transparency where
         -- everything's at?"
@@ -790,12 +823,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
       LEFT JOIN LATERAL (
         SELECT lds2.name, lds2.role, lds2.user_id
           FROM lease_document_signers lds2
-         WHERE lds2.document_id = (
-                 SELECT d.id FROM lease_document_signers lds3
-                   JOIN lease_documents d ON d.id = lds3.document_id
-                  WHERE lds3.user_id = u.id AND d.status IN ('sent','in_progress')
-                    AND d.renews_lease_id IS NULL
-                  ORDER BY d.created_at DESC LIMIT 1)
+         WHERE lds2.document_id = (${PENDING_LEASE_DOC_ID})
            AND lds2.status <> 'signed'
          ORDER BY lds2.order_index
          LIMIT 1
@@ -808,12 +836,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
                  'isMe', r.user_id = u.id
                ) ORDER BY r.order_index) AS signers
           FROM lease_document_signers r
-         WHERE r.document_id = (
-                 SELECT d.id FROM lease_document_signers lds4
-                   JOIN lease_documents d ON d.id = lds4.document_id
-                  WHERE lds4.user_id = u.id AND d.status IN ('sent','in_progress')
-                    AND d.renews_lease_id IS NULL
-                  ORDER BY d.created_at DESC LIMIT 1)
+         WHERE r.document_id = (${PENDING_LEASE_DOC_ID})
       ) roster ON TRUE
       -- S655: the new lease waiting on them, once the landlord has signed it
       -- (issued: it has a lease). Before that there is nothing for them to see.

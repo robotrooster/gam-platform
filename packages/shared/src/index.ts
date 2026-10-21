@@ -3601,18 +3601,79 @@ export const LEASE_DOCUMENT_TYPE_LABEL: Record<LeaseDocumentType, string> = {
   work_trade_addendum: 'Work-Trade Addendum',
 }
 
-// Generic signer roles for standalone documents. The e-sign engine matches a
-// template field's signer_role to a document signer's role, so ANY consistent
-// role string works — these are the common presets (+ labels for the UI). Lease
-// documents keep using landlord / witness / tenant roles.
+// ============================================================================
+// SIGNER ROLES — ONE VOCABULARY, SO A ROLE YOU CAN PLACE IS A ROLE YOU CAN FILL
+// ----------------------------------------------------------------------------
+// The e-sign engine matches a template field's signer_role to a document
+// signer's role. The same string on both sides, or the field belongs to nobody
+// and is dropped from the document without a word.
+//
+// 10/20 — Blu, at Mattoon, wanted a work-trade agreement his tenant signs. He
+// built the form with a landlord box and a tenant box, added the document, and
+// could not get it signed. Nic: "On the signing page, it only wants to let him
+// pick either buyer or seller or... person one or person two. It wouldn't let
+// the data box be targeted to landlord and tenant. So he had no way to get that
+// document to sign from... you can't just have that be person one and person
+// two when it needs to be, you know, if it's a tenant, it needs to be able to
+// be signed by the tenant."
+//
+// The field editor could PLACE a landlord box. The signer picker could not
+// ASSIGN anybody to it. Three lists of roles existed — what the editor offered,
+// what the picker offered, what the builder accepted — and only the picker was
+// short. So his two fields matched no signer, were pruned, and the document
+// went out looking finished and unsignable.
+//
+// Nic, asked what the picker should offer: "any data field that can be picked
+// in the regular template flow for leases up to co tenant 3 etc. there should
+// be uniformity."
+//
+// Hence one list, below, in two honest halves. The field editor places from it,
+// the signer picker assigns from it, and the document builder accepts exactly
+// it. Uniformity by construction, not by three lists happening to agree —
+// apps/api/src/routes/standaloneSignerRoles.test.ts fails if they drift again.
+// ============================================================================
+
+/** The landlord and the residents — who a lease form binds its boxes to. */
+export const LEASE_SIGNER_ROLES = ['landlord', 'primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3'] as const
+
+/**
+ * Parties to a contract with no lease behind it: a financed home sale, a
+ * resident-to-resident bill of sale the landlord only facilitates. 'witness'
+ * has always lived in this half and applies to anything that needs one.
+ */
 export const GENERIC_SIGNER_ROLES = ['seller', 'purchaser', 'party_1', 'party_2', 'witness'] as const
 export type GenericSignerRole = typeof GENERIC_SIGNER_ROLES[number]
-export const GENERIC_SIGNER_ROLE_LABEL: Record<GenericSignerRole, string> = {
-  seller:    'Seller',
-  purchaser: 'Purchaser',
-  party_1:   'Party 1',
-  party_2:   'Party 2',
-  witness:   'Witness',
+
+/** Every role a box can be placed for and a signer can be assigned to. */
+export const DOCUMENT_SIGNER_ROLES = [...LEASE_SIGNER_ROLES, ...GENERIC_SIGNER_ROLES] as const
+export type DocumentSignerRole = typeof DOCUMENT_SIGNER_ROLES[number]
+
+// 'Primary Tenant' / 'Co-Tenant' are the words the rest of GAM already uses for
+// these people (LEASE_TENANT_ROLE_LABEL), so the picker says what a lease says.
+export const DOCUMENT_SIGNER_ROLE_LABEL: Record<DocumentSignerRole, string> = {
+  landlord:    'Landlord',
+  primary:     'Primary Tenant',
+  co_tenant_1: 'Co-Tenant 1',
+  co_tenant_2: 'Co-Tenant 2',
+  co_tenant_3: 'Co-Tenant 3',
+  seller:      'Seller',
+  purchaser:   'Purchaser',
+  party_1:     'Party 1',
+  party_2:     'Party 2',
+  witness:     'Witness',
+}
+/** Kept for the standalone contract defaults, which are a seller and a buyer. */
+export const GENERIC_SIGNER_ROLE_LABEL: Record<GenericSignerRole, string> =
+  DOCUMENT_SIGNER_ROLE_LABEL
+
+/**
+ * Is this one of the roles GAM offers? Custom role strings still pass
+ * isValidSignerRole below — a contract may name a contractor and a client — but
+ * a template field can only be BOUND to one of these, so a picker must not
+ * offer anything this rejects.
+ */
+export function isAssignableSignerRole(role: string): role is DocumentSignerRole {
+  return (DOCUMENT_SIGNER_ROLES as readonly string[]).includes(role)
 }
 // A signer role is valid if it's a known lease role, a generic role, or a sane
 // custom label (letters/digits/underscore/space, ≤40 chars) — the generic engine

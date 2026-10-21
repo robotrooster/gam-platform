@@ -6,6 +6,7 @@ import { UNIT_TYPES, UNIT_TYPE_LABEL, UTILITY_TYPE_LABEL, type UtilityType, METE
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check, PowerOff } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { readToast } from '../lib/meterReadToast'
 import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
 const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => api.post(url, form).then(r => r.data) }
 
@@ -331,7 +332,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                 <AlertTriangle size={16} style={{ color:'var(--amber, #d97706)' }}/> Readings to double-check
               </div>
               <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:10 }}>
-                The reading run flagged these for a second look. Re-check the meter, then correct the value or confirm it.
+                {/* 10/20: not only the run any more — a closing read taken at
+                    the counter lands here too when the number needs a human,
+                    and that one is holding a departing household's final bill. */}
+                Flagged for a second look. Re-check the meter, then correct the value or confirm it — a move-out read waiting here has no final bill yet.
               </div>
               <div style={{ display:'grid', gap:6 }}>
                 {(flagged as any[]).map((r:any) => (
@@ -433,8 +437,18 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             )}
           </div>
           </>)}
-          {/* ── SEND A BILL ────────────────────────────────── */}
-          <SendUtilityBillCard propertyId={propertyId} canSend={canReview} />
+          {/* 10/20 (Nic): there WAS a "Send a bill" card here and it is gone on
+              purpose. "I don't want a send a bill button on the utility page...
+              I want the bill to be in the POS. That's something that my front
+              desk has access to. That's not something they can see in the meter
+              reads or wherever utilities, like front desk doesn't have access to
+              that. They need to be able to do the things on checking people out
+              of their final situation."
+              Right on both counts: this screen is the landlord's meter setup,
+              and the person who needs to collect a last electric bill is at the
+              counter checking somebody out. The final bill is raised from the
+              register instead — the desk enters the move-out read there and the
+              charge, if there is one to make, lands on the ticket. */}
 
           {/* ── PROPANE (tank fills — gas for RVs) ─────────── */}
           <PropaneSection propertyId={propertyId} property={(properties as any[]).find((p:any)=>p.id===propertyId)} units={units as any[]} onChanged={invalidate} />
@@ -595,7 +609,14 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
     // to-do picked.
     () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined,
       ...(reason === 'move_out_final' && preset.leaseId && meterId === preset.meterId ? { leaseId: preset.leaseId } : {}) }),
-    { onSuccess: (r:any) => { toast(r?.data?.billed ? 'Read recorded — final bill created' : 'Reading recorded'); onClose() },
+    // 10/20: the answer has always said WHY a read did not bill — the cycle was
+    // already billed off the monthly run, the meter is on no unit, or the number
+    // is one the landlord has to look at before any final bill goes out — and
+    // NOTHING anywhere read that field. The desk saw a bare "Reading recorded"
+    // for all of it, which is how a dropped digit at a pull-out looked exactly
+    // like a clean read. The note never carries a figure or which way one was
+    // off: blind entry (S559) is only blind if a refusal cannot be read as a hint.
+    { onSuccess: (r:any) => { toast(readToast(r)); onClose() },
       onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not record the reading') }
   )
   return (
@@ -1328,150 +1349,6 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
   )
 }
 
-/**
- * SEND A BILL — 10/20 (Nic): "a lot of people that move out are going to get
- * their final electric bill as a pay link anyway... to send somebody a pay link
- * for their final bill, you would have to do it through the point of sale,
- * right? ... The point of sale is just an extension of things."
- *
- * The routes to do it (GET/POST /pos/pay-links/utility-bills) shipped with
- * nothing calling them. This is the button, and it belongs HERE rather than in
- * the register: this is the screen where a landlord already looks at what the
- * meters billed, and a final bill is not a sale somebody rings up — every
- * figure comes off the bill itself, so there is no price for a cashier to set.
- *
- * It sends ONE link and ONE email for everything ticked, which is the
- * one-email-per-thing rule (S652): a household leaving with power and water
- * owed gets a single bill to pay, not two.
- *
- * Nothing here can change an amount. The server takes bill IDs, never figures.
- */
-export function SendUtilityBillCard({ propertyId, canSend }: { propertyId: string; canSend: boolean }) {
-  const qc = useQueryClient()
-  const [picked, setPicked] = useState<Record<string, boolean>>({})
-  const [to, setTo] = useState('')
-
-  const { data: bills = [], isLoading } = useQuery(
-    ['utility-bills-sendable', propertyId],
-    () => apiGet(`/pos/pay-links/utility-bills?propertyId=${propertyId}`),
-    { enabled: !!propertyId && canSend }
-  )
-
-  const rows = bills as any[]
-  const chosen = rows.filter(b => picked[b.billId])
-  const total = chosen.reduce((t, b) => t + Number(b.amount || 0), 0)
-
-  // Everything ticked has to go to one person — one household, one balance.
-  const payers = new Set(chosen.map(b => (b.payerEmail || '').toLowerCase()).filter(Boolean))
-  const tooManyPayers = payers.size > 1
-  const suggested = chosen.find(b => b.payerEmail)?.payerEmail || ''
-  const address = to.trim() || suggested
-
-  const send = useMutation(
-    () => apiPost('/pos/pay-links/utility-bills', {
-      propertyId,
-      billIds: chosen.map(b => b.billId),
-      ...(to.trim() ? { customer: { email: to.trim() } } : {}),
-    }),
-    {
-      onSuccess: () => {
-        toast(`Bill sent to ${address} — ${fmt(total)}`)
-        setPicked({}); setTo('')
-        qc.invalidateQueries(['utility-bills-sendable', propertyId])
-      },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'The bill could not be sent.'),
-    }
-  )
-
-  if (!canSend) return null
-
-  return (
-    <>
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12, marginTop:4 }}>
-        <div>
-          <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Send a bill</h2>
-          <p style={{ fontSize:'.76rem', color:'var(--text-3)', margin:'4px 0 0' }}>
-            Email somebody a link to pay what their meters came to — a final bill for a household that has
-            left, or any bill they'd rather pay online. Paying it closes the bill out.
-          </p>
-        </div>
-      </div>
-      <div className="card" style={{ padding:0, marginBottom:28 }}>
-        {isLoading ? (
-          <div style={{ padding:28, fontSize:'.82rem', color:'var(--text-3)' }}>Looking for bills…</div>
-        ) : rows.length === 0 ? (
-          <div className="empty-state" style={{ padding:40 }}>
-            <Receipt size={36}/><h3>Nothing to send</h3>
-            <p>Every utility bill at this property is either paid or already out on a link. A bill shows up here once its meters are read.</p>
-          </div>
-        ) : (
-          <>
-            <div style={{ overflowX:'auto' }}>
-              <table style={{ width:'100%', borderCollapse:'collapse', minWidth:520 }}>
-                <thead>
-                  <tr>
-                    <th style={{ width:34 }}></th>
-                    <th style={{ textAlign:'left' }}>Bill</th>
-                    <th style={{ textAlign:'left' }}>Who</th>
-                    <th style={{ textAlign:'right' }}>Amount</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((b:any) => (
-                    <tr key={b.billId}>
-                      <td style={{ textAlign:'center' }}>
-                        <input
-                          id={`sendbill-${b.billId}`}
-                          type="checkbox"
-                          checked={!!picked[b.billId]}
-                          onChange={e => setPicked(p => ({ ...p, [b.billId]: e.target.checked }))}
-                        />
-                      </td>
-                      <td style={{ fontSize:'.82rem' }}>{b.lineName}</td>
-                      <td style={{ fontSize:'.8rem', color:'var(--text-2)' }}>
-                        {b.payerName || <span style={{ color:'var(--text-3)' }}>nobody on file</span>}
-                        {b.payerEmail && <span style={{ color:'var(--text-3)', fontSize:'.74rem' }}> · {b.payerEmail}</span>}
-                      </td>
-                      <td className="mono" style={{ textAlign:'right', fontSize:'.82rem' }}>{fmt(b.amount)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div style={{ borderTop:'1px solid var(--border)', padding:14, display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
-              <input
-                id="sendbill-to"
-                type="email"
-                value={to}
-                placeholder={suggested ? `Send to ${suggested}` : 'Email address'}
-                onChange={e => setTo(e.target.value)}
-                style={{ flex:'1 1 16rem', minWidth:0, fontSize:'.84rem', padding:'7px 9px' }}
-              />
-              <span className="mono" style={{ fontSize:'.84rem' }}>{chosen.length ? fmt(total) : '—'}</span>
-              <button
-                className="btn btn-primary btn-sm"
-                disabled={!chosen.length || (!address) || tooManyPayers || send.isLoading}
-                onClick={() => send.mutate()}
-              >
-                {send.isLoading ? 'Sending…' : `Send bill${chosen.length > 1 ? ` (${chosen.length})` : ''}`}
-              </button>
-            </div>
-            {tooManyPayers && (
-              <div style={{ padding:'0 14px 14px', fontSize:'.78rem', color:'var(--amber)' }}>
-                Those bills belong to different people. One link is one person's bill — tick one person's at a time.
-              </div>
-            )}
-            {!!chosen.length && !address && !tooManyPayers && (
-              <div style={{ padding:'0 14px 14px', fontSize:'.78rem', color:'var(--text-3)' }}>
-                Nobody's email is on file for that bill — type where it should go.
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </>
-  )
-}
 
 function TaxRatesCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()

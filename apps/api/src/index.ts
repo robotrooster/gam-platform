@@ -60,6 +60,7 @@ import { vehiclesRouter } from './routes/vehicles'
 import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
+import { propertyTaskListRouter } from './routes/propertyTaskList'
 import { unitsRouter }        from './routes/units'
 import { stayCheckOutRouter }  from './routes/stayCheckOut'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
@@ -396,6 +397,10 @@ app.use('/api/dump-locations', dumpLocationsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
+// 10/20 (Blu, via Nic): the park's own checklist. Its own mount, not a branch of
+// /api/properties, because "sitting outside of it" is the request and a thing
+// mounted inside maintenance or property config drifts back into one.
+app.use('/api/property-task-list', propertyTaskListRouter)
 // 10/4 (decisions #38): checking a guest out and settling the money.
 app.use('/api/units',         stayCheckOutRouter)
 app.use('/api/units',         unitsRouter)

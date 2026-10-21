@@ -3,7 +3,9 @@
  *
  * Covered routes (17):
  *   Shifts (3): clock-in, clock-out, active
- *   Tasks (3): GET, POST, PATCH/:id/complete
+ *   Tasks (1): GET — the old landlord-wide list's record. Its POST and
+ *     PATCH/:id/complete were REMOVED 10/20 when the tab was retired; the two
+ *     tests that covered them now hold that they are gone.
  *   Parts (3): GET, POST, PATCH/:id
  *   Purchases (4): GET, POST, PATCH/:id/approve, PATCH/:id/deny
  *   Scheduled (3): GET, POST, PATCH/:id/complete
@@ -162,11 +164,20 @@ describe('GET /shifts/active', () => {
 })
 
 // ───────────────────────────────────────────────────────────────────
-// DAILY TASKS
+// THE OLD LANDLORD-WIDE TASK LIST — RETIRED 10/20 (Nic)
+//
+// daily_tasks was the "Tasks" tab on the Maintenance Portal page. Blu's
+// per-property task list replaced it; Nic, on another duplicated surface the
+// same evening: "That doesn't need to be its own tab. That's kind of
+// ridiculous." The two writes are gone with the tab — a list nobody can see is
+// worse than two lists, and a POST that still worked would quietly rebuild the
+// second one. The READ stays, because GAM never erases and this is now the
+// record of what that list held: see routes/oneTaskList.test.ts for the fold
+// onto the parks and for what each row says about where its line went.
 // ───────────────────────────────────────────────────────────────────
 
 describe('GET /tasks', () => {
-  it('landlord-scoped: only own + only due_date=today OR recurring', async () => {
+  it('landlord-scoped, and now the whole record rather than a day of it', async () => {
     const f = await seed()
     await db.query(
       `INSERT INTO daily_tasks (landlord_id, title, due_date) VALUES
@@ -175,7 +186,6 @@ describe('GET /tasks', () => {
         ($1, 'Recurring A', NULL),
         ($2, 'Today B', CURRENT_DATE)`,
       [f.landlordAId, f.landlordBId])
-    // Recurring needs recurrence != 'none' to be picked up by the OR clause
     await db.query(
       `UPDATE daily_tasks SET recurrence='daily' WHERE title='Recurring A'`)
     const res = await request(buildApp())
@@ -183,45 +193,25 @@ describe('GET /tasks', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(res.status).toBe(200)
     const titles = res.body.data.map((t: any) => t.title).sort()
-    expect(titles).toEqual(['Recurring A', 'Today A'])
+    // 'Past A' used to be hidden by the screen's "due today or repeating"
+    // filter, which is part of how this list ended up half-used. A record shows
+    // everything. Still only this landlord's: 'Today B' is not here.
+    expect(titles).toEqual(['Past A', 'Recurring A', 'Today A'])
   })
 })
 
-describe('POST /tasks', () => {
-  it('happy: creates task with recurrence default none', async () => {
+describe('the two writes are gone', () => {
+  it('POST /tasks no longer exists', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post('/api/maint-portal/tasks')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ title: 'Mow lawn', dueDate: '2026-06-15' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.title).toBe('Mow lawn')
-    expect(res.body.data.recurrence).toBe('none')
-    expect(res.body.data.landlord_id).toBe(f.landlordAId)
-  })
-})
-
-describe('PATCH /tasks/:id/complete', () => {
-  it('unknown → 404 (S348 fix pin)', async () => {
-    const f = await seed()
-    const res = await request(buildApp())
-      .patch(`/api/maint-portal/tasks/${randomUUID()}/complete`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
     expect(res.status).toBe(404)
+    expect((await db.query(`SELECT id FROM daily_tasks`)).rows.length).toBe(0)
   })
 
-  it('cross-landlord → 404 (S348 fix pin)', async () => {
-    const f = await seed()
-    const t = await db.query<{ id: string }>(
-      `INSERT INTO daily_tasks (landlord_id, title) VALUES ($1, 'B task') RETURNING id`,
-      [f.landlordBId])
-    const res = await request(buildApp())
-      .patch(`/api/maint-portal/tasks/${t.rows[0].id}/complete`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(res.status).toBe(404)
-  })
-
-  it('happy: flips completed + stamps completed_at + completed_by', async () => {
+  it('PATCH /tasks/:id/complete no longer exists, and ticks nothing', async () => {
     const f = await seed()
     const t = await db.query<{ id: string }>(
       `INSERT INTO daily_tasks (landlord_id, title) VALUES ($1, 'A task') RETURNING id`,
@@ -229,9 +219,11 @@ describe('PATCH /tasks/:id/complete', () => {
     const res = await request(buildApp())
       .patch(`/api/maint-portal/tasks/${t.rows[0].id}/complete`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.completed).toBe(true)
-    expect(res.body.data.completed_by).toBe(f.landlordAUserId)
+    expect(res.status).toBe(404)
+    // The row is untouched — a retired endpoint must not half-write.
+    const row = await db.query<{ completed: boolean }>(
+      `SELECT completed FROM daily_tasks WHERE id = $1`, [t.rows[0].id])
+    expect(row.rows[0].completed).toBe(false)
   })
 })
 

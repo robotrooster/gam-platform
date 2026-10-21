@@ -1709,37 +1709,21 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     params: { notes: { type: 'string', description: 'What they did on the shift, in their words.' } },
     required: [],
   },
-  {
-    id: 'create_daily_task',
-    audience: 'landlord', method: 'POST', path: '/api/maint-portal/tasks',
-    description:
-      'Put a task on the board for the maintenance crew — one job, or something that repeats. Use ' +
-      'for "have someone check the pool chemicals every morning".\n' +
-      'This is the crew\u2019s own task list. It is NOT a tenant maintenance request: a tenant reporting ' +
-      'a broken heater is a maintenance request, which has a tenant waiting on it and its own ' +
-      'approval and cost trail. Do not put one of those here.',
-    params: {
-      title: { type: 'string', description: 'What needs doing, short.' },
-      description: { type: 'string', description: 'The detail.' },
-      assignedTo: { type: 'string', description: 'The user id of the person it goes to, from a lookup. Leave out for the whole crew.' },
-      dueDate: { type: 'string', description: 'When it is due, YYYY-MM-DD.' },
-      recurrence: { type: 'string', description: 'none, daily, weekly, or monthly.' },
-    },
-    required: ['title'],
-    confirmFirst: true,
-  },
-  {
-    id: 'complete_daily_task',
-    audience: 'landlord', method: 'PATCH', path: '/api/maint-portal/tasks/:taskId/complete',
-    pathParams: ['taskId'],
-    description:
-      'Mark a task on the maintenance crew\u2019s board as done, and record who finished it. Use for ' +
-      '"the pool is done" or "Danny finished the gutters".\n' +
-      'This is the crew\u2019s own task list, not a tenant\u2019s maintenance request — a tenant has ' +
-      'somebody waiting on an answer, and completing one of those is a different action.',
-    params: { taskId: { type: 'string', description: 'The task id, from a lookup.' } },
-    required: ['taskId'],
-  },
+  // 10/20 (Nic) — create_daily_task and complete_daily_task ARE GONE, and this
+  // note is here so nobody puts them back by reflex.
+  //
+  // They wrote to daily_tasks, the old landlord-wide "Tasks" tab. That list is
+  // retired: Blu's per-property task list replaced it, every line still waiting
+  // to be done was folded onto the park it belongs to (migration
+  // 20261022182000), and the two write endpoints behind these actions are gone.
+  // An action pointing at a dead endpoint is worse than no action — the
+  // assistant offers to put a job on the board and the job lands nowhere
+  // anybody looks.
+  //
+  // The park's list is deliberately NOT given an action in their place. All
+  // three of its writes are named in actionGap's DELIBERATE with the reason:
+  // Nic, relaying Blu, "it's stuff assigned by the landlord himself", and a
+  // tick is somebody saying they were at the meter and it is fixed.
   {
     id: 'add_inventory_item',
     audience: 'landlord', method: 'POST', path: '/api/maint-portal/parts',

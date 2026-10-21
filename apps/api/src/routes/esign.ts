@@ -20,6 +20,7 @@ import {
   STANDALONE_DOCUMENT_TYPES,
   NO_LEASE_DOCUMENT_TYPES,
   LEASE_TEMPLATE_PURPOSES,
+  LEASE_TEMPLATE_PURPOSE_LABEL,
   isValidSignerRole,
   MIGRATION_WINDOW_DAYS,
   leaseColumnDisplayValue,
@@ -31,7 +32,7 @@ import {
   leaseDueDay,
   dueDayLabel,
   parseDueDay,
-  GENERIC_SIGNER_ROLES,
+  DOCUMENT_SIGNER_ROLES,
   DISCLOSURE_TYPES,
   DISCLOSURE_TYPE_LABEL,
   TEMPLATE_APPLIES_TO,
@@ -71,6 +72,12 @@ import { landlordSigningContact } from '../services/landlordSigningContact'
 import { departureRuleSql } from '../services/departureRules'
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
 import { NOT_A_RESIDENT_ACCOUNT } from '../jobs/leaseParser/resolveIntent'
+// 10/20: who sits in which seat on a document — the lease roster's roles turned
+// into the roles templates are built with, and the seats a document raised from
+// one resident's page can fill (services/signerSeats).
+import {
+  householdSignerRows, planResidentSeats, residentSignerRows, residentSigningSeats,
+} from '../services/signerSeats'
 
 export const esignRouter = Router()
 
@@ -86,6 +93,35 @@ const TENANT_APP_URL   = process.env.TENANT_APP_URL   || 'http://localhost:3002'
 // creation time get their fields pruned (see POST /documents).
 const TENANT_ROLE_PATTERN = /^(primary|co_tenant_\d+)$/
 function isTenantRole(role: string): boolean { return TENANT_ROLE_PATTERN.test(role) }
+
+// ─────────────────────────────────────────────────────────────
+// 10/20 — ONE ANSWER TO "DOES THE LANDLORD SIGN FIRST ON THIS ONE?"
+// ─────────────────────────────────────────────────────────────
+//
+// Three gates asked that question and two of them answered it differently.
+// The send route skips the landlord-first ORDERING check on a standalone
+// document (S568: a contract signs in whatever order its creator set), while
+// the sign submit and the signing page applied the blanket "no tenant before
+// the landlord" rule to every document type there is.
+//
+// Nothing could reach the gap until the New Contract picker started offering
+// the resident roles (10/20, Blu's work-trade form). From then on, a contract
+// whose first signer row was a tenant and whose second was the landlord passed
+// send and was then refused to BOTH parties, permanently: the tenant was told
+// the landlord signs first, the landlord was told it was not his turn yet, and
+// the signing page told each of them to wait on the other. No endpoint reorders
+// a document's signers, so voiding it and building it again was the only exit,
+// and neither screen said why.
+//
+// So the question has one answer now, in one place, and all three gates read
+// it. A LEASE keeps the rule: the landlord types the terms into the document
+// and signs to lock them, which is the entire reason it exists (S28 → S535) —
+// a tenant must never sign over values that can still change. A standalone
+// contract has no lease values to lock, so the order its creator set stands,
+// and the strict order_index turn check is the only sequencing it needs.
+export function landlordSignsFirst(documentType: string | null | undefined): boolean {
+  return !(STANDALONE_DOCUMENT_TYPES as readonly string[]).includes(documentType ?? '')
+}
 
 // ─────────────────────────────────────────────────────────────
 // S654 — WHO A COMPANY MAY PUT ON ITS DOCUMENT, AND WHERE THEIR MAIL GOES
@@ -163,7 +199,29 @@ async function assertSignerLogins(
     if (s.role === 'landlord') {
       if (RESIDENT_TYPE_LOGINS.has(a.role)) throw new AppError(409, RESIDENT_CANNOT_SIGN_FOR_LANDLORD)
     } else if (isTenantRole(s.role)) {
-      if (a.role !== 'tenant') throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
+      // 10/20: this read `a.role !== 'tenant'`, which is a narrower question
+      // than the one the rule asks. The rule keeps a LANDLORD'S OR STAFF
+      // member's login out of a resident's seat; it was refusing everyone who
+      // is not already somebody's resident. So New Contract, which sends no
+      // user id and mints a 'contact' account for an address GAM has never
+      // seen, had that brand-new signer refused one line later as "an account
+      // that isn't a resident's" — an account that, from the landlord's side,
+      // did not exist until he typed it, with no next step he could take.
+      //
+      // Nic, 10/20, on the box Blu needed to fill: "if it's a tenant, it needs
+      // to be able to be signed by the tenant." The role names WHICH BOX on
+      // the form a person signs, not what kind of account they hold. So the
+      // same set the witness seat uses: a resident's or a contact's login, yes;
+      // a landlord's or a staff member's, never.
+      //
+      // This does not open a lease to a non-resident. Every lease door checks
+      // the tenant profile itself right after this call ("has no tenant profile
+      // — cannot sign as tenant"), and a login that IS a resident must still
+      // be this company's (assertResidentsBelong). What it opens is a
+      // standalone contract — a work-trade form, a bill of sale — which has no
+      // lease and never did need one. A tenant ACCOUNT still comes only from
+      // an invite or screening; a contact minted here stays a contact.
+      if (!RESIDENT_TYPE_LOGINS.has(a.role)) throw new AppError(409, NOT_A_RESIDENT_ACCOUNT)
     } else if (s.role === 'witness') {
       if (!RESIDENT_TYPE_LOGINS.has(a.role)) throw new AppError(409, WITNESS_NOT_A_STAFF_LOGIN)
     }
@@ -213,6 +271,14 @@ async function assertResidentsBelong(
   const stranger = residents.find(s => !tied.has(s.userId!))
   if (stranger) throw new AppError(409, notThisCompanysResident(stranger.name?.trim() || 'This person'))
 }
+
+/**
+ * The roles the document builder can bind a template field to. Exported so
+ * standaloneSignerRoles.test.ts can hold it equal to what the landlord's
+ * pickers offer — a role on offer that is missing here binds to nobody and the
+ * field is pruned in silence, which is the defect Blu hit on 10/20.
+ */
+export const KNOWN_SIGNER_ROLES: ReadonlySet<string> = new Set(DOCUMENT_SIGNER_ROLES)
 
 const LANDLORD_SEAT_NOT_THIS_COMPANY =
   "Only an owner or staff member of this company can sign for the landlord. Use your own login or one of your team's."
@@ -814,16 +880,21 @@ export async function createDocumentRecord(client: any, opts: {
     // An ABSENT role is fine. An UNKNOWN one never is: it can only mean the
     // caller and the templates disagree about the vocabulary, and every field
     // for the real role is about to be dropped. Fail where it is cheap.
-    const KNOWN_SIGNER_ROLES = new Set([
-      'landlord', 'primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3',
-      ...GENERIC_SIGNER_ROLES,
-    ])
+    // 10/20: this set used to be written out here by hand, and the landlord's
+    // signer picker had its own shorter list — which is how Blu ended up with a
+    // landlord box no landlord could be put in. One list now (@gam/shared
+    // DOCUMENT_SIGNER_ROLES), read by the builder, the field editor and the
+    // picker alike, so nothing can offer a role this would refuse.
     const unknown = [...filledRoles].filter(r => r && !KNOWN_SIGNER_ROLES.has(r))
     if (unknown.length) {
+      // 10/20: it read "role "co_tenant" match no field" and then named the
+      // roles in their database spelling. The role string stays — it is the one
+      // piece of diagnosis in here — and the sentence around it reads the way
+      // every other refusal does, since this one does reach a landlord's screen.
       throw new AppError(500,
         `Cannot build this document: signer role${unknown.length > 1 ? 's' : ''} `
-        + `"${unknown.join('", "')}" match no field on any template. `
-        + 'Tenants are primary / co_tenant_1..3.')
+        + `"${unknown.join('", "')}" match${unknown.length > 1 ? '' : 'es'} no box on any form. `
+        + 'The people a lease form has boxes for are the Landlord, the Primary Tenant and Co-Tenant 1-3.')
     }
     const tmplFields = await client.query(
       'SELECT * FROM lease_template_fields WHERE template_id=$1',
@@ -2610,7 +2681,13 @@ esignRouter.get('/recipients', requireAuth, requirePerm('leases.create'), async 
         JOIN v_lease_active_tenants vlat ON vlat.lease_id = l.id
         JOIN tenants t ON t.id = vlat.tenant_id
         JOIN users us ON us.id = t.user_id
-       WHERE l.landlord_id = $1 AND l.status = 'active' ${filter}
+       -- 10/20: = $1 against the LIST of the account's companies. Postgres
+       -- accepts a one-element '{uuid}' as a uuid, so this worked for everyone
+       -- who owns one company and raised "invalid input syntax for type uuid"
+       -- for an account with two — Nic's own two parks are two companies, and
+       -- his send form's recipient list is the screen that breaks. ANY(), like
+       -- every other read scoped to an account.
+       WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active' ${filter}
        ORDER BY u.unit_number, vlat.role`, params)
     // group by lease
     const groups = new Map<string, any>()
@@ -3839,6 +3916,241 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
   }
 })
 
+// ─────────────────────────────────────────────────────────────
+// 10/20 — "SEND A DOCUMENT FOR SIGNATURE" ON THE RESIDENT'S OWN PAGE
+// ─────────────────────────────────────────────────────────────
+//
+// Nic, 10/20, after Blu could not get his work-trade form signed: "can he just
+// go into Curtis's file, add a template that way, and have it signed to him?
+// Like, there's some sort of broken flow there that we need to get fixed."
+//
+// That is this door. Blu opens the resident, picks the form, and presses send.
+// GAM fills the seats itself — the resident is the Primary Tenant, Blu is the
+// Landlord, anyone else on their lease takes the co-tenant seats — so nobody
+// has to know what a signer role is. Knowing was the old price of admission:
+// New Contract asks for a role per signer row, and a role picked wrong binds
+// the form's boxes to nobody and prunes them in silence.
+//
+// TWO ENDPOINTS, ONE ANSWER ABOUT THE SEATS. The list says, before anything is
+// sent, which boxes get a person and which do not; the create builds from the
+// same reading (services/signerSeats). A form whose boxes this door cannot fill
+// — a witness, a seller — is NOT offered here: it says so and names the screen
+// that can send it. A role offered is a role that can be assigned.
+//
+// The document is a standalone CONTRACT (general_contract): its signed PDF is
+// the instrument, it materializes no lease, and it changes nothing about the
+// tenancy. Any form whose signature has to CHANGE a lease keeps its own door —
+// see RESIDENT_PAGE_PURPOSES_EXCLUDED below — because the door that papers the
+// change is also the one that bills it.
+
+/** A resident is this account's when a lease, an invite or a draft lease says so. */
+async function assertResidentOnAccount(tenantId: string, scopeIds: string[]): Promise<void> {
+  if (!SIGNER_UUID_RE.test(tenantId)) throw new AppError(404, 'That resident is not on your account.')
+  if (!scopeIds.length) throw new AppError(404, 'That resident is not on your account.')
+  const tied = await queryOne<{ ok: number }>(
+    `SELECT 1 AS ok FROM lease_tenants lt
+       JOIN leases l ON l.id = lt.lease_id
+      WHERE lt.tenant_id = $1 AND l.landlord_id = ANY($2::uuid[])
+     UNION ALL
+     SELECT 1 FROM pending_tenant_intents i
+      WHERE i.tenant_id = $1 AND i.landlord_id = ANY($2::uuid[]) AND i.cancelled_at IS NULL
+     UNION ALL
+     SELECT 1 FROM pending_lease_drafts d JOIN tenants t ON t.user_id = d.tenant_user_id
+      WHERE t.id = $1 AND d.landlord_id = ANY($2::uuid[])
+     LIMIT 1`, [tenantId, scopeIds])
+  if (!tied) throw new AppError(404, 'That resident is not on your account.')
+}
+
+/**
+ * The forms this door may send at all.
+ *
+ * A form whose SIGNATURE has to change a lease record goes through its own
+ * door, where the terms, the billing and the money live: a lease from the
+ * Leases screen, an addendum from Leases → Change (so GAM bills the new
+ * terms), an installment sale from the home sale on the unit (so the payments
+ * record against the home). Sending one of those from here would put signed
+ * paper in front of a resident that GAM would then not act on — the lease is
+ * law, and the law would say one thing while the billing said another.
+ *
+ * What is left is the paper whose signed PDF IS the whole instrument: a
+ * work-trade agreement, park rules, a disclosure, any form of the landlord's
+ * own. Which is exactly what Blu was trying to send.
+ */
+const RESIDENT_PAGE_PURPOSES_EXCLUDED = ['lease', 'installment_sale', 'addendum'] as const
+
+const residentFormsSql = `
+  SELECT t.id, t.landlord_id, t.name, COALESCE(t.purpose, 'other') AS purpose,
+         COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT f.signer_role), NULL), '{}') AS roles
+    FROM lease_templates t
+    LEFT JOIN lease_template_fields f ON f.template_id = t.id
+   WHERE t.landlord_id = ANY($1::uuid[])
+     AND t.is_active = TRUE
+     AND t.base_pdf_url IS NOT NULL
+     AND NOT (COALESCE(t.purpose, 'other') = ANY($2::text[]))
+   GROUP BY t.id
+   ORDER BY lower(t.name)`
+
+/**
+ * GET /api/esign/resident-forms/:tenantId — the forms this resident's page can
+ * send, each saying who would sign it.
+ */
+esignRouter.get('/resident-forms/:tenantId', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
+  try {
+    const tenantId = String(req.params.tenantId)
+    const scopeIds = landlordScopeIds(req.user!)
+    await assertResidentOnAccount(tenantId, scopeIds)
+
+    const templates = await query<any>(residentFormsSql, [scopeIds, [...RESIDENT_PAGE_PURPOSES_EXCLUDED]])
+    // One seat reading per company — an account's parks are separate companies
+    // and a resident of either may be sent a form filed under either (S633), so
+    // the landlord who signs and the lease that is read follow the FORM'S
+    // company rather than whichever one came back first.
+    const seatsByCompany = new Map<string, Awaited<ReturnType<typeof residentSigningSeats>>>()
+    for (const companyId of new Set((templates as any[]).map(t => t.landlord_id))) {
+      seatsByCompany.set(companyId, await residentSigningSeats({ tenantId, landlordId: companyId, scopeIds }))
+    }
+    const anySeats = [...seatsByCompany.values()].find(s => !!s)
+      ?? await residentSigningSeats({ tenantId, landlordId: scopeIds[0], scopeIds })
+    if (!anySeats) throw new AppError(404, 'That resident is not on your account.')
+
+    const forms = (templates as any[]).map(t => {
+      const ctx = seatsByCompany.get(t.landlord_id) ?? anySeats
+      const plan = planResidentSeats(t.roles ?? [], ctx)
+      return {
+        id: t.id,
+        name: t.name,
+        purposeLabel: LEASE_TEMPLATE_PURPOSE_LABEL[t.purpose as keyof typeof LEASE_TEMPLATE_PURPOSE_LABEL] ?? null,
+        suggestedTitle: residentDocumentTitle(t.name, ctx),
+        willSign: plan.willSign,
+        leftOff: plan.leftOff,
+        sendable: plan.sendable,
+        reason: plan.reason,
+      }
+    })
+    // What this door has already raised for them, so nobody sends the same
+    // agreement twice and the desk can see whose signature it is waiting on.
+    // Leases are left out on purpose: they live on the lease screens, and this
+    // card is about the paper that is not one.
+    const documents = await query<any>(
+      `SELECT d.id, d.title, d.status, d.created_at,
+              (SELECT x.name FROM lease_document_signers x
+                WHERE x.document_id = d.id AND x.status <> 'signed'
+                ORDER BY x.order_index LIMIT 1) AS waiting_on
+         FROM lease_documents d
+         JOIN lease_document_signers s ON s.document_id = d.id
+         JOIN tenants t ON t.user_id = s.user_id
+        WHERE t.id = $1
+          AND d.landlord_id = ANY($2::uuid[])
+          AND d.status <> 'voided'
+          AND d.document_type = ANY($3::text[])
+        GROUP BY d.id
+        ORDER BY d.created_at DESC
+        LIMIT 12`,
+      [tenantId, scopeIds, [...NO_LEASE_DOCUMENT_TYPES]])
+
+    res.json({ success: true, data: {
+      resident: {
+        name: anySeats.residentName,
+        unitLabel: anySeats.unitLabel,
+        propertyName: anySeats.propertyName,
+      },
+      forms,
+      documents,
+    } })
+  } catch (e) { next(e) }
+})
+
+/** "Mattoon Work Trade — Curtis Bell (Lot 1)", which is what the list shows. */
+function residentDocumentTitle(templateName: string, ctx: { residentName: string; unitLabel: string | null }): string {
+  const where = ctx.unitLabel ? ` (${ctx.unitLabel})` : ''
+  return `${templateName} — ${ctx.residentName}${where}`.slice(0, 160)
+}
+
+/**
+ * POST /api/esign/resident-documents — raise one of those forms for signature.
+ *
+ * Creates it only; the landlord app sends it with POST /documents/:id/send, the
+ * same second step New Contract takes, so the invites, the signing links and
+ * the 'contact' activation all run through the one send path.
+ */
+esignRouter.post('/resident-documents', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      tenantId:   z.string().uuid(),
+      templateId: z.string().uuid(),
+      title:      z.string().trim().min(1).max(160).optional(),
+    }).parse(req.body)
+
+    const scopeIds = landlordScopeIds(req.user!)
+    await assertResidentOnAccount(body.tenantId, scopeIds)
+
+    const tmpl = await queryOne<any>(
+      `SELECT t.id, t.landlord_id, t.name, t.base_pdf_url, COALESCE(t.purpose, 'other') AS purpose,
+              COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT f.signer_role), NULL), '{}') AS roles
+         FROM lease_templates t
+         LEFT JOIN lease_template_fields f ON f.template_id = t.id
+        WHERE t.id = $1 AND t.landlord_id = ANY($2::uuid[]) AND t.is_active = TRUE
+        GROUP BY t.id`, [body.templateId, scopeIds])
+    if (!tmpl) throw new AppError(404, 'That form is not one of yours.')
+    if (!tmpl.base_pdf_url) {
+      throw new AppError(400, `${tmpl.name} has no PDF yet — add one in GoldSign → Templates, then send it from here.`)
+    }
+    if ((RESIDENT_PAGE_PURPOSES_EXCLUDED as readonly string[]).includes(tmpl.purpose)) {
+      throw new AppError(400,
+        tmpl.purpose === 'lease'
+          ? 'A lease is sent from the Leases screen, where its terms and its move-in bill are set.'
+          : tmpl.purpose === 'addendum'
+            ? 'An addendum changes the lease, so it goes out from Leases → Change — that way GAM bills the new terms ' +
+              'instead of leaving them on paper only.'
+            : 'An installment sale contract is sent from the home sale on the unit, so the payments record against the home.')
+    }
+
+    const ctx = await residentSigningSeats({ tenantId: body.tenantId, landlordId: tmpl.landlord_id, scopeIds })
+    if (!ctx) throw new AppError(404, 'That resident is not on your account.')
+    const plan = planResidentSeats(tmpl.roles ?? [], ctx)
+    // D9, 10/20: a seat offered is a seat somebody can be put in. The list says
+    // the same sentence before the landlord ever presses send.
+    if (!plan.sendable) throw new AppError(400, plan.reason ?? 'This form cannot be sent from a resident\'s page.')
+    const signers = residentSignerRows(plan, ctx)
+
+    await client.query('BEGIN')
+    const txRows: RowsQuery = (sql, params) => client.query(sql, params).then((r: any) => r.rows)
+    // The same three checks every door that names signers runs (S654): the
+    // right KIND of login in each seat, a resident who is already this
+    // account's, and the landlord's seat at the address that login signs at.
+    const accounts = await assertSignerLogins(signers, txRows)
+    await assertResidentsBelong(signers, accounts, [tmpl.landlord_id, ...scopeIds], txRows)
+    await assertLandlordSigners(signers, { landlordId: tmpl.landlord_id, unitId: ctx.unitId }, txRows)
+
+    const doc = await createDocumentRecord(client, {
+      landlordId: tmpl.landlord_id,
+      templateId: tmpl.id,
+      // The space, so the form's own unit / property / landlord-name boxes come
+      // out filled and the landlord's signing link follows the property's named
+      // signer. No lease: this paper is its own instrument and makes none.
+      unitId: ctx.unitId,
+      leaseId: null,
+      title: body.title?.trim() || residentDocumentTitle(tmpl.name, ctx),
+      basePdfUrl: tmpl.base_pdf_url,
+      documentType: 'general_contract',
+      targetLeaseTenantId: null,
+      promoteLeaseTenantId: null,
+      signers,
+    })
+    await client.query('COMMIT')
+
+    res.status(201).json({ success: true, data: {
+      ...doc, willSign: plan.willSign, leftOff: plan.leftOff,
+    } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
 /**
  * S655: can this NEW LEASE (a document with renews_lease_id) still be canceled?
  * Null when it can; otherwise the refusal, in plain words with the next step.
@@ -4163,10 +4475,18 @@ async function draftNewLeaseForHousehold(user: any, opts: {
   if ((roster as any[]).length === 0) throw new AppError(409, 'This lease has nobody on it to sign a new lease.')
   const signers = [
     { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
-    ...(roster as any[]).map((r: any, i: number) => ({
-      userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
-      email: r.email, phone: r.phone, orderIndex: i + 2,
-    })),
+    // 10/20 — THE LEASE'S WORD FOR A SECOND RESIDENT IS NOT A SIGNER ROLE.
+    //
+    // lease_tenants.role holds 'primary' or 'co_tenant' — two values, by its
+    // own CHECK constraint. A template's boxes are bound to 'primary' and
+    // 'co_tenant_1'..'co_tenant_3'. Handing the lease's word straight to the
+    // builder put a role on the document that no form can carry: before the
+    // S652 unknown-role guard every co-tenant box was pruned in silence, and
+    // since it the build refuses outright — so this door died on the second
+    // resident with a 500 about fields matching no template. 23 live leases
+    // have a co-tenant. services/signerSeats does the one mapping now, for
+    // every door that builds a document from a household.
+    ...householdSignerRows(roster as any[], { startOrderIndex: 2 }),
   ]
 
   // Prefill: identity + carried-over settings ONLY. The new terms
@@ -5333,10 +5653,9 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
     if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to sign the addendum')
     const signers = [
       { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
-      ...(roster as any[]).map((r: any, i: number) => ({
-        userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
-        email: r.email, phone: r.phone, orderIndex: i + 2,
-      })),
+      // 10/20: 'co_tenant' is the lease's word, never a form's box — see the
+      // renewal door above. One mapping, in services/signerSeats.
+      ...householdSignerRows(roster as any[], { startOrderIndex: 2 }),
     ]
 
     await client.query('BEGIN')
@@ -5404,7 +5723,10 @@ export async function autoDraftWorkTradeAddendumForRenewal(newLeaseId: string): 
   if ((roster as any[]).length === 0) return
   const signers = [
     { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
-    ...(roster as any[]).map((r: any, i: number) => ({ userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`, email: r.email, phone: r.phone, orderIndex: i + 2 })),
+    // 10/20: same mapping as the two doors above — the auto-draft swallowed
+    // its own failure, so a renewed household with a co-tenant simply got no
+    // work-trade addendum drafted and nobody was told.
+    ...householdSignerRows(roster as any[], { startOrderIndex: 2 }),
   ]
   const client = await getClient()
   try {
@@ -5567,7 +5889,14 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
 
     // Fast-fail overlap pre-check before we start emailing anyone
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
-    if (primary && doc.unit_id) {
+    // 10/20: AND only on a document that can become a lease. A document that
+    // materializes no lease records no occupancy, so there is nothing to
+    // double-book — and a contract raised from a resident's page carries their
+    // SPACE (so the form's unit and property boxes come out filled), which this
+    // check read as that household already holding the space it names. A form
+    // with a start-date box on it was refused for the resident who lives there.
+    const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+    if (primary && doc.unit_id && !isNoLeaseDoc) {
       // Try to infer proposed start/end from field defaults if available
       const vals = await query<any>(`
         SELECT lease_column, value FROM lease_document_fields
@@ -5734,7 +6063,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     // landlord party + no lease-value fields, so this ordering rule does not
     // apply — they sign in whatever order the creator set.
     // ────────────────────────────────────────────────────────────────────────
-    const isStandaloneDoc = (STANDALONE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+    const isStandaloneDoc = !landlordSignsFirst(doc.document_type)
     if (!isStandaloneDoc) {
       const sortedSigners = [...(signers as any[])].sort(
         (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0)
@@ -6170,7 +6499,12 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
           WHERE document_id = $1 AND status != 'signed'
             AND (order_index < $2 OR (role = 'landlord' AND $3::boolean))
           ORDER BY order_index LIMIT 1`,
-        [doc.id, signer.order_index, isTenantRole(signer.role)])
+        // 10/20: and only where the landlord-first rule applies at all —
+        // otherwise this page told the tenant to wait on the landlord and the
+        // landlord to wait on the tenant, on a contract whose creator meant
+        // the tenant to go first. landlordSignsFirst() decides, once.
+        [doc.id, signer.order_index,
+          isTenantRole(signer.role) && landlordSignsFirst(doc.document_type)])
       if (blocker) waitingOn = blocker.role === 'landlord' ? 'the landlord' : blocker.name
     }
     const readOnly = docTerminal || signerTerminal || waitingOn !== null || closedReason !== null
@@ -6431,8 +6765,12 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     await client.query('BEGIN')
 
     // Phase A: pre-validation reads (inside txn for read-your-writes consistency)
+    // 10/20: the document's type comes along because the turn gates below run
+    // before the full document row is read, and one of them depends on it.
     const signerRes = await client.query(
-      `SELECT * FROM lease_document_signers WHERE document_id=$1 AND user_id=$2`,
+      `SELECT s.*, d.document_type FROM lease_document_signers s
+         JOIN lease_documents d ON d.id = s.document_id
+        WHERE s.document_id=$1 AND s.user_id=$2`,
       [req.params.documentId, req.user!.userId])
     const signer = signerRes.rows[0]
     if (!signer) throw new AppError(403, 'You are not a signer on this document')
@@ -6458,7 +6796,11 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // order_index could slip past. Any unsigned landlord-role signer on
     // the document blocks every tenant-role signature. Sublease
     // agreements are naturally unaffected (no landlord signer row).
-    if (isTenantRole(signer.role)) {
+    // 10/20: on a document where the landlord does NOT sign first by rule
+    // (a standalone contract — the send route has always said so), this gate
+    // deadlocked the whole document against the order its creator set. The
+    // order_index check just above is that document's turn rule.
+    if (isTenantRole(signer.role) && landlordSignsFirst(signer.document_type)) {
       const unsignedLandlord = await client.query(
         `SELECT 1 FROM lease_document_signers
           WHERE document_id=$1 AND role='landlord' AND status != 'signed'
@@ -6489,6 +6831,27 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
     if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
+    // ── 10/20: A PURCHASE AGREEMENT IS NOT A HOME SALE UNLESS IT IS ON A HOME ─
+    //
+    // The New Contract picker learned the landlord role today, so a landlord
+    // can finally put himself on a contract of his own. The modal opens on
+    // 'Purchase agreement', and a landlord who left that default could not
+    // sign what he had just written up: the installment-sale gate below fired
+    // on the document TYPE alone and refused his signature with "The
+    // installment contract needs the number of payments" — a sentence about a
+    // financed home sale, on a plain contract that has no sale boxes and no
+    // home. Nothing on the page lets him change a document's type afterward,
+    // so the only way out was to void it and start again.
+    //
+    // A financed sale is always the sale OF A UNIT: the home-sale setup and
+    // the onboarding packet both attach one, home_sale_contracts is keyed to
+    // it, and applySaleTermsFromDocument refuses a document without one. A
+    // standalone document is bound to no unit by construction. So the unit is
+    // what says which of the two this paper is, and all three sale branches
+    // below ask it instead of reading the type and assuming. A purchase
+    // agreement with no unit signs through as what it is: paper.
+    const isFinancedSaleDoc = doc.document_type === 'purchase_agreement' && !!doc.unit_id
+
     // S655: a NEW LEASE whose lease before it ENDED EARLY while nobody in the
     // household had signed it: nobody is staying on to take it up, it never
     // starts, and it is being canceled (scheduler.processNewLeaseSignings). A
@@ -6517,7 +6880,14 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // tenant their own signature, which is how issuance quietly became "the
     // tenant can never execute anything.
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
-    if (primary && doc.unit_id) {
+    // 10/20: AND only on a document that can become a lease. A document that
+    // materializes no lease records no occupancy, so there is nothing to
+    // double-book — and a contract raised from a resident's page carries their
+    // SPACE (so the form's unit and property boxes come out filled), which this
+    // check read as that household already holding the space it names. A form
+    // with a start-date box on it was refused for the resident who lives there.
+    const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+    if (primary && doc.unit_id && !isNoLeaseDoc) {
       // Check the dates being SIGNED, not only the ones already saved. The
       // landlord types the dates in this very submit; checking the saved
       // values let "6/31/2026", or a start overlapping the lease being renewed,
@@ -6660,7 +7030,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // S652 (Nic): the landlord TYPES the sale terms on the installment contract
     // and they become the record. Read them now, while he can still fix a box,
     // rather than after his signature is on the paper.
-    if (signer.role === 'landlord' && doc.document_type === 'purchase_agreement') {
+    if (signer.role === 'landlord' && isFinancedSaleDoc) {
       const { saleTermsFromFields, resolveTypedSaleTerms } = await import('../services/homeSale')
       resolveTypedSaleTerms(saleTermsFromFields(
         allFields.filter((f: any) => f.lease_column && String(f.lease_column).startsWith('sale_'))
@@ -6887,8 +7257,8 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
 
     // S576 (B-8): standalone contracts and work-trade addenda produce NO lease —
     // the signed PDF is the legal instrument. Hoisted out of the completion
-    // block in S647 because issuance below needs the same test.
-    const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+    // block in S647 because issuance below needs the same test; read once at
+    // the top of this submit since 10/20, where the occupancy check asks it too.
 
     // ── S647: THE LANDLORD'S SIGNATURE ISSUES THE LEASE ──────────────────
     //
@@ -6925,7 +7295,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // is attached to a company without their own signature") — the same
     // exception the lease issuance makes. Their sale starts on their own
     // signature, at completion. If the check itself fails, it waits too.
-    if (signer.role === 'landlord' && doc.document_type === 'purchase_agreement') {
+    if (signer.role === 'landlord' && isFinancedSaleDoc) {
       let saleRecorded = false
       try {
         const { applySaleTermsFromDocument } = await import('../services/homeSale')
@@ -7229,7 +7599,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // already recorded and must not be rolled back if scheduling fails.
       // activateHomeSaleContract is idempotent, and a failure leaves the
       // contract pending — visible, and retryable — rather than half-billed.
-      if (doc.document_type === 'purchase_agreement') {
+      if (isFinancedSaleDoc) {
         try {
           await activateHomeSaleContract(doc.id)
         } catch (e) {

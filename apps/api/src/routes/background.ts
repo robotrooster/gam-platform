@@ -810,7 +810,12 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // Not for the renter pool (no company yet). Never blocks the screening.
     if (!isSpeculative && effectiveLandlordId && tenant?.id) {
       const { applicantRegisterRecord } = await import('../services/posPeople')
-      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName })
+      // 10/20 (review): the book is the company's OWN account, not the caller's
+      // — the caller here is the APPLICANT, and an applicant is not the desk
+      // (services/registerBook accountAsCaller).
+      const { accountAsCaller } = await import('../services/registerBook')
+      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName },
+                                   await accountAsCaller(effectiveLandlordId, query))
         .catch((err: unknown) => logger.warn({ err, checkId: check?.id }, '[background] could not add the applicant to the register'))
     }
 

@@ -263,4 +263,67 @@ describe('a utility bill\'s pay link charged at the counter', () => {
     expect(await link(sentLink.id)).toMatchObject({ status: 'open' })
     expect((await settlements(sentLink.id))[0]).toMatchObject({ status: 'open' })
   })
+
+  /**
+   * 10/20 (review) — AND THE DISCOUNT IS THE SAME THEFT WITH NOBODY'S
+   * FINGERPRINTS ON THE LINE.
+   *
+   * The line guard above compares the line: its name, its price, its quantity
+   * and its tax. A cart-level discount touches none of them. A manager loads
+   * RV 27's $81.27 final electric into the register, presses Charge with $75.25
+   * off, and the line guard passes: $6.02 in the drawer, the bill closed out as
+   * paid in full, the whole $81.27 voided off the resident's debt with the same
+   * "collected on a pay link" note an honest collection writes, and the
+   * recovery report told $81.27 came in. Nothing afterwards reads as wrong.
+   */
+  it('a discount cannot come off the bill — not at the till, and not on the link', async () => {
+    const f = await seed()
+    // RV 27's final electric with the park's 8% utility tax on it: $75.25 + $6.02.
+    await db.query(`UPDATE utility_bills SET charge_amount = 75.25, tax_rate_pct = 8, tax_amount = 6.02 WHERE id = $1`, [f.billId])
+    await db.query(`UPDATE payments SET amount = 81.27 WHERE id = $1`, [f.paymentId])
+    await db.query(`UPDATE invoices SET total_amount = 81.27, subtotal_utilities = 81.27 WHERE id = $1`, [f.invoiceId])
+    const sentLink = (await sendBill(f)).body.data
+    expect(sentLink.total).toBe(81.27)
+    expect(await recovery(f)).toMatchObject({ recovered: 81.27, collected: 0, stillOwed: 81.27 })
+    const sent = (await db.query<any>(`SELECT items FROM pos_pay_links WHERE id = $1`, [sentLink.id])).rows[0].items[0]
+    const line = { id: null, name: sent.name, qty: sent.qty, price: sent.price, tax: sent.tax }
+
+    // The whole charge knocked off: the till takes the tax and nothing else.
+    const discounted = await chargeAtCounter(f, { payLinkId: sentLink.id, items: [line], discountAmount: 75.25 })
+    expect(discounted.status, JSON.stringify(discounted.body)).toBe(400)
+    expect(discounted.body.error).toMatch(/no discount comes off it/i)
+    expect(discounted.body.error).toMatch(/to stop asking for the bill, close the link/i)
+
+    // A dollar off is the same answer — a bill is collected in full or it is
+    // not collected. There is no size of discount that is honest here.
+    const dollarOff = await chargeAtCounter(f, { payLinkId: sentLink.id, items: [line], discountAmount: 1 })
+    expect(dollarOff.status, JSON.stringify(dollarOff.body)).toBe(400)
+
+    // Nothing was charged: the bill is as owed as it was, the charge is still
+    // on their invoice, and the link is still out with its open ask.
+    expect(await salesFor(sentLink.id)).toHaveLength(0)
+    expect(await bill(f.billId)).toMatchObject({ status: 'billed', paid_at: null })
+    expect((await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [f.paymentId])).rows[0].status).toBe('pending')
+    expect(await link(sentLink.id)).toMatchObject({ status: 'open' })
+    expect((await settlements(sentLink.id))[0]).toMatchObject({ status: 'open' })
+
+    // NOR ON THE LINK ITSELF. Adjust can put a discount on an open link, which
+    // would leave the payer's own card page asking $6.02 for a bill that closes
+    // out at $81.27 — the till's hole, reached from the Pay Links screen.
+    const adjusted = await request(buildApp()).patch(`/api/pos/pay-links/${sentLink.id}`)
+      .set('Authorization', `Bearer ${f.token}`).send({ items: [line], discountAmount: 75.25 })
+    expect(adjusted.status, JSON.stringify(adjusted.body)).toBe(400)
+    expect(adjusted.body.error).toMatch(/no discount comes off it/i)
+    const stillAsks = (await db.query<any>(
+      `SELECT discount_amount, total FROM pos_pay_links WHERE id = $1`, [sentLink.id])).rows[0]
+    expect(Number(stillAsks.discount_amount)).toBe(0)
+    expect(Number(stillAsks.total)).toBe(81.27)
+
+    // AND THE HONEST COLLECTION STILL GOES THROUGH, at the bill's own figure.
+    const paid = await chargeAtCounter(f, { payLinkId: sentLink.id, items: [line] })
+    expect(paid.status, JSON.stringify(paid.body)).toBe(201)
+    expect(Number(paid.body.data.total)).toBe(81.27)
+    expect(await bill(f.billId)).toMatchObject({ status: 'paid' })
+    expect(await recovery(f)).toMatchObject({ recovered: 81.27, collected: 81.27, stillOwed: 0 })
+  })
 })

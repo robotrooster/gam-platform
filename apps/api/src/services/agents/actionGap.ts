@@ -38,6 +38,22 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/20: the park's task list, which is a person's list on purpose ───────
+  // Blu wants a checklist the maintenance person consults and ticks off,
+  // "stuff assigned by the landlord himself". Both halves of that are reasons
+  // an assistant stays out of it. Ticking is somebody saying they were at the
+  // meter and it is fixed, and done_by_user_id keeps that name for good — an
+  // agent ticking a line would record work as done that nobody did, which is
+  // the same rule that keeps an agent off signatures. And a list an assistant
+  // writes is a list the landlord did not decide, which is the one thing Nic
+  // said this list is. Worth revisiting for ADDING a line once the assistants
+  // are back on; the tick is not worth revisiting.
+  'propertyTaskList POST /:propertyId':
+    'adds a line to a property\'s task list. Nic 10/20, relaying Blu: "it\'s stuff assigned by the landlord himself, not necessarily requests coming from the tenant, or work orders or whatever" — a list the assistant composes is a list nobody decided, which is the whole thing this list is meant to be.',
+  'propertyTaskList POST /:propertyId/items/:itemId/done':
+    'ticks a task off as done, and the row keeps who ticked it for good. That name is somebody saying they were there and did the work; an assistant pressing it records work nobody did. Same reason an agent never signs.',
+  'propertyTaskList POST /:propertyId/items/:itemId/hide':
+    'takes a line off the park\'s list. The landlord\'s own press — a task that can be made to disappear is a task that never has to be done, and the maintenance person is the one person it must not be removable by.',
   // ── 10/19: a mobile home changing hands with a debt on the spot ────────────
   // Every one of these moves money between two people, and the whole design is
   // that the landlord sees four figures BEFORE anything is written (what
@@ -444,6 +460,35 @@ const DELIBERATE = new Map(Object.entries({
   'esign DELETE /templates/:id/fields/:fieldId': 'field geometry on a PDF — removed visually, not described',
   'esign POST /documents': 'takes a hand-assembled signer list; draft_household_lease is the safe path',
   'esign POST /standalone-documents': 'takes the same hand-assembled signer list as POST /documents',
+  // ── 10/20: the door on the resident's own page ───────────────────────
+  //
+  // This IS the door Nic asked for — "can he just go into Curtis's file, add a
+  // template that way, and have it signed to him? Like, there's some sort of
+  // broken flow there that we need to get fixed." It stays a press on that page
+  // for a reason that is measured rather than judged.
+  //
+  // The call is named by two uuids in the BODY: which resident, and which of the
+  // landlord's own PDFs. The dispatcher turns a spoken name into an id for
+  // unitId, leaseId and propertyId only, and only where they sit in the PATH
+  // (portalDispatch.resolveHumanId), and no agent tool reads lease_templates at
+  // all — so a templateId could only ever be a number the model filled in, and
+  // agentRunner refuses an id this conversation never saw (idTraceability). An
+  // action here would be refused on every single call: the registry would read
+  // closed while the door was a dead end, which is exactly the trap S630 found
+  // sitting behind every "from a lookup" parameter.
+  //
+  // And the pick is the feature anyway. The list on the resident's page shows
+  // each form beside who would sign it and, where a box cannot be filled from
+  // that page, the words saying so and the screen that can send it (D9, 10/20);
+  // the whole point is that nobody has to know what a signer role is. What this
+  // door sends is the paper whose signed PDF IS the instrument — park rules, a
+  // disclosure, a work-trade agreement — so the wrong form is a real signed
+  // agreement, not a draft somebody corrects. The agent still draws up the ones
+  // it can name in a sentence, Blu's own case among them
+  // (draft_work_trade_addendum, draft_household_lease), and still sends and
+  // voids what is drafted.
+  'esign POST /resident-documents':
+    'raises one of the landlord\'s own forms for a resident to sign, picked off the list on that resident\'s page that names who would sign each one (D9, 10/20). The call is named by two uuids in the body and nothing an agent can call returns a template id, so every one it made would carry an invented id and be refused — a registry that reads closed over a door that is a dead end. The agent draws up the papers it can name instead (draft_work_trade_addendum, draft_household_lease) and sends and voids what is drafted.',
   'esign POST /documents/addendum-terms/batch': 'the batch form of an action the agent already has one at a time',
   'homeSale POST /': 'creates a financed sale contract with an amortisation schedule — a lending instrument',
 

@@ -1316,9 +1316,24 @@ describe('S560 billMoveOutRead odometer rollover', () => {
 
     const r = await billMoveOutRead(meterId, mo.id)
     expect(r.billed).toBe(false)
-    expect(r.reason).toMatch(/re-check|mis-entered|not near/i)
+    // 10/20: the refusal no longer asks the READER to re-check the number. Blind
+    // entry (S559) only holds if a refusal cannot be read as a hint — tell
+    // somebody "that is below the last read" and they have learned the last read
+    // is higher, and a few tries of that is the figure itself. So the desk gets
+    // the same sentence a too-HIGH read gets, and the number goes to the
+    // landlord's double-check queue, which is the only place it can be compared
+    // with the meter face.
+    expect(r.reason).toMatch(/double-check/i)
+    expect(r.reason).not.toMatch(/below|under|low|high|above/i)
     const bill = await db.query<any>(`SELECT id FROM utility_bills WHERE meter_id = $1`, [meterId])
     expect(bill.rows.length).toBe(0)   // no phantom 995k-unit bill
+    // And it is WRITTEN DOWN as a read somebody has to settle, rather than
+    // silently becoming the meter's newest figure — which is what cleared the
+    // closing-read to-do and handed the next occupant a stranger's kilowatt-hours.
+    const held = await db.query<any>(
+      `SELECT needs_review, review_note FROM utility_meter_readings WHERE id = $1`, [mo.id])
+    expect(held.rows[0].needs_review).toBe(true)
+    expect(held.rows[0].review_note).toMatch(/read the face again/i)
   })
 
   // ── S639 (Nic, DIRECTIVE) ────────────────────────────────────────────────

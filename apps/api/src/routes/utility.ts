@@ -9,7 +9,7 @@ import fs from 'fs'
 import crypto from 'crypto'
 import multer from 'multer'
 import { streamStoredFile } from '../lib/fileServe'
-import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
+import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -21,6 +21,9 @@ import { washPairing } from '../services/earlyDepartureWash'
 import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+// 10/20: who may be shown a meter reading figure, and a bill with the odometer
+// taken off it. One definition for the whole file (lib/meterReadBlind).
+import { METER_READING_VALUE_PERMS, canSeeMeterReadingValues, withoutReadingFigures } from '../lib/meterReadBlind'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { traderHasFieldPermission } from '../services/workTradeJobs'
 
@@ -50,6 +53,7 @@ import {
   generateBillsForProperty,
   generateBillsForLandlord,
   billMoveOutRead,
+  usageNeedsDoubleCheck,
 } from '../services/utilityBilling'
 import {
   openReadingRun,
@@ -69,7 +73,37 @@ utilityRouter.use(requireAuth)
 // Tenant: own bills. Landlord (or scoped worker with units.edit /
 // units.view_status / payments.view_all): all bills under their landlord.
 // Admin: all.
-utilityRouter.get('/bills', async (req, res, next) => {
+//
+// 10/20 — THIS ROUTE SAID ALL OF THAT IN A COMMENT AND ENFORCED NONE OF IT.
+//
+// It was declared with no requirePerm and no property scope, and the staff
+// branch was `ub.landlord_id = <the token's landlordId>`. So the front-desk
+// onsite_manager who walks the park — holding only "Enter meter readings",
+// assigned to one property — called it and got every utility bill in the
+// company, other parks included, each row carrying reading_end (last cycle's
+// closing odometer value) and usage_amount off `ub.*`. That is precisely the
+// number blind entry (S559) exists to withhold: walk in knowing it and you can
+// type a reading that produces normal-looking usage, which clears the rollover
+// check, the usage-alert thresholds and the landlord's double-check window in
+// one go. The meter list has stripped that figure from this exact caller since
+// 10/3; this route contradicted it.
+//
+// Three things now hold, in the order they fail:
+//   1. the permission gate the comment above always claimed (requireBillReader),
+//   2. the property lock every other staff-reachable utility read honors, and
+//   3. the odometer off the row for anyone outside the reading-value audience
+//      (lib/meterReadBlind), so holding units.view_status buys the prices and
+//      the charge, never the figures.
+// A tenant's own issued bill is untouched: the reading range is already printed
+// on their invoice line (jobs/invoiceGeneration), it is their own meter, and
+// they can walk out and look at its face any time.
+const BILL_READER_PERMS = [...METER_READING_VALUE_PERMS, 'units.view_status', 'payments.view_all']
+function requireBillReader(req: any, res: any, next: any) {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (req.user.role === 'tenant') return next()   // own bills only — see the handler
+  return requirePerm(...BILL_READER_PERMS)(req, res, next)
+}
+utilityRouter.get('/bills', requireBillReader, async (req, res, next) => {
   try {
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
@@ -90,6 +124,12 @@ utilityRouter.get('/bills', async (req, res, next) => {
     } else if (!isAdmin) {
       return res.json({ success: true, data: [] })
     }
+    // S560's property lock, which this read never had: a worker assigned to one
+    // park reads that park's bills. null = unrestricted (owners, all_properties).
+    const scopedPropIds = await getScopedPropertyIds(req.user)
+    if (scopedPropIds !== null) {
+      where += `${where ? ' AND' : 'WHERE'} u.property_id = ANY($${params.push(scopedPropIds)}::uuid[])`
+    }
     const bills = await query<any>(`
       SELECT ub.*, u.unit_number, p.name AS property_name,
         m.label AS meter_label, m.digits
@@ -98,7 +138,10 @@ utilityRouter.get('/bills', async (req, res, next) => {
       JOIN properties p  ON p.id = u.property_id
       JOIN utility_meters m ON m.id = ub.meter_id
       ${where} ORDER BY ub.billing_cycle_month DESC, p.name ASC`, params)
-    res.json({ success: true, data: bills })
+    // Blind entry: the odometer comes off for a staffer who may not see a
+    // reading figure. A tenant keeps their own bill's range (see the header).
+    const blind = role !== 'tenant' && !canSeeMeterReadingValues(req.user)
+    res.json({ success: true, data: blind ? bills.map(withoutReadingFigures) : bills })
   } catch (e) { next(e) }
 })
 
@@ -251,7 +294,10 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
     // a reading value back — the opening read keeps its id and date, not its
     // number. A staffer who only reads meters (no unit access) gets no prices
     // either; they need the meter, not what it bills at.
-    if (userHasPerm(req.user, 'properties.edit', 'units.edit')) return res.json({ success: true, data: meters })
+    // 10/20: the rule this line used to spell out in place now lives in
+    // lib/meterReadBlind, so the bills list and the readings export ask the
+    // same question instead of each carrying its own answer.
+    if (canSeeMeterReadingValues(req.user)) return res.json({ success: true, data: meters })
     const seesPrices = userHasPerm(req.user, 'units.view_status')
     res.json({ success: true, data: meters.map((m: any) => {
       const { opening_read, rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights, ...rest } = m
@@ -1247,6 +1293,10 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and the property lock. This report is one park's money — what it
+    // spent, billed back and collected — and the check above only says the
+    // caller works for the company that owns it.
+    await assertPropertyInScope(req.user, propertyId)
 
     // 10/12 (Nic, ledger P8): once the company's books are live, what the
     // property SPENT is its utility expenses as the books hold them — the
@@ -1646,6 +1696,11 @@ utilityRouter.get('/reading-history', requirePerm('properties.edit'), async (req
     const property = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and to the properties a team member is assigned to. The check
+    // above passes a manager for their whole COMPANY, so without this one a
+    // manager scoped to one park read every reading value at another park by
+    // passing its id in the query string.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(`
       SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits, m.reading_multiplier,
              COALESCE(m.out_of_service, FALSE) AS out_of_service,
@@ -1768,6 +1823,11 @@ utilityRouter.get('/tax-rates', requirePerm('units.edit', 'units.view_status', '
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/20: and the property lock. The check above passes anyone who works
+    // for the company that owns the park; this one asks whether the park is
+    // one of theirs, which is what "assigned to a property" has to mean on a
+    // read as well as on a write.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT utility_type, tax_rate_pct, label FROM property_utility_tax_rates
         WHERE property_id = $1`, [propertyId])
@@ -2124,11 +2184,18 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
     // a misread that slipped past the rollover guard would otherwise
     // land a huge charge on the tenant's next invoice.
     if (!meter.out_of_service && !needsReview && meter.billing_method === 'submeter' && prior) {
-      const threshold = METER_USAGE_ALERT_THRESHOLDS[meter.utility_type] ?? null
-      const usage = isRollover
+      // 10/20: compared in BILLING UNITS — the quantity the bill actually
+      // charges for — not in face turns. A face that counts per hundred gallons
+      // (S613's multiplier) reads 4130 → 6130 for 200,000 gallons; as turns
+      // that is 2,000 and the threshold never saw it. The rule itself is one
+      // function now (usageNeedsDoubleCheck), shared with the move-out path,
+      // which is how that path went without an upward check at all.
+      const faceTurns = isRollover
         ? (modulus - Number(prior.reading_value)) + body.readingValue
         : body.readingValue - Number(prior.reading_value)
-      if (threshold != null && usage > threshold) {
+      const mult = Number(meter.reading_multiplier)
+      const usage = faceTurns * (mult > 0 ? mult : 1)
+      if (usageNeedsDoubleCheck(meter.utility_type, usage)) {
         needsReview = true
         reviewNote = `Unusually high usage this cycle (${usage.toLocaleString()}) — double-check the meter`
       }
@@ -2353,6 +2420,11 @@ utilityRouter.get('/readings/flagged', requirePerm('properties.edit'), async (re
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/20: and to the park they were put on. This is the one window that
+    // shows the entered reading beside the prior one, and it was landlord-only
+    // already — but "landlord" there meant the company, so a manager held to
+    // Mountain View read Oak Park's pairs by passing its id in the query.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT r.id, r.reading_value, r.reading_date, r.billing_cycle_month, r.review_note,
               m.id AS meter_id, m.label, m.utility_type, m.digits,
@@ -2384,6 +2456,13 @@ utilityRouter.get('/readings/flagged', requirePerm('properties.edit'), async (re
 //                    meter, unknown usage).
 // Either way the flag clears; if the cycle's run already completed,
 // billing re-runs for that meter (idempotent — UNIQUE meter+unit+cycle).
+//
+// 10/20: this window now also settles a HELD MOVE-OUT READ — a departing
+// tenant's final read whose usage came in over the utility type's threshold
+// (one slipped digit at the counter prices a final bill in the thousands). It
+// billed nothing when it was taken, so there is nothing stale to clear; what
+// happens here is the final bill getting built, once, off whatever value the
+// landlord corrects or confirms.
 utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const body = z.object({
@@ -2419,6 +2498,38 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
        (body.correctedValue != null ? 'Corrected after double-check' : 'Confirmed correct after double-check')
          + (body.rollover ? ' (rollover)' : ''),
        !!body.rollover])
+
+    // 10/20 — A HELD MOVE-OUT READ IS FINISHED HERE, AND ONLY HERE.
+    //
+    // Everything below this point is the MONTHLY run's resolution: it drops the
+    // cycle's not-yet-invoiced bills and re-runs the monthly engine for the
+    // meter. A move-out read is not on a run and produced no bill of its own
+    // (it was held before anything was written), so that path would do two
+    // wrong things to it — delete the monthly bills belonging to whoever else
+    // is on this meter for the cycle, and then bill the monthly cycle instead
+    // of the departing household's final span.
+    //
+    // Its own billing call is the one that belongs here: the household the desk
+    // named and the space-move flag, both carried on the read since it was
+    // held, plus `reviewed` so the plausibility guard does not hold it a second
+    // time. The landlord has now looked at the number, which is the entire
+    // point of the window — a confirmed-genuine huge read bills, a corrected
+    // one bills the corrected usage, and either way the departing tenant's
+    // final bill goes out today instead of being lost.
+    if (reading.reason !== 'monthly_cycle') {
+      let billed = false
+      let billingNote: string | undefined
+      if (reading.reason === 'move_out_final' || reading.move_out_lease_id || reading.move_out_space_move) {
+        const r = await billMoveOutRead(reading.meter_id, reading.id, {
+          leaseId: reading.move_out_lease_id ?? null,
+          spaceMove: !!reading.move_out_space_move,
+          reviewed: true,
+        })
+        billed = r.billed
+        if (!billed) billingNote = r.reason
+      }
+      return res.json({ success: true, data: { reading: updated, billsCreated: billed ? 1 : 0, run: null, billingNote } })
+    }
 
     // S652 (Nic): "get rid of the clean meters random blind reread. Just flag
     // the ones that need flagging, with limited to one window." This IS that
@@ -2520,11 +2631,19 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
 // Every read at a property as a spreadsheet — one row per meter, a reading and
 // a usage column per month (Nic: "your sites and your reads at different dates
 // for total evaluation history of overall utility usage"). CSV opens in Excel.
-utilityRouter.get('/readings/export', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
+// 10/20: this spreadsheet IS the reading values, a column per month — so it is
+// gated on seeing a reading value, not on seeing unit status. It admitted
+// 'units.view_status', which is an onsite_manager permission held by the same
+// front desk that takes the walk, and which the meter list already refuses the
+// reading figure to. Nobody who walks blind downloads the answer key.
+utilityRouter.get('/readings/export', requirePerm(...METER_READING_VALUE_PERMS), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const prop = await queryOne<any>(`SELECT name, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!prop || !canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
+    // And held to the properties a team member is assigned to: landlord-wide
+    // access is the company, not the park (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, propertyId)
     const reads = await query<any>(`
       SELECT m.id AS meter_id, m.label, m.utility_type, m.digits, COALESCE(m.reading_multiplier, 1) AS mult,
              (SELECT string_agg(u.unit_number, ' / ' ORDER BY u.unit_number) FROM utility_meter_units mu
@@ -2715,12 +2834,17 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
 // of who entered their unit. Same posture as the S535 property-level late fees.
 utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {
-    const propertyId = String(req.query.propertyId || '')
-    if (!propertyId) throw new AppError(400, 'propertyId is required')
+    // 10/20: parsed as a uuid like every sibling read. A propertyId that was
+    // not one reached `WHERE id = $1` and came back a 500 out of Postgres
+    // instead of a bad request.
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and the property lock. The desk needs the price of the park they
+    // are standing in to ring up a fill — not another park's.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT utility_type, rate_per_unit, base_fee, sewer_rate_per_unit,
               prevailing_residential_rate, updated_at

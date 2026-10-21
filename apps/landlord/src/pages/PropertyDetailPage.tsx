@@ -24,6 +24,7 @@ import { AmenitiesPage } from './AmenitiesPage'
 import { InventoryPage } from './InventoryPage'
 import { MaintenancePage } from './MaintenancePage'
 import { PropertyOwnershipTab } from './PropertyOwnershipTab'
+import { PropertyTaskListTab } from './PropertyTaskListTab'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
@@ -53,6 +54,13 @@ const TABS = [
   { key: 'amenities', label: 'Amenities' },
   { key: 'inventory', label: 'Equipment' },
   { key: 'maintenance', label: 'Maintenance' },
+  // 10/20 (Nic, relaying Blu): the park's own checklist, and it sits BESIDE
+  // Maintenance rather than inside it. Nic asked where it should live and said
+  // per-property, on the property page; Blu's words were that it runs "in
+  // parallel to maintenance, sitting outside of it though". A sub-tab under
+  // Maintenance would read as a kind of work order, which is the one thing it
+  // is not.
+  { key: 'tasks', label: 'Task List' },
   { key: 'ownership', label: 'Ownership' },
 ] as const
 type TabKey = typeof TABS[number]['key']
@@ -176,6 +184,9 @@ export function PropertyDetailPage() {
           POS resale stock, which is a different table entirely. */}
       {tab === 'inventory' && <InventoryPage embeddedPropertyId={id!} />}
       {tab === 'maintenance' && <MaintenancePage embeddedPropertyId={id!} />}
+      {/* 10/20 (Blu, via Nic): jobs around the park for whoever is working
+          here. Deliberately not a work-order queue — see PropertyTaskListTab. */}
+      {tab === 'tasks' && <PropertyTaskListTab propertyId={id!} />}
       {/* S605 (Nic): selling the property, gated on every owner confirming. */}
       {tab === 'ownership' && <PropertyOwnershipTab propertyId={id!} propertyName={property.name} />}
 

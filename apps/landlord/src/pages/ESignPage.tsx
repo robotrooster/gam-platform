@@ -8,7 +8,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
-  STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
+  STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, DOCUMENT_SIGNER_ROLES, DOCUMENT_SIGNER_ROLE_LABEL,
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
   SCREENING_FEE_EXCLUSION_REASON,
   isAutoFilledLeaseColumn, matchesUnitQuery,
@@ -43,10 +43,12 @@ const FIELD_TYPES = [
   { type:'year',      label:'Year (pick from a list)', icon:'📆', color:'#0ea5e9', w:70, h:18 },
 ]
 
-// Lease roles + S568 generic roles (standalone contracts: purchase agreements,
-// bills of sale, general contracts — the field editor can place boxes for these).
-const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','co_tenant_3','witness',
-  'seller','purchaser','party_1','party_2']
+// 10/20 (Nic): "any data field that can be picked in the regular template flow
+// for leases up to co tenant 3 etc. there should be uniformity." This list used
+// to be written out here and the New Contract signer picker kept a shorter one
+// of its own, so Blu could place a landlord box on his Mattoon work-trade form
+// and then had nobody to assign it to. Both read @gam/shared now — one list.
+const SIGNER_ROLES = DOCUMENT_SIGNER_ROLES
 
 // DATA_LABELS derived from the shared lease_column registry. Single source
 // of truth is @gam/shared — adding a value there automatically surfaces it
@@ -841,7 +843,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
               <div key={role} onClick={() => setActiveRole(role)} style={{ padding:'6px 10px', borderRadius:6, cursor:'pointer', border:`1px solid ${activeRole===role?ROLE_COLORS[role]:'var(--border-0)'}`, background:activeRole===role?`${ROLE_COLORS[role]}22`:'transparent', fontSize:'.75rem', fontWeight:activeRole===role?700:400, color:activeRole===role?ROLE_COLORS[role]:'var(--text-3)', textTransform:'capitalize', display:'flex', alignItems:'center', gap:8 }}>
                 {/* persistent color swatch — the legend for box colors on the page */}
                 <span style={{ width:11, height:11, borderRadius:3, background:ROLE_COLORS[role]||'#888', flexShrink:0, border:'1px solid rgba(0,0,0,.2)' }} />
-                {humanize(role)}
+                {DOCUMENT_SIGNER_ROLE_LABEL[role]}
               </div>
             ))}
           </div>
@@ -941,7 +943,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                         onChange={e => updateSelected('signerRole', e.target.value)}
                         style={{ width:'100%', fontSize:'.75rem' }}>
                   {SIGNER_ROLES.map(role => (
-                    <option key={role} value={role}>{humanize(role)}</option>
+                    <option key={role} value={role}>{DOCUMENT_SIGNER_ROLE_LABEL[role]}</option>
                   ))}
                 </select>
                 <div style={{ display:'flex', alignItems:'center', gap:6, fontSize:'.62rem', color:'var(--text-3)', marginTop:4 }}>
@@ -1630,7 +1632,13 @@ function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; 
   const setSigner = (i: number, patch: Partial<{ name: string; email: string; role: string }>) =>
     setSigners(prev => prev.map((s, j) => j === i ? { ...s, ...patch } : s))
 
-  const roleOptions = GENERIC_SIGNER_ROLES
+  // Every role the field editor can place a box for, so a form built with
+  // landlord and tenant boxes can actually be sent to a landlord and a tenant.
+  const roleOptions = DOCUMENT_SIGNER_ROLES
+  // Land a new signer on a role nobody has yet — picking a taken one just
+  // tripped the "distinct role" warning and left the landlord to fix it.
+  const nextFreeRole = () =>
+    roleOptions.find(r => !signers.some(s => s.role === r)) ?? 'witness'
   const validEmails = signers.every(s => /.+@.+\..+/.test(s.email) && s.name.trim())
   const distinctRoles = new Set(signers.map(s => s.role)).size === signers.length
   const canSubmit = title.trim() && templateId && signers.length >= 1 && validEmails && distinctRoles && !busy
@@ -1673,7 +1681,7 @@ function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; 
               {templates.map((t: any) => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
             </select>
             {templates.length === 0 && (
-              <span style={{ fontSize: '.7rem', color: 'var(--amber)' }}>No templates yet — build one in the Templates tab (add seller/purchaser fields), then come back.</span>
+              <span style={{ fontSize: '.7rem', color: 'var(--amber)' }}>No templates yet — build one in the Templates tab, placing a box for each person who signs, then come back.</span>
             )}
           </label>
 
@@ -1684,8 +1692,8 @@ function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; 
             </div>
             {signers.map((s, i) => (
               <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
-                <select className="form-input" style={{ width: 120, fontSize: '.78rem' }} value={s.role} onChange={e => setSigner(i, { role: e.target.value })}>
-                  {roleOptions.map(r => <option key={r} value={r}>{GENERIC_SIGNER_ROLE_LABEL[r]}</option>)}
+                <select className="form-input" style={{ width: 148, fontSize: '.78rem' }} value={s.role} onChange={e => setSigner(i, { role: e.target.value })}>
+                  {roleOptions.map(r => <option key={r} value={r}>{DOCUMENT_SIGNER_ROLE_LABEL[r]}</option>)}
                 </select>
                 <input className="form-input" style={{ flex: 1, fontSize: '.78rem' }} placeholder="Full name" value={s.name} onChange={e => setSigner(i, { name: e.target.value })} />
                 <input className="form-input" style={{ flex: 1.3, fontSize: '.78rem' }} placeholder="Email" value={s.email} onChange={e => setSigner(i, { email: e.target.value })} />
@@ -1694,7 +1702,7 @@ function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; 
             ))}
             {signers.length < 6 && (
               <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.72rem' }}
-                onClick={() => setSigners(prev => [...prev, { name: '', email: '', role: 'party_1' }])}><Plus size={12} /> Add signer</button>
+                onClick={() => setSigners(prev => [...prev, { name: '', email: '', role: nextFreeRole() }])}><Plus size={12} /> Add signer</button>
             )}
             {!distinctRoles && <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 4 }}>Each signer needs a distinct role.</div>}
           </div>

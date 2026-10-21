@@ -501,7 +501,11 @@ describe('S652: a household lease uses the roles its template binds to', () => {
           { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev', orderIndex: 1 },
           { userId: f.tenantUserId, role: 'tenant', name: 'Test Tenant', email: 't@test.dev', orderIndex: 2 },
         ],
-      } as any)).rejects.toThrow(/primary \/ co_tenant/i)
+        // 10/20: the refusal names the unknown role and then says, in GAM's
+        // own words, who a lease form has boxes for — it used to end "Tenants
+        // are primary / co_tenant_1..3", a database spelling on a landlord's
+        // screen (memory: no raw enums in UI).
+      } as any)).rejects.toThrow(/"tenant" matches no box on any form.*Primary Tenant and Co-Tenant 1-3/is)
     } finally {
       await client.query('ROLLBACK').catch(() => {})
       client.release()

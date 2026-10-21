@@ -2911,6 +2911,162 @@ describe('S649 a two-company account uses the register by property', () => {
   })
 })
 
+// ── 10/20 (review) — THE CUSTOMER BOOK IS A READ, SO IT SPANS THE ACCOUNT ────
+//
+// The Customers tab stopped sending `?propertyId=` so the book would stop
+// looking like a property's (Nic: "I shouldn't have to toggle"). But that
+// parameter was also the only thing telling the API which company the register
+// was standing in, and Nic's live account owns two — Mountain View RV Park
+// Ranch LLC and Oak Park Motel and RV LLC. With nothing named, the list went
+// through the WRITE resolver and came back 400, "choose which one"; the page has
+// no handler for that, so it drew "No customers yet" over thirteen real
+// records. A read spans every company the account owns, each row saying which
+// company keeps it, and likely-duplicate matching stays inside one book.
+describe('10/20 the customer book spans every company the account owns', () => {
+  it('lists both books labeled, keeps duplicates per company, and folds only inside one', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let second = ''
+    try {
+      await c.query(`UPDATE landlords SET business_name = 'Mountain View RV Park Ranch LLC' WHERE id = $1`, [f.landlordId])
+      second = (await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Oak Park Motel and RV LLC') RETURNING id`,
+        [f.landlordUserId])).rows[0].id
+    } finally { c.release() }
+    const mk = async (landlordId: string, first: string, email: string | null, phone: string | null) =>
+      (await db.query<{ id: string }>(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone) VALUES ($1,$2,'Doe',$3,$4) RETURNING id`,
+        [landlordId, first, email, phone])).rows[0].id
+    const mvJane = await mk(f.landlordId, 'Jane', 'jane@example.com', '(602) 555-0100')
+    const mvBob  = await mk(f.landlordId, 'Bob',  null,               '602-555-0100')   // same phone, same company
+    const opJane = await mk(second,       'J',    'jane@example.com', null)             // same email, OTHER company
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId, second], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const auth = { Authorization: `Bearer ${token}` }
+
+    // The tab exactly as it ships: no property, no company named.
+    const list = await request(buildApp()).get('/api/pos/customers').set(auth)
+    expect(list.status, JSON.stringify(list.body)).toBe(200)
+    const by = Object.fromEntries(list.body.data.map((r: any) => [r.id, r]))
+    expect(Object.keys(by).sort()).toEqual([mvJane, mvBob, opJane].sort())
+    expect(by[mvJane]).toMatchObject({ landlord_id: f.landlordId, company: 'Mountain View RV Park Ranch LLC' })
+    expect(by[opJane]).toMatchObject({ landlord_id: second, company: 'Oak Park Motel and RV LLC' })
+    // Two records in one book with one phone are the same person; the other
+    // company's row with the same email is a different book and never offered.
+    expect(by[mvJane].duplicate_ids).toEqual([mvBob])
+    expect(by[mvBob].duplicate_ids).toEqual([mvJane])
+    expect(by[opJane].duplicate_ids).toEqual([])
+
+    // Naming a property still narrows the list to that property's company.
+    const one = await request(buildApp()).get(`/api/pos/customers?propertyId=${f.propertyId}`).set(auth)
+    expect(one.status, JSON.stringify(one.body)).toBe(200)
+    expect(one.body.data.map((r: any) => r.id).sort()).toEqual([mvJane, mvBob].sort())
+
+    // THE HISTORY THAT ROW OPENS (POSPage txQuery). A customer of the OTHER
+    // company is read by naming that company, so her purchases come back —
+    // read through the register's own property she had none, which drew an
+    // empty History tab under a row that had just counted them.
+    const hers = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status, pos_customer_id)
+       VALUES ($1, $2, 'cash', 9, 0, 9, 'completed', $3) RETURNING id`, [second, f.landlordUserId, opJane])).rows[0].id
+    const hist = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opJane}&landlordId=${second}`).set(auth)
+    expect(hist.status, JSON.stringify(hist.body)).toBe(200)
+    expect(hist.body.data.map((t: any) => t.id)).toEqual([hers])
+    // 10/20 (second review): THE SAME HISTORY WHICHEVER OF THE ACCOUNT'S
+    // COMPANIES IS NAMED, because it is HER history and not a location's. The
+    // row counts a person's purchases across the account's book — Nic's propane
+    // man is on one park's book and buys at the other's counter — so a row
+    // reading "1 purchase · $9" over an empty History tab was the list and the
+    // history contradicting each other on one screen. With nobody named it is
+    // still the register's own History at one counter (asserted above).
+    const either = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opJane}&landlordId=${f.landlordId}`).set(auth)
+    expect(either.status, JSON.stringify(either.body)).toBe(200)
+    expect(either.body.data.map((t: any) => t.id)).toEqual([hers])
+
+    // Folding across the two companies is refused in words that say why.
+    const across = await request(buildApp()).post(`/api/pos/customers/${mvBob}/merge`).set(auth).send({ into: opJane })
+    expect(across.status, JSON.stringify(across.body)).toBe(409)
+    expect(String(across.body?.error)).toMatch(/different companies of yours/i)
+    expect((await db.query<any>(`SELECT archived_at FROM pos_customers WHERE id = $1`, [mvBob])).rows[0].archived_at).toBeNull()
+    // Inside one company it still folds.
+    const inside = await request(buildApp()).post(`/api/pos/customers/${mvBob}/merge`).set(auth).send({ into: mvJane })
+    expect(inside.status, JSON.stringify(inside.body)).toBe(200)
+  })
+
+  // 10/20 (second review) — AND THE DESK IS WHO READS THIS TAB.
+  //
+  // Nic, decisions #11: a customer anywhere on the account is shown with their
+  // name and their site "to anyone with register access on that account,
+  // cashier included — they are his customers and the desk has to find them."
+  //
+  // The list above passed on an OWNER token and was still broken for the person
+  // who actually works the tab. It read landlordScopeIds(), which answers a
+  // team role with the ONE company its token carries — that is the whole of a
+  // team scope — so the on-site manager on Mountain View got Mountain View's
+  // book while the /people picker beside it, which asks the data, offered the
+  // account's. Two answers to one question on one screen, which is how the
+  // empty list started. The widening stops at the account: another landlord's
+  // book is not hers to read and naming his company is still a 403.
+  it('the desk, scoped to one company, reads the whole account book — and no further', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let second = ''
+    let outsider = { userId: '', landlordId: '' }
+    try {
+      await c.query(`UPDATE landlords SET business_name = 'Mountain View RV Park Ranch LLC' WHERE id = $1`, [f.landlordId])
+      second = (await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Oak Park Motel and RV LLC') RETURNING id`,
+        [f.landlordUserId])).rows[0].id
+      outsider = await seedLandlord(c)
+      await c.query(`UPDATE landlords SET business_name = 'Somebody Else LLC' WHERE id = $1`, [outsider.landlordId])
+    } finally { c.release() }
+    const mk = async (landlordId: string, first: string) =>
+      (await db.query<{ id: string }>(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name) VALUES ($1,$2,'Doe') RETURNING id`,
+        [landlordId, first])).rows[0].id
+    const mvJane = await mk(f.landlordId, 'Jane')
+    const opBob = await mk(second, 'Bob')              // the account's OTHER company
+    const theirs = await mk(outsider.landlordId, 'Nobody')  // another landlord entirely
+    // The propane sale: Oak Park's man, rung at the Mountain View counter she works.
+    const propane = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status, pos_customer_id, property_id)
+       VALUES ($1, $2, 'cash', 24, 0, 24, 'completed', $3, $4) RETURNING id`,
+      [f.landlordId, f.landlordUserId, opBob, f.propertyId])).rows[0].id
+    const desk = { Authorization: `Bearer ${await cashierFor(f, [f.propertyId])}` }
+
+    // The tab exactly as it ships: no property, no company named.
+    const list = await request(buildApp()).get('/api/pos/customers').set(desk)
+    expect(list.status, JSON.stringify(list.body)).toBe(200)
+    const rows = Object.fromEntries(list.body.data.map((r: any) => [r.id, r]))
+    expect(Object.keys(rows).sort()).toEqual([mvJane, opBob].sort())
+    expect(rows[opBob]).toMatchObject({ landlord_id: second, company: 'Oak Park Motel and RV LLC' })
+    expect(rows[mvJane].company).toBe('Mountain View RV Park Ranch LLC')
+    expect(Object.keys(rows)).not.toContain(theirs)
+    // The row counts the propane she rang, and opens it: the history names the
+    // company that keeps his record, which is not the one in her token.
+    expect(rows[opBob].purchases).toBe(1)
+    const hist = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opBob}&landlordId=${second}`).set(desk)
+    expect(hist.status, JSON.stringify(hist.body)).toBe(200)
+    expect(hist.body.data.map((t: any) => t.id)).toEqual([propane])
+
+    // And Save writes where that lookup read: a typed phone number on the
+    // account's other book is the counter's ordinary work, and it answered
+    // "merged or closed" — which had not happened — because the UPDATE beside
+    // the lookup demanded an exact company.
+    const saved = await request(buildApp()).patch(`/api/pos/customers/${opBob}`).set(desk).send({ phone: '(602) 555-0199' })
+    expect(saved.status, JSON.stringify(saved.body)).toBe(200)
+    expect(saved.body.data.phone).toBe('(602) 555-0199')
+
+    // Another landlord's company is not hers to name, on either read.
+    const askedTheirs = await request(buildApp()).get(`/api/pos/customers?landlordId=${outsider.landlordId}`).set(desk)
+    expect(askedTheirs.status, JSON.stringify(askedTheirs.body)).toBe(403)
+    const theirHistory = await request(buildApp()).get(`/api/pos/transactions?landlordId=${outsider.landlordId}`).set(desk)
+    expect(theirHistory.status, JSON.stringify(theirHistory.body)).toBe(403)
+  })
+})
+
 // S654 (Nic): "it goes away. It needs to be there the whole time … link it to be
 // always on the screen until the payment is processed. Also, it doesn't show a
 // customer name … I need to be able to choose a customer from the drop-down menu
@@ -3631,20 +3787,23 @@ describe('10/2 a cashier works only the properties they are assigned to', () => 
 })
 
 describe('10/2 typing a name at the register finds the person', () => {
-  it('finds this property\'s residents by part of a last name, with their site; a former resident says so; under two letters finds nothing', async () => {
+  it('finds the account\'s residents by part of a last name, with their site; a former resident says so; another park says which; under two letters finds nothing', async () => {
     const f = await seedPosFixture()
     const nic = await residentOf(f, 'Nicholas', 'Rhoades', { site: 'MH 02' })
     await residentOf(f, 'Ray', 'Rhodes', { site: '14', status: 'terminated' })
     const parkB = await secondProperty(f)
-    // Another property's resident is not listed as this register's own — no
-    // site, no "resident" — only as anyone else on GAM is: a name and a hint.
-    await residentOf(f, 'Rhonda', 'Elsewhere', { propertyId: parkB })
+    await db.query(`UPDATE properties SET name = 'Oak Park Motel and RV' WHERE id = $1`, [parkB])
+    // 10/20 (Nic): another park of his own is not "elsewhere". She is this
+    // account's resident, named with the park and the site the desk confirms
+    // her by — the masked hint is for another ACCOUNT's people. The park is
+    // printed only because it is not the one this register is standing in.
+    await residentOf(f, 'Rhonda', 'Elsewhere', { propertyId: parkB, site: '7' })
     const res = await searchAt(f, 'rho')
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data.map((p: any) => [p.name, p.hint, p.kind])).toEqual([
       ['Nicholas Rhoades', 'resident · Site MH 02', 'resident'],
       ['Ray Rhodes', 'former resident · Site 14', 'resident'],
-      ['Rhonda Elsewhere', 't•••@test.dev', 'elsewhere'],
+      ['Rhonda Elsewhere', 'resident · Oak Park Motel and RV · Site 7', 'resident'],
     ])
     expect(res.body.data[0]).toMatchObject({ key: `t:${nic}`, kind: 'resident', tenantId: nic })
     expect((await searchAt(f, 'r')).body.data).toEqual([])
@@ -3811,7 +3970,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     expect((await db.query<any>(`SELECT archived_at FROM pos_customers WHERE id = $1`, [theirs])).rows[0].archived_at).toBeNull()
   })
 
-  it('someone this company already has is linked, not copied: same email on a register customer here, or a resident of this company\'s other park', async () => {
+  it('someone this account already has is linked, not copied: same email on a register customer here, or a resident of its other park', async () => {
     const f = await seedPosFixture()
     const other = await seedPosFixture()
     // The same person on two companies' registers, by email.
@@ -3819,15 +3978,24 @@ describe('10/2 typing a name at the register finds the person', () => {
     const mine = await customerRow(f, 'Patricia', 'Rivers', { email: 'pat@rivers.com' })
     // Already this company's own by email, so nobody from elsewhere is listed for it.
     expect((await searchAt(f, 'rivers')).body.data.map((p: any) => [p.kind, p.customerId])).toEqual([['customer', mine]])
-    // A resident of this company's other park shows as a name only — and picked, is their resident record.
+    // 10/20 (Nic): a resident of the account's other park is its own customer,
+    // named with her park and site and reached by her tenant id — so there is
+    // no sealed pick at this counter to make a copy out of.
     const parkB = await secondProperty(f)
-    const rhonda = await residentOf(f, 'Rhonda', 'Parkb', { propertyId: parkB, email: 'rhonda@parkb.com' })
+    await db.query(`UPDATE properties SET name = 'Oak Park Motel and RV' WHERE id = $1`, [parkB])
+    const rhonda = await residentOf(f, 'Rhonda', 'Parkb', { propertyId: parkB, email: 'rhonda@parkb.com', site: '7' })
     const hit = (await searchAt(f, 'parkb')).body.data[0]
-    expect(hit).toMatchObject({ kind: 'elsewhere', name: 'Rhonda Parkb', email: null, tenantId: null })
-    const picked = await request(buildApp()).post('/api/pos/customers').set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ propertyId: f.propertyId, match: { pick: hit.pick } })
-    expect(picked.status, JSON.stringify(picked.body)).toBe(200)
-    expect(picked.body.data).toMatchObject({ tenant_id: rhonda, kind: 'resident', existing: true })
+    expect(hit).toMatchObject({ kind: 'resident', name: 'Rhonda Parkb', tenantId: rhonda,
+      email: 'rhonda@parkb.com', hint: 'resident · Oak Park Motel and RV · Site 7' })
+    expect(hit.pick).toBeUndefined()
+    // And adding her by hand here lands on HER — one record for the account,
+    // whichever of its counters wrote it.
+    const added = await request(buildApp()).post('/api/pos/customers').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, firstName: 'Rhonda', lastName: 'Parkb', email: 'rhonda@parkb.com' })
+    expect(added.status, JSON.stringify(added.body)).toBe(200)
+    expect(added.body.data).toMatchObject({ tenant_id: rhonda, kind: 'resident', existing: true })
+    expect((await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pos_customers WHERE tenant_id = $1 AND archived_at IS NULL`, [rhonda])).rows[0].n).toBe(1)
   })
 
   it('returns only what the picker needs — never balances, lease dates or payment history', async () => {
@@ -3884,11 +4052,12 @@ describe('10/2 typing a name at the register finds the person', () => {
     expect(await found('gmai')).toEqual([['customer', 'Ann Local']])
     expect(await found('0123')).toEqual([['customer', 'Ann Local']])
     expect(await found('ann@')).toEqual([['customer', 'Ann Local']])
-    // So do the people who lease with this company at its other parks (listed
-    // by name and a masked hint, as for anyone not at this property).
+    // So do the people who lease with this ACCOUNT at its other parks — 10/20
+    // (Nic): they are its own customers, listed by name with their park and
+    // site, so the looser rule is theirs as much as this property's.
     const parkB = await secondProperty(f)
     await residentOf(f, 'Rita', 'Parkb', { propertyId: parkB, phone: '928-555-0177' })
-    expect(await found('928-555-01')).toEqual([['elsewhere', 'Rita Parkb']])
+    expect(await found('928-555-01')).toEqual([['resident', 'Rita Parkb']])
   })
 
   // The review's own probe: the masked hint hands over the email's domain and

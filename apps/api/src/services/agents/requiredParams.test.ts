@@ -180,6 +180,9 @@ describe('every field a route requires is a field the agent can supply', () => {
    */
   it('actually read a schema for a meaningful share of the manifest', () => {
     console.log(`  [requiredParams] read required fields for ${examined} of ${PORTAL_ACTIONS.length} actions`)
-    expect(examined).toBeGreaterThanOrEqual(55)
+    // 10/20 (Nic): 55 → 54. create_daily_task went away with the old
+    // landlord-wide Tasks tab (one task list, not two), and its route went with
+    // it — one fewer action with a schema to read, not one fewer schema read.
+    expect(examined).toBeGreaterThanOrEqual(54)
   })
 })

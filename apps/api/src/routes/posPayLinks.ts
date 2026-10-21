@@ -38,6 +38,7 @@ import {
   parseForStaff, cartLineWords, NOT_ON_REGISTER, PICK_GONE, lowerLineIds, assertItemsAreOurs, customerFromElsewhere,
   assertWholeStays,
 } from '../services/posPeople'
+import { bookCaller, accountAsCaller } from '../services/registerBook'
 import { readSaleCard, findOrCreateCustomerForCard, type CardIdentity } from '../services/posCustomerCards'
 import { DateTime } from 'luxon'
 import { reservationDue, checkOutFor, releaseReservationTickets, ticketCarriesStay, stayTaxRate, taxInsidePayment,
@@ -47,10 +48,14 @@ import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStay
 // 10/20 (Nic): "A utility bill can be sent as a paylink, and a paylink's utility
 // line settles the bill and counts as recovery." This module decides all of it;
 // the route only carries the money.
+// 10/20 (review): the counter raises final bills too, and an ask it left open
+// is what hides a bill from the list below — so this door lets a dead one go.
+import { releaseStaleCounterAsks } from '../services/registerFinalUtility'
 import {
   utilityBillsSendable, utilityBillsForSending, openUtilityPayLinkSettlements,
   utilityBillsNotPayable, recordUtilityPayLinkSettlement, releaseUtilityPayLinkSettlements,
-  payLinkLineForBill, isUtilityBillLine, utilityBillIdsOnLink, type UtilityBillForLink,
+  payLinkLineForBill, isUtilityBillLine, utilityBillIdsOnLink, assertUtilityBillNotDiscounted,
+  type UtilityBillForLink,
 } from '../services/utilityPayLink'
 
 export const posPayLinksRouter = Router()
@@ -767,6 +772,15 @@ export function keepLinkServerLines(link: any, items: any[], press: string): any
         ? `This link is their ${l.name} bill (${money(Number(l.price) || 0)}) — that line is the bill itself and stays as it is. Put it back the way it was, then press ${press} again; to stop asking for it, close the link.`
         : `This link adds a month to their stay ("${l.name}") — that line stays as it is. Put it back, then press ${press} again; to give up the month, close the link.`)
     }
+    // 10/20 (fix): AT THE SERVER'S OWN FIGURES, not merely with its marks put
+    // back. typedKey matches a line by its name and its price, so everything
+    // else the line carries came back from the client — its tax rate among it.
+    // A bill line's rate is what puts the bill's own tax on the line
+    // (payLinkLineForBill), so a line sent back without it re-priced the link:
+    // the same $27.00 water bill, Adjusted with tax 0, emailed the payer a card
+    // page asking $27.00 and still closed out $28.20 when they paid it. The
+    // server wrote these three lines; they go back exactly as it wrote them.
+    hit.price = l.price; hit.qty = l.qty; hit.tax = Number(l.tax) || 0
     if (l.screening) hit.screening = true
     if (l.screening && l.bookingId) hit.bookingId = l.bookingId
     if (l.extend) hit.extend = l.extend
@@ -1129,7 +1143,8 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   if ([body.tenantId, body.posCustomerId, body.match].filter(Boolean).length > 1) {
     throw new AppError(400, `A link is for one person — remove the customer (×) and pick just one, then press ${press} again.`)
   }
-  await personOnSale(prop.landlord_id, { tenantId: body.tenantId, posCustomerId: body.posCustomerId })
+  const asking = await bookCaller(req.user, prop.landlord_id, query)
+  await personOnSale(prop.landlord_id, { tenantId: body.tenantId, posCustomerId: body.posCustomerId }, asking)
   // 10/2 (review): the register honors a link's prices and discount as they
   // were when it was sent, so sending one is held to the rule for ringing a
   // sale — a cashier without "Apply discounts" sends the catalog's prices and
@@ -1415,7 +1430,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
     const c = await getClient()
     try {
       await c.query('BEGIN')
-      const r = await customerFromElsewhere(c, prop.landlord_id, req.user.userId, body.match.pick)
+      const r = await customerFromElsewhere(c, prop.landlord_id, req.user.userId, body.match.pick, asking)
       await c.query('COMMIT')
       posCustomerId = r.customerId
       if (!r.existing) madeFromPick = r.customerId
@@ -1431,7 +1446,7 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
     // Nothing went out: a record made for the pick goes again.
     if (madeFromPick) {
       const { letGoOfPick } = await import('../services/posPeople')
-      await letGoOfPick(db, prop.landlord_id, madeFromPick).catch(() => false)
+      await letGoOfPick(db, prop.landlord_id, madeFromPick, asking).catch(() => false)
     }
     throw e
   }
@@ -1965,6 +1980,20 @@ posPayLinksRouter.get('/utility-bills', requirePerm('pos.ring_sale'), async (req
   try {
     const propertyId = parseForStaff(z.string().uuid(), req.query.propertyId, {}, LINK_PROPERTY_FIRST)
     const prop = await propertyFor(req, propertyId)
+    // 10/20 (review) — THE OTHER DOOR A DEAD COUNTER ASK IS LET GO AT.
+    //
+    // A closing read raised at the register holds its bill off THIS list while
+    // the ticket is open — one place to pay, which is the point of D1. Every
+    // press that ends the ticket lets that ask go; a browser that dies
+    // mid-ticket leaves it open, and the twelve-hour sweep hung off the
+    // counter's own lookup alone. So it only ran when somebody at that park
+    // took ANOTHER closing read: at a quiet park the bill was hidden here for
+    // days rather than for twelve hours, which is the opposite of D2 — a bill
+    // nobody collected is owed the ORDINARY way, and this is the ordinary way.
+    //
+    // The list a wedged bill is missing from is the right place to check, and
+    // it costs one UPDATE on a page a landlord opens by hand.
+    await releaseStaleCounterAsks(db, { landlordId: prop.landlord_id, propertyId })
     const bills = await utilityBillsSendable(db, { landlordId: prop.landlord_id, propertyId })
     res.json({ success: true, data: bills })
   } catch (e) { next(e) }
@@ -2005,7 +2034,8 @@ posPayLinksRouter.get('/people', requirePerm('pos.ring_sale'), peopleQueryGuard,
   try {
     const propertyId = parseForStaff(z.string().uuid(), req.query.propertyId, {}, LINK_PROPERTY_FIRST)
     const prop = await propertyFor(req, propertyId)
-    const people = await searchPeople({ landlordId: prop.landlord_id, propertyId, userId: req.user.userId, q: req.query.q, allowElsewhere: !req.crossCompanyLimited })
+    const people = await searchPeople({ landlordId: prop.landlord_id, propertyId, userId: req.user.userId, q: req.query.q, allowElsewhere: !req.crossCompanyLimited,
+                                        caller: await bookCaller(req.user, prop.landlord_id, query) })
     res.json({ success: true, data: people, ...(req.crossCompanyLimited ? { elsewhereLimited: true } : {}) })
   } catch (e) { next(e) }
 })
@@ -2112,6 +2142,11 @@ posPayLinksRouter.patch('/:id', requirePerm('pos.ring_sale'), async (req: any, r
     const discount = body.discountAmount ?? terms.discount
     // 10/2 (decisions #9): a link for a reservation is its price, whole.
     if (link.booking_id && Number(discount) > 0) throw new AppError(400, reservationNoDiscountWords('Save changes'))
+    // 10/20 (review): and a bill on this link is collected in full. Without
+    // this, Adjust could knock $75.25 off an $81.27 final electric and the
+    // payer's own card page would ask $6.02 for a bill that closes out at
+    // $81.27 — the register's hole, reached from the Pay Links screen.
+    assertUtilityBillNotDiscounted(link, discount, 'Save changes')
     if (body.discountAmount != null && carriesLinkDiscountPastShare(req.user, link, items, discount)) {
       throw new AppError(403, linkDiscountWholeWords('Save changes'))
     }
@@ -2898,9 +2933,16 @@ export async function finalizePayLink(session: {
         'part of a long stay\'s deposit')
     }
     // 10/2: a resident's sale names their register record too.
+    //
+    // 10/20 (review): a webhook has no person at a keyboard, so the book is the
+    // ACCOUNT'S OWN — the company's registered owner stands in (registerBook
+    // accountAsCaller). Not whoever is authenticated: there is nobody, and the
+    // settlement must see the whole account or it writes a second record for a
+    // man who already has one.
+    const asking = await accountAsCaller(link.landlord_id, query)
     let personId: string | null = link.pos_customer_id ?? null
     if (link.tenant_id && !personId) {
-      personId = await withSavepoint(client, () => residentRecord(client, link.landlord_id, link.tenant_id),
+      personId = await withSavepoint(client, () => residentRecord(client, link.landlord_id, link.tenant_id, asking),
         (e) => { logger.warn({ err: e, linkId }, '[pay-link] no register record for the resident'); return null })
     }
     let saleTenantId: string | null = link.tenant_id ?? null
@@ -2918,9 +2960,9 @@ export async function finalizePayLink(session: {
     if (card) {
       await withSavepoint(client, async () => {
         if (personId) {
-          await applyCardToPerson(client, { landlordId: link.landlord_id, card, person: { id: personId, lastName: personLastName } })
+          await applyCardToPerson(client, { landlordId: link.landlord_id, card, person: { id: personId, lastName: personLastName }, caller: asking })
         } else {
-          personId = (await findOrCreateCustomerForCard(client, { landlordId: link.landlord_id, card })).customerId
+          personId = (await findOrCreateCustomerForCard(client, { landlordId: link.landlord_id, card, caller: asking })).customerId
         }
       }, (e) => { logger.warn({ err: e, linkId }, '[pay-link] card not recorded against a customer') })
     }

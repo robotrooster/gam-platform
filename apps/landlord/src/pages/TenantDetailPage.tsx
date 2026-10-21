@@ -1,7 +1,10 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
-import { humanize, PAYMENT_STATUS_LABEL, LEASE_STATUS_LABEL, type PaymentStatus, type LeaseStatus } from '@gam/shared'
+import {
+  humanize, PAYMENT_STATUS_LABEL, LEASE_STATUS_LABEL, LEASE_DOCUMENT_STATUS_LABEL,
+  type PaymentStatus, type LeaseStatus, type LeaseDocumentStatus,
+} from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
@@ -359,6 +362,8 @@ export function TenantDetailPage() {
           </div>
 
           <PhotosAndNoticesCard tenantId={id!} />
+
+          <SendForSignatureCard tenantId={id!} />
 
           <CreditCard credit={data.credit ?? null} tenantId={id!} />
           <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} name={`${tenant.firstName ?? ''} ${tenant.lastName ?? ''}`.trim() || 'this tenant'} />
@@ -778,6 +783,217 @@ function PostPaymentCard({ tenantId, hasUnit, name }: { tenantId: string; hasUni
   )
 }
 
+
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * 10/20 (Nic) — SEND A DOCUMENT FOR SIGNATURE, FROM THE RESIDENT'S OWN FILE
+ * ─────────────────────────────────────────────────────────────
+ *
+ * Blu built a work-trade form for Mattoon with a landlord box and a tenant box
+ * and could not get it signed. Nic, on how he would expect to do it: "can he
+ * just go into Curtis's file, add a template that way, and have it signed to
+ * him? Like, there's some sort of broken flow there that we need to get fixed."
+ *
+ * So: the form, and press send. GAM fills the seats — the resident is the
+ * Primary Tenant, whoever signs for the landlord is the Landlord, the rest of
+ * their household takes the co-tenant boxes — because knowing what a signer
+ * role is was the old price of getting a document signed, and it is not a thing
+ * a park manager should ever have to learn.
+ *
+ * Everything this card says about who signs comes from the server
+ * (GET /esign/resident-forms/:tenantId), which is the same reading the create
+ * runs. A form whose boxes cannot be filled from here — one with a witness, a
+ * seller — is shown as not sendable from this page, with the screen that CAN
+ * send it named. A box offered is a box somebody can be put in.
+ */
+interface ResidentFormSeat { role: string; label: string; name: string }
+interface ResidentForm {
+  id: string
+  name: string
+  purposeLabel: string | null
+  suggestedTitle: string
+  willSign: ResidentFormSeat[]
+  leftOff: Array<{ role: string; label: string }>
+  sendable: boolean
+  reason: string | null
+}
+interface ResidentSigning {
+  resident: { name: string; unitLabel: string | null; propertyName: string | null }
+  forms: ResidentForm[]
+  documents: Array<{ id: string; title: string; status: string; waitingOn: string | null; createdAt: string }>
+}
+
+const SIGNING_DOC_BADGE: Record<string, string> = {
+  pending: 'badge-muted',
+  sent: 'badge-amber',
+  in_progress: 'badge-amber',
+  completed: 'badge-green',
+  execution_failed: 'badge-red',
+}
+
+function SendForSignatureCard({ tenantId }: { tenantId: string }) {
+  const { can } = usePerms()
+  const maySend = can('esign.send')
+  const [sending, setSending] = useState(false)
+  const { data, refetch } = useQuery<ResidentSigning>(
+    ['resident-signing', tenantId],
+    () => apiGet<ResidentSigning>(`/esign/resident-forms/${tenantId}`),
+    { enabled: maySend, retry: false },
+  )
+  if (!maySend) return null
+
+  const forms = data?.forms ?? []
+  const docs = data?.documents ?? []
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <span>Documents for signature</span>
+        <button className="btn btn-primary btn-sm" onClick={() => setSending(true)}>Send a document for signature</button>
+      </div>
+      {docs.length === 0 ? (
+        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>
+          Nothing out for signature. Agreements you send from here — a work-trade agreement, park
+          rules, any form of yours — show up in this list. A lease is sent from the Leases screen.
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {docs.map(d => (
+            <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.title}</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                  {new Date(d.createdAt).toLocaleDateString()}
+                  {d.status !== 'completed' && d.waitingOn ? ` · waiting on ${d.waitingOn}` : ''}
+                </div>
+              </div>
+              <span className={`badge ${SIGNING_DOC_BADGE[d.status] ?? 'badge-muted'}`}>
+                {LEASE_DOCUMENT_STATUS_LABEL[d.status as LeaseDocumentStatus] ?? humanize(d.status)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {sending && (
+        <SendForSignatureModal
+          tenantId={tenantId}
+          residentName={data?.resident?.name ?? 'this resident'}
+          forms={forms}
+          onClose={() => setSending(false)}
+          onSent={() => { setSending(false); refetch() }}
+        />
+      )}
+    </div>
+  )
+}
+
+function SendForSignatureModal({ tenantId, residentName, forms, onClose, onSent }: {
+  tenantId: string
+  residentName: string
+  forms: ResidentForm[]
+  onClose: () => void
+  onSent: () => void
+}) {
+  const sendable = forms.filter(f => f.sendable)
+  const [formId, setFormId] = useState(sendable.length === 1 ? sendable[0].id : '')
+  const [title, setTitle] = useState(sendable.length === 1 ? sendable[0].suggestedTitle : '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const chosen = forms.find(f => f.id === formId) ?? null
+
+  const pick = (f: ResidentForm) => {
+    if (!f.sendable) return
+    setFormId(f.id)
+    setTitle(f.suggestedTitle)
+  }
+
+  const send = async () => {
+    if (!chosen) return
+    setBusy(true); setError('')
+    try {
+      const created: any = await apiPost('/esign/resident-documents', {
+        tenantId, templateId: chosen.id, title: title.trim() || undefined,
+      })
+      // The same second step New Contract takes: sending is what mails each
+      // signer their link, and what invites anyone who has not set a password.
+      await apiPost(`/esign/documents/${created.data.id}/send`, {})
+      const who = (created.data.willSign ?? chosen.willSign).map((s: ResidentFormSeat) => s.name).join(' and ')
+      toast(`Sent for signature to ${who}.`)
+      onSent()
+    } catch (e: any) {
+      setError(e?.response?.data?.error || e?.message || 'Could not send that document.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal" style={{ maxWidth: 520, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div className="modal-title">Send a document for signature</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
+          Pick one of your forms. {residentName} is filled in as the tenant and you as the landlord,
+          so there is nothing to set up — press send and each of you gets a link to sign.
+        </div>
+
+        {forms.length === 0 ? (
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+            You have no forms to send yet. Build one in GoldSign → Templates — upload the PDF and
+            place a signature box for you and one for the tenant — then come back here.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+            {forms.map(f => (
+              <label key={f.id}
+                style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 11px', borderRadius: 10,
+                         background: f.id === formId ? 'var(--bg-3)' : 'var(--bg-2)',
+                         border: `1px solid ${f.id === formId ? 'var(--gold)' : 'var(--border-0)'}`,
+                         cursor: f.sendable ? 'pointer' : 'default', opacity: f.sendable ? 1 : .72 }}>
+                <input type="radio" name="resident-form" style={{ marginTop: 3 }}
+                  checked={f.id === formId} disabled={!f.sendable} onChange={() => pick(f)} />
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ fontSize: '.82rem', fontWeight: 600, color: 'var(--text-0)' }}>{f.name}</span>
+                  {f.purposeLabel && (
+                    <span style={{ fontSize: '.7rem', color: 'var(--text-3)', marginLeft: 6 }}>{f.purposeLabel}</span>
+                  )}
+                  <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
+                    {f.sendable
+                      ? `Signed by ${f.willSign.map(s => `${s.name} (${s.label})`).join(' and ')}.`
+                      : f.reason}
+                  </span>
+                  {f.sendable && f.leftOff.length > 0 && (
+                    <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--amber)', marginTop: 2, lineHeight: 1.5 }}>
+                      {f.leftOff.map(r => r.label).join(' and ')} {f.leftOff.length === 1 ? 'has' : 'have'} nobody
+                      on this lease, so {f.leftOff.length === 1 ? 'that box is' : 'those boxes are'} left off.
+                    </span>
+                  )}
+                </span>
+              </label>
+            ))}
+          </div>
+        )}
+
+        {chosen && (
+          <>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)', margin: '0 0 4px', display: 'block' }}>
+              What to call it <span style={{ color: 'var(--text-3)' }}>(both of you see this)</span>
+            </label>
+            <input className="form-input" value={title} maxLength={160}
+              onChange={e => setTitle(e.target.value)} />
+          </>
+        )}
+
+        {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+          <button className="btn btn-primary" disabled={!chosen || busy || !title.trim()} onClick={send}>
+            {busy ? 'Sending…' : 'Send for signature'}
+          </button>
+          <button className="btn btn-ghost" disabled={busy} onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 // S652 (Nic): the posted notices and record photos on this resident's file —
 // what a maintenance worker (or anyone with the permission) added from the

@@ -1,4 +1,4 @@
-import { meterReadingModulus } from '@gam/shared'
+import { meterReadingModulus, METER_USAGE_ALERT_THRESHOLDS } from '@gam/shared'
 import { db, query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
@@ -71,6 +71,57 @@ function cycleUsageFromReadings(
   let usage = cycleVal - priorVal
   if (usage < 0 && isRollover) usage = (meterReadingModulus(digits) - priorVal) + cycleVal
   return usage * (multiplier > 0 ? multiplier : 1)
+}
+
+/** 10/20 — THE ONE PLAUSIBILITY RULE FOR A SUBMETER'S USAGE.
+ *
+ *  Nic set these thresholds in S533 so a slipped digit cannot land a monster
+ *  charge on a tenant: usage over its utility type's number bills nothing and
+ *  waits for the landlord's double-check. The rule lived inline in the monthly
+ *  reading-run handler and nowhere else, which is exactly how the move-out read
+ *  — the path that bills, invoices and emails on the spot — went two sessions
+ *  with no upward check at all. One function now, called by both.
+ *
+ *  `usage` is in BILLING UNITS (the multiplier already applied), because that is
+ *  what the thresholds are written in and what the charge is computed from. */
+export function usageNeedsDoubleCheck(utilityType: string, usage: number): boolean {
+  const threshold = METER_USAGE_ALERT_THRESHOLDS[utilityType] ?? null
+  return threshold != null && usage > threshold
+}
+
+/** 10/20 — WHAT THE DESK IS TOLD WHEN A MOVE-OUT READ IS HELD.
+ *
+ *  The same sentence for a read that came in too high and one that came in too
+ *  low, on purpose. Blind staff entry (S559) is only blind if a refusal cannot
+ *  be read as a hint: "below the previous read" IS the previous read, a guess at
+ *  a time. It names no figure and no direction — only that nothing was billed
+ *  and the landlord has it. Written as a fragment because the screen puts it
+ *  after "Reading recorded." */
+export const HELD_FOR_DOUBLE_CHECK =
+  "this one waits on the landlord's double-check before any final bill goes out"
+
+/** 10/20 — HOLDING A MOVE-OUT READ IS ONE OPERATION.
+ *
+ *  Both reasons for holding one — usage over its utility type's threshold, and a
+ *  figure below the previous read on a meter nowhere near its ceiling — do
+ *  exactly the same thing with it, so they do it in the same place. The read is
+ *  kept and flagged for the landlord's double-check, and it carries forward the
+ *  two things only this call knows: WHOSE move-out it closes out (the to-do named
+ *  the leaving household, so the bill cannot land on one that left earlier) and
+ *  whether the resident is in fact staying — a space move, who must never get a
+ *  "your final utility bill is ready" email. */
+async function holdMoveOutReadForDoubleCheck(
+  readingId: string, note: string,
+  opts: { leaseId?: string | null; spaceMove?: boolean },
+): Promise<void> {
+  await query(`
+    UPDATE utility_meter_readings
+       SET needs_review = TRUE,
+           review_note = $2,
+           move_out_lease_id = COALESCE($3, move_out_lease_id),
+           move_out_space_move = $4
+     WHERE id = $1`,
+    [readingId, note, opts.leaseId ?? null, !!opts.spaceMove])
 }
 
 
@@ -378,11 +429,17 @@ function leaseInForceOn(dateSql: string): string {
  * terminated (on the property's calendar) and the day before it moved to
  * another space (effective_to is the first day there). 'infinity' when none
  * applies — a lease still running on the space.
+ *
+ * 10/20: the aliases are arguments now, because the turnover check below asks
+ * this same question about a SECOND household on the same space inside one
+ * query, and two copies of it side by side have to name different rows.
  */
-const LEASE_LAST_DAY_ON_SPACE_SQL =
-  `LEAST(COALESCE(l.end_date, 'infinity'::date),
-         COALESCE(timezone(p.timezone, l.terminated_at)::date, 'infinity'::date),
-         COALESCE(h.effective_to - 1, 'infinity'::date))`
+function leaseLastDayOnSpaceSql(h = 'h', l = 'l', p = 'p'): string {
+  return `LEAST(COALESCE(${l}.end_date, 'infinity'::date),
+         COALESCE(timezone(${p}.timezone, ${l}.terminated_at)::date, 'infinity'::date),
+         COALESCE(${h}.effective_to - 1, 'infinity'::date))`
+}
+const LEASE_LAST_DAY_ON_SPACE_SQL = leaseLastDayOnSpaceSql()
 
 /**
  * ── 10/3 (final sweep): WHO LIVED THERE ACROSS THE READ SPAN ──────────────────
@@ -1610,16 +1667,51 @@ export async function generateBillsForMeter(
     // turnover/reference read that reset the baseline, not last month's
     // cycle read. That's what keeps a departed short-term guest's usage off
     // the next occupant's bill.
+    // 10/20: and never a read WAITING ON THE LANDLORD. A read held for the
+    // double-check is kept but it is not the meter's reading of record, so it is
+    // nobody's baseline either — see billMoveOutRead for the pull-out typo that
+    // made it one and billed the departed guest's power to whoever moved in.
     const priorReading = await queryOne<any>(`
-      SELECT reading_value, reading_date
+      SELECT reading_value, reading_date, created_at
         FROM utility_meter_readings
        WHERE meter_id = $1
          AND (reading_date, created_at) < ($2, $3)
+         AND needs_review = false
        ORDER BY reading_date DESC, created_at DESC LIMIT 1
     `, [meterId, cycleReading.reading_date, cycleReading.created_at])
     if (!priorReading) {
       return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
         reason: 'no prior reading — first cycle baseline, no bill produced' }
+    }
+    // 10/20 — AND THE SPAN ITSELF HAS TO BE CLEAN.
+    //
+    // Stepping over a held read stretches this cycle's span back PAST it, so the
+    // span now covers days that belonged to whoever was on the space before —
+    // carrying the departed guest's power, which is the complaint this whole
+    // change answers, arriving by the other road. Worse, when the landlord does
+    // settle that read, its own final bill is built for the span it closes, and
+    // the same kilowatt-hours would then sit on two bills at once. Every dollar
+    // is counted once.
+    //
+    // So a cycle with an unsettled CLOSING read inside its span waits, the same
+    // way a cycle whose own read is flagged waits (just above). Only a closing
+    // read: a flagged monthly read is either this cycle's own — already held —
+    // or a past cycle's, which settles on its own run and must never hold a later
+    // month's rent-bearing invoice. Settling it releases this; meanwhile the
+    // landlord has it under "Readings to double-check", the closing-read to-do
+    // keeps asking for the walk, and ensureBillsForUnit comes back for the charge
+    // afterwards so it is not lost.
+    const unsettledInSpan = await queryOne<{ id: string }>(`
+      SELECT id FROM utility_meter_readings
+       WHERE meter_id = $1 AND needs_review = true AND reason <> 'monthly_cycle'
+         AND (reading_date, created_at) >  ($2, $3)
+         AND (reading_date, created_at) <= ($4, $5)
+       LIMIT 1`,
+      [meterId, priorReading.reading_date, priorReading.created_at,
+       cycleReading.reading_date, cycleReading.created_at])
+    if (unsettledInSpan) {
+      return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+        reason: 'a closing read inside this span is awaiting the landlord\'s double-check — no bill until it is settled' }
     }
     // Odometer rollover (S533, automatic): usage wraps past the meter's digit
     // capacity = (10^digits − prior) + current, e.g. a 6-digit 999822 → 000138
@@ -2067,7 +2159,13 @@ export async function billMoveOutRead(
   // (labeled with the old space, S641) — no "final" invoice, no "your last
   // days" email, no deposit talk. Anyone else the read bills (a household that
   // already left) still gets the final bill.
-  opts: { leaseId?: string | null; spaceMove?: boolean } = {},
+  // 10/20: the landlord has looked at this read in the double-check window and
+  // corrected or confirmed it, so the plausibility guard below steps aside — a
+  // human looking at the number IS the check, and without this a read the
+  // landlord confirms as genuine would be held again forever and the departing
+  // tenant would never be billed at all. Passed ONLY from the landlord-gated
+  // resolve-review route; never from the counter.
+  opts: { leaseId?: string | null; spaceMove?: boolean; reviewed?: boolean } = {},
 ): Promise<{ billed: boolean; reason?: string }> {
   const meter = await queryOne<any>(`SELECT * FROM utility_meters WHERE id = $1`, [meterId])
   if (!meter || meter.billing_method !== 'submeter') return { billed: false, reason: 'not a submeter' }
@@ -2080,11 +2178,19 @@ export async function billMoveOutRead(
   // S560: format billing_cycle_month to 'YYYY-MM-DD' in SQL — pg returns a
   // `date` column as a JS Date, and String(date).slice(0,10) yields "Wed Jul 01"
   // (invalid), which crashed tryInsertBill's insert. to_char keeps it a string.
-  const read = await queryOne<any>(`SELECT reading_value, reading_date, created_at, to_char(reading_date, 'YYYY-MM-DD') AS reading_day, to_char(billing_cycle_month, 'YYYY-MM-DD') AS billing_cycle_month FROM utility_meter_readings WHERE id = $1`, [readingId])
+  const read = await queryOne<any>(`SELECT reading_value, reading_date, created_at, is_rollover, to_char(reading_date, 'YYYY-MM-DD') AS reading_day, to_char(billing_cycle_month, 'YYYY-MM-DD') AS billing_cycle_month FROM utility_meter_readings WHERE id = $1`, [readingId])
   if (!read) return { billed: false, reason: 'reading not found' }
+  // 10/20: and never a read that is WAITING ON THE LANDLORD. A read held for the
+  // double-check is kept, but it is not the meter's reading of record, so it is
+  // not what anybody's usage is measured from either. That is the whole of the
+  // 48000/4800 complaint: a dropped digit at a pull-out became the next
+  // occupant's starting point, and their 49000 billed 44,200 kWh, nearly all of
+  // it the departed guest's power. Usage is measured from the last figure a
+  // person either took cleanly or looked at and settled.
   const prior = await queryOne<any>(`
     SELECT reading_value, to_char(reading_date, 'YYYY-MM-DD') AS reading_day FROM utility_meter_readings
      WHERE meter_id = $1 AND (reading_date, created_at) < ($2, $3)
+       AND needs_review = false
      ORDER BY reading_date DESC, created_at DESC LIMIT 1`,
     [meterId, read.reading_date, read.created_at])
   if (!prior) return { billed: false, reason: 'no prior read — baseline only, nothing to bill' }
@@ -2100,15 +2206,82 @@ export async function billMoveOutRead(
   // read was near its ceiling; if prior is well below the top, a below-prior read
   // is almost certainly a mis-entered (typo) reading, not a real wrap. Billing the
   // "wrap" there would over-charge the departing tenant a huge phantom amount, so
-  // we refuse and surface it (the person entering the move-out read sees the
-  // reason immediately and re-checks the number) rather than auto-bill a monster.
+  // we refuse it rather than auto-bill a monster.
   const digits = Number(meter.digits)
   const isRollover = cur < priorVal
-  if (isRollover && priorVal < meterReadingModulus(digits) * 0.9) {
-    return { billed: false, reason: 'move-out read is below the previous read but the meter was not near its ceiling — likely a mis-entered reading, not a rollover; please re-check the number' }
+  // 10/20 — THE REFUSAL HAD TO BE WRITTEN DOWN SOMEWHERE, AND IT WASN'T.
+  //
+  // S561 refused this read and said why, and then the refusal went nowhere. The
+  // reason came back to a route that put it in a field no screen read; the read
+  // itself stayed in the table as the meter's newest figure. So a dropped digit
+  // at a pull-out (4800 typed against a prior 48000) cleared the closing-read
+  // to-do as though the walk were done, raised no flag for the landlord, and
+  // became the next occupant's starting point. Nobody on either side was told,
+  // and the departing guest's power was billed to nobody at all.
+  //
+  // A refused read now goes exactly where an over-threshold one goes (the branch
+  // below): KEPT, because GAM never erases and because the landlord is the one
+  // who can walk out and read the face; flagged for the double-check queue,
+  // carrying the household the desk named so settling it bills the same people;
+  // and no longer the reading of record, so the to-do stays open and nobody's
+  // usage is measured from it until a human has settled it.
+  //
+  // The words the desk gets back are deliberately the SAME words a high read
+  // gets. Blind entry only holds if the two are indistinguishable: tell somebody
+  // "that is below the last read" and they have learned the last read is higher,
+  // and a few tries of that is the figure itself.
+  if (isRollover && !opts.reviewed && priorVal < meterReadingModulus(digits) * 0.9) {
+    await holdMoveOutReadForDoubleCheck(readingId,
+      'A move-out read below the previous read, on a meter nowhere near its ceiling — '
+        + 'read the face again: a dropped digit, or a genuine wrap to confirm',
+      opts)
+    logger.info({ meterId, readingId },
+      'utility billing: below-previous move-out read held for the landlord double-check')
+    return { billed: false, reason: HELD_FOR_DOUBLE_CHECK }
+  }
+  // Still below the previous read AFTER the landlord looked at it: their answer
+  // decides it, and there are only two answers (routes/utility.ts
+  // resolve-review). Confirmed a wrap → the wrapped usage bills below.
+  // Confirmed a swap or reset → the old meter's last turns went with it and
+  // there is no usage anybody can bill across the gap, which is exactly what the
+  // monthly engine does with that same answer.
+  if (isRollover && opts.reviewed && !read.is_rollover) {
+    return { billed: false, reason: 'settled as a meter swap or reset rather than a wrap — there is no usage to bill across it' }
   }
   const usage = cycleUsageFromReadings(cur, priorVal, isRollover, digits,
     Number(meter.reading_multiplier ?? 1))
+
+  // 10/20 — AN UPWARD SLIPPED DIGIT HAD NO CHECK AT ALL.
+  //
+  // The rollover guard above only looks DOWNWARD. A clerk at the counter who
+  // types 120000 for 12000 passes the only other test there is (under the
+  // six-digit cap) and this read bills 108,000 kWh: a $12,960 charge that is
+  // invoiced and emailed to the departing tenant the same second, pointed at
+  // their deposit, while the desk sees "Read recorded — final bill created" and
+  // no figure. The monthly run has held a read like that since S533; the move-out
+  // path is where it matters MOST and is where it was missing — the monthly one
+  // only sits on a bill nobody has sent yet.
+  //
+  // Same thresholds as the run, same silence toward the reader: BLIND STAFF
+  // ENTRY means the note that names the usage goes to the landlord's
+  // double-check queue (landlord-only), and the desk is told the situation —
+  // nothing was billed, the landlord has it — never a value, never which
+  // direction they were off. The read itself is KEPT: it is the next arrival's
+  // baseline, and GAM never erases.
+  //
+  // Nothing is held twice and nothing is held past the window: the landlord
+  // corrects or confirms it under "Readings to double-check" and that resolution
+  // bills it (routes/utility.ts resolve-review, with `reviewed`).
+  // (Submeters only — this function has already refused every other method.)
+  if (!opts.reviewed && usageNeedsDoubleCheck(meter.utility_type, usage)) {
+    await holdMoveOutReadForDoubleCheck(readingId,
+      `Unusually high usage on a move-out read (${usage.toLocaleString()}) — `
+        + `double-check the meter before this final bill goes out`,
+      opts)
+    logger.info({ meterId, readingId, utilityType: meter.utility_type },
+      'utility billing: move-out read held for the landlord double-check')
+    return { billed: false, reason: HELD_FOR_DOUBLE_CHECK }
+  }
 
   const units = await query<any>(`SELECT u.id AS unit_id FROM utility_meter_units mu JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = $1`, [meterId])
   const cycleIso = String(read.billing_cycle_month).slice(0, 10)
@@ -2484,7 +2657,13 @@ async function holdChargeForPendingUnit(args: InsertBillArgs): Promise<boolean> 
  * from the bill's due date, so September's usage goes on a bill due by
  * November 30 and on no bill after that.
  */
-async function reportUsageNobodyToBill(args: InsertBillArgs, why: 'nobody' | 'paused'): Promise<void> {
+async function reportUsageNobodyToBill(
+  args: InsertBillArgs, why: 'nobody' | 'paused' | 'turnover',
+  // 10/20: with 'turnover', the first day of the read span that belonged to the
+  // next household. The landlord is told the DAY, because that is the fact that
+  // explains the whole notice and the only one they can check against the board.
+  changedHandsOn?: string,
+): Promise<void> {
   try {
     const usage = Number(args.usageAmount ?? 0)
     if (args.allocationMethod !== 'submeter' || !(usage > 0) || !(Number(args.chargeAmount) > 0)) return
@@ -2505,7 +2684,12 @@ async function reportUsageNobodyToBill(args: InsertBillArgs, why: 'nobody' | 'pa
          AND b.check_out > COALESCE($4::date, $2::date)
        LIMIT 1`,
       [args.unitId, args.cycleMonth, args.readingEndDate ?? null, args.readingStartDate ?? null])
-    if (stayed) return
+    // 10/20: a turnover says it anyway. A guest arriving on the spot is the very
+    // thing being reported — the household that left still owes the days before
+    // the guest got there, and the only way to bill them is the closing read
+    // nobody took. Staying quiet because a reservation exists would silence the
+    // notice in exactly the case it was written for.
+    if (stayed && why !== 'turnover') return
     const told = await queryOne<{ n: number }>(`
       SELECT 1 AS n FROM notifications
        WHERE landlord_id = $1 AND type = 'utility_usage_unbilled'
@@ -2526,20 +2710,38 @@ async function reportUsageNobodyToBill(args: InsertBillArgs, why: 'nobody' | 'pa
     const dollars = `$${amount.toFixed(2)}`
     const space = `${w.unit_number} at ${w.property_name}`
     const deadline = lastBillDateForCycle(args.cycleMonth)
-    const body = why === 'paused'
+    const settledOutsideStep =
+      `If you collected it yourself, record a reading on that meter marked "Billed outside GAM — start fresh here".`
+    const body = why === 'turnover'
+      // 10/20 — THE SPOT CHANGED HANDS INSIDE THE READ. Says what happened, why
+      // nobody was charged, and the one thing that prevents it. It does NOT
+      // offer a way to bill it after the fact, because there isn't one: with no
+      // read at the handover there is nothing that can say whose power is
+      // whose, and GAM does not split a read by guesswork.
+      ? `The ${what.toLowerCase()} meter on ${space} moved ${used} (${dollars}) for ${cycleLabel(args.cycleMonth)}, `
+        + `but the spot changed hands on ${dayLabel(changedHandsOn)} partway through that read and no closing read was taken when the last household left. `
+        + `The usage covers two households and nothing says where one ends and the other begins, so it was billed to NEITHER — `
+        + `nobody is charged for power somebody else used. `
+        + `Read the meter at the pull-out and that read bills the departing household for its own days. `
+        + settledOutsideStep
+      : why === 'paused'
       ? `The ${what.toLowerCase()} meter on ${space} moved ${used} (${dollars}) for ${cycleLabel(args.cycleMonth)} `
         + `while the lease there was paused (hibernating), so it was not billed to anyone. `
         + `If someone is staying there, resume the lease on the Leases page in time for a bill due by ${deadline}; this usage goes on that bill. `
-        + `If you collected it yourself, record a reading on that meter marked "Billed outside GAM — start fresh here".`
+        + settledOutsideStep
       : `The ${what.toLowerCase()} meter on ${space} moved ${used} (${dollars}) for ${cycleLabel(args.cycleMonth)}, `
         + `but nobody is set up on that space (no lease, reservation, invite or service agreement), so it was not billed to anyone. `
         + `If someone has been living there, set them up as an existing resident of ${w.unit_number} in time for a bill due by ${deadline}; this usage goes on that bill. `
-        + `If you collected it yourself, record a reading on that meter marked "Billed outside GAM — start fresh here".`
+        + settledOutsideStep
     await createNotification({
       userId: w.user_id, landlordId: args.landlordId, type: 'utility_usage_unbilled',
-      title: `${what} used on ${w.unit_number} — nobody to bill`,
+      title: why === 'turnover'
+        ? `${what} used on ${w.unit_number} — the spot changed hands mid-read`
+        : `${what} used on ${w.unit_number} — nobody to bill`,
       body,
-      data: { meterId: args.meterId, unitId: args.unitId, cycle: args.cycleMonth, usage, amount: Math.round(amount * 100) / 100, why },
+      data: { meterId: args.meterId, unitId: args.unitId, cycle: args.cycleMonth, usage,
+              amount: Math.round(amount * 100) / 100, why,
+              ...(changedHandsOn ? { changedHandsOn } : {}) },
       actionUrl: '/utilities',
     })
   } catch (e) {
@@ -2739,6 +2941,139 @@ async function departingPayersFinalStubBillsNobody(
     leftOn: departure.leftOn, outcome: settled.outcome, amount: args.chargeAmount,
   }, `utility billing: departing payer's final stub — ${settled.why}`)
   return true
+}
+
+/**
+ * ── 10/20 — NOBODY IS BILLED FOR THE DAYS AFTER THEY LEFT ─────────────────────
+ *
+ * S548 gave a cycle to the household that covered the FIRST of the month, and
+ * justified the days on the end of it this way: "Read the meter AT turnover — a
+ * late final read folds the gap days into the departing tenant's bill." GAP
+ * days. Days nobody was on the spot. That is a fair thing to ask of the
+ * household that just drove off, and it is the only thing that line covers.
+ *
+ * The monthly run was reading the NEXT household's days the same way. Oak Park
+ * RV 27: lease A ran Sep 1 → Oct 10 and the household pulled out on the 10th
+ * with nobody taking a closing read; lease B arrived on the 12th; the October
+ * run read the submeter on the 30th against the read before it, Oct 4. The
+ * space-history row a lease opens is closed only when the lease MOVES spaces,
+ * never when it ends, so A still "covered October 1" and was billed Oct 4 →
+ * Oct 30 — eighteen days of household B's power. invoiceEndedLeaseBills then
+ * sent A "your final utility bill is ready" and the deposit-return sweep took
+ * it out of A's deposit. B was never billed for October at all: one bill per
+ * meter, spot, month and utility, and the slot was gone.
+ *
+ * Every other path here already asks this question. A move-out read carries six
+ * passes of it (the household has to have been on the spot after the read
+ * before; one that has LEFT ranks ahead of one still running; the caller may
+ * name whose read it is). A stay's agreement will not take a metered span
+ * another guest's booking overlaps. A month read on a LEASE had none of it, so
+ * lease → anything was the one turnover nobody checked.
+ *
+ * So: a household is never billed for a day it no longer held the spot and
+ * somebody else did. There is no read at the handover, and GAM bills off the
+ * meter — never off a guess at how to split one read between two households —
+ * so a span like that is billed to NOBODY and the landlord is told
+ * (reportUsageNobodyToBill 'turnover'). Nothing is written into the month's one
+ * bill slot, so the read that settles it can still be recorded. If the arrival
+ * is a nightly or weekly guest, those days were inside the guest's rate and
+ * belonged to nobody anyway (10/20, the standing rule) — the departing
+ * household is still not billed for them.
+ *
+ * Returns the first day of the span that was somebody else's, or null when the
+ * span is the payer's own.
+ *
+ * ONLY DAYS AFTER THE PAYER LEFT. The days BEFORE a household arrived are a
+ * settled rule, not a bug: nobody covered the 1st, so the cycle falls to the
+ * newest lease overlapping the month, gap days and all. Reaching backwards here
+ * would re-open that and strand an arrival's own month.
+ * NOT THE MOVE-OUT PATH. A closing read IS the departing household's read by
+ * definition, and what folds into it was settled above over six passes.
+ * NOT A FLAT CHARGE OR A POOLED SHARE. A flat rate is the price of the month
+ * (S637), and a pooled share is a slice of a master nobody read for this spot,
+ * already cut down to a stay's own days (10/5). Only a metered span — both read
+ * dates, this spot's own meter — measures one household's own use.
+ * NOT THE SAME HOUSEHOLD TWICE: their renewal, their next lease on the same
+ * spot, their own back-to-back reservation. A household that leaves and comes
+ * back still holds the spot at the end of the span, so it keeps the span.
+ */
+async function spanAnotherHouseholdHeld(
+  args: InsertBillArgs,
+  payer: { leaseId: string | null; serviceAgreementId: string | null; tenantId: string | null },
+): Promise<string | null> {
+  if (args.moveOut || args.pooledShare) return null
+  const spanStart = isoDay(args.readingStartDate)
+  const spanEnd = isoDay(args.readingEndDate)
+  if (!spanStart || !spanEnd) return null
+  if (!payer.leaseId && !payer.serviceAgreementId) return null
+
+  // The payer's own days on this spot: a lease's space-history row (or rows — a
+  // household can leave and come back), or a utility service agreement's own
+  // dates. An agreement's end date is its last day here, which is the day a
+  // stay checks out: generous by a few hours, and generous is the safe
+  // direction when the question is whether to STOP billing somebody.
+  const mineSql = `
+    SELECT h.effective_from AS from_day, ${LEASE_LAST_DAY_ON_SPACE_SQL} AS to_day
+      FROM lease_unit_history h
+      JOIN leases l ON l.id = h.lease_id
+      JOIN units u ON u.id = h.unit_id
+      JOIN properties p ON p.id = u.property_id
+     WHERE h.lease_id = $2::uuid AND h.unit_id = $1 AND h.effective_from <= $4::date
+    UNION ALL
+    SELECT sa.start_date, COALESCE(sa.end_date, 'infinity'::date)
+      FROM utility_service_agreements sa
+     WHERE sa.id = $3::uuid AND sa.unit_id = $1 AND sa.start_date <= $4::date`
+
+  // No evidence the payer was ever on this spot across the span — the S629
+  // invite case, where the residents are living there on the strength of an
+  // invite and have no space history yet. That rule decides those, not this one.
+  const mine = await queryOne<{ last_day: string | null; over: boolean }>(`
+    SELECT to_char(nullif(max(to_day), 'infinity'::date), 'YYYY-MM-DD') AS last_day,
+           max(to_day) < $4::date AS over
+      FROM (${mineSql}) mine`,
+    [args.unitId, payer.leaseId ?? null, payer.serviceAgreementId ?? null, spanEnd])
+  if (!mine?.last_day || !mine.over) return null
+
+  const handover = await queryOne<{ day: string }>(`
+    SELECT to_char(d.day::date, 'YYYY-MM-DD') AS day
+      FROM generate_series(GREATEST($2::date, $3::date) + 1, $4::date, interval '1 day') AS d(day)
+     WHERE (
+       -- another household's lease held the spot that day
+       EXISTS (
+         SELECT 1
+           FROM lease_unit_history oh
+           JOIN leases ol ON ol.id = oh.lease_id
+           JOIN units ou ON ou.id = oh.unit_id
+           JOIN properties op ON op.id = ou.property_id
+          WHERE oh.unit_id = $1
+            AND oh.lease_id IS DISTINCT FROM $5::uuid
+            AND ol.status IN ('active', 'expired', 'terminated')
+            AND NOT ${leaseNeverInForceSql('ol')}
+            AND d.day::date BETWEEN oh.effective_from AND ${leaseLastDayOnSpaceSql('oh', 'ol', 'op')}
+            -- a renewal, in either direction, is the same household staying on
+            AND ol.supersedes_lease_id IS DISTINCT FROM $5::uuid
+            AND NOT EXISTS (SELECT 1 FROM leases ml
+                             WHERE ml.id = $5::uuid AND ml.supersedes_lease_id = ol.id)
+            -- and so is their next lease on the same spot: same primary resident
+            AND NOT EXISTS (SELECT 1 FROM lease_tenants ot
+                             WHERE ot.lease_id = ol.id AND ot.role = 'primary'
+                               AND ot.tenant_id = $6::uuid)
+       )
+       -- or a guest was on the spot that night (not cancelled, not a no-show).
+       -- A guest with no account of their own is still somebody else; only the
+       -- payer's OWN reservation is not.
+       OR EXISTS (
+         SELECT 1 FROM unit_bookings b
+          WHERE b.unit_id = $1
+            AND b.status NOT IN ('cancelled', 'no_show') AND b.cancelled_at IS NULL
+            AND d.day::date >= b.check_in AND d.day::date < b.check_out
+            AND (b.tenant_id IS NULL OR $6::uuid IS NULL OR b.tenant_id <> $6::uuid)
+       )
+     )
+     ORDER BY d.day
+     LIMIT 1`,
+    [args.unitId, spanStart, mine.last_day, spanEnd, payer.leaseId ?? null, payer.tenantId ?? null])
+  return handover?.day ?? null
 }
 
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
@@ -3041,6 +3376,24 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     if (!await tenantOwesUtility(lt.lease_id, args.utilityType, args.meterId)) return false
   }
 
+  // 10/20 — DID THE SPOT CHANGE HANDS INSIDE THIS READ? Asked here for the same
+  // reason the wash is asked here: everything above answers whose usage this is,
+  // and this is the first point at which we can ask whether that household was
+  // still on the spot for all of it. Asked BEFORE the wash, because "is this
+  // span even one household's to carry" comes before "does the landlord eat
+  // their final bill" — and absorbing another household's days onto the book as
+  // a wash would record the wrong reason for the wrong money.
+  const changedHands = await spanAnotherHouseholdHeld(args, {
+    leaseId: lt.lease_id ?? null, serviceAgreementId, tenantId: lt.tenant_id ?? null,
+  })
+  if (changedHands) {
+    logger.info({ meterId: args.meterId, unitId: args.unitId, cycle: args.cycleMonth,
+                  leaseId: lt.lease_id ?? null, serviceAgreementId, changedHands },
+      'utility billing: the spot changed hands inside this read span — billed to nobody')
+    await reportUsageNobodyToBill(args, 'turnover', changedHands)
+    return false
+  }
+
   // 10/20 (Nic) — CALL IT A WASH. The payer for this span is settled, which is
   // the first point at which this question can be asked honestly: everything
   // above answers WHOSE usage this is, and only now can we ask whether that
@@ -3278,6 +3631,17 @@ export async function generateBillsForLandlord(
  * keys, sorts, or compares on this string.
  */
 const CYCLE_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+/** 10/20: one day of a month as a person says it — "Oct 11". The 'YYYY-MM-DD'
+ *  is read apart rather than put through a Date, because `new Date('2026-10-11')`
+ *  is UTC midnight and reading it with local getters west of UTC says Oct 10 —
+ *  the day before the one the landlord is being told about. */
+function dayLabel(iso: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso ?? ''))
+  if (!m) return 'that day'
+  return `${CYCLE_MONTHS[Number(m[2]) - 1] ?? m[2]} ${Number(m[3])}`
+}
+
 function cycleLabel(cycle: unknown): string {
   // billing_cycle_month is a DATE; node-pg hands it back as a local-midnight
   // Date, so read the LOCAL parts. toISOString() would shift a 1st-of-month
@@ -3376,15 +3740,22 @@ export async function releaseSuspendedChargesForLease(args: {
            WHERE meter_id = m.id) r ON TRUE
         LEFT JOIN property_utility_rates pur
                ON pur.property_id = m.property_id AND pur.utility_type = m.utility_type
+        -- 10/20: neither end of the span may be a read waiting on the
+        -- landlord. This is the OTHER road to a first utility bill (S647), and
+        -- the "base" leg takes the earliest non-cycle read of the month —
+        -- which is exactly what a held pull-out typo is. Unfixed, a 4800 typed against a
+        -- prior 48000 became the new resident's starting point the moment they
+        -- signed, and 44,200 kWh of somebody else's power was suspended against
+        -- their first bill.
         JOIN LATERAL (
           SELECT reading_value FROM utility_meter_readings
            WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
-             AND reason = 'monthly_cycle'
+             AND reason = 'monthly_cycle' AND needs_review = false
            ORDER BY reading_date DESC LIMIT 1) cyc ON TRUE
         JOIN LATERAL (
           SELECT reading_value FROM utility_meter_readings
            WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
-             AND reason <> 'monthly_cycle'
+             AND reason <> 'monthly_cycle' AND needs_review = false
            ORDER BY reading_date ASC LIMIT 1) base ON TRUE
        WHERE m.billing_method = 'submeter'
          AND (cyc.reading_value - base.reading_value) > 0

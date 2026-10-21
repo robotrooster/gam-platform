@@ -11,7 +11,7 @@ import {
   LayoutDashboard, Building2, DoorOpen, Users, CreditCard,
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
-  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus, UsersRound,
+  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
   Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt } from 'lucide-react'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
@@ -75,11 +75,22 @@ const NAV_ITEMS: Array<{
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
   { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
-  // 10/20 (Nic): "this looks like the same person... always have the landlord
-  // check that the customer is the same." Sits under Tenants because it is the
-  // same book of people, read a different way — and because the moment it
-  // matters is right after a schedule has been brought in.
-  { to: '/duplicate-people', icon: UsersRound,   label: 'Possible Duplicates', section: null,       category: 'tenants' },
+  // 10/20 (Nic), shown a "Possible Duplicates" tab in his own sidebar: "That
+  // doesn't need to be its own tab. That's kind of ridiculous." He is right,
+  // and the reason is the fix rather than the tab:
+  //
+  //   "a customer in GAM, in fact, should be one customer platform wide... the
+  //    landlord at each property can't see what the other one does, but when
+  //    they start typing in their name on the point of sale as a customer, they
+  //    are there. It needs to be platform wide, because otherwise it's going to
+  //    want to merge nobody and create separate records for every single place
+  //    that you ever possibly go that's using this."
+  //
+  // A list of people to reconcile is the symptom of splitting one person into a
+  // record per property. The register's customer search is where a person is
+  // found, across the account's properties, so there is nothing to merge later.
+  // The page and its route stay reachable for the proposals already raised;
+  // what comes out is the standing tab that implied this is routine work.
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
   // S639 (Nic): "I need my front desk person to go to one page, see all the
   // people that need to be contacted, and what phase they're in." Sits with

@@ -25,13 +25,19 @@ import {
   linkSaleToPerson, undoLink, saleTimeUndo, letGoOfPick, searchPeople, peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter,
   type CardOutcome, type LinkTarget, type StandIn,
 } from '../services/posPeople'
+import { inBook, inBookOfAny, askingAs, bookCaller, type BookCaller } from '../services/registerBook'
 import { reservationDue, releaseReservationTickets, ticketCarriesStay, stayItemIdsIn, stayTaxRate, taxInsidePayment, checkOutFor,
   priceWholeStay, wholeStayPrice, leaseDepositFor, stayExtensionQuote, extendStayByMonth, payTowardStay, SCREENING_LINE_NAME,
   type ReservationDue, type StayExtension } from '../services/registerStay'
 import {
-  utilityBillsNotPayable, recordUtilityPayLinkSettlement, assertUtilityBillLinesKept,
+  utilityBillsNotPayable, recordUtilityPayLinkSettlement, assertUtilityBillLinesKept, utilityBillIdsOnLink,
   type UtilitySettlementRecorded,
 } from '../services/utilityPayLink'
+import {
+  counterPersonContact, counterClosings, counterClosingById, quoteCounterReads, recordCounterReads,
+  counterBillIdsInCart, NOBODY_AT_THIS_PROPERTY, counterBillsOnCart, settleCounterBills, releaseCounterBills,
+  type CounterBillsOnCart, type CounterSettlement,
+} from '../services/registerFinalUtility'
 import { stayNeeds, recordScreeningPrepayment, markScreeningRequired, chooseStayTerms, screeningCollectedBy, continuousStayNights, screeningPaidForStay, canAttestReturningGuest, attestReturningGuest, RETURNING_GUEST_NOT_ALLOWED, type StayNeeds } from '../services/stayTerms'
 import {
   LINK_PAID_ONLINE, LINK_PAGE_STUCK, reservationNoDiscountWords, reservationPaidWords, reservationWhat, reservationLineName,
@@ -110,6 +116,45 @@ const ROW_TABLE: Record<string, string> = {
 
 function posLandlordId(req: any): string {
   return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId ?? req.posPropertyLandlordId, 'register')
+}
+
+/**
+ * Who the register's customer book answers to for this request
+ * (services/registerBook).
+ *
+ * The company is named rather than derived inside, because the book is "this
+ * company's account, as far as THIS caller reaches", and a lookup keyed on
+ * anything other than the company the route just authorized could drift from
+ * it. Every register read and write that touches people passes the answer down.
+ */
+const whoIsAsking = (req: any, company: string | null | undefined): Promise<BookCaller> =>
+  bookCaller(req.user, company, query)
+
+/**
+ * The company a READ in the register may name — posLandlordId's answer, widened
+ * to the account's register book.
+ *
+ * 10/20 (review): the Customers tab lists the whole account's book, and a row
+ * opens that person's history by naming the company which KEEPS their record
+ * (POSPage txQuery). For the desk that is often the account's OTHER company —
+ * Lisa's token carries Mountain View and the row she just read is Oak Park's —
+ * so the write resolver answered "That company is not yours to act on" and the
+ * button died on a row the same screen had just shown her. A company that
+ * shares her register book is her own account's; anything outside it falls
+ * through to the ordinary resolver, 403 and 400 and all. READ ONLY: every write
+ * still names a company the token itself carries.
+ */
+async function posReadLandlordId(req: any): Promise<string> {
+  const named = [req.body?.landlordId, req.query?.landlordId, req.posPropertyLandlordId]
+    .find((v) => typeof v === 'string' && v.trim() !== '') as string | undefined
+  const scope = landlordScopeIds(req.user!)
+  if (named && /^[0-9a-f-]{36}$/i.test(named) && scope.length) {
+    const p: unknown[] = [scope, named]
+    const w = askingAs(p, await whoIsAsking(req, undefined))
+    const shared = await queryOne<{ one: number }>(`SELECT 1 AS one WHERE ${inBookOfAny('$2::uuid', '$1', w)}`, p)
+    if (shared) return named
+  }
+  return posLandlordId(req)
 }
 
 /**
@@ -1918,6 +1963,147 @@ posRouter.get('/stays/current', requirePerm('pos.ring_sale'), async (req: any, r
   } catch (e) { next(e) }
 })
 
+// ── 10/20 (Nic): THE FINAL UTILITY BILL, RAISED AT THE REGISTER ─────────────
+//
+//   "I don't want it to generate a bill."
+//   "desk picks the customer and gam should know the site from the reservation.
+//    no reason for the front counter to pick a space too"
+//
+// Somebody is at the counter settling up on their way out. The desk reads their
+// meter off the pole, types the figure, and the power goes on the same ticket as
+// the propane. Nothing is emailed and nothing goes on an invoice while the
+// ticket is open: the ticket IS the bill, and paying it closes it out. Not paid,
+// and the bill is owed the ordinary way — the reading stands either way.
+//
+// Three doors, in the order the desk uses them, and only the third one writes.
+// services/registerFinalUtility carries every word of the reasoning.
+
+/** Who the desk has in front of them, and what of theirs can be closed out. */
+posRouter.get('/final-utility/customer', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = await assertPropertyIsLandlords(posLandlordId(req), req.query.propertyId)
+    await assertPropertyInScope(req.user, propertyId)
+    const landlordId = posLandlordId(req)
+    // The person already picked on the ticket is the person. Their email and
+    // phone come off their OWN record — a clerk retyping an address into this
+    // box is how a final bill lands on a stranger with a similar name.
+    const named = typeof req.query.tenantId === 'string' && req.query.tenantId
+      || typeof req.query.posCustomerId === 'string' && req.query.posCustomerId
+    if (!named) {
+      throw new AppError(400, 'Type who it is for and pick them first, then take the closing read.')
+    }
+    const contact = await counterPersonContact(db, landlordId, {
+      tenantId: req.query.tenantId, posCustomerId: req.query.posCustomerId,
+    })
+    // Picked, but a person this company has never dealt with: the honest answer
+    // is the same one somebody with no site here gets, not a refusal.
+    if (!contact) {
+      return res.json({ success: true, data: { matchedBy: null, closings: [], note: NOBODY_AT_THIS_PROPERTY } })
+    }
+    const found = await counterClosings(db, {
+      landlordId, propertyId, email: contact.email, phone: contact.phone,
+    })
+    res.json({ success: true, data: found })
+  } catch (e) { next(e) }
+})
+
+const FINAL_UTILITY_WORDS: Record<string, string> = {
+  propertyId: 'Pick the property at the top of the register first, then take the closing read again.',
+  closing: 'Pick which stay or lease is being closed out, then press the button again.',
+  reads: 'Type the figure off the face of the meter, then press the button again.',
+}
+const FINAL_UTILITY_OTHERWISE =
+  'That read could not be read as a number — type the whole figure off the face of the meter, then press the button again.'
+
+const finalUtilitySchema = z.object({
+  propertyId: z.string().uuid(),
+  closing: z.object({ kind: z.enum(['stay', 'lease']), id: z.string().uuid() }),
+  // One box per submeter the site has (D4). Six is more meters than any space
+  // in GAM has and leaves the door shut on a request asking for a thousand.
+  reads: z.array(z.object({
+    meterId: z.string().uuid(),
+    value: z.number().int().min(0),
+  })).min(1).max(6),
+})
+
+/**
+ * D5 — TYPING THE NUMBER WRITES NOTHING. The usage and the dollar amount come
+ * back for the desk to confirm and read out; no reading, no bill, no flag. A
+ * typo is retyped, because there is nothing yet to void.
+ */
+posRouter.post('/final-utility/quote', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = parseForStaff(finalUtilitySchema, req.body, FINAL_UTILITY_WORDS, FINAL_UTILITY_OTHERWISE)
+    await assertPropertyInScope(req.user, body.propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, body.propertyId)
+    const closing = await counterClosingById(db, {
+      landlordId, propertyId: body.propertyId, kind: body.closing.kind, id: body.closing.id,
+    })
+    const reads = await quoteCounterReads(db, {
+      landlordId, propertyId: body.propertyId, closing, reads: body.reads,
+    })
+    res.json({ success: true, data: { what: closing.what, spaceLabel: closing.spaceLabel, reads } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * D5 — CONFIRMING WRITES THE READING AND THE BILL TOGETHER.
+ * D1 — AND SENDS NOTHING, AND PUTS IT ON NO INVOICE.
+ *
+ * What comes back is the lines for the ticket (in the same shape an emailed
+ * bill's line has, so the kilowatts are counted once) and a plain sentence for
+ * everything that did NOT go on the ticket — a nightly guest's power inside the
+ * rate, a wash, a figure the landlord has to look at.
+ */
+posRouter.post('/final-utility/confirm', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = parseForStaff(finalUtilitySchema, req.body, FINAL_UTILITY_WORDS, FINAL_UTILITY_OTHERWISE)
+    await assertPropertyInScope(req.user, body.propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, body.propertyId)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const closing = await counterClosingById(client, {
+        landlordId, propertyId: body.propertyId, kind: body.closing.kind, id: body.closing.id,
+      })
+      const out = await recordCounterReads(client, {
+        landlordId, propertyId: body.propertyId, userId: req.user!.userId,
+        closing, reads: body.reads,
+      })
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { what: closing.what, ...out } })
+    } catch (e) {
+      try { await client.query('ROLLBACK') } catch {}
+      throw e
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+/**
+ * D2 — THE TICKET WAS NOT PAID, SO THE BILL GOES BACK TO THE ORDINARY ROUTE.
+ *
+ * The desk took the read off the ticket, cleared the cart, or they walked off.
+ * The counter's ask is let go and the bill is owed as usual — their invoice, or
+ * an emailed link. Nothing is written off by not being collected at a counter.
+ */
+posRouter.post('/final-utility/release', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = parseForStaff(z.object({
+      propertyId: z.string().uuid(),
+      billIds: z.array(z.string().uuid()).min(1).max(6),
+    }), req.body, FINAL_UTILITY_WORDS, FINAL_UTILITY_OTHERWISE)
+    await assertPropertyInScope(req.user, body.propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, body.propertyId)
+    const out = await releaseCounterBills(db, {
+      landlordId, propertyId: body.propertyId, billIds: body.billIds,
+    })
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 // ── S652: open tickets — written up at the pump, settled at the door ────────
 //
 // Nic: "we would need to somehow create the tickets in the office because
@@ -2004,7 +2190,7 @@ posRouter.post('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, n
 
     // S654: the person on a ticket is this company's. 10/2: never gated on
     // residency — anyone tied to this company in any way (services/posPeople).
-    await personOnSale(landlordId, { tenantId: body.tenantId, posCustomerId: body.posCustomerId })
+    await personOnSale(landlordId, { tenantId: body.tenantId, posCustomerId: body.posCustomerId }, await whoIsAsking(req, landlordId))
 
     const row = await queryOne<any>(
       `INSERT INTO pos_open_tickets
@@ -2154,7 +2340,7 @@ posRouter.put('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res
     // register keeps the cart and says what to do, where a 404/409 (the ticket
     // itself settled, voided or never this company's) clears it.
     if (named) {
-      await personOnSale(landlordId, { tenantId, posCustomerId }).catch((e) => {
+      await personOnSale(landlordId, { tenantId, posCustomerId }, await whoIsAsking(req, landlordId)).catch((e) => {
         throw e instanceof AppError && e.statusCode === 404 ? new AppError(422, e.message) : e
       })
     }
@@ -2267,9 +2453,10 @@ posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, re
     if (!tenantId && !posCustomerId) return res.json({ success: true, data: null })
     // 10/2 (review): asked from a register at a property the caller works.
     await assertSaleInScope(req.user, req.query.propertyId ? String(req.query.propertyId) : null)
-    await personOnSale(posLandlordId(req), { tenantId, posCustomerId })   // S654 (review): this company's person only
+    const asking = await whoIsAsking(req, posLandlordId(req))
+    await personOnSale(posLandlordId(req), { tenantId, posCustomerId }, asking)   // S654 (review): this company's person only
     const { savedCardFor } = await import('../services/posCardOnFile')
-    const card = await savedCardFor({ tenantId, posCustomerId, landlordId: posLandlordId(req) })
+    const card = await savedCardFor({ tenantId, posCustomerId, landlordId: posLandlordId(req), caller: asking })
     res.json({ success: true, data: card
       ? { brand: card.brand, last4: card.last4, holderName: card.holderName }
       : null })
@@ -2373,7 +2560,57 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // recovery." Settling it here closes the bill out at the BILL'S figure, so
     // the bill's own line is not the cashier's to reprice, shrink, untax or
     // leave out — the same refusal Adjust gives, before anything is priced.
-    if (payLink) assertUtilityBillLinesKept(payLink, items, 'Charge')
+    // 10/20 (review): nor is the sale the cashier's to discount while a bill is
+    // on it. The discount never touches a line, so it walked straight past the
+    // line check and left the till short of what the bill was closed out at.
+    // 10/20 (fix): and the cart it hands back is the one that gets charged —
+    // each bill line at the LINK'S own price and rate, not the register's copy
+    // of them. The guard matches to the cent and to four decimals of rate so a
+    // line can survive the round trip through the cart at all, and a tolerance
+    // is not a figure: the bill's tax rate is its own tax over its own charge
+    // (payLinkLineForBill), which is rarely a round number, so the near-enough
+    // copy is replaced with the real one before anything is priced.
+    if (payLink) items = assertUtilityBillLinesKept(payLink, items, discountAmount, 'Charge')
+
+    // 10/20 (Nic) — A CLOSING READ TAKEN AT THIS REGISTER PUTS THE BILL ITSELF
+    // ON THE TICKET, and the ticket IS the bill ("I don't want it to generate a
+    // bill"). Its line carries the bill's number, so the match is CARRIED and
+    // never guessed from a dollar figure and a name.
+    //
+    // Priced here, before anything is added up, so the till charges the BILL'S
+    // own figure: the line survives the round trip through the register to the
+    // cent and to four decimals of rate, and a tolerance is not a figure. The
+    // bill id is checked rather than trusted — this company's, this property's,
+    // still owed, and held by an open ask this register raised — because what it
+    // buys is a charge voided off somebody's invoice. Read again under the
+    // bills' own locks inside the sale's transaction below, so a second register
+    // settling the same read waits and then loses.
+    let counterBills: CounterBillsOnCart[] = []
+    const counterBillLine = (it: any): boolean =>
+      !it?.id && typeof it?.utilityBillId === 'string'
+      && counterBills.some((b) => b.billId === String(it.utilityBillId).toLowerCase())
+    //
+    // A PAY LINK'S OWN BILL LINE IS NOT ONE OF THESE. An emailed bill's line
+    // carries its bill number too (payLinkLineForBill), and that door closes
+    // the bill out itself — reading those lines here would look for an open
+    // counter ask that was never raised and refuse an ordinary link. So the
+    // counter door reads only a cart with no link on it; a counter-raised bill
+    // dropped onto a link's cart is told to be rung on its own, because the two
+    // doors each settle their own and one sale cannot be both.
+    const linkBillIds = payLink ? utilityBillIdsOnLink(payLink) : []
+    const ownBillIds = counterBillIdsInCart(items).filter((id) => !linkBillIds.includes(id))
+    if (payLink && ownBillIds.length) {
+      throw new AppError(400, 'This sale is settling an emailed pay link, so a closing read taken here cannot go on it — '
+        + 'nothing was charged. Press Clear, settle the link on its own, then ring the closing read as its own sale.')
+    }
+    if (!payLink && ownBillIds.length) {
+      const pre = await counterBillsOnCart(db, {
+        landlordId: posLandlordId(req), propertyId: propertyId || null,
+        items, discount: discountAmount, lock: false,
+      })
+      items = pre.items
+      counterBills = pre.bills
+    }
     // 10/2: a pay link's own lines are its bill, and a stay balance or a
     // one-off sent from a lease carries no register item. Settling THAT link
     // at the counter may charge those lines — only the link's own (same name,
@@ -2413,7 +2650,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       ticketScreeningLeft--
       return true
     }
-    assertCatalogItems(items.filter((it: any) => !linkOwnLine(it) && !ticketScreeningLine(it)).map((it: any) => ({ itemId: it.id })))
+    assertCatalogItems(items.filter((it: any) => !linkOwnLine(it) && !ticketScreeningLine(it) && !counterBillLine(it)).map((it: any) => ({ itemId: it.id })))
     if (linkScreening && !items.some((it: any) => isScreeningCartLine(it, linkScreening))) {
       throw new AppError(400, `This link carries the guest's background check (${money(linkScreening.price)}) — it cannot be taken off. `
         + 'Press Clear, open the link again from the list, then press Charge.')
@@ -2487,7 +2724,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     const linkPaysInFull = !!linkRes && (!!linkRes.stay || linkRes.charge >= linkRes.due.owed - 0.005)
     // S654: whoever the sale names — picked at the register for any tender —
     // has to be this company's resident or customer.
-    if (paymentMethod !== 'charge') await personOnSale(posLandlordId(req), { tenantId, posCustomerId })
+    const asking = await whoIsAsking(req, posLandlordId(req))
+    if (paymentMethod !== 'charge') await personOnSale(posLandlordId(req), { tenantId, posCustomerId }, asking)
 
     // S254: paymentMethod='charge' is FlexCharge. Gate up-front so
     // the rest of the route knows the call is FlexCharge-shaped.
@@ -2699,6 +2937,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     let linkScreeningAfterCommit: (() => Promise<void>) | null = null
     // What settling this link's utility bills did — read once the sale commits.
     let utilitySettled: UtilitySettlementRecorded | null = null
+    let counterSettled: CounterSettlement | null = null
 
     // 10/5 (Nic, A5) — THE BACKGROUND CHECK IS GAM'S MONEY, NEVER BOTH WAYS.
     // A card (the reader, a card on file) lands on GAM's balance: the check's
@@ -2741,7 +2980,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       const { savedCardFor, chargeSavedCard } = await import('../services/posCardOnFile')
       const card = await savedCardFor({
         tenantId: tenantId ?? null, posCustomerId: posCustomerId ?? null,
-        landlordId: posLandlordId(req),
+        landlordId: posLandlordId(req), caller: asking,
       })
       if (!card) {
         throw new AppError(409,
@@ -2801,7 +3040,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // record that is a resident's names the resident on the sale.
       let personLastName = ''
       if (tenantId) {
-        saleCustomerId = await residentRecord(client, posLandlordId(req), tenantId)
+        saleCustomerId = await residentRecord(client, posLandlordId(req), tenantId, asking)
       }
       if (saleCustomerId) {
         const r = (await client.query<{ tenant_id: string | null; last_name: string | null }>(
@@ -2821,10 +3060,10 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const card = cardIdentity
         const person = { id: saleCustomerId, lastName: personLastName }
         cardOutcome = await withSavepoint(client,
-          () => applyCardToPerson(client, { landlordId: posLandlordId(req), card, person }),
+          () => applyCardToPerson(client, { landlordId: posLandlordId(req), card, person, caller: asking }),
           (e) => { logger.warn({ err: e }, '[POS] card not put on the picked person'); return { kind: 'none' } as CardOutcome })
       } else if (cardIdentity) {
-        cardCustomer = await findOrCreateCustomerForCard(client, { landlordId: posLandlordId(req), card: cardIdentity })
+        cardCustomer = await findOrCreateCustomerForCard(client, { landlordId: posLandlordId(req), card: cardIdentity, caller: asking })
         saleCustomerId = cardCustomer.customerId
         // A card already linked to a resident names the resident on this sale too.
         saleTenantId = (await client.query<{ tenant_id: string | null }>(
@@ -2891,6 +3130,26 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             `UPDATE pos_transactions SET open_ticket_id = $2 WHERE id = $1`, [tx.id, openTicketId])
           await client.query(
             `UPDATE pos_open_tickets SET settled_transaction_id = $2 WHERE id = $1`, [openTicketId, tx.id])
+        }
+        // 10/20 (Nic): and a closing read taken at this register settles the
+        // same way — under the bills' own locks, read again now that the sale
+        // is written. A bill paid some other way in the meantime (their portal,
+        // another register, a link) is refused here and the whole sale rolls
+        // back: nothing is taken for kilowatts somebody has already paid for.
+        if (counterBills.length) {
+          const now = await counterBillsOnCart(client, {
+            landlordId: posLandlordId(req), propertyId: propertyId || null,
+            items, discount: discountAmount, lock: true,
+          })
+          for (const b of counterBills) {
+            const n = now.bills.find((x) => x.billId === b.billId)
+            if (!n || Math.round(n.charge * 100) !== Math.round(b.charge * 100)
+                   || Math.round(n.tax * 100) !== Math.round(b.tax * 100)) {
+              throw new AppError(409, `The ${b.name} bill changed a moment ago — nothing was charged. `
+                + 'Press Clear, then take the closing read again.')
+            }
+          }
+          counterSettled = await settleCounterBills(client, { bills: now.bills, saleId: tx.id })
         }
         // S652: the link is paid — in person, at the register. Claimed inside
         // the same transaction so a card paid online a second later is refused
@@ -3191,6 +3450,10 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         logger.error({ payLinkId: payLink?.id, saleId: tx.id, charges: utilitySettled.chargesHeld },
           '[POS] a utility bill was paid at the counter but its charge could not be taken off the payer\'s bill — it still reads as owed')
       }
+      if (counterSettled?.chargesHeld.length) {
+        logger.error({ saleId: tx.id, charges: counterSettled.chargesHeld },
+          '[POS] a closing read was collected at the counter but its charge could not be taken off the payer\'s bill — it still reads as owed')
+      }
       // A pay link settled here: its background check, and its lease-or-stay answer, the same as paid online.
       if (linkScreeningAfterCommit) await linkScreeningAfterCommit()
       if (payLink) await afterLinkPaid(payLink, req.user!.userId)
@@ -3230,11 +3493,13 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         // 10/2 (review): the email on a resident's own account only while they
         // live here (recordContactSql) — never to a company with a looser tie,
         // and never to one they have left (decisions #10).
+        const cp: unknown[] = [saleCustomerId]
+        const wc = askingAs(cp, asking)
         const c = await queryOne<any>(
           `SELECT c.id, c.tenant_id, COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
-                  ${recordContactSql('c', 'u').email} AS email
+                  ${recordContactSql('c', 'u', wc).email} AS email
              FROM pos_customers c LEFT JOIN tenants tn ON tn.id = c.tenant_id LEFT JOIN users u ON u.id = tn.user_id
-            WHERE c.id = $1`, [saleCustomerId])
+            WHERE c.id = $1`, cp)
         // 10/2 (review): "N previous purchases" is THIS company's count — a
         // resident who also buys at another company's register brings none
         // of those sales here.
@@ -4356,15 +4621,31 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
     // 10/2: and only a property the caller is assigned to; with none named, a
     // scoped cashier sees their own properties' sales.
     const { propertyId: txProp, scoped } = await salesScope(req)
-    const txParams: any[] = [posLandlordId(req)]
+    const txParams: any[] = [await posReadLandlordId(req)]
     const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}`
       : scoped ? `AND t.property_id = ANY($${txParams.push(scoped)}::uuid[])` : ''
     // S654 (Nic): a customer's purchase history — the receipt panel links here.
     const txCust = req.query.posCustomerId ? String(req.query.posCustomerId) : null
+    // WHO IS ASKING goes on the parameter list only when the book is actually
+    // read, which is only when somebody is named (see txBook below). A bound
+    // parameter no placeholder mentions is not harmless: Postgres has no column
+    // beside it to take a type from and refuses the whole statement, so the
+    // register's History tab answered 500 for every sale at every property.
+    const txWho = txCust ? askingAs(txParams, await whoIsAsking(req, txParams[0])) : null
     // 10/2: a resident's history is every sale naming them — including sales
     // rung before their register record existed, which carry only their tenant id.
     const txCustFilter = txCust ? (() => { const n = txParams.push(txCust)
-      return `AND (t.pos_customer_id = $${n} OR t.tenant_id = (SELECT pc2.tenant_id FROM pos_customers pc2 WHERE pc2.id = $${n} AND pc2.landlord_id = $1))` })() : ''
+      return `AND (t.pos_customer_id = $${n} OR t.tenant_id = (SELECT pc2.tenant_id FROM pos_customers pc2 WHERE pc2.id = $${n} AND ${inBook('pc2.landlord_id', '$1', txWho!)}))` })() : ''
+    // 10/20 (review): A NAMED PERSON'S HISTORY IS THEIRS, NOT A LOCATION'S.
+    //
+    // The Customers tab counts a person's purchases across the account's book —
+    // one person, one running total (the migration that put the book in the
+    // data says so in those words). A row reading "3 purchases · $42" that
+    // opened two was the list and the history contradicting each other on one
+    // screen, and it is Nic's own propane case: the man is on Oak Park's book
+    // and bought his propane at the Mountain View counter. With nobody named
+    // this is still the register's own History tab, which is one counter's.
+    const txBook = txCust ? inBook('t.landlord_id', '$1', txWho!) : 't.landlord_id = $1'
     const txns = await query<any>(`
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
@@ -4394,7 +4675,7 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
       LEFT JOIN pos_customers pc ON pc.id = t.pos_customer_id
       LEFT JOIN tenants ptn ON ptn.id = pc.tenant_id
       LEFT JOIN users pu ON pu.id = ptn.user_id
-      WHERE t.landlord_id=$1 ${txPropFilter} ${txCustFilter}
+      WHERE ${txBook} ${txPropFilter} ${txCustFilter}
       ORDER BY t.created_at DESC LIMIT 100`, txParams)
     res.json({ success: true, data: txns })
   } catch (e) { next(e) }
@@ -4882,7 +5163,7 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
         throw new AppError(409, 'The cart changed since this card charge was started — press Charge again.')
       }
       // 10/2: the breakdown never fails over the person — no name instead.
-      const who = await nameForReader(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId })
+      const who = await nameForReader(landlordId, { tenantId: req.body.tenantId, posCustomerId: req.body.posCustomerId }, await whoIsAsking(req, landlordId))
       const shown = await showCartOnReader({ stripeReaderId, lines: registerReaderLines(priced.items, quoted.surcharge),
         taxCents: Math.round(Number(quoted.taxAmount) * 100), totalCents: intent.amount, who,
         owner: `register:${(req as any).user.userId}:${propertyId}` })
@@ -4953,7 +5234,7 @@ posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_s
     // 10/2 (the Scott Duffy ticket): putting the cart up never fails over the
     // person. Somebody who cannot be named here shows no name; the sale itself
     // still checks who it names.
-    const who = await nameForReader(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId })
+    const who = await nameForReader(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId }, await whoIsAsking(req, landlordId))
     const action = await readerAction(stripeReaderId).catch(() => null)
     if (action && action.status === 'in_progress' && action.type !== 'set_reader_display') {
       return res.json({ success: true, data: { shown: false, busy: action.type } })
@@ -5059,14 +5340,16 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
       const pi = await retrieveTerminalPaymentIntentWithCharge({ paymentIntentId: tx.stripe_payment_intent_id })
       const card = cardIdentityFromIntent(pi)
       if (card?.generatedCard) {
-        await saveCardForCustomer({ landlordId: reader.landlord_id, customerId: tx.pos_customer_id, generatedCard: card.generatedCard, fingerprint: card.fingerprint })
+        await saveCardForCustomer({ landlordId: reader.landlord_id, customerId: tx.pos_customer_id, generatedCard: card.generatedCard, fingerprint: card.fingerprint,
+                                   caller: await whoIsAsking(req, reader.landlord_id) })
         saved = true
       } else reason = 'the card could not be kept'
     }
     // An email typed on the reader is the customer's: kept when we had none, and the receipt goes out.
     let receiptSentTo: string | null = null
     if (answer.email) {
-      receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id], { standIn: before })
+      receiptSentTo = await emailReceiptForSale(tx.id, answer.email, [reader.landlord_id],
+                                                await whoIsAsking(req, reader.landlord_id), { standIn: before })
     }
     res.json({ success: true, data: { answered: true, saved, reason, receiptSentTo, nameSet } })
   } catch (e) { next(e) }
@@ -5094,7 +5377,8 @@ posRouter.post('/transactions/:id/email-receipt', requirePerm('pos.ring_sale'), 
       [String(req.params.id), landlordScopeIds(req.user)])
     if (!sale) throw new AppError(404, SALE_GONE)
     await assertSaleInScope(req.user, sale.property_id)
-    const sentTo = await emailReceiptForSale(String(req.params.id), email, landlordScopeIds(req.user))
+    const sentTo = await emailReceiptForSale(String(req.params.id), email, landlordScopeIds(req.user),
+                                             await whoIsAsking(req, posLandlordId(req)))
     res.json({ success: true, data: { sentTo } })
   } catch (e) { next(e) }
 })
@@ -5166,8 +5450,11 @@ async function saleHeldWords(tx: { id: string; pay_link_id?: string | null; open
 }
 
 async function emailReceiptForSale(transactionId: string, email: string, landlordIds: string[],
+                                   caller: BookCaller,
                                    opts: { standIn?: StandIn | null } = {}): Promise<string> {
   {
+    const tp: unknown[] = [transactionId, landlordIds]
+    const wt = askingAs(tp, caller)
     const tx = await queryOne<any>(
       `SELECT t.*, p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip, l.business_name,
               pc.first_name AS c_first, pc.last_name AS c_last, pc.email AS c_email, pc.phone AS c_phone, pc.tenant_id AS c_tenant_id,
@@ -5176,7 +5463,7 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
               -- only while they live under this company's leases
               -- (tenantLivesHereSql) — never for a looser tie, and never once
               -- they have left (decisions #10).
-              CASE WHEN ${tenantLivesHereSql('tn.id', 't.landlord_id')} THEN u.email END AS t_email
+              CASE WHEN ${tenantLivesHereSql('tn.id', 't.landlord_id', wt)} THEN u.email END AS t_email
          FROM pos_transactions t
          JOIN landlords l ON l.id = t.landlord_id
          LEFT JOIN properties p ON p.id = t.property_id
@@ -5184,7 +5471,7 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
          LEFT JOIN tenants tn ON tn.id = t.tenant_id
          LEFT JOIN users u ON u.id = tn.user_id
         WHERE t.id = $1 AND t.landlord_id = ANY($2::uuid[])`,
-      [transactionId, landlordIds])
+      tp)
     if (!tx) throw new AppError(404, SALE_GONE)
     const items = await query<any>(
       `SELECT item_name, qty, unit_price, subtotal FROM pos_transaction_items WHERE transaction_id = $1 ORDER BY created_at`, [tx.id])
@@ -5239,10 +5526,10 @@ async function emailReceiptForSale(transactionId: string, email: string, landlor
         // left alone (it cannot be on two records).
         let same: { customerId?: string; tenantId?: string } | null = null
         let closed = false
-        try { same = await findSamePerson(client, tx.landlord_id, email, null) } catch { closed = true }
+        try { same = await findSamePerson(client, tx.landlord_id, email, null, caller) } catch { closed = true }
         if (same?.customerId || same?.tenantId) {
           const x = opts.standIn?.id === tx.pos_customer_id ? opts.standIn : await standInNow(client, tx.pos_customer_id)
-          if (x) await foldStandInInto(client, tx.landlord_id, x, same)
+          if (x) await foldStandInInto(client, tx.landlord_id, x, same, caller)
         } else if (!closed) {
           await client.query(`UPDATE pos_customers SET email = $1, updated_at = NOW() WHERE id = $2`, [email, tx.pos_customer_id])
         }
@@ -5300,7 +5587,8 @@ posRouter.get('/people', requirePerm('pos.ring_sale'), peopleQueryGuard, peopleS
     await assertPropertyInScope(req.user, propertyId)
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, propertyId)
-    const people = await searchPeople({ landlordId, propertyId, userId: req.user.userId, q: req.query.q, allowElsewhere: !req.crossCompanyLimited })
+    const people = await searchPeople({ landlordId, propertyId, userId: req.user.userId, q: req.query.q, allowElsewhere: !req.crossCompanyLimited,
+                                        caller: await whoIsAsking(req, landlordId) })
     // 10/2 (review): past the limit on looking elsewhere, the register says so
     // instead of quietly showing fewer people.
     res.json({ success: true, data: people, ...(req.crossCompanyLimited ? { elsewhereLimited: true } : {}) })
@@ -5327,13 +5615,14 @@ posRouter.post('/customers', requirePerm('pos.ring_sale'), async (req: any, res,
     const landlordId = posLandlordId(req)
     await assertPropertyIsLandlords(landlordId, b.propertyId)
     if (!b.match && !b.firstName) throw new AppError(400, 'Type at least a first name, then press Add customer.')
+    const asking = await whoIsAsking(req, landlordId)
     const client = await getClient()
     let made: { customerId: string; tenantId: string | null; existing: boolean }
     try {
       await client.query('BEGIN')
       made = b.match
-        ? await customerFromElsewhere(client, landlordId, req.user.userId, b.match.pick)
-        : await addCustomer(client, landlordId, { firstName: b.firstName!, lastName: b.lastName, email: b.email, phone: b.phone })
+        ? await customerFromElsewhere(client, landlordId, req.user.userId, b.match.pick, asking)
+        : await addCustomer(client, landlordId, { firstName: b.firstName!, lastName: b.lastName, email: b.email, phone: b.phone }, asking)
       await client.query('COMMIT')
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => {})
@@ -5343,11 +5632,13 @@ posRouter.post('/customers', requirePerm('pos.ring_sale'), async (req: any, res,
     // 10/2 (review): somebody picked from elsewhere who turns out to be tied to
     // this company only loosely (a cancelled invite, say) comes back by name —
     // their account's email and phone only while they live here.
+    const rp: unknown[] = [made.customerId]
+    const wr = askingAs(rp, asking)
     const row = await queryOne<any>(
       `SELECT c.id, c.tenant_id, COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
-              ${recordContactSql('c', 'u').email} AS email, ${recordContactSql('c', 'u').phone} AS phone
+              ${recordContactSql('c', 'u', wr).email} AS email, ${recordContactSql('c', 'u', wr).phone} AS phone
          FROM pos_customers c LEFT JOIN tenants tn ON tn.id = c.tenant_id LEFT JOIN users u ON u.id = tn.user_id
-        WHERE c.id = $1`, [made.customerId])
+        WHERE c.id = $1`, rp)
     const out = { ...row, kind: row.tenant_id ? 'resident' : 'customer', ...(made.existing ? { existing: true } : {}) }
     res.status(made.existing ? 200 : 201).json({ success: true, data: out })
   } catch (e) { next(e) }
@@ -5355,21 +5646,89 @@ posRouter.post('/customers', requirePerm('pos.ring_sale'), async (req: any, res,
 
 // The Customers tab. 10/2: a resident's register record is listed under the
 // name and email on their account, marked as a resident.
-posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
+//
+// 10/20 (Nic) — ONE BOOK, AND NO PROPERTY FILTER HERE, EVER: "When I click the
+// customer list, I want to be able to see that combined as all properties,
+// because that could be people from my other property could be customers at
+// this property for propane. I shouldn't have to toggle."
+// A register record hangs off the COMPANY (pos_customers.landlord_id) and has no
+// property of its own, which is the whole point: the man who stays at one park
+// and buys propane at another is one row, with one charge account, one set of
+// cards and one running total. Narrowing this by property would not filter the
+// book, it would SPLIT the person — and splitting a person per property is what
+// manufactured the duplicates we then had to go and propose merging. The
+// register's picker above (GET /people) names the property because a SALE rings
+// at one; who the company's customers are is not a question about a location.
+//
+// 10/20 (review) — AND "MY OTHER PROPERTY" IS OFTEN NOT THE SAME LLC, SO THIS
+// READ SPANS THE ACCOUNT.
+//
+// Nic's two parks are two companies — Mountain View RV Park Ranch LLC and Oak
+// Park Motel and RV LLC — so a list scoped to one of them is the toggle he just
+// had taken out. Asking which is worse still, and that is what this route did:
+// it went through posLandlordId, the resolver for a WRITE, which answers an
+// account that owns more than one company with a 400 saying "choose which one".
+// Nothing on the page reads that 400, so the tab drew its empty state and told
+// Nic his book was empty while thirteen records sat in the other company's.
+//
+// The rule, both ways round (lib/landlordScope): a READ spans every company the
+// account owns, a WRITE names its target. This is a read, and every row says
+// which company keeps it — nothing is blended and nothing is hidden.
+// Likely-duplicate matching stays INSIDE one company, because two companies'
+// books are never folded together (the fold refuses it outright below);
+// offering it would only waste a clerk's click.
+//
+// 10/20 (review, second pass) — AND THE DESK IS WHO READS THIS TAB.
+//
+// The read used to stop at landlordScopeIds(), which answers an OWNER with his
+// whole account and a TEAM role with the one company its token carries — that
+// is the whole of a team scope. So this came out right for Nic and wrong for
+// Lisa, the on-site manager at Mountain View who stands at the counter: her tab
+// listed Mountain View's book while the picker beside it, which asks the DATA
+// (register_book_companies), offered the account's. One screen, two answers to
+// one question — the same shape as the empty list that started this. Nic, on
+// who may see them: "they are his customers and the desk has to find them."
+//
+// So the session's companies are only where the read STARTS, and the book comes
+// from the data, exactly as every other register lookup here reads it
+// (services/registerBook). It never leaves the account that owns the company
+// the caller is scoped to.
+posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req: any, res, next) => {
   try {
-    const landlordId = posLandlordId(req)
-    // A resident's purchases include sales rung before their record existed.
-    const theirSale = `(t.pos_customer_id = c.id OR (c.tenant_id IS NOT NULL AND t.landlord_id = c.landlord_id AND t.tenant_id = c.tenant_id))`
+    // A company the request names still narrows the list to that one — the
+    // register's own property derives one (the middleware at the top of this
+    // file) when a page deliberately asks for a single company's book.
+    const named = [req.query?.landlordId, req.posPropertyLandlordId]
+      .find((v) => typeof v === 'string' && v.trim() !== '') as string | undefined
+    const companies = named ? [resolveLandlordTarget(req.user, named, 'register')] : landlordScopeIds(req.user)
+    if (!companies.length) throw new AppError(400, 'No landlord scope on this user')
+    // $1 is where the read STARTS and the next one is WHO IS ASKING: the book is
+    // the account's companies as far as this caller reaches, so the desk — who
+    // holds no company of her own — gets the account she works for, and a
+    // co-owner gets only what he co-owns (registerBook, and the three branches
+    // in the migration).
+    const params: unknown[] = [companies]
+    const who = askingAs(params, await whoIsAsking(req, named))
+    const theBook = named ? `c.landlord_id = ANY($1::uuid[])` : inBookOfAny('c.landlord_id', '$1', who)
+    // A resident's purchases include sales rung before their record existed —
+    // at either of the account's counters, because one person has one running
+    // total (services/registerBook). The register's own History tab reads the
+    // same way for a named person (GET /transactions), so a row that counts
+    // three purchases opens three.
+    const theirSale = `(t.pos_customer_id = c.id OR (c.tenant_id IS NOT NULL AND ${inBook('t.landlord_id', 'c.landlord_id', who)} AND t.tenant_id = c.tenant_id))`
     const rows = await query<any>(
       `WITH c AS (
          SELECT c.id, c.landlord_id, c.tenant_id, c.created_from, c.created_at, c.notes, c.stripe_customer_id,
                 COALESCE(u.first_name, c.first_name) AS first_name, COALESCE(u.last_name, c.last_name) AS last_name,
-                ${recordContactSql('c', 'u').email} AS email, ${recordContactSql('c', 'u').phone} AS phone
+                ${recordContactSql('c', 'u', who).email} AS email, ${recordContactSql('c', 'u', who).phone} AS phone,
+                l.business_name AS company
            FROM pos_customers c
            LEFT JOIN tenants tn ON tn.id = c.tenant_id
            LEFT JOIN users u ON u.id = tn.user_id
-          WHERE c.landlord_id = $1 AND c.archived_at IS NULL)
+           LEFT JOIN landlords l ON l.id = c.landlord_id
+          WHERE ${theBook} AND c.archived_at IS NULL)
        SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.created_from, c.created_at, c.notes,
+              c.landlord_id, c.company,
               c.tenant_id, (c.tenant_id IS NOT NULL) AS is_resident,
               (c.stripe_customer_id IS NOT NULL) AS has_stripe_customer,
               (SELECT COUNT(*)::int FROM pos_transactions t WHERE ${theirSale}) AS purchases,
@@ -5379,10 +5738,11 @@ posRouter.get('/customers', requirePerm('pos.ring_sale', 'pos.end_of_day'), asyn
                  FROM pos_customer_cards k WHERE k.pos_customer_id = c.id) AS cards,
               (SELECT COALESCE(json_agg(d.id), '[]'::json) FROM c d
                 WHERE d.id <> c.id
+                  AND d.landlord_id = c.landlord_id
                   AND ((c.email IS NOT NULL AND lower(d.email) = lower(c.email))
                     OR (${phoneDigits('c.phone')} <> '' AND ${phoneDigits('d.phone')} = ${phoneDigits('c.phone')}))) AS duplicate_ids
          FROM c
-        ORDER BY c.last_name, c.first_name`, [landlordId])
+        ORDER BY c.last_name, c.first_name`, params)
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -5403,22 +5763,37 @@ posRouter.patch('/customers/:id', requirePerm('pos.ring_sale'), async (req, res,
     // 10/2: a resident's name, email and phone are on their own account; the
     // register does not keep a second copy anyone could edit.
     if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, CUSTOMER_GONE)
+    const cp: unknown[] = [req.params.id, posLandlordId(req)]
+    const wc = askingAs(cp, await whoIsAsking(req, posLandlordId(req)))
     const cur = await queryOne<{ tenant_id: string | null }>(
-      `SELECT tenant_id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
-      [req.params.id, posLandlordId(req)])
+      `SELECT tenant_id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', wc)} AND archived_at IS NULL`,
+      cp)
     if (!cur) throw new AppError(404, CUSTOMER_GONE)
     if (cur.tenant_id) throw new AppError(409, "This is a resident — their name, email and phone are on their own account, so there is nothing to change here. Press Cancel.")
+    // 10/20 (second review): THE SAVE WRITES WHERE THE LOOKUP READ.
+    //
+    // The line above finds the record anywhere in this register's book; this
+    // one demanded an exact company, and the two disagreeing is a dead button
+    // on a row the tab had just shown. It is the desk who hits it: her token
+    // carries Mountain View, the row she opened is Oak Park's — one book, one
+    // account, both Nic's — and pressing Save told her the customer had been
+    // "merged or closed", which had not happened. A clerk fixing a typed phone
+    // number is the counter's ordinary work; what stays each company's is the
+    // money it holds about a person (its charge account, its receipts, its
+    // balances), none of which is touched here.
+    const edit: unknown[] = [b.firstName ?? null, b.lastName ?? null, b.email ?? null, b.phone ?? null,
+       'email' in b && b.email === null, 'phone' in b && b.phone === null,
+       req.params.id, posLandlordId(req)]
+    const who = askingAs(edit, await whoIsAsking(req, posLandlordId(req)))
     const row = await queryOne<any>(
       `UPDATE pos_customers SET
           first_name = COALESCE($1, first_name), last_name = COALESCE($2, last_name),
           email = CASE WHEN $3::text IS NULL AND $5::boolean THEN NULL ELSE COALESCE($3, email) END,
           phone = CASE WHEN $4::text IS NULL AND $6::boolean THEN NULL ELSE COALESCE($4, phone) END,
           updated_at = NOW()
-        WHERE id = $7 AND landlord_id = $8 AND archived_at IS NULL
+        WHERE id = $7 AND ${inBook('landlord_id', '$8', who)} AND archived_at IS NULL
         RETURNING id, first_name, last_name, email, phone`,
-      [b.firstName ?? null, b.lastName ?? null, b.email ?? null, b.phone ?? null,
-       'email' in b && b.email === null, 'phone' in b && b.phone === null,
-       req.params.id, posLandlordId(req)])
+      edit)
     if (!row) throw new AppError(404, CUSTOMER_GONE)
     res.json({ success: true, data: row })
   } catch (e: any) {
@@ -5433,10 +5808,39 @@ posRouter.post('/customers/:id/merge', requirePerm('pos.ring_sale'), async (req,
       'Pick the customer to merge into from the list, then press Merge again.')
     if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, CUSTOMER_GONE)
     const landlordId = posLandlordId(req)
+    // 10/20 (review): the Customers tab now lists every company the account
+    // owns, so the record on the "fold into" picker can be the other company's.
+    // Two companies keep two sets of records, and each set carries that LLC's
+    // own sales, cards and charge account — folding across them would move one
+    // company's money history into the other's books. It is refused in those
+    // words, rather than by the lookup inside mergePosCustomers answering
+    // "already merged or closed", which is not what happened.
+    //
+    // 10/20 (second review) — THE REFUSAL MOVED INTO THE FOLD, AND WHY.
+    //
+    // It used to live here and ask `ownsLandlord(user, the survivor's company)`,
+    // which is false for exactly the person who has to be stopped: the on-site
+    // manager at Mountain View holds pos.ring_sale, so her scope is [Mountain
+    // View] and Oak Park's company reads as "not hers" — the refusal never fired
+    // and the fold ran, Mountain View's sales and charge account into Oak Park's
+    // record. She needs no trick to reach that record: the
+    // widened people picker hands the desk every register customer on the
+    // account by name, with its id. The same guard compared the survivor
+    // against the SESSION's company, so the fold the other way round was open
+    // too (name Oak Park's record in the path, stand at Mountain View, pick a
+    // Mountain View survivor).
+    //
+    // The fold itself now compares the two records to each other, inside the
+    // FOR UPDATE that already holds them, so there is one place to get right
+    // and no door can skip it. All this route owes it is who is asking, which
+    // decides only whether the sentence says "companies" or "companies of
+    // yours" — an on-site manager is not told whose the other company is.
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      await mergePosCustomers(client, { landlordId, loserId: String(req.params.id), into })
+      await mergePosCustomers(client, { landlordId, loserId: String(req.params.id), into,
+        caller: await bookCaller(req.user, landlordId, query),
+        ownsCompany: (id) => ownsLandlord(req.user!, id) })
       await client.query('COMMIT')
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})
@@ -5511,7 +5915,8 @@ posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), asyn
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const out = await linkSaleToPerson(client, { landlordId, saleId: sale.id, target, saleCard, userId: req.user.userId })
+      const out = await linkSaleToPerson(client, { landlordId, saleId: sale.id, target, saleCard, userId: req.user.userId,
+                                                  caller: await whoIsAsking(req, landlordId) })
       await client.query('COMMIT')
       res.json({ success: true, data: out })
     } catch (e: any) {
@@ -5543,7 +5948,8 @@ posRouter.post('/transactions/:id/customer/undo', requirePerm('pos.ring_sale'), 
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const out = await undoLink(client, { landlordId, userId: req.user.userId, saleId: sale.id, token: undo })
+      const out = await undoLink(client, { landlordId, userId: req.user.userId, saleId: sale.id, token: undo,
+                                          caller: await whoIsAsking(req, landlordId) })
       await client.query('COMMIT')
       res.json({ success: true, data: out })
     } catch (e: any) {
@@ -5569,7 +5975,7 @@ posRouter.post('/customers/:id/let-go', requirePerm('pos.ring_sale'), async (req
     let letGo = false
     try {
       await client.query('BEGIN')
-      letGo = await letGoOfPick(client, landlordId, String(req.params.id))
+      letGo = await letGoOfPick(client, landlordId, String(req.params.id), await whoIsAsking(req, landlordId))
       await client.query('COMMIT')
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})
@@ -5595,11 +6001,11 @@ posRouter.post('/customers/:id/let-go', requirePerm('pos.ring_sale'), async (req
  * stored from anywhere else shows no name. A resident's register record goes
  * by their account's name.
  */
-const SESSION_PERSON_JOINS = `
-         LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id AND pcu.landlord_id = s.landlord_id
+const SESSION_PERSON_JOINS = (w: string) => `
+         LEFT JOIN pos_customers pcu ON pcu.id = s.pos_customer_id AND ${inBook('pcu.landlord_id', 's.landlord_id', w)}
          LEFT JOIN tenants       pct ON pct.id = pcu.tenant_id
          LEFT JOIN users         pcuu ON pcuu.id = pct.user_id
-         LEFT JOIN tenants       t   ON t.id   = s.tenant_id AND ${tenantOfCompanySql('t.id', 's.landlord_id')}
+         LEFT JOIN tenants       t   ON t.id   = s.tenant_id AND ${tenantOfCompanySql('t.id', 's.landlord_id', w)}
          LEFT JOIN users         tu  ON tu.id  = t.user_id`
 const SESSION_PERSON_NAME = `NULLIF(TRIM(COALESCE(
                 CASE WHEN pcu.id IS NOT NULL THEN COALESCE(pcuu.first_name, pcu.first_name, '') || ' ' || COALESCE(pcuu.last_name, pcu.last_name, '') END,
@@ -5612,8 +6018,8 @@ const SESSION_PERSON_NAME = `NULLIF(TRIM(COALESCE(
  * still opens (it is the register's background copy, and refusing it would
  * strand every line after it). A change naming somebody else is refused.
  */
-async function sessionPerson(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }): Promise<{ tenantId: string | null; posCustomerId: string | null }> {
-  await salePerson(landlordId, ids)   // refuses anybody who is not this company's
+async function sessionPerson(landlordId: string, ids: { tenantId?: unknown; posCustomerId?: unknown }, caller: BookCaller): Promise<{ tenantId: string | null; posCustomerId: string | null }> {
+  await salePerson(landlordId, ids, caller)   // refuses anybody who is not this company's
   return {
     tenantId: typeof ids.tenantId === 'string' && ids.tenantId ? ids.tenantId : null,
     posCustomerId: typeof ids.posCustomerId === 'string' && ids.posCustomerId ? ids.posCustomerId : null,
@@ -5626,14 +6032,16 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
     const status = String(req.query.status || 'open')
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
     const params: any[] = [posLandlordId(req), status]
+    // Pushed before the property filter so the joins' placeholder is fixed.
+    const w = askingAs(params, await whoIsAsking(req, posLandlordId(req)))
     let propertyClause = ''
     // 10/2 (review): a cashier sees the open carts of the properties they work.
     if (propertyId) {
       await assertPropertyInScope(req.user, propertyId)
-      params.push(propertyId); propertyClause = ' AND s.property_id = $3'
+      params.push(propertyId); propertyClause = ' AND s.property_id = $4'
     } else {
       const scope = await getScopedPropertyIds(req.user)
-      if (scope) { params.push(scope); propertyClause = ' AND s.property_id = ANY($3::uuid[])' }
+      if (scope) { params.push(scope); propertyClause = ' AND s.property_id = ANY($4::uuid[])' }
     }
     const sessions = await query<any>(
       `SELECT s.*,
@@ -5644,7 +6052,7 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
               (SELECT string_agg(x.item_name || CASE WHEN x.qty > 1 THEN ' ×' || x.qty::int ELSE '' END, ', ')
                  FROM (SELECT item_name, qty FROM pos_session_items WHERE session_id = s.id ORDER BY created_at LIMIT 3) x) AS preview
          FROM pos_sessions s
-         ${SESSION_PERSON_JOINS}
+         ${SESSION_PERSON_JOINS(w)}
          LEFT JOIN properties    pr  ON pr.id  = s.property_id
         WHERE s.landlord_id = $1
           AND s.status      = $2${propertyClause}
@@ -5675,7 +6083,7 @@ posRouter.post('/sessions', requirePerm('pos.ring_sale'), async (req, res, next)
     await assertPropertyInScope(req.user, propertyId)
     // 10/2 (review): only this company's person is stored on the cart.
     const who = (posCustomerId || tenantId)
-      ? await sessionPerson(posLandlordId(req), { tenantId, posCustomerId }).catch(() => ({ tenantId: null, posCustomerId: null }))
+      ? await sessionPerson(posLandlordId(req), { tenantId, posCustomerId }, await whoIsAsking(req, posLandlordId(req))).catch(() => ({ tenantId: null, posCustomerId: null }))
       : { tenantId: null, posCustomerId: null }
 
     const row = await queryOne<any>(
@@ -5714,15 +6122,17 @@ async function openSessionInScope(req: any, opts: { anyStatus?: boolean } = {}):
 posRouter.get('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     if (!/^[0-9a-f-]{36}$/i.test(String(req.params.id))) throw new AppError(404, SESSION_GONE)
+    const sp: unknown[] = [req.params.id, posLandlordId(req)]
+    const ws = askingAs(sp, await whoIsAsking(req, posLandlordId(req)))
     const session = await queryOne<any>(
       `SELECT s.*,
               ${SESSION_PERSON_NAME} AS customer_name,
               pr.name AS property_name
          FROM pos_sessions s
-         ${SESSION_PERSON_JOINS}
+         ${SESSION_PERSON_JOINS(ws)}
          LEFT JOIN properties    pr  ON pr.id  = s.property_id
         WHERE s.id = $1 AND s.landlord_id = $2`,
-      [req.params.id, posLandlordId(req)],
+      sp,
     )
     if (!session) throw new AppError(404, SESSION_GONE)
     // 10/2 (review): only a cart at a property the caller works.
@@ -5752,7 +6162,7 @@ posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, 
     const { posCustomerId, tenantId, discountAmount, notes } = req.body || {}
     if (posCustomerId && tenantId) throw new AppError(400, ONE_PERSON_CART)
     // 10/2 (review): a cart names only this company's person.
-    if (posCustomerId || tenantId) await sessionPerson(posLandlordId(req), { tenantId, posCustomerId })
+    if (posCustomerId || tenantId) await sessionPerson(posLandlordId(req), { tenantId, posCustomerId }, await whoIsAsking(req, posLandlordId(req)))
 
     const sets: string[] = []
     const params: any[] = []

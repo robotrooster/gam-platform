@@ -176,15 +176,36 @@ describe('GET /api/tenants/me', () => {
 // to pay. A unit of their own from THIS lease (the landlord's signature issued
 // it) is no reason to skip signing.
 describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', () => {
-  async function waitingOn(f: TFixture, landlordId: string, unitId: string, leaseId: string | null) {
+  const signingToken = () => randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+
+  /**
+   * A document sitting on this tenant's signature. It is a LEASE unless the
+   * case says otherwise, which is what every one of these was until 10/20 —
+   * the day a resident's own page could raise a work-trade form, and that form
+   * started answering the portal's "is your lease waiting?" question.
+   *
+   * landlordSignedFirst is how a real document goes out: the landlord signs
+   * his box, the document moves to 'in_progress', and the resident is the next
+   * unsigned signer.
+   */
+  async function waitingOn(
+    f: TFixture, landlordId: string, unitId: string, leaseId: string | null,
+    opts: { documentType?: string; title?: string; landlordSignedFirst?: boolean } = {},
+  ) {
     const doc = (await db.query<{ id: string }>(
       `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
-       VALUES ($1,$2,$3,'Lease','original_lease','in_progress') RETURNING id`,
-      [landlordId, unitId, leaseId])).rows[0].id
+       VALUES ($1,$2,$3,$4,$5,'in_progress') RETURNING id`,
+      [landlordId, unitId, leaseId, opts.title ?? 'Lease', opts.documentType ?? 'original_lease'])).rows[0].id
+    if (opts.landlordSignedFirst) {
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, signed_at)
+         VALUES ($1,$2,'landlord','Blu B','blu@test.dev',1,$3,'signed',NOW())`,
+        [doc, f.landlordUserId, signingToken()])
+    }
     await db.query(
       `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
        VALUES ($1,$2,'primary','T T','t@test.dev',2,$3,'sent')`,
-      [doc, f.tenantUserId, randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')])
+      [doc, f.tenantUserId, signingToken()])
     return doc
   }
   const me = (f: TFixture) => request(buildApp()).get('/api/tenants/me').set('Authorization', `Bearer ${f.tenantToken}`)
@@ -225,6 +246,62 @@ describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', ()
   it('nothing waiting: no lock-in flag at all', async () => {
     const f = await seedTFixture()
     expect((await me(f)).body.data.pending_lease_locks).toBeNull()
+  })
+
+  // ── 10/20 — THE MAINTENANCE AGREEMENT THAT TOOK CURTIS'S PORTAL ─────────
+  //
+  // Blu opens Curtis's file at Mattoon and sends the Mattoon Maintenance
+  // Agreement — a work-trade form with a landlord box and a tenant box, raised
+  // from the resident's own page. He signs his box first, which is how every
+  // GAM document goes out. Curtis has lived there two years and has rent due.
+  //
+  // Until the portal's question named the document TYPE, that maintenance
+  // agreement came back as Curtis's PENDING LEASE, said it locked his portal,
+  // and the tenant app sent every route he has to a signing page with no nav
+  // and no sign-out, titled "Sign your lease". He could not reach Payments
+  // until he signed a maintenance agreement. A lease holds the portal; paper
+  // waits on the Documents screen while they go on paying rent.
+  it('a work-trade form sent from the resident page is not their lease and does not lock the portal', async () => {
+    const f = await seedTFixture()
+    await waitingOn(f, f.landlordId, f.unitId, null, {
+      documentType: 'general_contract',
+      title: 'Mattoon Maintenance Agreement — Curtis Bell (Lot 1)',
+      landlordSignedFirst: true,
+    })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBeNull()
+    expect(d.pending_lease_locks).toBeNull()
+    // All four signals read the same document, so they go quiet together —
+    // otherwise the nav and the Home notice describe a lease the lock-in says
+    // is not there.
+    expect(d.pending_lease_waiting_on_is_me).toBeNull()
+    expect(d.pending_lease_waiting_on_name).toBeNull()
+    expect(d.pending_lease_signers).toBeNull()
+    // And he still has his home in front of him, which is the whole point.
+    expect(d.unit_id).toBe(f.unitId)
+  })
+
+  it('an add-a-roommate addendum is not their lease either', async () => {
+    const f = await seedTFixture()
+    await waitingOn(f, f.landlordId, f.unitId, f.leaseId!, {
+      documentType: 'addendum_add', title: 'Add a roommate', landlordSignedFirst: true })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBeNull()
+    expect(d.pending_lease_locks).toBeNull()
+  })
+
+  it('a contract raised after the lease never outranks the lease that is actually waiting', async () => {
+    const f = await seedTFixture()
+    const lease = await waitingOn(f, f.landlordId, f.unitId, f.leaseId!)
+    await waitingOn(f, f.landlordId, f.unitId, null, {
+      documentType: 'general_contract', title: 'Mattoon Maintenance Agreement', landlordSignedFirst: true })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBe(lease)
+    expect(d.pending_lease_locks).toBe(true)
+    // The newest open document is the contract; the roster still has to be the
+    // LEASE's roster, or the signing notice names the wrong paper.
+    expect((d.pending_lease_signers ?? []).map((s: any) => s.role)).toEqual(['primary'])
+    expect(d.pending_lease_waiting_on_is_me).toBe(true)
   })
 })
 

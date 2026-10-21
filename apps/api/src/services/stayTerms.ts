@@ -1590,7 +1590,14 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
       // Already ended. Its dates are what it bills (services/utilityBilling),
       // so a checked-out stay whose day of leaving was corrected afterwards
       // follows the real day — unless a lease took over from it.
-      if (b.status !== 'checked_out' || leaseTakesOver || existing.end_date === b.check_out) return { action: 'none' }
+      //
+      // 10/20 (review): and unless it covers NO DAY. An agreement ended the day
+      // it began is the record of a stay that never paid its own power at all —
+      // a no-show, or a stay re-dated back under thirty nights — and handing it
+      // a real span here would make it the payer again on the guest's way out
+      // the gate, which is the one thing the zero length is there to prevent.
+      if (b.status !== 'checked_out' || leaseTakesOver || existing.end_date === b.check_out
+          || existing.end_date === existing.start_date) return { action: 'none' }
       await query(
         `UPDATE utility_service_agreements SET end_date = $2, updated_at = NOW() WHERE id = $1`,
         [existing.id, b.check_out])
@@ -1613,7 +1620,63 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
     return { action: 'ended', agreementId: existing.id }
   }
 
+  // 10/20 (review) — THE NIGHT COUNT IS ASKED ON EVERY SAVE, NOT ONLY THE FIRST.
+  //
+  // This test used to sit at the bottom of the function, on the way to CREATING
+  // an agreement, and the update branch below simply re-dated whatever row it
+  // found. So a guest who booked 35 nights (agreement made, active) and was
+  // then re-dated down to 10 on the schedule kept an ACTIVE utility service
+  // agreement over a week-long stay — and a nightly or weekly guest's power is
+  // inside the rate they already paid, billed to NOBODY. The counter read that
+  // row back as "they pay their own", skipped the in-the-rate branch, and would
+  // have read a figure out to a guest who did not owe it.
+  //
+  // One test, asked every time, for the first save and every save after it.
+  // afterStaySaved (routes/units) calls this on every reservation save — "made,
+  // re-dated, moved or given another month" — so the row follows the dates
+  // instead of remembering what the dates used to be.
+  //
+  // Nothing to decide for an undecided short booking with no agreement, and
+  // that is most of the board — so it leaves before the chain is counted.
+  if (!existing && b.stay_terms !== 'stay') return { action: 'none' }
+  const chain = await continuousStayNights({
+    propertyId: b.property_id, bookingId, tenantId: b.tenant_id, email: b.guest_email,
+    checkIn: b.check_in, checkOut: b.check_out,
+  })
+  const paysItsOwn = chain.nights >= STAY_LEASE_CHOICE_NIGHTS
+
   if (existing) {
+    if (!paysItsOwn) {
+      // BACK UNDER THE LINE. The stay is a short one now, so nobody is the
+      // payer for any of it, and the right record of that is the zero-length
+      // agreement this file already uses for a stay that never happened: ended
+      // the day it began, which bills nothing anywhere (services/utilityBilling
+      // excludes it, the RUBS split does not count it, and the counter reads
+      // the read as in-the-rate). Ended rather than deleted because GAM never
+      // erases — the landlord can still see it was made and when it stopped.
+      // Re-dated back over thirty nights and the branch below brings it back,
+      // exactly as an undone check-out does.
+      if (existing.status === 'ended' && existing.end_date === existing.start_date) return { action: 'none' }
+      const done = await query<{ invoiced: number }>(
+        `UPDATE utility_service_agreements
+            SET status = 'ended', end_date = start_date, updated_at = NOW()
+          WHERE id = $1
+        RETURNING (SELECT COUNT(*)::int FROM invoices i
+                    WHERE i.service_agreement_id = utility_service_agreements.id) AS invoiced`,
+        [existing.id])
+      const invoiced = Number(done[0]?.invoiced ?? 0)
+      logger.info({ bookingId, agreementId: existing.id, nights: chain.nights },
+        '[stay-terms] stay re-dated under 30 nights — its utility agreement ended, its utilities are in the rate')
+      if (invoiced > 0) {
+        // Money was already asked for through an agreement this stay turns out
+        // never to have needed. Nothing here reverses an invoice — that is the
+        // landlord's call, not a side effect of a date change — but it must not
+        // pass in silence either.
+        logger.warn({ bookingId, agreementId: existing.id, invoiced, nights: chain.nights },
+          '[stay-terms] a re-dated short stay had already been invoiced for its utilities — the invoices stand and need a human')
+      }
+      return { action: 'ended', agreementId: existing.id }
+    }
     // In step with the stay: its dates and its site. A stay that came back
     // (a check-out undone) is billed again.
     try {
@@ -1634,11 +1697,7 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
   }
 
   if (b.stay_terms !== 'stay') return { action: 'none' }
-  const chain = await continuousStayNights({
-    propertyId: b.property_id, bookingId, tenantId: b.tenant_id, email: b.guest_email,
-    checkIn: b.check_in, checkOut: b.check_out,
-  })
-  if (chain.nights < STAY_LEASE_CHOICE_NIGHTS) return { action: 'none' }
+  if (!paysItsOwn) return { action: 'none' }
 
   return createStayAgreement(b, opts.byUserId ?? null)
 }

@@ -48,39 +48,47 @@ maintenancePortalRouter.get('/shifts/active', requirePerm('time.clock_in_out'), 
   } catch(e) { next(e) }
 })
 
-// ── DAILY TASKS ───────────────────────────────────────────────
+// ── THE OLD LANDLORD-WIDE TASK LIST — RETIRED 10/20 ───────────
+/**
+ * 10/20 (Nic) — ONE TASK LIST, NOT TWO.
+ *
+ * daily_tasks was a landlord-wide list of titles with a due date and a repeat,
+ * shown as the "Tasks" tab on the Maintenance Portal page and half-used. Blu's
+ * per-property task list went in beside it on 10/20, and two task lists is
+ * exactly the duplicated surface Nic asks to have flagged. Of another one the
+ * same evening: "That doesn't need to be its own tab. That's kind of
+ * ridiculous."
+ *
+ * So the tab is gone from the portal page, and WRITING here is gone with it:
+ * a list nobody can see is worse than two lists, and a POST that still worked
+ * would quietly rebuild the second one. Lines still waiting to be done were
+ * moved onto their park's list by migration 20261022182000 — including the
+ * agent's two actions, which now have nothing to write to and were removed
+ * from portalActions.ts rather than left pointing at a dead surface.
+ *
+ * THE READ STAYS, AND THIS IS THE REASON. GAM never erases. Every row is still
+ * here exactly as it was — its title, its due date, the repeat somebody set up,
+ * who finished the ones that got finished — and each one now carries
+ * folded_into_property_task_id saying which line on which park's list it
+ * became, or fold_note saying in plain words why it could not be placed. That
+ * is the record, so the record is readable; it is just not a screen any more.
+ *
+ * The "due today or repeating" filter is gone with the screen: a record shows
+ * everything, and the old filter hid every one-off task the day after it was
+ * due, which is part of how this list ended up half-used.
+ */
 maintenancePortalRouter.get('/tasks', requirePerm('work_orders.create', 'work_orders.complete', 'work_orders.reassign', 'time.clock_in_out'), async (req, res, next) => {
   try {
     const tasks = await query<any>(`
-      SELECT t.*, u.first_name||' '||u.last_name as assigned_name
-      FROM daily_tasks t LEFT JOIN users u ON u.id=t.assigned_to
-      WHERE t.landlord_id=$1 AND (t.due_date=CURRENT_DATE OR t.recurrence!='none')
-      ORDER BY t.completed ASC, t.due_date ASC`, [req.user!.profileId])
+      SELECT t.*,
+             u.first_name||' '||u.last_name as assigned_name,
+             c.first_name||' '||c.last_name as completed_by_name
+      FROM daily_tasks t
+      LEFT JOIN users u ON u.id=t.assigned_to
+      LEFT JOIN users c ON c.id=t.completed_by
+      WHERE t.landlord_id=$1
+      ORDER BY t.created_at DESC, t.id`, [req.user!.profileId])
     res.json({ success: true, data: tasks })
-  } catch(e) { next(e) }
-})
-
-maintenancePortalRouter.post('/tasks', requirePerm('work_orders.create', 'work_orders.reassign'), async (req, res, next) => {
-  try {
-    const { title, description, assignedTo, dueDate, recurrence } = req.body
-    const task = await queryOne<any>(
-      'INSERT INTO daily_tasks (landlord_id, title, description, assigned_to, due_date, recurrence) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [req.user!.profileId, title, description||null, assignedTo||null, dueDate||null, recurrence||'none']
-    )
-    res.json({ success: true, data: task })
-  } catch(e) { next(e) }
-})
-
-maintenancePortalRouter.patch('/tasks/:id/complete', requirePerm('work_orders.complete'), async (req, res, next) => {
-  try {
-    // S348: surface 404 when no matching landlord-scoped row exists, instead
-    // of silently returning data:null.
-    const task = await queryOne<any>(
-      'UPDATE daily_tasks SET completed=TRUE, completed_at=NOW(), completed_by=$1 WHERE id=$2 AND landlord_id=$3 RETURNING *',
-      [req.user!.userId, req.params.id, req.user!.profileId]
-    )
-    if (!task) throw new AppError(404, 'Task not found')
-    res.json({ success: true, data: task })
   } catch(e) { next(e) }
 })
 

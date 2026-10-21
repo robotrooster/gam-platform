@@ -15,6 +15,7 @@ import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, wor
 import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RETURNING_GUEST_DETAIL, type ReturningOffer } from '../components/ReturningGuestChoice'
 import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
 import { ReservationImportModal, MIGRATED_DOOR_LABEL, stayLockWords } from './ReservationImport'
+import { sentence } from '../lib/meterReadToast'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -1403,12 +1404,22 @@ export function SchedulePage() {
     if (!checkInPrompt) return
     setCheckInBusy(true)
     try {
+      // 10/20: keep what the answer says about each read. A closing read taken
+      // at check-in can come back billing nothing — the cycle was already billed
+      // off the monthly run, or the figure is one the landlord has to look at
+      // first — and this screen discarded that and said "Read recorded" either
+      // way. ONE line for the whole check-in, not one per meter.
+      const notes: string[] = []
       for (const m of checkInPrompt.meters) {
-        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
+        const r: any = await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
+        const note = r?.data?.billingNote
+        if (note && !notes.includes(note)) notes.push(note)
       }
       await doCheckIn(checkInPrompt.booking)
       qc.invalidateQueries('schedule')
-      toast('Read recorded — guest checked in')
+      toast(notes.length
+        ? `Read recorded — guest checked in. ${notes.map(sentence).join(' ')}`
+        : 'Read recorded — guest checked in')
       setCheckInPrompt(null); setDetailBooking(null)
     } catch (e: any) {
       if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }

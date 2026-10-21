@@ -191,7 +191,12 @@ export interface UtilityBillForLink {
   billingCycleMonth: string
   charge: number
   tax: number
-  /** The bill's own tax rate as a FRACTION (utility_bills.tax_rate_pct / 100), for the line. */
+  /**
+   * The rate that puts THIS bill's own tax back on THIS bill's own charge — its
+   * two money figures divided (billLineTaxRate), never the per-type percentage
+   * the bill snapshotted. See payLinkLineForBill for why that distinction is
+   * the difference between two doors agreeing and two doors disagreeing.
+   */
   taxRate: number
   /** What the payer is asked for: the charge and its tax. */
   amount: number
@@ -215,18 +220,74 @@ export function payLinkLineNameForBill(b: { utilityType: UtilityType; billingCyc
 }
 
 /**
+ * The rate a bill's line carries: ITS OWN TAX OVER ITS OWN CHARGE. Unrounded,
+ * because a rate is not the money — the money is the bill's, and this only has
+ * to put it back where it was.
+ */
+export const billLineTaxRate = (b: { charge: number; tax: number }): number =>
+  b.charge > 0 ? b.tax / b.charge : 0
+
+/** TRUE when that rate puts the bill's own tax back on its own charge, to the cent. */
+export const billTaxFitsItsCharge = (b: { charge: number; tax: number }): boolean =>
+  round2(round2(b.charge) * billLineTaxRate(b)) === round2(b.tax)
+
+/**
+ * What the desk is told about a bill GAM cannot ask for on one line — tax owed
+ * with no charge under it, say. There is no line that collects that figure AND
+ * closes the bill out at the same figure, and taking one amount while marking
+ * another paid is the single thing this door must never do. So it is said out
+ * loud and nothing is sent, rather than collected at the wrong number.
+ */
+export const billTaxDoesNotFitWords = (b: { lineName: string; charge: number; tax: number }, press: string): string =>
+  `The ${b.lineName} bill asks $${b.tax.toFixed(2)} of tax on a charge of $${b.charge.toFixed(2)}, and GAM cannot ask for `
+  + `that as one line without taking a different amount than the bill says — so nothing was sent. Correct that bill's own `
+  + `figures on the Utilities page, then press ${press} again; tell GAM support if it still will not go.`
+
+/**
  * The line a bill goes on the link as. No catalog item (it is a bill being
  * collected, not something off a shelf) and so NO `cat` either — the register's
  * category is a merchandising grouping and a bill has none to give. It names
  * its bill, which is the whole point: the match is carried, never guessed.
  *
- * Priced like any other taxed register line: the charge before tax, with the
- * bill's own rate on the line, so the sale records the utility tax AS TAX
- * instead of folding it into revenue the landlord does not get to keep. The
- * authoritative figures stay the bill's (and this settlement row's) — a rate
- * stored at four decimals is for the line, never for the money.
+ * Priced like any other taxed register line: the charge before tax, with a rate
+ * on the line, so the sale records the utility tax AS TAX instead of folding it
+ * into revenue the landlord does not get to keep.
+ *
+ * ── 10/20 (fix) — AND THE RATE IS THE BILL'S TWO FIGURES DIVIDED, NEVER THE
+ *    PERCENTAGE THE BILL SNAPSHOTTED ──────────────────────────────────────────
+ *
+ * utility_bills.tax_rate_pct is ONE utility's rate, and a bill is not always
+ * one utility. Sewer rides the water meter (S533: there is no sewer meter in
+ * the field, and the tenant sees ONE line item), so a water bill's tax is
+ * water × the water rate PLUS sewer × the sewer rate — two rates inside one tax
+ * figure, with tax_rate_pct holding only the first of them (utilityBilling
+ * generateBillsForMeter, and the same arithmetic again in billMoveOutRead).
+ *
+ * Hand the register that percentage and the two doors for one bill disagree,
+ * which is the whole thing this file exists to prevent. Oak Park sets Water 8%
+ * and leaves Sewer blank — both ordinary answers on the Utilities page. RV 27's
+ * water submeter, 0.005/gal with sewer 0.004, 3,000 gallons: charge $27.00, tax
+ * $1.20, tax_rate_pct 8, and the bill is $28.20. The emailed link asked $28.20,
+ * because it sums the bills' own money. The SAME link settled at the counter
+ * re-derived it instead — $27.00 × 8% = $2.16 — took $29.16, closed the bill
+ * out at $28.20 anyway, and booked the extra 96¢ as sales tax owed to an agency
+ * nobody owes it to. Reverse the landlord's two answers (Water blank, Sewer 8%)
+ * and the counter collected NO tax at all while the bill read $0.96 of tax paid
+ * in full.
+ *
+ * So the rate is derived from the money, which puts the bill's own tax back on
+ * its own charge exactly — whatever the tax is made of and however many rates
+ * went into it. (That also retires the old four-decimal rounding, which was
+ * wrong in its own right: tax_rate_pct is numeric(6,4) in PERCENT, and rounding
+ * it to four decimals as a FRACTION turned 8.1250% into 0.0813 and drifted a
+ * cent per $100 off the bill.)
+ *
+ * And it is CHECKED here rather than assumed, because this is the one place a
+ * bill becomes a line: a bill whose tax will not sit on its own charge is
+ * refused, not collected at the wrong figure.
  */
 export function payLinkLineForBill(b: UtilityBillForLink): Record<string, unknown> {
+  if (!billTaxFitsItsCharge(b)) throw new AppError(409, billTaxDoesNotFitWords(b, 'Send bill'))
   return { id: null, name: b.lineName, qty: 1, price: round2(b.charge), tax: b.taxRate, utilityBillId: b.billId }
 }
 
@@ -243,10 +304,46 @@ export function utilityBillIdsOnLink(link: { items?: unknown }): string[] {
 const billLineKey = (l: any) =>
   `${String(l?.name ?? '')}|${(Number(l?.price) || 0).toFixed(2)}|${(Number(l?.tax) || 0).toFixed(4)}`
 
+/** The bill-raised lines a link carries — the ones payLinkLineForBill wrote. */
+const billLinesOf = (link: any): any[] => (Array.isArray(link?.items) ? link.items : []).filter(isUtilityBillLine)
+
 /** What anybody is told who retyped a bill's line or lifted it out of the cart. */
 export const utilityBillLineIsTheBillWords = (l: any, press: string): string =>
   `This link is their ${String(l?.name ?? 'utility')} bill ($${(Number(l?.price) || 0).toFixed(2)}) — that line is the bill itself `
   + `and stays as it is. Put it back the way it was, then press ${press} again; to stop asking for it, close the link.`
+
+/** What anybody is told who tried to take a discount off a bill. */
+export const utilityBillNoDiscountWords = (l: any, press: string): string =>
+  `This link is their ${String(l?.name ?? 'utility')} bill ($${(Number(l?.price) || 0).toFixed(2)}) — settling it closes the bill out `
+  + `at the bill's own figure, so no discount comes off it. Take the discount off, then press ${press} again `
+  + `(ring anything you are discounting as its own sale); to stop asking for the bill, close the link.`
+
+/**
+ * 10/20 (review) — AND THE DISCOUNT BOX IS A DOOR INTO THE SAME ROOM.
+ *
+ * assertUtilityBillLinesKept below holds the LINE, and it cannot see a
+ * cart-level discount, which takes money off the sale without touching any
+ * line at all. RV 27's final electric is $81.27; the payer walks in instead of
+ * paying the card page, a manager loads the link into the register and presses
+ * Charge with $75.25 off. Every one of the line's four figures is untouched, so
+ * the line guard passed: $6.02 went in the drawer, the bill was closed out as
+ * paid in full, the whole $81.27 charge was voided off the resident's invoice
+ * with "collected on a pay link" — the same void an honest collection writes,
+ * so nothing reads as wrong afterwards — and the recovery report counted
+ * $81.27 as money in. The same hole was in Adjust, which can put the discount
+ * on the LINK instead and leave the payer's own card page asking $6.02.
+ *
+ * A bill is collected in full or it is not collected. So a cart or a link
+ * carrying a bill-raised line takes NO discount — the same answer a
+ * reservation's price already gets (reservationNoDiscountWords) — and a bill
+ * that is wrong is corrected on the bill, never at the till.
+ * (memory: gam-every-dollar-counted-once)
+ */
+export function assertUtilityBillNotDiscounted(link: any, discount: unknown, press: string): void {
+  const own = billLinesOf(link)
+  if (!own.length) return
+  if (Number(discount) > 0.005) throw new AppError(400, utilityBillNoDiscountWords(own[0], press))
+}
 
 /**
  * 10/20 (Nic) — AND AT THE TILL, A BILL'S LINE IS STILL THE BILL.
@@ -267,10 +364,24 @@ export const utilityBillLineIsTheBillWords = (l: any, press: string): string =>
  * come back from the register without the server's marks (the bill id among
  * them), so they are matched on what they charge, exactly as Adjust matches
  * them (routes/posPayLinks keepLinkServerLines).
+ *
+ * 10/20 (review): the sale's DISCOUNT is checked here too
+ * (assertUtilityBillNotDiscounted), because holding the line while leaving the
+ * money alone is what let $75.25 come off an $81.27 bill — the two cannot be
+ * checked apart.
+ *
+ * 10/20 (fix): and the cart comes back PRICED AS THE SERVER WROTE IT. The match
+ * above is made to the cent and to four decimals of rate, which is how a line
+ * survives the round trip through the register at all — but a tolerance is not
+ * a figure. Four decimals of rate is half a dollar on a $10,000 master share,
+ * so the kept lines are returned carrying the link's own price, quantity and
+ * rate rather than the register's near-enough copies. The caller charges what
+ * comes back.
  */
-export function assertUtilityBillLinesKept(link: any, items: unknown, press: string): void {
-  const own = (Array.isArray(link?.items) ? link.items : []).filter(isUtilityBillLine)
-  if (!own.length) return
+export function assertUtilityBillLinesKept(link: any, items: unknown, discount: unknown, press: string): any[] {
+  const cart0 = Array.isArray(items) ? items : []
+  const own = billLinesOf(link)
+  if (!own.length) return cart0
   const cart = new Map<string, number>()
   for (const it of (Array.isArray(items) ? items : [])) {
     if ((it as any)?.id) continue   // a catalog line is never a bill
@@ -288,6 +399,13 @@ export function assertUtilityBillLinesKept(link: any, items: unknown, press: str
       throw new AppError(400, utilityBillLineIsTheBillWords(e.line, press))
     }
   }
+  assertUtilityBillNotDiscounted(link, discount, press)
+  // Every line that matched is the link's own line, at the link's own figures.
+  return cart0.map((it: any) => {
+    if (it?.id) return it
+    const l = want.get(billLineKey(it))?.line
+    return l ? { ...it, price: round2(Number(l.price) || 0), tax: Number(l.tax) || 0 } : it
+  })
 }
 
 const BILL_SELECT = `
@@ -327,7 +445,8 @@ function billFromRow(r: any): UtilityBillForLink {
     utilityType: r.utility_type as UtilityType,
     billingCycleMonth: isoDay(r.cycle) ?? String(r.cycle),
     charge, tax, amount: round2(charge + tax),
-    taxRate: Math.round(((Number(r.tax_rate_pct) || 0) / 100) * 10000) / 10000,
+    // The bill's own two figures, not its snapshotted percentage (payLinkLineForBill).
+    taxRate: billLineTaxRate({ charge, tax }),
     paymentId: r.payment_id ?? null, invoiceId: r.invoice_id ?? null,
     payerName: (r.payer_name || '').trim() || null,
     payerEmail: r.payer_email || null,
@@ -497,6 +616,11 @@ export async function utilityBillsForSending(
     }
     if (!(UTILITY_TYPES as readonly string[]).includes(b.utilityType)) {
       throw new AppError(409, `GAM does not know what kind of utility the ${b.billingCycleMonth} bill on ${b.spaceLabel || 'that space'} is, so it cannot be sent. Tell GAM support.`)
+    }
+    // Its tax has to sit on its own charge, or the link would ask one figure
+    // and the bill would be closed out at another (payLinkLineForBill).
+    if (!billTaxFitsItsCharge(b)) {
+      throw new AppError(409, billTaxDoesNotFitWords(b, args.press))
     }
   }
   // ── ONE LINK IS ONE PERSON'S BILL ───────────────────────────────────────────

@@ -363,7 +363,11 @@ const LANDLORD_ENTRY: AgentProfile = {
     // charge) and where to do it; it does not raise, credit or void money.
     // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
     // void_tenant_credit are DELIBERATELY ABSENT.
-    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    // 10/20 (Nic): create_daily_task / complete_daily_task are GONE — the old
+    // landlord-wide Tasks tab they wrote to is retired, its open lines folded onto
+    // the parks they belong to, and the park's own list is not an agent's to write
+    // (see portalActions.ts and actionGap's DELIBERATE).
+    'clock_in', 'clock_out', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
     'complete_scheduled_maintenance',
@@ -481,7 +485,11 @@ const LANDLORD_ESCALATION: AgentProfile = {
     // charge) and where to do it; it does not raise, credit or void money.
     // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
     // void_tenant_credit are DELIBERATELY ABSENT.
-    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    // 10/20 (Nic): create_daily_task / complete_daily_task are GONE — the old
+    // landlord-wide Tasks tab they wrote to is retired, its open lines folded onto
+    // the parks they belong to, and the park's own list is not an agent's to write
+    // (see portalActions.ts and actionGap's DELIBERATE).
+    'clock_in', 'clock_out', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
     'complete_scheduled_maintenance',

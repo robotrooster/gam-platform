@@ -12,6 +12,7 @@ import {
 import { AppError } from '../middleware/errorHandler'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
 import { tenantLivesHereSql } from '../services/posPeople'
+import { askingAs, bookCaller } from '../services/registerBook'
 import { landlordScopeIds } from '../lib/landlordScope'
 import {
   requireAuth, requirePerm, getScopedPropertyIds, userHasPerm, propertyCutoffsOf, bookkeeperRequestScopeOf,
@@ -130,15 +131,23 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
     // company's own register record holds for them, never the account's
     // current address — that is wherever they live now, not this company's to
     // read (posPeople.recordContactSql applies the same rule at the register).
+    // 10/20 (review): the lives-here gate below reads the ACCOUNT's register
+    // book, so it has to be told who is asking — a co-owner of one company of
+    // the account reaches only that one (services/registerBook). The desk,
+    // holding no company of her own, reads the account she works for.
+    const tp: unknown[] = [landlordIds, scopedIds]
+    // No one company to name — this list spans the account — so the desk's own
+    // token company anchors it (bookCaller's fallback) and a landlord asks as themselves.
+    const wt = askingAs(tp, await bookCaller(req.user, undefined, query))
     const tickets = await query<any>(`
       SELECT t.id, t.items, t.note, t.property_id, p.name AS property_name,
              to_char(t.created_at, 'YYYY-MM-DD') AS written_on,
              t.tenant_id, t.pos_customer_id,
              COALESCE(tu.first_name, c.first_name, rc.first_name) AS first_name,
              COALESCE(tu.last_name,  c.last_name,  rc.last_name)  AS last_name,
-             COALESCE(CASE WHEN tn.id IS NOT NULL AND ${tenantLivesHereSql('tn.id', 't.landlord_id')} THEN tu.email END,
+             COALESCE(CASE WHEN tn.id IS NOT NULL AND ${tenantLivesHereSql('tn.id', 't.landlord_id', wt)} THEN tu.email END,
                       c.email, rc.email) AS email,
-             COALESCE(CASE WHEN tn.id IS NOT NULL AND ${tenantLivesHereSql('tn.id', 't.landlord_id')} THEN tu.phone END,
+             COALESCE(CASE WHEN tn.id IS NOT NULL AND ${tenantLivesHereSql('tn.id', 't.landlord_id', wt)} THEN tu.phone END,
                       c.phone, rc.phone) AS phone,
              (SELECT SUM((i->>'qty')::numeric * (i->>'price')::numeric * (1 + COALESCE((i->>'tax')::numeric, 0)))
                 FROM jsonb_array_elements(t.items) i)::float AS total
@@ -156,7 +165,7 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
         LEFT JOIN tenants tn ON tn.id = COALESCE(t.tenant_id, c.tenant_id)
         LEFT JOIN users tu ON tu.id = tn.user_id
        WHERE t.landlord_id = ANY($1::uuid[]) AND t.status = 'open'
-         AND ($2::uuid[] IS NULL OR t.property_id = ANY($2::uuid[]))`, [landlordIds, scopedIds])
+         AND ($2::uuid[] IS NULL OR t.property_id = ANY($2::uuid[]))`, tp)
     for (const t of tickets) {
       if (!(Number(t.total) > 0)) continue
       const row = {

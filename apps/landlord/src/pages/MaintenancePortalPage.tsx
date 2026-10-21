@@ -2,49 +2,67 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { Clock, CheckCircle, Package, ShoppingCart, Calendar, Wrench, Plus, User, AlertTriangle } from 'lucide-react'
+import { Clock, Package, ShoppingCart, Calendar, Wrench, Plus, AlertTriangle, ClipboardList, Circle } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
-type Tab = 'shift'|'workorders'|'tasks'|'parts'|'purchases'|'scheduled'
+type Tab = 'shift'|'workorders'|'propertytasks'|'parts'|'purchases'|'scheduled'
 
 export function MaintenancePortalPage() {
   const qc = useQueryClient()
   const [tab, setTab] = useState<Tab>('shift')
   const [showAddPart, setShowAddPart] = useState(false)
-  const [showAddTask, setShowAddTask] = useState(false)
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false)
   const [newPart, setNewPart] = useState({ name:'', sku:'', quantity:0, minQuantity:0, unit:'each', location:'', cost:'' })
-  const [newTask, setNewTask] = useState({ title:'', description:'', dueDate:'', recurrence:'none' })
   const [purchaseItems, setPurchaseItems] = useState<{name:string,qty:number,est:string}[]>([{name:'',qty:1,est:''}])
   const [purchaseNotes, setPurchaseNotes] = useState('')
 
   const { data: shiftData } = useQuery('shift-active', () => apiGet('/maint-portal/shifts/active'), { refetchInterval: 30000 })
   const { data: workOrders = [] } = useQuery<any[]>('maint-work-orders', () => apiGet('/maint-portal/work-orders'))
-  const { data: tasks = [] } = useQuery<any[]>('maint-tasks', () => apiGet('/maint-portal/tasks'))
   const { data: parts = [] } = useQuery<any[]>('maint-parts', () => apiGet('/maint-portal/parts'))
   const { data: purchases = [] } = useQuery<any[]>('maint-purchases', () => apiGet('/maint-portal/purchases'))
   const { data: scheduled = [] } = useQuery<any[]>('maint-scheduled', () => apiGet('/maint-portal/scheduled'))
+  // 10/20 (Blu, via Nic): the park checklists for the properties this worker is
+  // assigned to — open lines only, because a checklist screen shows what is
+  // left. The server decides which parks those are (maintenance_worker_scopes),
+  // so this asks for "mine" and gets exactly that.
+  const { data: propertyTasks = [] } = useQuery<any[]>('my-property-tasks', () => apiGet('/property-task-list'))
 
   const clockInMut = useMutation(() => apiPost('/maint-portal/shifts/clock-in', {}), { onSuccess: () => qc.invalidateQueries('shift-active') })
   const clockOutMut = useMutation(() => apiPost('/maint-portal/shifts/clock-out', {}), { onSuccess: () => qc.invalidateQueries('shift-active') })
-  const completeTaskMut = useMutation((id: string) => apiPatch('/maint-portal/tasks/'+id+'/complete', {}), { onSuccess: () => qc.invalidateQueries('maint-tasks') })
   const addPartMut = useMutation(() => apiPost('/maint-portal/parts', { ...newPart, quantity: parseInt(newPart.quantity as any)||0, minQuantity: parseInt(newPart.minQuantity as any)||0, cost: parseFloat(newPart.cost)||null }), { onSuccess: () => { qc.invalidateQueries('maint-parts'); setShowAddPart(false); setNewPart({ name:'', sku:'', quantity:0, minQuantity:0, unit:'each', location:'', cost:'' }) } })
-  const addTaskMut = useMutation(() => apiPost('/maint-portal/tasks', newTask), { onSuccess: () => { qc.invalidateQueries('maint-tasks'); setShowAddTask(false) } })
   const purchaseReqMut = useMutation(() => apiPost('/maint-portal/purchases', { items: purchaseItems, notes: purchaseNotes, totalEstimate: purchaseItems.reduce((a,i)=>a+parseFloat(i.est||'0')*i.qty,0) }), { onSuccess: () => { qc.invalidateQueries('maint-purchases'); setShowPurchaseRequest(false) } })
   const approvePurchaseMut = useMutation(({ id, budgetLimit }: any) => apiPatch('/maint-portal/purchases/'+id+'/approve', { budgetLimit }), { onSuccess: () => qc.invalidateQueries('maint-purchases') })
   const completedScheduledMut = useMutation((id: string) => apiPatch('/maint-portal/scheduled/'+id+'/complete', {}), { onSuccess: () => qc.invalidateQueries('maint-scheduled') })
+  // Ticking a park's checklist line. The property id goes in the path: a line
+  // belonging to a park this worker is not on is not reachable (routes/propertyTaskList).
+  const tickPropertyTaskMut = useMutation(
+    ({ propertyId, id }: { propertyId: string; id: string }) =>
+      apiPost(`/property-task-list/${propertyId}/items/${id}/done`, {}),
+    { onSuccess: () => qc.invalidateQueries('my-property-tasks') })
 
   const myShift = (shiftData as any)?.myShift
   const activeStaff = (shiftData as any)?.active || []
   const lowStock = (parts as any[]).filter(p => p.quantity <= p.minQuantity)
   const pendingPurchases = (purchases as any[]).filter(p => p.status === 'pending')
-  const todayTasks = (tasks as any[]).filter(t => !t.completed)
   const overdueScheduled = (scheduled as any[]).filter(s => s.nextDue && new Date(s.nextDue) <= new Date())
 
-  const TABS: {id:Tab, label:string, icon:any, badge?:number}[] = [
+  // `quiet` is the count that is NOT an alarm. Every other badge here means
+  // somebody is behind — parts below reorder level, purchases waiting, a
+  // scheduled job overdue — and red is right for those. The park task list is
+  // the one count that is just a number of jobs: Nic's rule for it is that
+  // "nothing here is late, because nothing here is tracked", and a red chip
+  // over it says the opposite of that in the one glance this strip gets.
+  const TABS: {id:Tab, label:string, icon:any, badge?:number, quiet?:boolean}[] = [
     { id:'shift',      label:'Shift',       icon:Clock,        badge: activeStaff.length },
     { id:'workorders', label:'Work Orders',  icon:Wrench,       badge: (workOrders as any[]).length },
-    { id:'tasks',      label:'Tasks',        icon:CheckCircle,  badge: todayTasks.length },
+    // 10/20 (Nic): just "Tasks" now. It was called "Property Tasks" to tell it
+    // apart from a landlord-wide Tasks tab that used to sit right here, with
+    // due dates and repeats, half-used. Nic's answer to two task lists was the
+    // same as his answer to the other duplicated surface that evening — "that
+    // doesn't need to be its own tab, that's kind of ridiculous" — so the old
+    // one is gone, its open lines are on the parks they belong to, and the
+    // qualifier can go with it.
+    { id:'propertytasks', label:'Tasks', icon:ClipboardList, badge: (propertyTasks as any[]).length || undefined, quiet: true },
     { id:'parts',      label:'Parts',        icon:Package,      badge: lowStock.length || undefined },
     { id:'purchases',  label:'Purchases',    icon:ShoppingCart, badge: pendingPurchases.length || undefined },
     { id:'scheduled',  label:'Scheduled',    icon:Calendar,     badge: overdueScheduled.length || undefined },
@@ -82,7 +100,7 @@ export function MaintenancePortalPage() {
               borderBottom:tab===t.id?'2px solid var(--gold)':'2px solid transparent',
               marginBottom:-1, position:'relative' }}>
             <t.icon size={14}/>{t.label}
-            {t.badge ? <span style={{ background:'var(--red)', color:'white', fontSize:'.65rem', fontWeight:700, padding:'1px 5px', borderRadius:10, minWidth:16, textAlign:'center' }}>{t.badge}</span> : null}
+            {t.badge ? <span style={{ background:t.quiet?'var(--bg-4)':'var(--red)', color:t.quiet?'var(--text-2)':'white', fontSize:'.65rem', fontWeight:700, padding:'1px 5px', borderRadius:10, minWidth:16, textAlign:'center' }}>{t.badge}</span> : null}
           </button>
         ))}
       </div>
@@ -142,53 +160,60 @@ export function MaintenancePortalPage() {
         </div>
       )}
 
-      {/* TASKS TAB */}
-      {tab==='tasks' && (
+      {/* PROPERTY TASKS TAB — 10/20 (Nic, relaying Blu)
+          "A list that the maintenance person can consult and check off when
+           it's done, kind of running in parallel to maintenance, sitting
+           outside of it though."
+          The park's checklist, grouped by park because this person works
+          several. Read and tick, nothing else: the landlord writes these lines
+          (routes/propertyTaskList.ts), and there is no status, priority, due
+          date or timer on any of them — Nic: "it's not counting how long it
+          takes to get closed after it's been open". */}
+      {tab==='propertytasks' && (
         <div>
-          <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
-            <button className="btn btn-primary btn-sm" onClick={()=>setShowAddTask(true)}><Plus size={13}/> Add Task</button>
-          </div>
           <div className="card" style={{ padding:0 }}>
-            {(tasks as any[]).length === 0 ? (
-              <div className="empty-state" style={{ padding:48 }}><CheckCircle size={40}/><h3>No tasks today</h3></div>
+            {(propertyTasks as any[]).length === 0 ? (
+              <div className="empty-state" style={{ padding:48 }}>
+                <ClipboardList size={40}/>
+                <h3>Nothing on the list</h3>
+                <p style={{ fontSize:'.8rem', color:'var(--text-3)' }}>
+                  Jobs your landlord adds for a property show up here.
+                </p>
+              </div>
             ) : (
               <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
-                {(tasks as any[]).map((t:any) => (
-                  <div key={t.id} style={{ display:'flex', alignItems:'center', gap:12, padding:'12px 16px', borderBottom:'1px solid var(--border-0)', opacity:t.completed?0.5:1 }}>
-                    <input type="checkbox" checked={t.completed} onChange={()=>!t.completed&&completeTaskMut.mutate(t.id)} style={{ width:18, height:18, cursor:'pointer' }}/>
-                    <div style={{ flex:1 }}>
-                      <div style={{ fontWeight:600, color:'var(--text-0)', textDecoration:t.completed?'line-through':'none' }}>{t.title}</div>
-                      {t.description && <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.description}</div>}
+                {Object.entries(
+                  (propertyTasks as any[]).reduce((acc: Record<string, any[]>, t: any) => {
+                    (acc[t.propertyName] ||= []).push(t); return acc
+                  }, {})
+                ).map(([parkName, lines]) => (
+                  <div key={parkName}>
+                    <div style={{ padding:'10px 16px', fontSize:'.72rem', fontWeight:600,
+                                  color:'var(--text-3)', borderBottom:'1px solid var(--border-0)' }}>
+                      {parkName}
                     </div>
-                    {t.assignedName && <div style={{ fontSize:'.72rem', color:'var(--text-3)', display:'flex', alignItems:'center', gap:4 }}><User size={11}/>{t.assignedName}</div>}
-                    {t.recurrence !== 'none' && <span className="badge badge-blue">{t.recurrence}</span>}
+                    {(lines as any[]).map((t:any) => (
+                      <div key={t.id} style={{ display:'flex', alignItems:'flex-start', gap:12,
+                                               padding:'12px 16px', borderBottom:'1px solid var(--border-0)' }}>
+                        <button
+                          onClick={()=>tickPropertyTaskMut.mutate({ propertyId: t.propertyId, id: t.id })}
+                          disabled={tickPropertyTaskMut.isLoading}
+                          title="Mark it done" aria-label="Mark it done"
+                          style={{ background:'none', border:'none', padding:0, marginTop:2,
+                                   cursor:'pointer', color:'var(--text-3)', lineHeight:0 }}>
+                          <Circle size={18}/>
+                        </button>
+                        <div style={{ flex:1, minWidth:0, fontSize:'.85rem', color:'var(--text-0)',
+                                      wordBreak:'break-word' }}>
+                          {t.body}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 ))}
               </div>
             )}
           </div>
-          {showAddTask && (
-            <div className="modal-overlay" onClick={()=>setShowAddTask(false)}>
-              <div className="modal" style={{ maxWidth:400 }} onClick={e=>e.stopPropagation()}>
-                <div className="modal-title">Add Task</div>
-                <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-                  <input className="input" placeholder="Task title *" value={newTask.title} onChange={e=>setNewTask(t=>({...t,title:e.target.value}))}/>
-                  <input className="input" placeholder="Description" value={newTask.description} onChange={e=>setNewTask(t=>({...t,description:e.target.value}))}/>
-                  <input className="input" type="date" value={newTask.dueDate} onChange={e=>setNewTask(t=>({...t,dueDate:e.target.value}))}/>
-                  <select className="input" value={newTask.recurrence} onChange={e=>setNewTask(t=>({...t,recurrence:e.target.value}))}>
-                    <option value="none">One-time</option>
-                    <option value="daily">Daily</option>
-                    <option value="weekly">Weekly</option>
-                    <option value="monthly">Monthly</option>
-                  </select>
-                </div>
-                <div className="modal-footer">
-                  <button className="btn btn-ghost" onClick={()=>setShowAddTask(false)}>Cancel</button>
-                  <button className="btn btn-primary" disabled={!newTask.title||addTaskMut.isLoading} onClick={()=>addTaskMut.mutate()}>Add Task</button>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       )}
 
@@ -324,7 +349,9 @@ export function MaintenancePortalPage() {
                     <tr key={s.id} style={{ background:overdue?'rgba(239,68,68,.04)':'' }}>
                       <td><div style={{ fontWeight:600 }}>{s.title}</div>{s.description&&<div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{s.description}</div>}</td>
                       <td style={{ fontSize:'.78rem' }}><div>{s.propertyName||'All properties'}</div>{s.unitNumber&&<div style={{ color:'var(--text-3)' }}>Unit {s.unitNumber}</div>}</td>
-                      <td><span className="badge badge-blue">{s.recurrence}</span></td>
+                      {/* 10/20: was printing the raw value — "biannual" is a
+                          column name, not a word anybody says. */}
+                      <td><span className="badge badge-blue">{humanize(s.recurrence)}</span></td>
                       <td style={{ fontSize:'.78rem', color:overdue?'var(--red)':'var(--text-2)', fontWeight:overdue?700:400 }}>{s.nextDue ? new Date(s.nextDue).toLocaleDateString() : '—'}{overdue&&' ⚠️'}</td>
                       <td style={{ fontSize:'.78rem' }}>{s.assignedName||'Unassigned'}</td>
                       <td><button className="btn btn-primary btn-sm" onClick={()=>completedScheduledMut.mutate(s.id)}>Complete</button></td>

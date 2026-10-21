@@ -10,6 +10,7 @@
  */
 import { db, query } from '../db'
 import { applicantRegisterRecord } from '../services/posPeople'
+import { accountAsCaller } from '../services/registerBook'
 import { getPoolIntakeShell } from '../services/poolIntake'
 
 async function main() {
@@ -28,7 +29,10 @@ async function main() {
       ORDER BY bc.landlord_id, bc.tenant_id, bc.created_at DESC`, [shell?.landlordId ?? null])
   for (const r of rows) {
     console.log(`${r.has_record ? 'already' : (apply ? 'adding ' : 'would add')}  ${r.business_name ?? r.landlord_id} · ${r.first_name ?? ''} ${r.last_name ?? ''}`)
-    if (apply) await applicantRegisterRecord(db, r.landlord_id, r.tenant_id, { firstName: r.first_name, lastName: r.last_name })
+    // A backfill has nobody at a keyboard: the company's own account asks, so
+    // the record is found wherever the account already keeps it (registerBook).
+    if (apply) await applicantRegisterRecord(db, r.landlord_id, r.tenant_id, { firstName: r.first_name, lastName: r.last_name },
+                                            await accountAsCaller(r.landlord_id, query))
   }
   console.log(`${rows.length} applicant(s) ${apply ? 'on the register' : '— DRY, nothing written'}`)
   await db.end()
